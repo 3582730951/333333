@@ -1,0 +1,28 @@
+{
+  "name": "pool-admin-spa",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@douyinfe/semi-icons": "^2.72.0",
+    "@douyinfe/semi-ui": "^2.72.0",
+    "axios": "^1.7.7",
+    "puppeteer": "^25.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.27.0",
+    "recharts": "^3.9.0"
+  },
+  "devDependencies": {
+    "@babel/parser": "^7.29.7",
+    "@babel/traverse": "^7.29.7",
+    "@douyinfe/semi-vite-plugin": "^2.100.0",
+    "@vitejs/plugin-react": "^4.3.3",
+    "vite": "^5.4.10"
+  }
+}

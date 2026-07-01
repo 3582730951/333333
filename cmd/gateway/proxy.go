@@ -1,0 +1,288 @@
+package main
+
+import (
+	"bufio"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"codex-account-pool/internal/supervisor"
+)
+
+// Proxy 是本地 MITM 代理核心
+type Proxy struct {
+	listenAddr string
+	poolURL    string
+	cache      *IdentityCache
+	caMgr      *CAManager
+	poolClient *http.Client
+	mu         sync.RWMutex
+}
+
+// NewProxy 创建代理实例
+func NewProxy(cfg Config) (*Proxy, error) {
+	caMgr, err := NewCAManager(cfg.MITM.CACert, cfg.MITM.CAKey)
+	if err != nil {
+		return nil, fmt.Errorf("init MITM CA: %w", err)
+	}
+	poolClient := newGatewayPoolClient()
+	return &Proxy{
+		listenAddr: cfg.ListenAddr,
+		poolURL:    cfg.PoolServerURL,
+		cache:      NewIdentityCache(cfg.PoolServerURL, cfg.DownstreamKey, cfg.IdentityTTL, poolClient),
+		caMgr:      caMgr,
+		poolClient: poolClient,
+	}, nil
+}
+
+func newGatewayPoolClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // pool_server 可能用自签名证书
+			Proxy:               http.ProxyFromEnvironment,
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+}
+
+// ListenAndServe 启动代理服务器
+func (p *Proxy) ListenAndServe() error {
+	ln, err := net.Listen("tcp", p.listenAddr)
+	if err != nil {
+		return fmt.Errorf("listen failed: %w", err)
+	}
+	defer ln.Close()
+
+	log.Printf("Claude Gateway listening on %s", p.listenAddr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("accept error: %v", err)
+			continue
+		}
+		go func() {
+			defer supervisor.Recover("gateway-connection")
+			p.handleConnection(conn)
+		}()
+	}
+}
+
+// handleConnection 处理单个连接
+func (p *Proxy) handleConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	// 读取 HTTP 请求行
+	buf := make([]byte, 4096)
+	n, err := clientConn.Read(buf)
+	if err != nil {
+		return
+	}
+
+	req := string(buf[:n])
+	lines := strings.Split(req, "\r\n")
+	if len(lines) == 0 {
+		return
+	}
+
+	parts := strings.Fields(lines[0])
+	if len(parts) < 3 {
+		return
+	}
+
+	method, target := parts[0], parts[1]
+
+	// CONNECT 方法 = HTTPS MITM
+	if method == "CONNECT" {
+		p.handleConnect(clientConn, target)
+		return
+	}
+
+	// 普通 HTTP 请求（直接转发，不改写）
+	p.handleHTTP(clientConn, req)
+}
+
+// handleConnect 处理 HTTPS CONNECT 隧道
+func (p *Proxy) handleConnect(clientConn net.Conn, target string) {
+	// 解析目标主机
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+
+	// 只拦截 api.anthropic.com 和 chatgpt.com
+	shouldIntercept := strings.Contains(host, "api.anthropic.com") ||
+		strings.Contains(host, "chatgpt.com") ||
+		strings.Contains(host, "backend-api")
+
+	if !shouldIntercept {
+		// 直接转发（不 MITM）
+		p.forwardConnect(clientConn, target)
+		return
+	}
+
+	// 响应 200 Connection Established
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// 生成临时证书
+	cert, err := p.caMgr.GenerateCert(host)
+	if err != nil {
+		log.Printf("cert generation failed: %v", err)
+		return
+	}
+
+	// TLS 握手
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	tlsConn := tls.Server(clientConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("TLS handshake failed: %v", err)
+		return
+	}
+	defer tlsConn.Close()
+
+	// 读取解密后的 HTTP 请求
+	httpReq, err := http.ReadRequest(bufio.NewReader(tlsConn))
+	if err != nil {
+		log.Printf("read HTTP request failed: %v", err)
+		return
+	}
+
+	// 改写请求
+	if err := p.rewriteRequest(httpReq); err != nil {
+		log.Printf("rewrite failed: %v", err)
+		writeGatewayError(tlsConn, http.StatusInternalServerError, "Rewrite failed")
+		return
+	}
+
+	// 转发到 pool_server
+	p.forwardToPool(tlsConn, httpReq)
+}
+
+// forwardConnect 直接转发 CONNECT（不拦截）
+func (p *Proxy) forwardConnect(clientConn net.Conn, target string) {
+	targetConn, err := net.Dial("tcp", target)
+	if err != nil {
+		writeGatewayError(clientConn, http.StatusBadGateway, "Upstream unavailable")
+		return
+	}
+	defer targetConn.Close()
+
+	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// 双向转发
+	go func() {
+		defer supervisor.Recover("gateway-copy-upstream")
+		_, _ = io.Copy(targetConn, clientConn)
+	}()
+	io.Copy(clientConn, targetConn)
+}
+
+// handleHTTP 处理普通 HTTP（直接转发）
+func (p *Proxy) handleHTTP(clientConn net.Conn, req string) {
+	// 简单实现：直接转发
+	writeGatewayError(clientConn, http.StatusNotImplemented, "Plain HTTP forwarding is not implemented")
+}
+
+// forwardToPool 转发到 pool_server
+func (p *Proxy) forwardToPool(clientConn *tls.Conn, req *http.Request) {
+	// 构造目标 URL
+	targetURL := p.poolURL + req.URL.Path
+	if req.URL.RawQuery != "" {
+		targetURL += "?" + req.URL.RawQuery
+	}
+
+	// 创建新请求
+	proxyReq, err := http.NewRequest(req.Method, targetURL, req.Body)
+	if err != nil {
+		log.Printf("create proxy request failed: %v", err)
+		return
+	}
+
+	// 复制请求头
+	for k, v := range req.Header {
+		proxyReq.Header[k] = v
+	}
+	// 添加网关模式标记
+	proxyReq.Header.Set("X-Gateway-Mode", "local")
+
+	resp, err := p.poolClient.Do(proxyReq)
+	if err != nil {
+		log.Printf("forward to pool failed: %v", err)
+		writeGatewayError(clientConn, http.StatusBadGateway, "Pool unavailable")
+		return
+	}
+	defer resp.Body.Close()
+
+	// 写回响应
+	w := newTLSResponseWriter(clientConn)
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func writeGatewayError(dst io.Writer, statusCode int, message string) {
+	body := strings.TrimSpace(message) + "\n"
+	w := newTLSResponseWriter(dst)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(statusCode)
+	_, _ = io.WriteString(w, body)
+}
+
+// tlsResponseWriter 包装连接为 http.ResponseWriter
+type tlsResponseWriter struct {
+	conn        io.Writer
+	header      http.Header
+	wroteHeader bool
+}
+
+func newTLSResponseWriter(conn io.Writer) *tlsResponseWriter {
+	return &tlsResponseWriter{
+		conn:   conn,
+		header: make(http.Header),
+	}
+}
+
+func (w *tlsResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *tlsResponseWriter) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.conn.Write(data)
+}
+
+func (w *tlsResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	reason := http.StatusText(statusCode)
+	if reason == "" {
+		reason = "status"
+	}
+	_, _ = fmt.Fprintf(w.conn, "HTTP/1.1 %d %s\r\n", statusCode, reason)
+	_ = w.Header().Write(w.conn)
+	_, _ = io.WriteString(w.conn, "\r\n")
+}

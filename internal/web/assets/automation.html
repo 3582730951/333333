@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>自动化策略配置 - Pool</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css">
+<style>
+  .wrap{max-width:1320px;margin:0 auto;padding:18px 4px 26px}
+  html.embedded body{background:transparent}
+  html.embedded body::before{display:none}
+  html.embedded .wrap{padding:2px 2px 18px}
+  .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(480px,1fr));gap:16px;margin-bottom:16px}
+  .policy-card{background:var(--chip);border:1px solid var(--line);border-radius:11px;padding:16px}
+  .policy-card.active{border-color:var(--acc);box-shadow:0 0 0 2px rgba(91,140,255,0.15)}
+  .policy-card h3{margin:0 0 12px;font-size:15px;display:flex;align-items:center;justify-content:space-between}
+  .toggle{position:relative;display:inline-block;width:42px;height:22px}
+  .toggle input{opacity:0;width:0;height:0}
+  .toggle .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--line);border-radius:22px;transition:.3s}
+  .toggle .slider:before{position:absolute;content:"";height:16px;width:16px;left:3px;bottom:3px;background:white;border-radius:50%;transition:.3s}
+  .toggle input:checked+.slider{background:var(--acc)}
+  .toggle input:checked+.slider:before{transform:translateX(20px)}
+  .cron-presets{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+  .cron-presets button{padding:6px 10px;font-size:12px;border-radius:6px;border:1px solid var(--line);background:var(--bg);cursor:pointer}
+  .cron-presets button:hover{background:var(--chip)}
+  .stat-box{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;text-align:center;margin-top:10px}
+  .stat-box .num{font-size:24px;font-weight:bold;color:var(--acc)}
+  .stat-box .lbl{font-size:12px;color:var(--muted);margin-top:4px}
+  .next-run{background:linear-gradient(90deg,rgba(91,140,255,0.1),rgba(124,92,255,0.1));border-left:3px solid var(--acc);padding:8px 12px;border-radius:6px;margin-top:10px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="readinessBanner" class="next-run" style="margin:0 4px 14px;border-left-width:4px">加载就绪状态…</div>
+  <div class="grid2">
+    <!-- Policy 1: Scheduled Batch -->
+    <div class="policy-card" id="policy-scheduled">
+      <h3>⏰ 定时批量注册 <label class="toggle"><input type="checkbox" id="scheduled-enabled" onchange="togglePolicy('scheduled')"><span class="slider"></span></label></h3>
+
+      <label class="f">Cron 表达式</label>
+      <div class="cron-presets">
+        <button onclick="setCron('0 2 * * *')">每天凌晨2点</button>
+        <button onclick="setCron('0 */6 * * *')">每6小时</button>
+        <button onclick="setCron('0 2 * * 1')">每周一凌晨</button>
+      </div>
+      <input class="t mono" id="scheduled-cron" value="0 2 * * *" placeholder="0 2 * * *">
+
+      <div class="row" style="flex-wrap:nowrap;margin-top:8px">
+        <div style="flex:1"><label class="f">注册数量</label><input class="t" type="number" id="scheduled-count" value="10" min="1"></div>
+        <div style="flex:1"><label class="f">平台</label><select class="t" id="scheduled-platform"><option value="chatgpt">ChatGPT</option><option value="claude">Claude</option></select></div>
+      </div>
+
+      <div class="row" style="flex-wrap:nowrap;margin-top:8px">
+        <div style="flex:1"><label class="f">分组</label><input class="t" id="scheduled-group" value="cyber"></div>
+        <div style="flex:1"><label class="f">出口</label><input class="t" id="scheduled-egress" value="egress_direct"></div>
+      </div>
+
+      <div class="next-run" id="scheduled-next">📅 下次执行: 计算中...</div>
+
+      <button class="btn" style="width:100%;margin-top:10px" onclick="savePolicy('scheduled')">保存配置</button>
+    </div>
+
+    <!-- Policy 2: Auto Refill -->
+    <div class="policy-card" id="policy-refill">
+      <h3>🔄 智能补充模式 <label class="toggle"><input type="checkbox" id="refill-enabled" onchange="togglePolicy('refill')"><span class="slider"></span></label></h3>
+
+      <label class="f">最低账号阈值</label>
+      <input class="t" type="range" id="refill-threshold" min="1" max="50" value="10" oninput="document.getElementById('refill-threshold-val').textContent=this.value">
+      <div style="text-align:center;margin-top:4px;font-size:13px">低于 <b id="refill-threshold-val">10</b> 个账号时触发</div>
+
+      <div class="row" style="flex-wrap:nowrap;margin-top:12px">
+        <div style="flex:1"><label class="f">补充到</label><input class="t" type="number" id="refill-target" value="20" min="1"></div>
+        <div style="flex:1"><label class="f">检查间隔</label>
+          <select class="t" id="refill-interval">
+            <option value="1800">30分钟</option>
+            <option value="3600" selected>1小时</option>
+            <option value="7200">2小时</option>
+            <option value="21600">6小时</option>
+          </select>
+        </div>
+      </div>
+
+      <label class="f" style="margin-top:8px">平台</label>
+      <select class="t" id="refill-platform"><option value="chatgpt">ChatGPT</option><option value="claude">Claude</option></select>
+
+      <div class="stat-box" id="refill-stats">
+        <div class="num" id="refill-current">--</div>
+        <div class="lbl">当前账号池数量</div>
+      </div>
+
+      <button class="btn" style="width:100%;margin-top:10px" onclick="savePolicy('refill')">保存配置</button>
+    </div>
+
+    <!-- Policy 3: Health Check -->
+    <div class="policy-card" id="policy-health">
+      <h3>🏥 账号健康维护 <label class="toggle"><input type="checkbox" id="health-enabled" onchange="togglePolicy('health')" checked><span class="slider"></span></label></h3>
+
+      <label class="f">检查间隔</label>
+      <select class="t" id="health-interval">
+        <option value="3600">1小时</option>
+        <option value="21600" selected>6小时</option>
+        <option value="43200">12小时</option>
+        <option value="86400">24小时</option>
+      </select>
+
+      <div style="margin-top:12px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="health-quarantine" checked>
+          <span>自动隔离失效账号</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:8px">
+          <input type="checkbox" id="health-refresh">
+          <span>尝试自动刷新 Token</span>
+        </label>
+      </div>
+
+      <div class="row" style="gap:8px;margin-top:12px">
+        <div class="stat-box" style="flex:1">
+          <div class="num" style="color:var(--ok)" id="health-alive">--</div>
+          <div class="lbl">存活</div>
+        </div>
+        <div class="stat-box" style="flex:1">
+          <div class="num" style="color:var(--bad)" id="health-dead">--</div>
+          <div class="lbl">失效</div>
+        </div>
+        <div class="stat-box" style="flex:1">
+          <div class="num" style="color:var(--warn)" id="health-cooling">--</div>
+          <div class="lbl">冷却</div>
+        </div>
+      </div>
+
+      <button class="btn" style="width:100%;margin-top:10px" onclick="savePolicy('health')">保存配置</button>
+    </div>
+
+    <!-- Policy 4: Plus Upgrade (Optional) -->
+    <div class="policy-card" id="policy-plus">
+      <h3>⭐ Plus 升级自动化 <label class="toggle"><input type="checkbox" id="plus-enabled" onchange="togglePolicy('plus')"><span class="slider"></span></label></h3>
+
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="plus-auto">
+        <span>自动升级新注册账号</span>
+      </label>
+
+      <label class="f" style="margin-top:12px">支付方式</label>
+      <select class="t" id="plus-payment">
+        <option value="gopay">Gopay 自动支付</option>
+        <option value="manual">手动支付</option>
+      </select>
+
+      <label class="f">失败重试次数</label>
+      <input class="t" type="number" id="plus-retry" value="3" min="0" max="10">
+
+      <div class="stat-box" style="margin-top:12px">
+        <div class="num" id="plus-count">--</div>
+        <div class="lbl">已升级账号数</div>
+      </div>
+
+      <button class="btn" style="width:100%;margin-top:10px" onclick="savePolicy('plus')">保存配置</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch {}
+  if (window.self !== window.top) document.documentElement.classList.add('embedded');
+
+  const API_BASE = window.location.origin;
+  function hdrs(extra = {}) {
+    const h = { 'Content-Type': 'application/json', ...extra };
+    try { const tok = localStorage.getItem('cp_tok') || ''; if (tok) h['Authorization'] = 'Bearer ' + tok; } catch {}
+    const m = document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)');
+    if (m) h['X-CP-CSRF'] = decodeURIComponent(m.pop());
+    return h;
+  }
+
+  function setCron(expr) { document.getElementById('scheduled-cron').value = expr; updateNextRun(); }
+
+  function togglePolicy(id) {
+    const card = document.getElementById('policy-' + id);
+    const enabled = document.getElementById(id + '-enabled').checked;
+    if (enabled) card.classList.add('active');
+    else card.classList.remove('active');
+  }
+
+  function updateNextRun() {
+    const cron = document.getElementById('scheduled-cron').value;
+    document.getElementById('scheduled-next').textContent = '📅 下次执行: ' + (cron || '未配置');
+  }
+
+  async function loadPolicies() {
+    try {
+      const res = await fetch(`${API_BASE}/admin/automation/policies`, { headers: hdrs(), credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      (data.policies || []).forEach(p => {
+        const id = p.type;
+        const enabledEl = document.getElementById(id + '-enabled');
+        if (enabledEl) {
+          enabledEl.checked = p.enabled !== false;
+          togglePolicy(id);
+        }
+        if (id === 'scheduled' && p.config) {
+          if (p.config.cron) document.getElementById('scheduled-cron').value = p.config.cron;
+          if (p.config.count) document.getElementById('scheduled-count').value = p.config.count;
+          if (p.config.platform) document.getElementById('scheduled-platform').value = p.config.platform;
+          if (p.config.group) document.getElementById('scheduled-group').value = p.config.group;
+          if (p.config.egress) document.getElementById('scheduled-egress').value = p.config.egress;
+        }
+        if (id === 'refill' && p.config) {
+          if (p.config.threshold) document.getElementById('refill-threshold').value = p.config.threshold;
+          if (p.config.target) document.getElementById('refill-target').value = p.config.target;
+          if (p.config.interval) document.getElementById('refill-interval').value = p.config.interval;
+        }
+        if (id === 'health' && p.config) {
+          if (p.config.interval) document.getElementById('health-interval').value = p.config.interval;
+          if (p.config.quarantine !== undefined) document.getElementById('health-quarantine').checked = p.config.quarantine;
+        }
+      });
+      updateNextRun();
+    } catch (e) { console.error('加载策略失败:', e); }
+  }
+
+  async function savePolicy(type) {
+    const enabled = document.getElementById(type + '-enabled').checked;
+    const config = {};
+    if (type === 'scheduled') {
+      config.cron = document.getElementById('scheduled-cron').value;
+      config.count = parseInt(document.getElementById('scheduled-count').value);
+      config.platform = document.getElementById('scheduled-platform').value;
+      config.group = document.getElementById('scheduled-group').value;
+      config.egress = document.getElementById('scheduled-egress').value;
+    } else if (type === 'refill') {
+      config.threshold = parseInt(document.getElementById('refill-threshold').value);
+      config.target = parseInt(document.getElementById('refill-target').value);
+      config.interval = parseInt(document.getElementById('refill-interval').value);
+    } else if (type === 'health') {
+      config.interval = parseInt(document.getElementById('health-interval').value);
+      config.quarantine = document.getElementById('health-quarantine').checked;
+      config.refresh = document.getElementById('health-refresh').checked;
+    } else if (type === 'plus') {
+      config.auto = document.getElementById('plus-auto').checked;
+      config.payment = document.getElementById('plus-payment').value;
+      config.retry = parseInt(document.getElementById('plus-retry').value);
+    }
+    try {
+      const res = await fetch(`${API_BASE}/admin/automation/policies`, {
+        method: 'POST', headers: hdrs(), credentials: 'same-origin',
+        body: JSON.stringify({ type, enabled, config })
+      });
+      if (res.ok) alert('✅ 策略已保存');
+      else alert('❌ 保存失败: ' + await res.text());
+    } catch (e) { alert('❌ 请求失败: ' + e.message); }
+  }
+
+  async function loadStats() {
+    try {
+      const res = await fetch(`${API_BASE}/admin/automation/stats`, { headers: hdrs(), credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.pool_count !== undefined) {
+        document.getElementById('refill-current').textContent = data.pool_count;
+      }
+      if (data.health) {
+        document.getElementById('health-alive').textContent = data.health.alive || 0;
+        document.getElementById('health-dead').textContent = data.health.dead || 0;
+        document.getElementById('health-cooling').textContent = data.health.cooling || 0;
+      }
+      if (data.plus_count !== undefined) {
+        document.getElementById('plus-count').textContent = data.plus_count;
+      }
+    } catch (e) { console.error('加载统计失败:', e); }
+  }
+
+  async function loadReadiness() {
+    const el = document.getElementById('readinessBanner');
+    if (!el) return;
+    try {
+      const res = await fetch(`${API_BASE}/admin/register/readiness`, { headers: hdrs(), credentials: 'same-origin' });
+      if (!res.ok) { el.textContent = '就绪状态不可用'; return; }
+      const d = await res.json();
+      const p = d.providers || {}, pool = d.pool || {};
+      const provLine = `provider: 邮箱 ${p.mailbox || 0} · 短信 ${p.sms || 0} · 验证码 ${p.captcha || 0}`;
+      const poolLine = `池: 活跃 ${pool.active || 0} / 目标 ${pool.target || 0}（缺口 ${pool.deficit || 0}）`;
+      if (d.ready) {
+        el.style.borderLeftColor = '#34d399';
+        el.innerHTML = `✅ <b>自动补号已就绪</b> — 部署后将按策略自动注册。&nbsp; ${provLine} &nbsp;·&nbsp; ${poolLine}`;
+      } else {
+        el.style.borderLeftColor = '#f59e0b';
+        const blk = (d.blockers || []).map(b => `<li>${b}</li>`).join('');
+        el.innerHTML = `⚠️ <b>暂不会自动补号</b> &nbsp; ${provLine} &nbsp;·&nbsp; ${poolLine}<ul style="margin:6px 0 0 18px">${blk}</ul>`;
+      }
+      const notes = d.notes || [];
+      if (notes.length) el.innerHTML += `<div style="color:var(--muted);font-size:12px;margin-top:6px">${notes.join(' · ')}</div>`;
+    } catch (e) { el.textContent = '就绪状态加载失败'; }
+  }
+
+  loadPolicies();
+  loadStats();
+  loadReadiness();
+  setInterval(loadStats, 10000);
+  setInterval(loadReadiness, 10000);
+</script>
+</body>
+</html>

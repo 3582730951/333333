@@ -1,0 +1,129 @@
+package api
+
+import (
+	"io"
+	"net/http"
+
+	"codex-account-pool/internal/cf"
+	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/scheduler"
+	"codex-account-pool/internal/upstream"
+)
+
+// handleAnthropicPassthrough is a transparent authenticated proxy for the extra
+// Anthropic endpoints that Claude Code skills / code-execution depend on but that
+// the message relay never served — so they 404'd and "无法访问官方 skills":
+//
+//   - the Files API (/v1/files…, multipart uploads + download)
+//   - /v1/skills…             (skills-2025-10-02)
+//   - /v1/agents…             (managed-agents-2026-04-01)
+//   - /v1/environments… , /v1/sessions…  (code-execution containers)
+//
+// Unlike /v1/messages these are NOT message turns: the body is opaque (a multipart
+// upload, a JSON skill/agent definition, or empty for a GET/DELETE) and must be
+// forwarded byte-for-byte — no cloak/virtualization, no model override, no Anthropic-
+// Beta superset injection. The client's own Content-Type / Accept / Anthropic-Beta /
+// Anthropic-Version ride through verbatim (PassThrough on the upstream request); we
+// only select a Claude account, attach its auth + the Claude Code identity fingerprint,
+// and route through the account's egress (incl. sidecar JA3 / WARP chain). The upstream
+// response is forwarded with header leak-scrub but WITHOUT body scrubbing — the bytes
+// are file content / resource definitions, not a model turn that could leak the virtual
+// identity.
+//
+// Account stickiness: passthrough resources are account-scoped (a file_id only resolves
+// on the account that uploaded it). ExtractAffinityKey folds in the downstream identity,
+// so every passthrough call from one downstream api key pins to one account — keeping a
+// file's whole lifecycle (upload → reference → delete) on a single upstream account.
+func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet, http.MethodPost, http.MethodDelete, http.MethodPut, http.MethodPatch:
+	default:
+		methodNotAllowed(w)
+		return
+	}
+
+	var raw []byte
+	if r.Body != nil {
+		b, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
+		if err != nil {
+			writeError(w, http.StatusRequestEntityTooLarge, err)
+			return
+		}
+		raw = b
+	}
+
+	release, ok := s.acquire(r.Context())
+	if !ok {
+		return
+	}
+	defer release()
+
+	// Authenticate + resolve the routing group (honors RequireDownstreamKey). The
+	// force-model/effort overrides are irrelevant here and never touch the opaque body.
+	pol, ok := s.resolveDownstreamPolicy(w, r)
+	if !ok {
+		return
+	}
+
+	affinity := routing.ExtractAffinityKey(r, raw)
+	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
+		Group:    pol.Group,
+		Provider: "claude",
+		Affinity: affinity,
+	})
+	if err != nil {
+		s.writePublicNoAccountError(r.Context(), w, http.StatusServiceUnavailable, pol.Group, "claude", "", err)
+		return
+	}
+	defer lease.Release()
+
+	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	osHint := s.osHint(nil, lease.Egress)
+	resp, err := s.upstream.Do(r.Context(), upstream.Request{
+		Method:         r.Method,
+		Provider:       "claude",
+		PassThrough:    true,
+		DownstreamPath: pathWithQuery(r.URL.Path, r.URL.RawQuery),
+		Headers:        r.Header.Clone(),
+		Body:           raw,
+		Account:        lease.Account,
+		Token:          token,
+		Egress:         lease.Egress,
+		CookieJarKey:   lease.Binding.CookieJarKey,
+		OSHint:         osHint,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		errorBody := readUpstreamErrorBody(resp.Body)
+		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
+			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
+		}
+		s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+		// No body scrubber: the passthrough body carries no virtual identity, and
+		// rewriting it (e.g. an upload-validation error echoing field bytes) is wrong.
+		// writeFilteredError still neutralizes pool-internal limit/quota leak bodies.
+		s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, nil)
+		return
+	}
+
+	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	s.captureQuota(r.Context(), lease.Account.ID, "claude", "", resp.Header)
+
+	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if isEventStream(resp.Header) {
+		_ = streamCopy(w, resp.Body)
+		return
+	}
+	_, _ = io.Copy(w, resp.Body)
+}

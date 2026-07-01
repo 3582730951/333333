@@ -1,0 +1,12 @@
+codex-pool.example.internal {
+    reverse_proxy 127.0.0.1:8787 {
+        flush_interval -1
+        transport http {
+            read_timeout 900s
+            write_timeout 900s
+        }
+    }
+    request_body {
+        max_size 256MB
+    }
+}

@@ -1,0 +1,5 @@
+requests>=2.28
+curl_cffi>=0.7
+grpcio>=1.50
+grpcio-tools>=1.50
+protobuf>=4.21

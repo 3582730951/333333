@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Provider 配置中心 - Pool</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css">
+<style>
+  .wrap{max-width:1320px;margin:0 auto;padding:18px 4px 26px}
+  html.embedded body{background:transparent}
+  html.embedded body::before{display:none}
+  html.embedded .wrap{padding:2px 2px 18px}
+  .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;margin-bottom:16px}
+  .provider-card{background:var(--chip);border:1px solid var(--line);border-radius:11px;padding:16px}
+  .provider-card h3{margin:0 0 12px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .provider-card h3 .chip{font-size:11px;padding:3px 8px}
+  .provider-item{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:10px}
+  .provider-item.disabled{opacity:0.5}
+  .provider-item .h{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .provider-item .h b{font-size:13px}
+  .toggle{position:relative;display:inline-block;width:42px;height:22px}
+  .toggle input{opacity:0;width:0;height:0}
+  .toggle .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:var(--line);border-radius:22px;transition:.3s}
+  .toggle .slider:before{position:absolute;content:"";height:16px;width:16px;left:3px;bottom:3px;background:white;border-radius:50%;transition:.3s}
+  .toggle input:checked+.slider{background:var(--acc)}
+  .toggle input:checked+.slider:before{transform:translateX(20px)}
+  .test-btn{padding:6px 12px;font-size:12px;border-radius:6px;border:1px solid var(--line);background:var(--bg);cursor:pointer;transition:.2s}
+  .test-btn:hover{background:var(--chip)}
+  .test-btn.loading{opacity:0.6;pointer-events:none}
+  .defaults{background:linear-gradient(135deg,var(--acc),var(--acc2));color:white;padding:16px;border-radius:11px}
+  .defaults h3{margin:0 0 12px;font-size:15px}
+  .defaults .row{display:flex;gap:12px;margin-bottom:10px}
+  .defaults .row>div{flex:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- SMS Providers -->
+  <div class="grid3">
+    <div class="provider-card">
+      <h3>📱 SMS 接码平台 <span class="chip">3 providers</span></h3>
+
+      <div class="provider-item" id="sms-smsbower">
+        <div class="h">
+          <b>SMSBower</b>
+          <label class="toggle"><input type="checkbox" id="smsbower-enabled" checked><span class="slider"></span></label>
+        </div>
+        <label class="f">API Key</label>
+        <input class="t" type="password" id="smsbower-key" placeholder="YOUR_API_KEY">
+        <label class="f">优先级</label>
+        <input class="t" type="number" id="smsbower-priority" value="100" min="1" max="100">
+        <button class="test-btn" onclick="testProvider('sms','smsbower')">测试连接</button>
+        <span id="smsbower-status" class="muted"></span>
+      </div>
+
+      <div class="provider-item" id="sms-herosms">
+        <div class="h">
+          <b>HeroSMS</b>
+          <label class="toggle"><input type="checkbox" id="herosms-enabled"><span class="slider"></span></label>
+        </div>
+        <label class="f">API Key</label>
+        <input class="t" type="password" id="herosms-key" placeholder="YOUR_API_KEY">
+        <label class="f">优先级</label>
+        <input class="t" type="number" id="herosms-priority" value="90" min="1" max="100">
+        <button class="test-btn" onclick="testProvider('sms','herosms')">测试连接</button>
+        <span id="herosms-status" class="muted"></span>
+      </div>
+
+      <div class="provider-item" id="sms-smsactivate">
+        <div class="h">
+          <b>SMS-Activate</b>
+          <label class="toggle"><input type="checkbox" id="smsactivate-enabled"><span class="slider"></span></label>
+        </div>
+        <label class="f">API Key</label>
+        <input class="t" type="password" id="smsactivate-key" placeholder="YOUR_API_KEY">
+        <label class="f">优先级</label>
+        <input class="t" type="number" id="smsactivate-priority" value="80" min="1" max="100">
+        <button class="test-btn" onclick="testProvider('sms','smsactivate')">测试连接</button>
+        <span id="smsactivate-status" class="muted"></span>
+      </div>
+
+      <div class="provider-item" id="sms-smspool">
+        <div class="h">
+          <b>SMSPool</b>
+          <label class="toggle"><input type="checkbox" id="smspool-enabled"><span class="slider"></span></label>
+        </div>
+        <label class="f">API Key</label>
+        <input class="t" type="password" id="smspool-key" placeholder="YOUR_API_KEY">
+        <label class="f">Service ID（SMSPool 服务编号）</label>
+        <input class="t" type="text" id="smspool-service" placeholder="如 1187（OpenAI）">
+        <label class="f">优先级</label>
+        <input class="t" type="number" id="smspool-priority" value="70" min="1" max="100">
+        <button class="test-btn" onclick="testProvider('sms','smspool')">测试连接</button>
+        <span id="smspool-status" class="muted"></span>
+      </div>
+    </div>
+
+    <!-- Mailbox Providers -->
+    <div class="provider-card">
+      <h3>📧 临时邮箱 <span class="chip">2 providers</span></h3>
+
+      <div class="provider-item" id="mailbox-cloudflare">
+        <div class="h">
+          <b>Cloudflare 自建（temp-email / MoeMail）</b>
+          <label class="toggle"><input type="checkbox" id="cf-enabled"><span class="slider"></span></label>
+        </div>
+        <label class="f">API URL</label>
+        <input class="t" type="text" id="cf-apiurl" placeholder="https://api.your-domain.com">
+        <label class="f">Admin Token（可选，开放注册可留空）</label>
+        <input class="t" type="password" id="cf-admin" placeholder="ADMIN_PASSWORDS">
+        <label class="f">收件域名</label>
+        <input class="t" type="text" id="cf-domain" placeholder="your-domain.com">
+        <label class="f">优先级</label>
+        <input class="t" type="number" id="cf-priority" value="60" min="1" max="100">
+        <button class="test-btn" onclick="testProvider('mailbox','cloudflare')">测试连接</button>
+        <span id="cf-status" class="muted"></span>
+      </div>
+
+      <div class="provider-item" id="mailbox-tempmail">
+        <div class="h">
+          <b>TempMail.lol</b>
+          <label class="toggle"><input type="checkbox" id="tempmail-enabled" checked><span class="slider"></span></label>
+        </div>
+        <label class="f">API Key (可选)</label>
+        <input class="t" type="password" id="tempmail-key" placeholder="留空使用公共服务">
+        <label class="f">域名后缀</label>
+        <select class="t" id="tempmail-domain">
+          <option value="tempmail.lol">@tempmail.lol</option>
+          <option value="1secmail.com">@1secmail.com</option>
+          <option value="guerrillamail.com">@guerrillamail.com</option>
+        </select>
+        <button class="test-btn" onclick="testProvider('mailbox','tempmail')">测试连接</button>
+        <span id="tempmail-status" class="muted"></span>
+      </div>
+    </div>
+
+    <!-- Captcha Solvers -->
+    <div class="provider-card">
+      <h3>🔐 验证码求解器 <span class="chip">2 solvers</span></h3>
+
+      <div class="provider-item" id="captcha-yescaptcha">
+        <div class="h">
+          <b>YesCaptcha</b>
+          <label class="toggle"><input type="checkbox" id="yescaptcha-enabled" checked><span class="slider"></span></label>
+        </div>
+        <label class="f">Client Key</label>
+        <input class="t" type="password" id="yescaptcha-key" placeholder="YOUR_CLIENT_KEY">
+        <label class="f">超时（秒）</label>
+        <input class="t" type="number" id="yescaptcha-timeout" value="120" min="30" max="300">
+        <button class="test-btn" onclick="testProvider('captcha','yescaptcha')">测试连接</button>
+        <span id="yescaptcha-status" class="muted"></span>
+      </div>
+
+      <div class="provider-item" id="captcha-2captcha">
+        <div class="h">
+          <b>2Captcha</b>
+          <label class="toggle"><input type="checkbox" id="2captcha-enabled"><span class="slider"></span></label>
+        </div>
+        <label class="f">API Key</label>
+        <input class="t" type="password" id="2captcha-key" placeholder="YOUR_API_KEY">
+        <label class="f">超时（秒）</label>
+        <input class="t" type="number" id="2captcha-timeout" value="120" min="30" max="300">
+        <button class="test-btn" onclick="testProvider('captcha','2captcha')">测试连接</button>
+        <span id="2captcha-status" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Global Defaults -->
+  <div class="defaults">
+    <h3>⚙️ 全局默认配置</h3>
+    <div class="row">
+      <div><label class="f" style="color:rgba(255,255,255,0.9)">默认 SMS Provider</label>
+        <select class="t" id="default-sms"><option value="smsbower">SMSBower</option><option value="herosms">HeroSMS</option><option value="smsactivate">SMS-Activate</option></select></div>
+      <div><label class="f" style="color:rgba(255,255,255,0.9)">默认邮箱 Provider</label>
+        <select class="t" id="default-mailbox"><option value="tempmail">TempMail.lol</option></select></div>
+      <div><label class="f" style="color:rgba(255,255,255,0.9)">默认验证码 Solver</label>
+        <select class="t" id="default-captcha"><option value="yescaptcha">YesCaptcha</option><option value="2captcha">2Captcha</option></select></div>
+    </div>
+    <div class="row">
+      <div><label class="f" style="color:rgba(255,255,255,0.9)">默认分组名称</label><input class="t" id="default-group" value="cyber"></div>
+      <div><label class="f" style="color:rgba(255,255,255,0.9)">默认出口配置</label><input class="t" id="default-egress" value="egress_direct"></div>
+    </div>
+    <button class="btn" style="width:100%;margin-top:6px;background:rgba(255,255,255,0.2)" onclick="saveAll()">💾 保存所有配置</button>
+  </div>
+</div>
+
+<script>
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch (e) {}
+  if (window.self !== window.top) document.documentElement.classList.add('embedded');
+
+  const API_BASE = window.location.origin;
+  function hdrs(extra = {}) {
+    const h = { 'Content-Type': 'application/json', ...extra };
+    try { const tok = localStorage.getItem('cp_tok') || ''; if (tok) h['Authorization'] = 'Bearer ' + tok; } catch {}
+    const m = document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)');
+    if (m) h['X-CP-CSRF'] = decodeURIComponent(m.pop());
+    return h;
+  }
+
+  // Declarative provider spec: config-field -> input-element id. Drives load/save/test so
+  // multi-field providers (Cloudflare api_url/admin_token/domain, SMSPool service) work.
+  const SPEC = [
+    {type:'sms',     key:'smsbower',    enabled:'smsbower-enabled',    priority:'smsbower-priority',    status:'smsbower-status',    fields:{api_key:'smsbower-key'}},
+    {type:'sms',     key:'herosms',     enabled:'herosms-enabled',     priority:'herosms-priority',     status:'herosms-status',     fields:{api_key:'herosms-key'}},
+    {type:'sms',     key:'smsactivate', enabled:'smsactivate-enabled', priority:'smsactivate-priority', status:'smsactivate-status', fields:{api_key:'smsactivate-key'}},
+    {type:'sms',     key:'smspool',     enabled:'smspool-enabled',     priority:'smspool-priority',     status:'smspool-status',     fields:{api_key:'smspool-key', service:'smspool-service'}},
+    {type:'mailbox', key:'cloudflare',  enabled:'cf-enabled',          priority:'cf-priority',          status:'cf-status',          fields:{api_url:'cf-apiurl', admin_token:'cf-admin', domain:'cf-domain'}},
+    {type:'mailbox', key:'tempmail',    enabled:'tempmail-enabled',    priority:null,                   status:'tempmail-status',    fields:{api_key:'tempmail-key'}},
+    {type:'captcha', key:'yescaptcha',  enabled:'yescaptcha-enabled',  priority:null,                   status:'yescaptcha-status',  fields:{api_key:'yescaptcha-key'}},
+    {type:'captcha', key:'2captcha',    enabled:'2captcha-enabled',    priority:null,                   status:'2captcha-status',    fields:{api_key:'2captcha-key'}},
+  ];
+  const elv = id => { const e = id && document.getElementById(id); return e ? e.value : ''; };
+
+  async function loadConfig() {
+    try {
+      const res = await fetch(`${API_BASE}/admin/register/providers`, { headers: hdrs(), credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      const byKey = {};
+      (data.providers || []).forEach(p => { byKey[p.key] = p; });
+      SPEC.forEach(s => {
+        const p = byKey[s.key];
+        if (!p) return;
+        const en = document.getElementById(s.enabled); if (en) en.checked = p.enabled !== false;
+        const pr = s.priority && document.getElementById(s.priority); if (pr && p.priority) pr.value = p.priority;
+        Object.entries(s.fields).forEach(([cfgKey, inputId]) => {
+          const el = document.getElementById(inputId);
+          if (el && p.config && p.config[cfgKey] != null) el.value = p.config[cfgKey];
+        });
+      });
+      const d = data.defaults || {};
+      ['sms','mailbox','captcha','group','egress'].forEach(k => { const el = document.getElementById('default-'+k); if (el && d[k]) el.value = d[k]; });
+    } catch (e) { console.error('加载配置失败:', e); }
+  }
+
+  async function saveAll() {
+    const providers = SPEC.map(s => {
+      const config = {};
+      Object.entries(s.fields).forEach(([cfgKey, inputId]) => { config[cfgKey] = elv(inputId); });
+      const en = document.getElementById(s.enabled);
+      return {
+        type: s.type, key: s.key,
+        enabled: en ? en.checked : false,
+        priority: s.priority ? (parseInt(elv(s.priority)) || 50) : 50,
+        config,
+      };
+    });
+    const defaults = {
+      sms: elv('default-sms'), mailbox: elv('default-mailbox'), captcha: elv('default-captcha'),
+      group: elv('default-group'), egress: elv('default-egress'),
+    };
+    try {
+      const res = await fetch(`${API_BASE}/admin/register/providers`, {
+        method: 'POST', headers: hdrs(), credentials: 'same-origin',
+        body: JSON.stringify({ providers, defaults })
+      });
+      if (res.ok) alert('✅ 配置已保存');
+      else alert('❌ 保存失败: ' + await res.text());
+    } catch (e) { alert('❌ 请求失败: ' + e.message); }
+  }
+
+  async function testProvider(type, key) {
+    const btnEl = event.target;
+    const spec = SPEC.find(s => s.key === key) || {fields:{}, status:key+'-status'};
+    const statusEl = document.getElementById(spec.status);
+    const config = {};
+    Object.entries(spec.fields).forEach(([cfgKey, inputId]) => { config[cfgKey] = elv(inputId); });
+    const primary = config.api_key || config.api_url || '';
+    if (!primary) { if (statusEl) statusEl.textContent = '⚠️ 请先填写配置'; return; }
+    btnEl.classList.add('loading'); btnEl.textContent = '测试中...'; if (statusEl) statusEl.textContent = '';
+    try {
+      const res = await fetch(`${API_BASE}/admin/register/providers/test`, {
+        method: 'POST', headers: hdrs(), credentials: 'same-origin',
+        body: JSON.stringify({ type, key, config })
+      });
+      const data = await res.json();
+      if (statusEl) {
+        if (data.success) statusEl.innerHTML = `<span style="color:var(--ok)">✓ 连接成功 (${data.latency_ms}ms)</span>`;
+        else statusEl.innerHTML = `<span style="color:var(--bad)">✗ ${data.message || '连接失败'}</span>`;
+      }
+    } catch (e) { if (statusEl) statusEl.innerHTML = `<span style="color:var(--bad)">✗ ${e.message}</span>`; }
+    btnEl.classList.remove('loading'); btnEl.textContent = '测试连接';
+  }
+
+  loadConfig();
+</script>
+</body>
+</html>

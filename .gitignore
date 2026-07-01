@@ -1,0 +1,49 @@
+# Runtime state and local logs
+.run/
+.gstack/
+*.log
+
+# Local databases and WAL/SHM sidecars
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local secrets and machine-specific config
+passwd.txt
+*.secrets
+*.secret
+*.env
+.env
+.env.*
+config.local*.json
+config.test*.json
+config.*.json
+!config.example.json
+!config.lifecycle.json
+
+# Build outputs and dependencies
+node_modules/
+web-spa/node_modules/
+web-spa/dist/
+pool-server
+pool-server-new
+pool_server
+pool_server_test
+codex-pool
+cmd/pool-server/pool-server
+
+# Python caches and captured traffic artifacts
+__pycache__/
+*.pyc
+*.pcap
+*.pcapng
+capture/out*/
+
+# Generated screenshots / visual inspection artifacts
+pngs/
+pngs_s/
+screenshot*.png
+
+# Keep the embedded console bundle tracked for the Go binary.
+!internal/console/dist/
+!internal/console/dist/**

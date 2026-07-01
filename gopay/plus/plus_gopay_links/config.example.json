@@ -1,0 +1,17 @@
+{
+  "auth": {
+    "session_token": ""
+  },
+  "gopay": {
+    "country_code": "62",
+    "phone_number": "",
+    "pin": "",
+    "midtrans_client_id": "YOUR_MIDTRANS_CLIENT_KEY",
+    "browser_locale": "zh-CN",
+    "pin_locale": "id"
+  },
+  "stripe": {
+    "publishable_key": "YOUR_STRIPE_PUBLISHABLE_KEY"
+  },
+  "proxy": ""
+}

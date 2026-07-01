@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package payment;
+
+option go_package = "./;pb";
+
+message StartGoPayRequest {
+  string session_token = 1;
+  string country_code = 2;
+  string phone_number = 3;
+  string pin = 4;
+  string proxy_url = 5;
+}
+
+message StartGoPayResponse {
+  bool success = 1;
+  string error_message = 2;
+  string flow_id = 3;
+  string snap_token = 4;
+  int64 issued_after_unix = 5;
+  int64 expires_at_unix = 6;
+}
+
+message CompleteGoPayRequest {
+  string flow_id = 1;
+  string otp = 2;
+}
+
+message CancelGoPayRequest {
+  string flow_id = 1;
+}
+
+message CancelGoPayResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message GoPayResponse {
+  bool success = 1;
+  string error_message = 2;
+  string charge_ref = 3;
+  string snap_token = 4;
+}
+
+service PaymentService {
+  rpc StartGoPay(StartGoPayRequest) returns (StartGoPayResponse);
+  rpc CompleteGoPay(CompleteGoPayRequest) returns (GoPayResponse);
+  rpc CancelGoPay(CancelGoPayRequest) returns (CancelGoPayResponse);
+}

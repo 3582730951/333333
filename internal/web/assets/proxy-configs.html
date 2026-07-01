@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>代理配置 - Pool</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css">
+<style>
+  .wrap{max-width:1180px;margin:0 auto;padding:18px 4px 26px}
+  html.embedded body{background:transparent}
+  html.embedded body::before{display:none}
+  html.embedded .wrap{padding:2px 2px 18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="note" style="margin:0 0 14px">
+    池内真实的出口 / 代理在左侧「<b>出口</b>」页统一管理（支持 socks5 / http / WARP / sidecar、批量导入、地区识别与健康检查）。
+    本页只读展示当前已配置的出口，供「账号注册」「自动化策略」按 ID 引用；新增 / 修改请到「出口」页。
+  </div>
+  <div class="panel">
+    <div class="hd"><h2>当前出口 / 代理</h2><span class="sp"></span><button class="btn sm" onclick="load()">刷新</button></div>
+    <div class="bd" style="padding:0" id="list"><div class="empty">加载中…</div></div>
+  </div>
+</div>
+
+<script>
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch {}
+  if (window.self !== window.top) document.documentElement.classList.add('embedded');
+  const API_BASE = window.location.origin;
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+  function hdrs(extra={}){
+    const h={'Content-Type':'application/json',...extra};
+    try{ const tok=localStorage.getItem('cp_tok')||''; if(tok) h['Authorization']='Bearer '+tok; }catch{}
+    const m=document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)'); if(m) h['X-CP-CSRF']=decodeURIComponent(m.pop());
+    return h;
+  }
+  function maskEndpoint(ep){ if(!ep) return '-'; return ep.replace(/\/\/([^:@/]+):([^@/]+)@/, '//$1:***@'); }
+  async function load(){
+    const box=document.getElementById('list');
+    try{
+      const res=await fetch(`${API_BASE}/admin/egress-profiles`, { headers: hdrs(), credentials:'same-origin' });
+      if(!res.ok){ box.innerHTML=`<div class="empty">HTTP ${res.status}</div>`; return; }
+      const egs=await res.json()||[];
+      if(!egs.length){ box.innerHTML='<div class="empty">暂无出口 — 请到「出口」页添加</div>'; return; }
+      box.innerHTML=`<table><thead><tr><th>ID / 名称</th><th>类型</th><th>Endpoint</th><th>地区 / 出口IP</th><th>健康</th><th>延迟</th></tr></thead><tbody>`+
+        egs.map(e=>`<tr><td>${esc(e.name||e.id)}<div class="mono muted">${esc(e.id)}</div></td>
+          <td class="mono">${esc(e.type||'')}</td>
+          <td class="mono" style="max-width:220px;word-break:break-all">${esc(maskEndpoint(e.endpoint))}</td>
+          <td>${e.region?`<span class="chip ${/^(JP|TW)/i.test(e.region)?'ok':'warn'}">${esc(e.region)}</span>`:'<span class="muted">—</span>'}<div class="mono muted">${esc(e.exit_ip||'')}</div></td>
+          <td><span class="chip ${e.health==='healthy'?'ok':e.health==='tripped'?'bad':'warn'}">${esc(e.health||'-')}</span></td>
+          <td class="mono">${e.latency_millis?e.latency_millis+'ms':'-'}</td></tr>`).join('')+`</tbody></table>`;
+    }catch(err){ box.innerHTML=`<div class="empty">${esc(err.message)}</div>`; }
+  }
+  load();
+</script>
+</body>
+</html>

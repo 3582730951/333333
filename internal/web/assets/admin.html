@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pool · 管理后台</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+<!-- AUTH (admin login) — rendered by core.js via adminapp.js -->
+<div id="authView"><div class="authwrap"><div class="authcard"><div class="empty" data-i18n="common.loading">加载中…</div></div></div></div>
+
+<!-- ACCESS DENIED (signed in as a non-admin user) -->
+<div id="denyView" class="hide"><div class="authwrap"><div class="authcard" style="text-align:center">
+  <div class="brand" style="justify-content:center"><div class="logo">CP</div><div><b>Pool</b><small data-i18n="brand.admin">管理后台</small></div></div>
+  <h2 data-i18n="admin.denied_title">需要管理员权限</h2>
+  <p class="sub" data-i18n="admin.denied_sub">当前账户不是管理员。请用管理员账户登录，或返回用户中心。</p>
+  <a class="btn pri" style="width:100%;justify-content:center" href="/" data-i18n="admin.to_portal">返回用户中心</a>
+  <div class="switch"><a onclick="doLogout()" data-i18n="act.logout">退出登录</a></div>
+</div></div></div>
+
+<!-- ADMIN CONSOLE SHELL -->
+<div id="appShell" class="hide">
+<div class="app" id="appGrid">
+  <aside class="side" id="sidebar">
+    <div class="brand"><div class="logo">CP</div><div><b>Pool</b><small data-i18n="brand.admin">管理后台 · 运营控制台</small></div></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="foot">单二进制 · 防中转特征<br>账号绑定虚拟身份 · v0.4</div>
+  </aside>
+  <main class="main">
+    <div class="top">
+      <button class="iconbtn" id="hamburger" title="menu" aria-label="menu" style="display:none"></button>
+      <h1 id="title"></h1>
+      <div class="sp"></div>
+      <button class="iconbtn" id="refreshBtn" onclick="refreshAll()" data-i18n-title="act.refresh" data-i18n-aria="act.refresh" title="刷新" aria-label="刷新"></button>
+      <span class="dot" id="hdot"></span>
+      <button class="iconbtn" id="themeBtn" onclick="toggleTheme()" data-i18n-title="common.theme" data-i18n-aria="common.theme" title="主题" aria-label="主题"></button>
+      <div class="seg" id="langSeg" role="group" aria-label="language"><button onclick="setLang('zh')">中</button><button onclick="setLang('en')">EN</button></div>
+      <div class="usermenu" id="userMenu"></div>
+    </div>
+
+    <!-- ADMIN VIEWS -->
+    <section data-view="overview" class="hide"><div id="overviewView"><div class="empty" data-i18n="common.loading">加载中…</div></div></section>
+    <section data-view="accounts" class="hide"><div id="accView"></div></section>
+    <section data-view="providers" class="hide"><div id="providersView"></div></section>
+    <section data-view="egress" class="hide"><div id="egView"></div></section>
+    <section data-view="usage" class="hide"><div id="usageView"></div></section>
+    <section data-view="isolation" class="hide"><div id="isoView"></div></section>
+    <section data-view="groups" class="hide"><div id="groupsView"></div></section>
+    <section data-view="keys" class="hide"><div id="keysView"></div></section>
+    <section data-view="users" class="hide"><div id="usersView"></div></section>
+    <section data-view="moderation" class="hide"><div id="modView"></div></section>
+    <section data-view="cf" class="hide"><div id="cfView"></div></section>
+    <section data-view="audit" class="hide"><div id="auditView"></div></section>
+    <section data-view="gopay" class="hide"><div id="gopayView"></div></section>
+    <section data-view="thinking" class="hide"><iframe id="thinkingFrame" class="embedframe" title="Thinking 配置"></iframe></section>
+    <section data-view="registration" class="hide"><iframe id="registrationFrame" class="embedframe" title="账号注册"></iframe></section>
+    <section data-view="reg_providers" class="hide"><iframe id="regProvidersFrame" class="embedframe" title="注册配置"></iframe></section>
+    <section data-view="reg_dashboard" class="hide"><iframe id="regDashboardFrame" class="embedframe" title="注册仪表盘"></iframe></section>
+    <section data-view="automation" class="hide"><iframe id="automationFrame" class="embedframe" title="自动化策略"></iframe></section>
+    <section data-view="lifecycle" class="hide"><iframe id="lifecycleFrame" class="embedframe" title="生命周期管理"></iframe></section>
+    <section data-view="proxies" class="hide"><iframe id="proxiesFrame" class="embedframe" title="代理配置"></iframe></section>
+    <section data-view="org" class="hide"><div id="orgView"></div></section>
+    <section data-view="sysconfig" class="hide"><div id="sysconfigView"></div></section>
+    <section data-view="settings" class="hide"><div id="settingsView"></div></section>
+    <datalist id="modelOpts"></datalist>
+  </main>
+</div>
+</div>
+
+<!-- IMPORT MODAL -->
+<div class="mask hide" id="importMask">
+  <div class="modal">
+    <div class="hd"><h3>导入账号 / Import</h3><span class="sp" style="flex:1"></span><button class="btn sm" onclick="closeImport()">✕</button></div>
+    <div class="bd">
+      <div class="tabs" id="impTabs">
+        <button data-m="oauth_codex" class="on" onclick="setImp('oauth_codex')">Codex · 网页登录</button>
+        <button data-m="oauth_claude" onclick="setImp('oauth_claude')">Claude · 网页登录</button>
+        <button data-m="token" onclick="setImp('token')">Codex · AT</button>
+        <button data-m="cookie" onclick="setImp('cookie')">Codex · Cookie</button>
+        <button data-m="authjson" onclick="setImp('authjson')">Codex · auth.json</button>
+        <button data-m="claude" onclick="setImp('claude')">Claude · Token</button>
+        <button data-m="customkey" onclick="setImp('customkey')">自定义 · API Key</button>
+      </div>
+      <p class="muted" id="impHint"></p>
+      <div id="oauthPanel" class="hide">
+        <div class="row" style="gap:8px"><button class="btn pri" id="oauthGenBtn" onclick="oauthStart()">① 生成登录链接</button><span class="muted" id="oauthStatus"></span></div>
+        <div id="oauthStep2" class="hide" style="margin-top:12px">
+          <label class="f">在浏览器打开此链接并登录</label>
+          <div class="row" style="gap:6px;flex-wrap:nowrap"><input class="t mono" id="oauthUrl" readonly style="flex:1"><a class="btn" id="oauthOpen" target="_blank" rel="noopener">打开</a><button class="btn" type="button" onclick="oauthCopy()">复制</button></div>
+          <label class="f" style="margin-top:10px">② 登录后把地址栏完整网址（或授权码）粘贴到这里</label>
+          <textarea class="t" id="oauthPaste" placeholder="http://localhost:1455/auth/callback?code=...&state=..."></textarea>
+          <div style="height:10px"></div><button class="btn pri" type="button" onclick="oauthComplete()">完成登录并加入账号池</button>
+        </div>
+      </div>
+      <div data-m="token"><label class="f">Access Token (AT)</label><textarea class="t" id="tk_at" placeholder="eyJhbGciOi..."></textarea><label class="f">ChatGPT-Account-ID（可选）</label><input class="t" id="tk_acc"></div>
+      <div data-m="cookie" class="hide"><label class="f">chatgpt.com 会话 Cookie</label><textarea class="t" id="ck_hdr" placeholder="__Secure-next-auth.session-token=...; ..."></textarea></div>
+      <div data-m="authjson" class="hide"><label class="f">auth.json 内容</label><textarea class="t" id="aj_txt" placeholder='{"OPENAI_API_KEY":"...","tokens":{...}}'></textarea></div>
+      <div data-m="claude" class="hide"><label class="f">Claude Token（sk-ant-oat... 或 sk-ant-api...）</label><textarea class="t" id="cl_at" placeholder="sk-ant-oat01-... 或 sk-ant-api03-..."></textarea></div>
+      <div data-m="customkey" class="hide"><label class="f">供应商 / Provider</label><select class="t" id="ck_provider"></select><label class="f">API Key</label><textarea class="t mono" id="ck_apikey" placeholder="sk-..."></textarea>
+        <p class="muted">为 DeepSeek / 硅基流动 等 OpenAI 兼容上游导入账号（Bearer 鉴权）。在「供应商」页管理 base_url 与模型。</p></div>
+      <div class="row" style="margin-top:6px"><div style="flex:1"><label class="f">标签 / Label</label><input class="t" id="imp_label" placeholder="main"></div><div style="flex:1"><label class="f">分组 / Group</label><input class="t" id="imp_group" placeholder="cyber"></div></div>
+      <div style="height:14px"></div><button class="btn pri" id="impSubmitBtn" onclick="doImport()">导入 / Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- ACCOUNT / SESSION DRAWER -->
+<div class="drawer" id="drawer"><div class="hd"><h3 id="drTitle"></h3><button class="btn sm" onclick="closeDrawer()">✕</button></div><div class="bd" id="drBody"></div></div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="i18n.js"></script>
+<script src="icons.js"></script>
+<script src="components.js"></script>
+<script src="core.js"></script>
+<script src="charts.js"></script>
+<script src="admin.js"></script>
+<script src="admin-integrations.js"></script>
+<script src="adminapp.js"></script>
+<script>
+  // mobile sidebar toggle
+  (function () {
+    function wire() {
+      var hb = document.getElementById("hamburger");
+      if (hb) { hb.innerHTML = (typeof icon === "function" ? icon("menu") : "≡"); hb.style.display = window.innerWidth <= 760 ? "grid" : "none"; hb.onclick = function () { document.getElementById("sidebar").classList.toggle("show"); }; }
+    }
+    window.addEventListener("resize", wire); window.addEventListener("DOMContentLoaded", wire);
+  })();
+</script>
+</body>
+</html>

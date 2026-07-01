@@ -1,0 +1,162 @@
+package api
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"net/http"
+	"strings"
+
+	"codex-account-pool/internal/storage"
+)
+
+// generateAPIKey returns a new random downstream api key in plaintext. It is
+// returned to the caller at creation and also stored encrypted at rest so the
+// admin/owner can later copy the key and its one-click install command.
+func generateAPIKey() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "cap_" + hex.EncodeToString(buf), nil
+}
+
+// adminAPIKeys manages downstream api keys: their routing group and the forced
+// model / reasoning-effort override the key imposes regardless of what the
+// client requested (the "强制改写下游使用的模型和推理强度" requirement). This is the
+// missing control surface for the force_model/force_effort columns that
+// resolveDownstreamPolicy already consumes.
+//
+//	GET  /admin/api-keys           -> list keys, including encrypted-at-rest secret when available
+//	POST /admin/api-keys           -> create; returns and stores the plaintext key
+func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		keys, err := s.store.ListAPIKeys(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if keys == nil {
+			keys = []storage.APIKey{}
+		}
+		writeJSON(w, http.StatusOK, keys)
+	case http.MethodPost:
+		var req struct {
+			Label       string `json:"label"`
+			GroupName   string `json:"group_name"`
+			ForceModel  string `json:"force_model"`
+			ForceEffort string `json:"force_effort"`
+			Enabled     *bool  `json:"enabled"`
+			TenantID    string `json:"tenant_id"`
+			ProjectID   string `json:"project_id"`
+		}
+		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		plain, err := generateAPIKey()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		enabled := true
+		if req.Enabled != nil {
+			enabled = *req.Enabled
+		}
+		key := storage.APIKey{
+			KeyHash:     hashAPIKey(plain),
+			Label:       strings.TrimSpace(req.Label),
+			GroupName:   strings.TrimSpace(req.GroupName),
+			ForceModel:  strings.TrimSpace(req.ForceModel),
+			ForceEffort: normalizeEffort(req.ForceEffort),
+			Enabled:     enabled,
+			TenantID:    strings.TrimSpace(req.TenantID),
+			ProjectID:   strings.TrimSpace(req.ProjectID),
+			Secret:      plain,
+		}
+		if err := s.store.UpsertAPIKey(r.Context(), key); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"key":          plain,
+			"key_hash":     key.KeyHash,
+			"label":        key.Label,
+			"group_name":   key.GroupName,
+			"force_model":  key.ForceModel,
+			"force_effort": key.ForceEffort,
+			"enabled":      key.Enabled,
+		})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+// adminAPIKeyAction handles PATCH/DELETE /admin/api-keys/{key_hash}. PATCH
+// updates the routing group / forced model / forced effort / label / enabled
+// flag in place; DELETE removes the key. Legacy rows created before api_keys.secret
+// stay unrecoverable and should be rotated to regain copy/install buttons.
+func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	hash := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/api-keys/"), "/")
+	if hash == "" || strings.Contains(hash, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		if err := s.store.DeleteAPIKey(r.Context(), hash); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": hash})
+	case http.MethodPatch:
+		key, found, err := s.store.LookupAPIKey(r.Context(), hash)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Label       *string `json:"label"`
+			GroupName   *string `json:"group_name"`
+			ForceModel  *string `json:"force_model"`
+			ForceEffort *string `json:"force_effort"`
+			Enabled     *bool   `json:"enabled"`
+		}
+		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.Label != nil {
+			key.Label = strings.TrimSpace(*req.Label)
+		}
+		if req.GroupName != nil {
+			key.GroupName = strings.TrimSpace(*req.GroupName)
+		}
+		if req.ForceModel != nil {
+			key.ForceModel = strings.TrimSpace(*req.ForceModel)
+		}
+		if req.ForceEffort != nil {
+			key.ForceEffort = normalizeEffort(*req.ForceEffort)
+		}
+		if req.Enabled != nil {
+			key.Enabled = *req.Enabled
+		}
+		if err := s.store.UpsertAPIKey(r.Context(), key); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, key)
+	default:
+		methodNotAllowed(w)
+	}
+}

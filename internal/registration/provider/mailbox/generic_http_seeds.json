@@ -1,0 +1,157 @@
+{
+  "providers": [
+    {
+      "key": "outlook_email",
+      "name": "outlookEmail API",
+      "description": "outlookEmail 第三方 API（临时 Outlook 邮箱）",
+      "type": "generic_http",
+      "pipeline": {
+        "email_mode": "generate",
+        "create_email": {
+          "method": "POST",
+          "path": "/email/create",
+          "extract": {
+            "email": "email",
+            "account_id": "id"
+          }
+        },
+        "list_emails": {
+          "method": "GET",
+          "path": "/email/{account_id}/messages"
+        },
+        "get_detail": {
+          "method": "GET",
+          "path": "/email/message/{message_id}"
+        },
+        "response_list_path": "messages",
+        "response_id_field": "id",
+        "response_body_fields": "subject,body,html"
+      },
+      "config_schema": {
+        "api_url": {
+          "label": "API Base URL",
+          "type": "text",
+          "default": "https://api.outlookemail.com",
+          "required": true
+        },
+        "auth_type": {
+          "label": "认证方式",
+          "type": "select",
+          "options": ["bearer", "api_key_param"],
+          "default": "bearer"
+        },
+        "auth_token": {
+          "label": "API Key / Bearer Token",
+          "type": "password",
+          "required": true
+        }
+      }
+    },
+    {
+      "key": "duckmail",
+      "name": "DuckMail",
+      "description": "DuckMail 临时邮箱（10分钟 TTL）",
+      "type": "generic_http",
+      "pipeline": {
+        "email_mode": "generate",
+        "create_email": {
+          "method": "POST",
+          "path": "/api/email",
+          "body": {},
+          "extract": {
+            "email": "address",
+            "account_id": "token"
+          }
+        },
+        "list_emails": {
+          "method": "GET",
+          "path": "/api/email/{account_id}"
+        },
+        "response_list_path": "emails",
+        "response_id_field": "id",
+        "response_body_fields": "subject,text,html"
+      },
+      "config_schema": {
+        "api_url": {
+          "label": "API Base URL",
+          "type": "text",
+          "default": "https://duckmail.io",
+          "required": true
+        }
+      }
+    },
+    {
+      "key": "tempmail_lol",
+      "name": "TempMail.lol",
+      "description": "TempMail.lol API（JWT 认证，60分钟 TTL）",
+      "type": "generic_http",
+      "pipeline": {
+        "email_mode": "generate",
+        "auth_steps": [
+          {
+            "method": "POST",
+            "path": "/api/v1/auth/login",
+            "body": {
+              "email": "{admin_email}",
+              "password": "{admin_password}"
+            },
+            "extract": {
+              "auth_token": "token"
+            }
+          }
+        ],
+        "create_email": {
+          "method": "POST",
+          "path": "/api/v1/mailbox",
+          "body": {
+            "prefix": "{prefix}"
+          },
+          "extract": {
+            "email": "address",
+            "account_id": "id"
+          }
+        },
+        "list_emails": {
+          "method": "GET",
+          "path": "/api/v1/mailbox/{account_id}/messages"
+        },
+        "get_detail": {
+          "method": "GET",
+          "path": "/api/v1/message/{message_id}"
+        },
+        "response_list_path": "messages",
+        "response_id_field": "id",
+        "response_body_fields": "subject,body_text,body_html"
+      },
+      "config_schema": {
+        "api_url": {
+          "label": "API Base URL",
+          "type": "text",
+          "default": "https://api.tempmail.lol",
+          "required": true
+        },
+        "admin_email": {
+          "label": "TempMail 管理员邮箱",
+          "type": "text",
+          "required": true
+        },
+        "admin_password": {
+          "label": "TempMail 管理员密码",
+          "type": "password",
+          "required": true
+        },
+        "prefix": {
+          "label": "邮箱前缀（可选）",
+          "type": "text",
+          "default": "chatgpt"
+        },
+        "auth_type": {
+          "label": "认证方式",
+          "type": "select",
+          "options": ["bearer"],
+          "default": "bearer"
+        }
+      }
+    }
+  ]
+}

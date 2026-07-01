@@ -1,0 +1,2 @@
+Admin: admin@local.test
+Password: Admin12345!

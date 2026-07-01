@@ -1,0 +1,3168 @@
+package storage
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"codex-account-pool/internal/secretbox"
+
+	_ "github.com/mattn/go-sqlite3"
+)
+
+const DefaultDirectEgressID = "egress_direct"
+
+type Store struct {
+	// db is the single-connection WRITE pool. SQLite permits only one writer at a
+	// time, so funneling every write through one connection means our own
+	// concurrency never collides into SQLITE_BUSY. Init() sets WAL/synchronous on it.
+	db *sql.DB
+	// rdb is the multi-connection READ pool against the same WAL database. Under WAL
+	// readers run concurrently with each other and with the single writer, each on
+	// the latest committed snapshot, so the per-request account-selection / token /
+	// group SELECTs no longer serialize behind the writer. For an in-memory test DB
+	// it is the same handle as db (see Open).
+	rdb *sql.DB
+	// tokenKey, when set (32 bytes), enables transparent AES-256-GCM encryption of the
+	// secret columns in account_auth_tokens (access/refresh/id token, upstream api key),
+	// api_keys.secret (copyable downstream key), and session cookies. nil = encryption
+	// disabled (plaintext, legacy behavior) — kept nil by tests/in-memory stores so
+	// they are unaffected. Set via SetTokenEncryptionKey from main using the resolved
+	// deployment identity secret.
+	tokenKey []byte
+}
+
+type Group struct {
+	Name                          string `json:"name"`
+	SystemPrompt                  string `json:"system_prompt"`
+	PromptMode                    string `json:"prompt_mode"`
+	SystemPromptApplyToCompaction bool   `json:"system_prompt_apply_to_compaction"`
+	Virtual2MEnabled              bool   `json:"virtual_2m_enabled"`
+	// ForceModel / ForceEffort, when set, are the group-level default override that
+	// rewrites the downstream-requested model / reasoning effort for any key in this
+	// group that does not set its own. Empty means "respect the client's request".
+	ForceModel  string `json:"force_model"`
+	ForceEffort string `json:"force_effort"`
+	// DefaultEgressID, when set, is the egress profile new accounts in this group
+	// bind to (so enabling a proxy for a group routes its upstream through it).
+	DefaultEgressID string `json:"default_egress_id"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
+// APIKey is a downstream client credential. The sha256 hash is used for auth lookup;
+// Secret stores a recoverable plaintext copy for admin/owner "copy key" and one-click
+// install UX, encrypted at rest when Store.SetTokenEncryptionKey is configured.
+// A key scopes requests to a group and may force the model / reasoning effort the
+// request uses upstream regardless of what the client asked for.
+type APIKey struct {
+	KeyHash     string `json:"key_hash"`
+	Label       string `json:"label"`
+	GroupName   string `json:"group_name"`
+	ForceModel  string `json:"force_model"`
+	ForceEffort string `json:"force_effort"`
+	Enabled     bool   `json:"enabled"`
+	TenantID    string `json:"tenant_id,omitempty"`
+	ProjectID   string `json:"project_id,omitempty"`
+	// UserID is the owning portal user (empty = admin-owned). Set when a user creates
+	// the key via the self-service /user/api-keys endpoint so it scopes to them.
+	UserID string `json:"user_id,omitempty"`
+	// Secret is plaintext in memory/API responses, but encrypted before persistence
+	// when tokenKey is configured. It lets the admin/owner re-copy the key and its
+	// one-click install command. Empty for legacy keys created before this column
+	// existed — those remain unrecoverable and must be rotated to get a copyable secret.
+	Secret    string `json:"secret,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+type Tenant struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+type User struct {
+	ID       string `json:"id"`
+	TenantID string `json:"tenant_id"`
+	Email    string `json:"email"`
+	Name     string `json:"name,omitempty"`
+	// Role is "admin" or "user" (default). Status is "active" or "disabled".
+	Role   string `json:"role"`
+	Status string `json:"status"`
+	// PasswordHash is the PBKDF2 verifier (see internal/api/password.go). Never
+	// serialized to clients (json:"-").
+	PasswordHash string `json:"-"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+// UserSession is a logged-in end-user/admin browser session. TokenHash is the
+// sha256 of the random cookie value (the plaintext token is never stored).
+type UserSession struct {
+	TokenHash string
+	UserID    string
+	CreatedAt int64
+	ExpiresAt int64
+	UserAgent string
+}
+
+type Project struct {
+	ID        string `json:"id"`
+	TenantID  string `json:"tenant_id"`
+	Name      string `json:"name"`
+	GroupName string `json:"group_name"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+type Account struct {
+	ID                string `json:"id"`
+	Label             string `json:"label"`
+	GroupName         string `json:"group_name"`
+	UpstreamAccountID string `json:"upstream_account_id,omitempty"`
+	ChatGPTUserID     string `json:"chatgpt_user_id,omitempty"`
+	Email             string `json:"email,omitempty"`
+	PlanType          string `json:"plan_type,omitempty"`
+	// Provider is the explicit upstream class: "" (legacy — infer codex/claude from
+	// the credential shape), "codex", "claude", or a custom OpenAI-compatible
+	// provider id (e.g. "deepseek"). It is the authoritative routing key; the
+	// token-shape heuristic (scheduler.ProviderFromToken) is only the fallback for
+	// pre-migration rows whose provider is still empty.
+	Provider         string `json:"provider,omitempty"`
+	Status           string `json:"status"`
+	IsFedramp        bool   `json:"is_fedramp"`
+	QuarantineUntil  int64  `json:"quarantine_until,omitempty"`
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
+	CreatedAt        int64  `json:"created_at"`
+	UpdatedAt        int64  `json:"updated_at"`
+}
+
+type AccountPoolSummary struct {
+	Total       int `json:"total"`
+	Active      int `json:"active"`
+	Quarantined int `json:"quarantined"`
+	Cooling     int `json:"cooling"`
+	Recheck     int `json:"recheck"`
+	Codex       int `json:"codex"`
+	Claude      int `json:"claude"`
+	Other       int `json:"other"`
+}
+
+type AccountToken struct {
+	AccountID    string `json:"account_id"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
+	IDTokenRaw   string `json:"id_token_raw,omitempty"`
+	LastRefresh  int64  `json:"last_refresh,omitempty"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+type ModelCapability struct {
+	AccountID                     string `json:"account_id"`
+	ModelSlug                     string `json:"model_slug"`
+	NativeContextWindow           int64  `json:"native_context_window"`
+	NativeMaxContextWindow        int64  `json:"native_max_context_window"`
+	EffectiveContextWindowPercent int64  `json:"effective_context_window_percent"`
+	AutoCompactTokenLimit         int64  `json:"auto_compact_token_limit"`
+	Visibility                    string `json:"visibility"`
+	ETag                          string `json:"etag"`
+	RawModelJSONHash              string `json:"raw_model_json_hash"`
+	Source                        string `json:"source"`
+	LastProbeAt                   int64  `json:"last_probe_at"`
+}
+
+type EgressProfile struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Endpoint string `json:"endpoint"`
+	// ChainProxy, when set, is an upstream proxy URL (e.g. a WARP exit's local
+	// SOCKS5 "socks5h://127.0.0.1:40000") that a curl_cffi_sidecar egress routes
+	// its impersonated request THROUGH. It is what lets a JA3-bound account also
+	// change its exit IP — present the real Codex/Claude TLS fingerprint AND leave
+	// from a clean (WARP) IP at once, the combination that actually clears a CF
+	// block. Ignored by non-sidecar egress types (those carry the proxy in Endpoint).
+	ChainProxy     string `json:"chain_proxy,omitempty"`
+	Region         string `json:"region"`
+	ExitIP         string `json:"exit_ip"`
+	StreamCapable  bool   `json:"stream_capable"`
+	Health         string `json:"health"`
+	LatencyMillis  int64  `json:"latency_millis"`
+	CFScore        int64  `json:"cf_score"`
+	LastCFRay      string `json:"last_cf_ray,omitempty"`
+	CooldownUntil  int64  `json:"cooldown_until,omitempty"`
+	MaxConcurrency int    `json:"max_concurrency"`
+	CreatedAt      int64  `json:"created_at"`
+	UpdatedAt      int64  `json:"updated_at"`
+	// ProxyAuthMode selects how cliproxy proxy IPs are obtained:
+	// "credential" = username/password mode (sid rotation + region in username, current default)
+	// "api_whitelist" = API whitelist mode (call api.cliproxy.io/white/api to extract ip:port)
+	// Empty string = credential mode (backward compatible).
+	ProxyAuthMode string `json:"proxy_auth_mode,omitempty"`
+	// ProxyAPIKey is the cliproxy account API token used only in api_whitelist mode.
+	// It is stored encrypted at rest like other secrets (enc:v1: prefix).
+	ProxyAPIKey string `json:"proxy_api_key,omitempty"`
+}
+
+type AccountEgressBinding struct {
+	AccountID        string `json:"account_id"`
+	PrimaryEgressID  string `json:"primary_egress_id"`
+	StandbyEgressIDs string `json:"standby_egress_ids"`
+	CookieJarKey     string `json:"cookie_jar_key"`
+	CooldownUntil    int64  `json:"cooldown_until,omitempty"`
+	// RecheckPending marks an account that was benched after an upstream error and
+	// must pass a liveness re-check ("测活") before it is allowed back into the
+	// candidate pool. While set, the scheduler treats the account as ineligible even
+	// after CooldownUntil elapses; the background recheck loop probes it and clears
+	// this flag only on a healthy result (re-cooling it otherwise). This is what
+	// guarantees a failed account never silently re-enters rotation unverified.
+	RecheckPending bool  `json:"recheck_pending,omitempty"`
+	CreatedAt      int64 `json:"created_at"`
+	UpdatedAt      int64 `json:"updated_at"`
+}
+
+func (b AccountEgressBinding) StandbyIDs() []string {
+	if strings.TrimSpace(b.StandbyEgressIDs) == "" {
+		return nil
+	}
+	parts := strings.Split(b.StandbyEgressIDs, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+type CFEvent struct {
+	ID        int64  `json:"id"`
+	AccountID string `json:"account_id"`
+	EgressID  string `json:"egress_id"`
+	Status    int    `json:"status"`
+	CFRay     string `json:"cf_ray,omitempty"`
+	Category  string `json:"category"`
+	Message   string `json:"message"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// InjectedCookie is an operator/auto-harvested cookie set (e.g. a cf_clearance
+// solved in a browser or by FlareSolverr) bound to a specific account+egress+host.
+// It is persisted so the cookie survives a restart and can be re-seeded into BOTH
+// the Go cookie jar (direct/proxy egress) and the curl_cffi sidecar's store (sidecar
+// egress). UserAgent/ExitIP record what the clearance is bound to — a cf_clearance is
+// only valid when replayed with the same UA + exit IP that solved it.
+type InjectedCookie struct {
+	AccountID    string `json:"account_id"`
+	EgressID     string `json:"egress_id"`
+	UpstreamHost string `json:"upstream_host"`
+	CookieHeader string `json:"cookie_header"`
+	UserAgent    string `json:"user_agent"`
+	ExitIP       string `json:"exit_ip"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+type AffinityBinding struct {
+	RouteKeyHash string `json:"route_key_hash"`
+	RouteKey     string `json:"route_key"`
+	Source       string `json:"source"`
+	AccountID    string `json:"account_id"`
+	Epoch        int64  `json:"epoch"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
+type VirtualLedgerItem struct {
+	ID             int64  `json:"id"`
+	RouteKeyHash   string `json:"route_key_hash"`
+	AccountID      string `json:"account_id"`
+	Model          string `json:"model"`
+	PromptCacheKey string `json:"prompt_cache_key"`
+	Role           string `json:"role"`
+	Content        string `json:"content"`
+	TokenEstimate  int64  `json:"token_estimate"`
+	RawJSON        string `json:"raw_json"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+type BillingHold struct {
+	ID              string `json:"id"`
+	RouteKeyHash    string `json:"route_key_hash"`
+	AccountID       string `json:"account_id"`
+	EstimatedTokens int64  `json:"estimated_tokens"`
+	Status          string `json:"status"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
+// AccountRateLimit is the latest rate-limit / remaining-quota snapshot captured
+// from an upstream response's rate-limit headers (Anthropic unified/tokens/requests
+// or OpenAI x-ratelimit-*). It is the data behind the per-account quota gauges in
+// the admin UI. A field set to -1 means "unknown / not signalled by this provider".
+type AccountRateLimit struct {
+	AccountID         string  `json:"account_id"`
+	Provider          string  `json:"provider"`
+	Model             string  `json:"model"`
+	LimiterType       string  `json:"limiter_type"`
+	Source            string  `json:"source"`             // primary window: unified | tokens | requests
+	UsedPercent       float64 `json:"used_percent"`       // 0..100 for the primary window, -1 unknown
+	LimitTokens       int64   `json:"limit_tokens"`       // -1 unknown
+	RemainingTokens   int64   `json:"remaining_tokens"`   // -1 unknown
+	LimitRequests     int64   `json:"limit_requests"`     // -1 unknown
+	RemainingRequests int64   `json:"remaining_requests"` // -1 unknown
+	ResetAt           int64   `json:"reset_at"`           // epoch seconds the primary window resets, 0 unknown
+	Status            string  `json:"status"`             // provider status hint, e.g. allowed_warning / rejected
+	Raw               string  `json:"raw,omitempty"`      // JSON of the raw rate-limit headers, for the drawer
+	UpdatedAt         int64   `json:"updated_at"`
+}
+
+// CustomProvider is an OpenAI-Chat-Completions-compatible upstream provider
+// (DeepSeek, Kimi/Moonshot, OpenRouter, a local vLLM, …) the relay can pool
+// accounts against. Unlike the built-in "codex"/"claude" upstreams it carries no
+// fingerprint mimicry: requests go out as a clean Bearer-auth OpenAI client. An
+// account's Provider column names which CustomProvider serves it. The model set is
+// auto-discovered from {BaseURL}/models and/or set manually by an operator (Models,
+// edited via input boxes in the admin UI — never raw JSON). BaseURL includes the
+// OpenAI-compat path prefix (e.g. ".../v1"); the adapter appends /chat/completions
+// and /models.
+type CustomProvider struct {
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	BaseURL            string   `json:"base_url"`
+	Enabled            bool     `json:"enabled"`
+	AutoDiscoverModels bool     `json:"auto_discover_models"`
+	Models             []string `json:"models"`
+	CreatedAt          int64    `json:"created_at"`
+	UpdatedAt          int64    `json:"updated_at"`
+}
+
+// ModerationConfig is the operator-configured response/history moderation policy.
+// When Enabled, each incoming request's conversation history is keyword-scanned
+// (Words, case-insensitive); on a hit the configured pool Model is asked to rewrite
+// the offending prior-turn text (preserving code verbatim) before forwarding upstream.
+// AutoTranslate appends an English translation when a Chinese word is added (UI side).
+type ModerationConfig struct {
+	Enabled       bool     `json:"enabled"`
+	Model         string   `json:"model"`
+	AutoTranslate bool     `json:"auto_translate"`
+	Words         []string `json:"words"`
+}
+
+func Open(path string) (*Store, error) {
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	db, err := sql.Open("sqlite3", path+sep+"_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		return nil, err
+	}
+	// Single-connection WRITE pool: SQLite has one writer, so serializing writes here
+	// means our concurrency never triggers SQLITE_BUSY. Init() sets WAL on this pool.
+	db.SetMaxOpenConns(1)
+
+	// Separate multi-connection READ pool against the same WAL file, so per-request
+	// SELECTs run in parallel instead of queuing behind the single writer. An
+	// in-memory shared-cache test DB reuses the one handle — a second pool there adds
+	// connection-lifetime/visibility quirks for no real gain (the split only helps
+	// file-backed databases under concurrent load).
+	rdb := db
+	if !strings.Contains(path, "mode=memory") {
+		r, rerr := sql.Open("sqlite3", path+sep+"_busy_timeout=5000&_foreign_keys=on&_journal_mode=WAL")
+		if rerr != nil {
+			_ = db.Close()
+			return nil, rerr
+		}
+		n := readPoolSize()
+		r.SetMaxOpenConns(n)
+		r.SetMaxIdleConns(n)
+		rdb = r
+	}
+	return &Store{db: db, rdb: rdb}, nil
+}
+
+// readPoolSize is the number of concurrent read connections: max(4, GOMAXPROCS)
+// capped at 32, overridable via CODEX_POOL_DB_MAX_READ_CONNS. Each connection keeps
+// its own SQLite page cache, so the cap bounds memory under the parallel-read pool.
+func readPoolSize() int {
+	if v := strings.TrimSpace(os.Getenv("CODEX_POOL_DB_MAX_READ_CONNS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	n := runtime.NumCPU()
+	if n < 4 {
+		n = 4
+	}
+	if n > 32 {
+		n = 32
+	}
+	return n
+}
+
+func OpenInMemory() (*Store, error) {
+	return Open("file:codex_pool_test?mode=memory&cache=shared")
+}
+
+func (s *Store) Close() error {
+	if s.rdb != nil && s.rdb != s.db {
+		_ = s.rdb.Close()
+	}
+	return s.db.Close()
+}
+
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
+func Now() int64 {
+	return time.Now().Unix()
+}
+
+func (s *Store) Init(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-32000; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	// Create lifecycle management tables
+	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
+		return err
+	}
+	if err := s.migrate(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateAccountRateLimits(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateLifecycle(ctx); err != nil {
+		return err
+	}
+	now := Now()
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, created_at, updated_at)
+VALUES('cyber', '', 'prepend', 1, 1, ?, ?)
+ON CONFLICT(name) DO NOTHING`, now, now); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO egress_profiles(id, name, type, endpoint, region, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at)
+VALUES(?, 'direct', 'direct', '', '', 1, 'healthy', 0, 0, '', 0, 128, ?, ?)
+ON CONFLICT(id) DO NOTHING`, DefaultDirectEgressID, now, now)
+	if err != nil {
+		return err
+	}
+	// Seed default OpenAI-compatible custom providers so the adapter works out of the
+	// box (the "适配 deepseek / 硅基流动" baseline). Operators can edit base_url / model
+	// list from the admin UI, disable them, or add more (Kimi, OpenRouter, vLLM, …).
+	// base_url carries the OpenAI-compat "/v1" prefix; the adapter appends
+	// /chat/completions and /models. ON CONFLICT keeps any operator edits on restart.
+	seededProviders := []struct{ id, name, baseURL, models string }{
+		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", `["deepseek-chat","deepseek-reasoner"]`},
+		// SiliconFlow (硅基流动) aggregates many open models behind one OpenAI-compatible
+		// API; its catalog is large and changes often, so seed an empty model list and
+		// rely on auto-discovery ({base}/models) once an API key is imported.
+		{"siliconflow", "SiliconFlow 硅基流动", "https://api.siliconflow.cn/v1", `[]`},
+	}
+	for _, p := range seededProviders {
+		if _, err = s.db.ExecContext(ctx, `
+INSERT INTO custom_providers(id, name, base_url, enabled, auto_discover_models, models_json, created_at, updated_at)
+VALUES(?, ?, ?, 1, 1, ?, ?, ?)
+ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, p.models, now, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const schemaSQL = `
+CREATE TABLE IF NOT EXISTS tenants(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS users(
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'user',
+  status TEXT NOT NULL DEFAULT 'active',
+  password_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE TABLE IF NOT EXISTS user_sessions(
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+CREATE TABLE IF NOT EXISTS projects(
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  group_name TEXT NOT NULL DEFAULT 'cyber',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_keys(
+  key_hash TEXT PRIMARY KEY,
+  tenant_id TEXT,
+  project_id TEXT,
+  label TEXT,
+  group_name TEXT NOT NULL DEFAULT '',
+  force_model TEXT NOT NULL DEFAULT '',
+  force_effort TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  secret TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS groups(
+  name TEXT PRIMARY KEY,
+  system_prompt TEXT NOT NULL DEFAULT '',
+  prompt_mode TEXT NOT NULL DEFAULT 'prepend',
+  system_prompt_apply_to_compaction INTEGER NOT NULL DEFAULT 1,
+  virtual_2m_enabled INTEGER NOT NULL DEFAULT 1,
+  force_model TEXT NOT NULL DEFAULT '',
+  force_effort TEXT NOT NULL DEFAULT '',
+  default_egress_id TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS accounts(
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  group_name TEXT NOT NULL DEFAULT 'cyber',
+  upstream_account_id TEXT,
+  chatgpt_user_id TEXT,
+  email TEXT,
+  plan_type TEXT,
+  provider TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  is_fedramp INTEGER NOT NULL DEFAULT 0,
+  quarantine_until INTEGER NOT NULL DEFAULT 0,
+  quarantine_reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_group_status ON accounts(group_name, status);
+CREATE TABLE IF NOT EXISTS account_auth_tokens(
+  account_id TEXT PRIMARY KEY,
+  access_token TEXT,
+  refresh_token TEXT,
+  openai_api_key TEXT,
+  id_token_raw TEXT,
+  last_refresh INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_model_capabilities(
+  account_id TEXT NOT NULL,
+  model_slug TEXT NOT NULL,
+  native_context_window INTEGER NOT NULL DEFAULT 0,
+  native_max_context_window INTEGER NOT NULL DEFAULT 0,
+  effective_context_window_percent INTEGER NOT NULL DEFAULT 100,
+  auto_compact_token_limit INTEGER NOT NULL DEFAULT 0,
+  visibility TEXT NOT NULL DEFAULT '',
+  etag TEXT NOT NULL DEFAULT '',
+  raw_model_json_hash TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'probe',
+  last_probe_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, model_slug),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+-- Composite index covering the model capability JOIN query used by capability-aware routing:
+-- SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id
+-- WHERE a.group_name = ? AND a.status = 'active' AND c.model_slug = ?
+CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id);
+CREATE TABLE IF NOT EXISTS affinity_bindings(
+  route_key_hash TEXT PRIMARY KEY,
+  route_key TEXT NOT NULL,
+  source TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS egress_profiles(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  endpoint TEXT NOT NULL DEFAULT '',
+  chain_proxy TEXT NOT NULL DEFAULT '',
+  region TEXT NOT NULL DEFAULT '',
+  exit_ip TEXT NOT NULL DEFAULT '',
+  stream_capable INTEGER NOT NULL DEFAULT 1,
+  health TEXT NOT NULL DEFAULT 'healthy',
+  latency_millis INTEGER NOT NULL DEFAULT 0,
+  cf_score INTEGER NOT NULL DEFAULT 0,
+  last_cf_ray TEXT NOT NULL DEFAULT '',
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  max_concurrency INTEGER NOT NULL DEFAULT 16,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  proxy_auth_mode TEXT NOT NULL DEFAULT '',
+  proxy_api_key TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS account_egress_bindings(
+  account_id TEXT PRIMARY KEY,
+  primary_egress_id TEXT NOT NULL,
+  standby_egress_ids TEXT NOT NULL DEFAULT '',
+  cookie_jar_key TEXT NOT NULL DEFAULT '',
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  recheck_pending INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+-- Index for egress binding cooldown queries used by shortestCooldown:
+-- SELECT account_id FROM account_egress_bindings WHERE cooldown_until <= ? AND recheck_pending = 0
+CREATE INDEX IF NOT EXISTS idx_egress_binding_cooldown ON account_egress_bindings(cooldown_until, recheck_pending);
+CREATE TABLE IF NOT EXISTS cf_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  cf_ray TEXT NOT NULL DEFAULT '',
+  category TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cf_events_account_egress_time ON cf_events(account_id, egress_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cf_events_egress_time ON cf_events(egress_id, created_at);
+CREATE TABLE IF NOT EXISTS virtual_context_ledger(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  route_key_hash TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  prompt_cache_key TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  token_estimate INTEGER NOT NULL DEFAULT 0,
+  raw_json TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_virtual_ledger_route_time ON virtual_context_ledger(route_key_hash, created_at);
+-- TTL cleanup optimization: index on created_at for efficient range deletes
+CREATE INDEX IF NOT EXISTS idx_virtual_ledger_created_at ON virtual_context_ledger(created_at);
+CREATE TABLE IF NOT EXISTS billing_holds(
+  id TEXT PRIMARY KEY,
+  route_key_hash TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL,
+  estimated_tokens INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'held',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS usage_records(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  route_key_hash TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  raw_usage_json TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_session_cookies(
+  account_id TEXT PRIMARY KEY,
+  cookie TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_injected_cookies(
+  account_id TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  upstream_host TEXT NOT NULL DEFAULT '',
+  cookie_header TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT '',
+  exit_ip TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, egress_id, upstream_host),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_rate_limits(
+  account_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  limiter_type TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  used_percent REAL NOT NULL DEFAULT -1,
+  limit_tokens INTEGER NOT NULL DEFAULT -1,
+  remaining_tokens INTEGER NOT NULL DEFAULT -1,
+  limit_requests INTEGER NOT NULL DEFAULT -1,
+  remaining_requests INTEGER NOT NULL DEFAULT -1,
+  reset_at INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT '',
+  raw_json TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, provider, model, limiter_type),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS settings(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS custom_providers(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  base_url TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  auto_discover_models INTEGER NOT NULL DEFAULT 1,
+  models_json TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL DEFAULT '',
+  account_label TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_account ON audit_log(account_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS registration_jobs(
+  id TEXT PRIMARY KEY,
+  platform TEXT NOT NULL DEFAULT 'chatgpt',
+  method TEXT NOT NULL,
+  total INTEGER NOT NULL DEFAULT 0,
+  succeeded INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  started_at INTEGER NOT NULL DEFAULT 0,
+  completed_at INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reg_jobs_status ON registration_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_reg_jobs_platform ON registration_jobs(platform);
+
+CREATE TABLE IF NOT EXISTS registration_records(
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  account_id TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  tier TEXT NOT NULL DEFAULT 'free',
+  cost_usd REAL NOT NULL DEFAULT 0,
+  duration_seconds INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  error TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reg_records_job ON registration_records(job_id);
+CREATE INDEX IF NOT EXISTS idx_reg_records_status ON registration_records(status);
+
+CREATE TABLE IF NOT EXISTS registration_task_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'info',
+  message TEXT NOT NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reg_events_task ON registration_task_events(task_id);
+
+CREATE TABLE IF NOT EXISTS provider_settings(
+  id TEXT PRIMARY KEY,
+  provider_type TEXT NOT NULL,
+  provider_key TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  priority INTEGER NOT NULL DEFAULT 0,
+  config_json TEXT NOT NULL DEFAULT '{}',
+  auth_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(provider_type, provider_key)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_settings_type ON provider_settings(provider_type);
+
+CREATE TABLE IF NOT EXISTS sms_blacklist(
+  phone TEXT PRIMARY KEY,
+  reason TEXT NOT NULL DEFAULT '',
+  fail_count INTEGER NOT NULL DEFAULT 1,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS account_lifecycle_status(
+  account_id TEXT PRIMARY KEY,
+  validity_status TEXT NOT NULL DEFAULT 'unknown',
+  subscription_tier TEXT NOT NULL DEFAULT 'free',
+  subscription_expires_at INTEGER NOT NULL DEFAULT 0,
+  last_health_check_at INTEGER NOT NULL DEFAULT 0,
+  last_token_refresh_at INTEGER NOT NULL DEFAULT 0,
+  health_check_fail_count INTEGER NOT NULL DEFAULT 0,
+  summary_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS registration_stats_daily(
+  date TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  method TEXT NOT NULL,
+  provider_key TEXT NOT NULL DEFAULT 'unknown',
+  total INTEGER NOT NULL DEFAULT 0,
+  succeeded INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, platform, method, provider_key)
+);
+`
+
+// migrate applies additive schema changes to databases created by an older
+// build. Each statement adds a column newer code relies on; SQLite errors with
+// "duplicate column name" when it already exists, which is ignored so the
+// migration is idempotent. New tables are handled by CREATE TABLE IF NOT EXISTS.
+// CREATE INDEX IF NOT EXISTS is also idempotent and adds new indexes to old DBs.
+func (s *Store) migrate(ctx context.Context) error {
+	stmts := []string{
+		`ALTER TABLE api_keys ADD COLUMN group_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE api_keys ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE api_keys ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN default_egress_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		// Multi-user portal: end-user credentials/roles, key ownership, and per-user
+		// usage attribution (older DBs created before the portal existed).
+		`ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'`,
+		`ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`,
+		`ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE api_keys ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE api_keys ADD COLUMN secret TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN api_key_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`,
+		// Cooldown→health-recheck gate: a benched account stays out of the candidate
+		// pool until a liveness probe confirms it recovered (older DBs created before
+		// the recheck loop existed).
+		`ALTER TABLE account_egress_bindings ADD COLUMN recheck_pending INTEGER NOT NULL DEFAULT 0`,
+		// SMS multi-platform tracking: record which provider + country a registration
+		// used, and what it cost, so the local stats API can aggregate per-platform
+		// per-country success rates (Phase 7 — additive migration).
+		`ALTER TABLE registration_records ADD COLUMN sms_provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE registration_records ADD COLUMN sms_country TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE registration_records ADD COLUMN sms_cost REAL NOT NULL DEFAULT 0`,
+		// CLIPProxy API whitelist mode + exit-region validation (Phase 8 — additive).
+		// ProxyAuthMode selects credential vs api_whitelist IP acquisition; ProxyAPIKey is
+		// the cliproxy account token used in api_whitelist mode.
+		`ALTER TABLE egress_profiles ADD COLUMN proxy_auth_mode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE egress_profiles ADD COLUMN proxy_api_key TEXT NOT NULL DEFAULT ''`,
+		// New indexes for query optimization (idempotent CREATE INDEX IF NOT EXISTS)
+		// Covers the model capability JOIN used by capability-aware routing
+		`CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id)`,
+		// Covers egress binding cooldown queries used by shortestCooldown
+		`CREATE INDEX IF NOT EXISTS idx_egress_binding_cooldown ON account_egress_bindings(cooldown_until, recheck_pending)`,
+		// Covers account detail drawer audit lookups without scanning the global audit log.
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_account ON audit_log(account_id, id DESC)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) migrateAccountRateLimits(ctx context.Context) error {
+	rows, err := s.rdb.QueryContext(ctx, `PRAGMA table_info(account_rate_limits)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	hasModel := false
+	hasLimiterType := false
+	accountIDPK := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		switch name {
+		case "model":
+			hasModel = true
+		case "limiter_type":
+			hasLimiterType = true
+		case "account_id":
+			accountIDPK = pk == 1
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if hasModel && hasLimiterType && !accountIDPK {
+		_, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_rate_limits_route ON account_rate_limits(account_id, provider, model, reset_at)`)
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS account_rate_limits_new(
+  account_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  limiter_type TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  used_percent REAL NOT NULL DEFAULT -1,
+  limit_tokens INTEGER NOT NULL DEFAULT -1,
+  remaining_tokens INTEGER NOT NULL DEFAULT -1,
+  limit_requests INTEGER NOT NULL DEFAULT -1,
+  remaining_requests INTEGER NOT NULL DEFAULT -1,
+  reset_at INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT '',
+  raw_json TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, provider, model, limiter_type),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+INSERT OR REPLACE INTO account_rate_limits_new(
+  account_id, provider, model, limiter_type, source, used_percent, limit_tokens, remaining_tokens,
+  limit_requests, remaining_requests, reset_at, status, raw_json, updated_at
+)
+SELECT account_id, provider, '', COALESCE(NULLIF(source, ''), 'default'), source, used_percent,
+  limit_tokens, remaining_tokens, limit_requests, remaining_requests, reset_at, status, raw_json, updated_at
+FROM account_rate_limits;
+DROP TABLE account_rate_limits;
+ALTER TABLE account_rate_limits_new RENAME TO account_rate_limits;
+CREATE INDEX IF NOT EXISTS idx_rate_limits_route ON account_rate_limits(account_id, provider, model, reset_at);
+`)
+	return err
+}
+
+// migrateLifecycle adds lifecycle management columns to existing accounts table
+func (s *Store) migrateLifecycle(ctx context.Context) error {
+	stmts := []string{
+		`ALTER TABLE accounts ADD COLUMN registration_method TEXT NOT NULL DEFAULT 'manual'`,
+		`ALTER TABLE accounts ADD COLUMN phone TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN subscription_status TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE accounts ADD COLUMN subscription_expires_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN last_validity_check_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN registration_task_id TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) GetGroup(ctx context.Context, name string) (Group, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups WHERE name = ?`, name)
+	var g Group
+	var apply, virtual int
+	err := row.Scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &g.CreatedAt, &g.UpdatedAt)
+	g.SystemPromptApplyToCompaction = apply != 0
+	g.Virtual2MEnabled = virtual != 0
+	return g, err
+}
+
+func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Group
+	for rows.Next() {
+		var g Group
+		var apply, virtual int
+		if err := rows.Scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &g.CreatedAt, &g.UpdatedAt); err != nil {
+			return nil, err
+		}
+		g.SystemPromptApplyToCompaction = apply != 0
+		g.Virtual2MEnabled = virtual != 0
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateGroup(ctx context.Context, g Group) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE groups SET system_prompt = ?, prompt_mode = ?, system_prompt_apply_to_compaction = ?, virtual_2m_enabled = ?, force_model = ?, force_effort = ?, default_egress_id = ?, updated_at = ? WHERE name = ?`,
+		g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), g.ForceModel, g.ForceEffort, g.DefaultEgressID, Now(), g.Name)
+	return err
+}
+
+// CreateGroup inserts a new group (multi-group support — the pool is no longer limited
+// to the single seeded "cyber" group). Name must be non-empty and unique (PRIMARY KEY);
+// prompt_mode defaults to "prepend" when blank. created_at/updated_at are stamped now.
+func (s *Store) CreateGroup(ctx context.Context, g Group) error {
+	if strings.TrimSpace(g.Name) == "" {
+		return errors.New("group name required")
+	}
+	if strings.TrimSpace(g.PromptMode) == "" {
+		g.PromptMode = "prepend"
+	}
+	now := Now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, force_model, force_effort, default_egress_id, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), g.ForceModel, g.ForceEffort, g.DefaultEgressID, now, now)
+	return err
+}
+
+// DeleteGroup removes a group by name. The caller must guard against deleting the
+// configured default group and against orphaning members (see CountAccountsByGroup).
+func (s *Store) DeleteGroup(ctx context.Context, name string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM groups WHERE name = ?`, name)
+	return err
+}
+
+// SetAccountGroup reassigns an account to a different group. Membership is the
+// accounts.group_name column the scheduler routes by, so this is the per-account
+// "改派分组" control.
+func (s *Store) SetAccountGroup(ctx context.Context, accountID, group string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET group_name = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(group), Now(), accountID)
+	return err
+}
+
+// CountAccountsByGroup returns how many accounts (any status) belong to a group — used
+// to guard group deletion and to show membership counts in the admin UI.
+func (s *Store) CountAccountsByGroup(ctx context.Context, group string) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE group_name = ?`, group).Scan(&n)
+	return n, err
+}
+
+const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), enabled, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,'')`
+
+func scanAPIKey(scan func(...interface{}) error) (APIKey, error) {
+	var k APIKey
+	var enabled int
+	err := scan(&k.KeyHash, &k.Label, &k.GroupName, &k.ForceModel, &k.ForceEffort, &enabled, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret)
+	k.Enabled = enabled != 0
+	return k, err
+}
+
+func (s *Store) scanAPIKey(scan func(...interface{}) error) (APIKey, error) {
+	k, err := scanAPIKey(scan)
+	if err != nil {
+		return k, err
+	}
+	k.Secret = s.openToken(k.Secret)
+	return k, nil
+}
+
+// LookupAPIKey returns the api key with the given sha256 hash, if present.
+func (s *Store) LookupAPIKey(ctx context.Context, keyHash string) (APIKey, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+apiKeyCols+` FROM api_keys WHERE key_hash = ?`, keyHash)
+	k, err := s.scanAPIKey(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return APIKey{}, false, nil
+	}
+	if err != nil {
+		return APIKey{}, false, err
+	}
+	return k, true, nil
+}
+
+// ListAPIKeys returns all api keys (hash only, never plaintext), newest first.
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+apiKeyCols+` FROM api_keys ORDER BY created_at DESC, key_hash`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []APIKey
+	for rows.Next() {
+		k, err := s.scanAPIKey(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// ListAPIKeysByUser returns the keys owned by one portal user (self-service view).
+func (s *Store) ListAPIKeysByUser(ctx context.Context, userID string) ([]APIKey, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+apiKeyCols+` FROM api_keys WHERE user_id = ? ORDER BY created_at DESC, key_hash`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []APIKey
+	for rows.Next() {
+		k, err := s.scanAPIKey(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// UpsertAPIKey inserts or updates an api key by hash.
+func (s *Store) UpsertAPIKey(ctx context.Context, k APIKey) error {
+	now := Now()
+	if k.CreatedAt == 0 {
+		k.CreatedAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, label, group_name, force_model, force_effort, enabled, secret, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, label=excluded.label, group_name=excluded.group_name, force_model=excluded.force_model, force_effort=excluded.force_effort, enabled=excluded.enabled, secret=excluded.secret, updated_at=excluded.updated_at`,
+		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.Label, k.GroupName, k.ForceModel, k.ForceEffort, boolInt(k.Enabled), s.sealToken(k.Secret), k.CreatedAt, now)
+	return err
+}
+
+// DeleteAPIKey removes an api key by hash.
+func (s *Store) DeleteAPIKey(ctx context.Context, keyHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE key_hash = ?`, keyHash)
+	return err
+}
+
+func (s *Store) ListTenants(ctx context.Context) ([]Tenant, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, name, created_at, updated_at FROM tenants ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Tenant
+	for rows.Next() {
+		var item Tenant
+		if err := rows.Scan(&item.ID, &item.Name, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertTenant(ctx context.Context, item Tenant) error {
+	now := Now()
+	if item.CreatedAt == 0 {
+		item.CreatedAt = now
+	}
+	item.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `INSERT INTO tenants(id, name, created_at, updated_at) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`,
+		item.ID, item.Name, item.CreatedAt, item.UpdatedAt)
+	return err
+}
+
+const userColumns = `id, tenant_id, email, COALESCE(name,''), COALESCE(role,'user'), COALESCE(status,'active'), COALESCE(password_hash,''), created_at, updated_at`
+
+func scanUser(scan func(...interface{}) error) (User, error) {
+	var u User
+	err := scan(&u.ID, &u.TenantID, &u.Email, &u.Name, &u.Role, &u.Status, &u.PasswordHash, &u.CreatedAt, &u.UpdatedAt)
+	return u, err
+}
+
+func (s *Store) ListUsers(ctx context.Context) ([]User, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+userColumns+` FROM users ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		item, err := scanUser(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// GetUserByEmail looks up a user by case-insensitive email; ok=false when absent.
+func (s *Store) GetUserByEmail(ctx context.Context, email string) (User, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE email = ? COLLATE NOCASE`, strings.TrimSpace(email))
+	u, err := scanUser(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, false, nil
+	}
+	return u, err == nil, err
+}
+
+// GetUser looks up a user by id; ok=false when absent.
+func (s *Store) GetUser(ctx context.Context, id string) (User, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE id = ?`, id)
+	u, err := scanUser(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, false, nil
+	}
+	return u, err == nil, err
+}
+
+// CountUsers returns the number of registered users (used to bootstrap the first
+// user as an admin).
+func (s *Store) CountUsers(ctx context.Context) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
+	return n, err
+}
+
+// HasAdminUser reports whether at least one active admin user exists. Once true, an
+// open deployment (no admin_token) stops allowing anonymous /admin access — the
+// portal has been bootstrapped and an admin must log in.
+func (s *Store) HasAdminUser(ctx context.Context) (bool, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'`).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) UpsertUser(ctx context.Context, item User) error {
+	now := Now()
+	if item.CreatedAt == 0 {
+		item.CreatedAt = now
+	}
+	item.UpdatedAt = now
+	if item.Role == "" {
+		item.Role = "user"
+	}
+	if item.Status == "" {
+		item.Status = "active"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO users(id, tenant_id, email, name, role, status, password_hash, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET tenant_id = excluded.tenant_id, email = excluded.email, name = excluded.name, role = excluded.role, status = excluded.status, password_hash = excluded.password_hash, updated_at = excluded.updated_at`,
+		item.ID, item.TenantID, item.Email, item.Name, item.Role, item.Status, item.PasswordHash, item.CreatedAt, item.UpdatedAt)
+	return err
+}
+
+// ── End-user sessions ──
+
+// CreateUserSession persists a session row (token already hashed by the caller).
+func (s *Store) CreateUserSession(ctx context.Context, sess UserSession) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_sessions(token_hash, user_id, user_agent, created_at, expires_at) VALUES(?, ?, ?, ?, ?) ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at`,
+		sess.TokenHash, sess.UserID, sess.UserAgent, sess.CreatedAt, sess.ExpiresAt)
+	return err
+}
+
+// GetUserSession returns a non-expired session by token hash; ok=false otherwise.
+func (s *Store) GetUserSession(ctx context.Context, tokenHash string) (UserSession, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT token_hash, user_id, COALESCE(user_agent,''), created_at, expires_at FROM user_sessions WHERE token_hash = ?`, tokenHash)
+	var sess UserSession
+	err := row.Scan(&sess.TokenHash, &sess.UserID, &sess.UserAgent, &sess.CreatedAt, &sess.ExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UserSession{}, false, nil
+	}
+	if err != nil {
+		return UserSession{}, false, err
+	}
+	if sess.ExpiresAt > 0 && sess.ExpiresAt < Now() {
+		_ = s.DeleteUserSession(ctx, tokenHash)
+		return UserSession{}, false, nil
+	}
+	return sess, true, nil
+}
+
+// DeleteUserSession removes one session (logout).
+func (s *Store) DeleteUserSession(ctx context.Context, tokenHash string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM user_sessions WHERE token_hash = ?`, tokenHash)
+	return err
+}
+
+// DeleteUserSessionsForUser removes all sessions for a user (e.g. on password
+// change or admin disable).
+func (s *Store) DeleteUserSessionsForUser(ctx context.Context, userID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM user_sessions WHERE user_id = ?`, userID)
+	return err
+}
+
+// DeleteUser removes a user along with their sessions and the downstream api keys
+// they own (admin user management). Other users' keys are untouched.
+func (s *Store) DeleteUser(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DELETE FROM user_sessions WHERE user_id = ?`,
+		`DELETE FROM api_keys WHERE user_id = ?`,
+		`DELETE FROM users WHERE id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListProjects(ctx context.Context) ([]Project, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, tenant_id, name, group_name, created_at, updated_at FROM projects ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Project
+	for rows.Next() {
+		var item Project
+		if err := rows.Scan(&item.ID, &item.TenantID, &item.Name, &item.GroupName, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertProject(ctx context.Context, item Project) error {
+	now := Now()
+	if item.GroupName == "" {
+		item.GroupName = "cyber"
+	}
+	if item.CreatedAt == 0 {
+		item.CreatedAt = now
+	}
+	item.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `INSERT INTO projects(id, tenant_id, name, group_name, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET tenant_id = excluded.tenant_id, name = excluded.name, group_name = excluded.group_name, updated_at = excluded.updated_at`,
+		item.ID, item.TenantID, item.Name, item.GroupName, item.CreatedAt, item.UpdatedAt)
+	return err
+}
+
+func (s *Store) UpsertAccount(ctx context.Context, account Account, token AccountToken) error {
+	now := Now()
+	if account.CreatedAt == 0 {
+		account.CreatedAt = now
+	}
+	account.UpdatedAt = now
+	if account.Status == "" {
+		account.Status = "active"
+	}
+	if account.GroupName == "" {
+		account.GroupName = "cyber"
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO accounts(id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+ label = excluded.label,
+ group_name = excluded.group_name,
+ upstream_account_id = excluded.upstream_account_id,
+ chatgpt_user_id = excluded.chatgpt_user_id,
+ email = excluded.email,
+ plan_type = excluded.plan_type,
+ provider = excluded.provider,
+ status = excluded.status,
+ is_fedramp = excluded.is_fedramp,
+ updated_at = excluded.updated_at`,
+		account.ID, account.Label, account.GroupName, account.UpstreamAccountID, account.ChatGPTUserID, account.Email, account.PlanType, account.Provider, account.Status, boolInt(account.IsFedramp), account.QuarantineUntil, account.QuarantineReason, account.CreatedAt, account.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	token.AccountID = account.ID
+	if token.CreatedAt == 0 {
+		token.CreatedAt = now
+	}
+	token.UpdatedAt = now
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO account_auth_tokens(account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+ access_token = excluded.access_token,
+ refresh_token = excluded.refresh_token,
+ openai_api_key = excluded.openai_api_key,
+ id_token_raw = excluded.id_token_raw,
+ last_refresh = excluded.last_refresh,
+ updated_at = excluded.updated_at`,
+		token.AccountID, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), token.LastRefresh, token.CreatedAt, token.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, created_at, updated_at)
+VALUES(?, ?, '', ?, 0, ?, ?)
+ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.ID+":"+DefaultDirectEgressID, now, now)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts ORDER BY created_at, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Account
+	for rows.Next() {
+		acc, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, acc)
+	}
+	return out, rows.Err()
+}
+
+// AccountPoolSummary returns the lightweight counts used by the dashboard. It avoids
+// the full /admin/accounts list path, which expands every account with capabilities,
+// egress bindings, and provider fallback lookups on each refresh.
+func (s *Store) AccountPoolSummary(ctx context.Context, now int64) (AccountPoolSummary, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT
+	a.provider,
+	a.status,
+	a.quarantine_until,
+	COALESCE(b.cooldown_until, 0),
+	COALESCE(b.recheck_pending, 0),
+	COALESCE(t.access_token, ''),
+	COALESCE(t.openai_api_key, '')
+FROM accounts a
+LEFT JOIN account_egress_bindings b ON b.account_id = a.id
+LEFT JOIN account_auth_tokens t ON t.account_id = a.id
+`)
+	if err != nil {
+		return AccountPoolSummary{}, err
+	}
+	defer rows.Close()
+
+	var summary AccountPoolSummary
+	for rows.Next() {
+		var provider, status, accessToken, apiKey string
+		var quarantineUntil, cooldownUntil int64
+		var recheck int
+		if err := rows.Scan(&provider, &status, &quarantineUntil, &cooldownUntil, &recheck, &accessToken, &apiKey); err != nil {
+			return AccountPoolSummary{}, err
+		}
+
+		summary.Total++
+		if status == "active" && quarantineUntil <= now {
+			summary.Active++
+		}
+		if quarantineUntil > now {
+			summary.Quarantined++
+		}
+		if cooldownUntil > now {
+			summary.Cooling++
+		}
+		if recheck != 0 {
+			summary.Recheck++
+		}
+		switch accountProviderSummary(provider, s.openToken(accessToken), s.openToken(apiKey)) {
+		case "codex":
+			summary.Codex++
+		case "claude":
+			summary.Claude++
+		default:
+			summary.Other++
+		}
+	}
+	return summary, rows.Err()
+}
+
+func accountProviderSummary(provider, accessToken, apiKey string) string {
+	if provider = strings.TrimSpace(provider); provider != "" {
+		return provider
+	}
+	if strings.HasPrefix(accessToken, "sk-ant") || strings.HasPrefix(apiKey, "sk-ant") {
+		return "claude"
+	}
+	return "codex"
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// ListAccountsPage returns a paginated, searchable account list with total count.
+// When search is empty, no LIKE filter is applied (the fast path for the default
+// "all accounts" view). Status filters are applied when non-empty.
+func (s *Store) ListAccountsPage(ctx context.Context, limit, offset int, search, status string) ([]Account, int, error) {
+	where := ""
+	args := []interface{}{}
+	if search != "" {
+		where = " WHERE (label LIKE ? OR email LIKE ? OR group_name LIKE ? OR id LIKE ?)"
+		s := "%" + search + "%"
+		args = append(args, s, s, s, s)
+	}
+	if status != "" {
+		if where == "" {
+			where = " WHERE status = ?"
+		} else {
+			where += " AND status = ?"
+		}
+		args = append(args, status)
+	}
+	var total int
+	countQuery := "SELECT COUNT(*) FROM accounts" + where
+	if err := s.rdb.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	query := "SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts" + where + " ORDER BY created_at, id DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, total, err
+	}
+	defer rows.Close()
+	var out []Account
+	for rows.Next() {
+		acc, err := scanAccount(rows)
+		if err != nil {
+			return nil, total, err
+		}
+		out = append(out, acc)
+	}
+	return out, total, rows.Err()
+}
+
+func (s *Store) AccountLabelsByID(ctx context.Context, accountIDs []string) (map[string]string, error) {
+	out := make(map[string]string, len(accountIDs))
+	ids := make([]string, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := out[id]; exists {
+			continue
+		}
+		out[id] = id
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, email FROM accounts WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, label, email string
+		if err := rows.Scan(&id, &label, &email); err != nil {
+			return nil, err
+		}
+		out[id] = firstNonEmptyString(label, email, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ResolveAccountProviders(ctx context.Context, accounts []Account) (map[string]string, error) {
+	out := make(map[string]string, len(accounts))
+	legacyIDs := make([]string, 0)
+	for _, account := range accounts {
+		if p := strings.TrimSpace(account.Provider); p != "" {
+			out[account.ID] = p
+			continue
+		}
+		legacyIDs = append(legacyIDs, account.ID)
+	}
+	if len(legacyIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, openai_api_key FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(legacyIDs))+`)`, stringArgs(legacyIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID, accessToken, apiKey string
+		if err := rows.Scan(&accountID, &accessToken, &apiKey); err != nil {
+			return nil, err
+		}
+		out[accountID] = accountProviderSummary("", s.openToken(accessToken), s.openToken(apiKey))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, accountID := range legacyIDs {
+		if _, ok := out[accountID]; !ok {
+			out[accountID] = "codex"
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) ListActiveAccountsByGroup(ctx context.Context, group string) ([]Account, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE group_name = ? AND status = 'active' ORDER BY created_at, id`, group)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Account
+	for rows.Next() {
+		acc, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, acc)
+	}
+	return out, rows.Err()
+}
+
+// AccountWithEgress bundles the account, its egress binding, and primary egress profile
+// in a single row so the scheduler's selectFresh candidate loop can iterate in memory
+// without N+1 queries per selection (was: GetEgressBinding + selectEgress per account).
+type AccountWithEgress struct {
+	Account Account
+	Binding AccountEgressBinding
+	Egress  EgressProfile // zero-value when primary egress deleted
+}
+
+// ListActiveAccountsWithEgress returns all active accounts in a group together with
+// their bindings and primary egress profiles in a single query. Used by the scheduler's
+// optimized selectFresh path to collapse N+1 DB round-trips into one.
+func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) ([]AccountWithEgress, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
+		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.quarantine_until,
+		       a.quarantine_reason, a.created_at, a.updated_at,
+		       b.primary_egress_id, b.standby_egress_ids, b.cookie_jar_key, b.cooldown_until,
+		       b.recheck_pending, b.created_at, b.updated_at,
+		       COALESCE(e.id,''), COALESCE(e.name,''), COALESCE(e.type,''), COALESCE(e.endpoint,''),
+		       COALESCE(e.chain_proxy,''), COALESCE(e.region,''), COALESCE(e.exit_ip,''),
+		       e.stream_capable, COALESCE(e.health,'healthy'), e.latency_millis, e.cf_score,
+		       COALESCE(e.last_cf_ray,''), e.cooldown_until, e.max_concurrency,
+		       e.created_at, e.updated_at,
+		       COALESCE(e.proxy_auth_mode,''), COALESCE(e.proxy_api_key,'')
+		FROM accounts a
+		JOIN account_egress_bindings b ON a.id = b.account_id
+		LEFT JOIN egress_profiles e ON b.primary_egress_id = e.id
+		WHERE a.group_name = ? AND a.status = 'active'
+		ORDER BY a.created_at, a.id
+	`, group)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountWithEgress
+	for rows.Next() {
+		var a AccountWithEgress
+		var isFedramp int
+		var recheck int
+		var streamCapable int
+		err := rows.Scan(
+			&a.Account.ID, &a.Account.Label, &a.Account.GroupName, &a.Account.UpstreamAccountID,
+			&a.Account.ChatGPTUserID, &a.Account.Email, &a.Account.PlanType, &a.Account.Provider,
+			&a.Account.Status, &isFedramp, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
+			&a.Account.CreatedAt, &a.Account.UpdatedAt,
+			&a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.CookieJarKey,
+			&a.Binding.CooldownUntil, &recheck, &a.Binding.CreatedAt, &a.Binding.UpdatedAt,
+			&a.Egress.ID, &a.Egress.Name, &a.Egress.Type, &a.Egress.Endpoint,
+			&a.Egress.ChainProxy, &a.Egress.Region, &a.Egress.ExitIP,
+			&streamCapable, &a.Egress.Health, &a.Egress.LatencyMillis, &a.Egress.CFScore,
+			&a.Egress.LastCFRay, &a.Egress.CooldownUntil, &a.Egress.MaxConcurrency,
+			&a.Egress.CreatedAt, &a.Egress.UpdatedAt,
+			&a.Egress.ProxyAuthMode, &a.Egress.ProxyAPIKey,
+		)
+		if err != nil {
+			return nil, err
+		}
+		a.Account.IsFedramp = isFedramp != 0
+		a.Binding.RecheckPending = recheck != 0
+		a.Egress.StreamCapable = streamCapable != 0
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id = ?`, id)
+	return scanAccount(row)
+}
+
+func (s *Store) ListAccountsByIDs(ctx context.Context, accountIDs []string) (map[string]Account, error) {
+	out := make(map[string]Account, len(accountIDs))
+	ids := make([]string, 0, len(accountIDs))
+	seen := make(map[string]struct{}, len(accountIDs))
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		account, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[account.ID] = account
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetAccountStatus(ctx context.Context, id, status string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?`, status, Now(), id)
+	return err
+}
+
+func (s *Store) DeleteAccount(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
+	return err
+}
+
+func (s *Store) SetAccountQuarantine(ctx context.Context, id string, until int64, reason string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET quarantine_until = ?, quarantine_reason = ?, updated_at = ? WHERE id = ?`, until, reason, Now(), id)
+	return err
+}
+
+func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
+	var t AccountToken
+	err := row.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.CreatedAt, &t.UpdatedAt)
+	t.AccessToken = s.openToken(t.AccessToken)
+	t.RefreshToken = s.openToken(t.RefreshToken)
+	t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
+	t.IDTokenRaw = s.openToken(t.IDTokenRaw)
+	return t, err
+}
+
+func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string) (map[string]AccountToken, error) {
+	out := make(map[string]AccountToken, len(accountIDs))
+	ids := make([]string, 0, len(accountIDs))
+	seen := make(map[string]struct{}, len(accountIDs))
+	for _, id := range accountIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t AccountToken
+		if err := rows.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		t.AccessToken = s.openToken(t.AccessToken)
+		t.RefreshToken = s.openToken(t.RefreshToken)
+		t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
+		t.IDTokenRaw = s.openToken(t.IDTokenRaw)
+		out[t.AccountID] = t
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, updated_at = ? WHERE account_id = ?`,
+		s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, Now(), t.AccountID)
+	return err
+}
+
+// SetTokenEncryptionKey enables transparent at-rest encryption of secret columns using
+// a 32-byte key derived from the deployment secret (identity.ResolveSecret in main).
+// Call once after Open/Init and before serving. An empty secret leaves encryption off.
+func (s *Store) SetTokenEncryptionKey(secret []byte) {
+	if len(secret) == 0 {
+		return
+	}
+	s.tokenKey = secretbox.DeriveKey(secret)
+}
+
+// sealToken encrypts a secret for storage (no-op when encryption is disabled, and
+// best-effort: a Seal failure falls back to storing the value rather than losing it).
+func (s *Store) sealToken(v string) string {
+	out, err := secretbox.Seal(s.tokenKey, v)
+	if err != nil {
+		return v
+	}
+	return out
+}
+
+// openToken decrypts a stored secret. Legacy plaintext passes through unchanged. A
+// decrypt failure (e.g. the operator rotated identity_secret) returns the raw stored
+// value rather than panicking — the account simply fails auth and can be re-imported.
+func (s *Store) openToken(v string) string {
+	out, err := secretbox.Open(s.tokenKey, v)
+	if err != nil {
+		return v
+	}
+	return out
+}
+
+// EncryptExistingTokens re-encrypts any plaintext rows in secret-bearing tables so an
+// existing pool is protected at rest, not just newly-written rows. Idempotent (skips
+// already-sealed values) and a no-op when encryption is disabled. Returns the number of
+// rows upgraded. Run once at startup after SetTokenEncryptionKey.
+func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
+	if len(s.tokenKey) == 0 {
+		return 0, nil
+	}
+	n := 0
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw FROM account_auth_tokens`)
+	if err != nil {
+		return 0, err
+	}
+	type rec struct{ id, at, rt, ak, it string }
+	var pending []rec
+	for rows.Next() {
+		var r rec
+		if err := rows.Scan(&r.id, &r.at, &r.rt, &r.ak, &r.it); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		// Only rows with at least one non-empty, not-yet-sealed secret need an upgrade.
+		if anyPlaintextSecret(r.at, r.rt, r.ak, r.it) {
+			pending = append(pending, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, r := range pending {
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ? WHERE account_id = ?`,
+			s.sealToken(r.at), s.sealToken(r.rt), s.sealToken(r.ak), s.sealToken(r.it), r.id); err != nil {
+			return n, err
+		}
+		n++
+	}
+	keyRows, err := s.rdb.QueryContext(ctx, `SELECT key_hash, secret FROM api_keys WHERE secret <> ''`)
+	if err != nil {
+		return n, err
+	}
+	type keyRec struct{ hash, secret string }
+	var keyPending []keyRec
+	for keyRows.Next() {
+		var r keyRec
+		if err := keyRows.Scan(&r.hash, &r.secret); err != nil {
+			keyRows.Close()
+			return n, err
+		}
+		if anyPlaintextSecret(r.secret) {
+			keyPending = append(keyPending, r)
+		}
+	}
+	keyRows.Close()
+	if err := keyRows.Err(); err != nil {
+		return n, err
+	}
+	for _, r := range keyPending {
+		if _, err := s.db.ExecContext(ctx, `UPDATE api_keys SET secret = ?, updated_at = ? WHERE key_hash = ?`, s.sealToken(r.secret), Now(), r.hash); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
+// anyPlaintextSecret reports whether any field is a non-empty value that is not already
+// encrypted (so EncryptExistingTokens only touches rows that actually need upgrading).
+func anyPlaintextSecret(vals ...string) bool {
+	for _, v := range vals {
+		if v != "" && !secretbox.IsSealed(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSessionCookie stores the chatgpt.com session cookie used to (re)mint a
+// ChatGPT access token for cookie-imported "AT" accounts.
+func (s *Store) SetSessionCookie(ctx context.Context, accountID, cookie string) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_session_cookies(account_id, cookie, updated_at) VALUES(?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET cookie = excluded.cookie, updated_at = excluded.updated_at`,
+		accountID, s.sealToken(cookie), Now())
+	return err
+}
+
+// GetSessionCookie returns the stored session cookie for an account, or "" if none.
+func (s *Store) GetSessionCookie(ctx context.Context, accountID string) (string, error) {
+	var cookie string
+	err := s.rdb.QueryRowContext(ctx, `SELECT cookie FROM account_session_cookies WHERE account_id = ?`, accountID).Scan(&cookie)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return s.openToken(cookie), err
+}
+
+// UpsertInjectedCookie persists (or replaces) a browser-repair/FlareSolverr cookie
+// set for an account+egress+host so it can be re-seeded after a restart and reused by
+// the escalation ladder.
+func (s *Store) UpsertInjectedCookie(ctx context.Context, c InjectedCookie) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO account_injected_cookies(account_id, egress_id, upstream_host, cookie_header, user_agent, exit_ip, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id, egress_id, upstream_host) DO UPDATE SET
+ cookie_header = excluded.cookie_header,
+ user_agent = excluded.user_agent,
+ exit_ip = excluded.exit_ip,
+ updated_at = excluded.updated_at`,
+		c.AccountID, c.EgressID, c.UpstreamHost, c.CookieHeader, c.UserAgent, c.ExitIP, Now())
+	return err
+}
+
+// ListInjectedCookies returns all persisted injected cookies (for startup re-seeding).
+func (s *Store) ListInjectedCookies(ctx context.Context) ([]InjectedCookie, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, egress_id, upstream_host, cookie_header, user_agent, exit_ip, updated_at FROM account_injected_cookies`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []InjectedCookie
+	for rows.Next() {
+		var c InjectedCookie
+		if err := rows.Scan(&c.AccountID, &c.EgressID, &c.UpstreamHost, &c.CookieHeader, &c.UserAgent, &c.ExitIP, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertCapabilities(ctx context.Context, capabilities []ModelCapability) error {
+	if len(capabilities) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// A probe yields the full current capability set for an account, so replace that
+	// account's rows wholesale: delete first, then insert. Plain upsert-per-slug would
+	// leave behind models that disappeared between probes — e.g. a now-filtered hidden
+	// preset (codex-auto-review) or a model the account lost access to — which would
+	// keep being advertised forever. Scoped to the account IDs actually present in the
+	// input (an empty input early-returns above, so this never wipes on a transient).
+	deleted := map[string]bool{}
+	for _, c := range capabilities {
+		if deleted[c.AccountID] {
+			continue
+		}
+		deleted[c.AccountID] = true
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_model_capabilities WHERE account_id = ?`, c.AccountID); err != nil {
+			return err
+		}
+	}
+	for _, c := range capabilities {
+		if c.LastProbeAt == 0 {
+			c.LastProbeAt = Now()
+		}
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO account_model_capabilities(account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id, model_slug) DO UPDATE SET
+ native_context_window = excluded.native_context_window,
+ native_max_context_window = excluded.native_max_context_window,
+ effective_context_window_percent = excluded.effective_context_window_percent,
+ auto_compact_token_limit = excluded.auto_compact_token_limit,
+ visibility = excluded.visibility,
+ etag = excluded.etag,
+ raw_model_json_hash = excluded.raw_model_json_hash,
+ source = excluded.source,
+ last_probe_at = excluded.last_probe_at`,
+			c.AccountID, c.ModelSlug, c.NativeContextWindow, c.NativeMaxContextWindow, c.EffectiveContextWindowPercent, c.AutoCompactTokenLimit, c.Visibility, c.ETag, c.RawModelJSONHash, c.Source, c.LastProbeAt)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]ModelCapability, error) {
+	query := `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities`
+	args := []interface{}{}
+	if accountID != "" {
+		query += ` WHERE account_id = ?`
+		args = append(args, accountID)
+	}
+	query += ` ORDER BY account_id, model_slug`
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ModelCapability
+	for rows.Next() {
+		var c ModelCapability
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListCapabilitiesByAccountIDs(ctx context.Context, accountIDs []string) (map[string][]ModelCapability, error) {
+	out := make(map[string][]ModelCapability, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c ModelCapability
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
+			return nil, err
+		}
+		out[c.AccountID] = append(out[c.AccountID], c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) BestNativeWindow(ctx context.Context, accountID, model string) (int64, error) {
+	var value int64
+	err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(MAX(native_max_context_window), 0) FROM account_model_capabilities WHERE account_id = ? AND (? = '' OR model_slug = ?)`, accountID, model, model).Scan(&value)
+	return value, err
+}
+
+// AccountsWithModel returns the set of active accounts in a group whose probed
+// capabilities include the given model. Used for capability-aware routing: when
+// the set is non-empty the scheduler restricts selection to it (so a request for
+// a model is sent to an account that actually has it); when empty (nothing probed
+// for that model) the caller falls back to all accounts rather than over-restrict.
+func (s *Store) AccountsWithModel(ctx context.Context, group, model string) (map[string]bool, error) {
+	if model == "" {
+		return nil, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id WHERE a.group_name = ? AND a.status = 'active' AND c.model_slug = ?`, group, model)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertEgressProfile(ctx context.Context, p EgressProfile) error {
+	now := Now()
+	if p.ID == "" {
+		return errors.New("egress id required")
+	}
+	if p.Name == "" {
+		p.Name = p.ID
+	}
+	if p.Type == "" {
+		p.Type = "direct"
+	}
+	if p.Health == "" {
+		p.Health = "healthy"
+	}
+	if p.MaxConcurrency <= 0 {
+		p.MaxConcurrency = 16
+	}
+	if p.CreatedAt == 0 {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO egress_profiles(id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+ name = excluded.name,
+ type = excluded.type,
+ endpoint = excluded.endpoint,
+ chain_proxy = excluded.chain_proxy,
+ region = excluded.region,
+ exit_ip = excluded.exit_ip,
+ stream_capable = excluded.stream_capable,
+ health = excluded.health,
+ latency_millis = excluded.latency_millis,
+ cf_score = excluded.cf_score,
+ last_cf_ray = excluded.last_cf_ray,
+ cooldown_until = excluded.cooldown_until,
+ max_concurrency = excluded.max_concurrency,
+ updated_at = excluded.updated_at,
+ proxy_auth_mode = excluded.proxy_auth_mode,
+ proxy_api_key = excluded.proxy_api_key`,
+		p.ID, p.Name, p.Type, p.Endpoint, p.ChainProxy, p.Region, p.ExitIP, boolInt(p.StreamCapable), p.Health, p.LatencyMillis, p.CFScore, p.LastCFRay, p.CooldownUntil, p.MaxConcurrency, p.CreatedAt, p.UpdatedAt, p.ProxyAuthMode, p.ProxyAPIKey)
+	return err
+}
+
+func (s *Store) GetEgressProfile(ctx context.Context, id string) (EgressProfile, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key FROM egress_profiles WHERE id = ?`, id)
+	return scanEgress(row)
+}
+
+func (s *Store) ListEgressProfiles(ctx context.Context) ([]EgressProfile, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key FROM egress_profiles ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EgressProfile
+	for rows.Next() {
+		p, err := scanEgress(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SetEgressCooldown(ctx context.Context, id string, until int64, ray string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE egress_profiles SET cooldown_until = ?, health = CASE WHEN ? > strftime('%s','now') THEN 'cooldown' ELSE health END, last_cf_ray = ?, cf_score = cf_score + 1, updated_at = ? WHERE id = ?`,
+		until, until, ray, Now(), id)
+	return err
+}
+
+func (s *Store) SetEgressHealth(ctx context.Context, id, health string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE egress_profiles SET health = ?, updated_at = ? WHERE id = ?`, health, Now(), id)
+	return err
+}
+
+func (s *Store) GetEgressBinding(ctx context.Context, accountID string) (AccountEgressBinding, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id = ?`, accountID)
+	var b AccountEgressBinding
+	var recheck int
+	err := row.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt)
+	b.RecheckPending = recheck != 0
+	return b, err
+}
+
+func (s *Store) ListEgressBindingsByAccountIDs(ctx context.Context, accountIDs []string) (map[string]AccountEgressBinding, error) {
+	out := make(map[string]AccountEgressBinding, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b AccountEgressBinding
+		var recheck int
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		b.RecheckPending = recheck != 0
+		out[b.AccountID] = b
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertEgressBinding(ctx context.Context, b AccountEgressBinding) error {
+	now := Now()
+	if b.CookieJarKey == "" {
+		b.CookieJarKey = b.AccountID + ":" + b.PrimaryEgressID
+	}
+	if b.CreatedAt == 0 {
+		b.CreatedAt = now
+	}
+	b.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET
+ primary_egress_id = excluded.primary_egress_id,
+ standby_egress_ids = excluded.standby_egress_ids,
+ cookie_jar_key = excluded.cookie_jar_key,
+ cooldown_until = excluded.cooldown_until,
+ recheck_pending = excluded.recheck_pending,
+ updated_at = excluded.updated_at`,
+		b.AccountID, b.PrimaryEgressID, b.StandbyEgressIDs, b.CookieJarKey, b.CooldownUntil, boolInt(b.RecheckPending), b.CreatedAt, b.UpdatedAt)
+	return err
+}
+
+func (s *Store) SetBindingCooldown(ctx context.Context, accountID string, until int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE account_egress_bindings SET cooldown_until = ?, updated_at = ? WHERE account_id = ?`, until, Now(), accountID)
+	return err
+}
+
+// BenchBindingForRecheck cools an account's binding AND marks it recheck-pending in
+// one write, so a single upstream error both rotates the pool off the account and
+// keeps it out of the candidate set until the background recheck loop verifies it is
+// healthy again. This is the seamless-failover counterpart to a plain cooldown:
+// SetBindingCooldown alone would let the account silently re-enter rotation the
+// instant its cooldown elapsed, with no liveness proof.
+func (s *Store) BenchBindingForRecheck(ctx context.Context, accountID string, until int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE account_egress_bindings SET cooldown_until = ?, recheck_pending = 1, updated_at = ? WHERE account_id = ?`, until, Now(), accountID)
+	return err
+}
+
+// SetBindingRecheckPending toggles the recheck-pending flag without touching the
+// cooldown. Used to drop the flag for an account that can no longer be probed
+// (deleted/quarantined) so the recheck loop stops revisiting it.
+func (s *Store) SetBindingRecheckPending(ctx context.Context, accountID string, pending bool) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE account_egress_bindings SET recheck_pending = ?, updated_at = ? WHERE account_id = ?`, boolInt(pending), Now(), accountID)
+	return err
+}
+
+// ClearBindingRecheck marks an account healthy again: clears both the cooldown and
+// the recheck-pending flag so it immediately rejoins the candidate pool. Called by
+// the recheck loop after a successful liveness probe.
+func (s *Store) ClearBindingRecheck(ctx context.Context, accountID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE account_egress_bindings SET cooldown_until = 0, recheck_pending = 0, updated_at = ? WHERE account_id = ?`, Now(), accountID)
+	return err
+}
+
+// ListBindingsNeedingRecheck returns the bindings whose cooldown has elapsed but
+// which are still recheck-pending — i.e. the accounts the recheck loop should now
+// probe. Gating on cooldown_until <= now means the initial cooldown window (often a
+// server-signaled Retry-After) is always honored before the first probe.
+func (s *Store) ListBindingsNeedingRecheck(ctx context.Context, now int64) ([]AccountEgressBinding, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE recheck_pending = 1 AND cooldown_until <= ?`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountEgressBinding
+	for rows.Next() {
+		var b AccountEgressBinding
+		var recheck int
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		b.RecheckPending = recheck != 0
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// AddStandbyEgress appends egressID to an account's standby_egress_ids list if it
+// is not already present (primary or standby), so a CF-hit account gains a fallback
+// egress (e.g. a WARP exit) the scheduler's selectEgress will reroute to when the
+// primary binding is cooled. It is idempotent. Returns (added, err): added is false
+// when the egress was already the primary or already in the standby list.
+func (s *Store) AddStandbyEgress(ctx context.Context, accountID, egressID string) (bool, error) {
+	egressID = strings.TrimSpace(egressID)
+	if egressID == "" {
+		return false, errors.New("egress id required")
+	}
+	binding, err := s.GetEgressBinding(ctx, accountID)
+	if err != nil {
+		return false, err
+	}
+	if binding.PrimaryEgressID == egressID {
+		return false, nil
+	}
+	for _, id := range binding.StandbyIDs() {
+		if id == egressID {
+			return false, nil
+		}
+	}
+	ids := append(binding.StandbyIDs(), egressID)
+	binding.StandbyEgressIDs = strings.Join(ids, ",")
+	if err := s.UpsertEgressBinding(ctx, binding); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ListEgressBindings returns every account→egress binding. Used by the WARP manager
+// to compute per-exit membership (how many accounts a given WARP exit serves) so it
+// can pack accounts ≤N per exit. Bounded by the account count and only read on CF
+// events / assignment, never the hot path.
+func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountEgressBinding
+	for rows.Next() {
+		var b AccountEgressBinding
+		var recheck int
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		b.RecheckPending = recheck != 0
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash, route_key, source, account_id, epoch, created_at, updated_at FROM affinity_bindings WHERE route_key_hash = ?`, routeKeyHash)
+	var b AffinityBinding
+	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt)
+	return b, err
+}
+
+func (s *Store) UpsertAffinityBinding(ctx context.Context, b AffinityBinding) error {
+	now := Now()
+	if b.CreatedAt == 0 {
+		b.CreatedAt = now
+	}
+	b.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO affinity_bindings(route_key_hash, route_key, source, account_id, epoch, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(route_key_hash) DO UPDATE SET
+ account_id = excluded.account_id,
+ source = excluded.source,
+ route_key = excluded.route_key,
+ epoch = affinity_bindings.epoch + 1,
+ updated_at = excluded.updated_at`,
+		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Epoch, b.CreatedAt, b.UpdatedAt)
+	return err
+}
+
+// ListAffinityBindingsByAccount returns the conversations currently pinned to an
+// account (the per-account session map), most-recently-bound first. The epoch is
+// the rebind/handoff counter for that conversation — a high epoch indicates churn
+// (repeated failover), useful for the isolation view.
+func (s *Store) ListAffinityBindingsByAccount(ctx context.Context, accountID string, limit int) ([]AffinityBinding, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT route_key_hash, route_key, source, account_id, epoch, created_at, updated_at FROM affinity_bindings WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?`, accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AffinityBinding
+	for rows.Next() {
+		var b AffinityBinding
+		if err := rows.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// CountAffinityBindingsByAccount returns how many conversations are pinned to an
+// account (for the dashboard / account view summary).
+func (s *Store) CountAffinityBindingsByAccount(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM affinity_bindings WHERE account_id = ?`, accountID).Scan(&n)
+	return n, err
+}
+
+// GetSetting returns a runtime setting override and whether it was present. These
+// store admin-UI-toggleable flags (e.g. conversation_isolation) so they can be
+// changed without editing the config file or restarting; absence means "use the
+// config default".
+func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error) {
+	var v string
+	err := s.rdb.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+// SetSetting stores a runtime setting override.
+func (s *Store) SetSetting(ctx context.Context, key, value string) error {
+	return s.SetSettings(ctx, map[string]string{key: value})
+}
+
+// SetSettings stores a batch of runtime setting overrides atomically. Settings-center
+// saves often touch related knobs together; one transaction prevents half-applied UI
+// changes if SQLite rejects any row in the batch.
+func (s *Store) SetSettings(ctx context.Context, values map[string]string) error {
+	if len(values) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := Now()
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, key, values[key], now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+const moderationSettingKey = "moderation_config"
+
+// GetModerationConfig returns the response/history moderation config (stored as a
+// JSON blob in the settings table). A missing/blank value yields a disabled default.
+func (s *Store) GetModerationConfig(ctx context.Context) (ModerationConfig, error) {
+	cfg := ModerationConfig{AutoTranslate: true}
+	v, ok, err := s.GetSetting(ctx, moderationSettingKey)
+	if err != nil || !ok || strings.TrimSpace(v) == "" {
+		return cfg, err
+	}
+	_ = json.Unmarshal([]byte(v), &cfg)
+	cfg.Words = decodeProviderModelsFromSlice(cfg.Words) // trim + de-dup, reuse helper
+	return cfg, nil
+}
+
+// SetModerationConfig persists the moderation config as JSON.
+func (s *Store) SetModerationConfig(ctx context.Context, cfg ModerationConfig) error {
+	cfg.Words = decodeProviderModelsFromSlice(cfg.Words)
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return s.SetSetting(ctx, moderationSettingKey, string(raw))
+}
+
+// ── Custom OpenAI-compatible providers ──
+
+func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error) {
+	var p CustomProvider
+	var enabled, auto int
+	var modelsJSON string
+	if err := scan(&p.ID, &p.Name, &p.BaseURL, &enabled, &auto, &modelsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		return CustomProvider{}, err
+	}
+	p.Enabled = enabled != 0
+	p.AutoDiscoverModels = auto != 0
+	p.Models = decodeProviderModels(modelsJSON)
+	return p, nil
+}
+
+// decodeProviderModels parses the stored models_json (a JSON array of slugs) into a
+// clean, de-duplicated slice. Tolerates empty/legacy values, returning nil.
+func decodeProviderModels(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var arr []string
+	if json.Unmarshal([]byte(raw), &arr) != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(arr))
+	for _, m := range arr {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+const customProviderCols = `id, name, base_url, enabled, auto_discover_models, models_json, created_at, updated_at`
+
+func (s *Store) ListCustomProviders(ctx context.Context) ([]CustomProvider, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+customProviderCols+` FROM custom_providers ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CustomProvider
+	for rows.Next() {
+		p, err := scanCustomProvider(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetCustomProvider returns a provider by id; the bool is false when not present.
+func (s *Store) GetCustomProvider(ctx context.Context, id string) (CustomProvider, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+customProviderCols+` FROM custom_providers WHERE id = ?`, id)
+	p, err := scanCustomProvider(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CustomProvider{}, false, nil
+	}
+	if err != nil {
+		return CustomProvider{}, false, err
+	}
+	return p, true, nil
+}
+
+// UpsertCustomProvider inserts or updates a provider by id. The Models slice is
+// stored as a JSON array; the admin UI edits it via input boxes, never raw JSON.
+func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) error {
+	if strings.TrimSpace(p.ID) == "" {
+		return errors.New("provider id required")
+	}
+	if p.Name == "" {
+		p.Name = p.ID
+	}
+	now := Now()
+	if p.CreatedAt == 0 {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	modelsJSON := "[]"
+	if cleaned := decodeProviderModelsFromSlice(p.Models); len(cleaned) > 0 {
+		if raw, err := json.Marshal(cleaned); err == nil {
+			modelsJSON = string(raw)
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO custom_providers(id, name, base_url, enabled, auto_discover_models, models_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+ name = excluded.name,
+ base_url = excluded.base_url,
+ enabled = excluded.enabled,
+ auto_discover_models = excluded.auto_discover_models,
+ models_json = excluded.models_json,
+ updated_at = excluded.updated_at`,
+		p.ID, p.Name, p.BaseURL, boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, p.CreatedAt, p.UpdatedAt)
+	return err
+}
+
+// decodeProviderModelsFromSlice trims, de-duplicates, and drops empties from an
+// incoming model slice (the same normalization decodeProviderModels applies on read).
+func decodeProviderModelsFromSlice(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, m := range in {
+		m = strings.TrimSpace(m)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	return out
+}
+
+func (s *Store) DeleteCustomProvider(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM custom_providers WHERE id = ?`, id)
+	return err
+}
+
+// AuditLogRow is one operator-visible audit record (account lifecycle / automated
+// actions such as ban-detection deletes).
+type AuditLogRow struct {
+	ID           int64  `json:"id"`
+	AccountID    string `json:"account_id"`
+	AccountLabel string `json:"account_label"`
+	Action       string `json:"action"`
+	State        string `json:"state"`
+	Reason       string `json:"reason"`
+	Detail       string `json:"detail"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+// InsertAuditLog appends an audit record. It is written BEFORE any destructive
+// action (e.g. ban delete) so the trail survives even after the account row is
+// gone.
+func (s *Store) InsertAuditLog(ctx context.Context, row AuditLogRow) error {
+	if row.CreatedAt == 0 {
+		row.CreatedAt = Now()
+	}
+	if len(row.Detail) > 4000 {
+		row.Detail = row.Detail[:4000]
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO audit_log(account_id, account_label, action, state, reason, detail, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		row.AccountID, row.AccountLabel, row.Action, row.State, row.Reason, row.Detail, row.CreatedAt)
+	return err
+}
+
+// ListAuditLog returns the most recent audit records, newest first.
+func (s *Store) ListAuditLog(ctx context.Context, limit int) ([]AuditLogRow, error) {
+	limit = normalizeAuditLimit(limit)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, account_id, account_label, action, state, reason, detail, created_at FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAuditLogRows(rows)
+}
+
+// ListAuditLogForAccount returns recent audit records for one account without
+// forcing callers to load and filter the global audit stream.
+func (s *Store) ListAuditLogForAccount(ctx context.Context, accountID string, limit int) ([]AuditLogRow, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return s.ListAuditLog(ctx, limit)
+	}
+	limit = normalizeAuditLimit(limit)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, account_id, account_label, action, state, reason, detail, created_at FROM audit_log WHERE account_id = ? ORDER BY id DESC LIMIT ?`, accountID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAuditLogRows(rows)
+}
+
+func normalizeAuditLimit(limit int) int {
+	if limit <= 0 || limit > 1000 {
+		return 200
+	}
+	return limit
+}
+
+func scanAuditLogRows(rows *sql.Rows) ([]AuditLogRow, error) {
+	var out []AuditLogRow
+	for rows.Next() {
+		var r AuditLogRow
+		if err := rows.Scan(&r.ID, &r.AccountID, &r.AccountLabel, &r.Action, &r.State, &r.Reason, &r.Detail, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) InsertCFEvent(ctx context.Context, e CFEvent) error {
+	if e.CreatedAt == 0 {
+		e.CreatedAt = Now()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO cf_events(account_id, egress_id, status, cf_ray, category, message, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+		e.AccountID, e.EgressID, e.Status, e.CFRay, e.Category, e.Message, e.CreatedAt)
+	return err
+}
+
+func (s *Store) ListCFEvents(ctx context.Context, limit int) ([]CFEvent, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, account_id, egress_id, status, cf_ray, category, message, created_at FROM cf_events ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CFEvent
+	for rows.Next() {
+		var e CFEvent
+		if err := rows.Scan(&e.ID, &e.AccountID, &e.EgressID, &e.Status, &e.CFRay, &e.Category, &e.Message, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CountCFEvents(ctx context.Context, where string, args ...interface{}) (int, error) {
+	var count int
+	query := `SELECT COUNT(*) FROM cf_events`
+	if strings.TrimSpace(where) != "" {
+		query += ` WHERE ` + where
+	}
+	err := s.rdb.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
+func (s *Store) DistinctCFAccountsForEgress(ctx context.Context, egressID string, since int64) (int, error) {
+	var count int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(DISTINCT account_id) FROM cf_events WHERE egress_id = ? AND created_at >= ?`, egressID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Store) DistinctCFEgressForAccount(ctx context.Context, accountID string, since int64) (int, error) {
+	var count int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(DISTINCT egress_id) FROM cf_events WHERE account_id = ? AND created_at >= ?`, accountID, since).Scan(&count)
+	return count, err
+}
+
+func (s *Store) InsertVirtualLedger(ctx context.Context, item VirtualLedgerItem) error {
+	if item.CreatedAt == 0 {
+		item.CreatedAt = Now()
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO virtual_context_ledger(route_key_hash, account_id, model, prompt_cache_key, role, content, token_estimate, raw_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		item.RouteKeyHash, item.AccountID, item.Model, item.PromptCacheKey, item.Role, item.Content, item.TokenEstimate, item.RawJSON, item.CreatedAt)
+	return err
+}
+
+// PurgeVirtualLedger deletes ledger rows older than maxAge seconds.
+// The idx_virtual_ledger_route_time index on (route_key_hash, created_at)
+// makes the age filter efficient: SQLite uses it to seek to the old rows
+// per route rather than scanning the whole table. A background goroutine
+// or cron should call this periodically (e.g. every 5 minutes) to prevent
+// unbounded ledger growth. Rows are deleted in batches of 500 to avoid
+// long write transactions.
+func (s *Store) PurgeVirtualLedger(ctx context.Context, maxAgeSeconds int64) (int64, error) {
+	if maxAgeSeconds <= 0 {
+		maxAgeSeconds = 3600 // default: 1 hour
+	}
+	cutoff := Now() - maxAgeSeconds
+	var totalDeleted int64
+	for {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM virtual_context_ledger WHERE id IN (SELECT id FROM virtual_context_ledger WHERE created_at < ? LIMIT 500)`,
+			cutoff)
+		if err != nil {
+			return totalDeleted, err
+		}
+		n, _ := res.RowsAffected()
+		totalDeleted += n
+		if n < 500 {
+			break
+		}
+		// Yield to other operations briefly
+		time.Sleep(time.Millisecond)
+	}
+	return totalDeleted, nil
+}
+
+func (s *Store) ListVirtualLedger(ctx context.Context, routeKeyHash string, limit int) ([]VirtualLedgerItem, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, route_key_hash, account_id, model, prompt_cache_key, role, content, token_estimate, raw_json, created_at FROM virtual_context_ledger WHERE route_key_hash = ? ORDER BY id DESC LIMIT ?`, routeKeyHash, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reversed []VirtualLedgerItem
+	for rows.Next() {
+		var item VirtualLedgerItem
+		if err := rows.Scan(&item.ID, &item.RouteKeyHash, &item.AccountID, &item.Model, &item.PromptCacheKey, &item.Role, &item.Content, &item.TokenEstimate, &item.RawJSON, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		reversed = append(reversed, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]VirtualLedgerItem, 0, len(reversed))
+	for i := len(reversed) - 1; i >= 0; i-- {
+		out = append(out, reversed[i])
+	}
+	return out, nil
+}
+
+func (s *Store) InsertUsageRecord(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached int64, raw json.RawMessage) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, raw_usage_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, string(raw), Now())
+	return err
+}
+
+// UserUsageRow is a per-model rollup of one portal user's usage (their own console).
+type UserUsageRow struct {
+	Model            string `json:"model"`
+	Requests         int64  `json:"requests"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	TotalTokens      int64  `json:"total_tokens"`
+	CachedTokens     int64  `json:"cached_tokens"`
+}
+
+// UsageByUser aggregates a single user's usage per model, most-used first.
+func (s *Store) UsageByUser(ctx context.Context, userID string) ([]UserUsageRow, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserUsageRow
+	for rows.Next() {
+		var r UserUsageRow
+		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UsageByModel aggregates usage across ALL accounts grouped by model since the given
+// epoch second (0 = all time). Powers the admin per-model cache-hit-rate view; same row
+// shape as UsageByUser (UserUsageRow) — the UI computes hit rate = cached/prompt.
+func (s *Store) UsageByModel(ctx context.Context, since int64) ([]UserUsageRow, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserUsageRow
+	for rows.Next() {
+		var r UserUsageRow
+		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UsageTimeseriesByUser is UsageTimeseries scoped to one user's attributed rows.
+func (s *Store) UsageTimeseriesByUser(ctx context.Context, userID string, since, bucketSeconds int64) ([]UsageBucket, error) {
+	if bucketSeconds <= 0 {
+		bucketSeconds = 3600
+	}
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT (created_at / ?) * ? AS bucket, COUNT(*),
+       COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+       COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
+FROM usage_records WHERE user_id = ? AND created_at >= ?
+GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, userID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageBucket
+	for rows.Next() {
+		var b UsageBucket
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.PromptTokens, &b.CompletionTokens, &b.CachedTokens, &b.TotalTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// UsageSummaryRow is a per-account rollup of recorded usage.
+type UsageSummaryRow struct {
+	AccountID        string `json:"account_id"`
+	Requests         int64  `json:"requests"`
+	PromptTokens     int64  `json:"prompt_tokens"`
+	CompletionTokens int64  `json:"completion_tokens"`
+	TotalTokens      int64  `json:"total_tokens"`
+	CachedTokens     int64  `json:"cached_tokens"`
+}
+
+// UsageSummary aggregates usage_records per account, most-used first.
+func (s *Store) UsageSummary(ctx context.Context) ([]UsageSummaryRow, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+FROM usage_records GROUP BY account_id ORDER BY SUM(total_tokens) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageSummaryRow
+	for rows.Next() {
+		var row UsageSummaryRow
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// UsageSummaryByAccountIDs aggregates usage only for the requested accounts.
+func (s *Store) UsageSummaryByAccountIDs(ctx context.Context, accountIDs []string) (map[string]UsageSummaryRow, error) {
+	out := make(map[string]UsageSummaryRow, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+FROM usage_records
+WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)
+GROUP BY account_id`, stringArgs(accountIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row UsageSummaryRow
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens); err != nil {
+			return nil, err
+		}
+		out[row.AccountID] = row
+	}
+	return out, rows.Err()
+}
+
+// UsageBucket is a time-bucketed rollup of usage_records, used to render the
+// usage-over-time area chart on the dashboard.
+type UsageBucket struct {
+	Bucket           int64 `json:"bucket"` // epoch seconds at the start of the bucket
+	Requests         int64 `json:"requests"`
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+	CachedTokens     int64 `json:"cached_tokens"`
+	TotalTokens      int64 `json:"total_tokens"`
+}
+
+// UsageTimeseries returns usage_records aggregated into fixed-width time buckets
+// from since (epoch seconds) to now, oldest first. bucketSeconds must be > 0.
+func (s *Store) UsageTimeseries(ctx context.Context, since, bucketSeconds int64) ([]UsageBucket, error) {
+	if bucketSeconds <= 0 {
+		bucketSeconds = 3600
+	}
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT (created_at / ?) * ? AS bucket,
+       COUNT(*),
+       COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+       COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
+FROM usage_records
+WHERE created_at >= ?
+GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UsageBucket
+	for rows.Next() {
+		var b UsageBucket
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.PromptTokens, &b.CompletionTokens, &b.CachedTokens, &b.TotalTokens); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// UpsertAccountRateLimit stores the latest rate-limit / quota snapshot for an
+// account/provider/model/limiter dimension, replacing only that dimension.
+func (s *Store) UpsertAccountRateLimit(ctx context.Context, r AccountRateLimit) error {
+	if r.UpdatedAt == 0 {
+		r.UpdatedAt = Now()
+	}
+	r.Provider = strings.TrimSpace(r.Provider)
+	r.Model = strings.TrimSpace(r.Model)
+	r.LimiterType = strings.TrimSpace(r.LimiterType)
+	if r.LimiterType == "" {
+		r.LimiterType = strings.TrimSpace(r.Source)
+	}
+	if r.LimiterType == "" {
+		r.LimiterType = "default"
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO account_rate_limits(account_id, provider, model, limiter_type, source, used_percent, limit_tokens, remaining_tokens, limit_requests, remaining_requests, reset_at, status, raw_json, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id, provider, model, limiter_type) DO UPDATE SET
+ source = excluded.source, used_percent = excluded.used_percent,
+ limit_tokens = excluded.limit_tokens, remaining_tokens = excluded.remaining_tokens,
+ limit_requests = excluded.limit_requests, remaining_requests = excluded.remaining_requests,
+ reset_at = excluded.reset_at, status = excluded.status, raw_json = excluded.raw_json, updated_at = excluded.updated_at`,
+		r.AccountID, r.Provider, r.Model, r.LimiterType, r.Source, r.UsedPercent, r.LimitTokens, r.RemainingTokens,
+		r.LimitRequests, r.RemainingRequests, r.ResetAt, r.Status, r.Raw, r.UpdatedAt)
+	return err
+}
+
+func scanAccountRateLimit(scan func(...interface{}) error) (AccountRateLimit, error) {
+	var r AccountRateLimit
+	err := scan(&r.AccountID, &r.Provider, &r.Model, &r.LimiterType, &r.Source, &r.UsedPercent, &r.LimitTokens, &r.RemainingTokens,
+		&r.LimitRequests, &r.RemainingRequests, &r.ResetAt, &r.Status, &r.Raw, &r.UpdatedAt)
+	return r, err
+}
+
+const rateLimitCols = `account_id, provider, model, limiter_type, source, used_percent, limit_tokens, remaining_tokens, limit_requests, remaining_requests, reset_at, status, raw_json, updated_at`
+
+// GetAccountRateLimit returns the most recently updated quota snapshot for an
+// account. The returned bool is false when no snapshot has been captured yet.
+func (s *Store) GetAccountRateLimit(ctx context.Context, accountID string) (AccountRateLimit, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id = ? ORDER BY updated_at DESC LIMIT 1`, accountID)
+	r, err := scanAccountRateLimit(row.Scan)
+	if err == sql.ErrNoRows {
+		return AccountRateLimit{}, false, nil
+	}
+	if err != nil {
+		return AccountRateLimit{}, false, err
+	}
+	return r, true, nil
+}
+
+// GetAccountRateLimitFor returns a quota snapshot for one concrete
+// account/provider/model/limiter dimension.
+func (s *Store) GetAccountRateLimitFor(ctx context.Context, accountID, provider, model, limiterType string) (AccountRateLimit, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id = ? AND provider = ? AND model = ? AND limiter_type = ?`,
+		accountID, strings.TrimSpace(provider), strings.TrimSpace(model), strings.TrimSpace(limiterType))
+	r, err := scanAccountRateLimit(row.Scan)
+	if err == sql.ErrNoRows {
+		return AccountRateLimit{}, false, nil
+	}
+	if err != nil {
+		return AccountRateLimit{}, false, err
+	}
+	return r, true, nil
+}
+
+// ListAccountRateLimits returns every stored quota snapshot, most-recently-updated
+// first, for the admin quota overview.
+func (s *Store) ListAccountRateLimits(ctx context.Context) ([]AccountRateLimit, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AccountRateLimit
+	for rows.Next() {
+		r, err := scanAccountRateLimit(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AccountRateLimitCooldownUntil returns the reset time for an active exhausted
+// limiter that applies to the requested provider/model. A blank model row is treated
+// as account-wide; a model-specific row applies only to that model.
+func (s *Store) AccountRateLimitCooldownUntil(ctx context.Context, accountID, provider, model string, now int64) (int64, bool, error) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id = ? AND reset_at > ? AND (? = '' OR provider = '' OR provider = ?) AND (model = '' OR model = ?) ORDER BY reset_at ASC`,
+		accountID, now, provider, provider, model)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanAccountRateLimit(rows.Scan)
+		if err != nil {
+			return 0, false, err
+		}
+		if accountRateLimitExhausted(r) {
+			return r.ResetAt, true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, err
+	}
+	return 0, false, nil
+}
+
+func accountRateLimitExhausted(r AccountRateLimit) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Status), "rejected") {
+		return true
+	}
+	switch strings.TrimSpace(r.LimiterType) {
+	case "requests":
+		return r.RemainingRequests == 0
+	case "tokens", "input_tokens", "output_tokens", "unified", "5h_polled":
+		return r.RemainingTokens == 0
+	}
+	return r.RemainingTokens == 0 || r.RemainingRequests == 0
+}
+
+func (s *Store) CreateBillingHold(ctx context.Context, routeKeyHash, accountID string, estimatedTokens int64) (string, error) {
+	now := Now()
+	id := fmt.Sprintf("hold_%d_%s", time.Now().UnixNano(), accountID)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', ?, ?)`,
+		id, routeKeyHash, accountID, estimatedTokens, now, now)
+	return id, err
+}
+
+func (s *Store) SettleBillingHold(ctx context.Context, id, status string) error {
+	if id == "" {
+		return nil
+	}
+	if status == "" {
+		status = "settled"
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ?`, status, Now(), id)
+	return err
+}
+
+func (s *Store) GetBillingHold(ctx context.Context, id string) (BillingHold, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at FROM billing_holds WHERE id = ?`, id)
+	var hold BillingHold
+	err := row.Scan(&hold.ID, &hold.RouteKeyHash, &hold.AccountID, &hold.EstimatedTokens, &hold.Status, &hold.CreatedAt, &hold.UpdatedAt)
+	return hold, err
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", n), ",")
+}
+
+func stringArgs(values []string) []interface{} {
+	args := make([]interface{}, len(values))
+	for i, value := range values {
+		args[i] = value
+	}
+	return args
+}
+
+type scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanAccount(row scanner) (Account, error) {
+	var acc Account
+	var fed int
+	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &acc.UpstreamAccountID, &acc.ChatGPTUserID, &acc.Email, &acc.PlanType, &acc.Provider, &acc.Status, &fed, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
+	acc.IsFedramp = fed != 0
+	return acc, err
+}
+
+func scanEgress(row scanner) (EgressProfile, error) {
+	var p EgressProfile
+	var stream int
+	err := row.Scan(&p.ID, &p.Name, &p.Type, &p.Endpoint, &p.ChainProxy, &p.Region, &p.ExitIP, &stream, &p.Health, &p.LatencyMillis, &p.CFScore, &p.LastCFRay, &p.CooldownUntil, &p.MaxConcurrency, &p.CreatedAt, &p.UpdatedAt, &p.ProxyAuthMode, &p.ProxyAPIKey)
+	p.StreamCapable = stream != 0
+	return p, err
+}
+
+func NotFound(err error) bool {
+	return errors.Is(err, sql.ErrNoRows)
+}
+
+func MustJSON(v interface{}) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%q}`, err.Error())
+	}
+	return string(raw)
+}

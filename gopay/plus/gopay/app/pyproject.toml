@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opai-gopay-protocol"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "tls_client>=1.0",
+    "PySocks>=1.7",
+    "pymysql>=1.1",
+]
+
+[project.scripts]
+opai = "opai.cli.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thinking 配置 - Pool Server</title>
+        <link rel="stylesheet" href="app.css">
+    <style>
+        /* page-local overrides on top of shared app.css */
+        html.embedded body { background: transparent; padding: 2px; }
+        body { padding: 20px; }
+        .wrap { max-width: 1200px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap:wrap;gap:10px }
+        .header h1 { font-size: 22px; font-weight: 700; display: flex; align-items: center; gap: 10px; margin:0 }
+        .card-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+        .card-desc { color: var(--muted); margin-bottom: 16px; font-size: 13px; }
+        .think-form-group { margin-bottom: 16px; }
+        .think-form-label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
+        .override-list { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+        .override-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line); font-size:13px }
+        .override-item:last-child { border-bottom: none; }
+        .override-item:hover { background: rgba(125,140,170,.06); }
+        .override-name { font-weight: 600; }
+        .override-value { color: var(--muted); font-size: 12.5px; }
+        .think-slider { width: 100%; height: 6px; border-radius: 3px; background: var(--chip); outline: none; -webkit-appearance: none; margin-top: 8px; }
+        .think-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--acc); cursor: pointer; border: 2px solid var(--panel); }
+        .slider-labels { display: flex; justify-content: space-between; margin-top: 6px; font-size: 10.5px; color: var(--muted); }
+        .preview-box { background: var(--chip); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; font-family: ui-monospace,monospace; font-size: 12px; max-height: 400px; overflow: auto; color: var(--txt); white-space:pre-wrap }
+        .think-alert { padding: 10px 14px; border-radius: 9px; margin-bottom: 16px; font-size:13px; }
+        .think-alert.ok { background: rgba(52,211,153,.12); color: var(--ok); border: 1px solid rgba(52,211,153,.25); }
+        .think-alert.bad { background: rgba(248,113,113,.12); color: var(--bad); border: 1px solid rgba(248,113,113,.25); }
+    </style>
+<body>
+    <div class="wrap">
+        <div class="header">
+            <h1>
+                Thinking 配置
+            </h1>
+            <div class="row">
+                <button class="btn" onclick="loadConfig()">刷新</button>
+                <button class="btn pri" onclick="saveConfig()">保存配置</button>
+            </div>
+        </div>
+
+        <div id="alert-container"></div>
+
+        <!-- 全局配置 -->
+        <div class="panel" style="margin-bottom:16px">
+            <div class="hd" style="border-bottom:0;padding-bottom:6px"><h2>全局配置</h2></div>
+            <div class="bd"><div class="card-desc">配置默认的 Thinking 行为，适用于所有未指定覆盖的模型。</div>
+
+            <div class="think-form-group">
+                <label class="think-form-label">
+                    <span>启用 Thinking</span>
+                </label>
+                <label class="sw"><input type="checkbox" id="enabled"><i></i></label>
+            </div>
+
+            <div class="think-form-group">
+                <label class="think-form-label" for="defaultMode">默认模式</label>
+                <select id="defaultMode" class="t" onchange="updateModeUI()">
+                    <option value="level">Level (离散级别)</option>
+                    <option value="budget">Budget (预算数值)</option>
+                    <option value="auto">Auto (自动)</option>
+                    <option value="none">None (禁用)</option>
+                </select>
+            </div>
+
+            <div class="think-form-group" id="levelGroup">
+                <label class="think-form-label" for="defaultLevel">默认级别</label>
+                <select id="defaultLevel" class="t">
+                    <option value="minimal">Minimal (最小)</option>
+                    <option value="low">Low (低)</option>
+                    <option value="medium" selected>Medium (中等)</option>
+                    <option value="high">High (高)</option>
+                    <option value="xhigh">XHigh (超高)</option>
+                    <option value="max">Max (最大)</option>
+                </select>
+                <div class="slider-container">
+                    <input type="range" class="think-slider" id="levelSlider" min="0" max="5" value="2" step="1" oninput="syncLevelSlider()">
+                    <div class="slider-labels">
+                        <span>Minimal</span>
+                        <span>Low</span>
+                        <span>Medium</span>
+                        <span>High</span>
+                        <span>XHigh</span>
+                        <span>Max</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="think-form-group" id="budgetGroup" style="display:none;">
+                <label class="think-form-label" for="defaultBudget">默认预算 (tokens)</label>
+                <input type="number" id="defaultBudget" class="t" value="8192" min="0" max="200000" step="512">
+                <small style="color: var(--text-secondary);">推荐范围: 512 - 128000</small>
+            </div></div>
+
+        <!-- 提供商覆盖 -->
+        <div class="panel" style="margin-bottom:16px">
+            <div class="hd" style="border-bottom:0;padding-bottom:6px"><h2>提供商覆盖</h2></div>
+            <div class="bd"><div class="card-desc">为特定提供商（Claude、Codex）配置不同的 Thinking 设置。</div>
+
+            <div class="row" style="margin-bottom: 16px;">
+                <button class="btn sm" onclick="addProviderOverride()">+ 添加提供商</button>
+            </div>
+
+            <div class="override-list" id="providerList">
+                <div class="empty">暂无提供商覆盖</div>
+            </div></div>
+
+        <!-- 模型覆盖 -->
+        <div class="panel" style="margin-bottom:16px">
+            <div class="hd" style="border-bottom:0;padding-bottom:6px"><h2>模型覆盖</h2></div>
+            <div class="bd"><div class="card-desc">为特定模型配置独立的 Thinking 设置，优先级最高。</div>
+
+            <div class="row" style="margin-bottom: 16px;">
+                <button class="btn sm" onclick="addModelOverride()">+ 添加模型</button>
+            </div>
+
+            <div class="override-list" id="modelList">
+                <div class="empty">暂无模型覆盖</div>
+            </div></div>
+
+        <!-- 实时预览 -->
+        <div class="panel" style="margin-bottom:16px">
+            <div class="hd" style="border-bottom:0;padding-bottom:6px"><h2>实时预览</h2></div>
+            <div class="bd"><div class="card-desc">预览配置应用到实际请求的效果。</div>
+
+            <div class="think-form-group">
+                <label class="think-form-label" for="previewProvider">Provider</label>
+                <select id="previewProvider" class="t">
+                    <option value="claude">Claude</option>
+                    <option value="codex">Codex</option>
+                </select>
+            </div>
+
+            <div class="think-form-group">
+                <label class="think-form-label" for="previewModel">Model</label>
+                <input type="text" id="previewModel" class="t" value="claude-opus-4-8" placeholder="claude-opus-4-8">
+            </div>
+
+            <button class="btn pri" onclick="preview()">🔍 预览应用</button>
+
+            <div id="previewResult" style="margin-top: 20px; display: none;">
+                <h4 style="margin-bottom: 12px;">预览结果</h4>
+                <div class="preview-box" id="previewContent"></div>
+            </div>
+        </div></div>
+    </div>
+
+    <script>
+        // share the console theme + transparent backdrop when embedded as an iframe
+        try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch {}
+        if (window.self !== window.top) document.documentElement.classList.add('embedded');
+
+        const API_BASE = '/admin/thinking';
+        let currentConfig = {};
+
+        // same auth as the console: session cookie + CSRF, or legacy admin_token (cp_tok)
+        function hdrs(extra = {}) {
+            const h = { 'Content-Type': 'application/json', ...extra };
+            try { const tok = localStorage.getItem('cp_tok') || ''; if (tok) h['Authorization'] = 'Bearer ' + tok; } catch {}
+            const m = document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)'); if (m) h['X-CP-CSRF'] = decodeURIComponent(m.pop());
+            return h;
+        }
+
+        // 加载配置
+        async function loadConfig() {
+            try {
+                const res = await fetch(API_BASE, { headers: hdrs(), credentials: 'same-origin' });
+                if (!res.ok) throw new Error('Failed to load config');
+
+                currentConfig = await res.json();
+                renderConfig();
+                showAlert('配置加载成功', 'ok');
+            } catch (err) {
+                showAlert('加载配置失败: ' + err.message, 'bad');
+            }
+        }
+
+        // 渲染配置
+        function renderConfig() {
+            document.getElementById('enabled').checked = currentConfig.enabled || false;
+            document.getElementById('defaultMode').value = currentConfig.default_mode || 'level';
+            document.getElementById('defaultLevel').value = currentConfig.default_level || 'medium';
+            document.getElementById('defaultBudget').value = currentConfig.default_budget || 8192;
+
+            updateModeUI();
+            syncLevelSlider();
+            renderProviders();
+            renderModels();
+        }
+
+        // 更新模式 UI
+        function updateModeUI() {
+            const mode = document.getElementById('defaultMode').value;
+            document.getElementById('levelGroup').style.display = mode === 'level' ? 'block' : 'none';
+            document.getElementById('budgetGroup').style.display = mode === 'budget' ? 'block' : 'none';
+        }
+
+        // 同步滑块
+        function syncLevelSlider() {
+            const levels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+            const select = document.getElementById('defaultLevel');
+            const slider = document.getElementById('levelSlider');
+            const index = levels.indexOf(select.value);
+            if (index >= 0) slider.value = index;
+        }
+
+        document.getElementById('levelSlider').addEventListener('input', function() {
+            const levels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+            document.getElementById('defaultLevel').value = levels[this.value];
+        });
+
+        // 渲染提供商列表
+        function renderProviders() {
+            const list = document.getElementById('providerList');
+            const providers = currentConfig.providers || {};
+
+            if (Object.keys(providers).length === 0) {
+                list.innerHTML = '<div class="empty">暂无提供商覆盖</div>';
+                return;
+            }
+
+            list.innerHTML = Object.entries(providers).map(([name, override]) => `
+                <div class="override-item">
+                    <div>
+                        <div class="override-name">${name}</div>
+                        <div class="override-value">${formatOverride(override)}</div>
+                    </div>
+                    <button class="btn sm" onclick="removeProviderOverride('${name}')">删除</button>
+                </div>
+            `).join('');
+        }
+
+        // 渲染模型列表
+        function renderModels() {
+            const list = document.getElementById('modelList');
+            const models = currentConfig.models || {};
+
+            if (Object.keys(models).length === 0) {
+                list.innerHTML = '<div class="empty">暂无模型覆盖</div>';
+                return;
+            }
+
+            list.innerHTML = Object.entries(models).map(([name, override]) => `
+                <div class="override-item">
+                    <div>
+                        <div class="override-name">${name}</div>
+                        <div class="override-value">${formatOverride(override)}</div>
+                    </div>
+                    <button class="btn sm" onclick="removeModelOverride('${name}')">删除</button>
+                </div>
+            `).join('');
+        }
+
+        // 格式化覆盖配置
+        function formatOverride(override) {
+            if (override.mode === 'level') {
+                return `Level: ${override.level || 'medium'}`;
+            } else if (override.mode === 'budget') {
+                return `Budget: ${override.budget || 0} tokens`;
+            } else if (override.mode === 'auto') {
+                return 'Auto';
+            } else {
+                return 'None';
+            }
+        }
+
+        // 添加提供商覆盖
+        function addProviderOverride() {
+            const name = prompt('输入提供商名称 (claude/codex):');
+            if (!name) return;
+
+            if (!currentConfig.providers) currentConfig.providers = {};
+            currentConfig.providers[name] = { mode: 'level', level: 'medium' };
+            renderProviders();
+        }
+
+        // 删除提供商覆盖
+        function removeProviderOverride(name) {
+            if (!confirm(`确定删除提供商 "${name}" 的覆盖配置?`)) return;
+            delete currentConfig.providers[name];
+            renderProviders();
+        }
+
+        // 添加模型覆盖
+        function addModelOverride() {
+            const name = prompt('输入模型名称 (如 claude-opus-4-8):');
+            if (!name) return;
+
+            if (!currentConfig.models) currentConfig.models = {};
+            currentConfig.models[name] = { mode: 'level', level: 'high' };
+            renderModels();
+        }
+
+        // 删除模型覆盖
+        function removeModelOverride(name) {
+            if (!confirm(`确定删除模型 "${name}" 的覆盖配置?`)) return;
+            delete currentConfig.models[name];
+            renderModels();
+        }
+
+        // 保存配置
+        async function saveConfig() {
+            const config = {
+                enabled: document.getElementById('enabled').checked,
+                default_mode: document.getElementById('defaultMode').value,
+                default_level: document.getElementById('defaultLevel').value,
+                default_budget: parseInt(document.getElementById('defaultBudget').value),
+                providers: currentConfig.providers || {},
+                models: currentConfig.models || {}
+            };
+
+            try {
+                const res = await fetch(API_BASE, {
+                    method: 'POST',
+                    headers: hdrs(),
+                    credentials: 'same-origin',
+                    body: JSON.stringify(config)
+                });
+
+                if (!res.ok) throw new Error('Failed to save');
+
+                showAlert('配置保存成功！', 'ok');
+                await loadConfig();
+            } catch (err) {
+                showAlert('保存失败: ' + err.message, 'bad');
+            }
+        }
+
+        // 预览
+        async function preview() {
+            const provider = document.getElementById('previewProvider').value;
+            const model = document.getElementById('previewModel').value;
+
+            try {
+                const res = await fetch(API_BASE + '/preview', {
+                    method: 'POST',
+                    headers: hdrs(),
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ provider, model, body: {}})
+                });
+
+                if (!res.ok) throw new Error('Preview failed');
+
+                const result = await res.json();
+                document.getElementById('previewResult').style.display = 'block';
+                document.getElementById('previewContent').textContent = JSON.stringify(result, null, 2);
+            } catch (err) {
+                showAlert('预览失败: ' + err.message, 'bad');
+            }
+        }
+
+        // 显示提示
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `think-alert ${type}`;
+            alert.textContent = message;
+            container.appendChild(alert);
+
+            setTimeout(() => alert.remove(), 3000);
+        }
+
+        // 页面加载时加载配置
+        loadConfig();
+    </script>
+</body>
+</html>

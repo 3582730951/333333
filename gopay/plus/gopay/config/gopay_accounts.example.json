@@ -1,0 +1,9 @@
+[
+  {
+    "phone": "",
+    "pin": "YOUR_6_DIGIT_PIN",
+    "country_code": "+62",
+    "adb_serial": "",
+    "no_cooldown": true
+  }
+]

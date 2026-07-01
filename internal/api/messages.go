@@ -1,0 +1,366 @@
+package api
+
+import (
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+
+	"codex-account-pool/internal/cf"
+	"codex-account-pool/internal/cloak"
+	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/scheduler"
+	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/streamrewrite"
+	"codex-account-pool/internal/tokensave"
+	"codex-account-pool/internal/upstream"
+	"codex-account-pool/internal/virtual"
+)
+
+// appendVirtualHomeToWords ensures the streamrewrite scrubber replaces the real
+// home directory prefix with the virtual home directory (the value of `virtualHome`).
+// We know the virtual home (it is the identity's HomeDir), but we DON'T know the
+// downstream's real home — so the trick is to mark the virtual home as a sentinel
+// and let cloak.normalizeSystemInfo already rewrite the *system prompt's* home to
+// the virtual value in the request. For the RESPONSE stream, the model may echo
+// back paths containing the virtual home we wrote; that's already virtual, so it
+// is safe. What this helper guards against is the operator-configured real home
+// in sensitive_words not matching the actual downstream home — so we also append
+// the virtual home so the scrubber is at least no-op on it (never accidentally
+// scrub the virtual value). The real replacement happens via the operator's
+// sensitive_words list. This is a defensive no-op-ensuring helper.
+func appendVirtualHomeToWords(words []string, virtualHome string) []string {
+	if virtualHome == "" {
+		return words
+	}
+	for _, w := range words {
+		if w == virtualHome {
+			return words
+		}
+	}
+	// We do NOT add virtualHome as a sensitive word — scrubbing it would replace
+	// the (already-virtual) value we wrote into the request, which is wrong.
+	// This helper exists to be the extension point for future per-request real-home
+	// discovery; for now it is a transparent pass-through that preserves the
+	// existing operator-configured sensitive_words behavior.
+	return words
+}
+
+// handleMessages is the native Anthropic relay endpoint (/v1/messages and
+// /v1/messages/count_tokens). It selects a Claude-provider account from the
+// pool, virtualizes the request to a consistent first-party Claude Code client
+// (account-bound identity, tool-name normalization, sensitive-word scrubbing),
+// forwards it upstream with the official Claude Code fingerprint, and scrubs the
+// upstream response — including SSE, where the replacement is exhaustive even
+// across chunk boundaries.
+func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	raw, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, err)
+		return
+	}
+	release, ok := s.acquire(r.Context())
+	if !ok {
+		return
+	}
+	defer release()
+	path := r.URL.Path
+
+	// Resolve the downstream api key's policy (routing group + forced model /
+	// reasoning effort) and apply the overrides to the body BEFORE model
+	// extraction and account selection — so the request both lands on an account
+	// that has the forced model and is actually sent that model upstream. This
+	// makes the native Anthropic path honor the same per-key/group policy as the
+	// Codex and OpenAI-compat paths ("claude 也适用"); it also enforces
+	// RequireDownstreamKey here, which this handler previously bypassed.
+	pol, ok := s.resolveDownstreamPolicy(w, r)
+	if !ok {
+		return
+	}
+	r = r.WithContext(withDownstreamKey(r.Context(), pol))
+	if pol.ForceModel != "" {
+		raw = setForcedModel(raw, pol.ForceModel)
+	}
+	if pol.ForceEffort != "" {
+		raw = applyForcedThinkingClaude(raw, pol.ForceEffort)
+	}
+	// Server-side token compression (opt-in, default OFF): conservatively compress large
+	// tool-result blocks before forwarding upstream, cutting billed input tokens (the
+	// rtk-style server-side analogue). Only tool_result content is touched.
+	if s.flagEnabled(r.Context(), "token_save_enabled", s.cfg.TokenSaveEnabled) {
+		if nb, saved := tokensave.CompressAnthropicToolResults(raw, tokensave.DefaultOptions()); saved > 0 {
+			raw = nb
+			log.Printf("[TOKEN-SAVE] /v1/messages: compressed tool results, ~%d bytes saved", saved)
+		}
+	}
+	// Compliance: sanitize prior-turn history before forwarding (no effect on the
+	// streamed reply). count_tokens runs through here too — harmless.
+	raw = s.moderateHistory(r.Context(), raw, "anthropic")
+
+	affinity := routing.ExtractAffinityKey(r, raw)
+	strict := routing.IsStrictSticky(path, r, raw)
+	model := routing.Model(raw)
+
+	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is relayed to
+	// that provider, converting Anthropic Messages ↔ Chat Completions both ways. Claude
+	// Code drives this by requesting a provider model (e.g. ANTHROPIC_MODEL=deepseek-chat
+	// or a DeepSeek-forced key). count_tokens has no chat-completions equivalent, so it
+	// is answered locally with an estimate rather than proxied.
+	if prov, ok := s.customProviderForModel(r.Context(), model); ok {
+		if strings.HasSuffix(path, "/count_tokens") {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
+			return
+		}
+		s.handleMessagesViaCustom(w, r, raw, model, pol.Group, prov)
+		return
+	}
+
+	// Native Anthropic Messages requests are always self-contained (the full
+	// conversation is in `messages`; there is no server-side previous_response_id), so
+	// they are movable and fail over to a fresh account on a recoverable error instead
+	// of leaking it downstream.
+	movable := !routing.HasServerSideState(path, r, raw)
+	attempts := 1
+	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
+		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
+			attempts = 1
+		}
+	}
+	exclude := map[string]bool{}
+	for attempt := 0; attempt < attempts; attempt++ {
+		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, attempt < attempts-1, exclude) != outcomeRetry {
+			return
+		}
+	}
+}
+
+// claudeMessagesAttempt serves one account's attempt at a native Anthropic
+// /v1/messages request. It returns outcomeRetry when the caller should transparently
+// fail over to a fresh account — a recoverable error on a movable request, detected
+// before any response bytes are written — and outcomeDone otherwise. The leased
+// account is added to exclude before any retry so it is not re-selected. Mirrors the
+// Codex path's codexAttempt; a benched account is held out of the pool until the
+// recheck loop re-validates it.
+func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group string, allowRetry bool, exclude map[string]bool) attemptOutcome {
+	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
+		Group:           group,
+		Provider:        "claude",
+		Affinity:        affinity,
+		Strict:          strict,
+		Model:           model,
+		EstimatedTokens: virtual.EstimateTokensJSON(raw),
+		Exclude:         exclude,
+	})
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, scheduler.ErrStrictUnavailable) {
+			status = http.StatusConflict
+		}
+		s.writePublicNoAccountError(r.Context(), w, status, group, "claude", model, err)
+		return outcomeDone
+	}
+	defer lease.Release()
+	retry := func() attemptOutcome {
+		if exclude != nil {
+			exclude[lease.Account.ID] = true
+		}
+		return outcomeRetry
+	}
+
+	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return outcomeDone
+	}
+
+	osHint := s.osHint(raw, lease.Egress)
+	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
+	// Virtualize the request to a consistent first-party Claude Code client and, in the
+	// SAME single JSON parse/marshal pass, stamp the x-anthropic-billing-header for
+	// OAuth/Claude-Code traffic (cc_version coherent with our UA, fresh per-request cch).
+	// Folding the billing stamp in here avoids a second full unmarshal+marshal over what
+	// is often a very large Claude Code request body. cch is random (not a body hash), so
+	// this is byte-equivalent to the old separate post-pass, only cheaper.
+	oauth := claudeIsOAuth(token)
+	billingVer := ""
+	if oauth {
+		billingVer = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
+	}
+	// Build the sensitive-word list with the virtual home directory auto-injected,
+	// so the real home directory prefix is replaced by the virtual one in both the
+	// request body and the response stream — without the operator needing to
+	// manually add it to sensitive_words. The virtual home is known here (from the
+	// per-account identity), so we append it and let cloak.VirtualizeClaudeCode's
+	// streamrewrite replace every occurrence of the real home prefix in the stream.
+	// Project paths are deliberately NOT rewritten.
+	wordsForClaude := s.cfg.SensitiveWordsFor("claude")
+	wordsForClaude = appendVirtualHomeToWords(wordsForClaude, id.HomeDir)
+	result := cloak.VirtualizeClaudeCodeWithCache(raw, id, wordsForClaude, oauth, billingVer, cloak.ClaudeCodeCacheOptions{
+		NativeBreakpoints: s.nativeCacheBreakpointInjectEnabled(r.Context()),
+		TTL:               s.claudeCacheTTL(r.Context()),
+	})
+	body := result.Body
+
+	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	// Session 33: Carry the billing hold id in the request context for usage fallback.
+	r = r.WithContext(withBillingHold(r.Context(), holdID))
+	// Anthropic is not behind a CF challenge wall the way chatgpt.com is, so we
+	// call upstream directly rather than through the Codex CF-retry/egress-rotation
+	// path — and below we only treat an actual interstitial challenge as CF, never
+	// a normal API 4xx/429 (which still carries cf-ray/server: cloudflare).
+	resp, err := s.upstream.Do(r.Context(), upstream.Request{
+		Method:         http.MethodPost,
+		Provider:       "claude",
+		DownstreamPath: path,
+		Headers:        r.Header.Clone(),
+		Body:           body,
+		Account:        lease.Account,
+		Token:          token,
+		Egress:         lease.Egress,
+		CookieJarKey:   lease.Binding.CookieJarKey,
+		OSHint:         osHint,
+	})
+	if err != nil {
+		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
+		if allowRetry && movable {
+			return retry() // transport error — a fresh account/egress may succeed
+		}
+		writeError(w, http.StatusBadGateway, err)
+		return outcomeDone
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		errorBody := readUpstreamErrorBody(resp.Body)
+		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
+			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
+		}
+		v := s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		// Recoverable error (rate limit / region / stale auth / ban) on a movable
+		// request → move to a fresh account. No bytes have been written, so the
+		// downstream never sees this.
+		if allowRetry && movable && retryableForFailover(v, resp.StatusCode) {
+			return retry()
+		}
+		s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber)
+		return outcomeDone
+	}
+	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
+
+	if isEventStream(resp.Header) {
+		captured, retryableStream, captureErr := captureClaudeSSEForFailover(resp.Body, s.streamFailoverCaptureOptions(r.Context()))
+		if captured != nil {
+			defer captured.Close()
+		}
+		if captureErr != nil {
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_capture_failed")
+			if allowRetry && movable {
+				return retry()
+			}
+			writePublicUnavailable(w, http.StatusServiceUnavailable)
+			return outcomeDone
+		}
+		if retryableStream {
+			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, captured.Head(64*1024))
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
+			if allowRetry && movable {
+				return retry()
+			}
+			writePublicUnavailable(w, http.StatusServiceUnavailable)
+			return outcomeDone
+		}
+		streamBody, err := captured.Reader()
+		if err != nil {
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_capture_replay_failed")
+			writePublicUnavailable(w, http.StatusServiceUnavailable)
+			return outcomeDone
+		}
+		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		if err := s.streamSSE(r.Context(), w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
+		} else {
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
+		}
+		return outcomeDone
+	}
+	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	responseBody, err := s.readUpstreamResponseBody(resp.Body)
+	if err != nil {
+		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_response_too_large")
+		writeError(w, http.StatusBadGateway, err)
+		return outcomeDone
+	}
+	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
+	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
+	_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
+	return outcomeDone
+}
+
+// claudeIsOAuth reports whether the stored credential is a Claude OAuth token
+// (Claude Pro/Max) rather than an Anthropic API key. OAuth traffic must carry
+// the full Claude Code fingerprint (identity system block, tool renames).
+func claudeIsOAuth(token storage.AccountToken) bool {
+	cred := strings.TrimSpace(token.AccessToken)
+	if cred == "" {
+		cred = strings.TrimSpace(token.OpenAIAPIKey)
+	}
+	return !strings.HasPrefix(cred, "sk-ant-api")
+}
+
+// streamCopyRewrite copies an upstream SSE stream to the client while replacing
+// every scrubber pattern, including matches that straddle two read boundaries.
+// When the scrubber is empty it degrades to a plain flushing copy.
+func streamCopyRewrite(w http.ResponseWriter, body io.Reader, scrubber *streamrewrite.Matcher) error {
+	if scrubber == nil || scrubber.Empty() {
+		return streamCopy(w, body)
+	}
+	flusher, _ := w.(http.Flusher)
+	rw := scrubber.NewRewriter()
+	bufp := sseBufPool.Get().(*[]byte)
+	defer sseBufPool.Put(bufp)
+	buf := *bufp
+	writeOut := func(p []byte) error {
+		if len(p) == 0 {
+			return nil
+		}
+		if _, err := w.Write(p); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			if err := writeOut(rw.Write(buf[:n])); err != nil {
+				return err
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return writeOut(rw.Flush())
+			}
+			return readErr
+		}
+	}
+}
+
+// identitySecret returns the identity secret resolved once at startup (see
+// Server.identitySecretCached). It MUST match upstream.NewClient's resolution so the
+// request-header identity and the response-stream scrub identity are the same — both
+// call identity.ResolveSecret with the same configured value, which is deterministic.
+func (s *Server) identitySecret() []byte {
+	return s.identitySecretCached
+}

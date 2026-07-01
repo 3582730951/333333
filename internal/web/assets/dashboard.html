@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>注册仪表盘 - Pool</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css">
+<style>
+  /* page-local layout on top of the shared dark console stylesheet (app.css) */
+  .wrap{max-width:1320px;margin:0 auto;padding:18px 4px 26px}
+  html.embedded body{background:transparent}
+  html.embedded body::before{display:none}
+  html.embedded .wrap{padding:2px 2px 18px}
+  .sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:16px}
+  .scard{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow)}
+  .scard .lbl{font-size:12px;color:var(--muted)}
+  .scard .val{font-size:30px;font-weight:750;margin-top:6px;letter-spacing:-.01em}
+  .scard .sub{font-size:12px;color:var(--muted);margin-top:2px}
+  .crow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2fr);gap:16px;margin-bottom:16px}
+  @media(max-width:960px){.crow{grid-template-columns:1fr}}
+  .ebars{display:flex;flex-direction:column;gap:9px;padding:4px 2px}
+  .erow{display:grid;grid-template-columns:1fr 120px 48px;align-items:center;gap:10px;font-size:12.5px}
+  .erow .el{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .erow .eb{height:9px;border-radius:6px;background:var(--chip);border:1px solid var(--line);overflow:hidden}
+  .erow .eb>i{display:block;height:100%;background:linear-gradient(90deg,var(--warn),var(--bad))}
+  .erow .ev{font-family:ui-monospace,monospace;color:var(--muted);text-align:right}
+  .center{display:flex;align-items:center;justify-content:center;gap:18px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="error" class="note" style="display:none;border-color:var(--bad);color:var(--bad)"></div>
+  <div id="loading" class="empty">加载中…</div>
+
+  <div id="content" style="display:none">
+    <div class="sgrid">
+      <div class="scard"><div class="lbl">总任务</div><div class="val" id="stat-jobs">-</div></div>
+      <div class="scard"><div class="lbl">总注册</div><div class="val" id="stat-total">-</div></div>
+      <div class="scard"><div class="lbl">成功</div><div class="val" id="stat-success" style="color:var(--ok)">-</div></div>
+      <div class="scard"><div class="lbl">失败</div><div class="val" id="stat-failed" style="color:var(--bad)">-</div></div>
+      <div class="scard"><div class="lbl">成功率</div><div class="val" id="stat-rate">-</div><div class="sub" id="stat-rate-sub"></div></div>
+    </div>
+
+    <div class="crow">
+      <div class="panel"><div class="hd"><h2>成功 / 失败分布</h2></div><div class="bd center" id="donutBox"></div></div>
+      <div class="panel"><div class="hd"><h2>14 天趋势</h2><span class="sp"></span>
+        <span class="legend"><span><i style="background:var(--ok)"></i>成功</span><span><i style="background:var(--bad)"></i>失败</span></span></div>
+        <div class="bd chartwrap" id="trendBox"></div></div>
+    </div>
+
+    <div class="panel"><div class="hd"><h2>Top 10 错误</h2></div><div class="bd" id="errorsBox"></div></div>
+  </div>
+</div>
+
+<script>
+  // share the console theme + transparent backdrop when embedded as an iframe
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch {}
+  if (window.self !== window.top) document.documentElement.classList.add('embedded');
+
+  const API_BASE = window.location.origin;
+  function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+  function fmt(n){ n=+n||0; if(n>=1e6) return (n/1e6).toFixed(2)+'M'; if(n>=1e3) return (n/1e3).toFixed(1)+'k'; return n; }
+  // same auth as the console: session cookie + CSRF, or legacy admin_token (cp_tok). The
+  // previous version read 'admin_token' from localStorage (wrong key) → always 401.
+  function hdrs(extra={}){
+    const h={'Content-Type':'application/json',...extra};
+    try{ const tok=localStorage.getItem('cp_tok')||''; if(tok) h['Authorization']='Bearer '+tok; }catch{}
+    const m=document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)'); if(m) h['X-CP-CSRF']=decodeURIComponent(m.pop());
+    return h;
+  }
+
+  /* ---- inline SVG charts (zero-dependency, dark-theme aware) ---- */
+  function donut(succ, fail){
+    const total=succ+fail||1, r=54, thick=18, c=2*Math.PI*r, cx=70;
+    let off=0, arcs='';
+    [{v:succ,col:'var(--ok)'},{v:fail,col:'var(--bad)'}].forEach(s=>{
+      if(s.v<=0) return; const len=s.v/total*c;
+      arcs+=`<circle cx="${cx}" cy="${cx}" r="${r}" fill="none" stroke="${s.col}" stroke-width="${thick}" stroke-dasharray="${len.toFixed(2)} ${(c-len).toFixed(2)}" stroke-dashoffset="${(-off).toFixed(2)}" transform="rotate(-90 ${cx} ${cx})"/>`;
+      off+=len;
+    });
+    const rate = total ? Math.round(succ/(succ+fail||1)*100) : 0;
+    return `<svg viewBox="0 0 140 140" width="170" height="170"><circle cx="${cx}" cy="${cx}" r="${r}" fill="none" stroke="var(--chip)" stroke-width="${thick}"/>${arcs}
+      <text x="${cx}" y="${cx-2}" text-anchor="middle" font-size="26" font-weight="750" fill="var(--txt)">${rate}%</text>
+      <text x="${cx}" y="${cx+18}" text-anchor="middle" font-size="11" fill="var(--muted)">成功率</text></svg>
+      <div class="legend" style="flex-direction:column;gap:8px"><span><i style="background:var(--ok)"></i>成功 ${fmt(succ)}</span><span><i style="background:var(--bad)"></i>失败 ${fmt(fail)}</span></div>`;
+  }
+  function trend(byDay){
+    if(!byDay||!byDay.length) return '<div class="empty">暂无数据</div>';
+    const w=720,h=240,padL=38,padB=26,padT=12,padR=12,n=byDay.length,iw=w-padL-padR,ih=h-padT-padB;
+    const max=Math.max(1,...byDay.map(d=>Math.max(+d.succeeded||0,+d.failed||0)));
+    const X=i=>padL+(n===1?iw/2:i/(n-1)*iw), Y=v=>padT+ih-(v/max)*ih;
+    let grid='';
+    for(let g=0;g<=4;g++){ const yv=max*g/4, y=Y(yv);
+      grid+=`<line class="gridln" x1="${padL}" y1="${y.toFixed(1)}" x2="${w-padR}" y2="${y.toFixed(1)}"/>`;
+      grid+=`<text class="axis" x="${padL-5}" y="${(y+3).toFixed(1)}" text-anchor="end">${fmt(yv)}</text>`; }
+    const line=(key,col,fill)=>{
+      let d='M'+X(0).toFixed(1)+' '+Y(+byDay[0][key]||0).toFixed(1);
+      for(let i=1;i<n;i++) d+=' L'+X(i).toFixed(1)+' '+Y(+byDay[i][key]||0).toFixed(1);
+      const area=d+` L${X(n-1).toFixed(1)} ${Y(0).toFixed(1)} L${X(0).toFixed(1)} ${Y(0).toFixed(1)} Z`;
+      return `<path d="${area}" fill="${fill}" opacity=".5"/><path d="${d}" fill="none" stroke="${col}" stroke-width="1.8" stroke-linejoin="round"/>`;
+    };
+    let xl=''; const idxs=n>2?[0,Math.floor((n-1)/2),n-1]:byDay.map((_,i)=>i);
+    idxs.forEach(i=>{ const anc=i===0?'start':i===n-1?'end':'middle'; const dt=String(byDay[i].date||'').slice(5);
+      xl+=`<text class="axis" x="${X(i).toFixed(1)}" y="${h-6}" text-anchor="${anc}">${esc(dt)}</text>`; });
+    return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}">${grid}
+      ${line('failed','var(--bad)','rgba(248,113,113,.25)')}${line('succeeded','var(--ok)','rgba(52,211,153,.25)')}${xl}</svg>`;
+  }
+  function errorsBars(list){
+    if(!list||!list.length) return '<div class="empty">无错误记录 🎉</div>';
+    const max=Math.max(1,...list.map(e=>+e.count||0));
+    return '<div class="ebars">'+list.map(e=>{
+      const msg=String(e.error||'unknown'); const short=msg.length>52?msg.slice(0,50)+'…':msg;
+      return `<div class="erow"><span class="el" title="${esc(msg)}">${esc(short)}</span>
+        <span class="eb"><i style="width:${Math.max(3,Math.round((+e.count||0)/max*100))}%"></i></span>
+        <span class="ev">${e.count}</span></div>`;
+    }).join('')+'</div>';
+  }
+
+  async function loadStats(){
+    try{
+      const resp = await fetch(`${API_BASE}/admin/register/stats`, { headers: hdrs(), credentials:'same-origin' });
+      if(!resp.ok){ const tx=await resp.text(); throw new Error(`HTTP ${resp.status}: ${tx.slice(0,200)}`); }
+      const data = await resp.json();
+      const totals = data.totals||{};
+      const byDay = (data.by_day||[]).slice().reverse(); // backend returns DESC; chart wants oldest→newest
+      const topErr = data.top_errors || data.errors || []; // backend field is "errors"
+      document.getElementById('stat-jobs').textContent = (totals.jobs||0).toLocaleString();
+      document.getElementById('stat-total').textContent = (totals.records||0).toLocaleString();
+      document.getElementById('stat-success').textContent = (totals.succeeded||0).toLocaleString();
+      document.getElementById('stat-failed').textContent = (totals.failed||0).toLocaleString();
+      const rate = (+(totals.success_rate) || 0) * 100; // backend sends a 0..1 fraction
+      const rEl = document.getElementById('stat-rate'), rSub = document.getElementById('stat-rate-sub');
+      rEl.textContent = rate.toFixed(1)+'%';
+      if(rate>=90){ rEl.style.color='var(--ok)'; rSub.textContent='优秀'; }
+      else if(rate>=70){ rEl.style.color='var(--warn)'; rSub.textContent='良好'; }
+      else { rEl.style.color='var(--bad)'; rSub.textContent='需改进'; }
+      document.getElementById('donutBox').innerHTML = donut(+totals.succeeded||0, +totals.failed||0);
+      document.getElementById('trendBox').innerHTML = trend(byDay);
+      document.getElementById('errorsBox').innerHTML = errorsBars(topErr);
+      document.getElementById('loading').style.display='none';
+      document.getElementById('error').style.display='none';
+      document.getElementById('content').style.display='block';
+    }catch(err){
+      document.getElementById('loading').style.display='none';
+      const e=document.getElementById('error'); e.style.display='block'; e.textContent='加载失败: '+err.message;
+    }
+  }
+  loadStats();
+  setInterval(loadStats, 60000);
+</script>
+</body>
+</html>

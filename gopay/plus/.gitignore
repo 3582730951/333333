@@ -1,0 +1,60 @@
+# Local secrets and runtime configuration
+.env
+.env.*
+*.local
+config.json
+config.*.json
+!config.example.json
+plus_gopay_links/config.json
+plus_gopay_links/config.*.json
+!plus_gopay_links/config.example.json
+gopay/config/pipeline.json
+gopay/config/*.json
+!gopay/config/*.example.json
+gopay/config/*.txt
+!gopay/config/envelope_links.empty
+gopay/config/chatgpt_token.json
+gopay/config/gopay_master.json
+gopay/config/gopay_master_tokens.json
+gopay/config/gopay_worker_accounts.json
+gopay/config/herosms_api_key
+gopay/config/fivesim_api_token
+gopay/config/cliproxy.url
+gopay/config/last_snap_token.txt
+gopay/app/src/opai/core/envelope_links.json
+
+# Runtime state, logs, generated files
+data/
+tmp/
+wa_session/
+orchestrator.log
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.pma
+*.pid
+.pytest_cache/
+
+# Browser/session profiles must never be committed
+429/chrome_profile/
+chrome_profile/
+**/Default/Login Data*
+**/Default/Network/Cookies*
+**/Default/Local Storage/
+**/Default/Session Storage/
+
+# Dependencies and build/cache output
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Local research/checkouts and generated archives
+_research/
+docs/gopay-plus-tutorial/
+*.zip
+gopay.pdf

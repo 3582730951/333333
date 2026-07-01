@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>账号注册管理 - Pool</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css">
+<style>
+  .wrap{max-width:1320px;margin:0 auto;padding:18px 4px 26px}
+  html.embedded body{background:transparent}
+  html.embedded body::before{display:none}
+  html.embedded .wrap{padding:2px 2px 18px}
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}
+  .kpi{background:var(--chip);border:1px solid var(--line);border-radius:11px;padding:14px;text-align:center}
+  .kpi .num{font-size:28px;font-weight:bold;color:var(--acc)}
+  .kpi .lbl{font-size:12px;color:var(--muted);margin-top:4px}
+  .grid{display:grid;grid-template-columns:1fr 1.5fr;gap:16px}
+  @media(max-width:960px){.grid{grid-template-columns:1fr}}
+  .task{background:var(--chip);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:11px;padding:13px 15px;margin-bottom:10px}
+  .task.completed{border-left-color:var(--ok)}
+  .task.failed{border-left-color:var(--bad)}
+  .task .h{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
+  .task .h b{font-family:ui-monospace,monospace;font-size:12.5px;word-break:break-all}
+  .task .meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+  .pbar{width:100%;height:7px;background:var(--bg);border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:9px}
+  .pbar>i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .3s}
+  .quick-btn{padding:8px 14px;font-size:13px;border-radius:8px;border:1px solid var(--line);background:var(--chip);cursor:pointer;transition:.2s}
+  .quick-btn:hover{background:var(--acc);border-color:var(--acc);color:white}
+  .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+  .modal-box{background:var(--bg2);border:1px solid var(--line);border-radius:12px;max-width:900px;width:calc(100% - 32px);max-height:80vh;display:flex;flex-direction:column}
+  .modal-hd{padding:16px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+  .modal-hd h3{margin:0;flex:1;font-size:16px}
+  .modal-body{padding:16px 20px;overflow-y:auto;flex:1}
+  .log-line{font-family:ui-monospace,monospace;font-size:12.5px;padding:4px 0;border-bottom:1px solid var(--line2);white-space:pre-wrap;word-break:break-all}
+  .log-line.info{color:var(--text)}
+  .log-line.warn{color:var(--warn)}
+  .log-line.error{color:var(--bad)}
+  .log-line.ok{color:var(--ok)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- KPI Stats -->
+  <div class="kpis">
+    <div class="kpi"><div class="num" id="stat-today">0</div><div class="lbl">今日成功注册</div></div>
+    <div class="kpi"><div class="num" style="color:var(--bad)" id="stat-failed">0</div><div class="lbl">今日失败</div></div>
+    <div class="kpi"><div class="num" style="color:var(--ok)" id="stat-total">0</div><div class="lbl">累计注册</div></div>
+    <div class="kpi"><div class="num" style="color:var(--warn)" id="stat-running">0</div><div class="lbl">运行中任务</div></div>
+  </div>
+
+  <div class="grid">
+    <!-- Create Task Form -->
+    <div class="panel">
+      <div class="hd"><h2>创建注册任务</h2></div>
+      <div class="bd">
+        <!-- Quick Actions -->
+        <div style="margin-bottom:12px">
+          <button class="quick-btn" onclick="useDefaults()">⚡ 使用默认配置</button>
+          <button class="quick-btn" onclick="quickStart()">🚀 一键启动</button>
+        </div>
+
+        <form id="createTaskForm">
+          <label class="f">任务类型 *</label>
+          <select class="t" id="taskType" required>
+            <option value="register">仅注册</option>
+            <option value="register_and_verify">注册 + 验证</option>
+          </select>
+
+          <label class="f">平台 *</label>
+          <select class="t" id="platform" required>
+            <option value="chatgpt">ChatGPT</option>
+            <option value="claude">Claude</option>
+          </select>
+
+          <label class="f">注册方式 *</label>
+          <select class="t" id="identityMode" required>
+            <option value="email">邮箱注册（邮箱 OTP）</option>
+            <option value="phone">手机号注册（短信 OTP）</option>
+          </select>
+
+          <div class="row" style="flex-wrap:nowrap">
+            <div style="flex:1"><label class="f">目标数量 *</label><input class="t" type="number" id="targetCount" min="1" value="5" required></div>
+            <div style="flex:1"><label class="f">并发数</label><input class="t" type="number" id="concurrency" min="1" max="10" value="2"></div>
+          </div>
+
+          <label class="f">分组名称 *</label>
+          <input class="t" type="text" id="groupName" value="cyber" required>
+
+          <label class="f">SMS Provider</label>
+          <select class="t" id="smsProvider">
+            <option value="">自动选择</option>
+            <option value="smsbower">SMSBower</option>
+            <option value="herosms">HeroSMS</option>
+            <option value="smsactivate">SMS-Activate</option>
+            <option value="smspool">SMSPool</option>
+          </select>
+
+          <label class="f">接码国家（SMS，可选）</label>
+          <input class="t" type="text" id="country" placeholder="如 ID / 6 / 1（依接码商而定）">
+
+          <label class="f">邮箱 Provider</label>
+          <select class="t" id="mailboxProvider">
+            <option value="">自动选择</option>
+            <option value="cloudflare">Cloudflare 自建（temp-email / MoeMail）</option>
+            <option value="tempmail">TempMail.lol</option>
+          </select>
+
+          <label class="f">验证码 Solver</label>
+          <select class="t" id="captchaSolver">
+            <option value="">自动选择</option>
+            <option value="yescaptcha">YesCaptcha</option>
+            <option value="2captcha">2Captcha</option>
+          </select>
+
+          <label class="f">出口配置 ID</label>
+          <input class="t" type="text" id="egressId" value="egress_direct">
+
+          <div style="height:14px"></div>
+          <button type="submit" class="btn pri">创建任务</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Task List -->
+    <div class="panel">
+      <div class="hd">
+        <h2>任务列表</h2>
+        <span class="sp"></span>
+        <button class="btn sm" onclick="exportAccounts('json')">导出 JSON</button>
+        <button class="btn sm" onclick="exportAccounts('csv')">导出 CSV</button>
+        <button class="btn sm" onclick="exportAccounts('at')">导出 AT</button>
+        <button class="btn sm" onclick="loadTasks()">刷新</button>
+      </div>
+      <div class="bd">
+        <div id="taskList"><div class="empty">加载中…</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Log Modal -->
+<div id="logModal" class="modal-mask" style="display:none" onclick="if(event.target===this)closeLogModal()">
+  <div class="modal-box">
+    <div class="modal-hd">
+      <h3>任务日志 - <span id="logTaskId"></span></h3>
+      <button class="btn sm" onclick="closeLogModal()">关闭</button>
+    </div>
+    <div class="modal-body" id="logContent">
+      <div class="empty">连接中…</div>
+    </div>
+  </div>
+</div>
+
+<script>
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch {}
+  if (window.self !== window.top) document.documentElement.classList.add('embedded');
+
+  const API_BASE = window.location.origin;
+  function esc(s) { return (s == null ? '' : String(s)).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+  function hdrs(extra = {}) {
+    const h = { 'Content-Type': 'application/json', ...extra };
+    try { const tok = localStorage.getItem('cp_tok') || ''; if (tok) h['Authorization'] = 'Bearer ' + tok; } catch {}
+    const m = document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)');
+    if (m) h['X-CP-CSRF'] = decodeURIComponent(m.pop());
+    return h;
+  }
+
+  async function useDefaults() {
+    try {
+      const res = await fetch(`${API_BASE}/admin/register/providers`, { headers: hdrs(), credentials: 'same-origin' });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.defaults) {
+        if (data.defaults.sms) document.getElementById('smsProvider').value = data.defaults.sms;
+        if (data.defaults.mailbox) document.getElementById('mailboxProvider').value = data.defaults.mailbox;
+        if (data.defaults.captcha) document.getElementById('captchaSolver').value = data.defaults.captcha;
+        if (data.defaults.group) document.getElementById('groupName').value = data.defaults.group;
+        if (data.defaults.egress) document.getElementById('egressId').value = data.defaults.egress;
+        alert('✅ 已应用默认配置');
+      }
+    } catch (e) { console.error(e); }
+  }
+
+  async function quickStart() {
+    await useDefaults();
+    setTimeout(() => document.getElementById('createTaskForm').requestSubmit(), 100);
+  }
+
+  document.getElementById('createTaskForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const data = {
+      platform: document.getElementById('platform').value,
+      method: 'protocol',
+      identity_mode: document.getElementById('identityMode').value,
+      count: parseInt(document.getElementById('targetCount').value),
+      group_name: document.getElementById('groupName').value,
+      egress_id: document.getElementById('egressId').value || 'egress_direct',
+      country: document.getElementById('country').value || undefined,
+      sms_provider: document.getElementById('smsProvider').value || undefined,
+      mailbox_provider: document.getElementById('mailboxProvider').value || undefined,
+      captcha_solver: document.getElementById('captchaSolver').value || undefined,
+    };
+    try {
+      const response = await fetch(`${API_BASE}/admin/register/batch`, {
+        method: 'POST', headers: hdrs(), credentials: 'same-origin', body: JSON.stringify(data)
+      });
+      if (response.ok) {
+        const result = await response.json();
+        alert(`✅ 任务创建成功！ID: ${result.job_id || result.task_id}`);
+        loadTasks();
+      } else {
+        alert('❌ 创建失败: ' + await response.text());
+      }
+    } catch (error) { alert('❌ 请求失败: ' + error.message); }
+  });
+
+  async function loadTasks() {
+    try {
+      const response = await fetch(`${API_BASE}/admin/register/batch?status=all`, { headers: hdrs(), credentials: 'same-origin' });
+      const data = await response.json();
+      const tasks = data.tasks || data.jobs || [];
+      const listEl = document.getElementById('taskList');
+
+      if (!response.ok) {
+        listEl.innerHTML = `<div class="empty">${esc((data.error && data.error.message) || ('HTTP ' + response.status))}</div>`;
+        return;
+      }
+      if (tasks.length === 0) {
+        listEl.innerHTML = '<div class="empty">暂无任务</div>';
+        return;
+      }
+
+      listEl.innerHTML = tasks.map(task => {
+        const progress = task.total > 0 ? Math.round((task.succeeded / task.total) * 100) : 0;
+        const chipCls = { pending: 'warn', running: 'acc', completed: 'ok', failed: 'bad' }[task.status] || '';
+        return `
+          <div class="task ${esc(task.status)}">
+            <div class="h"><b>${esc(task.id)}</b><span class="chip ${chipCls}">${esc(task.status)}</span></div>
+            <div class="meta">
+              <span>平台 ${esc(task.platform)}</span>
+              <span>进度 ${task.succeeded || 0}/${task.total || 0}</span>
+              <span style="color:var(--ok)">成功 ${task.succeeded || 0}</span>
+              <span style="color:var(--bad)">失败 ${task.failed || 0}</span>
+            </div>
+            <div class="pbar"><i style="width:${progress}%"></i></div>
+            <div class="row" style="margin-top:10px;gap:6px">
+              <button class="btn sm" onclick="viewLogs('${esc(task.id)}')">查看日志</button>
+              ${task.status === 'running' ? `<button class="btn sm bad" onclick="cancelTask('${esc(task.id)}')">取消任务</button>` : ''}
+            </div>
+          </div>`;
+      }).join('');
+
+      updateStats(tasks);
+    } catch (error) { console.error('加载任务失败:', error); }
+  }
+
+  function updateStats(tasks) {
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000;
+    const today = tasks.filter(t => (t.created_at || 0) >= todayStart);
+
+    document.getElementById('stat-today').textContent = today.filter(t => t.status === 'completed').reduce((s, t) => s + (t.succeeded || 0), 0);
+    document.getElementById('stat-failed').textContent = today.reduce((s, t) => s + (t.failed || 0), 0);
+    document.getElementById('stat-total').textContent = tasks.filter(t => t.status === 'completed').reduce((s, t) => s + (t.succeeded || 0), 0);
+    document.getElementById('stat-running').textContent = tasks.filter(t => t.status === 'running' || t.status === 'pending').length;
+  }
+
+  function viewLogs(taskId) {
+    document.getElementById('logTaskId').textContent = taskId;
+    document.getElementById('logContent').innerHTML = '<div class="empty">连接中…</div>';
+    document.getElementById('logModal').style.display = 'flex';
+
+    // SSE stream
+    const url = `${API_BASE}/admin/register/job/events?id=${taskId}`;
+    const evtSource = new EventSource(url);
+    const logDiv = document.getElementById('logContent');
+    logDiv.innerHTML = '';
+
+    evtSource.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        const line = document.createElement('div');
+        line.className = 'log-line ' + (data.level || 'info');
+        line.textContent = `[${new Date(data.timestamp * 1000).toLocaleTimeString()}] ${data.message || e.data}`;
+        logDiv.appendChild(line);
+        logDiv.scrollTop = logDiv.scrollHeight;
+      } catch {
+        const line = document.createElement('div');
+        line.className = 'log-line info';
+        line.textContent = e.data;
+        logDiv.appendChild(line);
+        logDiv.scrollTop = logDiv.scrollHeight;
+      }
+    };
+
+    evtSource.onerror = () => {
+      evtSource.close();
+      const line = document.createElement('div');
+      line.className = 'log-line warn';
+      line.textContent = '[连接已关闭]';
+      logDiv.appendChild(line);
+    };
+
+    // Store ref to close on modal close
+    window._currentSSE = evtSource;
+  }
+
+  function closeLogModal() {
+    document.getElementById('logModal').style.display = 'none';
+    if (window._currentSSE) {
+      window._currentSSE.close();
+      window._currentSSE = null;
+    }
+  }
+
+  async function exportAccounts(fmt) {
+    try {
+      const res = await fetch(`${API_BASE}/admin/accounts/export?format=${fmt}`, { headers: hdrs(), credentials: 'same-origin' });
+      if (!res.ok) { alert('❌ 导出失败: ' + await res.text()); return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fmt === 'csv' ? 'accounts.csv' : (fmt === 'at' ? 'access_tokens.txt' : 'accounts.json');
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) { alert('❌ 请求失败: ' + e.message); }
+  }
+
+  async function cancelTask(taskId) {
+    if (!confirm('确定要取消这个任务吗？')) return;
+    try {
+      const response = await fetch(`${API_BASE}/admin/register/job/${taskId}/cancel`, {
+        method: 'POST', headers: hdrs(), credentials: 'same-origin'
+      });
+      if (response.ok) { alert('✅ 任务已取消'); loadTasks(); }
+      else { alert('❌ 取消失败'); }
+    } catch (error) { alert('❌ 请求失败: ' + error.message); }
+  }
+
+  setInterval(loadTasks, 8000);
+  loadTasks();
+</script>
+</body>
+</html>

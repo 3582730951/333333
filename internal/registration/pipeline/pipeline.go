@@ -1,0 +1,387 @@
+// Package pipeline orchestrates registration flow
+package pipeline
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/registration/httpclient"
+	"codex-account-pool/internal/registration/openai"
+	"codex-account-pool/internal/registration/provider"
+	"codex-account-pool/internal/registration/provider/proxy"
+	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
+)
+
+// Pipeline coordinates providers and protocol engines
+type Pipeline struct {
+	store       *storage.Store
+	providerMgr *provider.Manager
+	upstream    *upstream.Client
+	httpClient  *http.Client // shared HTTP client for geo-validation / cliproxy API calls
+	cfg         *config.Config
+	// LogEvent is set by the registration Handler to receive structured step
+	// logs from the pipeline (proxy assign, sid rotate, fingerprint, browser
+	// launch, sms, mailbox, token read, subprocess output). When nil the
+	// pipeline logs nothing extra (the legacy one-line path).
+	LogEvent func(ctx context.Context, taskID, level, message string, detail interface{})
+}
+
+// NewPipeline creates a registration pipeline. up is the shared upstream client used to
+// build an egress-aware HTTP client for the OpenAI protocol flow (may be nil → direct).
+// cfg carries global cliproxy API settings (api base, fallback key, validate-region toggle).
+func NewPipeline(store *storage.Store, providerMgr *provider.Manager, up *upstream.Client, cfg *config.Config) *Pipeline {
+	return &Pipeline{
+		store:       store,
+		providerMgr: providerMgr,
+		upstream:    up,
+		httpClient:  &http.Client{Timeout: 15 * time.Second},
+		cfg:         cfg,
+	}
+}
+
+// egressClient returns an HTTP client whose transport routes through the egress profile
+// identified by egressID (proxy/WARP/direct), so registration traffic does not leave from
+// the shared VPS IP. Falls back to a plain client when no upstream client is wired or the
+// egress can't be built.
+func (p *Pipeline) egressClient(ctx context.Context, egressID string) *http.Client {
+	if p.upstream != nil {
+		egress, _ := p.store.GetEgressProfile(ctx, egressID)
+		endpoint := egress.Endpoint
+		// Rotating-residential (cliproxy) egress: swap in a fresh session id so each
+		// registration leaves from a different exit IP than the previous one.
+		if proxy.IsCliproxy(endpoint) {
+			endpoint = proxy.RotateSID(endpoint)
+		}
+		// Prefer the curl_cffi sidecar so the CF-walled OpenAI signup/OAuth calls present
+		// a real browser JA3 (the stdlib transport gets a Cloudflare JS challenge),
+		// chaining through the residential proxy above. Each task gets an isolated
+		// server-side cookie jar. Falls back to a plain egress client if no healthy
+		// sidecar is configured.
+		if sc := p.upstream.SidecarEndpoint(); sc != "" && httpclient.SidecarHealthy(ctx, sc) {
+			return httpclient.NewSidecarClient(sc, endpoint, "reg_"+randToken())
+		}
+		egress.Endpoint = endpoint
+		if hc, err := p.upstream.EgressHTTPClient(egress); err == nil && hc != nil {
+			return hc
+		}
+	}
+	return &http.Client{Timeout: 90 * time.Second}
+}
+
+// RegisterRequest defines a registration task
+type RegisterRequest struct {
+	Platform        string `json:"platform"` // "chatgpt"
+	Method          string `json:"method"`   // "protocol" | "browser"
+	Count           int    `json:"count"`
+	GroupName       string `json:"group_name"`
+	EgressID        string `json:"egress_id"`
+	UpgradeToPlus   bool   `json:"upgrade_to_plus"`
+	IdentityMode    string `json:"identity_mode"` // "phone" (default) | "email"
+	Country         string `json:"country"`       // SMS country code/id (default "ID")
+	SMSProvider     string `json:"sms_provider"`
+	SMSCountry      string `json:"sms_country,omitempty"` // ISO-2 of the country chosen (for stats recording)
+	SMSCost         float64 `json:"sms_cost,omitempty"`   // cost of the SMS number (for stats recording)
+	MailboxProvider string `json:"mailbox_provider"`
+	CaptchaSolver   string `json:"captcha_solver"`
+}
+
+// acquireSMS resolves the SMS provider + phone number + order id for one registration.
+//
+// Strategy (read from the "sms_platform_strategy" setting, default "auto"):
+//   - "auto": Manager.GetBestSMS picks the best (platform, country) from live platform
+//     statistics — each platform's same-day success ranking (getTopCountriesByService) plus
+//     price + inventory, weighted by the operator's preferred-country list (BR>CO>PL). It
+//     tries the top-N candidates in order, falling back on NO_NUMBERS/timeout.
+//   - "manual": the request's explicit req.Country is used verbatim against the providers in
+//     priority order (the legacy GetSMS path).
+//
+// Returns the chosen provider (so the caller can defer CancelNumber), phone, and order id.
+func (p *Pipeline) acquireSMS(ctx context.Context, req RegisterRequest) (provider.SMSProvider, string, string, error) {
+	strategy := "auto"
+	if p.store != nil {
+		if v, ok, _ := p.store.GetSetting(ctx, "sms_platform_strategy"); ok {
+			if v = strings.TrimSpace(v); v != "" {
+				strategy = strings.ToLower(v)
+			}
+		}
+	}
+	if strategy == "manual" {
+		// Explicit country wins; fall back to the preferred-default list's first entry.
+		country := strings.TrimSpace(req.Country)
+		if country == "" {
+			country = firstPreferredCountry(ctx, p.store)
+		}
+		return p.providerMgr.GetSMS(ctx, country)
+	}
+	// auto: live-stats smart selection across all funded platforms.
+	pref := preferredCountries(ctx, p.store)
+	topN := smsStatsTopN(ctx, p.store)
+	prov, phone, orderID, err := p.providerMgr.GetBestSMS(ctx, pref, topN)
+	if err == nil {
+		return prov, phone, orderID, nil
+	}
+	// Fallback: if smart selection found nothing (e.g. no platform exposes PriceProvider,
+	// or all stats calls failed), degrade to the legacy explicit-country path so a
+	// misconfigured-but-funded single platform still works.
+	country := strings.TrimSpace(req.Country)
+	if country == "" {
+		country = firstPreferredCountry(ctx, p.store)
+	}
+	return p.providerMgr.GetSMS(ctx, country)
+}
+
+// preferredCountries reads the "sms_preferred_countries" setting (comma-separated ISO-2,
+// default "BR,CO,PL") and returns it as a clean slice in priority order.
+func preferredCountries(ctx context.Context, store *storage.Store) []string {
+	def := []string{"BR", "CO", "PL"}
+	if store == nil {
+		return def
+	}
+	v, ok, _ := store.GetSetting(ctx, "sms_preferred_countries")
+	if !ok {
+		return def
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if c := strings.ToUpper(strings.TrimSpace(p)); c != "" {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
+// firstPreferredCountry returns the first entry of the preferred list (the highest-priority
+// country), used as the manual-mode fallback when the request names no country.
+func firstPreferredCountry(ctx context.Context, store *storage.Store) string {
+	return preferredCountries(ctx, store)[0]
+}
+
+// smsStatsTopN reads the "sms_stats_top_n" setting (default 3).
+func smsStatsTopN(ctx context.Context, store *storage.Store) int {
+	if store == nil {
+		return 3
+	}
+	v, ok, _ := store.GetSetting(ctx, "sms_stats_top_n")
+	if !ok {
+		return 3
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 1 {
+		return 3
+	}
+	return n
+}
+
+// RegisterOne registers a single account
+func (p *Pipeline) RegisterOne(ctx context.Context, req RegisterRequest) (*storage.Account, error) {
+	// "browser" runs the Playwright signup harness (services/codex_register) as a
+	// subprocess — the real-browser path for OpenAI's JS-gated signup.
+	if strings.EqualFold(strings.TrimSpace(req.Method), "browser") {
+		return p.browserRegisterOne(ctx, req)
+	}
+	// "protocol_v2" runs the maintained curl_cffi + local-Sentinel-PoW registrar.
+	if strings.EqualFold(strings.TrimSpace(req.Method), "protocol_v2") {
+		return p.protocolV2RegisterOne(ctx, req)
+	}
+	// "node" runs the puppeteer-real-browser registrar (other_new_gpt_register) as an
+	// orchestrated per-job subprocess: pool_server owns the per-job egress IP, browser
+	// fingerprint seed, isolated throwaway profile (cookie purge), and teardown. This is
+	// the transplanted registration engine.
+	if strings.EqualFold(strings.TrimSpace(req.Method), "node") {
+		return p.nodeRegisterOne(ctx, req)
+	}
+	// "browser_v3" runs the GuJumpgate Playwright harness — the flow that PROVABLY
+	// registers ChatGPT accounts (headless Chrome + --enable-automation removal +
+	// stealth + timestamp-filtered Hotmail OTP). Proxy from the admin egress profile.
+	if strings.EqualFold(strings.TrimSpace(req.Method), "browser_v3") {
+		return p.browserV3RegisterOne(ctx, req)
+	}
+	if req.Method != "" && req.Method != "protocol" {
+		return nil, fmt.Errorf("unsupported method %q (use \"protocol\", \"protocol_v2\", \"node\", \"browser\", or \"browser_v3\")", req.Method)
+	}
+	// Email-based signup uses a mailbox provider for the OTP; phone uses SMS.
+	if strings.EqualFold(strings.TrimSpace(req.IdentityMode), "email") {
+		return p.registerViaEmail(ctx, req)
+	}
+	if p.providerMgr == nil {
+		return nil, fmt.Errorf("no providers configured: add an SMS/mailbox provider on the Provider page first")
+	}
+
+	// Resolve the SMS provider + country. Under the "auto" strategy (default), the Manager
+	// queries each platform's live stats (balance + success-ranked price/inventory) and the
+	// operator's preferred-country priority (BR>CO>PL) to pick the best (platform, country);
+	// under "manual" the request's explicit country is used verbatim. Either way the chosen
+	// provider's lifecycle (CancelNumber on cleanup) is the caller's responsibility.
+	smsProvider, phone, orderID, err := p.acquireSMS(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("acquireSMS: %w", err)
+	}
+	defer smsProvider.CancelNumber(ctx, orderID)
+
+	// Generate device ID
+	deviceID := generateDeviceID()
+
+	// Egress-aware HTTP client: the OpenAI signup/OAuth flow egresses through the task's
+	// chosen proxy/WARP exit (off the shared VPS IP) instead of the old stub client.
+	egressHTTP := p.egressClient(ctx, req.EgressID)
+
+	// Create OpenAI register client
+	client := openai.NewRegisterClient(egressHTTP, deviceID)
+
+	// Generate credentials
+	password := generatePassword()
+	name := generateName()
+	birthdate := generateBirthdate()
+
+	// OTP getter
+	otpGetter := func() (string, error) {
+		code, err := smsProvider.WaitCode(ctx, orderID, 90*time.Second)
+		if err != nil {
+			return "", err
+		}
+		return code, nil
+	}
+
+	// Execute registration
+	result, err := client.Register(ctx, phone, password, name, birthdate, otpGetter)
+	if err != nil {
+		return nil, fmt.Errorf("register: %w", err)
+	}
+
+	// Create account in pool
+	account := &storage.Account{
+		ID:        generateAccountID(),
+		Label:     fmt.Sprintf("auto-%s", phone),
+		GroupName: req.GroupName,
+		Email:     result.Email,
+		Provider:  "codex",
+		Status:    "active",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	// Store tokens. The JWT access token from /api/auth/session is the credential the
+	// pool uses as the Codex bearer; fall back to the raw session-token cookie only if
+	// the access token could not be fetched (so the account is at least re-authable).
+	token := &storage.AccountToken{
+		AccountID:   account.ID,
+		AccessToken: firstNonEmpty(result.AccessToken, result.SessionToken),
+		CreatedAt:   time.Now().Unix(),
+		UpdatedAt:   time.Now().Unix(),
+	}
+
+	// Create account in pool
+	if err := p.store.UpsertAccount(ctx, *account, *token); err != nil {
+		return nil, fmt.Errorf("upsertAccount: %w", err)
+	}
+
+	return account, nil
+}
+
+// registerViaEmail registers one account using a mailbox provider for the email OTP
+// (the email identity mode). Mirrors RegisterOne's account-persistence tail.
+func (p *Pipeline) registerViaEmail(ctx context.Context, req RegisterRequest) (*storage.Account, error) {
+	if p.providerMgr == nil {
+		return nil, fmt.Errorf("no providers configured: add a mailbox provider on the Provider page first")
+	}
+	mbox, email, _, mailboxID, err := p.providerMgr.GetMailbox(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("getMailbox: %w", err)
+	}
+	defer mbox.DeleteEmail(ctx, mailboxID)
+
+	deviceID := generateDeviceID()
+	egressHTTP := p.egressClient(ctx, req.EgressID)
+	client := openai.NewRegisterClient(egressHTTP, deviceID)
+
+	password := generatePassword()
+	name := generateName()
+	birthdate := generateBirthdate()
+
+	otpGetter := func() (string, error) {
+		return mbox.WaitOTP(ctx, mailboxID, 180*time.Second)
+	}
+
+	result, err := client.RegisterEmail(ctx, email, password, name, birthdate, otpGetter)
+	if err != nil {
+		return nil, fmt.Errorf("registerEmail: %w", err)
+	}
+
+	account := &storage.Account{
+		ID:        generateAccountID(),
+		Label:     fmt.Sprintf("auto-%s", email),
+		GroupName: req.GroupName,
+		Email:     email,
+		Provider:  "codex",
+		Status:    "active",
+		CreatedAt: time.Now().Unix(),
+		UpdatedAt: time.Now().Unix(),
+	}
+	token := &storage.AccountToken{
+		AccountID:   account.ID,
+		AccessToken: firstNonEmpty(result.AccessToken, result.SessionToken),
+		CreatedAt:   time.Now().Unix(),
+		UpdatedAt:   time.Now().Unix(),
+	}
+	if err := p.store.UpsertAccount(ctx, *account, *token); err != nil {
+		return nil, fmt.Errorf("upsertAccount: %w", err)
+	}
+	return account, nil
+}
+
+// firstNonEmpty returns the first non-empty (after trimming) string, or "".
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func generateDeviceID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func generatePassword() string {
+	b := make([]byte, 12)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func generateName() string {
+	names := []string{"Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Jamie", "Avery"}
+	return names[time.Now().UnixNano()%int64(len(names))]
+}
+
+func generateBirthdate() string {
+	year := 1980 + time.Now().UnixNano()%30
+	return fmt.Sprintf("%d-01-01", year)
+}
+
+func generateAccountID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return "acc_" + hex.EncodeToString(b)
+}
+
+// randToken returns a short random hex token (for per-task cookie-jar keys).
+func randToken() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}

@@ -1,0 +1,10 @@
+{
+  "total_accounts": 1,
+  "email_provider": "hotmail_otp",
+  "proxy": "",
+  "output_file": "registered_accounts.txt",
+  "enable_oauth": true,
+  "oauth_redirect_uri": "http://localhost:1455/auth/callback",
+  "ak_file": "ak.txt",
+  "rk_file": "rk.txt"
+}

@@ -1,0 +1,36 @@
+{
+  "chatgpt_checkout_proxy": "http://127.0.0.1:10809",
+  "gopay_proxy_chain_upstream": "http://127.0.0.1:10809",
+  "pp_auto_register_root": "/opt/pp-auto-register",
+  "pp_mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "YOUR_MYSQL_PASSWORD",
+    "database": "plus_papay"
+  },
+  "payment_inbox": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "url": "http://127.0.0.1:8765",
+    "user": "opai",
+    "pass": "CHANGE_ME_STRONG_PASSWORD"
+  },
+  "default_pin": "YOUR_6_DIGIT_PIN",
+  "sms_provider": "herosms",
+  "gopay_welcome_wait_sec": 300,
+  "gopay_balance_wait_sec": 180,
+  "herosms_api_key_file": "config/herosms_api_key",
+  "fivesim_api_token_file": "config/fivesim_api_token",
+  "fivesim_country": "indonesia",
+  "fivesim_operator": "any",
+  "fivesim_product": "gojek",
+  "cliproxy_url_file": "config/cliproxy.url",
+  "cliproxy_regions": ["ID", "SG"],
+  "envelope_links_file": "config/envelope_links.txt",
+  "gopay_accounts_file": "config/gopay_worker_accounts.json",
+  "gopay_master_file": "config/gopay_master.json",
+  "gopay_fund_transfer": true,
+  "gopay_welcome_wait_transfer_sec": 30,
+  "gopay_master_fallback_envelope": false
+}

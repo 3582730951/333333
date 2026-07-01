@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>生命周期管理 - Pool</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css">
+<style>
+  .wrap{max-width:1180px;margin:0 auto;padding:18px 4px 26px}
+  html.embedded body{background:transparent}
+  html.embedded body::before{display:none}
+  html.embedded .wrap{padding:2px 2px 18px}
+  .task{background:var(--chip);border:1px solid var(--line);border-left:3px solid var(--acc);
+    border-radius:11px;padding:13px 15px;margin-bottom:10px}
+  .task.off{border-left-color:var(--muted);opacity:.7}
+  .task .h{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+  .task .h b{font-size:13.5px}
+  .task .meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="note" style="margin:0 0 14px">
+    生命周期维护任务负责池内账号的<b>健康巡检</b>与<b>会话令牌续期</b>，保持账号可用。
+    批量「账号注册 / 开通」请到左侧「<b>账号注册</b>」页；本页只读展示当前维护任务的状态。
+  </div>
+  <div class="panel">
+    <div class="hd"><h2>维护任务</h2><span class="sp"></span><button class="btn sm" onclick="loadTasks()">刷新</button></div>
+    <div class="bd"><div id="taskList"><div class="empty">加载中…</div></div></div>
+  </div>
+</div>
+
+<script>
+  try { document.documentElement.setAttribute('data-theme', localStorage.getItem('cp_theme') || 'dark'); } catch {}
+  if (window.self !== window.top) document.documentElement.classList.add('embedded');
+
+  const API_BASE = window.location.origin;
+  function esc(s) { return (s == null ? '' : String(s)).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function hdrs(extra = {}) {
+    const h = { 'Content-Type': 'application/json', ...extra };
+    try { const tok = localStorage.getItem('cp_tok') || ''; if (tok) h['Authorization'] = 'Bearer ' + tok; } catch {}
+    const m = document.cookie.match('(^|;)\\s*cp_csrf\\s*=\\s*([^;]+)');
+    if (m) h['X-CP-CSRF'] = decodeURIComponent(m.pop());
+    return h;
+  }
+
+  async function loadTasks() {
+    const listEl = document.getElementById('taskList');
+    try {
+      const response = await fetch(`${API_BASE}/admin/lifecycle/tasks`, { headers: hdrs(), credentials: 'same-origin' });
+      const data = await response.json();
+      if (!response.ok) { listEl.innerHTML = `<div class="empty">${esc((data && data.error && data.error.message) || ('HTTP ' + response.status))}</div>`; return; }
+      // backend returns { tasks: [{id,name,description,interval,enabled}] }
+      const tasks = (data && data.tasks) || (Array.isArray(data) ? data : []);
+      if (!tasks.length) { listEl.innerHTML = '<div class="empty">暂无维护任务</div>'; return; }
+      listEl.innerHTML = tasks.map(t => `
+        <div class="task ${t.enabled === false ? 'off' : ''}">
+          <div class="h"><b>${esc(t.name || t.id)}</b>
+            <span class="chip ${t.enabled === false ? 'warn' : 'ok'}">${t.enabled === false ? '已停用' : '启用'}</span></div>
+          <div class="meta">
+            <span class="mono">${esc(t.id)}</span>
+            ${t.interval ? `<span>间隔 ${esc(t.interval)}</span>` : ''}
+            ${t.description ? `<span>${esc(t.description)}</span>` : ''}
+          </div>
+        </div>`).join('');
+    } catch (error) { listEl.innerHTML = `<div class="empty">${esc(error.message)}</div>`; }
+  }
+
+  setInterval(loadTasks, 15000);
+  loadTasks();
+</script>
+</body>
+</html>

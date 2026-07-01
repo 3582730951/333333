@@ -1,0 +1,1388 @@
+// Package api provides HTTP API for registration features
+package api
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/registration/pipeline"
+	"codex-account-pool/internal/registration/provider"
+	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
+	"codex-account-pool/internal/upstream"
+)
+
+// Handler provides registration HTTP endpoints
+type Handler struct {
+	store      *storage.Store
+	up         *upstream.Client
+	httpClient *http.Client
+	pipeline   *pipeline.Pipeline
+
+	defaultMethod string // registration engine when a trigger names none (boot default)
+	defaultGroup  string // account group when a trigger names none (boot default)
+	concurrency   int    // max parallel registrations per batch (boot default)
+
+	mu         sync.Mutex
+	jobCancels map[string]context.CancelFunc // running job id → cancel
+}
+
+const registrationBatchMaxCount = 100
+
+var errInvalidRegisterRequest = errors.New("invalid registration request")
+
+// NewHandler creates a registration handler. It builds the live provider Manager from the
+// provider_settings table and wires the pipeline with an egress-aware upstream client, so
+// the operator's saved SMS/mailbox/captcha providers actually run. Call ReloadProviders
+// whenever provider settings change.
+func NewHandler(store *storage.Store, up *upstream.Client, defaultMethod string, concurrency int, cfg *config.Config) *Handler {
+	hc := &http.Client{Timeout: 60 * time.Second}
+	if strings.TrimSpace(defaultMethod) == "" {
+		defaultMethod = "node"
+	}
+	defaultGroup := config.DefaultGroupName
+	if cfg != nil && strings.TrimSpace(cfg.DefaultGroup) != "" {
+		defaultGroup = strings.TrimSpace(cfg.DefaultGroup)
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	h := &Handler{store: store, up: up, httpClient: hc, defaultMethod: defaultMethod, defaultGroup: defaultGroup, concurrency: concurrency, jobCancels: map[string]context.CancelFunc{}}
+	mgr, err := provider.BuildManagerWithError(context.Background(), store, hc)
+	if err != nil {
+		log.Printf("[REGISTRATION] provider manager bootstrap failed: %v", err)
+	}
+	h.pipeline = pipeline.NewPipeline(store, mgr, up, cfg)
+	// Wire the structured log bridge so the pipeline's step logs flow into
+	// registration_task_events and appear in the admin "注册事件记录" view.
+	h.pipeline.LogEvent = h.logEventDetail
+	return h
+}
+
+// resolveConcurrency returns the max parallel registrations for a batch: the admin-set
+// "registration_concurrency" setting wins, else the boot default. Each parallel job is
+// fully isolated by the orchestrator (unique egress IP via SID rotation, fingerprint
+// seed, throwaway profile), so raising this is safe ON A ROTATING EGRESS; a fixed-IP
+// egress should stay at 1 to honor the per-browser IP-uniqueness requirement.
+//
+// Memory/health guard: when the recent registration failure rate exceeds the configured
+// threshold ("reg_failure_threshold", default 0.6) OR the system has been auto-degraded
+// ("reg_degraded"), concurrency is forced to 1 so a struggling VPS is not asked to run
+// multiple browser instances at once — the most common cause of OOM on low-RAM hosts.
+func (h *Handler) resolveConcurrency(ctx context.Context) int {
+	// Auto-degrade: if the operator (or the failure-rate watcher) has flipped
+	// reg_degraded, force single-flight registration until it is cleared.
+	if degraded, _ := h.flagEnabledStr(ctx, "reg_degraded", "false"); degraded {
+		return 1
+	}
+	if h.recentFailureRate(ctx) >= h.failureThreshold(ctx) {
+		return 1
+	}
+	// VPS 低配内存感知并发上限：根据系统总内存限制最多并发多少个浏览器实例。
+	// ≤1.5G → max 1（绝不多开），≤4.5G → max 2，>4.5G → 不限制。
+	memCap := memoryBasedConcurrencyCap()
+	if v, ok := h.setting(ctx, "registration_concurrency"); ok {
+		trimmed := strings.TrimSpace(v)
+		if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 {
+			if n > memCap {
+				return memCap
+			}
+			return n
+		} else {
+			logInvalidRegistrationSetting("registration_concurrency", trimmed, "integer >= 1")
+		}
+	}
+	if h.concurrency < 1 {
+		return 1
+	}
+	if h.concurrency > memCap {
+		return memCap
+	}
+	return h.concurrency
+}
+
+// memoryBasedConcurrencyCap returns the max browser instances this host can safely run in
+// parallel based on total RAM. Reads /proc/meminfo on Linux; non-Linux returns a generous 4.
+func memoryBasedConcurrencyCap() int {
+	if runtime.GOOS != "linux" {
+		return 4
+	}
+	raw, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 4
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+		kb, _ := strconv.ParseInt(fields[1], 10, 64)
+		mb := kb / 1024
+		switch {
+		case mb <= 1536:
+			return 1 // 1H1G — single browser only
+		case mb <= 4608:
+			return 2 // 2H2G / 2H4G
+		default:
+			return 4 // 4H4G+
+		}
+	}
+	return 4
+}
+
+// failureThreshold reads the "reg_failure_threshold" setting (default 0.6).
+func (h *Handler) failureThreshold(ctx context.Context) float64 {
+	if v, ok := h.setting(ctx, "reg_failure_threshold"); ok {
+		trimmed := strings.TrimSpace(v)
+		if f, err := strconv.ParseFloat(trimmed, 64); err == nil && f > 0 && f <= 1 {
+			return f
+		} else {
+			logInvalidRegistrationSetting("reg_failure_threshold", trimmed, "float in (0,1]")
+		}
+	}
+	return 0.6
+}
+
+// recentFailureRate computes the failure rate over the most recent registration jobs
+// (default window: last 10 jobs within the last 10 minutes). Returns 0 when there is
+// not enough history to judge, so a cold start never auto-degrades.
+func (h *Handler) recentFailureRate(ctx context.Context) float64 {
+	var total, failed int
+	rows, err := h.store.DB().QueryContext(ctx,
+		`SELECT total, failed FROM registration_jobs
+		 WHERE total > 0 AND status IN ('completed','cancelled')
+		 ORDER BY created_at DESC LIMIT 10`)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t, f int
+		if err := rows.Scan(&t, &f); err != nil {
+			continue
+		}
+		total += t
+		failed += f
+	}
+	if total < 5 { // not enough history to judge
+		return 0
+	}
+	return float64(failed) / float64(total)
+}
+
+// flagEnabledStr reads a boolean setting stored as a string ("true"/"1"/"false"/"0").
+// Defaults to def when unset. Mirrors the api.Server.flagEnabled shape but on the
+// registration Handler, which only has the store.
+func (h *Handler) flagEnabledStr(ctx context.Context, key, def string) (bool, error) {
+	v, ok := h.setting(ctx, key)
+	if !ok {
+		switch strings.ToLower(strings.TrimSpace(def)) {
+		case "true", "1", "on", "yes":
+			return true, nil
+		}
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "on", "yes":
+		return true, nil
+	case "false", "0", "off", "no":
+		return false, nil
+	}
+	logInvalidRegistrationSetting(key, strings.TrimSpace(v), "boolean")
+	return false, nil
+}
+
+func (h *Handler) setting(ctx context.Context, key string) (string, bool) {
+	if h == nil || h.store == nil {
+		return "", false
+	}
+	v, ok, err := h.store.GetSetting(ctx, key)
+	if err != nil {
+		log.Printf("[REGISTRATION-CONFIG-ERROR] read setting %q failed: %v", key, err)
+		return "", false
+	}
+	return v, ok
+}
+
+func logInvalidRegistrationSetting(key, value, kind string) {
+	log.Printf("[REGISTRATION-CONFIG-WARN] setting %q has invalid %s value %q; using configured default", key, kind, value)
+}
+
+// resolveMethod returns the registration engine to use: an explicit request method
+// wins; otherwise the admin-set "default_register_method" setting; otherwise the boot
+// default (config DefaultRegisterMethod, "node"). One setting flips the engine for both
+// the admin trigger and auto-refill.
+func (h *Handler) resolveMethod(ctx context.Context, reqMethod string) string {
+	if m := strings.TrimSpace(reqMethod); m != "" {
+		return m
+	}
+	if v, ok := h.setting(ctx, "default_register_method"); ok {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return h.defaultMethod
+}
+
+func lockedIdentityModeForMethod(method string) string {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "node", "browser":
+		return "phone"
+	case "protocol_v2", "browser_v3":
+		return "email"
+	default:
+		return ""
+	}
+}
+
+func supportedRegistrationMethod(method string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "protocol", "protocol_v2", "node", "browser", "browser_v3":
+		return true
+	default:
+		return false
+	}
+}
+
+func registrationMethodUsesSMSCountry(method, identityMode string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "node", "browser", "browser_v3":
+		return true
+	case "protocol", "":
+		return strings.EqualFold(strings.TrimSpace(identityMode), "phone")
+	default:
+		return false
+	}
+}
+
+func registrationMethodRequiresSMSProvider(method, identityMode string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "node", "browser":
+		return true
+	case "protocol", "":
+		return strings.EqualFold(strings.TrimSpace(identityMode), "phone")
+	default:
+		return false
+	}
+}
+
+func registrationMethodRequiresMailboxProvider(method, identityMode string) bool {
+	return strings.EqualFold(strings.TrimSpace(method), "protocol") && strings.EqualFold(strings.TrimSpace(identityMode), "email")
+}
+
+func registrationMethodRequiresEmailOTPProvider(method string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "protocol_v2", "browser_v3":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.RegisterRequest) error {
+	req.Platform = strings.ToLower(strings.TrimSpace(req.Platform))
+	if req.Platform == "" {
+		req.Platform = "chatgpt"
+	}
+	if req.Platform != "chatgpt" {
+		return invalidRegisterRequest("unsupported platform %q", req.Platform)
+	}
+
+	req.Method = strings.ToLower(strings.TrimSpace(h.resolveMethod(ctx, req.Method)))
+	if req.Method == "" {
+		req.Method = "node"
+	}
+	if !supportedRegistrationMethod(req.Method) {
+		return invalidRegisterRequest("unsupported method %q", req.Method)
+	}
+
+	if req.Count < 1 {
+		return invalidRegisterRequest("count must be >= 1")
+	}
+	if req.Count > registrationBatchMaxCount {
+		return invalidRegisterRequest("count must be <= %d", registrationBatchMaxCount)
+	}
+
+	req.GroupName = strings.TrimSpace(req.GroupName)
+	if req.GroupName == "" {
+		req.GroupName = strings.TrimSpace(h.defaultGroup)
+	}
+	if req.GroupName == "" {
+		req.GroupName = config.DefaultGroupName
+	}
+	if _, err := h.store.GetGroup(ctx, req.GroupName); err != nil {
+		return invalidRegisterRequest("group %q not found", req.GroupName)
+	}
+
+	req.EgressID = strings.TrimSpace(req.EgressID)
+	if req.EgressID == "" {
+		req.EgressID = storage.DefaultDirectEgressID
+	}
+	if _, err := h.store.GetEgressProfile(ctx, req.EgressID); err != nil {
+		return invalidRegisterRequest("egress %q not found", req.EgressID)
+	}
+
+	req.IdentityMode = strings.ToLower(strings.TrimSpace(req.IdentityMode))
+	switch req.IdentityMode {
+	case "", "phone", "sms", "email":
+	default:
+		return invalidRegisterRequest("unsupported identity_mode %q", req.IdentityMode)
+	}
+	if req.IdentityMode == "sms" {
+		req.IdentityMode = "phone"
+	}
+	if lock := lockedIdentityModeForMethod(req.Method); lock != "" {
+		if req.IdentityMode != "" && req.IdentityMode != lock {
+			return invalidRegisterRequest("%s requires identity_mode=%s", req.Method, lock)
+		}
+		req.IdentityMode = lock
+	}
+	if req.IdentityMode == "" {
+		req.IdentityMode = "phone"
+	}
+	req.Country = strings.ToUpper(strings.TrimSpace(req.Country))
+	if h.store != nil {
+		strategy := "auto"
+		if v, ok, err := h.store.GetSetting(ctx, "sms_platform_strategy"); err != nil {
+			return fmt.Errorf("read sms_platform_strategy: %w", err)
+		} else if ok {
+			strategy = strings.ToLower(strings.TrimSpace(v))
+		}
+		switch strategy {
+		case "", "auto":
+		case "manual":
+			if registrationMethodUsesSMSCountry(req.Method, req.IdentityMode) && req.Country == "" {
+				if v, ok, err := h.store.GetSetting(ctx, "sms_manual_country"); err != nil {
+					return fmt.Errorf("read sms_manual_country: %w", err)
+				} else if ok {
+					country, err := normalizePhoneCountryISO(v, true)
+					if err != nil {
+						return invalidRegisterRequest("sms_manual_country: %v", err)
+					}
+					req.Country = country
+				}
+			}
+			if registrationMethodUsesSMSCountry(req.Method, req.IdentityMode) && req.Country == "" {
+				return invalidRegisterRequest("sms manual country is required when sms_platform_strategy=manual")
+			}
+		default:
+			return invalidRegisterRequest("unsupported sms_platform_strategy %q", strategy)
+		}
+	}
+	req.SMSProvider = strings.TrimSpace(req.SMSProvider)
+	req.MailboxProvider = strings.TrimSpace(req.MailboxProvider)
+	req.CaptchaSolver = strings.TrimSpace(req.CaptchaSolver)
+	return nil
+}
+
+func invalidRegisterRequest(format string, args ...interface{}) error {
+	return fmt.Errorf("%w: %s", errInvalidRegisterRequest, fmt.Sprintf(format, args...))
+}
+
+// ReloadProviders rebuilds the provider Manager from the current provider_settings and
+// re-wires the pipeline, so saving providers in the UI takes effect without a restart.
+func (h *Handler) ReloadProviders(ctx context.Context) error {
+	mgr, err := provider.BuildManagerWithError(ctx, h.store, h.httpClient)
+	if err != nil {
+		return err
+	}
+	// cfg is nil here — ReloadProviders is called after save, the pipeline already has
+	// its original cfg from NewHandler. We keep the same pipeline's httpClient/cfg.
+	h.pipeline = pipeline.NewPipeline(h.store, mgr, h.up, nil)
+	h.pipeline.LogEvent = h.logEventDetail
+	return nil
+}
+
+// HandleRegisterBatch starts a batch registration job
+func (h *Handler) HandleRegisterBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	var req pipeline.RegisterRequest
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	jobID, err := h.StartJob(r.Context(), req)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errInvalidRegisterRequest) {
+			status = http.StatusBadRequest
+		}
+		writeError(w, status, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"job_id": jobID,
+		"status": "started",
+	})
+}
+
+// StartJob inserts a registration job row and launches its async batch processing under a
+// cancelable context. Returns the job id. Shared by the HTTP handler and the automation
+// scheduler (auto-refill).
+func (h *Handler) StartJob(ctx context.Context, req pipeline.RegisterRequest) (string, error) {
+	if err := h.normalizeRegisterRequest(ctx, &req); err != nil {
+		return "", err
+	}
+	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
+	configJSON, _ := json.Marshal(req)
+	if _, err := h.store.DB().ExecContext(ctx,
+		`INSERT INTO registration_jobs (id, platform, method, total, status, config_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+		jobID, req.Platform, req.Method, req.Count, string(configJSON), time.Now().Unix(), time.Now().Unix()); err != nil {
+		return "", err
+	}
+	// The job outlives the triggering request → fresh cancelable context (not r.Context()).
+	jctx, cancel := context.WithCancel(context.Background())
+	h.mu.Lock()
+	h.jobCancels[jobID] = cancel
+	h.mu.Unlock()
+	go h.runProcessBatch(jctx, jobID, req)
+	return jobID, nil
+}
+
+func (h *Handler) runProcessBatch(ctx context.Context, jobID string, req pipeline.RegisterRequest) {
+	defer func() {
+		if v := recover(); v != nil {
+			supervisor.LogPanic("registration-job", v)
+			h.failRegistrationJob(jobID, fmt.Sprintf("registration job panic: %v", v))
+		}
+	}()
+	h.processBatch(ctx, jobID, req)
+}
+
+func (h *Handler) failRegistrationJob(jobID, message string) {
+	bg := context.Background()
+	now := time.Now().Unix()
+	_, _ = h.store.DB().ExecContext(bg,
+		`UPDATE registration_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=?`,
+		message, now, now, jobID)
+	h.logEvent(bg, jobID, "error", message)
+}
+
+func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.RegisterRequest) {
+	// Release the cancel registration when the job ends (also cancels the context to
+	// free any in-flight provider polls).
+	defer func() {
+		h.mu.Lock()
+		if c := h.jobCancels[jobID]; c != nil {
+			c()
+		}
+		delete(h.jobCancels, jobID)
+		h.mu.Unlock()
+	}()
+
+	// DB writes use a background context so progress/cancelled status is still recorded
+	// after the job's own context is cancelled.
+	bg := context.Background()
+	h.store.DB().ExecContext(bg,
+		`UPDATE registration_jobs SET status='running', started_at=?, updated_at=? WHERE id=?`,
+		time.Now().Unix(), time.Now().Unix(), jobID)
+
+	succeeded := 0
+	failed := 0
+	cancelled := false
+
+	// Bounded-concurrency worker pool. Each parallel registration is isolated by the
+	// orchestrator (unique egress IP, fingerprint, throwaway profile). DB writes and the
+	// shared counters run under `mu`, so concurrency never trips sqlite — only the slow
+	// part (RegisterOne: the browser automation) runs in parallel. concurrency=1 (default)
+	// preserves the original sequential behavior exactly.
+	concurrency := h.resolveConcurrency(bg)
+	var mu sync.Mutex
+	cancelled = runBounded(ctx, req.Count, concurrency, func(i int) {
+		recordID := fmt.Sprintf("rec_%d_%d", time.Now().UnixNano(), i)
+		start := time.Now()
+		recordCreated := false
+		settled := false
+		defer func() {
+			if v := recover(); v != nil {
+				supervisor.LogPanic("registration-batch-worker", v)
+				if settled {
+					return
+				}
+				message := fmt.Sprintf("Registration %d panicked: %v", i+1, v)
+				duration := int(time.Since(start).Seconds())
+				mu.Lock()
+				defer mu.Unlock()
+				failed++
+				if !recordCreated {
+					_, _ = h.store.DB().ExecContext(bg,
+						`INSERT INTO registration_records (id, job_id, status, error, duration_seconds, created_at)
+						 VALUES (?, ?, 'failed', ?, ?, ?)`,
+						recordID, jobID, message, duration, time.Now().Unix())
+				} else {
+					_, _ = h.store.DB().ExecContext(bg,
+						`UPDATE registration_records SET status='failed', error=?, duration_seconds=? WHERE id=?`,
+						message, duration, recordID)
+				}
+				h.logEvent(bg, jobID, "error", message)
+				_, _ = h.store.DB().ExecContext(bg,
+					`UPDATE registration_jobs SET succeeded=?, failed=?, updated_at=? WHERE id=?`,
+					succeeded, failed, time.Now().Unix(), jobID)
+			}
+		}()
+		mu.Lock()
+		h.store.DB().ExecContext(bg,
+			`INSERT INTO registration_records (id, job_id, status, created_at)
+			 VALUES (?, ?, 'pending', ?)`,
+			recordID, jobID, time.Now().Unix())
+		recordCreated = true
+		mu.Unlock()
+
+		// The slow part runs OUTSIDE the lock → genuine parallelism across browsers.
+		account, err := h.pipeline.RegisterOne(ctx, req)
+		duration := int(time.Since(start).Seconds())
+
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			failed++
+			h.store.DB().ExecContext(bg,
+				`UPDATE registration_records SET status='failed', error=?, duration_seconds=? WHERE id=?`,
+				err.Error(), duration, recordID)
+			h.logEvent(bg, jobID, "error", fmt.Sprintf("Registration %d failed: %v", i+1, err))
+		} else {
+			succeeded++
+			h.store.DB().ExecContext(bg,
+				`UPDATE registration_records SET status='success', account_id=?, sms_provider=?, sms_country=?, sms_cost=?, duration_seconds=? WHERE id=?`,
+				account.ID, req.SMSProvider, req.SMSCountry, req.SMSCost, duration, recordID)
+			h.logEvent(bg, jobID, "info", fmt.Sprintf("Registration %d succeeded: %s", i+1, account.ID))
+		}
+		h.store.DB().ExecContext(bg,
+			`UPDATE registration_jobs SET succeeded=?, failed=?, updated_at=? WHERE id=?`,
+			succeeded, failed, time.Now().Unix(), jobID)
+		settled = true
+	})
+
+	status := "completed"
+	if cancelled {
+		status = "cancelled"
+	}
+	h.store.DB().ExecContext(bg,
+		`UPDATE registration_jobs SET status=?, completed_at=?, updated_at=? WHERE id=?`,
+		status, time.Now().Unix(), time.Now().Unix(), jobID)
+
+	h.logEvent(bg, jobID, "info", fmt.Sprintf("Batch %s: %d succeeded, %d failed", status, succeeded, failed))
+
+	// Post-batch health watch: if recent failures push the rolling failure rate past the
+	// configured threshold, auto-degrade registration concurrency to 1 so a struggling
+	// low-RAM VPS is not asked to run parallel browsers — and surface it in the log so
+	// the operator sees why concurrency dropped. The operator can clear reg_degraded
+	// from the SettingsV2 "日志与降级" tab once the underlying issue is fixed.
+	if succeeded+failed > 0 {
+		rate := float64(failed) / float64(succeeded+failed)
+		threshold := h.failureThreshold(bg)
+		if rate >= threshold {
+			_ = h.store.SetSetting(bg, "reg_degraded", "true")
+			h.logEvent(bg, jobID, "warn", fmt.Sprintf(
+				"Auto-degraded: batch failure rate %.0f%% >= threshold %.0f%%; concurrency forced to 1. Clear 'reg_degraded' in Settings to re-enable.",
+				rate*100, threshold*100))
+		}
+	}
+}
+
+// runBounded runs n indexed tasks with at most `limit` running concurrently, calling
+// work(i) for each. It returns cancelled=true if ctx was cancelled before all tasks were
+// launched (already-running tasks still finish). limit<1 is treated as 1. Pure (no I/O),
+// so the concurrency bound is unit-testable without the registration pipeline.
+func runBounded(ctx context.Context, n, limit int, work func(i int)) (cancelled bool) {
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		if ctx.Err() != nil {
+			cancelled = true
+			break
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			cancelled = true
+			wg.Wait()
+			return cancelled
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer supervisor.Recover("registration-batch-worker")
+			defer func() { <-sem }()
+			work(i)
+		}(i)
+	}
+	wg.Wait()
+	return cancelled
+}
+
+// HandleJobList returns recent registration jobs for the task list. Optional ?status=
+// filters by status (other than "all").
+func (h *Handler) HandleJobList(w http.ResponseWriter, r *http.Request) {
+	query := `SELECT id, platform, method, total, succeeded, failed, status, started_at, completed_at, error, created_at
+		FROM registration_jobs`
+	args := []interface{}{}
+	if st := strings.TrimSpace(r.URL.Query().Get("status")); st != "" && st != "all" {
+		query += ` WHERE status=?`
+		args = append(args, st)
+	}
+	query += ` ORDER BY created_at DESC LIMIT 200`
+
+	rows, err := h.store.DB().QueryContext(r.Context(), query, args...)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+
+	type job struct {
+		ID          string `json:"id"`
+		Platform    string `json:"platform"`
+		Method      string `json:"method"`
+		Total       int    `json:"total"`
+		Succeeded   int    `json:"succeeded"`
+		Failed      int    `json:"failed"`
+		Status      string `json:"status"`
+		StartedAt   int64  `json:"started_at"`
+		CompletedAt int64  `json:"completed_at"`
+		Error       string `json:"error"`
+		CreatedAt   int64  `json:"created_at"`
+	}
+	jobs := []job{}
+	for rows.Next() {
+		var j job
+		if err := rows.Scan(&j.ID, &j.Platform, &j.Method, &j.Total, &j.Succeeded, &j.Failed,
+			&j.Status, &j.StartedAt, &j.CompletedAt, &j.Error, &j.CreatedAt); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		jobs = append(jobs, j)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"jobs": jobs})
+}
+
+// HandleJobCancel cancels a running job: it cancels the in-flight context (if the job is
+// still running in this process) and marks a pending/running job 'cancelled' in the DB.
+func (h *Handler) HandleJobCancel(w http.ResponseWriter, r *http.Request, jobID string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if strings.TrimSpace(jobID) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing job id"))
+		return
+	}
+	h.mu.Lock()
+	cancel := h.jobCancels[jobID]
+	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	res, err := h.store.DB().ExecContext(r.Context(),
+		`UPDATE registration_jobs SET status='cancelled', completed_at=?, updated_at=? WHERE id=? AND status IN ('pending','running')`,
+		time.Now().Unix(), time.Now().Unix(), jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if changed == 0 {
+		status, err := h.registrationJobStatus(r.Context(), jobID)
+		if err != nil {
+			h.writeRegistrationJobStatusError(w, jobID, err)
+			return
+		}
+		writeError(w, http.StatusConflict, fmt.Errorf("registration job %q is %s and cannot be cancelled", jobID, status))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"job_id": jobID, "cancelled": true})
+}
+
+// HandleStats returns registration success-dashboard aggregates over the jobs/records
+// tables: totals, a per-day success/fail series (last 14 days), and per-provider-error
+// counts. Powers the 注册成功率仪表盘.
+func (h *Handler) HandleStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	db := h.store.DB()
+	ctx := r.Context()
+
+	var jobs, jobSucc, jobFail int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(succeeded),0), COALESCE(SUM(failed),0) FROM registration_jobs`).
+		Scan(&jobs, &jobSucc, &jobFail); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	var recTotal, recSucc, recFail int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*),
+		        COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),
+		        COALESCE(SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END),0)
+		 FROM registration_records`).
+		Scan(&recTotal, &recSucc, &recFail); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	byDay := []map[string]interface{}{}
+	rows, err := db.QueryContext(ctx,
+		`SELECT strftime('%Y-%m-%d', created_at, 'unixepoch') d,
+		        SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),
+		        SUM(CASE WHEN status='failed'  THEN 1 ELSE 0 END)
+		 FROM registration_records GROUP BY d ORDER BY d DESC LIMIT 14`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d string
+		var s, f int
+		if err := rows.Scan(&d, &s, &f); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		byDay = append(byDay, map[string]interface{}{"date": d, "succeeded": s, "failed": f})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// Top failure reasons (truncated) for error aggregation.
+	errs := []map[string]interface{}{}
+	rows, err = db.QueryContext(ctx,
+		`SELECT substr(error,1,80) e, COUNT(*) c FROM registration_records
+		 WHERE status='failed' AND error<>'' GROUP BY e ORDER BY c DESC LIMIT 10`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e string
+		var c int
+		if err := rows.Scan(&e, &c); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		errs = append(errs, map[string]interface{}{"error": e, "count": c})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	rate := 0.0
+	if recTotal > 0 {
+		rate = float64(recSucc) / float64(recTotal)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"totals": map[string]interface{}{"jobs": jobs, "records": recTotal, "succeeded": recSucc, "failed": recFail, "success_rate": rate},
+		"by_day": byDay,
+		"errors": errs,
+	})
+}
+
+func (h *Handler) logEvent(ctx context.Context, taskID, level, message string) {
+	h.logEventDetail(ctx, taskID, level, message, nil)
+}
+
+// logEventDetail writes a structured registration event with an optional detail
+// object (JSON-encoded into detail_json). Used by the node registrar's step
+// logging so each phase of a registration (proxy assign / sid rotate /
+// fingerprint / browser launch / sms / mailbox / token read / subprocess output)
+// is captured for the admin "注册事件记录" view and AI-analysis export.
+func (h *Handler) logEventDetail(ctx context.Context, taskID, level, message string, detail interface{}) {
+	// Respect the verbose-logging toggle: when an operator has turned OFF
+	// reg_verbose_logging (e.g. on a low-RAM VPS where the DB was growing too
+	// fast), only keep error/warn-level events so failures are still diagnosable
+	// but the high-volume info steps are dropped.
+	verbose := true
+	if v, ok := h.setting(ctx, "reg_verbose_logging"); ok {
+		trimmed := strings.TrimSpace(v)
+		switch strings.ToLower(trimmed) {
+		case "false", "0", "off", "no":
+			verbose = false
+		case "true", "1", "on", "yes", "":
+			verbose = true
+		default:
+			logInvalidRegistrationSetting("reg_verbose_logging", trimmed, "boolean")
+		}
+	}
+	if !verbose && level != "error" && level != "warn" {
+		return
+	}
+	detailJSON := "{}"
+	if detail != nil {
+		if b, err := json.Marshal(detail); err == nil {
+			detailJSON = string(b)
+		}
+	}
+	h.store.DB().ExecContext(ctx,
+		`INSERT INTO registration_task_events (task_id, level, message, detail_json, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		taskID, level, message, detailJSON, time.Now().Unix())
+}
+
+// HandleJobStatus returns job status
+func (h *Handler) HandleJobStatus(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("id")
+	if jobID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing job id"))
+		return
+	}
+
+	row := h.store.DB().QueryRowContext(r.Context(),
+		`SELECT id, platform, method, total, succeeded, failed, status, started_at, completed_at, error
+		 FROM registration_jobs WHERE id=?`, jobID)
+
+	var job struct {
+		ID          string `json:"id"`
+		Platform    string `json:"platform"`
+		Method      string `json:"method"`
+		Total       int    `json:"total"`
+		Succeeded   int    `json:"succeeded"`
+		Failed      int    `json:"failed"`
+		Status      string `json:"status"`
+		StartedAt   int64  `json:"started_at"`
+		CompletedAt int64  `json:"completed_at"`
+		Error       string `json:"error"`
+	}
+
+	err := row.Scan(&job.ID, &job.Platform, &job.Method, &job.Total, &job.Succeeded,
+		&job.Failed, &job.Status, &job.StartedAt, &job.CompletedAt, &job.Error)
+	if err != nil {
+		h.writeRegistrationJobStatusError(w, jobID, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, job)
+}
+
+// HandleJobEvents streams events via SSE
+func (h *Handler) HandleJobEvents(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("id")
+	if jobID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing job id"))
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	if _, err := h.registrationJobStatus(r.Context(), jobID); err != nil {
+		h.writeRegistrationJobStatusError(w, jobID, err)
+		return
+	}
+
+	rows, err := h.store.DB().QueryContext(r.Context(),
+		`SELECT level, message, created_at FROM registration_task_events WHERE task_id=? ORDER BY id`,
+		jobID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	for rows.Next() {
+		var level, message string
+		var createdAt int64
+		if err := rows.Scan(&level, &message, &createdAt); err != nil {
+			writeRegistrationSSEError(w, err)
+			flusher.Flush()
+			return
+		}
+		data := map[string]interface{}{
+			"level":   level,
+			"message": message,
+			"time":    createdAt,
+		}
+		dataJSON, _ := json.Marshal(data)
+		fmt.Fprintf(w, "data: %s\n\n", dataJSON)
+	}
+	if err := rows.Err(); err != nil {
+		writeRegistrationSSEError(w, err)
+		flusher.Flush()
+		return
+	}
+	flusher.Flush()
+
+	// Keep connection alive (in production, use pub/sub)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+func (h *Handler) registrationJobStatus(ctx context.Context, jobID string) (string, error) {
+	var status string
+	err := h.store.DB().QueryRowContext(ctx, `SELECT status FROM registration_jobs WHERE id=?`, jobID).Scan(&status)
+	return status, err
+}
+
+func (h *Handler) writeRegistrationJobStatusError(w http.ResponseWriter, jobID string, err error) {
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("registration job %q not found", jobID))
+		return
+	}
+	writeError(w, http.StatusInternalServerError, err)
+}
+
+func writeRegistrationSSEError(w io.Writer, err error) {
+	data, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": err.Error(),
+			"type":    "codex_pool_error",
+		},
+	})
+	fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
+}
+
+// HandleProviderSettings manages provider configurations
+func (h *Handler) HandleProviderSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.listProviders(w, r)
+	case http.MethodPost:
+		h.createProvider(w, r)
+	case http.MethodPut:
+		h.updateProvider(w, r)
+	case http.MethodDelete:
+		h.deleteProvider(w, r)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+// HandleProviderOptions returns the registered SMS / mailbox / captcha providers
+// as {label, value} option lists, so the registration / automation / lifecycle
+// forms can render Select dropdowns instead of free-text inputs. Reuses the live
+// provider Manager built from provider_settings.
+func (h *Handler) HandleProviderOptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	ctx := r.Context()
+	mgr, err := provider.BuildManagerWithError(ctx, h.store, h.httpClient)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	smsOpts := make([]map[string]string, 0, len(mgr.SMS))
+	for _, p := range mgr.SMS {
+		name := p.Name()
+		smsOpts = append(smsOpts, map[string]string{"label": name, "value": name})
+	}
+	mailOpts := make([]map[string]string, 0, len(mgr.Mailbox))
+	for _, p := range mgr.Mailbox {
+		name := p.Name()
+		mailOpts = append(mailOpts, map[string]string{"label": name, "value": name})
+	}
+	capOpts := make([]map[string]string, 0, len(mgr.Captcha))
+	for _, p := range mgr.Captcha {
+		name := p.Name()
+		capOpts = append(capOpts, map[string]string{"label": name, "value": name})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"sms":     smsOpts,
+		"mailbox": mailOpts,
+		"captcha": capOpts,
+	})
+}
+
+// regDefaultKeys maps the UI's default fields to their settings-table keys.
+var regDefaultKeys = map[string]string{
+	"sms":     "reg_default_sms",
+	"mailbox": "reg_default_mailbox",
+	"captcha": "reg_default_captcha",
+	"group":   "reg_default_group",
+	"egress":  "reg_default_egress",
+}
+
+func cfgString(v interface{}) string { s, _ := v.(string); return strings.TrimSpace(s) }
+
+func (h *Handler) getDefaults(ctx context.Context) map[string]string {
+	out, _ := h.getDefaultsWithError(ctx)
+	return out
+}
+
+func (h *Handler) getDefaultsWithError(ctx context.Context) (map[string]string, error) {
+	out := map[string]string{}
+	for field, key := range regDefaultKeys {
+		v, ok, err := h.store.GetSetting(ctx, key)
+		if err != nil {
+			return out, fmt.Errorf("read registration default %q: %w", field, err)
+		}
+		if ok && v != "" {
+			out[field] = v
+		}
+	}
+	return out, nil
+}
+
+func (h *Handler) saveDefaults(ctx context.Context, d map[string]interface{}) error {
+	return h.saveDefaultsWithExecutor(ctx, h.store.DB(), d)
+}
+
+func (h *Handler) saveDefaultsWithExecutor(ctx context.Context, exec sqlExecutor, d map[string]interface{}) error {
+	for field, key := range regDefaultKeys {
+		if v, ok := d[field]; ok {
+			if _, err := exec.ExecContext(ctx,
+				`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+				key, cfgString(v), storage.Now()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// listProviders returns the configured providers AND the global defaults, in the
+// {providers, defaults} shape the Provider/registration pages expect (the old bare-array
+// response left the UI's data.providers / data.defaults undefined → nothing rendered).
+func (h *Handler) listProviders(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.store.DB().QueryContext(r.Context(),
+		`SELECT id, provider_type, provider_key, display_name, enabled, priority, config_json
+		 FROM provider_settings ORDER BY provider_type, priority DESC`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	defer rows.Close()
+
+	providers := []map[string]interface{}{}
+	for rows.Next() {
+		var id, providerType, providerKey, displayName, configJSON string
+		var enabled, priority int
+		if err := rows.Scan(&id, &providerType, &providerKey, &displayName, &enabled, &priority, &configJSON); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+
+		var config map[string]interface{}
+		if strings.TrimSpace(configJSON) != "" {
+			if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("provider %s/%s has invalid config_json: %w", providerType, providerKey, err))
+				return
+			}
+		}
+		if config == nil {
+			config = map[string]interface{}{}
+		}
+
+		providers = append(providers, map[string]interface{}{
+			"id":           id,
+			"type":         providerType,
+			"key":          providerKey,
+			"display_name": displayName,
+			"enabled":      enabled == 1,
+			"priority":     priority,
+			"config":       config,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	defaults, err := h.getDefaultsWithError(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"providers": providers,
+		"defaults":  defaults,
+	})
+}
+
+type providerInput struct {
+	Type        string                 `json:"type"`
+	Key         string                 `json:"key"`
+	DisplayName string                 `json:"display_name"`
+	Enabled     bool                   `json:"enabled"`
+	Priority    int                    `json:"priority"`
+	Config      map[string]interface{} `json:"config"`
+}
+
+// createProvider accepts EITHER a bulk save {providers:[...], defaults:{...}} (the
+// Provider config page's "save all") or a single provider {type,key,...}. Both upsert by
+// (provider_type, provider_key) so re-saving updates in place instead of erroring on the
+// UNIQUE constraint, then reload the live Manager so the change takes effect immediately.
+func (h *Handler) createProvider(w http.ResponseWriter, r *http.Request) {
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	var bulk struct {
+		Providers []providerInput        `json:"providers"`
+		Defaults  map[string]interface{} `json:"defaults"`
+	}
+	_ = json.Unmarshal(raw, &bulk)
+	if len(bulk.Providers) > 0 || len(bulk.Defaults) > 0 {
+		providers := make([]providerInput, 0, len(bulk.Providers))
+		for i, p := range bulk.Providers {
+			normalized, err := normalizeProviderInput(p)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("providers[%d]: %w", i, err))
+				return
+			}
+			providers = append(providers, normalized)
+		}
+		defaults := bulk.Defaults
+		if len(defaults) > 0 {
+			normalized, err := normalizeRegDefaults(defaults)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			defaults = normalized
+		}
+		if err := h.saveProviderBatch(r.Context(), providers, defaults); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err := h.ReloadProviders(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"saved": len(providers)})
+		return
+	}
+
+	var p providerInput
+	if err := json.Unmarshal(raw, &p); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	normalized, err := normalizeProviderInput(p)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	id, err := h.upsertProvider(r.Context(), normalized)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := h.ReloadProviders(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+type sqlReadWriter interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+type sqlExecutor interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func normalizeProviderInput(p providerInput) (providerInput, error) {
+	p.Type = strings.ToLower(strings.TrimSpace(p.Type))
+	p.Key = strings.TrimSpace(p.Key)
+	p.DisplayName = strings.TrimSpace(p.DisplayName)
+	if p.Type == "" || p.Key == "" {
+		return p, fmt.Errorf("type and key are required")
+	}
+	switch p.Type {
+	case "sms", "mailbox", "captcha":
+	default:
+		return p, fmt.Errorf("unsupported provider type %q", p.Type)
+	}
+	if p.Config == nil {
+		p.Config = map[string]interface{}{}
+	}
+	return p, nil
+}
+
+func (h *Handler) saveProviderBatch(ctx context.Context, providers []providerInput, defaults map[string]interface{}) error {
+	tx, err := h.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, p := range providers {
+		if _, err := h.upsertProviderWithExecutor(ctx, tx, p); err != nil {
+			return err
+		}
+	}
+	if len(defaults) > 0 {
+		if err := h.saveDefaultsWithExecutor(ctx, tx, defaults); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// upsertProvider inserts or updates a provider row keyed by (provider_type, provider_key)
+// via an explicit select-then-write (so it does not depend on a UNIQUE constraint being
+// present). A blank incoming api_key preserves the previously stored one, so re-saving the
+// whole page (where a password field may not echo back) never wipes an existing key.
+func (h *Handler) upsertProvider(ctx context.Context, p providerInput) (string, error) {
+	normalized, err := normalizeProviderInput(p)
+	if err != nil {
+		return "", err
+	}
+	return h.upsertProviderWithExecutor(ctx, h.store.DB(), normalized)
+}
+
+func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWriter, p providerInput) (string, error) {
+	cfg := make(map[string]interface{}, len(p.Config))
+	for k, v := range p.Config {
+		cfg[k] = v
+	}
+	var existingID, existingCfg string
+	err := exec.QueryRowContext(ctx,
+		`SELECT id, config_json FROM provider_settings WHERE provider_type=? AND provider_key=?`,
+		p.Type, p.Key).Scan(&existingID, &existingCfg)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	if cfgString(cfg["api_key"]) == "" && existingCfg != "" {
+		old := map[string]interface{}{}
+		if json.Unmarshal([]byte(existingCfg), &old) == nil {
+			if k := cfgString(old["api_key"]); k != "" {
+				cfg["api_key"] = k
+			}
+		}
+	}
+	configJSON, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	enabled := 0
+	if p.Enabled {
+		enabled = 1
+	}
+	display := p.DisplayName
+	if display == "" {
+		display = p.Key
+	}
+	now := time.Now().Unix()
+	if existingID != "" {
+		if _, err := exec.ExecContext(ctx,
+			`UPDATE provider_settings SET display_name=?, enabled=?, priority=?, config_json=?, updated_at=? WHERE id=?`,
+			display, enabled, p.Priority, string(configJSON), now, existingID); err != nil {
+			return "", err
+		}
+		return existingID, nil
+	}
+	id := fmt.Sprintf("prov_%d", time.Now().UnixNano())
+	if _, err := exec.ExecContext(ctx,
+		`INSERT INTO provider_settings (id, provider_type, provider_key, display_name, enabled, priority, config_json, auth_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)`,
+		id, p.Type, p.Key, display, enabled, p.Priority, string(configJSON), now, now); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// updateProvider upserts a single provider (PUT). Kept for API completeness; the UI uses
+// the bulk POST path.
+func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {
+	var p providerInput
+	if err := decodeJSONRequestBody(r.Body, &p, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	normalized, err := normalizeProviderInput(p)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	id, err := h.upsertProvider(r.Context(), normalized)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := h.ReloadProviders(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+func (h *Handler) deleteProvider(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing id"))
+		return
+	}
+
+	_, err := h.store.DB().ExecContext(r.Context(), `DELETE FROM provider_settings WHERE id=?`, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err := h.ReloadProviders(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

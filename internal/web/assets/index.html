@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pool · 用户中心</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+<!-- AUTH (login / register) — rendered by core.js via portal.js -->
+<div id="authView"><div class="authwrap"><div class="authcard"><div class="empty" data-i18n="common.loading">加载中…</div></div></div></div>
+
+<!-- USER PORTAL SHELL -->
+<div id="appShell" class="hide">
+<div class="app" id="appGrid">
+  <aside class="side" id="sidebar">
+    <div class="brand"><div class="logo">CP</div><div><b>Pool</b><small data-i18n="brand.portal">用户中心 · 自助控制台</small></div></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="foot"><span data-i18n="brand.sub">Codex · Claude · 多供应商中转</span><br>v0.4</div>
+  </aside>
+  <main class="main">
+    <div class="top">
+      <button class="iconbtn" id="hamburger" title="menu" aria-label="menu" style="display:none"></button>
+      <h1 id="title"></h1>
+      <div class="sp"></div>
+      <button class="iconbtn" id="refreshBtn" onclick="refreshAll()" data-i18n-title="act.refresh" data-i18n-aria="act.refresh" title="刷新" aria-label="刷新"></button>
+      <span class="dot" id="hdot"></span>
+      <button class="iconbtn" id="themeBtn" onclick="toggleTheme()" data-i18n-title="common.theme" data-i18n-aria="common.theme" title="主题" aria-label="主题"></button>
+      <div class="seg" id="langSeg" role="group" aria-label="language"><button onclick="setLang('zh')">中</button><button onclick="setLang('en')">EN</button></div>
+      <div class="usermenu" id="userMenu"></div>
+    </div>
+
+    <!-- USER CONSOLE VIEWS -->
+    <section data-view="dashboard" class="hide"><div id="dashView"><div class="empty" data-i18n="common.loading">加载中…</div></div></section>
+    <section data-view="mykeys" class="hide"><div id="mykeysView"></div></section>
+    <section data-view="myusage" class="hide"><div id="myusageView"></div></section>
+    <section data-view="models" class="hide"><div id="modelsView"></div></section>
+    <section data-view="mysettings" class="hide"><div id="mysettingsView"></div></section>
+    <datalist id="modelOpts"></datalist>
+  </main>
+</div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="i18n.js"></script>
+<script src="icons.js"></script>
+<script src="components.js"></script>
+<script src="core.js"></script>
+<script src="charts.js"></script>
+<script src="user.js"></script>
+<script src="portal.js"></script>
+<script>
+  // mobile sidebar toggle
+  (function () {
+    function wire() {
+      var hb = document.getElementById("hamburger");
+      if (hb) { hb.innerHTML = (typeof icon === "function" ? icon("menu") : "≡"); hb.style.display = window.innerWidth <= 760 ? "grid" : "none"; hb.onclick = function () { document.getElementById("sidebar").classList.toggle("show"); }; }
+    }
+    window.addEventListener("resize", wire); window.addEventListener("DOMContentLoaded", wire);
+  })();
+</script>
+</body>
+</html>
