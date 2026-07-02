@@ -1,0 +1,147 @@
+.pool-app-layout {
+  min-height: 100vh;
+  background: var(--pool-bg-page);
+  color: var(--pool-text);
+}
+
+.pool-app-layout.pool-layout,
+.pool-main-layout.pool-layout {
+  display: block;
+}
+
+.pool-layout {
+  display: flex;
+  min-height: 100%;
+}
+
+.pool-main-layout {
+  min-height: 100vh;
+  width: auto;
+}
+
+.pool-sider {
+  background: var(--pool-bg-surface);
+  border-right: 1px solid var(--pool-border);
+}
+
+.pool-header {
+  background: var(--pool-bg-surface);
+  border-bottom: 1px solid var(--pool-border);
+}
+
+.pool-content {
+  min-height: calc(100vh - 56px);
+}
+
+.pool-shell {
+  width: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 22px;
+}
+
+.pool-brand {
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 10px;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--pool-text);
+}
+
+.pool-sidebar-collapse {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-top: 1px solid var(--pool-border);
+}
+
+.pool-topbar-left,
+.pool-topbar-actions {
+  min-width: 0;
+}
+
+.pool-topbar-title {
+  min-width: 0;
+}
+
+.pool-topbar-current,
+.pool-topbar-title-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-pagehead {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.pool-pagehead-copy {
+  min-width: 0;
+}
+
+.pool-pagehead .sub {
+  color: var(--pool-text-2);
+  margin-top: 4px;
+}
+
+.pool-pagehead-actions,
+.pool-page-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pool-page-actions > * {
+  flex: 0 0 auto;
+}
+
+.pool-resource-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .pool-shell {
+    padding: 16px;
+  }
+
+  .pool-pagehead {
+    flex-direction: column;
+  }
+
+  .pool-pagehead-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .pool-resource-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .pool-shell {
+    padding: 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  .pool-page-actions {
+    width: 100%;
+  }
+
+  .pool-page-actions > * {
+    max-width: 100%;
+  }
+}

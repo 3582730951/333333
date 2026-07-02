@@ -1,5 +1,5 @@
 import React from 'react';
-import { Toast, Typography } from '@douyinfe/semi-ui';
+import { Toast, Typography } from './pool/index.jsx';
 import { errMsg, errRequestID } from '../api.js';
 import RequestIDLine from './RequestIDLine.jsx';
 

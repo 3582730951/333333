@@ -1,5 +1,5 @@
 import React from 'react';
-import { Typography } from '@douyinfe/semi-ui';
+import { Typography } from './pool/index.jsx';
 
 // Consistent page header: title + optional subtitle on the left, actions on the right.
 export default function PageHeader({ title, subtitle, actions }) {
@@ -30,7 +30,7 @@ export function Panel({ title, extra, children, style }) {
 }
 
 // Horizontal usage/percent meter (CPU/mem/disk/quota).
-export function Meter({ label, pct, color = 'var(--semi-color-primary)', right }) {
+export function Meter({ label, pct, color = 'var(--pool-accent)', right }) {
   const p = Math.max(0, Math.min(100, Number(pct) || 0));
   return (
     <div style={{ marginBottom: 12 }}>

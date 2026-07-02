@@ -17,16 +17,16 @@ if (!/className="actions pool-page-actions"/.test(headerSource)) {
   problems.push('PageHeader.jsx actions wrapper must keep both legacy actions and pool-page-actions classes.');
 }
 
-const themeFile = path.join(root, 'src', 'theme.css');
-const themeSource = fs.readFileSync(themeFile, 'utf8');
+const layoutFile = path.join(root, 'src', 'styles', 'layout.css');
+const layoutSource = fs.readFileSync(layoutFile, 'utf8');
 for (const required of [
   '.pool-pagehead-copy',
   '.pool-page-actions',
   '.pool-page-actions > *',
   '@media (max-width: 520px)',
 ]) {
-  if (!themeSource.includes(required)) {
-    problems.push(`theme.css must include responsive PageHeader action layout rule ${required}.`);
+  if (!layoutSource.includes(required)) {
+    problems.push(`styles/layout.css must include responsive PageHeader action layout rule ${required}.`);
   }
 }
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Tag, Button } from '@douyinfe/semi-ui';
-import { IconRefresh, IconPlus, IconUser, IconKey, IconSetting, IconLineChartStroked } from '@douyinfe/semi-icons';
+import { Tag, Button } from '../components/pool/index.jsx';
+import { IconRefresh, IconPlus, IconUser, IconKey, IconSetting, IconLineChartStroked } from '../components/pool/icons.jsx';
 import { useNavigate } from 'react-router-dom';
 import { get } from '../api.js';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
@@ -148,7 +148,7 @@ export default function Dashboard() {
           {d.health?.ok ? <Tag color="green">服务正常</Tag> : <Tag color="red">服务异常</Tag>}
           <Button icon={<IconRefresh />} onClick={load} loading={loading}>刷新</Button>
           {!loading && (
-            <span style={{ fontSize: 12, color: 'var(--semi-color-text-3)' }}>
+            <span style={{ fontSize: 12, color: 'var(--pool-text-3)' }}>
               {formatLastRefresh()} · {pageVisible ? `${countdown}s 后自动刷新` : '后台暂停自动刷新'}
             </span>
           )}
@@ -164,7 +164,7 @@ export default function Dashboard() {
         flexWrap: 'wrap',
         alignItems: 'center',
       }}>
-        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--semi-color-text-2)', marginRight: 4 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--pool-text-2)', marginRight: 4 }}>
           快捷操作
         </span>
         <Button icon={<IconPlus />} type="primary" onClick={() => navigate('/accounts?action=import')}>

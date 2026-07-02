@@ -1,6 +1,6 @@
-import React, { useState, useCallback, useRef } from 'react';
-import { Button, Toast, Tag, Modal, Form } from '@douyinfe/semi-ui';
-import { IconRefresh, IconEdit, IconPlus } from '@douyinfe/semi-icons';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import { ActionMenu, Button, Toast, Tag, Modal, Form, Select, Typography } from '../components/pool/index.jsx';
+import { IconRefresh, IconEdit, IconPlus } from '../components/pool/icons.jsx';
 import { get, post } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -17,7 +17,7 @@ const AUTH_MODES = [
   { value: 'api_whitelist', label: 'API 白名单模式 (api_whitelist)', desc: '调 api.cliproxy.io/white/api 提取 ip:port，无认证，按 region 锁国家。' },
 ];
 
-const EMPTY_EGRESS = { profiles: [], pools: [], groups: [], error: null };
+const EMPTY_EGRESS = { profiles: [], pools: [], config: [], error: null };
 
 const formatDynamicConfig = (value) => {
   if (!value) return '{}';
@@ -40,29 +40,30 @@ export default function Egress() {
   const [editing, setEditing] = useState(null); // null | {} (new) | existing row
   const [poolEditing, setPoolEditing] = useState(null);
   const [memberEditing, setMemberEditing] = useState(null);
-  const [policyEditing, setPolicyEditing] = useState(null);
+  const [registrationPoolDraft, setRegistrationPoolDraft] = useState('');
   const formApi = useRef(null);
   const poolFormApi = useRef(null);
   const memberFormApi = useRef(null);
-  const policyFormApi = useRef(null);
 
   const fetchRows = useCallback(async ({ signal }) => {
     const { values, error } = await loadResourceGroup({
       profiles: { label: '出口配置', load: () => get('/admin/egress-profiles', undefined, { signal }) },
       pools: { label: '出口池', load: () => get('/admin/egress-pools', undefined, { signal }) },
-      groups: { label: '分组', load: () => get('/admin/groups', undefined, { signal }) },
+      config: { label: '系统配置', load: () => get('/admin/config', undefined, { signal }) },
     });
     return {
       profiles: Array.isArray(values.profiles) ? values.profiles : values.profiles?.profiles || values.profiles?.egress_profiles || [],
       pools: Array.isArray(values.pools) ? values.pools : values.pools?.pools || [],
-      groups: Array.isArray(values.groups) ? values.groups : values.groups?.groups || [],
+      config: Array.isArray(values.config) ? values.config : [],
       error,
     };
   }, []);
   const { data = EMPTY_EGRESS, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: EMPTY_EGRESS });
   const rows = data.profiles || [];
   const pools = data.pools || [];
-  const groups = data.groups || [];
+  const configRows = data.config || [];
+  const registrationPoolSetting = configRows.find((row) => row.key === 'registration_egress_pool_id')?.value || '';
+  const registrationPools = pools.filter((pool) => !pool.purpose || pool.purpose === 'registration');
   const healthyCount = rows.filter((row) => !row.health || row.health === 'healthy').length;
   const proxyCount = rows.filter((row) => row.type && row.type !== 'direct').length;
   const concurrencyTotal = rows.reduce((sum, row) => sum + (Number(row.max_concurrency) || 0), 0);
@@ -73,6 +74,10 @@ export default function Egress() {
     { label: '出口池', value: pools.length },
     { label: '总并发', value: concurrencyTotal },
   ];
+
+  useEffect(() => {
+    setRegistrationPoolDraft(registrationPoolSetting);
+  }, [registrationPoolSetting]);
 
   const openEdit = (row) => {
     setEditing(row ? { ...row, dynamic_config_json: formatDynamicConfig(row.dynamic_config_json) } : {
@@ -127,27 +132,13 @@ export default function Egress() {
     }
   });
 
-  const loadPolicy = useCallback(async (groupName) => {
-    const name = groupName || groups[0]?.name || 'cyber';
-    const policy = await get(`/admin/groups/${encodeURIComponent(name)}/egress-policy`);
-    setPolicyEditing({
-      group_name: name,
-      registration_pool_id: policy.registration_pool_id || '',
-      runtime_pool_id: policy.runtime_pool_id || '',
-      assignment_strategy: policy.assignment_strategy || 'sticky_least_used',
-    });
-  }, [groups]);
-
-  const { run: savePolicy, running: savingPolicy } = useAsyncAction(async (vals) => {
+  const { run: saveRegistrationPool, running: savingRegistrationPool } = useAsyncAction(async () => {
     try {
-      const groupName = vals.group_name || policyEditing?.group_name || groups[0]?.name || 'cyber';
-      await post(`/admin/groups/${encodeURIComponent(groupName)}/egress-policy`, {
-        registration_pool_id: vals.registration_pool_id || '',
-        runtime_pool_id: vals.runtime_pool_id || '',
-        assignment_strategy: vals.assignment_strategy || 'sticky_least_used',
-      });
-      Toast.success('分组出口策略已保存');
-      setPolicyEditing(null);
+      await post('/admin/settings-center', [{
+        section: 'config',
+        values: { registration_egress_pool_id: registrationPoolDraft || '' },
+      }]);
+      Toast.success('自动注册出口池已保存');
       await load();
     } catch (err) {
       showErrorToast(err);
@@ -249,10 +240,13 @@ export default function Egress() {
       key: 'ops',
       width: 160,
       render: (_, row) => (
-        <ActionGroup minWidth={140} compact>
-          <Button size="small" icon={<IconEdit />} onClick={() => setPoolEditing({ ...row })}>编辑</Button>
-          <Button size="small" icon={<IconPlus />} onClick={() => setMemberEditing({ id: row.id, egress_id: '', enabled: true, capacity: 0 })}>成员</Button>
-        </ActionGroup>
+        <ActionMenu
+          label="出口池操作"
+          items={[
+            { label: '编辑', icon: <IconEdit />, onSelect: () => setPoolEditing({ ...row }) },
+            { label: '成员', icon: <IconPlus />, onSelect: () => setMemberEditing({ id: row.id, egress_id: '', enabled: true, capacity: 0 }) },
+          ]}
+        />
       ),
     },
   ];
@@ -281,11 +275,28 @@ export default function Egress() {
     <div>
       <PageHeader title="出口 / 代理" subtitle={`共 ${rows.length} 个出口 · curl_cffi sidecar / 住宅代理 / WARP / CLIPProxy`}
         actions={<>
-          <Button icon={<IconEdit />} onClick={() => loadPolicy(groups[0]?.name || 'cyber')}>分组策略</Button>
-          <Button icon={<IconPlus />} onClick={() => setPoolEditing({ id: '', name: '', purpose: 'runtime', assignment_strategy: 'sticky_least_used' })}>新建出口池</Button>
+          <Button icon={<IconPlus />} onClick={() => setPoolEditing({ id: '', name: '', purpose: 'registration', assignment_strategy: 'sticky_least_used' })}>新建出口池</Button>
           <Button icon={<IconPlus />} onClick={() => openEdit(null)}>新建</Button>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
         </>} />
+      <div className="pool-toolbar pool-egress-registration-toolbar">
+        <Typography.Text strong>自动注册出口池</Typography.Text>
+        <Select
+          value={registrationPoolDraft}
+          onChange={setRegistrationPoolDraft}
+          optionList={[
+            { label: '未设置', value: '' },
+            ...(registrationPools || []).map((pool) => ({ label: `${pool.name || pool.id} (${pool.members?.length || 0})`, value: pool.id })),
+          ]}
+          style={{ width: 260 }}
+        />
+        <Button
+          size="small"
+          loading={savingRegistrationPool}
+          disabled={registrationPoolDraft === registrationPoolSetting}
+          onClick={saveRegistrationPool}
+        >保存</Button>
+      </div>
       <div className="pool-resource-split">
         <ResourceTable
           error={error}
@@ -324,7 +335,7 @@ export default function Egress() {
         scroll={false}
         rowHeight={64}
         emptyTitle="暂无出口池"
-        emptyDesc="创建 registration/runtime 池后，注册任务和账号绑定会按策略分配出口"
+        emptyDesc="创建 registration 池后，注册任务可从池内选择代理出口"
         emptyType="egress"
         skeletonRows={4}
       />
@@ -421,10 +432,9 @@ export default function Egress() {
             onSubmit={savePool}
             labelPosition="top"
           >
-            <Form.Input field="id" label="ID" disabled={!!poolEditing.id} placeholder="pool_runtime_cuff" />
-            <Form.Input field="name" label="名称" placeholder="运行期 cuff 出口池" />
+            <Form.Input field="id" label="ID" disabled={!!poolEditing.id} placeholder="pool_registration_proxy" />
+            <Form.Input field="name" label="名称" placeholder="自动注册代理池" />
             <Form.Select field="purpose" label="用途" optionList={[
-              { value: 'runtime', label: 'runtime - 账号运行出口' },
               { value: 'registration', label: 'registration - 注册代理池' },
               { value: 'custom', label: 'custom' },
             ]} />
@@ -462,46 +472,6 @@ export default function Egress() {
             }))} />
             <Form.Switch field="enabled" label="启用成员" />
             <Form.InputNumber field="capacity" label="容量（0=使用出口并发）" min={0} max={10000} />
-          </Form>
-        )}
-      </Modal>
-
-      <Modal
-        title="分组出口策略"
-        visible={!!policyEditing}
-        onCancel={() => {
-          if (savingPolicy) return;
-          policyFormApi.current = null;
-          setPolicyEditing(null);
-        }}
-        onOk={() => policyFormApi.current?.submitForm?.()}
-        confirmLoading={savingPolicy}
-        maskClosable={!savingPolicy}
-        width={560}
-      >
-        {policyEditing && (
-          <Form
-            key={policyEditing.group_name}
-            getFormApi={(api) => { policyFormApi.current = api; }}
-            initValues={policyEditing}
-            onSubmit={savePolicy}
-            labelPosition="top"
-          >
-            <Form.Select field="group_name" label="分组" optionList={(groups.length ? groups : [{ name: 'cyber' }]).map((group) => ({
-              label: group.name,
-              value: group.name,
-            }))} onChange={(v) => loadPolicy(v)} />
-            <Form.Select field="registration_pool_id" label="注册代理池" optionList={[
-              { label: '未设置', value: '' },
-              ...pools.filter((p) => !p.purpose || p.purpose === 'registration').map((p) => ({ label: p.name || p.id, value: p.id })),
-            ]} />
-            <Form.Select field="runtime_pool_id" label="注册后账号出口池" optionList={[
-              { label: '未设置', value: '' },
-              ...pools.filter((p) => !p.purpose || p.purpose === 'runtime').map((p) => ({ label: p.name || p.id, value: p.id })),
-            ]} />
-            <Form.Select field="assignment_strategy" label="分配策略" optionList={[
-              { label: 'sticky_least_used', value: 'sticky_least_used' },
-            ]} />
           </Form>
         )}
       </Modal>

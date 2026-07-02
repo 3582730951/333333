@@ -1,6 +1,6 @@
 import React, { useCallback } from 'react';
-import { Button, Progress, Tag, Toast } from '@douyinfe/semi-ui';
-import { IconRefresh, IconDownload } from '@douyinfe/semi-icons';
+import { Button, Progress, Tag, Toast } from '../components/pool/index.jsx';
+import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
 import { get } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -8,7 +8,7 @@ import useAsyncResource from '../hooks/useAsyncResource.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtTokens, fmtRelative } from '../lib/format.js';
 
-const pctColor = (p) => (p >= 90 ? 'var(--semi-color-danger)' : p >= 70 ? 'var(--semi-color-warning)' : 'var(--semi-color-success)');
+const pctColor = (p) => (p >= 90 ? 'var(--pool-danger)' : p >= 70 ? 'var(--pool-warning)' : 'var(--pool-success)');
 
 export default function Quota() {
   const fetchRows = useCallback(async ({ signal }) => {

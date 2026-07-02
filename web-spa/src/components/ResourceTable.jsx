@@ -1,5 +1,5 @@
 import React from 'react';
-import { Table } from '@douyinfe/semi-ui';
+import { Table } from './pool/index.jsx';
 import EmptyState from './EmptyState.jsx';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
 import { TableSkeleton } from './Skeleton.jsx';

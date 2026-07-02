@@ -330,36 +330,27 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		return invalidRegisterRequest("group %q not found", req.GroupName)
 	}
 
-	req.RegistrationEgressPoolID = strings.TrimSpace(req.RegistrationEgressPoolID)
-	req.RuntimeEgressPoolID = strings.TrimSpace(req.RuntimeEgressPoolID)
-	if policy, err := h.store.GetGroupEgressPolicy(ctx, req.GroupName); err == nil {
-		if req.RegistrationEgressPoolID == "" {
-			req.RegistrationEgressPoolID = strings.TrimSpace(policy.RegistrationPoolID)
-		}
-		if req.RuntimeEgressPoolID == "" {
-			req.RuntimeEgressPoolID = strings.TrimSpace(policy.RuntimePoolID)
-		}
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("read group egress policy: %w", err)
-	}
-	if req.RegistrationEgressPoolID == "" {
-		return invalidRegisterRequest("registration_egress_pool_id is required; configure group %q egress policy or pass a registration pool", req.GroupName)
-	}
-	if req.RuntimeEgressPoolID == "" {
-		return invalidRegisterRequest("runtime_egress_pool_id is required; configure group %q egress policy or pass a runtime pool", req.GroupName)
-	}
-	if _, err := h.store.SelectEgressFromPool(ctx, req.RegistrationEgressPoolID); err != nil {
-		return invalidRegisterRequest("registration egress pool %q is not usable: %v", req.RegistrationEgressPoolID, err)
-	}
-	if _, err := h.store.SelectEgressFromPool(ctx, req.RuntimeEgressPoolID); err != nil {
-		return invalidRegisterRequest("runtime egress pool %q is not usable: %v", req.RuntimeEgressPoolID, err)
-	}
 	req.EgressID = strings.TrimSpace(req.EgressID)
 	if req.EgressID != "" {
 		if _, err := h.store.GetEgressProfile(ctx, req.EgressID); err != nil {
 			return invalidRegisterRequest("egress %q not found", req.EgressID)
 		}
+		req.RegistrationEgressPoolID = ""
+	} else {
+		req.RegistrationEgressPoolID = strings.TrimSpace(req.RegistrationEgressPoolID)
+		if req.RegistrationEgressPoolID == "" {
+			if poolID, ok := h.setting(ctx, "registration_egress_pool_id"); ok {
+				req.RegistrationEgressPoolID = strings.TrimSpace(poolID)
+			}
+		}
+		if req.RegistrationEgressPoolID == "" {
+			return invalidRegisterRequest("registration_egress_pool_id is required; configure the default registration egress pool or pass a registration pool")
+		}
+		if _, err := h.store.SelectEgressFromPool(ctx, req.RegistrationEgressPoolID); err != nil {
+			return invalidRegisterRequest("registration egress pool %q is not usable: %v", req.RegistrationEgressPoolID, err)
+		}
 	}
+	req.RuntimeEgressPoolID = ""
 
 	req.IdentityMode = strings.ToLower(strings.TrimSpace(req.IdentityMode))
 	switch req.IdentityMode {
@@ -645,13 +636,11 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 }
 
 func (h *Handler) bindRegisteredAccountToRuntimePool(ctx context.Context, req pipeline.RegisterRequest, accountID string) error {
-	runtimePoolID := strings.TrimSpace(req.RuntimeEgressPoolID)
-	if runtimePoolID == "" {
-		return invalidRegisterRequest("runtime_egress_pool_id is required before binding registered account")
-	}
-	if _, err := h.store.AssignAccountToEgressPool(ctx, accountID, runtimePoolID); err != nil {
-		return fmt.Errorf("bind account %s to runtime egress pool %s: %w", accountID, runtimePoolID, err)
-	}
+	// Legacy compatibility hook: registered accounts keep the direct binding created
+	// by storage.UpsertAccount. Operators change runtime egress per account.
+	_ = ctx
+	_ = req
+	_ = accountID
 	return nil
 }
 

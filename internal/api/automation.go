@@ -417,7 +417,6 @@ func (s *Server) autoRefill(ctx context.Context, p *Policy) {
 		Count:                    need,
 		GroupName:                strFromConfig(p.Config, "group", ""),
 		RegistrationEgressPoolID: strFromConfig(p.Config, "registration_egress_pool_id", ""),
-		RuntimeEgressPoolID:      strFromConfig(p.Config, "runtime_egress_pool_id", ""),
 		SMSProvider:              strFromConfig(p.Config, "sms_provider", ""),
 	}
 	jobID, err := s.regHandler.StartJob(ctx, req)

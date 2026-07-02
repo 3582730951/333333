@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { Button, Modal, Form, Toast, Tag, Popconfirm } from '@douyinfe/semi-ui';
-import { IconRefresh, IconPlus } from '@douyinfe/semi-icons';
+import { ActionMenu, Button, Modal, Form, Toast, Tag } from '../components/pool/index.jsx';
+import { IconDelete, IconEdit, IconRefresh, IconPlus } from '../components/pool/icons.jsx';
 import { get, post, patch, del } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -60,12 +60,29 @@ export default function Users() {
   });
 
   const renderUserActions = (r) => (
-    <div className="pool-row-actions">
-      <Button size="small" disabled={saving || removing} onClick={() => setEdit({ mode: 'edit', user: r })}>编辑</Button>
-      <Popconfirm title={`删除用户 ${r.email}？`} onConfirm={() => remove(r.id)}>
-        <Button size="small" type="danger" loading={isRemoving(r.id)} disabled={saving || (removing && !isRemoving(r.id))}>删除</Button>
-      </Popconfirm>
-    </div>
+    <ActionMenu
+      label="用户操作"
+      items={[
+        {
+          label: '编辑',
+          icon: <IconEdit />,
+          disabled: saving || removing,
+          onSelect: () => setEdit({ mode: 'edit', user: r }),
+        },
+        {
+          label: isRemoving(r.id) ? '删除中' : '删除用户',
+          icon: <IconDelete />,
+          destructive: true,
+          disabled: saving || (removing && !isRemoving(r.id)),
+          confirm: {
+            title: `删除用户 ${r.email}？`,
+            description: '删除后该用户将无法继续使用门户访问。',
+            confirmText: '删除',
+          },
+          onSelect: () => remove(r.id),
+        },
+      ]}
+    />
   );
 
   const cols = [
@@ -75,7 +92,7 @@ export default function Users() {
     { title: '状态', dataIndex: 'status', width: 96, sorter: (a, b) => String(a.status || '').localeCompare(String(b.status || '')), render: (v) => <Tag color={v === 'active' ? 'green' : 'grey'}>{v}</Tag> },
     { title: '创建时间', dataIndex: 'created_at', width: 180, sorter: (a, b) => (a.created_at || 0) - (b.created_at || 0), defaultSortOrder: 'descend', render: fmtDateTime },
     {
-      title: '操作', width: 132, render: (_, r) => (
+      title: '操作', width: 90, render: (_, r) => (
         renderUserActions(r)
       ),
     },

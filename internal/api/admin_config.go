@@ -613,10 +613,10 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	return nil
 }
 
-// adminGroupAction handles the /admin/groups/<name> subtree: PATCH updates the group
-// (any group — generalizing the old cyber-only path), DELETE removes it (guarded against
-// the default group and non-empty groups), and POST <name>/assign-egress bulk-sets the
-// egress pool for every active account in the group.
+// adminGroupAction handles the /admin/groups/<name> subtree. PATCH/DELETE are the
+// active group-management surface. The assign-egress and egress-policy subroutes are
+// retained for legacy clients only; the console and runtime routing no longer use group
+// egress policy to decide an account's default outlet.
 func (s *Server) adminGroupAction(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -726,10 +726,9 @@ func (s *Server) adminGroupEgressPolicy(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-// adminGroupAssignEgress bulk-sets the primary and/or standby egress pool for EVERY
-// active account in the group, so an operator can route a whole group off the shared VPS
-// IP (or onto a WARP/proxy standby pool) in one call instead of per account. This is the
-// per-account egress diversity control — the shared-IP CF mitigation at the source.
+// adminGroupAssignEgress is a legacy bulk compatibility endpoint. Runtime routing still
+// reads only the per-account binding written here; the group itself is not consulted by
+// schedulers, registration, imports, or account moves.
 func (s *Server) adminGroupAssignEgress(w http.ResponseWriter, r *http.Request, groupName string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)

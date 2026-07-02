@@ -1,4 +1,13 @@
-export const PALETTE = ['#3b82f6', '#22c55e', '#8b5cf6', '#f59e0b', '#06b6d4', '#ef4444', '#ec4899', '#14b8a6'];
+export const PALETTE = [
+  'var(--chart-blue)',
+  'var(--chart-green)',
+  'var(--chart-purple)',
+  'var(--chart-orange)',
+  'var(--pool-info)',
+  'var(--chart-red)',
+  'var(--pool-purple)',
+  'var(--pool-success)',
+];
 
 export const COLORS = {
   blue: PALETTE[0],
@@ -9,7 +18,7 @@ export const COLORS = {
   red: PALETTE[5],
   pink: PALETTE[6],
   teal: PALETTE[7],
-  grey: '#94a3b8',
+  grey: 'var(--chart-gray)',
 };
 
 export function modelColor(name) {

@@ -1,6 +1,6 @@
 import React from 'react';
-import { Button } from '@douyinfe/semi-ui';
-import { IconInbox, IconPlus, IconRefresh, IconFile, IconKey, IconSetting } from '@douyinfe/semi-icons';
+import { Button } from './pool/index.jsx';
+import { IconInbox, IconPlus, IconRefresh, IconFile, IconKey, IconSetting } from './pool/icons.jsx';
 
 // Consistent empty state with icon + hint + optional CTA, used as Table `empty`.
 export default function EmptyState({
@@ -40,14 +40,14 @@ export default function EmptyState({
     <div style={{
       padding: '48px 0',
       textAlign: 'center',
-      background: 'var(--semi-color-bg-0)',
+      background: 'var(--pool-bg-page)',
       borderRadius: 8,
-      border: '1px dashed var(--semi-color-border)',
+      border: '1px dashed var(--pool-border)',
       margin: '16px 0'
     }}>
       <div style={{
         fontSize: 36,
-        color: 'var(--semi-color-text-3)',
+        color: 'var(--pool-text-3)',
         marginBottom: 8,
         lineHeight: 1.4,
         display: 'flex',
@@ -60,7 +60,7 @@ export default function EmptyState({
       <div style={{
         fontSize: 15,
         fontWeight: 600,
-        color: 'var(--semi-color-text-1)',
+        color: 'var(--pool-text)',
         marginBottom: 4
       }}>
         {title}

@@ -1,0 +1,62 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--pool-bg-page);
+  color: var(--pool-text);
+  font-family: var(--pool-font-sans);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+a {
+  color: var(--pool-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+::selection {
+  background: var(--pool-accent-soft);
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--pool-focus);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--pool-bg-page);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--pool-bg-surface-3);
+  border-radius: 999px;
+  border: 2px solid var(--pool-bg-page);
+}

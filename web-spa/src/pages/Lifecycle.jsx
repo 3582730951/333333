@@ -1,15 +1,16 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { Button, Modal, Form, Toast, Tag, Progress, SideSheet, Typography, Popconfirm } from '@douyinfe/semi-ui';
-import { IconRefresh, IconPlus } from '@douyinfe/semi-icons';
+import { ActionMenu, Button, Modal, Form, Toast, Tag } from '../components/pool/index.jsx';
+import { IconDelete, IconFile, IconRefresh, IconPlus } from '../components/pool/icons.jsx';
 import { get, post, del } from '../api.js';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
+import { LogStream, ServiceHealthStrip, TaskDetailDrawer, TaskProgress } from '../components/WorkflowPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
-import useLifecycleTaskLogs, { lifecycleLogKey } from '../hooks/useLifecycleTaskLogs.js';
+import useLifecycleTaskLogs from '../hooks/useLifecycleTaskLogs.js';
 import useVisibleInterval from '../hooks/useVisibleInterval.js';
 import { fmtDateTime } from '../lib/format.js';
 import { loadResourceGroup } from '../lib/resource.js';
@@ -124,23 +125,39 @@ export default function Lifecycle() {
     { title: '出口', dataIndex: 'egress_id', render: (v) => v ? <Tag size="small">{v}</Tag> : '—' },
     { title: '状态', dataIndex: 'status', render: statusTag },
     {
-      title: '进度', render: (_, r) => {
-        const pct = r.target_count ? Math.round(((r.completed_count || 0) / r.target_count) * 100) : 0;
-        return <div style={{ minWidth: 120 }}><Progress percent={pct} showInfo size="small" /></div>;
-      },
+      title: '进度',
+      render: (_, r) => (
+        <TaskProgress
+          task={r}
+          totalKey="target_count"
+          completedKey="completed_count"
+          successKey="success_count"
+          failedKey="failed_count"
+        />
+      ),
     },
-    { title: '成功 / 失败', render: (_, r) => <span><span style={{ color: 'var(--semi-color-success)' }}>{r.success_count || 0}</span> / <span style={{ color: 'var(--semi-color-danger)' }}>{r.failed_count || 0}</span></span> },
+    { title: '成功 / 失败', render: (_, r) => <span><span className="pool-success-text">{r.success_count || 0}</span> / <span className="pool-danger-text">{r.failed_count || 0}</span></span> },
     { title: '创建时间', dataIndex: 'created_at', render: fmtDateTime },
     {
       title: '操作', render: (_, r) => (
-        <div style={{ display: 'flex', gap: 6 }}>
-          <Button size="small" onClick={() => openLogs(r)}>日志</Button>
-          {(r.status === 'pending' || r.status === 'running') && (
-            <Popconfirm title="取消该任务？" onConfirm={() => cancel(r.id)}>
-              <Button size="small" type="danger" loading={isCancelling(r.id)} disabled={creating || (cancelling && !isCancelling(r.id))}>取消</Button>
-            </Popconfirm>
-          )}
-        </div>
+        <ActionMenu
+          label="任务操作"
+          items={[
+            { label: '详情 / 日志', icon: <IconFile />, onSelect: () => openLogs(r) },
+            {
+              label: isCancelling(r.id) ? '取消中' : '取消任务',
+              icon: <IconDelete />,
+              destructive: true,
+              disabled: !['pending', 'running'].includes(r.status) || creating || (cancelling && !isCancelling(r.id)),
+              confirm: {
+                title: '取消该任务？',
+                description: `任务 ${r.id} 将被取消，已完成的结果不会回滚。`,
+                confirmText: '取消任务',
+              },
+              onSelect: () => cancel(r.id),
+            },
+          ]}
+        />
       ),
     },
   ];
@@ -156,18 +173,7 @@ export default function Lifecycle() {
       <LoadErrorBanner error={error || lifecycle.error} onRetry={load} />
       <LoadErrorBanner error={optionsError || options.error} onRetry={reloadOptions} title="表单选项读取失败" />
 
-      {services.length > 0 && (
-        <div style={{ marginBottom: 12, padding: '10px 12px', border: '1px solid var(--semi-color-border)', borderRadius: 6, background: 'var(--semi-color-fill-0)' }}>
-          <Typography.Text strong style={{ marginRight: 12 }}>外部服务</Typography.Text>
-          {services.map((svc) => (
-            <span key={svc.name} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginRight: 14, marginBottom: 4 }}>
-              <span>{svc.name}</span>
-              {statusTag(svc.status)}
-              {svc.last_error ? <Typography.Text type="danger" size="small">{svc.last_error}</Typography.Text> : null}
-            </span>
-          ))}
-        </div>
-      )}
+      <ServiceHealthStrip services={services} renderStatus={statusTag} />
 
       <ResourceTable
         loading={loading}
@@ -179,6 +185,7 @@ export default function Lifecycle() {
         emptyTitle="暂无任务"
         skeletonRows={6}
         skeletonCols={8}
+        onRow={(row) => ({ onClick: () => openLogs(row) })}
       />
 
       <Modal title="新建生命周期任务" visible={createOpen} onCancel={() => setCreateOpen(false)} onOk={create} confirmLoading={creating} okText="创建" width={560}>
@@ -207,27 +214,15 @@ export default function Lifecycle() {
         </Form>
       </Modal>
 
-      <SideSheet
-        title={logTask ? `任务日志 · ${logTask.id}` : '任务日志'}
+      <TaskDetailDrawer
+        task={logTask}
         visible={!!logTask}
-        onCancel={() => setLogTask(null)}
-        width={560}
+        onClose={() => setLogTask(null)}
+        title={logTask ? `生命周期任务 · ${logTask.id}` : '生命周期任务'}
+        status={logTask ? statusTag(logTask.status) : null}
       >
-        <LoadErrorBanner error={logError} onRetry={logTask ? reloadLogs : undefined} title="任务日志读取失败" />
-        {logTask ? (
-          <div style={{ marginBottom: 10 }}>
-            <Tag color={logStreaming ? 'green' : 'grey'}>{logStreaming ? '实时连接中' : '实时连接断开'}</Tag>
-          </div>
-        ) : null}
-        {!logs.length && <Typography.Text type="tertiary">暂无日志</Typography.Text>}
-        <div className="pool-mono" style={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
-          {logs.map((l, i) => (
-            <div key={lifecycleLogKey(l, i)}>
-              <span className="pool-muted">[{fmtDateTime(l.timestamp)}]</span> <Tag size="small" color={l.level === 'error' ? 'red' : 'grey'}>{l.level || 'info'}</Tag> {l.message}
-            </div>
-          ))}
-        </div>
-      </SideSheet>
+        <LogStream logs={logs} streaming={logStreaming} error={logError} onRetry={logTask ? reloadLogs : undefined} />
+      </TaskDetailDrawer>
     </div>
   );
 }

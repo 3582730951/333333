@@ -375,6 +375,11 @@ type Config struct {
 	// puppeteer-real-browser registrar (other_new_gpt_register) orchestrated per-job.
 	// Runtime-overridable via the "default_register_method" setting. Default "node".
 	DefaultRegisterMethod string `json:"default_register_method"`
+	// RegistrationEgressPoolID is the runtime-editable default pool used only for
+	// launching registration tasks when a request does not name an egress_id or
+	// registration_egress_pool_id. Registered accounts still keep their own direct
+	// account_egress_bindings default until an admin changes that account.
+	RegistrationEgressPoolID string `json:"registration_egress_pool_id"`
 	// LeakScrubEnabled hides pool-internal upstream signals from the downstream
 	// client: the x-codex-*/openai-model/x-ratelimit-* response headers, the
 	// informational rate-limit SSE frames, and limit/quota/overload/billing error
@@ -1089,6 +1094,7 @@ func (c *Config) normalize() {
 	if c.RegistrationTimeout <= 0 {
 		c.RegistrationTimeout = 300
 	}
+	c.RegistrationEgressPoolID = strings.TrimSpace(c.RegistrationEgressPoolID)
 	if c.DefaultSMSProvider == "" {
 		c.DefaultSMSProvider = "smsbower"
 	}

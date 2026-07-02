@@ -1,10 +1,10 @@
 import React, { Suspense, lazy, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Routes, Route, useNavigate, useLocation, Navigate } from 'react-router-dom';
-import { Layout, Nav, Button, Avatar, Toast, Spin } from '@douyinfe/semi-ui';
+import { Layout, Nav, Button, Avatar, Toast, Spin } from './components/pool/index.jsx';
 import {
   IconHome, IconUserGroup, IconSetting, IconHistogram, IconKey, IconMoon, IconSun,
   IconExit, IconPulse, IconList, IconLanguage, IconChevronDown,
-} from '@douyinfe/semi-icons';
+} from './components/pool/icons.jsx';
 import { clearToken, me, logout as apiLogout, isUnauthorizedError } from './api.js';
 import AppErrorBoundary, {
   isChunkLoadError,
@@ -13,7 +13,7 @@ import AppErrorBoundary, {
 } from './components/AppErrorBoundary.jsx';
 import LoadErrorBanner from './components/LoadErrorBanner.jsx';
 import useResponsiveLayout from './hooks/useResponsiveLayout.js';
-import { setDocumentBodyAttribute } from './lib/browserDocument.js';
+import { setDocumentElementAttribute } from './lib/browserDocument.js';
 import { addDocumentListener, addWindowListener, cancelBrowserIdleCallback, requestBrowserIdleCallback } from './lib/browserLifecycle.js';
 import { prefersReducedNetworkData } from './lib/browserNetwork.js';
 import { getLocalItem, setLocalItem } from './lib/browserStorage.js';
@@ -205,7 +205,7 @@ function renderRoutes(routes, fallbackPath) {
 
 export default function App() {
   const [auth, setAuth] = useState({ ready: false, authed: false, role: '', user: null, error: null });
-  const [dark, setDark] = useState(() => getLocalItem('pool_theme') === 'dark');
+  const [dark, setDark] = useState(() => getLocalItem('pool_theme') !== 'light');
   const [locale, setLocaleState] = useState(getLocale());
   const responsive = useResponsiveLayout();
   const [collapsed, setCollapsed] = useState(responsive.collapsedByWidth);
@@ -285,7 +285,7 @@ export default function App() {
   }, [accountMenuOpen]);
 
   useEffect(() => {
-    setDocumentBodyAttribute('theme-mode', dark ? 'dark' : null);
+    setDocumentElementAttribute('data-theme', dark ? 'dark' : 'light');
     setLocalItem('pool_theme', dark ? 'dark' : 'light');
   }, [dark]);
 
@@ -322,7 +322,7 @@ export default function App() {
   }
   if (auth.error) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, background: 'var(--semi-color-bg-0)' }}>
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, background: 'var(--pool-bg-page)' }}>
         <div style={{ width: 'min(560px, 100%)' }}>
           <LoadErrorBanner error={auth.error} onRetry={checkAuth} title="控制台连接失败" />
         </div>
@@ -349,7 +349,7 @@ export default function App() {
       {/* Mobile overlay */}
       {mobileOpen && (
         <div style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 999,
+          position: 'fixed', inset: 0, background: 'var(--pool-bg-overlay)', zIndex: 999,
           backdropFilter: 'blur(4px)', transition: 'opacity 0.3s ease'
         }} onClick={() => setMobileOpen(false)} />
       )}
@@ -366,7 +366,7 @@ export default function App() {
           height: '100vh',
           zIndex: 1000,
           transition: responsive.isMobile ? 'transform 0.3s ease' : 'none',
-          transform: mobileOpen ? 'translateX(0)' : undefined,
+          transform: responsive.isMobile ? (mobileOpen ? 'translateX(0)' : 'translateX(-100%)') : undefined,
         }}
         className={[
           responsive.isMobile && !mobileOpen ? 'sider-collapsed-mobile' : '',
@@ -374,7 +374,7 @@ export default function App() {
         ].filter(Boolean).join(' ')}
       >
         <div className="pool-brand" style={{ height: 56, borderBottom: '1px solid var(--pool-border)' }}>
-          <Avatar size="extra-small" style={{ background: 'var(--semi-color-primary)' }}>P</Avatar>
+          <Avatar size="extra-small" style={{ background: 'var(--pool-accent)' }}>P</Avatar>
           {!navCollapsed && <span style={{ marginLeft: 10 }}>{t('app.title')}</span>}
         </div>
         <Nav
@@ -434,12 +434,12 @@ export default function App() {
               style={{ display: responsive.isMobile ? 'flex' : 'none' }}
               aria-label="切换菜单"
             />
-            <div className="pool-topbar-title" style={{ fontWeight: 600, color: 'var(--semi-color-text-1)', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="pool-topbar-title" style={{ fontWeight: 600, color: 'var(--pool-text)', display: 'flex', alignItems: 'center', gap: 8 }}>
               <span className="pool-topbar-title-main">{isAdmin ? t('app.admin') : t('app.portal')}</span>
               {pageLabel ? (
                 <>
-                  <span className="pool-topbar-divider" style={{ color: 'var(--semi-color-text-3)' }}>·</span>
-                  <span className="pool-topbar-current" style={{ color: 'var(--semi-color-text-2)', fontWeight: 400 }}>{pageLabel}</span>
+                  <span className="pool-topbar-divider" style={{ color: 'var(--pool-text-3)' }}>·</span>
+                  <span className="pool-topbar-current" style={{ color: 'var(--pool-text-2)', fontWeight: 400 }}>{pageLabel}</span>
                 </>
               ) : null}
             </div>

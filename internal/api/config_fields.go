@@ -171,6 +171,8 @@ func configFields() []configField {
 		{Key: "default_register_method", Label: "默认注册引擎", Category: catReg, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"node", "protocol_v2", "browser_v3", "protocol", "browser"},
 			Help:    "node=移植的 puppeteer-real-browser 注册机(每任务独立 IP/指纹/Cookie 清理)。触发注册未指定引擎时使用。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.DefaultRegisterMethod, "node") }},
+		{Key: "registration_egress_pool_id", Label: "自动注册出口池", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "注册任务发起阶段使用的默认代理出口池。注册成功的账号仍默认直连，账号详情页单独修改运行出口。", boot: func(c config.Config) interface{} { return c.RegistrationEgressPoolID }},
 		{Key: "registration_concurrency", Label: "注册并发上限", Category: catReg, Type: fieldInt, Effect: effectHot,
 			Help: "单批最多并行的注册数(每个浏览器独立隔离)。仅在轮换出口上提高，固定 IP 出口保持 1。", boot: func(c config.Config) interface{} { return c.RegistrationConcurrency }},
 		{Key: "codex_install_model", Label: "Codex 安装默认模型", Category: catReg, Type: fieldString, Effect: effectHot,

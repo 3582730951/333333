@@ -162,7 +162,7 @@ func TestRegistrationReadinessReportsPoolReadErrors(t *testing.T) {
 
 func TestAutoRefillUsesRegistrationDefaultGroup(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
-	regPool, runtimePool := configureRegistrationEgressPools(t, h)
+	regPool, _ := configureRegistrationEgressPools(t, h)
 
 	h.app.autoRefill(context.Background(), &Policy{
 		Enabled: true,
@@ -180,8 +180,11 @@ func TestAutoRefillUsesRegistrationDefaultGroup(t *testing.T) {
 	if req["group_name"] != config.DefaultGroupName {
 		t.Fatalf("auto-refill group_name = %q, want %q", req["group_name"], config.DefaultGroupName)
 	}
-	if req["registration_egress_pool_id"] != regPool || req["runtime_egress_pool_id"] != runtimePool {
-		t.Fatalf("auto-refill pools = %q/%q, want %q/%q", req["registration_egress_pool_id"], req["runtime_egress_pool_id"], regPool, runtimePool)
+	if req["registration_egress_pool_id"] != regPool {
+		t.Fatalf("auto-refill registration_egress_pool_id = %q, want %q", req["registration_egress_pool_id"], regPool)
+	}
+	if req["runtime_egress_pool_id"] != "" {
+		t.Fatalf("auto-refill runtime_egress_pool_id = %q, want ignored/empty", req["runtime_egress_pool_id"])
 	}
 	if req["egress_id"] != "" {
 		t.Fatalf("auto-refill egress_id = %q, want empty so worker selects from registration pool", req["egress_id"])

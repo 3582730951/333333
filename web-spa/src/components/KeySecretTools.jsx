@@ -1,6 +1,6 @@
 import React from 'react';
-import { Button, Space, Tag, Toast, Tooltip, Typography } from '@douyinfe/semi-ui';
-import { IconClose, IconCopy } from '@douyinfe/semi-icons';
+import { Button, Space, Tag, Toast, Tooltip, Typography } from './pool/index.jsx';
+import { IconClose, IconCopy } from './pool/icons.jsx';
 import { writeClipboard } from '../lib/browserClipboard.js';
 import { browserOrigin } from '../lib/browserNavigation.js';
 

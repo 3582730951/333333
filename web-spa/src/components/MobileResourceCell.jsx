@@ -1,5 +1,5 @@
 import React from 'react';
-import { Typography } from '@douyinfe/semi-ui';
+import { Typography } from './pool/index.jsx';
 
 function hasRenderableValue(value) {
   return value !== null && value !== undefined && value !== '';

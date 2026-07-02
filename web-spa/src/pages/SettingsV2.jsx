@@ -2,8 +2,8 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Tabs, TabPane, Card, Toast, Typography, Button, Switch, Select,
   InputNumber, Input, Tag, Banner, Form,
-} from '@douyinfe/semi-ui';
-import { IconSave, IconRefresh } from '@douyinfe/semi-icons';
+} from '../components/pool/index.jsx';
+import { IconSave, IconRefresh } from '../components/pool/icons.jsx';
 import { get, post } from '../api.js';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeader from '../components/PageHeader.jsx';

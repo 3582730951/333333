@@ -18,7 +18,7 @@ function ChartFallback({ height = 240 }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        color: 'var(--semi-color-text-2)',
+        color: 'var(--pool-text-2)',
         fontSize: 13,
       }}
     >

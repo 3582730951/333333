@@ -1,5 +1,6 @@
 import React from 'react';
-import { Button, Popconfirm, Switch, Tag, Typography } from '@douyinfe/semi-ui';
+import { ActionMenu, Switch, Tag, Typography } from './pool/index.jsx';
+import { IconDelete } from './pool/icons.jsx';
 import { KeyCopyActions } from './KeySecretTools.jsx';
 import ResourceTable from './ResourceTable.jsx';
 import { fmtDateTime } from '../lib/format.js';
@@ -48,9 +49,23 @@ function mobileInfoCell(row, mode) {
 function deleteAction(row, onDelete, deleteRunning, isDeleteRunning, disabled = false) {
   const hash = keyHash(row);
   return (
-    <Popconfirm title="删除该 Key？" onConfirm={() => onDelete?.(hash)}>
-      <Button size="small" type="danger" loading={isDeleteRunning(hash)} disabled={disabled || (deleteRunning && !isDeleteRunning(hash))}>删除</Button>
-    </Popconfirm>
+    <ActionMenu
+      label="API Key 操作"
+      items={[
+        {
+          label: isDeleteRunning(hash) ? '删除中' : '删除 Key',
+          icon: <IconDelete />,
+          destructive: true,
+          disabled: disabled || (deleteRunning && !isDeleteRunning(hash)),
+          confirm: {
+            title: '删除该 Key？',
+            description: '删除后该 API Key 将立即失效。',
+            confirmText: '删除',
+          },
+          onSelect: () => onDelete?.(hash),
+        },
+      ]}
+    />
   );
 }
 

@@ -1,15 +1,15 @@
 import React, { useState, useCallback } from 'react';
 import {
-  Button, Tag, Toast, Modal, Form, Typography, Popconfirm, Input, Select,
-} from '@douyinfe/semi-ui';
-import { IconRefresh, IconPlus, IconSearch, IconDownload } from '@douyinfe/semi-icons';
+  ActionMenu, Button, ConfirmDialog, Tag, Toast, Modal, Form, Typography, Input, Select,
+} from '../components/pool/index.jsx';
+import { IconRefresh, IconPlus, IconSearch, IconDownload } from '../components/pool/icons.jsx';
 import { get, post, batchOp } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import AccountDrawer from '../components/AccountDrawer.jsx';
 import OAuthLoginModal from '../components/OAuthLoginModal.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
-import { ActionGroup, TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
+import { TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
@@ -126,6 +126,16 @@ export default function Accounts() {
   });
   const action = (id, act) => runAccountAction(accountActionKey(id, act), id, act);
 
+  const handleAccountUpdated = async (id, patch = {}) => {
+    const nextData = await load();
+    const fresh = nextData?.rows?.find((row) => row.id === id);
+    if (fresh) {
+      setDrawerAcct(fresh);
+    } else if (drawerAcct?.id === id) {
+      setDrawerAcct((current) => current ? { ...current, egress_binding: patch } : current);
+    }
+  };
+
   const { run: bulkAction, running: bulkActionRunning } = useAsyncAction(async (act, label) => {
     if (!selected.length) return;
     const result = await batchOp(label, selected, (id) => post(`/admin/accounts/${id}/${act}`, {}));
@@ -156,14 +166,33 @@ export default function Accounts() {
   const isAccountActionLoading = (id, act) => isAccountActionKeyRunning(accountActionKey(id, act));
 
   const renderAccountActions = (r) => (
-    <ActionGroup minWidth={196} compact>
-      <Button size="small" loading={isAccountActionLoading(r.id, 'health-test')} disabled={anyAccountOperationRunning && !isAccountActionLoading(r.id, 'health-test')} onClick={() => action(r.id, 'health-test')}>测活</Button>
-      <Button size="small" loading={isAccountActionLoading(r.id, 'clear-quarantine')} disabled={anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine')} onClick={() => action(r.id, 'clear-quarantine')}>解隔</Button>
-      <Button size="small" disabled={anyAccountOperationRunning} onClick={() => setDrawerAcct(r)}>详情</Button>
-      <Popconfirm title="确认删除该账号？" onConfirm={() => action(r.id, 'delete')}>
-        <Button size="small" type="danger" loading={isAccountActionLoading(r.id, 'delete')} disabled={anyAccountOperationRunning && !isAccountActionLoading(r.id, 'delete')}>删除</Button>
-      </Popconfirm>
-    </ActionGroup>
+    <ActionMenu
+      label="账号操作"
+      items={[
+        {
+          label: isAccountActionLoading(r.id, 'health-test') ? '测活中' : '测活',
+          disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'health-test'),
+          onSelect: () => action(r.id, 'health-test'),
+        },
+        {
+          label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解隔中' : '解隔',
+          disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine'),
+          onSelect: () => action(r.id, 'clear-quarantine'),
+        },
+        { label: '详情', disabled: anyAccountOperationRunning, onSelect: () => setDrawerAcct(r) },
+        {
+          label: isAccountActionLoading(r.id, 'delete') ? '删除中' : '删除',
+          destructive: true,
+          disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'delete'),
+          confirm: {
+            title: '确认删除该账号？',
+            description: `账号 ${r.label || r.email || r.id} 删除后不可恢复。`,
+            confirmText: '删除',
+          },
+          onSelect: () => action(r.id, 'delete'),
+        },
+      ]}
+    />
   );
 
   const filtered = rows; // filtering is now server-side
@@ -285,9 +314,15 @@ export default function Accounts() {
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', '测活')}>批量测活</Button>
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解隔离')}>批量解隔离</Button>
           <Button size="small" disabled={anyAccountOperationRunning} onClick={() => { setMoveGroup(''); setMoveOpen(true); }}>移动分组</Button>
-          <Popconfirm title={`删除选中的 ${selected.length} 个账号？`} onConfirm={() => bulkAction('delete', '删除')}>
+          <ConfirmDialog
+            title={`删除选中的 ${selected.length} 个账号？`}
+            description="批量删除后不可恢复，失败项会保留在已选列表中。"
+            destructive
+            confirmText="批量删除"
+            onConfirm={() => bulkAction('delete', '删除')}
+          >
             <Button size="small" type="danger" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning}>批量删除</Button>
-          </Popconfirm>
+          </ConfirmDialog>
           <Button size="small" theme="borderless" disabled={anyAccountOperationRunning} onClick={() => setSelected([])}>取消</Button>
         </div>
       )}
@@ -320,7 +355,7 @@ export default function Accounts() {
       <AccountDrawer account={drawerAcct} usage={drawerAcct ? drawerAcct.usage : null}
         statusTag={statusTag} onAction={action} actionRunning={accountActionRunning}
         actionDisabled={bulkActionRunning || bulkMoveRunning} isActionLoading={isAccountActionLoading}
-        onClose={() => setDrawerAcct(null)} />
+        onUpdated={handleAccountUpdated} onClose={() => setDrawerAcct(null)} />
       <Modal title="批量移动到分组" visible={moveOpen} onCancel={() => { if (!bulkMoveRunning) setMoveOpen(false); }} onOk={bulkMove} confirmLoading={bulkMoveRunning} okText="移动">
         <Select value={moveGroup} onChange={setMoveGroup} style={{ width: '100%' }} placeholder="选择目标分组"
           optionList={groups.map((g) => ({ label: g.name, value: g.name }))} />

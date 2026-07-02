@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
-import { Button, Form, Modal } from '@douyinfe/semi-ui';
-import { IconPlus } from '@douyinfe/semi-icons';
+import { Button, Form, Modal } from './pool/index.jsx';
+import { IconPlus } from './pool/icons.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 

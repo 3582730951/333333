@@ -112,7 +112,7 @@ func TestAssignAccountToEgressPoolStickyLeastUsed(t *testing.T) {
 	}
 }
 
-func TestUpsertAccountUsesGroupRuntimePoolForNewBindings(t *testing.T) {
+func TestUpsertAccountIgnoresGroupRuntimePoolForNewBindings(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	if err := store.UpsertEgressProfile(ctx, EgressProfile{
@@ -140,7 +140,7 @@ func TestUpsertAccountUsesGroupRuntimePoolForNewBindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("binding: %v", err)
 	}
-	if binding.PrimaryEgressID != "runtime_sidecar" {
-		t.Fatalf("primary egress = %q, want runtime pool member runtime_sidecar", binding.PrimaryEgressID)
+	if binding.PrimaryEgressID != DefaultDirectEgressID {
+		t.Fatalf("primary egress = %q, want default direct egress despite legacy group runtime policy", binding.PrimaryEgressID)
 	}
 }

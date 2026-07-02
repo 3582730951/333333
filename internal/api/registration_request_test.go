@@ -77,6 +77,9 @@ func configureRegistrationEgressPools(t *testing.T, h *testHarness) (registratio
 	}); err != nil {
 		t.Fatalf("upsert group egress policy: %v", err)
 	}
+	if err := h.store.SetSetting(ctx, "registration_egress_pool_id", "pool_registration"); err != nil {
+		t.Fatalf("set registration egress pool setting: %v", err)
+	}
 	return "pool_registration", "pool_runtime"
 }
 
@@ -113,7 +116,7 @@ func TestRegisterBatchRejectsInvalidRequestsBeforeQueueing(t *testing.T) {
 	}
 }
 
-func TestRegisterBatchRequiresRegistrationAndRuntimePools(t *testing.T) {
+func TestRegisterBatchRequiresRegistrationPool(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 
 	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1}`)
@@ -125,9 +128,27 @@ func TestRegisterBatchRequiresRegistrationAndRuntimePools(t *testing.T) {
 	}
 }
 
+func TestRegisterBatchDoesNotRequireRuntimePool(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	regPool, _ := configureRegistrationEgressPools(t, h)
+	ctx := context.Background()
+	if err := h.store.UpsertGroupEgressPolicy(ctx, storage.GroupEgressPolicy{
+		GroupName:          config.DefaultGroupName,
+		RegistrationPoolID: regPool,
+		AssignmentStrategy: "sticky_least_used",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1,"method":"protocol","identity_mode":"email"}`)
+	if code != http.StatusOK {
+		t.Fatalf("register batch with registration pool only = %d, want 200: %s", code, raw)
+	}
+}
+
 func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
-	regPool, runtimePool := configureRegistrationEgressPools(t, h)
+	regPool, _ := configureRegistrationEgressPools(t, h)
 
 	req := pipeline.RegisterRequest{Count: 1}
 	if err := h.app.regHandler.normalizeRegisterRequest(context.Background(), &req); err != nil {
@@ -145,8 +166,8 @@ func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 	if req.RegistrationEgressPoolID != regPool {
 		t.Fatalf("registration_egress_pool_id = %q, want %q", req.RegistrationEgressPoolID, regPool)
 	}
-	if req.RuntimeEgressPoolID != runtimePool {
-		t.Fatalf("runtime_egress_pool_id = %q, want %q", req.RuntimeEgressPoolID, runtimePool)
+	if req.RuntimeEgressPoolID != "" {
+		t.Fatalf("runtime_egress_pool_id = %q, want ignored/empty", req.RuntimeEgressPoolID)
 	}
 	if req.EgressID != "" {
 		t.Fatalf("egress_id = %q, want empty until a worker selects a registration-pool member", req.EgressID)
@@ -233,23 +254,23 @@ func TestManualSMSCountryNotRequiredForProtocolV2Email(t *testing.T) {
 	}
 }
 
-func TestRegisteredAccountIsBoundToRuntimePool(t *testing.T) {
+func TestRegisteredAccountKeepsDefaultDirectEgress(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
-	_, runtimePool := configureRegistrationEgressPools(t, h)
+	configureRegistrationEgressPools(t, h)
 	ctx := context.Background()
 	if err := h.store.UpsertAccount(ctx, storage.Account{ID: "acc-registered", GroupName: config.DefaultGroupName, Status: "active"}, storage.AccountToken{AccessToken: "tok"}); err != nil {
 		t.Fatalf("upsert account: %v", err)
 	}
 
-	if err := h.app.regHandler.bindRegisteredAccountToRuntimePool(ctx, pipeline.RegisterRequest{RuntimeEgressPoolID: runtimePool}, "acc-registered"); err != nil {
-		t.Fatalf("bindRegisteredAccountToRuntimePool: %v", err)
+	if err := h.app.regHandler.bindRegisteredAccountToRuntimePool(ctx, pipeline.RegisterRequest{}, "acc-registered"); err != nil {
+		t.Fatalf("bindRegisteredAccountToRuntimePool compatibility no-op: %v", err)
 	}
 	binding, err := h.store.GetEgressBinding(ctx, "acc-registered")
 	if err != nil {
 		t.Fatalf("binding: %v", err)
 	}
-	if binding.PrimaryEgressID != "runtime_sidecar" {
-		t.Fatalf("primary egress = %q, want runtime_sidecar", binding.PrimaryEgressID)
+	if binding.PrimaryEgressID != storage.DefaultDirectEgressID {
+		t.Fatalf("primary egress = %q, want default direct egress", binding.PrimaryEgressID)
 	}
 }
 

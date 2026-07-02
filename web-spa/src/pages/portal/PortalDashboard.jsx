@@ -1,6 +1,6 @@
 import React, { useCallback } from 'react';
-import { Button } from '@douyinfe/semi-ui';
-import { IconRefresh } from '@douyinfe/semi-icons';
+import { Button } from '../../components/pool/index.jsx';
+import { IconRefresh } from '../../components/pool/icons.jsx';
 import { get } from '../../api.js';
 import LoadErrorBanner from '../../components/LoadErrorBanner.jsx';
 import PageHeader, { Panel } from '../../components/PageHeader.jsx';

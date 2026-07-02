@@ -210,17 +210,18 @@ async function runCase(browser, testCase) {
   await installMocks(page);
   await page.goto(`${baseURL}${testCase.route}`, { waitUntil: 'networkidle0', timeout: 60000 });
   await page.screenshot({ path: testCase.screenshot, fullPage: true });
-  const metrics = await page.evaluate(({ expectedMobileHeader, requiredText }) => {
+  const metrics = await page.evaluate(({ expectedMobileHeader, requiredText, requiredLabels }) => {
     const viewport = { width: window.innerWidth, height: window.innerHeight };
     const text = document.body.textContent.replace(/\s+/g, ' ').trim();
     const headers = [...document.querySelectorAll('.pool-table-wrapper th')].map((el) => el.textContent.trim()).filter(Boolean);
+    const labels = [...document.querySelectorAll('[aria-label]')].map((el) => el.getAttribute('aria-label') || '');
     const rect = (selector) => {
       const el = document.querySelector(selector);
       if (!el) return null;
       const r = el.getBoundingClientRect();
       return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
     };
-    const sider = rect('.semi-layout-sider');
+    const sider = rect('.pool-sider');
     const topTitle = rect('.pool-topbar-title');
     const topActions = rect('.pool-topbar-actions');
     return {
@@ -232,9 +233,10 @@ async function runCase(browser, testCase) {
       hasDesktopColumns: headers.includes('Key / 一键安装') && headers.includes('操作'),
       hasExpectedMobileHeader: !expectedMobileHeader || (headers.length === 1 && headers[0] === expectedMobileHeader),
       hasRequiredText: requiredText.every((item) => text.includes(item)),
+      hasRequiredLabels: requiredLabels.every((item) => labels.includes(item)),
       reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
     };
-  }, { expectedMobileHeader: testCase.expectedMobileHeader || '', requiredText: testCase.requiredText || [] });
+  }, { expectedMobileHeader: testCase.expectedMobileHeader || '', requiredText: testCase.requiredText || [], requiredLabels: testCase.requiredLabels || [] });
   await page.close();
   return { name: testCase.name, badResponses, metrics, screenshot: testCase.screenshot };
 }
@@ -250,6 +252,7 @@ function assertCase(result) {
   if (result.name === 'desktop-keys' && !result.metrics.hasDesktopColumns) failures.push('desktop table columns are missing');
   if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileHeader) failures.push('mobile table is not using the expected single-column layout');
   if (result.name.startsWith('mobile-') && !result.metrics.hasRequiredText) failures.push('mobile page is missing required row text/actions');
+  if (result.name.startsWith('mobile-') && !result.metrics.hasRequiredLabels) failures.push('mobile page is missing required accessible action labels');
   if (result.name === 'mobile-keys' && !result.metrics.reducedMotion) failures.push('reduced-motion media query is not active');
   return failures;
 }
@@ -271,7 +274,8 @@ async function main() {
           height: 844,
           reducedMotion: true,
           expectedMobileHeader: 'API Key',
-          requiredText: ['旧 Key，需轮换后复制', '删除'],
+          requiredText: ['旧 Key，需轮换后复制'],
+          requiredLabels: ['API Key 操作'],
           screenshot: path.join(screenshotDir, 'accept-mobile-keys.png'),
         },
         {
@@ -281,7 +285,8 @@ async function main() {
           height: 844,
           reducedMotion: true,
           expectedMobileHeader: '账号',
-          requiredText: ['primary-prod', '测活', '详情'],
+          requiredText: ['primary-prod'],
+          requiredLabels: ['账号操作'],
           screenshot: path.join(screenshotDir, 'accept-mobile-accounts.png'),
         },
         {
@@ -291,7 +296,8 @@ async function main() {
           height: 844,
           reducedMotion: true,
           expectedMobileHeader: '提供商',
-          requiredText: ['OpenAI', '导入 Key', '编辑'],
+          requiredText: ['OpenAI'],
+          requiredLabels: ['提供商操作'],
           screenshot: path.join(screenshotDir, 'accept-mobile-providers.png'),
         },
         {
@@ -301,7 +307,8 @@ async function main() {
           height: 844,
           reducedMotion: true,
           expectedMobileHeader: '用户',
-          requiredText: ['alice@example.com', '编辑', '删除'],
+          requiredText: ['alice@example.com'],
+          requiredLabels: ['用户操作'],
           screenshot: path.join(screenshotDir, 'accept-mobile-users.png'),
         },
       ]) {

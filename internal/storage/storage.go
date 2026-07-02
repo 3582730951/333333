@@ -51,8 +51,9 @@ type Group struct {
 	// group that does not set its own. Empty means "respect the client's request".
 	ForceModel  string `json:"force_model"`
 	ForceEffort string `json:"force_effort"`
-	// DefaultEgressID, when set, is the egress profile new accounts in this group
-	// bind to (so enabling a proxy for a group routes its upstream through it).
+	// DefaultEgressID is a legacy operator note kept for backward-compatible group
+	// payloads. Runtime routing no longer reads it; account_egress_bindings owns the
+	// account's default egress.
 	DefaultEgressID string `json:"default_egress_id"`
 	CreatedAt       int64  `json:"created_at"`
 	UpdatedAt       int64  `json:"updated_at"`
@@ -1513,28 +1514,15 @@ ON CONFLICT(account_id) DO UPDATE SET
 	if err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, created_at, updated_at)
 VALUES(?, ?, '', ?, 0, ?, ?)
 ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.ID+":"+DefaultDirectEgressID, now, now)
 	if err != nil {
 		return err
 	}
-	insertedBinding := false
-	if n, err := res.RowsAffected(); err == nil && n > 0 {
-		insertedBinding = true
-	}
 	if err := tx.Commit(); err != nil {
 		return err
-	}
-	if insertedBinding {
-		if policy, err := s.GetGroupEgressPolicy(ctx, account.GroupName); err == nil && strings.TrimSpace(policy.RuntimePoolID) != "" {
-			if _, err := s.AssignAccountToEgressPool(ctx, account.ID, policy.RuntimePoolID); err != nil {
-				return err
-			}
-		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
 	}
 	return nil
 }

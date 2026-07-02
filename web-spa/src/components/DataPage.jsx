@@ -1,6 +1,6 @@
 import React, { useCallback } from 'react';
-import { Button, Typography } from '@douyinfe/semi-ui';
-import { IconRefresh } from '@douyinfe/semi-icons';
+import { Button, Typography } from './pool/index.jsx';
+import { IconRefresh } from './pool/icons.jsx';
 import { get } from '../api.js';
 import ResourceTable from './ResourceTable.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';

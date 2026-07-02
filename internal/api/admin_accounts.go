@@ -215,7 +215,6 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return storage.Account{}, err
 	}
-	s.applyGroupDefaultEgress(ctx, account.ID, groupName)
 	// Probe the new account's upstream model list once, in the background, so the
 	// advertised /v1/models union reflects it without waiting for the periodic
 	// sweep. Detached context + fire-and-forget so it never blocks the import
@@ -227,35 +226,6 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 		_, _ = s.probeAccountModels(cctx, acc)
 	}(account)
 	return account, nil
-}
-
-// applyGroupDefaultEgress sets a freshly imported account's PRIMARY egress to its
-// group's configured DefaultEgressID (when set and the profile exists), so enabling a
-// proxy/pool for a group automatically routes its accounts off the shared VPS IP — the
-// shared-IP CF root cause — instead of every import defaulting to egress_direct. A
-// no-op (keeps the direct binding from UpsertAccount) when the group sets no default or
-// the egress is missing. Best-effort: failures never block the import.
-func (s *Server) applyGroupDefaultEgress(ctx context.Context, accountID, groupName string) {
-	if groupName == "" {
-		groupName = s.cfg.DefaultGroup
-	}
-	group, err := s.store.GetGroup(ctx, groupName)
-	if err != nil || strings.TrimSpace(group.DefaultEgressID) == "" {
-		return
-	}
-	if _, err := s.store.GetEgressProfile(ctx, group.DefaultEgressID); err != nil {
-		return
-	}
-	binding, err := s.store.GetEgressBinding(ctx, accountID)
-	if err != nil {
-		return
-	}
-	if binding.PrimaryEgressID == group.DefaultEgressID {
-		return
-	}
-	binding.PrimaryEgressID = group.DefaultEgressID
-	binding.CookieJarKey = accountID + ":" + group.DefaultEgressID
-	_ = s.store.UpsertEgressBinding(ctx, binding)
 }
 
 // adminImportToken imports a ChatGPT account from a bare access token ("AT"

@@ -1,0 +1,991 @@
+.pool-button {
+  min-height: 32px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 120ms ease;
+  white-space: nowrap;
+}
+
+.pool-button:hover:not(:disabled) {
+  background: var(--pool-bg-hover);
+  border-color: var(--pool-border-strong);
+}
+
+.pool-button:active:not(:disabled) {
+  transform: translateY(1px);
+  background: var(--pool-bg-pressed);
+}
+
+.pool-button:disabled {
+  cursor: not-allowed;
+  color: var(--pool-text-disabled);
+  opacity: 0.7;
+}
+
+.pool-button--primary {
+  border-color: var(--pool-accent);
+  background: var(--pool-accent);
+  color: white;
+}
+
+.pool-button--primary:hover:not(:disabled) {
+  background: var(--pool-accent-hover);
+  border-color: var(--pool-accent-hover);
+}
+
+.pool-button--danger {
+  border-color: var(--pool-danger-soft);
+  color: var(--pool-danger);
+  background: var(--pool-danger-soft);
+}
+
+.pool-button--borderless {
+  border-color: transparent;
+  background: transparent;
+}
+
+.pool-button--light {
+  background: var(--pool-accent-soft);
+  border-color: transparent;
+  color: var(--pool-accent);
+}
+
+.pool-button--small {
+  min-height: 28px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.pool-button--large {
+  min-height: 38px;
+  padding: 0 16px;
+}
+
+.pool-button--block {
+  width: 100%;
+}
+
+.pool-button__icon,
+.pool-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.pool-icon-button {
+  width: 34px;
+  padding: 0;
+}
+
+.pool-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--pool-border-strong);
+  border-top-color: var(--pool-accent);
+  border-radius: 999px;
+  animation: pool-spin 800ms linear infinite;
+  display: inline-block;
+}
+
+.pool-spinner--large {
+  width: 28px;
+  height: 28px;
+}
+
+@keyframes pool-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.pool-card,
+.pool-panel,
+.pool-chart-card,
+.pool-stat,
+.pool-data-card,
+.pool-metric-card {
+  background: var(--pool-bg-surface);
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+  box-shadow: var(--pool-shadow-sm);
+}
+
+.pool-card,
+.pool-panel,
+.pool-chart-card {
+  padding: 16px;
+}
+
+.pool-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.pool-card-body {
+  min-width: 0;
+}
+
+.pool-stat,
+.pool-data-card,
+.pool-metric-card {
+  padding: 14px;
+}
+
+.pool-input-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text);
+  padding: 0 10px;
+}
+
+.pool-input-wrap:focus-within {
+  border-color: var(--pool-accent);
+  box-shadow: var(--pool-focus);
+}
+
+.pool-input,
+.pool-textarea,
+.pool-select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text);
+  min-height: 34px;
+  padding: 0 10px;
+}
+
+.pool-input-wrap .pool-input {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  min-height: 30px;
+}
+
+.pool-textarea {
+  min-height: 90px;
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+.pool-input::placeholder,
+.pool-textarea::placeholder {
+  color: var(--pool-text-3);
+}
+
+.pool-select {
+  appearance: none;
+}
+
+.pool-field {
+  margin-bottom: 13px;
+}
+
+.pool-field--left {
+  display: grid;
+  grid-template-columns: var(--pool-form-label-width, 148px) minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+}
+
+.pool-field__label {
+  display: block;
+  color: var(--pool-text-2);
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.pool-field--left .pool-field__label {
+  margin: 7px 0 0;
+  text-align: right;
+}
+
+.pool-field__help {
+  margin-top: 5px;
+  color: var(--pool-text-3);
+  font-size: 12px;
+}
+
+.pool-field__error {
+  margin-top: 5px;
+  color: var(--pool-danger);
+  font-size: 12px;
+}
+
+.pool-switch {
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1px solid var(--pool-border);
+  background: var(--pool-bg-surface-3);
+  position: relative;
+  padding: 0;
+  cursor: pointer;
+}
+
+.pool-switch[data-state='checked'] {
+  background: var(--pool-accent);
+  border-color: var(--pool-accent);
+}
+
+.pool-switch__thumb {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: white;
+  transform: translateX(1px);
+  transition: transform 140ms ease;
+}
+
+.pool-switch[data-state='checked'] .pool-switch__thumb {
+  transform: translateX(17px);
+}
+
+.pool-tag,
+.pool-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 22px;
+  border-radius: 999px;
+  padding: 0 8px;
+  background: var(--pool-gray-soft);
+  color: var(--pool-text-2);
+  border: 1px solid var(--pool-border);
+  font-size: 12px;
+}
+
+.pool-tag--green,
+.pool-status-pill--success {
+  color: var(--pool-success);
+  background: var(--pool-success-soft);
+}
+
+.pool-tag--red,
+.pool-status-pill--danger {
+  color: var(--pool-danger);
+  background: var(--pool-danger-soft);
+}
+
+.pool-tag--orange,
+.pool-tag--amber,
+.pool-status-pill--warning {
+  color: var(--pool-warning);
+  background: var(--pool-warning-soft);
+}
+
+.pool-tag--blue,
+.pool-status-pill--info {
+  color: var(--pool-info);
+  background: var(--pool-info-soft);
+}
+
+.pool-tag--violet,
+.pool-tag--purple {
+  color: var(--pool-purple);
+  background: var(--pool-purple-soft);
+}
+
+.pool-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.pool-table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+  background: var(--pool-bg-surface);
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+}
+
+.pool-table {
+  width: 100%;
+  min-width: var(--pool-table-fit-width, 720px);
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.pool-table th,
+.pool-table td {
+  border-bottom: 1px solid var(--pool-border);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: middle;
+  color: var(--pool-text);
+}
+
+.pool-table th {
+  height: 38px;
+  color: var(--pool-text-2);
+  font-size: 12px;
+  font-weight: 650;
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-table tbody tr {
+  min-height: var(--pool-table-row-height, 60px);
+}
+
+.pool-table tbody tr:hover {
+  background: var(--pool-bg-hover);
+}
+
+.pool-table tbody tr[aria-selected='true'] {
+  background: var(--pool-bg-selected);
+}
+
+.pool-table-sort {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pool-table-empty {
+  padding: 28px;
+  text-align: center;
+}
+
+.pool-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--pool-border);
+  color: var(--pool-text-2);
+}
+
+.pool-modal-overlay,
+.pool-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--pool-bg-overlay);
+  z-index: 1000;
+}
+
+.pool-modal-content,
+.pool-drawer-content {
+  position: fixed;
+  z-index: 1001;
+  background: var(--pool-bg-elevated);
+  color: var(--pool-text);
+  border: 1px solid var(--pool-border);
+  box-shadow: var(--pool-shadow-md);
+}
+
+.pool-modal-content {
+  top: 10vh;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(var(--pool-modal-width, 560px), calc(100vw - 28px));
+  border-radius: var(--pool-radius-lg);
+  max-height: 82vh;
+  overflow: auto;
+}
+
+.pool-drawer-content {
+  top: 0;
+  right: 0;
+  width: min(var(--pool-drawer-width, 560px), 100vw);
+  height: 100vh;
+  border-radius: 0;
+  overflow: auto;
+}
+
+.pool-modal-header,
+.pool-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--pool-border);
+}
+
+.pool-modal-title,
+.pool-drawer-title {
+  font-weight: 650;
+  font-size: 16px;
+}
+
+.pool-modal-body,
+.pool-drawer-body {
+  padding: 18px;
+}
+
+.pool-modal-footer,
+.pool-drawer-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--pool-border);
+}
+
+.pool-banner {
+  display: flex;
+  gap: 10px;
+  border: 1px solid var(--pool-border);
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text);
+  border-radius: var(--pool-radius-md);
+  padding: 12px;
+  margin-bottom: 14px;
+}
+
+.pool-banner--danger {
+  border-color: var(--pool-danger-soft);
+  background: var(--pool-danger-soft);
+}
+
+.pool-banner--warning {
+  border-color: var(--pool-warning-soft);
+  background: var(--pool-warning-soft);
+}
+
+.pool-toast-viewport {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 2000;
+  display: grid;
+  gap: 10px;
+  width: min(360px, calc(100vw - 24px));
+}
+
+.pool-toast {
+  border: 1px solid var(--pool-border);
+  background: var(--pool-bg-elevated);
+  color: var(--pool-text);
+  border-radius: var(--pool-radius-md);
+  box-shadow: var(--pool-shadow-md);
+  padding: 11px 12px;
+}
+
+.pool-toast--success {
+  border-color: var(--pool-success-soft);
+}
+
+.pool-toast--error {
+  border-color: var(--pool-danger-soft);
+}
+
+.pool-tabs {
+  display: grid;
+  gap: 14px;
+}
+
+.pool-tabs--left {
+  grid-template-columns: 190px minmax(0, 1fr);
+  align-items: start;
+}
+
+.pool-tabs-list {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--pool-border);
+}
+
+.pool-tabs--left .pool-tabs-list {
+  flex-direction: column;
+  border-bottom: 0;
+  border-right: 1px solid var(--pool-border);
+  padding-right: 10px;
+}
+
+.pool-tab-trigger {
+  border: 0;
+  border-radius: var(--pool-radius-sm);
+  background: transparent;
+  color: var(--pool-text-2);
+  padding: 9px 11px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.pool-tab-trigger[data-state='active'] {
+  background: var(--pool-bg-selected);
+  color: var(--pool-text);
+}
+
+.pool-nav {
+  padding: 10px 8px;
+}
+
+.pool-nav-section {
+  margin-bottom: 6px;
+}
+
+.pool-nav-group-label,
+.pool-nav-item {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  border: 0;
+  border-radius: var(--pool-radius-sm);
+  background: transparent;
+  color: var(--pool-text-2);
+  padding: 0 10px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.pool-nav-item:hover,
+.pool-nav-group-label:hover {
+  background: var(--pool-bg-hover);
+  color: var(--pool-text);
+}
+
+.pool-nav-item[aria-current='page'] {
+  background: var(--pool-bg-selected);
+  color: var(--pool-text);
+}
+
+.pool-nav-children {
+  margin: 4px 0 4px 22px;
+  display: grid;
+  gap: 3px;
+}
+
+.pool-sidebar-is-collapsed .pool-nav-text,
+.pool-sidebar-is-collapsed .pool-nav-children {
+  display: none;
+}
+
+.pool-account-avatar,
+.pool-avatar {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--pool-accent-soft);
+  color: var(--pool-accent);
+  font-weight: 700;
+}
+
+.pool-account-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 240px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+  background: var(--pool-bg-elevated);
+  box-shadow: var(--pool-shadow-md);
+  padding: 8px;
+  z-index: 300;
+}
+
+.pool-account-menu-wrap {
+  position: relative;
+}
+
+.pool-account-menu-title {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+}
+
+.pool-account-menu-title small {
+  color: var(--pool-text-3);
+}
+
+.pool-account-menu-divider {
+  height: 1px;
+  background: var(--pool-border);
+  margin: 6px 0;
+}
+
+.pool-account-menu-item {
+  width: 100%;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  border-radius: var(--pool-radius-sm);
+  background: transparent;
+  color: var(--pool-text);
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.pool-account-menu-item:hover {
+  background: var(--pool-bg-hover);
+}
+
+.pool-empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 30px 18px;
+  color: var(--pool-text-2);
+}
+
+.pool-empty-title {
+  color: var(--pool-text);
+  font-weight: 650;
+}
+
+.pool-empty-icon {
+  color: var(--pool-text-3);
+}
+
+.pool-action-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pool-resource-summary,
+.pool-account-summary {
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.pool-resource-summary__meta,
+.pool-account-metaline,
+.pool-muted {
+  color: var(--pool-text-3);
+  font-size: 12px;
+}
+
+.pool-account-titleline,
+.pool-provider-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.pool-provider-summary__copy {
+  min-width: 0;
+}
+
+.pool-text-clamp {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.pool-text-strong {
+  font-weight: 650;
+}
+
+.pool-text-muted {
+  color: var(--pool-text-3);
+}
+
+.pool-mono {
+  font-family: var(--pool-font-mono);
+}
+
+.pool-progress {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--pool-bg-surface-3);
+  overflow: hidden;
+}
+
+.pool-progress__bar {
+  height: 100%;
+  width: var(--pool-progress-value, 0%);
+  background: var(--pool-accent);
+}
+
+.pool-tiny-meter {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--pool-bg-surface-3);
+  overflow: hidden;
+}
+
+.pool-tiny-meter__bar {
+  height: 100%;
+  width: var(--pool-meter-value, 0%);
+  background: var(--pool-accent);
+}
+
+.pool-bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+  background: var(--pool-bg-surface);
+}
+
+.pool-task-progress {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.pool-task-progress__stats {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--pool-text-2);
+  font-size: 12px;
+}
+
+.pool-readiness-panel__body {
+  display: grid;
+  gap: 8px;
+}
+
+.pool-readiness-panel__tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.pool-service-health-strip {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-service-health-strip__items {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.pool-service-health-strip__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pool-task-detail {
+  display: grid;
+  gap: 16px;
+}
+
+.pool-task-detail__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pool-task-detail__grid,
+.pool-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.pool-task-detail__grid div,
+.pool-kv-grid div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-task-detail__grid dt,
+.pool-kv-grid dt {
+  margin-bottom: 4px;
+  color: var(--pool-text-3);
+  font-size: 12px;
+}
+
+.pool-task-detail__grid dd,
+.pool-kv-grid dd {
+  margin: 0;
+  color: var(--pool-text);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.pool-log-stream {
+  display: grid;
+  gap: 10px;
+}
+
+.pool-log-stream__state {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.pool-log-stream__lines {
+  display: grid;
+  gap: 6px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.pool-log-stream__line {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.pool-gopay-fallback,
+.pool-gopay-panels {
+  display: grid;
+  gap: 14px;
+}
+
+.pool-gopay-panels {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.pool-gopay-panel {
+  min-width: 0;
+}
+
+@media (max-width: 640px) {
+  .pool-tabs--left {
+    grid-template-columns: 1fr;
+  }
+
+  .pool-tabs--left .pool-tabs-list {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--pool-border);
+    padding-right: 0;
+  }
+
+  .pool-field--left {
+    display: block;
+  }
+
+  .pool-field--left .pool-field__label {
+    text-align: left;
+    margin: 0 0 6px;
+  }
+
+  .pool-table {
+    min-width: 100%;
+  }
+
+  .pool-table--cards {
+    border-collapse: separate;
+    border-spacing: 0 10px;
+  }
+
+  .pool-table--cards thead {
+    display: none;
+  }
+
+  .pool-table--cards tbody {
+    display: grid;
+    gap: 10px;
+  }
+
+  .pool-table--cards tbody tr {
+    display: grid;
+    min-height: 0;
+    border: 1px solid var(--pool-border);
+    border-radius: var(--pool-radius-md);
+    background: var(--pool-bg-surface);
+    overflow: hidden;
+  }
+
+  .pool-table--cards tbody tr:hover {
+    background: var(--pool-bg-surface);
+  }
+
+  .pool-table--cards tbody tr[aria-selected='true'] {
+    background: var(--pool-bg-selected);
+  }
+
+  .pool-table--cards td {
+    display: grid;
+    grid-template-columns: minmax(86px, 34%) minmax(0, 1fr);
+    gap: 12px;
+    align-items: start;
+    border-bottom: 1px solid var(--pool-border);
+    padding: 10px 14px;
+    overflow-wrap: anywhere;
+  }
+
+  .pool-table--cards td:last-child {
+    border-bottom: 0;
+  }
+
+  .pool-table--cards td::before {
+    content: attr(data-label);
+    color: var(--pool-text-3);
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.5;
+  }
+
+  .pool-table--cards td[data-label=''] {
+    grid-template-columns: 1fr;
+  }
+
+  .pool-table--cards td[data-label='']::before {
+    display: none;
+  }
+
+  .pool-service-health-strip {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .pool-task-detail__grid,
+  .pool-kv-grid,
+  .pool-gopay-panels {
+    grid-template-columns: 1fr;
+  }
+}

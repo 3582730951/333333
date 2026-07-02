@@ -1,8 +1,8 @@
 import React from 'react';
 
 // KPI stat card with optional icon, accent color, and sub-label.
-export default function StatCard({ label, value, sub, icon, color = 'var(--semi-color-primary)', tone }) {
-  const bg = tone || 'var(--semi-color-primary-light-default)';
+export default function StatCard({ label, value, sub, icon, color = 'var(--pool-accent)', tone }) {
+  const bg = tone || 'var(--pool-accent-soft)';
   return (
     <div className="pool-stat">
       <span className="accent" style={{ background: color }} />

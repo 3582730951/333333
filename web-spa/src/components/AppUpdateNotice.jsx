@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Button, Typography } from '@douyinfe/semi-ui';
-import { IconClose, IconRefresh } from '@douyinfe/semi-icons';
+import { Button, Typography } from './pool/index.jsx';
+import { IconClose, IconRefresh } from './pool/icons.jsx';
 import { assetSignatureFromHTML, currentAssetSignature } from '../lib/assetSignature.js';
 import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
 import {

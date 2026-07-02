@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Button, Toast, Typography, Form, Card, Tag, Banner, Select } from '@douyinfe/semi-ui';
-import { IconRefresh, IconPlay, IconSetting } from '@douyinfe/semi-icons';
+import { Button, Toast, Typography, Form, Card, Tag, Select } from '../components/pool/index.jsx';
+import { IconRefresh, IconPlay, IconSetting } from '../components/pool/icons.jsx';
 import { useNavigate } from 'react-router-dom';
 import { get, post, errMsg } from '../api.js';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
-import { MetricRail, TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
+import { MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
+import { ReadinessPanel, TaskDetailDrawer, TaskProgress } from '../components/WorkflowPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
@@ -23,15 +24,6 @@ const EMPTY_REGISTRATION = { jobs: [], readiness: null, readinessError: '' };
 const EMPTY_OPTIONS = { groups: [], egresses: [], pools: [], providerOpts: { sms: [], mailbox: [], captcha: [] }, error: null };
 
 const readinessProviderCount = (readiness, key) => Number(readiness?.providers?.[key] || 0);
-
-function jobProgress(job) {
-  const total = Math.max(0, Number(job?.total) || 0);
-  const succeeded = Math.max(0, Number(job?.succeeded) || 0);
-  const failed = Math.max(0, Number(job?.failed) || 0);
-  const done = total > 0 ? Math.min(total, succeeded + failed) : succeeded + failed;
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  return { total, succeeded, failed, done, pct };
-}
 
 const normalizeRegisterMethod = (method, fallback = 'node') => String(method || fallback || 'node').trim().toLowerCase();
 
@@ -75,6 +67,7 @@ const manualStartBlockers = (readiness, identityMode, method) => {
 
 export default function Registration() {
   const navigate = useNavigate();
+  const [detailJob, setDetailJob] = useState(null);
   // Country strategy & reference data
   const [strategy, setStrategy] = useState('auto'); // "auto" | "manual"
   const [manualCountry, setManualCountry] = useState('');
@@ -209,7 +202,6 @@ export default function Registration() {
         group_name: v.group_name || '',
         method: requestMethod,
         registration_egress_pool_id: v.registration_egress_pool_id || '',
-        runtime_egress_pool_id: v.runtime_egress_pool_id || '',
         sms_provider: v.sms_provider || '',
         identity_mode: requestIdentityMode,
         country: smsCountryRequired && strategy === 'manual' ? (manualCountry || '') : '',
@@ -239,21 +231,7 @@ export default function Registration() {
       title: '进度',
       key: 'progress',
       width: 320,
-      render: (_, row) => {
-        const progress = jobProgress(row);
-        const meterMax = progress.total || Math.max(progress.done, 1);
-        return (
-          <div className="pool-job-progress">
-            <div className="pool-job-stats">
-              <b>{progress.pct}%</b>
-              <span className="pool-job-stat-success">成功 {progress.succeeded}</span>
-              <span className="pool-job-stat-danger">失败 {progress.failed}</span>
-              <span>总数 {progress.total}</span>
-            </div>
-            <TinyMeter value={progress.done} max={meterMax} label={`完成 ${progress.done}/${meterMax}`} />
-          </div>
-        );
-      },
+      render: (_, row) => <TaskProgress task={row} totalKey="total" successKey="succeeded" failedKey="failed" />,
     },
     {
       title: '路由',
@@ -303,7 +281,6 @@ export default function Registration() {
   ] : [];
   const pool = readiness?.pool || {};
   const registrationPools = pools.filter((p) => !p.purpose || p.purpose === 'registration');
-  const runtimePools = pools.filter((p) => !p.purpose || p.purpose === 'runtime');
   const smsProviderOptions = [
     { label: '自动', value: '' },
     { label: 'SMSBower', value: 'smsbower' },
@@ -329,62 +306,21 @@ export default function Registration() {
       <LoadErrorBanner error={strategyError} onRetry={loadStrategyConfig} title="注册策略读取失败" />
 
       <Card className="pool-card pool-registration-start-card" style={{ marginBottom: 18 }} title="启动注册任务">
-        {readinessError ? (
-          <Banner className="pool-registration-readiness" type="danger" icon={null} closeIcon={null}
-            description={(
-              <div className="pool-registration-readiness-body">
-                <div className="pool-registration-readiness-heading">依赖检查失败</div>
-                <div className="pool-registration-readiness-copy">{readinessError}</div>
-              </div>
-            )} />
-        ) : readiness ? (
-          <Banner
-            className="pool-registration-readiness"
-            type={startBlockers.length ? 'warning' : 'success'}
-            icon={null}
-            closeIcon={null}
-            description={(
-              <div className="pool-registration-readiness-body">
-                <div className="pool-registration-readiness-heading">
-                  {startBlockers.length ? '启动前检查未通过' : '启动前检查通过'}
-                </div>
-                <div className="pool-registration-readiness-copy">
-                  {startBlockers.length
-                    ? startBlockers.join('; ')
-                    : readiness.policy_error
-                      ? '当前身份模式所需依赖可用；自动化策略需要处理。'
-                      : '当前身份模式所需依赖可用。'}
-                </div>
-                <div className="pool-registration-readiness-tags">
-                  {providerSummary.map(([k, v]) => <Tag key={k} color={v > 0 ? 'green' : 'grey'}>{k}: {v}</Tag>)}
-                  <Tag color={(pool.deficit || 0) > 0 ? 'amber' : 'green'}>缺口: {pool.deficit || 0}</Tag>
-                  {readiness.policy_error ? <Tag color="orange">automation: 异常</Tag> : null}
-                </div>
-              </div>
-            )}
-          />
-        ) : (
-          <Banner className="pool-registration-readiness" type="info" icon={null} closeIcon={null}
-            description={(
-              <div className="pool-registration-readiness-body">
-                <div className="pool-registration-readiness-heading">正在读取依赖状态</div>
-                <div className="pool-registration-readiness-copy">请稍候，注册依赖状态读取完成后即可启动任务。</div>
-              </div>
-            )} />
-        )}
+        <ReadinessPanel
+          readiness={readiness}
+          readinessError={readinessError}
+          blockers={startBlockers}
+          providerSummary={providerSummary}
+          pool={pool}
+        />
         <Form layout="horizontal" onSubmit={start} className="pool-registration-start-form">
           <Form.InputNumber field="count" label="数量" initValue={1} min={1} max={100} disabled={starting || savingStrategy} style={{ width: 120 }} />
           <Form.Select field="group_name" label="分组" placeholder="默认" disabled={starting || savingStrategy} style={{ width: 180 }}
             optionList={[{ label: '默认', value: '' }, ...(groups || []).map((g) => ({ label: g?.name || '未知', value: g?.name || '' }))]} />
-          <Form.Select field="registration_egress_pool_id" label="注册代理池" placeholder="按分组策略" disabled={starting || savingStrategy} style={{ width: 220 }}
+          <Form.Select field="registration_egress_pool_id" label="注册代理池" disabled={starting || savingStrategy} style={{ width: 220 }}
             optionList={[
-              { label: '按分组策略', value: '' },
+              { label: '使用出口页默认', value: '' },
               ...(registrationPools || []).map((p) => ({ label: `${p.name || p.id} (${p.members?.length || 0})`, value: p.id })),
-            ]} />
-          <Form.Select field="runtime_egress_pool_id" label="注册后出口池" placeholder="按分组策略" disabled={starting || savingStrategy} style={{ width: 220 }}
-            optionList={[
-              { label: '按分组策略', value: '' },
-              ...(runtimePools || []).map((p) => ({ label: `${p.name || p.id} (${p.members?.length || 0})`, value: p.id })),
             ]} />
           <Form.Select field="method" label="引擎" initValue="" disabled={starting || savingStrategy} style={{ width: 170 }}
             optionList={[
@@ -494,9 +430,17 @@ export default function Registration() {
           emptyType="refresh"
           skeletonRows={6}
           skeletonCols={4}
+          onRow={(row) => ({ onClick: () => setDetailJob(row) })}
         />
         <MetricRail items={jobMetrics} />
       </div>
+      <TaskDetailDrawer
+        task={detailJob}
+        visible={!!detailJob}
+        onClose={() => setDetailJob(null)}
+        title={detailJob ? `注册任务 · ${detailJob.id || 'register-job'}` : '注册任务'}
+        status={detailJob ? jobTag(detailJob.status) : null}
+      />
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import React from 'react';
-import { Button, Toast, Typography } from '@douyinfe/semi-ui';
-import { IconCopy } from '@douyinfe/semi-icons';
+import { Button, Toast, Typography } from './pool/index.jsx';
+import { IconCopy } from './pool/icons.jsx';
 import { writeClipboard } from '../lib/browserClipboard.js';
 
 export async function copyRequestID(requestID) {

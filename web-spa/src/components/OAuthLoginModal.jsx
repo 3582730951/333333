@@ -1,11 +1,11 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   Modal, Tabs, TabPane, Form, Input, Button, Typography, Toast, Divider, Tooltip,
-} from '@douyinfe/semi-ui';
+} from './pool/index.jsx';
 import {
   IconCopy, IconTick, IconRefresh, IconLink,
   IconChevronRight, IconCheckCircleStroked, IconFile,
-} from '@douyinfe/semi-icons';
+} from './pool/icons.jsx';
 import { oauthStart, oauthComplete, post } from '../api.js';
 import { showErrorToast } from './ErrorToast.jsx';
 import VendorLogo from './VendorLogo.jsx';
@@ -258,12 +258,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             minHeight: 200,
             padding: 12,
             borderRadius: 6,
-            border: '1px solid var(--semi-color-border)',
+            border: '1px solid var(--pool-border)',
             fontSize: 13,
             fontFamily: 'monospace',
             resize: 'vertical',
-            background: 'var(--semi-color-bg-1)',
-            color: 'var(--semi-color-text-1)',
+            background: 'var(--pool-bg-surface)',
+            color: 'var(--pool-text)',
           }}
         />
       </Form>
@@ -396,7 +396,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
           <div
             style={{
               padding: '12px 16px',
-              background: 'var(--semi-color-fill-0)',
+              background: 'var(--pool-bg-surface-2)',
               borderRadius: 6,
               marginBottom: 16,
             }}

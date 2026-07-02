@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Card, Form, Button, Toast, Typography, Avatar, Tabs, TabPane } from '@douyinfe/semi-ui';
+import { Card, Form, Button, Toast, Typography, Avatar, Tabs, TabPane } from '../components/pool/index.jsx';
 import { setToken, clearToken, get, login, registerUser } from '../api.js';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
@@ -34,7 +34,7 @@ export default function Login({ onSuccess }) {
     <div className="pool-login-wrap">
       <Card className="pool-card" style={{ width: 420, boxShadow: 'var(--pool-shadow-hover)' }} bodyStyle={{ padding: 24 }}>
         <div style={{ textAlign: 'center', marginBottom: 14 }}>
-          <Avatar size="default" style={{ background: 'var(--semi-color-primary)' }}>P</Avatar>
+          <Avatar size="default" style={{ background: 'var(--pool-accent)' }}>P</Avatar>
           <Typography.Title heading={4} style={{ marginTop: 10 }}>Pool 控制台</Typography.Title>
           <Typography.Text type="tertiary" size="small">账号池中继 · 管理与用户门户</Typography.Text>
         </div>

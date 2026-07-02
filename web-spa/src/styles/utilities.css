@@ -1,0 +1,67 @@
+.pool-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.pool-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pool-inline--wrap {
+  flex-wrap: wrap;
+}
+
+.pool-grid {
+  display: grid;
+  gap: 14px;
+}
+
+.pool-grid-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.pool-grid-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.pool-grid-4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.pool-text-secondary {
+  color: var(--pool-text-2);
+}
+
+.pool-text-tertiary {
+  color: var(--pool-text-3);
+}
+
+.pool-danger-text {
+  color: var(--pool-danger);
+}
+
+.pool-success-text {
+  color: var(--pool-success);
+}
+
+.pool-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 900px) {
+  .pool-grid-4,
+  .pool-grid-3,
+  .pool-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}

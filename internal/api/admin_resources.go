@@ -6,6 +6,7 @@ package api
 import (
 	"codex-account-pool/internal/proxyparse"
 	"codex-account-pool/internal/storage"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,24 +25,105 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 		}
 		writeJSON(w, http.StatusOK, binding)
 	case http.MethodPost:
-		var req storage.AccountEgressBinding
+		var req map[string]json.RawMessage
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		req.AccountID = accountID
-		if req.PrimaryEgressID == "" {
+		var primary string
+		if raw, ok := req["primary_egress_id"]; ok {
+			if err := json.Unmarshal(raw, &primary); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("primary_egress_id must be a string"))
+				return
+			}
+		}
+		primary = strings.TrimSpace(primary)
+		if primary == "" {
 			writeError(w, http.StatusBadRequest, errors.New("primary_egress_id required"))
 			return
 		}
-		if err := s.store.UpsertEgressBinding(r.Context(), req); err != nil {
+		if _, err := s.store.GetAccount(r.Context(), accountID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, err)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, req)
+		if _, err := s.store.GetEgressProfile(r.Context(), primary); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("egress %q not found", primary))
+			return
+		}
+		binding, err := s.store.GetEgressBinding(r.Context(), accountID)
+		if err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			binding = storage.AccountEgressBinding{AccountID: accountID}
+		}
+		standby := binding.StandbyIDs()
+		if raw, ok := req["standby_egress_ids"]; ok {
+			ids, err := parseStandbyEgressIDs(raw)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			standby = ids
+		}
+		standby = normalizeStandbyEgressIDs(primary, standby)
+		for _, id := range standby {
+			if _, err := s.store.GetEgressProfile(r.Context(), id); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("egress %q not found", id))
+				return
+			}
+		}
+		binding.AccountID = accountID
+		binding.PrimaryEgressID = primary
+		binding.StandbyEgressIDs = strings.Join(standby, ",")
+		binding.CookieJarKey = accountID + ":" + primary
+		if err := s.store.UpsertEgressBinding(r.Context(), binding); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		got, err := s.store.GetEgressBinding(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, got)
 	default:
 		methodNotAllowed(w)
 	}
+}
+
+func parseStandbyEgressIDs(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var ids []string
+	if err := json.Unmarshal(raw, &ids); err == nil {
+		return ids, nil
+	}
+	var csv string
+	if err := json.Unmarshal(raw, &csv); err != nil {
+		return nil, fmt.Errorf("standby_egress_ids must be a string or array of strings")
+	}
+	return strings.Split(csv, ","), nil
+}
+
+func normalizeStandbyEgressIDs(primary string, ids []string) []string {
+	seen := map[string]bool{primary: true}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 func (s *Server) adminBrowserRepair(w http.ResponseWriter, r *http.Request, accountID string) {

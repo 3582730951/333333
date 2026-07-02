@@ -1,6 +1,6 @@
 import React from 'react';
-import { Banner, Button, Spin, Tag, Typography } from '@douyinfe/semi-ui';
-import { IconUndo } from '@douyinfe/semi-icons';
+import { Banner, Button, Spin, Tag, Typography } from './pool/index.jsx';
+import { IconUndo } from './pool/icons.jsx';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
 
 const initialTabSpinStyle = { width: '100%', marginTop: 80 };

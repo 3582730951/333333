@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo } from 'react';
-import { Button, Tag, Select, Typography, Toast } from '@douyinfe/semi-ui';
-import { IconRefresh, IconDownload } from '@douyinfe/semi-icons';
+import { Button, Tag, Select, Typography, Toast } from '../components/pool/index.jsx';
+import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
 import { get } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';

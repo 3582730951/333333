@@ -38,6 +38,50 @@ export function setDocumentBodyAttribute(name, value) {
   }
 }
 
+export function documentElementAttribute(name) {
+  try {
+    if (!name || typeof document === 'undefined' || !document.documentElement) return '';
+    return document.documentElement.getAttribute(name) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setDocumentElementAttribute(name, value) {
+  try {
+    if (!name || typeof document === 'undefined' || !document.documentElement) return false;
+    if (value == null || value === false) {
+      document.documentElement.removeAttribute(name);
+    } else {
+      document.documentElement.setAttribute(name, String(value));
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function observeDocumentElementAttributes(callback, attributeFilter = []) {
+  try {
+    if (typeof MutationObserver === 'undefined' || typeof callback !== 'function') return noop;
+    if (typeof document === 'undefined' || !document.documentElement) return noop;
+    const observer = new MutationObserver(callback);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: attributeFilter.length ? attributeFilter : undefined,
+    });
+    return () => {
+      try {
+        observer.disconnect();
+      } catch {
+        // Observer cleanup must not break component unmount.
+      }
+    };
+  } catch {
+    return noop;
+  }
+}
+
 export function observeDocumentBodyAttributes(callback, attributeFilter = []) {
   try {
     if (typeof MutationObserver === 'undefined' || typeof callback !== 'function') return noop;

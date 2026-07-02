@@ -1,5 +1,5 @@
 import React from 'react';
-import { Space, Tag, Tooltip } from '@douyinfe/semi-ui';
+import { Space, Tag, Tooltip } from './pool/index.jsx';
 
 function textTitle(value) {
   if (typeof value === 'string' || typeof value === 'number') return String(value);

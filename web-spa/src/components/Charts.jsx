@@ -3,26 +3,26 @@ import {
   ResponsiveContainer, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts';
-import { documentBodyAttribute, observeDocumentBodyAttributes } from '../lib/browserDocument.js';
+import { documentElementAttribute, observeDocumentElementAttributes } from '../lib/browserDocument.js';
 import { fmtTokens, fmtTime } from '../lib/format.js';
 import { PALETTE, modelColor } from '../lib/chartTheme.js';
 
-// Track Semi-UI light/dark so chart axes/grid stay legible on theme toggle.
+// Track the console theme so chart axes/grid stay legible on theme toggle.
 export function useIsDark() {
-  const read = () => documentBodyAttribute('theme-mode') === 'dark';
+  const read = () => documentElementAttribute('data-theme') !== 'light';
   const [dark, setDark] = useState(read());
   useEffect(() => {
-    return observeDocumentBodyAttributes(() => setDark(read()), ['theme-mode']);
+    return observeDocumentElementAttributes(() => setDark(read()), ['data-theme']);
   }, []);
   return dark;
 }
 
-function axisColors(dark) {
+function axisColors() {
   return {
-    grid: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)',
-    tick: dark ? 'rgba(255,255,255,0.55)' : 'rgba(0,0,0,0.5)',
-    tooltipBg: dark ? '#1c1f26' : '#ffffff',
-    tooltipBorder: dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)',
+    grid: 'var(--pool-chart-grid)',
+    tick: 'var(--pool-chart-tick)',
+    tooltipBg: 'var(--pool-chart-tooltip-bg)',
+    tooltipBorder: 'var(--pool-chart-tooltip-border)',
   };
 }
 
@@ -50,8 +50,8 @@ function tooltipStyle(c) {
 
 // Stacked token-usage area chart from UsageBucket[] ({bucket, prompt_tokens, completion_tokens, cached_tokens, total_tokens}).
 export function UsageAreaChart({ buckets = [], height = 260 }) {
-  const dark = useIsDark();
-  const c = axisColors(dark);
+  useIsDark();
+  const c = axisColors();
   const data = (buckets || []).map((b) => ({
     t: fmtTime(b.bucket),
     输入: b.prompt_tokens || 0,
@@ -86,8 +86,8 @@ export function UsageAreaChart({ buckets = [], height = 260 }) {
 // Generic donut from [{name, value}]. Shows the total in the center with a
 // custom SVG label so the chart is both visual and numeric.
 export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal = true }) {
-  const dark = useIsDark();
-  const c = axisColors(dark);
+  useIsDark();
+  const c = axisColors();
   const items = (data || []).filter((d) => (d.value || 0) > 0);
   if (!items.length) return <Empty />;
   const total = items.reduce((s, d) => s + (d.value || 0), 0);
@@ -122,8 +122,8 @@ export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal
 
 // Grouped bar from [{x, ...series}] with series=[{key,color,name}].
 export function GroupedBar({ data = [], series = [], height = 240, stacked = false, showValues = true }) {
-  const dark = useIsDark();
-  const c = axisColors(dark);
+  useIsDark();
+  const c = axisColors();
   if (!data.length) return <Empty />;
   const labelEl = showValues ? { position: 'top', fill: c.tick, fontSize: 11 } : false;
   return (
@@ -177,7 +177,7 @@ export function CacheRateBars({ data = [] }) {
 
 function Empty() {
   return (
-    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--semi-color-text-2)', fontSize: 13 }}>
+    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--pool-text-2)', fontSize: 13 }}>
       暂无数据
     </div>
   );

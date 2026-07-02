@@ -1,5 +1,5 @@
 import React from 'react';
-import { IconGlobe } from '@douyinfe/semi-icons';
+import { IconGlobe } from './pool/icons.jsx';
 import openaiLogo from '../assets/vendors/openai-blossom.svg';
 import anthropicLogo from '../assets/vendors/anthropic.svg';
 import paypalLogo from '../assets/vendors/paypal.svg';

@@ -58,7 +58,7 @@ if (!/\bfunction\s+ConfigFieldRow\b/.test(source)) {
 }
 
 if (/className="pool-settings-row"\s+style=/.test(source)) {
-  problems.push('SettingsV2.jsx must keep config row layout in theme.css, not inline JSX styles.');
+  problems.push('SettingsV2.jsx must keep config row layout in shared styles, not inline JSX styles.');
 }
 
 if (!/\bfunction\s+settingsFormKey\b/.test(source)) {

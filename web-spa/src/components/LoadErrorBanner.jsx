@@ -1,6 +1,6 @@
 import React from 'react';
-import { Banner, Button, Typography } from '@douyinfe/semi-ui';
-import { IconRefresh } from '@douyinfe/semi-icons';
+import { Banner, Button, Typography } from './pool/index.jsx';
+import { IconRefresh } from './pool/icons.jsx';
 import { errMsg, errRequestID } from '../api.js';
 import RequestIDLine from './RequestIDLine.jsx';
 

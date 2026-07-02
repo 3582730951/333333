@@ -1,7 +1,7 @@
 import React, { useState, useCallback } from 'react';
-import { Button, Select, Toast } from '@douyinfe/semi-ui';
-import { IconRefresh } from '@douyinfe/semi-icons';
-import { IconDownload } from '@douyinfe/semi-icons';
+import { Button, Select, Toast } from '../components/pool/index.jsx';
+import { IconRefresh } from '../components/pool/icons.jsx';
+import { IconDownload } from '../components/pool/icons.jsx';
 import { get } from '../api.js';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';

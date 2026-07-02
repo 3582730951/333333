@@ -1,5 +1,5 @@
 import React from 'react';
-import { Tag, Typography } from '@douyinfe/semi-ui';
+import { Tag, Typography } from './pool/index.jsx';
 import { Panel, Meter } from './PageHeader.jsx';
 import { COLORS } from '../lib/chartTheme.js';
 import { fmtBytes, fmtDuration, fmtInt, fmtKB, fmtRelative } from '../lib/format.js';

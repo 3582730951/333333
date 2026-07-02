@@ -1,10 +1,10 @@
 import React, { useState, useCallback } from 'react';
-import { Button, Toast, Modal, Form, Popconfirm, Tag } from '@douyinfe/semi-ui';
-import { IconPlus, IconRefresh } from '@douyinfe/semi-icons';
+import { ActionMenu, Button, Toast, Modal, Form, Tag } from '../components/pool/index.jsx';
+import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import { get, post, del } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
-import { ActionGroup, MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
+import { MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
@@ -79,11 +79,20 @@ export default function Groups() {
       key: 'ops',
       width: 116,
       render: (_, r) => (
-        <ActionGroup minWidth={80}>
-          <Popconfirm title={`删除分组 ${r.name}?`} onConfirm={() => remove(r.name)}>
-            <Button size="small" type="danger" loading={isRemoving(r.name)} disabled={creating || (removing && !isRemoving(r.name))}>删除</Button>
-          </Popconfirm>
-        </ActionGroup>
+        <ActionMenu
+          label="分组操作"
+          items={[{
+            label: isRemoving(r.name) ? '删除中' : '删除',
+            destructive: true,
+            disabled: creating || (removing && !isRemoving(r.name)),
+            confirm: {
+              title: `删除分组 ${r.name}?`,
+              description: '删除分组会移除该分组配置，不会删除账号。',
+              confirmText: '删除',
+            },
+            onSelect: () => remove(r.name),
+          }]}
+        />
     ) },
   ];
 

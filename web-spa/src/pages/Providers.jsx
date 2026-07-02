@@ -1,12 +1,12 @@
 import React, { useState, useCallback } from 'react';
-import { Button, Toast, Modal, Form, Tag, Popconfirm } from '@douyinfe/semi-ui';
-import { IconPlus, IconRefresh, IconEdit, IconKey, IconDelete } from '@douyinfe/semi-icons';
+import { ActionMenu, Button, Toast, Modal, Form, Tag } from '../components/pool/index.jsx';
+import { IconPlus, IconRefresh, IconEdit, IconKey, IconDelete } from '../components/pool/icons.jsx';
 import { get, post, del } from '../api.js';
 import { rowsOf } from '../components/DataPage.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
-import { ActionGroup, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
+import { TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import VendorLogo from '../components/VendorLogo.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
@@ -84,13 +84,25 @@ export default function Providers() {
   };
 
   const renderProviderActions = (row) => (
-    <ActionGroup minWidth={220}>
-      <Button size="small" icon={<IconEdit />} disabled={providerOperationRunning} onClick={() => setEditor({ mode: 'edit', values: providerFormValues(row) })}>编辑</Button>
-      <Button size="small" icon={<IconKey />} disabled={providerOperationRunning} onClick={() => setImporter(row)}>导入 Key</Button>
-      <Popconfirm title={`删除提供商 ${row.id}？`} onConfirm={() => remove(row.id)}>
-        <Button size="small" type="danger" icon={<IconDelete />} loading={isRemovingProvider(row.id)} disabled={(savingProvider || importingKey) || (removingProvider && !isRemovingProvider(row.id))}>删除</Button>
-      </Popconfirm>
-    </ActionGroup>
+    <ActionMenu
+      label="提供商操作"
+      items={[
+        { label: '编辑', icon: <IconEdit />, disabled: providerOperationRunning, onSelect: () => setEditor({ mode: 'edit', values: providerFormValues(row) }) },
+        { label: '导入 Key', icon: <IconKey />, disabled: providerOperationRunning, onSelect: () => setImporter(row) },
+        {
+          label: isRemovingProvider(row.id) ? '删除中' : '删除',
+          icon: <IconDelete />,
+          destructive: true,
+          disabled: (savingProvider || importingKey) || (removingProvider && !isRemovingProvider(row.id)),
+          confirm: {
+            title: `删除提供商 ${row.id}？`,
+            description: '删除后该提供商配置将不可用于后续账号导入。',
+            confirmText: '删除',
+          },
+          onSelect: () => remove(row.id),
+        },
+      ]}
+    />
   );
 
   const columns = [

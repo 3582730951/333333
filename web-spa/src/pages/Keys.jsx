@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
-import { Button, Toast } from '@douyinfe/semi-ui';
-import { IconPlus, IconRefresh } from '@douyinfe/semi-icons';
+import { Button, Toast } from '../components/pool/index.jsx';
+import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import { get, post, del } from '../api.js';
 import ApiKeyCreateModal from '../components/ApiKeyCreateModal.jsx';
 import ApiKeysTable from '../components/ApiKeysTable.jsx';

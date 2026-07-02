@@ -1,6 +1,6 @@
 import React from 'react';
-import { Button, Space, Typography } from '@douyinfe/semi-ui';
-import { IconHome, IconRefresh } from '@douyinfe/semi-icons';
+import { Button, Space, Typography } from './pool/index.jsx';
+import { IconHome, IconRefresh } from './pool/icons.jsx';
 import { currentAssetSignature } from '../lib/assetSignature.js';
 import { errRequestID } from '../api.js';
 import { dispatchBrowserEvent } from '../lib/browserEvents.js';
