@@ -1,0 +1,186 @@
+package cloak
+
+import (
+	"encoding/json"
+	"regexp"
+	"strings"
+	"testing"
+
+	"codex-account-pool/internal/identity"
+)
+
+// real Claude Code 2.1.x metadata.user_id is a JSON string (captured ground truth).
+var userIDShape = regexp.MustCompile(`^\{"device_id":"[a-f0-9]{64}","account_uuid":"[^"]*","session_id":"[0-9a-f-]{36}"\}$`)
+
+func TestClaudeVirtualUserIDMatchesRealShape(t *testing.T) {
+	id := identity.For(nil, "acc-uid")
+	got := claudeVirtualUserID(id, true)
+	if !userIDShape.MatchString(got) {
+		t.Fatalf("oauth user_id does not match real Claude Code JSON shape: %q", got)
+	}
+	if bare := claudeVirtualUserID(id, false); bare != id.UserID {
+		t.Fatalf("api-key user_id should be the bare id, got %q", bare)
+	}
+}
+
+// billingRe extracts the three fields of the billing header.
+var billingRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=(\S+)\.([0-9a-f]{3}); cc_entrypoint=cli; cch=([0-9a-f]{5});$`)
+
+func firstSystemText(t *testing.T, body []byte) string {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sys, ok := root["system"].([]interface{})
+	if !ok || len(sys) == 0 {
+		t.Fatalf("system is not a non-empty array: %v", root["system"])
+	}
+	return sys[0].(map[string]interface{})["text"].(string)
+}
+
+func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
+	// An OpenAI-compat→Claude body has no billing header; we must prepend one.
+	body := []byte(`{"model":"claude","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`)
+	out := EnsureClaudeCodeBillingHeader(body, "2.1.159")
+	first := firstSystemText(t, out)
+	m := billingRe.FindStringSubmatch(first)
+	if m == nil {
+		t.Fatalf("billing header not prepended/well-formed: %q", first)
+	}
+	if m[1] != "2.1.159" {
+		t.Fatalf("cc_version not aligned to our version: %q", first)
+	}
+	// buildHash (m[2]) + cch (m[3]) are per-request random hex of the captured shape.
+	// The billing block must carry NO cache_control.
+	var root map[string]interface{}
+	_ = json.Unmarshal(out, &root)
+	if _, has := root["system"].([]interface{})[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("billing block must not carry cache_control")
+	}
+}
+
+func TestBillingHeaderRealignedInPlaceForRealClaudeCode(t *testing.T) {
+	// Real Claude Code already carries a billing header reporting the DOWNSTREAM's
+	// version; we must realign cc_version to ours (no duplicate block) and refresh cch.
+	body := []byte(`{"model":"claude","system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.180.abc; cc_entrypoint=cli; cch=deadb;"},` +
+		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}` +
+		`],"messages":[]}`)
+	out := EnsureClaudeCodeBillingHeader(body, "2.1.160")
+	var root map[string]interface{}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	sys := root["system"].([]interface{})
+	if len(sys) != 2 {
+		t.Fatalf("expected no duplicate block, got %d system blocks", len(sys))
+	}
+	m := billingRe.FindStringSubmatch(sys[0].(map[string]interface{})["text"].(string))
+	if m == nil || m[1] != "2.1.160" {
+		t.Fatalf("billing header not realigned to our version: %v", sys[0])
+	}
+	// cch must be regenerated (no longer the client's stale value).
+	if m[3] == "deadb" {
+		t.Fatalf("cch should be regenerated, still has client's stale value")
+	}
+}
+
+func TestEnsureClaudeCodeSystemDoesNotDoubleInjectOnBillingHeader(t *testing.T) {
+	// A genuine Claude Code request leads with the billing block; Virtualize must NOT
+	// prepend a second identity block.
+	body := []byte(`{"model":"claude","metadata":{"user_id":"real-user-abc123"},"system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.953; cc_entrypoint=cli; cch=d4baa;"},` +
+		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}` +
+		`]}`)
+	res := Virtualize(body, identity.For(nil, "acc-real"), nil, true)
+	var root map[string]interface{}
+	_ = json.Unmarshal(res.Body, &root)
+	sys := root["system"].([]interface{})
+	// Count identity-line blocks: must be exactly one (no duplicate).
+	n := 0
+	for _, b := range sys {
+		if t, _ := b.(map[string]interface{})["text"].(string); strings.HasPrefix(strings.TrimSpace(t), claudeCodeIdentityLine) {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("expected exactly one identity block (no double injection), got %d in %d blocks", n, len(sys))
+	}
+	if first := sys[0].(map[string]interface{})["text"].(string); !strings.HasPrefix(first, claudeBillingHeaderPrefix) {
+		t.Fatalf("the original billing block should remain first, got %q", first)
+	}
+}
+
+// canonicalizeForCompare strips the two per-request random fields (the cc_version
+// 3-hex buildHash suffix and the 5-hex cch) from a billing block so two bodies that
+// differ only in those nonces compare equal. Everything else must match byte-for-byte.
+func canonicalizeForCompare(t *testing.T, body []byte) string {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if sys, ok := root["system"].([]interface{}); ok {
+		for _, blk := range sys {
+			bm, ok := blk.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if txt, _ := bm["text"].(string); strings.HasPrefix(strings.TrimSpace(txt), claudeBillingHeaderPrefix) {
+				bm["text"] = billingRe.ReplaceAllString(txt, "x-anthropic-billing-header: cc_version=$1.NNN; cc_entrypoint=cli; cch=NNNNN;")
+			}
+		}
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(out)
+}
+
+// TestVirtualizeClaudeCodeFoldsBillingEquivalently is the regression guard for the
+// performance refactor: folding the billing-header stamp into Virtualize's single
+// parse/marshal pass (VirtualizeClaudeCode) must produce a body byte-identical — modulo
+// the inherently-random cch/buildHash nonces — to the old two-pass sequence
+// (Virtualize then EnsureClaudeCodeBillingHeader). If they ever diverge in structure,
+// the "pure performance" claim is false.
+func TestVirtualizeClaudeCodeFoldsBillingEquivalently(t *testing.T) {
+	id := identity.For(nil, "acc-fold")
+	bodies := [][]byte{
+		// Genuine Claude Code (leads with billing + identity blocks).
+		[]byte(`{"model":"claude","metadata":{"user_id":"real-user"},"system":[` +
+			`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.180.abc; cc_entrypoint=cli; cch=deadb;"},` +
+			`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.\nPlatform: linux\nOS Version: x"}` +
+			`],"messages":[{"role":"user","content":"hi"}]}`),
+		// OpenAI-compat→Claude (no billing block, string system).
+		[]byte(`{"model":"claude","system":"be helpful","messages":[{"role":"user","content":"hi"}]}`),
+		// No system at all.
+		[]byte(`{"model":"claude","messages":[{"role":"user","content":"hi"}]}`),
+	}
+	for i, body := range bodies {
+		words := []string{"secret"}
+		twoPass := Virtualize(body, id, words, true)
+		twoPassBody := EnsureClaudeCodeBillingHeader(twoPass.Body, "2.1.159")
+		onePass := VirtualizeClaudeCode(body, id, words, true, "2.1.159")
+
+		got := canonicalizeForCompare(t, onePass.Body)
+		want := canonicalizeForCompare(t, twoPassBody)
+		if got != want {
+			t.Fatalf("case %d: one-pass body diverges from two-pass\n one-pass=%s\n two-pass=%s", i, got, want)
+		}
+	}
+}
+
+// TestVirtualizeClaudeCodeNoBillingMatchesVirtualize confirms an empty billingVersion
+// (or non-OAuth) keeps VirtualizeClaudeCode identical to plain Virtualize — no billing
+// block is injected, so the API-key / probe paths are unaffected.
+func TestVirtualizeClaudeCodeNoBillingMatchesVirtualize(t *testing.T) {
+	id := identity.For(nil, "acc-nobill")
+	body := []byte(`{"model":"claude","system":"hello","messages":[{"role":"user","content":"hi"}]}`)
+	plain := Virtualize(body, id, nil, true).Body
+	folded := VirtualizeClaudeCode(body, id, nil, true, "").Body
+	if string(plain) != string(folded) {
+		t.Fatalf("empty billingVersion must equal Virtualize\n plain =%s\n folded=%s", plain, folded)
+	}
+}

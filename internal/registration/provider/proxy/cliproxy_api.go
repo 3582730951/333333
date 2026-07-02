@@ -26,14 +26,14 @@ import (
 
 // CliproxyAPIExtractor calls the cliproxy.io white-api to extract dynamic residential IPs.
 type CliproxyAPIExtractor struct {
-	BaseURL string      // default https://api.cliproxy.io
-	APIKey  string      // cliproxy account API token (may be empty — some endpoints are keyless)
+	BaseURL string // default https://api.cliproxy.io
+	APIKey  string // cliproxy account API token (may be empty — some endpoints are keyless)
 	HC      *http.Client
 }
 
 // ipCacheEntry caches one extracted ip:port per region with its expiry.
 type ipCacheEntry struct {
-	ip       string
+	ip        string
 	expiresAt time.Time
 }
 

@@ -120,15 +120,15 @@ func main() {
 	}
 
 	if v := os.Getenv("CLIPROXY_API_KEY"); v != "" {
-			d, err := b64UTF16(v)
-			if err != nil {
-				// CLIPROXY_API_KEY might be plain ASCII (not base64-encoded); try raw.
-				sec.Cliproxy.APIKey = strings.TrimSpace(v)
-			} else {
-				sec.Cliproxy.APIKey = strings.TrimSpace(d)
-			}
+		d, err := b64UTF16(v)
+		if err != nil {
+			// CLIPROXY_API_KEY might be plain ASCII (not base64-encoded); try raw.
+			sec.Cliproxy.APIKey = strings.TrimSpace(v)
+		} else {
+			sec.Cliproxy.APIKey = strings.TrimSpace(d)
 		}
-		if *outJSON != "" {
+	}
+	if *outJSON != "" {
 		raw, _ := json.MarshalIndent(sec, "", "  ")
 		if err := os.WriteFile(*outJSON, raw, 0o600); err != nil {
 			fmt.Fprintln(os.Stderr, "write json:", err)

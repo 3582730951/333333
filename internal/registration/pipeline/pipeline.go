@@ -78,19 +78,19 @@ func (p *Pipeline) egressClient(ctx context.Context, egressID string) *http.Clie
 
 // RegisterRequest defines a registration task
 type RegisterRequest struct {
-	Platform        string `json:"platform"` // "chatgpt"
-	Method          string `json:"method"`   // "protocol" | "browser"
-	Count           int    `json:"count"`
-	GroupName       string `json:"group_name"`
-	EgressID        string `json:"egress_id"`
-	UpgradeToPlus   bool   `json:"upgrade_to_plus"`
-	IdentityMode    string `json:"identity_mode"` // "phone" (default) | "email"
-	Country         string `json:"country"`       // SMS country code/id (default "ID")
-	SMSProvider     string `json:"sms_provider"`
-	SMSCountry      string `json:"sms_country,omitempty"` // ISO-2 of the country chosen (for stats recording)
-	SMSCost         float64 `json:"sms_cost,omitempty"`   // cost of the SMS number (for stats recording)
-	MailboxProvider string `json:"mailbox_provider"`
-	CaptchaSolver   string `json:"captcha_solver"`
+	Platform        string  `json:"platform"` // "chatgpt"
+	Method          string  `json:"method"`   // "protocol" | "browser"
+	Count           int     `json:"count"`
+	GroupName       string  `json:"group_name"`
+	EgressID        string  `json:"egress_id"`
+	UpgradeToPlus   bool    `json:"upgrade_to_plus"`
+	IdentityMode    string  `json:"identity_mode"` // "phone" (default) | "email"
+	Country         string  `json:"country"`       // SMS country code/id (default "ID")
+	SMSProvider     string  `json:"sms_provider"`
+	SMSCountry      string  `json:"sms_country,omitempty"` // ISO-2 of the country chosen (for stats recording)
+	SMSCost         float64 `json:"sms_cost,omitempty"`    // cost of the SMS number (for stats recording)
+	MailboxProvider string  `json:"mailbox_provider"`
+	CaptchaSolver   string  `json:"captcha_solver"`
 }
 
 // acquireSMS resolves the SMS provider + phone number + order id for one registration.

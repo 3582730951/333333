@@ -1,0 +1,300 @@
+package storage
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	store, err := Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func TestInitCreatesCyberGroupAndDirectEgress(t *testing.T) {
+	store := newTestStore(t)
+	group, err := store.GetGroup(context.Background(), "cyber")
+	if err != nil {
+		t.Fatalf("get cyber group: %v", err)
+	}
+	if group.SystemPrompt != "" {
+		t.Fatalf("cyber prompt = %q, want empty", group.SystemPrompt)
+	}
+	if group.PromptMode != "prepend" {
+		t.Fatalf("prompt mode = %q", group.PromptMode)
+	}
+	if !group.SystemPromptApplyToCompaction {
+		t.Fatalf("system prompt should apply to compaction by default")
+	}
+	egress, err := store.GetEgressProfile(context.Background(), DefaultDirectEgressID)
+	if err != nil {
+		t.Fatalf("get direct egress: %v", err)
+	}
+	if egress.Type != "direct" || !egress.StreamCapable {
+		t.Fatalf("unexpected direct egress: %+v", egress)
+	}
+}
+
+func TestAccountImportCreatesEgressBinding(t *testing.T) {
+	store := newTestStore(t)
+	err := store.UpsertAccount(context.Background(), Account{
+		ID:                "acc-1",
+		Label:             "test",
+		GroupName:         "cyber",
+		UpstreamAccountID: "chatgpt-account",
+		Status:            "active",
+	}, AccountToken{AccessToken: "access"})
+	if err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	binding, err := store.GetEgressBinding(context.Background(), "acc-1")
+	if err != nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	if binding.PrimaryEgressID != DefaultDirectEgressID {
+		t.Fatalf("primary egress = %q", binding.PrimaryEgressID)
+	}
+}
+
+func TestAccountPoolSummaryCountsDashboardFields(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := Now()
+	accounts := []struct {
+		account Account
+		token   AccountToken
+	}{
+		{Account{ID: "codex-active", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AccessToken: "codex-token"}},
+		{Account{ID: "claude-legacy", GroupName: "cyber", Status: "active"}, AccountToken{AccessToken: "sk-ant-oat-test"}},
+		{Account{ID: "custom-disabled", GroupName: "cyber", Provider: "deepseek", Status: "disabled"}, AccountToken{OpenAIAPIKey: "sk-custom"}},
+		{Account{ID: "codex-quarantined", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AccessToken: "codex-token-2"}},
+	}
+	for _, item := range accounts {
+		if err := store.UpsertAccount(ctx, item.account, item.token); err != nil {
+			t.Fatalf("upsert %s: %v", item.account.ID, err)
+		}
+	}
+	if err := store.SetBindingCooldown(ctx, "codex-active", now+300); err != nil {
+		t.Fatalf("set cooldown: %v", err)
+	}
+	if err := store.SetBindingRecheckPending(ctx, "claude-legacy", true); err != nil {
+		t.Fatalf("set recheck pending: %v", err)
+	}
+	if err := store.SetAccountQuarantine(ctx, "codex-quarantined", now+600, "test"); err != nil {
+		t.Fatalf("set quarantine: %v", err)
+	}
+
+	got, err := store.AccountPoolSummary(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := AccountPoolSummary{
+		Total:       4,
+		Active:      2,
+		Quarantined: 1,
+		Cooling:     1,
+		Recheck:     1,
+		Codex:       2,
+		Claude:      1,
+		Other:       1,
+	}
+	if got != want {
+		t.Fatalf("summary = %#v, want %#v", got, want)
+	}
+}
+
+func TestAccountBatchExpansionHelpers(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	accounts := []struct {
+		account Account
+		token   AccountToken
+	}{
+		{Account{ID: "codex-explicit", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AccessToken: "codex-token"}},
+		{Account{ID: "claude-legacy", GroupName: "cyber", Status: "active"}, AccountToken{AccessToken: "sk-ant-oat-test"}},
+	}
+	for _, item := range accounts {
+		if err := store.UpsertAccount(ctx, item.account, item.token); err != nil {
+			t.Fatalf("upsert %s: %v", item.account.ID, err)
+		}
+	}
+	if err := store.SetBindingRecheckPending(ctx, "claude-legacy", true); err != nil {
+		t.Fatalf("set recheck pending: %v", err)
+	}
+	if err := store.UpsertCapabilities(ctx, []ModelCapability{
+		{AccountID: "codex-explicit", ModelSlug: "gpt-5"},
+		{AccountID: "claude-legacy", ModelSlug: "claude-sonnet"},
+	}); err != nil {
+		t.Fatalf("upsert capabilities: %v", err)
+	}
+	accountRows, _, err := store.ListAccountsPage(ctx, 20, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	providers, err := store.ResolveAccountProviders(ctx, accountRows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if providers["codex-explicit"] != "codex" || providers["claude-legacy"] != "claude" {
+		t.Fatalf("providers = %#v, want codex explicit and claude legacy fallback", providers)
+	}
+
+	bindings, err := store.ListEgressBindingsByAccountIDs(ctx, []string{"codex-explicit", "claude-legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bindings) != 2 || !bindings["claude-legacy"].RecheckPending {
+		t.Fatalf("bindings = %#v, want two bindings with claude recheck pending", bindings)
+	}
+
+	caps, err := store.ListCapabilitiesByAccountIDs(ctx, []string{"codex-explicit", "claude-legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := caps["codex-explicit"]; len(got) != 1 || got[0].ModelSlug != "gpt-5" {
+		t.Fatalf("codex capabilities = %#v, want gpt-5", got)
+	}
+	if got := caps["claude-legacy"]; len(got) != 1 || got[0].ModelSlug != "claude-sonnet" {
+		t.Fatalf("claude capabilities = %#v, want claude-sonnet", got)
+	}
+}
+
+func TestListAccountsByIDs(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	for _, account := range []Account{
+		{ID: "acc-a", Label: "A", GroupName: "cyber", Status: "active"},
+		{ID: "acc-b", Label: "B", GroupName: "cyber", Status: "disabled"},
+		{ID: "acc-c", Label: "C", GroupName: "cyber", Status: "active"},
+	} {
+		if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token-" + account.ID}); err != nil {
+			t.Fatalf("upsert %s: %v", account.ID, err)
+		}
+	}
+
+	got, err := store.ListAccountsByIDs(ctx, []string{"acc-a", "missing", "acc-b", "acc-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("accounts = %#v, want two requested existing accounts", got)
+	}
+	if got["acc-a"].Label != "A" || got["acc-b"].Status != "disabled" {
+		t.Fatalf("accounts = %#v, want acc-a label and acc-b status", got)
+	}
+	if _, ok := got["acc-c"]; ok {
+		t.Fatalf("loaded unrequested account: %#v", got["acc-c"])
+	}
+}
+
+func TestUsageSummaryByAccountIDs(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.InsertUsageRecord(ctx, "acc-a", "", "", "", "gpt-5", 10, 20, 30, 3, nil); err != nil {
+		t.Fatalf("insert acc-a usage: %v", err)
+	}
+	if err := store.InsertUsageRecord(ctx, "acc-a", "", "", "", "gpt-5", 1, 2, 3, 1, nil); err != nil {
+		t.Fatalf("insert second acc-a usage: %v", err)
+	}
+	if err := store.InsertUsageRecord(ctx, "acc-b", "", "", "", "claude-sonnet", 5, 6, 11, 0, nil); err != nil {
+		t.Fatalf("insert acc-b usage: %v", err)
+	}
+	if err := store.InsertUsageRecord(ctx, "acc-c", "", "", "", "other", 100, 100, 200, 0, nil); err != nil {
+		t.Fatalf("insert acc-c usage: %v", err)
+	}
+
+	got, err := store.UsageSummaryByAccountIDs(ctx, []string{"acc-a", "acc-b", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("summary row count = %d, want 2: %#v", len(got), got)
+	}
+	if row := got["acc-a"]; row.Requests != 2 || row.PromptTokens != 11 || row.CompletionTokens != 22 || row.TotalTokens != 33 || row.CachedTokens != 4 {
+		t.Fatalf("acc-a summary = %#v, want aggregated usage", row)
+	}
+	if row := got["acc-b"]; row.Requests != 1 || row.TotalTokens != 11 {
+		t.Fatalf("acc-b summary = %#v, want one request total 11", row)
+	}
+	if _, ok := got["acc-c"]; ok {
+		t.Fatalf("summary included non-requested account: %#v", got["acc-c"])
+	}
+	if empty, err := store.UsageSummaryByAccountIDs(ctx, nil); err != nil || len(empty) != 0 {
+		t.Fatalf("empty accountIDs = %#v err=%v, want empty map", empty, err)
+	}
+}
+
+func TestListAuditLogForAccount(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.InsertAuditLog(ctx, AuditLogRow{AccountID: "acc-a", AccountLabel: "alpha", Action: "first", State: "alive"}); err != nil {
+		t.Fatalf("insert acc-a first audit: %v", err)
+	}
+	if err := store.InsertAuditLog(ctx, AuditLogRow{AccountID: "acc-b", AccountLabel: "beta", Action: "other", State: "banned"}); err != nil {
+		t.Fatalf("insert acc-b audit: %v", err)
+	}
+	if err := store.InsertAuditLog(ctx, AuditLogRow{AccountID: "acc-a", AccountLabel: "alpha", Action: "latest", State: "alive"}); err != nil {
+		t.Fatalf("insert acc-a latest audit: %v", err)
+	}
+
+	got, err := store.ListAuditLogForAccount(ctx, "acc-a", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("account audit rows = %d, want 2: %#v", len(got), got)
+	}
+	if got[0].Action != "latest" || got[1].Action != "first" {
+		t.Fatalf("account audit order = %#v, want newest first for acc-a", got)
+	}
+	for _, row := range got {
+		if row.AccountID != "acc-a" {
+			t.Fatalf("account audit included unrelated row: %#v", row)
+		}
+	}
+}
+
+func TestSetSettingsIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.SetSetting(ctx, "aaa_runtime_key", "old"); err != nil {
+		t.Fatalf("seed setting: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+CREATE TRIGGER fail_zzz_runtime_key
+BEFORE INSERT ON settings
+WHEN NEW.key = 'zzz_runtime_key'
+BEGIN
+	SELECT RAISE(ABORT, 'synthetic settings failure');
+END`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+
+	err := store.SetSettings(ctx, map[string]string{
+		"aaa_runtime_key": "new",
+		"zzz_runtime_key": "blocked",
+	})
+	if err == nil {
+		t.Fatal("SetSettings succeeded, want synthetic failure")
+	}
+
+	got, ok, err := store.GetSetting(ctx, "aaa_runtime_key")
+	if err != nil {
+		t.Fatalf("read rolled-back key: %v", err)
+	}
+	if !ok || got != "old" {
+		t.Fatalf("aaa_runtime_key = %q ok=%v, want old value after rollback", got, ok)
+	}
+	if got, ok, err := store.GetSetting(ctx, "zzz_runtime_key"); err != nil || ok {
+		t.Fatalf("zzz_runtime_key = %q ok=%v err=%v, want absent after rollback", got, ok, err)
+	}
+}
