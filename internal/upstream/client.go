@@ -317,6 +317,9 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	// probe at server.go:2243, and continues the Session-21 masked-bug chain.
 	if strings.Contains(req.DownstreamPath, "/responses") {
 		req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL)
+		if !req.CodexResponsesWebSocket {
+			req.Body = stripCodexResponsesPromptCacheRetention(req.Body)
+		}
 	}
 	if req.CodexResponsesWebSocket {
 		return c.doCodexResponsesWebSocket(ctx, req)

@@ -27,6 +27,12 @@ function normalize(data) {
   return [];
 }
 
+function fmtPct(v) {
+  const n = Number(v) || 0;
+  if (n > 0 && n < 0.1) return (n * 100).toFixed(1) + '%';
+  return Math.round(n * 100) + '%';
+}
+
 export default function Usage() {
   const [range, setRange] = useState(86400);
 
@@ -37,31 +43,39 @@ export default function Usage() {
       usage: { label: '账号用量', load: () => get('/admin/usage', undefined, { signal }) },
       timeseries: { label: '趋势数据', load: () => get('/admin/usage/timeseries', { since: now - r.value, bucket: r.bucket }, { signal }) },
       byModel: { label: '模型统计', load: () => get('/admin/usage/by-model', { since: now - r.value }, { signal }) },
+      cache: { label: '缓存诊断', load: () => get('/admin/usage/cache', { since: now - r.value }, { signal }) },
     });
     return {
       rows: normalize(values.usage),
       ts: values.timeseries?.buckets || [],
       byModel: values.byModel?.models || [],
+      cache: values.cache || {},
       error,
     };
   }, [range]);
 
   const {
-    data = { rows: [], ts: [], byModel: [], error: null },
+    data = { rows: [], ts: [], byModel: [], cache: {}, error: null },
     loading,
     error,
     lastRefresh,
     reload: load,
-  } = useAsyncResource(fetchUsage, [fetchUsage], { initialData: { rows: [], ts: [], byModel: [], error: null } });
+  } = useAsyncResource(fetchUsage, [fetchUsage], { initialData: { rows: [], ts: [], byModel: [], cache: {}, error: null } });
   const rows = data.rows || [];
   const ts = data.ts || [];
   const byModel = data.byModel || [];
+  const cache = data.cache || {};
+  const cacheSummary = cache.summary || {};
+  const cacheByKey = cache.by_api_key || [];
+  const cacheByAccountModel = cache.by_account_model || [];
   const loadError = error || data.error;
 
   const totalTokens = ts.reduce((s, b) => s + (b.total_tokens || 0), 0);
   const totalReqs = ts.reduce((s, b) => s + (b.requests || 0), 0);
-  const cached = ts.reduce((s, b) => s + (b.cached_tokens || 0), 0);
-  const cacheRate = totalTokens ? Math.round((cached / totalTokens) * 100) : 0;
+  const cached = cacheSummary.cached_tokens || ts.reduce((s, b) => s + (b.cached_tokens || 0), 0);
+  const promptForCache = cacheSummary.prompt_tokens || ts.reduce((s, b) => s + (b.prompt_tokens || 0), 0);
+  const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cached / promptForCache : 0);
+  const requestHitRate = cacheSummary.request_hit_rate || 0;
 
   const topAccts = [...rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)).slice(0, 10)
     .map((a) => ({ x: (a.label || a.account_id || '').slice(0, 10), 输入: a.prompt_tokens || 0, 输出: a.completion_tokens || 0 }));
@@ -84,6 +98,24 @@ export default function Usage() {
     { title: '总计', dataIndex: 'total_tokens', sorter: (a, b) => (a.total_tokens || 0) - (b.total_tokens || 0), defaultSortOrder: 'descend', render: (v) => <b>{fmtTokens(v)}</b> },
   ];
 
+  const cacheKeyCols = [
+    { title: 'API Key', dataIndex: 'api_key_hash_prefix', render: (v) => v || '未归因' },
+    { title: '请求', dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
+    { title: '请求命中', dataIndex: 'request_hit_rate', sorter: (a, b) => (a.request_hit_rate || 0) - (b.request_hit_rate || 0), render: fmtPct },
+    { title: 'Token 命中', dataIndex: 'token_hit_rate', sorter: (a, b) => (a.token_hit_rate || 0) - (b.token_hit_rate || 0), render: fmtPct },
+    { title: '缓存 Token', dataIndex: 'cached_tokens', sorter: (a, b) => (a.cached_tokens || 0) - (b.cached_tokens || 0), render: fmtTokens },
+    { title: '估算占比', dataIndex: 'estimated_rate', render: fmtPct },
+  ];
+
+  const cacheAccountModelCols = [
+    { title: '账号', dataIndex: 'account_id', render: (v) => v || '未归因' },
+    { title: '模型', dataIndex: 'model', render: (v) => v || 'unknown' },
+    { title: '请求', dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
+    { title: '命中请求', dataIndex: 'hit_requests', sorter: (a, b) => (a.hit_requests || 0) - (b.hit_requests || 0), render: fmtInt },
+    { title: '请求命中', dataIndex: 'request_hit_rate', render: fmtPct },
+    { title: 'Token 命中', dataIndex: 'token_hit_rate', sorter: (a, b) => (a.token_hit_rate || 0) - (b.token_hit_rate || 0), render: fmtPct },
+  ];
+
   return (
     <div>
       <PageHeader title="用量分析" subtitle="Token 消耗与按账号明细"
@@ -98,8 +130,8 @@ export default function Usage() {
       <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
         <StatCard label="总 Token" value={fmtTokens(totalTokens)} color={C.violet} />
         <StatCard label="请求数" value={fmtInt(totalReqs)} color={C.blue} />
-        <StatCard label="缓存命中率" value={cacheRate + '%'} color={C.green} sub={`${fmtTokens(cached)} 缓存 token`} />
-        <StatCard label="活跃账号" value={fmtInt(rows.length)} color={C.cyan} sub="有用量记录" />
+        <StatCard label="请求命中概率" value={fmtPct(requestHitRate)} color={C.green} sub={`${fmtInt(cacheSummary.hit_requests || 0)} / ${fmtInt(cacheSummary.requests || 0)} 请求`} />
+        <StatCard label="缓存 Token 占比" value={fmtPct(cacheRate)} color={C.cyan} sub={`${fmtTokens(cached)} / ${fmtTokens(promptForCache)} 输入`} />
       </div>
 
       <div className="pool-chart-card" style={{ marginBottom: 18 }}>
@@ -115,6 +147,37 @@ export default function Usage() {
           <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cached / prompt · 颜色区分模型（命中率越高成本越低）</div></div></div>
           <div style={{ paddingTop: 6 }}><CacheRateBars data={byModel} /></div>
         </div>
+      </div>
+
+      <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
+        <Panel title="按 API Key 缓存诊断">
+          <ResourceTable
+            loading={loading}
+            lastRefresh={lastRefresh}
+            dataSource={cacheByKey}
+            columns={cacheKeyCols}
+            rowKey={(r) => r.api_key_hash_prefix || 'none'}
+            pagination={{ pageSize: 8 }}
+            emptyTitle="暂无缓存诊断"
+            skeletonRows={6}
+            skeletonCols={6}
+            density="compact"
+          />
+        </Panel>
+        <Panel title="按账号 / 模型缓存诊断">
+          <ResourceTable
+            loading={loading}
+            lastRefresh={lastRefresh}
+            dataSource={cacheByAccountModel}
+            columns={cacheAccountModelCols}
+            rowKey={(r) => `${r.account_id || 'none'}:${r.model || 'unknown'}`}
+            pagination={{ pageSize: 8 }}
+            emptyTitle="暂无缓存诊断"
+            skeletonRows={6}
+            skeletonCols={6}
+            density="compact"
+          />
+        </Panel>
       </div>
 
       <Panel title="按账号用量">

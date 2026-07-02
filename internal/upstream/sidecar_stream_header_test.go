@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,5 +68,73 @@ func TestCanonicalizeHeaders(t *testing.T) {
 	}
 	if canon.Get("Anthropic-Version") != "2023-06-01" {
 		t.Fatalf("Anthropic-Version = %q", canon.Get("Anthropic-Version"))
+	}
+}
+
+func TestCodexSidecarResponsesStripsPromptCacheRetention(t *testing.T) {
+	var gotBody string
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		enc, _ := json.Marshal(map[string][]string{"content-type": {"application/json"}})
+		w.Header().Set("x-sidecar-upstream-status", "200")
+		w.Header().Set("x-sidecar-upstream-headers-b64", base64.StdEncoding.EncodeToString(enc))
+		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
+	}))
+	defer sidecar.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = "https://chatgpt.com/backend-api/codex"
+	client := NewClient(cfg)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses",
+		Headers:        http.Header{"Originator": []string{"codex_cli_rs"}},
+		Body:           []byte(`{"model":"gpt-5.5","input":"hi","prompt_cache_retention":"24h"}`),
+		Account:        storage.Account{ID: "acc-sidecar", UpstreamAccountID: "acct-sidecar"},
+		Token:          storage.AccountToken{AccessToken: "access-sidecar"},
+		Egress:         storage.EgressProfile{ID: "sidecar", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if strings.Contains(gotBody, "prompt_cache_retention") || strings.Contains(gotBody, "24h") {
+		t.Fatalf("sidecar HTTP/SSE body must strip prompt_cache_retention:\n%s", gotBody)
+	}
+}
+
+func TestCodexHTTPResponsesStripsPromptCacheRetention(t *testing.T) {
+	var gotPath, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = upstream.URL + "/backend-api/codex"
+	client := NewClient(cfg)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses",
+		Headers:        http.Header{"Originator": []string{"codex_cli_rs"}},
+		Body:           []byte(`{"model":"gpt-5.4","input":"hi","prompt_cache_retention":"24h"}`),
+		Account:        storage.Account{ID: "acc-http", UpstreamAccountID: "acct-http"},
+		Token:          storage.AccountToken{AccessToken: "access-http"},
+		Egress:         storage.EgressProfile{ID: "direct", Type: "direct", Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if gotPath != "/backend-api/codex/responses" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if strings.Contains(gotBody, "prompt_cache_retention") || strings.Contains(gotBody, "24h") {
+		t.Fatalf("HTTP/SSE body must strip prompt_cache_retention:\n%s", gotBody)
 	}
 }

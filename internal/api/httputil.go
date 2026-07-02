@@ -6,6 +6,8 @@ package api
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,7 @@ import (
 
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/routing"
 )
 
 const upstreamErrorBodyLimit = 1 << 20
@@ -85,6 +88,16 @@ func isStreamRequest(raw []byte) bool {
 
 func isEventStream(h http.Header) bool {
 	return strings.Contains(strings.ToLower(h.Get("content-type")), "text/event-stream")
+}
+
+func normalizeCodexStreamContentType(h http.Header, requestedStream bool) {
+	if !requestedStream || isEventStream(h) {
+		return
+	}
+	ct := strings.ToLower(strings.TrimSpace(h.Get("content-type")))
+	if ct == "" || strings.HasPrefix(ct, "text/plain") {
+		h.Set("Content-Type", "text/event-stream")
+	}
 }
 
 // sseBufPool recycles the 32 KiB copy buffers used by the streaming relay paths
@@ -223,6 +236,180 @@ func codexRequiresNewerVersion(body []byte) bool {
 	hay := strings.ToLower(string(body))
 	return strings.Contains(hay, "requires a newer version of codex") ||
 		strings.Contains(hay, "upgrade to the latest app or cli")
+}
+
+func forceResponsesStream(raw []byte) []byte {
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return raw
+	}
+	root["stream"] = true
+	out, err := json.Marshal(root)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func ensureResponsesPromptCacheKey(raw []byte, key string) []byte {
+	key = strings.TrimSpace(key)
+	if key == "" || routing.PromptCacheKey(raw) != "" {
+		return raw
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return raw
+	}
+	if _, ok := root["prompt_cache_key"]; ok {
+		return raw
+	}
+	root["prompt_cache_key"] = key
+	out, err := json.Marshal(root)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func automaticPromptCacheKey(model, prefixHash string) string {
+	model = strings.TrimSpace(model)
+	prefixHash = strings.TrimSpace(prefixHash)
+	if prefixHash == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(model + "\x00" + prefixHash))
+	return "auto_" + hex.EncodeToString(sum[:])[:24]
+}
+
+func automaticPromptCachePrefixHash(raw []byte) string {
+	prefixHash := routing.StablePromptPrefixHash(raw)
+	if prefixHash == "" || !automaticPromptCacheKeySafe(raw) {
+		return ""
+	}
+	return prefixHash
+}
+
+func automaticPromptCacheKeySafe(raw []byte) bool {
+	var root map[string]interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return false
+	}
+	seq := root["messages"]
+	if seq == nil {
+		seq = root["input"]
+	}
+	switch items := seq.(type) {
+	case string:
+		return true
+	case []interface{}:
+		if len(items) == 0 {
+			return false
+		}
+		for _, item := range items {
+			if !simplePromptMessage(item) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func simplePromptMessage(v interface{}) bool {
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		_, isText := v.(string)
+		return isText
+	}
+	if t, _ := m["type"].(string); strings.TrimSpace(t) != "" {
+		return false
+	}
+	role, _ := m["role"].(string)
+	switch role {
+	case "system", "developer", "user", "assistant":
+	default:
+		return false
+	}
+	return cacheKeySafePromptContent(m["content"])
+}
+
+func simplePromptContent(v interface{}) bool {
+	switch c := v.(type) {
+	case string:
+		return true
+	case []interface{}:
+		if len(c) == 0 {
+			return true
+		}
+		for _, part := range c {
+			if !simplePromptContentPart(part) {
+				return false
+			}
+		}
+		return true
+	case map[string]interface{}:
+		return simplePromptContentPart(c)
+	default:
+		return false
+	}
+}
+
+func cacheKeySafePromptContent(v interface{}) bool {
+	switch c := v.(type) {
+	case string:
+		return true
+	case []interface{}:
+		if len(c) == 0 {
+			return true
+		}
+		for _, part := range c {
+			if !cacheKeySafePromptContentPart(part) {
+				return false
+			}
+		}
+		return true
+	case map[string]interface{}:
+		return cacheKeySafePromptContentPart(c)
+	default:
+		return false
+	}
+}
+
+func cacheKeySafePromptContentPart(v interface{}) bool {
+	switch part := v.(type) {
+	case string:
+		return true
+	case map[string]interface{}:
+		t, _ := part["type"].(string)
+		switch t {
+		case "input_text", "text":
+			_, ok := part["text"].(string)
+			return ok
+		case "input_image", "image_url", "image", "input_file", "file", "input_audio", "audio":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func simplePromptContentPart(v interface{}) bool {
+	switch part := v.(type) {
+	case string:
+		return true
+	case map[string]interface{}:
+		t, _ := part["type"].(string)
+		if t != "input_text" && t != "text" {
+			return false
+		}
+		_, ok := part["text"].(string)
+		return ok
+	default:
+		return false
+	}
 }
 
 func generatedID(prefix string) string {

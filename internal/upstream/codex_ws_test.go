@@ -50,7 +50,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath:          "/v1/responses",
 		Headers:                 http.Header{"Originator": []string{"codex_exec"}, "x-client-request-id": []string{"thread-123"}},
-		Body:                    []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}],"stream":true}`),
+		Body:                    []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}],"stream":true,"prompt_cache_retention":"24h"}`),
 		Account:                 storage.Account{ID: "acc-ws", UpstreamAccountID: "workspace-should-not-leak"},
 		Token:                   storage.AccountToken{AccessToken: "access-ws"},
 		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -101,6 +101,9 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 
 	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-5.5" || gotPayload["stream"] != true {
 		t.Fatalf("bad response.create payload: %+v", gotPayload)
+	}
+	if gotPayload["prompt_cache_retention"] != "24h" {
+		t.Fatalf("WS path should preserve prompt_cache_retention, got payload: %+v", gotPayload)
 	}
 	metadata, _ := gotPayload["client_metadata"].(map[string]interface{})
 	if metadata["x-codex-window-id"] != "thread-123:0" || metadata["x-codex-turn-metadata"] == "" {

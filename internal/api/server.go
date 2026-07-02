@@ -235,6 +235,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/moderation/translate", s.adminModerationTranslate)
 	s.mux.HandleFunc("/admin/cf-events", s.adminCFEvents)
 	s.mux.HandleFunc("/admin/usage", s.adminUsage)
+	s.mux.HandleFunc("/admin/usage/cache", s.adminUsageCache)
 	s.mux.HandleFunc("/admin/usage/timeseries", s.adminUsageTimeseries)
 	s.mux.HandleFunc("/admin/usage/by-model", s.adminUsageByModel)
 	s.mux.HandleFunc("/admin/quota", s.adminQuota)
@@ -247,6 +248,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/config", s.adminConfig)
 	s.mux.HandleFunc("/admin/egress-pools", s.adminEgressPools)
 	s.mux.HandleFunc("/admin/egress-pools/", s.adminEgressPoolAction)
+	s.mux.HandleFunc("/admin/export/logs", s.adminDiagnosticsExport)
 	s.mux.HandleFunc("/admin/audit", s.adminAudit)
 	s.mux.HandleFunc("/admin/groups", s.adminGroups)
 	s.mux.HandleFunc("/admin/groups/", s.adminGroupAction)
@@ -583,6 +585,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				writeError(w, http.StatusBadRequest, err)
 				return codexAttemptResult{Outcome: outcomeDone}
 			}
+			if !isStreamRequest(raw) {
+				body = forceResponsesStream(body)
+			}
 			path = "/v1/responses"
 		}
 	}
@@ -629,6 +634,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	if !prepared && s.settingString(r.Context(), "codex_prompt_cache_retention", s.cfg.CodexPromptCacheRetention) != "" && prompt.SupportsExtendedPromptCache(model) {
 		ret := s.settingString(r.Context(), "codex_prompt_cache_retention", s.cfg.CodexPromptCacheRetention)
 		body = prompt.EnsureResponsesPromptCacheRetention(body, ret)
+	}
+	if !prepared && routing.PromptCacheKey(body) == "" {
+		if prefixHash := automaticPromptCachePrefixHash(body); prefixHash != "" {
+			body = ensureResponsesPromptCacheKey(body, automaticPromptCacheKey(model, prefixHash))
+		}
 	}
 
 	// Virtual-context ledger key. We only pool prior turns under a TRUE
@@ -765,9 +775,36 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				}
 				errorBody = readUpstreamErrorBody(resp.Body)
 				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
+				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 			} else if rerr != nil {
 				log.Printf("codex auth refresh %s: %v", lease.Account.ID, rerr)
 				s.handleCodexRefreshFailure(r.Context(), lease.Account, refreshed, rerr, "gateway")
+			}
+		}
+		if codexUseWebSocket && v.State == ban.PermissionDenied && !forceCodexResponsesWebSocket(r.Context()) {
+			originalStatus := resp.StatusCode
+			originalHeader := resp.Header.Clone()
+			originalBody := append([]byte(nil), errorBody...)
+			_ = resp.Body.Close()
+			fallbackReq := requestForToken(token)
+			fallbackReq.CodexResponsesWebSocket = false
+			resp, finalEgress, err = s.doWithCFRetry(r.Context(), fallbackReq, lease, strict)
+			if err != nil {
+				log.Printf("codex websocket permission fallback %s: %v", lease.Account.ID, err)
+				resp = &upstream.Response{
+					StatusCode: originalStatus,
+					Header:     originalHeader,
+					Body:       io.NopCloser(bytes.NewReader(originalBody)),
+				}
+				errorBody = originalBody
+				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
+				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
+			} else if resp.StatusCode < 400 {
+				goto codexSuccess
+			} else {
+				errorBody = readUpstreamErrorBody(resp.Body)
+				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
+				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 			}
 		}
 		if codexClientVersion == "" && codexRequiresNewerVersion(errorBody) {
@@ -793,6 +830,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 			errorBody = readUpstreamErrorBody(resp.Body)
 			detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
+			v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		}
 		if cf.Recordable(detection) {
 			s.handleCFEvent(r.Context(), lease.Account, finalEgress, resp.StatusCode, detection)
@@ -822,6 +860,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 codexSuccess:
+	normalizeCodexStreamContentType(resp.Header, isStreamRequest(body))
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
 
@@ -882,6 +921,9 @@ codexSuccess:
 					_ = r2.Body.Close()
 				}
 			}
+		}
+		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
+			responseBody = responseJSON
 		}
 		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")

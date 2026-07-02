@@ -120,3 +120,22 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string) []byte {
 	}
 	return out
 }
+
+func stripCodexResponsesPromptCacheRetention(raw []byte) []byte {
+	var probe struct {
+		PromptCacheRetention *json.RawMessage `json:"prompt_cache_retention"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil || probe.PromptCacheRetention == nil {
+		return raw
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return raw
+	}
+	delete(payload, "prompt_cache_retention")
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return raw
+	}
+	return out
+}

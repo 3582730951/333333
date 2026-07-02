@@ -1,0 +1,142 @@
+package api
+
+import (
+	"archive/zip"
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+
+	"codex-account-pool/internal/storage"
+)
+
+func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	account := storage.Account{
+		ID:                "acc-real-1",
+		Label:             "Alpha Sensitive",
+		Email:             "sensitive@example.com",
+		GroupName:         "cyber",
+		Provider:          "codex",
+		Status:            "active",
+		UpstreamAccountID: "upstream-secret",
+		ChatGPTUserID:     "chatgpt-secret",
+		PlanType:          "plus",
+	}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "access-secret"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.InsertAuditLog(ctx, storage.AuditLogRow{
+		AccountID:    account.ID,
+		AccountLabel: account.Label,
+		Action:       "permission_denied_no_quarantine",
+		State:        "permission_denied",
+		Reason:       "scope",
+		Detail:       "account acc-real-1 sensitive@example.com Alpha Sensitive upstream-secret chatgpt-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.InsertCFEvent(ctx, storage.CFEvent{
+		AccountID: account.ID,
+		EgressID:  storage.DefaultDirectEgressID,
+		Status:    http.StatusForbidden,
+		CFRay:     "ray-secret",
+		Category:  "edge",
+		Message:   "blocked acc-real-1 sensitive@example.com Alpha Sensitive upstream-secret chatgpt-secret",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.InsertUsageRecord(ctx, account.ID, "route-secret", "api-key-hash", "user-1", "gpt-5.5", 10, 3, 13, 4,
+		json.RawMessage(`{"account":"acc-real-1","email":"sensitive@example.com","label":"Alpha Sensitive","upstream":"upstream-secret","chatgpt":"chatgpt-secret"}`)); err != nil {
+		t.Fatal(err)
+	}
+	holdID, err := h.store.CreateBillingHold(ctx, "route-secret", account.ID, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SettleBillingHold(ctx, holdID, "failed_upstream"); err != nil {
+		t.Fatal(err)
+	}
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/logs", "")
+	if code != http.StatusOK {
+		t.Fatalf("diagnostics export = %d: %s", code, raw)
+	}
+	files := readZipFiles(t, raw)
+	required := []string{
+		"manifest.json",
+		"account_map.csv",
+		"audit_log.csv",
+		"cf_events.csv",
+		"usage_records.csv",
+		"billing_holds.csv",
+		"accounts_snapshot.csv",
+		"egress_snapshot.csv",
+	}
+	for _, name := range required {
+		if _, ok := files[name]; !ok {
+			t.Fatalf("diagnostics zip missing %s; has %v", name, zipFileNames(files))
+		}
+	}
+
+	accountMap := files["account_map.csv"]
+	for _, want := range []string{"ACC-0001", account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID} {
+		if !strings.Contains(accountMap, want) {
+			t.Fatalf("account_map.csv missing %q:\n%s", want, accountMap)
+		}
+	}
+
+	for _, name := range required {
+		if name == "account_map.csv" {
+			continue
+		}
+		text := files[name]
+		for _, forbidden := range []string{account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("%s leaked %q:\n%s", name, forbidden, text)
+			}
+		}
+	}
+	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv"} {
+		if !strings.Contains(files[name], "ACC-0001") {
+			t.Fatalf("%s should use stable account code ACC-0001:\n%s", name, files[name])
+		}
+	}
+}
+
+func readZipFiles(t *testing.T, raw []byte) map[string]string {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatalf("open diagnostics zip: %v\n%s", err, raw)
+	}
+	out := make(map[string]string, len(zr.File))
+	for _, f := range zr.File {
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		_, copyErr := buf.ReadFrom(rc)
+		closeErr := rc.Close()
+		if copyErr != nil {
+			t.Fatal(copyErr)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		out[f.Name] = buf.String()
+	}
+	return out
+}
+
+func zipFileNames(files map[string]string) []string {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	return names
+}

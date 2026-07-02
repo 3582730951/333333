@@ -1,11 +1,12 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { Button, Tag, Select, Typography, Toast } from '../components/pool/index.jsx';
 import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
-import { get } from '../api.js';
+import api, { errMsg, get } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
+import { downloadBlob } from '../lib/browserDownload.js';
 import { fmtDateTime, fmtRelative } from '../lib/format.js';
 
 const stateColor = (s) => {
@@ -13,8 +14,19 @@ const stateColor = (s) => {
   return m[s] || 'blue';
 };
 
+const filenameFromDisposition = (value) => {
+  const raw = String(value || '');
+  const utf8 = raw.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    try { return decodeURIComponent(utf8[1].trim().replace(/^"|"$/g, '')); } catch { return utf8[1].trim().replace(/^"|"$/g, ''); }
+  }
+  const plain = raw.match(/filename=([^;]+)/i);
+  return plain?.[1]?.trim().replace(/^"|"$/g, '') || '';
+};
+
 export default function Audit() {
   const [action, setAction] = useState('');
+  const [diagnosticsExporting, setDiagnosticsExporting] = useState(false);
   const fetchRows = useCallback(async ({ signal }) => {
     const d = await get('/admin/audit', { limit: 500 }, { signal });
     return Array.isArray(d) ? d : d?.rows || [];
@@ -39,6 +51,21 @@ export default function Audit() {
     if (!ok) Toast.error('导出失败，请检查浏览器下载权限');
   };
 
+  const exportDiagnostics = async () => {
+    setDiagnosticsExporting(true);
+    try {
+      const res = await api.get('/admin/export/logs', { responseType: 'blob' });
+      const name = filenameFromDisposition(res.headers?.['content-disposition']) || 'codex-pool-diagnostics.zip';
+      const blob = res.data instanceof Blob ? res.data : new Blob([res.data], { type: 'application/zip' });
+      if (!downloadBlob(name, blob)) Toast.error('导出失败，请检查浏览器下载权限');
+      else Toast.success('诊断包已导出');
+    } catch (e) {
+      Toast.error(`导出诊断包失败：${errMsg(e)}`);
+    } finally {
+      setDiagnosticsExporting(false);
+    }
+  };
+
   const cols = [
     { title: '时间', dataIndex: 'created_at', width: 170, sorter: (a, b) => (a.created_at || 0) - (b.created_at || 0), defaultSortOrder: 'descend',
       render: (v) => (
@@ -61,6 +88,7 @@ export default function Audit() {
         actions={<>
           <Select value={action} onChange={setAction} placeholder="全部动作" style={{ width: 180 }}
             optionList={[{ label: '全部动作', value: '' }, ...actions.map((a) => ({ label: a, value: a }))]} />
+          <Button icon={<IconDownload />} loading={diagnosticsExporting} onClick={exportDiagnostics}>导出诊断包</Button>
           <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
         </>} />

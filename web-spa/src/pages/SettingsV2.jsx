@@ -167,6 +167,22 @@ function ConfigTab() {
     } catch (e) { showErrorToast(e); }
   });
 
+  const { run: applyOptimalTemplate, running: applyingTemplate } = useAsyncAction(async () => {
+    try {
+      const r = await post('/admin/settings-center/apply-template', { template_id: 'optimal-codex-pool' });
+      const savedDiffs = r?.saved || [];
+      const oldSnap = {};
+      savedDiffs.forEach((d) => {
+        if (d?.section === 'config' && d?.key) oldSnap[d.key] = d.old_value;
+      });
+      setPrevSnapshot({ oldSnap, pending: {} });
+      setDiffs(savedDiffs);
+      setPending({});
+      Toast.success(`已应用模板: ${r?.name || '推荐默认系统配置'}`);
+      await load();
+    } catch (e) { showErrorToast(e); }
+  });
+
   const cats = useMemo(() => configCategories(fields), [fields]);
   const configErrors = useMemo(() => configSettingsErrors(fields), [fields]);
 
@@ -186,6 +202,9 @@ function ConfigTab() {
       toolbar={
         <>
           <Button icon={<IconRefresh />} onClick={refresh}>刷新</Button>
+          <Button icon={<IconSave />} loading={applyingTemplate} onClick={applyOptimalTemplate}>
+            应用推荐模板
+          </Button>
           <Button icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0}>
             保存改动 ({Object.keys(pending).length})
           </Button>

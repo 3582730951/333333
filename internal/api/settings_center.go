@@ -1080,6 +1080,42 @@ func registrationTemplates() []map[string]interface{} {
 	}
 }
 
+func optimalSystemTemplateValues() map[string]interface{} {
+	return map[string]interface{}{
+		"conversation_isolation":                  true,
+		"codex_prefer_sidecar_ja3_over_ws":        true,
+		"codex_prompt_cache_retention":            "24h",
+		"rate_limit_guard_enabled":                true,
+		"seamless_failover":                       true,
+		"failover_max_attempts":                   float64(3),
+		"force_failover_on_429":                   false,
+		"leak_scrub":                              true,
+		"token_save_enabled":                      false,
+		"claude_cache_control_inject":             true,
+		"claude_native_cache_breakpoint_inject":   true,
+		"claude_cache_ttl":                        "1h",
+		"claude_gateway_unknown_target_policy":    "block",
+		"claude_gateway_disable_nonessential_env": true,
+		"claude_gateway_strict_linux_default":     true,
+		"codex_install_model":                     "gpt-5.5",
+		"codex_install_effort":                    "xhigh",
+		"codex_install_approval_policy":           "never",
+		"codex_install_sandbox_mode":              "danger-full-access",
+	}
+}
+
+func systemConfigTemplates() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"id":          "optimal-codex-pool",
+			"name":        "推荐默认系统配置",
+			"description": "缓存命中、无缝换号、泄漏擦除和安装默认值的保守最优组合；不启用会改写请求内容的 token 压缩。",
+			"section":     "config",
+			"values":      optimalSystemTemplateValues(),
+		},
+	}
+}
+
 // handleSettingsCenterTemplate handles POST /admin/settings-center/apply-template.
 func (s *Server) handleSettingsCenterTemplate(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
@@ -1095,6 +1131,30 @@ func (s *Server) handleSettingsCenterTemplate(w http.ResponseWriter, r *http.Req
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	for _, t := range systemConfigTemplates() {
+		if t["id"] == req.TemplateID {
+			values, _ := t["values"].(map[string]interface{})
+			plan, err := s.planSettingsCenterPatches(r.Context(), []settingsCenterPatch{{Section: "config", Values: values}})
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			if err := s.store.SetSettings(r.Context(), plan.settings); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if plan.changedUpstream {
+				s.upstream.UpdateConfig(s.effectiveUpstreamConfig(r.Context()))
+			}
+			if plan.changedScheduler && s.scheduler != nil {
+				s.scheduler.UpdateConfig(s.effectiveSchedulerConfig(r.Context()))
+			}
+			out := cloneSettingsMap(t)
+			out["saved"] = plan.diffs
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
 	}
 	for _, t := range registrationTemplates() {
 		if t["id"] == req.TemplateID {

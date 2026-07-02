@@ -273,7 +273,7 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		s.handleBannedAccount(r.Context(), account, v, res.Status, res.Body, "health_test")
 		deleted = s.flagEnabled(r.Context(), "ban_auto_delete", s.cfg.BanAutoDelete)
 	} else if v.State == ban.PermissionDenied {
-		s.handlePermissionDeniedAccount(r.Context(), account, v, res.Status, res.Body, "health_test")
+		s.recordPermissionDeniedNoQuarantine(r.Context(), account, v, res.Status, res.Body, "health_test")
 	} else {
 		// Include the upstream/sidecar body on any error status so the operator can see
 		// WHY a probe failed (e.g. a sidecar 502 carries {"error":"..."} naming an

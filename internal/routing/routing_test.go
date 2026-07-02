@@ -1,7 +1,9 @@
 package routing
 
 import (
+	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -110,5 +112,101 @@ func TestRelayConversationAnchorDistinguishesConversations(t *testing.T) {
 	k1b := ExtractAffinityKey(req, oneTurn2)
 	if k1.Hash != k1b.Hash {
 		t.Fatal("conversation anchor not stable across turns (would break stickiness + cache)")
+	}
+}
+
+func TestLargeStablePrefixAffinityIgnoresFinalUserTurn(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer downstream-key")
+	longPrefix := strings.Repeat("repo context line with stable instructions and tool inventory. ", 80)
+	one := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"system","content":` + strconv.Quote(longPrefix) + `},{"role":"user","content":"summarize file A"}]}`)
+	two := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"system","content":` + strconv.Quote(longPrefix) + `},{"role":"user","content":"summarize file B"}]}`)
+
+	k1 := ExtractAffinityKey(req, one)
+	k2 := ExtractAffinityKey(req, two)
+	if k1.Source != "cache_prefix_hash" || k2.Source != "cache_prefix_hash" {
+		t.Fatalf("source = %q/%q, want cache_prefix_hash", k1.Source, k2.Source)
+	}
+	if k1.Hash != k2.Hash {
+		t.Fatalf("same stable prefix routed differently: %s != %s", k1.Hash, k2.Hash)
+	}
+
+	differentReasoning := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"low"},"input":[{"role":"system","content":` + strconv.Quote(longPrefix) + `},{"role":"user","content":"summarize file B"}]}`)
+	k3 := ExtractAffinityKey(req, differentReasoning)
+	if k1.Hash == k3.Hash {
+		t.Fatal("reasoning effort must remain part of cache affinity")
+	}
+}
+
+func TestLargeStablePrefixAffinityInsideFinalUserText(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer downstream-key")
+	longPrefix := strings.Repeat("stable repository snapshot line for prompt cache reuse. ", 140)
+	one := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(longPrefix+"Question: summarize file A") + `}]}]}`)
+	two := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(longPrefix+"Question: summarize file B") + `}]}]}`)
+
+	k1 := ExtractAffinityKey(req, one)
+	k2 := ExtractAffinityKey(req, two)
+	if k1.Source != "cache_prefix_hash" || k2.Source != "cache_prefix_hash" {
+		t.Fatalf("source = %q/%q, want cache_prefix_hash", k1.Source, k2.Source)
+	}
+	if k1.Hash != k2.Hash {
+		t.Fatalf("same intra-message stable prefix routed differently: %s != %s", k1.Hash, k2.Hash)
+	}
+
+	differentPrefix := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(strings.Repeat("different repository snapshot line. ", 180)+"Question: summarize file B") + `}]}]}`)
+	k3 := ExtractAffinityKey(req, differentPrefix)
+	if k1.Hash == k3.Hash {
+		t.Fatal("different intra-message stable prefixes must not share affinity")
+	}
+}
+
+func TestLargeStablePrefixAffinityInsideMultimodalFinalUserText(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer downstream-key")
+	longPrefix := strings.Repeat("stable multimodal repository snapshot line. ", 150)
+	one := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(longPrefix) + `},{"type":"input_image","image_url":"data:image/png;base64,AAAA"},{"type":"input_text","text":"Question: inspect image A"}]}]}`)
+	two := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(longPrefix) + `},{"type":"input_image","image_url":"data:image/png;base64,BBBB"},{"type":"input_text","text":"Question: inspect image B"}]}]}`)
+
+	k1 := ExtractAffinityKey(req, one)
+	k2 := ExtractAffinityKey(req, two)
+	if k1.Source != "cache_prefix_hash" || k2.Source != "cache_prefix_hash" {
+		t.Fatalf("source = %q/%q, want cache_prefix_hash", k1.Source, k2.Source)
+	}
+	if k1.Hash != k2.Hash {
+		t.Fatalf("same multimodal stable text prefix routed differently: %s != %s", k1.Hash, k2.Hash)
+	}
+}
+
+func TestStablePromptPrefixFingerprintDiagnosticsDoNotExposePromptText(t *testing.T) {
+	longPrefix := strings.Repeat("stable repository snapshot line for prompt cache reuse. ", 140)
+	body := []byte(`{"model":"gpt-5.5","reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(longPrefix+"Question: summarize file A") + `}]}]}`)
+
+	fp := StablePromptPrefixFingerprint(body)
+	if fp.Hash == "" || fp.Source != "text_prefix" || fp.Reason != "ok" || fp.PrefixBytes < cachePrefixAffinityMinBytes {
+		t.Fatalf("fingerprint = %+v", fp)
+	}
+	diag, err := json.Marshal(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(diag), "stable repository snapshot") || strings.Contains(string(diag), "summarize file A") {
+		t.Fatalf("diagnostics leaked prompt text: %s", diag)
+	}
+}
+
+func TestSmallRequestsKeepConversationAnchorAffinity(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Authorization", "Bearer downstream-key")
+	one := []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"task one"}]}`)
+	two := []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"task two"}]}`)
+
+	k1 := ExtractAffinityKey(req, one)
+	k2 := ExtractAffinityKey(req, two)
+	if k1.Source != "downstream_api_project_model" || k2.Source != "downstream_api_project_model" {
+		t.Fatalf("source = %q/%q, want downstream_api_project_model", k1.Source, k2.Source)
+	}
+	if k1.Hash == k2.Hash {
+		t.Fatal("small independent requests should keep conversation-anchor separation")
 	}
 }

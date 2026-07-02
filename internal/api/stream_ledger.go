@@ -22,6 +22,15 @@ func newCodexStreamLedgerRecorder() *codexStreamLedgerRecorder {
 	return &codexStreamLedgerRecorder{}
 }
 
+func codexSSEToResponseJSON(raw []byte) []byte {
+	if !bytes.Contains(raw, []byte("data:")) || !bytes.Contains(raw, []byte("response.")) {
+		return nil
+	}
+	rec := newCodexStreamLedgerRecorder()
+	_, _ = rec.Write(raw)
+	return rec.ResponseJSON()
+}
+
 func (r *codexStreamLedgerRecorder) Write(p []byte) (int, error) {
 	r.buf = append(r.buf, p...)
 	for {

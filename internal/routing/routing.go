@@ -9,10 +9,22 @@ import (
 	"strings"
 )
 
+const (
+	cachePrefixAffinityMinBytes = 2048
+	cachePrefixTextHeadBytes    = 4096
+)
+
 type AffinityKey struct {
 	Key    string `json:"key"`
 	Hash   string `json:"hash"`
 	Source string `json:"source"`
+}
+
+type PromptPrefixFingerprint struct {
+	Hash        string `json:"hash"`
+	Source      string `json:"source"`
+	Reason      string `json:"reason"`
+	PrefixBytes int    `json:"prefix_bytes"`
 }
 
 func ExtractAffinityKey(r *http.Request, body []byte) AffinityKey {
@@ -33,6 +45,9 @@ func ExtractAffinityKey(r *http.Request, body []byte) AffinityKey {
 	}
 	if v := headerValue(r, "x-codex-turn-metadata"); v != "" {
 		return newKey("x-codex-turn-metadata:"+v, "x-codex-turn-metadata")
+	}
+	if key := cachePrefixKey(r, body); key != "" {
+		return newKey(key, "cache_prefix_hash")
 	}
 	if key := downstreamKey(r, body); key != "" {
 		return newKey(key, "downstream_api_project_model")
@@ -89,6 +104,14 @@ func PromptCacheKey(body []byte) string {
 	return JSONStringField(body, "prompt_cache_key")
 }
 
+func StablePromptPrefixHash(body []byte) string {
+	return StablePromptPrefixFingerprint(body).Hash
+}
+
+func StablePromptPrefixFingerprint(body []byte) PromptPrefixFingerprint {
+	return stablePromptPrefixFingerprint(body)
+}
+
 func Model(body []byte) string {
 	return JSONStringField(body, "model")
 }
@@ -122,6 +145,133 @@ func downstreamKey(r *http.Request, body []byte) string {
 		return ""
 	}
 	return strings.Join([]string{"downstream", token, project, model, anchor}, ":")
+}
+
+func cachePrefixKey(r *http.Request, body []byte) string {
+	token := bearerFingerprint(r.Header.Get("Authorization"))
+	project := firstNonEmpty(
+		headerValue(r, "openai-project"),
+		headerValue(r, "x-project-id"),
+		JSONStringField(body, "project"),
+	)
+	model := JSONStringField(body, "model")
+	if token == "" && project == "" {
+		return ""
+	}
+	prefixHash := StablePromptPrefixHash(body)
+	if prefixHash == "" {
+		return ""
+	}
+	return strings.Join([]string{"cache_prefix", token, project, model, prefixHash}, ":")
+}
+
+func stablePromptPrefixFingerprint(body []byte) PromptPrefixFingerprint {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return PromptPrefixFingerprint{Reason: "empty_body"}
+	}
+	var root map[string]interface{}
+	if json.Unmarshal(body, &root) != nil {
+		return PromptPrefixFingerprint{Reason: "invalid_json"}
+	}
+	seqName := "messages"
+	seq := root[seqName]
+	if seq == nil {
+		seqName = "input"
+		seq = root[seqName]
+	}
+	switch items := seq.(type) {
+	case []interface{}:
+		if len(items) == 0 {
+			return PromptPrefixFingerprint{Reason: "empty_sequence"}
+		}
+		if fp := messagePrefixFingerprint(root, seqName, items); fp.Hash != "" {
+			return fp
+		}
+		return finalUserTextPrefixFingerprint(root, items[len(items)-1])
+	case string:
+		return textPrefixFingerprint(root, seqName, items)
+	default:
+		return PromptPrefixFingerprint{Reason: "unsupported_sequence"}
+	}
+}
+
+func messagePrefixFingerprint(root map[string]interface{}, seqName string, items []interface{}) PromptPrefixFingerprint {
+	prefix, removed := withoutFinalUserTurn(items)
+	if !removed {
+		return PromptPrefixFingerprint{Reason: "final_turn_not_user"}
+	}
+	stable := map[string]interface{}{
+		seqName: prefix,
+	}
+	copyPromptPrefixRootFields(root, stable)
+	return hashPromptPrefixCandidate(stable, "message_prefix")
+}
+
+func finalUserTextPrefixFingerprint(root map[string]interface{}, item interface{}) PromptPrefixFingerprint {
+	if roleOf(item) != "user" {
+		return PromptPrefixFingerprint{Reason: "final_turn_not_user"}
+	}
+	m, ok := item.(map[string]interface{})
+	if !ok {
+		return PromptPrefixFingerprint{Reason: "final_user_not_object"}
+	}
+	text, ok := simpleTextContent(m["content"])
+	if !ok {
+		text, ok = leadingTextContentPrefix(m["content"])
+		if !ok {
+			return PromptPrefixFingerprint{Reason: "complex_final_user_content"}
+		}
+	}
+	return textPrefixFingerprint(root, "input_text", text)
+}
+
+func textPrefixFingerprint(root map[string]interface{}, fieldName, text string) PromptPrefixFingerprint {
+	if len([]byte(text)) < cachePrefixTextHeadBytes {
+		return PromptPrefixFingerprint{Reason: "text_prefix_too_short"}
+	}
+	stable := map[string]interface{}{
+		fieldName: firstNBytes(text, cachePrefixTextHeadBytes),
+	}
+	copyPromptPrefixRootFields(root, stable)
+	return hashPromptPrefixCandidate(stable, "text_prefix")
+}
+
+func copyPromptPrefixRootFields(root, dst map[string]interface{}) {
+	for _, key := range []string{
+		"instructions",
+		"reasoning",
+		"tools",
+		"tool_choice",
+		"parallel_tool_calls",
+	} {
+		if v, ok := root[key]; ok {
+			dst[key] = v
+		}
+	}
+}
+
+func hashPromptPrefixCandidate(stable map[string]interface{}, source string) PromptPrefixFingerprint {
+	raw, err := json.Marshal(stable)
+	if err != nil || len(raw) < cachePrefixAffinityMinBytes {
+		return PromptPrefixFingerprint{Reason: "prefix_too_short"}
+	}
+	sum := sha256.Sum256(raw)
+	return PromptPrefixFingerprint{
+		Hash:        hex.EncodeToString(sum[:]),
+		Source:      source,
+		Reason:      "ok",
+		PrefixBytes: len(raw),
+	}
+}
+
+func withoutFinalUserTurn(items []interface{}) ([]interface{}, bool) {
+	last := len(items) - 1
+	if roleOf(items[last]) != "user" {
+		return nil, false
+	}
+	out := make([]interface{}, last)
+	copy(out, items[:last])
+	return out, true
 }
 
 // ConversationAnchor returns a stable-across-turns, distinct-across-conversations
@@ -177,6 +327,90 @@ func roleOf(v interface{}) string {
 		}
 	}
 	return ""
+}
+
+func simpleTextContent(v interface{}) (string, bool) {
+	switch c := v.(type) {
+	case string:
+		return c, true
+	case []interface{}:
+		var b strings.Builder
+		for _, part := range c {
+			text, ok := simpleTextPart(part)
+			if !ok {
+				return "", false
+			}
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(text)
+		}
+		return b.String(), true
+	case map[string]interface{}:
+		return simpleTextPart(c)
+	default:
+		return "", false
+	}
+}
+
+func leadingTextContentPrefix(v interface{}) (string, bool) {
+	switch c := v.(type) {
+	case string:
+		return c, true
+	case map[string]interface{}:
+		return simpleTextPart(c)
+	case []interface{}:
+		var b strings.Builder
+		for _, part := range c {
+			text, ok := simpleTextPart(part)
+			if !ok {
+				break
+			}
+			if b.Len() > 0 {
+				b.WriteByte('\n')
+			}
+			b.WriteString(text)
+		}
+		if b.Len() == 0 {
+			return "", false
+		}
+		return b.String(), true
+	default:
+		return "", false
+	}
+}
+
+func simpleTextPart(v interface{}) (string, bool) {
+	switch part := v.(type) {
+	case string:
+		return part, true
+	case map[string]interface{}:
+		t, _ := part["type"].(string)
+		if t != "input_text" && t != "text" {
+			return "", false
+		}
+		text, ok := part["text"].(string)
+		return text, ok
+	default:
+		return "", false
+	}
+}
+
+func firstNBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !isUTF8Boundary(s[n]) {
+		n--
+	}
+	if n <= 0 {
+		return ""
+	}
+	return s[:n]
+}
+
+func isUTF8Boundary(b byte) bool {
+	return b&0xc0 != 0x80
 }
 
 func bearerFingerprint(value string) string {

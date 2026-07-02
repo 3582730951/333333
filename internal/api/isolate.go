@@ -198,18 +198,7 @@ func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, s
 	// → all accounts quarantined → entire group offline. Now we only audit-log the
 	// event and let failover + transparent error handling do their job.
 	if v.State == ban.PermissionDenied {
-		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
-			AccountID:    account.ID,
-			AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
-			Action:       "permission_denied_no_quarantine",
-			State:        string(v.State),
-			Reason:       v.Reason,
-			Detail:       fmt.Sprintf("source=upstream_error provider=%s http=%d body=%s", account.PlanType, status, bodySnippet(body, 600)),
-		})
-		// Bench for 5 minutes (not hours) so the pool rotates off this account for
-		// THIS conversation, but it remains available for other conversations that
-		// may not hit the restricted endpoint.
-		_ = s.store.SetBindingCooldown(ctx, account.ID, storage.Now()+300)
+		s.recordPermissionDeniedNoQuarantine(ctx, account, v, status, body, "upstream_error")
 		return v
 	}
 	s.benchOnLimit(ctx, account.ID, status, header, body)
@@ -265,10 +254,9 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 // output mentioned scope-related keywords ("api.responses.write", "missing scopes"),
 // triggering false positives that quarantined entire account pools.
 //
-// Current behavior (onUpstreamError): PermissionDenied now only audit-logs and
-// applies a short (5-minute) cooldown for the current conversation, allowing
-// transparent failover or surfacing the 403 to the client if all accounts lack the
-// scope. The account remains active for other conversations.
+// Current behavior (onUpstreamError): PermissionDenied now only audit-logs. The
+// current request can still fail over through the caller's exclude map, but the
+// account remains active and schedulable for later requests.
 //
 // This function is kept for reference and potential future use under explicit admin
 // control (e.g., a manual "quarantine this account for scope issues" button).
@@ -286,6 +274,17 @@ func (s *Server) handlePermissionDeniedAccount(ctx context.Context, account stor
 		until := storage.Now() + int64(s.cfg.QuarantineDurationHours*3600)
 		_ = s.store.SetAccountQuarantine(ctx, account.ID, until, "permission denied: "+v.Reason+"; re-login with updated scopes required")
 	}
+}
+
+func (s *Server) recordPermissionDeniedNoQuarantine(ctx context.Context, account storage.Account, v ban.Verdict, status int, body []byte, source string) {
+	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+		AccountID:    account.ID,
+		AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+		Action:       "permission_denied_no_quarantine",
+		State:        string(v.State),
+		Reason:       v.Reason,
+		Detail:       fmt.Sprintf("source=%s provider=%s http=%d body=%s", source, account.PlanType, status, bodySnippet(body, 600)),
+	})
 }
 
 // guardRateLimit applies the proactive (success-path) cooldown so new conversations

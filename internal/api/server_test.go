@@ -10,8 +10,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"codex-account-pool/internal/ban"
@@ -188,6 +191,203 @@ func TestGatewayResponsesRawStreamingAndHeaders(t *testing.T) {
 	}
 }
 
+func TestGatewayAutoPromptCacheKeyForLargeStablePrefix(t *testing.T) {
+	var upstreamBody string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody = readBody(t, r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11}}}\n\n"))
+	})
+	h.importAccount(t, "auto-pck", "upstream-auto-pck", "access-auto-pck")
+	instructions := strings.Repeat("stable repository context for automatic prompt cache key. ", 80)
+	body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"instructions":` + strconv.Quote(instructions) + `,"input":[{"role":"user","content":"final question"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(upstreamBody, `"prompt_cache_key":"cp_`) {
+		t.Fatalf("large stable prefix did not get a namespaced prompt_cache_key:\n%s", upstreamBody)
+	}
+	if !strings.Contains(upstreamBody, `"effort":"high"`) || !strings.Contains(upstreamBody, `"final question"`) {
+		t.Fatalf("auto prompt_cache_key changed reasoning or content:\n%s", upstreamBody)
+	}
+}
+
+func TestGatewayAutoPromptCacheKeyForStablePrefixInsideFinalUserText(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11}}}\n\n"))
+	})
+	h.importAccount(t, "auto-pck-text-prefix", "upstream-auto-pck-text-prefix", "access-auto-pck-text-prefix")
+	prefix := strings.Repeat("stable repository snapshot line for prompt cache reuse. ", 140)
+	for _, question := range []string{"Question: summarize file A", "Question: summarize file B"} {
+		body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prefix+question) + `}]}]}`
+		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("captured requests = %d", len(reqs))
+	}
+	key1 := promptCacheKeyFromBody(t, reqs[0].Body)
+	key2 := promptCacheKeyFromBody(t, reqs[1].Body)
+	if key1 == "" || key2 == "" || key1 != key2 {
+		t.Fatalf("prompt_cache_key mismatch: %q vs %q\nfirst: %s\nsecond: %s", key1, key2, reqs[0].Body, reqs[1].Body)
+	}
+	if !strings.Contains(reqs[0].Body, "Question: summarize file A") || !strings.Contains(reqs[1].Body, "Question: summarize file B") {
+		t.Fatalf("auto prompt_cache_key changed user content\nfirst: %s\nsecond: %s", reqs[0].Body, reqs[1].Body)
+	}
+	if !strings.Contains(reqs[0].Body, `"effort":"high"`) || !strings.Contains(reqs[1].Body, `"effort":"high"`) {
+		t.Fatalf("auto prompt_cache_key changed reasoning\nfirst: %s\nsecond: %s", reqs[0].Body, reqs[1].Body)
+	}
+}
+
+func TestGatewayAutoPromptCacheKeyForStablePrefixInsideTopLevelInputText(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11}}}\n\n"))
+	})
+	h.importAccount(t, "auto-pck-input-text-prefix", "upstream-auto-pck-input-text-prefix", "access-auto-pck-input-text-prefix")
+	prefix := strings.Repeat("stable repository snapshot line for top level text cache reuse. ", 120)
+	for _, question := range []string{"Question: summarize file A", "Question: summarize file B"} {
+		body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"input":` + strconv.Quote(prefix+question) + `}`
+		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("captured requests = %d", len(reqs))
+	}
+	key1 := promptCacheKeyFromBody(t, reqs[0].Body)
+	key2 := promptCacheKeyFromBody(t, reqs[1].Body)
+	if key1 == "" || key2 == "" || key1 != key2 {
+		t.Fatalf("prompt_cache_key mismatch: %q vs %q\nfirst: %s\nsecond: %s", key1, key2, reqs[0].Body, reqs[1].Body)
+	}
+	if !strings.Contains(reqs[0].Body, "Question: summarize file A") || !strings.Contains(reqs[1].Body, "Question: summarize file B") {
+		t.Fatalf("auto prompt_cache_key changed input text\nfirst: %s\nsecond: %s", reqs[0].Body, reqs[1].Body)
+	}
+}
+
+func TestGatewayAutoPromptCacheKeyForStablePrefixInsideMultimodalToolRequest(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11}}}\n\n"))
+	})
+	h.importAccount(t, "auto-pck-mm-tool-prefix", "upstream-auto-pck-mm-tool-prefix", "access-auto-pck-mm-tool-prefix")
+	prefix := strings.Repeat("stable multimodal repository snapshot line for cache reuse. ", 130)
+	tools := `[
+		{"type":"function","name":"inspect_asset","description":"Inspect a referenced asset and return structured findings.","parameters":{"type":"object","properties":{"asset_id":{"type":"string"},"focus":{"type":"string"}},"required":["asset_id"]}},
+		{"type":"function","name":"search_repo","description":"Search the stable repository context without changing answer quality.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}
+	]`
+	for _, tc := range []struct {
+		image    string
+		question string
+	}{
+		{"AAAA", "Question: inspect image A"},
+		{"BBBB", "Question: inspect image B"},
+	} {
+		body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"tools":` + tools + `,"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prefix) + `},{"type":"input_image","image_url":"data:image/png;base64,` + tc.image + `"},{"type":"input_text","text":` + strconv.Quote(tc.question) + `}]}]}`
+		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("captured requests = %d", len(reqs))
+	}
+	key1 := promptCacheKeyFromBody(t, reqs[0].Body)
+	key2 := promptCacheKeyFromBody(t, reqs[1].Body)
+	if key1 == "" || key2 == "" || key1 != key2 {
+		t.Fatalf("prompt_cache_key mismatch: %q vs %q\nfirst: %s\nsecond: %s", key1, key2, reqs[0].Body, reqs[1].Body)
+	}
+	for _, req := range reqs {
+		if !strings.Contains(req.Body, `"type":"input_image"`) || !strings.Contains(req.Body, `"name":"inspect_asset"`) {
+			t.Fatalf("auto prompt_cache_key changed multimodal/tool content:\n%s", req.Body)
+		}
+		if !strings.Contains(req.Body, `"effort":"high"`) {
+			t.Fatalf("auto prompt_cache_key changed reasoning:\n%s", req.Body)
+		}
+	}
+}
+
+func promptCacheKeyFromBody(t *testing.T, body string) string {
+	t.Helper()
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode upstream body: %v\n%s", err, body)
+	}
+	key, _ := payload["prompt_cache_key"].(string)
+	return key
+}
+
+func equalJSONIgnoringPromptCacheKey(t *testing.T, want, got string) bool {
+	t.Helper()
+	var wm map[string]interface{}
+	var gm map[string]interface{}
+	if err := json.Unmarshal([]byte(want), &wm); err != nil {
+		t.Fatalf("decode wanted JSON: %v\n%s", err, want)
+	}
+	if err := json.Unmarshal([]byte(got), &gm); err != nil {
+		t.Fatalf("decode got JSON: %v\n%s", err, got)
+	}
+	delete(wm, "prompt_cache_key")
+	delete(gm, "prompt_cache_key")
+	return reflect.DeepEqual(wm, gm)
+}
+
+func TestGatewayDoesNotAutoPromptCacheKeyForSmallRequest(t *testing.T) {
+	var upstreamBody string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody = readBody(t, r)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11}}}\n\n"))
+	})
+	h.importAccount(t, "small-no-pck", "upstream-small-no-pck", "access-small-no-pck")
+	body := `{"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":"hello"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if strings.Contains(upstreamBody, "prompt_cache_key") {
+		t.Fatalf("small request should not get an automatic prompt_cache_key:\n%s", upstreamBody)
+	}
+}
+
 func TestGatewaySanitizesInjectedPromptCacheRetention(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp","model":"gpt-5.5","output_text":"ok","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
@@ -224,8 +424,8 @@ func TestGatewaySanitizesInjectedPromptCacheRetention(t *testing.T) {
 	if len(reqs) != 2 {
 		t.Fatalf("requests = %d", len(reqs))
 	}
-	if !strings.Contains(reqs[1].Body, `"prompt_cache_retention":"in_memory"`) || strings.Contains(reqs[1].Body, "not-a-valid-retention") {
-		t.Fatalf("client retention was not preserved cleanly:\n%s", reqs[1].Body)
+	if strings.Contains(reqs[1].Body, "prompt_cache_retention") || strings.Contains(reqs[1].Body, "not-a-valid-retention") {
+		t.Fatalf("HTTP/SSE retention should be stripped cleanly:\n%s", reqs[1].Body)
 	}
 }
 
@@ -275,6 +475,174 @@ func TestGatewayStreamingRecordsUsage(t *testing.T) {
 	ar.Body.Close()
 	if len(rows) == 0 {
 		t.Fatal("/admin/usage returned empty after a streamed completion — overview would show a demo")
+	}
+}
+
+func TestGatewayStreamingRecordsUsageWithoutEventStreamContentType(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.4\"}}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":21,\"output_tokens\":9,\"total_tokens\":30,\"input_tokens_details\":{\"cached_tokens\":7}}}}\n\n" +
+			"data: [DONE]\n\n"))
+	})
+	h.importAccount(t, "stream-usage-no-ct", "upstream-su-no-ct", "access-su-no-ct")
+	body := `{"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("gateway should normalize streamed content type, got %q", resp.Header.Get("Content-Type"))
+	}
+
+	h.app.WaitForAsyncWrites()
+	var prompt, completion, total, cached int64
+	var model string
+	row := h.store.DB().QueryRow(`SELECT model, prompt_tokens, completion_tokens, total_tokens, cached_tokens FROM usage_records ORDER BY id DESC LIMIT 1`)
+	if err := row.Scan(&model, &prompt, &completion, &total, &cached); err != nil {
+		t.Fatalf("no usage record written for streamed response without event-stream header: %v", err)
+	}
+	if model != "gpt-5.4" || prompt != 21 || completion != 9 || total != 30 || cached != 7 {
+		t.Fatalf("streamed usage mis-recorded without event-stream header: model=%q prompt=%d completion=%d total=%d cached=%d", model, prompt, completion, total, cached)
+	}
+}
+
+func TestGatewayChatStreamConvertsResponsesSSEWithoutEventStreamContentType(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chat_stream\",\"model\":\"gpt-5.4\"}}\n\n" +
+			"event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"chat stream ok\"}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_chat_stream\",\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n" +
+			"data: [DONE]\n\n"))
+	})
+	h.importAccount(t, "chat-stream-no-ct", "upstream-chat-stream-no-ct", "access-chat-stream-no-ct")
+
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-5.4","messages":[{"role":"user","content":"reply exactly: chat stream ok"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gateway status = %d body=%s", resp.StatusCode, raw)
+	}
+	body := string(raw)
+	if !strings.Contains(body, `"object":"chat.completion.chunk"`) || !strings.Contains(body, `"content":"chat stream ok"`) {
+		t.Fatalf("chat stream was not converted to chat chunks:\n%s", body)
+	}
+	if strings.Contains(body, "response.output_text.delta") {
+		t.Fatalf("raw Responses SSE leaked to chat downstream:\n%s", body)
+	}
+}
+
+func TestGatewayNonStreamingChatUsesStreamingCodexUpstream(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]interface{}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body["stream"] != true {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"detail":"Stream must be set to true"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chat_streamed\",\"model\":\"gpt-5.4\"}}\n\n" +
+			"event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"chat nonstream ok\"}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_chat_streamed\",\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":11,\"output_tokens\":3,\"total_tokens\":14,\"input_tokens_details\":{\"cached_tokens\":2}}}}\n\n" +
+			"data: [DONE]\n\n"))
+	})
+	h.importAccount(t, "chat-nonstream-wham", "upstream-chat-nonstream", "access-chat-nonstream")
+
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-5.4","messages":[{"role":"user","content":"reply exactly: chat nonstream ok"}],"stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gateway status = %d body=%s", resp.StatusCode, raw)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("downstream response is not JSON: %v\n%s", err, raw)
+	}
+	if got["object"] != "chat.completion" {
+		t.Fatalf("object = %v, body=%s", got["object"], raw)
+	}
+	choices, _ := got["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("choices missing: %s", raw)
+	}
+	msg, _ := choices[0].(map[string]interface{})["message"].(map[string]interface{})
+	if msg["content"] != "chat nonstream ok" {
+		t.Fatalf("chat content = %v, body=%s", msg["content"], raw)
+	}
+	usage, _ := got["usage"].(map[string]interface{})
+	if usage["total_tokens"] != float64(14) {
+		t.Fatalf("usage not preserved from SSE completion: %#v", usage)
+	}
+}
+
+func TestGatewayNonStreamingChatUpstreamBodyStableAcrossIdenticalRequests(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]interface{}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		if body["stream"] != true {
+			t.Fatalf("non-stream chat should use streaming Codex upstream body: %s", raw)
+		}
+		reasoning, _ := body["reasoning"].(map[string]interface{})
+		if reasoning["effort"] != "high" {
+			t.Fatalf("reasoning effort changed or dropped: %s", raw)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stable\",\"model\":\"gpt-5.4\"}}\n\n" +
+			"event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stable\",\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1,\"total_tokens\":8}}}\n\n" +
+			"data: [DONE]\n\n"))
+	})
+	h.importAccount(t, "chat-body-stable", "upstream-chat-body-stable", "access-chat-body-stable")
+
+	body := `{"model":"gpt-5.4","reasoning":{"effort":"high"},"messages":[{"role":"system","content":"stable prefix"},{"role":"user","content":"reply ok"}],"stream":false}`
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d", i+1, resp.StatusCode)
+		}
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("captured requests = %d", len(reqs))
+	}
+	if reqs[0].Body != reqs[1].Body {
+		t.Fatalf("identical downstream chat requests produced different upstream bodies\nfirst:  %s\nsecond: %s", reqs[0].Body, reqs[1].Body)
 	}
 }
 
@@ -349,7 +717,10 @@ func TestGatewayPreservesResponsesAttachmentsWhenVirtual2MEnabled(t *testing.T) 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("gateway status = %d", resp.StatusCode)
 	}
-	if upstreamBody != body {
+	if promptCacheKeyFromBody(t, upstreamBody) == "" {
+		t.Fatalf("attachment request with large stable prefix did not get prompt_cache_key:\n%s", upstreamBody)
+	}
+	if !equalJSONIgnoringPromptCacheKey(t, body, upstreamBody) {
 		t.Fatalf("attachment Responses input changed before upstream\nwant: %s\n got: %s", body, upstreamBody)
 	}
 }
@@ -785,10 +1156,17 @@ func TestGatewayHandlesMissingScopeWithoutQuarantine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Session 31: PermissionDenied NO LONGER auto-quarantines (function-level vs
-	// account-level). The account should remain active, only a short cooldown applied.
+	// PermissionDenied is a function-level failure. The account should remain active
+	// and must not receive account-wide cooldown/recheck state.
 	if gotAcc.QuarantineUntil > storage.Now() {
 		t.Fatalf("account should NOT be quarantined for PermissionDenied (was Session <31 behavior): quarantine_until=%d reason=%q", gotAcc.QuarantineUntil, gotAcc.QuarantineReason)
+	}
+	binding, err := h.store.GetEgressBinding(ctx, acc.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.CooldownUntil != 0 || binding.RecheckPending {
+		t.Fatalf("PermissionDenied must not set binding cooldown/recheck: %+v", binding)
 	}
 	// Verify the error was audit-logged (not quarantined, but still tracked).
 	logs, err := h.store.ListAuditLog(ctx, 10)
@@ -905,6 +1283,65 @@ func TestGatewayUsesResponsesWebSocketForGatedStreamingModel(t *testing.T) {
 	}
 	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-5.5" || gotPayload["stream"] != true {
 		t.Fatalf("bad websocket payload: %+v", gotPayload)
+	}
+}
+
+func TestGatewayFallsBackToHTTPSSEWhenGatedModelWebSocketMissingScope(t *testing.T) {
+	var wsHits int32
+	var httpHits int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/responses":
+			atomic.AddInt32(&wsHits, 1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.responses.write.","type":"invalid_request_error"}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/responses":
+			atomic.AddInt32(&httpHits, 1)
+			raw, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(raw), "prompt_cache_retention") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"detail":"Unsupported parameter: prompt_cache_retention"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: response.completed\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_fallback","model":"gpt-5.5","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected upstream request %s %s", r.Method, r.URL.Path)
+		}
+	})
+	accountID := h.importAccount(t, "gated-ws-fallback", "acct-gated-ws-fallback", "access-gated-ws-fallback")
+
+	body := `{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gateway status = %d body=%s", resp.StatusCode, got)
+	}
+	if !strings.Contains(string(got), "resp_fallback") || !strings.Contains(string(got), "data: [DONE]") {
+		t.Fatalf("gateway SSE body missing fallback response:\n%s", got)
+	}
+	if atomic.LoadInt32(&wsHits) != 1 || atomic.LoadInt32(&httpHits) != 1 {
+		t.Fatalf("wsHits=%d httpHits=%d", wsHits, httpHits)
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/v1/responses" ||
+		reqs[1].Method != http.MethodPost || reqs[1].Path != "/backend-api/codex/responses" {
+		t.Fatalf("upstream requests = %+v", reqs)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.CooldownUntil != 0 || binding.RecheckPending {
+		t.Fatalf("websocket permission fallback must not bench account: %+v", binding)
 	}
 }
 
@@ -1457,10 +1894,13 @@ func TestStatefulTurnRebuildsFromLedgerBeforeFailover(t *testing.T) {
 			t.Fatalf("rebuilt request leaked old account state %q: header=%q body=%s", forbidden, bReq.TurnState, bReq.Body)
 		}
 	}
-	for _, want := range []string{"hello", "assistant answer", "next", `"effort":"high"`, `"name":"lookup"`, `"prompt_cache_retention":"24h"`} {
+	for _, want := range []string{"hello", "assistant answer", "next", `"effort":"high"`, `"name":"lookup"`} {
 		if !strings.Contains(bReq.Body, want) {
 			t.Fatalf("rebuilt request missing %q:\n%s", want, bReq.Body)
 		}
+	}
+	if strings.Contains(bReq.Body, "prompt_cache_retention") {
+		t.Fatalf("non-WS rebuilt request should strip prompt_cache_retention:\n%s", bReq.Body)
 	}
 }
 
@@ -1944,6 +2384,48 @@ func TestHealthTestAliveDoesNotDelete(t *testing.T) {
 	}
 	if _, err := h.store.GetAccount(context.Background(), acc); err != nil {
 		t.Fatalf("healthy account must not be deleted: %v", err)
+	}
+}
+
+func TestHealthTestPermissionDeniedDoesNotQuarantine(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: api.responses.write."}}`))
+	})
+	acc := h.importAccount(t, "health-scope", "upstream-health-scope", "access-health-scope")
+
+	resp, err := http.Post(h.pool.URL+"/admin/accounts/"+acc+"/health-test", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&res)
+	resp.Body.Close()
+	if res["state"] != "permission_denied" {
+		t.Fatalf("expected permission_denied health verdict, got %v", res)
+	}
+	gotAcc, err := h.store.GetAccount(context.Background(), acc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAcc.QuarantineUntil != 0 || gotAcc.QuarantineReason != "" {
+		t.Fatalf("health PermissionDenied must not quarantine account: %+v", gotAcc)
+	}
+	audit, err := h.store.ListAuditLog(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit) == 0 {
+		t.Fatal("expected a health PermissionDenied audit record")
+	}
+	for _, row := range audit {
+		if row.Action == "auth_quarantine" {
+			t.Fatalf("health PermissionDenied used deprecated auth_quarantine audit: %+v", audit)
+		}
+	}
+	if audit[0].Action != "permission_denied_no_quarantine" || audit[0].State != string(ban.PermissionDenied) {
+		t.Fatalf("expected non-quarantine PermissionDenied audit, got %+v", audit)
 	}
 }
 

@@ -3220,6 +3220,28 @@ type UserUsageRow struct {
 	CachedTokens     int64  `json:"cached_tokens"`
 }
 
+type CacheUsageReport struct {
+	Summary        CacheUsageMetricRow   `json:"summary"`
+	ByAccount      []CacheUsageMetricRow `json:"by_account"`
+	ByModel        []CacheUsageMetricRow `json:"by_model"`
+	ByAPIKey       []CacheUsageMetricRow `json:"by_api_key"`
+	ByAccountModel []CacheUsageMetricRow `json:"by_account_model"`
+}
+
+type CacheUsageMetricRow struct {
+	AccountID         string  `json:"account_id,omitempty"`
+	Model             string  `json:"model,omitempty"`
+	APIKeyHashPrefix  string  `json:"api_key_hash_prefix,omitempty"`
+	Requests          int64   `json:"requests"`
+	HitRequests       int64   `json:"hit_requests"`
+	RequestHitRate    float64 `json:"request_hit_rate"`
+	PromptTokens      int64   `json:"prompt_tokens"`
+	CachedTokens      int64   `json:"cached_tokens"`
+	TokenHitRate      float64 `json:"token_hit_rate"`
+	EstimatedRequests int64   `json:"estimated_requests"`
+	EstimatedRate     float64 `json:"estimated_rate"`
+}
+
 // UsageByUser aggregates a single user's usage per model, most-used first.
 func (s *Store) UsageByUser(ctx context.Context, userID string) ([]UserUsageRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
@@ -3260,6 +3282,108 @@ FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_token
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CacheUsageMetrics(ctx context.Context, since int64) (CacheUsageReport, error) {
+	summary, err := s.cacheUsageSummary(ctx, since)
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byAccount, err := s.cacheUsageRows(ctx, since, "account")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byModel, err := s.cacheUsageRows(ctx, since, "model")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byAPIKey, err := s.cacheUsageRows(ctx, since, "api_key")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byAccountModel, err := s.cacheUsageRows(ctx, since, "account_model")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	return CacheUsageReport{
+		Summary:        summary,
+		ByAccount:      byAccount,
+		ByModel:        byModel,
+		ByAPIKey:       byAPIKey,
+		ByAccountModel: byAccountModel,
+	}, nil
+}
+
+func (s *Store) cacheUsageSummary(ctx context.Context, since int64) (CacheUsageMetricRow, error) {
+	var row CacheUsageMetricRow
+	err := s.rdb.QueryRowContext(ctx, `
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(prompt_tokens),0),
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN LOWER(REPLACE(COALESCE(raw_usage_json,''),' ','')) LIKE '%"estimated":true%' THEN 1 ELSE 0 END),0)
+FROM usage_records
+WHERE created_at >= ?`, since).Scan(&row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.EstimatedRequests)
+	if err != nil {
+		return CacheUsageMetricRow{}, err
+	}
+	finalizeCacheUsageMetric(&row)
+	return row, nil
+}
+
+func (s *Store) cacheUsageRows(ctx context.Context, since int64, dimension string) ([]CacheUsageMetricRow, error) {
+	selectCols := "COALESCE(account_id,''), '', ''"
+	groupBy := "account_id"
+	switch dimension {
+	case "account":
+	case "model":
+		selectCols = "'', COALESCE(model,''), ''"
+		groupBy = "model"
+	case "api_key":
+		selectCols = "'', '', CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END"
+		groupBy = "CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END"
+	case "account_model":
+		selectCols = "COALESCE(account_id,''), COALESCE(model,''), ''"
+		groupBy = "account_id, model"
+	default:
+		return nil, fmt.Errorf("unknown cache usage dimension %q", dimension)
+	}
+	rows, err := s.rdb.QueryContext(ctx, fmt.Sprintf(`
+SELECT %s,
+       COUNT(*),
+       COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(prompt_tokens),0),
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN LOWER(REPLACE(COALESCE(raw_usage_json,''),' ','')) LIKE '%%"estimated":true%%' THEN 1 ELSE 0 END),0)
+FROM usage_records
+WHERE created_at >= ?
+GROUP BY %s
+ORDER BY SUM(cached_tokens) DESC, COUNT(*) DESC
+LIMIT 200`, selectCols, groupBy), since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CacheUsageMetricRow
+	for rows.Next() {
+		var row CacheUsageMetricRow
+		if err := rows.Scan(&row.AccountID, &row.Model, &row.APIKeyHashPrefix, &row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.EstimatedRequests); err != nil {
+			return nil, err
+		}
+		finalizeCacheUsageMetric(&row)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
+	if row.Requests > 0 {
+		row.RequestHitRate = float64(row.HitRequests) / float64(row.Requests)
+		row.EstimatedRate = float64(row.EstimatedRequests) / float64(row.Requests)
+	}
+	if row.PromptTokens > 0 {
+		row.TokenHitRate = float64(row.CachedTokens) / float64(row.PromptTokens)
+	}
 }
 
 // UsageTimeseriesByUser is UsageTimeseries scoped to one user's attributed rows.

@@ -80,6 +80,17 @@ func postSettingsCenter(t *testing.T, h *testHarness, body string) (int, string)
 	return resp.StatusCode, string(raw)
 }
 
+func postSettingsTemplate(t *testing.T, h *testHarness, body string) (int, string) {
+	t.Helper()
+	resp, err := http.Post(h.pool.URL+"/admin/settings-center/apply-template", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, string(raw)
+}
+
 func getSettingsCenter(t *testing.T, h *testHarness, query string) (int, map[string]interface{}, string) {
 	t.Helper()
 	resp, err := http.Get(h.pool.URL + "/admin/settings-center" + query)
@@ -111,6 +122,62 @@ func getAdminSettings(t *testing.T, h *testHarness) map[string]interface{} {
 		t.Fatalf("decode /admin/settings: %v (%s)", err, raw)
 	}
 	return body
+}
+
+func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp"}`))
+	})
+
+	status, body := postSettingsTemplate(t, h, `{"template_id":"optimal-codex-pool"}`)
+	if status != http.StatusOK {
+		t.Fatalf("apply optimal template status = %d: %s", status, body)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode template response: %v\n%s", err, body)
+	}
+	if got["id"] != "optimal-codex-pool" {
+		t.Fatalf("template id = %#v", got["id"])
+	}
+	saved, _ := got["saved"].([]interface{})
+	if len(saved) == 0 {
+		t.Fatalf("template did not report saved diffs: %#v", got)
+	}
+	status, center, raw := getSettingsCenter(t, h, "?sections=config")
+	if status != http.StatusOK {
+		t.Fatalf("GET config after template = %d: %s", status, raw)
+	}
+	rows, _ := center["config"].([]interface{})
+	values := map[string]interface{}{}
+	for _, row := range rows {
+		m, _ := row.(map[string]interface{})
+		key, _ := m["key"].(string)
+		if key != "" {
+			values[key] = m["value"]
+		}
+	}
+	wants := map[string]interface{}{
+		"conversation_isolation":                true,
+		"codex_prefer_sidecar_ja3_over_ws":      true,
+		"codex_prompt_cache_retention":          "24h",
+		"rate_limit_guard_enabled":              true,
+		"seamless_failover":                     true,
+		"force_failover_on_429":                 false,
+		"leak_scrub":                            true,
+		"token_save_enabled":                    false,
+		"codex_install_effort":                  "xhigh",
+		"codex_install_model":                   "gpt-5.5",
+		"codex_install_approval_policy":         "never",
+		"codex_install_sandbox_mode":            "danger-full-access",
+		"claude_cache_control_inject":           true,
+		"claude_native_cache_breakpoint_inject": true,
+	}
+	for key, want := range wants {
+		if values[key] != want {
+			t.Fatalf("template value %s = %#v, want %#v", key, values[key], want)
+		}
+	}
 }
 
 func patchAdminSettingsStatus(t *testing.T, h *testHarness, body string) (int, string) {
