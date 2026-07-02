@@ -94,9 +94,13 @@ func TestWriteGatewayErrorUsesParseableResponse(t *testing.T) {
 	}
 }
 
-func TestProxyPlainHTTPPoolRequestForwardsCompleteBody(t *testing.T) {
-	body := strings.Repeat("x", 8192)
-	gotBody := make(chan string, 1)
+func TestProxyPlainHTTPPoolRequestForwardsOneMiBBody(t *testing.T) {
+	body := strings.Repeat("x", 1<<20)
+	type receivedRequest struct {
+		body          string
+		contentLength int64
+	}
+	gotRequest := make(chan receivedRequest, 1)
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/messages" {
 			t.Fatalf("path = %q", r.URL.Path)
@@ -108,7 +112,10 @@ func TestProxyPlainHTTPPoolRequestForwardsCompleteBody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gotBody <- string(data)
+		gotRequest <- receivedRequest{
+			body:          string(data),
+			contentLength: r.ContentLength,
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -141,9 +148,12 @@ func TestProxyPlainHTTPPoolRequestForwardsCompleteBody(t *testing.T) {
 		t.Fatalf("status = %d body=%s", resp.StatusCode, data)
 	}
 	select {
-	case got := <-gotBody:
-		if got != body {
-			t.Fatalf("forwarded body length = %d, want %d", len(got), len(body))
+	case got := <-gotRequest:
+		if got.body != body {
+			t.Fatalf("forwarded body length = %d, want %d", len(got.body), len(body))
+		}
+		if got.contentLength != int64(len(body)) {
+			t.Fatalf("forwarded content length = %d, want %d", got.contentLength, len(body))
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("pool did not receive request")

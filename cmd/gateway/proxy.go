@@ -254,6 +254,7 @@ func (p *Proxy) forwardToPool(clientConn io.Writer, req *http.Request) {
 		log.Printf("create proxy request failed: %v", err)
 		return
 	}
+	proxyReq.ContentLength = req.ContentLength
 
 	// 复制请求头
 	for k, v := range req.Header {
