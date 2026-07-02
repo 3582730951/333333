@@ -36,6 +36,7 @@ web-spa/dist/
 /cmd/pool-server/pool-server
 /wsl-list.txt
 /other_new_gpt_register
+/docs
 
 # Python caches and captured traffic artifacts
 __pycache__/
