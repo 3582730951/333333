@@ -254,6 +254,10 @@ type Config struct {
 	// ephemeral (5 min), "1h" = extended (1 hour; higher hit rate across gaps, the
 	// cache write costs ~2x). Applies only to auto-injected breakpoints.
 	ClaudeCacheTTL string `json:"claude_cache_ttl"`
+	// ClaudeCCHSigning signs the Claude Code billing-header cch field over the final
+	// Messages body for OAuth traffic. Default on; disable only as an upstream
+	// compatibility escape hatch.
+	ClaudeCCHSigning bool `json:"claude_cch_signing"`
 	// BanDetectionEnabled turns on automatic classification of upstream responses
 	// into ban / rate-limit / auth / region verdicts (heuristics ported from the
 	// reference Codex Manager). Default on.
@@ -602,6 +606,7 @@ func Default() Config {
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
 		ClaudeNativeCacheBreakpointInject: true,
+		ClaudeCCHSigning:                  true,
 		BanDetectionEnabled:               true,
 		BanAutoDelete:                     true,
 		QuarantineDurationHours:           72,
@@ -853,6 +858,11 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("CODEX_POOL_CLAUDE_CACHE_INJECT"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.ClaudeCacheControlInject = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_CLAUDE_CCH_SIGNING"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.ClaudeCCHSigning = parsed
 		}
 	}
 	if v := os.Getenv("CODEX_POOL_LEAK_SCRUB"); v != "" {

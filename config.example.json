@@ -44,6 +44,7 @@
   "conversation_isolation": true,
   "claude_cache_control_inject": true,
   "claude_native_cache_breakpoint_inject": true,
+  "claude_cch_signing": true,
   "claude_cache_ttl": "",
   "ban_detection_enabled": true,
   "ban_auto_delete": true,

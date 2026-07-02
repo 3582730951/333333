@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+
+	"codex-account-pool/internal/anthropicwire"
 )
 
 // ChatCompletionToAnthropic converts an OpenAI Chat Completions request body
@@ -80,11 +82,13 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 			appendToolResult(map[string]interface{}{
 				"type":        "tool_result",
 				"tool_use_id": stringOr(m["tool_call_id"], ""),
-				"content":     chatContentToText(m["content"]),
+				"content":     chatToolResultContent(m["content"]),
 			})
 		case "assistant":
 			blocks := []interface{}{}
-			if txt := chatContentToText(m["content"]); txt != "" {
+			if content, blocky := chatContentToAnthropicContent(m["content"]); blocky {
+				blocks = append(blocks, content.([]interface{})...)
+			} else if txt, _ := content.(string); txt != "" {
 				blocks = append(blocks, map[string]interface{}{"type": "text", "text": txt})
 			}
 			for _, tc := range toSlice(m["tool_calls"]) {
@@ -105,9 +109,10 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 			}
 			anthMessages = append(anthMessages, map[string]interface{}{"role": "assistant", "content": blocks})
 		default: // user
+			content, _ := chatContentToAnthropicContent(m["content"])
 			anthMessages = append(anthMessages, map[string]interface{}{
 				"role":    "user",
-				"content": chatContentToText(m["content"]),
+				"content": content,
 			})
 		}
 	}
@@ -231,8 +236,14 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 		}
 	}
 	if !changed {
+		if anthropicwire.NormalizeCacheControlTTL(root) {
+			if out, err := json.Marshal(root); err == nil {
+				return out
+			}
+		}
 		return body
 	}
+	anthropicwire.NormalizeCacheControlTTL(root)
 	out, err := json.Marshal(root)
 	if err != nil {
 		return body
@@ -482,6 +493,116 @@ func chatContentToText(v interface{}) string {
 		return strings.Join(parts, "")
 	}
 	return ""
+}
+
+func chatContentToAnthropicContent(v interface{}) (interface{}, bool) {
+	switch t := v.(type) {
+	case string:
+		return t, false
+	case []interface{}:
+		blocks := make([]interface{}, 0, len(t))
+		hasNonText := false
+		var textParts []string
+		for _, p := range t {
+			pm, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			block, nonText := openAIContentPartToAnthropic(pm)
+			if block == nil {
+				continue
+			}
+			if nonText {
+				hasNonText = true
+			}
+			if !hasNonText {
+				if text, ok := block.(map[string]interface{})["text"].(string); ok {
+					textParts = append(textParts, text)
+				}
+			}
+			blocks = append(blocks, block)
+		}
+		if hasNonText {
+			return blocks, true
+		}
+		return strings.Join(textParts, ""), false
+	default:
+		return "", false
+	}
+}
+
+func chatToolResultContent(v interface{}) interface{} {
+	content, blocky := chatContentToAnthropicContent(v)
+	if blocky {
+		return content
+	}
+	return chatContentToText(v)
+}
+
+func openAIContentPartToAnthropic(part map[string]interface{}) (interface{}, bool) {
+	typ, _ := part["type"].(string)
+	switch typ {
+	case "text", "input_text":
+		return map[string]interface{}{"type": "text", "text": stringOr(part["text"], "")}, false
+	case "image_url":
+		image, _ := part["image_url"].(map[string]interface{})
+		url := stringOr(mapGet(image, "url"), "")
+		if url == "" {
+			return nil, false
+		}
+		if mediaType, data, ok := parseDataURI(url); ok {
+			return map[string]interface{}{
+				"type": "image",
+				"source": map[string]interface{}{
+					"type":       "base64",
+					"media_type": mediaType,
+					"data":       data,
+				},
+			}, true
+		}
+		return map[string]interface{}{
+			"type": "image",
+			"source": map[string]interface{}{
+				"type": "url",
+				"url":  url,
+			},
+		}, true
+	case "file":
+		file, _ := part["file"].(map[string]interface{})
+		fileData := stringOr(mapGet(file, "file_data"), "")
+		mediaType, data, ok := parseDataURI(fileData)
+		if !ok {
+			return nil, false
+		}
+		return map[string]interface{}{
+			"type": "document",
+			"source": map[string]interface{}{
+				"type":       "base64",
+				"media_type": mediaType,
+				"data":       data,
+			},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func parseDataURI(uri string) (mediaType, data string, ok bool) {
+	if !strings.HasPrefix(uri, "data:") {
+		return "", "", false
+	}
+	parts := strings.SplitN(uri, ",", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	meta := strings.TrimPrefix(parts[0], "data:")
+	if idx := strings.Index(meta, ";"); idx >= 0 {
+		meta = meta[:idx]
+	}
+	if meta == "" {
+		meta = "application/octet-stream"
+	}
+	return meta, parts[1], true
 }
 
 func toStringSlice(v interface{}) []string {

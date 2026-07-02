@@ -7,11 +7,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
+
+	xxHash64 "github.com/pierrec/xxHash/xxHash64"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // Official Claude Code anti-fingerprint constants (see cliproxyapi-reference).
@@ -69,6 +75,9 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// 3. Path is a messages endpoint (not files/skills/agents)
 	if !spec.PassThrough && c.cfg.ThinkingEnabled && strings.Contains(path, "/v1/messages") {
 		spec.Body = c.applyThinkingConfig(spec.Body, "claude", spec.Model, spec.Account)
+	}
+	if !spec.PassThrough && strings.Contains(path, "/v1/messages") {
+		spec = c.normalizeClaudeMessagesSpec(spec)
 	}
 
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
@@ -420,6 +429,273 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+const claudeCCHSeed uint64 = 0x6E52736AC806831E
+const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
+
+var claudeBillingHeaderCCHPattern = regexp.MustCompile(`\bcch=([0-9a-f]{5});`)
+
+func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
+	var root map[string]interface{}
+	if json.Unmarshal(spec.Body, &root) != nil {
+		return spec
+	}
+
+	changed := false
+	if _, ok := root["metadata"]; ok {
+		delete(root, "metadata")
+		changed = true
+	}
+	if betas := extractClaudeBodyBetas(root["betas"]); len(betas) > 0 {
+		delete(root, "betas")
+		spec.Headers = cloneHeaders(spec.Headers)
+		spec.Headers.Add("Anthropic-Beta", strings.Join(betas, ","))
+		changed = true
+	} else if _, ok := root["betas"]; ok {
+		delete(root, "betas")
+		changed = true
+	}
+
+	if sanitizeClaudeWebSearchTools(root) {
+		changed = true
+	}
+	if sanitizeClaudeHistory(root) {
+		changed = true
+	}
+	if normalizeClaudeThinkingCompatibility(root) {
+		changed = true
+	}
+	if anthropicwire.NormalizeCacheControlTTL(root) {
+		changed = true
+	}
+
+	body := spec.Body
+	if changed {
+		if marshaled, err := json.Marshal(root); err == nil {
+			body = marshaled
+		}
+	}
+	if c.claudeCCHSigningEnabled(spec) {
+		body = signClaudeBillingCCH(body)
+	}
+	spec.Body = body
+	return spec
+}
+
+func extractClaudeBodyBetas(v interface{}) []string {
+	switch t := v.(type) {
+	case string:
+		return splitCSV(t)
+	case []interface{}:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s, ok := item.(string); ok {
+				out = append(out, splitCSV(s)...)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func cloneHeaders(h http.Header) http.Header {
+	if h == nil {
+		return http.Header{}
+	}
+	return h.Clone()
+}
+
+func sanitizeClaudeWebSearchTools(root map[string]interface{}) bool {
+	tools, ok := root["tools"].([]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, item := range tools {
+		tool, ok := item.(map[string]interface{})
+		if !ok || !isClaudeWebSearchTool(tool) {
+			continue
+		}
+		for _, key := range []string{"allowed_domains", "blocked_domains"} {
+			if arr, ok := tool[key].([]interface{}); ok && len(arr) == 0 {
+				delete(tool, key)
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func isClaudeWebSearchTool(tool map[string]interface{}) bool {
+	typ, _ := tool["type"].(string)
+	name, _ := tool["name"].(string)
+	return strings.HasPrefix(typ, "web_search") || strings.HasPrefix(name, "web_search")
+}
+
+func sanitizeClaudeHistory(root map[string]interface{}) bool {
+	msgs, ok := root["messages"].([]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, msg := range msgs {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blocks, ok := m["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		out := make([]interface{}, 0, len(blocks))
+		for _, block := range blocks {
+			bm, ok := block.(map[string]interface{})
+			if !ok {
+				out = append(out, block)
+				continue
+			}
+			if isEmptyClaudeThinkingBlock(bm) {
+				changed = true
+				continue
+			}
+			if typ, _ := bm["type"].(string); typ == "tool_use" {
+				if stripClaudeToolUseProvenance(bm) {
+					changed = true
+				}
+			}
+			out = append(out, bm)
+		}
+		if len(out) != len(blocks) {
+			m["content"] = out
+		}
+	}
+	return changed
+}
+
+func isEmptyClaudeThinkingBlock(block map[string]interface{}) bool {
+	typ, _ := block["type"].(string)
+	if typ != "thinking" {
+		return false
+	}
+	text, _ := block["text"].(string)
+	signature, _ := block["signature"].(string)
+	return strings.TrimSpace(text) == "" && strings.TrimSpace(signature) == ""
+}
+
+func stripClaudeToolUseProvenance(block map[string]interface{}) bool {
+	changed := false
+	for _, key := range []string{"signature", "thoughtSignature", "thought_signature", "model"} {
+		if _, ok := block[key]; ok {
+			delete(block, key)
+			changed = true
+		}
+	}
+	extra, ok := block["extra_content"].(map[string]interface{})
+	if !ok {
+		return changed
+	}
+	google, ok := extra["google"].(map[string]interface{})
+	if !ok {
+		return changed
+	}
+	if _, ok := google["thought_signature"]; ok {
+		delete(google, "thought_signature")
+		changed = true
+	}
+	if len(google) == 0 {
+		delete(extra, "google")
+		changed = true
+	}
+	if len(extra) == 0 {
+		delete(block, "extra_content")
+		changed = true
+	}
+	return changed
+}
+
+func normalizeClaudeThinkingCompatibility(root map[string]interface{}) bool {
+	changed := false
+	if toolChoice, ok := root["tool_choice"].(map[string]interface{}); ok {
+		switch typ, _ := toolChoice["type"].(string); typ {
+		case "any", "tool":
+			if _, ok := root["thinking"]; ok {
+				delete(root, "thinking")
+				changed = true
+			}
+			if removeOutputConfigEffort(root) {
+				changed = true
+			}
+			return changed
+		}
+	}
+
+	thinking, ok := root["thinking"].(map[string]interface{})
+	if !ok {
+		return changed
+	}
+	switch typ, _ := thinking["type"].(string); typ {
+	case "enabled", "adaptive", "auto":
+		if temp, ok := root["temperature"].(float64); !ok || temp != 1 {
+			root["temperature"] = 1.0
+			changed = true
+		}
+		for _, key := range []string{"top_p", "top_k"} {
+			if _, ok := root[key]; ok {
+				delete(root, key)
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func removeOutputConfigEffort(root map[string]interface{}) bool {
+	output, ok := root["output_config"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	if _, ok := output["effort"]; ok {
+		delete(output, "effort")
+		changed = true
+	}
+	if len(output) == 0 {
+		delete(root, "output_config")
+		changed = true
+	}
+	return changed
+}
+
+func (c *Client) claudeCCHSigningEnabled(spec Request) bool {
+	if !c.cfgSnapshot().ClaudeCCHSigning {
+		return false
+	}
+	token := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey)
+	return token != "" && !claudeUsesAPIKey(token)
+}
+
+func signClaudeBillingCCH(body []byte) []byte {
+	billingHeader := gjson.GetBytes(body, "system.0.text").String()
+	if !strings.HasPrefix(strings.TrimSpace(billingHeader), claudeBillingHeaderPrefix) {
+		return body
+	}
+	if !claudeBillingHeaderCCHPattern.MatchString(billingHeader) {
+		return body
+	}
+	unsignedBillingHeader := claudeBillingHeaderCCHPattern.ReplaceAllString(billingHeader, "cch=00000;")
+	unsignedBody, err := sjson.SetBytes(body, "system.0.text", unsignedBillingHeader)
+	if err != nil {
+		return body
+	}
+	cch := fmt.Sprintf("%05x", xxHash64.Checksum(unsignedBody, claudeCCHSeed)&0xFFFFF)
+	signedBillingHeader := claudeBillingHeaderCCHPattern.ReplaceAllString(unsignedBillingHeader, "cch="+cch+";")
+	signedBody, err := sjson.SetBytes(unsignedBody, "system.0.text", signedBillingHeader)
+	if err != nil {
+		return unsignedBody
+	}
+	return signedBody
 }
 
 // claudeSessionID derives the virtual X-Claude-Code-Session-Id, bound to the account.

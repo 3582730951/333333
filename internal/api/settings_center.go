@@ -1093,6 +1093,7 @@ func optimalSystemTemplateValues() map[string]interface{} {
 		"token_save_enabled":                      false,
 		"claude_cache_control_inject":             true,
 		"claude_native_cache_breakpoint_inject":   true,
+		"claude_cch_signing":                      true,
 		"claude_cache_ttl":                        "1h",
 		"claude_gateway_unknown_target_policy":    "block",
 		"claude_gateway_disable_nonessential_env": true,

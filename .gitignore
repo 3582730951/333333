@@ -30,6 +30,7 @@ web-spa/node_modules/
 web-spa/dist/
 /pool-server
 /pool-server-new
+/other_cpa
 /pool_server
 /pool_server_test
 /codex-pool

@@ -76,6 +76,25 @@ func TestCodexCLIVersionEnvOverride(t *testing.T) {
 	}
 }
 
+func TestClaudeCCHSigningDefaultAndEnvOverride(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load default: %v", err)
+	}
+	if !cfg.ClaudeCCHSigning {
+		t.Fatal("ClaudeCCHSigning default must be true")
+	}
+
+	t.Setenv("CODEX_POOL_CLAUDE_CCH_SIGNING", "false")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatalf("Load env: %v", err)
+	}
+	if cfg.ClaudeCCHSigning {
+		t.Fatal("CODEX_POOL_CLAUDE_CCH_SIGNING=false was not applied")
+	}
+}
+
 func TestCodexJA3OrDefaultRemoved(t *testing.T) {
 	// CodexJA3OrDefault was removed; JA3 resolution for Codex now lives in
 	// upstream.resolveCodexJA3 (default Chrome, real Codex JA3 opt-in), mirroring

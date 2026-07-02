@@ -91,6 +91,46 @@ func TestChatToolsAndToolCallsConversion(t *testing.T) {
 	}
 }
 
+func TestChatCompletionToAnthropicPreservesMultimodalContent(t *testing.T) {
+	raw := []byte(`{"model":"claude-x","messages":[{"role":"user","content":[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"image_url","image_url":{"url":"https://example.com/cat.jpg"}},{"type":"file","file":{"file_data":"data:application/pdf;base64,JVBERi0="}}]}]}`)
+	out, err := ChatCompletionToAnthropic(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	msgs := m["messages"].([]interface{})
+	blocks, ok := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if !ok {
+		t.Fatalf("multimodal content should be converted to Anthropic blocks, got %T: %v", msgs[0].(map[string]interface{})["content"], msgs[0].(map[string]interface{})["content"])
+	}
+	if blocks[0].(map[string]interface{})["text"] != "look" {
+		t.Fatalf("text block not preserved: %v", blocks[0])
+	}
+	imgData := blocks[1].(map[string]interface{})
+	if imgData["type"] != "image" {
+		t.Fatalf("data image not converted: %v", imgData)
+	}
+	imgDataSrc := imgData["source"].(map[string]interface{})
+	if imgDataSrc["type"] != "base64" || imgDataSrc["media_type"] != "image/png" || imgDataSrc["data"] != "AAAA" {
+		t.Fatalf("data image source = %v", imgDataSrc)
+	}
+	imgURL := blocks[2].(map[string]interface{})["source"].(map[string]interface{})
+	if imgURL["type"] != "url" || imgURL["url"] != "https://example.com/cat.jpg" {
+		t.Fatalf("url image source = %v", imgURL)
+	}
+	doc := blocks[3].(map[string]interface{})
+	if doc["type"] != "document" {
+		t.Fatalf("file not converted to document: %v", doc)
+	}
+	docSrc := doc["source"].(map[string]interface{})
+	if docSrc["type"] != "base64" || docSrc["media_type"] != "application/pdf" || docSrc["data"] != "JVBERi0=" {
+		t.Fatalf("document source = %v", docSrc)
+	}
+}
+
 func TestEnsureAnthropicCacheControl(t *testing.T) {
 	// Compat-converted body: plain-string system + plain-string user content with
 	// no cache_control anywhere → should gain breakpoints at the system tail and
@@ -120,6 +160,24 @@ func TestEnsureAnthropicCacheControl(t *testing.T) {
 	out3 := EnsureAnthropicCacheControl([]byte(`{"system":"s","messages":[{"role":"user","content":"x"}]}`), "1h")
 	if !strings.Contains(string(out3), `"ttl":"1h"`) {
 		t.Fatalf("1h ttl not applied: %s", out3)
+	}
+}
+
+func TestEnsureAnthropicCacheControlNormalizesTTLOrder(t *testing.T) {
+	raw := []byte(`{"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	out := EnsureAnthropicCacheControl(raw, "")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	sys := m["system"].([]interface{})[0].(map[string]interface{})
+	if _, has := sys["cache_control"].(map[string]interface{})["ttl"]; has {
+		t.Fatalf("system ttl should be downgraded after an earlier default/5m marker: %v", sys)
+	}
+	msg := m["messages"].([]interface{})[0].(map[string]interface{})
+	block := msg["content"].([]interface{})[0].(map[string]interface{})
+	if _, has := block["cache_control"].(map[string]interface{})["ttl"]; has {
+		t.Fatalf("message ttl should be downgraded after an earlier default/5m marker: %v", block)
 	}
 }
 

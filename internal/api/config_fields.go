@@ -103,6 +103,8 @@ func configFields() []configField {
 			Help: "开=在 OpenAI 兼容→Claude 路径自动注入 cache_control。", boot: func(c config.Config) interface{} { return c.ClaudeCacheControlInject }},
 		{Key: "claude_native_cache_breakpoint_inject", Label: "Claude 原生缓存断点", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=对已识别的 Claude Code auto-context 前缀保守补充 cache_control 断点。", boot: func(c config.Config) interface{} { return c.ClaudeNativeCacheBreakpointInject }},
+		{Key: "claude_cch_signing", Label: "Claude CCH 签名", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
+			Help: "开=OAuth Claude 请求按最终 body 生成确定性 cch。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
 		{Key: "claude_cache_ttl", Label: "Claude 缓存 TTL", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"", "1h"}, Help: "注入缓存的 TTL：空=标准(5m)，1h=长缓存。", boot: func(c config.Config) interface{} {
 				if strings.TrimSpace(c.ClaudeCacheTTL) == "1h" {
@@ -310,6 +312,7 @@ func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 	c.ClaudeCLIVersionOverride = s.settingString(ctx, "claude_cli_version", c.ClaudeCLIVersionOverride)
 	c.ClaudeNodeVersion = s.settingString(ctx, "claude_node_version", c.ClaudeNodeVersion)
 	c.ClaudeStainlessVersion = s.settingString(ctx, "claude_stainless_version", c.ClaudeStainlessVersion)
+	c.ClaudeCCHSigning = s.flagEnabled(ctx, "claude_cch_signing", c.ClaudeCCHSigning)
 	return c
 }
 
