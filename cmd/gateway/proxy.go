@@ -82,34 +82,22 @@ func (p *Proxy) ListenAndServe() error {
 func (p *Proxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// 读取 HTTP 请求行
-	buf := make([]byte, 4096)
-	n, err := clientConn.Read(buf)
+	httpReq, err := http.ReadRequest(bufio.NewReader(clientConn))
 	if err != nil {
 		return
 	}
 
-	req := string(buf[:n])
-	lines := strings.Split(req, "\r\n")
-	if len(lines) == 0 {
-		return
-	}
-
-	parts := strings.Fields(lines[0])
-	if len(parts) < 3 {
-		return
-	}
-
-	method, target := parts[0], parts[1]
-
 	// CONNECT 方法 = HTTPS MITM
-	if method == "CONNECT" {
+	if httpReq.Method == "CONNECT" {
+		target := httpReq.Host
+		if target == "" && httpReq.URL != nil {
+			target = httpReq.URL.Host
+		}
 		p.handleConnect(clientConn, target)
 		return
 	}
 
-	// 普通 HTTP 请求（直接转发，不改写）
-	p.handleHTTP(clientConn, req)
+	p.handleHTTP(clientConn, httpReq)
 }
 
 // handleConnect 处理 HTTPS CONNECT 隧道
@@ -195,16 +183,67 @@ func (p *Proxy) forwardConnect(clientConn net.Conn, target string) {
 	io.Copy(clientConn, targetConn)
 }
 
-// handleHTTP 处理普通 HTTP（直接转发）
-func (p *Proxy) handleHTTP(clientConn net.Conn, req string) {
-	// 简单实现：直接转发
-	writeGatewayError(clientConn, http.StatusNotImplemented, "Plain HTTP forwarding is not implemented")
+// handleHTTP 处理普通 HTTP。它只允许转发到配置的 pool host；其他目标仍按
+// strict gateway policy 拦截，避免 HTTP_PROXY 被滥用成开放代理。
+func (p *Proxy) handleHTTP(clientConn io.Writer, req *http.Request) {
+	if !requestTargetsPool(req, p.poolURL) {
+		writeGatewayError(clientConn, http.StatusForbidden, "Blocked by Claude Gateway strict policy")
+		return
+	}
+	p.forwardToPool(clientConn, req)
+}
+
+func requestTargetsPool(req *http.Request, poolURL string) bool {
+	if req == nil {
+		return false
+	}
+	target := req.Host
+	if req.URL != nil && req.URL.Host != "" {
+		target = req.URL.Host
+	}
+	pool := strings.TrimSpace(poolURL)
+	if pool == "" {
+		return false
+	}
+	poolHost := pool
+	if strings.Contains(pool, "://") {
+		if u, err := http.NewRequest(http.MethodGet, pool, nil); err == nil && u.URL != nil {
+			poolHost = u.URL.Host
+		}
+	}
+	return sameGatewayHostPort(target, poolHost)
+}
+
+func sameGatewayHostPort(target, pool string) bool {
+	targetHost := normalizeTargetHost(target)
+	poolHost := normalizeTargetHost(pool)
+	if targetHost == "" || poolHost == "" || targetHost != poolHost {
+		return false
+	}
+	targetPort := gatewayHostPort(target)
+	poolPort := gatewayHostPort(pool)
+	return poolPort == "" || targetPort == poolPort
+}
+
+func gatewayHostPort(hostport string) string {
+	hostport = strings.TrimSpace(hostport)
+	if hostport == "" {
+		return ""
+	}
+	if _, port, err := net.SplitHostPort(hostport); err == nil {
+		return port
+	}
+	if strings.Count(hostport, ":") == 1 {
+		parts := strings.SplitN(hostport, ":", 2)
+		return parts[1]
+	}
+	return ""
 }
 
 // forwardToPool 转发到 pool_server
-func (p *Proxy) forwardToPool(clientConn *tls.Conn, req *http.Request) {
+func (p *Proxy) forwardToPool(clientConn io.Writer, req *http.Request) {
 	// 构造目标 URL
-	targetURL := p.poolURL + req.URL.Path
+	targetURL := strings.TrimRight(p.poolURL, "/") + req.URL.EscapedPath()
 	if req.URL.RawQuery != "" {
 		targetURL += "?" + req.URL.RawQuery
 	}

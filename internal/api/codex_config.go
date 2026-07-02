@@ -10,8 +10,8 @@ import (
 // handleCodexConfigScript serves GET /file/{apikey} (the key may also arrive as
 // ?key=… or in the Authorization header): a one-shot bash script that points the
 // official `codex` CLI and Claude Code at THIS pool, then best-effort installs rtk
-// hooks. Running it once writes ~/.codex/config.toml and merges
-// ~/.claude/settings.json env so both CLIs are ready without manual gateway setup.
+// hooks. Running it once writes ~/.codex/config.toml for Codex and initializes the
+// gateway strict runtime that injects Claude's ANTHROPIC_BASE_URL/AUTH_TOKEN env.
 //
 // Config shape is verified against codex-rs (codex-model-provider-info):
 //   - wire_api MUST be "responses" ("chat" was removed upstream).
@@ -290,6 +290,23 @@ ensure_rtk() {
   command -v rtk >/dev/null 2>&1
 }
 
+ensure_user_local_bin_on_path() {
+  mkdir -p "$HOME/.local/bin"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+  esac
+  local profile="$HOME/.profile"
+  if [ -n "${BASH_VERSION:-}" ]; then
+    profile="$HOME/.bashrc"
+  fi
+  touch "$profile"
+  if ! grep -F 'export PATH="$HOME/.local/bin:$PATH"' "$profile" >/dev/null 2>&1; then
+    printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$profile"
+    say "已写入 PATH -> $profile"
+  fi
+}
+
 configure_codex() {
   local install_rtk="$1"
   local CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
@@ -329,7 +346,6 @@ EOF
 }
 
 install_gateway_binary() {
-  export PATH="$HOME/.local/bin:$PATH"
   if command -v gateway >/dev/null 2>&1; then
     return 0
   fi
@@ -340,12 +356,18 @@ install_gateway_binary() {
     x86_64) arch="amd64" ;;
     aarch64|arm64) arch="arm64" ;;
   esac
-  mkdir -p "$HOME/.local/bin"
-  target="$HOME/.local/bin/gateway"
   tmp="$(mktemp)"
   curl -fsSL "$ORIGIN/download/gateway?os=$os&arch=$arch" -o "$tmp"
   chmod +x "$tmp"
+  if [ "$(id -u)" = "0" ]; then
+    mkdir -p /usr/local/bin
+    target="/usr/local/bin/gateway"
+  else
+    ensure_user_local_bin_on_path
+    target="$HOME/.local/bin/gateway"
+  fi
   mv "$tmp" "$target"
+  export PATH="$(dirname "$target"):$PATH"
   say "已安装 gateway -> $target ($os/$arch)"
 }
 
@@ -356,9 +378,12 @@ configure_claude() {
     exit 1
   fi
   export POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-%s}"
+  export ANTHROPIC_BASE_URL="$ORIGIN"
+  export ANTHROPIC_AUTH_TOKEN="$API_KEY"
 %s
 
   say "配置 Claude Code 本地 gateway strict runtime: $ORIGIN"
+  say "Claude Code API: ANTHROPIC_BASE_URL=$ORIGIN"
   install_gateway_binary
   gateway init --pool-url "$ORIGIN" --key "$API_KEY"
 

@@ -89,6 +89,7 @@ func TestSetupScriptClaudeBranchUsesGatewayStrictRuntime(t *testing.T) {
 		`gateway init --pool-url "$ORIGIN" --key "$API_KEY"`,
 		"gateway probe-identity",
 		"gateway run-claude --",
+		"ANTHROPIC_BASE_URL=$ORIGIN",
 		`POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-1}"`,
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 		"DO_NOT_TRACK=1",
@@ -104,10 +105,24 @@ func TestSetupScriptClaudeBranchUsesGatewayStrictRuntime(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		".claude/settings.json",
-		`ANTHROPIC_BASE_URL"`,
 	} {
 		if strings.Contains(claudeBranch, forbidden) {
 			t.Fatalf("claude branch must not contain %q\n---\n%s", forbidden, claudeBranch)
+		}
+	}
+}
+
+func TestSetupScriptGatewayInstallerLeavesGatewayOnPath(t *testing.T) {
+	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "", "", "")
+	installer := scriptBetween(t, script, "install_gateway_binary() {", "\n}\n\nconfigure_claude()")
+	for _, want := range []string{
+		`if [ "$(id -u)" = "0" ]`,
+		`target="/usr/local/bin/gateway"`,
+		`target="$HOME/.local/bin/gateway"`,
+		`ensure_user_local_bin_on_path`,
+	} {
+		if !strings.Contains(installer, want) {
+			t.Fatalf("gateway installer should persist gateway on PATH; missing %q\n---\n%s", want, installer)
 		}
 	}
 }

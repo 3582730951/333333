@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -90,6 +91,65 @@ func TestWriteGatewayErrorUsesParseableResponse(t *testing.T) {
 	}
 	if got := string(body); got != "Pool unavailable\n" {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestProxyPlainHTTPPoolRequestForwardsCompleteBody(t *testing.T) {
+	body := strings.Repeat("x", 8192)
+	gotBody := make(chan string, 1)
+	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer cap_secret" {
+			t.Fatalf("authorization = %q", got)
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotBody <- string(data)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer pool.Close()
+
+	p := &Proxy{
+		poolURL:    pool.URL,
+		poolClient: pool.Client(),
+	}
+	client, server := net.Pipe()
+	defer client.Close()
+	go p.handleConnection(server)
+
+	if err := client.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	req := fmt.Sprintf("POST %s/v1/messages HTTP/1.1\r\nHost: %s\r\nAuthorization: Bearer cap_secret\r\nContent-Length: %d\r\n\r\n%s", pool.URL, strings.TrimPrefix(pool.URL, "http://"), len(body), body)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(client, req)
+		writeErr <- err
+	}()
+	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, data)
+	}
+	select {
+	case got := <-gotBody:
+		if got != body {
+			t.Fatalf("forwarded body length = %d, want %d", len(got), len(body))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("pool did not receive request")
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
 	}
 }
 

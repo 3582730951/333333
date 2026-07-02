@@ -8,6 +8,7 @@ import (
 func TestBuildBubblewrapArgsPreservesRuntimeCWD(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ListenAddr = "127.0.0.1:8765"
+	cfg.PoolServerURL = "http://165.254.109.23:8787/"
 	cfg.DownstreamKey = "cap_secret"
 	id := &CachedIdentity{
 		Local: &LocalEnvironment{
@@ -41,6 +42,8 @@ func TestBuildBubblewrapArgsPreservesRuntimeCWD(t *testing.T) {
 		"\x00--chdir\x00/workspace/project\x00",
 		"\x00--ro-bind\x00/tmp/runtime/resolv.conf\x00/etc/resolv.conf\x00",
 		"\x00--setenv\x00HTTP_PROXY\x00http://127.0.0.1:8765\x00",
+		"\x00--setenv\x00NO_PROXY\x00localhost,127.0.0.1,165.254.109.23,165.254.109.23:8787\x00",
+		"\x00--setenv\x00ANTHROPIC_BASE_URL\x00http://165.254.109.23:8787\x00",
 		"\x00--setenv\x00ANTHROPIC_AUTH_TOKEN\x00cap_secret\x00",
 		"\x00--\x00/bin/claude\x00--version\x00",
 	} {
@@ -50,6 +53,30 @@ func TestBuildBubblewrapArgsPreservesRuntimeCWD(t *testing.T) {
 	}
 	if strings.Contains(joined, "\x00--chdir\x00/home/virtuser/workspace/project\x00") {
 		t.Fatalf("runtime cwd must not be rewritten to virtual workspace\nargs=%q", args)
+	}
+}
+
+func TestStrictRuntimeEnvPointsClaudeCodeAtPoolAPI(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:8765"
+	cfg.PoolServerURL = "https://pool.example:1455/"
+	cfg.DownstreamKey = "cap_secret"
+	id := &CachedIdentity{
+		Virtual: &VirtualIdentity{
+			Username: "virtuser",
+			HomeDir:  "/home/virtuser",
+		},
+	}
+
+	joined := "\n" + strings.Join(strictRuntimeEnv(cfg, id), "\n") + "\n"
+	for _, want := range []string{
+		"\nANTHROPIC_BASE_URL=https://pool.example:1455\n",
+		"\nANTHROPIC_AUTH_TOKEN=cap_secret\n",
+		"\nNO_PROXY=localhost,127.0.0.1,pool.example,pool.example:1455\n",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("strict runtime env missing %q\n---\n%s", want, joined)
+		}
 	}
 }
 

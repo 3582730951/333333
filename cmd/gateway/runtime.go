@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -364,7 +365,8 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		"HTTP_PROXY=" + proxy,
 		"HTTPS_PROXY=" + proxy,
 		"ALL_PROXY=" + proxy,
-		"NO_PROXY=localhost,127.0.0.1",
+		"NO_PROXY=" + gatewayNoProxy(cfg),
+		"ANTHROPIC_BASE_URL=" + poolServerBaseURL(cfg),
 		"ANTHROPIC_AUTH_TOKEN=" + cfg.DownstreamKey,
 	}
 	policy := defaultGatewayPolicy()
@@ -381,6 +383,70 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 			"OTEL_METRICS_EXPORTER=none",
 			"OTEL_LOGS_EXPORTER=none",
 		)
+	}
+	return out
+}
+
+func poolServerBaseURL(cfg Config) string {
+	base := strings.TrimRight(strings.TrimSpace(cfg.PoolServerURL), "/")
+	if base == "" {
+		base = strings.TrimRight(DefaultConfig().PoolServerURL, "/")
+	}
+	return base
+}
+
+func gatewayNoProxy(cfg Config) string {
+	entries := []string{"localhost", "127.0.0.1"}
+	entries = append(entries, poolServerNoProxyEntries(cfg.PoolServerURL)...)
+	return strings.Join(uniqueNonEmpty(entries), ",")
+}
+
+func poolServerNoProxyEntries(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		return noProxyEntriesForHostPort(u.Hostname(), u.Port())
+	}
+	host := raw
+	port := ""
+	if h, p, err := net.SplitHostPort(raw); err == nil {
+		host = h
+		port = p
+	}
+	return noProxyEntriesForHostPort(host, port)
+}
+
+func noProxyEntriesForHostPort(host, port string) []string {
+	host = strings.Trim(strings.TrimSpace(host), "[]")
+	if host == "" {
+		return nil
+	}
+	entries := []string{host}
+	if port != "" {
+		if strings.Contains(host, ":") {
+			entries = append(entries, "["+host+"]:"+port)
+		} else {
+			entries = append(entries, host+":"+port)
+		}
+	}
+	return entries
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
 	}
 	return out
 }
