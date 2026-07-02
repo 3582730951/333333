@@ -3,7 +3,8 @@
 // consistent first-party Claude Code client instead of the relay/host machine.
 //
 // It performs four jobs:
-//   - overrides metadata.user_id (telemetry) with the account's stable virtual id;
+//   - removes top-level metadata before forwarding to Anthropic while keeping a
+//     scrub rule for any downstream metadata.user_id;
 //   - for OAuth (Claude Pro/Max) traffic, normalizes custom tool names to Claude
 //     Code's TitleCase and guarantees the canonical Claude Code identity system
 //     block is present (Anthropic fingerprints third-party clients by both);
@@ -100,22 +101,15 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 	var root map[string]interface{}
 	if json.Unmarshal(body, &root) == nil {
 		nativeClaudeCode := firstSystemIsClaudeCode(root)
-		vid := claudeVirtualUserID(id, oauth)
 		if md, ok := root["metadata"].(map[string]interface{}); ok {
+			vid := claudeVirtualUserID(id, oauth)
 			if orig, _ := md["user_id"].(string); orig != "" && orig != vid {
 				rules = append(rules, streamrewrite.Rule{Pattern: orig, Replacement: vid})
 			}
-			md["user_id"] = vid
-			// Strip additional telemetry keys that may leak the downstream's
-			// identity. The real Claude Code sends only user_id (with device_id /
-			// account_uuid / session_id embedded in the user_id JSON string for OAuth,
-			// not as separate metadata keys). If a downstream client or a future
-			// Claude Code version adds extra telemetry fields to metadata, we remove
-			// them so they cannot leak the downstream's identity. user_id is already
-			// set above and is preserved.
-			stripMetadataTelemetry(md)
-		} else {
-			root["metadata"] = map[string]interface{}{"user_id": vid}
+			// Current Anthropic Messages rejects top-level `metadata` on this Claude
+			// Code/OAuth surface with "metadata: Extra inputs are not permitted".
+			// Do not forward telemetry; keep only the response scrub rule above.
+			delete(root, "metadata")
 		}
 		if oauth {
 			// Only normalize tool names for requests that are GENUINELY Claude Code

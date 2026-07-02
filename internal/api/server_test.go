@@ -2619,6 +2619,9 @@ func TestClaudeMessagesRelayVirtualizesAndScrubs(t *testing.T) {
 	if strings.Contains(up.Body, "real-user") {
 		t.Fatalf("user_id not virtualized: %s", up.Body)
 	}
+	if strings.Contains(up.Body, `"metadata"`) {
+		t.Fatalf("metadata must not be forwarded to Anthropic messages: %s", up.Body)
+	}
 	// Paths are preserved in the request too (policy: never rewrite cwd/paths).
 	if !strings.Contains(up.Body, "/Users/realbob") {
 		t.Fatalf("paths must be preserved in request: %s", up.Body)

@@ -25,13 +25,8 @@ func TestVirtualizeReplacesUserIDInjectsSystemAndRenamesTools(t *testing.T) {
 	res := Virtualize(body, id, nil, true)
 	root := mustRoot(t, res.Body)
 
-	// OAuth path emits the real Claude Code metadata.user_id JSON string shape.
-	wantUID := claudeVirtualUserID(id, true)
-	if md := root["metadata"].(map[string]interface{}); md["user_id"] != wantUID {
-		t.Fatalf("user_id not replaced with structured form: %v (want %v)", md["user_id"], wantUID)
-	}
-	if !strings.Contains(wantUID, `"device_id":"`+id.UserID+`"`) || !strings.Contains(wantUID, `"session_id":`) {
-		t.Fatalf("user_id has wrong shape: %v", wantUID)
+	if _, ok := root["metadata"]; ok {
+		t.Fatalf("metadata must not be forwarded to Anthropic messages: %s", res.Body)
 	}
 	sys := root["system"].([]interface{})
 	if sys[0].(map[string]interface{})["text"] != claudeCodeIdentityLine {
