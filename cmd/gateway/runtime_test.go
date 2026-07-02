@@ -83,3 +83,23 @@ func TestStrictRuntimeEnvCanOmitNonessentialTrafficControls(t *testing.T) {
 		}
 	}
 }
+
+func TestStrictRuntimePasswdPrefersVirtualUserWhenHostUIDIsRoot(t *testing.T) {
+	id := &CachedIdentity{
+		Virtual: &VirtualIdentity{
+			Username: "virtuser",
+			HomeDir:  "/home/virtuser",
+		},
+	}
+
+	passwd, group := renderStrictRuntimeIdentityFiles(id, 0, 0)
+	if !strings.HasPrefix(passwd, "virtuser:x:0:0:Pool User:/home/virtuser:/bin/bash\n") {
+		t.Fatalf("virtual user must be first when host uid is root so whoami resolves correctly\n---\n%s", passwd)
+	}
+	if strings.Index(passwd, "virtuser:x:0:0:") > strings.Index(passwd, "root:x:0:0:") {
+		t.Fatalf("root entry precedes virtual user entry\n---\n%s", passwd)
+	}
+	if !strings.HasPrefix(group, "virtuser:x:0:\n") {
+		t.Fatalf("virtual group should be first for root gid\n---\n%s", group)
+	}
+}

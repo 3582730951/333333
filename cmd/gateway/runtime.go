@@ -241,8 +241,7 @@ func prepareStrictRuntimePaths(identity *CachedIdentity) (strictRuntimePaths, er
 	groupPath := filepath.Join(runtimeDir, "group")
 	uid := os.Getuid()
 	gid := os.Getgid()
-	passwd := fmt.Sprintf("root:x:0:0:root:/root:/bin/sh\n%s:x:%d:%d:Pool User:%s:/bin/bash\n", identity.Virtual.Username, uid, gid, identity.Virtual.HomeDir)
-	group := fmt.Sprintf("root:x:0:\n%s:x:%d:\n", identity.Virtual.Username, gid)
+	passwd, group := renderStrictRuntimeIdentityFiles(identity, uid, gid)
 	if err := os.WriteFile(passwdPath, []byte(passwd), gatewayPublicCertMode); err != nil {
 		return strictRuntimePaths{}, err
 	}
@@ -258,6 +257,17 @@ func prepareStrictRuntimePaths(identity *CachedIdentity) (strictRuntimePaths, er
 		Group:           groupPath,
 		RuntimeCWD:      preservedRuntimeCWD(identity),
 	}, nil
+}
+
+func renderStrictRuntimeIdentityFiles(identity *CachedIdentity, uid, gid int) (string, string) {
+	username := identity.Virtual.Username
+	home := identity.Virtual.HomeDir
+	// Put the virtual identity first. When the installer is run as root, both root
+	// and the virtual identity use uid 0 inside bwrap; libc/whoami returns the first
+	// matching passwd entry, so root-first made the strict self-check fail.
+	passwd := fmt.Sprintf("%s:x:%d:%d:Pool User:%s:/bin/bash\nroot:x:0:0:root:/root:/bin/sh\n", username, uid, gid, home)
+	group := fmt.Sprintf("%s:x:%d:\nroot:x:0:\n", username, gid)
+	return passwd, group
 }
 
 func buildBubblewrapArgs(cfg Config, identity *CachedIdentity, paths strictRuntimePaths, command string, args []string) []string {
