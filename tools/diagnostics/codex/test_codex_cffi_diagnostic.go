@@ -1,7 +1,7 @@
 //go:build ignore
 
-// Standalone diagnostic program (run with `go run test_codex_cffi_diagnostic.go`),
-// excluded from the normal build/test/vet like its sibling test_codex_usage.go.
+// Standalone diagnostic program (run with `go run ./tools/diagnostics/codex/test_codex_cffi_diagnostic.go`),
+// excluded from the normal build/test/vet like `go run ./tools/diagnostics/codex/test_codex_usage.go`.
 package main
 
 import (

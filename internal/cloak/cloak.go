@@ -50,7 +50,7 @@ const claudeCodeIdentityLine = "You are Claude Code, Anthropic's official CLI fo
 // 3-hex cc_version suffix AND the 5-hex cch are PER-REQUEST content fingerprints (they
 // change every request — e.g. "say hi"→f01/c511f, "what is 2+2"→268/8c02b — not just
 // per version), obfuscated client-side and NOT reproducible from the wire (verified via
-// capture/analyze_billing.py). other_cpa's salted-index formula is for an older build and
+// tools/capture/analyze_billing.py). other_cpa's salted-index formula is for an older build and
 // does not reproduce them. So we emit fresh random hex of the right shape: present +
 // well-formed + non-correlatable, which is what matters (a MISSING header is the real
 // third-party tell; Anthropic does not byte-validate these across the client fleet).
@@ -592,7 +592,7 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 // version is the SAME claude-cli version emitted in the User-Agent, so cc_version and the
 // UA agree. cch is fresh random 5-hex: the real client's cch is not reproducible from the
 // forwarded body (verified — it is not a stable hash of any content slice we can recompute;
-// see capture/analyze_billing.py) and rotates every request anyway, so a fresh value is the
+// see tools/capture/analyze_billing.py) and rotates every request anyway, so a fresh value is the
 // faithful, non-correlatable choice. Apply only to OAuth/Claude-Code traffic.
 func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 	var root map[string]interface{}
