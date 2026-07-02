@@ -57,3 +57,26 @@ func TestParseLinesBatch(t *testing.T) {
 		t.Fatalf("expected 1 error for the broken line, got %d (%v)", len(errs), errs)
 	}
 }
+
+func TestFromFieldsEndpointSchemes(t *testing.T) {
+	tests := []struct {
+		name       string
+		egressType string
+		want       string
+	}{
+		{name: "http proxy", egressType: "http_proxy", want: "http://user:pass@proxy.example:8000"},
+		{name: "socks5h proxy", egressType: "socks5h_proxy", want: "socks5h://user:pass@proxy.example:8000"},
+		{name: "socks5 proxy", egressType: "socks5_proxy", want: "socks5://user:pass@proxy.example:8000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, err := FromFields("proxy.example", "8000", "user", "pass")
+			if err != nil {
+				t.Fatalf("FromFields: %v", err)
+			}
+			if got := d.Endpoint(tt.egressType); got != tt.want {
+				t.Fatalf("endpoint = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

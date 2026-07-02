@@ -64,6 +64,11 @@ type nodeJob struct {
 	// CountryID is the platform's numeric country id for CountryISO (hero-sms: BR=73, etc.),
 	// resolved at acquireSMS time so the node engine doesn't have to query it again.
 	CountryID string
+	// SMSProvider/SMSConfig carry the operator-selected SMS platform for this job. The
+	// config is sourced from provider_settings; legacy heroSms* keys are still written
+	// for HeroSMS so older Node registrar builds keep working.
+	SMSProvider string
+	SMSConfig   map[string]interface{}
 }
 
 // nodeRegistrarBaseConfig loads the admin-managed base config for the Node registrar:
@@ -100,7 +105,28 @@ func (p *Pipeline) nodeRegistrarBaseConfig(ctx context.Context, regDir string) m
 	if path := strings.TrimSpace(os.Getenv("CODEX_REG_NODE_CONFIG")); path != "" {
 		mergeJSONFileInto(base, path)
 	}
+	p.applyNodeSMSProviderSettings(ctx, base)
 	return base
+}
+
+func (p *Pipeline) applyNodeSMSProviderSettings(ctx context.Context, base map[string]interface{}) {
+	if p == nil || p.store == nil {
+		return
+	}
+	rows, err := p.store.DB().QueryContext(ctx, `SELECT provider_key, config_json FROM provider_settings WHERE provider_type='sms' AND enabled=1 ORDER BY priority DESC`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, cfgJSON string
+		if err := rows.Scan(&key, &cfgJSON); err != nil {
+			continue
+		}
+		cfg := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(cfgJSON), &cfg)
+		applyNodeSMSProviderConfig(base, key, cfg)
+	}
 }
 
 // mergeJSONFileInto shallow-merges a JSON object file into dst (no-op if missing/bad).
@@ -124,6 +150,10 @@ func buildNodeJobConfig(base map[string]interface{}, j nodeJob) map[string]inter
 	cfg := make(map[string]interface{}, len(base)+8)
 	for k, v := range base {
 		cfg[k] = v
+	}
+	if providerName := strings.ToLower(strings.TrimSpace(j.SMSProvider)); providerName != "" {
+		cfg["smsProvider"] = providerName
+		applyNodeSMSProviderConfig(cfg, providerName, j.SMSConfig)
 	}
 	// Per-job egress → unique outbound IP. Set both the structured proxy fields (config.js
 	// reads proxyHost/Port/Username/Password) and rely on HTTPS_PROXY env as a backstop.
@@ -175,6 +205,73 @@ func buildNodeJobConfig(base map[string]interface{}, j nodeJob) map[string]inter
 	// Per-job fingerprint seed → fingerprint isolation across concurrent browsers.
 	cfg["fingerprintSeed"] = j.FingerprintSeed
 	return cfg
+}
+
+func applyNodeSMSProviderConfig(cfg map[string]interface{}, providerName string, providerConfig map[string]interface{}) {
+	if cfg == nil || providerConfig == nil {
+		return
+	}
+	providerName = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(providerName), "_", ""), "-", ""))
+	apiKey := cfgString(providerConfig["api_key"])
+	service := cfgString(providerConfig["service"])
+	if service == "" {
+		service = "dr"
+	}
+	switch providerName {
+	case "smsbower":
+		if apiKey != "" {
+			cfg["smsBowerApiKey"] = apiKey
+			cfg["smsbowerApiKey"] = apiKey
+		}
+		cfg["smsBowerService"] = service
+		cfg["smsbowerService"] = service
+	case "herosms":
+		if apiKey != "" {
+			cfg["heroSmsApiKey"] = apiKey
+		}
+		cfg["heroSmsService"] = service
+	}
+}
+
+func cfgString(v interface{}) string {
+	s, _ := v.(string)
+	return strings.TrimSpace(s)
+}
+
+func (p *Pipeline) nodeSelectedSMSConfig(ctx context.Context, requested string) (string, map[string]interface{}) {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "" {
+		requested = "auto"
+	}
+	if p == nil || p.store == nil {
+		return requested, nil
+	}
+	rows, err := p.store.DB().QueryContext(ctx, `SELECT provider_key, config_json FROM provider_settings WHERE provider_type='sms' AND enabled=1 ORDER BY priority DESC`)
+	if err != nil {
+		return requested, nil
+	}
+	defer rows.Close()
+	var firstName string
+	var firstCfg map[string]interface{}
+	for rows.Next() {
+		var key, cfgJSON string
+		if err := rows.Scan(&key, &cfgJSON); err != nil {
+			continue
+		}
+		name := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(key), "_", ""), "-", ""))
+		cfg := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(cfgJSON), &cfg)
+		if firstName == "" {
+			firstName, firstCfg = name, cfg
+		}
+		if requested != "auto" && requested == name {
+			return name, cfg
+		}
+	}
+	if requested == "auto" {
+		return requested, firstCfg
+	}
+	return requested, nil
 }
 
 // splitHostPort parses a plain "host:port" string (no scheme, no user/pass) into host and port.
@@ -349,6 +446,7 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 	// would be ideal, but the engine itself does getCountries+getTopCountries and will use
 	// heroSmsCountry from its own catalog resolution — so we only set it when we know it.
 	countryID := heroSmsCountryID(countryISO)
+	selectedSMSProvider, selectedSMSConfig := p.nodeSelectedSMSConfig(ctx, req.SMSProvider)
 
 	// Drive retries by spawning a FRESH node process per attempt (REG_ONE_SHOT=1), each
 	// doing exactly ONE browser launch. This sidesteps the puppeteer-real-browser relaunch
@@ -399,6 +497,8 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 			FingerprintSeed: randomFingerprintSeed(),
 			CountryISO:      countryISO,
 			CountryID:       countryID,
+			SMSProvider:     selectedSMSProvider,
+			SMSConfig:       selectedSMSConfig,
 		}
 		cfg := buildNodeJobConfig(baseConfig, job)
 		// Fresh residential exit IP per attempt (credential mode only): rotate the cliproxy

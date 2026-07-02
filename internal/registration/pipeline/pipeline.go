@@ -78,19 +78,21 @@ func (p *Pipeline) egressClient(ctx context.Context, egressID string) *http.Clie
 
 // RegisterRequest defines a registration task
 type RegisterRequest struct {
-	Platform        string  `json:"platform"` // "chatgpt"
-	Method          string  `json:"method"`   // "protocol" | "browser"
-	Count           int     `json:"count"`
-	GroupName       string  `json:"group_name"`
-	EgressID        string  `json:"egress_id"`
-	UpgradeToPlus   bool    `json:"upgrade_to_plus"`
-	IdentityMode    string  `json:"identity_mode"` // "phone" (default) | "email"
-	Country         string  `json:"country"`       // SMS country code/id (default "ID")
-	SMSProvider     string  `json:"sms_provider"`
-	SMSCountry      string  `json:"sms_country,omitempty"` // ISO-2 of the country chosen (for stats recording)
-	SMSCost         float64 `json:"sms_cost,omitempty"`    // cost of the SMS number (for stats recording)
-	MailboxProvider string  `json:"mailbox_provider"`
-	CaptchaSolver   string  `json:"captcha_solver"`
+	Platform                 string  `json:"platform"` // "chatgpt"
+	Method                   string  `json:"method"`   // "protocol" | "browser"
+	Count                    int     `json:"count"`
+	GroupName                string  `json:"group_name"`
+	EgressID                 string  `json:"egress_id"`
+	RegistrationEgressPoolID string  `json:"registration_egress_pool_id"`
+	RuntimeEgressPoolID      string  `json:"runtime_egress_pool_id"`
+	UpgradeToPlus            bool    `json:"upgrade_to_plus"`
+	IdentityMode             string  `json:"identity_mode"` // "phone" (default) | "email"
+	Country                  string  `json:"country"`       // SMS country code/id (default "ID")
+	SMSProvider              string  `json:"sms_provider"`
+	SMSCountry               string  `json:"sms_country,omitempty"` // ISO-2 of the country chosen (for stats recording)
+	SMSCost                  float64 `json:"sms_cost,omitempty"`    // cost of the SMS number (for stats recording)
+	MailboxProvider          string  `json:"mailbox_provider"`
+	CaptchaSolver            string  `json:"captcha_solver"`
 }
 
 // acquireSMS resolves the SMS provider + phone number + order id for one registration.
@@ -105,6 +107,14 @@ type RegisterRequest struct {
 //
 // Returns the chosen provider (so the caller can defer CancelNumber), phone, and order id.
 func (p *Pipeline) acquireSMS(ctx context.Context, req RegisterRequest) (provider.SMSProvider, string, string, error) {
+	requestedProvider := strings.ToLower(strings.TrimSpace(req.SMSProvider))
+	if requestedProvider != "" && requestedProvider != "auto" {
+		country := strings.TrimSpace(req.Country)
+		if country == "" {
+			country = firstPreferredCountry(ctx, p.store)
+		}
+		return p.providerMgr.GetSMSFromProvider(ctx, requestedProvider, country)
+	}
 	strategy := "auto"
 	if p.store != nil {
 		if v, ok, _ := p.store.GetSetting(ctx, "sms_platform_strategy"); ok {

@@ -629,11 +629,14 @@ func (s *Server) adminGroupAction(w http.ResponseWriter, r *http.Request) {
 	parts := strings.SplitN(rest, "/", 2)
 	name := parts[0]
 	if len(parts) == 2 {
-		if parts[1] != "assign-egress" {
+		switch parts[1] {
+		case "assign-egress":
+			s.adminGroupAssignEgress(w, r, name)
+		case "egress-policy":
+			s.adminGroupEgressPolicy(w, r, name)
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		s.adminGroupAssignEgress(w, r, name)
 		return
 	}
 	switch r.Method {
@@ -666,6 +669,58 @@ func (s *Server) adminGroupAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"group": name, "deleted": true})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *Server) adminGroupEgressPolicy(w http.ResponseWriter, r *http.Request, groupName string) {
+	if _, err := s.store.GetGroup(r.Context(), groupName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("group %q not found", groupName))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		policy, err := s.store.GetGroupEgressPolicy(r.Context(), groupName)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeJSON(w, http.StatusOK, storage.GroupEgressPolicy{GroupName: groupName, AssignmentStrategy: "sticky_least_used"})
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, policy)
+	case http.MethodPost:
+		var policy storage.GroupEgressPolicy
+		if err := decodeJSONRequestBody(r.Body, &policy, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		policy.GroupName = groupName
+		for _, poolID := range []string{policy.RegistrationPoolID, policy.RuntimePoolID} {
+			if strings.TrimSpace(poolID) == "" {
+				continue
+			}
+			if _, err := s.store.GetEgressPool(r.Context(), poolID); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("egress pool %q not found", poolID))
+				return
+			}
+		}
+		if err := s.store.UpsertGroupEgressPolicy(r.Context(), policy); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		got, err := s.store.GetGroupEgressPolicy(r.Context(), groupName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, got)
 	default:
 		methodNotAllowed(w)
 	}

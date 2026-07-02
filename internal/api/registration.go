@@ -330,12 +330,35 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		return invalidRegisterRequest("group %q not found", req.GroupName)
 	}
 
-	req.EgressID = strings.TrimSpace(req.EgressID)
-	if req.EgressID == "" {
-		req.EgressID = storage.DefaultDirectEgressID
+	req.RegistrationEgressPoolID = strings.TrimSpace(req.RegistrationEgressPoolID)
+	req.RuntimeEgressPoolID = strings.TrimSpace(req.RuntimeEgressPoolID)
+	if policy, err := h.store.GetGroupEgressPolicy(ctx, req.GroupName); err == nil {
+		if req.RegistrationEgressPoolID == "" {
+			req.RegistrationEgressPoolID = strings.TrimSpace(policy.RegistrationPoolID)
+		}
+		if req.RuntimeEgressPoolID == "" {
+			req.RuntimeEgressPoolID = strings.TrimSpace(policy.RuntimePoolID)
+		}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read group egress policy: %w", err)
 	}
-	if _, err := h.store.GetEgressProfile(ctx, req.EgressID); err != nil {
-		return invalidRegisterRequest("egress %q not found", req.EgressID)
+	if req.RegistrationEgressPoolID == "" {
+		return invalidRegisterRequest("registration_egress_pool_id is required; configure group %q egress policy or pass a registration pool", req.GroupName)
+	}
+	if req.RuntimeEgressPoolID == "" {
+		return invalidRegisterRequest("runtime_egress_pool_id is required; configure group %q egress policy or pass a runtime pool", req.GroupName)
+	}
+	if _, err := h.store.SelectEgressFromPool(ctx, req.RegistrationEgressPoolID); err != nil {
+		return invalidRegisterRequest("registration egress pool %q is not usable: %v", req.RegistrationEgressPoolID, err)
+	}
+	if _, err := h.store.SelectEgressFromPool(ctx, req.RuntimeEgressPoolID); err != nil {
+		return invalidRegisterRequest("runtime egress pool %q is not usable: %v", req.RuntimeEgressPoolID, err)
+	}
+	req.EgressID = strings.TrimSpace(req.EgressID)
+	if req.EgressID != "" {
+		if _, err := h.store.GetEgressProfile(ctx, req.EgressID); err != nil {
+			return invalidRegisterRequest("egress %q not found", req.EgressID)
+		}
 	}
 
 	req.IdentityMode = strings.ToLower(strings.TrimSpace(req.IdentityMode))
@@ -385,7 +408,7 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 			return invalidRegisterRequest("unsupported sms_platform_strategy %q", strategy)
 		}
 	}
-	req.SMSProvider = strings.TrimSpace(req.SMSProvider)
+	req.SMSProvider = strings.ToLower(strings.TrimSpace(req.SMSProvider))
 	req.MailboxProvider = strings.TrimSpace(req.MailboxProvider)
 	req.CaptchaSolver = strings.TrimSpace(req.CaptchaSolver)
 	return nil
@@ -552,7 +575,25 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		mu.Unlock()
 
 		// The slow part runs OUTSIDE the lock → genuine parallelism across browsers.
-		account, err := h.pipeline.RegisterOne(ctx, req)
+		// Each worker resolves one concrete registration-pool member just before launch,
+		// so concurrent jobs can spread across the dynamic residential pool.
+		workerReq := req
+		var err error
+		if strings.TrimSpace(workerReq.EgressID) == "" {
+			egress, selErr := h.store.SelectEgressFromPool(ctx, workerReq.RegistrationEgressPoolID)
+			if selErr != nil {
+				err = fmt.Errorf("select registration egress: %w", selErr)
+			} else {
+				workerReq.EgressID = egress.ID
+			}
+		}
+		var account *storage.Account
+		if err == nil {
+			account, err = h.pipeline.RegisterOne(ctx, workerReq)
+		}
+		if err == nil && account != nil {
+			err = h.bindRegisteredAccountToRuntimePool(bg, workerReq, account.ID)
+		}
 		duration := int(time.Since(start).Seconds())
 
 		mu.Lock()
@@ -601,6 +642,17 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 				rate*100, threshold*100))
 		}
 	}
+}
+
+func (h *Handler) bindRegisteredAccountToRuntimePool(ctx context.Context, req pipeline.RegisterRequest, accountID string) error {
+	runtimePoolID := strings.TrimSpace(req.RuntimeEgressPoolID)
+	if runtimePoolID == "" {
+		return invalidRegisterRequest("runtime_egress_pool_id is required before binding registered account")
+	}
+	if _, err := h.store.AssignAccountToEgressPool(ctx, accountID, runtimePoolID); err != nil {
+		return fmt.Errorf("bind account %s to runtime egress pool %s: %w", accountID, runtimePoolID, err)
+	}
+	return nil
 }
 
 // runBounded runs n indexed tasks with at most `limit` running concurrently, calling

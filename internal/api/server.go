@@ -245,6 +245,8 @@ func (s *Server) routes() {
 	// GET returns every runtime-editable field with its effective value + metadata;
 	// PATCH validates and persists any subset, hot-applying upstream-consumed fields.
 	s.mux.HandleFunc("/admin/config", s.adminConfig)
+	s.mux.HandleFunc("/admin/egress-pools", s.adminEgressPools)
+	s.mux.HandleFunc("/admin/egress-pools/", s.adminEgressPoolAction)
 	s.mux.HandleFunc("/admin/audit", s.adminAudit)
 	s.mux.HandleFunc("/admin/groups", s.adminGroups)
 	s.mux.HandleFunc("/admin/groups/", s.adminGroupAction)

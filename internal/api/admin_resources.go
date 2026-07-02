@@ -8,6 +8,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -95,19 +96,16 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 		// Accept either a full EgressProfile {type,endpoint,...} or the four-field
 		// proxy form {type,host,port,username,password}; build the endpoint URL from
 		// the fields when no explicit endpoint is given.
-		var req struct {
-			storage.EgressProfile
-			Host         string `json:"host"`
-			Port         string `json:"port"`
-			Username     string `json:"username"`
-			Password     string `json:"password"`
-			DetectRegion *bool  `json:"detect_region"`
-		}
+		var req egressProfileRequest
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		profile := req.EgressProfile
+		profile, err := req.profile()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		if strings.TrimSpace(profile.Endpoint) == "" && strings.TrimSpace(req.Host) != "" {
 			d, err := proxyparse.FromFields(req.Host, req.Port, req.Username, req.Password)
 			if err != nil {
@@ -142,6 +140,196 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, profile)
 	default:
 		methodNotAllowed(w)
+	}
+}
+
+type egressProfileRequest struct {
+	ID                string          `json:"id"`
+	Name              string          `json:"name"`
+	Type              string          `json:"type"`
+	Endpoint          string          `json:"endpoint"`
+	ChainProxy        string          `json:"chain_proxy"`
+	Region            string          `json:"region"`
+	ExitIP            string          `json:"exit_ip"`
+	StreamCapable     *bool           `json:"stream_capable"`
+	Health            string          `json:"health"`
+	LatencyMillis     int64           `json:"latency_millis"`
+	CFScore           int64           `json:"cf_score"`
+	LastCFRay         string          `json:"last_cf_ray"`
+	CooldownUntil     int64           `json:"cooldown_until"`
+	MaxConcurrency    int             `json:"max_concurrency"`
+	ProxyAuthMode     string          `json:"proxy_auth_mode"`
+	ProxyAPIKey       string          `json:"proxy_api_key"`
+	IPMode            string          `json:"ip_mode"`
+	ProviderKey       string          `json:"provider_key"`
+	DynamicConfigJSON json.RawMessage `json:"dynamic_config_json"`
+	Host              string          `json:"host"`
+	Port              string          `json:"port"`
+	Username          string          `json:"username"`
+	Password          string          `json:"password"`
+	DetectRegion      *bool           `json:"detect_region"`
+}
+
+func (r egressProfileRequest) profile() (storage.EgressProfile, error) {
+	dynamicJSON, err := normalizeDynamicConfigJSON(r.DynamicConfigJSON)
+	if err != nil {
+		return storage.EgressProfile{}, err
+	}
+	stream := true
+	if r.StreamCapable != nil {
+		stream = *r.StreamCapable
+	}
+	return storage.EgressProfile{
+		ID:                strings.TrimSpace(r.ID),
+		Name:              strings.TrimSpace(r.Name),
+		Type:              strings.TrimSpace(r.Type),
+		Endpoint:          strings.TrimSpace(r.Endpoint),
+		ChainProxy:        strings.TrimSpace(r.ChainProxy),
+		Region:            strings.TrimSpace(r.Region),
+		ExitIP:            strings.TrimSpace(r.ExitIP),
+		StreamCapable:     stream,
+		Health:            strings.TrimSpace(r.Health),
+		LatencyMillis:     r.LatencyMillis,
+		CFScore:           r.CFScore,
+		LastCFRay:         strings.TrimSpace(r.LastCFRay),
+		CooldownUntil:     r.CooldownUntil,
+		MaxConcurrency:    r.MaxConcurrency,
+		ProxyAuthMode:     strings.TrimSpace(r.ProxyAuthMode),
+		ProxyAPIKey:       strings.TrimSpace(r.ProxyAPIKey),
+		IPMode:            strings.TrimSpace(r.IPMode),
+		ProviderKey:       strings.TrimSpace(r.ProviderKey),
+		DynamicConfigJSON: dynamicJSON,
+	}, nil
+}
+
+func normalizeDynamicConfigJSON(raw json.RawMessage) (string, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return "{}", nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", fmt.Errorf("dynamic_config_json: %w", err)
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return "{}", nil
+		}
+		if json.Valid([]byte(s)) {
+			return s, nil
+		}
+		encoded, _ := json.Marshal(map[string]string{"value": s})
+		return string(encoded), nil
+	}
+	if !json.Valid(raw) {
+		return "", errors.New("dynamic_config_json must be valid JSON")
+	}
+	return trimmed, nil
+}
+
+func (s *Server) adminEgressPools(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		pools, err := s.store.ListEgressPools(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, pools)
+	case http.MethodPost:
+		var pool storage.EgressPool
+		if err := decodeJSONRequestBody(r.Body, &pool, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if strings.TrimSpace(pool.ID) == "" {
+			pool.ID = generatedID("egress_pool")
+		}
+		if err := s.store.UpsertEgressPool(r.Context(), pool); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		got, err := s.store.GetEgressPool(r.Context(), pool.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, got)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *Server) adminEgressPoolAction(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/egress-pools/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	poolID, action := parts[0], parts[1]
+	switch action {
+	case "members":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		if _, err := s.store.GetEgressPool(r.Context(), poolID); err != nil {
+			writeError(w, http.StatusNotFound, fmt.Errorf("egress pool %q not found", poolID))
+			return
+		}
+		var req struct {
+			EgressID string `json:"egress_id"`
+			Enabled  *bool  `json:"enabled"`
+			Capacity int    `json:"capacity"`
+		}
+		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		req.EgressID = strings.TrimSpace(req.EgressID)
+		if req.EgressID == "" {
+			writeError(w, http.StatusBadRequest, errors.New("egress_id required"))
+			return
+		}
+		if _, err := s.store.GetEgressProfile(r.Context(), req.EgressID); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("egress %q not found", req.EgressID))
+			return
+		}
+		enabled := true
+		if req.Enabled != nil {
+			enabled = *req.Enabled
+		}
+		if err := s.store.UpsertEgressPoolMember(r.Context(), storage.EgressPoolMember{PoolID: poolID, EgressID: req.EgressID, Enabled: enabled, Capacity: req.Capacity}); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		pool, err := s.store.GetEgressPool(r.Context(), poolID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, pool)
+	case "rebalance":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		pool, err := s.store.GetEgressPool(r.Context(), poolID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"pool_id": pool.ID, "members": len(pool.Members), "strategy": pool.AssignmentStrategy})
+	default:
+		http.NotFound(w, r)
 	}
 }
 

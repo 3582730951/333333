@@ -428,10 +428,13 @@ function SavePolicyFields({ fields, initial, disabled, groupOptions, egressOptio
 
 // ── RegistrarTab ─────────────────────────────────────────────────────────────
 
-const KNOWN = ['heroSmsApiKey', 'heroSmsService', 'heroSmsCountry', 'phoneCountryCode',
-  'mailProvider', 'mailDomains', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword'];
+const KNOWN = ['phoneCountryCode', 'mailProvider', 'mailDomains', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword'];
+const SMS_PROVIDER_CARDS = [
+  { key: 'smsbower', name: 'SMSBower' },
+  { key: 'herosms', name: 'HeroSMS' },
+];
 const REGISTRAR_META_KEYS = new Set(['defaults', 'registrar_error', 'defaults_error']);
-const EMPTY_REGISTRAR = { cfg: {}, registrarErrors: {} };
+const EMPTY_REGISTRAR = { cfg: {}, smsProviders: [], registrarErrors: {} };
 
 function registrarConfigOnly(section) {
   const out = {};
@@ -446,11 +449,20 @@ function RegistrarTab() {
   const [prevSnapshot, setPrevSnapshot] = useState(null);
 
   const fetchRegistrar = useCallback(async ({ signal }) => {
-    const r = await get(settingsCenterURL('registrar'), undefined, { signal });
-    const section = r.registrar || {};
+    const { values, error: groupError } = await loadResourceGroup({
+      registrar: { label: '注册器配置', load: () => get(settingsCenterURL('registrar'), undefined, { signal }) },
+      providers: { label: '接码平台', load: () => get('/admin/register/providers', undefined, { signal }) },
+    });
+    const section = values.registrar?.registrar || {};
+    const providerRows = values.providers?.providers || [];
     return {
       cfg: registrarConfigOnly(section),
-      registrarErrors: { config: section.registrar_error || '', defaults: section.defaults_error || '' },
+      smsProviders: providerRows.filter((p) => p.type === 'sms' && SMS_PROVIDER_CARDS.some((card) => card.key === p.key)),
+      registrarErrors: {
+        config: section.registrar_error || '',
+        defaults: section.defaults_error || '',
+        providers: groupError ? '接码平台配置读取失败' : '',
+      },
     };
   }, []);
 
@@ -463,6 +475,7 @@ function RegistrarTab() {
   } = useAsyncResource(fetchRegistrar, [fetchRegistrar], { initialData: EMPTY_REGISTRAR });
 
   const cfg = registrar.cfg || {};
+  const smsProviders = registrar.smsProviders || [];
   const registrarErrors = registrar.registrarErrors || {};
 
   const { run: save, running: saving } = useAsyncAction(async (values) => {
@@ -484,9 +497,21 @@ function RegistrarTab() {
       }
       if (out.heroSmsCountry !== undefined && out.heroSmsCountry !== '') out.heroSmsCountry = Number(out.heroSmsCountry);
       if (out.proxyPort !== undefined && out.proxyPort !== '') out.proxyPort = Number(out.proxyPort);
+      const providers = SMS_PROVIDER_CARDS.map((card) => ({
+        type: 'sms',
+        key: card.key,
+        display_name: card.name,
+        enabled: values[`${card.key}_enabled`] !== false,
+        priority: Number(values[`${card.key}_priority`]) || 0,
+        config: {
+          api_key: values[`${card.key}_api_key`] || '',
+          service: values[`${card.key}_service`] || 'dr',
+        },
+      }));
+      await post('/admin/register/providers', { providers });
       const r = await post('/admin/settings-center', [{ section: 'registrar', mode: 'replace', values: out }]);
-      setDiffs(r?.saved || []);
-      setPrevSnapshot({ oldSnap });
+      setDiffs(r?.saved || [{ section: 'registrar', key: 'sms_providers', old_value: 'saved', new_value: 'saved' }]);
+      setPrevSnapshot({ oldSnap, oldProviders: smsProviders });
       Toast.success('注册器凭据已保存');
       await load();
     } catch (e) { showErrorToast(e); }
@@ -495,6 +520,18 @@ function RegistrarTab() {
   const { run: undo, running: undoing } = useAsyncAction(async () => {
     if (!prevSnapshot) return;
     try {
+      if (Array.isArray(prevSnapshot.oldProviders)) {
+        await post('/admin/register/providers', {
+          providers: prevSnapshot.oldProviders.map((row) => ({
+            type: 'sms',
+            key: row.key,
+            display_name: row.display_name || row.key,
+            enabled: row.enabled !== false,
+            priority: Number(row.priority) || 0,
+            config: row.config || {},
+          })),
+        });
+      }
       await post('/admin/settings-center', [{ section: 'registrar', mode: 'replace', values: prevSnapshot.oldSnap }]);
       Toast.success('已撤销');
       setDiffs(null);
@@ -505,6 +542,14 @@ function RegistrarTab() {
 
   const known = {};
   KNOWN.forEach((k) => { if (cfg[k] !== undefined) known[k] = cfg[k]; });
+  SMS_PROVIDER_CARDS.forEach((card, index) => {
+    const row = smsProviders.find((p) => p.key === card.key) || {};
+    const providerConfig = row.config || {};
+    known[`${card.key}_enabled`] = row.enabled !== false;
+    known[`${card.key}_priority`] = row.priority ?? (card.key === 'smsbower' ? 100 : 90 - index);
+    known[`${card.key}_api_key`] = providerConfig.api_key || '';
+    known[`${card.key}_service`] = providerConfig.service || 'dr';
+  });
   if (Array.isArray(known.mailDomains)) known.mailDomains = known.mailDomains.join(', ');
   const extra = {};
   Object.keys(cfg).forEach((k) => { if (!KNOWN.includes(k)) extra[k] = cfg[k]; });
@@ -524,11 +569,18 @@ function RegistrarTab() {
       settingsErrors={registrarErrors}
     >
       <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
-        description="配置自动注册所需的全部凭据。住宅代理区域需与手机号国家匹配；测活链代理仅本地需要，VPS 留空。" />
+        description="配置自动注册所需的全部凭据。接码平台保存到 provider_settings；住宅代理区域需与手机号国家匹配。" />
       <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" style={{ display: 'flex', flexWrap: 'wrap', gap: '0 24px' }}>
-        <Form.Input field="heroSmsApiKey" label="hero-sms API Key" mode="password" style={{ width: 320 }} placeholder="短信平台密钥" />
-        <Form.Input field="heroSmsService" label="短信服务代码" style={{ width: 140 }} placeholder="dr" />
-        <Form.Input field="heroSmsCountry" label="短信国家ID" style={{ width: 120 }} placeholder="73" />
+        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
+          {SMS_PROVIDER_CARDS.map((card) => (
+            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+              <Form.Switch field={`${card.key}_enabled`} label="启用" />
+              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+              <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} placeholder="接码平台密钥" />
+              <Form.Input field={`${card.key}_service`} label="服务代码" style={{ width: 120 }} placeholder="dr" />
+            </Card>
+          ))}
+        </div>
         <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
         <Form.Input field="mailProvider" label="邮箱提供商" style={{ width: 180 }} placeholder="1secmail" />
         <Form.Input field="mailDomains" label="邮箱域名(逗号分隔)" style={{ width: 360 }} placeholder="guerrillamail.com, sharklasers.com" />

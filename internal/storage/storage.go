@@ -214,6 +214,47 @@ type EgressProfile struct {
 	// ProxyAPIKey is the cliproxy account API token used only in api_whitelist mode.
 	// It is stored encrypted at rest like other secrets (enc:v1: prefix).
 	ProxyAPIKey string `json:"proxy_api_key,omitempty"`
+	// IPMode describes the operator-facing address behavior, e.g.
+	// "static_residential", "dynamic_residential", or "datacenter". It is metadata used
+	// by the admin UI and registration policy; request routing still follows Type/Endpoint.
+	IPMode string `json:"ip_mode,omitempty"`
+	// ProviderKey records the proxy/egress vendor or local mechanism ("cliproxy",
+	// "cuff", "warp", ...). It is deliberately free-form so operators can add providers
+	// without schema churn.
+	ProviderKey string `json:"provider_key,omitempty"`
+	// DynamicConfigJSON stores provider-specific dynamic proxy settings as a JSON object
+	// string. Keeping it opaque at the storage layer lets the UI support SID rotation,
+	// API whitelist extraction, and future providers without hardcoding one schema here.
+	DynamicConfigJSON string `json:"dynamic_config_json,omitempty"`
+}
+
+type EgressPool struct {
+	ID                 string             `json:"id"`
+	Name               string             `json:"name"`
+	Purpose            string             `json:"purpose"` // "registration" | "runtime" | custom
+	AssignmentStrategy string             `json:"assignment_strategy"`
+	CreatedAt          int64              `json:"created_at"`
+	UpdatedAt          int64              `json:"updated_at"`
+	Members            []EgressPoolMember `json:"members,omitempty"`
+}
+
+type EgressPoolMember struct {
+	PoolID    string        `json:"pool_id"`
+	EgressID  string        `json:"egress_id"`
+	Enabled   bool          `json:"enabled"`
+	Capacity  int           `json:"capacity"`
+	CreatedAt int64         `json:"created_at"`
+	UpdatedAt int64         `json:"updated_at"`
+	Egress    EgressProfile `json:"egress,omitempty"`
+}
+
+type GroupEgressPolicy struct {
+	GroupName          string `json:"group_name"`
+	RegistrationPoolID string `json:"registration_pool_id"`
+	RuntimePoolID      string `json:"runtime_pool_id"`
+	AssignmentStrategy string `json:"assignment_strategy"`
+	CreatedAt          int64  `json:"created_at"`
+	UpdatedAt          int64  `json:"updated_at"`
 }
 
 type AccountEgressBinding struct {
@@ -624,7 +665,39 @@ CREATE TABLE IF NOT EXISTS egress_profiles(
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   proxy_auth_mode TEXT NOT NULL DEFAULT '',
-  proxy_api_key TEXT NOT NULL DEFAULT ''
+  proxy_api_key TEXT NOT NULL DEFAULT '',
+  ip_mode TEXT NOT NULL DEFAULT '',
+  provider_key TEXT NOT NULL DEFAULT '',
+  dynamic_config_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS egress_pools(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  purpose TEXT NOT NULL DEFAULT '',
+  assignment_strategy TEXT NOT NULL DEFAULT 'sticky_least_used',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS egress_pool_members(
+  pool_id TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  capacity INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(pool_id, egress_id),
+  FOREIGN KEY(pool_id) REFERENCES egress_pools(id) ON DELETE CASCADE,
+  FOREIGN KEY(egress_id) REFERENCES egress_profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_egress_pool_members_egress ON egress_pool_members(egress_id);
+CREATE TABLE IF NOT EXISTS group_egress_policies(
+  group_name TEXT PRIMARY KEY,
+  registration_pool_id TEXT NOT NULL DEFAULT '',
+  runtime_pool_id TEXT NOT NULL DEFAULT '',
+  assignment_strategy TEXT NOT NULL DEFAULT 'sticky_least_used',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS account_egress_bindings(
   account_id TEXT PRIMARY KEY,
@@ -887,6 +960,38 @@ func (s *Store) migrate(ctx context.Context) error {
 		// the cliproxy account token used in api_whitelist mode.
 		`ALTER TABLE egress_profiles ADD COLUMN proxy_auth_mode TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN proxy_api_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE egress_profiles ADD COLUMN ip_mode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE egress_profiles ADD COLUMN provider_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE egress_profiles ADD COLUMN dynamic_config_json TEXT NOT NULL DEFAULT '{}'`,
+		`CREATE TABLE IF NOT EXISTS egress_pools(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  purpose TEXT NOT NULL DEFAULT '',
+  assignment_strategy TEXT NOT NULL DEFAULT 'sticky_least_used',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE TABLE IF NOT EXISTS egress_pool_members(
+  pool_id TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  capacity INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(pool_id, egress_id),
+  FOREIGN KEY(pool_id) REFERENCES egress_pools(id) ON DELETE CASCADE,
+  FOREIGN KEY(egress_id) REFERENCES egress_profiles(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_egress_pool_members_egress ON egress_pool_members(egress_id)`,
+		`CREATE TABLE IF NOT EXISTS group_egress_policies(
+  group_name TEXT PRIMARY KEY,
+  registration_pool_id TEXT NOT NULL DEFAULT '',
+  runtime_pool_id TEXT NOT NULL DEFAULT '',
+  assignment_strategy TEXT NOT NULL DEFAULT 'sticky_least_used',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(group_name) REFERENCES groups(name) ON DELETE CASCADE
+)`,
 		// New indexes for query optimization (idempotent CREATE INDEX IF NOT EXISTS)
 		// Covers the model capability JOIN used by capability-aware routing
 		`CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id)`,
@@ -1408,14 +1513,30 @@ ON CONFLICT(account_id) DO UPDATE SET
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
 INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, created_at, updated_at)
 VALUES(?, ?, '', ?, 0, ?, ?)
 ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.ID+":"+DefaultDirectEgressID, now, now)
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	insertedBinding := false
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		insertedBinding = true
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if insertedBinding {
+		if policy, err := s.GetGroupEgressPolicy(ctx, account.GroupName); err == nil && strings.TrimSpace(policy.RuntimePoolID) != "" {
+			if _, err := s.AssignAccountToEgressPool(ctx, account.ID, policy.RuntimePoolID); err != nil {
+				return err
+			}
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
@@ -1661,7 +1782,8 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 		       e.stream_capable, COALESCE(e.health,'healthy'), e.latency_millis, e.cf_score,
 		       COALESCE(e.last_cf_ray,''), e.cooldown_until, e.max_concurrency,
 		       e.created_at, e.updated_at,
-		       COALESCE(e.proxy_auth_mode,''), COALESCE(e.proxy_api_key,'')
+		       COALESCE(e.proxy_auth_mode,''), COALESCE(e.proxy_api_key,''),
+		       COALESCE(e.ip_mode,''), COALESCE(e.provider_key,''), COALESCE(e.dynamic_config_json,'{}')
 		FROM accounts a
 		JOIN account_egress_bindings b ON a.id = b.account_id
 		LEFT JOIN egress_profiles e ON b.primary_egress_id = e.id
@@ -1691,6 +1813,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 			&a.Egress.LastCFRay, &a.Egress.CooldownUntil, &a.Egress.MaxConcurrency,
 			&a.Egress.CreatedAt, &a.Egress.UpdatedAt,
 			&a.Egress.ProxyAuthMode, &a.Egress.ProxyAPIKey,
+			&a.Egress.IPMode, &a.Egress.ProviderKey, &a.Egress.DynamicConfigJSON,
 		)
 		if err != nil {
 			return nil, err
@@ -2112,13 +2235,16 @@ func (s *Store) UpsertEgressProfile(ctx context.Context, p EgressProfile) error 
 	if p.MaxConcurrency <= 0 {
 		p.MaxConcurrency = 16
 	}
+	if strings.TrimSpace(p.DynamicConfigJSON) == "" {
+		p.DynamicConfigJSON = "{}"
+	}
 	if p.CreatedAt == 0 {
 		p.CreatedAt = now
 	}
 	p.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO egress_profiles(id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO egress_profiles(id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key, ip_mode, provider_key, dynamic_config_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name = excluded.name,
  type = excluded.type,
@@ -2135,18 +2261,21 @@ ON CONFLICT(id) DO UPDATE SET
  max_concurrency = excluded.max_concurrency,
  updated_at = excluded.updated_at,
  proxy_auth_mode = excluded.proxy_auth_mode,
- proxy_api_key = excluded.proxy_api_key`,
-		p.ID, p.Name, p.Type, p.Endpoint, p.ChainProxy, p.Region, p.ExitIP, boolInt(p.StreamCapable), p.Health, p.LatencyMillis, p.CFScore, p.LastCFRay, p.CooldownUntil, p.MaxConcurrency, p.CreatedAt, p.UpdatedAt, p.ProxyAuthMode, p.ProxyAPIKey)
+ proxy_api_key = excluded.proxy_api_key,
+ ip_mode = excluded.ip_mode,
+ provider_key = excluded.provider_key,
+ dynamic_config_json = excluded.dynamic_config_json`,
+		p.ID, p.Name, p.Type, p.Endpoint, p.ChainProxy, p.Region, p.ExitIP, boolInt(p.StreamCapable), p.Health, p.LatencyMillis, p.CFScore, p.LastCFRay, p.CooldownUntil, p.MaxConcurrency, p.CreatedAt, p.UpdatedAt, p.ProxyAuthMode, p.ProxyAPIKey, p.IPMode, p.ProviderKey, p.DynamicConfigJSON)
 	return err
 }
 
 func (s *Store) GetEgressProfile(ctx context.Context, id string) (EgressProfile, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key FROM egress_profiles WHERE id = ?`, id)
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key, ip_mode, provider_key, dynamic_config_json FROM egress_profiles WHERE id = ?`, id)
 	return scanEgress(row)
 }
 
 func (s *Store) ListEgressProfiles(ctx context.Context) ([]EgressProfile, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key FROM egress_profiles ORDER BY id`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, name, type, endpoint, chain_proxy, region, exit_ip, stream_capable, health, latency_millis, cf_score, last_cf_ray, cooldown_until, max_concurrency, created_at, updated_at, proxy_auth_mode, proxy_api_key, ip_mode, provider_key, dynamic_config_json FROM egress_profiles ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -2160,6 +2289,310 @@ func (s *Store) ListEgressProfiles(ctx context.Context) ([]EgressProfile, error)
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+func normalizeEgressPoolStrategy(strategy string) string {
+	if strings.TrimSpace(strategy) == "" {
+		return "sticky_least_used"
+	}
+	return strings.TrimSpace(strategy)
+}
+
+func (s *Store) UpsertEgressPool(ctx context.Context, p EgressPool) error {
+	now := Now()
+	p.ID = strings.TrimSpace(p.ID)
+	if p.ID == "" {
+		return errors.New("egress pool id required")
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		p.Name = p.ID
+	}
+	p.Purpose = strings.TrimSpace(p.Purpose)
+	p.AssignmentStrategy = normalizeEgressPoolStrategy(p.AssignmentStrategy)
+	if p.CreatedAt == 0 {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO egress_pools(id, name, purpose, assignment_strategy, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+ name = excluded.name,
+ purpose = excluded.purpose,
+ assignment_strategy = excluded.assignment_strategy,
+ updated_at = excluded.updated_at`,
+		p.ID, p.Name, p.Purpose, p.AssignmentStrategy, p.CreatedAt, p.UpdatedAt)
+	return err
+}
+
+func (s *Store) GetEgressPool(ctx context.Context, id string) (EgressPool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, name, purpose, assignment_strategy, created_at, updated_at FROM egress_pools WHERE id = ?`, strings.TrimSpace(id))
+	var p EgressPool
+	if err := row.Scan(&p.ID, &p.Name, &p.Purpose, &p.AssignmentStrategy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		return p, err
+	}
+	members, err := s.ListEgressPoolMembers(ctx, p.ID)
+	if err != nil {
+		return p, err
+	}
+	p.Members = members
+	return p, nil
+}
+
+func (s *Store) ListEgressPools(ctx context.Context) ([]EgressPool, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, name, purpose, assignment_strategy, created_at, updated_at FROM egress_pools ORDER BY purpose, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EgressPool
+	for rows.Next() {
+		var p EgressPool
+		if err := rows.Scan(&p.ID, &p.Name, &p.Purpose, &p.AssignmentStrategy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		members, err := s.ListEgressPoolMembers(ctx, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Members = members
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertEgressPoolMember(ctx context.Context, m EgressPoolMember) error {
+	now := Now()
+	m.PoolID = strings.TrimSpace(m.PoolID)
+	m.EgressID = strings.TrimSpace(m.EgressID)
+	if m.PoolID == "" || m.EgressID == "" {
+		return errors.New("pool_id and egress_id are required")
+	}
+	if m.Capacity < 0 {
+		m.Capacity = 0
+	}
+	if m.CreatedAt == 0 {
+		m.CreatedAt = now
+	}
+	m.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO egress_pool_members(pool_id, egress_id, enabled, capacity, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(pool_id, egress_id) DO UPDATE SET
+ enabled = excluded.enabled,
+ capacity = excluded.capacity,
+ updated_at = excluded.updated_at`,
+		m.PoolID, m.EgressID, boolInt(m.Enabled), m.Capacity, m.CreatedAt, m.UpdatedAt)
+	return err
+}
+
+func (s *Store) ListEgressPoolMembers(ctx context.Context, poolID string) ([]EgressPoolMember, error) {
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT m.pool_id, m.egress_id, m.enabled, m.capacity, m.created_at, m.updated_at,
+       e.id, e.name, e.type, e.endpoint, e.chain_proxy, e.region, e.exit_ip,
+       e.stream_capable, e.health, e.latency_millis, e.cf_score, e.last_cf_ray,
+       e.cooldown_until, e.max_concurrency, e.created_at, e.updated_at,
+       e.proxy_auth_mode, e.proxy_api_key, e.ip_mode, e.provider_key, e.dynamic_config_json
+FROM egress_pool_members m
+JOIN egress_profiles e ON e.id = m.egress_id
+WHERE m.pool_id = ?
+ORDER BY m.egress_id`, strings.TrimSpace(poolID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EgressPoolMember
+	for rows.Next() {
+		var m EgressPoolMember
+		var enabled int
+		var stream int
+		if err := rows.Scan(
+			&m.PoolID, &m.EgressID, &enabled, &m.Capacity, &m.CreatedAt, &m.UpdatedAt,
+			&m.Egress.ID, &m.Egress.Name, &m.Egress.Type, &m.Egress.Endpoint,
+			&m.Egress.ChainProxy, &m.Egress.Region, &m.Egress.ExitIP, &stream,
+			&m.Egress.Health, &m.Egress.LatencyMillis, &m.Egress.CFScore, &m.Egress.LastCFRay,
+			&m.Egress.CooldownUntil, &m.Egress.MaxConcurrency, &m.Egress.CreatedAt, &m.Egress.UpdatedAt,
+			&m.Egress.ProxyAuthMode, &m.Egress.ProxyAPIKey, &m.Egress.IPMode, &m.Egress.ProviderKey, &m.Egress.DynamicConfigJSON,
+		); err != nil {
+			return nil, err
+		}
+		m.Enabled = enabled != 0
+		m.Egress.StreamCapable = stream != 0
+		if strings.TrimSpace(m.Egress.DynamicConfigJSON) == "" {
+			m.Egress.DynamicConfigJSON = "{}"
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertGroupEgressPolicy(ctx context.Context, p GroupEgressPolicy) error {
+	now := Now()
+	p.GroupName = strings.TrimSpace(p.GroupName)
+	if p.GroupName == "" {
+		return errors.New("group_name required")
+	}
+	p.RegistrationPoolID = strings.TrimSpace(p.RegistrationPoolID)
+	p.RuntimePoolID = strings.TrimSpace(p.RuntimePoolID)
+	p.AssignmentStrategy = normalizeEgressPoolStrategy(p.AssignmentStrategy)
+	if p.CreatedAt == 0 {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO group_egress_policies(group_name, registration_pool_id, runtime_pool_id, assignment_strategy, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?)
+ON CONFLICT(group_name) DO UPDATE SET
+ registration_pool_id = excluded.registration_pool_id,
+ runtime_pool_id = excluded.runtime_pool_id,
+ assignment_strategy = excluded.assignment_strategy,
+ updated_at = excluded.updated_at`,
+		p.GroupName, p.RegistrationPoolID, p.RuntimePoolID, p.AssignmentStrategy, p.CreatedAt, p.UpdatedAt)
+	return err
+}
+
+func (s *Store) GetGroupEgressPolicy(ctx context.Context, groupName string) (GroupEgressPolicy, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT group_name, registration_pool_id, runtime_pool_id, assignment_strategy, created_at, updated_at FROM group_egress_policies WHERE group_name = ?`, strings.TrimSpace(groupName))
+	var p GroupEgressPolicy
+	if err := row.Scan(&p.GroupName, &p.RegistrationPoolID, &p.RuntimePoolID, &p.AssignmentStrategy, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+func egressPoolMemberHealthy(m EgressPoolMember, now int64) bool {
+	if !m.Enabled {
+		return false
+	}
+	health := strings.ToLower(strings.TrimSpace(m.Egress.Health))
+	if health != "" && health != "healthy" {
+		return false
+	}
+	if m.Egress.CooldownUntil > now {
+		return false
+	}
+	return true
+}
+
+func (s *Store) primaryBindingCounts(ctx context.Context) (map[string]int, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT primary_egress_id, COUNT(*) FROM account_egress_bindings GROUP BY primary_egress_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) selectEgressPoolMember(ctx context.Context, poolID string) (EgressPoolMember, error) {
+	members, err := s.ListEgressPoolMembers(ctx, poolID)
+	if err != nil {
+		return EgressPoolMember{}, err
+	}
+	if len(members) == 0 {
+		return EgressPoolMember{}, fmt.Errorf("egress pool %q has no members", poolID)
+	}
+	counts, err := s.primaryBindingCounts(ctx)
+	if err != nil {
+		return EgressPoolMember{}, err
+	}
+	now := Now()
+	var candidates []EgressPoolMember
+	for _, m := range members {
+		if !egressPoolMemberHealthy(m, now) {
+			continue
+		}
+		count := counts[m.EgressID]
+		capacity := m.Capacity
+		if capacity <= 0 {
+			capacity = m.Egress.MaxConcurrency
+		}
+		if capacity > 0 && count >= capacity {
+			continue
+		}
+		candidates = append(candidates, m)
+	}
+	if len(candidates) == 0 {
+		return EgressPoolMember{}, fmt.Errorf("egress pool %q has no healthy members with available capacity", poolID)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ci, cj := counts[candidates[i].EgressID], counts[candidates[j].EgressID]
+		if ci != cj {
+			return ci < cj
+		}
+		capi, capj := candidates[i].Capacity, candidates[j].Capacity
+		if capi <= 0 {
+			capi = candidates[i].Egress.MaxConcurrency
+		}
+		if capj <= 0 {
+			capj = candidates[j].Egress.MaxConcurrency
+		}
+		if capi != capj {
+			return capi > capj
+		}
+		return candidates[i].EgressID < candidates[j].EgressID
+	})
+	return candidates[0], nil
+}
+
+func (s *Store) SelectEgressFromPool(ctx context.Context, poolID string) (EgressProfile, error) {
+	member, err := s.selectEgressPoolMember(ctx, strings.TrimSpace(poolID))
+	if err != nil {
+		return EgressProfile{}, err
+	}
+	return member.Egress, nil
+}
+
+func (s *Store) AssignAccountToEgressPool(ctx context.Context, accountID, poolID string) (AccountEgressBinding, error) {
+	accountID = strings.TrimSpace(accountID)
+	poolID = strings.TrimSpace(poolID)
+	if accountID == "" {
+		return AccountEgressBinding{}, errors.New("account_id required")
+	}
+	if poolID == "" {
+		return AccountEgressBinding{}, errors.New("egress pool id required")
+	}
+	members, err := s.ListEgressPoolMembers(ctx, poolID)
+	if err != nil {
+		return AccountEgressBinding{}, err
+	}
+	memberIDs := map[string]bool{}
+	for _, m := range members {
+		if egressPoolMemberHealthy(m, Now()) {
+			memberIDs[m.EgressID] = true
+		}
+	}
+	if binding, err := s.GetEgressBinding(ctx, accountID); err == nil && memberIDs[binding.PrimaryEgressID] {
+		return binding, nil
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return AccountEgressBinding{}, err
+	}
+	chosen, err := s.selectEgressPoolMember(ctx, poolID)
+	if err != nil {
+		return AccountEgressBinding{}, err
+	}
+	binding := AccountEgressBinding{
+		AccountID:       accountID,
+		PrimaryEgressID: chosen.EgressID,
+		CookieJarKey:    accountID + ":" + chosen.EgressID,
+	}
+	if err := s.UpsertEgressBinding(ctx, binding); err != nil {
+		return AccountEgressBinding{}, err
+	}
+	return s.GetEgressBinding(ctx, accountID)
 }
 
 func (s *Store) SetEgressCooldown(ctx context.Context, id string, until int64, ray string) error {
@@ -3150,8 +3583,11 @@ func scanAccount(row scanner) (Account, error) {
 func scanEgress(row scanner) (EgressProfile, error) {
 	var p EgressProfile
 	var stream int
-	err := row.Scan(&p.ID, &p.Name, &p.Type, &p.Endpoint, &p.ChainProxy, &p.Region, &p.ExitIP, &stream, &p.Health, &p.LatencyMillis, &p.CFScore, &p.LastCFRay, &p.CooldownUntil, &p.MaxConcurrency, &p.CreatedAt, &p.UpdatedAt, &p.ProxyAuthMode, &p.ProxyAPIKey)
+	err := row.Scan(&p.ID, &p.Name, &p.Type, &p.Endpoint, &p.ChainProxy, &p.Region, &p.ExitIP, &stream, &p.Health, &p.LatencyMillis, &p.CFScore, &p.LastCFRay, &p.CooldownUntil, &p.MaxConcurrency, &p.CreatedAt, &p.UpdatedAt, &p.ProxyAuthMode, &p.ProxyAPIKey, &p.IPMode, &p.ProviderKey, &p.DynamicConfigJSON)
 	p.StreamCapable = stream != 0
+	if strings.TrimSpace(p.DynamicConfigJSON) == "" {
+		p.DynamicConfigJSON = "{}"
+	}
 	return p, err
 }
 

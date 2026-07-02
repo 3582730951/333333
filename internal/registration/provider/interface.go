@@ -3,6 +3,7 @@ package provider
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -100,6 +101,28 @@ func (m *Manager) GetSMS(ctx context.Context, country string) (SMSProvider, stri
 		if err == nil {
 			return p, phone, orderID, nil
 		}
+	}
+	return nil, "", "", ErrNoProviderAvailable
+}
+
+func (m *Manager) GetSMSFromProvider(ctx context.Context, providerName, country string) (SMSProvider, string, string, error) {
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	if providerName == "" || providerName == "auto" {
+		return m.GetSMS(ctx, country)
+	}
+	var lastErr error
+	for _, p := range m.SMS {
+		if strings.EqualFold(strings.TrimSpace(p.Name()), providerName) {
+			phone, orderID, err := p.GetNumber(ctx, country)
+			if err == nil {
+				return p, phone, orderID, nil
+			}
+			lastErr = err
+			break
+		}
+	}
+	if lastErr != nil {
+		return nil, "", "", lastErr
 	}
 	return nil, "", "", ErrNoProviderAvailable
 }

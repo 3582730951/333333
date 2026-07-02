@@ -177,3 +177,37 @@ func TestGetBestSMS_NoneAvailable(t *testing.T) {
 		t.Errorf("expected ErrNoProviderAvailable, got %v", err)
 	}
 }
+
+func TestGetSMSFromProviderOnlyCallsNamedPlatform(t *testing.T) {
+	herosms := &mockSMSProvider{
+		namev: "herosms",
+		numberResults: map[string]struct {
+			phone   string
+			orderID string
+			err     error
+		}{"BR": {"+550001", "hero-order", nil}},
+	}
+	smsbower := &mockSMSProvider{
+		namev: "smsbower",
+		numberResults: map[string]struct {
+			phone   string
+			orderID string
+			err     error
+		}{"BR": {"+550002", "bower-order", nil}},
+	}
+	m := &Manager{SMS: []SMSProvider{herosms, smsbower}}
+
+	p, phone, orderID, err := m.GetSMSFromProvider(context.Background(), "smsbower", "BR")
+	if err != nil {
+		t.Fatalf("GetSMSFromProvider: %v", err)
+	}
+	if p.Name() != "smsbower" || phone != "+550002" || orderID != "bower-order" {
+		t.Fatalf("got provider=%s phone=%s order=%s, want smsbower/+550002/bower-order", p.Name(), phone, orderID)
+	}
+	if len(herosms.calls) != 0 {
+		t.Fatalf("herosms should not be called when smsbower is selected, calls=%v", herosms.calls)
+	}
+	if len(smsbower.calls) != 1 || smsbower.calls[0] != "BR" {
+		t.Fatalf("smsbower calls=%v, want [BR]", smsbower.calls)
+	}
+}

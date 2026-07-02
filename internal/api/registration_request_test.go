@@ -30,6 +30,56 @@ func insertRegistrationJob(t *testing.T, h *testHarness, id, status string) {
 	}
 }
 
+func configureRegistrationEgressPools(t *testing.T, h *testHarness) (registrationPoolID, runtimePoolID string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.store.UpsertEgressProfile(ctx, storage.EgressProfile{
+		ID:             "reg_proxy",
+		Name:           "registration proxy",
+		Type:           "http_proxy",
+		Endpoint:       "http://user:pass@reg.example:8000",
+		IPMode:         "dynamic_residential",
+		ProviderKey:    "cliproxy",
+		StreamCapable:  true,
+		Health:         "healthy",
+		MaxConcurrency: 16,
+	}); err != nil {
+		t.Fatalf("upsert registration profile: %v", err)
+	}
+	if err := h.store.UpsertEgressProfile(ctx, storage.EgressProfile{
+		ID:             "runtime_sidecar",
+		Name:           "runtime sidecar",
+		Type:           "curl_cffi_sidecar",
+		Endpoint:       "http://127.0.0.1:8790",
+		StreamCapable:  true,
+		Health:         "healthy",
+		MaxConcurrency: 16,
+	}); err != nil {
+		t.Fatalf("upsert runtime profile: %v", err)
+	}
+	if err := h.store.UpsertEgressPool(ctx, storage.EgressPool{ID: "pool_registration", Purpose: "registration", AssignmentStrategy: "sticky_least_used"}); err != nil {
+		t.Fatalf("upsert registration pool: %v", err)
+	}
+	if err := h.store.UpsertEgressPoolMember(ctx, storage.EgressPoolMember{PoolID: "pool_registration", EgressID: "reg_proxy", Enabled: true}); err != nil {
+		t.Fatalf("upsert registration member: %v", err)
+	}
+	if err := h.store.UpsertEgressPool(ctx, storage.EgressPool{ID: "pool_runtime", Purpose: "runtime", AssignmentStrategy: "sticky_least_used"}); err != nil {
+		t.Fatalf("upsert runtime pool: %v", err)
+	}
+	if err := h.store.UpsertEgressPoolMember(ctx, storage.EgressPoolMember{PoolID: "pool_runtime", EgressID: "runtime_sidecar", Enabled: true}); err != nil {
+		t.Fatalf("upsert runtime member: %v", err)
+	}
+	if err := h.store.UpsertGroupEgressPolicy(ctx, storage.GroupEgressPolicy{
+		GroupName:          config.DefaultGroupName,
+		RegistrationPoolID: "pool_registration",
+		RuntimePoolID:      "pool_runtime",
+		AssignmentStrategy: "sticky_least_used",
+	}); err != nil {
+		t.Fatalf("upsert group egress policy: %v", err)
+	}
+	return "pool_registration", "pool_runtime"
+}
+
 func registrationJobStatus(t *testing.T, h *testHarness, id string) string {
 	t.Helper()
 	var status string
@@ -41,6 +91,7 @@ func registrationJobStatus(t *testing.T, h *testHarness, id string) string {
 
 func TestRegisterBatchRejectsInvalidRequestsBeforeQueueing(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	configureRegistrationEgressPools(t, h)
 
 	cases := []string{
 		`{"count":0}`,
@@ -62,8 +113,21 @@ func TestRegisterBatchRejectsInvalidRequestsBeforeQueueing(t *testing.T) {
 	}
 }
 
+func TestRegisterBatchRequiresRegistrationAndRuntimePools(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("register batch without pools = %d, want 400: %s", code, raw)
+	}
+	if count := registrationJobCount(t, h); count != 0 {
+		t.Fatalf("register batch without pools wrote %d jobs, want 0", count)
+	}
+}
+
 func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	regPool, runtimePool := configureRegistrationEgressPools(t, h)
 
 	req := pipeline.RegisterRequest{Count: 1}
 	if err := h.app.regHandler.normalizeRegisterRequest(context.Background(), &req); err != nil {
@@ -78,8 +142,14 @@ func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 	if req.GroupName != config.DefaultGroupName {
 		t.Fatalf("group_name = %q, want %q", req.GroupName, config.DefaultGroupName)
 	}
-	if req.EgressID != storage.DefaultDirectEgressID {
-		t.Fatalf("egress_id = %q, want %q", req.EgressID, storage.DefaultDirectEgressID)
+	if req.RegistrationEgressPoolID != regPool {
+		t.Fatalf("registration_egress_pool_id = %q, want %q", req.RegistrationEgressPoolID, regPool)
+	}
+	if req.RuntimeEgressPoolID != runtimePool {
+		t.Fatalf("runtime_egress_pool_id = %q, want %q", req.RuntimeEgressPoolID, runtimePool)
+	}
+	if req.EgressID != "" {
+		t.Fatalf("egress_id = %q, want empty until a worker selects a registration-pool member", req.EgressID)
 	}
 	if req.IdentityMode != "phone" {
 		t.Fatalf("identity_mode = %q, want phone", req.IdentityMode)
@@ -88,6 +158,7 @@ func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 
 func TestRegisterRequestManualCountryFallbackAndValidation(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	configureRegistrationEgressPools(t, h)
 	ctx := context.Background()
 
 	if err := h.store.SetSetting(ctx, "sms_platform_strategy", "manual"); err != nil {
@@ -123,6 +194,7 @@ func TestRegisterRequestManualCountryFallbackAndValidation(t *testing.T) {
 
 func TestRegisterRequestRejectsUnsupportedIdentityForMethod(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	configureRegistrationEgressPools(t, h)
 
 	cases := []string{
 		`{"count":1,"method":"node","identity_mode":"email"}`,
@@ -143,6 +215,7 @@ func TestRegisterRequestRejectsUnsupportedIdentityForMethod(t *testing.T) {
 
 func TestManualSMSCountryNotRequiredForProtocolV2Email(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	configureRegistrationEgressPools(t, h)
 	ctx := context.Background()
 	if err := h.store.SetSetting(ctx, "sms_platform_strategy", "manual"); err != nil {
 		t.Fatal(err)
@@ -157,6 +230,26 @@ func TestManualSMSCountryNotRequiredForProtocolV2Email(t *testing.T) {
 	}
 	if req.Country != "" {
 		t.Fatalf("country = %q, want empty for protocol_v2 email", req.Country)
+	}
+}
+
+func TestRegisteredAccountIsBoundToRuntimePool(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	_, runtimePool := configureRegistrationEgressPools(t, h)
+	ctx := context.Background()
+	if err := h.store.UpsertAccount(ctx, storage.Account{ID: "acc-registered", GroupName: config.DefaultGroupName, Status: "active"}, storage.AccountToken{AccessToken: "tok"}); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	if err := h.app.regHandler.bindRegisteredAccountToRuntimePool(ctx, pipeline.RegisterRequest{RuntimeEgressPoolID: runtimePool}, "acc-registered"); err != nil {
+		t.Fatalf("bindRegisteredAccountToRuntimePool: %v", err)
+	}
+	binding, err := h.store.GetEgressBinding(ctx, "acc-registered")
+	if err != nil {
+		t.Fatalf("binding: %v", err)
+	}
+	if binding.PrimaryEgressID != "runtime_sidecar" {
+		t.Fatalf("primary egress = %q, want runtime_sidecar", binding.PrimaryEgressID)
 	}
 }
 

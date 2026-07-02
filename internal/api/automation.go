@@ -411,12 +411,14 @@ func (s *Server) autoRefill(ctx context.Context, p *Policy) {
 		need = automationRefillCap
 	}
 	req := pipeline.RegisterRequest{
-		Platform:     strFromConfig(p.Config, "platform", "chatgpt"),
-		Method:       strFromConfig(p.Config, "register_method", ""), // "" → StartJob applies the configured default ("node")
-		IdentityMode: strFromConfig(p.Config, "identity_mode", ""),
-		Count:        need,
-		GroupName:    strFromConfig(p.Config, "group", ""),
-		EgressID:     strFromConfig(p.Config, "egress", "egress_direct"),
+		Platform:                 strFromConfig(p.Config, "platform", "chatgpt"),
+		Method:                   strFromConfig(p.Config, "register_method", ""), // "" → StartJob applies the configured default ("node")
+		IdentityMode:             strFromConfig(p.Config, "identity_mode", ""),
+		Count:                    need,
+		GroupName:                strFromConfig(p.Config, "group", ""),
+		RegistrationEgressPoolID: strFromConfig(p.Config, "registration_egress_pool_id", ""),
+		RuntimeEgressPoolID:      strFromConfig(p.Config, "runtime_egress_pool_id", ""),
+		SMSProvider:              strFromConfig(p.Config, "sms_provider", ""),
 	}
 	jobID, err := s.regHandler.StartJob(ctx, req)
 	if err != nil {

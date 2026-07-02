@@ -20,7 +20,7 @@ const jobTag = (s) => {
 
 const DEFAULT_PREFERRED = ['BR', 'CO', 'PL'];
 const EMPTY_REGISTRATION = { jobs: [], readiness: null, readinessError: '' };
-const EMPTY_OPTIONS = { groups: [], egresses: [], error: null };
+const EMPTY_OPTIONS = { groups: [], egresses: [], pools: [], providerOpts: { sms: [], mailbox: [], captcha: [] }, error: null };
 
 const readinessProviderCount = (readiness, key) => Number(readiness?.providers?.[key] || 0);
 
@@ -112,11 +112,13 @@ export default function Registration() {
   const fetchOptions = useCallback(async ({ signal }) => {
     const { values, error } = await loadResourceGroup({
       groups: { label: '分组选项', load: () => get('/admin/groups', undefined, { signal }) },
-      egresses: { label: '出口选项', load: () => get('/admin/egress-profiles', undefined, { signal }) },
+      pools: { label: '出口池选项', load: () => get('/admin/egress-pools', undefined, { signal }) },
+      providers: { label: '服务商选项', load: () => get('/admin/register/providers/options', undefined, { signal }) },
     });
     return {
       groups: Array.isArray(values.groups) ? values.groups : values.groups?.groups || [],
-      egresses: Array.isArray(values.egresses) ? values.egresses : values.egresses?.profiles || [],
+      pools: Array.isArray(values.pools) ? values.pools : values.pools?.pools || [],
+      providerOpts: values.providers || EMPTY_OPTIONS.providerOpts,
       error,
     };
   }, []);
@@ -206,7 +208,9 @@ export default function Registration() {
         count: Number(v.count) || 1,
         group_name: v.group_name || '',
         method: requestMethod,
-        egress_id: v.egress_id || '',
+        registration_egress_pool_id: v.registration_egress_pool_id || '',
+        runtime_egress_pool_id: v.runtime_egress_pool_id || '',
+        sms_provider: v.sms_provider || '',
         identity_mode: requestIdentityMode,
         country: smsCountryRequired && strategy === 'manual' ? (manualCountry || '') : '',
       };
@@ -275,7 +279,8 @@ export default function Registration() {
   const readiness = registration.readiness;
   const readinessError = registration.readinessError || '';
   const groups = options.groups || [];
-  const egresses = options.egresses || [];
+  const pools = options.pools || [];
+  const providerOpts = options.providerOpts || EMPTY_OPTIONS.providerOpts;
   const strategyReady = Boolean(strategyConfig || strategyError);
 
   // Build country option list for the searchable Select.
@@ -297,6 +302,16 @@ export default function Registration() {
     ['captcha', readinessProviderCount(readiness, 'captcha')],
   ] : [];
   const pool = readiness?.pool || {};
+  const registrationPools = pools.filter((p) => !p.purpose || p.purpose === 'registration');
+  const runtimePools = pools.filter((p) => !p.purpose || p.purpose === 'runtime');
+  const smsProviderOptions = [
+    { label: '自动', value: '' },
+    { label: 'SMSBower', value: 'smsbower' },
+    { label: 'HeroSMS', value: 'herosms' },
+    ...(providerOpts.sms || [])
+      .filter((opt) => !['smsbower', 'herosms'].includes(String(opt.value || '').toLowerCase()))
+      .map((opt) => ({ label: opt.label, value: opt.value })),
+  ];
 
   return (
     <div>
@@ -361,6 +376,16 @@ export default function Registration() {
           <Form.InputNumber field="count" label="数量" initValue={1} min={1} max={100} disabled={starting || savingStrategy} style={{ width: 120 }} />
           <Form.Select field="group_name" label="分组" placeholder="默认" disabled={starting || savingStrategy} style={{ width: 180 }}
             optionList={[{ label: '默认', value: '' }, ...(groups || []).map((g) => ({ label: g?.name || '未知', value: g?.name || '' }))]} />
+          <Form.Select field="registration_egress_pool_id" label="注册代理池" placeholder="按分组策略" disabled={starting || savingStrategy} style={{ width: 220 }}
+            optionList={[
+              { label: '按分组策略', value: '' },
+              ...(registrationPools || []).map((p) => ({ label: `${p.name || p.id} (${p.members?.length || 0})`, value: p.id })),
+            ]} />
+          <Form.Select field="runtime_egress_pool_id" label="注册后出口池" placeholder="按分组策略" disabled={starting || savingStrategy} style={{ width: 220 }}
+            optionList={[
+              { label: '按分组策略', value: '' },
+              ...(runtimePools || []).map((p) => ({ label: `${p.name || p.id} (${p.members?.length || 0})`, value: p.id })),
+            ]} />
           <Form.Select field="method" label="引擎" initValue="" disabled={starting || savingStrategy} style={{ width: 170 }}
             optionList={[
               { label: `默认 (${defaultMethod})`, value: '' },
@@ -376,14 +401,6 @@ export default function Registration() {
               setSelectedMethod(nextMethod);
               setIdentityMode(lockedIdentityForMethod(nextEffectiveMethod) || identityMode || 'phone');
             }} />
-          <Form.Select field="egress_id" label="出口" placeholder="egress_direct" disabled={starting || savingStrategy} style={{ width: 280 }}
-            optionList={[
-              { label: 'egress_direct (默认)', value: '' },
-              ...(egresses || []).filter(e => e && e.id).map((e) => ({
-                label: `${e.name || e.id || 'unknown'} (${e.type || 'direct'})${e.proxy_auth_mode === 'api_whitelist' ? ' · API白名单' : ''}`,
-                value: e.id,
-              })),
-            ]} />
           <div className="pool-registration-control">
             <Typography.Text size="small" className="pool-registration-field-label">身份</Typography.Text>
             <Select
@@ -400,6 +417,8 @@ export default function Registration() {
 
           {smsCountryRequired && (
           <div className="pool-registration-strategy-row">
+            <Form.Select field="sms_provider" label="SMS 平台" initValue="" disabled={starting || savingStrategy} style={{ width: 160 }}
+              optionList={smsProviderOptions} />
             <div className="pool-registration-control">
               <Typography.Text size="small" className="pool-registration-field-label">国家策略</Typography.Text>
               <Select value={strategy} onChange={(v) => {
