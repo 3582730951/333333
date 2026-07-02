@@ -71,6 +71,35 @@ const (
 	legacyClaudeOAuthTokenURL = "https://console.anthropic.com/v1/oauth/token"
 )
 
+var (
+	defaultClaudeGatewayInterceptHosts = []string{
+		"api.anthropic.com",
+		"api.openai.com",
+		"chatgpt.com",
+		"*.chatgpt.com",
+		"*backend-api*",
+	}
+	defaultClaudeGatewayBlockedHostPatterns = []string{
+		"statsig",
+		"sentry",
+		"telemetry",
+		"segment",
+		"posthog",
+		"amplitude",
+		"datadog",
+		"update",
+		"autoupdate",
+	}
+)
+
+func DefaultClaudeGatewayInterceptHosts() []string {
+	return append([]string(nil), defaultClaudeGatewayInterceptHosts...)
+}
+
+func DefaultClaudeGatewayBlockedHostPatterns() []string {
+	return append([]string(nil), defaultClaudeGatewayBlockedHostPatterns...)
+}
+
 type Config struct {
 	ListenAddr                     string `json:"listen_addr"`
 	DatabasePath                   string `json:"database_path"`
@@ -331,6 +360,16 @@ type Config struct {
 	CodexInstallEffort         string `json:"codex_install_effort"`          // default "xhigh"
 	CodexInstallApprovalPolicy string `json:"codex_install_approval_policy"` // default "never"
 	CodexInstallSandboxMode    string `json:"codex_install_sandbox_mode"`    // default "danger-full-access"
+	// Claude gateway local runtime / egress policy. These are surfaced through the
+	// admin System config page and returned by /v1/gateway/identity so installed
+	// gateway binaries can follow operator-edited policy without recompilation.
+	ClaudeGatewayInterceptHosts         []string `json:"claude_gateway_intercept_hosts"`
+	ClaudeGatewayForwardHosts           []string `json:"claude_gateway_forward_hosts"`
+	ClaudeGatewayBlockedHostPatterns    []string `json:"claude_gateway_blocked_host_patterns"`
+	ClaudeGatewayUnknownTargetPolicy    string   `json:"claude_gateway_unknown_target_policy"` // block|forward
+	ClaudeGatewayDisableNonessentialEnv bool     `json:"claude_gateway_disable_nonessential_env"`
+	ClaudeGatewayStrictLinuxDefault     bool     `json:"claude_gateway_strict_linux_default"`
+	ClaudeGatewayVirtualDNSServers      []string `json:"claude_gateway_virtual_dns_servers"`
 	// DefaultRegisterMethod is the registration engine used when a trigger (admin batch
 	// or auto-refill) does not name a method. "node" = the transplanted
 	// puppeteer-real-browser registrar (other_new_gpt_register) orchestrated per-job.
@@ -568,38 +607,43 @@ func Default() Config {
 		// Without it, the pool will keep sending to an exhausted account until it
 		// gets a 429, causing poor UX. The guard honors rate-limit headers from
 		// successful responses and preemptively rotates to fresh accounts.
-		RateLimitGuardEnabled:          true,
-		SeamlessFailover:               true,
-		FailoverMaxAttempts:            3,
-		StreamFailoverHoldMemoryBytes:  DefaultStreamFailoverHoldMemoryBytes,
-		StreamFailoverHoldDiskBytes:    DefaultStreamFailoverHoldDiskBytes,
-		ForceFailoverOn429:             false,
-		AccountRecheckEnabled:          true,
-		AccountRecheckIntervalSeconds:  DefaultAccountRecheckIntervalSeconds,
-		AccountRecheckBackoffSeconds:   DefaultAccountRecheckBackoffSeconds,
-		CodexPromptCacheRetention:      "24h",
-		CodexInstallModel:              "gpt-5.5",
-		CodexInstallEffort:             "xhigh",
-		CodexInstallApprovalPolicy:     "never",
-		CodexInstallSandboxMode:        "danger-full-access",
-		DefaultRegisterMethod:          "node",
-		StrictStickyMaxCooldownSeconds: DefaultStrictStickyMaxCooldownSeconds,
-		CooldownWaitMaxSeconds:         DefaultCooldownWaitMaxSeconds,
-		LeakScrubEnabled:               true,
-		ModelProbeIntervalHours:        DefaultModelProbeIntervalHours,
-		GeoProbeURL:                    DefaultGeoProbeURL,
-		GopayDir:                       DefaultGopayDir,
-		GopayPython:                    DefaultGopayPython,
-		GopayOrchestratorURL:           DefaultGopayOrchestratorURL,
-		WarpExitBasePort:               40000,
-		WarpAccountsPerExit:            3,
-		RegistrationConcurrency:        1,
-		RegistrationTimeout:            300,
-		GopayAutoStart:                 true,
-		CodexPreferSidecarJA3OverWS:    true,
-		SMSPlatformStrategy:            "auto",
-		SMSPreferredCountries:          "BR,CO,PL",
-		SMSStatsTopN:                   3,
+		RateLimitGuardEnabled:               true,
+		SeamlessFailover:                    true,
+		FailoverMaxAttempts:                 3,
+		StreamFailoverHoldMemoryBytes:       DefaultStreamFailoverHoldMemoryBytes,
+		StreamFailoverHoldDiskBytes:         DefaultStreamFailoverHoldDiskBytes,
+		ForceFailoverOn429:                  false,
+		AccountRecheckEnabled:               true,
+		AccountRecheckIntervalSeconds:       DefaultAccountRecheckIntervalSeconds,
+		AccountRecheckBackoffSeconds:        DefaultAccountRecheckBackoffSeconds,
+		CodexPromptCacheRetention:           "24h",
+		CodexInstallModel:                   "gpt-5.5",
+		CodexInstallEffort:                  "xhigh",
+		CodexInstallApprovalPolicy:          "never",
+		CodexInstallSandboxMode:             "danger-full-access",
+		ClaudeGatewayInterceptHosts:         DefaultClaudeGatewayInterceptHosts(),
+		ClaudeGatewayBlockedHostPatterns:    DefaultClaudeGatewayBlockedHostPatterns(),
+		ClaudeGatewayUnknownTargetPolicy:    "block",
+		ClaudeGatewayDisableNonessentialEnv: true,
+		ClaudeGatewayStrictLinuxDefault:     true,
+		DefaultRegisterMethod:               "node",
+		StrictStickyMaxCooldownSeconds:      DefaultStrictStickyMaxCooldownSeconds,
+		CooldownWaitMaxSeconds:              DefaultCooldownWaitMaxSeconds,
+		LeakScrubEnabled:                    true,
+		ModelProbeIntervalHours:             DefaultModelProbeIntervalHours,
+		GeoProbeURL:                         DefaultGeoProbeURL,
+		GopayDir:                            DefaultGopayDir,
+		GopayPython:                         DefaultGopayPython,
+		GopayOrchestratorURL:                DefaultGopayOrchestratorURL,
+		WarpExitBasePort:                    40000,
+		WarpAccountsPerExit:                 3,
+		RegistrationConcurrency:             1,
+		RegistrationTimeout:                 300,
+		GopayAutoStart:                      true,
+		CodexPreferSidecarJA3OverWS:         true,
+		SMSPlatformStrategy:                 "auto",
+		SMSPreferredCountries:               "BR,CO,PL",
+		SMSStatsTopN:                        3,
 
 		// Thinking defaults: disabled by default (opt-in feature)
 		ThinkingEnabled:       false,
@@ -996,6 +1040,18 @@ func (c *Config) normalize() {
 	}
 	if c.CodexOAuthScope == "" {
 		c.CodexOAuthScope = DefaultCodexOAuthScope
+	}
+	if len(c.ClaudeGatewayInterceptHosts) == 0 {
+		c.ClaudeGatewayInterceptHosts = DefaultClaudeGatewayInterceptHosts()
+	}
+	if len(c.ClaudeGatewayBlockedHostPatterns) == 0 {
+		c.ClaudeGatewayBlockedHostPatterns = DefaultClaudeGatewayBlockedHostPatterns()
+	}
+	switch strings.ToLower(strings.TrimSpace(c.ClaudeGatewayUnknownTargetPolicy)) {
+	case "block", "forward":
+		c.ClaudeGatewayUnknownTargetPolicy = strings.ToLower(strings.TrimSpace(c.ClaudeGatewayUnknownTargetPolicy))
+	default:
+		c.ClaudeGatewayUnknownTargetPolicy = "block"
 	}
 	if c.ClaudeOAuthAuthURL == "" {
 		c.ClaudeOAuthAuthURL = DefaultClaudeOAuthAuthURL

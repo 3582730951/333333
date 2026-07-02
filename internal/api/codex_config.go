@@ -76,7 +76,11 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 	effort := s.settingString(r.Context(), "codex_install_effort", s.cfg.CodexInstallEffort)
 	approval := s.settingString(r.Context(), "codex_install_approval_policy", s.cfg.CodexInstallApprovalPolicy)
 	sandbox := s.settingString(r.Context(), "codex_install_sandbox_mode", s.cfg.CodexInstallSandboxMode)
-	_, _ = w.Write([]byte(buildCodexConfigScript(origin, key, model, effort, approval, sandbox)))
+	scriptOptions := CodexSetupScriptOptions{
+		StrictLinuxDefault:     s.flagEnabled(r.Context(), "claude_gateway_strict_linux_default", s.cfg.ClaudeGatewayStrictLinuxDefault),
+		DisableNonessentialEnv: s.flagEnabled(r.Context(), "claude_gateway_disable_nonessential_env", s.cfg.ClaudeGatewayDisableNonessentialEnv),
+	}
+	_, _ = w.Write([]byte(buildCodexConfigScript(origin, key, model, effort, approval, sandbox, scriptOptions)))
 }
 
 // externalOrigin reconstructs the publicly reachable scheme://host for this request,
@@ -136,13 +140,30 @@ func isCodexSource(source string) bool {
 	return !strings.HasPrefix(s, "claude") && !strings.HasPrefix(s, "custom:")
 }
 
+type CodexSetupScriptOptions struct {
+	StrictLinuxDefault     bool
+	DisableNonessentialEnv bool
+}
+
+func defaultCodexSetupScriptOptions() CodexSetupScriptOptions {
+	return CodexSetupScriptOptions{
+		StrictLinuxDefault:     true,
+		DisableNonessentialEnv: true,
+	}
+}
+
 // buildCodexConfigScript renders the bash installer. It backs up any existing
 // config.toml, honors CODEX_HOME, and writes a config selecting the pool provider plus
 // the operator-configured Codex defaults (model, reasoning effort, and the
-// approval/sandbox pair that together enable fully-automated "goal mode"). It also
-// merges Claude Code env and best-effort installs rtk hooks. The key is generated as
-// cap_<hex>, but the renderer still strips quote characters defensively.
-func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox string) string {
+// approval/sandbox pair that together enable fully-automated "goal mode"). The script
+// keeps Codex and Claude Code separate: Codex only writes ~/.codex/config.toml, while
+// Claude Code is launched through the local gateway strict Linux runtime.
+func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox string, options ...CodexSetupScriptOptions) string {
+	scriptOptions := defaultCodexSetupScriptOptions()
+	if len(options) > 0 {
+		scriptOptions = options[0]
+	}
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
 	safeKey := strings.ReplaceAll(apiKey, "'", "")
 	keyLine := ""
 	if safeKey != "" {
@@ -180,27 +201,110 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 	if sb := clean(sandbox); sb != "" {
 		fmt.Fprintf(&extra, "sandbox_mode = \"%s\"\n", sb)
 	}
+	strictDefault := "1"
+	if !scriptOptions.StrictLinuxDefault {
+		strictDefault = "0"
+	}
+	disableNonessentialEnv := renderClaudeDisableNonessentialEnvExports(scriptOptions.DisableNonessentialEnv, "  ")
 	return fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
 
-# ── Pool → Codex 一键配置脚本（执行一次即可）─────────────────────────────
 ORIGIN=%s
 API_KEY=%s
 MODEL=%s
 PROVIDER_ID="poolserver"
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-CONFIG="$CODEX_HOME/config.toml"
+POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-%s}"
 
-echo "🚀 配置 Codex + Claude Code 接入 Pool: $ORIGIN"
-mkdir -p "$CODEX_HOME"
+say() { printf '%%s\n' "$*"; }
 
-if [ -f "$CONFIG" ]; then
-  BAK="$CONFIG.bak.$(date +%%Y%%m%%d%%H%%M%%S)"
-  cp "$CONFIG" "$BAK"
-  echo "📦 已备份原有配置 → $BAK"
-fi
+prompt_line() {
+  if [ -w /dev/tty ]; then
+    printf '%%s\n' "$*" > /dev/tty
+  else
+    printf '%%s\n' "$*" >&2
+  fi
+}
 
-cat > "$CONFIG" <<EOF
+read_tty() {
+  local prompt="$1"
+  local answer=""
+  if [ -r /dev/tty ]; then
+    printf '%%s' "$prompt" > /dev/tty
+    IFS= read -r answer < /dev/tty
+  else
+    printf '%%s' "$prompt" >&2
+    IFS= read -r answer || true
+  fi
+  printf '%%s' "$answer"
+}
+
+select_client() {
+  case "${POOL_CLIENT:-}" in
+    claude|Claude|CLAUDE) printf 'claude'; return ;;
+    codex|Codex|CODEX) printf 'codex'; return ;;
+    "") ;;
+    *) say "Invalid POOL_CLIENT=${POOL_CLIENT}. Use claude or codex."; exit 1 ;;
+  esac
+  prompt_line "选择客户端:"
+  prompt_line "  1) Claude Code"
+  prompt_line "  2) Codex"
+  local choice
+  choice="$(read_tty '请输入 1 或 2: ')"
+  case "$choice" in
+    1) printf 'claude' ;;
+    2) printf 'codex' ;;
+    *) say "未选择有效客户端。自动化请设置 POOL_CLIENT=claude|codex"; exit 1 ;;
+  esac
+}
+
+select_rtk() {
+  if [ "${POOL_SKIP_RTK:-0}" = "1" ]; then
+    printf '0'
+    return
+  fi
+  case "${POOL_INSTALL_RTK:-}" in
+    1|true|TRUE|yes|YES) printf '1'; return ;;
+    0|false|FALSE|no|NO) printf '0'; return ;;
+    "") ;;
+    *) say "Invalid POOL_INSTALL_RTK=${POOL_INSTALL_RTK}. Use 1 or 0."; exit 1 ;;
+  esac
+  prompt_line ""
+  prompt_line "选择 skills/RTK 安装:"
+  prompt_line "  1) 安装 RTK"
+  prompt_line "  2) 不安装任何 skills"
+  local choice
+  choice="$(read_tty '请输入 1 或 2: ')"
+  case "$choice" in
+    1) printf '1' ;;
+    2) printf '0' ;;
+    *) say "未选择有效 RTK 选项。自动化请设置 POOL_INSTALL_RTK=1|0"; exit 1 ;;
+  esac
+}
+
+ensure_rtk() {
+  if command -v rtk >/dev/null 2>&1; then
+    return 0
+  fi
+  curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v rtk >/dev/null 2>&1
+}
+
+configure_codex() {
+  local install_rtk="$1"
+  local CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+  local CONFIG="$CODEX_HOME/config.toml"
+
+  say "配置 Codex 接入 Pool: $ORIGIN"
+  mkdir -p "$CODEX_HOME"
+
+  if [ -f "$CONFIG" ]; then
+    local BAK="$CONFIG.bak.$(date +%%Y%%m%%d%%H%%M%%S)"
+    cp "$CONFIG" "$BAK"
+    say "已备份原有配置 -> $BAK"
+  fi
+
+  cat > "$CONFIG" <<EOF
 # Generated by Pool — points the codex CLI at a self-hosted pool.
 model = "$MODEL"
 model_provider = "$PROVIDER_ID"
@@ -212,70 +316,99 @@ wire_api = "responses"
 %s
 EOF
 
-echo "✅ 已写入 $CONFIG"
-echo "   model=$MODEL  (reasoning/approval/sandbox 见 $CONFIG)"
-echo ""
-echo "现在直接运行即可使用本池："
-echo "    codex \"你的需求\""
-echo ""
-echo "• 可用模型列表： $ORIGIN/v1/models"
-echo "• 切换模型：编辑 $CONFIG 中的 model = 字段"
-echo "• 关闭全自动：把 approval_policy 改为 \"on-request\"、sandbox_mode 改为 \"workspace-write\""
-echo "• 还原配置：恢复上面备份的 .bak 文件"
-
-# ── Claude Code 配置（写入/合并 ~/.claude/settings.json 的 env）──────────────
-CLAUDE_DIR="$HOME/.claude"
-CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
-echo ""
-echo "🟣 配置 Claude Code 接入 Pool…"
-mkdir -p "$CLAUDE_DIR"
-if [ -f "$CLAUDE_SETTINGS" ]; then
-  cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$(date +%%Y%%m%%d%%H%%M%%S)" 2>/dev/null || true
-fi
-if command -v python3 >/dev/null 2>&1; then
-  if python3 - "$CLAUDE_SETTINGS" "$ORIGIN" "$API_KEY" <<'PY'
-import json, os, sys
-path, origin, key = sys.argv[1], sys.argv[2], sys.argv[3]
-data = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f: data = json.load(f)
-    except Exception: data = {}
-if not isinstance(data, dict): data = {}
-env = data.get("env") if isinstance(data.get("env"), dict) else {}
-env["ANTHROPIC_BASE_URL"] = origin
-env["ANTHROPIC_AUTH_TOKEN"] = key if key else "any-non-empty"
-data["env"] = env
-with open(path, "w") as f: json.dump(data, f, indent=2)
-PY
-  then echo "✅ 已写入 Claude Code 配置 → $CLAUDE_SETTINGS (ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN)"
-  else echo "⚠️  Claude Code 自动配置失败，请手动：export ANTHROPIC_BASE_URL=$ORIGIN ; export ANTHROPIC_AUTH_TOKEN=$API_KEY"
-  fi
-else
-  echo "⚠️  未找到 python3，无法自动合并 Claude Code 配置；请手动设置环境变量："
-  echo "      export ANTHROPIC_BASE_URL=$ORIGIN"
-  echo "      export ANTHROPIC_AUTH_TOKEN=${API_KEY:-any-non-empty}"
-fi
-echo "   (Claude Code 直接运行 claude 即可走本池；模型用 Claude 系，由池路由)"
-
-# ── (自动) rtk 客户端 token 压缩：命令感知地压缩工具输出，省上游 token ──────
-# rtk 是第三方开源工具(Apache-2.0, github.com/rtk-ai/rtk)，在客户端命令执行前/后
-# 压缩输出，比服务端通用压缩更精准。此步非致命且可跳过：重跑时加 POOL_SKIP_RTK=1。
-if [ "${POOL_SKIP_RTK:-0}" != "1" ]; then
-  echo ""
-  echo "🔧 安装并接入 rtk（客户端 token 压缩，可用 POOL_SKIP_RTK=1 跳过）…"
-  if ! command -v rtk >/dev/null 2>&1; then
-    curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh \
-      || echo "⚠️  rtk 安装失败（已跳过，不影响 Codex 配置）"
-  fi
-  export PATH="$HOME/.local/bin:$PATH"
-  if command -v rtk >/dev/null 2>&1; then
-    rtk init --codex >/dev/null 2>&1 && echo "✅ 已为 Codex 接入 rtk" || echo "⚠️  rtk Codex 接入未完成"
-    if [ -d "$HOME/.claude" ]; then
-      rtk init -g --hook-only --auto-patch >/dev/null 2>&1 \
-        && echo "✅ 已为 Claude Code 接入 rtk PreToolUse hook" || true
+  say "已写入 $CONFIG"
+  say "model=$MODEL"
+  if [ "$install_rtk" = "1" ]; then
+    say "安装并接入 RTK (Codex)..."
+    if ensure_rtk; then
+      rtk init --codex >/dev/null 2>&1 && say "已为 Codex 接入 RTK" || say "RTK Codex 接入未完成"
+    else
+      say "RTK 安装失败，已跳过"
     fi
   fi
-fi
-`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), extra.String(), keyLine)
+}
+
+install_gateway_binary() {
+  export PATH="$HOME/.local/bin:$PATH"
+  if command -v gateway >/dev/null 2>&1; then
+    return 0
+  fi
+  local os arch target tmp
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+  esac
+  mkdir -p "$HOME/.local/bin"
+  target="$HOME/.local/bin/gateway"
+  tmp="$(mktemp)"
+  curl -fsSL "$ORIGIN/download/gateway" -o "$tmp"
+  chmod +x "$tmp"
+  mv "$tmp" "$target"
+  say "已安装 gateway -> $target ($os/$arch)"
+}
+
+configure_claude() {
+  local install_rtk="$1"
+  if [ "$(uname -s)" != "Linux" ]; then
+    say "Claude Code strict mode only supports Linux."
+    exit 1
+  fi
+  export POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-%s}"
+%s
+
+  say "配置 Claude Code 本地 gateway strict runtime: $ORIGIN"
+  install_gateway_binary
+  gateway init --pool-url "$ORIGIN" --key "$API_KEY"
+
+  if [ "$install_rtk" = "1" ]; then
+    say "安装并接入 RTK (Claude Code hook)..."
+    if ensure_rtk; then
+      rtk init -g --hook-only --auto-patch >/dev/null 2>&1 && say "已为 Claude Code 接入 RTK hook" || say "RTK Claude hook 接入未完成"
+    else
+      say "RTK 安装失败，已跳过"
+    fi
+  fi
+
+  gateway probe-identity
+  if command -v claude >/dev/null 2>&1; then
+    gateway install-wrapper || say "包装器安装失败；可直接运行 gateway run-claude -- <args>"
+  fi
+  say "Claude Code 运行方式:"
+  say "  gateway start"
+  say "  gateway run-claude -- \"你的需求\""
+}
+
+main() {
+  local client install_rtk
+  client="$(select_client)"
+  install_rtk="$(select_rtk)"
+  case "$client" in
+    codex) configure_codex "$install_rtk" ;;
+    claude) configure_claude "$install_rtk" ;;
+  esac
+}
+
+main "$@"
+`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), strictDefault, extra.String(), keyLine, strictDefault, disableNonessentialEnv)
+}
+
+func renderClaudeDisableNonessentialEnvExports(enabled bool, indent string) string {
+	if !enabled {
+		return ""
+	}
+	lines := []string{
+		"export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"export DO_NOT_TRACK=1",
+		"export DISABLE_TELEMETRY=1",
+		"export DISABLE_ERROR_REPORTING=1",
+		"export DISABLE_AUTOUPDATER=1",
+		"export OTEL_METRICS_EXPORTER=none",
+		"export OTEL_LOGS_EXPORTER=none",
+	}
+	for i, line := range lines {
+		lines[i] = indent + line
+	}
+	return strings.Join(lines, "\n")
 }

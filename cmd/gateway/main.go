@@ -210,6 +210,10 @@ func main() {
 		handleStart(defaultConfigPath)
 	case "status":
 		os.Exit(handleStatus(defaultConfigPath))
+	case "probe-identity":
+		os.Exit(handleProbeIdentity(defaultConfigPath))
+	case "run-claude":
+		os.Exit(handleRunClaude(defaultConfigPath))
 	case "trust-ca":
 		handleTrustCA(defaultConfigPath)
 	case "install-wrapper":
@@ -231,6 +235,8 @@ func printUsage() {
 Usage:
   gateway init [--pool-url URL] [--key KEY]    初始化配置和 CA
   gateway start                                 启动代理服务器
+  gateway run-claude -- <args>                  在 strict Linux runtime 中启动 Claude Code
+  gateway probe-identity                        拉取身份并验证 strict runtime
   gateway status                                显示运行状态
   gateway trust-ca [--print-commands]           信任 CA 证书
   gateway install-wrapper                       安装 claude 命令包装器
@@ -315,6 +321,9 @@ type gatewayStatusReport struct {
 	PoolReachable           bool
 	PoolStatus              int
 	PoolError               string
+	StrictRuntimeSupported  bool
+	StrictRuntimeError      string
+	IdentityCachePresent    bool
 }
 
 func handleStatus(configPath string) int {
@@ -342,6 +351,12 @@ func inspectGatewayStatus(ctx context.Context, configPath string) gatewayStatusR
 	report.DownstreamKeyConfigured = cfg.DownstreamKey != ""
 	report.CACertPresent = fileExists(cfg.MITM.CACert)
 	report.CAKeyPresent = fileExists(cfg.MITM.CAKey)
+	report.IdentityCachePresent = identityCachePresent()
+	if err := checkStrictRuntimeSupport(); err != nil {
+		report.StrictRuntimeError = err.Error()
+	} else {
+		report.StrictRuntimeSupported = true
+	}
 
 	if conn, err := net.DialTimeout("tcp", cfg.ListenAddr, 2*time.Second); err == nil {
 		report.GatewayReachable = true
@@ -376,6 +391,13 @@ func printGatewayStatus(report gatewayStatusReport) {
 	fmt.Println("  Downstream key:", yesNo(report.DownstreamKeyConfigured))
 	fmt.Println("  CA cert:", yesNo(report.CACertPresent))
 	fmt.Println("  CA key:", yesNo(report.CAKeyPresent))
+	fmt.Println("  Identity cache:", yesNo(report.IdentityCachePresent))
+	if report.StrictRuntimeSupported {
+		fmt.Println("  Strict runtime:", "available")
+	} else {
+		fmt.Println("  Strict runtime:", "not available")
+		fmt.Println("  Strict runtime error:", report.StrictRuntimeError)
+	}
 	if report.GatewayReachable {
 		fmt.Println("  Gateway TCP:", "reachable")
 	} else {

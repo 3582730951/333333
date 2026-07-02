@@ -1,0 +1,85 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestBuildBubblewrapArgsPreservesRuntimeCWD(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:8765"
+	cfg.DownstreamKey = "cap_secret"
+	id := &CachedIdentity{
+		Local: &LocalEnvironment{
+			WorkDir: "/workspace/project",
+		},
+		Virtual: &VirtualIdentity{
+			Username:   "virtuser",
+			Hostname:   "virt-host",
+			HomeDir:    "/home/virtuser",
+			DNSServers: []string{"1.1.1.1"},
+			ProcessInfo: ProcessInfo{
+				CWD: "/home/virtuser/workspace/project",
+			},
+		},
+	}
+	paths := strictRuntimePaths{
+		VirtualHomeHost: "/tmp/runtime/home",
+		ResolvConf:      "/tmp/runtime/resolv.conf",
+		Passwd:          "/tmp/runtime/passwd",
+		Group:           "/tmp/runtime/group",
+		RuntimeCWD:      "/workspace/project",
+	}
+
+	args := buildBubblewrapArgs(cfg, id, paths, "/bin/claude", []string{"--version"})
+	joined := "\x00" + strings.Join(args, "\x00") + "\x00"
+	for _, want := range []string{
+		"\x00--dir\x00/etc\x00",
+		"\x00--dir\x00/home\x00",
+		"\x00--bind\x00/tmp/runtime/home\x00/home/virtuser\x00",
+		"\x00--bind\x00/workspace/project\x00/workspace/project\x00",
+		"\x00--chdir\x00/workspace/project\x00",
+		"\x00--ro-bind\x00/tmp/runtime/resolv.conf\x00/etc/resolv.conf\x00",
+		"\x00--setenv\x00HTTP_PROXY\x00http://127.0.0.1:8765\x00",
+		"\x00--setenv\x00ANTHROPIC_AUTH_TOKEN\x00cap_secret\x00",
+		"\x00--\x00/bin/claude\x00--version\x00",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("bubblewrap args missing %q\nargs=%q", want, args)
+		}
+	}
+	if strings.Contains(joined, "\x00--chdir\x00/home/virtuser/workspace/project\x00") {
+		t.Fatalf("runtime cwd must not be rewritten to virtual workspace\nargs=%q", args)
+	}
+}
+
+func TestStrictRuntimeEnvCanOmitNonessentialTrafficControls(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:8765"
+	cfg.DownstreamKey = "cap_secret"
+	id := &CachedIdentity{
+		Virtual: &VirtualIdentity{
+			Username: "virtuser",
+			HomeDir:  "/home/virtuser",
+			GatewayPolicy: GatewayPolicy{
+				DisableNonessentialEnv: false,
+				UnknownTargetPolicy:    "block",
+			},
+		},
+	}
+
+	joined := "\n" + strings.Join(strictRuntimeEnv(cfg, id), "\n") + "\n"
+	for _, forbidden := range []string{
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"DO_NOT_TRACK=1",
+		"DISABLE_TELEMETRY=1",
+		"DISABLE_ERROR_REPORTING=1",
+		"DISABLE_AUTOUPDATER=1",
+		"OTEL_METRICS_EXPORTER=none",
+		"OTEL_LOGS_EXPORTER=none",
+	} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("strict runtime env should omit admin-disabled %q\n---\n%s", forbidden, joined)
+		}
+	}
+}

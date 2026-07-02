@@ -82,15 +82,36 @@ Windows (管理员权限 PowerShell):
 }
 
 // GenerateWrapper 生成 claude 命令包装器
-func GenerateWrapper(realClaude, wrapperPath, proxyPort string) error {
+func GenerateWrapper(realClaude, wrapperPath, proxyPort string, disableNonessentialEnvOption ...bool) error {
+	disableNonessentialEnv := true
+	if len(disableNonessentialEnvOption) > 0 {
+		disableNonessentialEnv = disableNonessentialEnvOption[0]
+	}
 	script := fmt.Sprintf(`#!/bin/bash
 # Claude Gateway Wrapper
+export CLAUDE_REAL_BIN=%q
+export HTTP_PROXY=http://127.0.0.1:%s
 export HTTPS_PROXY=http://127.0.0.1:%s
+export ALL_PROXY=http://127.0.0.1:%s
 export NO_PROXY=localhost,127.0.0.1
-exec "%s" "$@"
-`, proxyPort, realClaude)
+%s
+exec gateway run-claude -- "$@"
+`, realClaude, proxyPort, proxyPort, proxyPort, renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
 
 	return os.WriteFile(wrapperPath, []byte(script), 0755)
+}
+
+func renderWrapperDisableNonessentialEnvExports(enabled bool) string {
+	if !enabled {
+		return ""
+	}
+	return `export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DO_NOT_TRACK=1
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_AUTOUPDATER=1
+export OTEL_METRICS_EXPORTER=none
+export OTEL_LOGS_EXPORTER=none`
 }
 
 // InstallWrapper 安装 claude 命令包装器
@@ -109,8 +130,13 @@ func InstallWrapper() error {
 		}
 	}
 
+	disableNonessentialEnv := true
+	if policy, ok := cachedGatewayPolicy(); ok {
+		disableNonessentialEnv = policy.DisableNonessentialEnv
+	}
+
 	// 生成包装器
-	if err := GenerateWrapper(backupPath, realClaude, "8765"); err != nil {
+	if err := GenerateWrapper(backupPath, realClaude, "8765", disableNonessentialEnv); err != nil {
 		return fmt.Errorf("generate wrapper failed: %w", err)
 	}
 

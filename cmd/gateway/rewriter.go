@@ -49,11 +49,13 @@ func rewriteMetadataUserID(body []byte, identity *CachedIdentity) ([]byte, error
 		root["parent_thread_id"] = identity.Virtual.SessionID
 	}
 
-	out, err := json.Marshal(root)
-	if err != nil {
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(root); err != nil {
 		return body, err
 	}
-	return out, nil
+	return bytes.TrimSpace(out.Bytes()), nil
 }
 
 // rewriteTextPatterns 使用 Aho-Corasick 风格的多模式匹配替换文本
@@ -66,10 +68,22 @@ func rewriteTextPatterns(body []byte, identity *CachedIdentity) []byte {
 		{identity.Local.Hostname, identity.Virtual.Hostname},
 		{identity.Local.HomeDir, identity.Virtual.HomeDir},
 	}
+	for i, localDNS := range identity.Local.DNSServers {
+		virtualDNS := ""
+		if i < len(identity.Virtual.DNSServers) {
+			virtualDNS = identity.Virtual.DNSServers[i]
+		} else if len(identity.Virtual.DNSServers) > 0 {
+			virtualDNS = identity.Virtual.DNSServers[len(identity.Virtual.DNSServers)-1]
+		}
+		replacements = append(replacements, struct {
+			pattern string
+			repl    string
+		}{localDNS, virtualDNS})
+	}
 
 	result := body
 	for _, r := range replacements {
-		if r.pattern == "" {
+		if r.pattern == "" || r.repl == "" {
 			continue
 		}
 		result = bytes.ReplaceAll(result, []byte(r.pattern), []byte(r.repl))
@@ -96,6 +110,16 @@ func rewriteEnvBlock(body []byte, identity *CachedIdentity) []byte {
 		// 环境变量引用
 		content = strings.ReplaceAll(content, identity.Local.HomeDir, identity.Virtual.HomeDir)
 		content = strings.ReplaceAll(content, identity.Local.Username, identity.Virtual.Username)
+		for i, localDNS := range identity.Local.DNSServers {
+			if localDNS == "" || len(identity.Virtual.DNSServers) == 0 {
+				continue
+			}
+			virtualDNS := identity.Virtual.DNSServers[0]
+			if i < len(identity.Virtual.DNSServers) {
+				virtualDNS = identity.Virtual.DNSServers[i]
+			}
+			content = strings.ReplaceAll(content, localDNS, virtualDNS)
+		}
 
 		return []byte(content)
 	})
@@ -121,6 +145,9 @@ func replaceMarkerValue(s, marker, value string) string {
 	// 找到行尾
 	end := valStart
 	for end < len(s) && s[end] != '\n' && s[end] != '\r' {
+		if s[end] == '\\' && end+1 < len(s) && (s[end+1] == 'n' || s[end+1] == 'r') {
+			break
+		}
 		end++
 	}
 

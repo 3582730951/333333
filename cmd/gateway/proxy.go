@@ -120,14 +120,19 @@ func (p *Proxy) handleConnect(clientConn net.Conn, target string) {
 		host = target
 	}
 
-	// 只拦截 api.anthropic.com 和 chatgpt.com
-	shouldIntercept := strings.Contains(host, "api.anthropic.com") ||
-		strings.Contains(host, "chatgpt.com") ||
-		strings.Contains(host, "backend-api")
-
-	if !shouldIntercept {
-		// 直接转发（不 MITM）
+	decision := classifyGatewayTarget(host, p.poolURL, p.gatewayPolicy())
+	switch decision.Action {
+	case gatewayTargetBlock:
+		logBlockedGatewayTarget(host, decision.Reason)
+		writeGatewayError(clientConn, http.StatusForbidden, "Blocked by Claude Gateway strict policy")
+		return
+	case gatewayTargetForward:
 		p.forwardConnect(clientConn, target)
+		return
+	case gatewayTargetIntercept:
+		// Continue into MITM handling below.
+	default:
+		writeGatewayError(clientConn, http.StatusForbidden, "Blocked by Claude Gateway strict policy")
 		return
 	}
 

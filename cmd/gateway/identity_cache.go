@@ -19,10 +19,12 @@ const gatewayRewriteBodyLimit = 64 << 20
 
 // LocalEnvironment 本地真实环境
 type LocalEnvironment struct {
-	Username string
-	Hostname string
-	HomeDir  string
-	EnvVars  map[string]string
+	Username   string
+	Hostname   string
+	HomeDir    string
+	WorkDir    string
+	DNSServers []string
+	EnvVars    map[string]string
 }
 
 // VirtualIdentity VPS 下发的虚拟身份
@@ -48,6 +50,7 @@ type VirtualIdentity struct {
 	GatewayIP               string            `json:"gateway_ip"`
 	LocalIP                 string            `json:"local_ip"`
 	ProcessInfo             ProcessInfo       `json:"process_info"`
+	GatewayPolicy           GatewayPolicy     `json:"gateway_policy"`
 }
 
 type ProcessInfo struct {
@@ -55,6 +58,7 @@ type ProcessInfo struct {
 	ParentPID int      `json:"parent_pid"`
 	Command   string   `json:"command"`
 	Args      []string `json:"args"`
+	CWD       string   `json:"cwd"`
 }
 
 // CachedIdentity 缓存的身份信息
@@ -157,11 +161,14 @@ func (c *IdentityCache) getLocalEnvironment() *LocalEnvironment {
 	if homeDir == "" {
 		homeDir = os.Getenv("USERPROFILE") // Windows
 	}
+	workDir, _ := os.Getwd()
 
 	return &LocalEnvironment{
-		Username: username,
-		Hostname: hostname,
-		HomeDir:  homeDir,
+		Username:   username,
+		Hostname:   hostname,
+		HomeDir:    homeDir,
+		WorkDir:    workDir,
+		DNSServers: readLocalDNSServers(),
 		EnvVars: map[string]string{
 			"HOME":   homeDir,
 			"USER":   username,
@@ -171,6 +178,21 @@ func (c *IdentityCache) getLocalEnvironment() *LocalEnvironment {
 			"TMPDIR": os.Getenv("TMPDIR"),
 		},
 	}
+}
+
+func readLocalDNSServers() []string {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return nil
+	}
+	var servers []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "nameserver" {
+			servers = append(servers, fields[1])
+		}
+	}
+	return servers
 }
 
 // fetchFromPool 从 pool_server 获取虚拟身份
@@ -216,6 +238,10 @@ func readRewriteBody(r io.Reader) ([]byte, error) {
 
 // rewriteRequest 改写请求体
 func (p *Proxy) rewriteRequest(req *http.Request) error {
+	if req.Method != "POST" || !shouldRewriteGatewayRequest(req.URL.Path) {
+		return nil
+	}
+
 	// 检测 provider
 	provider := "claude"
 	if strings.Contains(req.Host, "chatgpt.com") || strings.Contains(req.URL.Path, "codex") {
@@ -226,11 +252,6 @@ func (p *Proxy) rewriteRequest(req *http.Request) error {
 	identity, err := p.cache.Get(provider)
 	if err != nil {
 		return fmt.Errorf("get identity failed: %w", err)
-	}
-
-	// 只改写 POST 请求的 body
-	if req.Method != "POST" {
-		return nil
 	}
 
 	// 读取原始 body

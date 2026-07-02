@@ -60,11 +60,12 @@ type configField struct {
 }
 
 const (
-	catIdentity = "虚拟身份 / 指纹"
-	catBehavior = "行为 / 缓存"
-	catLimits   = "限流 / 封禁"
-	catReg      = "注册 / 引擎"
-	catBoot     = "引导（需重启）"
+	catIdentity      = "虚拟身份 / 指纹"
+	catBehavior      = "行为 / 缓存"
+	catClaudeGateway = "本地 Gateway / Claude Code"
+	catLimits        = "限流 / 封禁"
+	catReg           = "注册 / 引擎"
+	catBoot          = "引导（需重启）"
 )
 
 // configFields is the ordered registry rendered by the System config page. Thinking
@@ -117,6 +118,23 @@ func configFields() []configField {
 			Help: "开=为非 compact 请求注入 web_search 工具。", boot: func(c config.Config) interface{} { return c.WebSearchEnabled }},
 		{Key: "require_downstream_key", Label: "要求下游密钥", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=下游请求必须带有效 API Key，否则 401。", boot: func(c config.Config) interface{} { return c.RequireDownstreamKey }},
+
+		// ── 本地 Gateway / Claude Code ────────────────────────────────────────
+		{Key: "claude_gateway_intercept_hosts", Label: "Gateway 拦截主机", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
+			Help: "本地 gateway 会 MITM 并改写的 API 主机/通配符列表。默认覆盖 Anthropic/Codex 必需 API。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayInterceptHosts }},
+		{Key: "claude_gateway_forward_hosts", Label: "Gateway 放行主机", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
+			Help: "除 pool 服务端外额外允许直连转发的主机/通配符列表。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayForwardHosts }},
+		{Key: "claude_gateway_blocked_host_patterns", Label: "Gateway 阻断目标", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
+			Help: "阻断的非必要遥测/更新目标关键词或通配符。空=不按关键词阻断。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayBlockedHostPatterns }},
+		{Key: "claude_gateway_unknown_target_policy", Label: "未知目标策略", Category: catClaudeGateway, Type: fieldSelect, Effect: effectHot,
+			Options: []string{"block", "forward"},
+			Help:    "block=只允许配置中的必要目标；forward=未命中阻断规则时直连转发。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeGatewayUnknownTargetPolicy, "block") }},
+		{Key: "claude_gateway_disable_nonessential_env", Label: "写入禁遥测环境变量", Category: catClaudeGateway, Type: fieldBool, Effect: effectHot,
+			Help: "开=脚本、wrapper 和 strict runtime 写入官方禁遥测/禁更新环境变量。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayDisableNonessentialEnv }},
+		{Key: "claude_gateway_strict_linux_default", Label: "Claude strict Linux 默认启用", Category: catClaudeGateway, Type: fieldBool, Effect: effectHot,
+			Help: "开=/file 脚本默认 POOL_STRICT_LINUX=1；关=默认 0，仍可由环境变量覆盖。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayStrictLinuxDefault }},
+		{Key: "claude_gateway_virtual_dns_servers", Label: "虚拟 DNS 服务器", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
+			Help: "可选覆盖 /v1/gateway/identity 下发的 DNS。留空=按虚拟身份稳定派生。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayVirtualDNSServers }},
 
 		// ── 限流 / 封禁 ────────────────────────────────────────────────────────
 		{Key: "ban_detection_enabled", Label: "封禁检测", Category: catLimits, Type: fieldBool, Effect: effectHot,

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
@@ -46,6 +47,9 @@ type GatewayIdentityResponse struct {
 
 	// 进程信息（虚拟）
 	ProcessInfo ProcessInfo `json:"process_info"`
+
+	// 本地 gateway 策略（管理员 UI 可编辑）
+	GatewayPolicy GatewayPolicy `json:"gateway_policy"`
 }
 
 type ProcessInfo struct {
@@ -53,6 +57,16 @@ type ProcessInfo struct {
 	ParentPID int      `json:"parent_pid"`
 	Command   string   `json:"command"`
 	Args      []string `json:"args"`
+	CWD       string   `json:"cwd"`
+}
+
+type GatewayPolicy struct {
+	InterceptHosts         []string `json:"intercept_hosts"`
+	ForwardHosts           []string `json:"forward_hosts"`
+	BlockedHostPatterns    []string `json:"blocked_host_patterns"`
+	UnknownTargetPolicy    string   `json:"unknown_target_policy"`
+	DisableNonessentialEnv bool     `json:"disable_nonessential_env"`
+	StrictLinuxDefault     bool     `json:"strict_linux_default"`
 }
 
 // handleGatewayIdentity 返回本地网关需要的虚拟身份
@@ -74,7 +88,7 @@ func (s *Server) handleGatewayIdentity(w http.ResponseWriter, r *http.Request) {
 	id := identity.For(s.identitySecret(), downstreamKey)
 
 	// 生成虚拟网络环境
-	dnsServers := generateVirtualDNS(id)
+	dnsServers := s.gatewayDNSServers(r.Context(), id)
 	gatewayIP, localIP := generateVirtualNetwork(id)
 
 	resp := GatewayIdentityResponse{
@@ -99,9 +113,39 @@ func (s *Server) handleGatewayIdentity(w http.ResponseWriter, r *http.Request) {
 		GatewayIP:               gatewayIP,
 		LocalIP:                 localIP,
 		ProcessInfo:             generateVirtualProcessInfo(id),
+		GatewayPolicy:           s.gatewayPolicy(r.Context()),
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) gatewayDNSServers(ctx context.Context, id identity.Identity) []string {
+	servers := s.settingCSV(ctx, "claude_gateway_virtual_dns_servers", s.cfg.ClaudeGatewayVirtualDNSServers)
+	if len(servers) == 0 {
+		return generateVirtualDNS(id)
+	}
+	return servers
+}
+
+func (s *Server) gatewayPolicy(ctx context.Context) GatewayPolicy {
+	unknown := normalizeGatewayUnknownTargetPolicy(s.settingString(ctx, "claude_gateway_unknown_target_policy", s.cfg.ClaudeGatewayUnknownTargetPolicy))
+	return GatewayPolicy{
+		InterceptHosts:         s.settingCSV(ctx, "claude_gateway_intercept_hosts", s.cfg.ClaudeGatewayInterceptHosts),
+		ForwardHosts:           s.settingCSV(ctx, "claude_gateway_forward_hosts", s.cfg.ClaudeGatewayForwardHosts),
+		BlockedHostPatterns:    s.settingCSV(ctx, "claude_gateway_blocked_host_patterns", s.cfg.ClaudeGatewayBlockedHostPatterns),
+		UnknownTargetPolicy:    unknown,
+		DisableNonessentialEnv: s.flagEnabled(ctx, "claude_gateway_disable_nonessential_env", s.cfg.ClaudeGatewayDisableNonessentialEnv),
+		StrictLinuxDefault:     s.flagEnabled(ctx, "claude_gateway_strict_linux_default", s.cfg.ClaudeGatewayStrictLinuxDefault),
+	}
+}
+
+func normalizeGatewayUnknownTargetPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "forward":
+		return "forward"
+	default:
+		return "block"
+	}
 }
 
 func (s *Server) allowGatewayIdentityKey(w http.ResponseWriter, r *http.Request, plain string) bool {

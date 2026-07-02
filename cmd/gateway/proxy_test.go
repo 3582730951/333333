@@ -380,6 +380,142 @@ func TestReadRewriteBodyRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+func TestGatewayTargetPolicyBlocksNonessentialTraffic(t *testing.T) {
+	poolURL := "https://pool.example:1455"
+	for _, host := range []string{
+		"statsig.anthropic.com:443",
+		"sentry.io:443",
+		"o123.ingest.sentry.io:443",
+		"updates.anthropic.com:443",
+		"telemetry.anthropic.com:443",
+	} {
+		decision := classifyGatewayTarget(host, poolURL)
+		if decision.Action != gatewayTargetBlock {
+			t.Fatalf("%s action = %s, want block", host, decision.Action)
+		}
+		if decision.Reason == "" {
+			t.Fatalf("%s block reason is empty", host)
+		}
+	}
+}
+
+func TestGatewayTargetPolicyAllowsOnlyEssentialHosts(t *testing.T) {
+	poolURL := "https://pool.example:1455"
+	tests := []struct {
+		host string
+		want gatewayTargetAction
+	}{
+		{"api.anthropic.com:443", gatewayTargetIntercept},
+		{"pool.example:1455", gatewayTargetForward},
+		{"example.com:443", gatewayTargetBlock},
+	}
+	for _, tt := range tests {
+		decision := classifyGatewayTarget(tt.host, poolURL)
+		if decision.Action != tt.want {
+			t.Fatalf("%s action = %s, want %s (reason: %s)", tt.host, decision.Action, tt.want, decision.Reason)
+		}
+	}
+}
+
+func TestGatewayTargetPolicyUsesEditableIdentityPolicy(t *testing.T) {
+	poolURL := "https://pool.example:1455"
+	policy := GatewayPolicy{
+		InterceptHosts:         []string{"custom-api.example.com"},
+		ForwardHosts:           []string{"assets.example.com"},
+		BlockedHostPatterns:    []string{"blocked-metrics"},
+		UnknownTargetPolicy:    "forward",
+		DisableNonessentialEnv: true,
+		StrictLinuxDefault:     true,
+	}
+
+	tests := []struct {
+		host string
+		want gatewayTargetAction
+	}{
+		{"api.anthropic.com:443", gatewayTargetForward},
+		{"custom-api.example.com:443", gatewayTargetIntercept},
+		{"assets.example.com:443", gatewayTargetForward},
+		{"blocked-metrics.example.com:443", gatewayTargetBlock},
+		{"unknown.example.com:443", gatewayTargetForward},
+	}
+	for _, tt := range tests {
+		decision := classifyGatewayTarget(tt.host, poolURL, policy)
+		if decision.Action != tt.want {
+			t.Fatalf("%s action = %s, want %s (reason: %s)", tt.host, decision.Action, tt.want, decision.Reason)
+		}
+	}
+}
+
+func TestShouldRewriteGatewayRequestOnlyMessages(t *testing.T) {
+	for _, path := range []string{"/v1/messages", "/v1/messages?x=1"} {
+		if !shouldRewriteGatewayRequest(path) {
+			t.Fatalf("%s should be rewritten", path)
+		}
+	}
+	for _, path := range []string{"/v1/files", "/v1/skills", "/v1/agents", "/v1/environments", "/v1/messages/count"} {
+		if shouldRewriteGatewayRequest(path) {
+			t.Fatalf("%s should pass through without body rewrite", path)
+		}
+	}
+}
+
+func TestGenerateWrapperRoutesClaudeThroughRunClaude(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "claude")
+	realClaude := filepath.Join(dir, "claude.real")
+	if err := GenerateWrapper(realClaude, wrapper, "8765"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"CLAUDE_REAL_BIN=",
+		"HTTP_PROXY=http://127.0.0.1:8765",
+		"HTTPS_PROXY=http://127.0.0.1:8765",
+		"ALL_PROXY=http://127.0.0.1:8765",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"DISABLE_AUTOUPDATER=1",
+		"exec gateway run-claude --",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("wrapper missing %q\n---\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, `exec "`+realClaude+`" "$@"`) {
+		t.Fatalf("wrapper must invoke gateway run-claude, not real claude directly:\n%s", script)
+	}
+}
+
+func TestGenerateWrapperCanOmitNonessentialTrafficEnv(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "claude")
+	realClaude := filepath.Join(dir, "claude.real")
+	if err := GenerateWrapper(realClaude, wrapper, "8765", false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, forbidden := range []string{
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"DO_NOT_TRACK=1",
+		"DISABLE_TELEMETRY=1",
+		"DISABLE_ERROR_REPORTING=1",
+		"DISABLE_AUTOUPDATER=1",
+		"OTEL_METRICS_EXPORTER=none",
+		"OTEL_LOGS_EXPORTER=none",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("wrapper should omit admin-disabled env %q\n---\n%s", forbidden, script)
+		}
+	}
+}
+
 func TestInspectGatewayStatusReportsConfiguredServices(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

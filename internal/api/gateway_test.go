@@ -60,6 +60,9 @@ func TestGatewayIdentity(t *testing.T) {
 	if resp.ProcessInfo.PID == 0 {
 		t.Error("process_info.pid should not be 0")
 	}
+	if resp.ProcessInfo.CWD != "" {
+		t.Errorf("process_info.cwd should be empty; gateway must preserve local cwd, got %q", resp.ProcessInfo.CWD)
+	}
 
 	// Determinism: the same downstream_key yields a stable virtual identity; a different
 	// key must not collide.
@@ -68,6 +71,79 @@ func TestGatewayIdentity(t *testing.T) {
 	}
 	if other := call("cap_other999"); other.SessionID == resp.SessionID {
 		t.Error("a different downstream_key should yield a different identity")
+	}
+}
+
+func TestGatewayIdentityIncludesEditablePolicyAndDNSOverride(t *testing.T) {
+	srv := newGatewayIdentityTestServer(t)
+	ctx := context.Background()
+	if err := srv.store.SetSettings(ctx, map[string]string{
+		"claude_gateway_intercept_hosts":          "api.anthropic.com,custom-api.example.com",
+		"claude_gateway_forward_hosts":            "assets.example.com",
+		"claude_gateway_blocked_host_patterns":    "statsig,customtelemetry",
+		"claude_gateway_unknown_target_policy":    "forward",
+		"claude_gateway_disable_nonessential_env": "false",
+		"claude_gateway_strict_linux_default":     "false",
+		"claude_gateway_virtual_dns_servers":      "9.9.9.9,149.112.112.112",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/v1/gateway/identity?provider=claude", nil)
+	req.Header.Set("Authorization", "Bearer cap_policy")
+	w := httptest.NewRecorder()
+	srv.handleGatewayIdentity(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp GatewayIdentityResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if got := strings.Join(resp.DNSServers, ","); got != "9.9.9.9,149.112.112.112" {
+		t.Fatalf("dns override = %q", got)
+	}
+	if got := strings.Join(resp.GatewayPolicy.InterceptHosts, ","); got != "api.anthropic.com,custom-api.example.com" {
+		t.Fatalf("intercept hosts = %q", got)
+	}
+	if got := strings.Join(resp.GatewayPolicy.ForwardHosts, ","); got != "assets.example.com" {
+		t.Fatalf("forward hosts = %q", got)
+	}
+	if got := strings.Join(resp.GatewayPolicy.BlockedHostPatterns, ","); got != "statsig,customtelemetry" {
+		t.Fatalf("blocked patterns = %q", got)
+	}
+	if resp.GatewayPolicy.UnknownTargetPolicy != "forward" {
+		t.Fatalf("unknown target policy = %q", resp.GatewayPolicy.UnknownTargetPolicy)
+	}
+	if resp.GatewayPolicy.DisableNonessentialEnv {
+		t.Fatal("disable nonessential env should follow admin override false")
+	}
+	if resp.GatewayPolicy.StrictLinuxDefault {
+		t.Fatal("strict linux default should follow admin override false")
+	}
+}
+
+func TestClaudeGatewayPolicyConfigFieldsAreAdminEditable(t *testing.T) {
+	for _, key := range []string{
+		"claude_gateway_intercept_hosts",
+		"claude_gateway_forward_hosts",
+		"claude_gateway_blocked_host_patterns",
+		"claude_gateway_unknown_target_policy",
+		"claude_gateway_disable_nonessential_env",
+		"claude_gateway_strict_linux_default",
+		"claude_gateway_virtual_dns_servers",
+	} {
+		field, ok := configFieldByKey(key)
+		if !ok {
+			t.Fatalf("admin config field %q is missing", key)
+		}
+		if field.Effect != effectHot {
+			t.Fatalf("%s effect = %s, want hot", key, field.Effect)
+		}
+		if field.Category == "" {
+			t.Fatalf("%s should have a UI category", key)
+		}
 	}
 }
 
