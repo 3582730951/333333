@@ -4,15 +4,21 @@
 package api
 
 import (
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/proxyparse"
+	cliproxyproxy "codex-account-pool/internal/registration/provider/proxy"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, accountID string) {
@@ -250,10 +256,23 @@ type egressProfileRequest struct {
 	Username          string          `json:"username"`
 	Password          string          `json:"password"`
 	DetectRegion      *bool           `json:"detect_region"`
+	APIBase           string          `json:"api_base"`
+	APINum            int             `json:"api_num"`
+	APITime           int             `json:"api_time"`
+}
+
+type egressProfileTestRequest struct {
+	EgressID string                `json:"egress_id"`
+	Profile  *egressProfileRequest `json:"profile"`
+	ProbeURL string                `json:"probe_url"`
 }
 
 func (r egressProfileRequest) profile() (storage.EgressProfile, error) {
 	dynamicJSON, err := normalizeDynamicConfigJSON(r.DynamicConfigJSON)
+	if err != nil {
+		return storage.EgressProfile{}, err
+	}
+	dynamicJSON, err = mergeEgressDynamicConfig(dynamicJSON, r)
 	if err != nil {
 		return storage.EgressProfile{}, err
 	}
@@ -310,6 +329,33 @@ func normalizeDynamicConfigJSON(raw json.RawMessage) (string, error) {
 	return trimmed, nil
 }
 
+func mergeEgressDynamicConfig(dynamicJSON string, req egressProfileRequest) (string, error) {
+	if strings.TrimSpace(req.APIBase) == "" && req.APINum <= 0 && req.APITime <= 0 {
+		return dynamicJSON, nil
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(dynamicJSON), &obj); err != nil {
+		return dynamicJSON, nil
+	}
+	if obj == nil {
+		obj = map[string]interface{}{}
+	}
+	if v := strings.TrimSpace(req.APIBase); v != "" {
+		obj["api_base"] = v
+	}
+	if req.APINum > 0 {
+		obj["api_num"] = req.APINum
+	}
+	if req.APITime > 0 {
+		obj["api_time"] = req.APITime
+	}
+	encoded, err := json.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("dynamic_config_json: %w", err)
+	}
+	return string(encoded), nil
+}
+
 func (s *Server) adminEgressPools(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -321,11 +367,26 @@ func (s *Server) adminEgressPools(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, pools)
+		out := make([]storage.EgressPool, 0, len(pools))
+		for _, pool := range pools {
+			if !isRegistrationEgressPoolPurpose(pool.Purpose) {
+				continue
+			}
+			out = append(out, normalizeRegistrationEgressPool(pool))
+		}
+		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
 		var pool storage.EgressPool
 		if err := decodeJSONRequestBody(r.Body, &pool, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		pool.Purpose = strings.TrimSpace(pool.Purpose)
+		if pool.Purpose == "" {
+			pool.Purpose = "registration"
+		}
+		if !isRegistrationEgressPoolPurpose(pool.Purpose) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("only registration egress pools are supported"))
 			return
 		}
 		if strings.TrimSpace(pool.ID) == "" {
@@ -340,7 +401,7 @@ func (s *Server) adminEgressPools(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, got)
+		writeJSON(w, http.StatusOK, normalizeRegistrationEgressPool(got))
 	default:
 		methodNotAllowed(w)
 	}
@@ -363,8 +424,8 @@ func (s *Server) adminEgressPoolAction(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w)
 			return
 		}
-		if _, err := s.store.GetEgressPool(r.Context(), poolID); err != nil {
-			writeError(w, http.StatusNotFound, fmt.Errorf("egress pool %q not found", poolID))
+		if _, err := s.getRegistrationEgressPool(r.Context(), poolID); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		var req struct {
@@ -398,15 +459,15 @@ func (s *Server) adminEgressPoolAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, pool)
+		writeJSON(w, http.StatusOK, normalizeRegistrationEgressPool(pool))
 	case "rebalance":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w)
 			return
 		}
-		pool, err := s.store.GetEgressPool(r.Context(), poolID)
+		pool, err := s.getRegistrationEgressPool(r.Context(), poolID)
 		if err != nil {
-			writeError(w, http.StatusNotFound, err)
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"pool_id": pool.ID, "members": len(pool.Members), "strategy": pool.AssignmentStrategy})
@@ -420,6 +481,10 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/egress-profiles/"), "/")
+	if rest == "test" {
+		s.adminEgressProfileTest(w, r)
+		return
+	}
 	// Collection-level action: bulk import of "host:port:user:pass" lines.
 	if rest == "import" {
 		s.adminEgressImport(w, r)
@@ -478,6 +543,208 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *Server) adminEgressProfileTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req egressProfileTestRequest
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	profile, err := s.egressProfileForTest(r.Context(), req)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	probeURL := strings.TrimSpace(req.ProbeURL)
+	if probeURL == "" {
+		probeURL = strings.TrimSpace(s.cfg.GeoProbeURL)
+	}
+	if probeURL == "" {
+		probeURL = config.DefaultGeoProbeURL
+	}
+	result, err := s.probeEgressProfileURL(r.Context(), profile, probeURL)
+	if err != nil {
+		status := http.StatusBadGateway
+		if isEgressProfileInputError(err) {
+			status = http.StatusBadRequest
+		}
+		writeError(w, status, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":             true,
+		"egress_id":      strings.TrimSpace(req.EgressID),
+		"exit_ip":        result.IP,
+		"region":         result.Country,
+		"country":        result.Country,
+		"region_name":    result.Region,
+		"city":           result.City,
+		"latency_ms":     result.LatencyMS,
+		"latency_millis": result.LatencyMS,
+		"probe_url":      probeURL,
+		"warnings":       egressProfileProbeWarnings(profile, result),
+	})
+}
+
+func (s *Server) egressProfileForTest(ctx context.Context, req egressProfileTestRequest) (storage.EgressProfile, error) {
+	if id := strings.TrimSpace(req.EgressID); id != "" {
+		return s.store.GetEgressProfile(ctx, id)
+	}
+	if req.Profile == nil {
+		return storage.EgressProfile{}, errors.New("egress_id or profile required")
+	}
+	profile, err := req.Profile.profile()
+	if err != nil {
+		return storage.EgressProfile{}, err
+	}
+	if strings.TrimSpace(profile.Type) == "" {
+		profile.Type = "direct"
+	}
+	if strings.TrimSpace(profile.Endpoint) == "" && strings.TrimSpace(req.Profile.Host) != "" {
+		d, err := proxyparse.FromFields(req.Profile.Host, req.Profile.Port, req.Profile.Username, req.Profile.Password)
+		if err != nil {
+			return storage.EgressProfile{}, err
+		}
+		profile.Endpoint = d.Endpoint(profile.Type)
+	}
+	if strings.EqualFold(strings.TrimSpace(profile.ProxyAuthMode), "api_whitelist") && strings.TrimSpace(profile.Endpoint) == "" {
+		return s.cliproxyAPIWhitelistProbeProfile(ctx, profile, req.Profile)
+	}
+	return profile, nil
+}
+
+func (s *Server) cliproxyAPIWhitelistProbeProfile(ctx context.Context, profile storage.EgressProfile, req *egressProfileRequest) (storage.EgressProfile, error) {
+	base := "https://api.cliproxy.io"
+	if s.cfg.CliproxyAPIBase != "" {
+		base = strings.TrimSpace(s.cfg.CliproxyAPIBase)
+	}
+	if req != nil && strings.TrimSpace(req.APIBase) != "" {
+		base = strings.TrimSpace(req.APIBase)
+	}
+	apiKey := strings.TrimSpace(profile.ProxyAPIKey)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(s.cfg.CliproxyAPIKey)
+	}
+	region := strings.TrimSpace(profile.Region)
+	if region == "" {
+		region = "Rand"
+	}
+	num := 1
+	if req != nil && req.APINum > 0 {
+		num = req.APINum
+	}
+	timeMin := 10
+	if req != nil && req.APITime > 0 {
+		timeMin = req.APITime
+	}
+	extractor := &cliproxyproxy.CliproxyAPIExtractor{
+		BaseURL: base,
+		APIKey:  apiKey,
+		HC:      &http.Client{Timeout: 15 * time.Second},
+	}
+	ips, err := extractor.ExtractIPs(ctx, region, num, timeMin)
+	if err != nil {
+		return storage.EgressProfile{}, err
+	}
+	if len(ips) == 0 || strings.TrimSpace(ips[0]) == "" {
+		return storage.EgressProfile{}, errors.New("cliproxy api: no ips in response")
+	}
+	endpoint := strings.TrimSpace(ips[0])
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "http://" + endpoint
+	}
+	profile.Type = "http_proxy"
+	profile.Endpoint = endpoint
+	return profile, nil
+}
+
+func (s *Server) probeEgressProfileURL(ctx context.Context, profile storage.EgressProfile, probeURL string) (upstream.ProbeResult, error) {
+	client, err := s.upstream.EgressHTTPClient(profile)
+	if err != nil {
+		return upstream.ProbeResult{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return upstream.ProbeResult{}, err
+	}
+	req.Header.Set("User-Agent", "curl/8.4.0")
+	req.Header.Set("Accept", "application/json")
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return upstream.ProbeResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	latency := time.Since(start).Milliseconds()
+	if resp.StatusCode >= 400 {
+		return upstream.ProbeResult{}, fmt.Errorf("geo probe status %d", resp.StatusCode)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return upstream.ProbeResult{}, fmt.Errorf("geo probe parse: %w", err)
+	}
+	pick := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := m[k]; ok {
+				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+					return strings.TrimSpace(s)
+				}
+			}
+		}
+		return ""
+	}
+	return upstream.ProbeResult{
+		IP:        pick("ip", "query", "ip_addr", "YourFuckingIPAddress"),
+		Country:   pick("country_code", "countryCode", "country"),
+		Region:    pick("region", "region_name", "regionName", "region_code"),
+		City:      pick("city"),
+		LatencyMS: latency,
+	}, nil
+}
+
+func egressProfileProbeWarnings(profile storage.EgressProfile, result upstream.ProbeResult) []string {
+	warnings := []string{}
+	wantRegion := strings.ToUpper(strings.TrimSpace(profile.Region))
+	gotRegion := strings.ToUpper(strings.TrimSpace(result.Country))
+	if wantRegion != "" && wantRegion != "RAND" && gotRegion != "" && wantRegion != gotRegion {
+		warnings = append(warnings, fmt.Sprintf("配置地区 %s 与实际出口地区 %s 不一致", wantRegion, gotRegion))
+	}
+	if strings.TrimSpace(result.IP) == "" {
+		warnings = append(warnings, "探测响应未返回出口 IP")
+	}
+	return warnings
+}
+
+func isEgressProfileInputError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, part := range []string{
+		"endpoint required",
+		"unsupported egress type",
+		"invalid url",
+		"invalid url escape",
+		"missing protocol scheme",
+		"first path segment in url cannot contain colon",
+	} {
+		if strings.Contains(msg, part) {
+			return true
+		}
+	}
+	return false
 }
 
 // adminEgressImport bulk-creates proxy egress profiles from newline-separated

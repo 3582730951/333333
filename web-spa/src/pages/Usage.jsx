@@ -76,6 +76,9 @@ export default function Usage() {
   const promptForCache = cacheSummary.prompt_tokens || ts.reduce((s, b) => s + (b.prompt_tokens || 0), 0);
   const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cached / promptForCache : 0);
   const requestHitRate = cacheSummary.request_hit_rate || 0;
+  const missed = Math.max(0, promptForCache - cached);
+  const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cached / promptForCache) * 100))) : 0;
+  const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct) : 0;
 
   const topAccts = [...rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)).slice(0, 10)
     .map((a) => ({ x: (a.label || a.account_id || '').slice(0, 10), 输入: a.prompt_tokens || 0, 输出: a.completion_tokens || 0 }));
@@ -132,6 +135,25 @@ export default function Usage() {
         <StatCard label="请求数" value={fmtInt(totalReqs)} color={C.blue} />
         <StatCard label="请求命中概率" value={fmtPct(requestHitRate)} color={C.green} sub={`${fmtInt(cacheSummary.hit_requests || 0)} / ${fmtInt(cacheSummary.requests || 0)} 请求`} />
         <StatCard label="缓存 Token 占比" value={fmtPct(cacheRate)} color={C.cyan} sub={`${fmtTokens(cached)} / ${fmtTokens(promptForCache)} 输入`} />
+      </div>
+
+      <div className="pool-cache-breakdown" style={{ marginBottom: 18 }}>
+        <div className="pool-cache-breakdown__head">
+          <div>
+            <div className="pool-section-title">缓存命中构成</div>
+            <div className="pool-text-tertiary">cached tokens / eligible prompt tokens</div>
+          </div>
+          <b>{fmtPct(cacheRate)}</b>
+        </div>
+        <div className="pool-cache-breakdown__bar" aria-label="cache hit breakdown">
+          <span className="pool-cache-breakdown__cached" style={{ width: `${cachedPct}%` }} />
+          <span className="pool-cache-breakdown__missed" style={{ width: `${missedPct}%` }} />
+        </div>
+        <div className="pool-cache-breakdown__legend">
+          <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--cached" />命中 {fmtTokens(cached)}</span>
+          <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--missed" />未命中 {fmtTokens(missed)}</span>
+          <span>请求命中 {fmtPct(requestHitRate)}</span>
+        </div>
       </div>
 
       <div className="pool-chart-card" style={{ marginBottom: 18 }}>

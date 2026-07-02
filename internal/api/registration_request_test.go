@@ -128,6 +128,30 @@ func TestRegisterBatchRequiresRegistrationPool(t *testing.T) {
 	}
 }
 
+func TestRegisterBatchRejectsNonRegistrationPool(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	_, runtimePool := configureRegistrationEgressPools(t, h)
+
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1,"registration_egress_pool_id":"`+runtimePool+`"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("register batch with runtime pool = %d, want 400: %s", code, raw)
+	}
+	if count := registrationJobCount(t, h); count != 0 {
+		t.Fatalf("runtime-pool register batch wrote %d jobs, want 0", count)
+	}
+
+	if err := h.store.SetSetting(context.Background(), "registration_egress_pool_id", runtimePool); err != nil {
+		t.Fatal(err)
+	}
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("register batch with runtime default pool = %d, want 400: %s", code, raw)
+	}
+	if count := registrationJobCount(t, h); count != 0 {
+		t.Fatalf("runtime-default register batch wrote %d jobs, want 0", count)
+	}
+}
+
 func TestRegisterBatchDoesNotRequireRuntimePool(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	regPool, _ := configureRegistrationEgressPools(t, h)

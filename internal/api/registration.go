@@ -346,6 +346,9 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		if req.RegistrationEgressPoolID == "" {
 			return invalidRegisterRequest("registration_egress_pool_id is required; configure the default registration egress pool or pass a registration pool")
 		}
+		if _, err := h.getRegistrationEgressPool(ctx, req.RegistrationEgressPoolID); err != nil {
+			return invalidRegisterRequest("registration egress pool %q is not a registration pool: %v", req.RegistrationEgressPoolID, err)
+		}
 		if _, err := h.store.SelectEgressFromPool(ctx, req.RegistrationEgressPoolID); err != nil {
 			return invalidRegisterRequest("registration egress pool %q is not usable: %v", req.RegistrationEgressPoolID, err)
 		}

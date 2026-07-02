@@ -200,7 +200,7 @@ func settingsCenterPatchBody(p settingsCenterPatch) map[string]interface{} {
 func (s *Server) validateSettingsCenterPatch(ctx context.Context, p settingsCenterPatch) error {
 	switch p.Section {
 	case "config":
-		return s.validateConfigPatch(p)
+		return s.validateConfigPatch(ctx, p)
 	case "registrar":
 		return s.validateRegistrarPatch(p)
 	case "automation":
@@ -308,6 +308,14 @@ func (s *Server) planConfigPatch(ctx context.Context, plan *settingsCenterWriteP
 		stored, err := validateSettingValue(f, v)
 		if err != nil {
 			return fmt.Errorf("%s: %w", k, err)
+		}
+		if k == "registration_egress_pool_id" {
+			poolID := strings.TrimSpace(stored)
+			if poolID != "" {
+				if _, err := s.getRegistrationEgressPool(ctx, poolID); err != nil {
+					return fmt.Errorf("%s: %w", k, err)
+				}
+			}
 		}
 		plan.setSetting(k, stored)
 		if f.Effect == effectUpstream {
@@ -534,7 +542,7 @@ func (s *Server) planRuntimeSettingsPatch(ctx context.Context, plan *settingsCen
 
 // ── config section ──────────────────────────────────────────────────────────
 
-func (s *Server) validateConfigPatch(p settingsCenterPatch) error {
+func (s *Server) validateConfigPatch(ctx context.Context, p settingsCenterPatch) error {
 	body := settingsCenterPatchBody(p)
 	if len(body) == 0 {
 		return nil
@@ -549,6 +557,14 @@ func (s *Server) validateConfigPatch(p settingsCenterPatch) error {
 		}
 		if _, err := validateSettingValue(f, v); err != nil {
 			return fmt.Errorf("%s: %w", k, err)
+		}
+		if k == "registration_egress_pool_id" {
+			poolID := strings.TrimSpace(cfgString(v))
+			if poolID != "" {
+				if _, err := s.getRegistrationEgressPool(ctx, poolID); err != nil {
+					return fmt.Errorf("%s: %w", k, err)
+				}
+			}
 		}
 	}
 	return nil

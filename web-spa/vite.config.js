@@ -27,6 +27,7 @@ export default defineConfig({
     port: 5188,
     proxy: {
       '/admin': 'http://127.0.0.1:8799',
+      '/auth': 'http://127.0.0.1:8799',
       '/v1': 'http://127.0.0.1:8799',
       '/healthz': 'http://127.0.0.1:8799',
       '/file': 'http://127.0.0.1:8799',

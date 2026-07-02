@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,6 +88,10 @@ func (p *Pipeline) cliproxyAPIIP(ctx context.Context, egress storage.EgressProfi
 			base = v
 		}
 	}
+	dynamic := egressDynamicConfig(egress)
+	if v := dynamicString(dynamic, "api_base"); v != "" {
+		base = v
+	}
 	apiKey := strings.TrimSpace(egress.ProxyAPIKey)
 	if apiKey == "" && p.cfg != nil {
 		// Fall back to a global key from the secrets/config if the per-egress one is empty.
@@ -97,7 +102,50 @@ func (p *Pipeline) cliproxyAPIIP(ctx context.Context, egress storage.EgressProfi
 		region = "Rand"
 	}
 	ext := &proxy.CliproxyAPIExtractor{BaseURL: base, APIKey: apiKey, HC: p.httpClient}
-	return ext.CachedIP(ctx, region, 1, 10)
+	return ext.CachedIP(ctx, region, dynamicInt(dynamic, "api_num", 1), dynamicInt(dynamic, "api_time", 10))
+}
+
+func egressDynamicConfig(egress storage.EgressProfile) map[string]interface{} {
+	text := strings.TrimSpace(egress.DynamicConfigJSON)
+	if text == "" {
+		return nil
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+func dynamicString(m map[string]interface{}, key string) string {
+	if len(m) == 0 {
+		return ""
+	}
+	if s, ok := m[key].(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func dynamicInt(m map[string]interface{}, key string, fallback int) int {
+	if len(m) == 0 {
+		return fallback
+	}
+	switch v := m[key].(type) {
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	case int:
+		if v > 0 {
+			return v
+		}
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return fallback
 }
 
 func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterRequest) (*storage.Account, error) {

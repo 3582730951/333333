@@ -125,6 +125,10 @@ export default function Dashboard() {
 
   const tokens = (d.ts || []).reduce((s, b) => s + (b.total_tokens || 0), 0);
   const reqs = (d.ts || []).reduce((s, b) => s + (b.requests || 0), 0);
+  const cachePromptTokens = (d.byModel || []).reduce((s, m) => s + (m.prompt_tokens || 0), 0);
+  const cacheHitTokens = (d.byModel || []).reduce((s, m) => s + (m.cached_tokens || 0), 0);
+  const cacheHitRate = cachePromptTokens > 0 ? cacheHitTokens / cachePromptTokens : 0;
+  const regRate = d.reg ? (d.reg.totals?.success_rate || 0) : 0;
 
   const statusDonut = [
     { name: '活跃', value: active, color: C.green },
@@ -156,7 +160,34 @@ export default function Dashboard() {
 
       <LoadErrorBanner error={loadError} onRetry={load} />
 
-      {/* 快捷操作入口 */}
+      <section className="pool-dashboard-command" style={{ marginBottom: 18 }}>
+        <div className="pool-dashboard-command__main">
+          <div className="pool-dashboard-command__eyebrow">
+            {d.health?.ok ? <Tag color="green">服务正常</Tag> : <Tag color="red">服务异常</Tag>}
+            <span>{formatLastRefresh()}</span>
+          </div>
+          <div className="pool-dashboard-command__metric">
+            <strong>{fmtInt(active)}</strong>
+            <span>可调度账号</span>
+          </div>
+          <div className="pool-dashboard-command__subgrid">
+            <div><span>24h 请求</span><b>{fmtInt(reqs)}</b></div>
+            <div><span>24h Token</span><b>{fmtTokens(tokens)}</b></div>
+            <div><span>缓存命中</span><b>{Math.round(cacheHitRate * 100)}%</b></div>
+            <div><span>注册成功率</span><b>{d.reg ? `${Math.round(regRate * 100)}%` : '—'}</b></div>
+          </div>
+        </div>
+        <div className="pool-dashboard-command__side">
+          <div className="pool-section-title">需要关注</div>
+          <div className="pool-attention-list">
+            <div><span>隔离账号</span><b className={quarantined ? 'pool-danger-text' : ''}>{fmtInt(quarantined)}</b></div>
+            <div><span>待复测</span><b className={recheck ? 'pool-danger-text' : ''}>{fmtInt(recheck)}</b></div>
+            <div><span>冷却中</span><b>{fmtInt(cooling)}</b></div>
+            <div><span>模型覆盖</span><b>{fmtInt((d.byModel || []).length)}</b></div>
+          </div>
+        </div>
+      </section>
+
       <div className="pool-quick-actions" style={{
         display: 'flex',
         gap: 10,

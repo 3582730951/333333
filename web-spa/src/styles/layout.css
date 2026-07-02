@@ -16,7 +16,8 @@
 
 .pool-main-layout {
   min-height: 100vh;
-  width: auto;
+  width: calc(100vw - var(--pool-sidebar-width, 0px));
+  min-width: 0;
 }
 
 .pool-sider {
@@ -112,6 +113,10 @@
 }
 
 @media (max-width: 900px) {
+  .pool-app-mobile .pool-main-layout {
+    width: 100vw;
+  }
+
   .pool-shell {
     padding: 16px;
   }

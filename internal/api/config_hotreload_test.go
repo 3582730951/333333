@@ -605,6 +605,18 @@ func TestSettingsCenterConfigPatchValidatesSMSCountries(t *testing.T) {
 	}
 }
 
+func TestSettingsCenterConfigPatchRequiresRegistrationPoolPurpose(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp"}`))
+	})
+	_, runtimePool := configureRegistrationEgressPools(t, h)
+
+	status, body := postSettingsCenter(t, h, `[{"section":"config","values":{"registration_egress_pool_id":"`+runtimePool+`"}}]`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("settings-center runtime registration_egress_pool_id status = %d, want 400: %s", status, body)
+	}
+}
+
 func TestSettingsCenterConfigPatchRejectsUnknownKey(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp"}`))

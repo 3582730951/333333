@@ -105,7 +105,7 @@ export default function Registration() {
   const fetchOptions = useCallback(async ({ signal }) => {
     const { values, error } = await loadResourceGroup({
       groups: { label: '分组选项', load: () => get('/admin/groups', undefined, { signal }) },
-      pools: { label: '出口池选项', load: () => get('/admin/egress-pools', undefined, { signal }) },
+      pools: { label: '注册池选项', load: () => get('/admin/egress-pools', undefined, { signal }) },
       providers: { label: '服务商选项', load: () => get('/admin/register/providers/options', undefined, { signal }) },
     });
     return {

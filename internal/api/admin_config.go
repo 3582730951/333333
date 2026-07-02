@@ -702,12 +702,15 @@ func (s *Server) adminGroupEgressPolicy(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		policy.GroupName = groupName
-		for _, poolID := range []string{policy.RegistrationPoolID, policy.RuntimePoolID} {
-			if strings.TrimSpace(poolID) == "" {
-				continue
-			}
-			if _, err := s.store.GetEgressPool(r.Context(), poolID); err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("egress pool %q not found", poolID))
+		policy.RegistrationPoolID = strings.TrimSpace(policy.RegistrationPoolID)
+		policy.RuntimePoolID = strings.TrimSpace(policy.RuntimePoolID)
+		if policy.RuntimePoolID != "" {
+			writeError(w, http.StatusBadRequest, errors.New("runtime egress pools are no longer supported; use per-account egress bindings"))
+			return
+		}
+		if policy.RegistrationPoolID != "" {
+			if _, err := s.getRegistrationEgressPool(r.Context(), policy.RegistrationPoolID); err != nil {
+				writeError(w, http.StatusBadRequest, err)
 				return
 			}
 		}

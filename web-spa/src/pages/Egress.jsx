@@ -7,6 +7,7 @@ import ResourceTable from '../components/ResourceTable.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
 import { ActionGroup, MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
+import EgressProfileForm from '../components/EgressProfileForm.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { loadResourceGroup } from '../lib/resource.js';
@@ -40,6 +41,7 @@ export default function Egress() {
   const [editing, setEditing] = useState(null); // null | {} (new) | existing row
   const [poolEditing, setPoolEditing] = useState(null);
   const [memberEditing, setMemberEditing] = useState(null);
+  const [savedProfile, setSavedProfile] = useState(null);
   const [registrationPoolDraft, setRegistrationPoolDraft] = useState('');
   const formApi = useRef(null);
   const poolFormApi = useRef(null);
@@ -48,7 +50,7 @@ export default function Egress() {
   const fetchRows = useCallback(async ({ signal }) => {
     const { values, error } = await loadResourceGroup({
       profiles: { label: '出口配置', load: () => get('/admin/egress-profiles', undefined, { signal }) },
-      pools: { label: '出口池', load: () => get('/admin/egress-pools', undefined, { signal }) },
+      pools: { label: '注册池', load: () => get('/admin/egress-pools', undefined, { signal }) },
       config: { label: '系统配置', load: () => get('/admin/config', undefined, { signal }) },
     });
     return {
@@ -71,7 +73,7 @@ export default function Egress() {
     { label: '出口数', value: rows.length },
     { label: '健康出口', value: healthyCount, tone: healthyCount === rows.length ? 'success' : 'warning' },
     { label: '代理出口', value: proxyCount },
-    { label: '出口池', value: pools.length },
+    { label: '注册池', value: registrationPools.length },
     { label: '总并发', value: concurrencyTotal },
   ];
 
@@ -91,11 +93,10 @@ export default function Egress() {
   const { run: save, running: saving } = useAsyncAction(async (vals) => {
     try {
       const body = { ...editing, ...vals, dynamic_config_json: parseDynamicConfig(vals.dynamic_config_json) };
-      // api_whitelist 模式：把 api_base/num/time 塞进 endpoint 让后端解析（或留空由后端默认）。
-      // credential 模式：endpoint 即完整代理 URL。
-      await post('/admin/egress-profiles', body);
+      const saved = await post('/admin/egress-profiles', body);
       Toast.success('已保存');
       setEditing(null);
+      setSavedProfile(saved || body);
       await load();
     } catch (err) {
       showErrorToast(err);
@@ -108,8 +109,8 @@ export default function Egress() {
 
   const { run: savePool, running: savingPool } = useAsyncAction(async (vals) => {
     try {
-      await post('/admin/egress-pools', { ...poolEditing, ...vals });
-      Toast.success('出口池已保存');
+      await post('/admin/egress-pools', { ...poolEditing, ...vals, purpose: 'registration' });
+      Toast.success('注册池已保存');
       setPoolEditing(null);
       await load();
     } catch (err) {
@@ -138,7 +139,41 @@ export default function Egress() {
         section: 'config',
         values: { registration_egress_pool_id: registrationPoolDraft || '' },
       }]);
-      Toast.success('自动注册出口池已保存');
+      Toast.success('默认注册池已保存');
+      await load();
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
+  const { run: joinSavedProfileToRegistrationPool, running: joiningSavedProfile } = useAsyncAction(async () => {
+    if (!savedProfile?.id) return;
+    try {
+      const fallbackPoolID = 'pool_registration_default';
+      let poolID = registrationPoolSetting || registrationPools[0]?.id || fallbackPoolID;
+      const poolExists = registrationPools.some((pool) => pool.id === poolID);
+      if (!poolExists) {
+        await post('/admin/egress-pools', {
+          id: poolID,
+          name: '默认注册池',
+          purpose: 'registration',
+          assignment_strategy: 'sticky_least_used',
+        });
+      }
+      if (!registrationPoolSetting) {
+        await post('/admin/settings-center', [{
+          section: 'config',
+          values: { registration_egress_pool_id: poolID },
+        }]);
+        setRegistrationPoolDraft(poolID);
+      }
+      await post(`/admin/egress-pools/${encodeURIComponent(poolID)}/members`, {
+        egress_id: savedProfile.id,
+        enabled: true,
+        capacity: 0,
+      });
+      Toast.success('已加入默认注册池');
+      setSavedProfile(null);
       await load();
     } catch (err) {
       showErrorToast(err);
@@ -203,16 +238,16 @@ export default function Egress() {
       render: (_, row) => renderActions(row),
     },
   ];
-  const poolColumns = [
+  const registrationPoolColumns = [
     {
-      title: '出口池',
+      title: '注册池',
       key: 'pool',
       width: 260,
       render: (_, row) => (
         <div className="pool-resource-summary">
           <TextClamp strong>{row.name || row.id}</TextClamp>
           <div className="pool-resource-summary__meta">
-            <Tag size="small" color={row.purpose === 'registration' ? 'orange' : row.purpose === 'runtime' ? 'blue' : 'grey'}>{row.purpose || 'custom'}</Tag>
+            <Tag size="small" color="orange">registration</Tag>
             <span>{row.id}</span>
           </div>
         </div>
@@ -241,7 +276,7 @@ export default function Egress() {
       width: 160,
       render: (_, row) => (
         <ActionMenu
-          label="出口池操作"
+          label="注册池操作"
           items={[
             { label: '编辑', icon: <IconEdit />, onSelect: () => setPoolEditing({ ...row }) },
             { label: '成员', icon: <IconPlus />, onSelect: () => setMemberEditing({ id: row.id, egress_id: '', enabled: true, capacity: 0 }) },
@@ -269,18 +304,16 @@ export default function Egress() {
     },
   ];
 
-  const isApiMode = editing?.proxy_auth_mode === 'api_whitelist';
-
   return (
     <div>
       <PageHeader title="出口 / 代理" subtitle={`共 ${rows.length} 个出口 · curl_cffi sidecar / 住宅代理 / WARP / CLIPProxy`}
         actions={<>
-          <Button icon={<IconPlus />} onClick={() => setPoolEditing({ id: '', name: '', purpose: 'registration', assignment_strategy: 'sticky_least_used' })}>新建出口池</Button>
+          <Button icon={<IconPlus />} onClick={() => setPoolEditing({ id: '', name: '', purpose: 'registration', assignment_strategy: 'sticky_least_used' })}>新建注册池</Button>
           <Button icon={<IconPlus />} onClick={() => openEdit(null)}>新建</Button>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
         </>} />
       <div className="pool-toolbar pool-egress-registration-toolbar">
-        <Typography.Text strong>自动注册出口池</Typography.Text>
+        <Typography.Text strong>默认注册池</Typography.Text>
         <Select
           value={registrationPoolDraft}
           onChange={setRegistrationPoolDraft}
@@ -325,8 +358,8 @@ export default function Egress() {
         onRetry={load}
         loading={loading}
         lastRefresh={lastRefresh}
-        dataSource={pools}
-        columns={poolColumns}
+        dataSource={registrationPools}
+        columns={registrationPoolColumns}
         rowKey="id"
         pagination={{ pageSize: 12 }}
         className="pool-egress-pools-table"
@@ -334,8 +367,8 @@ export default function Egress() {
         layout="fit"
         scroll={false}
         rowHeight={64}
-        emptyTitle="暂无出口池"
-        emptyDesc="创建 registration 池后，注册任务可从池内选择代理出口"
+        emptyTitle="暂无注册池"
+        emptyDesc="创建注册池后，注册任务可从池内选择代理出口"
         emptyType="egress"
         skeletonRows={4}
       />
@@ -354,65 +387,42 @@ export default function Egress() {
         width={640}
       >
         {editing && (
-          <Form
-            key={editing.id || 'new'}
-            getFormApi={(api) => { formApi.current = api; }}
-            initValues={editing}
+          <EgressProfileForm
+            initialValues={editing}
+            saving={saving}
             onSubmit={save}
-            labelPosition="top"
-          >
-            <Form.Input field="id" label="ID" disabled={!!editing.id} placeholder="egress_xxx" />
-            <Form.Input field="name" label="名称" placeholder="cliproxy BR residential" />
-            <Form.Select field="type" label="类型" optionList={[
-              { value: 'direct', label: 'direct (直连)' },
-              { value: 'http_proxy', label: 'http_proxy (HTTP 代理)' },
-              { value: 'https_proxy', label: 'https_proxy' },
-              { value: 'socks5_proxy', label: 'socks5_proxy' },
-              { value: 'socks5h_proxy', label: 'socks5h_proxy' },
-              { value: 'curl_cffi_sidecar', label: 'curl_cffi_sidecar (JA3 伪装)' },
-            ]} />
-            <Form.Select
-              field="proxy_auth_mode"
-              label="代理模式（CLIPProxy 取 IP 方式）"
-              optionList={AUTH_MODES.map(m => ({ value: m.value, label: m.label }))}
-              help={AUTH_MODES.find(m => m.value === (editing.proxy_auth_mode || ''))?.desc}
-            />
-
-            {!isApiMode && (
-              <Form.Input
-                field="endpoint"
-                label="Endpoint（账号密码模式）"
-                placeholder="http://user-region-BR-sid-XXXX-t-5:pass@host:port"
-                help="credential 模式：完整代理 URL，region/sid 在用户名里。"
-              />
-            )}
-            {isApiMode && (
-              <>
-                <Form.Input field="api_base" label="CLIPProxy API Base URL" placeholder="https://api.cliproxy.io" />
-                <Form.Input field="proxy_api_key" mode="password" label="CLIPProxy API Key" placeholder="账户 API token（调 /white/api 鉴权）" />
-                <Form.InputNumber field="api_num" label="提取数量 (num)" min={1} max={10} />
-                <Form.InputNumber field="api_time" label="轮转时长 (time, 分钟)" min={1} max={60} />
-              </>
-            )}
-
-            <Form.Input field="region" label="地区/国家 (ISO-2 或 Rand)" placeholder="BR / US / Rand" help="号码国家锁定：BR 号码必须配 region-BR 代理。" />
-            <Form.Input field="exit_ip" label="出口 IP（可选，自动检测填充）" />
-            <Form.Input field="chain_proxy" label="Chain Proxy（上游，可选）" placeholder="socks5h://127.0.0.1:40000" />
-            <Form.Select field="ip_mode" label="IP 模式" optionList={[
-              { value: 'static_residential', label: '静态住宅 IP' },
-              { value: 'dynamic_residential', label: '动态住宅 IP' },
-              { value: 'datacenter', label: '机房 / 普通代理' },
-              { value: 'local_sidecar', label: '本地 sidecar / cuff' },
-            ]} />
-            <Form.Input field="provider_key" label="服务商标识" placeholder="cliproxy / cuff / warp" />
-            <Form.TextArea field="dynamic_config_json" label="动态代理配置 JSON" autosize placeholder='{ "rotation": "sid" }' />
-            <Form.InputNumber field="max_concurrency" label="并发上限" min={1} max={128} />
-          </Form>
+            getFormApi={(api) => { formApi.current = api; }}
+          />
         )}
       </Modal>
 
       <Modal
-        title={poolEditing?.id ? `编辑出口池 ${poolEditing.id}` : '新建出口池'}
+        title="加入注册池"
+        visible={!!savedProfile}
+        onCancel={() => {
+          if (!joiningSavedProfile) setSavedProfile(null);
+        }}
+        maskClosable={!joiningSavedProfile}
+        width={520}
+        footer={(
+          <>
+            <Button disabled={joiningSavedProfile} onClick={() => setSavedProfile(null)}>稍后处理</Button>
+            <Button theme="solid" loading={joiningSavedProfile} onClick={joinSavedProfileToRegistrationPool}>加入默认注册池</Button>
+          </>
+        )}
+      >
+        <div className="pool-egress-next-step">
+          <Typography.Text strong>{savedProfile?.name || savedProfile?.id}</Typography.Text>
+          <Typography.Text type="tertiary">保存成功。注册任务只会从注册池选择出口，建议现在把这个出口加入默认注册池。</Typography.Text>
+          <div className="pool-resource-summary__meta">
+            <Tag color="orange">{registrationPoolSetting || registrationPools[0]?.id || 'pool_registration_default'}</Tag>
+            <span>{savedProfile?.type || 'direct'} · {savedProfile?.region || '未指定地区'}</span>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal
+        title={poolEditing?.id ? `编辑注册池 ${poolEditing.id}` : '新建注册池'}
         visible={!!poolEditing}
         onCancel={() => {
           if (savingPool) return;
@@ -434,10 +444,6 @@ export default function Egress() {
           >
             <Form.Input field="id" label="ID" disabled={!!poolEditing.id} placeholder="pool_registration_proxy" />
             <Form.Input field="name" label="名称" placeholder="自动注册代理池" />
-            <Form.Select field="purpose" label="用途" optionList={[
-              { value: 'registration', label: 'registration - 注册代理池' },
-              { value: 'custom', label: 'custom' },
-            ]} />
             <Form.Select field="assignment_strategy" label="分配策略" optionList={[
               { value: 'sticky_least_used', label: 'sticky_least_used' },
             ]} />

@@ -376,7 +376,7 @@ async function loadGroups() {
   const cards = GROUPS_CACHE.map((g) => groupCard(g, counts[g.name] || 0)).join("");
   $("#groupsView").innerHTML = `
     <div class="panel" style="max-width:860px"><div class="hd"><h2>${en ? "Groups" : "分组管理"}</h2><span class="sp"></span><button class="btn" onclick="newGroupForm()">${icon("plus")} ${en ? "New group" : "新建分组"}</button></div>
-      <div class="bd"><div class="note">${en ? "Each group pins a model + reasoning effort + egress pool for its accounts; a downstream API key (or the default group) routes requests here." : "每个分组可为其账号固定模型 + 推理强度 + 出口池；下游 API Key（或默认分组）据此路由。"}</div>
+      <div class="bd"><div class="note">${en ? "Each group pins a model + reasoning effort for its accounts; a downstream API key (or the default group) routes requests here." : "每个分组可为其账号固定模型 + 推理强度；下游 API Key（或默认分组）据此路由。"}</div>
       <div id="newGroupBox"></div>${cards || `<div class="muted">${en ? "No groups." : "暂无分组。"}</div>`}</div></div>
     <div class="panel" style="max-width:860px;margin-top:12px"><div class="hd"><h2>${en ? "Account membership" : "账号归属"}</h2></div><div class="bd" style="padding:0" id="membersTable"></div></div>`;
   renderMembers(accs);
