@@ -343,7 +343,7 @@ install_gateway_binary() {
   mkdir -p "$HOME/.local/bin"
   target="$HOME/.local/bin/gateway"
   tmp="$(mktemp)"
-  curl -fsSL "$ORIGIN/download/gateway" -o "$tmp"
+  curl -fsSL "$ORIGIN/download/gateway?os=$os&arch=$arch" -o "$tmp"
   chmod +x "$tmp"
   mv "$tmp" "$target"
   say "已安装 gateway -> $target ($os/$arch)"

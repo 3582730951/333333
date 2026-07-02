@@ -907,6 +907,20 @@ build_project() {
 
   log "Building ${APP_NAME}"
   "$GO_BIN" build -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/${APP_NAME}" ./cmd/pool-server
+
+  log "Building downloadable gateway binaries"
+  mkdir -p "${BUILD_DIR}/gateway-bin"
+  local target goos goarch ext
+  for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+    goos="${target%/*}"
+    goarch="${target#*/}"
+    ext=""
+    if [[ "$goos" == "windows" ]]; then
+      ext=".exe"
+    fi
+    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+      "$GO_BIN" build -trimpath -ldflags="-s -w" -o "${BUILD_DIR}/gateway-bin/gateway-${goos}-${goarch}${ext}" ./cmd/gateway
+  done
 }
 
 prepare_runtime_layout() {
@@ -926,6 +940,7 @@ prepare_runtime_layout() {
 
   run_root install -d -m 0755 "$BIN_DIR"
   run_root install -d -m 0755 "$APP_DIR"
+  run_root install -d -m 0755 "${APP_DIR}/bin"
   run_root install -d -m 0755 "$CONFIG_DIR" "$config_parent"
   run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR"
   run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$database_parent"
@@ -947,6 +962,7 @@ install_binary_and_config() {
     run_root cp -a "${BIN_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}.prev"
   fi
   run_root install -m 0755 "${BUILD_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}"
+  run_root install -m 0755 "${BUILD_DIR}/gateway-bin"/gateway-* "${APP_DIR}/bin/"
 
   if [[ -f "$CONFIG_FILE" ]]; then
     warn "Keeping existing config: ${CONFIG_FILE}"

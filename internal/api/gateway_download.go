@@ -5,33 +5,34 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // handleDownloadGateway 提供网关二进制下载
 func (s *Server) handleDownloadGateway(w http.ResponseWriter, r *http.Request) {
 	// 根据客户端 OS 返回对应二进制
-	clientOS := detectClientOS(r)
-	clientArch := detectClientArch(r)
-
-	binaryPath := fmt.Sprintf("./bin/gateway-%s-%s", clientOS, clientArch)
-
-	// 如果不存在，尝试当前目录的 gateway
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		binaryPath = "./bin/gateway"
+	clientOS, err := detectClientOS(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	clientArch, err := detectClientArch(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 
-	// 最后尝试：实时编译
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		if err := s.buildGateway(clientOS, clientArch); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("build gateway: %w", err))
-			return
-		}
+	binaryPath, err := s.gatewayBinaryPath(clientOS, clientArch)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 
 	// 设置下载头
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=gateway-%s-%s", clientOS, clientArch))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", gatewayBinaryName(clientOS, clientArch)))
 
 	http.ServeFile(w, r, binaryPath)
 }
@@ -80,7 +81,7 @@ esac
 
 # 下载网关二进制
 echo "[1/5] 下载网关..."
-GATEWAY_URL="%s/download/gateway"
+GATEWAY_URL="%s/download/gateway?os=$OS&arch=$ARCH"
 curl -fsSL "$GATEWAY_URL" -o /tmp/gateway || {
   echo "❌ 下载失败，请检查网络或 VPS 地址"
   exit 1
@@ -161,11 +162,78 @@ func extractAPIKey(r *http.Request) string {
 	return ""
 }
 
+func (s *Server) gatewayBinaryPath(targetOS, targetArch string) (string, error) {
+	name := gatewayBinaryName(targetOS, targetArch)
+	dirs := gatewayBinaryDirs()
+	for _, dir := range dirs {
+		for _, candidate := range []string{
+			filepath.Join(dir, name),
+			filepath.Join(dir, genericGatewayBinaryName(targetOS)),
+		} {
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				return candidate, nil
+			}
+		}
+	}
+
+	outputPath, err := s.buildGateway(targetOS, targetArch)
+	if err != nil {
+		return "", fmt.Errorf("gateway binary %s not found in %s and live build failed: %w", name, strings.Join(dirs, ", "), err)
+	}
+	if st, err := os.Stat(outputPath); err == nil && !st.IsDir() {
+		return outputPath, nil
+	}
+	return "", fmt.Errorf("live build completed but output binary is missing: %s", outputPath)
+}
+
+func gatewayBinaryDirs() []string {
+	var dirs []string
+	if env := strings.TrimSpace(os.Getenv("GATEWAY_BIN_DIR")); env != "" {
+		dirs = append(dirs, filepath.SplitList(env)...)
+	}
+	dirs = append(dirs, "./bin")
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		dirs = append(dirs,
+			filepath.Join(exeDir, "bin"),
+			filepath.Clean(filepath.Join(exeDir, "..", "lib", "codex-pool", "bin")),
+		)
+	}
+	dirs = append(dirs, "/usr/local/lib/codex-pool/bin")
+
+	seen := make(map[string]bool, len(dirs))
+	out := dirs[:0]
+	for _, dir := range dirs {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	return out
+}
+
+func gatewayBinaryName(targetOS, targetArch string) string {
+	name := fmt.Sprintf("gateway-%s-%s", targetOS, targetArch)
+	if targetOS == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
+func genericGatewayBinaryName(targetOS string) string {
+	if targetOS == "windows" {
+		return "gateway.exe"
+	}
+	return "gateway"
+}
+
 // buildGateway 实时编译网关二进制
-func (s *Server) buildGateway(targetOS, targetArch string) error {
-	outputPath := fmt.Sprintf("./bin/gateway-%s-%s", targetOS, targetArch)
+func (s *Server) buildGateway(targetOS, targetArch string) (string, error) {
+	outputPath := filepath.Join("./bin", gatewayBinaryName(targetOS, targetArch))
 	if err := os.MkdirAll("./bin", 0755); err != nil {
-		return err
+		return "", err
 	}
 
 	cmd := exec.Command("go", "build",
@@ -177,42 +245,62 @@ func (s *Server) buildGateway(targetOS, targetArch string) error {
 		"CGO_ENABLED=0",
 	)
 
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return outputPath, nil
 }
 
 // detectClientOS 从 User-Agent 检测客户端 OS
-func detectClientOS(r *http.Request) string {
+func detectClientOS(r *http.Request) (string, error) {
+	if raw := r.URL.Query().Get("os"); raw != "" {
+		return normalizeGatewayOS(raw)
+	}
 	ua := r.UserAgent()
 	switch {
-	case contains(ua, "Mac"):
-		return "darwin"
-	case contains(ua, "Linux"):
-		return "linux"
-	case contains(ua, "Windows"):
-		return "windows"
+	case strings.Contains(ua, "Mac"):
+		return "darwin", nil
+	case strings.Contains(ua, "Linux"):
+		return "linux", nil
+	case strings.Contains(ua, "Windows"):
+		return "windows", nil
 	default:
-		return runtime.GOOS
+		return normalizeGatewayOS(runtime.GOOS)
 	}
 }
 
 // detectClientArch 检测客户端架构
-func detectClientArch(r *http.Request) string {
+func detectClientArch(r *http.Request) (string, error) {
+	if raw := r.URL.Query().Get("arch"); raw != "" {
+		return normalizeGatewayArch(raw)
+	}
 	ua := r.UserAgent()
-	if contains(ua, "ARM") || contains(ua, "aarch64") {
-		return "arm64"
+	if strings.Contains(ua, "ARM") || strings.Contains(ua, "arm64") || strings.Contains(ua, "aarch64") {
+		return "arm64", nil
 	}
-	return "amd64"
+	return normalizeGatewayArch(runtime.GOARCH)
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && indexOf(s, substr) >= 0
+func normalizeGatewayOS(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "linux":
+		return "linux", nil
+	case "darwin", "mac", "macos":
+		return "darwin", nil
+	case "windows", "win":
+		return "windows", nil
+	default:
+		return "", fmt.Errorf("unsupported gateway os %q", v)
+	}
 }
 
-func indexOf(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
+func normalizeGatewayArch(v string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "amd64", "x86_64":
+		return "amd64", nil
+	case "arm64", "aarch64":
+		return "arm64", nil
+	default:
+		return "", fmt.Errorf("unsupported gateway arch %q", v)
 	}
-	return -1
 }
