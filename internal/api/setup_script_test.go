@@ -87,6 +87,8 @@ func TestSetupScriptClaudeBranchUsesGatewayStrictRuntime(t *testing.T) {
 	for _, want := range []string{
 		"install_gateway_binary",
 		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"`,
+		`"$GATEWAY_BIN" stop`,
+		`"$GATEWAY_BIN" start-background`,
 		`"$GATEWAY_BIN" probe-identity`,
 		"$GATEWAY_BIN run-claude --",
 		"ANTHROPIC_BASE_URL=$ORIGIN",
@@ -118,6 +120,8 @@ func TestSetupScriptGatewayInstallerLeavesGatewayOnPath(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "", "", "")
 	installer := scriptBetween(t, script, "install_gateway_binary() {", "\n}\n\nconfigure_claude()")
 	for _, want := range []string{
+		`existing_gateway="$(command -v gateway 2>/dev/null || true)"`,
+		`if [ -n "$existing_gateway" ] && [ -w "$existing_gateway" ]`,
 		`if [ "$(id -u)" = "0" ]`,
 		`target="/usr/local/bin/gateway"`,
 		`target="$HOME/.local/bin/gateway"`,
@@ -126,6 +130,9 @@ func TestSetupScriptGatewayInstallerLeavesGatewayOnPath(t *testing.T) {
 		if !strings.Contains(installer, want) {
 			t.Fatalf("gateway installer should persist gateway on PATH; missing %q\n---\n%s", want, installer)
 		}
+	}
+	if strings.Contains(installer, `if GATEWAY_BIN="$(command -v gateway 2>/dev/null)"; then`) {
+		t.Fatalf("gateway installer must not skip downloading a newer binary when gateway already exists\n---\n%s", installer)
 	}
 }
 

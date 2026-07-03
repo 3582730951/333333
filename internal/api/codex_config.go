@@ -347,10 +347,8 @@ EOF
 
 GATEWAY_BIN=""
 install_gateway_binary() {
-  if GATEWAY_BIN="$(command -v gateway 2>/dev/null)"; then
-    return 0
-  fi
-  local os arch target tmp
+  local os arch target tmp existing_gateway
+  existing_gateway="$(command -v gateway 2>/dev/null || true)"
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   arch="$(uname -m)"
   case "$arch" in
@@ -360,7 +358,9 @@ install_gateway_binary() {
   tmp="$(mktemp)"
   curl -fsSL "$ORIGIN/download/gateway?os=$os&arch=$arch" -o "$tmp"
   chmod +x "$tmp"
-  if [ "$(id -u)" = "0" ]; then
+  if [ -n "$existing_gateway" ] && [ -w "$existing_gateway" ]; then
+    target="$existing_gateway"
+  elif [ "$(id -u)" = "0" ]; then
     mkdir -p /usr/local/bin
     target="/usr/local/bin/gateway"
   else
@@ -370,7 +370,7 @@ install_gateway_binary() {
   mv "$tmp" "$target"
   GATEWAY_BIN="$target"
   export PATH="$(dirname "$target"):$PATH"
-  say "已安装 gateway -> $target ($os/$arch)"
+  say "已安装/更新 gateway -> $target ($os/$arch)"
 }
 
 configure_claude() {
@@ -389,6 +389,10 @@ configure_claude() {
   say "Claude Code API: ANTHROPIC_BASE_URL=$ORIGIN"
   install_gateway_binary
   "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"
+  "$GATEWAY_BIN" stop || true
+  if ! "$GATEWAY_BIN" trust-ca; then
+    say "CA 自动信任失败；请按上方命令手动信任后继续使用 Claude Code"
+  fi
 
   if [ "$install_rtk" = "1" ]; then
     say "安装并接入 RTK (Claude Code hook)..."
@@ -403,10 +407,12 @@ configure_claude() {
   if command -v claude >/dev/null 2>&1; then
     "$GATEWAY_BIN" install-wrapper || say "包装器安装失败；可直接运行 $GATEWAY_BIN run-claude -- <args>"
   fi
+  "$GATEWAY_BIN" start-background || say "后台启动失败；请查看 ~/.claude-gateway/gateway.log"
   say "Claude Code 运行方式:"
-  say "  $GATEWAY_BIN start"
-  say "  $GATEWAY_BIN run-claude -- \"你的需求\""
+  say "  claude \"你的需求\""
   say "  claude-plan \"先写计划再执行\""
+  say "  $GATEWAY_BIN status"
+  say "  tail -f ~/.claude-gateway/gateway.log"
 }
 
 main() {

@@ -208,6 +208,10 @@ func main() {
 		handleInit(defaultConfigPath)
 	case "start":
 		handleStart(defaultConfigPath)
+	case "start-background":
+		os.Exit(handleStartBackground(defaultConfigPath))
+	case "stop":
+		os.Exit(handleStop(defaultConfigPath))
 	case "status":
 		os.Exit(handleStatus(defaultConfigPath))
 	case "probe-identity":
@@ -235,6 +239,8 @@ func printUsage() {
 Usage:
   gateway init [--pool-url URL] [--key KEY]    初始化配置和 CA
   gateway start                                 启动代理服务器
+  gateway start-background                      nohup 后台启动代理服务器（写入 PID/log）
+  gateway stop                                  停止后台/旧版代理服务器
   gateway run-claude -- <args>                  在 strict Linux runtime 中启动 Claude Code
   claude-plan <args>                            通过包装器直接以 plan mode 启动 Claude Code
   gateway probe-identity                        拉取身份并验证 strict runtime
@@ -252,7 +258,7 @@ Examples:
   gateway init --pool-url https://your-vps.com:1455 --key cap_xxx
   gateway trust-ca
   gateway install-wrapper
-  gateway start
+  gateway start-background
 
   # 日常使用（包装器安装后）
   claude "your prompt"       # 自动走网关
@@ -289,7 +295,7 @@ func handleInit(configPath string) {
 	fmt.Println("\n下一步:")
 	fmt.Println("  1. gateway trust-ca        # 信任 CA 证书")
 	fmt.Println("  2. gateway install-wrapper # 安装命令包装器")
-	fmt.Println("  3. gateway start           # 启动网关")
+	fmt.Println("  3. gateway start-background # 后台启动网关")
 }
 
 func handleStart(configPath string) {
@@ -474,7 +480,7 @@ func handleInstallWrapper() {
 	if err := InstallWrapper(); err != nil {
 		log.Fatalf("Install wrapper failed: %v", err)
 	}
-	fmt.Println("✓ Wrapper installed. Now run: gateway start")
+	fmt.Println("✓ Wrapper installed. Now run: gateway start-background")
 }
 
 func handleUninstall() {
@@ -535,14 +541,18 @@ func handleQuickInstall(configPath string) {
 	}
 	fmt.Println("  ✓ 包装器已安装")
 
-	// 4. 测试连接
-	fmt.Println("\n[4/4] 测试连接...")
-	fmt.Println("  ⏩ 跳过（手动测试: gateway start）")
+	// 4. 重启后台网关
+	fmt.Println("\n[4/4] 重启后台网关...")
+	_ = handleStop(configPath)
+	if code := handleStartBackground(configPath); code != 0 {
+		os.Exit(code)
+	}
 
 	fmt.Println("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("✅ 安装完成！")
 	fmt.Println("\n使用方法:")
-	fmt.Println("  1. 在新终端运行: gateway start")
-	fmt.Println("  2. 在另一个终端直接使用: claude \"your prompt\"")
+	fmt.Println("  1. 直接使用: claude \"your prompt\"")
+	fmt.Println("  2. 查看状态: gateway status")
+	fmt.Println("  3. 查看日志: tail -f ~/.claude-gateway/gateway.log")
 	fmt.Println("\n网关会自动拦截并改写请求，无需手动设置环境变量。")
 }

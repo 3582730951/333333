@@ -80,7 +80,7 @@ case "$ARCH" in
 esac
 
 # 下载网关二进制
-echo "[1/5] 下载网关..."
+echo "[1/6] 下载网关..."
 GATEWAY_URL="%s/download/gateway?os=$OS&arch=$ARCH"
 curl -fsSL "$GATEWAY_URL" -o /tmp/gateway || {
   echo "❌ 下载失败，请检查网络或 VPS 地址"
@@ -89,7 +89,7 @@ curl -fsSL "$GATEWAY_URL" -o /tmp/gateway || {
 chmod +x /tmp/gateway
 
 # 移动到系统目录
-echo "[2/5] 安装到 /usr/local/bin..."
+echo "[2/6] 安装到 /usr/local/bin..."
 sudo mv /tmp/gateway /usr/local/bin/gateway || {
   echo "⚠️  需要 sudo 权限，请手动执行："
   echo "    sudo mv /tmp/gateway /usr/local/bin/gateway"
@@ -99,17 +99,22 @@ GATEWAY_BIN="/usr/local/bin/gateway"
 
 # 配置
 echo ""
-echo "[3/5] 配置网关..."
+echo "[3/6] 配置网关..."
 POOL_URL="%s"
 %s
 export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 
 # 初始化配置
-echo "[4/5] 初始化配置和 CA..."
+echo "[4/6] 初始化配置和 CA..."
 "$GATEWAY_BIN" init --pool-url "$POOL_URL" --key "$API_KEY"
 
+# 停止旧版/旧配置网关（包括上次 nohup 后台进程）
+echo ""
+echo "[5/6] 停止旧网关..."
+"$GATEWAY_BIN" stop || true
+
 # 自动信任 CA
-echo "[5/5] 信任 CA 证书..."
+echo "[6/6] 信任 CA 证书..."
 if ! "$GATEWAY_BIN" trust-ca; then
   echo ""
   echo "⚠️  自动信任失败，请手动执行："
@@ -117,7 +122,7 @@ if ! "$GATEWAY_BIN" trust-ca; then
   echo ""
   echo "执行完成后，运行以下命令继续："
   echo "  $GATEWAY_BIN install-wrapper"
-  echo "  $GATEWAY_BIN start &"
+  echo "  $GATEWAY_BIN start-background"
   exit 0
 fi
 
@@ -131,17 +136,23 @@ else
   echo "    如果稍后安装 Claude Code，运行: $GATEWAY_BIN install-wrapper"
 fi
 
+# 后台启动新网关
+echo ""
+echo "后台启动 Claude Gateway..."
+"$GATEWAY_BIN" start-background
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "✅ 安装完成！"
 echo ""
 echo "使用方法:"
-echo "  1. 启动网关: $GATEWAY_BIN start &"
-echo "  2. 使用 Claude: claude \"your prompt\""
-echo "  3. 计划模式: claude-plan \"your prompt\""
+echo "  1. 使用 Claude: claude \"your prompt\""
+echo "  2. 计划模式: claude-plan \"your prompt\""
+echo "  3. 停止网关: $GATEWAY_BIN stop"
 echo ""
 echo "查看状态: $GATEWAY_BIN status"
 echo "查看日志: tail -f ~/.claude-gateway/gateway.log"
+echo "PID 文件: ~/.claude-gateway/gateway.pid"
 `, baseURL, baseURL, apiKeyLine)
 
 	w.Header().Set("Content-Type", "text/x-shellscript")

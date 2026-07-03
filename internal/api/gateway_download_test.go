@@ -67,3 +67,35 @@ func TestSetupScriptDownloadsGatewayForDetectedPlatform(t *testing.T) {
 		t.Fatalf("gateway installer should pass detected platform to download endpoint\n---\n%s", claudeInstall)
 	}
 }
+
+func TestGatewayInstallScriptRestartsManagedGateway(t *testing.T) {
+	app := &Server{}
+	req := httptest.NewRequest(http.MethodGet, "/install-gateway.sh?key=cap_abc123", nil)
+	req.Host = "pool.example"
+	rec := httptest.NewRecorder()
+	app.handleGatewayInstallScript(rec, req)
+
+	resp := rec.Result()
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	script := string(body)
+	for _, want := range []string{
+		`"$GATEWAY_BIN" stop`,
+		`"$GATEWAY_BIN" start-background`,
+		"gateway.pid",
+		"gateway.log",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("install-gateway script should manage background gateway; missing %q\n---\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, `$GATEWAY_BIN start &`) {
+		t.Fatalf("install-gateway script should not tell users to manually background start\n---\n%s", script)
+	}
+}
