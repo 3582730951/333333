@@ -469,7 +469,7 @@ func TestGatewayTargetPolicyBlocksNonessentialTraffic(t *testing.T) {
 	}
 }
 
-func TestGatewayTargetPolicyAllowsOnlyEssentialHosts(t *testing.T) {
+func TestGatewayTargetPolicyInterceptsClaudeAndForwardsUnknownHosts(t *testing.T) {
 	poolURL := "https://pool.example:1455"
 	tests := []struct {
 		host string
@@ -484,7 +484,12 @@ func TestGatewayTargetPolicyAllowsOnlyEssentialHosts(t *testing.T) {
 		{"pypi.org:443", gatewayTargetForward},
 		{"api.osv.dev:443", gatewayTargetForward},
 		{"pool.example:1455", gatewayTargetForward},
-		{"example.com:443", gatewayTargetBlock},
+		{"api.openalex.org:443", gatewayTargetForward},
+		{"api.crossref.org:443", gatewayTargetForward},
+		{"api.semanticscholar.org:443", gatewayTargetForward},
+		{"export.arxiv.org:443", gatewayTargetForward},
+		{"example.com:443", gatewayTargetForward},
+		{"statsig.anthropic.com:443", gatewayTargetBlock},
 	}
 	for _, tt := range tests {
 		decision := classifyGatewayTarget(tt.host, poolURL)

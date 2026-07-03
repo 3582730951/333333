@@ -41,7 +41,7 @@ func defaultGatewayPolicy() GatewayPolicy {
 		InterceptHosts:         poolconfig.DefaultClaudeGatewayInterceptHosts(),
 		ForwardHosts:           poolconfig.DefaultClaudeGatewayForwardHosts(),
 		BlockedHostPatterns:    poolconfig.DefaultClaudeGatewayBlockedHostPatterns(),
-		UnknownTargetPolicy:    "block",
+		UnknownTargetPolicy:    "forward",
 		DisableNonessentialEnv: true,
 		StrictLinuxDefault:     true,
 	}
@@ -88,7 +88,7 @@ func classifyGatewayTarget(target, poolURL string, policies ...GatewayPolicy) ga
 	if policy.UnknownTargetPolicy == "forward" {
 		return gatewayTargetDecision{Action: gatewayTargetForward}
 	}
-	return gatewayTargetDecision{Action: gatewayTargetBlock, Reason: "strict gateway policy allows only Anthropic/Pool traffic"}
+	return gatewayTargetDecision{Action: gatewayTargetBlock, Reason: "gateway policy blocks unknown target"}
 }
 
 func shouldRewriteGatewayRequest(path string) bool {

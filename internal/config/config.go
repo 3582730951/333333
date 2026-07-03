@@ -650,7 +650,7 @@ func Default() Config {
 		ClaudeGatewayInterceptHosts:         DefaultClaudeGatewayInterceptHosts(),
 		ClaudeGatewayForwardHosts:           DefaultClaudeGatewayForwardHosts(),
 		ClaudeGatewayBlockedHostPatterns:    DefaultClaudeGatewayBlockedHostPatterns(),
-		ClaudeGatewayUnknownTargetPolicy:    "block",
+		ClaudeGatewayUnknownTargetPolicy:    "forward",
 		ClaudeGatewayDisableNonessentialEnv: true,
 		ClaudeGatewayStrictLinuxDefault:     true,
 		DefaultRegisterMethod:               "node",
@@ -1086,7 +1086,7 @@ func (c *Config) normalize() {
 	case "block", "forward":
 		c.ClaudeGatewayUnknownTargetPolicy = strings.ToLower(strings.TrimSpace(c.ClaudeGatewayUnknownTargetPolicy))
 	default:
-		c.ClaudeGatewayUnknownTargetPolicy = "block"
+		c.ClaudeGatewayUnknownTargetPolicy = "forward"
 	}
 	if c.ClaudeOAuthAuthURL == "" {
 		c.ClaudeOAuthAuthURL = DefaultClaudeOAuthAuthURL

@@ -130,7 +130,7 @@ func configFields() []configField {
 			Help: "阻断的非必要遥测/更新目标关键词或通配符。空=不按关键词阻断。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayBlockedHostPatterns }},
 		{Key: "claude_gateway_unknown_target_policy", Label: "未知目标策略", Category: catClaudeGateway, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"block", "forward"},
-			Help:    "block=只允许配置中的必要目标；forward=未命中阻断规则时直连转发。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeGatewayUnknownTargetPolicy, "block") }},
+			Help:    "forward=默认只 MITM Claude/API，其他目标直连转发；block=只允许配置中的必要目标。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeGatewayUnknownTargetPolicy, "forward") }},
 		{Key: "claude_gateway_disable_nonessential_env", Label: "写入禁遥测环境变量", Category: catClaudeGateway, Type: fieldBool, Effect: effectHot,
 			Help: "开=脚本、wrapper 和 strict runtime 写入官方禁遥测/禁更新环境变量。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayDisableNonessentialEnv }},
 		{Key: "claude_gateway_strict_linux_default", Label: "Claude strict Linux 默认启用", Category: catClaudeGateway, Type: fieldBool, Effect: effectHot,

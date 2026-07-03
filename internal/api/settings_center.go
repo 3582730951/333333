@@ -1113,7 +1113,7 @@ func optimalSystemTemplateValues() map[string]interface{} {
 		"claude_native_cache_breakpoint_inject":   true,
 		"claude_cch_signing":                      true,
 		"claude_cache_ttl":                        "1h",
-		"claude_gateway_unknown_target_policy":    "block",
+		"claude_gateway_unknown_target_policy":    "forward",
 		"claude_gateway_forward_hosts":            strings.Join(config.DefaultClaudeGatewayForwardHosts(), ","),
 		"claude_gateway_disable_nonessential_env": true,
 		"claude_gateway_strict_linux_default":     true,

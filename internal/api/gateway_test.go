@@ -69,6 +69,9 @@ func TestGatewayIdentity(t *testing.T) {
 	if got := strings.Join(resp.GatewayPolicy.ForwardHosts, ","); !strings.Contains(got, "api.openai.com") || !strings.Contains(got, "api.github.com") || !strings.Contains(got, "api.osv.dev") {
 		t.Fatalf("default gateway policy must forward child-tool hosts, got %q", got)
 	}
+	if resp.GatewayPolicy.UnknownTargetPolicy != "forward" {
+		t.Fatalf("default gateway policy must forward unknown child-tool hosts, got %q", resp.GatewayPolicy.UnknownTargetPolicy)
+	}
 
 	// Determinism: the same downstream_key yields a stable virtual identity; a different
 	// key must not collide.
