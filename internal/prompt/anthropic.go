@@ -183,16 +183,12 @@ func StopReasonToFinish(v interface{}) string {
 	}
 }
 
-// EnsureAnthropicCacheControl adds Anthropic prompt-cache breakpoints to a
-// /v1/messages body that has none — most importantly the OpenAI-compat→Claude
-// path, whose converted body would otherwise be billed at full input price every
-// turn (zero cache hits). It mirrors what the native Claude Code client does: a
-// breakpoint at the end of the (large, stable) system prompt and on the most
-// recent turn, capped at the Anthropic limit of 4 total breakpoints. A body that
-// already carries cache_control keeps at least one free slot respected: we only
-// top up to 4, never remove the client's own breakpoints. ttl == "1h" requests
-// the extended (1-hour) cache; anything else uses the standard 5-minute ephemeral
-// cache. Model quality, reasoning, and output are unaffected — only billing drops.
+// EnsureAnthropicCacheControl adds Anthropic prompt-cache breakpoints to stable
+// Claude /v1/messages prefixes. It is intentionally structural: tools, system
+// text, Claude Code's auto-context reminder, and prior user turns can be cached
+// without changing model quality, reasoning, tool schemas, or the latest user
+// request. ttl == "1h" requests the extended (1-hour) cache; anything else uses
+// the standard 5-minute ephemeral cache.
 func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 	var root map[string]interface{}
 	if json.Unmarshal(body, &root) != nil {
@@ -201,24 +197,24 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 	existing := countCacheControl(root["system"]) + countCacheControl(root["tools"]) + countCacheControlMessages(root["messages"])
 	budget := 4 - existing
 	if budget <= 0 {
+		if anthropicwire.NormalizeCacheControlTTL(root) {
+			if out, err := json.Marshal(root); err == nil {
+				return out
+			}
+		}
 		return body
 	}
 	mk := func() map[string]interface{} {
 		m := map[string]interface{}{"type": "ephemeral"}
-		if ttl == "1h" {
+		if strings.TrimSpace(ttl) == "1h" {
 			m["ttl"] = "1h"
 		}
 		return m
 	}
 	changed := false
-	// 1) End of the system prompt — the largest stable cacheable prefix.
-	if sys, ok := markSystemTail(root["system"], mk); ok {
-		root["system"] = sys
-		budget--
-		changed = true
-	}
-	// 2) End of the tool definition prefix. Tool schemas are stable across turns and
-	// should be preferred over marking volatile last-user content.
+
+	// 1) End of the tool definition prefix. Tool schemas are stable across turns
+	// and should be preferred over marking volatile last-user content.
 	hasTools := hasCacheableList(root["tools"])
 	if budget > 0 {
 		if markListTail(root["tools"], mk) {
@@ -226,9 +222,35 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 			changed = true
 		}
 	}
-	// 3) Most recent message turn as a fallback for bodies without a stable tools
-	// prefix, so simple multi-turn agent loops still reuse the prompt prefix.
-	if budget > 0 && !hasTools {
+	// 2) End of the non-billing system prompt. Claude Code's billing header
+	// changes per request and must not become a cache breakpoint.
+	if budget > 0 {
+		if sys, ok := markSystemTail(root["system"], mk); ok {
+			root["system"] = sys
+			budget--
+			changed = true
+		}
+	}
+	// 3) Claude Code native auto-context block: this is the stable prefix before
+	// the real user request in current Claude Code request shapes.
+	if budget > 0 {
+		if markClaudeNativeAutoContext(root["messages"], mk) {
+			budget--
+			changed = true
+		}
+	}
+	// 4) Multi-turn conversation history. The newest user message stays unmarked
+	// so different final questions can share the earlier prefix.
+	markedHistory := false
+	if budget > 0 {
+		if markSecondToLastUserTurn(root["messages"], mk) {
+			budget--
+			markedHistory = true
+			changed = true
+		}
+	}
+	// 5) Fallback for simple one-turn compat bodies without tools/history.
+	if budget > 0 && !hasTools && !markedHistory {
 		if msgs, ok := root["messages"].([]interface{}); ok && len(msgs) > 0 {
 			if markMessageTail(msgs[len(msgs)-1], mk) {
 				changed = true
@@ -303,18 +325,22 @@ func countCacheControlMessages(messages interface{}) int {
 }
 
 // markSystemTail puts a cache_control breakpoint at the end of the system prompt,
-// converting a plain-string system into a single text block when needed. Returns
-// the (possibly rewritten) system value and whether a breakpoint was added.
+// converting a plain-string system into a single text block when needed. It never
+// marks Claude Code's x-anthropic-billing-header block, which changes per request.
 func markSystemTail(system interface{}, mk func() map[string]interface{}) (interface{}, bool) {
 	switch s := system.(type) {
 	case string:
-		if strings.TrimSpace(s) == "" {
+		if strings.TrimSpace(s) == "" || isClaudeBillingHeaderText(s) {
 			return system, false
 		}
 		return []interface{}{map[string]interface{}{"type": "text", "text": s, "cache_control": mk()}}, true
 	case []interface{}:
 		for i := len(s) - 1; i >= 0; i-- {
 			if m, ok := s[i].(map[string]interface{}); ok {
+				text, _ := m["text"].(string)
+				if isClaudeBillingHeaderText(text) {
+					continue
+				}
 				if _, has := m["cache_control"]; has {
 					return system, false
 				}
@@ -324,6 +350,10 @@ func markSystemTail(system interface{}, mk func() map[string]interface{}) (inter
 		}
 	}
 	return system, false
+}
+
+func isClaudeBillingHeaderText(s string) bool {
+	return strings.HasPrefix(strings.TrimSpace(s), "x-anthropic-billing-header:")
 }
 
 func markListTail(v interface{}, mk func() map[string]interface{}) bool {
@@ -341,6 +371,67 @@ func markListTail(v interface{}, mk func() map[string]interface{}) bool {
 		}
 	}
 	return false
+}
+
+func markClaudeNativeAutoContext(messages interface{}, mk func() map[string]interface{}) bool {
+	msgs, ok := messages.([]interface{})
+	if !ok || len(msgs) == 0 {
+		return false
+	}
+	msg, ok := msgs[0].(map[string]interface{})
+	if !ok || msg["role"] != "user" {
+		return false
+	}
+	blocks, ok := msg["content"].([]interface{})
+	if !ok || len(blocks) < 2 {
+		return false
+	}
+	auto, ok := blocks[0].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if _, has := auto["cache_control"]; has {
+		return false
+	}
+	if typ, _ := auto["type"].(string); typ != "" && typ != "text" {
+		return false
+	}
+	text, _ := auto["text"].(string)
+	if !strings.HasPrefix(strings.TrimSpace(text), "<system-reminder>") ||
+		!strings.Contains(text, "As you answer the user's questions, you can use the following context:") {
+		return false
+	}
+	next, ok := blocks[1].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if typ, _ := next["type"].(string); typ != "" && typ != "text" {
+		return false
+	}
+	nextText, _ := next["text"].(string)
+	if strings.TrimSpace(nextText) == "" || strings.HasPrefix(strings.TrimSpace(nextText), "<system-reminder>") {
+		return false
+	}
+	auto["cache_control"] = mk()
+	return true
+}
+
+func markSecondToLastUserTurn(messages interface{}, mk func() map[string]interface{}) bool {
+	msgs, ok := messages.([]interface{})
+	if !ok {
+		return false
+	}
+	userIdx := make([]int, 0, len(msgs))
+	for i, msg := range msgs {
+		m, ok := msg.(map[string]interface{})
+		if ok && m["role"] == "user" {
+			userIdx = append(userIdx, i)
+		}
+	}
+	if len(userIdx) < 2 {
+		return false
+	}
+	return markMessageTail(msgs[userIdx[len(userIdx)-2]], mk)
 }
 
 // markMessageTail puts a cache_control breakpoint on the last content block of a

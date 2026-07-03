@@ -222,6 +222,9 @@ func prepareStrictRuntimePaths(identity *CachedIdentity) (strictRuntimePaths, er
 	if err := os.MkdirAll(filepath.Join(virtualHomeHost, ".claude"), gatewayPrivateDirMode); err != nil {
 		return strictRuntimePaths{}, err
 	}
+	if err := ensureClaudeAutoPlanSettings(virtualHomeHost); err != nil {
+		return strictRuntimePaths{}, err
+	}
 	if err := os.MkdirAll(filepath.Join(virtualHomeHost, "workspace"), gatewayPrivateDirMode); err != nil {
 		return strictRuntimePaths{}, err
 	}
@@ -258,6 +261,51 @@ func prepareStrictRuntimePaths(identity *CachedIdentity) (strictRuntimePaths, er
 		Group:           groupPath,
 		RuntimeCWD:      preservedRuntimeCWD(identity),
 	}, nil
+}
+
+func ensureClaudeAutoPlanSettings(virtualHomeHost string) error {
+	path := filepath.Join(virtualHomeHost, ".claude", "settings.json")
+	settings := map[string]interface{}{}
+	if raw, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return fmt.Errorf("read Claude Code settings: %w", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	env := mapSetting(settings, "env")
+	if _, ok := env["CLAUDE_CODE_ENABLE_AUTO_MODE"]; !ok {
+		env["CLAUDE_CODE_ENABLE_AUTO_MODE"] = "1"
+	}
+	settings["env"] = env
+
+	if _, ok := settings["useAutoModeDuringPlan"]; !ok {
+		settings["useAutoModeDuringPlan"] = true
+	}
+
+	permissions := mapSetting(settings, "permissions")
+	if _, ok := permissions["defaultMode"]; !ok {
+		permissions["defaultMode"] = "auto"
+	}
+	settings["permissions"] = permissions
+
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, gatewayConfigFileMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, gatewayConfigFileMode)
+}
+
+func mapSetting(settings map[string]interface{}, key string) map[string]interface{} {
+	if existing, ok := settings[key].(map[string]interface{}); ok {
+		return existing
+	}
+	return map[string]interface{}{}
 }
 
 func renderStrictRuntimeIdentityFiles(identity *CachedIdentity, uid, gid int) (string, string) {
@@ -368,6 +416,7 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		"NO_PROXY=" + gatewayNoProxy(cfg),
 		"ANTHROPIC_BASE_URL=" + poolServerBaseURL(cfg),
 		"ANTHROPIC_AUTH_TOKEN=" + cfg.DownstreamKey,
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 	}
 	policy := defaultGatewayPolicy()
 	if identity != nil && identity.Virtual != nil {

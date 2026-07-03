@@ -546,6 +546,7 @@ func TestGenerateWrapperRoutesClaudeThroughRunClaude(t *testing.T) {
 		"HTTP_PROXY=http://127.0.0.1:8765",
 		"HTTPS_PROXY=http://127.0.0.1:8765",
 		"ALL_PROXY=http://127.0.0.1:8765",
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 		"DISABLE_AUTOUPDATER=1",
 		"exec gateway run-claude --",
@@ -556,6 +557,29 @@ func TestGenerateWrapperRoutesClaudeThroughRunClaude(t *testing.T) {
 	}
 	if strings.Contains(script, `exec "`+realClaude+`" "$@"`) {
 		t.Fatalf("wrapper must invoke gateway run-claude, not real claude directly:\n%s", script)
+	}
+}
+
+func TestGeneratePlanWrapperStartsClaudeInPlanMode(t *testing.T) {
+	dir := t.TempDir()
+	wrapper := filepath.Join(dir, "claude-plan")
+	realClaude := filepath.Join(dir, "claude.real")
+	if err := GeneratePlanWrapper(realClaude, wrapper, "8765"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, want := range []string{
+		"CLAUDE_REAL_BIN=",
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
+		"exec gateway run-claude -- --permission-mode plan",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("plan wrapper missing %q\n---\n%s", want, script)
+		}
 	}
 }
 

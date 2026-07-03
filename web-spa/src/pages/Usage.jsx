@@ -28,7 +28,7 @@ function normalize(data) {
 }
 
 function fmtPct(v) {
-  const n = Number(v) || 0;
+  const n = Math.max(0, Math.min(1, Number(v) || 0));
   if (n > 0 && n < 0.1) return (n * 100).toFixed(1) + '%';
   return Math.round(n * 100) + '%';
 }
@@ -72,12 +72,13 @@ export default function Usage() {
 
   const totalTokens = ts.reduce((s, b) => s + (b.total_tokens || 0), 0);
   const totalReqs = ts.reduce((s, b) => s + (b.requests || 0), 0);
-  const cached = cacheSummary.cached_tokens || ts.reduce((s, b) => s + (b.cached_tokens || 0), 0);
-  const promptForCache = cacheSummary.prompt_tokens || ts.reduce((s, b) => s + (b.prompt_tokens || 0), 0);
-  const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cached / promptForCache : 0);
+  const cacheRead = cacheSummary.cache_read_tokens || ts.reduce((s, b) => s + (b.cache_read_tokens || 0), 0);
+  const cacheCreation = cacheSummary.cache_creation_tokens || ts.reduce((s, b) => s + (b.cache_creation_tokens || 0), 0);
+  const promptForCache = cacheSummary.cache_input_tokens || cacheSummary.prompt_tokens || ts.reduce((s, b) => s + (b.cache_input_tokens || b.prompt_tokens || 0), 0);
+  const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cacheRead / promptForCache : 0);
   const requestHitRate = cacheSummary.request_hit_rate || 0;
-  const missed = Math.max(0, promptForCache - cached);
-  const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cached / promptForCache) * 100))) : 0;
+  const missed = Math.max(0, promptForCache - cacheRead);
+  const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / promptForCache) * 100))) : 0;
   const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct) : 0;
 
   const topAccts = [...rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)).slice(0, 10)
@@ -87,7 +88,8 @@ export default function Usage() {
     const ok = downloadCSV('usage-by-account.csv', toCSV(rows, [
       { title: 'account', get: (r) => r.label || r.account_id }, { title: 'requests', get: (r) => r.requests },
       { title: 'prompt_tokens', get: (r) => r.prompt_tokens }, { title: 'completion_tokens', get: (r) => r.completion_tokens },
-      { title: 'cached_tokens', get: (r) => r.cached_tokens }, { title: 'total_tokens', get: (r) => r.total_tokens },
+      { title: 'cached_tokens', get: (r) => r.cached_tokens }, { title: 'cache_input_tokens', get: (r) => r.cache_input_tokens }, { title: 'cache_read_tokens', get: (r) => r.cache_read_tokens },
+      { title: 'cache_creation_tokens', get: (r) => r.cache_creation_tokens }, { title: 'total_tokens', get: (r) => r.total_tokens },
     ]));
     if (!ok) Toast.error('导出失败，请检查浏览器下载权限');
   };
@@ -97,7 +99,8 @@ export default function Usage() {
     { title: '请求数', dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: '输入', dataIndex: 'prompt_tokens', sorter: (a, b) => (a.prompt_tokens || 0) - (b.prompt_tokens || 0), render: fmtTokens },
     { title: '输出', dataIndex: 'completion_tokens', sorter: (a, b) => (a.completion_tokens || 0) - (b.completion_tokens || 0), render: fmtTokens },
-    { title: '缓存', dataIndex: 'cached_tokens', render: fmtTokens },
+    { title: '读命中', dataIndex: 'cache_read_tokens', render: (v) => fmtTokens(v || 0) },
+    { title: '写缓存', dataIndex: 'cache_creation_tokens', render: fmtTokens },
     { title: '总计', dataIndex: 'total_tokens', sorter: (a, b) => (a.total_tokens || 0) - (b.total_tokens || 0), defaultSortOrder: 'descend', render: (v) => <b>{fmtTokens(v)}</b> },
   ];
 
@@ -106,7 +109,8 @@ export default function Usage() {
     { title: '请求', dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: '请求命中', dataIndex: 'request_hit_rate', sorter: (a, b) => (a.request_hit_rate || 0) - (b.request_hit_rate || 0), render: fmtPct },
     { title: 'Token 命中', dataIndex: 'token_hit_rate', sorter: (a, b) => (a.token_hit_rate || 0) - (b.token_hit_rate || 0), render: fmtPct },
-    { title: '缓存 Token', dataIndex: 'cached_tokens', sorter: (a, b) => (a.cached_tokens || 0) - (b.cached_tokens || 0), render: fmtTokens },
+    { title: '读命中 Token', dataIndex: 'cache_read_tokens', sorter: (a, b) => (a.cache_read_tokens || 0) - (b.cache_read_tokens || 0), render: (v) => fmtTokens(v || 0) },
+    { title: '写缓存 Token', dataIndex: 'cache_creation_tokens', sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
     { title: '估算占比', dataIndex: 'estimated_rate', render: fmtPct },
   ];
 
@@ -117,6 +121,7 @@ export default function Usage() {
     { title: '命中请求', dataIndex: 'hit_requests', sorter: (a, b) => (a.hit_requests || 0) - (b.hit_requests || 0), render: fmtInt },
     { title: '请求命中', dataIndex: 'request_hit_rate', render: fmtPct },
     { title: 'Token 命中', dataIndex: 'token_hit_rate', sorter: (a, b) => (a.token_hit_rate || 0) - (b.token_hit_rate || 0), render: fmtPct },
+    { title: '写缓存', dataIndex: 'cache_creation_tokens', sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
   ];
 
   return (
@@ -134,14 +139,15 @@ export default function Usage() {
         <StatCard label="总 Token" value={fmtTokens(totalTokens)} color={C.violet} />
         <StatCard label="请求数" value={fmtInt(totalReqs)} color={C.blue} />
         <StatCard label="请求命中概率" value={fmtPct(requestHitRate)} color={C.green} sub={`${fmtInt(cacheSummary.hit_requests || 0)} / ${fmtInt(cacheSummary.requests || 0)} 请求`} />
-        <StatCard label="缓存 Token 占比" value={fmtPct(cacheRate)} color={C.cyan} sub={`${fmtTokens(cached)} / ${fmtTokens(promptForCache)} 输入`} />
+        <StatCard label="缓存 Token 占比" value={fmtPct(cacheRate)} color={C.cyan} sub={`${fmtTokens(cacheRead)} / ${fmtTokens(promptForCache)} 输入`} />
+        <StatCard label="写入缓存 Token" value={fmtTokens(cacheCreation)} color={C.amber} sub="cache_creation_input_tokens" />
       </div>
 
       <div className="pool-cache-breakdown" style={{ marginBottom: 18 }}>
         <div className="pool-cache-breakdown__head">
           <div>
             <div className="pool-section-title">缓存命中构成</div>
-            <div className="pool-text-tertiary">cached tokens / eligible prompt tokens</div>
+            <div className="pool-text-tertiary">cache read tokens / eligible prompt tokens</div>
           </div>
           <b>{fmtPct(cacheRate)}</b>
         </div>
@@ -150,7 +156,8 @@ export default function Usage() {
           <span className="pool-cache-breakdown__missed" style={{ width: `${missedPct}%` }} />
         </div>
         <div className="pool-cache-breakdown__legend">
-          <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--cached" />命中 {fmtTokens(cached)}</span>
+          <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--cached" />读命中 {fmtTokens(cacheRead)}</span>
+          <span>写入缓存 {fmtTokens(cacheCreation)}</span>
           <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--missed" />未命中 {fmtTokens(missed)}</span>
           <span>请求命中 {fmtPct(requestHitRate)}</span>
         </div>
@@ -166,7 +173,7 @@ export default function Usage() {
           <GroupedBar data={topAccts} series={[{ key: '输入', color: C.blue }, { key: '输出', color: C.green }]} stacked />
         </div>
         <div className="pool-chart-card">
-          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cached / prompt · 颜色区分模型（命中率越高成本越低）</div></div></div>
+          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cache read / prompt · 颜色区分模型（命中率越高成本越低）</div></div></div>
           <div style={{ paddingTop: 6 }}><CacheRateBars data={byModel} /></div>
         </div>
       </div>

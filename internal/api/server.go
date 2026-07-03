@@ -1254,7 +1254,7 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	s.enqueueWrite(func() {
 		wctx, cancel := bgWriteContext()
 		defer cancel()
-		err := s.store.InsertUsageRecord(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.RawUsage)
+		err := s.store.InsertUsageRecordWithCacheDetails(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage)
 		if err != nil {
 			log.Printf("[USAGE-ERROR] InsertUsageRecord failed: account=%s, model=%s, prompt=%d, completion=%d, total=%d, error=%v",
 				accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, err)
@@ -1324,7 +1324,7 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	s.enqueueWrite(func() {
 		wctx, cancel := bgWriteContext()
 		defer cancel()
-		err := s.store.InsertUsageRecord(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.RawUsage)
+		err := s.store.InsertUsageRecordWithCacheDetails(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage)
 		if err != nil {
 			log.Printf("[USAGE-ERROR] InsertUsageRecord failed (streaming): account=%s, model=%s, prompt=%d, completion=%d, total=%d, error=%v",
 				accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, err)

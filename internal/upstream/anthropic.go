@@ -689,13 +689,117 @@ func signClaudeBillingCCH(body []byte) []byte {
 	if err != nil {
 		return body
 	}
-	cch := fmt.Sprintf("%05x", xxHash64.Checksum(unsignedBody, claudeCCHSeed)&0xFFFFF)
+	cch := fmt.Sprintf("%05x", xxHash64.Checksum(claudeCCHSigningBody(unsignedBody), claudeCCHSeed)&0xFFFFF)
 	signedBillingHeader := claudeBillingHeaderCCHPattern.ReplaceAllString(unsignedBillingHeader, "cch="+cch+";")
 	signedBody, err := sjson.SetBytes(unsignedBody, "system.0.text", signedBillingHeader)
 	if err != nil {
 		return unsignedBody
 	}
 	return signedBody
+}
+
+func claudeCCHSigningBody(unsignedBody []byte) []byte {
+	var root map[string]interface{}
+	if json.Unmarshal(unsignedBody, &root) != nil {
+		return unsignedBody
+	}
+	hasToolOrSystemCache := claudeBlockListHasCacheControl(root["tools"]) || claudeBlockListHasCacheControl(root["system"])
+	hasMessageCache := claudeMessagesHaveCacheControl(root["messages"])
+	if !hasToolOrSystemCache && !hasMessageCache {
+		return unsignedBody
+	}
+
+	if hasToolOrSystemCache {
+		delete(root, "messages")
+	} else if prefix, ok := claudeMessagesPrefixThroughCacheControl(root["messages"]); ok {
+		root["messages"] = prefix
+	} else {
+		return unsignedBody
+	}
+	if out, err := json.Marshal(root); err == nil {
+		return out
+	}
+	return unsignedBody
+}
+
+func claudeBlockListHasCacheControl(v interface{}) bool {
+	blocks, ok := v.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, block := range blocks {
+		if bm, ok := block.(map[string]interface{}); ok {
+			if _, has := bm["cache_control"]; has {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func claudeMessagesHaveCacheControl(v interface{}) bool {
+	msgs, ok := v.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, msg := range msgs {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, has := m["cache_control"]; has {
+			return true
+		}
+		if blocks, ok := m["content"].([]interface{}); ok {
+			for _, block := range blocks {
+				if bm, ok := block.(map[string]interface{}); ok {
+					if _, has := bm["cache_control"]; has {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func claudeMessagesPrefixThroughCacheControl(v interface{}) ([]interface{}, bool) {
+	msgs, ok := v.([]interface{})
+	if !ok {
+		return nil, false
+	}
+	out := make([]interface{}, 0, len(msgs))
+	for _, msg := range msgs {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			out = append(out, msg)
+			continue
+		}
+		if _, has := m["cache_control"]; has {
+			out = append(out, m)
+			return out, true
+		}
+		blocks, ok := m["content"].([]interface{})
+		if !ok {
+			out = append(out, m)
+			continue
+		}
+		for i, block := range blocks {
+			if bm, ok := block.(map[string]interface{}); ok {
+				if _, has := bm["cache_control"]; has {
+					cp := make(map[string]interface{}, len(m))
+					for k, v := range m {
+						cp[k] = v
+					}
+					cp["content"] = blocks[:i+1]
+					out = append(out, cp)
+					return out, true
+				}
+			}
+		}
+		out = append(out, m)
+	}
+	return nil, false
 }
 
 // claudeSessionID derives the virtual X-Claude-Code-Session-Id, bound to the account.

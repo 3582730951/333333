@@ -759,6 +759,8 @@ CREATE TABLE IF NOT EXISTS usage_records(
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens INTEGER NOT NULL DEFAULT 0,
   cached_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
   raw_usage_json TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
@@ -946,6 +948,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE api_keys ADD COLUMN secret TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN api_key_hash TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
 		// Cooldown→health-recheck gate: a benched account stays out of the candidate
 		// pool until a liveness probe confirms it recovered (older DBs created before
 		// the recheck loop existed).
@@ -3205,19 +3209,25 @@ func (s *Store) ListVirtualLedger(ctx context.Context, routeKeyHash string, limi
 }
 
 func (s *Store) InsertUsageRecord(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached int64, raw json.RawMessage) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, raw_usage_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, string(raw), Now())
+	return s.InsertUsageRecordWithCacheDetails(ctx, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cached, 0, raw)
+}
+
+func (s *Store) InsertUsageRecordWithCacheDetails(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached, cacheRead, cacheCreation int64, raw json.RawMessage) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, raw_usage_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation, string(raw), Now())
 	return err
 }
 
 // UserUsageRow is a per-model rollup of one portal user's usage (their own console).
 type UserUsageRow struct {
-	Model            string `json:"model"`
-	Requests         int64  `json:"requests"`
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CompletionTokens int64  `json:"completion_tokens"`
-	TotalTokens      int64  `json:"total_tokens"`
-	CachedTokens     int64  `json:"cached_tokens"`
+	Model               string `json:"model"`
+	Requests            int64  `json:"requests"`
+	PromptTokens        int64  `json:"prompt_tokens"`
+	CompletionTokens    int64  `json:"completion_tokens"`
+	TotalTokens         int64  `json:"total_tokens"`
+	CachedTokens        int64  `json:"cached_tokens"`
+	CacheReadTokens     int64  `json:"cache_read_tokens"`
+	CacheCreationTokens int64  `json:"cache_creation_tokens"`
 }
 
 type CacheUsageReport struct {
@@ -3229,23 +3239,37 @@ type CacheUsageReport struct {
 }
 
 type CacheUsageMetricRow struct {
-	AccountID         string  `json:"account_id,omitempty"`
-	Model             string  `json:"model,omitempty"`
-	APIKeyHashPrefix  string  `json:"api_key_hash_prefix,omitempty"`
-	Requests          int64   `json:"requests"`
-	HitRequests       int64   `json:"hit_requests"`
-	RequestHitRate    float64 `json:"request_hit_rate"`
-	PromptTokens      int64   `json:"prompt_tokens"`
-	CachedTokens      int64   `json:"cached_tokens"`
-	TokenHitRate      float64 `json:"token_hit_rate"`
-	EstimatedRequests int64   `json:"estimated_requests"`
-	EstimatedRate     float64 `json:"estimated_rate"`
+	AccountID           string  `json:"account_id,omitempty"`
+	Model               string  `json:"model,omitempty"`
+	APIKeyHashPrefix    string  `json:"api_key_hash_prefix,omitempty"`
+	Requests            int64   `json:"requests"`
+	HitRequests         int64   `json:"hit_requests"`
+	RequestHitRate      float64 `json:"request_hit_rate"`
+	PromptTokens        int64   `json:"prompt_tokens"`
+	CachedTokens        int64   `json:"cached_tokens"`
+	CacheInputTokens    int64   `json:"cache_input_tokens"`
+	CacheReadTokens     int64   `json:"cache_read_tokens"`
+	CacheCreationTokens int64   `json:"cache_creation_tokens"`
+	TokenHitRate        float64 `json:"token_hit_rate"`
+	EstimatedRequests   int64   `json:"estimated_requests"`
+	EstimatedRate       float64 `json:"estimated_rate"`
 }
+
+const (
+	cacheRawNormalizedSQL   = "LOWER(REPLACE(COALESCE(raw_usage_json,''),' ',''))"
+	cacheReadTokensSQL      = "(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END)"
+	anthropicCacheUsageSQL  = "(" + cacheRawNormalizedSQL + " LIKE '%cache_read_input_tokens%' OR " + cacheRawNormalizedSQL + " LIKE '%cache_creation_input_tokens%' OR cache_creation_tokens > 0)"
+	cacheInputTokensSQL     = "(CASE WHEN " + anthropicCacheUsageSQL + " THEN prompt_tokens + " + cacheReadTokensSQL + " + cache_creation_tokens ELSE prompt_tokens END)"
+	estimatedUsageRecordSQL = "CASE WHEN " + cacheRawNormalizedSQL + " LIKE '%\"estimated\":true%' THEN 1 ELSE 0 END"
+)
 
 // UsageByUser aggregates a single user's usage per model, most-used first.
 func (s *Store) UsageByUser(ctx context.Context, userID string) ([]UserUsageRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
+       COALESCE(SUM(cache_creation_tokens),0)
 FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -3254,7 +3278,7 @@ FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) D
 	var out []UserUsageRow
 	for rows.Next() {
 		var r UserUsageRow
-		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens); err != nil {
+		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3267,7 +3291,10 @@ FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) D
 // shape as UsageByUser (UserUsageRow) — the UI computes hit rate = cached/prompt.
 func (s *Store) UsageByModel(ctx context.Context, since int64) ([]UserUsageRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
+       COALESCE(SUM(cache_creation_tokens),0)
 FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, since)
 	if err != nil {
 		return nil, err
@@ -3276,7 +3303,7 @@ FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_token
 	var out []UserUsageRow
 	for rows.Next() {
 		var r UserUsageRow
-		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens); err != nil {
+		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3318,12 +3345,15 @@ func (s *Store) cacheUsageSummary(ctx context.Context, since int64) (CacheUsageM
 	var row CacheUsageMetricRow
 	err := s.rdb.QueryRowContext(ctx, `
 SELECT COUNT(*),
-       COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN `+cacheReadTokensSQL+` > 0 THEN 1 ELSE 0 END),0),
        COALESCE(SUM(prompt_tokens),0),
        COALESCE(SUM(cached_tokens),0),
-       COALESCE(SUM(CASE WHEN LOWER(REPLACE(COALESCE(raw_usage_json,''),' ','')) LIKE '%"estimated":true%' THEN 1 ELSE 0 END),0)
+       COALESCE(SUM(`+cacheInputTokensSQL+`),0),
+       COALESCE(SUM(`+cacheReadTokensSQL+`),0),
+       COALESCE(SUM(cache_creation_tokens),0),
+       COALESCE(SUM(`+estimatedUsageRecordSQL+`),0)
 FROM usage_records
-WHERE created_at >= ?`, since).Scan(&row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.EstimatedRequests)
+WHERE created_at >= ?`, since).Scan(&row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.EstimatedRequests)
 	if err != nil {
 		return CacheUsageMetricRow{}, err
 	}
@@ -3348,13 +3378,19 @@ func (s *Store) cacheUsageRows(ctx context.Context, since int64, dimension strin
 	default:
 		return nil, fmt.Errorf("unknown cache usage dimension %q", dimension)
 	}
+	cacheReadSQL := strings.ReplaceAll(cacheReadTokensSQL, "%", "%%")
+	cacheInputSQL := strings.ReplaceAll(cacheInputTokensSQL, "%", "%%")
+	estimatedSQL := strings.ReplaceAll(estimatedUsageRecordSQL, "%", "%%")
 	rows, err := s.rdb.QueryContext(ctx, fmt.Sprintf(`
 SELECT %s,
        COUNT(*),
-       COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN `+cacheReadSQL+` > 0 THEN 1 ELSE 0 END),0),
        COALESCE(SUM(prompt_tokens),0),
        COALESCE(SUM(cached_tokens),0),
-       COALESCE(SUM(CASE WHEN LOWER(REPLACE(COALESCE(raw_usage_json,''),' ','')) LIKE '%%"estimated":true%%' THEN 1 ELSE 0 END),0)
+       COALESCE(SUM(`+cacheInputSQL+`),0),
+       COALESCE(SUM(`+cacheReadSQL+`),0),
+       COALESCE(SUM(cache_creation_tokens),0),
+       COALESCE(SUM(`+estimatedSQL+`),0)
 FROM usage_records
 WHERE created_at >= ?
 GROUP BY %s
@@ -3367,7 +3403,7 @@ LIMIT 200`, selectCols, groupBy), since)
 	var out []CacheUsageMetricRow
 	for rows.Next() {
 		var row CacheUsageMetricRow
-		if err := rows.Scan(&row.AccountID, &row.Model, &row.APIKeyHashPrefix, &row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.EstimatedRequests); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Model, &row.APIKeyHashPrefix, &row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.EstimatedRequests); err != nil {
 			return nil, err
 		}
 		finalizeCacheUsageMetric(&row)
@@ -3381,8 +3417,19 @@ func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
 		row.RequestHitRate = float64(row.HitRequests) / float64(row.Requests)
 		row.EstimatedRate = float64(row.EstimatedRequests) / float64(row.Requests)
 	}
-	if row.PromptTokens > 0 {
-		row.TokenHitRate = float64(row.CachedTokens) / float64(row.PromptTokens)
+	denominator := row.CacheInputTokens
+	if denominator <= 0 {
+		denominator = row.PromptTokens
+		row.CacheInputTokens = row.PromptTokens
+	}
+	if denominator > 0 {
+		row.TokenHitRate = float64(row.CacheReadTokens) / float64(denominator)
+		if row.TokenHitRate > 1 {
+			row.TokenHitRate = 1
+		}
+		if row.TokenHitRate < 0 {
+			row.TokenHitRate = 0
+		}
 	}
 }
 
@@ -3394,7 +3441,10 @@ func (s *Store) UsageTimeseriesByUser(ctx context.Context, userID string, since,
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT (created_at / ?) * ? AS bucket, COUNT(*),
        COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
-       COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
+       COALESCE(SUM(cache_creation_tokens),0),
+       COALESCE(SUM(total_tokens),0)
 FROM usage_records WHERE user_id = ? AND created_at >= ?
 GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, userID, since)
 	if err != nil {
@@ -3404,7 +3454,7 @@ GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, userID, since)
 	var out []UsageBucket
 	for rows.Next() {
 		var b UsageBucket
-		if err := rows.Scan(&b.Bucket, &b.Requests, &b.PromptTokens, &b.CompletionTokens, &b.CachedTokens, &b.TotalTokens); err != nil {
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.PromptTokens, &b.CompletionTokens, &b.CachedTokens, &b.CacheReadTokens, &b.CacheCreationTokens, &b.TotalTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -3414,18 +3464,23 @@ GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, userID, since)
 
 // UsageSummaryRow is a per-account rollup of recorded usage.
 type UsageSummaryRow struct {
-	AccountID        string `json:"account_id"`
-	Requests         int64  `json:"requests"`
-	PromptTokens     int64  `json:"prompt_tokens"`
-	CompletionTokens int64  `json:"completion_tokens"`
-	TotalTokens      int64  `json:"total_tokens"`
-	CachedTokens     int64  `json:"cached_tokens"`
+	AccountID           string `json:"account_id"`
+	Requests            int64  `json:"requests"`
+	PromptTokens        int64  `json:"prompt_tokens"`
+	CompletionTokens    int64  `json:"completion_tokens"`
+	TotalTokens         int64  `json:"total_tokens"`
+	CachedTokens        int64  `json:"cached_tokens"`
+	CacheReadTokens     int64  `json:"cache_read_tokens"`
+	CacheCreationTokens int64  `json:"cache_creation_tokens"`
 }
 
 // UsageSummary aggregates usage_records per account, most-used first.
 func (s *Store) UsageSummary(ctx context.Context) ([]UsageSummaryRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
+       COALESCE(SUM(cache_creation_tokens),0)
 FROM usage_records GROUP BY account_id ORDER BY SUM(total_tokens) DESC`)
 	if err != nil {
 		return nil, err
@@ -3434,7 +3489,7 @@ FROM usage_records GROUP BY account_id ORDER BY SUM(total_tokens) DESC`)
 	var out []UsageSummaryRow
 	for rows.Next() {
 		var row UsageSummaryRow
-		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
@@ -3449,7 +3504,10 @@ func (s *Store) UsageSummaryByAccountIDs(ctx context.Context, accountIDs []strin
 		return out, nil
 	}
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0)
+SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
+       COALESCE(SUM(cache_creation_tokens),0)
 FROM usage_records
 WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)
 GROUP BY account_id`, stringArgs(accountIDs)...)
@@ -3459,7 +3517,7 @@ GROUP BY account_id`, stringArgs(accountIDs)...)
 	defer rows.Close()
 	for rows.Next() {
 		var row UsageSummaryRow
-		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens); err != nil {
 			return nil, err
 		}
 		out[row.AccountID] = row
@@ -3470,12 +3528,14 @@ GROUP BY account_id`, stringArgs(accountIDs)...)
 // UsageBucket is a time-bucketed rollup of usage_records, used to render the
 // usage-over-time area chart on the dashboard.
 type UsageBucket struct {
-	Bucket           int64 `json:"bucket"` // epoch seconds at the start of the bucket
-	Requests         int64 `json:"requests"`
-	PromptTokens     int64 `json:"prompt_tokens"`
-	CompletionTokens int64 `json:"completion_tokens"`
-	CachedTokens     int64 `json:"cached_tokens"`
-	TotalTokens      int64 `json:"total_tokens"`
+	Bucket              int64 `json:"bucket"` // epoch seconds at the start of the bucket
+	Requests            int64 `json:"requests"`
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
+	CachedTokens        int64 `json:"cached_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
 }
 
 // UsageTimeseries returns usage_records aggregated into fixed-width time buckets
@@ -3488,7 +3548,10 @@ func (s *Store) UsageTimeseries(ctx context.Context, since, bucketSeconds int64)
 SELECT (created_at / ?) * ? AS bucket,
        COUNT(*),
        COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
-       COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0)
+       COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
+       COALESCE(SUM(cache_creation_tokens),0),
+       COALESCE(SUM(total_tokens),0)
 FROM usage_records
 WHERE created_at >= ?
 GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since)
@@ -3499,7 +3562,7 @@ GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since)
 	var out []UsageBucket
 	for rows.Next() {
 		var b UsageBucket
-		if err := rows.Scan(&b.Bucket, &b.Requests, &b.PromptTokens, &b.CompletionTokens, &b.CachedTokens, &b.TotalTokens); err != nil {
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.PromptTokens, &b.CompletionTokens, &b.CachedTokens, &b.CacheReadTokens, &b.CacheCreationTokens, &b.TotalTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, b)

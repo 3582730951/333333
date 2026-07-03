@@ -27,10 +27,8 @@ func TestCodexCreatedFrameDoesNotCommitContent(t *testing.T) {
 	}
 }
 
-func TestProbeEarlyClaudeSSEFailureDetectsErrorAfterMessageStart(t *testing.T) {
-	stream := "event: message_start\n" +
-		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"role\":\"assistant\"}}\n\n" +
-		"event: error\n" +
+func TestProbeEarlyClaudeSSEFailureDetectsErrorBeforeMessageStart(t *testing.T) {
+	stream := "event: error\n" +
 		"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This account has hit its usage limit.\"}}\n\n"
 	prefix, retry, err := probeEarlyClaudeSSEFailure(strings.NewReader(stream))
 	if err != nil {
@@ -38,6 +36,14 @@ func TestProbeEarlyClaudeSSEFailureDetectsErrorAfterMessageStart(t *testing.T) {
 	}
 	if !retry {
 		t.Fatalf("expected retryable early Claude error, prefix=%q", prefix)
+	}
+}
+
+func TestClaudeMessageStartCommitsStream(t *testing.T) {
+	frame := []byte("event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"role\":\"assistant\"}}\n\n")
+	if !claudeSSEFrameCommitsContent(frame) {
+		t.Fatal("message_start should commit the Claude stream so downstream sees incremental output")
 	}
 }
 

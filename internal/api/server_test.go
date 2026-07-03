@@ -2058,9 +2058,7 @@ func TestClaudeMessagesStreamingEarlyErrorRetriesBeforeWrite(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		switch r.Header.Get("Authorization") {
 		case "Bearer sk-ant-oat-a":
-			_, _ = w.Write([]byte("event: message_start\n" +
-				"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"role\":\"assistant\"}}\n\n" +
-				"event: error\n" +
+			_, _ = w.Write([]byte("event: error\n" +
 				"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This account has hit its usage limit.\"}}\n\n"))
 		case "Bearer sk-ant-oat-b":
 			bCalled = true
@@ -2100,7 +2098,7 @@ func TestClaudeMessagesStreamingEarlyErrorRetriesBeforeWrite(t *testing.T) {
 	}
 }
 
-func TestClaudeMessagesStreamingContentThenErrorRetriesWithoutLeakingPartial(t *testing.T) {
+func TestClaudeMessagesStreamingContentThenErrorDoesNotRetryAfterCommit(t *testing.T) {
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -2144,15 +2142,15 @@ func TestClaudeMessagesStreamingContentThenErrorRetriesWithoutLeakingPartial(t *
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !bCalled {
-		t.Fatalf("Claude stream content-then-error was not retried on account B; body=%s", body)
+	if bCalled {
+		t.Fatalf("Claude stream retried after content was already committed; body=%s", body)
 	}
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ok-from-b") || strings.Contains(string(body), "partial-from-a") || strings.Contains(string(body), "rate_limit_error") || strings.Contains(string(body), "msg_a") {
-		t.Fatalf("downstream saw account A partial/error after Claude retry: status=%d body=%s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "partial-from-a") || !strings.Contains(string(body), "rate_limit_error") || strings.Contains(string(body), "ok-from-b") {
+		t.Fatalf("downstream did not see the committed account A stream: status=%d body=%s", resp.StatusCode, body)
 	}
 }
 
-func TestClaudeMessagesStreamingCaptureLimitRetriesWithoutDiskSpill(t *testing.T) {
+func TestClaudeMessagesStreamingIgnoresCaptureLimitAfterCommit(t *testing.T) {
 	tempDir := t.TempDir()
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2196,11 +2194,11 @@ func TestClaudeMessagesStreamingCaptureLimitRetriesWithoutDiskSpill(t *testing.T
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !bCalled {
-		t.Fatalf("Claude stream over hold cap was not retried on account B; body=%s", body)
+	if bCalled {
+		t.Fatalf("Claude stream retried because of capture limit after content was committed; body=%s", body)
 	}
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ok-from-b") || strings.Contains(string(body), "partial-from-a") || strings.Contains(string(body), "msg_a") {
-		t.Fatalf("downstream saw oversized account A stream after retry: status=%d body=%s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "partial-from-a") || strings.Contains(string(body), "ok-from-b") {
+		t.Fatalf("downstream did not stream oversized account A response: status=%d body=%s", resp.StatusCode, body)
 	}
 	entries, err := os.ReadDir(tempDir)
 	if err != nil {

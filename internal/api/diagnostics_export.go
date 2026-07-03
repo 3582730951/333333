@@ -18,18 +18,20 @@ import (
 )
 
 type diagnosticUsageRecord struct {
-	ID               int64
-	AccountID        string
-	RouteKeyHash     string
-	APIKeyHash       string
-	UserID           string
-	Model            string
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	CachedTokens     int64
-	RawUsageJSON     string
-	CreatedAt        int64
+	ID                  int64
+	AccountID           string
+	RouteKeyHash        string
+	APIKeyHash          string
+	UserID              string
+	Model               string
+	PromptTokens        int64
+	CompletionTokens    int64
+	TotalTokens         int64
+	CachedTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	RawUsageJSON        string
+	CreatedAt           int64
 }
 
 type diagnosticBillingHold struct {
@@ -174,7 +176,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, auditRows []storage.Au
 	files["account_map.csv"] = csvString([]string{"account_code", "account_id", "email", "label", "upstream_account_id", "chatgpt_user_id", "provider", "group_name", "status"}, accountMapRows(codebook))
 	files["audit_log.csv"] = csvString([]string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, auditLogRows(auditRows, codebook))
 	files["cf_events.csv"] = csvString([]string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, cfEventRows(cfRows, codebook))
-	files["usage_records.csv"] = csvString([]string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "raw_usage_json"}, usageRecordRows(usageRows, codebook))
+	files["usage_records.csv"] = csvString([]string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "raw_usage_json"}, usageRecordRows(usageRows, codebook))
 	files["billing_holds.csv"] = csvString([]string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status"}, billingHoldRows(holds, codebook))
 	files["accounts_snapshot.csv"] = csvString([]string{"account_code", "group_name", "provider", "status", "plan_type", "is_fedramp", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, bindings, codebook))
 	files["egress_snapshot.csv"] = csvString([]string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
@@ -216,7 +218,7 @@ func listDiagnosticCFEvents(ctx context.Context, db *sql.DB) ([]storage.CFEvent,
 }
 
 func listDiagnosticUsageRecords(ctx context.Context, db *sql.DB) ([]diagnosticUsageRecord, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, raw_usage_json, created_at FROM usage_records ORDER BY id ASC`)
+	rows, err := db.QueryContext(ctx, `SELECT id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, raw_usage_json, created_at FROM usage_records ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +226,7 @@ func listDiagnosticUsageRecords(ctx context.Context, db *sql.DB) ([]diagnosticUs
 	var out []diagnosticUsageRecord
 	for rows.Next() {
 		var r diagnosticUsageRecord
-		if err := rows.Scan(&r.ID, &r.AccountID, &r.RouteKeyHash, &r.APIKeyHash, &r.UserID, &r.Model, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.RawUsageJSON, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.AccountID, &r.RouteKeyHash, &r.APIKeyHash, &r.UserID, &r.Model, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.RawUsageJSON, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -390,6 +392,8 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 			itoa64(row.CompletionTokens),
 			itoa64(row.TotalTokens),
 			itoa64(row.CachedTokens),
+			itoa64(row.CacheReadTokens),
+			itoa64(row.CacheCreationTokens),
 			codebook.sanitize(row.RawUsageJSON),
 		})
 	}

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -72,11 +75,50 @@ func TestStrictRuntimeEnvPointsClaudeCodeAtPoolAPI(t *testing.T) {
 	for _, want := range []string{
 		"\nANTHROPIC_BASE_URL=https://pool.example:1455\n",
 		"\nANTHROPIC_AUTH_TOKEN=cap_secret\n",
+		"\nCLAUDE_CODE_ENABLE_AUTO_MODE=1\n",
 		"\nNO_PROXY=localhost,127.0.0.1,pool.example,pool.example:1455\n",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("strict runtime env missing %q\n---\n%s", want, joined)
 		}
+	}
+}
+
+func TestPrepareStrictRuntimePathsWritesClaudeAutoPlanSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	id := &CachedIdentity{
+		Local: &LocalEnvironment{WorkDir: "/workspace/project"},
+		Virtual: &VirtualIdentity{
+			Username:   "virtuser",
+			Hostname:   "virt-host",
+			HomeDir:    "/home/virtuser",
+			DNSServers: []string{"1.1.1.1"},
+		},
+	}
+
+	paths, err := prepareStrictRuntimePaths(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(paths.VirtualHomeHost, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatalf("strict runtime must write Claude Code settings.json: %v", err)
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("settings.json is not valid JSON: %v\n%s", err, raw)
+	}
+	env, _ := settings["env"].(map[string]interface{})
+	if env["CLAUDE_CODE_ENABLE_AUTO_MODE"] != "1" {
+		t.Fatalf("settings env must enable auto mode: %s", raw)
+	}
+	if settings["useAutoModeDuringPlan"] != true {
+		t.Fatalf("settings must enable auto mode during plan: %s", raw)
+	}
+	permissions, _ := settings["permissions"].(map[string]interface{})
+	if permissions["defaultMode"] != "auto" {
+		t.Fatalf("settings permissions.defaultMode must be auto: %s", raw)
 	}
 }
 

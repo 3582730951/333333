@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -206,6 +208,9 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		TTL:               s.claudeCacheTTL(r.Context()),
 	})
 	body := result.Body
+	if s.nativeCacheBreakpointInjectEnabled(r.Context()) {
+		body = prompt.EnsureAnthropicCacheControl(body, s.claudeCacheTTL(r.Context()))
+	}
 
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
@@ -256,12 +261,9 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if isEventStream(resp.Header) {
-		captured, retryableStream, captureErr := captureClaudeSSEForFailover(resp.Body, s.streamFailoverCaptureOptions(r.Context()))
-		if captured != nil {
-			defer captured.Close()
-		}
-		if captureErr != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_capture_failed")
+		prefix, retryableStream, probeErr := probeEarlyClaudeSSEFailure(resp.Body)
+		if probeErr != nil {
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
 				return retry()
 			}
@@ -269,7 +271,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			return outcomeDone
 		}
 		if retryableStream {
-			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, captured.Head(64*1024))
+			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, prefix)
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if allowRetry && movable {
 				return retry()
@@ -277,12 +279,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return outcomeDone
 		}
-		streamBody, err := captured.Reader()
-		if err != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_capture_replay_failed")
-			writePublicUnavailable(w, http.StatusServiceUnavailable)
-			return outcomeDone
-		}
+		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		if err := s.streamSSE(r.Context(), w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {

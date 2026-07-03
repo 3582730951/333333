@@ -94,8 +94,31 @@ export HTTP_PROXY=http://127.0.0.1:%s
 export HTTPS_PROXY=http://127.0.0.1:%s
 export ALL_PROXY=http://127.0.0.1:%s
 export NO_PROXY=localhost,127.0.0.1
+export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 %s
 exec gateway run-claude -- "$@"
+`, realClaude, proxyPort, proxyPort, proxyPort, renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
+
+	return os.WriteFile(wrapperPath, []byte(script), 0755)
+}
+
+// GeneratePlanWrapper generates a convenience launcher that starts Claude Code
+// directly in plan mode while still using the gateway strict runtime.
+func GeneratePlanWrapper(realClaude, wrapperPath, proxyPort string, disableNonessentialEnvOption ...bool) error {
+	disableNonessentialEnv := true
+	if len(disableNonessentialEnvOption) > 0 {
+		disableNonessentialEnv = disableNonessentialEnvOption[0]
+	}
+	script := fmt.Sprintf(`#!/bin/bash
+# Claude Gateway Plan Wrapper
+export CLAUDE_REAL_BIN=%q
+export HTTP_PROXY=http://127.0.0.1:%s
+export HTTPS_PROXY=http://127.0.0.1:%s
+export ALL_PROXY=http://127.0.0.1:%s
+export NO_PROXY=localhost,127.0.0.1
+export CLAUDE_CODE_ENABLE_AUTO_MODE=1
+%s
+exec gateway run-claude -- --permission-mode plan "$@"
 `, realClaude, proxyPort, proxyPort, proxyPort, renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
 
 	return os.WriteFile(wrapperPath, []byte(script), 0755)
@@ -139,8 +162,13 @@ func InstallWrapper() error {
 	if err := GenerateWrapper(backupPath, realClaude, "8765", disableNonessentialEnv); err != nil {
 		return fmt.Errorf("generate wrapper failed: %w", err)
 	}
+	planWrapper := filepath.Join(filepath.Dir(realClaude), "claude-plan")
+	if err := GeneratePlanWrapper(backupPath, planWrapper, "8765", disableNonessentialEnv); err != nil {
+		return fmt.Errorf("generate plan wrapper failed: %w", err)
+	}
 
 	fmt.Printf("✓ Installed wrapper: %s → %s\n", realClaude, backupPath)
+	fmt.Printf("✓ Installed plan wrapper: %s\n", planWrapper)
 	return nil
 }
 
@@ -161,6 +189,10 @@ func UninstallWrapper() error {
 			return err
 		}
 		fmt.Printf("✓ Restored original: %s\n", claudePath)
+	}
+	planWrapper := filepath.Join(filepath.Dir(claudePath), "claude-plan")
+	if _, err := os.Stat(planWrapper); err == nil {
+		_ = os.Remove(planWrapper)
 	}
 
 	return nil

@@ -14,15 +14,25 @@ func TestParseCachedTokens(t *testing.T) {
 }
 
 func TestParseAnthropicUsage(t *testing.T) {
-	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40}}`))
+	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":75}}`))
 	if parsed.PromptTokens != 100 || parsed.CompletionTokens != 20 {
 		t.Fatalf("anthropic tokens: %+v", parsed)
 	}
 	if parsed.CachedTokens != 40 {
 		t.Fatalf("cache_read_input_tokens not parsed: %+v", parsed)
 	}
+	if parsed.CacheReadTokens != 40 || parsed.CacheCreationTokens != 75 {
+		t.Fatalf("anthropic cache read/create not split: %+v", parsed)
+	}
 	if parsed.TotalTokens != 120 {
 		t.Fatalf("total not derived from input+output: %+v", parsed)
+	}
+}
+
+func TestParseAnthropicCacheCreationIsNotReportedAsHit(t *testing.T) {
+	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":75}}`))
+	if parsed.CachedTokens != 0 || parsed.CacheReadTokens != 0 || parsed.CacheCreationTokens != 75 {
+		t.Fatalf("cache creation must not be counted as a read hit: %+v", parsed)
 	}
 }
 
@@ -98,7 +108,7 @@ func TestStreamScannerClaudeMessages(t *testing.T) {
 	// message_delta frames whose final output_tokens is the running total.
 	transcript := strings.Join([]string{
 		`event: message_start`,
-		`data: {"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":200,"cache_read_input_tokens":50,"output_tokens":1}}}`,
+		`data: {"type":"message_start","message":{"model":"claude-opus-4-8","usage":{"input_tokens":200,"cache_read_input_tokens":50,"cache_creation_input_tokens":21,"output_tokens":1}}}`,
 		``,
 		`event: content_block_delta`,
 		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"yo"}}`,
@@ -107,7 +117,7 @@ func TestStreamScannerClaudeMessages(t *testing.T) {
 		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":17}}`,
 		``,
 		`event: message_delta`,
-		`data: {"type":"message_delta","delta":{},"usage":{"output_tokens":88}}`,
+		`data: {"type":"message_delta","delta":{},"usage":{"output_tokens":88,"cache_creation_input_tokens":34}}`,
 		``,
 	}, "\n")
 	p, ok := feedStream(t, "claude", transcript)
@@ -116,6 +126,9 @@ func TestStreamScannerClaudeMessages(t *testing.T) {
 	}
 	if p.Model != "claude-opus-4-8" || p.PromptTokens != 200 || p.CachedTokens != 50 {
 		t.Fatalf("claude stream input/cache = %+v", p)
+	}
+	if p.CacheReadTokens != 50 || p.CacheCreationTokens != 34 {
+		t.Fatalf("claude stream cache read/create = %+v", p)
 	}
 	if p.CompletionTokens != 88 { // last message_delta wins
 		t.Fatalf("claude stream output = %d, want 88 (final delta)", p.CompletionTokens)

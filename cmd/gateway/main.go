@@ -236,6 +236,7 @@ Usage:
   gateway init [--pool-url URL] [--key KEY]    初始化配置和 CA
   gateway start                                 启动代理服务器
   gateway run-claude -- <args>                  在 strict Linux runtime 中启动 Claude Code
+  claude-plan <args>                            通过包装器直接以 plan mode 启动 Claude Code
   gateway probe-identity                        拉取身份并验证 strict runtime
   gateway status                                显示运行状态
   gateway trust-ca [--print-commands]           信任 CA 证书
@@ -254,7 +255,8 @@ Examples:
   gateway start
 
   # 日常使用（包装器安装后）
-  claude "your prompt"  # 自动走网关`)
+  claude "your prompt"       # 自动走网关
+  claude-plan "your prompt"  # 直接进入 plan mode`)
 }
 
 func handleInit(configPath string) {

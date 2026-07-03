@@ -22,7 +22,6 @@
 package cloak
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -46,15 +45,12 @@ const claudeCodeIdentityLine = "You are Claude Code, Anthropic's official CLI fo
 
 // claudeBillingHeaderPrefix marks the x-anthropic-billing-header system block that
 // real Claude Code prepends to every request (carrying cc_version + the per-request
-// cch "prompt fingerprint"). Captured ground truth (capture/out_mock, claude-cli
-// 2.1.160): it is the FIRST system block, type text, with NO cache_control. Both the
-// 3-hex cc_version suffix AND the 5-hex cch are PER-REQUEST content fingerprints (they
-// change every request — e.g. "say hi"→f01/c511f, "what is 2+2"→268/8c02b — not just
-// per version), obfuscated client-side and NOT reproducible from the wire (verified via
-// tools/capture/analyze_billing.py). other_cpa's salted-index formula is for an older build and
-// does not reproduce them. So we emit fresh random hex of the right shape: present +
-// well-formed + non-correlatable, which is what matters (a MISSING header is the real
-// third-party tell; Anthropic does not byte-validate these across the client fleet).
+// cch "prompt fingerprint"). Captured ground truth: it is the FIRST system block,
+// type text, with NO cache_control. The real client rotates the fingerprint fields,
+// but those bytes live before every system/message cache breakpoint. We therefore
+// synthesize deterministic well-formed values here and let the upstream layer sign
+// cch against a stable cache prefix, so cacheable prefixes can survive different
+// final user questions.
 const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
 
 // claudeCodeToolNames maps OpenCode/lowercase tool names to Claude Code's
@@ -84,12 +80,11 @@ type ClaudeCodeCacheOptions struct {
 // (meaningful only for OAuth/Claude-Code traffic) stamps the billing system block in
 // place, so callers no longer need a second EnsureClaudeCodeBillingHeader round-trip —
 // a full unmarshal+marshal — over what for Claude Code is often a very large request
-// body. This is a pure performance refactor: cch is a fresh per-request random value
-// (not a hash of the body), so injecting it before the final marshal is byte-equivalent
-// in effect to a separate post-pass, only cheaper. The billing block carries no
-// cache_control and is placed at system[0] (ahead of any identity block), matching the
-// captured real client shape, and is added AFTER capCacheControlBreakpoints so it
-// neither consumes a breakpoint nor is affected by the cap.
+// body. The billing block carries no cache_control and is placed at system[0] (ahead
+// of any identity block), matching the captured real client shape, and is added AFTER
+// capCacheControlBreakpoints so it neither consumes a breakpoint nor is affected by
+// the cap. Its placeholder fingerprint fields are deterministic; the upstream layer
+// rewrites cch after final sanitization.
 func VirtualizeClaudeCode(body []byte, id identity.Identity, sensitiveWords []string, oauth bool, billingVersion string) Result {
 	return VirtualizeClaudeCodeWithCache(body, id, sensitiveWords, oauth, billingVersion, ClaudeCodeCacheOptions{})
 }
@@ -574,20 +569,17 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 //	x-anthropic-billing-header: cc_version=<version>.<buildHash>; cc_entrypoint=cli; cch=<5hex>;
 //
 // It MUST run as the FINAL body step — after all other virtualization AND after any
-// cache_control injection — because cch is a per-request fingerprint over the content.
+// cache_control injection — because cch is signed after final sanitization in the
+// upstream layer.
 // Behavior:
 //   - real Claude Code (block already present): the block is REPLACED so cc_version is
 //     realigned to our account-bound claude-cli version (the downstream's real version
-//     would otherwise contradict our User-Agent) and cch is regenerated for the body we
-//     actually forward (our edits already invalidated the client's cch).
+//     would otherwise contradict our User-Agent).
 //   - other clients (OpenAI-compat→Claude, etc.): the block is PREPENDED, so the request
 //     is not missing the header every genuine Claude Code request carries.
 //
 // version is the SAME claude-cli version emitted in the User-Agent, so cc_version and the
-// UA agree. cch is fresh random 5-hex: the real client's cch is not reproducible from the
-// forwarded body (verified — it is not a stable hash of any content slice we can recompute;
-// see tools/capture/analyze_billing.py) and rotates every request anyway, so a fresh value is the
-// faithful, non-correlatable choice. Apply only to OAuth/Claude-Code traffic.
+// UA agree. Apply only to OAuth/Claude-Code traffic.
 func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 	var root map[string]interface{}
 	if json.Unmarshal(body, &root) != nil {
@@ -608,7 +600,7 @@ func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 // the byte-level caller can leave the body untouched). Factored out of
 // EnsureClaudeCodeBillingHeader so VirtualizeClaudeCode can fold the stamp into its
 // single parse/marshal pass without a second JSON round-trip. See
-// EnsureClaudeCodeBillingHeader for the per-request-fingerprint rationale.
+// EnsureClaudeCodeBillingHeader for the fingerprint rationale.
 func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 	billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderText(version)}
 	switch sys := root["system"].(type) {
@@ -639,25 +631,30 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 }
 
 // claudeBillingHeaderText builds the billing-header block for a claude-cli version:
-// cc_version=<version>.<rand3hex> and a fresh per-request cch=<rand5hex>, with the
-// cli entrypoint (matching our forced User-Agent). Both fingerprints are per-request
-// and not reproducible (see claudeBillingHeaderPrefix), so fresh random hex of the
-// right shape is the faithful choice.
+// cc_version=<version>.<stable3hex> and cch=<stable5hex>, with the cli entrypoint
+// matching our forced User-Agent. These values must be stable because the block is
+// before every system/message cache breakpoint; the upstream layer signs cch against
+// the final sanitized cache prefix.
 func claudeBillingHeaderText(version string) string {
 	if version == "" {
 		version = identity.ClaudeCLIVersion
 	}
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;",
-		version, claudeRandHex(3), claudeRandHex(5))
+		version, claudeStableHex(3, "cc-version", version), claudeStableHex(5, "cch", version))
 }
 
-// claudeRandHex returns n random lowercase hex chars (0-padded on the rare rand error).
-func claudeRandHex(n int) string {
-	b := make([]byte, (n+1)/2)
-	if _, err := rand.Read(b); err != nil {
-		return strings.Repeat("0", n)
+func claudeStableHex(n int, parts ...string) string {
+	h := sha256.New()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
 	}
-	return hex.EncodeToString(b)[:n]
+	sum := h.Sum(nil)
+	out := hex.EncodeToString(sum)
+	if n > len(out) {
+		n = len(out)
+	}
+	return out[:n]
 }
 
 // nodePlatform maps a virtual OS name to the Node.js process.platform value

@@ -44,6 +44,20 @@ func TestVirtualizeReplacesUserIDInjectsSystemAndRenamesTools(t *testing.T) {
 	}
 }
 
+func TestVirtualizeClaudeCodePreservesExitPlanModeTool(t *testing.T) {
+	id := identity.For(nil, "acc-plan")
+	body := []byte(`{"model":"claude","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"tools":[{"name":"ExitPlanMode","input_schema":{"type":"object"}},{"name":"bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"plan"}]}`)
+	res := Virtualize(body, id, nil, true)
+	root := mustRoot(t, res.Body)
+	tools := root["tools"].([]interface{})
+	if got := tools[0].(map[string]interface{})["name"]; got != "ExitPlanMode" {
+		t.Fatalf("ExitPlanMode tool must be preserved for Claude Code plan mode, got %v\n%s", got, res.Body)
+	}
+	if got := tools[1].(map[string]interface{})["name"]; got != "Bash" {
+		t.Fatalf("normal Claude Code tools should still be normalized, got %v", got)
+	}
+}
+
 func TestVirtualizeDoesNotRenameThirdPartyTools(t *testing.T) {
 	id := identity.For(nil, "acc-tp")
 	// A non-Claude-Code OAuth client (no identity block) that happens to define a tool

@@ -51,7 +51,7 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 	if m[1] != "2.1.159" {
 		t.Fatalf("cc_version not aligned to our version: %q", first)
 	}
-	// buildHash (m[2]) + cch (m[3]) are per-request random hex of the captured shape.
+	// buildHash (m[2]) + cch (m[3]) are stable hex of the captured shape.
 	// The billing block must carry NO cache_control.
 	var root map[string]interface{}
 	_ = json.Unmarshal(out, &root)
@@ -60,9 +60,18 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 	}
 }
 
+func TestBillingHeaderIsStableForSameVersion(t *testing.T) {
+	body := []byte(`{"model":"claude","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`)
+	first := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+	second := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+	if first != second {
+		t.Fatalf("billing header must be stable for cacheable prefixes:\nfirst =%s\nsecond=%s", first, second)
+	}
+}
+
 func TestBillingHeaderRealignedInPlaceForRealClaudeCode(t *testing.T) {
 	// Real Claude Code already carries a billing header reporting the DOWNSTREAM's
-	// version; we must realign cc_version to ours (no duplicate block) and refresh cch.
+	// version; we must realign cc_version to ours (no duplicate block).
 	body := []byte(`{"model":"claude","system":[` +
 		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.180.abc; cc_entrypoint=cli; cch=deadb;"},` +
 		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}` +
@@ -112,9 +121,9 @@ func TestEnsureClaudeCodeSystemDoesNotDoubleInjectOnBillingHeader(t *testing.T) 
 	}
 }
 
-// canonicalizeForCompare strips the two per-request random fields (the cc_version
-// 3-hex buildHash suffix and the 5-hex cch) from a billing block so two bodies that
-// differ only in those nonces compare equal. Everything else must match byte-for-byte.
+// canonicalizeForCompare strips the synthetic fingerprint fields from a billing
+// block so two bodies can compare only their structural request shape. Everything
+// else must match byte-for-byte.
 func canonicalizeForCompare(t *testing.T, body []byte) string {
 	t.Helper()
 	var root map[string]interface{}
@@ -141,8 +150,8 @@ func canonicalizeForCompare(t *testing.T, body []byte) string {
 
 // TestVirtualizeClaudeCodeFoldsBillingEquivalently is the regression guard for the
 // performance refactor: folding the billing-header stamp into Virtualize's single
-// parse/marshal pass (VirtualizeClaudeCode) must produce a body byte-identical — modulo
-// the inherently-random cch/buildHash nonces — to the old two-pass sequence
+// parse/marshal pass (VirtualizeClaudeCode) must produce a body byte-identical to
+// the old two-pass sequence
 // (Virtualize then EnsureClaudeCodeBillingHeader). If they ever diverge in structure,
 // the "pure performance" claim is false.
 func TestVirtualizeClaudeCodeFoldsBillingEquivalently(t *testing.T) {

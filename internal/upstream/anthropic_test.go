@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/storage"
 )
 
@@ -373,6 +376,79 @@ func TestClaudeCCHSigningIsDeterministicByDefaultAndConfigurable(t *testing.T) {
 	disabled := captureClaudeBody(t, cfg, body)
 	if got := extractCCH(t, disabled); got != "fffff" {
 		t.Fatalf("claude_cch_signing=false should leave cch unchanged, got %q body=%s", got, disabled)
+	}
+}
+
+func TestClaudeCCHSigningUsesStableCachePrefix(t *testing.T) {
+	bodyA := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what changed in file A?"}]}]}`)
+	bodyB := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what changed in file B?"}]}]}`)
+	bodyC := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"different stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what changed in file A?"}]}]}`)
+
+	cchA := extractCCH(t, string(signClaudeBillingCCH(bodyA)))
+	cchB := extractCCH(t, string(signClaudeBillingCCH(bodyB)))
+	cchC := extractCCH(t, string(signClaudeBillingCCH(bodyC)))
+	if cchA != cchB {
+		t.Fatalf("same cacheable system prefix must sign to same cch despite final user tail: %q vs %q", cchA, cchB)
+	}
+	if cchA == cchC {
+		t.Fatalf("different cacheable system prefix should change cch, got %q for both", cchA)
+	}
+}
+
+func TestClaudeCCHSigningUsesStableMessageCachePrefix(t *testing.T) {
+	bodyA := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"text","text":"stable project context","cache_control":{"type":"ephemeral"}},{"type":"text","text":"tail A"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/workspace/a.go"}}]},{"role":"user","content":[{"type":"text","text":"final question A"}]}]}`)
+	bodyB := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"text","text":"stable project context","cache_control":{"type":"ephemeral"}},{"type":"text","text":"tail B"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/workspace/b.go"}}]},{"role":"user","content":[{"type":"text","text":"final question B"}]}]}`)
+	bodyC := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"DIFFERENT"}},{"type":"text","text":"stable project context","cache_control":{"type":"ephemeral"}},{"type":"text","text":"tail A"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/workspace/a.go"}}]},{"role":"user","content":[{"type":"text","text":"final question A"}]}]}`)
+
+	cchA := extractCCH(t, string(signClaudeBillingCCH(bodyA)))
+	cchB := extractCCH(t, string(signClaudeBillingCCH(bodyB)))
+	cchC := extractCCH(t, string(signClaudeBillingCCH(bodyC)))
+	if cchA != cchB {
+		t.Fatalf("same cacheable multimodal message prefix must sign to same cch despite volatile tail: %q vs %q", cchA, cchB)
+	}
+	if cchA == cchC {
+		t.Fatalf("different cacheable multimodal prefix should change cch, got %q for both", cchA)
+	}
+}
+
+func TestClaudeNativeCachePrefixStableAfterVirtualizationAndSigning(t *testing.T) {
+	id := identity.For(nil, "acc-native-cache")
+	build := func(question string) []byte {
+		body := []byte(`{"model":"claude-x","stream":true,"system":[` +
+			`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.180.abc; cc_entrypoint=cli; cch=deadb;"},` +
+			`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}},` +
+			`{"type":"text","text":"stable repo instructions"}` +
+			`],"tools":[{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],` +
+			`"messages":[{"role":"user","content":[` +
+			`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# Repo\nStable context.\n</system-reminder>\n\n"},` +
+			`{"type":"text","text":` + strconv.Quote(question) + `}` +
+			`]}]}`)
+		res := cloak.VirtualizeClaudeCodeWithCache(body, id, nil, true, "2.1.160", cloak.ClaudeCodeCacheOptions{
+			NativeBreakpoints: true,
+			TTL:               "1h",
+		})
+		withCache := prompt.EnsureAnthropicCacheControl(res.Body, "1h")
+		return signClaudeBillingCCH(withCache)
+	}
+
+	a := build("inspect file A")
+	b := build("inspect file B")
+	if got, want := extractCCH(t, string(a)), extractCCH(t, string(b)); got != want {
+		t.Fatalf("native Claude stable prefix should keep cch stable across final questions: %q vs %q\na=%s\nb=%s", got, want, a, b)
+	}
+	if !strings.Contains(string(a), "inspect file A") || !strings.Contains(string(b), "inspect file B") {
+		t.Fatalf("final user question was changed or removed\na=%s\nb=%s", a, b)
+	}
+}
+
+func TestClaudeCCHSigningIgnoresNestedSchemaCacheControlField(t *testing.T) {
+	bodyA := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"tools":[{"name":"Custom","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"final question A"}]}]}`)
+	bodyB := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"tools":[{"name":"Custom","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"final question B"}]}]}`)
+
+	cchA := extractCCH(t, string(signClaudeBillingCCH(bodyA)))
+	cchB := extractCCH(t, string(signClaudeBillingCCH(bodyB)))
+	if cchA == cchB {
+		t.Fatalf("schema property named cache_control must not be treated as a prompt-cache breakpoint, got same cch %q", cchA)
 	}
 }
 

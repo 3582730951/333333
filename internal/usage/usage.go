@@ -6,12 +6,14 @@ import (
 )
 
 type Parsed struct {
-	Model            string
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	CachedTokens     int64
-	RawUsage         json.RawMessage
+	Model               string
+	PromptTokens        int64
+	CompletionTokens    int64
+	TotalTokens         int64
+	CachedTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	RawUsage            json.RawMessage
 }
 
 func ParseResponse(raw []byte) Parsed {
@@ -31,13 +33,16 @@ func ParseResponse(raw []byte) Parsed {
 		return Parsed{Model: model}
 	}
 	rawUsage, _ := json.Marshal(usageMap)
+	cached := cachedTokens(usageMap)
 	parsed := Parsed{
-		Model:            model,
-		PromptTokens:     promptTokens(usageMap),
-		CompletionTokens: intField(usageMap, "output_tokens", "completion_tokens"),
-		TotalTokens:      intField(usageMap, "total_tokens"),
-		CachedTokens:     cachedTokens(usageMap),
-		RawUsage:         rawUsage,
+		Model:               model,
+		PromptTokens:        promptTokens(usageMap),
+		CompletionTokens:    intField(usageMap, "output_tokens", "completion_tokens"),
+		TotalTokens:         intField(usageMap, "total_tokens"),
+		CachedTokens:        cached,
+		CacheReadTokens:     cached,
+		CacheCreationTokens: intField(usageMap, "cache_creation_input_tokens"),
+		RawUsage:            rawUsage,
 	}
 	// Anthropic usage carries no total_tokens; derive one so downstream billing
 	// views have a single comparable figure across providers.
@@ -112,13 +117,15 @@ type StreamScanner struct {
 	provider string
 	buf      []byte // partial trailing line not yet terminated by '\n'
 
-	model            string
-	promptTokens     int64
-	completionTokens int64
-	totalTokens      int64
-	cachedTokens     int64
-	lastUsage        json.RawMessage
-	got              bool
+	model               string
+	promptTokens        int64
+	completionTokens    int64
+	totalTokens         int64
+	cachedTokens        int64
+	cacheReadTokens     int64
+	cacheCreationTokens int64
+	lastUsage           json.RawMessage
+	got                 bool
 }
 
 // NewStreamScanner returns a usage scanner for the given relay provider ("codex",
@@ -208,6 +215,8 @@ func (s *StreamScanner) observeOpenAIChat(ev map[string]interface{}) {
 	s.completionTokens = intField(um, "completion_tokens", "output_tokens")
 	s.totalTokens = intField(um, "total_tokens")
 	s.cachedTokens = cachedTokens(um)
+	s.cacheReadTokens = s.cachedTokens
+	s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
 	s.lastUsage, _ = json.Marshal(um)
 	s.got = true
 }
@@ -228,6 +237,8 @@ func (s *StreamScanner) observeCodex(ev map[string]interface{}) {
 	s.completionTokens = intField(um, "output_tokens", "completion_tokens")
 	s.totalTokens = intField(um, "total_tokens")
 	s.cachedTokens = cachedTokens(um)
+	s.cacheReadTokens = s.cachedTokens
+	s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
 	s.lastUsage, _ = json.Marshal(um)
 	s.got = true
 }
@@ -247,7 +258,9 @@ func (s *StreamScanner) observeClaude(ev map[string]interface{}) {
 			return
 		}
 		s.promptTokens = intField(um, "input_tokens")
-		s.cachedTokens = cachedTokens(um)
+		s.cacheReadTokens = intField(um, "cache_read_input_tokens")
+		s.cachedTokens = s.cacheReadTokens
+		s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
 		s.lastUsage, _ = json.Marshal(um)
 		s.got = true
 	case "message_delta":
@@ -257,6 +270,15 @@ func (s *StreamScanner) observeClaude(ev map[string]interface{}) {
 		}
 		if out := intField(um, "output_tokens"); out > 0 {
 			s.completionTokens = out
+			s.got = true
+		}
+		if read := intField(um, "cache_read_input_tokens"); read > 0 {
+			s.cacheReadTokens = read
+			s.cachedTokens = read
+			s.got = true
+		}
+		if created := intField(um, "cache_creation_input_tokens"); created > 0 {
+			s.cacheCreationTokens = created
 			s.got = true
 		}
 	}
@@ -277,12 +299,28 @@ func (s *StreamScanner) Parsed() (Parsed, bool) {
 		// A frame was seen but carried no countable tokens — nothing worth recording.
 		return Parsed{}, false
 	}
+	rawUsage := s.lastUsage
+	if s.provider == "claude" {
+		um := map[string]int64{
+			"input_tokens":  s.promptTokens,
+			"output_tokens": s.completionTokens,
+		}
+		if s.cacheReadTokens > 0 {
+			um["cache_read_input_tokens"] = s.cacheReadTokens
+		}
+		if s.cacheCreationTokens > 0 {
+			um["cache_creation_input_tokens"] = s.cacheCreationTokens
+		}
+		rawUsage, _ = json.Marshal(um)
+	}
 	return Parsed{
-		Model:            s.model,
-		PromptTokens:     s.promptTokens,
-		CompletionTokens: s.completionTokens,
-		TotalTokens:      total,
-		CachedTokens:     s.cachedTokens,
-		RawUsage:         s.lastUsage,
+		Model:               s.model,
+		PromptTokens:        s.promptTokens,
+		CompletionTokens:    s.completionTokens,
+		TotalTokens:         total,
+		CachedTokens:        s.cachedTokens,
+		CacheReadTokens:     s.cacheReadTokens,
+		CacheCreationTokens: s.cacheCreationTokens,
+		RawUsage:            rawUsage,
 	}, true
 }

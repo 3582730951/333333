@@ -95,27 +95,29 @@ sudo mv /tmp/gateway /usr/local/bin/gateway || {
   echo "    sudo mv /tmp/gateway /usr/local/bin/gateway"
   exit 1
 }
+GATEWAY_BIN="/usr/local/bin/gateway"
 
 # 配置
 echo ""
 echo "[3/5] 配置网关..."
 POOL_URL="%s"
 %s
+export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 
 # 初始化配置
 echo "[4/5] 初始化配置和 CA..."
-gateway init --pool-url "$POOL_URL" --key "$API_KEY"
+"$GATEWAY_BIN" init --pool-url "$POOL_URL" --key "$API_KEY"
 
 # 自动信任 CA
 echo "[5/5] 信任 CA 证书..."
-if ! gateway trust-ca; then
+if ! "$GATEWAY_BIN" trust-ca; then
   echo ""
   echo "⚠️  自动信任失败，请手动执行："
-  gateway trust-ca --print-commands
+  "$GATEWAY_BIN" trust-ca --print-commands
   echo ""
   echo "执行完成后，运行以下命令继续："
-  echo "  gateway install-wrapper"
-  echo "  gateway start &"
+  echo "  $GATEWAY_BIN install-wrapper"
+  echo "  $GATEWAY_BIN start &"
   exit 0
 fi
 
@@ -123,10 +125,10 @@ fi
 echo ""
 echo "安装 claude 命令包装器..."
 if command -v claude >/dev/null 2>&1; then
-  gateway install-wrapper
+  "$GATEWAY_BIN" install-wrapper
 else
   echo "⚠️  未检测到 claude 命令，跳过包装器安装"
-  echo "    如果稍后安装 Claude Code，运行: gateway install-wrapper"
+  echo "    如果稍后安装 Claude Code，运行: $GATEWAY_BIN install-wrapper"
 fi
 
 echo ""
@@ -134,10 +136,11 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "✅ 安装完成！"
 echo ""
 echo "使用方法:"
-echo "  1. 启动网关: gateway start &"
+echo "  1. 启动网关: $GATEWAY_BIN start &"
 echo "  2. 使用 Claude: claude \"your prompt\""
+echo "  3. 计划模式: claude-plan \"your prompt\""
 echo ""
-echo "查看状态: gateway status"
+echo "查看状态: $GATEWAY_BIN status"
 echo "查看日志: tail -f ~/.claude-gateway/gateway.log"
 `, baseURL, baseURL, apiKeyLine)
 

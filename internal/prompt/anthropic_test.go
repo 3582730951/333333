@@ -218,6 +218,76 @@ func TestEnsureAnthropicCacheControlMarksToolsBeforeVolatileLastUser(t *testing.
 	}
 }
 
+func TestEnsureAnthropicCacheControlMarksNativeClaudeStablePrefixes(t *testing.T) {
+	raw := []byte(`{"model":"claude","system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=12345;"},` +
+		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},` +
+		`{"type":"text","text":"stable project instructions"}` +
+		`],"tools":[{"name":"Bash","input_schema":{"type":"object"}},{"name":"Read","input_schema":{"type":"object"}}],` +
+		`"messages":[` +
+		`{"role":"user","content":[` +
+		`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# repo\nstable files\n</system-reminder>\n\n"},` +
+		`{"type":"text","text":"first real request"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"ok"}]},` +
+		`{"role":"user","content":[{"type":"text","text":"different final question"}]}` +
+		`]}`)
+	out := EnsureAnthropicCacheControl(raw, "1h")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	sys := m["system"].([]interface{})
+	if _, has := sys[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("billing block must not be marked: %v", sys[0])
+	}
+	if cc, ok := sys[2].(map[string]interface{})["cache_control"].(map[string]interface{}); !ok || cc["ttl"] != "1h" {
+		t.Fatalf("last non-billing system block should be marked with 1h: %v", sys[2])
+	}
+	tools := m["tools"].([]interface{})
+	if _, has := tools[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("only last tool should be marked: %v", tools[0])
+	}
+	if cc, ok := tools[1].(map[string]interface{})["cache_control"].(map[string]interface{}); !ok || cc["ttl"] != "1h" {
+		t.Fatalf("last tool should be marked with 1h: %v", tools[1])
+	}
+	msgs := m["messages"].([]interface{})
+	firstBlocks := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if cc, ok := firstBlocks[0].(map[string]interface{})["cache_control"].(map[string]interface{}); !ok || cc["ttl"] != "1h" {
+		t.Fatalf("native auto-context prefix should be marked with 1h: %v", firstBlocks[0])
+	}
+	if cc, ok := firstBlocks[1].(map[string]interface{})["cache_control"].(map[string]interface{}); !ok || cc["ttl"] != "1h" {
+		t.Fatalf("second-to-last user turn should be marked with 1h: %v", firstBlocks[1])
+	}
+	lastBlocks := msgs[2].(map[string]interface{})["content"].([]interface{})
+	if _, has := lastBlocks[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("volatile final user turn must not be marked: %v", lastBlocks[0])
+	}
+	if n := cacheControlCount(t, out); n != 4 {
+		t.Fatalf("cache marker count = %d, want tool+system+auto-context+history", n)
+	}
+}
+
+func TestEnsureAnthropicCacheControlMarksSecondToLastUserTurn(t *testing.T) {
+	raw := []byte(`{"model":"claude","messages":[` +
+		`{"role":"user","content":"first stable question"},` +
+		`{"role":"assistant","content":[{"type":"text","text":"answer"}]},` +
+		`{"role":"user","content":"final volatile question"}` +
+		`]}`)
+	out := EnsureAnthropicCacheControl(raw, "")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	msgs := m["messages"].([]interface{})
+	firstBlocks := msgs[0].(map[string]interface{})["content"].([]interface{})
+	if _, ok := firstBlocks[0].(map[string]interface{})["cache_control"]; !ok {
+		t.Fatalf("second-to-last user turn should be marked: %v", firstBlocks[0])
+	}
+	if last := msgs[2].(map[string]interface{})["content"]; last != "final volatile question" {
+		t.Fatalf("final user turn should remain unmarked and unchanged: %v", last)
+	}
+}
+
 func cacheControlCount(t *testing.T, body []byte) int {
 	t.Helper()
 	var m map[string]interface{}

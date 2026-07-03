@@ -172,6 +172,7 @@ func codexSSEFrameCommitsContent(frame []byte) bool {
 func claudeSSEFrameCommitsContent(frame []byte) bool {
 	lower := strings.ToLower(string(frame))
 	for _, marker := range []string{
+		"message_start",
 		"content_block_start",
 		"content_block_delta",
 		"text_delta",

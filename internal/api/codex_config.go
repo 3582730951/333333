@@ -345,8 +345,9 @@ EOF
   fi
 }
 
+GATEWAY_BIN=""
 install_gateway_binary() {
-  if command -v gateway >/dev/null 2>&1; then
+  if GATEWAY_BIN="$(command -v gateway 2>/dev/null)"; then
     return 0
   fi
   local os arch target tmp
@@ -367,6 +368,7 @@ install_gateway_binary() {
     target="$HOME/.local/bin/gateway"
   fi
   mv "$tmp" "$target"
+  GATEWAY_BIN="$target"
   export PATH="$(dirname "$target"):$PATH"
   say "已安装 gateway -> $target ($os/$arch)"
 }
@@ -380,12 +382,13 @@ configure_claude() {
   export POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-%s}"
   export ANTHROPIC_BASE_URL="$ORIGIN"
   export ANTHROPIC_AUTH_TOKEN="$API_KEY"
+  export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 %s
 
   say "配置 Claude Code 本地 gateway strict runtime: $ORIGIN"
   say "Claude Code API: ANTHROPIC_BASE_URL=$ORIGIN"
   install_gateway_binary
-  gateway init --pool-url "$ORIGIN" --key "$API_KEY"
+  "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"
 
   if [ "$install_rtk" = "1" ]; then
     say "安装并接入 RTK (Claude Code hook)..."
@@ -396,13 +399,14 @@ configure_claude() {
     fi
   fi
 
-  gateway probe-identity
+  "$GATEWAY_BIN" probe-identity
   if command -v claude >/dev/null 2>&1; then
-    gateway install-wrapper || say "包装器安装失败；可直接运行 gateway run-claude -- <args>"
+    "$GATEWAY_BIN" install-wrapper || say "包装器安装失败；可直接运行 $GATEWAY_BIN run-claude -- <args>"
   fi
   say "Claude Code 运行方式:"
-  say "  gateway start"
-  say "  gateway run-claude -- \"你的需求\""
+  say "  $GATEWAY_BIN start"
+  say "  $GATEWAY_BIN run-claude -- \"你的需求\""
+  say "  claude-plan \"先写计划再执行\""
 }
 
 main() {
