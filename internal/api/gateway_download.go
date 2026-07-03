@@ -79,6 +79,12 @@ case "$ARCH" in
   aarch64|arm64) ARCH="arm64" ;;
 esac
 
+# 先停止旧版网关；旧版本没有 stop 命令时忽略，安装新版后还会再兜底停止一次。
+if command -v gateway >/dev/null 2>&1; then
+  echo "停止旧网关..."
+  gateway stop || true
+fi
+
 # 下载网关二进制
 echo "[1/6] 下载网关..."
 GATEWAY_URL="%s/download/gateway?os=$OS&arch=$ARCH"

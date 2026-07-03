@@ -121,6 +121,7 @@ func TestSetupScriptGatewayInstallerLeavesGatewayOnPath(t *testing.T) {
 	installer := scriptBetween(t, script, "install_gateway_binary() {", "\n}\n\nconfigure_claude()")
 	for _, want := range []string{
 		`existing_gateway="$(command -v gateway 2>/dev/null || true)"`,
+		`"$existing_gateway" stop || true`,
 		`if [ -n "$existing_gateway" ] && [ -w "$existing_gateway" ]`,
 		`if [ "$(id -u)" = "0" ]`,
 		`target="/usr/local/bin/gateway"`,

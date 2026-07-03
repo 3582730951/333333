@@ -349,6 +349,9 @@ GATEWAY_BIN=""
 install_gateway_binary() {
   local os arch target tmp existing_gateway
   existing_gateway="$(command -v gateway 2>/dev/null || true)"
+  if [ -n "$existing_gateway" ]; then
+    "$existing_gateway" stop || true
+  fi
   os="$(uname -s | tr '[:upper:]' '[:lower:]')"
   arch="$(uname -m)"
   case "$arch" in

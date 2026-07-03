@@ -86,6 +86,7 @@ func TestGatewayInstallScriptRestartsManagedGateway(t *testing.T) {
 	}
 	script := string(body)
 	for _, want := range []string{
+		`gateway stop || true`,
 		`"$GATEWAY_BIN" stop`,
 		`"$GATEWAY_BIN" start-background`,
 		"gateway.pid",
