@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"codex-account-pool/internal/config"
 )
 
 // settingsCenterView is the aggregate returned by GET /admin/settings-center.
@@ -1112,6 +1114,7 @@ func optimalSystemTemplateValues() map[string]interface{} {
 		"claude_cch_signing":                      true,
 		"claude_cache_ttl":                        "1h",
 		"claude_gateway_unknown_target_policy":    "block",
+		"claude_gateway_forward_hosts":            strings.Join(config.DefaultClaudeGatewayForwardHosts(), ","),
 		"claude_gateway_disable_nonessential_env": true,
 		"claude_gateway_strict_linux_default":     true,
 		"codex_install_model":                     "gpt-5.5",

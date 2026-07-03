@@ -93,11 +93,11 @@ export CLAUDE_REAL_BIN=%q
 export HTTP_PROXY=http://127.0.0.1:%s
 export HTTPS_PROXY=http://127.0.0.1:%s
 export ALL_PROXY=http://127.0.0.1:%s
-export NO_PROXY=localhost,127.0.0.1
+export NO_PROXY=%s
 export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 %s
 exec gateway run-claude -- "$@"
-`, realClaude, proxyPort, proxyPort, proxyPort, renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
+`, realClaude, proxyPort, proxyPort, proxyPort, defaultWrapperNoProxy(), renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
 
 	return os.WriteFile(wrapperPath, []byte(script), 0755)
 }
@@ -115,11 +115,11 @@ export CLAUDE_REAL_BIN=%q
 export HTTP_PROXY=http://127.0.0.1:%s
 export HTTPS_PROXY=http://127.0.0.1:%s
 export ALL_PROXY=http://127.0.0.1:%s
-export NO_PROXY=localhost,127.0.0.1
+export NO_PROXY=%s
 export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 %s
 exec gateway run-claude -- --permission-mode plan "$@"
-`, realClaude, proxyPort, proxyPort, proxyPort, renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
+`, realClaude, proxyPort, proxyPort, proxyPort, defaultWrapperNoProxy(), renderWrapperDisableNonessentialEnvExports(disableNonessentialEnv))
 
 	return os.WriteFile(wrapperPath, []byte(script), 0755)
 }

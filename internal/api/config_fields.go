@@ -123,9 +123,9 @@ func configFields() []configField {
 
 		// ── 本地 Gateway / Claude Code ────────────────────────────────────────
 		{Key: "claude_gateway_intercept_hosts", Label: "Gateway 拦截主机", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
-			Help: "本地 gateway 会 MITM 并改写的 API 主机/通配符列表。默认覆盖 Anthropic/Codex 必需 API。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayInterceptHosts }},
+			Help: "本地 gateway 会 MITM 并改写的 API 主机/通配符列表。默认只覆盖 Anthropic/Claude 必需 API，避免影响 Claude Bash 内的 Codex。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayInterceptHosts }},
 		{Key: "claude_gateway_forward_hosts", Label: "Gateway 放行主机", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
-			Help: "除 pool 服务端外额外允许直连转发的主机/通配符列表。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayForwardHosts }},
+			Help: "除 pool 服务端外额外允许 tunnel/bypass 的主机/通配符列表；默认放行 OpenAI/Codex、GitHub、PyPI、npm、OSV，不做 MITM。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayForwardHosts }},
 		{Key: "claude_gateway_blocked_host_patterns", Label: "Gateway 阻断目标", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
 			Help: "阻断的非必要遥测/更新目标关键词或通配符。空=不按关键词阻断。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayBlockedHostPatterns }},
 		{Key: "claude_gateway_unknown_target_policy", Label: "未知目标策略", Category: catClaudeGateway, Type: fieldSelect, Effect: effectHot,

@@ -63,6 +63,12 @@ func TestGatewayIdentity(t *testing.T) {
 	if resp.ProcessInfo.CWD != "" {
 		t.Errorf("process_info.cwd should be empty; gateway must preserve local cwd, got %q", resp.ProcessInfo.CWD)
 	}
+	if got := strings.Join(resp.GatewayPolicy.InterceptHosts, ","); strings.Contains(got, "api.openai.com") || strings.Contains(got, "chatgpt.com") {
+		t.Fatalf("default gateway policy must not MITM Codex/OpenAI hosts: %q", got)
+	}
+	if got := strings.Join(resp.GatewayPolicy.ForwardHosts, ","); !strings.Contains(got, "api.openai.com") || !strings.Contains(got, "api.github.com") || !strings.Contains(got, "api.osv.dev") {
+		t.Fatalf("default gateway policy must forward child-tool hosts, got %q", got)
+	}
 
 	// Determinism: the same downstream_key yields a stable virtual identity; a different
 	// key must not collide.

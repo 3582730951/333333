@@ -476,6 +476,13 @@ func TestGatewayTargetPolicyAllowsOnlyEssentialHosts(t *testing.T) {
 		want gatewayTargetAction
 	}{
 		{"api.anthropic.com:443", gatewayTargetIntercept},
+		{"api.openai.com:443", gatewayTargetForward},
+		{"chatgpt.com:443", gatewayTargetForward},
+		{"chatgpt.com:443", gatewayTargetForward},
+		{"chat.openai.com:443", gatewayTargetForward},
+		{"api.github.com:443", gatewayTargetForward},
+		{"pypi.org:443", gatewayTargetForward},
+		{"api.osv.dev:443", gatewayTargetForward},
 		{"pool.example:1455", gatewayTargetForward},
 		{"example.com:443", gatewayTargetBlock},
 	}
@@ -546,6 +553,7 @@ func TestGenerateWrapperRoutesClaudeThroughRunClaude(t *testing.T) {
 		"HTTP_PROXY=http://127.0.0.1:8765",
 		"HTTPS_PROXY=http://127.0.0.1:8765",
 		"ALL_PROXY=http://127.0.0.1:8765",
+		"NO_PROXY=localhost,127.0.0.1,api.openai.com,chatgpt.com,.chatgpt.com",
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 		"DISABLE_AUTOUPDATER=1",

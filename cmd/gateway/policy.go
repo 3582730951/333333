@@ -39,6 +39,7 @@ type GatewayPolicy struct {
 func defaultGatewayPolicy() GatewayPolicy {
 	return GatewayPolicy{
 		InterceptHosts:         poolconfig.DefaultClaudeGatewayInterceptHosts(),
+		ForwardHosts:           poolconfig.DefaultClaudeGatewayForwardHosts(),
 		BlockedHostPatterns:    poolconfig.DefaultClaudeGatewayBlockedHostPatterns(),
 		UnknownTargetPolicy:    "block",
 		DisableNonessentialEnv: true,

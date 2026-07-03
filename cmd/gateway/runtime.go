@@ -403,6 +403,10 @@ func destinationParentDirs(target string) []string {
 
 func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 	proxy := gatewayProxyURL(cfg.ListenAddr)
+	policy := defaultGatewayPolicy()
+	if identity != nil && identity.Virtual != nil {
+		policy = effectiveGatewayPolicy(identity.Virtual.GatewayPolicy)
+	}
 	out := []string{
 		"HOME=" + identity.Virtual.HomeDir,
 		"USER=" + identity.Virtual.Username,
@@ -413,14 +417,10 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		"HTTP_PROXY=" + proxy,
 		"HTTPS_PROXY=" + proxy,
 		"ALL_PROXY=" + proxy,
-		"NO_PROXY=" + gatewayNoProxy(cfg),
+		"NO_PROXY=" + gatewayNoProxy(cfg, policy),
 		"ANTHROPIC_BASE_URL=" + poolServerBaseURL(cfg),
 		"ANTHROPIC_AUTH_TOKEN=" + cfg.DownstreamKey,
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
-	}
-	policy := defaultGatewayPolicy()
-	if identity != nil && identity.Virtual != nil {
-		policy = effectiveGatewayPolicy(identity.Virtual.GatewayPolicy)
 	}
 	if policy.DisableNonessentialEnv {
 		out = append(out,
@@ -444,10 +444,44 @@ func poolServerBaseURL(cfg Config) string {
 	return base
 }
 
-func gatewayNoProxy(cfg Config) string {
+func gatewayNoProxy(cfg Config, policies ...GatewayPolicy) string {
+	policy := defaultGatewayPolicy()
+	if len(policies) > 0 {
+		policy = effectiveGatewayPolicy(policies[0])
+	}
 	entries := []string{"localhost", "127.0.0.1"}
 	entries = append(entries, poolServerNoProxyEntries(cfg.PoolServerURL)...)
+	entries = append(entries, gatewayPolicyNoProxyEntries(policy)...)
 	return strings.Join(uniqueNonEmpty(entries), ",")
+}
+
+func defaultWrapperNoProxy() string {
+	entries := []string{"localhost", "127.0.0.1"}
+	entries = append(entries, gatewayPolicyNoProxyEntries(defaultGatewayPolicy())...)
+	return strings.Join(uniqueNonEmpty(entries), ",")
+}
+
+func gatewayPolicyNoProxyEntries(policy GatewayPolicy) []string {
+	out := make([]string, 0, len(policy.ForwardHosts)*2)
+	for _, host := range policy.ForwardHosts {
+		out = append(out, noProxyEntriesForGatewayPattern(host)...)
+	}
+	return out
+}
+
+func noProxyEntriesForGatewayPattern(pattern string) []string {
+	host := normalizeTargetHost(pattern)
+	if host == "" {
+		return nil
+	}
+	if strings.HasPrefix(host, "*.") {
+		domain := strings.TrimPrefix(host, "*.")
+		return []string{domain, "." + domain}
+	}
+	if strings.Contains(host, "*") {
+		return nil
+	}
+	return noProxyEntriesForHostPort(host, "")
 }
 
 func poolServerNoProxyEntries(raw string) []string {

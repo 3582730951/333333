@@ -74,10 +74,22 @@ const (
 var (
 	defaultClaudeGatewayInterceptHosts = []string{
 		"api.anthropic.com",
+	}
+	defaultClaudeGatewayForwardHosts = []string{
 		"api.openai.com",
 		"chatgpt.com",
 		"*.chatgpt.com",
-		"*backend-api*",
+		"chat.openai.com",
+		"github.com",
+		"*.github.com",
+		"api.github.com",
+		"pypi.org",
+		"files.pythonhosted.org",
+		"*.pythonhosted.org",
+		"registry.npmjs.org",
+		"*.npmjs.org",
+		"osv.dev",
+		"api.osv.dev",
 	}
 	defaultClaudeGatewayBlockedHostPatterns = []string{
 		"statsig",
@@ -94,6 +106,10 @@ var (
 
 func DefaultClaudeGatewayInterceptHosts() []string {
 	return append([]string(nil), defaultClaudeGatewayInterceptHosts...)
+}
+
+func DefaultClaudeGatewayForwardHosts() []string {
+	return append([]string(nil), defaultClaudeGatewayForwardHosts...)
 }
 
 func DefaultClaudeGatewayBlockedHostPatterns() []string {
@@ -632,6 +648,7 @@ func Default() Config {
 		CodexInstallApprovalPolicy:          "never",
 		CodexInstallSandboxMode:             "danger-full-access",
 		ClaudeGatewayInterceptHosts:         DefaultClaudeGatewayInterceptHosts(),
+		ClaudeGatewayForwardHosts:           DefaultClaudeGatewayForwardHosts(),
 		ClaudeGatewayBlockedHostPatterns:    DefaultClaudeGatewayBlockedHostPatterns(),
 		ClaudeGatewayUnknownTargetPolicy:    "block",
 		ClaudeGatewayDisableNonessentialEnv: true,
@@ -1058,6 +1075,9 @@ func (c *Config) normalize() {
 	}
 	if len(c.ClaudeGatewayInterceptHosts) == 0 {
 		c.ClaudeGatewayInterceptHosts = DefaultClaudeGatewayInterceptHosts()
+	}
+	if len(c.ClaudeGatewayForwardHosts) == 0 {
+		c.ClaudeGatewayForwardHosts = DefaultClaudeGatewayForwardHosts()
 	}
 	if len(c.ClaudeGatewayBlockedHostPatterns) == 0 {
 		c.ClaudeGatewayBlockedHostPatterns = DefaultClaudeGatewayBlockedHostPatterns()
