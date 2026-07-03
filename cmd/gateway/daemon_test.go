@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -57,4 +58,21 @@ func TestListenerPIDsFindsProcessWithoutPIDFile(t *testing.T) {
 		}
 	}
 	t.Fatalf("listenerPIDs(%q) = %v, want current pid %d", ln.Addr().String(), pids, os.Getpid())
+}
+
+func TestGatewayWindowsDownloadBinaryBuilds(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain not available")
+	}
+	out := filepath.Join(t.TempDir(), "gateway-windows-amd64.exe")
+	cmd := exec.Command(goBin, "build", "-trimpath", "-o", out, ".")
+	cmd.Env = append(os.Environ(),
+		"CGO_ENABLED=0",
+		"GOOS=windows",
+		"GOARCH=amd64",
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("windows gateway build failed: %v\n%s", err, output)
+	}
 }
