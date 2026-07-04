@@ -26,7 +26,7 @@ const EMPTY_ACCOUNT_SUMMARY = {
   other: 0,
 };
 const EMPTY_DASHBOARD_CORE = { accountSummary: EMPTY_ACCOUNT_SUMMARY, ts: [], health: null, error: null };
-const EMPTY_DASHBOARD_SECONDARY = { reg: null, sys: null, byModel: [], error: null };
+const EMPTY_DASHBOARD_SECONDARY = { reg: null, sys: null, byModel: [], cache: null, error: null };
 const EMPTY_DASHBOARD = { ...EMPTY_DASHBOARD_CORE, ...EMPTY_DASHBOARD_SECONDARY };
 const DASHBOARD_REFRESH_MS = 15000;
 
@@ -55,11 +55,13 @@ export default function Dashboard() {
       registration: { label: '注册统计', load: () => get('/admin/register/stats', undefined, { signal }) },
       system: { label: '系统资源', load: () => get('/admin/system', undefined, { signal }) },
       byModel: { label: '模型统计', load: () => get('/admin/usage/by-model', { since: now - 7 * 86400 }, { signal }) },
+      cache: { label: '缓存统计', load: () => get('/admin/usage/cache', { fields: 'summary,by_model' }, { signal }) },
     });
     return {
       reg: values.registration || null,
       sys: values.system || null,
       byModel: values.byModel?.models || [],
+      cache: values.cache || null,
       error,
     };
   }, []);
@@ -125,8 +127,10 @@ export default function Dashboard() {
 
   const tokens = (d.ts || []).reduce((s, b) => s + (b.total_tokens || 0), 0);
   const reqs = (d.ts || []).reduce((s, b) => s + (b.requests || 0), 0);
-  const cachePromptTokens = (d.byModel || []).reduce((s, m) => s + (m.cache_input_tokens || m.prompt_tokens || 0), 0);
-  const cacheHitTokens = (d.byModel || []).reduce((s, m) => s + (m.cache_read_tokens || m.cached_tokens || 0), 0);
+  const cacheByModel = d.cache?.by_model || [];
+  const cacheSummary = d.cache?.summary || {};
+  const cachePromptTokens = cacheSummary.cache_input_tokens ?? cacheByModel.reduce((s, m) => s + (m.cache_input_tokens || m.prompt_tokens || 0), 0);
+  const cacheHitTokens = cacheSummary.cache_read_tokens ?? cacheByModel.reduce((s, m) => s + (m.cache_read_tokens || m.cached_tokens || 0), 0);
   const cacheHitRate = cachePromptTokens > 0 ? cacheHitTokens / cachePromptTokens : 0;
   const regRate = d.reg ? (d.reg.totals?.success_rate || 0) : 0;
 
@@ -142,7 +146,14 @@ export default function Dashboard() {
     { name: '其它', value: other, color: COLORS.grey },
   ];
   const regByDay = (d.reg?.by_day || []).map((x) => ({ x: (x.date || '').slice(5), 成功: x.succeeded || 0, 失败: x.failed || 0 }));
-  const modelTokenDonut = (d.byModel || []).slice(0, 6).map((m) => ({ name: m.model || '(未知)', value: m.total_tokens || 0, color: modelColor(m.model) }));
+  const modelTokenDonut = (d.byModel || []).slice(0, 6).map((m) => ({ name: m.model_label || m.model || '(未知)', value: m.total_tokens || 0, color: modelColor(m.model_key || m.model) }));
+  const modelTokenFormatter = (n) => {
+    n = Number(n) || 0;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B tok`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M tok`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K tok`;
+    return `${n} tok`;
+  };
   const sys = d.sys;
 
   return (
@@ -240,10 +251,10 @@ export default function Dashboard() {
 
       <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
         <div className="pool-chart-card">
-          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cache read / cache input，近 7 天 · 颜色区分模型</div></div></div>
-          <div style={{ paddingTop: 6 }}><CacheRateBars data={d.byModel} /></div>
+          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cache read / cache input，重置后重新累计</div></div></div>
+          <div style={{ paddingTop: 6 }}><CacheRateBars data={cacheByModel} /></div>
         </div>
-        <div className="pool-chart-card"><div className="head"><div className="t">模型 Token 占比</div></div><DonutChart data={modelTokenDonut} unit=" tok" /></div>
+        <div className="pool-chart-card"><div className="head"><div className="t">模型 Token 占比</div></div><DonutChart data={modelTokenDonut} valueFormatter={modelTokenFormatter} /></div>
       </div>
 
       {sys?.supported && (

@@ -72,6 +72,7 @@ func Virtualize(body []byte, id identity.Identity, sensitiveWords []string, oaut
 
 type ClaudeCodeCacheOptions struct {
 	NativeBreakpoints bool
+	BreakpointPolicy  string
 	TTL               string
 }
 
@@ -121,7 +122,7 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 			normalizeClaudeCodeIdentityCacheTTL(root, cache.TTL)
 		}
 		normalizeSystemInfo(root, id)
-		if oauth && nativeClaudeCode && cache.NativeBreakpoints {
+		if oauth && nativeClaudeCode && cache.NativeBreakpoints && normalizeClaudeCodeBreakpointPolicy(cache.BreakpointPolicy) != "coarse_safe" {
 			injectClaudeNativeAutoContextBreakpoint(root, cache.TTL)
 		}
 		capCacheControlBreakpoints(root, 4)
@@ -142,6 +143,15 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 	m := streamrewrite.New(rules)
 	out = m.ReplaceAll(out)
 	return Result{Body: out, Scrubber: m}
+}
+
+func normalizeClaudeCodeBreakpointPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "coarse_safe":
+		return "coarse_safe"
+	default:
+		return "balanced"
+	}
 }
 
 // ScrubSensitive returns the body with operator sensitive words replaced and a

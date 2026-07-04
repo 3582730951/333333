@@ -286,6 +286,39 @@ func TestEnsureAnthropicCacheControlMarksNativeClaudeStablePrefixes(t *testing.T
 	}
 }
 
+func TestEnsureAnthropicCacheControlCoarseSafeSkipsUserHistoryBreakpoints(t *testing.T) {
+	raw := []byte(`{"model":"claude","system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=12345;"},` +
+		`{"type":"text","text":"stable project instructions"}` +
+		`],"tools":[{"name":"Bash","input_schema":{"type":"object"}}],` +
+		`"messages":[` +
+		`{"role":"user","content":[` +
+		`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# repo\nstable files\n</system-reminder>\n\n"},` +
+		`{"type":"text","text":"first real request"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"ok"}]},` +
+		`{"role":"user","content":[{"type":"text","text":"final volatile question"}]}` +
+		`]}`)
+	out := EnsureAnthropicCacheControlWithPolicy(raw, "1h", "coarse_safe")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if n := cacheControlCount(t, out); n != 2 {
+		t.Fatalf("coarse_safe marker count = %d, want tool+system only: %s", n, out)
+	}
+	msgs := m["messages"].([]interface{})
+	firstBlocks := msgs[0].(map[string]interface{})["content"].([]interface{})
+	for _, idx := range []int{0, 1} {
+		if _, has := firstBlocks[idx].(map[string]interface{})["cache_control"]; has {
+			t.Fatalf("coarse_safe must not mark user/history block %d: %v", idx, firstBlocks[idx])
+		}
+	}
+	lastBlocks := msgs[2].(map[string]interface{})["content"].([]interface{})
+	if _, has := lastBlocks[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("coarse_safe must not mark latest user block: %v", lastBlocks[0])
+	}
+}
+
 func TestEnsureAnthropicCacheControlMarksSecondToLastUserTurn(t *testing.T) {
 	raw := []byte(`{"model":"claude","messages":[` +
 		`{"role":"user","content":"first stable question"},` +

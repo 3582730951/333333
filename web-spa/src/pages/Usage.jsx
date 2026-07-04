@@ -7,8 +7,8 @@ import ResourceTable from '../components/ResourceTable.jsx';
 import PageHeader, { Panel } from '../components/PageHeader.jsx';
 import StatCard from '../components/StatCard.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';
-import { UsageAreaChart, GroupedBar, CacheRateBars } from '../components/LazyCharts.jsx';
-import { COLORS } from '../lib/chartTheme.js';
+import { UsageAreaChart, GroupedBar, CacheRateBars, UsageModelAreaChart } from '../components/LazyCharts.jsx';
+import { COLORS, modelColor } from '../lib/chartTheme.js';
 import { fmtTokens, fmtInt } from '../lib/format.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { loadResourceGroup } from '../lib/resource.js';
@@ -18,6 +18,13 @@ const RANGES = [
   { label: '今日', value: 'today', bucket: 3600 },
   { label: '近 7 天', value: 604800, bucket: 86400 },
   { label: '近 30 天', value: 2592000, bucket: 86400 },
+];
+const FULL_CACHE_FIELDS = 'summary,by_account,by_model,by_api_key,by_account_model,by_route,by_route_account_model,by_time_bucket';
+const CACHE_METRICS = [
+  { label: '总 Token', value: 'total_tokens' },
+  { label: '读命中', value: 'cache_read_tokens' },
+  { label: '写缓存', value: 'cache_creation_tokens' },
+  { label: '输入 Token', value: 'prompt_tokens' },
 ];
 
 function normalize(data) {
@@ -50,17 +57,31 @@ function fmtOffset(seconds) {
   return `UTC${sign}${hh}:${mm}`;
 }
 
+function modelKey(row) {
+  return row?.model_key || row?.series_key || row?.model || '__unknown__';
+}
+
+function modelLabel(row) {
+  return row?.model_label || row?.series_label || row?.model || '(未知)';
+}
+
 export default function Usage() {
   const [range, setRange] = useState('today');
   const [resetOpen, setResetOpen] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [trendMode, setTrendMode] = useState('model');
+  const [cacheMetric, setCacheMetric] = useState('cache_read_tokens');
+  const [selectedCacheModels, setSelectedCacheModels] = useState([]);
+  const [hoveredModel, setHoveredModel] = useState(null);
 
   const fetchUsage = useCallback(async ({ signal }) => {
     const r = RANGES.find((x) => x.value === range) || RANGES[0];
     const now = Math.floor(Date.now() / 1000);
     const windowParams = r.value === 'today' ? undefined : { since: now - Number(r.value) };
-    const bucketParams = r.value === 'today' ? { bucket: r.bucket } : { since: now - Number(r.value), bucket: r.bucket };
-    const cacheParams = { bucket: r.bucket };
+    const bucketParams = r.value === 'today'
+      ? { bucket: r.bucket, series_dimension: 'model', series_limit: 6 }
+      : { since: now - Number(r.value), bucket: r.bucket, series_dimension: 'model', series_limit: 6 };
+    const cacheParams = { bucket: r.bucket, fields: FULL_CACHE_FIELDS };
     const { values, error } = await loadResourceGroup({
       usage: { label: '账号用量', load: () => get('/admin/usage', windowParams, { signal }) },
       timeseries: { label: '趋势数据', load: () => get('/admin/usage/timeseries', bucketParams, { signal }) },
@@ -70,6 +91,8 @@ export default function Usage() {
     return {
       rows: normalize(values.usage),
       ts: values.timeseries?.buckets || [],
+      modelSeries: values.timeseries?.model_series || [],
+      series: values.timeseries?.series || [],
       byModel: values.byModel?.models || [],
       cache: values.cache || {},
       usageWindow: values.usage || {},
@@ -78,14 +101,16 @@ export default function Usage() {
   }, [range]);
 
   const {
-    data = { rows: [], ts: [], byModel: [], cache: {}, usageWindow: {}, error: null },
+    data = { rows: [], ts: [], modelSeries: [], series: [], byModel: [], cache: {}, usageWindow: {}, error: null },
     loading,
     error,
     lastRefresh,
     reload: load,
-  } = useAsyncResource(fetchUsage, [fetchUsage], { initialData: { rows: [], ts: [], byModel: [], cache: {}, usageWindow: {}, error: null } });
+  } = useAsyncResource(fetchUsage, [fetchUsage], { initialData: { rows: [], ts: [], modelSeries: [], series: [], byModel: [], cache: {}, usageWindow: {}, error: null } });
   const rows = data.rows || [];
   const ts = data.ts || [];
+  const modelSeries = data.modelSeries || [];
+  const series = data.series || [];
   const byModel = data.byModel || [];
   const cache = data.cache || {};
   const cacheSummary = cache.summary || {};
@@ -113,7 +138,29 @@ export default function Usage() {
   const cacheWriteShare = cacheSummary.cache_write_share ?? (promptForCache ? cacheCreation / promptForCache : 0);
   const requestHitRate = cacheSummary.request_hit_rate ?? 0;
   const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / promptForCache) * 100))) : 0;
-  const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct) : 0;
+  const cacheWritePct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheCreation / promptForCache) * 100))) : 0;
+  const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct - cacheWritePct) : 0;
+  const cacheCompositionSegments = (cache.by_model || []).slice(0, 8).map((m) => ({
+    key: modelKey(m),
+    label: modelLabel(m),
+    color: modelColor(modelKey(m)),
+    read: m.cache_read_tokens || 0,
+    requests: m.requests,
+    request_hit_rate: m.request_hit_rate,
+    real_token_hit_rate: m.real_token_hit_rate,
+    eligible_cache_hit_rate: m.eligible_cache_hit_rate,
+    cache_write_share: m.cache_write_share,
+    total_tokens: m.total_tokens,
+  }));
+  const cacheSegmentTotal = cacheCompositionSegments.reduce((s, m) => s + m.read, 0);
+  const selectedKeySet = new Set(selectedCacheModels.length ? selectedCacheModels : series.map((s) => s.series_key));
+
+  const toggleCacheModel = (key) => {
+    const all = series.map((s) => s.series_key);
+    const base = selectedCacheModels.length ? selectedCacheModels : all;
+    const next = base.includes(key) ? base.filter((x) => x !== key) : [...base, key];
+    setSelectedCacheModels(next.length ? next : all);
+  };
 
   const topAccts = [...rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)).slice(0, 10)
     .map((a) => ({ x: (a.label || a.account_id || '').slice(0, 10), 输入: a.prompt_tokens || 0, 输出: a.completion_tokens || 0 }));
@@ -179,6 +226,7 @@ export default function Usage() {
 
   const cacheRouteCols = [
     { title: '路由', dataIndex: 'route_key_hash_prefix', width: 130, render: (v) => v || '未归因' },
+    { title: '路由类型', dataIndex: 'route_class', width: 130, render: textOrDash },
     { title: '亲和来源', dataIndex: 'affinity_source', width: 150, render: textOrDash },
     { title: 'Key 来源', dataIndex: 'prompt_cache_key_source', width: 150, render: textOrDash },
     { title: '稳定前缀', dataIndex: 'stable_prefix_source', width: 150, render: (v, r) => `${textOrDash(v)} / ${textOrDash(r.stable_prefix_reason)}` },
@@ -188,11 +236,13 @@ export default function Usage() {
     { title: '请求', dataIndex: 'requests', width: 90, sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: '请求命中', dataIndex: 'request_hit_rate', width: 110, render: fmtPct },
     { title: 'Token 命中', dataIndex: 'real_token_hit_rate', width: 120, sorter: (a, b) => (a.real_token_hit_rate || 0) - (b.real_token_hit_rate || 0), render: fmtPct },
+    { title: '写占比', dataIndex: 'cache_write_share', width: 110, sorter: (a, b) => (a.cache_write_share || 0) - (b.cache_write_share || 0), render: fmtPct },
     { title: '读命中', dataIndex: 'cache_read_tokens', width: 120, sorter: (a, b) => (a.cache_read_tokens || 0) - (b.cache_read_tokens || 0), render: fmtTokens },
     { title: '写缓存', dataIndex: 'cache_creation_tokens', width: 120, sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
     { title: '未命中', dataIndex: 'cache_miss_tokens', width: 120, sorter: (a, b) => (a.cache_miss_tokens || 0) - (b.cache_miss_tokens || 0), render: fmtTokens },
     { title: '断点', dataIndex: 'cache_breakpoint_count', width: 90, sorter: (a, b) => (a.cache_breakpoint_count || 0) - (b.cache_breakpoint_count || 0), render: fmtInt },
     { title: '最新 User 标记', dataIndex: 'latest_user_cache_control', width: 130, render: (v) => (v ? '是' : '否') },
+    { title: '风险', dataIndex: 'risk_flags', width: 180, render: (v) => (Array.isArray(v) && v.length ? v.join(' / ') : '—') },
   ];
 
   const cacheRouteAccountModelCols = [
@@ -217,6 +267,7 @@ export default function Usage() {
     r.route_key_hash_prefix || 'none',
     r.account_id || '',
     r.model || '',
+    r.route_class || '',
     r.affinity_source || '',
     r.prompt_cache_key_source || '',
     r.stable_prefix_source || '',
@@ -269,19 +320,78 @@ export default function Usage() {
         </div>
         <div className="pool-cache-breakdown__bar" aria-label="cache hit breakdown">
           <span className="pool-cache-breakdown__cached" style={{ width: `${cachedPct}%` }} />
+          <span className="pool-cache-breakdown__write" style={{ width: `${cacheWritePct}%` }} />
           <span className="pool-cache-breakdown__missed" style={{ width: `${missedPct}%` }} />
         </div>
+        {cacheCompositionSegments.length ? (
+          <div className="pool-cache-model-strip" aria-label="cache read by model">
+            {cacheCompositionSegments.map((m) => (
+              <span
+                key={m.key}
+                onMouseEnter={() => setHoveredModel(m)}
+                onMouseLeave={() => setHoveredModel(null)}
+                style={{
+                  width: `${cacheSegmentTotal > 0 ? Math.max(2, (m.read / cacheSegmentTotal) * 100) : 0}%`,
+                  background: m.color,
+                }}
+              />
+            ))}
+            {hoveredModel ? (
+              <div className="pool-cache-model-tooltip">
+                <b>{hoveredModel.label}</b>
+                <span>Token {fmtTokens(hoveredModel.total_tokens)}</span>
+                <span>请求数 {fmtInt(hoveredModel.requests)}</span>
+                <span>请求命中率 {fmtPct(hoveredModel.request_hit_rate)}</span>
+                <span>真实 Token 命中 {fmtPct(hoveredModel.real_token_hit_rate)}</span>
+                <span>可缓存命中 {fmtPct(hoveredModel.eligible_cache_hit_rate)}</span>
+                <span>写缓存占比 {fmtPct(hoveredModel.cache_write_share)}</span>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div className="pool-cache-breakdown__legend">
           <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--cached" />读命中 {fmtTokens(cacheRead)}</span>
-          <span>写入缓存 {fmtTokens(cacheCreation)}</span>
+          <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--write" />写入缓存 {fmtTokens(cacheCreation)}</span>
           <span><i className="pool-cache-breakdown__dot pool-cache-breakdown__dot--missed" />未命中 {fmtTokens(cacheMiss)}</span>
           <span>请求命中 {fmtPct(requestHitRate)}</span>
         </div>
       </div>
 
       <div className="pool-chart-card" style={{ marginBottom: 18 }}>
-        <div className="head"><div className="t">Token 用量趋势</div></div>
-        <div style={{ height: 280 }}><UsageAreaChart buckets={ts} height={280} /></div>
+        <div className="head">
+          <div><div className="t">Token 用量趋势</div><div className="s">默认按模型，保留输入 / 输出 / 缓存视图</div></div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Button size="small" theme={trendMode === 'model' ? 'solid' : 'outline'} onClick={() => setTrendMode('model')}>按模型</Button>
+            <Button size="small" theme={trendMode === 'type' ? 'solid' : 'outline'} onClick={() => setTrendMode('type')}>按类型</Button>
+          </div>
+        </div>
+        <div style={{ height: 280 }}>
+          {trendMode === 'model'
+            ? <UsageModelAreaChart modelSeries={modelSeries} series={series} height={280} selectedKeys={selectedKeySet} />
+            : <UsageAreaChart buckets={ts} height={280} />}
+        </div>
+      </div>
+
+      <div className="pool-chart-card" style={{ marginBottom: 18 }}>
+        <div className="head">
+          <div><div className="t">模型缓存趋势</div><div className="s">Top 6 动态模型 · 多选与指标切换</div></div>
+          <Select value={cacheMetric} onChange={setCacheMetric} optionList={CACHE_METRICS} style={{ width: 130 }} />
+        </div>
+        <div className="pool-model-toggle-row">
+          {series.map((s) => {
+            const active = selectedKeySet.has(s.series_key);
+            const color = modelColor(s.series_key);
+            return (
+              <button key={s.series_key} type="button" className={`pool-model-toggle ${active ? 'is-active' : ''}`} onClick={() => toggleCacheModel(s.series_key)}>
+                <i style={{ background: color }} />
+                <span>{s.series_label || s.series_key}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ height: 260 }}>
+          <UsageModelAreaChart modelSeries={modelSeries} series={series} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} />
+        </div>
       </div>
 
       <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>

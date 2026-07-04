@@ -2823,6 +2823,45 @@ func TestChatCompletionsRoutesToClaudeByModel(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsClaudeUsesConvertedAnthropicStablePrefixAffinity(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_stable","model":"claude-opus-4-8","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":30,"output_tokens":1,"cache_read_input_tokens":20}}`))
+	})
+	h.importAccount(t, "claude-stable-a", "", "sk-ant-oat-stable-a")
+	h.importAccount(t, "claude-stable-b", "", "sk-ant-oat-stable-b")
+	systemPrefix := strings.Repeat("stable converted Anthropic system prefix. ", 120)
+
+	for _, question := range []string{"summarize file A", "summarize file B"} {
+		body := `{"model":"claude-opus-4-8","messages":[{"role":"system","content":` + strconv.Quote(systemPrefix) + `},{"role":"user","content":` + strconv.Quote(question) + `}]}`
+		resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("upstream requests = %d", len(reqs))
+	}
+	if reqs[0].AccountID != reqs[1].AccountID {
+		t.Fatalf("same converted stable prefix should stay on one account, got %s then %s", reqs[0].AccountID, reqs[1].AccountID)
+	}
+	h.app.WaitForAsyncWrites()
+	var affinitySource string
+	if err := h.store.DB().QueryRow(`SELECT affinity_source FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(&affinitySource); err != nil {
+		t.Fatal(err)
+	}
+	if affinitySource != "cache_prefix_hash" {
+		t.Fatalf("affinity_source = %q, want cache_prefix_hash", affinitySource)
+	}
+}
+
 func TestClaudeCacheTTLEmptySettingDowngradesToStandard(t *testing.T) {
 	var upstreamBody string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

@@ -190,6 +190,10 @@ func StopReasonToFinish(v interface{}) string {
 // request. ttl == "1h" requests the extended (1-hour) cache; anything else uses
 // the standard 5-minute ephemeral cache.
 func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
+	return EnsureAnthropicCacheControlWithPolicy(body, ttl, "legacy")
+}
+
+func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []byte {
 	var root map[string]interface{}
 	if json.Unmarshal(body, &root) != nil {
 		return body
@@ -230,6 +234,22 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 			changed = true
 		}
 	}
+	if normalizeAnthropicCachePolicy(policy) == "coarse_safe" {
+		if !changed {
+			if anthropicwire.NormalizeCacheControlTTL(root) {
+				if out, err := json.Marshal(root); err == nil {
+					return out
+				}
+			}
+			return body
+		}
+		anthropicwire.NormalizeCacheControlTTL(root)
+		out, err := json.Marshal(root)
+		if err != nil {
+			return body
+		}
+		return out
+	}
 	// 3) Claude Code native auto-context block: this is the stable prefix before
 	// the real user request in current Claude Code request shapes.
 	if budget > 0 {
@@ -260,6 +280,15 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 		return body
 	}
 	return out
+}
+
+func normalizeAnthropicCachePolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "coarse_safe":
+		return "coarse_safe"
+	default:
+		return "balanced"
+	}
 }
 
 type AnthropicCacheControlDiagnostics struct {

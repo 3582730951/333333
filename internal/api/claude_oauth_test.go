@@ -104,9 +104,14 @@ func TestPollOneClaudeQuotaUsesOAuthUsageEndpoint(t *testing.T) {
 	for _, row := range rows {
 		seen[row.LimiterType] = row
 	}
-	for _, want := range []string{"5h_oauth_usage", "7d_oauth_usage", "oauth_app", "opus", "sonnet"} {
+	for _, want := range []string{"5h_oauth_usage", "7d_oauth_usage", "oauth_app"} {
 		if _, ok := seen[want]; !ok {
 			t.Fatalf("missing limiter %q in %#v", want, rows)
+		}
+	}
+	for _, forbidden := range []string{"opus", "sonnet"} {
+		if _, ok := seen[forbidden]; ok {
+			t.Fatalf("model-family limiter %q must not be persisted for quota selection: %#v", forbidden, rows)
 		}
 	}
 	if seen["5h_oauth_usage"].UsedPercent != 40 || seen["7d_oauth_usage"].UsedPercent != 25 {
@@ -156,12 +161,8 @@ func TestParseClaudeOAuthUsageFindsNestedWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.Windows) != 1 {
+	if len(parsed.Windows) != 0 {
 		t.Fatalf("windows = %#v", parsed.Windows)
-	}
-	win := parsed.Windows[0]
-	if win.LimiterType != "sonnet" || win.Model != "sonnet" || win.UsedPercent != 7 || win.RemainingTokens != 0 {
-		t.Fatalf("nested sonnet window not parsed: %#v", win)
 	}
 }
 

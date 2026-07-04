@@ -167,6 +167,32 @@ func TestVirtualizeClaudeCodeWithCacheMarksAutoContextPrefix(t *testing.T) {
 	}
 }
 
+func TestVirtualizeClaudeCodeWithCacheCoarseSafeDoesNotMarkAutoContextPrefix(t *testing.T) {
+	id := identity.For(nil, "acc-cache-coarse")
+	body := []byte(`{"model":"claude","metadata":{"user_id":"real-user-123"},"system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.953; cc_entrypoint=sdk-cli; cch=d4baa;"},` +
+		`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}},` +
+		`{"type":"text","text":"stable instructions","cache_control":{"type":"ephemeral"}}` +
+		`],"messages":[{"role":"user","content":[` +
+		`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday.\n</system-reminder>\n\n"},` +
+		`{"type":"text","text":"real user request","cache_control":{"type":"ephemeral"}}` +
+		`]}]}`)
+
+	res := VirtualizeClaudeCodeWithCache(body, id, nil, true, "2.1.160", ClaudeCodeCacheOptions{
+		NativeBreakpoints: true,
+		BreakpointPolicy:  "coarse_safe",
+		TTL:               "1h",
+	})
+	root := mustRoot(t, res.Body)
+	blocks := root["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
+	if _, has := blocks[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("coarse_safe must not mark auto-context user block: %v", blocks[0])
+	}
+	if got := countClaudeCacheControls(root); got != 3 {
+		t.Fatalf("coarse_safe cache_control count = %d, want existing 3", got)
+	}
+}
+
 func TestVirtualizeClaudeCodeWithCacheSkipsUnknownShapeAndDisabled(t *testing.T) {
 	id := identity.For(nil, "acc-cache-skip")
 	body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.953; cc_entrypoint=sdk-cli; cch=d4baa;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"plain user request"}]}]}`)

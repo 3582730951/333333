@@ -558,7 +558,26 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, groups)
+		names := make([]string, 0, len(groups))
+		for _, group := range groups {
+			names = append(names, group.Name)
+		}
+		counts, err := s.store.CountAccountsByGroups(r.Context(), names)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		type groupView struct {
+			storage.Group
+			AccountCount       int `json:"account_count"`
+			ActiveAccountCount int `json:"active_account_count"`
+		}
+		out := make([]groupView, 0, len(groups))
+		for _, group := range groups {
+			c := counts[group.Name]
+			out = append(out, groupView{Group: group, AccountCount: c.AccountCount, ActiveAccountCount: c.ActiveAccountCount})
+		}
+		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
 		// Create a new group. Body: {name, [system_prompt, force_model, force_effort,
 		// default_egress_id, virtual_2m_enabled, ...]} — same field set as PATCH.

@@ -28,6 +28,45 @@ type PromptPrefixFingerprint struct {
 }
 
 func ExtractAffinityKey(r *http.Request, body []byte) AffinityKey {
+	if key := extractGenericTrueAffinityKey(r, body); key.Hash != "" {
+		return key
+	}
+	if key := cachePrefixKey(r, body); key != "" {
+		return newKey(key, "cache_prefix_hash")
+	}
+	if key := downstreamKey(r, body); key != "" {
+		return newKey(key, "downstream_api_project_model")
+	}
+	if hash := stableMessagesHash(body); hash != "" {
+		return newKey("stable_messages:"+hash, "stable_messages_hash")
+	}
+	return AffinityKey{}
+}
+
+func ExtractClaudeAffinityKey(r *http.Request, body []byte) AffinityKey {
+	if key := ExtractClaudeTrueAffinityKey(r, body); key.Hash != "" {
+		return key
+	}
+	if key := claudeCachePrefixKey(r, body); key != "" {
+		return newKey(key, "cache_prefix_hash")
+	}
+	if key := downstreamKey(r, body); key != "" {
+		return newKey(key, "downstream_api_project_model")
+	}
+	if hash := stableMessagesHash(body); hash != "" {
+		return newKey("stable_messages:"+hash, "stable_messages_hash")
+	}
+	return AffinityKey{}
+}
+
+func ExtractClaudeTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
+	if v := headerValue(r, "x-claude-code-session-id"); v != "" {
+		return newKey("x-claude-code-session-id:"+v, "x-claude-code-session-id")
+	}
+	return extractGenericTrueAffinityKey(r, body)
+}
+
+func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 	if v := headerValue(r, "x-codex-parent-thread-id"); v != "" {
 		return newKey("x-codex-parent-thread-id:"+v, "x-codex-parent-thread-id")
 	}
@@ -45,15 +84,6 @@ func ExtractAffinityKey(r *http.Request, body []byte) AffinityKey {
 	}
 	if v := headerValue(r, "x-codex-turn-metadata"); v != "" {
 		return newKey("x-codex-turn-metadata:"+v, "x-codex-turn-metadata")
-	}
-	if key := cachePrefixKey(r, body); key != "" {
-		return newKey(key, "cache_prefix_hash")
-	}
-	if key := downstreamKey(r, body); key != "" {
-		return newKey(key, "downstream_api_project_model")
-	}
-	if hash := stableMessagesHash(body); hash != "" {
-		return newKey("stable_messages:"+hash, "stable_messages_hash")
 	}
 	return AffinityKey{}
 }
@@ -110,6 +140,43 @@ func StablePromptPrefixHash(body []byte) string {
 
 func StablePromptPrefixFingerprint(body []byte) PromptPrefixFingerprint {
 	return stablePromptPrefixFingerprint(body)
+}
+
+func AnthropicStablePromptPrefixHash(body []byte) string {
+	return AnthropicStablePromptPrefixFingerprint(body).Hash
+}
+
+func AnthropicStablePromptPrefixFingerprint(body []byte) PromptPrefixFingerprint {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return PromptPrefixFingerprint{Reason: "empty_body"}
+	}
+	var root map[string]interface{}
+	if json.Unmarshal(body, &root) != nil {
+		return PromptPrefixFingerprint{Reason: "invalid_json"}
+	}
+	stable := map[string]interface{}{}
+	if sys, ok := stableAnthropicSystem(root["system"]); ok {
+		stable["system"] = sys
+	}
+	if tools, ok := root["tools"]; ok {
+		stable["tools"] = tools
+	}
+	if toolChoice, ok := root["tool_choice"]; ok {
+		stable["tool_choice"] = toolChoice
+	}
+	msgs, ok := root["messages"].([]interface{})
+	if ok && len(msgs) > 0 {
+		prefix, removed := withoutFinalUserTurn(msgs)
+		if !removed {
+			return PromptPrefixFingerprint{Reason: "final_turn_not_user"}
+		}
+		stable["messages"] = prefix
+	} else if _, hasSystem := stable["system"]; !hasSystem {
+		if _, hasTools := stable["tools"]; !hasTools {
+			return PromptPrefixFingerprint{Reason: "empty_sequence"}
+		}
+	}
+	return hashPromptPrefixCandidate(stable, "anthropic_message_prefix")
 }
 
 func Model(body []byte) string {
@@ -174,6 +241,24 @@ func cachePrefixKey(r *http.Request, body []byte) string {
 	return strings.Join([]string{"cache_prefix", token, project, model, prefixHash}, ":")
 }
 
+func claudeCachePrefixKey(r *http.Request, body []byte) string {
+	token := bearerFingerprint(r.Header.Get("Authorization"))
+	project := firstNonEmpty(
+		headerValue(r, "openai-project"),
+		headerValue(r, "x-project-id"),
+		JSONStringField(body, "project"),
+	)
+	model := JSONStringField(body, "model")
+	if token == "" && project == "" {
+		return ""
+	}
+	prefixHash := AnthropicStablePromptPrefixHash(body)
+	if prefixHash == "" {
+		return ""
+	}
+	return strings.Join([]string{"claude_cache_prefix", token, project, model, prefixHash}, ":")
+}
+
 func stablePromptPrefixFingerprint(body []byte) PromptPrefixFingerprint {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return PromptPrefixFingerprint{Reason: "empty_body"}
@@ -202,6 +287,37 @@ func stablePromptPrefixFingerprint(body []byte) PromptPrefixFingerprint {
 	default:
 		return PromptPrefixFingerprint{Reason: "unsupported_sequence"}
 	}
+}
+
+func stableAnthropicSystem(v interface{}) (interface{}, bool) {
+	switch sys := v.(type) {
+	case string:
+		if strings.TrimSpace(sys) == "" || isClaudeBillingHeaderText(sys) {
+			return nil, false
+		}
+		return sys, true
+	case []interface{}:
+		out := make([]interface{}, 0, len(sys))
+		for _, item := range sys {
+			if m, ok := item.(map[string]interface{}); ok {
+				text, _ := m["text"].(string)
+				if isClaudeBillingHeaderText(text) {
+					continue
+				}
+			}
+			out = append(out, item)
+		}
+		if len(out) == 0 {
+			return nil, false
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func isClaudeBillingHeaderText(s string) bool {
+	return strings.HasPrefix(strings.TrimSpace(s), "x-anthropic-billing-header:")
 }
 
 func messagePrefixFingerprint(root map[string]interface{}, seqName string, items []interface{}) PromptPrefixFingerprint {

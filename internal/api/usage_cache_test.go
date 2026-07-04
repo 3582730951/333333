@@ -7,6 +7,8 @@ import (
 	"math"
 	"net/http"
 	"testing"
+
+	"codex-account-pool/internal/storage"
 )
 
 func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
@@ -23,7 +25,7 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 	if err := h.store.InsertUsageRecord(ctx, "acc-b", "route-b", "fedcba9876543210", "", "gpt-5.4", 300, 30, 330, 120, json.RawMessage(`{"real":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.InsertUsageRecordWithCacheDetails(ctx, "acc-c", "route-c", "facefeed12345678", "", "claude-sonnet", 400, 40, 440, 0, 0, 210, json.RawMessage(`{"real":true}`)); err != nil {
+	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, "acc-c", "route-c", "facefeed12345678", "", "claude-sonnet", 400, 40, 440, 0, 0, 210, json.RawMessage(`{"real":true}`), storage.UsageDiagnostics{AffinitySource: "downstream_api_project_model"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.store.InsertUsageRecordWithCacheDetails(ctx, "acc-d", "route-d", "ca11ab1e12345678", "", "claude-sonnet", 50, 5, 55, 700, 700, 0, json.RawMessage(`{"usage":{"input_tokens":50,"cache_read_input_tokens":700}}`)); err != nil {
@@ -69,9 +71,13 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 			HitRequests int64  `json:"hit_requests"`
 		} `json:"by_account_model"`
 		ByRoute []struct {
-			RouteKeyHashPrefix string `json:"route_key_hash_prefix"`
-			Requests           int64  `json:"requests"`
-			AffinitySource     string `json:"affinity_source"`
+			RouteKeyHashPrefix string   `json:"route_key_hash_prefix"`
+			Requests           int64    `json:"requests"`
+			AffinitySource     string   `json:"affinity_source"`
+			RouteClass         string   `json:"route_class"`
+			CacheWriteShare    float64  `json:"cache_write_share"`
+			SingleUseRoute     bool     `json:"single_use_route"`
+			RiskFlags          []string `json:"risk_flags"`
 		} `json:"by_route"`
 		ByTimeBucket []struct {
 			Bucket              int64 `json:"bucket"`
@@ -127,6 +133,36 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 	}
 	if len(got.ByRoute) == 0 || got.ByRoute[0].RouteKeyHashPrefix == "" {
 		t.Fatalf("by_route missing or lacks route hash prefix: %+v", got.ByRoute)
+	}
+	var coarseRoute *struct {
+		RouteKeyHashPrefix string   `json:"route_key_hash_prefix"`
+		Requests           int64    `json:"requests"`
+		AffinitySource     string   `json:"affinity_source"`
+		RouteClass         string   `json:"route_class"`
+		CacheWriteShare    float64  `json:"cache_write_share"`
+		SingleUseRoute     bool     `json:"single_use_route"`
+		RiskFlags          []string `json:"risk_flags"`
+	}
+	for i := range got.ByRoute {
+		if got.ByRoute[i].AffinitySource == "downstream_api_project_model" {
+			coarseRoute = &got.ByRoute[i]
+			break
+		}
+	}
+	if coarseRoute == nil || coarseRoute.RouteClass != "coarse" || !coarseRoute.SingleUseRoute {
+		t.Fatalf("coarse route diagnostics missing: %+v", got.ByRoute)
+	}
+	for _, want := range []string{"high_write_share", "single_use", "coarse_route"} {
+		found := false
+		for _, gotFlag := range coarseRoute.RiskFlags {
+			if gotFlag == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("coarse route risk flags %v missing %q", coarseRoute.RiskFlags, want)
+		}
 	}
 	if len(got.ByTimeBucket) == 0 || got.ByTimeBucket[0].CacheMissTokens == 0 {
 		t.Fatalf("by_time_bucket missing cache miss breakdown: %+v", got.ByTimeBucket)

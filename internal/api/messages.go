@@ -105,9 +105,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// streamed reply). count_tokens runs through here too — harmless.
 	raw = s.moderateHistory(r.Context(), raw, "anthropic")
 
-	affinity := routing.ExtractAffinityKey(r, raw)
 	strict := routing.IsStrictSticky(path, r, raw)
 	model := routing.Model(raw)
+	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
 
 	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is relayed to
 	// that provider, converting Anthropic Messages ↔ Chat Completions both ways. Claude
@@ -136,7 +136,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	exclude := map[string]bool{}
 	for attempt := 0; attempt < attempts; attempt++ {
-		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, attempt < attempts-1, exclude) != outcomeRetry {
+		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, attempt < attempts-1, exclude) != outcomeRetry {
 			return
 		}
 	}
@@ -149,7 +149,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // account is added to exclude before any retry so it is not re-selected. Mirrors the
 // Codex path's codexAttempt; a benched account is held out of the pool until the
 // recheck loop re-validates it.
-func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group string, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	streamReq := isStreamRequest(raw)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           group,
@@ -218,13 +218,15 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	wordsForClaude = appendVirtualHomeToWords(wordsForClaude, id.HomeDir)
 	nativeCacheInject := s.nativeCacheBreakpointInjectEnabled(r.Context())
 	claudeTTL := s.claudeCacheTTL(r.Context())
+	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, group, apiKeyHash)
 	result := cloak.VirtualizeClaudeCodeWithCache(raw, id, wordsForClaude, oauth, billingVer, cloak.ClaudeCodeCacheOptions{
 		NativeBreakpoints: nativeCacheInject,
+		BreakpointPolicy:  breakpointPolicy,
 		TTL:               claudeTTL,
 	})
 	body := result.Body
 	if nativeCacheInject {
-		body = prompt.EnsureAnthropicCacheControl(body, claudeTTL)
+		body = prompt.EnsureAnthropicCacheControlWithPolicy(body, claudeTTL, breakpointPolicy)
 	}
 
 	usageDiag := claudeRequestUsageDiagnostics(body, affinity, claudeTTL, nativeCacheInject)

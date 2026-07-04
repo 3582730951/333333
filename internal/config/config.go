@@ -261,6 +261,20 @@ type Config struct {
 	// prompt caching). Default on; quality/behavior unchanged, only cached-token
 	// billing drops. Runtime-toggleable from the admin UI.
 	ClaudeCacheControlInject bool `json:"claude_cache_control_inject"`
+	// ClaudeCacheAffinityPolicy controls Claude account affinity. "legacy" preserves
+	// the pre-optimization route key order; "balanced" prefers true Claude sessions
+	// and stable Anthropic cache prefixes before falling back to coarse routing.
+	ClaudeCacheAffinityPolicy string `json:"claude_cache_affinity_policy"`
+	// ClaudeCacheBreakpointPolicy controls injected Claude cache_control placement.
+	// "legacy" preserves the old full injection behavior; "balanced" keeps full
+	// breakpoints for true/stable routes and uses coarse_safe for coarse routes;
+	// "coarse_safe" only marks stable tools and non-billing system prefixes.
+	ClaudeCacheBreakpointPolicy string `json:"claude_cache_breakpoint_policy"`
+	// ClaudeCacheOptimizationRollout is a JSON scope for Claude cache optimization
+	// rollout. Supported keys: groups, api_key_hash_prefixes, account_ids
+	// (breakpoints only), and percent. "{}" means all Claude traffic; model-level
+	// scoping is intentionally unsupported.
+	ClaudeCacheOptimizationRollout string `json:"claude_cache_optimization_rollout"`
 	// ClaudeNativeCacheBreakpointInject conservatively adds one cache_control marker
 	// to a recognized Claude Code auto-context prefix when the native request has spare
 	// marker budget. It never changes prompt text, tools, thinking, auth, or billing
@@ -621,6 +635,9 @@ func Default() Config {
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
+		ClaudeCacheAffinityPolicy:         "balanced",
+		ClaudeCacheBreakpointPolicy:       "balanced",
+		ClaudeCacheOptimizationRollout:    "{}",
 		ClaudeNativeCacheBreakpointInject: true,
 		ClaudeCacheTTL:                    "1h",
 		ClaudeCCHSigning:                  true,

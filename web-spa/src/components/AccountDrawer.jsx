@@ -31,17 +31,20 @@ export default function AccountDrawer({
 }) {
   const binding = account?.egress_binding || null;
   const [selectedEgress, setSelectedEgress] = useState('');
+  const [selectedGroup, setSelectedGroup] = useState('');
 
   const fetchDetails = useCallback(async ({ signal }) => {
     if (!account) return EMPTY_ACCOUNT_DETAIL;
-    const [data, profiles] = await Promise.all([
+    const [data, profiles, groups] = await Promise.all([
       get('/admin/audit', { account_id: account.id, limit: 10 }, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
+      get('/admin/groups', undefined, { signal }),
     ]);
     const rows = Array.isArray(data) ? data : data?.rows || [];
     return {
       audit: rows,
       profiles: Array.isArray(profiles) ? profiles : profiles?.profiles || profiles?.egress_profiles || [],
+      groups: Array.isArray(groups) ? groups : groups?.groups || [],
     };
   }, [account]);
 
@@ -60,6 +63,10 @@ export default function AccountDrawer({
     setSelectedEgress(binding?.primary_egress_id || '');
   }, [account?.id, binding?.primary_egress_id]);
 
+  useEffect(() => {
+    setSelectedGroup(account?.group_name || '');
+  }, [account?.id, account?.group_name]);
+
   const { run: saveDefaultEgress, running: savingDefaultEgress } = useAsyncAction(async () => {
     if (!account || !selectedEgress) return;
     try {
@@ -73,10 +80,23 @@ export default function AccountDrawer({
     }
   });
 
+  const { run: saveGroup, running: savingGroup } = useAsyncAction(async () => {
+    if (!account || !selectedGroup) return;
+    try {
+      await post(`/admin/accounts/${encodeURIComponent(account.id)}/group`, { group: selectedGroup });
+      Toast.success('分组已保存');
+      await onUpdated?.(account.id, { group_name: selectedGroup });
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
   if (!account) return null;
   const u = usage;
   const audit = details.audit || [];
   const profiles = details.profiles || [];
+  const groups = details.groups || [];
+  const groupPolicy = groups.find((group) => group.name === (selectedGroup || account.group_name)) || null;
   const egressOptions = profiles.map((profile) => ({
     label: `${profile.name || profile.id} (${profile.type || 'direct'})`,
     value: profile.id,
@@ -94,6 +114,28 @@ export default function AccountDrawer({
         <Row k="分组" v={account.group_name || '默认'} />
         <Row k="套餐" v={account.plan_type || '—'} />
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
+      </Panel>
+
+      <Panel title="分组策略" style={{ marginBottom: 14 }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+          <Select
+            value={selectedGroup}
+            onChange={setSelectedGroup}
+            optionList={groups.map((group) => ({ label: group.name, value: group.name }))}
+            placeholder="选择分组"
+            disabled={savingGroup || !groups.length}
+            style={{ flex: 1, minWidth: 0 }}
+          />
+          <Button
+            size="small"
+            loading={savingGroup}
+            disabled={!selectedGroup || selectedGroup === account.group_name}
+            onClick={saveGroup}
+          >保存</Button>
+        </div>
+        <Row k="继承模型" v={groupPolicy?.force_model || '默认模型'} />
+        <Row k="继承努力级别" v={groupPolicy?.force_effort || '默认'} />
+        <Row k="成员" v={`${groupPolicy?.active_account_count ?? 0} / ${groupPolicy?.account_count ?? 0} 活跃`} />
       </Panel>
 
       <Panel title="出口绑定" style={{ marginBottom: 14 }}>

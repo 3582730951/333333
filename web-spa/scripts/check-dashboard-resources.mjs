@@ -66,7 +66,7 @@ assertLoader('fetchDashboardCore', {
 });
 
 assertLoader('fetchDashboardSecondary', {
-  required: ['/admin/register/stats', '/admin/system', '/admin/usage/by-model'],
+  required: ['/admin/register/stats', '/admin/system', '/admin/usage/by-model', '/admin/usage/cache'],
 });
 
 if (/const\s+fetchDashboard\s*=/.test(source)) {

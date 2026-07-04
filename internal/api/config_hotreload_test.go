@@ -445,6 +445,20 @@ func TestAdminConfigRejectsInvalidSchedulerFields(t *testing.T) {
 	}
 }
 
+func TestAdminConfigRejectsClaudeCacheRolloutModelScope(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp"}`))
+	})
+
+	status, body := patchConfigStatus(t, h, `{"claude_cache_optimization_rollout":"{\"models\":[\"claude-opus-4-8\"]}"}`)
+	if status != http.StatusBadRequest {
+		t.Fatalf("model-scoped claude cache rollout status = %d, want 400: %s", status, body)
+	}
+	if !strings.Contains(body, "unsupported rollout key") || !strings.Contains(body, "models") {
+		t.Fatalf("model-scoped claude cache rollout body = %q", body)
+	}
+}
+
 func TestAdminConfigPatchDoesNotPartiallyPersistInvalidBatch(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp"}`))

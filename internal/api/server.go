@@ -424,7 +424,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// relayed to the Anthropic upstream (format-converted both ways) instead of
 	// Codex; everything else continues down the Codex/Responses path.
 	if isChat && isClaudeModel(model) {
-		s.handleChatViaClaude(w, r, raw, model, pol.Group, pol.ForceEffort)
+		s.handleChatViaClaude(w, r, raw, model, pol)
 		return
 	}
 

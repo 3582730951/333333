@@ -460,9 +460,53 @@
   background: var(--pool-success);
 }
 
+.pool-cache-breakdown__write {
+  background: var(--pool-warning);
+  border-left: 1px solid var(--pool-bg-surface);
+}
+
 .pool-cache-breakdown__missed {
   background: var(--pool-bg-surface-3);
   border-left: 1px solid var(--pool-bg-surface);
+}
+
+.pool-cache-model-strip {
+  position: relative;
+  height: 10px;
+  display: flex;
+  overflow: visible;
+  border-radius: 999px;
+  background: var(--pool-bg-surface-3);
+}
+
+.pool-cache-model-strip > span {
+  min-width: 2px;
+  height: 10px;
+  cursor: default;
+}
+
+.pool-cache-model-strip > span:first-child {
+  border-radius: 999px 0 0 999px;
+}
+
+.pool-cache-model-strip > span:last-of-type {
+  border-radius: 0 999px 999px 0;
+}
+
+.pool-cache-model-tooltip {
+  position: absolute;
+  left: 12px;
+  top: 16px;
+  z-index: 4;
+  min-width: 190px;
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--pool-chart-tooltip-border);
+  border-radius: 8px;
+  background: var(--pool-chart-tooltip-bg);
+  box-shadow: var(--pool-shadow);
+  font-size: 12px;
 }
 
 .pool-cache-breakdown__dot {
@@ -477,8 +521,54 @@
   background: var(--pool-success);
 }
 
+.pool-cache-breakdown__dot--write {
+  background: var(--pool-warning);
+}
+
 .pool-cache-breakdown__dot--missed {
   background: var(--pool-chart-gray);
+}
+
+.pool-model-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+  margin: 0 0 10px;
+}
+
+.pool-model-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  max-width: 180px;
+  padding: 4px 8px;
+  border: 1px solid var(--pool-border);
+  border-radius: 6px;
+  background: var(--pool-bg-surface);
+  color: var(--pool-text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pool-model-toggle i {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+}
+
+.pool-model-toggle span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-model-toggle.is-active {
+  border-color: var(--pool-primary);
+  color: var(--pool-text);
+  background: var(--pool-bg-surface-2);
 }
 
 .pool-input-wrap {

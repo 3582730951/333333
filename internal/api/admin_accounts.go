@@ -68,6 +68,7 @@ type accountView struct {
 	Capabilities []storage.ModelCapability     `json:"capabilities"`
 	Egress       *storage.AccountEgressBinding `json:"egress_binding,omitempty"`
 	Usage        *storage.UsageSummaryRow      `json:"usage,omitempty"`
+	QuotaSummary QuotaSummary                  `json:"quota_summary"`
 }
 
 func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) ([]accountView, error) {
@@ -91,12 +92,26 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 	if err != nil {
 		return nil, err
 	}
+	tokens, err := s.store.ListTokensByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	quotaSnapshots, err := s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	now := storage.Now()
 	out := make([]accountView, 0, len(accounts))
 	for _, account := range accounts {
+		var token *storage.AccountToken
+		if t, ok := tokens[account.ID]; ok {
+			token = &t
+		}
 		view := accountView{
 			Account:      account,
 			Provider:     providers[account.ID],
 			Capabilities: capabilities[account.ID],
+			QuotaSummary: BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now),
 		}
 		if binding, ok := bindings[account.ID]; ok {
 			view.Egress = &binding
@@ -418,6 +433,9 @@ func (s *Server) adminSetAccountGroup(w http.ResponseWriter, r *http.Request, ac
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "group": group})
 }
 
@@ -456,6 +474,9 @@ func (s *Server) adminAccountsAssignGroup(w http.ResponseWriter, r *http.Request
 		if err := s.store.SetAccountGroup(r.Context(), id, group); err == nil {
 			updated++
 		}
+	}
+	if updated > 0 && s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"group": group, "accounts_updated": updated})
 }

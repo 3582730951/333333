@@ -22,6 +22,15 @@ func TestAdminQuotaDoesNotLoadAllAccounts(t *testing.T) {
 		end = len(rest)
 	}
 	body := rest[:end]
+	helperStart := strings.Index(source, "func (s *Server) quotaViewsForAccounts(")
+	if helperStart >= 0 {
+		helperRest := source[helperStart+len("func (s *Server) quotaViewsForAccounts("):]
+		helperEnd := strings.Index(helperRest, "\nfunc ")
+		if helperEnd < 0 {
+			helperEnd = len(helperRest)
+		}
+		body += helperRest[:helperEnd]
+	}
 	if strings.Contains(body, ".ListAccounts(") {
 		t.Fatal("adminQuota must not load the full account table; resolve labels only for quota snapshot account IDs")
 	}

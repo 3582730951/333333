@@ -49,8 +49,23 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.store.InsertUsageRecord(ctx, account.ID, "route-secret", "api-key-hash", "user-1", "gpt-5.5", 10, 3, 13, 4,
-		json.RawMessage(`{"account":"acc-real-1","email":"sensitive@example.com","label":"Alpha Sensitive","upstream":"upstream-secret","chatgpt":"chatgpt-secret"}`)); err != nil {
+	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route-secret", "api-key-hash", "user-1", "gpt-5.5", 10, 3, 13, 4, 4, 2,
+		json.RawMessage(`{"account":"acc-real-1","email":"sensitive@example.com","label":"Alpha Sensitive","upstream":"upstream-secret","chatgpt":"chatgpt-secret"}`),
+		storage.UsageDiagnostics{
+			AffinitySource:         "cache_prefix_hash",
+			PromptCacheKeyPresent:  true,
+			PromptCacheKeySource:   "auto_stable_prefix",
+			StablePrefixSource:     "anthropic_message_prefix",
+			StablePrefixReason:     "ok",
+			StablePrefixBytes:      4096,
+			RetentionEffective:     "24h",
+			RetentionSource:        "gateway_default",
+			ClaudeCacheTTL:         "1h",
+			CacheControlInjected:   true,
+			CacheBreakpointCount:   2,
+			LatestUserCacheControl: false,
+			RouteEpoch:             7,
+		}); err != nil {
 		t.Fatal(err)
 	}
 	holdID, err := h.store.CreateBillingHold(ctx, "route-secret", account.ID, 42)
@@ -103,6 +118,17 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv"} {
 		if !strings.Contains(files[name], "ACC-0001") {
 			t.Fatalf("%s should use stable account code ACC-0001:\n%s", name, files[name])
+		}
+	}
+	usageCSV := files["usage_records.csv"]
+	for _, want := range []string{"affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "route_epoch"} {
+		if !strings.Contains(usageCSV, want) {
+			t.Fatalf("usage_records.csv missing diagnostic column %q:\n%s", want, usageCSV)
+		}
+	}
+	for _, want := range []string{"cache_prefix_hash", "stable_prefix", "auto_stable_prefix", "anthropic_message_prefix", "4096", "24h", "1h", "7"} {
+		if !strings.Contains(usageCSV, want) {
+			t.Fatalf("usage_records.csv missing diagnostic value %q:\n%s", want, usageCSV)
 		}
 	}
 }

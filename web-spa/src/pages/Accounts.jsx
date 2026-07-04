@@ -42,6 +42,10 @@ function accountUsage(account) {
 }
 
 function quotaPercent(account) {
+  const summaryPct = account?.quota_summary?.primary?.used_percent;
+  if (Number.isFinite(Number(summaryPct)) && Number(summaryPct) >= 0) {
+    return Math.max(0, Math.min(100, Math.round(Number(summaryPct))));
+  }
   const candidates = [account.quota_pct, account.quota_percent, account.quota_used_pct, account.usage_pct];
   const direct = candidates.find((value) => Number.isFinite(Number(value)));
   if (direct !== undefined) return Math.max(0, Math.min(100, Number(direct)));
@@ -51,6 +55,10 @@ function quotaPercent(account) {
     return Math.max(0, Math.min(100, Math.round(((limit - remaining) / limit) * 100)));
   }
   return null;
+}
+
+function quotaReason(account) {
+  return account?.quota_summary?.sync_reason || (quotaPercent(account) == null ? 'never_polled' : 'ok');
 }
 
 function routeSummary(account) {
@@ -71,6 +79,7 @@ export default function Accounts() {
   const [drawerAcct, setDrawerAcct] = useState(null);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveGroup, setMoveGroup] = useState('');
+  const [moveIDs, setMoveIDs] = useState([]);
 
   const fetchAccountData = useCallback(async ({ signal }) => {
     const { values, error } = await loadResourceGroup({
@@ -154,10 +163,13 @@ export default function Accounts() {
   });
 
   const { run: bulkMove, running: bulkMoveRunning } = useAsyncAction(async () => {
+    const ids = moveIDs.length ? moveIDs : selected;
+    if (!ids.length) return;
     try {
-      await post('/admin/accounts/assign-group', { ids: selected, group: moveGroup });
-      Toast.success(`已移动 ${selected.length} 个账号到「${moveGroup || '默认'}」`);
+      await post('/admin/accounts/assign-group', { ids, group: moveGroup });
+      Toast.success(`已移动 ${ids.length} 个账号到「${moveGroup || '默认'}」`);
       setMoveOpen(false);
+      setMoveIDs([]);
       setSelected([]);
       await load();
     } catch (e) { showErrorToast(e); }
@@ -178,6 +190,15 @@ export default function Accounts() {
           label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解隔中' : '解隔',
           disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine'),
           onSelect: () => action(r.id, 'clear-quarantine'),
+        },
+        {
+          label: '移动分组',
+          disabled: anyAccountOperationRunning,
+          onSelect: () => {
+            setMoveIDs([r.id]);
+            setMoveGroup(r.group_name || '');
+            setMoveOpen(true);
+          },
         },
         { label: '详情', disabled: anyAccountOperationRunning, onSelect: () => setDrawerAcct(r) },
         {
@@ -233,9 +254,10 @@ export default function Accounts() {
       width: 132,
       render: (_, r) => {
         const pct = quotaPercent(r);
+        const reason = quotaReason(r);
         return (
           <div className="pool-quota-cell">
-            <span>{pct === null ? '未同步' : `${pct}% 已用`}</span>
+            <span>{pct === null ? `未同步 · ${reason}` : `${pct}% 已用`}</span>
             <TinyMeter value={pct ?? 0} label={pct === null ? '未同步' : `${pct}% 已用`} />
           </div>
         );
@@ -313,7 +335,7 @@ export default function Accounts() {
           <span>已选 <b>{selected.length}</b> 项</span>
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', '测活')}>批量测活</Button>
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解隔离')}>批量解隔离</Button>
-          <Button size="small" disabled={anyAccountOperationRunning} onClick={() => { setMoveGroup(''); setMoveOpen(true); }}>移动分组</Button>
+          <Button size="small" disabled={anyAccountOperationRunning} onClick={() => { setMoveIDs([...selected]); setMoveGroup(''); setMoveOpen(true); }}>移动分组</Button>
           <ConfirmDialog
             title={`删除选中的 ${selected.length} 个账号？`}
             description="批量删除后不可恢复，失败项会保留在已选列表中。"
@@ -356,7 +378,7 @@ export default function Accounts() {
         statusTag={statusTag} onAction={action} actionRunning={accountActionRunning}
         actionDisabled={bulkActionRunning || bulkMoveRunning} isActionLoading={isAccountActionLoading}
         onUpdated={handleAccountUpdated} onClose={() => setDrawerAcct(null)} />
-      <Modal title="批量移动到分组" visible={moveOpen} onCancel={() => { if (!bulkMoveRunning) setMoveOpen(false); }} onOk={bulkMove} confirmLoading={bulkMoveRunning} okText="移动">
+      <Modal title={moveIDs.length === 1 ? '移动账号到分组' : '批量移动到分组'} visible={moveOpen} onCancel={() => { if (!bulkMoveRunning) { setMoveOpen(false); setMoveIDs([]); } }} onOk={bulkMove} confirmLoading={bulkMoveRunning} okText="移动">
         <Select value={moveGroup} onChange={setMoveGroup} style={{ width: '100%' }} placeholder="选择目标分组"
           optionList={groups.map((g) => ({ label: g.name, value: g.name }))} />
       </Modal>

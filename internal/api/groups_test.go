@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 )
@@ -100,5 +101,42 @@ func TestMultiGroupCRUDAndReassign(t *testing.T) {
 	}
 	if code, _ := grpReq(t, h, http.MethodPost, "/admin/accounts/"+acc+"/group", `{"group":"ghost"}`); code != http.StatusBadRequest {
 		t.Fatalf("reassign to missing group = %d, want 400", code)
+	}
+}
+
+func TestGroupsExposeAccountCountsAndGroupMovesInvalidateSchedulerCache(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"id":"resp"}`)) })
+	accActive := h.importAccount(t, "active", "up-active", "tok-active")
+	accDisabled := h.importAccount(t, "disabled", "up-disabled", "tok-disabled")
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-counts"}`); code != http.StatusOK {
+		t.Fatalf("create group = %d: %s", code, body)
+	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accActive+"/group", `{"group":"team-counts"}`); code != http.StatusOK {
+		t.Fatalf("move active = %d: %s", code, body)
+	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accDisabled+"/group", `{"group":"team-counts"}`); code != http.StatusOK {
+		t.Fatalf("move disabled = %d: %s", code, body)
+	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accDisabled+"/disable", ``); code != http.StatusOK {
+		t.Fatalf("disable = %d: %s", code, body)
+	}
+	g := findGroup(listGroups(t, h), "team-counts")
+	if g == nil {
+		t.Fatal("team-counts not listed")
+	}
+	if g["account_count"] != float64(2) || g["active_account_count"] != float64(1) {
+		t.Fatalf("group counts = %#v, want account_count=2 active_account_count=1", g)
+	}
+
+	raw, err := os.ReadFile("admin_accounts.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(raw)
+	for _, fn := range []string{"adminSetAccountGroup", "adminAccountsAssignGroup"} {
+		body := functionBody(t, source, fn)
+		if !strings.Contains(body, ".InvalidateAccountCache()") {
+			t.Fatalf("%s must call scheduler.InvalidateAccountCache after group changes", fn)
+		}
 	}
 }

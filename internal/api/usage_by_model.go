@@ -1,8 +1,10 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"codex-account-pool/internal/storage"
@@ -67,12 +69,19 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 			bucket = n
 		}
 	}
-	report, err := s.store.CacheUsageMetricsWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
+	fields, err := parseCacheUsageFields(r.URL.Query().Get("fields"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	report, err := s.store.CacheUsageMetricsWindowFields(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), 200, fields)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if bucket != 3600 {
+	includeAll := len(fields) == 0
+	includeField := func(name string) bool { return includeAll || fields[name] }
+	if bucket != 3600 && includeField("by_time_bucket") {
 		if buckets, berr := s.store.CacheUsageBucketsWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket); berr == nil {
 			report.ByTimeBucket = buckets
 		} else {
@@ -80,16 +89,65 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{
-		"since":                  win.EffectiveStartAt,
-		"now":                    win.EffectiveUntilAt,
-		"summary":                report.Summary,
-		"by_account":             report.ByAccount,
-		"by_model":               report.ByModel,
-		"by_api_key":             report.ByAPIKey,
-		"by_account_model":       report.ByAccountModel,
-		"by_route":               report.ByRoute,
-		"by_route_account_model": report.ByRouteAccountModel,
-		"by_time_bucket":         report.ByTimeBucket,
-	}, win))
+	body := map[string]interface{}{
+		"since": win.EffectiveStartAt,
+		"now":   win.EffectiveUntilAt,
+	}
+	if includeField("summary") {
+		body["summary"] = report.Summary
+	}
+	if includeField("by_account") {
+		body["by_account"] = report.ByAccount
+	}
+	if includeField("by_model") {
+		body["by_model"] = report.ByModel
+	}
+	if includeField("by_api_key") {
+		body["by_api_key"] = report.ByAPIKey
+	}
+	if includeField("by_account_model") {
+		body["by_account_model"] = report.ByAccountModel
+	}
+	if includeField("by_route") {
+		body["by_route"] = report.ByRoute
+	}
+	if includeField("by_route_account_model") {
+		body["by_route_account_model"] = report.ByRouteAccountModel
+	}
+	if includeField("by_time_bucket") {
+		body["by_time_bucket"] = report.ByTimeBucket
+	}
+	writeJSON(w, http.StatusOK, mergeWindowFields(body, win))
+}
+
+func parseCacheUsageFields(raw string) (map[string]bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	allowed := map[string]bool{
+		"summary":                true,
+		"by_account":             true,
+		"by_model":               true,
+		"by_api_key":             true,
+		"by_account_model":       true,
+		"by_route":               true,
+		"by_route_account_model": true,
+		"by_time_bucket":         true,
+	}
+	out := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		field := strings.TrimSpace(part)
+		if field == "" {
+			continue
+		}
+		if !allowed[field] {
+			return nil, errors.New("unknown cache usage field: " + field)
+		}
+		out[field] = true
+	}
+	if len(out) == 0 {
+		return nil, errors.New("fields must include at least one field")
+	}
+	return out, nil
 }

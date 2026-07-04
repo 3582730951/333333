@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -101,6 +102,14 @@ func configFields() []configField {
 			Help: "开=每账号独立命名会话标识，避免串号导致的跨账号 401 级联。", boot: func(c config.Config) interface{} { return c.ConversationIsolation }},
 		{Key: "claude_cache_control_inject", Label: "Claude 缓存注入", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=在 OpenAI 兼容→Claude 路径自动注入 cache_control。", boot: func(c config.Config) interface{} { return c.ClaudeCacheControlInject }},
+		{Key: "claude_cache_affinity_policy", Label: "Claude 缓存亲和策略", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
+			Options: []string{"legacy", "balanced"},
+			Help:    "legacy=旧路由；balanced=优先 Claude session 与稳定前缀，减少粗路由缓存写入。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeCacheAffinityPolicy, "balanced") }},
+		{Key: "claude_cache_breakpoint_policy", Label: "Claude 缓存断点策略", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
+			Options: []string{"legacy", "balanced", "coarse_safe"},
+			Help:    "legacy=旧注入；balanced=粗路由自动降级；coarse_safe=仅标记 tools 与非 billing system。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeCacheBreakpointPolicy, "balanced") }},
+		{Key: "claude_cache_optimization_rollout", Label: "Claude 缓存灰度 JSON", Category: catBehavior, Type: fieldString, Effect: effectHot,
+			Help: "JSON 灰度范围：groups/api_key_hash_prefixes/percent，断点还支持 account_ids。{}=全量；不支持按具体 Claude 模型灰度。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeCacheOptimizationRollout, "{}") }},
 		{Key: "claude_native_cache_breakpoint_inject", Label: "Claude 原生缓存断点", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=对已识别的 Claude Code auto-context 前缀保守补充 cache_control 断点。", boot: func(c config.Config) interface{} { return c.ClaudeNativeCacheBreakpointInject }},
 		{Key: "claude_cch_signing", Label: "Claude CCH 签名", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
@@ -458,6 +467,34 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 			return "", fmt.Errorf("must be greater than or equal to 0")
 		}
 		return raw, nil
+	case "claude_cache_optimization_rollout":
+		str, ok := v.(string)
+		if !ok {
+			return "", fmt.Errorf("expected JSON object string")
+		}
+		str = strings.TrimSpace(str)
+		if str == "" {
+			str = "{}"
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(str), &obj); err != nil {
+			return "", fmt.Errorf("invalid JSON object: %w", err)
+		}
+		if obj == nil {
+			return "", fmt.Errorf("expected JSON object")
+		}
+		allowed := map[string]bool{
+			"groups":                true,
+			"api_key_hash_prefixes": true,
+			"account_ids":           true,
+			"percent":               true,
+		}
+		for key := range obj {
+			if !allowed[key] {
+				return "", fmt.Errorf("unsupported rollout key %q", key)
+			}
+		}
+		return str, nil
 	}
 	switch f.Type {
 	case fieldBool:

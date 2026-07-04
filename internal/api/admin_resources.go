@@ -1105,9 +1105,29 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 	if buckets == nil {
 		buckets = []storage.UsageBucket{}
 	}
-	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{
+	body := map[string]interface{}{
 		"since": win.EffectiveStartAt, "bucket": bucket, "now": win.EffectiveUntilAt, "buckets": buckets,
-	}, win))
+	}
+	if strings.TrimSpace(r.URL.Query().Get("series_dimension")) == "model" {
+		limit := 6
+		if raw := strings.TrimSpace(r.URL.Query().Get("series_limit")); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n <= 0 || n > 20 {
+				writeError(w, http.StatusBadRequest, errors.New("series_limit must be an integer from 1 to 20"))
+				return
+			}
+			limit = n
+		}
+		series, rows, err := s.store.UsageModelSeriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		body["series_dimension"] = "model"
+		body["series"] = series
+		body["model_series"] = rows
+	}
+	writeJSON(w, http.StatusOK, mergeWindowFields(body, win))
 }
 
 // adminQuota returns the latest captured rate-limit / remaining-quota snapshot for
@@ -1121,78 +1141,164 @@ func (s *Server) adminQuota(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if truthyQuery(r.URL.Query().Get("include_missing")) {
+		page, pageSize, err := parseQuotaPageParams(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		search := strings.TrimSpace(r.URL.Query().Get("search"))
+		status := strings.TrimSpace(r.URL.Query().Get("status"))
+		accounts, total, err := s.store.ListAccountsPageDesc(r.Context(), pageSize, (page-1)*pageSize, search, status)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		rows, err := s.quotaViewsForAccounts(r.Context(), accounts)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"rows": rows, "total": total, "page": page, "pageSize": pageSize,
+		})
+		return
+	}
 	snaps, err := s.store.ListAccountRateLimits(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	accountIDs := make([]string, 0, len(snaps))
-	for _, snap := range snaps {
-		accountIDs = append(accountIDs, snap.AccountID)
-	}
-	labels, err := s.store.AccountLabelsByID(r.Context(), accountIDs)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	accountIDs := uniqueQuotaAccountIDs(snaps)
 	accountsByID, err := s.store.ListAccountsByIDs(r.Context(), accountIDs)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	tokensByID, err := s.store.ListTokensByAccountIDs(r.Context(), accountIDs)
+	accounts := make([]storage.Account, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		if account, ok := accountsByID[id]; ok {
+			accounts = append(accounts, account)
+		}
+	}
+	rows, err := s.quotaViewsForAccounts(r.Context(), accounts)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	type secondaryWindow struct {
-		UsedPercent        float64 `json:"used_percent"`
-		RemainingTokens    int64   `json:"remaining_tokens"`
-		LimitTokens        int64   `json:"limit_tokens"`
-		LimitWindowSeconds int64   `json:"limit_window_seconds"`
-		ResetAfterSeconds  int64   `json:"reset_after_seconds"`
+	writeJSON(w, http.StatusOK, rows)
+}
+
+type quotaView struct {
+	storage.AccountRateLimit
+	Label              string       `json:"label"`
+	PlanType           string       `json:"plan_type,omitempty"`
+	OAuthRateLimitTier string       `json:"oauth_rate_limit_tier,omitempty"`
+	Secondary7d        *QuotaWindow `json:"secondary_7d,omitempty"`
+	Secondary7dUsed    float64      `json:"secondary_7d_used_pct"`
+	QuotaSummary       QuotaSummary `json:"quota_summary"`
+}
+
+func (s *Server) quotaViewsForAccounts(ctx context.Context, accounts []storage.Account) ([]quotaView, error) {
+	accountIDs := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		accountIDs = append(accountIDs, account.ID)
 	}
-	type quotaView struct {
-		storage.AccountRateLimit
-		Label              string           `json:"label"`
-		PlanType           string           `json:"plan_type,omitempty"`
-		OAuthRateLimitTier string           `json:"oauth_rate_limit_tier,omitempty"`
-		Secondary7d        *secondaryWindow `json:"secondary_7d,omitempty"`
-		Secondary7dUsed    float64          `json:"secondary_7d_used_pct"`
+	labels, err := s.store.AccountLabelsByID(ctx, accountIDs)
+	if err != nil {
+		return nil, err
 	}
-	out := make([]quotaView, 0, len(snaps))
-	for _, snap := range snaps {
-		qv := quotaView{AccountRateLimit: snap, Label: labels[snap.AccountID]}
-		if account, ok := accountsByID[snap.AccountID]; ok {
-			qv.PlanType = account.PlanType
+	tokensByID, err := s.store.ListTokensByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	snapsByID, err := s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	now := storage.Now()
+	out := make([]quotaView, 0, len(accounts))
+	for _, account := range accounts {
+		var token *storage.AccountToken
+		if t, ok := tokensByID[account.ID]; ok {
+			token = &t
 		}
-		if token, ok := tokensByID[snap.AccountID]; ok {
+		snaps := snapsByID[account.ID]
+		summary := BuildQuotaSummary(account, token, snaps, now)
+		base := quotaBaseSnapshot(account, summary, snaps)
+		qv := quotaView{
+			AccountRateLimit: base,
+			Label:            labels[account.ID],
+			PlanType:         account.PlanType,
+			QuotaSummary:     summary,
+			Secondary7d:      summary.Secondary,
+		}
+		if token != nil {
 			qv.OAuthRateLimitTier = token.OAuthRateLimitTier
 		}
-		if snap.Raw != "" {
-			var detail struct {
-				Secondary struct {
-					UsedPercent        float64 `json:"used_percent"`
-					RemainingTokens    int64   `json:"remaining_tokens"`
-					LimitTokens        int64   `json:"limit_tokens"`
-					LimitWindowSeconds int64   `json:"limit_window_seconds"`
-					ResetAfterSeconds  int64   `json:"reset_after_seconds"`
-				} `json:"secondary"`
-			}
-			if json.Unmarshal([]byte(snap.Raw), &detail) == nil && detail.Secondary.LimitWindowSeconds > 0 {
-				qv.Secondary7d = &secondaryWindow{
-					UsedPercent:        detail.Secondary.UsedPercent,
-					RemainingTokens:    detail.Secondary.RemainingTokens,
-					LimitTokens:        detail.Secondary.LimitTokens,
-					LimitWindowSeconds: detail.Secondary.LimitWindowSeconds,
-					ResetAfterSeconds:  detail.Secondary.ResetAfterSeconds,
-				}
-				qv.Secondary7dUsed = detail.Secondary.UsedPercent
-			}
+		if summary.Secondary != nil {
+			qv.Secondary7dUsed = summary.Secondary.UsedPercent
 		}
 		out = append(out, qv)
 	}
-	writeJSON(w, http.StatusOK, out)
+	return out, nil
+}
+
+func quotaBaseSnapshot(account storage.Account, summary QuotaSummary, snaps []storage.AccountRateLimit) storage.AccountRateLimit {
+	provider := strings.TrimSpace(summary.Provider)
+	if provider == "" {
+		provider = strings.TrimSpace(account.Provider)
+	}
+	if primary := selectQuotaPrimary(provider, snaps); primary != nil {
+		return *primary
+	}
+	if len(snaps) > 0 {
+		return snaps[0]
+	}
+	return storage.AccountRateLimit{
+		AccountID:         account.ID,
+		Provider:          provider,
+		UsedPercent:       -1,
+		LimitTokens:       -1,
+		RemainingTokens:   -1,
+		LimitRequests:     -1,
+		RemainingRequests: -1,
+	}
+}
+
+func uniqueQuotaAccountIDs(snaps []storage.AccountRateLimit) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, snap := range snaps {
+		id := strings.TrimSpace(snap.AccountID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+func parseQuotaPageParams(r *http.Request) (int, int, error) {
+	page, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
+	if err != nil || page <= 0 {
+		return 0, 0, errors.New("page must be a positive integer")
+	}
+	pageSize, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("pageSize")))
+	if err != nil || pageSize <= 0 || pageSize > 500 {
+		return 0, 0, errors.New("pageSize must be an integer from 1 to 500")
+	}
+	return page, pageSize, nil
+}
+
+func truthyQuery(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // adminIdentity exposes the synthetic, account-bound virtual identity the relay

@@ -47,6 +47,43 @@ func TestAffinityPriorityParentThreadWins(t *testing.T) {
 	}
 }
 
+func TestClaudeSessionAffinityWinsOverStablePrefix(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("X-Claude-Code-Session-Id", "claude-session-1")
+	longSystem := strings.Repeat("stable Claude Code system prefix. ", 120)
+	body := []byte(`{"model":"claude-opus-4-8","conversation_id":"conv-body","system":` + strconv.Quote(longSystem) + `,"messages":[{"role":"user","content":"question"}]}`)
+
+	key := ExtractClaudeAffinityKey(req, body)
+
+	if key.Source != "x-claude-code-session-id" {
+		t.Fatalf("source = %q, want x-claude-code-session-id", key.Source)
+	}
+	if !strings.Contains(key.Key, "claude-session-1") {
+		t.Fatalf("key = %q", key.Key)
+	}
+}
+
+func TestAnthropicStablePrefixIncludesTopLevelSystemAndTools(t *testing.T) {
+	longSystem := strings.Repeat("stable Anthropic system prompt line. ", 120)
+	tools := `[{"name":"Read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]`
+	one := []byte(`{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.1.abc; cc_entrypoint=cli; cch=11111;"},{"type":"text","text":` + strconv.Quote(longSystem) + `}],"tools":` + tools + `,"messages":[{"role":"user","content":"summarize A"}]}`)
+	two := []byte(`{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.1.abc; cc_entrypoint=cli; cch=22222;"},{"type":"text","text":` + strconv.Quote(longSystem) + `}],"tools":` + tools + `,"messages":[{"role":"user","content":"summarize B"}]}`)
+
+	fp1 := AnthropicStablePromptPrefixFingerprint(one)
+	fp2 := AnthropicStablePromptPrefixFingerprint(two)
+
+	if fp1.Hash == "" || fp1.Source != "anthropic_message_prefix" || fp1.Reason != "ok" {
+		t.Fatalf("fingerprint = %+v", fp1)
+	}
+	if fp1.Hash != fp2.Hash {
+		t.Fatalf("same Anthropic stable prefix routed differently: %s != %s", fp1.Hash, fp2.Hash)
+	}
+	changedTool := []byte(`{"model":"claude-opus-4-8","system":[{"type":"text","text":` + strconv.Quote(longSystem) + `}],"tools":[{"name":"Write","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"summarize B"}]}`)
+	if fp3 := AnthropicStablePromptPrefixFingerprint(changedTool); fp3.Hash == fp1.Hash {
+		t.Fatal("tool schema changes must change Anthropic stable prefix affinity")
+	}
+}
+
 func TestStrictStickyDetection(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
 	if !IsStrictSticky("/v1/responses/compact", req, []byte(`{}`)) {

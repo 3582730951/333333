@@ -33,7 +33,7 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	report, err := s.store.CacheUsageMetricsWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
+	report, err := s.store.CacheUsageMetricsWindowFullRoutes(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -88,6 +88,7 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"by_route.csv",
 		"by_route_account_model.csv",
 		"by_time_bucket.csv",
+		"route_map.csv",
 		"account_map.csv",
 	}
 	manifest := map[string]interface{}{
@@ -116,11 +117,18 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"summary.csv":                csvString(cacheMetricHeader("window_start", "window_until"), cacheSummaryRows(report.Summary, win, hasData)),
 		"by_api_key.csv":             csvString(cacheMetricHeader("api_key_hash_prefix"), cacheMetricRows(report.ByAPIKey, codebook, false, false)),
 		"by_account_model.csv":       csvString(cacheMetricHeader("account_code", "model"), cacheMetricRows(report.ByAccountModel, codebook, true, true)),
-		"by_route.csv":               csvString(cacheRouteHeader(false), cacheRouteRows(report.ByRoute, codebook, false)),
-		"by_route_account_model.csv": csvString(cacheRouteHeader(true), cacheRouteRows(report.ByRouteAccountModel, codebook, true)),
+		"by_route.csv":               "",
+		"by_route_account_model.csv": "",
 		"by_time_bucket.csv":         csvString(cacheBucketHeader(), cacheBucketRows(report.ByTimeBucket)),
+		"route_map.csv":              "",
 		"account_map.csv":            csvString([]string{"account_code", "account_id", "email", "label", "upstream_account_id", "chatgpt_user_id", "provider", "group_name", "status"}, accountMapRows(codebook)),
 	}
+	routes := newRouteExportCodebook()
+	routes.addRows(report.ByRoute)
+	routes.addRows(report.ByRouteAccountModel)
+	files["by_route.csv"] = csvString(cacheRouteHeader(false), cacheRouteRows(report.ByRoute, codebook, routes, false))
+	files["by_route_account_model.csv"] = csvString(cacheRouteHeader(true), cacheRouteRows(report.ByRouteAccountModel, codebook, routes, true))
+	files["route_map.csv"] = csvString([]string{"route_code", "route_key_hash_prefix", "route_class", "affinity_source"}, routes.rows())
 	return files, order, nil
 }
 
@@ -137,7 +145,7 @@ func cacheReportHasRows(report storage.CacheUsageReport) bool {
 }
 
 func cacheMetricHeader(prefix ...string) []string {
-	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "token_hit_rate", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate")
+	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate")
 }
 
 func cacheSummaryRows(row storage.CacheUsageMetricRow, win adminUsageWindow, hasData bool) [][]string {
@@ -165,31 +173,19 @@ func cacheMetricRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCode
 }
 
 func cacheRouteHeader(withAccountModel bool) []string {
-	prefix := []string{"route_code", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "route_epoch"}
+	prefix := []string{"route_code", "route_class", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "single_use_route", "risk_flags", "route_epoch"}
 	if withAccountModel {
 		prefix = append([]string{"account_code", "model"}, prefix...)
 	}
 	return cacheMetricHeader(prefix...)
 }
 
-func cacheRouteRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCodebook, withAccountModel bool) [][]string {
+func cacheRouteRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCodebook, routes *routeExportCodebook, withAccountModel bool) [][]string {
 	out := make([][]string, 0, len(rows))
-	routeCodes := map[string]string{}
-	nextRouteCode := func(prefix string) string {
-		prefix = strings.TrimSpace(prefix)
-		if prefix == "" {
-			return ""
-		}
-		if code, ok := routeCodes[prefix]; ok {
-			return code
-		}
-		code := fmt.Sprintf("ROUTE-%04d", len(routeCodes)+1)
-		routeCodes[prefix] = code
-		return code
-	}
 	for _, row := range rows {
 		prefix := []string{
-			nextRouteCode(row.RouteKeyHashPrefix),
+			routes.code(row.RouteKeyHashPrefix),
+			row.RouteClass,
 			row.AffinitySource,
 			row.PromptCacheKeySource,
 			row.StablePrefixSource,
@@ -202,6 +198,8 @@ func cacheRouteRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCodeb
 			itoa64(row.CacheControlInjected),
 			itoa64(row.CacheBreakpointCount),
 			itoa64(row.LatestUserCacheControl),
+			strconv.FormatBool(row.SingleUseRoute),
+			strings.Join(row.RiskFlags, "|"),
 			itoa64(row.RouteEpoch),
 		}
 		if withAccountModel {
@@ -227,11 +225,64 @@ func cacheMetricFields(row storage.CacheUsageMetricRow) []string {
 		itoa64(row.CacheCreation5mTokens),
 		itoa64(row.CacheCreation1hTokens),
 		floatString(row.TokenHitRate),
+		floatString(row.CacheWriteShare),
 		floatString(row.EligibleHitRate),
 		floatString(row.RealTokenHitRate),
 		itoa64(row.EstimatedRequests),
 		floatString(row.EstimatedRate),
 	}
+}
+
+type routeExportCodebook struct {
+	byPrefix map[string]string
+	entries  []routeExportEntry
+}
+
+type routeExportEntry struct {
+	Code           string
+	HashPrefix     string
+	RouteClass     string
+	AffinitySource string
+}
+
+func newRouteExportCodebook() *routeExportCodebook {
+	return &routeExportCodebook{byPrefix: map[string]string{}}
+}
+
+func (b *routeExportCodebook) addRows(rows []storage.CacheUsageMetricRow) {
+	for _, row := range rows {
+		prefix := strings.TrimSpace(row.RouteKeyHashPrefix)
+		if prefix == "" {
+			continue
+		}
+		if _, ok := b.byPrefix[prefix]; ok {
+			continue
+		}
+		code := fmt.Sprintf("ROUTE-%04d", len(b.entries)+1)
+		b.byPrefix[prefix] = code
+		b.entries = append(b.entries, routeExportEntry{
+			Code:           code,
+			HashPrefix:     prefix,
+			RouteClass:     row.RouteClass,
+			AffinitySource: row.AffinitySource,
+		})
+	}
+}
+
+func (b *routeExportCodebook) code(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return ""
+	}
+	return b.byPrefix[prefix]
+}
+
+func (b *routeExportCodebook) rows() [][]string {
+	out := make([][]string, 0, len(b.entries))
+	for _, row := range b.entries {
+		out = append(out, []string{row.Code, row.HashPrefix, row.RouteClass, row.AffinitySource})
+	}
+	return out
 }
 
 func cacheBucketHeader() []string {
@@ -268,7 +319,7 @@ func floatString(v float64) string {
 }
 
 func listDiagnosticUsageRecordsWindow(ctx context.Context, db *sql.DB, since, until int64) ([]diagnosticUsageRecord, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, raw_usage_json, created_at FROM usage_records WHERE created_at >= ? AND created_at < ? ORDER BY id ASC`, since, until)
+	rows, err := db.QueryContext(ctx, diagnosticUsageRecordSelectSQL()+` WHERE created_at >= ? AND created_at < ? ORDER BY id ASC`, since, until)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +327,7 @@ func listDiagnosticUsageRecordsWindow(ctx context.Context, db *sql.DB, since, un
 	var out []diagnosticUsageRecord
 	for rows.Next() {
 		var r diagnosticUsageRecord
-		if err := rows.Scan(&r.ID, &r.AccountID, &r.RouteKeyHash, &r.APIKeyHash, &r.UserID, &r.Model, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens, &r.RawUsageJSON, &r.CreatedAt); err != nil {
+		if err := scanDiagnosticUsageRecord(rows, &r); err != nil {
 			return nil, err
 		}
 		r.RouteKeyHash = truncateHashPrefix(r.RouteKeyHash)

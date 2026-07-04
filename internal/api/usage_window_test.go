@@ -211,6 +211,133 @@ func TestAdminUsageDailyResetAuditDedupes(t *testing.T) {
 	}
 }
 
+func TestAdminUsageCacheFieldsAndDynamicModelNormalization(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	now := time.Now().Unix()
+	insertUsageAt(t, h, "acc-deepseek", " deepseek-chat ", "hash-deepseek-123", "route-deepseek", 100, 10, 110, 40, 40, 20, now-3)
+	insertUsageAt(t, h, "acc-custom", "custom-new-2027", "hash-custom-123", "route-custom", 80, 8, 88, 10, 10, 15, now-2)
+	insertUsageAt(t, h, "acc-claude-future", "claude-future-2027", "hash-claude-123", "route-claude", 70, 7, 77, 20, 20, 5, now-1)
+	insertUsageAt(t, h, "acc-unknown", "", "hash-unknown-123", "route-unknown", 60, 6, 66, 0, 0, 0, now-1)
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/usage/cache?fields=summary,by_model", "")
+	if code != http.StatusOK {
+		t.Fatalf("cache fields = %d: %s", code, raw)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode cache fields: %v (%s)", err, raw)
+	}
+	for _, want := range []string{"summary", "by_model"} {
+		if _, ok := payload[want]; !ok {
+			t.Fatalf("cache fields response missing %s: %s", want, raw)
+		}
+	}
+	for _, forbidden := range []string{"by_account", "by_api_key", "by_account_model", "by_route", "by_route_account_model", "by_time_bucket"} {
+		if _, ok := payload[forbidden]; ok {
+			t.Fatalf("cache fields response included unrequested %s: %s", forbidden, raw)
+		}
+	}
+	var byModel []struct {
+		Model      string `json:"model"`
+		ModelKey   string `json:"model_key"`
+		ModelLabel string `json:"model_label"`
+	}
+	if err := json.Unmarshal(payload["by_model"], &byModel); err != nil {
+		t.Fatalf("decode by_model: %v", err)
+	}
+	got := map[string]string{}
+	for _, row := range byModel {
+		got[row.ModelKey] = row.ModelLabel
+		if row.Model == " deepseek-chat " {
+			t.Fatalf("model value should be trimmed, got %#v", row)
+		}
+	}
+	for key, label := range map[string]string{
+		"deepseek-chat":      "deepseek-chat",
+		"custom-new-2027":    "custom-new-2027",
+		"claude-future-2027": "claude-future-2027",
+		"__unknown__":        "(未知)",
+	} {
+		if got[key] != label {
+			t.Fatalf("model %q label = %q, want %q (all=%#v)", key, got[key], label, got)
+		}
+	}
+	if code, raw := grpReq(t, h, http.MethodGet, "/admin/usage/cache?fields=summary,nope", ""); code != http.StatusBadRequest {
+		t.Fatalf("invalid cache fields = %d, want 400: %s", code, raw)
+	}
+}
+
+func TestAdminUsageByModelAndSeriesAreDynamicUsageRecordModels(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	base := time.Now().Unix() - 600
+	insertUsageAt(t, h, "acc-a1", " model-a ", "hash-a1", "route-a1", 100, 0, 100, 0, 0, 0, base+10)
+	insertUsageAt(t, h, "acc-b1", "model-b", "hash-b1", "route-b1", 60, 0, 60, 0, 0, 0, base+10)
+	insertUsageAt(t, h, "acc-b2", "model-b", "hash-b2", "route-b2", 60, 0, 60, 0, 0, 0, base+70)
+	insertUsageAt(t, h, "acc-c1", "custom-new-2027", "hash-c1", "route-c1", 90, 0, 90, 0, 0, 0, base+70)
+	insertUsageAt(t, h, "acc-u", "", "hash-u", "route-u", 5, 0, 5, 0, 0, 0, base+70)
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/usage/by-model?since=0", "")
+	if code != http.StatusOK {
+		t.Fatalf("by-model = %d: %s", code, raw)
+	}
+	var byModelResp struct {
+		Models []struct {
+			Model      string `json:"model"`
+			ModelKey   string `json:"model_key"`
+			ModelLabel string `json:"model_label"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &byModelResp); err != nil {
+		t.Fatalf("decode by-model: %v (%s)", err, raw)
+	}
+	seen := map[string]string{}
+	for _, row := range byModelResp.Models {
+		seen[row.ModelKey] = row.ModelLabel
+		if row.Model == " model-a " {
+			t.Fatalf("by-model should trim model strings: %#v", row)
+		}
+	}
+	for key, label := range map[string]string{"model-a": "model-a", "model-b": "model-b", "custom-new-2027": "custom-new-2027", "__unknown__": "(未知)"} {
+		if seen[key] != label {
+			t.Fatalf("by-model missing %q => %q: all=%#v", key, label, seen)
+		}
+	}
+
+	code, raw = grpReq(t, h, http.MethodGet, fmt.Sprintf("/admin/usage/timeseries?since=%d&until=%d&bucket=60&series_dimension=model&series_limit=2", base, base+180), "")
+	if code != http.StatusOK {
+		t.Fatalf("model series = %d: %s", code, raw)
+	}
+	var seriesResp struct {
+		ModelSeries []struct {
+			Bucket      int64  `json:"bucket"`
+			SeriesKey   string `json:"series_key"`
+			SeriesLabel string `json:"series_label"`
+			TotalTokens int64  `json:"total_tokens"`
+		} `json:"model_series"`
+		Series []struct {
+			SeriesKey   string `json:"series_key"`
+			SeriesLabel string `json:"series_label"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(raw, &seriesResp); err != nil {
+		t.Fatalf("decode model series: %v (%s)", err, raw)
+	}
+	if len(seriesResp.Series) != 2 {
+		t.Fatalf("series length = %d, want 2: %#v", len(seriesResp.Series), seriesResp.Series)
+	}
+	if seriesResp.Series[0].SeriesKey != "model-b" || seriesResp.Series[1].SeriesKey != "model-a" {
+		t.Fatalf("series order = %#v, want whole-window top model-b then model-a", seriesResp.Series)
+	}
+	if len(seriesResp.ModelSeries) > 4 {
+		t.Fatalf("model_series rows = %d, want at most series_limit * bucket_count: %#v", len(seriesResp.ModelSeries), seriesResp.ModelSeries)
+	}
+	for _, row := range seriesResp.ModelSeries {
+		if row.SeriesKey == "custom-new-2027" || row.SeriesLabel == "Other" {
+			t.Fatalf("model series must not use per-bucket topN or Other aggregation: %#v", seriesResp.ModelSeries)
+		}
+	}
+}
+
 func TestNewAdminUsageEndpointsRejectNonAdminAndAPIKey(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	admin := jarClient(t)
@@ -288,7 +415,7 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 		t.Fatalf("response is not a zip: %v\n%s", err, raw)
 	}
 	files := readZipFiles(t, raw)
-	for _, name := range []string{"manifest.json", "summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "account_map.csv"} {
+	for _, name := range []string{"manifest.json", "summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "route_map.csv", "account_map.csv"} {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("cache hit zip missing %s; has %v", name, zipFileNames(files))
 		}
@@ -304,6 +431,9 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 	}
 	if strings.Contains(files["by_route.csv"], "route_key_hash_prefix") || strings.Contains(files["by_route.csv"], "route-secret") || !strings.Contains(files["by_route.csv"], "ROUTE-0001") {
 		t.Fatalf("by_route must use per-export route_code instead of route hash prefix:\n%s", files["by_route.csv"])
+	}
+	if !strings.Contains(files["route_map.csv"], "route_key_hash_prefix") || !strings.Contains(files["route_map.csv"], "route-secret") || !strings.Contains(files["route_map.csv"], "route_class") {
+		t.Fatalf("route_map.csv must expose the zip-level route codebook:\n%s", files["route_map.csv"])
 	}
 	if !strings.Contains(files["account_map.csv"], account.ID) || !strings.Contains(files["account_map.csv"], account.Email) {
 		t.Fatalf("account_map.csv should contain local admin mapping:\n%s", files["account_map.csv"])
@@ -335,4 +465,41 @@ func TestAdminCacheHitsExportEmptyZipHasHeaders(t *testing.T) {
 		t.Fatal("empty export zip had no files")
 	}
 	_ = io.EOF
+}
+
+func TestAdminCacheHitsExportUsesFullRouteAggregation(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	accountID := h.importAccount(t, "full-route-export", "upstream-full-route-export", "access-full-route-export")
+	now := time.Now().Unix() - 1
+	for i := 0; i < 205; i++ {
+		route := fmt.Sprintf("r%03d-full-export-route", i)
+		if err := h.store.InsertUsageRecordWithCacheDetails(ctx, accountID, route, "apikey-full-export", "", "claude-opus-4-8", 100, 1, 101, 0, 0, int64(i+1), json.RawMessage(`{"usage":{"input_tokens":100}}`)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.store.DB().ExecContext(ctx, `UPDATE usage_records SET created_at = ? WHERE id = (SELECT MAX(id) FROM usage_records)`, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0", "")
+	if code != http.StatusOK {
+		t.Fatalf("cache hit export = %d: %s", code, raw)
+	}
+	files := readZipFiles(t, raw)
+	routeMap := files["route_map.csv"]
+	lines := strings.Split(strings.TrimSpace(routeMap), "\n")
+	if len(lines) != 206 {
+		t.Fatalf("route_map.csv rows = %d including header, want 206; content starts:\n%s", len(lines), firstN(routeMap, 800))
+	}
+	if !strings.Contains(routeMap, "r000-full-ex") {
+		t.Fatalf("route_map.csv should contain route hash prefixes:\n%s", firstN(routeMap, 800))
+	}
+}
+
+func firstN(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

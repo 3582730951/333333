@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -59,6 +60,39 @@ type quotaPollTarget struct {
 	Account storage.Account
 	Token   storage.AccountToken
 	Egress  storage.EgressProfile
+}
+
+type quotaPollError struct {
+	reason     string
+	statusCode int
+	body       string
+	err        error
+}
+
+func (e quotaPollError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	if e.statusCode > 0 {
+		return fmt.Sprintf("http %d", e.statusCode)
+	}
+	if e.reason != "" {
+		return e.reason
+	}
+	return "quota poll failed"
+}
+
+func (e quotaPollError) Unwrap() error {
+	return e.err
+}
+
+func newQuotaPollError(reason string, statusCode int, body []byte, err error) quotaPollError {
+	return quotaPollError{
+		reason:     firstNonEmpty(strings.TrimSpace(reason), "poll_failed"),
+		statusCode: statusCode,
+		body:       bodySnippet(body, 300),
+		err:        err,
+	}
 }
 
 // StartQuotaPoller launches the background quota poller. Called once from main.
@@ -142,6 +176,7 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 			}
 			defer func() { <-sem }()
 			if err := s.pollOneCodexQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
+				s.recordQuotaPollError(ctx, target.Account, "codex", err)
 				mu.Lock()
 				failed++
 				mu.Unlock()
@@ -177,6 +212,7 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 			}
 			defer func() { <-sem }()
 			if err := s.pollOneClaudeQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
+				s.recordQuotaPollError(ctx, target.Account, "claude", err)
 				mu.Lock()
 				failed++
 				mu.Unlock()
@@ -306,6 +342,49 @@ func isQuotaPollCandidate(account storage.Account, now int64) bool {
 	return provider == "" || provider == "codex" || provider == "chatgpt" || provider == "openai" || provider == "claude"
 }
 
+func (s *Server) recordQuotaPollError(ctx context.Context, acc storage.Account, provider string, err error) {
+	if strings.TrimSpace(acc.ID) == "" {
+		return
+	}
+	var qerr quotaPollError
+	if !errors.As(err, &qerr) {
+		qerr = quotaPollError{reason: "poll_failed", err: err}
+	}
+	reason := firstNonEmpty(strings.TrimSpace(qerr.reason), "poll_failed")
+	syncReason := "error/" + reason
+	detail := map[string]interface{}{
+		"sync_reason": syncReason,
+		"error":       "",
+	}
+	if qerr.err != nil {
+		detail["error"] = qerr.err.Error()
+	} else if err != nil {
+		detail["error"] = err.Error()
+	}
+	if qerr.statusCode > 0 {
+		detail["http_status"] = qerr.statusCode
+	}
+	if strings.TrimSpace(qerr.body) != "" {
+		detail["body_snippet"] = qerr.body
+	}
+	raw, _ := json.Marshal(detail)
+	now := storage.Now()
+	_ = s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID:         acc.ID,
+		Provider:          strings.TrimSpace(provider),
+		LimiterType:       "quota_poll_error",
+		Source:            "quota_poll_error",
+		UsedPercent:       -1,
+		LimitTokens:       -1,
+		RemainingTokens:   -1,
+		LimitRequests:     -1,
+		RemainingRequests: -1,
+		Status:            syncReason,
+		Raw:               string(raw),
+		UpdatedAt:         now,
+	})
+}
+
 // pollOneCodexQuota fetches the wham usage snapshot for one account and persists
 // two AccountRateLimit rows: one for the 5h (primary) window and one for the 7d
 // (secondary) window.
@@ -315,7 +394,7 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		accessToken = strings.TrimSpace(token.OpenAIAPIKey)
 	}
 	if accessToken == "" {
-		return fmt.Errorf("no access token")
+		return newQuotaPollError("token_missing", 0, nil, fmt.Errorf("no access token"))
 	}
 	chatgptUserID := acc.ChatGPTUserID
 	if chatgptUserID == "" {
@@ -328,7 +407,7 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 
 	hc, err := s.upstream.EgressHTTPClient(egress)
 	if err != nil {
-		return fmt.Errorf("build http client: %w", err)
+		return newQuotaPollError("egress_error", 0, nil, fmt.Errorf("build http client: %w", err))
 	}
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, whamUsageURL, nil)
@@ -341,18 +420,18 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("http: %w", err)
+		return newQuotaPollError("network_error", 0, nil, fmt.Errorf("http: %w", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return newQuotaPollError("http_error", resp.StatusCode, body, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 
 	var wham whamUsageResponse
 	if err := json.NewDecoder(resp.Body).Decode(&wham); err != nil {
-		return fmt.Errorf("decode: %w", err)
+		return newQuotaPollError("decode_error", 0, nil, fmt.Errorf("decode: %w", err))
 	}
 
 	now := storage.Now()
@@ -373,7 +452,7 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 
 	pw := wham.RateLimit.PrimaryWindow
 	if pw.LimitWindowSeconds <= 0 {
-		return fmt.Errorf("no primary window in wham response")
+		return newQuotaPollError("partial", 0, rawDetail, fmt.Errorf("no primary window in wham response"))
 	}
 
 	snap := storage.AccountRateLimit{
@@ -417,10 +496,10 @@ func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, to
 	var err error
 	token, err = s.prepareClaudeToken(ctx, acc, token, "quota_preflight")
 	if err != nil {
-		return err
+		return newQuotaPollError("auth_error", 0, nil, err)
 	}
 	if !claudeTokenCanRefresh(token) {
-		return fmt.Errorf("claude oauth usage requires oauth access_token and refresh_token")
+		return newQuotaPollError("unsupported_claude_non_oauth", 0, nil, fmt.Errorf("claude oauth usage requires oauth access_token and refresh_token"))
 	}
 	headers := http.Header{}
 	headers.Set("Accept", "application/json")
@@ -439,7 +518,7 @@ func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, to
 	}
 	resp, err := s.upstream.Do(ctx, requestForToken(token))
 	if err != nil {
-		return fmt.Errorf("http: %w", err)
+		return newQuotaPollError("network_error", 0, nil, fmt.Errorf("http: %w", err))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -449,18 +528,18 @@ func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, to
 			resp.Body.Close()
 			resp, err = s.upstream.Do(ctx, requestForToken(token))
 			if err != nil {
-				return fmt.Errorf("http after refresh: %w", err)
+				return newQuotaPollError("network_error", 0, nil, fmt.Errorf("http after refresh: %w", err))
 			}
 			defer resp.Body.Close()
 			body, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(bodySnippet(body, 300))))
+		return newQuotaPollError("http_error", resp.StatusCode, body, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(bodySnippet(body, 300))))
 	}
 	parsed, err := parseClaudeOAuthUsage(body, storage.Now())
 	if err != nil {
-		return err
+		return newQuotaPollError("decode_error", 0, body, err)
 	}
 	if parsed.PlanType != "" {
 		_ = s.store.SetAccountPlanType(ctx, acc.ID, parsed.PlanType)
@@ -470,7 +549,7 @@ func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, to
 		_ = s.store.UpdateToken(ctx, token)
 	}
 	if len(parsed.Windows) == 0 {
-		return fmt.Errorf("no usage windows")
+		return newQuotaPollError("partial", 0, body, fmt.Errorf("no usage windows"))
 	}
 	rawByLimiter := map[string]string{}
 	for _, win := range parsed.Windows {
@@ -563,7 +642,7 @@ func claudeUsageWindowFromMap(name string, m map[string]interface{}, now int64) 
 	if !ok && limitWindow == 0 && resetAfter == 0 && resetAt == 0 {
 		return claudeOAuthUsageWindow{}, false
 	}
-	windowName := firstNonEmpty(jsonStringAny(m, "limiter_type", "limiterType", "name", "type", "model"), name)
+	windowName := firstNonEmpty(jsonStringAny(m, "limiter_type", "limiterType", "name", "type"), name)
 	limiter, model := normalizeClaudeUsageLimiter(windowName, limitWindow)
 	if limiter == "" {
 		return claudeOAuthUsageWindow{}, false
@@ -591,10 +670,8 @@ func normalizeClaudeUsageLimiter(name string, windowSeconds int64) (limiter, mod
 	switch {
 	case strings.Contains(l, "oauth") && strings.Contains(l, "app"):
 		return "oauth_app", ""
-	case strings.Contains(l, "opus"):
-		return "opus", "opus"
-	case strings.Contains(l, "sonnet"):
-		return "sonnet", "sonnet"
+	case strings.Contains(l, "claude") || strings.Contains(l, "opus") || strings.Contains(l, "sonnet") || strings.Contains(l, "haiku"):
+		return "", ""
 	case strings.Contains(l, "5h") || strings.Contains(l, "five") || (windowSeconds > 0 && windowSeconds <= 6*3600):
 		return "5h_oauth_usage", ""
 	case strings.Contains(l, "7d") || strings.Contains(l, "week") || windowSeconds >= 6*24*3600:

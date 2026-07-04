@@ -12,7 +12,6 @@ import (
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
-	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
@@ -33,7 +32,7 @@ func isClaudeModel(model string) bool {
 // it with the Claude Code fingerprint, and converts the response back to OpenAI
 // shape — both for non-streaming JSON and for streaming (Anthropic SSE events →
 // chat.completion.chunk SSE). Scrubbing is applied throughout.
-func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup, forceEffort string) {
+func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw []byte, model string, pol downstreamPolicy) {
 	stream := isStreamRequest(raw)
 	anthBody, err := prompt.ChatCompletionToAnthropic(raw)
 	if err != nil {
@@ -41,7 +40,8 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 
-	affinity := routing.ExtractAffinityKey(r, raw)
+	routeGroup := pol.Group
+	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, anthBody, routeGroup, pol.KeyHash, model)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,
 		Provider:        "claude",
@@ -80,6 +80,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 	cacheInject := s.cacheInjectEnabled(r.Context())
 	claudeTTL := s.claudeCacheTTL(r.Context())
+	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, routeGroup, pol.KeyHash)
 	result := cloak.VirtualizeClaudeCodeWithCache(anthBody, id, s.cfg.SensitiveWordsFor("claude"), claudeIsOAuth(token), "", cloak.ClaudeCodeCacheOptions{TTL: claudeTTL})
 	// The OpenAI→Anthropic conversion emits no cache_control, so without this the
 	// compat path is billed at full input price every turn. Inject the standard
@@ -87,7 +88,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	// caches like native Claude Code. Quality/reasoning unchanged; only cached-token
 	// cost drops.
 	if cacheInject {
-		result.Body = prompt.EnsureAnthropicCacheControl(result.Body, claudeTTL)
+		result.Body = prompt.EnsureAnthropicCacheControlWithPolicy(result.Body, claudeTTL, breakpointPolicy)
 	}
 	// Final body step (after cache_control injection): stamp the Claude Code
 	// x-anthropic-billing-header so OAuth traffic relayed from an OpenAI-compatible
