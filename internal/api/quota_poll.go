@@ -37,8 +37,9 @@ const (
 	quotaPollIntervalFloor = 120 // seconds — never poll more often than every 2 min
 	quotaPollInterval      = 300 // seconds — default
 	quotaPollMaxConcurrent = 5   // max concurrent fetches per tick
-	whamUsageURL           = "https://chatgpt.com/backend-api/wham/usage"
 )
+
+var whamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
 // whamUsageResponse mirrors the JSON shape returned by /backend-api/wham/usage.
 type whamUsageResponse struct {
@@ -48,12 +49,15 @@ type whamUsageResponse struct {
 		PrimaryWindow   whamWindow `json:"primary_window"`
 		SecondaryWindow whamWindow `json:"secondary_window"`
 	} `json:"rate_limit"`
+	RateLimitResetCredits      map[string]interface{} `json:"rate_limit_reset_credits"`
+	RateLimitResetCreditsCamel map[string]interface{} `json:"rateLimitResetCredits"`
 }
 
 type whamWindow struct {
 	UsedPercent        float64 `json:"used_percent"`
 	LimitWindowSeconds int64   `json:"limit_window_seconds"`
 	ResetAfterSeconds  int64   `json:"reset_after_seconds"`
+	Status             string  `json:"status"`
 }
 
 type quotaPollTarget struct {
@@ -424,22 +428,18 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return newQuotaPollError("http_error", resp.StatusCode, body, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 
 	var wham whamUsageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&wham); err != nil {
+	if err := json.Unmarshal(body, &wham); err != nil {
 		return newQuotaPollError("decode_error", 0, nil, fmt.Errorf("decode: %w", err))
 	}
 
 	now := storage.Now()
 
-	// Primary (5h) window → the urgency gauge operators care about.
-	// The ON CONFLICT(account_id) constraint means only one row per
-	// account, so we store the 5h window as the primary snapshot and
-	// embed the 7d window in the raw_json detail for the drawer.
 	var rawDetail []byte
 	if wham.RateLimit.SecondaryWindow.LimitWindowSeconds > 0 {
 		raw, _ := json.Marshal(map[string]interface{}{
@@ -469,6 +469,28 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		UpdatedAt:       now,
 	}
 	_ = s.store.UpsertAccountRateLimit(ctx, snap)
+	sw := wham.RateLimit.SecondaryWindow
+	if sw.LimitWindowSeconds > 0 {
+		_ = s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+			AccountID:         acc.ID,
+			Provider:          "codex",
+			LimiterType:       "7d_polled",
+			Source:            "7d_polled",
+			UsedPercent:       sw.UsedPercent,
+			RemainingTokens:   -1,
+			LimitTokens:       -1,
+			LimitRequests:     -1,
+			RemainingRequests: -1,
+			ResetAt:           now + sw.ResetAfterSeconds,
+			Status:            statusFromCodexWhamWindow(sw),
+			Raw:               string(rawDetail),
+			UpdatedAt:         now,
+		})
+	}
+	if credits := parseCodexResetCredits(body, "usage_fallback"); credits.Known {
+		credits.UpdatedAt = now
+		s.upsertCodexResetCreditsSnapshot(ctx, acc.ID, credits)
+	}
 	return nil
 }
 
@@ -742,6 +764,16 @@ func jsonIntDefault(m map[string]interface{}, def int64, keys ...string) int64 {
 
 func statusFromReached(reached bool) string {
 	if reached {
+		return "rejected"
+	}
+	return "allowed_warning"
+}
+
+func statusFromCodexWhamWindow(win whamWindow) string {
+	if status := strings.TrimSpace(win.Status); status != "" {
+		return status
+	}
+	if win.UsedPercent >= 100 {
 		return "rejected"
 	}
 	return "allowed_warning"

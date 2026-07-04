@@ -75,6 +75,17 @@ const drawer = read('components/AccountDrawer.jsx');
 if (!/saveGroup/.test(drawer) || !/groupPolicy/.test(drawer) || !/\/admin\/accounts\/.*\/group/.test(drawer)) {
   problems.push('AccountDrawer must support changing group and displaying inherited group policy.');
 }
+const identityIndex = drawer.indexOf('title="身份"');
+const quotaIndex = drawer.indexOf('title="账号额度"');
+if (quotaIndex <= identityIndex || identityIndex < 0) {
+  problems.push('AccountDrawer must render an 账号额度 section immediately after identity.');
+}
+if (!/quota_summary\?\.reset_credits/.test(drawer) || !/formatResetCredits/.test(drawer)) {
+  problems.push('AccountDrawer must render quota_summary.reset_credits through a reset-credit formatter.');
+}
+if (!/available_count[\s\S]{0,160}`\$\{credits\.available_count\} 次`/.test(drawer)) {
+  problems.push('AccountDrawer reset-credit formatter must preserve known 0 as "0 次" instead of unknown.');
+}
 
 if (problems.length > 0) {
   console.error('UI regression contract check failed:');

@@ -317,6 +317,14 @@ type Config struct {
 	// remaining headers approach zero, so the pool rotates BEFORE hitting the wall.
 	// Default on. Reduces limit-hits without touching quality/experience.
 	RateLimitGuardEnabled bool `json:"rate_limit_guard_enabled"`
+	// Codex reset credits are ChatGPT-side active reset credits for the Codex 7d
+	// rate-limit window. Auto consume is default-on; allow/deny lists are emergency
+	// rollout controls.
+	CodexResetCreditsAutoEnabled           bool     `json:"codex_reset_credits_auto_enabled"`
+	CodexResetCreditsUnknownConsumeEnabled bool     `json:"codex_reset_credits_unknown_consume_enabled"`
+	CodexResetCreditsAccountDenylist       []string `json:"codex_reset_credits_account_denylist"`
+	CodexResetCreditsAccountAllowlist      []string `json:"codex_reset_credits_account_allowlist"`
+	CodexResetCreditsGroupAllowlist        []string `json:"codex_reset_credits_group_allowlist"`
 	// SeamlessFailover transparently retries a request on a fresh account when the
 	// chosen account returns a recoverable error (rate limit / region / auth / ban)
 	// — but ONLY for self-contained requests (no previous_response_id), which carry
@@ -651,44 +659,46 @@ func Default() Config {
 		// Without it, the pool will keep sending to an exhausted account until it
 		// gets a 429, causing poor UX. The guard honors rate-limit headers from
 		// successful responses and preemptively rotates to fresh accounts.
-		RateLimitGuardEnabled:               true,
-		SeamlessFailover:                    true,
-		FailoverMaxAttempts:                 3,
-		StreamFailoverHoldMemoryBytes:       DefaultStreamFailoverHoldMemoryBytes,
-		StreamFailoverHoldDiskBytes:         DefaultStreamFailoverHoldDiskBytes,
-		ForceFailoverOn429:                  false,
-		AccountRecheckEnabled:               true,
-		AccountRecheckIntervalSeconds:       DefaultAccountRecheckIntervalSeconds,
-		AccountRecheckBackoffSeconds:        DefaultAccountRecheckBackoffSeconds,
-		CodexPromptCacheRetention:           "24h",
-		CodexInstallModel:                   "gpt-5.5",
-		CodexInstallEffort:                  "xhigh",
-		CodexInstallApprovalPolicy:          "never",
-		CodexInstallSandboxMode:             "danger-full-access",
-		ClaudeGatewayInterceptHosts:         DefaultClaudeGatewayInterceptHosts(),
-		ClaudeGatewayForwardHosts:           DefaultClaudeGatewayForwardHosts(),
-		ClaudeGatewayBlockedHostPatterns:    DefaultClaudeGatewayBlockedHostPatterns(),
-		ClaudeGatewayUnknownTargetPolicy:    "forward",
-		ClaudeGatewayDisableNonessentialEnv: true,
-		ClaudeGatewayStrictLinuxDefault:     true,
-		DefaultRegisterMethod:               "node",
-		StrictStickyMaxCooldownSeconds:      DefaultStrictStickyMaxCooldownSeconds,
-		CooldownWaitMaxSeconds:              DefaultCooldownWaitMaxSeconds,
-		LeakScrubEnabled:                    true,
-		ModelProbeIntervalHours:             DefaultModelProbeIntervalHours,
-		GeoProbeURL:                         DefaultGeoProbeURL,
-		GopayDir:                            DefaultGopayDir,
-		GopayPython:                         DefaultGopayPython,
-		GopayOrchestratorURL:                DefaultGopayOrchestratorURL,
-		WarpExitBasePort:                    40000,
-		WarpAccountsPerExit:                 3,
-		RegistrationConcurrency:             1,
-		RegistrationTimeout:                 300,
-		GopayAutoStart:                      true,
-		CodexPreferSidecarJA3OverWS:         true,
-		SMSPlatformStrategy:                 "auto",
-		SMSPreferredCountries:               "BR,CO,PL",
-		SMSStatsTopN:                        3,
+		RateLimitGuardEnabled:                  true,
+		CodexResetCreditsAutoEnabled:           true,
+		CodexResetCreditsUnknownConsumeEnabled: true,
+		SeamlessFailover:                       true,
+		FailoverMaxAttempts:                    3,
+		StreamFailoverHoldMemoryBytes:          DefaultStreamFailoverHoldMemoryBytes,
+		StreamFailoverHoldDiskBytes:            DefaultStreamFailoverHoldDiskBytes,
+		ForceFailoverOn429:                     false,
+		AccountRecheckEnabled:                  true,
+		AccountRecheckIntervalSeconds:          DefaultAccountRecheckIntervalSeconds,
+		AccountRecheckBackoffSeconds:           DefaultAccountRecheckBackoffSeconds,
+		CodexPromptCacheRetention:              "24h",
+		CodexInstallModel:                      "gpt-5.5",
+		CodexInstallEffort:                     "xhigh",
+		CodexInstallApprovalPolicy:             "never",
+		CodexInstallSandboxMode:                "danger-full-access",
+		ClaudeGatewayInterceptHosts:            DefaultClaudeGatewayInterceptHosts(),
+		ClaudeGatewayForwardHosts:              DefaultClaudeGatewayForwardHosts(),
+		ClaudeGatewayBlockedHostPatterns:       DefaultClaudeGatewayBlockedHostPatterns(),
+		ClaudeGatewayUnknownTargetPolicy:       "forward",
+		ClaudeGatewayDisableNonessentialEnv:    true,
+		ClaudeGatewayStrictLinuxDefault:        true,
+		DefaultRegisterMethod:                  "node",
+		StrictStickyMaxCooldownSeconds:         DefaultStrictStickyMaxCooldownSeconds,
+		CooldownWaitMaxSeconds:                 DefaultCooldownWaitMaxSeconds,
+		LeakScrubEnabled:                       true,
+		ModelProbeIntervalHours:                DefaultModelProbeIntervalHours,
+		GeoProbeURL:                            DefaultGeoProbeURL,
+		GopayDir:                               DefaultGopayDir,
+		GopayPython:                            DefaultGopayPython,
+		GopayOrchestratorURL:                   DefaultGopayOrchestratorURL,
+		WarpExitBasePort:                       40000,
+		WarpAccountsPerExit:                    3,
+		RegistrationConcurrency:                1,
+		RegistrationTimeout:                    300,
+		GopayAutoStart:                         true,
+		CodexPreferSidecarJA3OverWS:            true,
+		SMSPlatformStrategy:                    "auto",
+		SMSPreferredCountries:                  "BR,CO,PL",
+		SMSStatsTopN:                           3,
 
 		// Thinking defaults: disabled by default (opt-in feature)
 		ThinkingEnabled:       false,

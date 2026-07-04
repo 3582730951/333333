@@ -379,6 +379,20 @@ type AccountRateLimit struct {
 	UpdatedAt         int64   `json:"updated_at"`
 }
 
+type CodexResetCreditConsumption struct {
+	AccountID       string `json:"account_id"`
+	SevenDayResetAt int64  `json:"seven_day_reset_at"`
+	RedeemRequestID string `json:"redeem_request_id"`
+	Status          string `json:"status"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
+type CodexResetCreditClaim struct {
+	Claimed bool                        `json:"claimed"`
+	Row     CodexResetCreditConsumption `json:"row"`
+}
+
 // CustomProvider is an OpenAI-Chat-Completions-compatible upstream provider
 // (DeepSeek, Kimi/Moonshot, OpenRouter, a local vLLM, …) the relay can pool
 // accounts against. Unlike the built-in "codex"/"claude" upstreams it carries no
@@ -830,6 +844,16 @@ CREATE TABLE IF NOT EXISTS account_rate_limits(
   PRIMARY KEY(account_id, provider, model, limiter_type),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS codex_reset_credit_consumptions(
+  account_id TEXT NOT NULL,
+  seven_day_reset_at INTEGER NOT NULL,
+  redeem_request_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'in_progress',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, seven_day_reset_at),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS settings(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL DEFAULT '',
@@ -1058,6 +1082,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_egress_binding_cooldown ON account_egress_bindings(cooldown_until, recheck_pending)`,
 		// Covers account detail drawer audit lookups without scanning the global audit log.
 		`CREATE INDEX IF NOT EXISTS idx_audit_log_account ON audit_log(account_id, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS codex_reset_credit_consumptions(
+  account_id TEXT NOT NULL,
+  seven_day_reset_at INTEGER NOT NULL,
+  redeem_request_id TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'in_progress',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, seven_day_reset_at),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -4452,6 +4486,79 @@ func accountRateLimitExhausted(r AccountRateLimit) bool {
 		return r.RemainingTokens == 0
 	}
 	return r.RemainingTokens == 0 || r.RemainingRequests == 0
+}
+
+func scanCodexResetCreditConsumption(scan func(...interface{}) error) (CodexResetCreditConsumption, error) {
+	var row CodexResetCreditConsumption
+	err := scan(&row.AccountID, &row.SevenDayResetAt, &row.RedeemRequestID, &row.Status, &row.CreatedAt, &row.UpdatedAt)
+	return row, err
+}
+
+const codexResetCreditConsumptionCols = `account_id, seven_day_reset_at, redeem_request_id, status, created_at, updated_at`
+
+func (s *Store) ClaimCodexResetCreditConsumption(ctx context.Context, accountID string, sevenDayResetAt int64, redeemRequestID string, now int64) (CodexResetCreditClaim, error) {
+	accountID = strings.TrimSpace(accountID)
+	redeemRequestID = strings.TrimSpace(redeemRequestID)
+	if now == 0 {
+		now = Now()
+	}
+	if accountID == "" || sevenDayResetAt <= 0 || redeemRequestID == "" {
+		return CodexResetCreditClaim{}, fmt.Errorf("invalid codex reset credit claim")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CodexResetCreditClaim{}, err
+	}
+	defer tx.Rollback()
+
+	row := tx.QueryRowContext(ctx, `SELECT `+codexResetCreditConsumptionCols+` FROM codex_reset_credit_consumptions WHERE account_id = ? AND seven_day_reset_at = ?`, accountID, sevenDayResetAt)
+	existing, err := scanCodexResetCreditConsumption(row.Scan)
+	if err == nil {
+		if strings.TrimSpace(existing.Status) == "in_progress" && now-existing.UpdatedAt > 120 {
+			if _, err := tx.ExecContext(ctx, `UPDATE codex_reset_credit_consumptions SET status = 'unknown', updated_at = ? WHERE account_id = ? AND seven_day_reset_at = ?`, now, accountID, sevenDayResetAt); err != nil {
+				return CodexResetCreditClaim{}, err
+			}
+			existing.Status = "unknown"
+			existing.UpdatedAt = now
+		}
+		if err := tx.Commit(); err != nil {
+			return CodexResetCreditClaim{}, err
+		}
+		return CodexResetCreditClaim{Claimed: false, Row: existing}, nil
+	}
+	if err != sql.ErrNoRows {
+		return CodexResetCreditClaim{}, err
+	}
+
+	inserted := CodexResetCreditConsumption{
+		AccountID:       accountID,
+		SevenDayResetAt: sevenDayResetAt,
+		RedeemRequestID: redeemRequestID,
+		Status:          "in_progress",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO codex_reset_credit_consumptions(account_id, seven_day_reset_at, redeem_request_id, status, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		inserted.AccountID, inserted.SevenDayResetAt, inserted.RedeemRequestID, inserted.Status, inserted.CreatedAt, inserted.UpdatedAt); err != nil {
+		return CodexResetCreditClaim{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CodexResetCreditClaim{}, err
+	}
+	return CodexResetCreditClaim{Claimed: true, Row: inserted}, nil
+}
+
+func (s *Store) UpdateCodexResetCreditConsumptionStatus(ctx context.Context, accountID string, sevenDayResetAt int64, status string, now int64) error {
+	accountID = strings.TrimSpace(accountID)
+	status = strings.TrimSpace(status)
+	if now == 0 {
+		now = Now()
+	}
+	if accountID == "" || sevenDayResetAt <= 0 || status == "" {
+		return fmt.Errorf("invalid codex reset credit consumption status")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE codex_reset_credit_consumptions SET status = ?, updated_at = ? WHERE account_id = ? AND seven_day_reset_at = ?`, status, now, accountID, sevenDayResetAt)
+	return err
 }
 
 func (s *Store) CreateBillingHold(ctx context.Context, routeKeyHash, accountID string, estimatedTokens int64) (string, error) {

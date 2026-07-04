@@ -17,6 +17,11 @@ const Row = ({ k, v }) => (
 
 const EMPTY_ACCOUNT_DETAIL = { audit: [] };
 
+function formatResetCredits(credits) {
+  if (!credits || credits.status !== 'ok' || credits.available_count == null) return '未知';
+  return `${credits.available_count} 次`;
+}
+
 // Account detail drawer: identity, egress binding, usage, recent audit + quick actions.
 export default function AccountDrawer({
   account,
@@ -103,6 +108,7 @@ export default function AccountDrawer({
   }));
   const isActionLoading = (act) => Boolean(isActionLoadingProp?.(account.id, act));
   const isActionDisabled = (act) => actionDisabled || (actionRunning && !isActionLoading(act));
+  const resetCredits = account.quota_summary?.reset_credits;
 
   return (
     <Drawer title={account.label || account.id} visible={!!account} onCancel={onClose} width={520} className="pool-account-drawer">
@@ -114,6 +120,11 @@ export default function AccountDrawer({
         <Row k="分组" v={account.group_name || '默认'} />
         <Row k="套餐" v={account.plan_type || '—'} />
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
+      </Panel>
+
+      <Panel title="账号额度" style={{ marginBottom: 14 }}>
+        <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
+        <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
       </Panel>
 
       <Panel title="分组策略" style={{ marginBottom: 14 }}>

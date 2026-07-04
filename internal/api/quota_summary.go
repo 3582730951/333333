@@ -26,16 +26,24 @@ type QuotaWindow struct {
 }
 
 type QuotaSummary struct {
-	AccountID string       `json:"account_id"`
-	Provider  string       `json:"provider"`
-	Primary   *QuotaWindow `json:"primary,omitempty"`
-	Secondary *QuotaWindow `json:"secondary,omitempty"`
+	AccountID    string             `json:"account_id"`
+	Provider     string             `json:"provider"`
+	Primary      *QuotaWindow       `json:"primary,omitempty"`
+	Secondary    *QuotaWindow       `json:"secondary,omitempty"`
+	ResetCredits *QuotaResetCredits `json:"reset_credits,omitempty"`
 
 	SyncReason string `json:"sync_reason"`
 	SyncedAt   int64  `json:"synced_at,omitempty"`
 	Stale      bool   `json:"stale,omitempty"`
 	Partial    bool   `json:"partial,omitempty"`
 	Supported  bool   `json:"supported"`
+}
+
+type QuotaResetCredits struct {
+	Status         string `json:"status"`
+	AvailableCount int64  `json:"available_count"`
+	Source         string `json:"source"`
+	UpdatedAt      int64  `json:"updated_at"`
 }
 
 func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, snapshots []storage.AccountRateLimit, now int64) QuotaSummary {
@@ -55,6 +63,9 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 	}
 	if secondary != nil {
 		out.Secondary = secondary
+	}
+	if reset := selectQuotaResetCredits(snapshots); reset != nil {
+		out.ResetCredits = reset
 	}
 
 	if !quotaAccountActive(account, now) {
@@ -140,7 +151,7 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 		if limiter == "" {
 			limiter = strings.TrimSpace(snap.Source)
 		}
-		if limiter == "7d_oauth_usage" || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
+		if limiter == "7d_oauth_usage" || limiter == "7d_polled" || limiter == codexResetCreditsLimiterType || limiter == "quota_poll_error" || strings.HasPrefix(strings.TrimSpace(snap.Status), "error/") {
 			continue
 		}
 		if provider == "claude" && (limiter == "opus" || limiter == "sonnet" || limiter == "haiku") {
@@ -168,6 +179,10 @@ func latestSnapshotWithLimiter(snapshots []storage.AccountRateLimit, limiter str
 }
 
 func selectQuotaSecondary(primary *storage.AccountRateLimit, snapshots []storage.AccountRateLimit, now int64) *QuotaWindow {
+	if snap := latestSnapshotWithLimiter(snapshots, "7d_polled"); snap != nil {
+		w := quotaWindowFromSnapshot(*snap)
+		return &w
+	}
 	if primary != nil {
 		if secondary := secondaryFromRaw(primary.Raw, primary.UpdatedAt, now); secondary != nil {
 			return secondary
@@ -178,6 +193,23 @@ func selectQuotaSecondary(primary *storage.AccountRateLimit, snapshots []storage
 		return &w
 	}
 	return nil
+}
+
+func selectQuotaResetCredits(snapshots []storage.AccountRateLimit) *QuotaResetCredits {
+	snap := latestSnapshotWithLimiter(snapshots, codexResetCreditsLimiterType)
+	if snap == nil {
+		return nil
+	}
+	count := int64(0)
+	if snap.RemainingRequests >= 0 {
+		count = snap.RemainingRequests
+	}
+	return &QuotaResetCredits{
+		Status:         firstNonEmpty(strings.TrimSpace(snap.Status), "unknown"),
+		AvailableCount: count,
+		Source:         firstNonEmpty(strings.TrimSpace(snap.Source), codexResetCreditsLimiterType),
+		UpdatedAt:      snap.UpdatedAt,
+	}
 }
 
 func secondaryFromRaw(raw string, updatedAt, now int64) *QuotaWindow {

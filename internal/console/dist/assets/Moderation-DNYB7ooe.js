@@ -1,0 +1,1 @@
+import{j as t}from"./vendor-react-Yo7RVi3I.js";import{C as o}from"./ConfigForm-yFlCdLNa.js";import"./index-CEJGBeH3.js";import"./vendor-axios-DhXgJQ-f.js";import"./useAsyncResource-otrVF4HE.js";import"./useAsyncAction-Ccv_HCTC.js";function a(){return t.jsx(o,{title:"内容合规",subtitle:"敏感词与历史合规配置",url:"/admin/moderation"})}export{a as default};

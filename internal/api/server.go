@@ -99,6 +99,9 @@ type Server struct {
 	asyncMu     sync.RWMutex
 	asyncClosed bool
 	asyncBytes  int64
+
+	codexResetMu    sync.Mutex
+	codexResetLocks map[string]*sync.Mutex
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -124,6 +127,7 @@ func NewServer(dep Dependencies) *Server {
 		regHandler:       NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		lifecycleHandler: newServerLifecycleHandlers(dep.Store),
 		claudeRefresh:    newClaudeRefreshGates(),
+		codexResetLocks:  map[string]*sync.Mutex{},
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
@@ -793,6 +797,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			resp.Body.Close()
 		}
 	}()
+	codexResetRetried := false
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
@@ -879,6 +884,24 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
 			v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		}
+		if !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
+			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, errorBody, "http_error") {
+			codexResetRetried = true
+			if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+				token = latest
+			}
+			_ = resp.Body.Close()
+			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+			if err != nil {
+				log.Printf("codex reset-credit retry %s: %v", lease.Account.ID, err)
+			} else if resp.StatusCode < 400 {
+				goto codexSuccess
+			} else {
+				errorBody = readUpstreamErrorBody(resp.Body)
+				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
+				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
+			}
+		}
 		if cf.Recordable(detection) {
 			s.handleCFEvent(r.Context(), lease.Account, finalEgress, resp.StatusCode, detection)
 		}
@@ -908,7 +931,13 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 codexSuccess:
 	normalizeCodexStreamContentType(resp.Header, isStreamRequest(body))
-	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	resetHeaderExhaustion := false
+	if !codexResetRetried && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
+		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
+	}
+	if !resetHeaderExhaustion {
+		s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	}
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
 
 	// Diagnostic logging for usage tracking
@@ -928,6 +957,26 @@ codexSuccess:
 		// instead of 429). When detected, cool the account and fail over to a fresh
 		// one so the downstream never sees the error.
 		if cd := usageLimitCooldown(200, responseBody); cd > 0 {
+			if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
+				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
+				codexResetRetried = true
+				if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+					token = latest
+				}
+				_ = resp.Body.Close()
+				retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+				if retryErr == nil && retryResp.StatusCode < 400 {
+					resp = retryResp
+					finalEgress = retryEgress
+					goto codexSuccess
+				}
+				if retryResp != nil && retryResp.Body != nil {
+					_ = retryResp.Body.Close()
+				}
+				if retryErr != nil {
+					log.Printf("codex soft-200 reset-credit retry %s: %v", lease.Account.ID, retryErr)
+				}
+			}
 			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 			// Rate limit in 200 body — treat like a 429 for failover purposes.
@@ -1032,6 +1081,25 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		if retryableStream {
+			if !codexResetRetried && codexResetTriggerAllowed(200, captured.Head(64*1024)) &&
+				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, captured.Head(64*1024), "stream_retryable_limit") {
+				codexResetRetried = true
+				if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+					token = latest
+				}
+				retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+				if retryErr == nil && retryResp.StatusCode < 400 {
+					resp = retryResp
+					finalEgress = retryEgress
+					goto codexSuccess
+				}
+				if retryResp != nil && retryResp.Body != nil {
+					_ = retryResp.Body.Close()
+				}
+				if retryErr != nil {
+					log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
+				}
+			}
 			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, captured.Head(64*1024))
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if allowRetry && movable {
@@ -1073,6 +1141,26 @@ codexSuccess:
 	// Same logic as the isChat non-streaming path above: when the upstream returns
 	// a soft limit error in a 200 body, cool the account and fail over.
 	if cd := usageLimitCooldown(200, responseBody); cd > 0 {
+		if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
+			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
+			codexResetRetried = true
+			if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+				token = latest
+			}
+			_ = resp.Body.Close()
+			retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+			if retryErr == nil && retryResp.StatusCode < 400 {
+				resp = retryResp
+				finalEgress = retryEgress
+				goto codexSuccess
+			}
+			if retryResp != nil && retryResp.Body != nil {
+				_ = retryResp.Body.Close()
+			}
+			if retryErr != nil {
+				log.Printf("codex raw soft-200 reset-credit retry %s: %v", lease.Account.ID, retryErr)
+			}
+		}
 		s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 		// Honor failover here too: a soft rate-limit in a 200 body is the same condition

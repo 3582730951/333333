@@ -38,6 +38,7 @@ web-spa/dist/
 /wsl-list.txt
 /other_new_gpt_register
 /docs
+/other
 
 # Python caches and captured traffic artifacts
 __pycache__/
