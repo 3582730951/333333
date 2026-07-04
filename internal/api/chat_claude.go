@@ -14,6 +14,7 @@ import (
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
+	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/upstream"
 	"codex-account-pool/internal/usage"
@@ -63,6 +64,18 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	refreshHeartbeat := newClaudeRefreshSSEHeartbeat(w, true)
+	if !stream {
+		refreshHeartbeat = nil
+	}
+	token, err = s.prepareClaudeTokenWithHeartbeat(r.Context(), lease.Account, token, "chat_claude_preflight", refreshHeartbeat.beat)
+	if err != nil {
+		if refreshHeartbeat.writeError(err) {
+			return
+		}
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
 	osHint := s.osHint(raw, lease.Egress)
 	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 	cacheInject := s.cacheInjectEnabled(r.Context())
@@ -87,20 +100,26 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	usageDiag := claudeRequestUsageDiagnostics(result.Body, affinity, claudeTTL, cacheInject)
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
-	resp, err := s.upstream.Do(r.Context(), upstream.Request{
-		Method:         http.MethodPost,
-		Provider:       "claude",
-		DownstreamPath: "/v1/messages",
-		Headers:        r.Header.Clone(),
-		Body:           result.Body,
-		Account:        lease.Account,
-		Token:          token,
-		Egress:         lease.Egress,
-		CookieJarKey:   lease.Binding.CookieJarKey,
-		OSHint:         osHint,
-	})
+	requestForToken := func(t storage.AccountToken) upstream.Request {
+		return upstream.Request{
+			Method:         http.MethodPost,
+			Provider:       "claude",
+			DownstreamPath: "/v1/messages",
+			Headers:        r.Header.Clone(),
+			Body:           result.Body,
+			Account:        lease.Account,
+			Token:          t,
+			Egress:         lease.Egress,
+			CookieJarKey:   lease.Binding.CookieJarKey,
+			OSHint:         osHint,
+		}
+	}
+	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
+		if refreshHeartbeat.writeError(err) {
+			return
+		}
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
@@ -108,8 +127,33 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 
 	if resp.StatusCode >= 400 {
 		errBody := readUpstreamErrorBody(resp.Body)
+		if claudeAuthError(resp.StatusCode, resp.Header, errBody) && claudeTokenCanRefresh(token) {
+			if refreshed, rerr := s.forceRefreshClaudeTokenWithHeartbeat(r.Context(), lease.Account, "auth_error", refreshHeartbeat.beat); rerr == nil {
+				token = refreshed
+				resp.Body.Close()
+				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+				if err != nil {
+					_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_refresh")
+					if refreshHeartbeat.writeError(err) {
+						return
+					}
+					writeError(w, http.StatusBadGateway, err)
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode < 400 {
+					goto chatClaudeSuccess
+				}
+				errBody = readUpstreamErrorBody(resp.Body)
+			} else if refreshHeartbeat.writeError(rerr) {
+				return
+			}
+		}
 		s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		if refreshHeartbeat.writeError(errors.New("claude upstream returned an error after authentication refresh")) {
+			return
+		}
 		// Downstream is an OpenAI-compatible client, so neutralize into the OpenAI
 		// error envelope (hides the Anthropic limit/overload/billing specifics).
 		status, out := resp.StatusCode, errBody
@@ -123,13 +167,16 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		_, _ = w.Write(result.Scrubber.ReplaceAll(out))
 		return
 	}
+chatClaudeSuccess:
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if stream && isEventStream(resp.Header) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
+		if !refreshHeartbeat.Committed() {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+		}
 		// Tee the upstream Anthropic SSE through a usage scanner so streamed
 		// /v1/chat/completions traffic records token usage just like the native
 		// /v1/messages path (the scanner reads the raw Anthropic frames, not the

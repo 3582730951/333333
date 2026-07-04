@@ -430,6 +430,15 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		req.DownstreamPath = "/v1/responses"
 		req.Body = []byte(`{"model":"` + model + `","instructions":"You are a coding agent.","store":false,"input":[{"role":"user","content":"ping"}],"stream":true}`)
 	}
+	if provider == "claude" {
+		var perr error
+		token, perr = s.prepareClaudeToken(ctx, account, token, "health_preflight")
+		if perr != nil {
+			res.Err = perr
+			return res
+		}
+		req.Token = token
+	}
 	resp, err := s.upstream.Do(ctx, req)
 	if err != nil {
 		res.Err = err
@@ -437,6 +446,19 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if provider == "claude" && claudeAuthError(resp.StatusCode, resp.Header, body) && claudeTokenCanRefresh(token) {
+		if refreshed, rerr := s.forceRefreshClaudeToken(ctx, account, "auth_error"); rerr == nil {
+			req.Token = refreshed
+			retryResp, retryErr := s.upstream.Do(ctx, req)
+			if retryErr != nil {
+				res.Err = retryErr
+				return res
+			}
+			defer retryResp.Body.Close()
+			body, _ = io.ReadAll(io.LimitReader(retryResp.Body, 1<<20))
+			resp = retryResp
+		}
+	}
 	res.Status = resp.StatusCode
 	res.Body = body
 	res.Verdict = ban.Classify(resp.StatusCode < 400, resp.StatusCode, resp.Header, body)

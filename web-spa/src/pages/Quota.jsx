@@ -32,6 +32,7 @@ export default function Quota() {
   const exportCSV = () => {
     const ok = downloadCSV('quota.csv', toCSV(rows, [
       { title: 'account', get: (r) => r.label || r.account_id }, { title: 'provider', get: (r) => r.provider },
+      { title: 'plan_type', get: (r) => r.plan_type }, { title: 'oauth_rate_limit_tier', get: (r) => r.oauth_rate_limit_tier },
       { title: '5h_used_pct', get: (r) => r.used_percent }, { title: '7d_used_pct', get: (r) => r.secondary_7d_used_pct },
       { title: 'remaining_tokens', get: (r) => r.remaining_tokens }, { title: 'status', get: (r) => r.status },
     ]));
@@ -41,6 +42,9 @@ export default function Quota() {
   const cols = [
     { title: '账号', dataIndex: 'account_id', width: 230, render: (v, r) => <b>{r.label || v}</b> },
     { title: '平台', dataIndex: 'provider', width: 96, render: (v) => v ? <Tag>{v}</Tag> : '—' },
+    { title: '套餐', dataIndex: 'plan_type', width: 110, render: (v) => v ? <Tag>{v}</Tag> : '—' },
+    { title: 'OAuth Tier', dataIndex: 'oauth_rate_limit_tier', width: 140, render: (v) => v ? <span className="pool-mono">{v}</span> : '—' },
+    { title: '窗口', dataIndex: 'limiter_type', width: 150, render: (v) => v ? <span className="pool-mono">{v}</span> : '—' },
     { title: '5h 用量', dataIndex: 'used_percent', width: 170, sorter: (a, b) => (a.used_percent || 0) - (b.used_percent || 0), defaultSortOrder: 'descend', render: bar },
     { title: '7d 用量', dataIndex: 'secondary_7d_used_pct', width: 170, sorter: (a, b) => (a.secondary_7d_used_pct || 0) - (b.secondary_7d_used_pct || 0), render: bar },
     { title: '剩余 token', dataIndex: 'remaining_tokens', width: 150, sorter: (a, b) => (a.remaining_tokens || 0) - (b.remaining_tokens || 0), render: (v) => (v == null || v < 0 ? '—' : fmtTokens(v)) },
@@ -62,13 +66,13 @@ export default function Quota() {
         lastRefresh={lastRefresh}
         dataSource={rows}
         columns={cols}
-        rowKey={(r) => r.account_id}
+        rowKey={(r) => `${r.account_id}:${r.provider || ''}:${r.model || ''}:${r.limiter_type || ''}`}
         pagination={{ pageSize: 20 }}
         layout="fit"
         className="pool-quota-table"
         emptyTitle="暂无配额数据"
         skeletonRows={8}
-        skeletonCols={7}
+        skeletonCols={10}
       />
     </div>
   );

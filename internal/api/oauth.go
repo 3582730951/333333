@@ -465,14 +465,45 @@ func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, co
 		return authparse.ParsedAuth{}, fmt.Errorf("anthropic token exchange failed (%d): %s", resp.StatusCode, bodySnippet(body, 300))
 	}
 	var tr struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		Account      struct {
+		AccessToken      string   `json:"access_token"`
+		RefreshToken     string   `json:"refresh_token"`
+		ExpiresIn        int64    `json:"expires_in"`
+		ExpiresAt        int64    `json:"expires_at"`
+		Scope            string   `json:"scope"`
+		Scopes           []string `json:"scopes"`
+		SubscriptionType string   `json:"subscription_type"`
+		RateLimitTier    string   `json:"rate_limit_tier"`
+		Account          struct {
 			EmailAddress string `json:"email_address"`
 		} `json:"account"`
+		ClaudeAiOauth struct {
+			SubscriptionType string   `json:"subscriptionType"`
+			RateLimitTier    string   `json:"rateLimitTier"`
+			Scopes           []string `json:"scopes"`
+			ExpiresAt        int64    `json:"expiresAt"`
+		} `json:"claudeAiOauth"`
 	}
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return authparse.ParsedAuth{}, fmt.Errorf("parse token response: %w", err)
 	}
-	return authparse.ParseOAuthClaude(tr.AccessToken, tr.RefreshToken, tr.Account.EmailAddress)
+	expiresAt := tr.ExpiresAt
+	if expiresAt == 0 {
+		expiresAt = tr.ClaudeAiOauth.ExpiresAt
+	}
+	if expiresAt > 1_000_000_000_000 {
+		expiresAt /= 1000
+	}
+	if expiresAt == 0 && tr.ExpiresIn > 0 {
+		expiresAt = time.Now().Unix() + tr.ExpiresIn
+	}
+	scopes := tr.Scopes
+	if len(scopes) == 0 && tr.Scope != "" {
+		scopes = strings.Fields(tr.Scope)
+	}
+	if len(scopes) == 0 {
+		scopes = tr.ClaudeAiOauth.Scopes
+	}
+	subscriptionType := firstNonEmpty(tr.SubscriptionType, tr.ClaudeAiOauth.SubscriptionType)
+	rateLimitTier := firstNonEmpty(tr.RateLimitTier, tr.ClaudeAiOauth.RateLimitTier)
+	return authparse.ParseOAuthClaudeMetadata(tr.AccessToken, tr.RefreshToken, tr.Account.EmailAddress, subscriptionType, rateLimitTier, expiresAt, scopes)
 }

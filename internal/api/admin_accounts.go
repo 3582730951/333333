@@ -166,15 +166,19 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		ChatGPTUserID:     parsed.ChatGPTUserID,
 		Email:             parsed.Email,
 		PlanType:          parsed.PlanType,
+		Provider:          parsed.Provider,
 		Status:            "active",
 		IsFedramp:         parsed.IsFedramp,
 	}
 	token := storage.AccountToken{
-		AccessToken:  parsed.AccessToken,
-		RefreshToken: parsed.RefreshToken,
-		OpenAIAPIKey: parsed.OpenAIAPIKey,
-		IDTokenRaw:   parsed.IDTokenRaw,
-		LastRefresh:  storage.Now(),
+		AccessToken:        parsed.AccessToken,
+		RefreshToken:       parsed.RefreshToken,
+		OpenAIAPIKey:       parsed.OpenAIAPIKey,
+		IDTokenRaw:         parsed.IDTokenRaw,
+		LastRefresh:        storage.Now(),
+		ExpiresAt:          parsed.ExpiresAt,
+		Scopes:             strings.Join(parsed.Scopes, " "),
+		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -193,6 +197,9 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	if refreshToken == "" {
 		refreshToken = parsed.RefreshToken
 	}
+	if provider == "" {
+		provider = parsed.Provider
+	}
 	account := storage.Account{
 		ID:                parsed.AccountID,
 		Label:             label,
@@ -206,11 +213,14 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 		IsFedramp:         parsed.IsFedramp,
 	}
 	token := storage.AccountToken{
-		AccessToken:  parsed.AccessToken,
-		RefreshToken: refreshToken,
-		OpenAIAPIKey: parsed.OpenAIAPIKey,
-		IDTokenRaw:   parsed.IDTokenRaw,
-		LastRefresh:  storage.Now(),
+		AccessToken:        parsed.AccessToken,
+		RefreshToken:       refreshToken,
+		OpenAIAPIKey:       parsed.OpenAIAPIKey,
+		IDTokenRaw:         parsed.IDTokenRaw,
+		LastRefresh:        storage.Now(),
+		ExpiresAt:          parsed.ExpiresAt,
+		Scopes:             strings.Join(parsed.Scopes, " "),
+		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return storage.Account{}, err

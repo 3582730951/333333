@@ -7,6 +7,7 @@ import (
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
+	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
 )
 
@@ -82,21 +83,29 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	token, err = s.prepareClaudeToken(r.Context(), lease.Account, token, "passthrough_preflight")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
 
 	osHint := s.osHint(nil, lease.Egress)
-	resp, err := s.upstream.Do(r.Context(), upstream.Request{
-		Method:         r.Method,
-		Provider:       "claude",
-		PassThrough:    true,
-		DownstreamPath: pathWithQuery(r.URL.Path, r.URL.RawQuery),
-		Headers:        r.Header.Clone(),
-		Body:           raw,
-		Account:        lease.Account,
-		Token:          token,
-		Egress:         lease.Egress,
-		CookieJarKey:   lease.Binding.CookieJarKey,
-		OSHint:         osHint,
-	})
+	requestForToken := func(t storage.AccountToken) upstream.Request {
+		return upstream.Request{
+			Method:         r.Method,
+			Provider:       "claude",
+			PassThrough:    true,
+			DownstreamPath: pathWithQuery(r.URL.Path, r.URL.RawQuery),
+			Headers:        r.Header.Clone(),
+			Body:           raw,
+			Account:        lease.Account,
+			Token:          t,
+			Egress:         lease.Egress,
+			CookieJarKey:   lease.Binding.CookieJarKey,
+			OSHint:         osHint,
+		}
+	}
+	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -105,6 +114,22 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
+		if claudeAuthError(resp.StatusCode, resp.Header, errorBody) && claudeTokenCanRefresh(token) {
+			if refreshed, rerr := s.forceRefreshClaudeToken(r.Context(), lease.Account, "auth_error"); rerr == nil {
+				token = refreshed
+				resp.Body.Close()
+				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+				if err != nil {
+					writeError(w, http.StatusBadGateway, err)
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode < 400 {
+					goto passthroughSuccess
+				}
+				errorBody = readUpstreamErrorBody(resp.Body)
+			}
+		}
 		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
 			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
 		}
@@ -115,6 +140,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, nil)
 		return
 	}
+passthroughSuccess:
 
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", "", resp.Header)

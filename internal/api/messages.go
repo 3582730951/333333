@@ -150,6 +150,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // Codex path's codexAttempt; a benched account is held out of the pool until the
 // recheck loop re-validates it.
 func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group string, allowRetry bool, exclude map[string]bool) attemptOutcome {
+	streamReq := isStreamRequest(raw)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           group,
 		Provider:        "claude",
@@ -178,6 +179,18 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return outcomeDone
+	}
+	refreshHeartbeat := newClaudeRefreshSSEHeartbeat(w, false)
+	if !streamReq {
+		refreshHeartbeat = nil
+	}
+	token, err = s.prepareClaudeTokenWithHeartbeat(r.Context(), lease.Account, token, "messages_preflight", refreshHeartbeat.beat)
+	if err != nil {
+		if refreshHeartbeat.writeError(err) {
+			return outcomeDone
+		}
+		writeError(w, http.StatusBadGateway, err)
 		return outcomeDone
 	}
 
@@ -222,22 +235,28 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	// call upstream directly rather than through the Codex CF-retry/egress-rotation
 	// path — and below we only treat an actual interstitial challenge as CF, never
 	// a normal API 4xx/429 (which still carries cf-ray/server: cloudflare).
-	resp, err := s.upstream.Do(r.Context(), upstream.Request{
-		Method:         http.MethodPost,
-		Provider:       "claude",
-		DownstreamPath: path,
-		Headers:        r.Header.Clone(),
-		Body:           body,
-		Account:        lease.Account,
-		Token:          token,
-		Egress:         lease.Egress,
-		CookieJarKey:   lease.Binding.CookieJarKey,
-		OSHint:         osHint,
-	})
+	requestForToken := func(t storage.AccountToken) upstream.Request {
+		return upstream.Request{
+			Method:         http.MethodPost,
+			Provider:       "claude",
+			DownstreamPath: path,
+			Headers:        r.Header.Clone(),
+			Body:           body,
+			Account:        lease.Account,
+			Token:          t,
+			Egress:         lease.Egress,
+			CookieJarKey:   lease.Binding.CookieJarKey,
+			OSHint:         osHint,
+		}
+	}
+	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
 		if allowRetry && movable {
 			return retry() // transport error — a fresh account/egress may succeed
+		}
+		if refreshHeartbeat.writeError(err) {
+			return outcomeDone
 		}
 		writeError(w, http.StatusBadGateway, err)
 		return outcomeDone
@@ -246,6 +265,34 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
+		if claudeAuthError(resp.StatusCode, resp.Header, errorBody) && claudeTokenCanRefresh(token) {
+			if refreshed, rerr := s.forceRefreshClaudeTokenWithHeartbeat(r.Context(), lease.Account, "auth_error", refreshHeartbeat.beat); rerr == nil {
+				token = refreshed
+				resp.Body.Close()
+				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
+				if err != nil {
+					_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_refresh")
+					if allowRetry && movable {
+						return retry()
+					}
+					if refreshHeartbeat.writeError(err) {
+						return outcomeDone
+					}
+					writeError(w, http.StatusBadGateway, err)
+					return outcomeDone
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode < 400 {
+					goto claudeSuccess
+				}
+				errorBody = readUpstreamErrorBody(resp.Body)
+			} else {
+				log.Printf("claude auth refresh %s: %v", lease.Account.ID, rerr)
+				if refreshHeartbeat.writeError(rerr) {
+					return outcomeDone
+				}
+			}
+		}
 		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
 			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
 		}
@@ -257,9 +304,13 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		if allowRetry && movable && retryableForFailover(v, resp.StatusCode) {
 			return retry()
 		}
+		if refreshHeartbeat.writeError(errors.New("claude upstream returned an error after authentication refresh")) {
+			return outcomeDone
+		}
 		s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber)
 		return outcomeDone
 	}
+claudeSuccess:
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
@@ -270,6 +321,9 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			if allowRetry && movable {
 				return retry()
 			}
+			if refreshHeartbeat.writeError(probeErr) {
+				return outcomeDone
+			}
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return outcomeDone
 		}
@@ -279,12 +333,17 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			if allowRetry && movable {
 				return retry()
 			}
+			if refreshHeartbeat.writeError(errors.New("claude stream returned retryable error after authentication refresh")) {
+				return outcomeDone
+			}
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return outcomeDone
 		}
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
-		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
+		if !refreshHeartbeat.Committed() {
+			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+		}
 		if err := s.streamSSE(r.Context(), w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {

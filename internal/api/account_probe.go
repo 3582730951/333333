@@ -4,7 +4,6 @@
 package api
 
 import (
-	"bytes"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
@@ -134,22 +133,49 @@ func (s *Server) upsertStaticCodexModels(ctx context.Context, accountID string) 
 // a guess. Either way the UI and /v1/models stop showing an empty/failed set.
 // A probe failure here NEVER bans the account: capability discovery is advisory.
 func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account, token storage.AccountToken, binding storage.AccountEgressBinding, egress storage.EgressProfile) ([]storage.ModelCapability, error) {
-	resp, err := s.upstream.Do(ctx, upstream.Request{
-		Method:         http.MethodGet,
-		Provider:       "claude",
-		DownstreamPath: "/v1/models",
-		Headers:        http.Header{},
-		Account:        account,
-		Token:          token,
-		Egress:         egress,
-		CookieJarKey:   binding.CookieJarKey,
-	})
+	var err error
+	token, err = s.prepareClaudeToken(ctx, account, token, "model_probe_preflight")
+	if err != nil {
+		log.Printf("claude model probe %s: refresh wait: %v; using static model set", account.ID, err)
+		return s.upsertStaticClaudeModels(ctx, account.ID)
+	}
+	requestForToken := func(t storage.AccountToken) upstream.Request {
+		return upstream.Request{
+			Method:         http.MethodGet,
+			Provider:       "claude",
+			DownstreamPath: "/v1/models",
+			Headers:        http.Header{},
+			Account:        account,
+			Token:          t,
+			Egress:         egress,
+			CookieJarKey:   binding.CookieJarKey,
+		}
+	}
+	resp, err := s.upstream.Do(ctx, requestForToken(token))
 	if err == nil {
 		raw, derr := upstream.DrainAndClose(resp.Body)
 		switch {
 		case derr != nil:
 			log.Printf("claude model probe %s: read body: %v; using static model set", account.ID, derr)
 		case resp.StatusCode >= 400:
+			if claudeAuthError(resp.StatusCode, resp.Header, raw) && claudeTokenCanRefresh(token) {
+				if refreshed, rerr := s.forceRefreshClaudeToken(ctx, account, "auth_error"); rerr == nil {
+					token = refreshed
+					if retryResp, retryErr := s.upstream.Do(ctx, requestForToken(token)); retryErr == nil {
+						raw, derr = upstream.DrainAndClose(retryResp.Body)
+						resp = retryResp
+						if derr == nil && resp.StatusCode < 400 {
+							if caps, perr := capability.ParseClaudeModels(account.ID, raw, capability.ETagFromHeader(resp.Header)); perr == nil && len(caps) > 0 {
+								caps = capability.MergeClaudeStatic(account.ID, caps)
+								if uerr := s.store.UpsertCapabilities(ctx, caps); uerr != nil {
+									return nil, uerr
+								}
+								return caps, nil
+							}
+						}
+					}
+				}
+			}
 			snippet := string(raw)
 			if len(snippet) > 200 {
 				snippet = snippet[:200]
@@ -174,7 +200,11 @@ func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account,
 	} else {
 		log.Printf("claude model probe %s: %v; using static model set", account.ID, err)
 	}
-	caps := capability.StaticClaudeModels(account.ID)
+	return s.upsertStaticClaudeModels(ctx, account.ID)
+}
+
+func (s *Server) upsertStaticClaudeModels(ctx context.Context, accountID string) ([]storage.ModelCapability, error) {
+	caps := capability.StaticClaudeModels(accountID)
 	if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
 		return nil, err
 	}
@@ -618,58 +648,19 @@ func (s *Server) handleCodexRefreshFailure(ctx context.Context, account storage.
 // Anthropic OAuth token endpoint. API keys (sk-ant-api) are static, so there is
 // nothing to refresh for them.
 func (s *Server) refreshClaude(w http.ResponseWriter, r *http.Request, token storage.AccountToken) {
-	cred := token.AccessToken
-	if cred == "" {
-		cred = token.OpenAIAPIKey
+	account, err := s.store.GetAccount(r.Context(), token.AccountID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
 	}
-	if strings.HasPrefix(cred, "sk-ant-api") || token.RefreshToken == "" {
+	if !claudeTokenCanRefresh(token) {
 		token.LastRefresh = storage.Now()
 		_ = s.store.UpdateToken(r.Context(), token)
 		writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": token.AccountID, "refreshed": false, "reason": "api key or missing refresh_token; nothing to refresh"})
 		return
 	}
-	payload, _ := json.Marshal(map[string]string{
-		"grant_type":    "refresh_token",
-		"refresh_token": token.RefreshToken,
-		"client_id":     s.cfg.ClaudeOAuthClientID,
-	})
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.cfg.ClaudeOAuthTokenURL, bytes.NewReader(payload))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	resp, err := oauthHTTPClient().Do(req)
-	if err != nil {
+	if _, err := s.forceRefreshClaudeToken(r.Context(), account, "admin_refresh"); err != nil {
 		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		writeRaw(w, resp.StatusCode, resp.Header, raw)
-		return
-	}
-	var refreshed struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
-	if err := json.Unmarshal(raw, &refreshed); err != nil {
-		writeError(w, http.StatusBadGateway, err)
-		return
-	}
-	if refreshed.AccessToken == "" {
-		writeError(w, http.StatusBadGateway, errors.New("anthropic oauth response had no access_token"))
-		return
-	}
-	token.AccessToken = refreshed.AccessToken
-	if refreshed.RefreshToken != "" {
-		token.RefreshToken = refreshed.RefreshToken
-	}
-	token.LastRefresh = storage.Now()
-	if err := s.store.UpdateToken(r.Context(), token); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": token.AccountID, "refreshed": true, "method": "anthropic_oauth"})

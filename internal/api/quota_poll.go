@@ -14,6 +14,7 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
+	"codex-account-pool/internal/upstream"
 )
 
 // quotaPoller periodically fetches 5h/7d rate-limit windows from the ChatGPT
@@ -85,7 +86,7 @@ func (s *Server) StartQuotaPoller(ctx context.Context) {
 	})
 }
 
-// pollAllCodexQuotas fetches /backend-api/wham/usage for every active Codex
+// pollAllCodexQuotas fetches usage snapshots for every active Codex/Claude
 // account, concurrency-capped. Best-effort: a single account failure never
 // blocks the rest.
 func (s *Server) pollAllCodexQuotas(ctx context.Context) {
@@ -105,10 +106,12 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 		return
 	}
 	codex, missingTokens := codexQuotaPollTargets(accounts, tokens, now)
-	if len(codex) == 0 && missingTokens == 0 {
+	claude := claudeQuotaPollTargets(accounts, tokens, now)
+	if len(codex) == 0 && len(claude) == 0 && missingTokens == 0 {
 		return
 	}
 	s.attachQuotaPollEgresses(ctx, codex)
+	s.attachQuotaPollEgresses(ctx, claude)
 	updated := 0
 	failed := missingTokens
 	// Concurrency-capped worker pool so we never open N connections at once.
@@ -150,9 +153,44 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 			}
 		}()
 	}
+	for i := range claude {
+		target := claude[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if v := recover(); v != nil {
+					mu.Lock()
+					failed++
+					mu.Unlock()
+					supervisor.LogPanic("quota-poller-worker", v)
+				}
+			}()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				log.Printf("[QUOTA-POLL] account=%s skipped: %v", target.Account.ID, ctx.Err())
+				return
+			}
+			defer func() { <-sem }()
+			if err := s.pollOneClaudeQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				log.Printf("[QUOTA-POLL] account=%s claude poll failed: %v", target.Account.ID, err)
+			} else {
+				mu.Lock()
+				updated++
+				mu.Unlock()
+			}
+		}()
+	}
 	wg.Wait()
 	if updated > 0 || failed > 0 {
-		log.Printf("[QUOTA-POLL] tick complete: updated=%d failed=%d total_codex=%d", updated, failed, len(codex))
+		log.Printf("[QUOTA-POLL] tick complete: updated=%d failed=%d total_codex=%d total_claude=%d", updated, failed, len(codex), len(claude))
 	}
 }
 
@@ -174,6 +212,9 @@ func codexQuotaPollTargets(accounts []storage.Account, tokens map[string]storage
 		if !isQuotaPollCandidate(account, now) {
 			continue
 		}
+		if p := strings.TrimSpace(account.Provider); p != "" && p != "codex" && p != "chatgpt" && p != "openai" {
+			continue
+		}
 		token, ok := tokens[account.ID]
 		if !ok {
 			missingTokens++
@@ -185,6 +226,28 @@ func codexQuotaPollTargets(accounts []storage.Account, tokens map[string]storage
 		targets = append(targets, quotaPollTarget{Account: account, Token: token})
 	}
 	return targets, missingTokens
+}
+
+func claudeQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.AccountToken, now int64) []quotaPollTarget {
+	targets := make([]quotaPollTarget, 0, len(accounts))
+	for _, account := range accounts {
+		if !isQuotaPollCandidate(account, now) {
+			continue
+		}
+		token, ok := tokens[account.ID]
+		if !ok {
+			continue
+		}
+		provider := strings.TrimSpace(account.Provider)
+		if provider == "" {
+			provider = scheduler.ProviderFromToken(token)
+		}
+		if provider != "claude" || !claudeTokenCanRefresh(token) {
+			continue
+		}
+		targets = append(targets, quotaPollTarget{Account: account, Token: token})
+	}
+	return targets
 }
 
 func (s *Server) attachQuotaPollEgresses(ctx context.Context, targets []quotaPollTarget) {
@@ -240,7 +303,7 @@ func isQuotaPollCandidate(account storage.Account, now int64) bool {
 		return false
 	}
 	provider := strings.TrimSpace(account.Provider)
-	return provider == "" || provider == "codex" || provider == "chatgpt" || provider == "openai"
+	return provider == "" || provider == "codex" || provider == "chatgpt" || provider == "openai" || provider == "claude"
 }
 
 // pollOneCodexQuota fetches the wham usage snapshot for one account and persists
@@ -328,6 +391,276 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	}
 	_ = s.store.UpsertAccountRateLimit(ctx, snap)
 	return nil
+}
+
+type claudeOAuthUsageParsed struct {
+	PlanType      string
+	RateLimitTier string
+	Windows       []claudeOAuthUsageWindow
+}
+
+type claudeOAuthUsageWindow struct {
+	LimiterType        string
+	Model              string
+	Source             string
+	UsedPercent        float64
+	LimitTokens        int64
+	RemainingTokens    int64
+	LimitWindowSeconds int64
+	ResetAfterSeconds  int64
+	ResetAt            int64
+	Status             string
+	Raw                string
+}
+
+func (s *Server) pollOneClaudeQuota(ctx context.Context, acc storage.Account, token storage.AccountToken, egress storage.EgressProfile) error {
+	var err error
+	token, err = s.prepareClaudeToken(ctx, acc, token, "quota_preflight")
+	if err != nil {
+		return err
+	}
+	if !claudeTokenCanRefresh(token) {
+		return fmt.Errorf("claude oauth usage requires oauth access_token and refresh_token")
+	}
+	headers := http.Header{}
+	headers.Set("Accept", "application/json")
+	headers.Set("Anthropic-Beta", "oauth-2025-04-20")
+	requestForToken := func(t storage.AccountToken) upstream.Request {
+		return upstream.Request{
+			Method:         http.MethodGet,
+			Provider:       "claude",
+			PassThrough:    true,
+			DownstreamPath: "/api/oauth/usage",
+			Headers:        headers,
+			Account:        acc,
+			Token:          t,
+			Egress:         egress,
+		}
+	}
+	resp, err := s.upstream.Do(ctx, requestForToken(token))
+	if err != nil {
+		return fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if refreshed, rerr := s.forceRefreshClaudeToken(ctx, acc, "auth_error"); rerr == nil {
+			token = refreshed
+			resp.Body.Close()
+			resp, err = s.upstream.Do(ctx, requestForToken(token))
+			if err != nil {
+				return fmt.Errorf("http after refresh: %w", err)
+			}
+			defer resp.Body.Close()
+			body, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(bodySnippet(body, 300))))
+	}
+	parsed, err := parseClaudeOAuthUsage(body, storage.Now())
+	if err != nil {
+		return err
+	}
+	if parsed.PlanType != "" {
+		_ = s.store.SetAccountPlanType(ctx, acc.ID, parsed.PlanType)
+	}
+	if parsed.RateLimitTier != "" && parsed.RateLimitTier != token.OAuthRateLimitTier {
+		token.OAuthRateLimitTier = parsed.RateLimitTier
+		_ = s.store.UpdateToken(ctx, token)
+	}
+	if len(parsed.Windows) == 0 {
+		return fmt.Errorf("no usage windows")
+	}
+	rawByLimiter := map[string]string{}
+	for _, win := range parsed.Windows {
+		rawByLimiter[win.LimiterType] = win.Raw
+	}
+	for _, win := range parsed.Windows {
+		raw := win.Raw
+		if win.LimiterType == "5h_oauth_usage" {
+			if secondary := rawByLimiter["7d_oauth_usage"]; secondary != "" {
+				combined, _ := json.Marshal(map[string]interface{}{
+					"plan_type":             parsed.PlanType,
+					"oauth_rate_limit_tier": parsed.RateLimitTier,
+					"primary":               json.RawMessage([]byte(win.Raw)),
+					"secondary":             json.RawMessage([]byte(secondary)),
+				})
+				raw = string(combined)
+			}
+		}
+		snap := storage.AccountRateLimit{
+			AccountID:         acc.ID,
+			Provider:          "claude",
+			Model:             win.Model,
+			LimiterType:       win.LimiterType,
+			Source:            win.Source,
+			UsedPercent:       win.UsedPercent,
+			LimitTokens:       win.LimitTokens,
+			RemainingTokens:   win.RemainingTokens,
+			LimitRequests:     -1,
+			RemainingRequests: -1,
+			ResetAt:           win.ResetAt,
+			Status:            firstNonEmpty(win.Status, "allowed"),
+			Raw:               raw,
+			UpdatedAt:         storage.Now(),
+		}
+		if err := s.store.UpsertAccountRateLimit(ctx, snap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseClaudeOAuthUsage(body []byte, now int64) (claudeOAuthUsageParsed, error) {
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		return claudeOAuthUsageParsed{}, fmt.Errorf("decode: %w", err)
+	}
+	out := claudeOAuthUsageParsed{
+		PlanType:      jsonStringAny(root, "subscription_type", "subscriptionType", "plan_type"),
+		RateLimitTier: jsonStringAny(root, "rate_limit_tier", "rateLimitTier", "oauth_rate_limit_tier"),
+	}
+	add := func(path string, m map[string]interface{}) {
+		win, ok := claudeUsageWindowFromMap(path, m, now)
+		if !ok {
+			return
+		}
+		raw, _ := json.Marshal(m)
+		win.Raw = string(raw)
+		out.Windows = append(out.Windows, win)
+	}
+	var walk func(string, interface{})
+	walk = func(path string, v interface{}) {
+		switch typed := v.(type) {
+		case map[string]interface{}:
+			if path != "" {
+				add(path, typed)
+			}
+			for name, child := range typed {
+				childPath := name
+				if path != "" {
+					childPath = path + "." + name
+				}
+				walk(childPath, child)
+			}
+		case []interface{}:
+			for i, child := range typed {
+				childPath := fmt.Sprintf("%s.%d", path, i)
+				walk(childPath, child)
+			}
+		}
+	}
+	walk("", root)
+	return out, nil
+}
+
+func claudeUsageWindowFromMap(name string, m map[string]interface{}, now int64) (claudeOAuthUsageWindow, bool) {
+	used, ok := jsonFloatAny(m, "used_percent", "usedPercent", "usage_percent")
+	limitWindow := jsonIntAny(m, "limit_window_seconds", "limitWindowSeconds", "window_seconds", "windowSeconds")
+	resetAfter := jsonIntAny(m, "reset_after_seconds", "resetAfterSeconds")
+	resetAt := jsonIntAny(m, "reset_at", "resetAt", "resets_at", "resetsAt")
+	if !ok && limitWindow == 0 && resetAfter == 0 && resetAt == 0 {
+		return claudeOAuthUsageWindow{}, false
+	}
+	windowName := firstNonEmpty(jsonStringAny(m, "limiter_type", "limiterType", "name", "type", "model"), name)
+	limiter, model := normalizeClaudeUsageLimiter(windowName, limitWindow)
+	if limiter == "" {
+		return claudeOAuthUsageWindow{}, false
+	}
+	model = firstNonEmpty(model, jsonStringAny(m, "model"))
+	if resetAt == 0 && resetAfter > 0 {
+		resetAt = now + resetAfter
+	}
+	return claudeOAuthUsageWindow{
+		LimiterType:        limiter,
+		Model:              model,
+		Source:             limiter,
+		UsedPercent:        used,
+		LimitTokens:        jsonIntDefault(m, -1, "limit_tokens", "limitTokens"),
+		RemainingTokens:    jsonIntDefault(m, -1, "remaining_tokens", "remainingTokens"),
+		LimitWindowSeconds: limitWindow,
+		ResetAfterSeconds:  resetAfter,
+		ResetAt:            resetAt,
+		Status:             jsonStringAny(m, "status", "state"),
+	}, true
+}
+
+func normalizeClaudeUsageLimiter(name string, windowSeconds int64) (limiter, model string) {
+	l := strings.ToLower(strings.TrimSpace(name))
+	switch {
+	case strings.Contains(l, "oauth") && strings.Contains(l, "app"):
+		return "oauth_app", ""
+	case strings.Contains(l, "opus"):
+		return "opus", "opus"
+	case strings.Contains(l, "sonnet"):
+		return "sonnet", "sonnet"
+	case strings.Contains(l, "5h") || strings.Contains(l, "five") || (windowSeconds > 0 && windowSeconds <= 6*3600):
+		return "5h_oauth_usage", ""
+	case strings.Contains(l, "7d") || strings.Contains(l, "week") || windowSeconds >= 6*24*3600:
+		return "7d_oauth_usage", ""
+	default:
+		return "", ""
+	}
+}
+
+func jsonStringAny(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if s, ok := m[key].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+func jsonFloatAny(m map[string]interface{}, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case float64:
+			return v, true
+		case int:
+			return float64(v), true
+		case int64:
+			return float64(v), true
+		case string:
+			var f float64
+			if _, err := fmt.Sscanf(strings.TrimSpace(v), "%f", &f); err == nil {
+				return f, true
+			}
+		}
+	}
+	return -1, false
+}
+
+func jsonIntAny(m map[string]interface{}, keys ...string) int64 {
+	n, _ := jsonIntAnyOK(m, keys...)
+	return n
+}
+
+func jsonIntAnyOK(m map[string]interface{}, keys ...string) (int64, bool) {
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case float64:
+			return int64(v), true
+		case int:
+			return int64(v), true
+		case int64:
+			return v, true
+		case string:
+			var n int64
+			if _, err := fmt.Sscanf(strings.TrimSpace(v), "%d", &n); err == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func jsonIntDefault(m map[string]interface{}, def int64, keys ...string) int64 {
+	if n, ok := jsonIntAnyOK(m, keys...); ok {
+		return n
+	}
+	return def
 }
 
 func statusFromReached(reached bool) string {

@@ -160,14 +160,17 @@ type AccountPoolSummary struct {
 }
 
 type AccountToken struct {
-	AccountID    string `json:"account_id"`
-	AccessToken  string `json:"access_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	OpenAIAPIKey string `json:"openai_api_key,omitempty"`
-	IDTokenRaw   string `json:"id_token_raw,omitempty"`
-	LastRefresh  int64  `json:"last_refresh,omitempty"`
-	CreatedAt    int64  `json:"created_at"`
-	UpdatedAt    int64  `json:"updated_at"`
+	AccountID          string `json:"account_id"`
+	AccessToken        string `json:"access_token,omitempty"`
+	RefreshToken       string `json:"refresh_token,omitempty"`
+	OpenAIAPIKey       string `json:"openai_api_key,omitempty"`
+	IDTokenRaw         string `json:"id_token_raw,omitempty"`
+	LastRefresh        int64  `json:"last_refresh,omitempty"`
+	ExpiresAt          int64  `json:"expires_at,omitempty"`
+	Scopes             string `json:"scopes,omitempty"`
+	OAuthRateLimitTier string `json:"oauth_rate_limit_tier,omitempty"`
+	CreatedAt          int64  `json:"created_at"`
+	UpdatedAt          int64  `json:"updated_at"`
 }
 
 type ModelCapability struct {
@@ -615,6 +618,9 @@ CREATE TABLE IF NOT EXISTS account_auth_tokens(
   openai_api_key TEXT,
   id_token_raw TEXT,
   last_refresh INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  scopes TEXT NOT NULL DEFAULT '',
+  oauth_rate_limit_tier TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
@@ -957,6 +963,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN oauth_rate_limit_tier TEXT NOT NULL DEFAULT ''`,
 		// Multi-user portal: end-user credentials/roles, key ownership, and per-user
 		// usage attribution (older DBs created before the portal existed).
 		`ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
@@ -1543,16 +1552,19 @@ ON CONFLICT(id) DO UPDATE SET
 	}
 	token.UpdatedAt = now
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO account_auth_tokens(account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_auth_tokens(account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
  access_token = excluded.access_token,
  refresh_token = excluded.refresh_token,
  openai_api_key = excluded.openai_api_key,
  id_token_raw = excluded.id_token_raw,
  last_refresh = excluded.last_refresh,
+ expires_at = excluded.expires_at,
+ scopes = excluded.scopes,
+ oauth_rate_limit_tier = excluded.oauth_rate_limit_tier,
  updated_at = excluded.updated_at`,
-		token.AccountID, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), token.LastRefresh, token.CreatedAt, token.UpdatedAt)
+		token.AccountID, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), token.LastRefresh, token.ExpiresAt, token.Scopes, token.OAuthRateLimitTier, token.CreatedAt, token.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -1899,6 +1911,11 @@ func (s *Store) SetAccountStatus(ctx context.Context, id, status string) error {
 	return err
 }
 
+func (s *Store) SetAccountPlanType(ctx context.Context, id, planType string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET plan_type = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(planType), Now(), id)
+	return err
+}
+
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
 	return err
@@ -1910,9 +1927,9 @@ func (s *Store) SetAccountQuarantine(ctx context.Context, id string, until int64
 }
 
 func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
 	var t AccountToken
-	err := row.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.CreatedAt, &t.UpdatedAt)
+	err := row.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
 	t.AccessToken = s.openToken(t.AccessToken)
 	t.RefreshToken = s.openToken(t.RefreshToken)
 	t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
@@ -1938,14 +1955,14 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var t AccountToken
-		if err := rows.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		t.AccessToken = s.openToken(t.AccessToken)
@@ -1958,8 +1975,8 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 }
 
 func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, updated_at = ? WHERE account_id = ?`,
-		s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, Now(), t.AccountID)
+	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
+		s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
 	return err
 }
 

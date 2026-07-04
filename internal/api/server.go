@@ -89,6 +89,7 @@ type Server struct {
 	// regHandler handles registration API requests
 	regHandler       *Handler
 	lifecycleHandler *LifecycleHandlers
+	claudeRefresh    *claudeRefreshGates
 	// asyncWrites carries fire-and-forget DB writes (usage rows, virtual-ledger rows)
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
@@ -122,6 +123,7 @@ func NewServer(dep Dependencies) *Server {
 		relState:         reliability.NewStore(relStateTTL, relStateMax),
 		regHandler:       NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		lifecycleHandler: newServerLifecycleHandlers(dep.Store),
+		claudeRefresh:    newClaudeRefreshGates(),
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.

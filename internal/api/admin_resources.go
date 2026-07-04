@@ -1135,6 +1135,16 @@ func (s *Server) adminQuota(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	accountsByID, err := s.store.ListAccountsByIDs(r.Context(), accountIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	tokensByID, err := s.store.ListTokensByAccountIDs(r.Context(), accountIDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	type secondaryWindow struct {
 		UsedPercent        float64 `json:"used_percent"`
 		RemainingTokens    int64   `json:"remaining_tokens"`
@@ -1144,13 +1154,21 @@ func (s *Server) adminQuota(w http.ResponseWriter, r *http.Request) {
 	}
 	type quotaView struct {
 		storage.AccountRateLimit
-		Label           string           `json:"label"`
-		Secondary7d     *secondaryWindow `json:"secondary_7d,omitempty"`
-		Secondary7dUsed float64          `json:"secondary_7d_used_pct"`
+		Label              string           `json:"label"`
+		PlanType           string           `json:"plan_type,omitempty"`
+		OAuthRateLimitTier string           `json:"oauth_rate_limit_tier,omitempty"`
+		Secondary7d        *secondaryWindow `json:"secondary_7d,omitempty"`
+		Secondary7dUsed    float64          `json:"secondary_7d_used_pct"`
 	}
 	out := make([]quotaView, 0, len(snaps))
 	for _, snap := range snaps {
 		qv := quotaView{AccountRateLimit: snap, Label: labels[snap.AccountID]}
+		if account, ok := accountsByID[snap.AccountID]; ok {
+			qv.PlanType = account.PlanType
+		}
+		if token, ok := tokensByID[snap.AccountID]; ok {
+			qv.OAuthRateLimitTier = token.OAuthRateLimitTier
+		}
 		if snap.Raw != "" {
 			var detail struct {
 				Secondary struct {

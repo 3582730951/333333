@@ -12,22 +12,30 @@ import (
 )
 
 type ParsedAuth struct {
-	AccountID         string
-	UpstreamAccountID string
-	AccessToken       string
-	RefreshToken      string
-	OpenAIAPIKey      string
-	IDTokenRaw        string
-	Email             string
-	ChatGPTUserID     string
-	PlanType          string
-	IsFedramp         bool
+	AccountID          string
+	UpstreamAccountID  string
+	AccessToken        string
+	RefreshToken       string
+	OpenAIAPIKey       string
+	IDTokenRaw         string
+	Email              string
+	ChatGPTUserID      string
+	PlanType           string
+	Provider           string
+	ExpiresAt          int64
+	Scopes             []string
+	OAuthRateLimitTier string
+	IsFedramp          bool
 }
 
 func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	var root map[string]interface{}
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return ParsedAuth{}, err
+	}
+
+	if claude, ok := objectField(root, "claudeAiOauth", "claude_ai_oauth"); ok {
+		return parseClaudeCredentialsJSON(claude)
 	}
 
 	var out ParsedAuth
@@ -59,6 +67,32 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token nor OPENAI_API_KEY")
 	}
 	out.AccountID = stableAccountID(out.UpstreamAccountID, out.Email, out.AccessToken, out.OpenAIAPIKey)
+	return out, nil
+}
+
+func parseClaudeCredentialsJSON(m map[string]interface{}) (ParsedAuth, error) {
+	out := ParsedAuth{
+		Provider:           "claude",
+		AccessToken:        stringFieldAny(m, "accessToken", "access_token"),
+		RefreshToken:       stringFieldAny(m, "refreshToken", "refresh_token"),
+		ExpiresAt:          epochSecondsField(m, "expiresAt", "expires_at"),
+		Scopes:             stringSliceField(m, "scopes", "scope"),
+		PlanType:           stringFieldAny(m, "subscriptionType", "subscription_type"),
+		OAuthRateLimitTier: stringFieldAny(m, "rateLimitTier", "rate_limit_tier"),
+	}
+	if out.PlanType == "" {
+		out.PlanType = out.OAuthRateLimitTier
+	}
+	if acct, ok := objectField(m, "account", "user", "profile"); ok {
+		out.Email = stringFieldAny(acct, "email_address", "emailAddress", "email")
+	}
+	if out.Email == "" {
+		out.Email = stringFieldAny(m, "email", "email_address", "emailAddress")
+	}
+	if out.AccessToken == "" {
+		return ParsedAuth{}, errors.New("claude credentials have no access token")
+	}
+	out.AccountID = stableAccountID(out.Email, out.AccessToken)
 	return out, nil
 }
 
@@ -100,14 +134,26 @@ func ParseOAuthCodex(accessToken, refreshToken, idTokenRaw string) (ParsedAuth, 
 // (not a JWT), so the provider is later inferred from that prefix and only the
 // account email returned by the exchange is carried through.
 func ParseOAuthClaude(accessToken, refreshToken, email string) (ParsedAuth, error) {
+	return ParseOAuthClaudeMetadata(accessToken, refreshToken, email, "", "", 0, nil)
+}
+
+func ParseOAuthClaudeMetadata(accessToken, refreshToken, email, subscriptionType, rateLimitTier string, expiresAt int64, scopes []string) (ParsedAuth, error) {
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
 		return ParsedAuth{}, errors.New("oauth token exchange returned no access_token")
 	}
 	out := ParsedAuth{
-		AccessToken:  accessToken,
-		RefreshToken: strings.TrimSpace(refreshToken),
-		Email:        strings.TrimSpace(email),
+		Provider:           "claude",
+		AccessToken:        accessToken,
+		RefreshToken:       strings.TrimSpace(refreshToken),
+		Email:              strings.TrimSpace(email),
+		PlanType:           strings.TrimSpace(subscriptionType),
+		OAuthRateLimitTier: strings.TrimSpace(rateLimitTier),
+		ExpiresAt:          expiresAt,
+		Scopes:             append([]string(nil), scopes...),
+	}
+	if out.PlanType == "" {
+		out.PlanType = out.OAuthRateLimitTier
 	}
 	out.AccountID = stableAccountID(out.Email, out.AccessToken)
 	return out, nil
@@ -163,6 +209,96 @@ func stringField(m map[string]interface{}, key string) string {
 	default:
 		return ""
 	}
+}
+
+func stringFieldAny(m map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if v := strings.TrimSpace(stringField(m, key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func objectField(m map[string]interface{}, keys ...string) (map[string]interface{}, bool) {
+	for _, key := range keys {
+		if v, ok := m[key].(map[string]interface{}); ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func epochSecondsField(m map[string]interface{}, keys ...string) int64 {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		var n int64
+		switch t := v.(type) {
+		case float64:
+			n = int64(t)
+		case json.Number:
+			parsed, _ := t.Int64()
+			n = parsed
+		case string:
+			var parsed int64
+			if _, err := fmt.Sscanf(strings.TrimSpace(t), "%d", &parsed); err == nil {
+				n = parsed
+			}
+		}
+		if n > 1_000_000_000_000 {
+			n /= 1000
+		}
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func stringSliceField(m map[string]interface{}, keys ...string) []string {
+	for _, key := range keys {
+		v, ok := m[key]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case []interface{}:
+			out := make([]string, 0, len(t))
+			for _, item := range t {
+				if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+					out = append(out, strings.TrimSpace(s))
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case []string:
+			out := make([]string, 0, len(t))
+			for _, s := range t {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case string:
+			fields := strings.FieldsFunc(t, func(r rune) bool { return r == ' ' || r == ',' })
+			out := make([]string, 0, len(fields))
+			for _, s := range fields {
+				if s = strings.TrimSpace(s); s != "" {
+					out = append(out, s)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	return nil
 }
 
 func extractIDTokenRaw(v interface{}) string {

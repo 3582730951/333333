@@ -64,6 +64,41 @@ func TestAccountImportCreatesEgressBinding(t *testing.T) {
 	}
 }
 
+func TestAccountTokenOAuthMetadataPersists(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "claude-meta", Label: "Claude", GroupName: "cyber", Provider: "claude", Status: "active", PlanType: "max"}
+	token := AccountToken{
+		AccessToken:        "sk-ant-oat-old",
+		RefreshToken:       "refresh-claude",
+		ExpiresAt:          1760000123,
+		Scopes:             "user:profile user:inference user:sessions:claude_code",
+		OAuthRateLimitTier: "tier_4",
+	}
+	if err := store.UpsertAccount(ctx, account, token); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetToken(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresAt != token.ExpiresAt || got.Scopes != token.Scopes || got.OAuthRateLimitTier != token.OAuthRateLimitTier {
+		t.Fatalf("metadata not persisted: %+v", got)
+	}
+	got.AccessToken = "sk-ant-oat-new"
+	got.ExpiresAt = 1760000999
+	if err := store.UpdateToken(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.GetToken(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccessToken != "sk-ant-oat-new" || got.ExpiresAt != 1760000999 || got.OAuthRateLimitTier != "tier_4" {
+		t.Fatalf("metadata lost on update: %+v", got)
+	}
+}
+
 func TestBackfillUsageCacheDiagnosticsIncludesZeroPromptAnthropicRows(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
