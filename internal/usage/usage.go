@@ -6,14 +6,18 @@ import (
 )
 
 type Parsed struct {
-	Model               string
-	PromptTokens        int64
-	CompletionTokens    int64
-	TotalTokens         int64
-	CachedTokens        int64
-	CacheReadTokens     int64
-	CacheCreationTokens int64
-	RawUsage            json.RawMessage
+	Model                 string
+	PromptTokens          int64
+	CompletionTokens      int64
+	TotalTokens           int64
+	CachedTokens          int64
+	CacheReadTokens       int64
+	CacheCreationTokens   int64
+	CacheMissTokens       int64
+	CacheTotalInputTokens int64
+	CacheCreation5mTokens int64
+	CacheCreation1hTokens int64
+	RawUsage              json.RawMessage
 }
 
 func ParseResponse(raw []byte) Parsed {
@@ -34,22 +38,55 @@ func ParseResponse(raw []byte) Parsed {
 	}
 	rawUsage, _ := json.Marshal(usageMap)
 	cached := cachedTokens(usageMap)
+	cacheCreation := intField(usageMap, "cache_creation_input_tokens")
 	parsed := Parsed{
-		Model:               model,
-		PromptTokens:        promptTokens(usageMap),
-		CompletionTokens:    intField(usageMap, "output_tokens", "completion_tokens"),
-		TotalTokens:         intField(usageMap, "total_tokens"),
-		CachedTokens:        cached,
-		CacheReadTokens:     cached,
-		CacheCreationTokens: intField(usageMap, "cache_creation_input_tokens"),
-		RawUsage:            rawUsage,
+		Model:                 model,
+		PromptTokens:          promptTokens(usageMap),
+		CompletionTokens:      intField(usageMap, "output_tokens", "completion_tokens"),
+		TotalTokens:           intField(usageMap, "total_tokens"),
+		CachedTokens:          cached,
+		CacheReadTokens:       cached,
+		CacheCreationTokens:   cacheCreation,
+		CacheCreation5mTokens: nestedIntField(usageMap, "cache_creation", "ephemeral_5m_input_tokens"),
+		CacheCreation1hTokens: nestedIntField(usageMap, "cache_creation", "ephemeral_1h_input_tokens"),
+		RawUsage:              rawUsage,
 	}
+	fillCacheInputBreakdown(&parsed, usageMap)
 	// Anthropic usage carries no total_tokens; derive one so downstream billing
 	// views have a single comparable figure across providers.
 	if parsed.TotalTokens == 0 {
 		parsed.TotalTokens = parsed.PromptTokens + parsed.CompletionTokens
 	}
 	return parsed
+}
+
+func fillCacheInputBreakdown(parsed *Parsed, usageMap map[string]interface{}) {
+	if parsed == nil {
+		return
+	}
+	if isAnthropicCacheUsage(usageMap) {
+		parsed.CacheMissTokens = parsed.PromptTokens
+		parsed.CacheTotalInputTokens = parsed.PromptTokens + parsed.CacheReadTokens + parsed.CacheCreationTokens
+		return
+	}
+	parsed.CacheMissTokens = parsed.PromptTokens - parsed.CacheReadTokens
+	if parsed.CacheMissTokens < 0 {
+		parsed.CacheMissTokens = 0
+	}
+	parsed.CacheTotalInputTokens = parsed.PromptTokens
+}
+
+func isAnthropicCacheUsage(m map[string]interface{}) bool {
+	if _, ok := m["cache_read_input_tokens"]; ok {
+		return true
+	}
+	if _, ok := m["cache_creation_input_tokens"]; ok {
+		return true
+	}
+	if _, ok := m["cache_creation"].(map[string]interface{}); ok {
+		return true
+	}
+	return false
 }
 
 func intField(m map[string]interface{}, keys ...string) int64 {
@@ -64,6 +101,13 @@ func intField(m map[string]interface{}, keys ...string) int64 {
 				return int64(t)
 			}
 		}
+	}
+	return 0
+}
+
+func nestedIntField(m map[string]interface{}, parent, child string) int64 {
+	if detail, ok := m[parent].(map[string]interface{}); ok {
+		return intField(detail, child)
 	}
 	return 0
 }
@@ -117,15 +161,19 @@ type StreamScanner struct {
 	provider string
 	buf      []byte // partial trailing line not yet terminated by '\n'
 
-	model               string
-	promptTokens        int64
-	completionTokens    int64
-	totalTokens         int64
-	cachedTokens        int64
-	cacheReadTokens     int64
-	cacheCreationTokens int64
-	lastUsage           json.RawMessage
-	got                 bool
+	model                 string
+	promptTokens          int64
+	completionTokens      int64
+	totalTokens           int64
+	cachedTokens          int64
+	cacheReadTokens       int64
+	cacheCreationTokens   int64
+	cacheMissTokens       int64
+	cacheTotalInputTokens int64
+	cacheCreation5mTokens int64
+	cacheCreation1hTokens int64
+	lastUsage             json.RawMessage
+	got                   bool
 }
 
 // NewStreamScanner returns a usage scanner for the given relay provider ("codex",
@@ -217,6 +265,9 @@ func (s *StreamScanner) observeOpenAIChat(ev map[string]interface{}) {
 	s.cachedTokens = cachedTokens(um)
 	s.cacheReadTokens = s.cachedTokens
 	s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
+	s.cacheCreation5mTokens = nestedIntField(um, "cache_creation", "ephemeral_5m_input_tokens")
+	s.cacheCreation1hTokens = nestedIntField(um, "cache_creation", "ephemeral_1h_input_tokens")
+	s.fillCacheInputBreakdown(um)
 	s.lastUsage, _ = json.Marshal(um)
 	s.got = true
 }
@@ -239,6 +290,9 @@ func (s *StreamScanner) observeCodex(ev map[string]interface{}) {
 	s.cachedTokens = cachedTokens(um)
 	s.cacheReadTokens = s.cachedTokens
 	s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
+	s.cacheCreation5mTokens = nestedIntField(um, "cache_creation", "ephemeral_5m_input_tokens")
+	s.cacheCreation1hTokens = nestedIntField(um, "cache_creation", "ephemeral_1h_input_tokens")
+	s.fillCacheInputBreakdown(um)
 	s.lastUsage, _ = json.Marshal(um)
 	s.got = true
 }
@@ -261,6 +315,9 @@ func (s *StreamScanner) observeClaude(ev map[string]interface{}) {
 		s.cacheReadTokens = intField(um, "cache_read_input_tokens")
 		s.cachedTokens = s.cacheReadTokens
 		s.cacheCreationTokens = intField(um, "cache_creation_input_tokens")
+		s.cacheCreation5mTokens = nestedIntField(um, "cache_creation", "ephemeral_5m_input_tokens")
+		s.cacheCreation1hTokens = nestedIntField(um, "cache_creation", "ephemeral_1h_input_tokens")
+		s.fillCacheInputBreakdown(um)
 		s.lastUsage, _ = json.Marshal(um)
 		s.got = true
 	case "message_delta":
@@ -281,7 +338,32 @@ func (s *StreamScanner) observeClaude(ev map[string]interface{}) {
 			s.cacheCreationTokens = created
 			s.got = true
 		}
+		if created5m := nestedIntField(um, "cache_creation", "ephemeral_5m_input_tokens"); created5m > 0 {
+			s.cacheCreation5mTokens = created5m
+			s.got = true
+		}
+		if created1h := nestedIntField(um, "cache_creation", "ephemeral_1h_input_tokens"); created1h > 0 {
+			s.cacheCreation1hTokens = created1h
+			s.got = true
+		}
+		s.fillCacheInputBreakdown(um)
 	}
+}
+
+func (s *StreamScanner) fillCacheInputBreakdown(um map[string]interface{}) {
+	if s == nil {
+		return
+	}
+	if isAnthropicCacheUsage(um) || s.provider == "claude" {
+		s.cacheMissTokens = s.promptTokens
+		s.cacheTotalInputTokens = s.promptTokens + s.cacheReadTokens + s.cacheCreationTokens
+		return
+	}
+	s.cacheMissTokens = s.promptTokens - s.cacheReadTokens
+	if s.cacheMissTokens < 0 {
+		s.cacheMissTokens = 0
+	}
+	s.cacheTotalInputTokens = s.promptTokens
 }
 
 // Parsed returns the accumulated usage and whether any usage frame was seen. The
@@ -314,13 +396,17 @@ func (s *StreamScanner) Parsed() (Parsed, bool) {
 		rawUsage, _ = json.Marshal(um)
 	}
 	return Parsed{
-		Model:               s.model,
-		PromptTokens:        s.promptTokens,
-		CompletionTokens:    s.completionTokens,
-		TotalTokens:         total,
-		CachedTokens:        s.cachedTokens,
-		CacheReadTokens:     s.cacheReadTokens,
-		CacheCreationTokens: s.cacheCreationTokens,
-		RawUsage:            rawUsage,
+		Model:                 s.model,
+		PromptTokens:          s.promptTokens,
+		CompletionTokens:      s.completionTokens,
+		TotalTokens:           total,
+		CachedTokens:          s.cachedTokens,
+		CacheReadTokens:       s.cacheReadTokens,
+		CacheCreationTokens:   s.cacheCreationTokens,
+		CacheMissTokens:       s.cacheMissTokens,
+		CacheTotalInputTokens: s.cacheTotalInputTokens,
+		CacheCreation5mTokens: s.cacheCreation5mTokens,
+		CacheCreation1hTokens: s.cacheCreation1hTokens,
+		RawUsage:              rawUsage,
 	}, true
 }

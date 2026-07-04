@@ -72,7 +72,13 @@ func adminUsageRows(t *testing.T, h *testHarness) []map[string]interface{} {
 	}
 	var rows []map[string]interface{}
 	if err := json.Unmarshal(raw, &rows); err != nil {
-		t.Fatalf("decode /admin/usage: %v (%s)", err, raw)
+		var envelope struct {
+			Rows []map[string]interface{} `json:"rows"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			t.Fatalf("decode /admin/usage: %v (%s)", err, raw)
+		}
+		rows = envelope.Rows
 	}
 	return rows
 }

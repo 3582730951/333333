@@ -1051,12 +1051,25 @@ func (s *Server) adminUsage(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	summary, err := s.store.UsageSummary(r.Context())
+	now := time.Now()
+	if err := s.store.EnsureUsageDailyResetAudit(r.Context(), now); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	win, err := s.resolveAdminUsageWindow(r, now, false)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	summary, err := s.store.UsageSummaryWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, summary)
+	if summary == nil {
+		summary = []storage.UsageSummaryRow{}
+	}
+	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{"rows": summary}, win))
 }
 
 // adminUsageTimeseries returns usage aggregated into fixed-width time buckets for
@@ -1070,23 +1083,31 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	now := storage.Now()
+	now := time.Now()
+	if err := s.store.EnsureUsageDailyResetAudit(r.Context(), now); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	win, err := s.resolveAdminUsageWindow(r, now, false)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	bucket, _ := strconv.ParseInt(r.URL.Query().Get("bucket"), 10, 64)
 	if bucket <= 0 {
 		bucket = 3600
 	}
-	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
-	if since <= 0 {
-		since = now - 24*3600
-	}
-	buckets, err := s.store.UsageTimeseries(r.Context(), since, bucket)
+	buckets, err := s.store.UsageTimeseriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"since": since, "bucket": bucket, "now": now, "buckets": buckets,
-	})
+	if buckets == nil {
+		buckets = []storage.UsageBucket{}
+	}
+	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{
+		"since": win.EffectiveStartAt, "bucket": bucket, "now": win.EffectiveUntilAt, "buckets": buckets,
+	}, win))
 }
 
 // adminQuota returns the latest captured rate-limit / remaining-quota snapshot for

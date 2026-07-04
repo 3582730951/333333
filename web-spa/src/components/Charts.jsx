@@ -76,7 +76,8 @@ export function UsageAreaChart({ buckets = [], height = 260 }) {
         <Tooltip {...tooltipStyle(c)} formatter={(v) => fmtTokens(v)} />
         <Legend wrapperStyle={{ fontSize: 12 }} />
         {['输入', '输出', '缓存'].map((k, i) => (
-          <Area key={k} type="monotone" dataKey={k} stackId="1" stroke={PALETTE[i]} fill={`url(#g-${i})`} strokeWidth={2} />
+          <Area key={k} type="monotone" dataKey={k} stackId="1" stroke={PALETTE[i]} fill={`url(#g-${i})`} strokeWidth={2}
+            isAnimationActive={false} />
         ))}
       </AreaChart>
     </ResponsiveContainer>
@@ -110,7 +111,7 @@ export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal
     <ResponsiveContainer width="100%" height={height}>
       <PieChart>
         <Pie data={items} dataKey="value" nameKey="name" innerRadius="58%" outerRadius="82%"
-          paddingAngle={2} stroke="none" label={centerLabel} labelLine={false}>
+          paddingAngle={2} stroke="none" label={centerLabel} labelLine={false} isAnimationActive={false}>
           {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
         </Pie>
         <Tooltip {...tooltipStyle(c)} formatter={(v, n) => [`${v}${unit}`, n]} />
@@ -137,21 +138,21 @@ export function GroupedBar({ data = [], series = [], height = 240, stacked = fal
         {series.map((s, i) => (
           <Bar key={s.key} dataKey={s.key} name={s.name || s.key} fill={s.color || PALETTE[i % PALETTE.length]}
             stackId={stacked ? '1' : undefined} radius={stacked ? 0 : [4, 4, 0, 0]} maxBarSize={36}
-            label={labelEl} />
+            label={labelEl} isAnimationActive={false} />
         ))}
       </BarChart>
     </ResponsiveContainer>
   );
 }
 
-// Per-model cache-hit-rate bars (rate = cached/prompt), each model its own color.
+// Per-model cache-hit-rate bars (rate = cache_read/cache_input), each model its own color.
 export function CacheRateBars({ data = [] }) {
   const rows = (data || [])
-    .filter((d) => (d.prompt_tokens || 0) > 0)
+    .filter((d) => (d.cache_input_tokens || d.prompt_tokens || 0) > 0)
     .map((d) => ({
       model: d.model || '(未知)',
-      rate: Math.round((100 * (d.cached_tokens || 0)) / (d.prompt_tokens || 1)),
-      prompt: d.prompt_tokens || 0,
+      rate: Math.max(0, Math.min(100, Math.round((100 * (d.cache_read_tokens || d.cached_tokens || 0)) / (d.cache_input_tokens || d.prompt_tokens || 1)))),
+      prompt: d.cache_input_tokens || d.prompt_tokens || 0,
     }));
   if (!rows.length) return <Empty />;
   return (

@@ -3,7 +3,7 @@ import { Form, Button, Toast, Tag } from '../../components/pool/index.jsx';
 import { IconSave } from '../../components/pool/icons.jsx';
 import { me, patch } from '../../api.js';
 import LoadErrorBanner from '../../components/LoadErrorBanner.jsx';
-import PageHeader, { Panel } from '../../components/PageHeader.jsx';
+import PageHeader from '../../components/PageHeader.jsx';
 import { showErrorToast } from '../../components/ErrorToast.jsx';
 import useAsyncAction from '../../hooks/useAsyncAction.js';
 import useAsyncResource from '../../hooks/useAsyncResource.js';
@@ -37,11 +37,12 @@ export default function PortalProfile() {
         </div>
         {user && (
           <Form getFormApi={(a) => { formApi.current = a; }} labelPosition="left" labelWidth={110} initValues={{ name: user.name || '' }}>
-            <Form.Input field="name" label="名称" placeholder="显示名称" style={{ width: 320 }} />
-            <Panel title="修改密码" style={{ marginTop: 12 }}>
-              <Form.Input field="old_password" label="当前密码" mode="password" placeholder="如已设置密码则必填" style={{ width: 320 }} />
-              <Form.Input field="new_password" label="新密码" mode="password" placeholder="≥8 位，留空不修改" style={{ width: 320 }} />
-            </Panel>
+            <Form.Input field="name" label="名称" placeholder="显示名称" style={{ width: 320, maxWidth: '100%' }} />
+            <div className="pool-profile-section">
+              <div className="pool-profile-section__title">修改密码</div>
+              <Form.Input field="old_password" label="当前密码" mode="password" placeholder="如已设置密码则必填" style={{ width: 320, maxWidth: '100%' }} />
+              <Form.Input field="new_password" label="新密码" mode="password" placeholder="≥8 位，留空不修改" style={{ width: 320, maxWidth: '100%' }} />
+            </div>
             <Button theme="solid" icon={<IconSave />} loading={saving} onClick={save} style={{ marginTop: 16 }}>保存</Button>
           </Form>
         )}

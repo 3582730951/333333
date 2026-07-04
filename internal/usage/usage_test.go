@@ -11,10 +11,13 @@ func TestParseCachedTokens(t *testing.T) {
 	if parsed.Model != "gpt" || parsed.PromptTokens != 100 || parsed.CachedTokens != 80 {
 		t.Fatalf("unexpected usage: %+v", parsed)
 	}
+	if parsed.CacheMissTokens != 20 || parsed.CacheTotalInputTokens != 100 {
+		t.Fatalf("openai cache miss/total input wrong: %+v", parsed)
+	}
 }
 
 func TestParseAnthropicUsage(t *testing.T) {
-	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":75}}`))
+	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":40,"cache_creation_input_tokens":75,"cache_creation":{"ephemeral_5m_input_tokens":25,"ephemeral_1h_input_tokens":50}}}`))
 	if parsed.PromptTokens != 100 || parsed.CompletionTokens != 20 {
 		t.Fatalf("anthropic tokens: %+v", parsed)
 	}
@@ -24,15 +27,24 @@ func TestParseAnthropicUsage(t *testing.T) {
 	if parsed.CacheReadTokens != 40 || parsed.CacheCreationTokens != 75 {
 		t.Fatalf("anthropic cache read/create not split: %+v", parsed)
 	}
+	if parsed.CacheMissTokens != 100 || parsed.CacheTotalInputTokens != 215 {
+		t.Fatalf("anthropic cache miss/total input wrong: %+v", parsed)
+	}
+	if parsed.CacheCreation5mTokens != 25 || parsed.CacheCreation1hTokens != 50 {
+		t.Fatalf("anthropic cache creation ttl split wrong: %+v", parsed)
+	}
 	if parsed.TotalTokens != 120 {
 		t.Fatalf("total not derived from input+output: %+v", parsed)
 	}
 }
 
 func TestParseAnthropicCacheCreationIsNotReportedAsHit(t *testing.T) {
-	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":75}}`))
+	parsed := ParseResponse([]byte(`{"model":"claude-x","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":75}}`))
 	if parsed.CachedTokens != 0 || parsed.CacheReadTokens != 0 || parsed.CacheCreationTokens != 75 {
 		t.Fatalf("cache creation must not be counted as a read hit: %+v", parsed)
+	}
+	if parsed.CacheMissTokens != 100 || parsed.CacheTotalInputTokens != 175 {
+		t.Fatalf("anthropic cache-write-only total input wrong: %+v", parsed)
 	}
 }
 
@@ -129,6 +141,9 @@ func TestStreamScannerClaudeMessages(t *testing.T) {
 	}
 	if p.CacheReadTokens != 50 || p.CacheCreationTokens != 34 {
 		t.Fatalf("claude stream cache read/create = %+v", p)
+	}
+	if p.CacheMissTokens != 200 || p.CacheTotalInputTokens != 284 {
+		t.Fatalf("claude stream cache miss/total input = %+v", p)
 	}
 	if p.CompletionTokens != 88 { // last message_delta wins
 		t.Fatalf("claude stream output = %d, want 88 (final delta)", p.CompletionTokens)

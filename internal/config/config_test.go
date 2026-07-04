@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,6 +93,61 @@ func TestClaudeCCHSigningDefaultAndEnvOverride(t *testing.T) {
 	}
 	if cfg.ClaudeCCHSigning {
 		t.Fatal("CODEX_POOL_CLAUDE_CCH_SIGNING=false was not applied")
+	}
+}
+
+func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
+	path := filepath.Join("..", "..", "config.example.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read example config: %v", err)
+	}
+	var example map[string]interface{}
+	if err := json.Unmarshal(raw, &example); err != nil {
+		t.Fatalf("decode example config: %v", err)
+	}
+
+	wants := map[string]interface{}{
+		"conversation_isolation":                true,
+		"codex_prefer_sidecar_ja3_over_ws":      true,
+		"codex_prompt_cache_retention":          "24h",
+		"claude_cache_control_inject":           true,
+		"claude_native_cache_breakpoint_inject": true,
+		"claude_cch_signing":                    true,
+		"claude_cache_ttl":                      "1h",
+		"rate_limit_guard_enabled":              true,
+		"seamless_failover":                     true,
+		"failover_max_attempts":                 float64(3),
+		"force_failover_on_429":                 false,
+		"leak_scrub_enabled":                    true,
+		"token_save_enabled":                    false,
+		"codex_install_model":                   "gpt-5.5",
+		"codex_install_effort":                  "xhigh",
+	}
+	for key, want := range wants {
+		if got, ok := example[key]; !ok || got != want {
+			t.Fatalf("config.example.json[%q] = %#v (present=%v), want %#v", key, got, ok, want)
+		}
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load example config: %v", err)
+	}
+	if cfg.ClaudeCacheTTL != "1h" {
+		t.Fatalf("ClaudeCacheTTL = %q, want 1h", cfg.ClaudeCacheTTL)
+	}
+	if cfg.CodexPromptCacheRetention != "24h" {
+		t.Fatalf("CodexPromptCacheRetention = %q, want 24h", cfg.CodexPromptCacheRetention)
+	}
+	if cfg.TokenSaveEnabled {
+		t.Fatal("TokenSaveEnabled must stay false by default because it rewrites request content")
+	}
+	if cfg.CodexInstallModel != "gpt-5.5" {
+		t.Fatalf("CodexInstallModel = %q, want gpt-5.5", cfg.CodexInstallModel)
+	}
+	if cfg.CodexInstallEffort != "xhigh" {
+		t.Fatalf("CodexInstallEffort = %q, want xhigh", cfg.CodexInstallEffort)
 	}
 }
 

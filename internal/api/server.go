@@ -235,7 +235,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/moderation/translate", s.adminModerationTranslate)
 	s.mux.HandleFunc("/admin/cf-events", s.adminCFEvents)
 	s.mux.HandleFunc("/admin/usage", s.adminUsage)
+	s.mux.HandleFunc("/admin/usage/window", s.adminUsageWindowEndpoint)
 	s.mux.HandleFunc("/admin/usage/cache", s.adminUsageCache)
+	s.mux.HandleFunc("/admin/usage/cache/reset", s.adminUsageCacheReset)
 	s.mux.HandleFunc("/admin/usage/timeseries", s.adminUsageTimeseries)
 	s.mux.HandleFunc("/admin/usage/by-model", s.adminUsageByModel)
 	s.mux.HandleFunc("/admin/quota", s.adminQuota)
@@ -298,6 +300,7 @@ func (s *Server) routes() {
 	// credentials, automation policies, lifecycle defaults, logging & memory knobs.
 	s.mux.HandleFunc("/admin/settings-center", s.handleSettingsCenter)
 	s.mux.HandleFunc("/admin/settings-center/apply-template", s.handleSettingsCenterTemplate)
+	s.mux.HandleFunc("/admin/export/cache-hits", s.adminCacheHitsExport)
 
 	// Embedded admin UI (catch-all; more specific API routes above take precedence).
 	s.mux.Handle("/console/", console.Handler())
@@ -400,7 +403,11 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	isChat := path == "/v1/chat/completions"
 	isCompact := strings.Contains(path, "/responses/compact")
-	affinity := routing.ExtractAffinityKey(r, raw)
+	affinityGroup := pol.Group
+	if affinityGroup == "" {
+		affinityGroup = s.cfg.DefaultGroup
+	}
+	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
 	// movable: the request carries its full input and so can be re-sent to a fresh
 	// account losslessly. This is the failover gate. It is broader than !strict: a
 	// strict-sticky turn (tool_result/function_call_output, kept on one account for
@@ -469,7 +476,11 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentModel == "" {
 			currentModel = model
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, affinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, attempt < attempts-1, forceFailoverOn429, exclude)
+		currentAffinity := codexSelectionAffinity(headerReq, current.Raw, routing.ExtractAffinityKey(headerReq, current.Raw), affinityGroup)
+		if currentAffinity.Hash == "" {
+			currentAffinity = affinity
+		}
+		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, attempt < attempts-1, forceFailoverOn429, exclude)
 		if result.Outcome != outcomeRetry {
 			return
 		}
@@ -562,6 +573,15 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// only be overwritten. The rare unmarshal-failure fallback path returns the
 	// original slice, which is read-only from this point on.
 	body := raw
+	promptCacheKeySource := "none"
+	if routing.PromptCacheKey(body) != "" {
+		promptCacheKeySource = "downstream"
+	}
+	retentionEffective := routing.JSONStringField(body, "prompt_cache_retention")
+	retentionSource := "none"
+	if retentionEffective != "" {
+		retentionSource = "downstream"
+	}
 	group, err := s.store.GetGroup(r.Context(), lease.Account.GroupName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -631,15 +651,34 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// returns to a previously-used account, can still hit a warm cache. A
 	// downstream-supplied prompt_cache_retention always wins; the field is not part of
 	// the cacheable prefix, so this never disturbs existing hits.
-	if !prepared && s.settingString(r.Context(), "codex_prompt_cache_retention", s.cfg.CodexPromptCacheRetention) != "" && prompt.SupportsExtendedPromptCache(model) {
-		ret := s.settingString(r.Context(), "codex_prompt_cache_retention", s.cfg.CodexPromptCacheRetention)
-		body = prompt.EnsureResponsesPromptCacheRetention(body, ret)
+	if !prepared {
+		ret := strings.TrimSpace(s.settingString(r.Context(), "codex_prompt_cache_retention", s.cfg.CodexPromptCacheRetention))
+		switch {
+		case retentionEffective != "":
+		case ret == "":
+			retentionSource = "disabled"
+		case !prompt.SupportsExtendedPromptCache(model):
+			retentionSource = "unsupported_model"
+		default:
+			body = prompt.EnsureResponsesPromptCacheRetention(body, ret)
+			if after := routing.JSONStringField(body, "prompt_cache_retention"); after != "" {
+				retentionEffective = after
+				retentionSource = "gateway_default"
+			} else {
+				retentionSource = "invalid_gateway_default"
+			}
+		}
 	}
 	if !prepared && routing.PromptCacheKey(body) == "" {
 		if prefixHash := automaticPromptCachePrefixHash(body); prefixHash != "" {
-			body = ensureResponsesPromptCacheKey(body, automaticPromptCacheKey(model, prefixHash))
+			updated := ensureResponsesPromptCacheKey(body, automaticPromptCacheKey(model, prefixHash))
+			if routing.PromptCacheKey(updated) != "" {
+				body = updated
+				promptCacheKeySource = "auto_stable_prefix"
+			}
 		}
 	}
+	logicalUsageDiag := codexRequestUsageDiagnostics(body, affinity, promptCacheKeySource, retentionEffective, retentionSource)
 
 	// Virtual-context ledger key. We only pool prior turns under a TRUE
 	// per-conversation correlator; for coarse/heuristic affinity (downstream
@@ -731,7 +770,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// Session 33: Carry the billing hold id in the request context so deferred
 	// usage recording (recordUsage / recordParsedUsage) can fall back to
 	// estimated_tokens when the response body lacks countable usage data.
-	r = r.WithContext(withBillingHold(r.Context(), holdID))
+	withCodexUsageContext := func() {
+		r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), codexRetentionDiagnosticsForTransport(logicalUsageDiag, codexUseWebSocket)))
+	}
+	withCodexUsageContext()
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
@@ -800,6 +842,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
 				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 			} else if resp.StatusCode < 400 {
+				codexUseWebSocket = false
+				withCodexUsageContext()
 				goto codexSuccess
 			} else {
 				errorBody = readUpstreamErrorBody(resp.Body)
@@ -812,6 +856,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if !isChat && !isCompact && isStreamRequest(body) {
 				codexUseWebSocket = true
 			}
+			withCodexUsageContext()
 			_ = resp.Body.Close()
 			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
 			if err != nil {
@@ -1247,6 +1292,11 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 		}
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
+	diag := usageDiagnosticsFromCtx(ctx)
+	diag.CacheMissTokens = parsed.CacheMissTokens
+	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
+	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
+	diag.CacheCreation1hTokens = parsed.CacheCreation1hTokens
 	// Defer the insert off the request path. Usage rows are read only by the admin
 	// dashboards (never by request processing), so eventual recording is correct; the
 	// closure captures only the small parsed usage + identity, and uses a detached
@@ -1254,7 +1304,7 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	s.enqueueWrite(func() {
 		wctx, cancel := bgWriteContext()
 		defer cancel()
-		err := s.store.InsertUsageRecordWithCacheDetails(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage)
+		err := s.store.InsertUsageRecordWithDiagnostics(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage, diag)
 		if err != nil {
 			log.Printf("[USAGE-ERROR] InsertUsageRecord failed: account=%s, model=%s, prompt=%d, completion=%d, total=%d, error=%v",
 				accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, err)
@@ -1321,10 +1371,15 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 		}
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
+	diag := usageDiagnosticsFromCtx(ctx)
+	diag.CacheMissTokens = parsed.CacheMissTokens
+	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
+	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
+	diag.CacheCreation1hTokens = parsed.CacheCreation1hTokens
 	s.enqueueWrite(func() {
 		wctx, cancel := bgWriteContext()
 		defer cancel()
-		err := s.store.InsertUsageRecordWithCacheDetails(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage)
+		err := s.store.InsertUsageRecordWithDiagnostics(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage, diag)
 		if err != nil {
 			log.Printf("[USAGE-ERROR] InsertUsageRecord failed (streaming): account=%s, model=%s, prompt=%d, completion=%d, total=%d, error=%v",
 				accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, err)

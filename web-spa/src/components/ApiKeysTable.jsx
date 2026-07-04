@@ -137,21 +137,20 @@ export default function ApiKeysTable({
   ];
 
   return (
-    <div className="pool-table-wrapper pool-key-table">
-      <ResourceTable
-        dataSource={rows}
-        columns={columns}
-        mobileColumns={mobileColumns}
-        rowKey={keyRowID}
-        loading={loading}
-        pagination={portal ? { pageSize: 15 } : false}
-        emptyTitle={portal ? '还没有 API Key' : '暂无 API Key'}
-        emptyType="keys"
-        skeletonRows={6}
-        skeletonCols={columns.length}
-        scroll={{ x: 1080 }}
-        mobileScroll={false}
-      />
-    </div>
+    <ResourceTable
+      className="pool-key-table"
+      dataSource={rows}
+      columns={columns}
+      mobileColumns={mobileColumns}
+      rowKey={keyRowID}
+      loading={loading}
+      pagination={portal ? { pageSize: 15 } : false}
+      emptyTitle={portal ? '还没有 API Key' : '暂无 API Key'}
+      emptyType="keys"
+      skeletonRows={6}
+      skeletonCols={columns.length}
+      scroll={{ x: 1080 }}
+      mobileScroll={false}
+    />
   );
 }

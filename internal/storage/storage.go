@@ -761,6 +761,25 @@ CREATE TABLE IF NOT EXISTS usage_records(
   cached_tokens INTEGER NOT NULL DEFAULT 0,
   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
   cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+  usage_provider TEXT NOT NULL DEFAULT '',
+  estimated INTEGER NOT NULL DEFAULT 0,
+  cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_total_input_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0,
+  affinity_source TEXT NOT NULL DEFAULT '',
+  prompt_cache_key_present INTEGER NOT NULL DEFAULT 0,
+  prompt_cache_key_source TEXT NOT NULL DEFAULT '',
+  stable_prefix_source TEXT NOT NULL DEFAULT '',
+  stable_prefix_reason TEXT NOT NULL DEFAULT '',
+  stable_prefix_bytes INTEGER NOT NULL DEFAULT 0,
+  retention_effective TEXT NOT NULL DEFAULT '',
+  retention_source TEXT NOT NULL DEFAULT '',
+  claude_cache_ttl TEXT NOT NULL DEFAULT '',
+  cache_control_injected INTEGER NOT NULL DEFAULT 0,
+  cache_breakpoint_count INTEGER NOT NULL DEFAULT 0,
+  latest_user_cache_control INTEGER NOT NULL DEFAULT 0,
+  route_epoch INTEGER NOT NULL DEFAULT 0,
   raw_usage_json TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
@@ -950,6 +969,25 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN user_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN usage_provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_miss_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_total_input_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN affinity_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_present INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN prompt_cache_key_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN stable_prefix_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN stable_prefix_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN stable_prefix_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN retention_effective TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN retention_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN claude_cache_ttl TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN cache_control_injected INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_breakpoint_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN latest_user_cache_control INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN route_epoch INTEGER NOT NULL DEFAULT 0`,
 		// Cooldown→health-recheck gate: a benched account stays out of the candidate
 		// pool until a liveness probe confirms it recovered (older DBs created before
 		// the recheck loop existed).
@@ -1013,7 +1051,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	return s.backfillUsageCacheDiagnostics(ctx)
 }
 
 func (s *Store) migrateAccountRateLimits(ctx context.Context) error {
@@ -3044,6 +3082,36 @@ func (s *Store) InsertAuditLog(ctx context.Context, row AuditLogRow) error {
 	return err
 }
 
+const usageDailyResetDaySettingKey = "usage_daily_reset_day"
+
+func (s *Store) EnsureUsageDailyResetAudit(ctx context.Context, now time.Time) error {
+	localDay := now.In(time.Local).Format("2006-01-02")
+	createdAt := now.Unix()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `
+INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+WHERE settings.value <> excluded.value`, usageDailyResetDaySettingKey, localDay, createdAt)
+	if err != nil {
+		return err
+	}
+	changed, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id, account_label, action, state, reason, detail, created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
+			"usage_daily_window_reset", "ok", "daily_window", "admin usage daily window reset for VPS local day "+localDay, createdAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ListAuditLog returns the most recent audit records, newest first.
 func (s *Store) ListAuditLog(ctx context.Context, limit int) ([]AuditLogRow, error) {
 	limit = normalizeAuditLimit(limit)
@@ -3213,9 +3281,201 @@ func (s *Store) InsertUsageRecord(ctx context.Context, accountID, routeKeyHash, 
 }
 
 func (s *Store) InsertUsageRecordWithCacheDetails(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached, cacheRead, cacheCreation int64, raw json.RawMessage) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, raw_usage_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation, string(raw), Now())
+	return s.InsertUsageRecordWithDiagnostics(ctx, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation, raw, UsageDiagnostics{})
+}
+
+type UsageDiagnostics struct {
+	UsageProvider          string
+	Estimated              bool
+	CacheMissTokens        int64
+	CacheTotalInputTokens  int64
+	CacheCreation5mTokens  int64
+	CacheCreation1hTokens  int64
+	AffinitySource         string
+	PromptCacheKeyPresent  bool
+	PromptCacheKeySource   string
+	StablePrefixSource     string
+	StablePrefixReason     string
+	StablePrefixBytes      int
+	RetentionEffective     string
+	RetentionSource        string
+	ClaudeCacheTTL         string
+	CacheControlInjected   bool
+	CacheBreakpointCount   int
+	LatestUserCacheControl bool
+	RouteEpoch             int64
+}
+
+func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) error {
+	diag = finalizeUsageDiagnostics(model, prompt, cached, cacheRead, cacheCreation, raw, diag)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(
+account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
+usage_provider, estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
+affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
+retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control, route_epoch,
+raw_usage_json, created_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
+		diag.UsageProvider, boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
+		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
+		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount, boolInt(diag.LatestUserCacheControl), diag.RouteEpoch,
+		string(raw), Now())
 	return err
+}
+
+func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) UsageDiagnostics {
+	usageMap := rawUsageMap(raw)
+	if diag.Estimated || rawEstimated(raw, usageMap) {
+		diag.Estimated = true
+	}
+	if diag.UsageProvider == "" {
+		diag.UsageProvider = usageProvider(model, usageMap, cacheCreation)
+	}
+	if diag.CacheCreation5mTokens == 0 {
+		diag.CacheCreation5mTokens = nestedUsageInt(usageMap, "cache_creation", "ephemeral_5m_input_tokens")
+	}
+	if diag.CacheCreation1hTokens == 0 {
+		diag.CacheCreation1hTokens = nestedUsageInt(usageMap, "cache_creation", "ephemeral_1h_input_tokens")
+	}
+	if diag.CacheTotalInputTokens <= 0 || diag.CacheMissTokens < 0 {
+		if isAnthropicUsageMap(usageMap, cacheCreation) {
+			diag.CacheMissTokens = prompt
+			diag.CacheTotalInputTokens = prompt + cacheRead + cacheCreation
+		} else {
+			diag.CacheMissTokens = prompt - cacheRead
+			if diag.CacheMissTokens < 0 {
+				diag.CacheMissTokens = 0
+			}
+			diag.CacheTotalInputTokens = prompt
+		}
+	}
+	if diag.CacheTotalInputTokens < 0 {
+		diag.CacheTotalInputTokens = 0
+	}
+	if diag.CacheMissTokens < 0 {
+		diag.CacheMissTokens = 0
+	}
+	_ = cached // kept in the signature so callers can pass the parsed usage shape without lossy recomputation.
+	return diag
+}
+
+func rawUsageMap(raw json.RawMessage) map[string]interface{} {
+	var root map[string]interface{}
+	if len(raw) == 0 || json.Unmarshal(raw, &root) != nil {
+		return nil
+	}
+	if usage, ok := root["usage"].(map[string]interface{}); ok {
+		return usage
+	}
+	if response, ok := root["response"].(map[string]interface{}); ok {
+		if usage, ok := response["usage"].(map[string]interface{}); ok {
+			return usage
+		}
+	}
+	return root
+}
+
+func rawEstimated(raw json.RawMessage, usageMap map[string]interface{}) bool {
+	if b, ok := usageMap["estimated"].(bool); ok && b {
+		return true
+	}
+	var root map[string]interface{}
+	if len(raw) > 0 && json.Unmarshal(raw, &root) == nil {
+		if b, ok := root["estimated"].(bool); ok && b {
+			return true
+		}
+	}
+	return false
+}
+
+func usageProvider(model string, usageMap map[string]interface{}, cacheCreation int64) string {
+	if isAnthropicUsageMap(usageMap, cacheCreation) || strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude") {
+		return "anthropic"
+	}
+	return "openai"
+}
+
+func isAnthropicUsageMap(usageMap map[string]interface{}, cacheCreation int64) bool {
+	if cacheCreation > 0 {
+		return true
+	}
+	if _, ok := usageMap["cache_read_input_tokens"]; ok {
+		return true
+	}
+	if _, ok := usageMap["cache_creation_input_tokens"]; ok {
+		return true
+	}
+	return usageMap["cache_creation"] != nil
+}
+
+func usageInt(m map[string]interface{}, keys ...string) int64 {
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case float64:
+			return int64(v)
+		case int64:
+			return v
+		case int:
+			return int64(v)
+		case json.Number:
+			n, _ := v.Int64()
+			return n
+		}
+	}
+	return 0
+}
+
+func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
+	if detail, ok := m[parent].(map[string]interface{}); ok {
+		return usageInt(detail, child)
+	}
+	return 0
+}
+
+func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT id, model, prompt_tokens, cached_tokens,
+       CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END,
+       cache_creation_tokens, raw_usage_json
+FROM usage_records
+WHERE cache_total_input_tokens = 0
+  AND (prompt_tokens > 0 OR cached_tokens > 0 OR cache_read_tokens > 0 OR cache_creation_tokens > 0
+       OR raw_usage_json LIKE '%cache_read_input_tokens%' OR raw_usage_json LIKE '%cache_creation_input_tokens%' OR raw_usage_json LIKE '%estimated%')`)
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id                                int64
+		model, raw                        string
+		prompt, cached, cacheRead, create int64
+	}
+	var items []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.model, &r.prompt, &r.cached, &r.cacheRead, &r.create, &r.raw); err != nil {
+			rows.Close()
+			return err
+		}
+		items = append(items, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, r := range items {
+		diag := finalizeUsageDiagnostics(r.model, r.prompt, r.cached, r.cacheRead, r.create, json.RawMessage(r.raw), UsageDiagnostics{})
+		if _, err := s.db.ExecContext(ctx, `
+UPDATE usage_records
+SET usage_provider = ?, estimated = ?, cache_miss_tokens = ?, cache_total_input_tokens = ?,
+    cache_creation_5m_tokens = ?, cache_creation_1h_tokens = ?
+WHERE id = ?`,
+			diag.UsageProvider, boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens,
+			diag.CacheCreation5mTokens, diag.CacheCreation1hTokens, r.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UserUsageRow is a per-model rollup of one portal user's usage (their own console).
@@ -3226,41 +3486,90 @@ type UserUsageRow struct {
 	CompletionTokens    int64  `json:"completion_tokens"`
 	TotalTokens         int64  `json:"total_tokens"`
 	CachedTokens        int64  `json:"cached_tokens"`
+	CacheInputTokens    int64  `json:"cache_input_tokens"`
 	CacheReadTokens     int64  `json:"cache_read_tokens"`
 	CacheCreationTokens int64  `json:"cache_creation_tokens"`
 }
 
 type CacheUsageReport struct {
-	Summary        CacheUsageMetricRow   `json:"summary"`
-	ByAccount      []CacheUsageMetricRow `json:"by_account"`
-	ByModel        []CacheUsageMetricRow `json:"by_model"`
-	ByAPIKey       []CacheUsageMetricRow `json:"by_api_key"`
-	ByAccountModel []CacheUsageMetricRow `json:"by_account_model"`
+	Summary             CacheUsageMetricRow   `json:"summary"`
+	ByAccount           []CacheUsageMetricRow `json:"by_account"`
+	ByModel             []CacheUsageMetricRow `json:"by_model"`
+	ByAPIKey            []CacheUsageMetricRow `json:"by_api_key"`
+	ByAccountModel      []CacheUsageMetricRow `json:"by_account_model"`
+	ByRoute             []CacheUsageMetricRow `json:"by_route"`
+	ByRouteAccountModel []CacheUsageMetricRow `json:"by_route_account_model"`
+	ByTimeBucket        []CacheUsageBucket    `json:"by_time_bucket"`
 }
 
 type CacheUsageMetricRow struct {
-	AccountID           string  `json:"account_id,omitempty"`
-	Model               string  `json:"model,omitempty"`
-	APIKeyHashPrefix    string  `json:"api_key_hash_prefix,omitempty"`
-	Requests            int64   `json:"requests"`
-	HitRequests         int64   `json:"hit_requests"`
-	RequestHitRate      float64 `json:"request_hit_rate"`
-	PromptTokens        int64   `json:"prompt_tokens"`
-	CachedTokens        int64   `json:"cached_tokens"`
-	CacheInputTokens    int64   `json:"cache_input_tokens"`
-	CacheReadTokens     int64   `json:"cache_read_tokens"`
-	CacheCreationTokens int64   `json:"cache_creation_tokens"`
-	TokenHitRate        float64 `json:"token_hit_rate"`
-	EstimatedRequests   int64   `json:"estimated_requests"`
-	EstimatedRate       float64 `json:"estimated_rate"`
+	AccountID              string  `json:"account_id,omitempty"`
+	Model                  string  `json:"model,omitempty"`
+	APIKeyHashPrefix       string  `json:"api_key_hash_prefix,omitempty"`
+	RouteKeyHashPrefix     string  `json:"route_key_hash_prefix,omitempty"`
+	AffinitySource         string  `json:"affinity_source,omitempty"`
+	PromptCacheKeySource   string  `json:"prompt_cache_key_source,omitempty"`
+	StablePrefixSource     string  `json:"stable_prefix_source,omitempty"`
+	StablePrefixReason     string  `json:"stable_prefix_reason,omitempty"`
+	RetentionEffective     string  `json:"retention_effective,omitempty"`
+	RetentionSource        string  `json:"retention_source,omitempty"`
+	ClaudeCacheTTL         string  `json:"claude_cache_ttl,omitempty"`
+	Requests               int64   `json:"requests"`
+	RealRequests           int64   `json:"real_requests"`
+	HitRequests            int64   `json:"hit_requests"`
+	RequestHitRate         float64 `json:"request_hit_rate"`
+	PromptTokens           int64   `json:"prompt_tokens"`
+	CachedTokens           int64   `json:"cached_tokens"`
+	CacheInputTokens       int64   `json:"cache_input_tokens"`
+	CacheMissTokens        int64   `json:"cache_miss_tokens"`
+	CacheReadTokens        int64   `json:"cache_read_tokens"`
+	CacheCreationTokens    int64   `json:"cache_creation_tokens"`
+	CacheCreation5mTokens  int64   `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens  int64   `json:"cache_creation_1h_tokens"`
+	TokenHitRate           float64 `json:"token_hit_rate"`
+	CacheReadShare         float64 `json:"cache_read_share"`
+	CacheWriteShare        float64 `json:"cache_write_share"`
+	EligibleHitRate        float64 `json:"eligible_cache_hit_rate"`
+	RealTokenHitRate       float64 `json:"real_token_hit_rate"`
+	EstimatedRequests      int64   `json:"estimated_requests"`
+	EstimatedRate          float64 `json:"estimated_rate"`
+	StablePrefixBytes      int64   `json:"stable_prefix_bytes"`
+	PromptCacheKeyPresent  int64   `json:"prompt_cache_key_present"`
+	CacheControlInjected   int64   `json:"cache_control_injected"`
+	CacheBreakpointCount   int64   `json:"cache_breakpoint_count"`
+	LatestUserCacheControl int64   `json:"latest_user_cache_control"`
+	RouteEpoch             int64   `json:"route_epoch"`
+	realCacheInputTokens   int64
+	realCacheReadTokens    int64
+}
+
+type CacheUsageBucket struct {
+	Bucket                int64   `json:"bucket"`
+	Requests              int64   `json:"requests"`
+	RealRequests          int64   `json:"real_requests"`
+	HitRequests           int64   `json:"hit_requests"`
+	PromptTokens          int64   `json:"prompt_tokens"`
+	CacheInputTokens      int64   `json:"cache_input_tokens"`
+	CacheMissTokens       int64   `json:"cache_miss_tokens"`
+	CacheReadTokens       int64   `json:"cache_read_tokens"`
+	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
+	CacheCreation5mTokens int64   `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens int64   `json:"cache_creation_1h_tokens"`
+	CacheReadShare        float64 `json:"cache_read_share"`
+	CacheWriteShare       float64 `json:"cache_write_share"`
+	EligibleHitRate       float64 `json:"eligible_cache_hit_rate"`
+	EstimatedRequests     int64   `json:"estimated_requests"`
+	EstimatedRate         float64 `json:"estimated_rate"`
 }
 
 const (
-	cacheRawNormalizedSQL   = "LOWER(REPLACE(COALESCE(raw_usage_json,''),' ',''))"
-	cacheReadTokensSQL      = "(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END)"
-	anthropicCacheUsageSQL  = "(" + cacheRawNormalizedSQL + " LIKE '%cache_read_input_tokens%' OR " + cacheRawNormalizedSQL + " LIKE '%cache_creation_input_tokens%' OR cache_creation_tokens > 0)"
-	cacheInputTokensSQL     = "(CASE WHEN " + anthropicCacheUsageSQL + " THEN prompt_tokens + " + cacheReadTokensSQL + " + cache_creation_tokens ELSE prompt_tokens END)"
-	estimatedUsageRecordSQL = "CASE WHEN " + cacheRawNormalizedSQL + " LIKE '%\"estimated\":true%' THEN 1 ELSE 0 END"
+	cacheReadTokensSQL       = "(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END)"
+	cacheTotalInputTokensSQL = "(CASE WHEN cache_total_input_tokens > 0 THEN cache_total_input_tokens ELSE prompt_tokens END)"
+	cacheMissTokensSQL       = "(CASE WHEN cache_miss_tokens > 0 THEN cache_miss_tokens ELSE MAX(prompt_tokens - " + cacheReadTokensSQL + ", 0) END)"
+	estimatedUsageRecordSQL  = "(CASE WHEN estimated > 0 THEN 1 ELSE 0 END)"
+	realUsageRecordSQL       = "(CASE WHEN estimated > 0 THEN 0 ELSE 1 END)"
+	realCacheInputTokensSQL  = "(CASE WHEN estimated > 0 THEN 0 ELSE " + cacheTotalInputTokensSQL + " END)"
+	realCacheReadTokensSQL   = "(CASE WHEN estimated > 0 THEN 0 ELSE " + cacheReadTokensSQL + " END)"
 )
 
 // UsageByUser aggregates a single user's usage per model, most-used first.
@@ -3268,6 +3577,7 @@ func (s *Store) UsageByUser(ctx context.Context, userID string) ([]UserUsageRow,
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
 FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, userID)
@@ -3278,7 +3588,7 @@ FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) D
 	var out []UserUsageRow
 	for rows.Next() {
 		var r UserUsageRow
-		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens); err != nil {
+		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheInputTokens, &r.CacheReadTokens, &r.CacheCreationTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3290,12 +3600,17 @@ FROM usage_records WHERE user_id = ? GROUP BY model ORDER BY SUM(total_tokens) D
 // epoch second (0 = all time). Powers the admin per-model cache-hit-rate view; same row
 // shape as UsageByUser (UserUsageRow) — the UI computes hit rate = cached/prompt.
 func (s *Store) UsageByModel(ctx context.Context, since int64) ([]UserUsageRow, error) {
+	return s.UsageByModelWindow(ctx, since, usageWindowOpenEndedUntil)
+}
+
+func (s *Store) UsageByModelWindow(ctx context.Context, since, until int64) ([]UserUsageRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT COALESCE(model,''), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
+       COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
-FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, since)
+FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY model ORDER BY SUM(total_tokens) DESC`, since, until)
 	if err != nil {
 		return nil, err
 	}
@@ -3303,7 +3618,7 @@ FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_token
 	var out []UserUsageRow
 	for rows.Next() {
 		var r UserUsageRow
-		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens); err != nil {
+		if err := rows.Scan(&r.Model, &r.Requests, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheInputTokens, &r.CacheReadTokens, &r.CacheCreationTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -3311,49 +3626,76 @@ FROM usage_records WHERE created_at >= ? GROUP BY model ORDER BY SUM(total_token
 	return out, rows.Err()
 }
 
+const usageWindowOpenEndedUntil int64 = 1 << 62
+
 func (s *Store) CacheUsageMetrics(ctx context.Context, since int64) (CacheUsageReport, error) {
-	summary, err := s.cacheUsageSummary(ctx, since)
+	return s.CacheUsageMetricsWindow(ctx, since, usageWindowOpenEndedUntil)
+}
+
+func (s *Store) CacheUsageMetricsWindow(ctx context.Context, since, until int64) (CacheUsageReport, error) {
+	summary, err := s.cacheUsageSummary(ctx, since, until)
 	if err != nil {
 		return CacheUsageReport{}, err
 	}
-	byAccount, err := s.cacheUsageRows(ctx, since, "account")
+	byAccount, err := s.cacheUsageRows(ctx, since, until, "account")
 	if err != nil {
 		return CacheUsageReport{}, err
 	}
-	byModel, err := s.cacheUsageRows(ctx, since, "model")
+	byModel, err := s.cacheUsageRows(ctx, since, until, "model")
 	if err != nil {
 		return CacheUsageReport{}, err
 	}
-	byAPIKey, err := s.cacheUsageRows(ctx, since, "api_key")
+	byAPIKey, err := s.cacheUsageRows(ctx, since, until, "api_key")
 	if err != nil {
 		return CacheUsageReport{}, err
 	}
-	byAccountModel, err := s.cacheUsageRows(ctx, since, "account_model")
+	byAccountModel, err := s.cacheUsageRows(ctx, since, until, "account_model")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byRoute, err := s.cacheUsageRows(ctx, since, until, "route")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byRouteAccountModel, err := s.cacheUsageRows(ctx, since, until, "route_account_model")
+	if err != nil {
+		return CacheUsageReport{}, err
+	}
+	byTimeBucket, err := s.CacheUsageBucketsWindow(ctx, since, until, 3600)
 	if err != nil {
 		return CacheUsageReport{}, err
 	}
 	return CacheUsageReport{
-		Summary:        summary,
-		ByAccount:      byAccount,
-		ByModel:        byModel,
-		ByAPIKey:       byAPIKey,
-		ByAccountModel: byAccountModel,
+		Summary:             summary,
+		ByAccount:           byAccount,
+		ByModel:             byModel,
+		ByAPIKey:            byAPIKey,
+		ByAccountModel:      byAccountModel,
+		ByRoute:             byRoute,
+		ByRouteAccountModel: byRouteAccountModel,
+		ByTimeBucket:        byTimeBucket,
 	}, nil
 }
 
-func (s *Store) cacheUsageSummary(ctx context.Context, since int64) (CacheUsageMetricRow, error) {
+func (s *Store) cacheUsageSummary(ctx context.Context, since, until int64) (CacheUsageMetricRow, error) {
 	var row CacheUsageMetricRow
 	err := s.rdb.QueryRowContext(ctx, `
 SELECT COUNT(*),
+       COALESCE(SUM(`+realUsageRecordSQL+`),0),
        COALESCE(SUM(CASE WHEN `+cacheReadTokensSQL+` > 0 THEN 1 ELSE 0 END),0),
        COALESCE(SUM(prompt_tokens),0),
        COALESCE(SUM(cached_tokens),0),
-       COALESCE(SUM(`+cacheInputTokensSQL+`),0),
+       COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
+       COALESCE(SUM(`+cacheMissTokensSQL+`),0),
        COALESCE(SUM(`+cacheReadTokensSQL+`),0),
        COALESCE(SUM(cache_creation_tokens),0),
-       COALESCE(SUM(`+estimatedUsageRecordSQL+`),0)
+       COALESCE(SUM(cache_creation_5m_tokens),0),
+       COALESCE(SUM(cache_creation_1h_tokens),0),
+       COALESCE(SUM(`+estimatedUsageRecordSQL+`),0),
+       COALESCE(SUM(`+realCacheInputTokensSQL+`),0),
+       COALESCE(SUM(`+realCacheReadTokensSQL+`),0)
 FROM usage_records
-WHERE created_at >= ?`, since).Scan(&row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.EstimatedRequests)
+WHERE created_at >= ? AND created_at < ?`, since, until).Scan(&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests, &row.realCacheInputTokens, &row.realCacheReadTokens)
 	if err != nil {
 		return CacheUsageMetricRow{}, err
 	}
@@ -3361,41 +3703,57 @@ WHERE created_at >= ?`, since).Scan(&row.Requests, &row.HitRequests, &row.Prompt
 	return row, nil
 }
 
-func (s *Store) cacheUsageRows(ctx context.Context, since int64, dimension string) ([]CacheUsageMetricRow, error) {
-	selectCols := "COALESCE(account_id,''), '', ''"
+func (s *Store) cacheUsageRows(ctx context.Context, since, until int64, dimension string) ([]CacheUsageMetricRow, error) {
+	selectCols := "COALESCE(account_id,''), '', '', '', '', '', '', '', '', '', ''"
 	groupBy := "account_id"
 	switch dimension {
 	case "account":
 	case "model":
-		selectCols = "'', COALESCE(model,''), ''"
+		selectCols = "'', COALESCE(model,''), '', '', '', '', '', '', '', '', ''"
 		groupBy = "model"
 	case "api_key":
-		selectCols = "'', '', CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END"
+		selectCols = "'', '', CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END, '', '', '', '', '', '', '', ''"
 		groupBy = "CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END"
 	case "account_model":
-		selectCols = "COALESCE(account_id,''), COALESCE(model,''), ''"
+		selectCols = "COALESCE(account_id,''), COALESCE(model,''), '', '', '', '', '', '', '', '', ''"
 		groupBy = "account_id, model"
+	case "route":
+		selectCols = "'', '', '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
+		groupBy = "CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
+	case "route_account_model":
+		selectCols = "COALESCE(account_id,''), COALESCE(model,''), '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
+		groupBy = "account_id, model, CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
 	default:
 		return nil, fmt.Errorf("unknown cache usage dimension %q", dimension)
 	}
-	cacheReadSQL := strings.ReplaceAll(cacheReadTokensSQL, "%", "%%")
-	cacheInputSQL := strings.ReplaceAll(cacheInputTokensSQL, "%", "%%")
-	estimatedSQL := strings.ReplaceAll(estimatedUsageRecordSQL, "%", "%%")
+	cacheReadSQL := cacheReadTokensSQL
 	rows, err := s.rdb.QueryContext(ctx, fmt.Sprintf(`
 SELECT %s,
        COUNT(*),
+       COALESCE(SUM(%s),0),
        COALESCE(SUM(CASE WHEN `+cacheReadSQL+` > 0 THEN 1 ELSE 0 END),0),
        COALESCE(SUM(prompt_tokens),0),
        COALESCE(SUM(cached_tokens),0),
-       COALESCE(SUM(`+cacheInputSQL+`),0),
+       COALESCE(SUM(%s),0),
+       COALESCE(SUM(%s),0),
        COALESCE(SUM(`+cacheReadSQL+`),0),
        COALESCE(SUM(cache_creation_tokens),0),
-       COALESCE(SUM(`+estimatedSQL+`),0)
+       COALESCE(SUM(cache_creation_5m_tokens),0),
+       COALESCE(SUM(cache_creation_1h_tokens),0),
+       COALESCE(SUM(%s),0),
+       COALESCE(SUM(%s),0),
+       COALESCE(SUM(%s),0),
+       COALESCE(MAX(stable_prefix_bytes),0),
+       COALESCE(SUM(prompt_cache_key_present),0),
+       COALESCE(SUM(cache_control_injected),0),
+       COALESCE(MAX(cache_breakpoint_count),0),
+       COALESCE(SUM(latest_user_cache_control),0),
+       COALESCE(MAX(route_epoch),0)
 FROM usage_records
-WHERE created_at >= ?
+WHERE created_at >= ? AND created_at < ?
 GROUP BY %s
-ORDER BY SUM(cached_tokens) DESC, COUNT(*) DESC
-LIMIT 200`, selectCols, groupBy), since)
+ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUNT(*) DESC
+LIMIT 200`, selectCols, realUsageRecordSQL, cacheTotalInputTokensSQL, cacheMissTokensSQL, estimatedUsageRecordSQL, realCacheInputTokensSQL, realCacheReadTokensSQL, groupBy), since, until)
 	if err != nil {
 		return nil, err
 	}
@@ -3403,7 +3761,17 @@ LIMIT 200`, selectCols, groupBy), since)
 	var out []CacheUsageMetricRow
 	for rows.Next() {
 		var row CacheUsageMetricRow
-		if err := rows.Scan(&row.AccountID, &row.Model, &row.APIKeyHashPrefix, &row.Requests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.EstimatedRequests); err != nil {
+		if err := rows.Scan(
+			&row.AccountID, &row.Model, &row.APIKeyHashPrefix, &row.RouteKeyHashPrefix,
+			&row.AffinitySource, &row.PromptCacheKeySource, &row.StablePrefixSource, &row.StablePrefixReason,
+			&row.RetentionEffective, &row.RetentionSource, &row.ClaudeCacheTTL,
+			&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens,
+			&row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens,
+			&row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests,
+			&row.realCacheInputTokens, &row.realCacheReadTokens, &row.StablePrefixBytes,
+			&row.PromptCacheKeyPresent, &row.CacheControlInjected, &row.CacheBreakpointCount,
+			&row.LatestUserCacheControl, &row.RouteEpoch,
+		); err != nil {
 			return nil, err
 		}
 		finalizeCacheUsageMetric(&row)
@@ -3424,12 +3792,105 @@ func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
 	}
 	if denominator > 0 {
 		row.TokenHitRate = float64(row.CacheReadTokens) / float64(denominator)
+		row.CacheReadShare = row.TokenHitRate
+		row.CacheWriteShare = float64(row.CacheCreationTokens) / float64(denominator)
 		if row.TokenHitRate > 1 {
 			row.TokenHitRate = 1
 		}
 		if row.TokenHitRate < 0 {
 			row.TokenHitRate = 0
 		}
+		if row.CacheReadShare > 1 {
+			row.CacheReadShare = 1
+		}
+		if row.CacheReadShare < 0 {
+			row.CacheReadShare = 0
+		}
+		if row.CacheWriteShare > 1 {
+			row.CacheWriteShare = 1
+		}
+		if row.CacheWriteShare < 0 {
+			row.CacheWriteShare = 0
+		}
+	}
+	eligible := row.CacheReadTokens + row.CacheCreationTokens
+	if eligible > 0 {
+		row.EligibleHitRate = float64(row.CacheReadTokens) / float64(eligible)
+	}
+	if row.realCacheInputTokens > 0 {
+		row.RealTokenHitRate = float64(row.realCacheReadTokens) / float64(row.realCacheInputTokens)
+		if row.RealTokenHitRate > 1 {
+			row.RealTokenHitRate = 1
+		}
+		if row.RealTokenHitRate < 0 {
+			row.RealTokenHitRate = 0
+		}
+	}
+}
+
+func (s *Store) CacheUsageBuckets(ctx context.Context, since, bucketSeconds int64) ([]CacheUsageBucket, error) {
+	return s.CacheUsageBucketsWindow(ctx, since, usageWindowOpenEndedUntil, bucketSeconds)
+}
+
+func (s *Store) CacheUsageBucketsWindow(ctx context.Context, since, until, bucketSeconds int64) ([]CacheUsageBucket, error) {
+	if bucketSeconds <= 0 {
+		bucketSeconds = 3600
+	}
+	rows, err := s.rdb.QueryContext(ctx, `
+SELECT (created_at / ?) * ? AS bucket,
+       COUNT(*),
+       COALESCE(SUM(`+realUsageRecordSQL+`),0),
+       COALESCE(SUM(CASE WHEN `+cacheReadTokensSQL+` > 0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(prompt_tokens),0),
+       COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
+       COALESCE(SUM(`+cacheMissTokensSQL+`),0),
+       COALESCE(SUM(`+cacheReadTokensSQL+`),0),
+       COALESCE(SUM(cache_creation_tokens),0),
+       COALESCE(SUM(cache_creation_5m_tokens),0),
+       COALESCE(SUM(cache_creation_1h_tokens),0),
+       COALESCE(SUM(`+estimatedUsageRecordSQL+`),0)
+FROM usage_records
+WHERE created_at >= ? AND created_at < ?
+GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since, until)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CacheUsageBucket
+	for rows.Next() {
+		var b CacheUsageBucket
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.RealRequests, &b.HitRequests, &b.PromptTokens, &b.CacheInputTokens, &b.CacheMissTokens, &b.CacheReadTokens, &b.CacheCreationTokens, &b.CacheCreation5mTokens, &b.CacheCreation1hTokens, &b.EstimatedRequests); err != nil {
+			return nil, err
+		}
+		finalizeCacheUsageBucket(&b)
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func finalizeCacheUsageBucket(b *CacheUsageBucket) {
+	if b.Requests > 0 {
+		b.EstimatedRate = float64(b.EstimatedRequests) / float64(b.Requests)
+	}
+	if b.CacheInputTokens > 0 {
+		b.CacheReadShare = float64(b.CacheReadTokens) / float64(b.CacheInputTokens)
+		b.CacheWriteShare = float64(b.CacheCreationTokens) / float64(b.CacheInputTokens)
+		if b.CacheReadShare > 1 {
+			b.CacheReadShare = 1
+		}
+		if b.CacheReadShare < 0 {
+			b.CacheReadShare = 0
+		}
+		if b.CacheWriteShare > 1 {
+			b.CacheWriteShare = 1
+		}
+		if b.CacheWriteShare < 0 {
+			b.CacheWriteShare = 0
+		}
+	}
+	eligible := b.CacheReadTokens + b.CacheCreationTokens
+	if eligible > 0 {
+		b.EligibleHitRate = float64(b.CacheReadTokens) / float64(eligible)
 	}
 }
 
@@ -3476,12 +3937,16 @@ type UsageSummaryRow struct {
 
 // UsageSummary aggregates usage_records per account, most-used first.
 func (s *Store) UsageSummary(ctx context.Context) ([]UsageSummaryRow, error) {
+	return s.UsageSummaryWindow(ctx, 0, usageWindowOpenEndedUntil)
+}
+
+func (s *Store) UsageSummaryWindow(ctx context.Context, since, until int64) ([]UsageSummaryRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
-FROM usage_records GROUP BY account_id ORDER BY SUM(total_tokens) DESC`)
+FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY account_id ORDER BY SUM(total_tokens) DESC`, since, until)
 	if err != nil {
 		return nil, err
 	}
@@ -3541,6 +4006,10 @@ type UsageBucket struct {
 // UsageTimeseries returns usage_records aggregated into fixed-width time buckets
 // from since (epoch seconds) to now, oldest first. bucketSeconds must be > 0.
 func (s *Store) UsageTimeseries(ctx context.Context, since, bucketSeconds int64) ([]UsageBucket, error) {
+	return s.UsageTimeseriesWindow(ctx, since, usageWindowOpenEndedUntil, bucketSeconds)
+}
+
+func (s *Store) UsageTimeseriesWindow(ctx context.Context, since, until, bucketSeconds int64) ([]UsageBucket, error) {
 	if bucketSeconds <= 0 {
 		bucketSeconds = 3600
 	}
@@ -3553,8 +4022,8 @@ SELECT (created_at / ?) * ? AS bucket,
        COALESCE(SUM(cache_creation_tokens),0),
        COALESCE(SUM(total_tokens),0)
 FROM usage_records
-WHERE created_at >= ?
-GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since)
+WHERE created_at >= ? AND created_at < ?
+GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since, until)
 	if err != nil {
 		return nil, err
 	}

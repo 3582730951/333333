@@ -622,6 +622,7 @@ func Default() Config {
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
 		ClaudeNativeCacheBreakpointInject: true,
+		ClaudeCacheTTL:                    "1h",
 		ClaudeCCHSigning:                  true,
 		BanDetectionEnabled:               true,
 		BanAutoDelete:                     true,

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+
+	"codex-account-pool/internal/storage"
 )
 
 // downstreamPolicy is the resolved policy for an incoming gateway request: which
@@ -41,6 +43,7 @@ const (
 	// ctxKeyBillingHold carries the billing_hold id so usage recording can fall
 	// back to estimated_tokens when the upstream response body lacks usage data.
 	ctxKeyBillingHold
+	ctxKeyUsageDiagnostics
 )
 
 func withInternal(ctx context.Context) context.Context {
@@ -76,6 +79,17 @@ func holdIDFromCtx(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+func withUsageDiagnostics(ctx context.Context, diag storage.UsageDiagnostics) context.Context {
+	return context.WithValue(ctx, ctxKeyUsageDiagnostics, diag)
+}
+
+func usageDiagnosticsFromCtx(ctx context.Context) storage.UsageDiagnostics {
+	if v, ok := ctx.Value(ctxKeyUsageDiagnostics).(storage.UsageDiagnostics); ok {
+		return v
+	}
+	return storage.UsageDiagnostics{}
 }
 
 // hashAPIKey is the canonical sha256 hex of a downstream api key; both key

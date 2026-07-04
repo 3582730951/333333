@@ -64,6 +64,34 @@ func TestAccountImportCreatesEgressBinding(t *testing.T) {
 	}
 }
 
+func TestBackfillUsageCacheDiagnosticsIncludesZeroPromptAnthropicRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO usage_records(account_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens, raw_usage_json, created_at)
+VALUES
+('acc-read', 'claude-x', 0, 1, 1, 700, 700, 0, '{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":700}', ?),
+('acc-write', 'claude-x', 0, 1, 1, 0, 0, 75, '{"input_tokens":0,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":75}', ?)`, Now(), Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillUsageCacheDiagnostics(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var readTotal, writeTotal, readMiss, writeMiss int64
+	var readProvider, writeProvider string
+	if err := store.db.QueryRowContext(ctx, `SELECT usage_provider, cache_total_input_tokens, cache_miss_tokens FROM usage_records WHERE account_id='acc-read'`).Scan(&readProvider, &readTotal, &readMiss); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT usage_provider, cache_total_input_tokens, cache_miss_tokens FROM usage_records WHERE account_id='acc-write'`).Scan(&writeProvider, &writeTotal, &writeMiss); err != nil {
+		t.Fatal(err)
+	}
+	if readProvider != "anthropic" || readTotal != 700 || readMiss != 0 {
+		t.Fatalf("read row backfill = provider %q total %d miss %d", readProvider, readTotal, readMiss)
+	}
+	if writeProvider != "anthropic" || writeTotal != 75 || writeMiss != 0 {
+		t.Fatalf("write row backfill = provider %q total %d miss %d", writeProvider, writeTotal, writeMiss)
+	}
+}
+
 func TestAccountPoolSummaryCountsDashboardFields(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

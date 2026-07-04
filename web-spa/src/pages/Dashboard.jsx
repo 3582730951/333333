@@ -125,8 +125,8 @@ export default function Dashboard() {
 
   const tokens = (d.ts || []).reduce((s, b) => s + (b.total_tokens || 0), 0);
   const reqs = (d.ts || []).reduce((s, b) => s + (b.requests || 0), 0);
-  const cachePromptTokens = (d.byModel || []).reduce((s, m) => s + (m.prompt_tokens || 0), 0);
-  const cacheHitTokens = (d.byModel || []).reduce((s, m) => s + (m.cached_tokens || 0), 0);
+  const cachePromptTokens = (d.byModel || []).reduce((s, m) => s + (m.cache_input_tokens || m.prompt_tokens || 0), 0);
+  const cacheHitTokens = (d.byModel || []).reduce((s, m) => s + (m.cache_read_tokens || m.cached_tokens || 0), 0);
   const cacheHitRate = cachePromptTokens > 0 ? cacheHitTokens / cachePromptTokens : 0;
   const regRate = d.reg ? (d.reg.totals?.success_rate || 0) : 0;
 
@@ -240,7 +240,7 @@ export default function Dashboard() {
 
       <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
         <div className="pool-chart-card">
-          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cached / prompt，近 7 天 · 颜色区分模型</div></div></div>
+          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cache read / cache input，近 7 天 · 颜色区分模型</div></div></div>
           <div style={{ paddingTop: 6 }}><CacheRateBars data={d.byModel} /></div>
         </div>
         <div className="pool-chart-card"><div className="head"><div className="t">模型 Token 占比</div></div><DonutChart data={modelTokenDonut} unit=" tok" /></div>

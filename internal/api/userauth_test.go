@@ -173,7 +173,7 @@ func TestAuthAdminTokenBackCompat(t *testing.T) {
 	h.pool.Close()
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = h.upstream.URL + "/backend-api/codex"
-	cfg.AdminToken = "secret-token"
+	cfg.AdminToken = "cap_secret-token"
 	cfg.StickyWaitMillis = 1
 	app := NewServer(Dependencies{
 		Config:    cfg,
@@ -195,7 +195,7 @@ func TestAuthAdminTokenBackCompat(t *testing.T) {
 	}
 
 	// The configured admin_token is honored on both /auth/me and /admin/*.
-	bearer := map[string]string{"Authorization": "Bearer secret-token"}
+	bearer := map[string]string{"Authorization": "Bearer cap_secret-token"}
 	if resp, body := doReq(t, c, http.MethodGet, h.pool.URL+"/auth/me", "", bearer); resp.StatusCode != http.StatusOK || body["role"] != "admin" || body["via"] != "admin_token" {
 		t.Fatalf("/auth/me with token: %d %v", resp.StatusCode, body)
 	}

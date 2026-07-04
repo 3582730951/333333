@@ -50,6 +50,31 @@ func TestAffinityBindsSameAccount(t *testing.T) {
 	}
 }
 
+func TestAffinityBindingCannotCrossGroups(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if err := store.UpsertAccount(ctx, storage.Account{ID: "acc-a", Label: "acc-a", GroupName: "group-a", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccount(ctx, storage.Account{ID: "acc-b", Label: "acc-b", GroupName: "group-b", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: "hash-shared", RouteKey: "cache_prefix:gpt:abc", Source: "cache_prefix_hash", AccountID: "acc-a"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	lease, err := s.Select(ctx, Route{Group: "group-b", Affinity: routing.AffinityKey{Hash: "hash-shared", Key: "cache_prefix:gpt:abc", Source: "cache_prefix_hash"}})
+	if err != nil {
+		t.Fatalf("select group-b: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-b" {
+		t.Fatalf("sticky affinity crossed groups: got %q, want acc-b", lease.Account.ID)
+	}
+}
+
 func TestStrictStickyDoesNotSwitchUnavailableAccount(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

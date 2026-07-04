@@ -116,6 +116,15 @@ func Model(body []byte) string {
 	return JSONStringField(body, "model")
 }
 
+func AffinityFromKey(key, source string) AffinityKey {
+	key = strings.TrimSpace(key)
+	source = strings.TrimSpace(source)
+	if key == "" || source == "" {
+		return AffinityKey{}
+	}
+	return newKey(key, source)
+}
+
 func newKey(key, source string) AffinityKey {
 	sum := sha256.Sum256([]byte(key))
 	return AffinityKey{

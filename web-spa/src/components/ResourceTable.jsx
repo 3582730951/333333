@@ -79,6 +79,7 @@ export default function ResourceTable({
     'pool-table-wrapper',
     density ? `pool-table-density-${density}` : '',
     layout ? `pool-table-layout-${layout}` : '',
+    isMobile && activeScroll === false ? 'pool-table-wrapper--mobile-cards' : '',
     className,
   ].filter(Boolean).join(' ');
   const resolvedRowHeight = rowHeight || densityRowHeights[density] || densityRowHeights.regular;

@@ -306,23 +306,24 @@ export default function Registration() {
       <LoadErrorBanner error={strategyError} onRetry={loadStrategyConfig} title="注册策略读取失败" />
 
       <Card className="pool-card pool-registration-start-card" style={{ marginBottom: 18 }} title="启动注册任务">
-        <ReadinessPanel
-          readiness={readiness}
-          readinessError={readinessError}
-          blockers={startBlockers}
-          providerSummary={providerSummary}
-          pool={pool}
-        />
+        <div className="pool-registration-start-layout">
+          <ReadinessPanel
+            readiness={readiness}
+            readinessError={readinessError}
+            blockers={startBlockers}
+            providerSummary={providerSummary}
+            pool={pool}
+          />
         <Form layout="horizontal" onSubmit={start} className="pool-registration-start-form">
-          <Form.InputNumber field="count" label="数量" initValue={1} min={1} max={100} disabled={starting || savingStrategy} style={{ width: 120 }} />
-          <Form.Select field="group_name" label="分组" placeholder="默认" disabled={starting || savingStrategy} style={{ width: 180 }}
+          <Form.InputNumber field="count" label="数量" initValue={1} min={1} max={100} disabled={starting || savingStrategy} />
+          <Form.Select field="group_name" label="分组" placeholder="默认" disabled={starting || savingStrategy}
             optionList={[{ label: '默认', value: '' }, ...(groups || []).map((g) => ({ label: g?.name || '未知', value: g?.name || '' }))]} />
-          <Form.Select field="registration_egress_pool_id" label="注册代理池" disabled={starting || savingStrategy} style={{ width: 220 }}
+          <Form.Select field="registration_egress_pool_id" label="注册代理池" disabled={starting || savingStrategy}
             optionList={[
               { label: '使用出口页默认', value: '' },
               ...(registrationPools || []).map((p) => ({ label: `${p.name || p.id} (${p.members?.length || 0})`, value: p.id })),
             ]} />
-          <Form.Select field="method" label="引擎" initValue="" disabled={starting || savingStrategy} style={{ width: 170 }}
+          <Form.Select field="method" label="引擎" initValue="" disabled={starting || savingStrategy}
             optionList={[
               { label: `默认 (${defaultMethod})`, value: '' },
               { label: 'protocol', value: 'protocol' },
@@ -342,7 +343,6 @@ export default function Registration() {
             <Select
               value={activeIdentityMode}
               disabled={!!lockedIdentityMode || starting || savingStrategy}
-              style={{ width: 160 }}
               optionList={[
                 { label: '邮箱验证', value: 'email' },
                 { label: '短信验证', value: 'phone' },
@@ -353,7 +353,7 @@ export default function Registration() {
 
           {smsCountryRequired && (
           <div className="pool-registration-strategy-row">
-            <Form.Select field="sms_provider" label="SMS 平台" initValue="" disabled={starting || savingStrategy} style={{ width: 160 }}
+            <Form.Select field="sms_provider" label="SMS 平台" initValue="" disabled={starting || savingStrategy}
               optionList={smsProviderOptions} />
             <div className="pool-registration-control">
               <Typography.Text size="small" className="pool-registration-field-label">国家策略</Typography.Text>
@@ -365,7 +365,7 @@ export default function Registration() {
                 } else if (!manualCountry && savedManualCountry) {
                   setManualCountry(savedManualCountry);
                 }
-              }} disabled={starting || savingStrategy} style={{ width: 160 }}
+              }} disabled={starting || savingStrategy}
                 optionList={[
                   { label: '默认推荐', value: 'auto' },
                   { label: '指定国家', value: 'manual' },
@@ -377,7 +377,6 @@ export default function Registration() {
                 <Select
                   value={manualCountry} onChange={(v) => setManualCountry(v)}
                   disabled={starting || savingStrategy}
-                  style={{ width: 280 }}
                   placeholder="搜索并选择国家（中英文）"
                   optionList={countryOpts}
                   filter
@@ -397,15 +396,17 @@ export default function Registration() {
           </div>
           )}
 
-          <Button htmlType="submit" theme="solid" icon={<IconPlay />} loading={starting || savingStrategy}
-            disabled={starting || savingStrategy || !!readinessError || !readiness || !strategyReady || startBlockers.length > 0}
-            style={{ marginTop: 4 }}>启动</Button>
-          {blockers.length > 0 && (
-            <Button icon={<IconSetting />} onClick={() => navigate('/settings-v2#registrar')} style={{ marginTop: 4 }}>
-              处理配置
-            </Button>
-          )}
+          <div className="pool-registration-actions">
+            <Button htmlType="submit" theme="solid" icon={<IconPlay />} loading={starting || savingStrategy}
+              disabled={starting || savingStrategy || !!readinessError || !readiness || !strategyReady || startBlockers.length > 0}>启动</Button>
+            {blockers.length > 0 && (
+              <Button icon={<IconSetting />} onClick={() => navigate('/settings-v2#registrar')}>
+                处理配置
+              </Button>
+            )}
+          </div>
         </Form>
+        </div>
       </Card>
 
       <div className="pool-toolbar pool-registration-toolbar">

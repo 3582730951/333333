@@ -117,7 +117,8 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 			if firstSystemIsClaudeCode(root) {
 				remapToolNames(root)
 			}
-			ensureClaudeCodeSystem(root)
+			ensureClaudeCodeSystem(root, cache.TTL)
+			normalizeClaudeCodeIdentityCacheTTL(root, cache.TTL)
 		}
 		normalizeSystemInfo(root, id)
 		if oauth && nativeClaudeCode && cache.NativeBreakpoints {
@@ -206,11 +207,11 @@ func remapToolNames(root map[string]interface{}) {
 // official Claude Code identity line, preserving any caller-supplied system
 // content after it. It is idempotent: a request that already leads with the
 // identity line (i.e. real Claude Code) is left unchanged.
-func ensureClaudeCodeSystem(root map[string]interface{}) {
+func ensureClaudeCodeSystem(root map[string]interface{}, ttl string) {
 	identityBlock := map[string]interface{}{
 		"type":          "text",
 		"text":          claudeCodeIdentityLine,
-		"cache_control": map[string]interface{}{"type": "ephemeral"},
+		"cache_control": claudeCacheControl(ttl),
 	}
 	switch sys := root["system"].(type) {
 	case nil:
@@ -236,6 +237,30 @@ func ensureClaudeCodeSystem(root map[string]interface{}) {
 			}
 		}
 		root["system"] = append([]interface{}{identityBlock}, sys...)
+	}
+}
+
+func normalizeClaudeCodeIdentityCacheTTL(root map[string]interface{}, ttl string) {
+	if strings.TrimSpace(ttl) != "1h" {
+		return
+	}
+	sys, ok := root["system"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, item := range sys {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		text, _ := m["text"].(string)
+		if strings.TrimSpace(text) != claudeCodeIdentityLine {
+			continue
+		}
+		if _, has := m["cache_control"]; has {
+			m["cache_control"] = claudeCacheControl(ttl)
+		}
+		return
 	}
 }
 

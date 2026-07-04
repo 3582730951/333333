@@ -869,6 +869,10 @@ func (s *Server) adminAllowed(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	if s.cfg.AdminToken == "" {
+		if downstreamAPIKeyAttempt(r) {
+			writeError(w, http.StatusForbidden, errors.New("admin role required"))
+			return false
+		}
 		// No admin token configured and no session: open bootstrap until the portal has
 		// an admin, after which anonymous /admin is locked down (must log in as admin).
 		if s.hasAdminUser(r.Context()) {
@@ -877,13 +881,38 @@ func (s *Server) adminAllowed(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	}
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	token := adminBearerToken(r)
 	// Constant-time compare so a remote attacker can't time-probe the admin token
 	// byte-by-byte. (An empty AdminToken is handled by the bootstrap branch above, so
 	// both operands are non-empty secrets here.)
 	if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AdminToken)) == 1 {
 		return true
 	}
+	if downstreamAPIKeyAttempt(r) {
+		writeError(w, http.StatusForbidden, errors.New("admin role required"))
+		return false
+	}
 	writeError(w, http.StatusUnauthorized, errors.New("admin token required"))
+	return false
+}
+
+func adminBearerToken(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) >= 7 && strings.EqualFold(auth[:7], "bearer ") {
+		return strings.TrimSpace(auth[7:])
+	}
+	return ""
+}
+
+func downstreamAPIKeyAttempt(r *http.Request) bool {
+	for _, plain := range []string{
+		strings.TrimSpace(r.Header.Get("x-api-key")),
+		strings.TrimSpace(r.Header.Get("X-Downstream-Key")),
+		adminBearerToken(r),
+	} {
+		if strings.HasPrefix(plain, "cap_") {
+			return true
+		}
+	}
 	return false
 }

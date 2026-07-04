@@ -124,7 +124,7 @@ func (s *Server) leakScrubEnabled(ctx context.Context) bool {
 
 // claudeCacheTTL returns the normalized injected-cache TTL ("1h" or "").
 func (s *Server) claudeCacheTTL(ctx context.Context) string {
-	if strings.TrimSpace(s.settingString(ctx, "claude_cache_ttl", s.cfg.ClaudeCacheTTL)) == "1h" {
+	if strings.TrimSpace(s.settingStringAllowEmpty(ctx, "claude_cache_ttl", s.cfg.ClaudeCacheTTL)) == "1h" {
 		return "1h"
 	}
 	return ""

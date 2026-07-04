@@ -79,6 +79,48 @@ function configSettingsErrors(fields) {
   );
 }
 
+function labelFromKey(key) {
+  return String(key || '')
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function fieldTypeFromValue(value) {
+  if (typeof value === 'boolean') return 'bool';
+  if (Number.isInteger(value)) return 'int';
+  return 'string';
+}
+
+function normalizeConfigFields(data) {
+  if (Array.isArray(data)) return data;
+  const source = Array.isArray(data?.fields)
+    ? data.fields
+    : Array.isArray(data?.config)
+      ? data.config
+      : Array.isArray(data?.rows)
+        ? data.rows
+        : null;
+  if (source) return source;
+  const values = data?.values && typeof data.values === 'object' ? data.values : data;
+  if (!values || typeof values !== 'object') return [];
+  return Object.entries(values)
+    .filter(([, value]) => value === null || ['string', 'number', 'boolean'].includes(typeof value))
+    .map(([key, value]) => ({
+      key,
+      label: labelFromKey(key),
+      category: '运行时配置',
+      type: fieldTypeFromValue(value),
+      effect: 'hot',
+      options: [],
+      help: '',
+      value,
+      overridden: false,
+      settings_error: '',
+    }));
+}
+
 function ConfigFieldRow({ field, pending, onChange }) {
   const pendingValue = hasPendingValue(pending, field.key);
   return (
@@ -112,7 +154,7 @@ function ConfigTab() {
 
   const fetchConfig = useCallback(async ({ signal }) => {
     const f = await get('/admin/config', undefined, { signal });
-    return Array.isArray(f) ? f : [];
+    return normalizeConfigFields(f);
   }, []);
 
   const {
@@ -211,13 +253,19 @@ function ConfigTab() {
         </>
       }
     >
-      {Object.entries(cats).map(([cat, fs]) => (
-        <Card key={cat} className="pool-card" title={cat} style={{ marginBottom: 16 }}>
-          {fs.map((f) => (
-            <ConfigFieldRow key={f.key} field={f} pending={pending} onChange={setVal} />
-          ))}
+      {Object.entries(cats).length > 0 ? (
+        Object.entries(cats).map(([cat, fs]) => (
+          <Card key={cat} className="pool-card" title={cat} style={{ marginBottom: 16 }}>
+            {fs.map((f) => (
+              <ConfigFieldRow key={f.key} field={f} pending={pending} onChange={setVal} />
+            ))}
+          </Card>
+        ))
+      ) : (
+        <Card className="pool-card" title="暂无通用配置">
+          <Typography.Text type="tertiary">当前接口没有返回可编辑配置项。</Typography.Text>
         </Card>
-      ))}
+      )}
     </SettingsTabShell>
   );
 }

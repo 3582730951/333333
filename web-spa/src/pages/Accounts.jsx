@@ -226,7 +226,7 @@ export default function Accounts() {
         </div>
       ),
     },
-    { title: '健康', key: 'status', width: 92, render: (_, r) => statusTag(r) },
+    { title: '健康', key: 'status', width: 136, render: (_, r) => statusTag(r) },
     {
       title: '配额',
       key: 'quota',

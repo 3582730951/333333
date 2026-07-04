@@ -19,7 +19,9 @@ import (
 
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/storage"
 )
 
 const upstreamErrorBodyLimit = 1 << 20
@@ -287,6 +289,63 @@ func automaticPromptCachePrefixHash(raw []byte) string {
 		return ""
 	}
 	return prefixHash
+}
+
+func codexSelectionAffinity(r *http.Request, raw []byte, base routing.AffinityKey, group string) routing.AffinityKey {
+	if isTrueConversationAffinity(base.Source) {
+		return base
+	}
+	prefixHash := automaticPromptCachePrefixHash(raw)
+	if prefixHash == "" {
+		return base
+	}
+	model := routing.Model(raw)
+	return routing.AffinityFromKey(strings.Join([]string{"cache_prefix", strings.TrimSpace(group), model, prefixHash}, ":"), "cache_prefix_hash")
+}
+
+func codexRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, promptCacheKeySource, retentionEffective, retentionSource string) storage.UsageDiagnostics {
+	fp := routing.StablePromptPrefixFingerprint(body)
+	return storage.UsageDiagnostics{
+		UsageProvider:         "codex",
+		AffinitySource:        affinity.Source,
+		PromptCacheKeyPresent: routing.PromptCacheKey(body) != "",
+		PromptCacheKeySource:  promptCacheKeySource,
+		StablePrefixSource:    fp.Source,
+		StablePrefixReason:    fp.Reason,
+		StablePrefixBytes:     fp.PrefixBytes,
+		RetentionEffective:    retentionEffective,
+		RetentionSource:       retentionSource,
+	}
+}
+
+func codexRetentionDiagnosticsForTransport(diag storage.UsageDiagnostics, responsesWebSocket bool) storage.UsageDiagnostics {
+	if responsesWebSocket || diag.RetentionEffective == "" {
+		return diag
+	}
+	diag.RetentionEffective = ""
+	diag.RetentionSource = "stripped_http_transport"
+	return diag
+}
+
+func claudeRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, ttl string, injected bool) storage.UsageDiagnostics {
+	cacheDiag := prompt.InspectAnthropicCacheControl(body)
+	return storage.UsageDiagnostics{
+		UsageProvider:          "claude",
+		AffinitySource:         affinity.Source,
+		ClaudeCacheTTL:         ttl,
+		CacheControlInjected:   injected && cacheDiag.BreakpointCount > 0,
+		CacheBreakpointCount:   cacheDiag.BreakpointCount,
+		LatestUserCacheControl: cacheDiag.LatestUserCacheControl,
+	}
+}
+
+func isTrueConversationAffinity(source string) bool {
+	switch source {
+	case "x-codex-parent-thread-id", "thread_id", "conversation_id",
+		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
+		return true
+	}
+	return false
 }
 
 func automaticPromptCacheKeySafe(raw []byte) bool {

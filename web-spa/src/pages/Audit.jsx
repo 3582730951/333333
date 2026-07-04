@@ -27,6 +27,7 @@ const filenameFromDisposition = (value) => {
 export default function Audit() {
   const [action, setAction] = useState('');
   const [diagnosticsExporting, setDiagnosticsExporting] = useState(false);
+  const [cacheExporting, setCacheExporting] = useState(false);
   const fetchRows = useCallback(async ({ signal }) => {
     const d = await get('/admin/audit', { limit: 500 }, { signal });
     return Array.isArray(d) ? d : d?.rows || [];
@@ -66,6 +67,21 @@ export default function Audit() {
     }
   };
 
+  const exportCacheHits = async () => {
+    setCacheExporting(true);
+    try {
+      const res = await api.get('/admin/export/cache-hits', { responseType: 'blob' });
+      const name = filenameFromDisposition(res.headers?.['content-disposition']) || 'codex-pool-cache-hits.zip';
+      const blob = res.data instanceof Blob ? res.data : new Blob([res.data], { type: 'application/zip' });
+      if (!downloadBlob(name, blob)) Toast.error('导出失败，请检查浏览器下载权限');
+      else Toast.success('缓存命中 ZIP 已导出');
+    } catch (e) {
+      Toast.error(`导出缓存命中 ZIP 失败：${errMsg(e)}`);
+    } finally {
+      setCacheExporting(false);
+    }
+  };
+
   const cols = [
     { title: '时间', dataIndex: 'created_at', width: 170, sorter: (a, b) => (a.created_at || 0) - (b.created_at || 0), defaultSortOrder: 'descend',
       render: (v) => (
@@ -88,8 +104,11 @@ export default function Audit() {
         actions={<>
           <Select value={action} onChange={setAction} placeholder="全部动作" style={{ width: 180 }}
             optionList={[{ label: '全部动作', value: '' }, ...actions.map((a) => ({ label: a, value: a }))]} />
-          <Button icon={<IconDownload />} loading={diagnosticsExporting} onClick={exportDiagnostics}>导出诊断包</Button>
-          <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
+          <span className="pool-audit-export-group">
+            <Button icon={<IconDownload />} loading={cacheExporting} onClick={exportCacheHits}>导出缓存命中 ZIP</Button>
+            <Button icon={<IconDownload />} loading={diagnosticsExporting} onClick={exportDiagnostics}>导出诊断包</Button>
+            <Button icon={<IconDownload />} onClick={exportCSV}>导出审计 CSV</Button>
+          </span>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
         </>} />
       <ResourceTable

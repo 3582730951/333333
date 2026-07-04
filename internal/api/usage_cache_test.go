@@ -42,14 +42,20 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 	var got struct {
 		Summary struct {
 			Requests            int64   `json:"requests"`
+			RealRequests        int64   `json:"real_requests"`
 			HitRequests         int64   `json:"hit_requests"`
 			RequestHitRate      float64 `json:"request_hit_rate"`
 			PromptTokens        int64   `json:"prompt_tokens"`
 			CachedTokens        int64   `json:"cached_tokens"`
 			CacheInputTokens    int64   `json:"cache_input_tokens"`
+			CacheMissTokens     int64   `json:"cache_miss_tokens"`
 			CacheReadTokens     int64   `json:"cache_read_tokens"`
 			CacheCreationTokens int64   `json:"cache_creation_tokens"`
 			TokenHitRate        float64 `json:"token_hit_rate"`
+			CacheReadShare      float64 `json:"cache_read_share"`
+			CacheWriteShare     float64 `json:"cache_write_share"`
+			EligibleHitRate     float64 `json:"eligible_cache_hit_rate"`
+			RealTokenHitRate    float64 `json:"real_token_hit_rate"`
 			EstimatedRequests   int64   `json:"estimated_requests"`
 			EstimatedRate       float64 `json:"estimated_rate"`
 		} `json:"summary"`
@@ -62,6 +68,17 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 			Model       string `json:"model"`
 			HitRequests int64  `json:"hit_requests"`
 		} `json:"by_account_model"`
+		ByRoute []struct {
+			RouteKeyHashPrefix string `json:"route_key_hash_prefix"`
+			Requests           int64  `json:"requests"`
+			AffinitySource     string `json:"affinity_source"`
+		} `json:"by_route"`
+		ByTimeBucket []struct {
+			Bucket              int64 `json:"bucket"`
+			CacheReadTokens     int64 `json:"cache_read_tokens"`
+			CacheCreationTokens int64 `json:"cache_creation_tokens"`
+			CacheMissTokens     int64 `json:"cache_miss_tokens"`
+		} `json:"by_time_bucket"`
 	}
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("decode /admin/usage/cache: %v (%s)", err, raw)
@@ -69,14 +86,32 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 	if got.Summary.Requests != 5 || got.Summary.HitRequests != 3 {
 		t.Fatalf("summary requests wrong: %+v", got.Summary)
 	}
+	if got.Summary.RealRequests != 4 {
+		t.Fatalf("real_requests = %d, want 4", got.Summary.RealRequests)
+	}
 	if got.Summary.PromptTokens != 1050 || got.Summary.CachedTokens != 860 || got.Summary.CacheInputTokens != 1960 || got.Summary.CacheReadTokens != 860 || got.Summary.CacheCreationTokens != 210 || got.Summary.EstimatedRequests != 1 {
 		t.Fatalf("summary tokens wrong: %+v", got.Summary)
+	}
+	if got.Summary.CacheMissTokens != 890 {
+		t.Fatalf("cache_miss_tokens = %d, want 890", got.Summary.CacheMissTokens)
 	}
 	if math.Abs(got.Summary.RequestHitRate-0.6) > 0.0001 {
 		t.Fatalf("request_hit_rate = %v", got.Summary.RequestHitRate)
 	}
 	if math.Abs(got.Summary.TokenHitRate-(860.0/1960.0)) > 0.0001 {
 		t.Fatalf("token_hit_rate = %v", got.Summary.TokenHitRate)
+	}
+	if math.Abs(got.Summary.CacheReadShare-(860.0/1960.0)) > 0.0001 {
+		t.Fatalf("cache_read_share = %v", got.Summary.CacheReadShare)
+	}
+	if math.Abs(got.Summary.CacheWriteShare-(210.0/1960.0)) > 0.0001 {
+		t.Fatalf("cache_write_share = %v", got.Summary.CacheWriteShare)
+	}
+	if math.Abs(got.Summary.EligibleHitRate-(860.0/1070.0)) > 0.0001 {
+		t.Fatalf("eligible_cache_hit_rate = %v", got.Summary.EligibleHitRate)
+	}
+	if math.Abs(got.Summary.RealTokenHitRate-(860.0/1760.0)) > 0.0001 {
+		t.Fatalf("real_token_hit_rate = %v", got.Summary.RealTokenHitRate)
 	}
 	if got.Summary.TokenHitRate > 1 {
 		t.Fatalf("token_hit_rate must never exceed 1, got %v", got.Summary.TokenHitRate)
@@ -89,5 +124,11 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 	}
 	if len(got.ByAccountModel) == 0 {
 		t.Fatalf("by_account_model missing")
+	}
+	if len(got.ByRoute) == 0 || got.ByRoute[0].RouteKeyHashPrefix == "" {
+		t.Fatalf("by_route missing or lacks route hash prefix: %+v", got.ByRoute)
+	}
+	if len(got.ByTimeBucket) == 0 || got.ByTimeBucket[0].CacheMissTokens == 0 {
+		t.Fatalf("by_time_bucket missing cache miss breakdown: %+v", got.ByTimeBucket)
 	}
 }

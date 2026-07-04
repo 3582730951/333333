@@ -133,8 +133,9 @@ func TestChatCompletionToAnthropicPreservesMultimodalContent(t *testing.T) {
 
 func TestEnsureAnthropicCacheControl(t *testing.T) {
 	// Compat-converted body: plain-string system + plain-string user content with
-	// no cache_control anywhere → should gain breakpoints at the system tail and
-	// the last turn so the OpenAI-compat→Claude path actually caches.
+	// no cache_control anywhere → should gain a breakpoint at the system tail.
+	// The latest user turn is volatile and must not be marked as a fallback; doing so
+	// creates cache writes that rarely turn into reads when the next question differs.
 	raw := []byte(`{"model":"claude-x","system":"big system","max_tokens":1024,"messages":[{"role":"user","content":"hello"}]}`)
 	out := EnsureAnthropicCacheControl(raw, "")
 	var m map[string]interface{}
@@ -145,9 +146,12 @@ func TestEnsureAnthropicCacheControl(t *testing.T) {
 	if !ok || len(sys) == 0 || sys[0].(map[string]interface{})["cache_control"] == nil {
 		t.Fatalf("no cache_control on system tail: %v", m["system"])
 	}
-	blocks := m["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
-	if blocks[len(blocks)-1].(map[string]interface{})["cache_control"] == nil {
-		t.Fatalf("no cache_control on last turn: %v", blocks)
+	if content := m["messages"].([]interface{})[0].(map[string]interface{})["content"]; content != "hello" {
+		t.Fatalf("latest user turn should remain unmarked and unchanged: %v", content)
+	}
+	diag := InspectAnthropicCacheControl(out)
+	if diag.BreakpointCount != 1 || diag.LatestUserCacheControl {
+		t.Fatalf("cache diagnostics = %+v, want one stable marker and no latest-user marker", diag)
 	}
 
 	// A body already at the 4-breakpoint limit must be left unchanged (never exceed).
@@ -160,6 +164,21 @@ func TestEnsureAnthropicCacheControl(t *testing.T) {
 	out3 := EnsureAnthropicCacheControl([]byte(`{"system":"s","messages":[{"role":"user","content":"x"}]}`), "1h")
 	if !strings.Contains(string(out3), `"ttl":"1h"`) {
 		t.Fatalf("1h ttl not applied: %s", out3)
+	}
+}
+
+func TestEnsureAnthropicCacheControlDoesNotMarkSingleVolatileUserTurn(t *testing.T) {
+	raw := []byte(`{"model":"claude-x","messages":[{"role":"user","content":"latest volatile user turn"}]}`)
+	out := EnsureAnthropicCacheControl(raw, "1h")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := cacheControlCount(t, out); got != 0 {
+		t.Fatalf("single volatile user turn should not create cache writes, got %d markers: %s", got, out)
+	}
+	if content := m["messages"].([]interface{})[0].(map[string]interface{})["content"]; content != "latest volatile user turn" {
+		t.Fatalf("latest user turn should remain unchanged: %v", content)
 	}
 }
 

@@ -215,7 +215,6 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 
 	// 1) End of the tool definition prefix. Tool schemas are stable across turns
 	// and should be preferred over marking volatile last-user content.
-	hasTools := hasCacheableList(root["tools"])
 	if budget > 0 {
 		if markListTail(root["tools"], mk) {
 			budget--
@@ -241,20 +240,10 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 	}
 	// 4) Multi-turn conversation history. The newest user message stays unmarked
 	// so different final questions can share the earlier prefix.
-	markedHistory := false
 	if budget > 0 {
 		if markSecondToLastUserTurn(root["messages"], mk) {
 			budget--
-			markedHistory = true
 			changed = true
-		}
-	}
-	// 5) Fallback for simple one-turn compat bodies without tools/history.
-	if budget > 0 && !hasTools && !markedHistory {
-		if msgs, ok := root["messages"].([]interface{}); ok && len(msgs) > 0 {
-			if markMessageTail(msgs[len(msgs)-1], mk) {
-				changed = true
-			}
 		}
 	}
 	if !changed {
@@ -271,6 +260,22 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 		return body
 	}
 	return out
+}
+
+type AnthropicCacheControlDiagnostics struct {
+	BreakpointCount        int
+	LatestUserCacheControl bool
+}
+
+func InspectAnthropicCacheControl(body []byte) AnthropicCacheControlDiagnostics {
+	var root map[string]interface{}
+	if json.Unmarshal(body, &root) != nil {
+		return AnthropicCacheControlDiagnostics{}
+	}
+	return AnthropicCacheControlDiagnostics{
+		BreakpointCount:        countCacheControl(root["system"]) + countCacheControl(root["tools"]) + countCacheControlMessages(root["messages"]),
+		LatestUserCacheControl: latestUserCacheControl(root["messages"]),
+	}
 }
 
 func countCacheControl(system interface{}) int {
@@ -322,6 +327,34 @@ func countCacheControlMessages(messages interface{}) int {
 		}
 	}
 	return n
+}
+
+func latestUserCacheControl(messages interface{}) bool {
+	msgs, ok := messages.([]interface{})
+	if !ok {
+		return false
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg, ok := msgs[i].(map[string]interface{})
+		if !ok || msg["role"] != "user" {
+			continue
+		}
+		switch c := msg["content"].(type) {
+		case []interface{}:
+			for _, b := range c {
+				if bm, ok := b.(map[string]interface{}); ok {
+					if _, has := bm["cache_control"]; has {
+						return true
+					}
+				}
+			}
+		case map[string]interface{}:
+			_, has := c["cache_control"]
+			return has
+		}
+		return false
+	}
+	return false
 }
 
 // markSystemTail puts a cache_control breakpoint at the end of the system prompt,

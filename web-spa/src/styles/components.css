@@ -26,8 +26,11 @@
 
 .pool-button:disabled {
   cursor: not-allowed;
+  border-color: var(--pool-border);
+  background: var(--pool-bg-surface-3);
   color: var(--pool-text-disabled);
-  opacity: 0.7;
+  opacity: 1;
+  transform: none;
 }
 
 .pool-button--primary {
@@ -39,6 +42,14 @@
 .pool-button--primary:hover:not(:disabled) {
   background: var(--pool-accent-hover);
   border-color: var(--pool-accent-hover);
+}
+
+.pool-button--primary:disabled,
+.pool-button--danger:disabled,
+.pool-button--light:disabled {
+  border-color: var(--pool-border);
+  background: var(--pool-bg-surface-3);
+  color: var(--pool-text-disabled);
 }
 
 .pool-button--danger {
@@ -217,6 +228,88 @@
   color: var(--pool-text-2);
   font-size: 12px;
   line-height: 1.4;
+}
+
+.pool-window-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 18px;
+  padding: 10px 12px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface);
+  color: var(--pool-text-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.pool-window-strip__items {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px 14px;
+  flex-wrap: wrap;
+}
+
+.pool-window-strip__items span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.pool-window-strip__actions,
+.pool-audit-export-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.pool-audit-export-group {
+  padding: 3px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-window-strip__actions {
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
+
+.pool-confirm-copy p {
+  margin: 0 0 8px;
+}
+
+.pool-confirm-copy p:last-child {
+  margin-bottom: 0;
+}
+
+.pool-profile-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--pool-border);
+}
+
+.pool-profile-section__title {
+  margin-bottom: 12px;
+  color: var(--pool-text);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+@media (max-width: 760px) {
+  .pool-window-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pool-window-strip__actions {
+    justify-content: flex-start;
+  }
 }
 
 .pool-stat-grid {
@@ -510,6 +603,8 @@
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  max-width: 100%;
+  min-width: 0;
   min-height: 22px;
   border-radius: 999px;
   padding: 0 8px;
@@ -517,6 +612,8 @@
   color: var(--pool-text-2);
   border: 1px solid var(--pool-border);
   font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .pool-tag--green,
@@ -574,11 +671,36 @@
 
 .pool-table th,
 .pool-table td {
+  min-width: 0;
   border-bottom: 1px solid var(--pool-border);
   padding: 10px 12px;
   text-align: left;
   vertical-align: middle;
   color: var(--pool-text);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.pool-table th > *,
+.pool-table td > * {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.pool-audit-table .pool-table th,
+.pool-audit-table .pool-table td {
+  min-width: 0;
+}
+
+.pool-audit-table .pool-tag {
+  max-width: 100%;
+}
+
+.pool-audit-table .pool-tag,
+.pool-audit-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pool-table th {
@@ -603,6 +725,7 @@
 
 .pool-table-sort {
   width: 100%;
+  min-width: 0;
   border: 0;
   background: transparent;
   color: inherit;
@@ -612,6 +735,11 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.pool-table-sort span:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .pool-table-empty {
@@ -747,6 +875,7 @@
 .pool-tabs {
   display: grid;
   gap: 14px;
+  min-width: 0;
 }
 
 .pool-tabs--left {
@@ -758,6 +887,8 @@
   display: flex;
   gap: 6px;
   border-bottom: 1px solid var(--pool-border);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .pool-tabs--left .pool-tabs-list {
@@ -768,6 +899,8 @@
 }
 
 .pool-tab-trigger {
+  flex: 0 0 auto;
+  max-width: 100%;
   border: 0;
   border-radius: var(--pool-radius-sm);
   background: transparent;
@@ -775,11 +908,25 @@
   padding: 9px 11px;
   cursor: pointer;
   text-align: left;
+  white-space: nowrap;
 }
 
 .pool-tab-trigger[data-state='active'] {
   background: var(--pool-bg-selected);
   color: var(--pool-text);
+}
+
+.pool-tabs-panels,
+.pool-tabs-panels > [role='tabpanel'] {
+  min-width: 0;
+}
+
+.pool-tabs-panels > [role='tabpanel'][data-state='inactive'] {
+  display: none;
+}
+
+.pool-settings-tabs {
+  width: 100%;
 }
 
 .pool-nav {
@@ -938,6 +1085,27 @@
   min-width: 0;
 }
 
+.pool-table .pool-account-titleline,
+.pool-table .pool-provider-summary,
+.pool-table .pool-resource-summary__meta,
+.pool-table .pool-account-metaline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pool-table .pool-account-titleline .pool-text-clamp {
+  flex: 1 1 150px;
+}
+
+.pool-table .pool-resource-summary__meta > *,
+.pool-table .pool-account-metaline > * {
+  min-width: 0;
+}
+
 .pool-provider-summary__copy {
   min-width: 0;
 }
@@ -947,6 +1115,23 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+
+.pool-table .pool-text-clamp,
+.pool-table .pool-audit-detail {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.pool-table .pool-tag {
+  display: inline-block;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .pool-text-strong {
@@ -976,11 +1161,23 @@
 }
 
 .pool-tiny-meter {
+  min-width: 0;
   width: 100%;
   height: 6px;
   border-radius: 999px;
   background: var(--pool-bg-surface-3);
   overflow: hidden;
+}
+
+.pool-quota-cell {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.pool-quota-cell > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .pool-tiny-meter__bar {
@@ -1026,6 +1223,82 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.pool-registration-start-layout {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.85fr) minmax(460px, 1.25fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.pool-registration-start-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(140px, 1fr));
+  gap: 12px 14px;
+  align-items: end;
+}
+
+.pool-registration-start-form .pool-field {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.pool-registration-start-form .pool-input,
+.pool-registration-start-form .pool-select,
+.pool-registration-start-form .pool-input-wrap {
+  width: 100% !important;
+}
+
+.pool-registration-control {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.pool-registration-field-label {
+  color: var(--pool-text-2);
+}
+
+.pool-registration-strategy-row,
+.pool-registration-actions {
+  grid-column: 1 / -1;
+}
+
+.pool-registration-strategy-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  gap: 12px 14px;
+  align-items: end;
+}
+
+.pool-registration-strategy-note {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-sm);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-registration-strategy-note-main {
+  font-weight: 600;
+}
+
+.pool-registration-strategy-note-sub {
+  color: var(--pool-text-3);
+  font-size: 12px;
+}
+
+.pool-registration-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
 }
 
 .pool-service-health-strip {
@@ -1265,6 +1538,14 @@
     grid-template-columns: 1fr;
   }
 
+  .pool-account-menu-ident {
+    display: none;
+  }
+
+  .pool-account-menu-button {
+    padding: 0 6px;
+  }
+
   .pool-cache-breakdown__head {
     align-items: flex-start;
     flex-direction: column;
@@ -1282,6 +1563,12 @@
     padding-right: 0;
   }
 
+  .pool-registration-start-layout,
+  .pool-registration-start-form,
+  .pool-registration-strategy-row {
+    grid-template-columns: 1fr;
+  }
+
   .pool-field--left {
     display: block;
   }
@@ -1293,6 +1580,14 @@
 
   .pool-table {
     min-width: 100%;
+  }
+
+  .pool-table-wrapper--mobile-cards {
+    overflow-x: visible;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
   }
 
   .pool-table--cards {

@@ -329,6 +329,9 @@ func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route
 	if err != nil || account.Status != "active" || account.QuarantineUntil > storage.Now() {
 		return Lease{}, false
 	}
+	if route.Group != "" && account.GroupName != route.Group {
+		return Lease{}, false
+	}
 	if s.accountRateLimitedForRoute(ctx, account, route, storage.Now()) {
 		return Lease{}, false
 	}

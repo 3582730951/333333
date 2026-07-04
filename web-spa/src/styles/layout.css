@@ -125,7 +125,8 @@
     flex-direction: column;
   }
 
-  .pool-pagehead-actions {
+  .pool-pagehead-actions,
+  .pool-page-actions {
     width: 100%;
     justify-content: flex-start;
   }

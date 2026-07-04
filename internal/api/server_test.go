@@ -290,6 +290,60 @@ func TestGatewayAutoPromptCacheKeyForStablePrefixInsideTopLevelInputText(t *test
 	}
 }
 
+func TestGatewayCanonicalAutoPromptCacheAffinityPinsStablePrefixBeforeAccountSelection(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n"))
+	})
+	h.importAccount(t, "auto-affinity-a", "upstream-auto-affinity-a", "access-auto-affinity-a")
+	h.importAccount(t, "auto-affinity-b", "upstream-auto-affinity-b", "access-auto-affinity-b")
+
+	prefix := strings.Repeat("stable repository snapshot line for cross-account cache affinity. ", 130)
+	for _, question := range []string{"Question: summarize module A", "Question: summarize module B"} {
+		body := `{"model":"gpt-5.4","stream":true,"input":` + strconv.Quote(prefix+question) + `}`
+		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("captured requests = %d", len(reqs))
+	}
+	if reqs[0].AccountID != reqs[1].AccountID {
+		t.Fatalf("same stable cache prefix should stay on one warm account, got %s then %s", reqs[0].AccountID, reqs[1].AccountID)
+	}
+	key1 := promptCacheKeyFromBody(t, reqs[0].Body)
+	key2 := promptCacheKeyFromBody(t, reqs[1].Body)
+	if key1 == "" || key2 == "" || key1 != key2 || !strings.HasPrefix(key1, "cp_") {
+		t.Fatalf("upstream prompt_cache_key should be per-account and stable: %q vs %q", key1, key2)
+	}
+	h.app.WaitForAsyncWrites()
+	var affinitySource, promptCacheKeySource, stablePrefixSource, stablePrefixReason, retentionEffective, retentionSource string
+	var promptCacheKeyPresent int
+	var stablePrefixBytes int64
+	if err := h.store.DB().QueryRow(`SELECT affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes, retention_effective, retention_source FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(
+		&affinitySource, &promptCacheKeyPresent, &promptCacheKeySource, &stablePrefixSource, &stablePrefixReason, &stablePrefixBytes, &retentionEffective, &retentionSource,
+	); err != nil {
+		t.Fatalf("usage diagnostics missing: %v", err)
+	}
+	if affinitySource != "cache_prefix_hash" || promptCacheKeyPresent != 1 || promptCacheKeySource != "auto_stable_prefix" {
+		t.Fatalf("cache affinity diagnostics wrong: affinity=%q present=%d key_source=%q", affinitySource, promptCacheKeyPresent, promptCacheKeySource)
+	}
+	if stablePrefixSource != "text_prefix" || stablePrefixReason != "ok" || stablePrefixBytes <= 2048 {
+		t.Fatalf("stable prefix diagnostics wrong: source=%q reason=%q bytes=%d", stablePrefixSource, stablePrefixReason, stablePrefixBytes)
+	}
+	if retentionEffective != "" || retentionSource != "stripped_http_transport" {
+		t.Fatalf("retention diagnostics wrong: effective=%q source=%q", retentionEffective, retentionSource)
+	}
+}
+
 func TestGatewayAutoPromptCacheKeyForStablePrefixInsideMultimodalToolRequest(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -470,10 +524,12 @@ func TestGatewayStreamingRecordsUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rows []map[string]interface{}
-	_ = json.NewDecoder(ar.Body).Decode(&rows)
+	var usageBody struct {
+		Rows []map[string]interface{} `json:"rows"`
+	}
+	_ = json.NewDecoder(ar.Body).Decode(&usageBody)
 	ar.Body.Close()
-	if len(rows) == 0 {
+	if len(usageBody.Rows) == 0 {
 		t.Fatal("/admin/usage returned empty after a streamed completion — overview would show a demo")
 	}
 }
@@ -2611,6 +2667,17 @@ func TestClaudeMessagesRelayVirtualizesAndScrubs(t *testing.T) {
 	if up.Auth != "Bearer sk-ant-oat-test" {
 		t.Fatalf("claude oauth auth header = %q", up.Auth)
 	}
+	h.app.WaitForAsyncWrites()
+	var usageProvider, claudeTTL string
+	var cacheControlInjected, breakpointCount, latestUserCacheControl int
+	if err := h.store.DB().QueryRow(`SELECT usage_provider, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(
+		&usageProvider, &claudeTTL, &cacheControlInjected, &breakpointCount, &latestUserCacheControl,
+	); err != nil {
+		t.Fatalf("usage diagnostics missing: %v", err)
+	}
+	if usageProvider != "claude" || claudeTTL != "1h" || cacheControlInjected != 1 || breakpointCount == 0 || latestUserCacheControl != 0 {
+		t.Fatalf("claude cache diagnostics wrong: provider=%q ttl=%q injected=%d breakpoints=%d latest_user=%d", usageProvider, claudeTTL, cacheControlInjected, breakpointCount, latestUserCacheControl)
+	}
 	if !strings.Contains(up.Body, "You are Claude Code") {
 		t.Fatalf("claude code system block not injected: %s", up.Body)
 	}
@@ -2710,12 +2777,14 @@ func TestAnthropicPassthroughFilesAndSkills(t *testing.T) {
 }
 
 func TestChatCompletionsRoutesToClaudeByModel(t *testing.T) {
+	var upstreamBody string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/messages") {
 			t.Fatalf("claude-model chat should hit /v1/messages, got %s", r.URL.Path)
 		}
-		if body := readBody(t, r); !strings.Contains(body, `"max_tokens"`) {
-			t.Fatalf("OpenAI->Anthropic conversion missing max_tokens: %s", body)
+		upstreamBody = readBody(t, r)
+		if !strings.Contains(upstreamBody, `"max_tokens"`) {
+			t.Fatalf("OpenAI->Anthropic conversion missing max_tokens: %s", upstreamBody)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_2","model":"claude-x","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}`))
@@ -2737,6 +2806,53 @@ func TestChatCompletionsRoutesToClaudeByModel(t *testing.T) {
 	choice := root["choices"].([]interface{})[0].(map[string]interface{})
 	if choice["message"].(map[string]interface{})["content"] != "pong" {
 		t.Fatalf("content = %#v", choice["message"])
+	}
+	if !strings.Contains(upstreamBody, `"ttl":"1h"`) {
+		t.Fatalf("default claude cache ttl not applied upstream: %s", upstreamBody)
+	}
+	h.app.WaitForAsyncWrites()
+	var usageProvider, claudeTTL string
+	var breakpointCount, latestUserCacheControl int
+	if err := h.store.DB().QueryRow(`SELECT usage_provider, claude_cache_ttl, cache_breakpoint_count, latest_user_cache_control FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(
+		&usageProvider, &claudeTTL, &breakpointCount, &latestUserCacheControl,
+	); err != nil {
+		t.Fatalf("usage diagnostics missing: %v", err)
+	}
+	if usageProvider != "claude" || claudeTTL != "1h" || breakpointCount == 0 || latestUserCacheControl != 0 {
+		t.Fatalf("compat claude diagnostics wrong: provider=%q ttl=%q breakpoints=%d latest_user=%d", usageProvider, claudeTTL, breakpointCount, latestUserCacheControl)
+	}
+}
+
+func TestClaudeCacheTTLEmptySettingDowngradesToStandard(t *testing.T) {
+	var upstreamBody string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody = readBody(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_2","model":"claude-x","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}`))
+	})
+	h.importAccount(t, "claude-standard-cache", "", "sk-ant-oat-standard-cache")
+	if err := h.store.SetSetting(context.Background(), "claude_cache_ttl", ""); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"claude-x","messages":[{"role":"user","content":"ping"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if strings.Contains(upstreamBody, `"ttl":"1h"`) {
+		t.Fatalf("empty claude_cache_ttl setting should not send 1h marker: %s", upstreamBody)
+	}
+	h.app.WaitForAsyncWrites()
+	var claudeTTL string
+	if err := h.store.DB().QueryRow(`SELECT claude_cache_ttl FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(&claudeTTL); err != nil {
+		t.Fatalf("usage diagnostics missing: %v", err)
+	}
+	if claudeTTL != "" {
+		t.Fatalf("empty claude_cache_ttl setting should record standard ttl, got %q", claudeTTL)
 	}
 }
 

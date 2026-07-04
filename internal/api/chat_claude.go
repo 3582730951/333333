@@ -65,13 +65,16 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 	osHint := s.osHint(raw, lease.Egress)
 	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
-	result := cloak.Virtualize(anthBody, id, s.cfg.SensitiveWordsFor("claude"), claudeIsOAuth(token))
+	cacheInject := s.cacheInjectEnabled(r.Context())
+	claudeTTL := s.claudeCacheTTL(r.Context())
+	result := cloak.VirtualizeClaudeCodeWithCache(anthBody, id, s.cfg.SensitiveWordsFor("claude"), claudeIsOAuth(token), "", cloak.ClaudeCodeCacheOptions{TTL: claudeTTL})
 	// The OpenAI→Anthropic conversion emits no cache_control, so without this the
 	// compat path is billed at full input price every turn. Inject the standard
-	// Claude Code breakpoints (system tail + last turn, ≤4) so it caches like
-	// native Claude Code. Quality/reasoning unchanged; only cached-token cost drops.
-	if s.cacheInjectEnabled(r.Context()) {
-		result.Body = prompt.EnsureAnthropicCacheControl(result.Body, s.claudeCacheTTL(r.Context()))
+	// Claude Code breakpoints on stable prefixes (system/tools/history, ≤4) so it
+	// caches like native Claude Code. Quality/reasoning unchanged; only cached-token
+	// cost drops.
+	if cacheInject {
+		result.Body = prompt.EnsureAnthropicCacheControl(result.Body, claudeTTL)
 	}
 	// Final body step (after cache_control injection): stamp the Claude Code
 	// x-anthropic-billing-header so OAuth traffic relayed from an OpenAI-compatible
@@ -81,7 +84,9 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		result.Body = cloak.EnsureClaudeCodeBillingHeader(result.Body, s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion))
 	}
 
+	usageDiag := claudeRequestUsageDiagnostics(result.Body, affinity, claudeTTL, cacheInject)
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
+	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), upstream.Request{
 		Method:         http.MethodPost,
 		Provider:       "claude",

@@ -203,18 +203,21 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	// Project paths are deliberately NOT rewritten.
 	wordsForClaude := s.cfg.SensitiveWordsFor("claude")
 	wordsForClaude = appendVirtualHomeToWords(wordsForClaude, id.HomeDir)
+	nativeCacheInject := s.nativeCacheBreakpointInjectEnabled(r.Context())
+	claudeTTL := s.claudeCacheTTL(r.Context())
 	result := cloak.VirtualizeClaudeCodeWithCache(raw, id, wordsForClaude, oauth, billingVer, cloak.ClaudeCodeCacheOptions{
-		NativeBreakpoints: s.nativeCacheBreakpointInjectEnabled(r.Context()),
-		TTL:               s.claudeCacheTTL(r.Context()),
+		NativeBreakpoints: nativeCacheInject,
+		TTL:               claudeTTL,
 	})
 	body := result.Body
-	if s.nativeCacheBreakpointInjectEnabled(r.Context()) {
-		body = prompt.EnsureAnthropicCacheControl(body, s.claudeCacheTTL(r.Context()))
+	if nativeCacheInject {
+		body = prompt.EnsureAnthropicCacheControl(body, claudeTTL)
 	}
 
+	usageDiag := claudeRequestUsageDiagnostics(body, affinity, claudeTTL, nativeCacheInject)
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
-	r = r.WithContext(withBillingHold(r.Context(), holdID))
+	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	// Anthropic is not behind a CF challenge wall the way chatgpt.com is, so we
 	// call upstream directly rather than through the Codex CF-retry/egress-rotation
 	// path — and below we only treat an actual interstitial challenge as CF, never

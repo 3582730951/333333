@@ -75,6 +75,13 @@ func (s *Server) settingString(ctx context.Context, key, def string) string {
 	return def
 }
 
+func (s *Server) settingStringAllowEmpty(ctx context.Context, key, def string) string {
+	if v, ok := s.runtimeSetting(ctx, key); ok {
+		return strings.TrimSpace(v)
+	}
+	return def
+}
+
 // settingInt returns the stored override for key parsed as an int when present and
 // valid, otherwise def.
 func (s *Server) settingInt(ctx context.Context, key string, def int) int {
