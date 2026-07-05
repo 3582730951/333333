@@ -57,14 +57,15 @@ const joinInts = (value) => Array.isArray(value) ? value.join(', ') : '';
 const labelOf = (pairs, value) => pairs.find(([id]) => id === value)?.[1] || value || '默认';
 
 function normalizeForEditor(rule = {}) {
+  const source = rule || {};
   return {
     ...emptyRule(),
-    ...rule,
-    status_codes_text: joinInts(rule.status_codes),
-    body_keywords_text: joinList(rule.body_keywords),
-    manual_patterns_text: joinList(rule.model_patterns),
-    entrypoint: rule.entrypoints?.[0] || '',
-    provider: rule.providers?.[0] || '',
+    ...source,
+    status_codes_text: joinInts(source.status_codes),
+    body_keywords_text: joinList(source.body_keywords),
+    manual_patterns_text: joinList(source.model_patterns),
+    entrypoint: source.entrypoints?.[0] || '',
+    provider: source.providers?.[0] || '',
   };
 }
 
