@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	authparse "codex-account-pool/internal/auth"
 )
 
 type importConfig struct {
@@ -188,6 +190,14 @@ func runImport(ctx context.Context, cfg importConfig, client *http.Client, out i
 	if len(files) == 0 {
 		return importSummary{}, fmt.Errorf("目录 %s 中没有 JSON 文件", cfg.JSONDir)
 	}
+	fmt.Fprintf(out, "扫描到 %d 个 JSON 文件（递归: %s）\n", len(files), yesNo(cfg.Recursive))
+	if !cfg.Recursive {
+		if nested, err := countNestedJSONFiles(cfg.JSONDir); err == nil && nested > 0 {
+			fmt.Fprintf(out, "提示: 子目录里还有 %d 个 JSON 文件；如需导入它们，请重新运行并选择递归扫描。\n", nested)
+		}
+	}
+	printDuplicateIdentityWarnings(files, out)
+	fmt.Fprintln(out)
 	var summary importSummary
 	for _, path := range files {
 		result := importOneFile(ctx, cfg, client, path)
@@ -209,6 +219,68 @@ func runImport(ctx context.Context, cfg importConfig, client *http.Client, out i
 	}
 	fmt.Fprintf(out, "\n汇总: imported=%d duplicate=%d failed=%d\n", summary.Imported, summary.Duplicate, summary.Failed)
 	return summary, nil
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "是"
+	}
+	return "否"
+}
+
+func countNestedJSONFiles(dir string) (int, error) {
+	root, err := filepath.Abs(strings.TrimSpace(dir))
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		parent, err := filepath.Abs(filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		if parent == root {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(d.Name()), ".json") {
+			count++
+		}
+		return nil
+	})
+	return count, err
+}
+
+func printDuplicateIdentityWarnings(files []string, out io.Writer) {
+	byAccountID := map[string][]string{}
+	for _, path := range files {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		parsed, err := authparse.ParseAuthJSON(raw)
+		if err != nil || strings.TrimSpace(parsed.AccountID) == "" {
+			continue
+		}
+		byAccountID[parsed.AccountID] = append(byAccountID[parsed.AccountID], filepath.Base(path))
+	}
+	ids := make([]string, 0, len(byAccountID))
+	for id, names := range byAccountID {
+		if len(names) > 1 {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		names := append([]string(nil), byAccountID[id]...)
+		sort.Strings(names)
+		fmt.Fprintf(out, "警告: %d 个 JSON 会映射到同一账号 ID %s，账号池只会保留一个；文件: %s\n", len(names), id, strings.Join(names, ", "))
+	}
 }
 
 func importOneFile(ctx context.Context, cfg importConfig, client *http.Client, path string) importResult {

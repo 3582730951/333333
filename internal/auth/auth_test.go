@@ -77,6 +77,34 @@ func TestParseTopLevelSessionAuthJSONShape(t *testing.T) {
 	}
 }
 
+func TestParseAuthJSONDoesNotDedupeByEmailWhenAccountIDsAreMissing(t *testing.T) {
+	a, err := ParseAuthJSON([]byte(`{"access_token":"access-alias-a","email":"alias@example.internal"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseAuthJSON([]byte(`{"access_token":"access-alias-b","email":"alias@example.internal"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AccountID == b.AccountID {
+		t.Fatalf("same alias email should not collapse distinct token-only accounts: %q", a.AccountID)
+	}
+}
+
+func TestParseClaudeCredentialsDoesNotDedupeByEmailWhenTokenDiffers(t *testing.T) {
+	a, err := ParseAuthJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat-a","email":"alias@example.internal"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseAuthJSON([]byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat-b","email":"alias@example.internal"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AccountID == b.AccountID {
+		t.Fatalf("same alias email should not collapse distinct Claude token accounts: %q", a.AccountID)
+	}
+}
+
 func TestParseCodexOAuthAndAccessTokenUseChatGPTUserIDDedupe(t *testing.T) {
 	claims := map[string]interface{}{
 		"https://api.openai.com/auth": map[string]interface{}{

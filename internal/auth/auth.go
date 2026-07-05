@@ -94,7 +94,7 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	if out.AccessToken == "" && out.OpenAIAPIKey == "" {
 		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token, access_token nor OPENAI_API_KEY")
 	}
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.Email, out.AccessToken, out.OpenAIAPIKey)
+	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.AccessToken, out.OpenAIAPIKey)
 	return out, nil
 }
 
@@ -120,7 +120,7 @@ func parseClaudeCredentialsJSON(m map[string]interface{}) (ParsedAuth, error) {
 	if out.AccessToken == "" {
 		return ParsedAuth{}, errors.New("claude credentials have no access token")
 	}
-	out.AccountID = stableAccountID(out.Email, out.AccessToken)
+	out.AccountID = stableAccountID(out.AccessToken)
 	return out, nil
 }
 
@@ -153,7 +153,7 @@ func ParseOAuthCodex(accessToken, refreshToken, idTokenRaw string) (ParsedAuth, 
 		out.PlanType = claims.PlanType
 		out.IsFedramp = claims.IsFedramp
 	}
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.Email, out.AccessToken)
+	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.AccessToken)
 	return out, nil
 }
 
@@ -183,7 +183,7 @@ func ParseOAuthClaudeMetadata(accessToken, refreshToken, email, subscriptionType
 	if out.PlanType == "" {
 		out.PlanType = out.OAuthRateLimitTier
 	}
-	out.AccountID = stableAccountID(out.Email, out.AccessToken)
+	out.AccountID = stableAccountID(out.AccessToken)
 	return out, nil
 }
 
@@ -205,7 +205,7 @@ func ParseAccessToken(accessToken, accountID string) (ParsedAuth, error) {
 	}
 	out.PlanType = claims.PlanType
 	out.IsFedramp = claims.IsFedramp
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.Email, out.AccessToken)
+	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.AccessToken)
 	return out, nil
 }
 

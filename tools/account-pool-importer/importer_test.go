@@ -130,6 +130,40 @@ func TestRunImportContinuesAfterDuplicateAndHTTPFailure(t *testing.T) {
 	}
 }
 
+func TestRunImportReportsScannedFilesAndNonRecursiveHint(t *testing.T) {
+	dir := t.TempDir()
+	writeTestJSON(t, filepath.Join(dir, "root.json"), `{"access_token":"root"}`)
+	writeTestJSON(t, filepath.Join(dir, "nested", "child.json"), `{"access_token":"child"}`)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"import_status":"imported"}`))
+	}))
+	defer srv.Close()
+
+	var out strings.Builder
+	summary, err := runImport(context.Background(), importConfig{
+		PoolURL:   srv.URL,
+		APIKey:    "poolimp_secret",
+		JSONDir:   dir,
+		Recursive: false,
+	}, srv.Client(), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Imported != 1 || summary.Duplicate != 0 || summary.Failed != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	got := out.String()
+	for _, want := range []string{"扫描到 1 个 JSON 文件", "子目录里还有 1 个 JSON 文件", "递归", "root.json"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "child.json") {
+		t.Fatalf("non-recursive import should not process child.json, got:\n%s", got)
+	}
+}
+
 func baseNames(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
