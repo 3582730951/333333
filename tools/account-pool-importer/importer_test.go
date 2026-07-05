@@ -27,6 +27,8 @@ func TestCollectJSONFilesHonorsRecursiveOption(t *testing.T) {
 	dir := t.TempDir()
 	writeTestJSON(t, filepath.Join(dir, "root.json"), `{"access_token":"root"}`)
 	writeTestJSON(t, filepath.Join(dir, "nested", "child.json"), `{"access_token":"child"}`)
+	writeTestJSON(t, filepath.Join(dir, "old", "archived-root.json"), `{"access_token":"archived-root"}`)
+	writeTestJSON(t, filepath.Join(dir, "nested", "old", "archived-child.json"), `{"access_token":"archived-child"}`)
 	if err := os.WriteFile(filepath.Join(dir, "ignore.txt"), []byte("nope"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +129,76 @@ func TestRunImportContinuesAfterDuplicateAndHTTPFailure(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "poolimp_secret") || strings.Contains(out.String(), "access_token") {
 		t.Fatalf("output leaked sensitive content:\n%s", out.String())
+	}
+}
+
+func TestRunImportArchivesImportedAndDuplicateJSONFilesAndSkipsOld(t *testing.T) {
+	dir := t.TempDir()
+	writeTestJSON(t, filepath.Join(dir, "imported.json"), `{"access_token":"ok-root"}`)
+	writeTestJSON(t, filepath.Join(dir, "duplicate.json"), `{"access_token":"dup-root"}`)
+	writeTestJSON(t, filepath.Join(dir, "failed.json"), `{"access_token":"fail-root"}`)
+	writeTestJSON(t, filepath.Join(dir, "nested", "imported-child.json"), `{"access_token":"ok-child"}`)
+	writeTestJSON(t, filepath.Join(dir, "old", "already.json"), `{"access_token":"already-archived"}`)
+
+	var labels []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]interface{}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &req)
+		label, _ := req["label"].(string)
+		labels = append(labels, label)
+		switch label {
+		case "duplicate":
+			_, _ = w.Write([]byte(`{"duplicate":true,"import_status":"duplicate"}`))
+		case "failed":
+			http.Error(w, `{"error":"boom"}`, http.StatusBadGateway)
+		default:
+			_, _ = w.Write([]byte(`{"import_status":"imported"}`))
+		}
+	}))
+	defer srv.Close()
+
+	var out strings.Builder
+	summary, err := runImport(context.Background(), importConfig{
+		PoolURL:   srv.URL,
+		APIKey:    "poolimp_secret",
+		JSONDir:   dir,
+		Recursive: true,
+	}, srv.Client(), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Imported != 2 || summary.Duplicate != 1 || summary.Failed != 1 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if got, want := labels, []string{"duplicate", "failed", "imported", "imported-child"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("posted labels = %v, want %v", got, want)
+	}
+
+	for _, p := range []string{
+		filepath.Join(dir, "old", "imported.json"),
+		filepath.Join(dir, "old", "duplicate.json"),
+		filepath.Join(dir, "old", "nested", "imported-child.json"),
+		filepath.Join(dir, "old", "already.json"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("expected archived file %s: %v", p, err)
+		}
+	}
+	for _, p := range []string{
+		filepath.Join(dir, "imported.json"),
+		filepath.Join(dir, "duplicate.json"),
+		filepath.Join(dir, "nested", "imported-child.json"),
+	} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("expected original file moved away %s, stat err=%v", p, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "failed.json")); err != nil {
+		t.Fatalf("failed file should remain for retry: %v", err)
+	}
+	if strings.Contains(out.String(), "already.json") {
+		t.Fatalf("old directory file should be skipped, got output:\n%s", out.String())
 	}
 }
 

@@ -151,6 +151,9 @@ func collectJSONFiles(dir string, recursive bool) ([]string, error) {
 				return err
 			}
 			if d.IsDir() {
+				if path != dir && isOldDirName(d.Name()) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			if strings.EqualFold(filepath.Ext(d.Name()), ".json") {
@@ -204,10 +207,20 @@ func runImport(ctx context.Context, cfg importConfig, client *http.Client, out i
 		switch result.Status {
 		case "imported":
 			summary.Imported++
-			fmt.Fprintf(out, "imported  %s\n", filepath.Base(path))
+			if archived, err := archiveJSONFile(cfg.JSONDir, path); err != nil {
+				summary.Failed++
+				fmt.Fprintf(out, "imported  %s archive_failed error=%s\n", filepath.Base(path), trimForDisplay(err.Error()))
+			} else {
+				fmt.Fprintf(out, "imported  %s -> %s\n", filepath.Base(path), archived)
+			}
 		case "duplicate":
 			summary.Duplicate++
-			fmt.Fprintf(out, "duplicate %s\n", filepath.Base(path))
+			if archived, err := archiveJSONFile(cfg.JSONDir, path); err != nil {
+				summary.Failed++
+				fmt.Fprintf(out, "duplicate %s archive_failed error=%s\n", filepath.Base(path), trimForDisplay(err.Error()))
+			} else {
+				fmt.Fprintf(out, "duplicate %s -> %s\n", filepath.Base(path), archived)
+			}
 		default:
 			summary.Failed++
 			if result.HTTPStatus > 0 {
@@ -239,6 +252,9 @@ func countNestedJSONFiles(dir string) (int, error) {
 			return err
 		}
 		if d.IsDir() {
+			if path != root && isOldDirName(d.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		parent, err := filepath.Abs(filepath.Dir(path))
@@ -254,6 +270,62 @@ func countNestedJSONFiles(dir string) (int, error) {
 		return nil
 	})
 	return count, err
+}
+
+func isOldDirName(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "old")
+}
+
+func archiveJSONFile(rootDir, path string) (string, error) {
+	rootAbs, err := filepath.Abs(strings.TrimSpace(rootDir))
+	if err != nil {
+		return "", err
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("%s 不在 JSON 目录 %s 下", path, rootDir)
+	}
+	target := filepath.Join(rootAbs, "old", rel)
+	target, err = uniqueArchivePath(target)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(pathAbs, target); err != nil {
+		return "", err
+	}
+	displayRel, err := filepath.Rel(rootAbs, target)
+	if err != nil {
+		return filepath.ToSlash(target), nil
+	}
+	return filepath.ToSlash(displayRel), nil
+}
+
+func uniqueArchivePath(target string) (string, error) {
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		return target, nil
+	} else if err != nil {
+		return "", err
+	}
+	ext := filepath.Ext(target)
+	stem := strings.TrimSuffix(target, ext)
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s_%d%s", stem, i, ext)
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
 }
 
 func printDuplicateIdentityWarnings(files []string, out io.Writer) {
