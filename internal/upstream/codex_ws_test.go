@@ -110,3 +110,30 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 		t.Fatalf("missing websocket client metadata: %+v", metadata)
 	}
 }
+
+func TestCodexWebSocketPayloadPreservesPreviousResponseID(t *testing.T) {
+	client := NewClient(config.Default())
+	payload, err := buildCodexWebSocketCreatePayload([]byte(`{"model":"gpt","previous_response_id":"resp_real","session_id":"downstream-session","thread_id":"downstream-thread","input":"hi"}`), codexWebSocketIDs{
+		installationID: "install-1",
+		sessionID:      "session-derived",
+		threadID:       "thread-derived",
+		windowID:       "thread-derived:0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := client.codexWSNamespacePayload(Request{Account: storage.Account{ID: "acc"}}, codexWebSocketIDs{
+		sessionID: "session-derived",
+		threadID:  "thread-derived",
+	}, payload)
+	var root map[string]interface{}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatalf("payload json: %v\n%s", err, out)
+	}
+	if root["session_id"] != "session-derived" || root["thread_id"] != "thread-derived" {
+		t.Fatalf("session/thread ids should still be namespaced: %+v", root)
+	}
+	if root["previous_response_id"] != "resp_real" {
+		t.Fatalf("previous_response_id must pass through unchanged, got %+v", root)
+	}
+}

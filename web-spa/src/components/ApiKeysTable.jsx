@@ -34,6 +34,7 @@ function mobileInfoCell(row, mode) {
       <div className="pool-key-mobile-title">{label}</div>
       <div className="pool-key-mobile-meta">
         <Tag size="small">{group}</Tag>
+        {row.key_type === 'pool_import' ? <Tag size="small" color="violet">poolimp</Tag> : null}
         {row.enabled === false ? <Tag size="small" color="orange">停用</Tag> : <Tag size="small" color="green">启用</Tag>}
       </div>
       <Typography.Text type="tertiary" size="small" className="pool-key-mobile-detail">
@@ -120,11 +121,14 @@ export default function ApiKeysTable({
     },
   ] : [
     { title: '标签', dataIndex: 'label', width: 160, render: (value, row) => labelCell(value, row, mode) },
+    { title: '类型', dataIndex: 'key_type', width: 120, render: (value) => (value === 'pool_import' ? <Tag color="violet">poolimp 导入</Tag> : <Tag>推理</Tag>) },
     { title: '分组', dataIndex: 'group_name', width: 120, render: (value) => value || '默认' },
     { title: '强制模型', dataIndex: 'force_model', width: 180, render: (value) => value || '—' },
     { title: '推理强度', dataIndex: 'force_effort', width: 120, render: (value) => (value ? <Tag color="blue">{value}</Tag> : '—') },
     { title: 'Key / 一键安装', dataIndex: 'secret', width: 320, render: (value) => <KeyCopyActions secret={value} /> },
     { title: '启用', dataIndex: 'enabled', width: 90, render: (value) => (value === false ? <Tag color="orange">否</Tag> : <Tag color="green">是</Tag>) },
+    { title: '过期', dataIndex: 'expires_at', width: 150, render: (value) => (value ? fmtDateTime(value) : '永不过期') },
+    { title: '最后使用', dataIndex: 'last_used_at', width: 150, render: (value) => (value ? fmtDateTime(value) : '—') },
     {
       title: '操作',
       key: 'ops',

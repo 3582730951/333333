@@ -286,6 +286,8 @@ func normalizeAnthropicCachePolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
 	case "coarse_safe":
 		return "coarse_safe"
+	case "aggressive":
+		return "aggressive"
 	default:
 		return "balanced"
 	}

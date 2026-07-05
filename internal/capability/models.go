@@ -268,6 +268,10 @@ func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability
 			percent = 100
 		}
 		autoCompact := firstInt(model, "auto_compact_token_limit", "auto_compact_context_window", "compact_token_limit")
+		rawModel := ""
+		if b, err := json.Marshal(model); err == nil {
+			rawModel = string(b)
+		}
 		out = append(out, storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     slug,
@@ -278,6 +282,7 @@ func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability
 			Visibility:                    visibility,
 			ETag:                          etag,
 			RawModelJSONHash:              hash,
+			RawModelJSON:                  rawModel,
 			Source:                        "probe",
 			LastProbeAt:                   now,
 		})
@@ -353,6 +358,7 @@ func providerKeyForSource(source string) string {
 }
 
 func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Config) ([]byte, string, error) {
+	_ = cfg // kept for API compatibility; model responses now advertise only real native windows.
 	// Group by provider so a mixed pool advertises EVERY provider's models. The old
 	// single pool-wide "richest account" pick hid all but one provider's models when
 	// codex/claude/custom accounts coexisted. Within each provider we still advertise
@@ -369,7 +375,6 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	}
 	best := map[string]storage.ModelCapability{}
 	customSlug := map[string]bool{}
-	native2M := false
 	for _, key := range order {
 		isCustom := strings.HasPrefix(key, "custom:")
 		for _, cap := range richestAccountCaps(buckets[key]) {
@@ -378,9 +383,6 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 			}
 			if isCustom {
 				customSlug[cap.ModelSlug] = true
-			}
-			if cap.NativeMaxContextWindow >= cfg.VirtualContextWindow {
-				native2M = true
 			}
 		}
 	}
@@ -393,46 +395,47 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	for _, key := range keys {
 		cap := best[key]
 		window := cap.NativeMaxContextWindow
-		mode := "native"
-		switch {
-		case customSlug[cap.ModelSlug]:
-			// Custom OpenAI-compatible provider: advertise the native window only — the
-			// Codex virtual-2M context feature does not apply (and over-advertising a 2M
-			// window for a 64k DeepSeek model would invite oversized requests).
-		case window >= cfg.VirtualContextWindow:
-			mode = "native_2m"
-		case cfg.Virtual2MEnabled:
-			window = cfg.VirtualContextWindow
-			mode = "virtual_2m"
+		if window == 0 {
+			window = cap.NativeContextWindow
 		}
-		data = append(data, map[string]interface{}{
-			"id":                    cap.ModelSlug,
-			"object":                "model",
-			"owned_by":              "codex-pool",
-			"context_window":        window,
-			"native_context_window": cap.NativeMaxContextWindow,
-			"window_mode":           mode,
-			"visibility":            cap.Visibility,
-		})
+		native := cap.NativeMaxContextWindow
+		if native == 0 {
+			native = cap.NativeContextWindow
+		}
+		item := rawOfficialModelItem(cap)
+		item["id"] = cap.ModelSlug
+		item["object"] = "model"
+		item["owned_by"] = "codex-pool"
+		item["context_window"] = window
+		item["native_context_window"] = native
+		item["window_mode"] = "native"
+		item["visibility"] = cap.Visibility
+		if cap.NativeContextWindow > 0 {
+			item["native_base_context_window"] = cap.NativeContextWindow
+		}
+		if cap.NativeMaxContextWindow > 0 {
+			item["native_max_context_window"] = cap.NativeMaxContextWindow
+		}
+		if cap.AutoCompactTokenLimit > 0 {
+			item["auto_compact_token_limit"] = cap.AutoCompactTokenLimit
+		}
+		if cap.EffectiveContextWindowPercent > 0 {
+			item["effective_context_window_percent"] = cap.EffectiveContextWindowPercent
+		}
+		if customSlug[cap.ModelSlug] {
+			item["provider_window_mode"] = "custom_native"
+		}
+		data = append(data, item)
 	}
 	if len(data) == 0 {
-		mode := "virtual_2m"
-		window := cfg.VirtualContextWindow
-		if !cfg.Virtual2MEnabled {
-			mode = "unknown"
-			window = 0
-		}
 		data = append(data, map[string]interface{}{
 			"id":                    "gpt-5.4-codex",
 			"object":                "model",
 			"owned_by":              "codex-pool",
-			"context_window":        window,
+			"context_window":        0,
 			"native_context_window": 0,
-			"window_mode":           mode,
+			"window_mode":           "unknown",
 		})
-	} else if cfg.Virtual2MEnabled && !native2M {
-		// The individual model entries already advertise the virtual window; this marker
-		// lets Codex-compatible clients and the admin UI distinguish policy from probing.
 	}
 	resp := map[string]interface{}{"object": "list", "data": data}
 	raw, err := json.Marshal(resp)
@@ -441,6 +444,21 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	}
 	sum := sha256.Sum256(raw)
 	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
+}
+
+// rawOfficialModelItem returns the probed model JSON for official Codex accounts,
+// if present. Starting from the raw object preserves forward-compatible capability
+// metadata (future tools/features/capabilities) that the gateway does not yet
+// understand; BuildModelsResponse then overlays only the relay-required fields.
+func rawOfficialModelItem(cap storage.ModelCapability) map[string]interface{} {
+	if providerKeyForSource(cap.Source) != "codex" || strings.TrimSpace(cap.RawModelJSON) == "" {
+		return map[string]interface{}{}
+	}
+	var item map[string]interface{}
+	if err := json.Unmarshal([]byte(cap.RawModelJSON), &item); err != nil || item == nil {
+		return map[string]interface{}{}
+	}
+	return item
 }
 
 func ProbePath(clientVersion string) string {

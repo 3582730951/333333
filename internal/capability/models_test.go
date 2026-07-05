@@ -42,8 +42,8 @@ func TestParseDropsHiddenModels(t *testing.T) {
 	}
 }
 
-func TestBuildModelsResponseVirtual2M(t *testing.T) {
-	caps, _ := Parse("acc-1", []byte(`{"data":[{"id":"gpt-x","context_window":128000}]}`), "")
+func TestBuildModelsResponseAdvertisesRealContextNoVirtual2M(t *testing.T) {
+	caps, _ := Parse("acc-1", []byte(`{"data":[{"id":"gpt-x","context_window":128000,"max_context_window":272000,"effective_context_window_percent":90,"auto_compact_token_limit":240000}]}`), "")
 	body, etag, err := BuildModelsResponse(caps, config.Default())
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -55,8 +55,84 @@ func TestBuildModelsResponseVirtual2M(t *testing.T) {
 	_ = json.Unmarshal(body, &root)
 	data := root["data"].([]interface{})
 	model := data[0].(map[string]interface{})
-	if model["window_mode"] != "virtual_2m" {
-		t.Fatalf("window mode = %#v", model["window_mode"])
+	if model["context_window"].(float64) != 272000 || model["native_context_window"].(float64) != 272000 {
+		t.Fatalf("context windows should be real native values: %v", model)
+	}
+	if model["window_mode"] == "virtual_2m" {
+		t.Fatalf("virtual_2m must not be advertised: %v", model)
+	}
+	if model["auto_compact_token_limit"].(float64) != 240000 || model["effective_context_window_percent"].(float64) != 90 {
+		t.Fatalf("compact/window metadata missing: %v", model)
+	}
+}
+
+func TestBuildModelsResponsePreservesOfficialRawModelMetadata(t *testing.T) {
+	raw := []byte(`{"data":[{
+		"id":"gpt-future",
+		"context_window":128000,
+		"max_context_window":272000,
+		"visibility":"list",
+		"capabilities":{"responses":true,"tools":["function","web_search_preview"],"future_flag":"keep-me"},
+		"supported_tool_types":["function","web_search_preview"],
+		"feature_matrix":{"plugins":true,"browser_use":true}
+	}]}`)
+	caps, err := Parse("official-codex", raw, "etag-future")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(caps) != 1 {
+		t.Fatalf("caps len = %d", len(caps))
+	}
+	if caps[0].RawModelJSON == "" {
+		t.Fatalf("RawModelJSON was not stored: %+v", caps[0])
+	}
+
+	body, _, err := BuildModelsResponse(caps, config.Default())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	model := root["data"].([]interface{})[0].(map[string]interface{})
+	capsObj, ok := model["capabilities"].(map[string]interface{})
+	if !ok || capsObj["future_flag"] != "keep-me" {
+		t.Fatalf("official raw capabilities were not preserved: %#v", model)
+	}
+	if _, ok := model["supported_tool_types"].([]interface{}); !ok {
+		t.Fatalf("supported_tool_types missing from official raw metadata: %#v", model)
+	}
+	if feature, ok := model["feature_matrix"].(map[string]interface{}); !ok || feature["plugins"] != true {
+		t.Fatalf("feature_matrix missing from official raw metadata: %#v", model)
+	}
+}
+
+func TestBuildModelsResponseDoesNotForgeOfficialMetadataForCustomModels(t *testing.T) {
+	caps := []storage.ModelCapability{{
+		AccountID:                     "custom-1",
+		ModelSlug:                     "deepseek-chat",
+		NativeMaxContextWindow:        64000,
+		EffectiveContextWindowPercent: 100,
+		Visibility:                    "list",
+		Source:                        "custom:deepseek",
+	}}
+	body, _, err := BuildModelsResponse(caps, config.Default())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	model := root["data"].([]interface{})[0].(map[string]interface{})
+	for _, forbidden := range []string{"capabilities", "supported_tool_types", "feature_matrix"} {
+		if _, ok := model[forbidden]; ok {
+			t.Fatalf("custom model must not receive official metadata %q: %#v", forbidden, model)
+		}
+	}
+	if model["provider_window_mode"] != "custom_native" {
+		t.Fatalf("custom marker missing: %#v", model)
 	}
 }
 

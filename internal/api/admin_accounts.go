@@ -71,6 +71,12 @@ type accountView struct {
 	QuotaSummary QuotaSummary                  `json:"quota_summary"`
 }
 
+type accountImportResponse struct {
+	storage.Account
+	Duplicate    bool   `json:"duplicate,omitempty"`
+	ImportStatus string `json:"import_status,omitempty"`
+}
+
 func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) ([]accountView, error) {
 	accountIDs := make([]string, 0, len(accounts))
 	for _, account := range accounts {
@@ -168,7 +174,7 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Label == "" {
-		req.Label = firstNonEmpty(parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
+		req.Label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
 	if req.GroupName == "" {
 		req.GroupName = s.cfg.DefaultGroup
@@ -185,26 +191,34 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		Status:            "active",
 		IsFedramp:         parsed.IsFedramp,
 	}
+	lastRefresh := parsed.LastRefresh
+	if lastRefresh == 0 {
+		lastRefresh = storage.Now()
+	}
 	token := storage.AccountToken{
 		AccessToken:        parsed.AccessToken,
 		RefreshToken:       parsed.RefreshToken,
 		OpenAIAPIKey:       parsed.OpenAIAPIKey,
 		IDTokenRaw:         parsed.IDTokenRaw,
-		LastRefresh:        storage.Now(),
+		LastRefresh:        lastRefresh,
 		ExpiresAt:          parsed.ExpiresAt,
 		Scopes:             strings.Join(parsed.Scopes, " "),
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
+	}
+	if existing, err := s.store.GetAccount(r.Context(), account.ID); err == nil {
+		writeJSON(w, http.StatusOK, accountImportResponse{Account: existing, Duplicate: true, ImportStatus: "duplicate"})
+		return
 	}
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, account)
+	writeJSON(w, http.StatusOK, accountImportResponse{Account: account, ImportStatus: "imported"})
 }
 
 func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.ParsedAuth, label, groupName, refreshToken, provider string) (storage.Account, error) {
 	if label == "" {
-		label = firstNonEmpty(parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
+		label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
 	if groupName == "" {
 		groupName = s.cfg.DefaultGroup
@@ -227,15 +241,22 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 		Status:            "active",
 		IsFedramp:         parsed.IsFedramp,
 	}
+	lastRefresh := parsed.LastRefresh
+	if lastRefresh == 0 {
+		lastRefresh = storage.Now()
+	}
 	token := storage.AccountToken{
 		AccessToken:        parsed.AccessToken,
 		RefreshToken:       refreshToken,
 		OpenAIAPIKey:       parsed.OpenAIAPIKey,
 		IDTokenRaw:         parsed.IDTokenRaw,
-		LastRefresh:        storage.Now(),
+		LastRefresh:        lastRefresh,
 		ExpiresAt:          parsed.ExpiresAt,
 		Scopes:             strings.Join(parsed.Scopes, " "),
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
+	}
+	if existing, err := s.store.GetAccount(ctx, account.ID); err == nil {
+		return existing, nil
 	}
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return storage.Account{}, err

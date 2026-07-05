@@ -390,7 +390,7 @@ function groupCard(g, count) {
       <div style="flex:1"><label class="f">force_effort</label>${effortSelectHTML("ge_" + k, g.force_effort || "")}</div></div>
     <label class="f" style="margin-top:8px">default_egress_id</label><input class="t mono" id="gx_${k}" value="${esc(g.default_egress_id || "")}" placeholder="(${en ? "default / shared VPS" : "默认 / 共享VPS"})">
     <label class="f" style="margin-top:8px">system_prompt</label><textarea class="t" id="gp_${k}" placeholder="${en ? "(empty = passthrough)" : "（留空 = 不改写）"}">${esc(g.system_prompt || "")}</textarea>
-    <div class="row" style="gap:18px;margin:8px 0"><label class="row" style="gap:6px"><input type="checkbox" id="gc_${k}" ${g.system_prompt_apply_to_compaction ? "checked" : ""}> compaction</label><label class="row" style="gap:6px"><input type="checkbox" id="gv_${k}" ${g.virtual_2m_enabled ? "checked" : ""}> Virtual 2M</label></div>
+    <div class="row" style="gap:18px;margin:8px 0"><label class="row" style="gap:6px"><input type="checkbox" id="gc_${k}" ${g.system_prompt_apply_to_compaction ? "checked" : ""}> compaction</label></div>
     <div class="row" style="gap:6px"><button class="btn pri" onclick="saveGroup('${esc(g.name)}')">${t("act.save")}</button><button class="btn bad" onclick="deleteGroup('${esc(g.name)}')">${t("act.delete")}</button></div></div></div>`;
 }
 function newGroupForm() {
@@ -410,7 +410,7 @@ async function saveGroup(name) {
   const k = cssEsc(name);
   try {
     await api("/admin/groups/" + encodeURIComponent(name), { method: "PATCH", body: JSON.stringify({
-      system_prompt: $("#gp_" + k).value, system_prompt_apply_to_compaction: $("#gc_" + k).checked, virtual_2m_enabled: $("#gv_" + k).checked,
+      system_prompt: $("#gp_" + k).value, system_prompt_apply_to_compaction: $("#gc_" + k).checked,
       force_model: ($("#gm_" + k).value || "").trim(), force_effort: $("#ge_" + k).value, default_egress_id: ($("#gx_" + k).value || "").trim(),
     }) });
     toast(t("ok.saved"), "ok");

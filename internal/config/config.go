@@ -630,7 +630,7 @@ func Default() Config {
 		UpstreamBaseURL:                DefaultUpstreamBaseURL,
 		ClientVersion:                  DefaultClientVersion,
 		DefaultGroup:                   DefaultGroupName,
-		Virtual2MEnabled:               true,
+		Virtual2MEnabled:               false,
 		VirtualContextWindow:           DefaultVirtualWindow,
 		VirtualContextLedgerTTLSeconds: DefaultVirtualContextLedgerTTLSeconds,
 		StickyWaitMillis:               DefaultStickyWaitMillis,
@@ -644,7 +644,7 @@ func Default() Config {
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
 		ClaudeCacheAffinityPolicy:         "balanced",
-		ClaudeCacheBreakpointPolicy:       "balanced",
+		ClaudeCacheBreakpointPolicy:       "aggressive",
 		ClaudeCacheOptimizationRollout:    "{}",
 		ClaudeNativeCacheBreakpointInject: true,
 		ClaudeCacheTTL:                    "1h",

@@ -31,6 +31,87 @@ func TestParseOfficialAuthJSONShape(t *testing.T) {
 	}
 }
 
+func TestParseTopLevelSessionAuthJSONShape(t *testing.T) {
+	raw := []byte(`{
+		"access_token": "access-top",
+		"refresh_token": "refresh-top",
+		"id_token": "",
+		"account_id": "acct-top",
+		"chatgpt_account_id": "acct-chatgpt",
+		"chatgpt_user_id": "user-top",
+		"email": "top@example.internal",
+		"name": "Top User",
+		"plan_type": "plus",
+		"expired": 1760000000,
+		"last_refresh": 1750000000
+	}`)
+	parsed, err := ParseAuthJSON(raw)
+	if err != nil {
+		t.Fatalf("parse top-level session auth json: %v", err)
+	}
+	if parsed.AccessToken != "access-top" || parsed.RefreshToken != "refresh-top" {
+		t.Fatalf("tokens = %q/%q", parsed.AccessToken, parsed.RefreshToken)
+	}
+	if parsed.UpstreamAccountID != "acct-top" {
+		t.Fatalf("account_id priority = %q, want acct-top", parsed.UpstreamAccountID)
+	}
+	if parsed.ChatGPTUserID != "user-top" || parsed.Email != "top@example.internal" || parsed.Name != "Top User" || parsed.PlanType != "plus" {
+		t.Fatalf("metadata not parsed: %+v", parsed)
+	}
+	if parsed.ExpiresAt != 1760000000 || parsed.LastRefresh != 1750000000 {
+		t.Fatalf("times = expires %d last_refresh %d", parsed.ExpiresAt, parsed.LastRefresh)
+	}
+
+	// Dedupe identity priority includes chatgpt_user_id before token fingerprint when
+	// account/email are absent, so token rotation for the same ChatGPT user is stable.
+	a, err := ParseAuthJSON([]byte(`{"access_token":"access-a","chatgpt_user_id":"user-stable"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseAuthJSON([]byte(`{"access_token":"access-b","chatgpt_user_id":"user-stable"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.AccountID != b.AccountID {
+		t.Fatalf("same chatgpt_user_id produced different AccountID: %q vs %q", a.AccountID, b.AccountID)
+	}
+}
+
+func TestParseCodexOAuthAndAccessTokenUseChatGPTUserIDDedupe(t *testing.T) {
+	claims := map[string]interface{}{
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_user_id": "user-stable",
+		},
+	}
+	claimsRaw, _ := json.Marshal(claims)
+	idToken := "header." + base64.RawURLEncoding.EncodeToString(claimsRaw) + ".sig"
+	oauthA, err := ParseOAuthCodex("access-a", "refresh-a", idToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oauthB, err := ParseOAuthCodex("access-b", "refresh-b", idToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oauthA.AccountID != oauthB.AccountID {
+		t.Fatalf("oauth token rotation changed account id: %q vs %q", oauthA.AccountID, oauthB.AccountID)
+	}
+
+	accessTokenA := "header." + base64.RawURLEncoding.EncodeToString(claimsRaw) + ".sig-a"
+	accessTokenB := "header." + base64.RawURLEncoding.EncodeToString(claimsRaw) + ".sig-b"
+	atA, err := ParseAccessToken(accessTokenA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	atB, err := ParseAccessToken(accessTokenB, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atA.AccountID != atB.AccountID || atA.AccountID != oauthA.AccountID {
+		t.Fatalf("access-token and oauth dedupe diverged: at=%q/%q oauth=%q", atA.AccountID, atB.AccountID, oauthA.AccountID)
+	}
+}
+
 func TestParseClaudeCredentialsJSONShape(t *testing.T) {
 	raw := []byte(`{
 		"claudeAiOauth": {

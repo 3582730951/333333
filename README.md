@@ -16,6 +16,7 @@
   - **Skills / code-execution 透传**：`/v1/files`（含 multipart 上传/下载）、`/v1/skills`、`/v1/agents`、`/v1/environments`、`/v1/sessions`（及其子路径）。这些不是消息轮次，**body 原样透传不改写**（保留客户端自己的 `Content-Type`/`Anthropic-Beta`/`Anthropic-Version`），仅附加账号鉴权 + Claude Code 身份头并走账号出口（含 sidecar JA3 / WARP）。解决「无法访问官方 skills」（端点 404）。同一下游 key 的透传请求会黏在同一账号上，使 `file_id` 等账号作用域资源在其生命周期内一致。
 - SQLite WAL 存储，初始化默认 `cyber` 分组，系统提示词为空。
 - 官方 ChatGPT Codex upstream 默认：`https://chatgpt.com/backend-api/codex`。
+- **Codex 官方 Skills 兼容分层**：Tier 1 为官方 Codex 账号通道（完整官方 CLI skills / plugins / Browser Use / Responses 新字段优先兼容）；Tier 2 为第三方原生 Responses 供应商（本地 skills + function tools，云插件 best-effort）；Tier 3 为第三方 Chat Completions 桥接（基础 function tools，遇到 `web_search`/未知 Responses item 返回明确兼容错误，不静默丢弃）。诊断：`GET /admin/compat/skills`。
 - 导入官方 `auth.json`，转发 `Authorization`、`ChatGPT-Account-ID`、FedRAMP header。
 - 空 prompt raw fast path：普通 responses 在不需要注入和不需要 Virtual 2M 时保持原始 body。
 - affinity/sticky 路由：parent thread、thread/conversation、window、prompt_cache_key、turn metadata、下游 key/project/model、稳定消息 hash。
@@ -36,8 +37,9 @@
 
 ## 多供应商（DeepSeek / 硅基流动 等 OpenAI 兼容）
 
-- 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**上游（DeepSeek、硅基流动 SiliconFlow、Kimi/Moonshot、OpenRouter、本地 vLLM）都能接入。初始化即种入 `deepseek`（`https://api.deepseek.com/v1`）与 `siliconflow`（`https://api.siliconflow.cn/v1`）两个供应商,开箱即用。
-- 模型可**自动发现**(探测 `{base_url}/models` 并回写)或手动维护;同一供应商可被 **Codex(`/v1/responses`)、Claude Code(`/v1/messages`,`ANTHROPIC_MODEL=<模型>`)、第三方(`/v1/chat/completions`)** 三种入口使用(协议双向转换,含流式)。
+- 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**或 **OpenAI Responses 原生**上游（DeepSeek、硅基流动 SiliconFlow、Kimi/Moonshot、OpenRouter、本地 vLLM、Responses 兼容网关）都能接入。初始化即种入 `deepseek`（`https://api.deepseek.com/v1`）与 `siliconflow`（`https://api.siliconflow.cn/v1`）两个供应商,开箱即用。
+- 每个供应商显式声明 `upstream_protocol`：默认 `chat_completions`（Tier 3，Responses→Chat 桥接，只支持基础 function tools）；可选 `responses`（Tier 2，`/v1/responses` 原生透明转发，保留 typed tools、`include`、`previous_response_id` 与未来字段/事件）。
+- 模型可**自动发现**(探测 `{base_url}/models` 并回写)或手动维护;同一供应商可被 **Codex(`/v1/responses`)、Claude Code(`/v1/messages`,`ANTHROPIC_MODEL=<模型>`)、第三方(`/v1/chat/completions`)** 三种入口使用(按 `upstream_protocol` 透明转发或协议转换,含流式)。
 - 管理端「供应商」页用**输入框**维护(ID / 名称 / base_url + 逐条模型增删),非 JSON;并提供 DeepSeek / 硅基流动 / Kimi / OpenRouter **一键预设**。
 - REST:`GET/POST /admin/providers`、`DELETE /admin/providers/{id}`、`POST /admin/accounts/import-key`(裸 API Key 入池)。
 
@@ -168,6 +170,8 @@ requires_openai_auth = false
 experimental_bearer_token = "local-downstream-key"
 ```
 
+> 兼容提示：上面的 Codex CLI 配置始终使用 `wire_api = "responses"`。完整官方 Codex skills / plugins / Browser Use 体验需要下游模型路由到官方 Codex 账号池；第三方 API 供应商按 `upstream_protocol` 分层 best-effort。
+
 ## 自测
 
 ```bash
@@ -295,4 +299,3 @@ sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口
 当前源码全量重编译（含内嵌 UI）；②新增的数据库表/列由启动时的**幂等增量迁移**自动建好，新增配置项由
 `normalize()` 自动填默认值；③构建/部署的所有步骤都集中在随项目上传的 `install.sh` 里。所以无论日后加什么
 功能，流程始终是「覆盖文件夹 → `sudo ./update.sh`」一条命令，`update.sh` 本身保持不变。
-

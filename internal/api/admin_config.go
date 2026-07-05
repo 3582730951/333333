@@ -397,8 +397,13 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		}
 		req.Provider = provider
 		req.BaseURL = prov.BaseURL
-		req.DownstreamPath = "/chat/completions"
-		req.Body = []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`)
+		if prov.UpstreamProtocol == storage.CustomProviderProtocolResponses {
+			req.DownstreamPath = "/responses"
+			req.Body = []byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`)
+		} else {
+			req.DownstreamPath = "/chat/completions"
+			req.Body = []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`)
+		}
 	} else {
 		// The Codex /responses backend (WHAM) is STREAMING-ONLY and hard-validates the
 		// top-level fields the real Codex client always sends. THE PROBE MUST STREAM
@@ -569,13 +574,20 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		type groupView struct {
 			storage.Group
-			AccountCount       int `json:"account_count"`
-			ActiveAccountCount int `json:"active_account_count"`
+			AccountCount           int    `json:"account_count"`
+			ActiveAccountCount     int    `json:"active_account_count"`
+			ModelInstructionsError string `json:"model_instructions_error,omitempty"`
 		}
 		out := make([]groupView, 0, len(groups))
 		for _, group := range groups {
 			c := counts[group.Name]
-			out = append(out, groupView{Group: group, AccountCount: c.AccountCount, ActiveAccountCount: c.ActiveAccountCount})
+			view := groupView{Group: group, AccountCount: c.AccountCount, ActiveAccountCount: c.ActiveAccountCount}
+			if group.ModelInstructionsEnabled {
+				if _, _, err := s.compileGroupModelInstructions(r.Context(), group); err != nil {
+					view.ModelInstructionsError = err.Error()
+				}
+			}
+			out = append(out, view)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -599,7 +611,7 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, fmt.Errorf("group %q already exists", name))
 			return
 		}
-		g := storage.Group{Name: name, PromptMode: "prepend", Virtual2MEnabled: true, SystemPromptApplyToCompaction: true}
+		g := storage.Group{Name: name, PromptMode: "prepend", Virtual2MEnabled: false, SystemPromptApplyToCompaction: true}
 		if err := applyGroupFieldsFromBody(&g, bytes.NewReader(raw)); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -619,13 +631,15 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 // cyber back-compat handler, group create, and the generic PATCH /admin/groups/<name>.
 func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	var req struct {
-		SystemPrompt                  *string `json:"system_prompt"`
-		PromptMode                    *string `json:"prompt_mode"`
-		SystemPromptApplyToCompaction *bool   `json:"system_prompt_apply_to_compaction"`
-		Virtual2MEnabled              *bool   `json:"virtual_2m_enabled"`
-		ForceModel                    *string `json:"force_model"`
-		ForceEffort                   *string `json:"force_effort"`
-		DefaultEgressID               *string `json:"default_egress_id"`
+		SystemPrompt                  *string  `json:"system_prompt"`
+		PromptMode                    *string  `json:"prompt_mode"`
+		SystemPromptApplyToCompaction *bool    `json:"system_prompt_apply_to_compaction"`
+		Virtual2MEnabled              *bool    `json:"virtual_2m_enabled"`
+		ModelInstructionsEnabled      *bool    `json:"model_instructions_enabled"`
+		ModelInstructionsFiles        []string `json:"model_instructions_files"`
+		ForceModel                    *string  `json:"force_model"`
+		ForceEffort                   *string  `json:"force_effort"`
+		DefaultEgressID               *string  `json:"default_egress_id"`
 	}
 	if err := decodeJSONRequestBody(body, &req, adminJSONBodyLimit); err != nil {
 		return err
@@ -641,6 +655,16 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	}
 	if req.Virtual2MEnabled != nil {
 		g.Virtual2MEnabled = *req.Virtual2MEnabled
+	}
+	if req.ModelInstructionsEnabled != nil {
+		g.ModelInstructionsEnabled = *req.ModelInstructionsEnabled
+	}
+	if req.ModelInstructionsFiles != nil {
+		files, err := normalizeModelInstructionFileNames(req.ModelInstructionsFiles)
+		if err != nil {
+			return err
+		}
+		g.ModelInstructionsFiles = files
 	}
 	if req.ForceModel != nil {
 		g.ForceModel = strings.TrimSpace(*req.ForceModel)
@@ -951,7 +975,7 @@ func downstreamAPIKeyAttempt(r *http.Request) bool {
 		strings.TrimSpace(r.Header.Get("X-Downstream-Key")),
 		adminBearerToken(r),
 	} {
-		if strings.HasPrefix(plain, "cap_") {
+		if strings.HasPrefix(plain, "cap_") || strings.HasPrefix(plain, "poolimp_") {
 			return true
 		}
 	}

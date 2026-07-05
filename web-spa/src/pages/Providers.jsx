@@ -20,10 +20,16 @@ const splitModels = (value) => String(value || '')
 
 const joinModels = (models) => Array.isArray(models) ? models.join('\n') : '';
 
+const PROTOCOL_OPTIONS = [
+  { label: 'Chat Completions（函数工具，best-effort）', value: 'chat_completions' },
+  { label: 'Responses 原生（保留 typed tools/未知字段）', value: 'responses' },
+];
+
 const providerFormValues = (row) => ({
   id: row?.id || '',
   name: row?.name || '',
   base_url: row?.base_url || '',
+  upstream_protocol: row?.upstream_protocol || 'chat_completions',
   enabled: row?.enabled !== false,
   auto_discover_models: row?.auto_discover_models !== false,
   models_text: joinModels(row?.models),
@@ -44,6 +50,7 @@ export default function Providers() {
         id: values.id,
         name: values.name,
         base_url: values.base_url,
+        upstream_protocol: values.upstream_protocol || 'chat_completions',
         enabled: values.enabled !== false,
         auto_discover_models: values.auto_discover_models !== false,
         models: splitModels(values.models_text),
@@ -125,6 +132,12 @@ export default function Providers() {
     },
     { title: 'Base URL', dataIndex: 'base_url', width: 260, render: (v) => <TextClamp>{v || '-'}</TextClamp> },
     {
+      title: '协议',
+      dataIndex: 'upstream_protocol',
+      width: 150,
+      render: (v) => v === 'responses' ? <Tag color="green">Responses · Tier 2</Tag> : <Tag color="orange">Chat · Tier 3</Tag>,
+    },
+    {
       title: '模型',
       dataIndex: 'models',
       width: 220,
@@ -150,6 +163,7 @@ export default function Providers() {
           avatar={<VendorLogo vendor={row.id || row.name || 'custom'} size={30} />}
           badges={<><Tag>{row.id || '-'}</Tag><Tag color={row.enabled === false ? 'grey' : 'green'}>{row.enabled === false ? '停用' : '启用'}</Tag></>}
           details={[
+            { label: '协议', value: row.upstream_protocol === 'responses' ? 'Responses · Tier 2' : 'Chat Completions · Tier 3' },
             { label: '模型', value: renderModels(row.models, row) },
             { label: '发现', value: row.auto_discover_models === false ? '关闭' : '开启' },
           ]}
@@ -206,6 +220,15 @@ export default function Providers() {
             <Form.Input field="id" label="Provider ID" disabled={editor.mode === 'edit'} rules={[{ required: true }]} />
             <Form.Input field="name" label="显示名称" />
             <Form.Input field="base_url" label="Base URL" rules={[{ required: true }]} placeholder="https://api.example.com/v1" />
+            <Form.Select
+              field="upstream_protocol"
+              label="上游协议 / Skills 兼容层"
+              optionList={PROTOCOL_OPTIONS}
+              initValue="chat_completions"
+            />
+            <div className="pool-help-text" style={{ marginTop: -6, marginBottom: 8 }}>
+              官方 Codex 账号为 Tier 1；Responses 原生供应商为 Tier 2；Chat Completions 桥接为 Tier 3，仅承诺基础 function tools，遇到 typed tools 会返回明确兼容性错误。
+            </div>
             <Form.Switch field="enabled" label="启用" />
             <Form.Switch field="auto_discover_models" label="自动发现模型" />
             <Form.TextArea field="models_text" label="模型列表" autosize placeholder={"deepseek-chat\ndeepseek-reasoner"} />

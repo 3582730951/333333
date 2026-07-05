@@ -19,10 +19,12 @@ type ParsedAuth struct {
 	OpenAIAPIKey       string
 	IDTokenRaw         string
 	Email              string
+	Name               string
 	ChatGPTUserID      string
 	PlanType           string
 	Provider           string
 	ExpiresAt          int64
+	LastRefresh        int64
 	Scopes             []string
 	OAuthRateLimitTier string
 	IsFedramp          bool
@@ -40,33 +42,59 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 
 	var out ParsedAuth
 	out.OpenAIAPIKey = stringField(root, "OPENAI_API_KEY")
+	out.AccessToken = stringFieldAny(root, "access_token", "accessToken")
+	out.RefreshToken = stringFieldAny(root, "refresh_token", "refreshToken")
+	out.UpstreamAccountID = stringFieldAny(root, "account_id", "chatgpt_account_id", "chatgptAccountID")
+	out.ChatGPTUserID = stringFieldAny(root, "chatgpt_user_id", "chatgptUserID", "user_id")
+	out.Email = stringFieldAny(root, "email", "email_address", "emailAddress")
+	out.Name = stringFieldAny(root, "name", "full_name", "display_name", "displayName")
+	out.PlanType = stringFieldAny(root, "plan_type", "planType", "chatgpt_plan_type")
+	out.ExpiresAt = epochSecondsField(root, "expired", "expires_at", "expiresAt", "expires", "expiry")
+	out.LastRefresh = epochSecondsField(root, "last_refresh", "lastRefresh")
+	out.IDTokenRaw = extractIDTokenRaw(firstPresent(root["id_token"], root["idToken"]))
 	if tokens, ok := root["tokens"].(map[string]interface{}); ok {
-		out.AccessToken = stringField(tokens, "access_token")
-		out.RefreshToken = stringField(tokens, "refresh_token")
-		out.UpstreamAccountID = stringField(tokens, "account_id")
-		out.IDTokenRaw = extractIDTokenRaw(tokens["id_token"])
-		if out.IDTokenRaw != "" {
-			claims := decodeIDClaims(out.IDTokenRaw)
-			if out.Email == "" {
-				out.Email = claims.Email
-			}
-			if out.ChatGPTUserID == "" {
-				out.ChatGPTUserID = claims.ChatGPTUserID
-			}
-			if out.UpstreamAccountID == "" {
-				out.UpstreamAccountID = claims.ChatGPTAccountID
-			}
-			out.PlanType = claims.PlanType
-			out.IsFedramp = claims.IsFedramp
+		if out.AccessToken == "" {
+			out.AccessToken = stringField(tokens, "access_token")
 		}
+		if out.RefreshToken == "" {
+			out.RefreshToken = stringField(tokens, "refresh_token")
+		}
+		if out.UpstreamAccountID == "" {
+			out.UpstreamAccountID = stringFieldAny(tokens, "account_id", "chatgpt_account_id")
+		}
+		if out.IDTokenRaw == "" {
+			out.IDTokenRaw = extractIDTokenRaw(tokens["id_token"])
+		}
+		if out.ExpiresAt == 0 {
+			out.ExpiresAt = epochSecondsField(tokens, "expired", "expires_at", "expiresAt", "expires", "expiry")
+		}
+		if out.LastRefresh == 0 {
+			out.LastRefresh = epochSecondsField(tokens, "last_refresh", "lastRefresh")
+		}
+	}
+	if out.IDTokenRaw != "" {
+		claims := decodeIDClaims(out.IDTokenRaw)
+		if out.Email == "" {
+			out.Email = claims.Email
+		}
+		if out.ChatGPTUserID == "" {
+			out.ChatGPTUserID = claims.ChatGPTUserID
+		}
+		if out.UpstreamAccountID == "" {
+			out.UpstreamAccountID = claims.ChatGPTAccountID
+		}
+		if out.PlanType == "" {
+			out.PlanType = claims.PlanType
+		}
+		out.IsFedramp = claims.IsFedramp
 	}
 	if out.AccessToken == "" {
 		out.AccessToken = out.OpenAIAPIKey
 	}
 	if out.AccessToken == "" && out.OpenAIAPIKey == "" {
-		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token nor OPENAI_API_KEY")
+		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token, access_token nor OPENAI_API_KEY")
 	}
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.Email, out.AccessToken, out.OpenAIAPIKey)
+	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.Email, out.AccessToken, out.OpenAIAPIKey)
 	return out, nil
 }
 
@@ -125,7 +153,7 @@ func ParseOAuthCodex(accessToken, refreshToken, idTokenRaw string) (ParsedAuth, 
 		out.PlanType = claims.PlanType
 		out.IsFedramp = claims.IsFedramp
 	}
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.Email, out.AccessToken)
+	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.Email, out.AccessToken)
 	return out, nil
 }
 
@@ -177,7 +205,7 @@ func ParseAccessToken(accessToken, accountID string) (ParsedAuth, error) {
 	}
 	out.PlanType = claims.PlanType
 	out.IsFedramp = claims.IsFedramp
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.Email, out.AccessToken)
+	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.Email, out.AccessToken)
 	return out, nil
 }
 
@@ -218,6 +246,15 @@ func stringFieldAny(m map[string]interface{}, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstPresent(vs ...interface{}) interface{} {
+	for _, v := range vs {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 func objectField(m map[string]interface{}, keys ...string) (map[string]interface{}, bool) {

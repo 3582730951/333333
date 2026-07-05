@@ -26,10 +26,10 @@ func IsCustomProvider(provider string) bool {
 	}
 }
 
-// doOpenAICompatible performs a request against a custom OpenAI-Chat-Completions-
-// compatible provider. The target is the provider's BaseURL (which already carries
-// any "/v1" prefix) + DownstreamPath ("/chat/completions" for live traffic,
-// "/models" for discovery). Headers are a clean Bearer-auth OpenAI client set — no
+// doOpenAICompatible performs a request against a custom OpenAI-compatible provider
+// (Chat Completions or native Responses). The target is the provider's BaseURL
+// (which already carries any "/v1" prefix) + DownstreamPath ("/chat/completions",
+// "/responses", or "/models"). Headers are a clean Bearer-auth OpenAI client set — no
 // downstream header passthrough (which would leak the relay), no Codex/Claude
 // fingerprint (irrelevant to these providers). A sidecar-bound account still routes
 // through the impersonating sidecar (Chrome JA3) for proxy-chaining / IP control;

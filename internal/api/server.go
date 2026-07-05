@@ -202,6 +202,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/auth/me", s.handleAuthMe)
 	s.mux.HandleFunc("/client/errors", s.handleClientError)
 
+	// Automation-only account pool import. Requires a dedicated poolimp_ key and never
+	// exposes listing/export/inference/admin surfaces.
+	s.mux.HandleFunc("/api/account-pool/import", s.accountPoolImport)
+
 	// Registration automation APIs
 	s.mux.HandleFunc("/admin/register/providers/test", s.handleProviderTest)
 	s.mux.HandleFunc("/admin/automation/policies", s.handleAutomationPolicies)
@@ -246,6 +250,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/usage/cache/reset", s.adminUsageCacheReset)
 	s.mux.HandleFunc("/admin/usage/timeseries", s.adminUsageTimeseries)
 	s.mux.HandleFunc("/admin/usage/by-model", s.adminUsageByModel)
+	s.mux.HandleFunc("/admin/compat/skills", s.adminSkillsCompatDoctor)
 	s.mux.HandleFunc("/admin/quota", s.adminQuota)
 	// Host + registration-task resource metrics (CPU/mem/disk + node/Chrome/Xvfb RSS).
 	s.mux.HandleFunc("/admin/system", s.adminSystem)
@@ -260,6 +265,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/audit", s.adminAudit)
 	s.mux.HandleFunc("/admin/groups", s.adminGroups)
 	s.mux.HandleFunc("/admin/groups/", s.adminGroupAction)
+	s.mux.HandleFunc("/admin/model-instructions", s.adminModelInstructions)
 	s.mux.HandleFunc("/admin/tenants", s.adminTenants)
 	s.mux.HandleFunc("/admin/users", s.adminUsers)
 	s.mux.HandleFunc("/admin/users/", s.adminUserAction)
@@ -325,6 +331,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
+		return
+	}
+	if isPoolImportKeyPlain(downstreamBearer(r)) {
+		writeError(w, http.StatusForbidden, errors.New("pool import key cannot query models"))
 		return
 	}
 	caps, err := s.store.ListCapabilities(r.Context(), "")
@@ -413,15 +423,6 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if affinityGroup == "" {
 		affinityGroup = s.cfg.DefaultGroup
 	}
-	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
-	// movable: the request carries its full input and so can be re-sent to a fresh
-	// account losslessly. This is the failover gate. It is broader than !strict: a
-	// strict-sticky turn (tool_result/function_call_output, kept on one account for
-	// prompt-cache warmth) is still movable, and MUST be allowed to fail over on an
-	// error — pinning it was the cause of "429 leaks downstream, no auto-switch". Only
-	// genuine server-side-state turns (previous_response_id / x-codex-turn-state) are
-	// non-movable, because a fresh account cannot continue from state it never created.
-	movable := !routing.HasServerSideState(path, r, raw)
 	model := routing.Model(raw)
 
 	// OpenAI-compatible requests targeting a Claude model are transparently
@@ -443,6 +444,32 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	compiledModelInstructions := ""
+	if group, err := s.store.GetGroup(r.Context(), affinityGroup); err == nil && group.ModelInstructionsEnabled {
+		compiled, _, err := s.compileGroupModelInstructions(r.Context(), group)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		compiledModelInstructions = compiled
+		if !isChat {
+			raw = setResponsesInstructions(raw, compiledModelInstructions)
+		}
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
+	// movable: the request carries its full input and so can be re-sent to a fresh
+	// account losslessly. This is the failover gate. It is broader than !strict: a
+	// strict-sticky turn (tool_result/function_call_output, kept on one account for
+	// prompt-cache warmth) is still movable, and MUST be allowed to fail over on an
+	// error — pinning it was the cause of "429 leaks downstream, no auto-switch". Only
+	// genuine server-side-state turns (previous_response_id / x-codex-turn-state) are
+	// non-movable, because a fresh account cannot continue from state it never created.
+	movable := !routing.HasServerSideState(path, r, raw)
 
 	// Transparent seamless failover. A movable request (no per-account server-side
 	// state) carries its full input, so if the chosen account is rate-limited /
@@ -486,7 +513,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, attempt < attempts-1, forceFailoverOn429, exclude)
+		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attempt < attempts-1, forceFailoverOn429, exclude)
 		if result.Outcome != outcomeRetry {
 			return
 		}
@@ -525,7 +552,7 @@ type codexAttemptResult struct {
 // forceFailoverOn429 enables immediate failover on 429 even for strict requests.
 // exclude carries the accounts this request already failed on; the leased account is
 // added to it before any outcomeRetry so the next attempt selects a different one.
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort string, allowRetry bool, forceFailoverOn429 bool, exclude map[string]bool) codexAttemptResult {
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, forceFailoverOn429 bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,
@@ -552,22 +579,6 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		return codexAttemptResult{Outcome: outcomeRetry}
 	}
-	retryPrepared := func(next []byte, reason string) codexAttemptResult {
-		if exclude != nil {
-			exclude[lease.Account.ID] = true
-		}
-		nextHeader := stripCodexServerStateHeaders(baseHeader)
-		log.Printf("[FAILOVER] rebuilt stateful codex request for account failover: from_account=%s reason=%s bytes=%d", lease.Account.ID, reason, len(next))
-		return codexAttemptResult{
-			Outcome: outcomeRetry,
-			Retry: codexRetryRequest{
-				Raw:      next,
-				Header:   nextHeader,
-				Prepared: true,
-			},
-		}
-	}
-
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -594,7 +605,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 	if !prepared {
-		if prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
+		if compiledModelInstructions == "" && prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
 			if isChat {
 				body, _, err = prompt.InjectChatSystemPrompt(body, group.SystemPrompt)
 			} else {
@@ -615,6 +626,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				body = forceResponsesStream(body)
 			}
 			path = "/v1/responses"
+		}
+		if compiledModelInstructions != "" {
+			body = setResponsesInstructions(body, compiledModelInstructions)
 		}
 	}
 
@@ -686,39 +700,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 	logicalUsageDiag := codexRequestUsageDiagnostics(body, affinity, promptCacheKeySource, retentionEffective, retentionSource)
 
-	// Virtual-context ledger key. We only pool prior turns under a TRUE
-	// per-conversation correlator; for coarse/heuristic affinity (downstream
-	// token+model, or the stable-prefix hash) ledgerKey returns "" so sibling
-	// agents that merely share a coarse key are never merged into one
-	// reconstructed context — the multi-agent contamination guard (Q1).
-	lk := ledgerKey(affinity)
-	if lk != "" {
-		// Kept synchronous on purpose: the NEXT turn of this conversation reconstructs
-		// context by reading this row back (MaterializeIfNeeded → ListVirtualLedger), so
-		// deferring it could let a fast follow-up turn miss it. Usage rows (dashboard-only,
-		// never read by request processing) are the writes we move off-path instead.
-		s.planner.RecordRawRequest(r.Context(), lk, lease.Account.ID, model, routing.PromptCacheKey(body), body)
-	}
-	if !isChat && s.cfg.Virtual2MEnabled && group.Virtual2MEnabled {
-		nativeWindow, _ := s.store.BestNativeWindow(r.Context(), lease.Account.ID, model)
-		materialized, err := s.planner.MaterializeIfNeeded(r.Context(), lk, lease.Account.ID, nativeWindow, body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return codexAttemptResult{Outcome: outcomeDone}
-		}
-		body = materialized.Body
-	}
-	rebuildSourceBody := body
+	// Virtual2M is intentionally disabled: the gateway no longer records/replays a
+	// virtual context ledger and never trims Responses input. Official Codex
+	// compaction is forwarded unchanged to the upstream.
 	tryRebuildStateful := func(reason string) (codexAttemptResult, bool) {
-		if !allowRetry || movable || s.planner == nil {
-			return codexAttemptResult{}, false
-		}
-		rebuilt, ok := s.planner.RebuildStatefulRequest(r.Context(), lk, rebuildSourceBody)
-		if !ok {
-			log.Printf("[FAILOVER] stateful codex request not rebuilt: account=%s reason=%s ledger_key=%t", lease.Account.ID, reason, lk != "")
-			return codexAttemptResult{}, false
-		}
-		return retryPrepared(rebuilt.Body, reason), true
+		_ = reason
+		return codexAttemptResult{}, false
 	}
 
 	// Per-account conversation isolation ("串号隔离", default on, runtime-toggleable):
@@ -1033,7 +1020,6 @@ codexSuccess:
 				return codexAttemptResult{Outcome: outcomeDone}
 			}
 		}
-		s.planner.RecordRawResponse(r.Context(), lk, lease.Account.ID, model, routing.PromptCacheKey(rebuildSourceBody), responseBody)
 		chatBody, err := prompt.ResponsesToChatCompletion(responseBody, resp.Header.Get("x-request-id"), model)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
@@ -1124,9 +1110,6 @@ codexSuccess:
 		if err := s.streamSSE(r.Context(), w, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash); err != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
-			if responseBody := streamRecorder.ResponseJSON(); len(responseBody) > 0 {
-				s.planner.RecordRawResponse(r.Context(), lk, lease.Account.ID, model, routing.PromptCacheKey(rebuildSourceBody), responseBody)
-			}
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
 		}
 		return codexAttemptResult{Outcome: outcomeDone}
@@ -1193,7 +1176,6 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
-	s.planner.RecordRawResponse(r.Context(), lk, lease.Account.ID, model, routing.PromptCacheKey(rebuildSourceBody), responseBody)
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)

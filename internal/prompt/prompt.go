@@ -97,9 +97,17 @@ func ChatCompletionToResponses(raw []byte) ([]byte, error) {
 	if tc, ok := root["tool_choice"]; ok {
 		root["tool_choice"] = chatToolChoiceToResponses(tc)
 	}
+	if v, ok := root["max_tokens"]; ok {
+		root["max_output_tokens"] = v
+	}
+	if v, ok := root["max_completion_tokens"]; ok {
+		root["max_output_tokens"] = v
+	}
 	for _, drop := range []string{"n", "logprobs", "top_logprobs"} {
 		delete(root, drop)
 	}
+	delete(root, "max_tokens")
+	delete(root, "max_completion_tokens")
 	return json.Marshal(root)
 }
 
@@ -248,6 +256,9 @@ func ResponsesToChatCompletion(raw []byte, requestID, model string) ([]byte, err
 		}
 	} else {
 		message["content"] = content
+	}
+	if status, _ := root["status"].(string); status == "incomplete" {
+		finish = "length"
 	}
 	resp := map[string]interface{}{
 		"id":      requestID,

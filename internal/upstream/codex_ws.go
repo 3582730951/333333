@@ -247,7 +247,6 @@ func (c *Client) codexWSNamespacePayload(spec Request, ids codexWebSocketIDs, pa
 	if err := json.Unmarshal(payload, &root); err != nil {
 		return payload // leave untouched on parse failure (do not break the request)
 	}
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
 	changed := false
 	// session_id / thread_id at the top level: replace with the derived per-account
 	// value (same one used in client_metadata and the handshake headers), keeping
@@ -265,16 +264,6 @@ func (c *Client) codexWSNamespacePayload(spec Request, ids codexWebSocketIDs, pa
 				changed = true
 			}
 		}
-	}
-	// previous_response_id is server-side state on the downstream's account; a fresh
-	// account has no such state, so we drop it (the WS create is a self-contained
-	// response.create, so this is safe — same as the HTTP non-movable gate).
-	if v, ok := root["previous_response_id"].(string); ok && v != "" {
-		// Replace with a per-account derived id so a replayed value cannot correlate
-		// to another account's upstream state. Use the MachineID-seeded derivation so
-		// it is stable per account+original (consistent across retries).
-		root["previous_response_id"] = identity.DerivedUUID(id.MachineID, "prev:"+v)
-		changed = true
 	}
 	if !changed {
 		return payload

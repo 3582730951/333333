@@ -41,11 +41,13 @@ type Store struct {
 }
 
 type Group struct {
-	Name                          string `json:"name"`
-	SystemPrompt                  string `json:"system_prompt"`
-	PromptMode                    string `json:"prompt_mode"`
-	SystemPromptApplyToCompaction bool   `json:"system_prompt_apply_to_compaction"`
-	Virtual2MEnabled              bool   `json:"virtual_2m_enabled"`
+	Name                          string   `json:"name"`
+	SystemPrompt                  string   `json:"system_prompt"`
+	PromptMode                    string   `json:"prompt_mode"`
+	SystemPromptApplyToCompaction bool     `json:"system_prompt_apply_to_compaction"`
+	Virtual2MEnabled              bool     `json:"virtual_2m_enabled"`
+	ModelInstructionsEnabled      bool     `json:"model_instructions_enabled"`
+	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
 	// ForceModel / ForceEffort, when set, are the group-level default override that
 	// rewrites the downstream-requested model / reasoning effort for any key in this
 	// group that does not set its own. Empty means "respect the client's request".
@@ -72,10 +74,13 @@ type GroupAccountCounts struct {
 type APIKey struct {
 	KeyHash     string `json:"key_hash"`
 	Label       string `json:"label"`
+	KeyType     string `json:"key_type"`
 	GroupName   string `json:"group_name"`
 	ForceModel  string `json:"force_model"`
 	ForceEffort string `json:"force_effort"`
 	Enabled     bool   `json:"enabled"`
+	ExpiresAt   int64  `json:"expires_at,omitempty"`
+	LastUsedAt  int64  `json:"last_used_at,omitempty"`
 	TenantID    string `json:"tenant_id,omitempty"`
 	ProjectID   string `json:"project_id,omitempty"`
 	// UserID is the owning portal user (empty = admin-owned). Set when a user creates
@@ -188,6 +193,7 @@ type ModelCapability struct {
 	Visibility                    string `json:"visibility"`
 	ETag                          string `json:"etag"`
 	RawModelJSONHash              string `json:"raw_model_json_hash"`
+	RawModelJSON                  string `json:"raw_model_json,omitempty"`
 	Source                        string `json:"source"`
 	LastProbeAt                   int64  `json:"last_probe_at"`
 }
@@ -393,24 +399,43 @@ type CodexResetCreditClaim struct {
 	Row     CodexResetCreditConsumption `json:"row"`
 }
 
-// CustomProvider is an OpenAI-Chat-Completions-compatible upstream provider
-// (DeepSeek, Kimi/Moonshot, OpenRouter, a local vLLM, …) the relay can pool
+// CustomProvider is an OpenAI-compatible upstream provider (Chat Completions by
+// default, or native Responses when UpstreamProtocol="responses") the relay can pool
 // accounts against. Unlike the built-in "codex"/"claude" upstreams it carries no
 // fingerprint mimicry: requests go out as a clean Bearer-auth OpenAI client. An
 // account's Provider column names which CustomProvider serves it. The model set is
 // auto-discovered from {BaseURL}/models and/or set manually by an operator (Models,
 // edited via input boxes in the admin UI — never raw JSON). BaseURL includes the
 // OpenAI-compat path prefix (e.g. ".../v1"); the adapter appends /chat/completions
-// and /models.
+// or /responses for live requests, and /models for discovery.
 type CustomProvider struct {
 	ID                 string   `json:"id"`
 	Name               string   `json:"name"`
 	BaseURL            string   `json:"base_url"`
+	UpstreamProtocol   string   `json:"upstream_protocol"`
 	Enabled            bool     `json:"enabled"`
 	AutoDiscoverModels bool     `json:"auto_discover_models"`
 	Models             []string `json:"models"`
 	CreatedAt          int64    `json:"created_at"`
 	UpdatedAt          int64    `json:"updated_at"`
+}
+
+const (
+	CustomProviderProtocolChatCompletions = "chat_completions"
+	CustomProviderProtocolResponses       = "responses"
+)
+
+func NormalizeCustomProviderProtocol(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return CustomProviderProtocolChatCompletions, true
+	case CustomProviderProtocolChatCompletions:
+		return CustomProviderProtocolChatCompletions, true
+	case CustomProviderProtocolResponses:
+		return CustomProviderProtocolResponses, true
+	default:
+		return "", false
+	}
 }
 
 // ModerationConfig is the operator-configured response/history moderation policy.
@@ -519,7 +544,7 @@ func (s *Store) Init(ctx context.Context) error {
 	now := Now()
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, created_at, updated_at)
-VALUES('cyber', '', 'prepend', 1, 1, ?, ?)
+VALUES('cyber', '', 'prepend', 1, 0, ?, ?)
 ON CONFLICT(name) DO NOTHING`, now, now); err != nil {
 		return err
 	}
@@ -544,9 +569,9 @@ ON CONFLICT(id) DO NOTHING`, DefaultDirectEgressID, now, now)
 	}
 	for _, p := range seededProviders {
 		if _, err = s.db.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, enabled, auto_discover_models, models_json, created_at, updated_at)
-VALUES(?, ?, ?, 1, 1, ?, ?, ?)
-ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, p.models, now, now); err != nil {
+INSERT INTO custom_providers(id, name, base_url, upstream_protocol, enabled, auto_discover_models, models_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, 1, 1, ?, ?, ?)
+ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, CustomProviderProtocolChatCompletions, p.models, now, now); err != nil {
 			return err
 		}
 	}
@@ -592,11 +617,14 @@ CREATE TABLE IF NOT EXISTS api_keys(
   key_hash TEXT PRIMARY KEY,
   tenant_id TEXT,
   project_id TEXT,
+  key_type TEXT NOT NULL DEFAULT 'downstream',
   label TEXT,
   group_name TEXT NOT NULL DEFAULT '',
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  last_used_at INTEGER NOT NULL DEFAULT 0,
   secret TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -606,7 +634,9 @@ CREATE TABLE IF NOT EXISTS groups(
   system_prompt TEXT NOT NULL DEFAULT '',
   prompt_mode TEXT NOT NULL DEFAULT 'prepend',
   system_prompt_apply_to_compaction INTEGER NOT NULL DEFAULT 1,
-  virtual_2m_enabled INTEGER NOT NULL DEFAULT 1,
+  virtual_2m_enabled INTEGER NOT NULL DEFAULT 0,
+  model_instructions_enabled INTEGER NOT NULL DEFAULT 0,
+  model_instructions_files TEXT NOT NULL DEFAULT '[]',
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
   default_egress_id TEXT NOT NULL DEFAULT '',
@@ -654,6 +684,7 @@ CREATE TABLE IF NOT EXISTS account_model_capabilities(
   visibility TEXT NOT NULL DEFAULT '',
   etag TEXT NOT NULL DEFAULT '',
   raw_model_json_hash TEXT NOT NULL DEFAULT '',
+  raw_model_json TEXT NOT NULL DEFAULT '',
   source TEXT NOT NULL DEFAULT 'probe',
   last_probe_at INTEGER NOT NULL,
   PRIMARY KEY(account_id, model_slug),
@@ -863,6 +894,7 @@ CREATE TABLE IF NOT EXISTS custom_providers(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',
   base_url TEXT NOT NULL DEFAULT '',
+  upstream_protocol TEXT NOT NULL DEFAULT 'chat_completions',
   enabled INTEGER NOT NULL DEFAULT 1,
   auto_discover_models INTEGER NOT NULL DEFAULT 1,
   models_json TEXT NOT NULL DEFAULT '',
@@ -987,15 +1019,21 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE api_keys ADD COLUMN group_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE api_keys ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE api_keys ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE api_keys ADD COLUMN key_type TEXT NOT NULL DEFAULT 'downstream'`,
+		`ALTER TABLE api_keys ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE api_keys ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE groups ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN default_egress_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN model_instructions_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE groups ADD COLUMN model_instructions_files TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN oauth_rate_limit_tier TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_model_capabilities ADD COLUMN raw_model_json TEXT NOT NULL DEFAULT ''`,
 		// Multi-user portal: end-user credentials/roles, key ownership, and per-user
 		// usage attribution (older DBs created before the portal existed).
 		`ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
@@ -1046,6 +1084,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE egress_profiles ADD COLUMN ip_mode TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN provider_key TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN dynamic_config_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE custom_providers ADD COLUMN upstream_protocol TEXT NOT NULL DEFAULT 'chat_completions'`,
 		`CREATE TABLE IF NOT EXISTS egress_pools(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL DEFAULT '',
@@ -1192,17 +1231,13 @@ func (s *Store) migrateLifecycle(ctx context.Context) error {
 }
 
 func (s *Store) GetGroup(ctx context.Context, name string) (Group, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups WHERE name = ?`, name)
+	row := s.rdb.QueryRowContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups WHERE name = ?`, name)
 	var g Group
-	var apply, virtual int
-	err := row.Scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &g.CreatedAt, &g.UpdatedAt)
-	g.SystemPromptApplyToCompaction = apply != 0
-	g.Virtual2MEnabled = virtual != 0
-	return g, err
+	return scanGroup(row.Scan, &g)
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups ORDER BY name`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -1210,20 +1245,61 @@ func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
 	var out []Group
 	for rows.Next() {
 		var g Group
-		var apply, virtual int
-		if err := rows.Scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &g.CreatedAt, &g.UpdatedAt); err != nil {
+		if _, err := scanGroup(rows.Scan, &g); err != nil {
 			return nil, err
 		}
-		g.SystemPromptApplyToCompaction = apply != 0
-		g.Virtual2MEnabled = virtual != 0
 		out = append(out, g)
 	}
 	return out, rows.Err()
 }
 
+func scanGroup(scan func(...interface{}) error, g *Group) (Group, error) {
+	var apply, virtual, modelInstructionsEnabled int
+	var filesJSON string
+	err := scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &modelInstructionsEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &g.CreatedAt, &g.UpdatedAt)
+	if err != nil {
+		return *g, err
+	}
+	g.SystemPromptApplyToCompaction = apply != 0
+	g.Virtual2MEnabled = virtual != 0
+	g.ModelInstructionsEnabled = modelInstructionsEnabled != 0
+	g.ModelInstructionsFiles = decodeStringList(filesJSON)
+	return *g, nil
+}
+
+func encodeStringList(values []string) string {
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			cleaned = append(cleaned, value)
+		}
+	}
+	raw, err := json.Marshal(cleaned)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func decodeStringList(raw string) []string {
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
 func (s *Store) UpdateGroup(ctx context.Context, g Group) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE groups SET system_prompt = ?, prompt_mode = ?, system_prompt_apply_to_compaction = ?, virtual_2m_enabled = ?, force_model = ?, force_effort = ?, default_egress_id = ?, updated_at = ? WHERE name = ?`,
-		g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), g.ForceModel, g.ForceEffort, g.DefaultEgressID, Now(), g.Name)
+	_, err := s.db.ExecContext(ctx, `UPDATE groups SET system_prompt = ?, prompt_mode = ?, system_prompt_apply_to_compaction = ?, virtual_2m_enabled = ?, model_instructions_enabled = ?, model_instructions_files = ?, force_model = ?, force_effort = ?, default_egress_id = ?, updated_at = ? WHERE name = ?`,
+		g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, Now(), g.Name)
 	return err
 }
 
@@ -1238,9 +1314,9 @@ func (s *Store) CreateGroup(ctx context.Context, g Group) error {
 		g.PromptMode = "prepend"
 	}
 	now := Now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, force_model, force_effort, default_egress_id, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), g.ForceModel, g.ForceEffort, g.DefaultEgressID, now, now)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, now, now)
 	return err
 }
 
@@ -1304,13 +1380,16 @@ GROUP BY group_name`, stringArgs(names)...)
 	return out, rows.Err()
 }
 
-const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), enabled, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,'')`
+const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(key_type,'downstream'), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), enabled, expires_at, last_used_at, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,'')`
 
 func scanAPIKey(scan func(...interface{}) error) (APIKey, error) {
 	var k APIKey
 	var enabled int
-	err := scan(&k.KeyHash, &k.Label, &k.GroupName, &k.ForceModel, &k.ForceEffort, &enabled, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret)
+	err := scan(&k.KeyHash, &k.Label, &k.KeyType, &k.GroupName, &k.ForceModel, &k.ForceEffort, &enabled, &k.ExpiresAt, &k.LastUsedAt, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret)
 	k.Enabled = enabled != 0
+	if strings.TrimSpace(k.KeyType) == "" {
+		k.KeyType = "downstream"
+	}
 	return k, err
 }
 
@@ -1378,10 +1457,13 @@ func (s *Store) UpsertAPIKey(ctx context.Context, k APIKey) error {
 	if k.CreatedAt == 0 {
 		k.CreatedAt = now
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, label, group_name, force_model, force_effort, enabled, secret, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, label=excluded.label, group_name=excluded.group_name, force_model=excluded.force_model, force_effort=excluded.force_effort, enabled=excluded.enabled, secret=excluded.secret, updated_at=excluded.updated_at`,
-		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.Label, k.GroupName, k.ForceModel, k.ForceEffort, boolInt(k.Enabled), s.sealToken(k.Secret), k.CreatedAt, now)
+	if strings.TrimSpace(k.KeyType) == "" {
+		k.KeyType = "downstream"
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, key_type, label, group_name, force_model, force_effort, enabled, expires_at, last_used_at, secret, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, key_type=excluded.key_type, label=excluded.label, group_name=excluded.group_name, force_model=excluded.force_model, force_effort=excluded.force_effort, enabled=excluded.enabled, expires_at=excluded.expires_at, last_used_at=excluded.last_used_at, secret=excluded.secret, updated_at=excluded.updated_at`,
+		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.KeyType, k.Label, k.GroupName, k.ForceModel, k.ForceEffort, boolInt(k.Enabled), k.ExpiresAt, k.LastUsedAt, s.sealToken(k.Secret), k.CreatedAt, now)
 	return err
 }
 
@@ -2256,8 +2338,8 @@ func (s *Store) UpsertCapabilities(ctx context.Context, capabilities []ModelCapa
 			c.LastProbeAt = Now()
 		}
 		_, err := tx.ExecContext(ctx, `
-INSERT INTO account_model_capabilities(account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_model_capabilities(account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, model_slug) DO UPDATE SET
  native_context_window = excluded.native_context_window,
  native_max_context_window = excluded.native_max_context_window,
@@ -2266,9 +2348,10 @@ ON CONFLICT(account_id, model_slug) DO UPDATE SET
  visibility = excluded.visibility,
  etag = excluded.etag,
  raw_model_json_hash = excluded.raw_model_json_hash,
+ raw_model_json = excluded.raw_model_json,
  source = excluded.source,
  last_probe_at = excluded.last_probe_at`,
-			c.AccountID, c.ModelSlug, c.NativeContextWindow, c.NativeMaxContextWindow, c.EffectiveContextWindowPercent, c.AutoCompactTokenLimit, c.Visibility, c.ETag, c.RawModelJSONHash, c.Source, c.LastProbeAt)
+			c.AccountID, c.ModelSlug, c.NativeContextWindow, c.NativeMaxContextWindow, c.EffectiveContextWindowPercent, c.AutoCompactTokenLimit, c.Visibility, c.ETag, c.RawModelJSONHash, c.RawModelJSON, c.Source, c.LastProbeAt)
 		if err != nil {
 			return err
 		}
@@ -2277,7 +2360,7 @@ ON CONFLICT(account_id, model_slug) DO UPDATE SET
 }
 
 func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]ModelCapability, error) {
-	query := `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities`
+	query := `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at FROM account_model_capabilities`
 	args := []interface{}{}
 	if accountID != "" {
 		query += ` WHERE account_id = ?`
@@ -2292,7 +2375,7 @@ func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]Model
 	var out []ModelCapability
 	for rows.Next() {
 		var c ModelCapability
-		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -2305,14 +2388,14 @@ func (s *Store) ListCapabilitiesByAccountIDs(ctx context.Context, accountIDs []s
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var c ModelCapability
-		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
 			return nil, err
 		}
 		out[c.AccountID] = append(out[c.AccountID], c)
@@ -3037,8 +3120,13 @@ func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error)
 	var p CustomProvider
 	var enabled, auto int
 	var modelsJSON string
-	if err := scan(&p.ID, &p.Name, &p.BaseURL, &enabled, &auto, &modelsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &enabled, &auto, &modelsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return CustomProvider{}, err
+	}
+	if proto, ok := NormalizeCustomProviderProtocol(p.UpstreamProtocol); ok {
+		p.UpstreamProtocol = proto
+	} else {
+		p.UpstreamProtocol = CustomProviderProtocolChatCompletions
 	}
 	p.Enabled = enabled != 0
 	p.AutoDiscoverModels = auto != 0
@@ -3070,7 +3158,7 @@ func decodeProviderModels(raw string) []string {
 	return out
 }
 
-const customProviderCols = `id, name, base_url, enabled, auto_discover_models, models_json, created_at, updated_at`
+const customProviderCols = `id, name, base_url, upstream_protocol, enabled, auto_discover_models, models_json, created_at, updated_at`
 
 func (s *Store) ListCustomProviders(ctx context.Context) ([]CustomProvider, error) {
 	rows, err := s.rdb.QueryContext(ctx, `SELECT `+customProviderCols+` FROM custom_providers ORDER BY id`)
@@ -3111,6 +3199,11 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 	if p.Name == "" {
 		p.Name = p.ID
 	}
+	if proto, ok := NormalizeCustomProviderProtocol(p.UpstreamProtocol); ok {
+		p.UpstreamProtocol = proto
+	} else {
+		p.UpstreamProtocol = CustomProviderProtocolChatCompletions
+	}
 	now := Now()
 	if p.CreatedAt == 0 {
 		p.CreatedAt = now
@@ -3123,16 +3216,17 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 		}
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, enabled, auto_discover_models, models_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO custom_providers(id, name, base_url, upstream_protocol, enabled, auto_discover_models, models_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name = excluded.name,
  base_url = excluded.base_url,
+ upstream_protocol = excluded.upstream_protocol,
  enabled = excluded.enabled,
  auto_discover_models = excluded.auto_discover_models,
  models_json = excluded.models_json,
  updated_at = excluded.updated_at`,
-		p.ID, p.Name, p.BaseURL, boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, p.CreatedAt, p.UpdatedAt)
+		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, p.CreatedAt, p.UpdatedAt)
 	return err
 }
 

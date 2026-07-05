@@ -34,7 +34,11 @@ func ResponsesRequestToChatCompletion(raw []byte) ([]byte, error) {
 	if instr, ok := root["instructions"].(string); ok && strings.TrimSpace(instr) != "" {
 		messages = append(messages, map[string]interface{}{"role": "system", "content": instr})
 	}
-	messages = append(messages, responsesInputToChatMessages(root["input"])...)
+	convertedMessages, err := responsesInputToChatMessages(root["input"])
+	if err != nil {
+		return nil, err
+	}
+	messages = append(messages, convertedMessages...)
 	out["messages"] = messages
 
 	if v, ok := root["stream"].(bool); ok && v {
@@ -52,7 +56,11 @@ func ResponsesRequestToChatCompletion(raw []byte) ([]byte, error) {
 	if v, ok := root["parallel_tool_calls"]; ok {
 		out["parallel_tool_calls"] = v
 	}
-	if tools := responsesToolsToChat(root["tools"]); len(tools) > 0 {
+	tools, err := responsesToolsToChat(root["tools"])
+	if err != nil {
+		return nil, err
+	}
+	if len(tools) > 0 {
 		out["tools"] = tools
 	}
 	if tc := responsesToolChoiceToChat(root["tool_choice"]); tc != nil {
@@ -63,13 +71,13 @@ func ResponsesRequestToChatCompletion(raw []byte) ([]byte, error) {
 
 // responsesInputToChatMessages converts a Responses `input` (a bare string, or an
 // array of input items) into Chat Completions messages.
-func responsesInputToChatMessages(input interface{}) []interface{} {
+func responsesInputToChatMessages(input interface{}) ([]interface{}, error) {
 	switch t := input.(type) {
 	case string:
 		if strings.TrimSpace(t) == "" {
-			return nil
+			return nil, nil
 		}
-		return []interface{}{map[string]interface{}{"role": "user", "content": t}}
+		return []interface{}{map[string]interface{}{"role": "user", "content": t}}, nil
 	case []interface{}:
 		out := make([]interface{}, 0, len(t))
 		for _, item := range t {
@@ -109,13 +117,12 @@ func responsesInputToChatMessages(input interface{}) []interface{} {
 					"content": chatContentToText(m["content"]),
 				})
 			default:
-				// Unknown item types (web_search_call, …) are dropped — a plain Chat
-				// Completions provider cannot consume them.
+				return nil, responsesCompatibilityError("input item type", itemType)
 			}
 		}
-		return out
+		return out, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // responsesOutputToText flattens a function_call_output `output` (string, array of
@@ -140,10 +147,10 @@ func responsesOutputToText(v interface{}) string {
 // responsesToolsToChat flattens Responses flat function tools
 // ({type:"function",name,description,parameters}) into Chat Completions
 // ({type:"function",function:{…}}). Typed built-in tools (web_search, …) are dropped.
-func responsesToolsToChat(v interface{}) []interface{} {
+func responsesToolsToChat(v interface{}) ([]interface{}, error) {
 	arr, ok := v.([]interface{})
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	out := make([]interface{}, 0, len(arr))
 	for _, t := range arr {
@@ -156,7 +163,7 @@ func responsesToolsToChat(v interface{}) []interface{} {
 			continue
 		}
 		if typ, _ := tm["type"].(string); typ != "" && typ != "function" {
-			continue // typed built-in tool
+			return nil, responsesCompatibilityError("tool type", typ)
 		}
 		name := stringOr(mapGet(tm, "name"), "")
 		if name == "" {
@@ -174,7 +181,15 @@ func responsesToolsToChat(v interface{}) []interface{} {
 		}
 		out = append(out, map[string]interface{}{"type": "function", "function": fn})
 	}
-	return out
+	return out, nil
+}
+
+func responsesCompatibilityError(kind, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "<empty>"
+	}
+	return fmt.Errorf("unsupported Responses %s %q for chat_completions bridge; configure upstream_protocol=\"responses\" or use an official Codex account for this request", kind, value)
 }
 
 func responsesToolChoiceToChat(v interface{}) interface{} {

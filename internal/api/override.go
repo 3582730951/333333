@@ -130,6 +130,10 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 	plain := downstreamBearer(r)
 	if plain != "" {
 		if key, found, _ := s.store.LookupAPIKey(ctx, hashAPIKey(plain)); found {
+			if normalizeAPIKeyType(key.KeyType) == "pool_import" || isPoolImportKeyPlain(plain) {
+				writeError(w, http.StatusForbidden, errors.New("pool import key cannot be used for inference"))
+				return downstreamPolicy{}, false
+			}
 			if !key.Enabled {
 				if s.flagEnabled(ctx, "require_downstream_key", s.cfg.RequireDownstreamKey) {
 					writeError(w, http.StatusUnauthorized, errors.New("api key disabled"))
@@ -146,6 +150,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				pol.ForceModel = strings.TrimSpace(key.ForceModel)
 				pol.ForceEffort = strings.TrimSpace(key.ForceEffort)
 			}
+		} else if isPoolImportKeyPlain(plain) {
+			writeError(w, http.StatusForbidden, errors.New("pool import key cannot be used for inference"))
+			return downstreamPolicy{}, false
 		} else if s.flagEnabled(ctx, "require_downstream_key", s.cfg.RequireDownstreamKey) {
 			writeError(w, http.StatusUnauthorized, errors.New("unknown api key"))
 			return downstreamPolicy{}, false

@@ -178,6 +178,80 @@ func TestCustomProviderResponsesConversion(t *testing.T) {
 	}
 }
 
+func TestCustomProviderNativeResponsesPassthrough(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/responses"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-native","object":"response","model":"native-resp-model","status":"completed","output_text":"native ok","native_passthrough":true}`))
+		case strings.HasSuffix(r.URL.Path, "/chat/completions"):
+			t.Fatalf("native Responses provider must not be called through /chat/completions")
+		default:
+			t.Fatalf("unexpected native provider upstream path %s", r.URL.Path)
+		}
+	})
+	prov := map[string]interface{}{
+		"id": "native-resp", "name": "Native Responses", "base_url": h.upstream.URL,
+		"upstream_protocol": "responses",
+		"enabled":           true, "auto_discover_models": false, "models": []string{"native-resp-model"},
+	}
+	raw, _ := json.Marshal(prov)
+	resp, err := http.Post(h.pool.URL+"/admin/providers", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("upsert native provider status = %d", resp.StatusCode)
+	}
+	imp := map[string]interface{}{"provider_id": "native-resp", "api_key": "sk-native-resp", "label": "native"}
+	iraw, _ := json.Marshal(imp)
+	resp2, err := http.Post(h.pool.URL+"/admin/accounts/import-key", "application/json", bytes.NewReader(iraw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("import-key status = %d", resp2.StatusCode)
+	}
+
+	resp3, err := http.Post(h.pool.URL+"/v1/responses", "application/json",
+		strings.NewReader(`{"model":"native-resp-model","input":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_preview"}],"include":["web_search_call.results"],"unknown_future_field":{"x":1}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp3.Body.Close()
+	var root map[string]interface{}
+	if err := json.NewDecoder(resp3.Body).Decode(&root); err != nil {
+		t.Fatal(err)
+	}
+	if root["object"] != "response" || root["native_passthrough"] != true {
+		t.Fatalf("native Responses body was not transparently returned: %#v", root)
+	}
+
+	var responsesCall *capturedRequest
+	for i := range *h.captured {
+		c := &(*h.captured)[i]
+		if strings.HasSuffix(c.Path, "/responses") {
+			responsesCall = c
+		}
+		if strings.HasSuffix(c.Path, "/chat/completions") {
+			t.Fatalf("unexpected chat conversion call for native Responses provider: %+v", c)
+		}
+	}
+	if responsesCall == nil {
+		t.Fatalf("no native /responses upstream call captured: %+v", h.requests())
+	}
+	for _, want := range []string{`"web_search_preview"`, `"unknown_future_field"`, `"include"`} {
+		if !strings.Contains(responsesCall.Body, want) {
+			t.Fatalf("native Responses request lost %s: %s", want, responsesCall.Body)
+		}
+	}
+	if responsesCall.Auth != "Bearer sk-native-resp" {
+		t.Fatalf("native provider auth = %q, want imported API key", responsesCall.Auth)
+	}
+}
+
 func TestCustomProviderMessagesConversion(t *testing.T) {
 	h := newHarness(t, deepseekMock(t))
 	setupDeepSeek(t, h, []string{"deepseek-chat"}, false)

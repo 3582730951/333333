@@ -19,11 +19,11 @@ import (
 	"codex-account-pool/internal/virtual"
 )
 
-// chat_custom.go serves a request from a custom OpenAI-Chat-Completions-compatible
-// provider (DeepSeek, Kimi, …). The three entrypoints differ only in how the
-// downstream protocol is converted to/from Chat Completions:
-//   - handleChatViaCustom     : /v1/chat/completions — near-passthrough (chat ↔ chat)
-//   - handleResponsesViaCustom: /v1/responses (Codex) — Responses ↔ chat
+// chat_custom.go serves a request from a custom OpenAI-compatible provider
+// (DeepSeek, Kimi, OpenRouter, native Responses gateways, …). The three entrypoints
+// differ only in how the downstream protocol is converted or transparently forwarded:
+//   - handleChatViaCustom     : /v1/chat/completions — near-passthrough or chat ↔ Responses
+//   - handleResponsesViaCustom: /v1/responses (Codex) — native passthrough or Responses ↔ chat
 //   - handleMessagesViaCustom : /v1/messages (Claude Code) — Anthropic ↔ chat
 // The shared lease → upstream → error plumbing lives in callCustom.
 
@@ -81,20 +81,23 @@ type customCall struct {
 	affinity routing.AffinityKey
 }
 
-// callCustom selects a provider-matching account, calls the upstream Chat Completions
-// endpoint with the already-converted chatBody, and handles every failure path
+// callCustom selects a provider-matching account, calls the provider's selected
+// upstream endpoint with the already-prepared body, and handles every failure path
 // (writing a proto-appropriate error and releasing the lease/hold). On success it
 // returns the live response; the caller owns cc.lease.Release() and cc.resp.Body.Close()
 // and converts/records the response. proto selects the downstream error envelope:
 // "claude" for the /v1/messages path, "codex" (OpenAI shape) otherwise.
-func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider storage.CustomProvider, chatBody []byte, model, routeGroup, proto string) (customCall, bool) {
-	affinity := routing.ExtractAffinityKey(r, chatBody)
+func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider storage.CustomProvider, body []byte, model, routeGroup, proto, upstreamPath string) (customCall, bool) {
+	if strings.TrimSpace(upstreamPath) == "" {
+		upstreamPath = "/chat/completions"
+	}
+	affinity := routing.ExtractAffinityKey(r, body)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,
 		Provider:        provider.ID,
 		Affinity:        affinity,
 		Model:           model,
-		EstimatedTokens: virtual.EstimateTokensJSON(chatBody),
+		EstimatedTokens: virtual.EstimateTokensJSON(body),
 	})
 	if err != nil {
 		status := http.StatusServiceUnavailable
@@ -112,18 +115,18 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 	}
 	// Scrub operator sensitive words from the request body, and reuse the same matcher
 	// on the response/stream (zero-cost pass-through when no words are configured).
-	scrub := cloak.ScrubSensitive(chatBody, s.cfg.SensitiveWordsFor(provider.ID))
-	chatBody = scrub.Body
+	scrub := cloak.ScrubSensitive(body, s.cfg.SensitiveWordsFor(provider.ID))
+	body = scrub.Body
 	scrubber := scrub.Scrubber
-	osHint := s.osHint(chatBody, lease.Egress)
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(chatBody))
+	osHint := s.osHint(body, lease.Egress)
+	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	resp, err := s.upstream.Do(r.Context(), upstream.Request{
 		Method:         http.MethodPost,
 		Provider:       provider.ID,
 		BaseURL:        strings.TrimSpace(provider.BaseURL),
-		DownstreamPath: "/chat/completions",
+		DownstreamPath: upstreamPath,
 		Headers:        r.Header.Clone(),
-		Body:           chatBody,
+		Body:           body,
 		Account:        lease.Account,
 		Token:          token,
 		Egress:         lease.Egress,
@@ -154,12 +157,16 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 // sides speak Chat Completions, so the body and response pass through unchanged (only
 // sensitive-word scrubbing + usage capture are applied).
 func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	if provider.UpstreamProtocol == storage.CustomProviderProtocolResponses {
+		s.handleChatViaNativeResponsesCustom(w, r, raw, model, routeGroup, provider)
+		return
+	}
 	stream := isStreamRequest(raw)
 	chatBody := raw
 	if stream {
 		chatBody = withStreamUsage(chatBody)
 	}
-	cc, ok := s.callCustom(w, r, provider, chatBody, model, routeGroup, "codex")
+	cc, ok := s.callCustom(w, r, provider, chatBody, model, routeGroup, "codex", "/chat/completions")
 	if !ok {
 		return
 	}
@@ -191,6 +198,10 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 // handleResponsesViaCustom serves a Codex /v1/responses request from a custom provider:
 // Responses request → chat, then chat response/SSE → Responses response/SSE.
 func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	if provider.UpstreamProtocol == storage.CustomProviderProtocolResponses {
+		s.handleNativeResponsesViaCustom(w, r, raw, model, routeGroup, provider)
+		return
+	}
 	stream := isStreamRequest(raw)
 	chatBody, err := prompt.ResponsesRequestToChatCompletion(raw)
 	if err != nil {
@@ -200,7 +211,7 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 	if stream {
 		chatBody = withStreamUsage(chatBody)
 	}
-	cc, ok := s.callCustom(w, r, provider, chatBody, model, routeGroup, "codex")
+	cc, ok := s.callCustom(w, r, provider, chatBody, model, routeGroup, "codex", "/chat/completions")
 	if !ok {
 		return
 	}
@@ -234,6 +245,90 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 	_, _ = w.Write(out)
 }
 
+// handleNativeResponsesViaCustom relays /v1/responses to a custom provider that
+// explicitly advertises native Responses support. Unlike the chat_completions bridge,
+// it does not translate or drop typed tools, include fields, previous_response_id, or
+// future Responses fields/events.
+func (s *Server) handleNativeResponsesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	stream := isStreamRequest(raw)
+	cc, ok := s.callCustom(w, r, provider, raw, model, routeGroup, "codex", "/responses")
+	if !ok {
+		return
+	}
+	defer cc.lease.Release()
+	defer cc.resp.Body.Close()
+
+	if stream && isEventStream(cc.resp.Header) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(cc.resp.StatusCode)
+		uscan := usage.NewStreamScanner("codex")
+		_ = streamCopyRewrite(w, io.TeeReader(cc.resp.Body, uscan), cc.scrubber)
+		if parsed, ok := uscan.Parsed(); ok {
+			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
+		}
+		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled_streaming")
+		return
+	}
+	body, err := s.readUpstreamResponseBody(cc.resp.Body)
+	if err != nil {
+		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
+	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(cc.resp.StatusCode)
+	_, _ = w.Write(cc.scrubber.ReplaceAll(body))
+}
+
+// handleChatViaNativeResponsesCustom supports Chat Completions clients against a
+// native-Responses custom provider by using the same chat↔Responses adapter the
+// official Codex path uses, but without routing through ChatGPT accounts.
+func (s *Server) handleChatViaNativeResponsesCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	responsesBody, err := prompt.ChatCompletionToResponses(raw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	cc, ok := s.callCustom(w, r, provider, responsesBody, model, routeGroup, "codex", "/responses")
+	if !ok {
+		return
+	}
+	defer cc.lease.Release()
+	defer cc.resp.Body.Close()
+
+	if isStreamRequest(raw) && isEventStream(cc.resp.Header) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(cc.resp.StatusCode)
+		uscan := usage.NewStreamScanner("codex")
+		responsesStreamToChatSSE(w, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
+		if parsed, ok := uscan.Parsed(); ok {
+			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
+		}
+		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled_streaming")
+		return
+	}
+	body, err := s.readUpstreamResponseBody(cc.resp.Body)
+	if err != nil {
+		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
+	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	out, cerr := prompt.ResponsesToChatCompletion(cc.scrubber.ReplaceAll(body), cc.resp.Header.Get("x-request-id"), model)
+	if cerr != nil {
+		writeError(w, http.StatusBadGateway, cerr)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
+}
+
 // handleMessagesViaCustom serves a Claude Code /v1/messages request from a custom
 // provider: Anthropic request → chat, then chat response/SSE → Anthropic response/SSE.
 func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
@@ -246,7 +341,7 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 	if stream {
 		chatBody = withStreamUsage(chatBody)
 	}
-	cc, ok := s.callCustom(w, r, provider, chatBody, model, routeGroup, "claude")
+	cc, ok := s.callCustom(w, r, provider, chatBody, model, routeGroup, "claude", "/chat/completions")
 	if !ok {
 		return
 	}

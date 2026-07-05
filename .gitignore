@@ -39,6 +39,7 @@ web-spa/dist/
 /other_new_gpt_register
 /docs
 /other
+/example_zip
 
 # Python caches and captured traffic artifacts
 __pycache__/

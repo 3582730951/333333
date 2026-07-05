@@ -86,7 +86,7 @@ func TestChatPromptPrependsExistingSystem(t *testing.T) {
 }
 
 func TestChatCompletionToResponsesPlainTextUnchanged(t *testing.T) {
-	raw := []byte(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"n":2}`)
+	raw := []byte(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"max_tokens":123,"max_completion_tokens":456,"n":2}`)
 	out, err := ChatCompletionToResponses(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -99,9 +99,32 @@ func TestChatCompletionToResponsesPlainTextUnchanged(t *testing.T) {
 	if _, ok := root["n"]; ok {
 		t.Fatal("n should be dropped")
 	}
+	if _, ok := root["max_tokens"]; ok {
+		t.Fatal("max_tokens should be translated to max_output_tokens")
+	}
+	if _, ok := root["max_completion_tokens"]; ok {
+		t.Fatal("max_completion_tokens should be translated to max_output_tokens")
+	}
+	if root["max_output_tokens"].(float64) != 456 {
+		t.Fatalf("max_output_tokens = %v, want max_completion_tokens priority 456", root["max_output_tokens"])
+	}
 	input := root["input"].([]interface{})
 	if len(input) != 1 || input[0].(map[string]interface{})["content"] != "hi" {
 		t.Fatalf("plain text input not preserved: %v", input)
+	}
+}
+
+func TestResponsesToChatCompletionMapsIncompleteToLength(t *testing.T) {
+	raw := []byte(`{"id":"resp_length","model":"gpt","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`)
+	out, err := ResponsesToChatCompletion(raw, "", "gpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	_ = json.Unmarshal(out, &root)
+	choice := root["choices"].([]interface{})[0].(map[string]interface{})
+	if choice["finish_reason"] != "length" {
+		t.Fatalf("finish_reason = %v, want length for incomplete response", choice["finish_reason"])
 	}
 }
 

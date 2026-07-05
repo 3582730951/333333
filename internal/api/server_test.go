@@ -191,6 +191,33 @@ func TestGatewayResponsesRawStreamingAndHeaders(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesDoesNotVirtualTrimInput(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_no_trim","status":"completed","output_text":"ok"}`))
+	})
+	acc := h.importAccount(t, "trim", "up-trim", "access-trim")
+	setTestCapability(t, h, acc, "gpt", 64)
+	large := strings.Repeat("A", 2000)
+	body := `{"model":"gpt","conversation_id":"conv-no-trim","input":[{"role":"user","content":"old ` + large + `"},{"role":"assistant","content":"middle ` + large + `"},{"role":"user","content":"current"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	reqs := h.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("requests = %d", len(reqs))
+	}
+	if !strings.Contains(reqs[0].Body, "old "+large) || !strings.Contains(reqs[0].Body, "middle "+large) {
+		t.Fatalf("proxy trimmed or reconstructed input; upstream body=%s", reqs[0].Body)
+	}
+}
+
 func TestGatewayAutoPromptCacheKeyForLargeStablePrefix(t *testing.T) {
 	var upstreamBody string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1650,7 +1677,7 @@ func TestAdminTenantUserProjectAndAccountLifecycle(t *testing.T) {
 	}
 }
 
-func TestModelsProbeNativeAndVirtual(t *testing.T) {
+func TestModelsProbeAdvertisesNativeWindowsOnly(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/codex/models" {
 			t.Fatalf("path = %s", r.URL.Path)
@@ -1680,11 +1707,16 @@ func TestModelsProbeNativeAndVirtual(t *testing.T) {
 		m := item.(map[string]interface{})
 		modes[m["id"].(string)] = m["window_mode"].(string)
 	}
-	if modes["gpt-native"] != "native_2m" {
+	if modes["gpt-native"] != "native" {
 		t.Fatalf("native mode = %q", modes["gpt-native"])
 	}
-	if modes["gpt-virtual"] != "virtual_2m" {
-		t.Fatalf("virtual mode = %q", modes["gpt-virtual"])
+	if modes["gpt-virtual"] != "native" {
+		t.Fatalf("non-2m model must advertise its real native window, mode = %q", modes["gpt-virtual"])
+	}
+	for id, mode := range modes {
+		if mode == "virtual_2m" {
+			t.Fatalf("%s still advertises removed virtual_2m mode", id)
+		}
 	}
 	if resp.Header.Get("ETag") == "" {
 		t.Fatalf("missing etag")
@@ -1875,7 +1907,7 @@ func TestSeamlessFailoverOnLimitSwitchesAccountTransparently(t *testing.T) {
 	}
 }
 
-func TestStatefulTurnRebuildsFromLedgerBeforeFailover(t *testing.T) {
+func TestStatefulTurnDoesNotRebuildOrFailover(t *testing.T) {
 	var aCalls int
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1928,35 +1960,30 @@ func TestStatefulTurnRebuildsFromLedgerBeforeFailover(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ok") {
-		t.Fatalf("expected transparent success after stateful rebuild, got %d %s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("stateful turn should preserve upstream state and surface account A error status, got %d %s", resp.StatusCode, body)
 	}
-	if !bCalled {
-		t.Fatalf("stateful failed turn was not retried on account B")
+	if bCalled {
+		t.Fatalf("stateful turn with previous_response_id must not be rebuilt or retried on account B")
 	}
 	reqs := h.requests()
-	var bReq capturedRequest
+	var secondA capturedRequest
 	for _, req := range reqs {
-		if req.Auth == "Bearer access-b" {
-			bReq = req
+		if req.Auth == "Bearer access-a" && strings.Contains(req.Body, "next") {
+			secondA = req
 			break
 		}
 	}
-	if bReq.Body == "" {
-		t.Fatalf("missing captured account B request: %+v", reqs)
+	if secondA.Body == "" {
+		t.Fatalf("missing captured second account A request: %+v", reqs)
 	}
-	for _, forbidden := range []string{"previous_response_id", "resp_a_1", "account-a-state"} {
-		if strings.Contains(bReq.Body, forbidden) || strings.Contains(bReq.TurnState, forbidden) {
-			t.Fatalf("rebuilt request leaked old account state %q: header=%q body=%s", forbidden, bReq.TurnState, bReq.Body)
+	for _, want := range []string{"previous_response_id", "resp_a_1"} {
+		if !strings.Contains(secondA.Body, want) {
+			t.Fatalf("stateful request lost upstream state %q: body=%s", want, secondA.Body)
 		}
 	}
-	for _, want := range []string{"hello", "assistant answer", "next", `"effort":"high"`, `"name":"lookup"`} {
-		if !strings.Contains(bReq.Body, want) {
-			t.Fatalf("rebuilt request missing %q:\n%s", want, bReq.Body)
-		}
-	}
-	if strings.Contains(bReq.Body, "prompt_cache_retention") {
-		t.Fatalf("non-WS rebuilt request should strip prompt_cache_retention:\n%s", bReq.Body)
+	if secondA.TurnState != "account-a-state" {
+		t.Fatalf("turn state header should be preserved for the same upstream account, got %q", secondA.TurnState)
 	}
 }
 
@@ -2312,7 +2339,7 @@ func TestCodexStreamingContentThenFailedRetriesWithoutLeakingPartial(t *testing.
 	}
 }
 
-func TestCodexStreamingResponseRecordedForStatefulRebuild(t *testing.T) {
+func TestCodexStreamingStatefulTurnDoesNotUseRemovedLedger(t *testing.T) {
 	var aCalls int
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2368,28 +2395,29 @@ func TestCodexStreamingResponseRecordedForStatefulRebuild(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !bCalled {
-		t.Fatalf("expected stateful rebuild from streamed ledger on account B, status=%d body=%s bCalled=%v", resp.StatusCode, body, bCalled)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("stream-derived stateful turn should surface account A error status without ledger replay, status=%d body=%s", resp.StatusCode, body)
 	}
-	var bReq capturedRequest
+	if bCalled {
+		t.Fatalf("stream-derived stateful turn must not be rebuilt or retried on account B")
+	}
+	var secondA capturedRequest
 	for _, req := range h.requests() {
-		if req.Auth == "Bearer access-b" {
-			bReq = req
+		if req.Auth == "Bearer access-a" && strings.Contains(req.Body, "next") {
+			secondA = req
 			break
 		}
 	}
-	if bReq.Body == "" {
-		t.Fatalf("missing account B request")
+	if secondA.Body == "" {
+		t.Fatalf("missing second account A request")
 	}
-	for _, forbidden := range []string{"previous_response_id", "resp_a_stream", "account-a-stream-state"} {
-		if strings.Contains(bReq.Body, forbidden) || strings.Contains(bReq.TurnState, forbidden) {
-			t.Fatalf("rebuilt streamed request leaked old account state %q: header=%q body=%s", forbidden, bReq.TurnState, bReq.Body)
+	for _, want := range []string{"previous_response_id", "resp_a_stream"} {
+		if !strings.Contains(secondA.Body, want) {
+			t.Fatalf("stateful streamed request lost upstream state %q: body=%s", want, secondA.Body)
 		}
 	}
-	for _, want := range []string{"hello", "stream answer", "next"} {
-		if !strings.Contains(bReq.Body, want) {
-			t.Fatalf("rebuilt streamed request missing %q:\n%s", want, bReq.Body)
-		}
+	if secondA.TurnState != "account-a-stream-state" {
+		t.Fatalf("turn state header should be preserved for the same upstream account, got %q", secondA.TurnState)
 	}
 }
 

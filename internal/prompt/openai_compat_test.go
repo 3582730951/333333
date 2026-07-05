@@ -2,6 +2,7 @@ package prompt
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -58,6 +59,38 @@ func TestResponsesRequestToChatCompletion(t *testing.T) {
 	fn := tools[0].(map[string]interface{})["function"].(map[string]interface{})
 	if fn["name"] != "get_weather" {
 		t.Fatalf("tool not flattened to chat shape: %v", tools)
+	}
+}
+
+func TestResponsesRequestToChatCompletionRejectsUnsupportedResponsesTools(t *testing.T) {
+	in := []byte(`{
+	  "model":"deepseek-chat",
+	  "input":[{"role":"user","content":"search"}],
+	  "tools":[{"type":"web_search_preview"}]
+	}`)
+	_, err := ResponsesRequestToChatCompletion(in)
+	if err == nil {
+		t.Fatal("expected explicit compatibility error for typed Responses tool")
+	}
+	if !strings.Contains(err.Error(), `unsupported Responses tool type "web_search_preview"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestResponsesRequestToChatCompletionRejectsUnknownInputItems(t *testing.T) {
+	in := []byte(`{
+	  "model":"deepseek-chat",
+	  "input":[
+	    {"role":"user","content":"hi"},
+	    {"type":"web_search_call","id":"ws_1","status":"completed"}
+	  ]
+	}`)
+	_, err := ResponsesRequestToChatCompletion(in)
+	if err == nil {
+		t.Fatal("expected explicit compatibility error for unknown Responses input item")
+	}
+	if !strings.Contains(err.Error(), `unsupported Responses input item type "web_search_call"`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

@@ -1839,6 +1839,7 @@ EOF
 main() {
   ensure_project_files
   ensure_absolute_paths
+  log "Codex skills compatibility: full official skills/plugins/Browser Use support requires the official Codex account path; custom providers are best-effort."
   ensure_system_deps
   ensure_go
   build_project

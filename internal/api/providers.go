@@ -20,7 +20,7 @@ import (
 // adminProviders lists or upserts custom providers.
 //
 //	GET  /admin/providers
-//	POST /admin/providers  {id,name,base_url,enabled,auto_discover_models,models:[...]}
+//	POST /admin/providers  {id,name,base_url,upstream_protocol,enabled,auto_discover_models,models:[...]}
 func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -41,6 +41,7 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			ID                 string   `json:"id"`
 			Name               string   `json:"name"`
 			BaseURL            string   `json:"base_url"`
+			UpstreamProtocol   string   `json:"upstream_protocol"`
 			Enabled            *bool    `json:"enabled"`
 			AutoDiscoverModels *bool    `json:"auto_discover_models"`
 			Models             []string `json:"models"`
@@ -66,10 +67,16 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		proto, ok := storage.NormalizeCustomProviderProtocol(req.UpstreamProtocol)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("upstream_protocol must be chat_completions or responses"))
+			return
+		}
 		p := storage.CustomProvider{
 			ID:                 id,
 			Name:               strings.TrimSpace(req.Name),
 			BaseURL:            baseURL,
+			UpstreamProtocol:   proto,
 			Enabled:            true,
 			AutoDiscoverModels: true,
 			Models:             req.Models,

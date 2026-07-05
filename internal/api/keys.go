@@ -20,6 +20,25 @@ func generateAPIKey() (string, error) {
 	return "cap_" + hex.EncodeToString(buf), nil
 }
 
+func generatePoolImportKey() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "poolimp_" + hex.EncodeToString(buf), nil
+}
+
+func normalizeAPIKeyType(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "downstream", "cap", "api":
+		return "downstream"
+	case "pool_import", "pool-import", "poolimp", "account_pool_import", "account-pool-import":
+		return "pool_import"
+	default:
+		return strings.ToLower(strings.TrimSpace(v))
+	}
+}
+
 // adminAPIKeys manages downstream api keys: their routing group and the forced
 // model / reasoning-effort override the key imposes regardless of what the
 // client requested (the "强制改写下游使用的模型和推理强度" requirement). This is the
@@ -46,10 +65,12 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req struct {
 			Label       string `json:"label"`
+			KeyType     string `json:"key_type"`
 			GroupName   string `json:"group_name"`
 			ForceModel  string `json:"force_model"`
 			ForceEffort string `json:"force_effort"`
 			Enabled     *bool  `json:"enabled"`
+			ExpiresAt   int64  `json:"expires_at"`
 			TenantID    string `json:"tenant_id"`
 			ProjectID   string `json:"project_id"`
 		}
@@ -57,7 +78,14 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		plain, err := generateAPIKey()
+		keyType := normalizeAPIKeyType(req.KeyType)
+		var plain string
+		var err error
+		if keyType == "pool_import" {
+			plain, err = generatePoolImportKey()
+		} else {
+			plain, err = generateAPIKey()
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -69,10 +97,12 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 		key := storage.APIKey{
 			KeyHash:     hashAPIKey(plain),
 			Label:       strings.TrimSpace(req.Label),
+			KeyType:     keyType,
 			GroupName:   strings.TrimSpace(req.GroupName),
 			ForceModel:  strings.TrimSpace(req.ForceModel),
 			ForceEffort: normalizeEffort(req.ForceEffort),
 			Enabled:     enabled,
+			ExpiresAt:   req.ExpiresAt,
 			TenantID:    strings.TrimSpace(req.TenantID),
 			ProjectID:   strings.TrimSpace(req.ProjectID),
 			Secret:      plain,
@@ -85,10 +115,13 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 			"key":          plain,
 			"key_hash":     key.KeyHash,
 			"label":        key.Label,
+			"key_type":     key.KeyType,
 			"group_name":   key.GroupName,
 			"force_model":  key.ForceModel,
 			"force_effort": key.ForceEffort,
 			"enabled":      key.Enabled,
+			"expires_at":   key.ExpiresAt,
+			"last_used_at": key.LastUsedAt,
 		})
 	default:
 		methodNotAllowed(w)
@@ -127,10 +160,12 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 		}
 		var req struct {
 			Label       *string `json:"label"`
+			KeyType     *string `json:"key_type"`
 			GroupName   *string `json:"group_name"`
 			ForceModel  *string `json:"force_model"`
 			ForceEffort *string `json:"force_effort"`
 			Enabled     *bool   `json:"enabled"`
+			ExpiresAt   *int64  `json:"expires_at"`
 		}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -138,6 +173,9 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Label != nil {
 			key.Label = strings.TrimSpace(*req.Label)
+		}
+		if req.KeyType != nil {
+			key.KeyType = normalizeAPIKeyType(*req.KeyType)
 		}
 		if req.GroupName != nil {
 			key.GroupName = strings.TrimSpace(*req.GroupName)
@@ -150,6 +188,9 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Enabled != nil {
 			key.Enabled = *req.Enabled
+		}
+		if req.ExpiresAt != nil {
+			key.ExpiresAt = *req.ExpiresAt
 		}
 		if err := s.store.UpsertAPIKey(r.Context(), key); err != nil {
 			writeError(w, http.StatusInternalServerError, err)

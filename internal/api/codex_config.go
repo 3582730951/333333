@@ -335,6 +335,7 @@ EOF
 
   say "已写入 $CONFIG"
   say "model=$MODEL"
+  say "提示: Codex 官方 skills / plugins / Browser Use 最大兼容需要路由到官方 Codex 账号通道；第三方供应商为 best-effort。"
   if [ "$install_rtk" = "1" ]; then
     say "安装并接入 RTK (Codex)..."
     if ensure_rtk; then

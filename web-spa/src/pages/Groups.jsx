@@ -1,7 +1,7 @@
 import React, { useState, useCallback } from 'react';
-import { ActionMenu, Button, Toast, Modal, Form, Tag } from '../components/pool/index.jsx';
+import { ActionMenu, Button, Toast, Modal, Form, Tag, Switch } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
-import { get, post, del } from '../api.js';
+import { get, post, patch, del } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import { MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
@@ -14,29 +14,110 @@ function groupPolicyTags(row) {
   const tags = [];
   if (row.force_model) tags.push({ label: row.force_model, color: 'blue' });
   if (row.force_effort) tags.push({ label: `effort ${row.force_effort}`, color: 'violet' });
-  tags.push({ label: row.virtual_2m_enabled ? 'Virtual2M 开' : 'Virtual2M 关', color: row.virtual_2m_enabled ? 'green' : 'grey' });
+  if (row.model_instructions_enabled) tags.push({ label: `指令文件 ${row.model_instructions_files?.length || 0}`, color: row.model_instructions_error ? 'red' : 'green' });
   if (!row.force_model && !row.force_effort) tags.unshift({ label: '继承默认', color: 'grey' });
   return tags;
 }
 
+function cleanGroupValues(values) {
+  return {
+    name: String(values.name || '').trim(),
+    force_model: String(values.force_model || '').trim(),
+    force_effort: String(values.force_effort || '').trim(),
+    model_instructions_enabled: !!values.model_instructions_enabled,
+    model_instructions_files: String(values.model_instructions_files_csv || '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean),
+  };
+}
+
+function normalizedFileList(values = []) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values || []) {
+    const value = String(raw || '').trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
 export default function Groups() {
   const [open, setOpen] = useState(false);
+  const [instructionName, setInstructionName] = useState('');
+  const [instructionContent, setInstructionContent] = useState('');
+  const [editingGroup, setEditingGroup] = useState(null);
+  const [editFiles, setEditFiles] = useState([]);
 
   const fetchRows = useCallback(async ({ signal }) => {
-    const g = await get('/admin/groups', undefined, { signal });
-    return Array.isArray(g) ? g : g?.groups || [];
+    const [g, files] = await Promise.all([
+      get('/admin/groups', undefined, { signal }),
+      get('/admin/model-instructions', undefined, { signal }),
+    ]);
+    return {
+      groups: Array.isArray(g) ? g : g?.groups || [],
+      files: Array.isArray(files) ? files : files?.files || [],
+    };
   }, []);
-  const { data: rows = [], loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: [] });
+  const { data = { groups: [], files: [] }, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: { groups: [], files: [] } });
+  const rows = data.groups || [];
+  const instructionFiles = data.files || [];
   const groupMetrics = [
     { label: '分组数', value: rows.length },
     { label: '强制模型', value: rows.filter((row) => row.force_model).length },
     { label: '推理强度', value: rows.filter((row) => row.force_effort).length },
-    { label: 'Virtual2M', value: rows.filter((row) => row.virtual_2m_enabled).length, tone: 'success' },
+    { label: '模型指令', value: rows.filter((row) => row.model_instructions_enabled).length, tone: 'success' },
   ];
 
   const { run: create, running: creating } = useAsyncAction(async (values) => {
-    try { await post('/admin/groups', values); Toast.success('已创建'); setOpen(false); await load(); }
+    try { await post('/admin/groups', cleanGroupValues(values)); Toast.success('已创建'); setOpen(false); await load(); }
     catch (e) { showErrorToast(e); }
+  });
+
+  const { run: saveInstruction, running: savingInstruction } = useAsyncAction(async () => {
+    try {
+      await post('/admin/model-instructions', { name: instructionName, content: instructionContent });
+      Toast.success('模型指令文件已保存');
+      await load();
+    } catch (e) { showErrorToast(e); }
+  });
+
+  const openInstructionEditor = useCallback((group) => {
+    setEditingGroup({ ...group });
+    setEditFiles(normalizedFileList(group.model_instructions_files));
+  }, []);
+
+  const toggleEditFile = useCallback((name) => {
+    setEditFiles((current) => (
+      current.includes(name)
+        ? current.filter((item) => item !== name)
+        : [...current, name]
+    ));
+  }, []);
+
+  const moveEditFile = useCallback((index, delta) => {
+    setEditFiles((current) => {
+      const next = [...current];
+      const target = index + delta;
+      if (target < 0 || target >= next.length) return current;
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }, []);
+
+  const { run: saveGroupInstructions, running: savingGroupInstructions } = useAsyncAction(async () => {
+    if (!editingGroup?.name) return;
+    try {
+      await patch(`/admin/groups/${encodeURIComponent(editingGroup.name)}`, {
+        model_instructions_enabled: !!editingGroup.model_instructions_enabled,
+        model_instructions_files: editFiles,
+      });
+      Toast.success('分组模型指令已保存');
+      setEditingGroup(null);
+      await load();
+    } catch (e) { showErrorToast(e); }
   });
 
   const { run: remove, running: removing, isRunning: isRemoving } = useKeyedAsyncAction(async (name) => {
@@ -50,10 +131,12 @@ export default function Groups() {
       dataIndex: 'name',
       width: 260,
       render: (_, r) => (
-        <div className="pool-resource-summary">
-          <TextClamp strong>{r.name || '默认分组'}</TextClamp>
-          <div className="pool-resource-summary__meta">账号策略按分组继承，可被账号或 Key 覆盖</div>
-        </div>
+          <div className="pool-resource-summary">
+            <TextClamp strong>{r.name || '默认分组'}</TextClamp>
+          <div className="pool-resource-summary__meta">
+            {r.model_instructions_error ? `指令错误：${r.model_instructions_error}` : '账号策略按分组继承，可被账号或 Key 覆盖'}
+          </div>
+          </div>
       ),
     },
     {
@@ -81,24 +164,31 @@ export default function Groups() {
       render: (_, r) => (
         <ActionMenu
           label="分组操作"
-          items={[{
-            label: isRemoving(r.name) ? '删除中' : '删除',
-            destructive: true,
-            disabled: creating || (removing && !isRemoving(r.name)),
-            confirm: {
-              title: `删除分组 ${r.name}?`,
-              description: '删除分组会移除该分组配置，不会删除账号。',
-              confirmText: '删除',
+          items={[
+            {
+              label: '配置指令文件',
+              disabled: creating || removing,
+              onSelect: () => openInstructionEditor(r),
             },
-            onSelect: () => remove(r.name),
-          }]}
+            {
+              label: isRemoving(r.name) ? '删除中' : '删除',
+              destructive: true,
+              disabled: creating || (removing && !isRemoving(r.name)),
+              confirm: {
+                title: `删除分组 ${r.name}?`,
+                description: '删除分组会移除该分组配置，不会删除账号。',
+                confirmText: '删除',
+              },
+              onSelect: () => remove(r.name),
+            },
+          ]}
         />
     ) },
   ];
 
   return (
     <div>
-      <PageHeader title="分组" subtitle="按分组下发强制模型 / 推理强度 / 虚拟上下文"
+      <PageHeader title="分组" subtitle="按分组下发强制模型 / 推理强度 / Codex 模型指令文件"
         actions={<>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
           <Button icon={<IconPlus />} theme="solid" disabled={removing} onClick={() => setOpen(true)}>新建分组</Button>
@@ -122,15 +212,101 @@ export default function Groups() {
           emptyType="groups"
           skeletonRows={5}
         />
-        <MetricRail items={groupMetrics} />
+        <div style={{ display: 'grid', gap: 12 }}>
+          <MetricRail items={groupMetrics} />
+          <div className="pool-card" style={{ padding: 14 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>模型指令文件</div>
+            <Form onSubmit={saveInstruction}>
+              <Form.Input field="instruction_name" label="保存名称" value={instructionName} onChange={setInstructionName} placeholder="coding-style.md" />
+              <Form.TextArea field="instruction_content" label="内容" value={instructionContent} onChange={setInstructionContent} rows={6} />
+              <Button htmlType="submit" theme="solid" loading={savingInstruction} disabled={!instructionName.trim()}>Save</Button>
+            </Form>
+            <div style={{ marginTop: 10, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {instructionFiles.length ? instructionFiles.map((file) => (
+                <Tag key={file.name} size="small" color={file.error ? 'red' : 'blue'}>{file.name}</Tag>
+              )) : <Tag size="small">暂无文件</Tag>}
+            </div>
+          </div>
+        </div>
       </div>
       <Modal title="新建分组" visible={open} onCancel={() => { if (!creating) setOpen(false); }} footer={null} maskClosable={!creating}>
         <Form onSubmit={create}>
           <Form.Input field="name" label="分组名" rules={[{ required: true }]} />
           <Form.Input field="force_model" label="强制模型 (可选)" />
           <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((x) => ({ label: x || '不强制', value: x }))} />
+          <Form.Switch field="model_instructions_enabled" label="启用模型指令文件" />
+          <Form.Input
+            field="model_instructions_files_csv"
+            label="指令文件顺序"
+            placeholder={instructionFiles.map((file) => file.name).join(',') || 'coding-style.md,testing.txt'}
+            help="逗号分隔，按填写顺序拼接；仅对 ChatGPT/Codex 路由生效。"
+          />
           <Button htmlType="submit" theme="solid" loading={creating} style={{ marginTop: 12 }}>创建</Button>
         </Form>
+      </Modal>
+      <Modal
+        title={`模型指令文件 · ${editingGroup?.name || ''}`}
+        visible={!!editingGroup}
+        onCancel={() => { if (!savingGroupInstructions) setEditingGroup(null); }}
+        footer={null}
+        maskClosable={!savingGroupInstructions}
+      >
+        <div className="pool-form">
+          <label className="pool-field pool-field--left">
+            <span className="pool-field__label">启用</span>
+            <span>
+              <Switch
+                checked={!!editingGroup?.model_instructions_enabled}
+                disabled={savingGroupInstructions}
+                onChange={(checked) => setEditingGroup((current) => ({ ...(current || {}), model_instructions_enabled: checked }))}
+              />
+              <div className="pool-field__help">启用后仅注入 ChatGPT/Codex 路由，并作为 Responses 顶层 instructions。</div>
+            </span>
+          </label>
+          <div className="pool-field pool-field--left">
+            <span className="pool-field__label">多选文件</span>
+            <span>
+              <div style={{ display: 'grid', gap: 6 }}>
+                {instructionFiles.length ? instructionFiles.map((file) => (
+                  <label key={file.name} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <input
+                      type="checkbox"
+                      checked={editFiles.includes(file.name)}
+                      disabled={savingGroupInstructions}
+                      onChange={() => toggleEditFile(file.name)}
+                    />
+                    <span>{file.name}</span>
+                    {file.error ? <Tag size="small" color="red">{file.error}</Tag> : null}
+                  </label>
+                )) : <span className="pool-muted">暂无已保存文件，请先在右侧“模型指令文件”卡片保存 .md/.txt。</span>}
+              </div>
+              <div className="pool-field__help">勾选即挂载；下方列表顺序就是拼接顺序。</div>
+            </span>
+          </div>
+          <div className="pool-field pool-field--left">
+            <span className="pool-field__label">排序</span>
+            <span>
+              <div style={{ display: 'grid', gap: 6 }}>
+                {editFiles.length ? editFiles.map((name, index) => (
+                  <div key={name} style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
+                    <Tag size="small" color="blue">{index + 1}. {name}</Tag>
+                    <span style={{ display: 'flex', gap: 6 }}>
+                      <Button size="small" disabled={index === 0 || savingGroupInstructions} onClick={() => moveEditFile(index, -1)}>↑</Button>
+                      <Button size="small" disabled={index === editFiles.length - 1 || savingGroupInstructions} onClick={() => moveEditFile(index, 1)}>↓</Button>
+                    </span>
+                  </div>
+                )) : <span className="pool-muted">未选择文件</span>}
+              </div>
+            </span>
+          </div>
+          {editingGroup?.model_instructions_error ? (
+            <Tag color="red">当前错误：{editingGroup.model_instructions_error}</Tag>
+          ) : null}
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+            <Button disabled={savingGroupInstructions} onClick={() => setEditingGroup(null)}>取消</Button>
+            <Button theme="solid" loading={savingGroupInstructions} onClick={saveGroupInstructions}>保存</Button>
+          </div>
+        </div>
       </Modal>
     </div>
   );
