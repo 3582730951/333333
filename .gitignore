@@ -47,6 +47,7 @@ __pycache__/
 *.pcap
 *.pcapng
 capture/out*/
+auth.json
 
 # Generated screenshots / visual inspection artifacts
 pngs/

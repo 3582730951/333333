@@ -129,7 +129,7 @@ func (s *Server) adminProviderAction(w http.ResponseWriter, r *http.Request) {
 
 // adminImportKey imports a custom-provider account from a bare API key.
 //
-//	POST /admin/accounts/import-key  {provider_id, api_key, label, group_name}
+//	POST /admin/accounts/import-key  {provider_id, api_key, label, group_name, egress_id?}
 func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -139,10 +139,12 @@ func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ProviderID string `json:"provider_id"`
-		APIKey     string `json:"api_key"`
-		Label      string `json:"label"`
-		GroupName  string `json:"group_name"`
+		ProviderID      string `json:"provider_id"`
+		APIKey          string `json:"api_key"`
+		Label           string `json:"label"`
+		GroupName       string `json:"group_name"`
+		EgressID        string `json:"egress_id"`
+		PrimaryEgressID string `json:"primary_egress_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -166,7 +168,7 @@ func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 		label = providerID
 	}
 	parsed := authparse.ParsedAuth{AccountID: customAccountID(providerID, apiKey), OpenAIAPIKey: apiKey}
-	account, err := s.saveImportedAccount(r.Context(), parsed, label, req.GroupName, "", providerID)
+	account, err := s.saveImportedAccount(r.Context(), parsed, label, req.GroupName, "", providerID, requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

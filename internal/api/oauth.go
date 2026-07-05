@@ -315,7 +315,7 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 // pending PKCE session, exchanges it for tokens, and adds the account to the pool
 // via the shared saveImportedAccount path (provider is inferred from the token).
 //
-//	POST /admin/oauth/complete  {session_id, redirected, label?, group_name?}
+//	POST /admin/oauth/complete  {session_id, redirected, label?, group_name?, egress_id?}
 //	  -> the created account
 func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
@@ -326,10 +326,12 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		SessionID  string `json:"session_id"`
-		Redirected string `json:"redirected"`
-		Label      string `json:"label"`
-		GroupName  string `json:"group_name"`
+		SessionID       string `json:"session_id"`
+		Redirected      string `json:"redirected"`
+		Label           string `json:"label"`
+		GroupName       string `json:"group_name"`
+		EgressID        string `json:"egress_id"`
+		PrimaryEgressID string `json:"primary_egress_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -373,7 +375,7 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, "", "")
+	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, "", "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

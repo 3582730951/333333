@@ -91,7 +91,7 @@ func TestSaveImportedAccountIgnoresGroupDefaultEgress(t *testing.T) {
 		UpstreamAccountID: "up-imported-direct",
 		AccessToken:       "tok-imported-direct",
 		RefreshToken:      "refresh-imported-direct",
-	}, "imported-direct", "", "", "codex")
+	}, "imported-direct", "", "", "codex", "")
 	if err != nil {
 		t.Fatal(err)
 	}

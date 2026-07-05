@@ -79,6 +79,22 @@ const providerRows = [
     models: ['custom-chat'],
   },
 ];
+const egressRows = [
+  {
+    id: 'egress_direct',
+    name: 'Direct',
+    type: 'direct',
+    health: 'healthy',
+    stream_capable: true,
+  },
+  {
+    id: 'egress_alt',
+    name: 'Alt Proxy',
+    type: 'curl_cffi_sidecar',
+    health: 'healthy',
+    stream_capable: true,
+  },
+];
 const userRows = [
   {
     id: 'user_alice',
@@ -176,6 +192,10 @@ async function installMocks(page) {
     }
     if (requestPath === '/admin/providers') {
       req.respond(json({ providers: providerRows }));
+      return;
+    }
+    if (requestPath === '/admin/egress-profiles') {
+      req.respond(json({ profiles: egressRows }));
       return;
     }
     if (requestPath === '/admin/users') {

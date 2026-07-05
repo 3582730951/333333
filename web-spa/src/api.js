@@ -54,12 +54,13 @@ export const logout = () => post('/auth/logout', {}, { suppressUnauthorizedEvent
 
 // ── OAuth login helpers (web-login / paste-back import) ──
 export const oauthStart = (provider) => post('/admin/oauth/start', { provider });
-export const oauthComplete = (sessionId, redirected, label, groupName) =>
+export const oauthComplete = (sessionId, redirected, label, groupName, egressId) =>
   post('/admin/oauth/complete', {
     session_id: sessionId,
     redirected,
     label,
     group_name: groupName,
+    egress_id: egressId,
   });
 
 export const errMsg = (e) => {

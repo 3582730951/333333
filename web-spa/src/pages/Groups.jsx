@@ -14,6 +14,7 @@ function groupPolicyTags(row) {
   const tags = [];
   if (row.force_model) tags.push({ label: row.force_model, color: 'blue' });
   if (row.force_effort) tags.push({ label: `effort ${row.force_effort}`, color: 'violet' });
+  if (row.default_egress_id) tags.push({ label: `出口 ${row.default_egress_id}`, color: 'blue' });
   if (row.model_instructions_enabled) tags.push({ label: `指令文件 ${row.model_instructions_files?.length || 0}`, color: row.model_instructions_error ? 'red' : 'green' });
   if (!row.force_model && !row.force_effort) tags.unshift({ label: '继承默认', color: 'grey' });
   return tags;
@@ -29,8 +30,32 @@ function cleanGroupValues(values) {
       .split(',')
       .map((item) => item.trim())
       .filter(Boolean),
+    default_egress_id: String(values.default_egress_id || '').trim(),
   };
 }
+
+function cleanGroupPolicyValues(values) {
+  return {
+    name: String(values.name || '').trim(),
+    force_model: String(values.force_model || '').trim(),
+    force_effort: String(values.force_effort || '').trim(),
+    default_egress_id: String(values.default_egress_id || '').trim(),
+  };
+}
+
+const egressOptionList = (profiles = []) => {
+  const out = [{ label: '不设置（未显式选择时导入回退 egress_direct）', value: '' }];
+  const seen = new Set(['']);
+  const add = (profile) => {
+    const id = String(profile?.id || '').trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
+  };
+  add({ id: 'egress_direct', name: 'egress_direct', type: 'direct' });
+  for (const profile of profiles || []) add(profile);
+  return out;
+};
 
 function normalizedFileList(values = []) {
   const seen = new Set();
@@ -49,25 +74,30 @@ export default function Groups() {
   const [instructionName, setInstructionName] = useState('');
   const [instructionContent, setInstructionContent] = useState('');
   const [editingGroup, setEditingGroup] = useState(null);
+  const [policyEditor, setPolicyEditor] = useState(null);
   const [editFiles, setEditFiles] = useState([]);
 
   const fetchRows = useCallback(async ({ signal }) => {
-    const [g, files] = await Promise.all([
+    const [g, files, egresses] = await Promise.all([
       get('/admin/groups', undefined, { signal }),
       get('/admin/model-instructions', undefined, { signal }),
+      get('/admin/egress-profiles', undefined, { signal }),
     ]);
     return {
       groups: Array.isArray(g) ? g : g?.groups || [],
       files: Array.isArray(files) ? files : files?.files || [],
+      egresses: Array.isArray(egresses) ? egresses : egresses?.profiles || egresses?.egress_profiles || [],
     };
   }, []);
-  const { data = { groups: [], files: [] }, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: { groups: [], files: [] } });
+  const { data = { groups: [], files: [], egresses: [] }, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: { groups: [], files: [], egresses: [] } });
   const rows = data.groups || [];
   const instructionFiles = data.files || [];
+  const egressOptions = egressOptionList(data.egresses || []);
   const groupMetrics = [
     { label: '分组数', value: rows.length },
     { label: '强制模型', value: rows.filter((row) => row.force_model).length },
     { label: '推理强度', value: rows.filter((row) => row.force_effort).length },
+    { label: '默认出口', value: rows.filter((row) => row.default_egress_id).length },
     { label: '模型指令', value: rows.filter((row) => row.model_instructions_enabled).length, tone: 'success' },
   ];
 
@@ -120,6 +150,16 @@ export default function Groups() {
     } catch (e) { showErrorToast(e); }
   });
 
+  const { run: saveGroupPolicy, running: savingGroupPolicy } = useAsyncAction(async (values) => {
+    if (!policyEditor?.name) return;
+    try {
+      await patch(`/admin/groups/${encodeURIComponent(policyEditor.name)}`, cleanGroupPolicyValues(values));
+      Toast.success('分组策略已保存');
+      setPolicyEditor(null);
+      await load();
+    } catch (e) { showErrorToast(e); }
+  });
+
   const { run: remove, running: removing, isRunning: isRemoving } = useKeyedAsyncAction(async (name) => {
     try { await del(`/admin/groups/${encodeURIComponent(name)}`); Toast.success('已删除'); await load(); }
     catch (e) { showErrorToast(e); }
@@ -158,6 +198,12 @@ export default function Groups() {
       render: (v) => <TextClamp muted={!v}>{v || '继承默认'}</TextClamp>,
     },
     {
+      title: '默认出口',
+      dataIndex: 'default_egress_id',
+      width: 180,
+      render: (v) => <TextClamp muted={!v}>{v || '未设置'}</TextClamp>,
+    },
+    {
       title: '操作',
       key: 'ops',
       width: 116,
@@ -166,8 +212,13 @@ export default function Groups() {
           label="分组操作"
           items={[
             {
+              label: '编辑策略',
+              disabled: creating || removing || savingGroupPolicy,
+              onSelect: () => setPolicyEditor(r),
+            },
+            {
               label: '配置指令文件',
-              disabled: creating || removing,
+              disabled: creating || removing || savingGroupPolicy,
               onSelect: () => openInstructionEditor(r),
             },
             {
@@ -234,6 +285,7 @@ export default function Groups() {
           <Form.Input field="name" label="分组名" rules={[{ required: true }]} />
           <Form.Input field="force_model" label="强制模型 (可选)" />
           <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((x) => ({ label: x || '不强制', value: x }))} />
+          <Form.Select field="default_egress_id" label="默认出口" optionList={egressOptions} />
           <Form.Switch field="model_instructions_enabled" label="启用模型指令文件" />
           <Form.Input
             field="model_instructions_files_csv"
@@ -243,6 +295,31 @@ export default function Groups() {
           />
           <Button htmlType="submit" theme="solid" loading={creating} style={{ marginTop: 12 }}>创建</Button>
         </Form>
+      </Modal>
+      <Modal
+        title={`编辑分组策略 · ${policyEditor?.name || ''}`}
+        visible={!!policyEditor}
+        onCancel={() => { if (!savingGroupPolicy) setPolicyEditor(null); }}
+        footer={null}
+        maskClosable={!savingGroupPolicy}
+      >
+        {policyEditor ? (
+          <Form
+            initValues={{
+              name: policyEditor.name,
+              force_model: policyEditor.force_model || '',
+              force_effort: policyEditor.force_effort || '',
+              default_egress_id: policyEditor.default_egress_id || '',
+            }}
+            onSubmit={saveGroupPolicy}
+          >
+            <Form.Input field="name" label="分组名" disabled />
+            <Form.Input field="force_model" label="强制模型 (可选)" />
+            <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((x) => ({ label: x || '不强制', value: x }))} />
+            <Form.Select field="default_egress_id" label="默认出口" optionList={egressOptions} />
+            <Button htmlType="submit" theme="solid" loading={savingGroupPolicy} style={{ marginTop: 12 }}>保存</Button>
+          </Form>
+        ) : null}
       </Modal>
       <Modal
         title={`模型指令文件 · ${editingGroup?.name || ''}`}

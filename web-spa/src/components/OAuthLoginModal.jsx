@@ -1,12 +1,12 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import {
-  Modal, Tabs, TabPane, Form, Input, Button, Typography, Toast, Divider, Tooltip,
+  Modal, Tabs, TabPane, Form, Input, Select, Button, Typography, Toast, Divider, Tooltip,
 } from './pool/index.jsx';
 import {
   IconCopy, IconTick, IconRefresh, IconLink,
   IconChevronRight, IconCheckCircleStroked, IconFile,
 } from './pool/icons.jsx';
-import { oauthStart, oauthComplete, post } from '../api.js';
+import { get, oauthStart, oauthComplete, post } from '../api.js';
 import { showErrorToast } from './ErrorToast.jsx';
 import VendorLogo from './VendorLogo.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
@@ -15,6 +15,25 @@ import { clearBrowserInterval, clearBrowserTimeout, setBrowserInterval, setBrows
 import { openExternalURL } from '../lib/browserNavigation.js';
 
 const { Text } = Typography;
+
+function egressOptionList(profiles = []) {
+  const out = [];
+  const seen = new Set();
+  const add = (profile) => {
+    const id = String(profile?.id || '').trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
+  };
+  add({ id: 'egress_direct', name: 'egress_direct', type: 'direct' });
+  for (const profile of profiles || []) add(profile);
+  return out;
+}
+
+function normalizeEgressResponse(data) {
+  if (Array.isArray(data)) return data;
+  return data?.profiles || data?.egress_profiles || [];
+}
 
 // OAuthLoginModal - 新版账号导入弹窗，支持：
 // 1. ChatGPT/Codex OAuth 授权登录
@@ -30,6 +49,8 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [redirected, setRedirected] = useState('');
   const [copied, setCopied] = useState(false);
   const [manualRaw, setManualRaw] = useState('');
+  const [egressId, setEgressId] = useState('egress_direct');
+  const [egressProfiles, setEgressProfiles] = useState([]);
   const countdownRef = useRef(null);
   const copyResetRef = useRef(null);
   const actionEpochRef = useRef(0);
@@ -39,6 +60,20 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [label, setLabel] = useState('');
   const [groupName, setGroupName] = useState('');
   const [note, setNote] = useState('');
+  const egressOptions = useMemo(() => egressOptionList(egressProfiles), [egressProfiles]);
+
+  useEffect(() => {
+    if (!isVisible) return undefined;
+    let cancelled = false;
+    get('/admin/egress-profiles')
+      .then((data) => {
+        if (!cancelled) setEgressProfiles(normalizeEgressResponse(data));
+      })
+      .catch((e) => {
+        if (!cancelled) showErrorToast(e, { prefix: '出口列表读取失败' });
+      });
+    return () => { cancelled = true; };
+  }, [isVisible]);
 
   // Cleanup on close
   useEffect(() => {
@@ -80,6 +115,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setLabel('');
     setGroupName('');
     setNote('');
+    setEgressId('egress_direct');
     setCountdown(0);
     clearBrowserInterval(countdownRef.current);
     clearBrowserTimeout(copyResetRef.current);
@@ -139,7 +175,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       return;
     }
     try {
-      const result = await oauthComplete(sessionId, val, label, groupName);
+      const result = await oauthComplete(sessionId, val, label, groupName, egressId);
       if (actionEpoch !== actionEpochRef.current) return;
       Toast.success({
         content: (
@@ -170,6 +206,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         label,
         note,
         group_name: groupName,
+        egress_id: egressId,
         auth_json_text: val,
       });
       if (actionEpoch !== actionEpochRef.current) return;
@@ -238,6 +275,15 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             placeholder="留空使用默认分组"
             value={groupName}
             onChange={setGroupName}
+          />
+        </Form.Slot>
+
+        <Form.Slot label="账号默认出口">
+          <Select
+            value={egressId}
+            onChange={setEgressId}
+            optionList={egressOptions}
+            placeholder="选择默认出口"
           />
         </Form.Slot>
 
@@ -314,6 +360,15 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
                 placeholder="留空使用默认分组"
                 value={groupName}
                 onChange={setGroupName}
+              />
+            </Form.Slot>
+
+            <Form.Slot label="账号默认出口">
+              <Select
+                value={egressId}
+                onChange={setEgressId}
+                optionList={egressOptions}
+                placeholder="选择默认出口"
               />
             </Form.Slot>
           </Form>

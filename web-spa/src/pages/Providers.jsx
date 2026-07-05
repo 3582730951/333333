@@ -25,6 +25,20 @@ const PROTOCOL_OPTIONS = [
   { label: 'Responses 原生（保留 typed tools/未知字段）', value: 'responses' },
 ];
 
+const egressOptionList = (profiles = []) => {
+  const out = [];
+  const seen = new Set();
+  const add = (profile) => {
+    const id = String(profile?.id || '').trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
+  };
+  add({ id: 'egress_direct', name: 'egress_direct', type: 'direct' });
+  for (const profile of profiles || []) add(profile);
+  return out;
+};
+
 const providerFormValues = (row) => ({
   id: row?.id || '',
   name: row?.name || '',
@@ -43,6 +57,9 @@ export default function Providers() {
     return rowsOf(await get('/admin/providers', undefined, { signal }));
   }, []);
   const { data: rows = [], loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: [] });
+  const fetchEgressRows = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal })), []);
+  const { data: egressRows = [] } = useAsyncResource(fetchEgressRows, [fetchEgressRows], { initialData: [] });
+  const egressOptions = egressOptionList(egressRows);
 
   const { run: saveProvider, running: savingProvider } = useAsyncAction(async (values) => {
     try {
@@ -77,6 +94,7 @@ export default function Providers() {
         api_key: values.api_key,
         label: values.label,
         group_name: values.group_name,
+        egress_id: values.egress_id,
       });
       Toast.success('账号已导入');
       setImporter(null);
@@ -249,6 +267,7 @@ export default function Providers() {
             <Form.Input field="api_key" label="API Key" mode="password" rules={[{ required: true }]} />
             <Form.Input field="label" label="账号标签" placeholder={importer.name || importer.id} />
             <Form.Input field="group_name" label="分组" />
+            <Form.Select field="egress_id" label="账号默认出口" optionList={egressOptions} initValue="egress_direct" />
             <Button htmlType="submit" theme="solid" loading={importingKey} style={{ marginTop: 12 }}>导入</Button>
           </Form>
         ) : null}

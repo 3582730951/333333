@@ -20,10 +20,12 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Label        string          `json:"label"`
-		GroupName    string          `json:"group_name"`
-		AuthJSON     json.RawMessage `json:"auth_json"`
-		AuthJSONText string          `json:"auth_json_text"`
+		Label           string          `json:"label"`
+		GroupName       string          `json:"group_name"`
+		EgressID        string          `json:"egress_id"`
+		PrimaryEgressID string          `json:"primary_egress_id"`
+		AuthJSON        json.RawMessage `json:"auth_json"`
+		AuthJSONText    string          `json:"auth_json_text"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -80,6 +82,10 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.bindImportedAccountPrimaryEgress(r.Context(), account.ID, requestedImportEgressID(req.EgressID, req.PrimaryEgressID)); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

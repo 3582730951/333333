@@ -155,10 +155,12 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Label        string          `json:"label"`
-		GroupName    string          `json:"group_name"`
-		AuthJSON     json.RawMessage `json:"auth_json"`
-		AuthJSONText string          `json:"auth_json_text"`
+		Label           string          `json:"label"`
+		GroupName       string          `json:"group_name"`
+		EgressID        string          `json:"egress_id"`
+		PrimaryEgressID string          `json:"primary_egress_id"`
+		AuthJSON        json.RawMessage `json:"auth_json"`
+		AuthJSONText    string          `json:"auth_json_text"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -213,10 +215,14 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.bindImportedAccountPrimaryEgress(r.Context(), account.ID, requestedImportEgressID(req.EgressID, req.PrimaryEgressID)); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, accountImportResponse{Account: account, ImportStatus: "imported"})
 }
 
-func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.ParsedAuth, label, groupName, refreshToken, provider string) (storage.Account, error) {
+func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.ParsedAuth, label, groupName, refreshToken, provider, egressID string) (storage.Account, error) {
 	if label == "" {
 		label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
@@ -261,6 +267,9 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return storage.Account{}, err
 	}
+	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, egressID); err != nil {
+		return storage.Account{}, err
+	}
 	// Probe the new account's upstream model list once, in the background, so the
 	// advertised /v1/models union reflects it without waiting for the periodic
 	// sweep. Detached context + fire-and-forget so it never blocks the import
@@ -285,11 +294,13 @@ func (s *Server) adminImportToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Label        string `json:"label"`
-		GroupName    string `json:"group_name"`
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		AccountID    string `json:"account_id"`
+		Label           string `json:"label"`
+		GroupName       string `json:"group_name"`
+		EgressID        string `json:"egress_id"`
+		PrimaryEgressID string `json:"primary_egress_id"`
+		AccessToken     string `json:"access_token"`
+		RefreshToken    string `json:"refresh_token"`
+		AccountID       string `json:"account_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -300,7 +311,7 @@ func (s *Server) adminImportToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, req.RefreshToken, "")
+	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, req.RefreshToken, "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -320,10 +331,12 @@ func (s *Server) adminImportCookie(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Label        string `json:"label"`
-		GroupName    string `json:"group_name"`
-		CookieHeader string `json:"cookie_header"`
-		AccountID    string `json:"account_id"`
+		Label           string `json:"label"`
+		GroupName       string `json:"group_name"`
+		EgressID        string `json:"egress_id"`
+		PrimaryEgressID string `json:"primary_egress_id"`
+		CookieHeader    string `json:"cookie_header"`
+		AccountID       string `json:"account_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -343,7 +356,7 @@ func (s *Server) adminImportCookie(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, "", "")
+	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, "", "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
