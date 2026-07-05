@@ -77,6 +77,41 @@ func TestParseTopLevelSessionAuthJSONShape(t *testing.T) {
 	}
 }
 
+func TestParseAuthJSONPrefersChatGPTUserIDOverSharedWorkspaceAccountID(t *testing.T) {
+	makeIDToken := func(userID, accountID, email string) string {
+		claims := map[string]interface{}{
+			"https://api.openai.com/auth": map[string]interface{}{
+				"chatgpt_account_id": accountID,
+				"chatgpt_user_id":    userID,
+			},
+			"https://api.openai.com/profile": map[string]interface{}{
+				"email": email,
+			},
+		}
+		raw, _ := json.Marshal(claims)
+		return "header." + base64.RawURLEncoding.EncodeToString(raw) + ".sig"
+	}
+
+	sharedWorkspace := "workspace-shared"
+	a, err := ParseAuthJSON([]byte(`{"account_id":"` + sharedWorkspace + `","id_token":"` + makeIDToken("user-a", sharedWorkspace, "alias+a@example.internal") + `","access_token":"access-a"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParseAuthJSON([]byte(`{"account_id":"` + sharedWorkspace + `","id_token":"` + makeIDToken("user-b", sharedWorkspace, "alias+b@example.internal") + `","access_token":"access-b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.UpstreamAccountID != sharedWorkspace || b.UpstreamAccountID != sharedWorkspace {
+		t.Fatalf("workspace metadata not preserved: %+v / %+v", a, b)
+	}
+	if a.ChatGPTUserID != "user-a" || b.ChatGPTUserID != "user-b" {
+		t.Fatalf("chatgpt user ids not parsed: %+v / %+v", a, b)
+	}
+	if a.AccountID == b.AccountID {
+		t.Fatalf("different chatgpt_user_id values under one workspace collapsed into %q", a.AccountID)
+	}
+}
+
 func TestParseAuthJSONDoesNotDedupeByEmailWhenAccountIDsAreMissing(t *testing.T) {
 	a, err := ParseAuthJSON([]byte(`{"access_token":"access-alias-a","email":"alias@example.internal"}`))
 	if err != nil {

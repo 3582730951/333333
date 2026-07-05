@@ -94,7 +94,7 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	if out.AccessToken == "" && out.OpenAIAPIKey == "" {
 		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token, access_token nor OPENAI_API_KEY")
 	}
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.AccessToken, out.OpenAIAPIKey)
+	out.AccountID = stableAccountID(out.ChatGPTUserID, out.UpstreamAccountID, out.AccessToken, out.OpenAIAPIKey)
 	return out, nil
 }
 
@@ -153,7 +153,7 @@ func ParseOAuthCodex(accessToken, refreshToken, idTokenRaw string) (ParsedAuth, 
 		out.PlanType = claims.PlanType
 		out.IsFedramp = claims.IsFedramp
 	}
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.AccessToken)
+	out.AccountID = stableAccountID(out.ChatGPTUserID, out.UpstreamAccountID, out.AccessToken)
 	return out, nil
 }
 
@@ -205,7 +205,7 @@ func ParseAccessToken(accessToken, accountID string) (ParsedAuth, error) {
 	}
 	out.PlanType = claims.PlanType
 	out.IsFedramp = claims.IsFedramp
-	out.AccountID = stableAccountID(out.UpstreamAccountID, out.ChatGPTUserID, out.AccessToken)
+	out.AccountID = stableAccountID(out.ChatGPTUserID, out.UpstreamAccountID, out.AccessToken)
 	return out, nil
 }
 
