@@ -2,12 +2,14 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 )
 
@@ -136,6 +138,51 @@ func TestCustomProviderChatCompletionsPassthrough(t *testing.T) {
 	}
 	if cached != 3 {
 		t.Fatalf("custom passthrough cached_tokens = %d, want 3", cached)
+	}
+}
+
+func TestCustomProviderRuleFailoverRetriesDifferentAccount(t *testing.T) {
+	var secondCalled bool
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		switch r.Header.Get("Authorization") {
+		case "Bearer sk-deepseek-test":
+			w.WriteHeader(http.StatusTeapot)
+			_, _ = w.Write([]byte(`{"error":{"message":"vendor temporary block"}}`))
+		case "Bearer sk-deepseek-b":
+			secondCalled = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(dsChatResp))
+		default:
+			t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
+		}
+	})
+	accA := setupDeepSeek(t, h, []string{"deepseek-chat"}, false)
+	if err := h.store.UpsertAccount(context.Background(), storage.Account{ID: "ds-b", Label: "ds-b", GroupName: "cyber", Provider: "deepseek", Status: "active"}, storage.AccountToken{OpenAIAPIKey: "sk-deepseek-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertCapabilities(context.Background(), []storage.ModelCapability{{AccountID: "ds-b", ModelSlug: "deepseek-chat", Source: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{ID: "custom-failover", Name: "custom failover", Enabled: true, Priority: 1, Providers: []string{"openai_compatible"}, Entrypoints: []string{"chat_completions"}, ModelPatterns: []string{"deepseek-chat"}, StatusCodes: []int{http.StatusTeapot}, AccountAction: "none", DownstreamAction: "failover"}); err != nil {
+		t.Fatal(err)
+	}
+	reqBody := `{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !secondCalled {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("custom rule failover failed: status=%d secondCalled=%v body=%s", resp.StatusCode, secondCalled, body)
 	}
 }
 

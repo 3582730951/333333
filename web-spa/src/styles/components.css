@@ -1752,3 +1752,272 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Upstream error rules — calm Apple-style management surface */
+.upstream-rules-page {
+  display: grid;
+  gap: 18px;
+}
+
+.upstream-rule-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.upstream-rule-overview > div,
+.upstream-rule-card,
+.upstream-rule-test-panel {
+  border: 1px solid var(--pool-border);
+  background: color-mix(in srgb, var(--pool-bg-surface) 88%, transparent);
+  box-shadow: var(--pool-shadow-sm);
+  border-radius: 22px;
+  backdrop-filter: blur(18px);
+}
+
+.upstream-rule-overview > div {
+  min-height: 104px;
+  padding: 18px;
+  display: grid;
+  align-content: space-between;
+}
+
+.upstream-rule-overview span,
+.upstream-rule-meta,
+.upstream-rule-condition span,
+.upstream-rule-section-head p,
+.upstream-rule-note,
+.upstream-rule-natural {
+  color: var(--pool-text-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.upstream-rule-overview strong {
+  color: var(--pool-text);
+  font-size: 30px;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.upstream-rule-list {
+  display: grid;
+  gap: 12px;
+}
+
+.upstream-rule-empty {
+  border: 1px dashed var(--pool-border-strong);
+  color: var(--pool-text-2);
+  border-radius: 22px;
+  padding: 28px;
+  text-align: center;
+  background: var(--pool-bg-surface);
+}
+
+.upstream-rule-card {
+  padding: 14px;
+}
+
+.upstream-rule-row {
+  display: grid;
+  grid-template-columns: 64px minmax(180px, 1.3fr) minmax(180px, 1fr) minmax(170px, 0.9fr) auto;
+  gap: 14px;
+  align-items: center;
+}
+
+.upstream-rule-priority {
+  width: 48px;
+  height: 48px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  color: var(--pool-accent);
+  background: var(--pool-accent-soft);
+  font-weight: 750;
+}
+
+.upstream-rule-title,
+.upstream-rule-actions,
+.upstream-rule-ops,
+.upstream-rule-scope-pills {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upstream-rule-title strong {
+  color: var(--pool-text);
+  font-size: 15px;
+}
+
+.upstream-rule-meta {
+  margin-top: 6px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upstream-rule-meta span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--pool-gray-soft);
+}
+
+.upstream-rule-condition {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.upstream-rule-condition b {
+  color: var(--pool-text);
+  font-size: 12px;
+}
+
+.upstream-rule-summary {
+  margin-top: 12px;
+  border: 0;
+  background: transparent;
+  color: var(--pool-accent);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+}
+
+.upstream-rule-natural {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--pool-bg-surface-2);
+}
+
+.upstream-rule-test-panel {
+  padding: 18px;
+}
+
+.upstream-rule-section-head h2 {
+  margin: 0;
+  color: var(--pool-text);
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.upstream-rule-section-head p {
+  margin: 5px 0 0;
+}
+
+.upstream-rule-test-grid {
+  margin-top: 14px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.upstream-rule-test-grid textarea {
+  grid-column: span 4;
+  min-height: 78px;
+}
+
+.upstream-rule-preview {
+  margin: 14px 0 0;
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text-2);
+  overflow: auto;
+  max-height: 320px;
+}
+
+.upstream-rule-sheet .pool-drawer-content,
+.pool-drawer-content.upstream-rule-sheet {
+  border-radius: 24px 0 0 24px;
+}
+
+.upstream-rule-form {
+  display: grid;
+  gap: 18px;
+}
+
+.upstream-rule-form section,
+.upstream-rule-form details {
+  border: 1px solid var(--pool-border);
+  border-radius: 20px;
+  padding: 16px;
+  background: var(--pool-bg-surface);
+}
+
+.upstream-rule-form h3 {
+  margin: 0 0 12px;
+  color: var(--pool-text);
+  font-size: 15px;
+}
+
+.upstream-rule-form-grid,
+.upstream-rule-cascade {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.upstream-rule-cascade {
+  margin-top: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.upstream-rule-form label,
+.upstream-rule-cascade label {
+  display: grid;
+  gap: 7px;
+  color: var(--pool-text-2);
+  font-size: 12px;
+}
+
+.upstream-rule-scope-pills {
+  grid-column: 1 / -1;
+}
+
+.upstream-rule-scope-pills button {
+  border: 1px solid var(--pool-border);
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text-2);
+  border-radius: 999px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.upstream-rule-scope-pills button.active {
+  color: var(--pool-accent);
+  border-color: transparent;
+  background: var(--pool-accent-soft);
+}
+
+.upstream-rule-note {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--pool-info-soft);
+  color: var(--pool-text-2);
+}
+
+@media (max-width: 1100px) {
+  .upstream-rule-row,
+  .upstream-rule-test-grid,
+  .upstream-rule-form-grid,
+  .upstream-rule-cascade {
+    grid-template-columns: 1fr;
+  }
+  .upstream-rule-test-grid textarea {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  .upstream-rule-overview {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .upstream-rule-row {
+    gap: 10px;
+  }
+}

@@ -34,6 +34,7 @@ const pageLoaders = {
   SettingsV2: () => import('./pages/SettingsV2.jsx'),
   Keys: () => import('./pages/Keys.jsx'),
   Providers: () => import('./pages/Providers.jsx'),
+  UpstreamErrorRules: () => import('./pages/UpstreamErrorRules.jsx'),
   Lifecycle: () => import('./pages/Lifecycle.jsx'),
   Quota: () => import('./pages/Quota.jsx'),
   CFEvents: () => import('./pages/CFEvents.jsx'),
@@ -58,6 +59,7 @@ const Usage = lazy(pageLoaders.Usage);
 const SettingsV2 = lazy(pageLoaders.SettingsV2);
 const Keys = lazy(pageLoaders.Keys);
 const Providers = lazy(pageLoaders.Providers);
+const UpstreamErrorRules = lazy(pageLoaders.UpstreamErrorRules);
 const Lifecycle = lazy(pageLoaders.Lifecycle);
 const Quota = lazy(pageLoaders.Quota);
 const CFEvents = lazy(pageLoaders.CFEvents);
@@ -109,6 +111,7 @@ const ADMIN_ROUTE_MODEL = [
     { path: '/groups', labelKey: 'nav.groups', component: Groups },
     { path: '/egress', labelKey: 'nav.egress', component: Egress },
     { path: '/providers', labelKey: 'nav.providers', component: Providers },
+    { path: '/upstream-error-rules', labelKey: 'nav.upstream_error_rules', component: UpstreamErrorRules },
   ] },
   { key: 'g-reg', labelKey: 'nav.registration', icon: <IconPulse />, children: [
     { path: '/registration', labelKey: 'nav.auto_register', component: Registration },

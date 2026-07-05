@@ -399,6 +399,34 @@ type CodexResetCreditClaim struct {
 	Row     CodexResetCreditConsumption `json:"row"`
 }
 
+// UpstreamErrorRule lets operators override how a particular upstream HTTP error is
+// interpreted and surfaced. The lists are stored as JSON arrays so future providers,
+// entrypoints, and model families can be added without schema churn.
+type UpstreamErrorRule struct {
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Enabled          bool     `json:"enabled"`
+	Priority         int      `json:"priority"`
+	Providers        []string `json:"providers"`
+	Entrypoints      []string `json:"entrypoints"`
+	ModelPatterns    []string `json:"model_patterns"`
+	StatusCodes      []int    `json:"status_codes"`
+	BodyKeywords     []string `json:"body_keywords"`
+	MatchMode        string   `json:"match_mode"`
+	AccountAction    string   `json:"account_action"`
+	DownstreamAction string   `json:"downstream_action"`
+	ResponseStatus   int      `json:"response_status,omitempty"`
+	CustomMessage    string   `json:"custom_message,omitempty"`
+	CooldownSeconds  int64    `json:"cooldown_seconds,omitempty"`
+	PreferRetryAfter bool     `json:"prefer_retry_after"`
+	IdleSeconds      int64    `json:"idle_seconds,omitempty"`
+	IdlePingSeconds  int64    `json:"idle_ping_seconds,omitempty"`
+	SkipLog          bool     `json:"skip_log"`
+	Description      string   `json:"description,omitempty"`
+	CreatedAt        int64    `json:"created_at"`
+	UpdatedAt        int64    `json:"updated_at"`
+}
+
 // CustomProvider is an OpenAI-compatible upstream provider (Chat Completions by
 // default, or native Responses when UpstreamProtocol="responses") the relay can pool
 // accounts against. Unlike the built-in "codex"/"claude" upstreams it carries no
@@ -901,6 +929,31 @@ CREATE TABLE IF NOT EXISTS custom_providers(
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS upstream_error_rules(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  priority INTEGER NOT NULL DEFAULT 100,
+  providers_json TEXT NOT NULL DEFAULT '[]',
+  entrypoints_json TEXT NOT NULL DEFAULT '[]',
+  model_patterns_json TEXT NOT NULL DEFAULT '[]',
+  status_codes_json TEXT NOT NULL DEFAULT '[]',
+  body_keywords_json TEXT NOT NULL DEFAULT '[]',
+  match_mode TEXT NOT NULL DEFAULT 'any',
+  account_action TEXT NOT NULL DEFAULT 'builtin',
+  downstream_action TEXT NOT NULL DEFAULT 'builtin',
+  response_status INTEGER NOT NULL DEFAULT 0,
+  custom_message TEXT NOT NULL DEFAULT '',
+  cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+  prefer_retry_after INTEGER NOT NULL DEFAULT 0,
+  idle_seconds INTEGER NOT NULL DEFAULT 0,
+  idle_ping_seconds INTEGER NOT NULL DEFAULT 15,
+  skip_log INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_upstream_error_rules_enabled_priority ON upstream_error_rules(enabled, priority, created_at);
 CREATE TABLE IF NOT EXISTS audit_log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL DEFAULT '',
@@ -1131,6 +1184,31 @@ func (s *Store) migrate(ctx context.Context) error {
   PRIMARY KEY(account_id, seven_day_reset_at),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 )`,
+		`CREATE TABLE IF NOT EXISTS upstream_error_rules(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  enabled INTEGER NOT NULL DEFAULT 0,
+  priority INTEGER NOT NULL DEFAULT 100,
+  providers_json TEXT NOT NULL DEFAULT '[]',
+  entrypoints_json TEXT NOT NULL DEFAULT '[]',
+  model_patterns_json TEXT NOT NULL DEFAULT '[]',
+  status_codes_json TEXT NOT NULL DEFAULT '[]',
+  body_keywords_json TEXT NOT NULL DEFAULT '[]',
+  match_mode TEXT NOT NULL DEFAULT 'any',
+  account_action TEXT NOT NULL DEFAULT 'builtin',
+  downstream_action TEXT NOT NULL DEFAULT 'builtin',
+  response_status INTEGER NOT NULL DEFAULT 0,
+  custom_message TEXT NOT NULL DEFAULT '',
+  cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+  prefer_retry_after INTEGER NOT NULL DEFAULT 0,
+  idle_seconds INTEGER NOT NULL DEFAULT 0,
+  idle_ping_seconds INTEGER NOT NULL DEFAULT 15,
+  skip_log INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_upstream_error_rules_enabled_priority ON upstream_error_rules(enabled, priority, created_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -3248,6 +3326,193 @@ func decodeProviderModelsFromSlice(in []string) []string {
 
 func (s *Store) DeleteCustomProvider(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM custom_providers WHERE id = ?`, id)
+	return err
+}
+
+// ── Upstream error rules ──
+
+const upstreamErrorRuleCols = `id, name, enabled, priority, providers_json, entrypoints_json, model_patterns_json, status_codes_json, body_keywords_json, match_mode, account_action, downstream_action, response_status, custom_message, cooldown_seconds, prefer_retry_after, idle_seconds, idle_ping_seconds, skip_log, description, created_at, updated_at`
+
+func encodeStringListJSON(values []string) string {
+	clean := decodeProviderModelsFromSlice(values)
+	if clean == nil {
+		clean = []string{}
+	}
+	raw, err := json.Marshal(clean)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func encodeIntListJSON(values []int) string {
+	seen := map[int]bool{}
+	clean := make([]int, 0, len(values))
+	for _, value := range values {
+		if value <= 0 || seen[value] {
+			continue
+		}
+		seen[value] = true
+		clean = append(clean, value)
+	}
+	raw, err := json.Marshal(clean)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func decodeStringListJSON(raw string) []string {
+	return decodeProviderModels(raw)
+}
+
+func decodeIntListJSON(raw string) []int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var arr []int
+	if json.Unmarshal([]byte(raw), &arr) != nil {
+		return nil
+	}
+	seen := map[int]bool{}
+	out := make([]int, 0, len(arr))
+	for _, n := range arr {
+		if n <= 0 || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
+}
+
+func scanUpstreamErrorRule(scan func(...interface{}) error) (UpstreamErrorRule, error) {
+	var r UpstreamErrorRule
+	var enabled, preferRetryAfter, skipLog int
+	var providersJSON, entrypointsJSON, modelPatternsJSON, statusCodesJSON, bodyKeywordsJSON string
+	if err := scan(
+		&r.ID, &r.Name, &enabled, &r.Priority,
+		&providersJSON, &entrypointsJSON, &modelPatternsJSON, &statusCodesJSON, &bodyKeywordsJSON,
+		&r.MatchMode, &r.AccountAction, &r.DownstreamAction, &r.ResponseStatus, &r.CustomMessage,
+		&r.CooldownSeconds, &preferRetryAfter, &r.IdleSeconds, &r.IdlePingSeconds, &skipLog,
+		&r.Description, &r.CreatedAt, &r.UpdatedAt,
+	); err != nil {
+		return UpstreamErrorRule{}, err
+	}
+	r.Enabled = enabled != 0
+	r.PreferRetryAfter = preferRetryAfter != 0
+	r.SkipLog = skipLog != 0
+	r.Providers = decodeStringListJSON(providersJSON)
+	r.Entrypoints = decodeStringListJSON(entrypointsJSON)
+	r.ModelPatterns = decodeStringListJSON(modelPatternsJSON)
+	r.StatusCodes = decodeIntListJSON(statusCodesJSON)
+	r.BodyKeywords = decodeStringListJSON(bodyKeywordsJSON)
+	if strings.TrimSpace(r.MatchMode) == "" {
+		r.MatchMode = "any"
+	}
+	if strings.TrimSpace(r.AccountAction) == "" {
+		r.AccountAction = "builtin"
+	}
+	if strings.TrimSpace(r.DownstreamAction) == "" {
+		r.DownstreamAction = "builtin"
+	}
+	if r.IdlePingSeconds == 0 {
+		r.IdlePingSeconds = 15
+	}
+	return r, nil
+}
+
+func (s *Store) ListUpstreamErrorRules(ctx context.Context) ([]UpstreamErrorRule, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+upstreamErrorRuleCols+` FROM upstream_error_rules ORDER BY priority ASC, created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UpstreamErrorRule
+	for rows.Next() {
+		r, err := scanUpstreamErrorRule(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetUpstreamErrorRule(ctx context.Context, id string) (UpstreamErrorRule, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+upstreamErrorRuleCols+` FROM upstream_error_rules WHERE id = ?`, id)
+	r, err := scanUpstreamErrorRule(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UpstreamErrorRule{}, false, nil
+	}
+	if err != nil {
+		return UpstreamErrorRule{}, false, err
+	}
+	return r, true, nil
+}
+
+func (s *Store) UpsertUpstreamErrorRule(ctx context.Context, r UpstreamErrorRule) error {
+	r.ID = strings.TrimSpace(r.ID)
+	if r.ID == "" {
+		return errors.New("rule id required")
+	}
+	r.Name = strings.TrimSpace(r.Name)
+	if r.Name == "" {
+		r.Name = r.ID
+	}
+	r.MatchMode = strings.TrimSpace(r.MatchMode)
+	if r.MatchMode == "" {
+		r.MatchMode = "any"
+	}
+	r.AccountAction = strings.TrimSpace(r.AccountAction)
+	if r.AccountAction == "" {
+		r.AccountAction = "builtin"
+	}
+	r.DownstreamAction = strings.TrimSpace(r.DownstreamAction)
+	if r.DownstreamAction == "" {
+		r.DownstreamAction = "builtin"
+	}
+	if r.IdlePingSeconds == 0 {
+		r.IdlePingSeconds = 15
+	}
+	now := Now()
+	if r.CreatedAt == 0 {
+		r.CreatedAt = now
+	}
+	r.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO upstream_error_rules(id, name, enabled, priority, providers_json, entrypoints_json, model_patterns_json, status_codes_json, body_keywords_json, match_mode, account_action, downstream_action, response_status, custom_message, cooldown_seconds, prefer_retry_after, idle_seconds, idle_ping_seconds, skip_log, description, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+ name = excluded.name,
+ enabled = excluded.enabled,
+ priority = excluded.priority,
+ providers_json = excluded.providers_json,
+ entrypoints_json = excluded.entrypoints_json,
+ model_patterns_json = excluded.model_patterns_json,
+ status_codes_json = excluded.status_codes_json,
+ body_keywords_json = excluded.body_keywords_json,
+ match_mode = excluded.match_mode,
+ account_action = excluded.account_action,
+ downstream_action = excluded.downstream_action,
+ response_status = excluded.response_status,
+ custom_message = excluded.custom_message,
+ cooldown_seconds = excluded.cooldown_seconds,
+ prefer_retry_after = excluded.prefer_retry_after,
+ idle_seconds = excluded.idle_seconds,
+ idle_ping_seconds = excluded.idle_ping_seconds,
+ skip_log = excluded.skip_log,
+ description = excluded.description,
+ updated_at = excluded.updated_at`,
+		r.ID, r.Name, boolInt(r.Enabled), r.Priority,
+		encodeStringListJSON(r.Providers), encodeStringListJSON(r.Entrypoints), encodeStringListJSON(r.ModelPatterns), encodeIntListJSON(r.StatusCodes), encodeStringListJSON(r.BodyKeywords),
+		r.MatchMode, r.AccountAction, r.DownstreamAction, r.ResponseStatus, r.CustomMessage, r.CooldownSeconds, boolInt(r.PreferRetryAfter), r.IdleSeconds, r.IdlePingSeconds, boolInt(r.SkipLog), r.Description, r.CreatedAt, r.UpdatedAt)
+	return err
+}
+
+func (s *Store) DeleteUpstreamErrorRule(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM upstream_error_rules WHERE id = ?`, id)
 	return err
 }
 

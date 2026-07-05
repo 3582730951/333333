@@ -16,6 +16,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/upstream"
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
 	"codex-account-pool/internal/virtual"
 )
@@ -57,7 +58,15 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "claude", model, err)
 		return
 	}
-	defer lease.Release()
+	leaseReleased := false
+	releaseLease := func() {
+		if leaseReleased {
+			return
+		}
+		leaseReleased = true
+		lease.Release()
+	}
+	defer releaseLease()
 
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
 	if err != nil {
@@ -150,10 +159,40 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				return
 			}
 		}
-		s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
+		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+			Provider:   "claude",
+			Entrypoint: "chat_completions",
+			Model:      model,
+			Status:     resp.StatusCode,
+			Header:     resp.Header,
+			Body:       errBody,
+			Streaming:  stream,
+		})
+		if ruleMatched {
+			s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody, decision)
+		} else {
+			s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
+		}
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
 		if refreshHeartbeat.writeError(errors.New("claude upstream returned an error after authentication refresh")) {
 			return
+		}
+		if ruleMatched {
+			switch decision.Match.DownstreamAction {
+			case upstreamrules.DownstreamActionIdleStream:
+				if stream {
+					resp.Body.Close()
+					releaseLease()
+					releaseUpstreamSlot(r.Context())
+				}
+				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errBody, result.Scrubber, decision, stream) {
+					return
+				}
+			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
+				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errBody, result.Scrubber, decision, stream) {
+					return
+				}
+			}
 		}
 		// Downstream is an OpenAI-compatible client, so neutralize into the OpenAI
 		// error envelope (hides the Anthropic limit/overload/billing specifics).

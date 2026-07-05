@@ -9,6 +9,7 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 )
 
 // handleAnthropicPassthrough is a transparent authenticated proxy for the extra
@@ -57,7 +58,16 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	defer release()
+	released := false
+	releaseOnce := func() {
+		if released {
+			return
+		}
+		released = true
+		release()
+	}
+	defer releaseOnce()
+	r = r.WithContext(withUpstreamSlotRelease(r.Context(), releaseOnce))
 
 	// Authenticate + resolve the routing group (honors RequireDownstreamKey). The
 	// force-model/effort overrides are irrelevant here and never touch the opaque body.
@@ -76,7 +86,15 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		s.writePublicNoAccountError(r.Context(), w, http.StatusServiceUnavailable, pol.Group, "claude", "", err)
 		return
 	}
-	defer lease.Release()
+	leaseReleased := false
+	releaseLease := func() {
+		if leaseReleased {
+			return
+		}
+		leaseReleased = true
+		lease.Release()
+	}
+	defer releaseLease()
 
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
 	if err != nil {
@@ -133,7 +151,37 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
 			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
 		}
-		s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+			Provider:   "claude",
+			Entrypoint: "claude_passthrough",
+			Model:      "",
+			Status:     resp.StatusCode,
+			Header:     resp.Header,
+			Body:       errorBody,
+			Streaming:  isEventStream(resp.Header),
+		})
+		if ruleMatched {
+			s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody, decision)
+		} else {
+			s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+		}
+		if ruleMatched {
+			switch decision.Match.DownstreamAction {
+			case upstreamrules.DownstreamActionIdleStream:
+				if isEventStream(resp.Header) {
+					resp.Body.Close()
+					releaseLease()
+					releaseUpstreamSlot(r.Context())
+				}
+				if s.writeRuleDownstream(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, nil, decision, isEventStream(resp.Header)) {
+					return
+				}
+			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
+				if s.writeRuleDownstream(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, nil, decision, isEventStream(resp.Header)) {
+					return
+				}
+			}
+		}
 		// No body scrubber: the passthrough body carries no virtual identity, and
 		// rewriting it (e.g. an upload-validation error echoing field bytes) is wrong.
 		// writeFilteredError still neutralizes pool-internal limit/quota leak bodies.

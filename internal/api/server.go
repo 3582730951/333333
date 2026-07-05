@@ -32,6 +32,7 @@ import (
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
 	"codex-account-pool/internal/virtual"
 	"codex-account-pool/internal/warp"
@@ -313,6 +314,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/settings-center", s.handleSettingsCenter)
 	s.mux.HandleFunc("/admin/settings-center/apply-template", s.handleSettingsCenterTemplate)
 	s.mux.HandleFunc("/admin/export/cache-hits", s.adminCacheHitsExport)
+	s.mux.HandleFunc("/admin/upstream-error-rules/test", s.adminUpstreamErrorRulesTest)
+	s.mux.HandleFunc("/admin/upstream-error-rules/model-options", s.adminUpstreamErrorRuleModelOptions)
+	s.mux.HandleFunc("/admin/upstream-error-rules", s.adminUpstreamErrorRules)
+	s.mux.HandleFunc("/admin/upstream-error-rules/", s.adminUpstreamErrorRuleAction)
 
 	// Embedded admin UI (catch-all; more specific API routes above take precedence).
 	s.mux.Handle("/console/", console.Handler())
@@ -383,7 +388,16 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		defer release()
+		released := false
+		releaseOnce := func() {
+			if released {
+				return
+			}
+			released = true
+			release()
+		}
+		defer releaseOnce()
+		r = r.WithContext(withUpstreamSlotRelease(r.Context(), releaseOnce))
 	}
 	// Authenticate the downstream api key (if any) and resolve its routing group +
 	// forced model/effort policy. The forced model is applied to the body BEFORE
@@ -570,7 +584,15 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "", model, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
-	defer lease.Release()
+	leaseReleased := false
+	releaseLease := func() {
+		if leaseReleased {
+			return
+		}
+		leaseReleased = true
+		lease.Release()
+	}
+	defer releaseLease()
 	// retry marks the leased account as failed-for-this-request (so the next attempt
 	// excludes it) and signals the caller to fail over to a fresh account.
 	retry := func() codexAttemptResult {
@@ -892,13 +914,52 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		if cf.Recordable(detection) {
 			s.handleCFEvent(r.Context(), lease.Account, finalEgress, resp.StatusCode, detection)
 		}
+		entrypoint := "responses"
+		if isChat {
+			entrypoint = "chat_completions"
+		}
+		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+			Provider:   "codex",
+			Entrypoint: entrypoint,
+			Model:      model,
+			Status:     resp.StatusCode,
+			Header:     resp.Header,
+			Body:       errorBody,
+			Streaming:  isStreamRequest(raw),
+		})
 		if cf.EdgeOnly(detection) {
 			_ = s.store.BenchBindingForRecheck(r.Context(), lease.Account.ID, storage.Now()+60)
 			v = ban.Verdict{State: ban.RegionBlocked, Reason: "cloudflare_edge"}
+		} else if ruleMatched {
+			v = s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody, decision)
 		} else {
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		if ruleMatched {
+			switch decision.Match.DownstreamAction {
+			case upstreamrules.DownstreamActionFailover:
+				if allowRetry && movable {
+					return retry()
+				}
+			case upstreamrules.DownstreamActionIdleStream:
+				if isStreamRequest(raw) {
+					if resp.Body != nil {
+						_ = resp.Body.Close()
+						resp.Body = nil
+					}
+					releaseLease()
+					releaseUpstreamSlot(r.Context())
+				}
+				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, isStreamRequest(raw)) {
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
+				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, isStreamRequest(raw)) {
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+			}
+		}
 		canFailover := allowRetry && movable
 		if canFailover && retryableForFailover(v, resp.StatusCode) {
 			if v.State == ban.PermissionDenied && !s.hasCodexFailoverCandidate(r.Context(), routeGroup, lease.Account.ID) {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
@@ -18,6 +19,7 @@ import (
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/tokensave"
 	"codex-account-pool/internal/upstream"
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/virtual"
 )
 
@@ -71,7 +73,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	defer release()
+	released := false
+	releaseOnce := func() {
+		if released {
+			return
+		}
+		released = true
+		release()
+	}
+	defer releaseOnce()
+	r = r.WithContext(withUpstreamSlotRelease(r.Context(), releaseOnce))
 	path := r.URL.Path
 
 	// Resolve the downstream api key's policy (routing group + forced model /
@@ -168,7 +179,15 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		s.writePublicNoAccountError(r.Context(), w, status, group, "claude", model, err)
 		return outcomeDone
 	}
-	defer lease.Release()
+	leaseReleased := false
+	releaseLease := func() {
+		if leaseReleased {
+			return
+		}
+		leaseReleased = true
+		lease.Release()
+	}
+	defer releaseLease()
 	retry := func() attemptOutcome {
 		if exclude != nil {
 			exclude[lease.Account.ID] = true
@@ -298,8 +317,43 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
 			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
 		}
-		v := s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+			Provider:   "claude",
+			Entrypoint: "claude_messages",
+			Model:      model,
+			Status:     resp.StatusCode,
+			Header:     resp.Header,
+			Body:       errorBody,
+			Streaming:  isStreamRequest(raw),
+		})
+		var v ban.Verdict
+		if ruleMatched {
+			v = s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody, decision)
+		} else {
+			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+		}
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		if ruleMatched {
+			switch decision.Match.DownstreamAction {
+			case upstreamrules.DownstreamActionFailover:
+				if allowRetry && movable {
+					return retry()
+				}
+			case upstreamrules.DownstreamActionIdleStream:
+				if isStreamRequest(raw) {
+					resp.Body.Close()
+					releaseLease()
+					releaseUpstreamSlot(r.Context())
+				}
+				if s.writeRuleDownstream(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber, decision, isStreamRequest(raw)) {
+					return outcomeDone
+				}
+			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
+				if s.writeRuleDownstream(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber, decision, isStreamRequest(raw)) {
+					return outcomeDone
+				}
+			}
+		}
 		// Recoverable error (rate limit / region / stale auth / ban) on a movable
 		// request → move to a fresh account. No bytes have been written, so the
 		// downstream never sees this.

@@ -15,6 +15,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/upstream"
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
 	"codex-account-pool/internal/virtual"
 )
@@ -88,6 +89,14 @@ type customCall struct {
 // and converts/records the response. proto selects the downstream error envelope:
 // "claude" for the /v1/messages path, "codex" (OpenAI shape) otherwise.
 func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider storage.CustomProvider, body []byte, model, routeGroup, proto, upstreamPath string) (customCall, bool) {
+	attempts := s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts)
+	if attempts < 1 {
+		attempts = 1
+	}
+	return s.callCustomAttempt(w, r, provider, body, model, routeGroup, proto, upstreamPath, map[string]bool{}, attempts)
+}
+
+func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provider storage.CustomProvider, body []byte, model, routeGroup, proto, upstreamPath string, exclude map[string]bool, attemptsRemaining int) (customCall, bool) {
 	if strings.TrimSpace(upstreamPath) == "" {
 		upstreamPath = "/chat/completions"
 	}
@@ -98,6 +107,7 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 		Affinity:        affinity,
 		Model:           model,
 		EstimatedTokens: virtual.EstimateTokensJSON(body),
+		Exclude:         exclude,
 	})
 	if err != nil {
 		status := http.StatusServiceUnavailable
@@ -142,8 +152,58 @@ func (s *Server) callCustom(w http.ResponseWriter, r *http.Request, provider sto
 	if resp.StatusCode >= 400 {
 		errBody := readUpstreamErrorBody(resp.Body)
 		_ = resp.Body.Close()
-		s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
+		entrypoint := "custom_openai"
+		switch strings.TrimSpace(upstreamPath) {
+		case "/responses", "responses":
+			entrypoint = "responses"
+		case "/chat/completions", "chat/completions":
+			entrypoint = "chat_completions"
+		}
+		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+			Provider:   provider.ID,
+			Entrypoint: entrypoint,
+			Model:      model,
+			Status:     resp.StatusCode,
+			Header:     resp.Header,
+			Body:       errBody,
+			Streaming:  isStreamRequest(body),
+		})
+		if ruleMatched {
+			s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody, decision)
+		} else {
+			s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
+		}
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		if ruleMatched {
+			switch decision.Match.DownstreamAction {
+			case upstreamrules.DownstreamActionFailover:
+				if attemptsRemaining > 1 {
+					if exclude != nil {
+						exclude[lease.Account.ID] = true
+					}
+					lease.Release()
+					return s.callCustomAttempt(w, r, provider, body, model, routeGroup, proto, upstreamPath, exclude, attemptsRemaining-1)
+				}
+				s.writeRuleNeutralError(w)
+				lease.Release()
+				return customCall{}, false
+			case upstreamrules.DownstreamActionIdleStream:
+				if isStreamRequest(body) {
+					lease.Release()
+					releaseUpstreamSlot(r.Context())
+				} else {
+					lease.Release()
+				}
+				if s.writeRuleDownstream(r.Context(), w, proto, resp.StatusCode, resp.Header, errBody, scrubber, decision, isStreamRequest(body)) {
+					return customCall{}, false
+				}
+			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
+				if s.writeRuleDownstream(r.Context(), w, proto, resp.StatusCode, resp.Header, errBody, scrubber, decision, isStreamRequest(body)) {
+					lease.Release()
+					return customCall{}, false
+				}
+			}
+		}
 		s.writeFilteredError(r.Context(), w, proto, resp.StatusCode, resp.Header, errBody, scrubber)
 		lease.Release()
 		return customCall{}, false
