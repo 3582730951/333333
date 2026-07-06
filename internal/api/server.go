@@ -103,6 +103,8 @@ type Server struct {
 
 	codexResetMu    sync.Mutex
 	codexResetLocks map[string]*sync.Mutex
+	compatMu        sync.Mutex
+	compatRecent    []compatIncompatibilityRecord
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -187,12 +189,14 @@ func (s *Server) routes() {
 	// account selection + request/response virtualization live in messages.go.
 	s.mux.HandleFunc("/v1/messages", s.handleMessages)
 	s.mux.HandleFunc("/v1/messages/count_tokens", s.handleMessages)
-	// Extra Anthropic surfaces Claude Code skills / code-execution call beyond the
-	// message turn — Files API, skills, agents, environments, sessions. Transparently
-	// proxied (auth + identity attached, body untouched) so "官方 skills" work; see
-	// passthrough.go. Both the collection path and the trailing-slash subtree are
-	// registered (Go's mux treats "/v1/files" and "/v1/files/" as distinct patterns).
-	for _, p := range []string{"/v1/files", "/v1/files/", "/v1/skills", "/v1/skills/", "/v1/agents", "/v1/agents/", "/v1/environments", "/v1/environments/", "/v1/sessions", "/v1/sessions/"} {
+	// Shared Files/Skills endpoints exist in multiple official client ecosystems.
+	// Dispatch them by provider headers/key hints instead of always treating them as
+	// Claude passthrough.
+	for _, p := range []string{"/v1/files", "/v1/files/", "/v1/skills", "/v1/skills/"} {
+		s.mux.HandleFunc(p, s.handleSharedEndpoint)
+	}
+	// Claude-only extra surfaces for skills / code-execution beyond the message turn.
+	for _, p := range []string{"/v1/agents", "/v1/agents/", "/v1/environments", "/v1/environments/", "/v1/sessions", "/v1/sessions/"} {
 		s.mux.HandleFunc(p, s.handleAnthropicPassthrough)
 	}
 	// End-user portal authentication (multi-user). Cookie sessions; coexists with the

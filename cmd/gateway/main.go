@@ -241,7 +241,7 @@ Usage:
   gateway start                                 启动代理服务器
   gateway start-background                      nohup 后台启动代理服务器（写入 PID/log）
   gateway stop                                  停止后台/旧版代理服务器
-  gateway run-claude -- <args>                  在 strict Linux runtime 中启动 Claude Code
+  gateway run-claude -- <args>                  启动 Claude Code（默认 compat，strict 需显式开启）
   claude-plan <args>                            通过包装器直接以 plan mode 启动 Claude Code
   gateway probe-identity                        拉取身份并验证 strict runtime
   gateway status                                显示运行状态

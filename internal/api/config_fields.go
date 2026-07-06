@@ -149,7 +149,7 @@ func configFields() []configField {
 		{Key: "claude_gateway_disable_nonessential_env", Label: "写入禁遥测环境变量", Category: catClaudeGateway, Type: fieldBool, Effect: effectHot,
 			Help: "开=脚本、wrapper 和 strict runtime 写入官方禁遥测/禁更新环境变量。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayDisableNonessentialEnv }},
 		{Key: "claude_gateway_strict_linux_default", Label: "Claude strict Linux 默认启用", Category: catClaudeGateway, Type: fieldBool, Effect: effectHot,
-			Help: "开=/file 脚本默认 POOL_STRICT_LINUX=1；关=默认 0，仍可由环境变量覆盖。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayStrictLinuxDefault }},
+			Help: "开=/file 脚本默认 POOL_CLIENT_RUNTIME=strict；关=默认 compat，保留真实 HOME 下的 Claude skills/plugins/MCP。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayStrictLinuxDefault }},
 		{Key: "claude_gateway_virtual_dns_servers", Label: "虚拟 DNS 服务器", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
 			Help: "可选覆盖 /v1/gateway/identity 下发的 DNS。留空=按虚拟身份稳定派生。", boot: func(c config.Config) interface{} { return c.ClaudeGatewayVirtualDNSServers }},
 

@@ -265,6 +265,9 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 	stream := isStreamRequest(raw)
 	chatBody, err := prompt.ResponsesRequestToChatCompletion(raw)
 	if err != nil {
+		if s.writePromptCompatibilityError(w, err, "official_codex_or_custom_native_responses", "custom_chat_completions_bridge:"+provider.ID, "Set this provider's upstream_protocol=\"responses\" if it truly supports /v1/responses, or route this request to an official Codex account.") {
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -395,6 +398,9 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 	stream := isStreamRequest(raw)
 	chatBody, err := prompt.AnthropicRequestToChatCompletion(raw)
 	if err != nil {
+		if s.writePromptCompatibilityError(w, err, "official_claude", "custom_chat_completions_bridge:"+provider.ID, "Route this request to an official Claude account, or remove Claude-only typed server tools/plugins for this Chat Completions provider.") {
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}

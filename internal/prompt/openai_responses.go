@@ -30,6 +30,9 @@ func ResponsesRequestToChatCompletion(raw []byte) ([]byte, error) {
 	if m, ok := root["model"].(string); ok {
 		out["model"] = m
 	}
+	if include := firstResponsesInclude(root["include"]); include != "" {
+		return nil, responsesCompatibilityError("include", include)
+	}
 	messages := make([]interface{}, 0, 8)
 	if instr, ok := root["instructions"].(string); ok && strings.TrimSpace(instr) != "" {
 		messages = append(messages, map[string]interface{}{"role": "system", "content": instr})
@@ -67,6 +70,20 @@ func ResponsesRequestToChatCompletion(raw []byte) ([]byte, error) {
 		out["tool_choice"] = tc
 	}
 	return json.Marshal(out)
+}
+
+func firstResponsesInclude(v interface{}) string {
+	switch t := v.(type) {
+	case []interface{}:
+		for _, item := range t {
+			if s := stringOr(item, ""); strings.TrimSpace(s) != "" {
+				return s
+			}
+		}
+	case string:
+		return t
+	}
+	return ""
 }
 
 // responsesInputToChatMessages converts a Responses `input` (a bare string, or an
@@ -185,11 +202,7 @@ func responsesToolsToChat(v interface{}) ([]interface{}, error) {
 }
 
 func responsesCompatibilityError(kind, value string) error {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		value = "<empty>"
-	}
-	return fmt.Errorf("unsupported Responses %s %q for chat_completions bridge; configure upstream_protocol=\"responses\" or use an official Codex account for this request", kind, value)
+	return &CompatibilityError{Protocol: "Responses", Kind: kind, Value: value}
 }
 
 func responsesToolChoiceToChat(v interface{}) interface{} {

@@ -64,6 +64,18 @@ func TestAdminSkillsCompatDoctorReportsOfficialRawAndProviderTiers(t *testing.T)
 	if raw["models_with_raw_capabilities"].(float64) != 1 {
 		t.Fatalf("raw capability check wrong: %#v", raw)
 	}
+	codexAccounts := checks["official_codex_accounts"].(map[string]interface{})
+	if codexAccounts["status"] != "ok" || codexAccounts["active_accounts"].(float64) != 1 {
+		t.Fatalf("codex account check wrong: %#v", codexAccounts)
+	}
+	shared := checks["shared_endpoint_dispatch"].(map[string]interface{})
+	if shared["status"] != "ok" {
+		t.Fatalf("shared endpoint dispatch check wrong: %#v", shared)
+	}
+	runtime := checks["claude_runtime_mode"].(map[string]interface{})
+	if runtime["default_runtime"] != "compat" {
+		t.Fatalf("claude runtime default wrong: %#v", runtime)
+	}
 	providers := root["custom_providers"].([]interface{})
 	var sawNative bool
 	for _, p := range providers {
@@ -77,5 +89,8 @@ func TestAdminSkillsCompatDoctorReportsOfficialRawAndProviderTiers(t *testing.T)
 	}
 	if !sawNative {
 		t.Fatalf("native provider missing from doctor: %#v", providers)
+	}
+	if _, ok := root["recent_incompatibilities"].([]interface{}); !ok {
+		t.Fatalf("recent incompatibilities missing: %#v", root["recent_incompatibilities"])
 	}
 }

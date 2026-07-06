@@ -84,6 +84,54 @@ func TestStrictRuntimeEnvPointsClaudeCodeAtPoolAPI(t *testing.T) {
 	}
 }
 
+func TestClaudeRuntimeModeDefaultsToCompat(t *testing.T) {
+	t.Setenv("POOL_CLIENT_RUNTIME", "")
+	t.Setenv("POOL_STRICT_LINUX", "")
+	if strictLinuxRequested() {
+		t.Fatal("Claude runtime should default to compat; strict must be explicit")
+	}
+}
+
+func TestClaudeRuntimeModeStrictIsExplicit(t *testing.T) {
+	t.Setenv("POOL_CLIENT_RUNTIME", "strict")
+	t.Setenv("POOL_STRICT_LINUX", "")
+	if !strictLinuxRequested() {
+		t.Fatal("POOL_CLIENT_RUNTIME=strict should request strict runtime")
+	}
+	t.Setenv("POOL_CLIENT_RUNTIME", "")
+	t.Setenv("POOL_STRICT_LINUX", "1")
+	if !strictLinuxRequested() {
+		t.Fatal("legacy POOL_STRICT_LINUX=1 should still request strict runtime")
+	}
+}
+
+func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PoolServerURL = "https://pool.example/"
+	cfg.DownstreamKey = "cap_secret"
+	env := compatRuntimeEnv([]string{
+		"HOME=/home/real",
+		"ANTHROPIC_BASE_URL=https://api.anthropic.com",
+		"ANTHROPIC_AUTH_TOKEN=old",
+	}, cfg)
+	joined := "\n" + strings.Join(env, "\n") + "\n"
+	for _, want := range []string{
+		"\nHOME=/home/real\n",
+		"\nANTHROPIC_BASE_URL=https://pool.example\n",
+		"\nANTHROPIC_AUTH_TOKEN=cap_secret\n",
+		"\nCLAUDE_CODE_ENABLE_AUTO_MODE=1\n",
+		"\nPOOL_CLIENT_RUNTIME=compat\n",
+		"\nPOOL_STRICT_LINUX=0\n",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("compat runtime env missing %q\n---\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "https://api.anthropic.com") || strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=old") {
+		t.Fatalf("compat runtime env did not replace old Anthropic settings\n---\n%s", joined)
+	}
+}
+
 func TestStrictRuntimeEnvBypassesCodexAndAdvisoryHosts(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ListenAddr = "127.0.0.1:8765"

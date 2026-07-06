@@ -130,6 +130,15 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 			return
 		}
+		if caps := claudeOnlyCapabilitiesForChatBridge(r.Header, raw); len(caps) > 0 {
+			s.writeCapabilityUnavailable(w, http.StatusBadRequest,
+				"Claude-only capability cannot be represented through the Chat Completions bridge",
+				caps,
+				"official_claude",
+				"custom_chat_completions_bridge:"+prov.ID,
+				"Route this request to an official Claude account, or remove Claude-only beta/features for this Chat Completions provider.")
+			return
+		}
 		s.handleMessagesViaCustom(w, r, raw, model, pol.Group, prov)
 		return
 	}

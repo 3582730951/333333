@@ -2907,7 +2907,9 @@ func TestAnthropicPassthroughFilesAndSkills(t *testing.T) {
 	}
 
 	// 2) A GET on a skills sub-path (method + trailing subtree route both work).
-	resp2, err := http.Get(h.pool.URL + "/v1/skills/skill_42")
+	req2, _ := http.NewRequest(http.MethodGet, h.pool.URL+"/v1/skills/skill_42", nil)
+	req2.Header.Set("Anthropic-Beta", "skills-2025-10-02")
+	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -94,6 +94,21 @@ func TestResponsesRequestToChatCompletionRejectsUnknownInputItems(t *testing.T) 
 	}
 }
 
+func TestResponsesRequestToChatCompletionRejectsIncludeFields(t *testing.T) {
+	in := []byte(`{
+	  "model":"deepseek-chat",
+	  "input":"hi",
+	  "include":["web_search_call.results"]
+	}`)
+	_, err := ResponsesRequestToChatCompletion(in)
+	if err == nil {
+		t.Fatal("expected explicit compatibility error for Responses include fields")
+	}
+	if !strings.Contains(err.Error(), `unsupported Responses include "web_search_call.results"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestChatCompletionToResponsesResponse(t *testing.T) {
 	in := []byte(`{"id":"chatcmpl-1","model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hello","tool_calls":[{"id":"call_9","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}`)
 	out, err := ChatCompletionToResponsesResponse(in, "deepseek-chat")
@@ -191,6 +206,22 @@ func TestAnthropicRequestToChatCompletion(t *testing.T) {
 	tools := m["tools"].([]interface{})
 	if tools[0].(map[string]interface{})["function"].(map[string]interface{})["name"] != "f" {
 		t.Fatalf("anthropic tool not -> chat function tool: %v", tools)
+	}
+}
+
+func TestAnthropicRequestToChatCompletionRejectsTypedServerTools(t *testing.T) {
+	in := []byte(`{
+	  "model":"deepseek-chat",
+	  "max_tokens":512,
+	  "messages":[{"role":"user","content":"search"}],
+	  "tools":[{"type":"web_search_20250305","name":"web_search"}]
+	}`)
+	_, err := AnthropicRequestToChatCompletion(in)
+	if err == nil {
+		t.Fatal("expected explicit compatibility error for typed Claude server tool")
+	}
+	if !strings.Contains(err.Error(), `unsupported Claude tool type "web_search_20250305"`) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

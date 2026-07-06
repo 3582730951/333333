@@ -78,11 +78,16 @@ type APIKey struct {
 	GroupName   string `json:"group_name"`
 	ForceModel  string `json:"force_model"`
 	ForceEffort string `json:"force_effort"`
-	Enabled     bool   `json:"enabled"`
-	ExpiresAt   int64  `json:"expires_at,omitempty"`
-	LastUsedAt  int64  `json:"last_used_at,omitempty"`
-	TenantID    string `json:"tenant_id,omitempty"`
-	ProjectID   string `json:"project_id,omitempty"`
+	// ProviderHint disambiguates shared non-message endpoints such as /v1/files and
+	// /v1/skills. "auto" preserves legacy header-based detection; "codex" and
+	// "claude" pin official client families; "custom:<provider_id>" is reserved for
+	// custom provider-specific surfaces.
+	ProviderHint string `json:"provider_hint"`
+	Enabled      bool   `json:"enabled"`
+	ExpiresAt    int64  `json:"expires_at,omitempty"`
+	LastUsedAt   int64  `json:"last_used_at,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
+	ProjectID    string `json:"project_id,omitempty"`
 	// UserID is the owning portal user (empty = admin-owned). Set when a user creates
 	// the key via the self-service /user/api-keys endpoint so it scopes to them.
 	UserID string `json:"user_id,omitempty"`
@@ -650,6 +655,7 @@ CREATE TABLE IF NOT EXISTS api_keys(
   group_name TEXT NOT NULL DEFAULT '',
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
+  provider_hint TEXT NOT NULL DEFAULT 'auto',
   enabled INTEGER NOT NULL DEFAULT 1,
   expires_at INTEGER NOT NULL DEFAULT 0,
   last_used_at INTEGER NOT NULL DEFAULT 0,
@@ -1101,6 +1107,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE api_keys ADD COLUMN group_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE api_keys ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE api_keys ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE api_keys ADD COLUMN provider_hint TEXT NOT NULL DEFAULT 'auto'`,
 		`ALTER TABLE api_keys ADD COLUMN key_type TEXT NOT NULL DEFAULT 'downstream'`,
 		`ALTER TABLE api_keys ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE api_keys ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
@@ -1516,16 +1523,17 @@ GROUP BY group_name`, stringArgs(names)...)
 	return out, rows.Err()
 }
 
-const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(key_type,'downstream'), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), enabled, expires_at, last_used_at, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,'')`
+const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(key_type,'downstream'), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), COALESCE(provider_hint,'auto'), enabled, expires_at, last_used_at, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,'')`
 
 func scanAPIKey(scan func(...interface{}) error) (APIKey, error) {
 	var k APIKey
 	var enabled int
-	err := scan(&k.KeyHash, &k.Label, &k.KeyType, &k.GroupName, &k.ForceModel, &k.ForceEffort, &enabled, &k.ExpiresAt, &k.LastUsedAt, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret)
+	err := scan(&k.KeyHash, &k.Label, &k.KeyType, &k.GroupName, &k.ForceModel, &k.ForceEffort, &k.ProviderHint, &enabled, &k.ExpiresAt, &k.LastUsedAt, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret)
 	k.Enabled = enabled != 0
 	if strings.TrimSpace(k.KeyType) == "" {
 		k.KeyType = "downstream"
 	}
+	k.ProviderHint = normalizeStoredProviderHint(k.ProviderHint)
 	return k, err
 }
 
@@ -1596,11 +1604,20 @@ func (s *Store) UpsertAPIKey(ctx context.Context, k APIKey) error {
 	if strings.TrimSpace(k.KeyType) == "" {
 		k.KeyType = "downstream"
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, key_type, label, group_name, force_model, force_effort, enabled, expires_at, last_used_at, secret, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, key_type=excluded.key_type, label=excluded.label, group_name=excluded.group_name, force_model=excluded.force_model, force_effort=excluded.force_effort, enabled=excluded.enabled, expires_at=excluded.expires_at, last_used_at=excluded.last_used_at, secret=excluded.secret, updated_at=excluded.updated_at`,
-		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.KeyType, k.Label, k.GroupName, k.ForceModel, k.ForceEffort, boolInt(k.Enabled), k.ExpiresAt, k.LastUsedAt, s.sealToken(k.Secret), k.CreatedAt, now)
+	k.ProviderHint = normalizeStoredProviderHint(k.ProviderHint)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, key_type, label, group_name, force_model, force_effort, provider_hint, enabled, expires_at, last_used_at, secret, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, key_type=excluded.key_type, label=excluded.label, group_name=excluded.group_name, force_model=excluded.force_model, force_effort=excluded.force_effort, provider_hint=excluded.provider_hint, enabled=excluded.enabled, expires_at=excluded.expires_at, last_used_at=excluded.last_used_at, secret=excluded.secret, updated_at=excluded.updated_at`,
+		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.KeyType, k.Label, k.GroupName, k.ForceModel, k.ForceEffort, k.ProviderHint, boolInt(k.Enabled), k.ExpiresAt, k.LastUsedAt, s.sealToken(k.Secret), k.CreatedAt, now)
 	return err
+}
+
+func normalizeStoredProviderHint(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return "auto"
+	}
+	return v
 }
 
 // DeleteAPIKey removes an api key by hash.

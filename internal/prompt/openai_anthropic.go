@@ -54,7 +54,11 @@ func AnthropicRequestToChatCompletion(raw []byte) ([]byte, error) {
 	}
 	out["messages"] = messages
 
-	if tools := anthropicToolsToChat(root["tools"]); len(tools) > 0 {
+	tools, err := anthropicToolsToChat(root["tools"])
+	if err != nil {
+		return nil, err
+	}
+	if len(tools) > 0 {
 		out["tools"] = tools
 	}
 	if tc := anthropicToolChoiceToChat(root["tool_choice"]); tc != nil {
@@ -164,11 +168,12 @@ func anthropicToolResultContentToText(v interface{}) string {
 }
 
 // anthropicToolsToChat maps Anthropic tools (input_schema) to OpenAI function tools.
-// Typed server tools (web_search_*, …) without an input_schema are dropped.
-func anthropicToolsToChat(v interface{}) []interface{} {
+// Typed server tools (web_search_*, …) without an input_schema cannot be bridged
+// without dropping behavior, so they return a compatibility error.
+func anthropicToolsToChat(v interface{}) ([]interface{}, error) {
 	arr, ok := v.([]interface{})
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	out := make([]interface{}, 0, len(arr))
 	for _, t := range arr {
@@ -182,8 +187,8 @@ func anthropicToolsToChat(v interface{}) []interface{} {
 		}
 		schema, hasSchema := tm["input_schema"]
 		if !hasSchema {
-			if _, typed := tm["type"]; typed {
-				continue // typed server tool
+			if typ, typed := tm["type"].(string); typed && typ != "" {
+				return nil, anthropicCompatibilityError("tool type", typ)
 			}
 		}
 		fn := map[string]interface{}{"name": name}
@@ -197,7 +202,11 @@ func anthropicToolsToChat(v interface{}) []interface{} {
 		}
 		out = append(out, map[string]interface{}{"type": "function", "function": fn})
 	}
-	return out
+	return out, nil
+}
+
+func anthropicCompatibilityError(kind, value string) error {
+	return &CompatibilityError{Protocol: "Claude", Kind: kind, Value: value}
 }
 
 func anthropicToolChoiceToChat(v interface{}) interface{} {

@@ -14,9 +14,13 @@ import (
 func TestSetupScriptBashSyntaxAndContents(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "xhigh", "never", "danger-full-access")
 	for _, want := range []string{
-		"POOL_CLIENT",       // automation override
-		"POOL_INSTALL_RTK",  // automation override
-		"POOL_STRICT_LINUX", // Claude strict default
+		"POOL_CLIENT",      // automation override
+		"POOL_INSTALL_RTK", // automation override
+		"POOL_CLIENT_RUNTIME",
+		"POOL_STRICT_LINUX", // legacy gateway runtime flag derived from client runtime
+		"--client-runtime",
+		"--doctor-only",
+		"ADMIN_TOKEN",
 		"select_client",
 		"configure_codex",
 		"configure_claude",
@@ -80,7 +84,7 @@ func TestSetupScriptCodexBranchIsIsolatedFromClaudeGateway(t *testing.T) {
 	}
 }
 
-func TestSetupScriptClaudeBranchUsesGatewayStrictRuntime(t *testing.T) {
+func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "", "", "")
 
 	claudeBranch := scriptBetween(t, script, "configure_claude() {", "\n}\n\nmain()")
@@ -94,7 +98,8 @@ func TestSetupScriptClaudeBranchUsesGatewayStrictRuntime(t *testing.T) {
 		"ANTHROPIC_BASE_URL=$ORIGIN",
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 		"claude-plan",
-		`POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-1}"`,
+		`POOL_CLIENT_RUNTIME="${POOL_CLIENT_RUNTIME:-compat}"`,
+		`POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-0}"`,
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 		"DO_NOT_TRACK=1",
 		"DISABLE_TELEMETRY=1",
@@ -144,6 +149,9 @@ func TestSetupScriptRespectsEditableGatewayRuntimeOptions(t *testing.T) {
 	})
 
 	claudeBranch := scriptBetween(t, script, "configure_claude() {", "\n}\n\nmain()")
+	if !strings.Contains(claudeBranch, `POOL_CLIENT_RUNTIME="${POOL_CLIENT_RUNTIME:-compat}"`) {
+		t.Fatalf("claude branch should use editable runtime default compat\n---\n%s", claudeBranch)
+	}
 	if !strings.Contains(claudeBranch, `POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-0}"`) {
 		t.Fatalf("claude branch should use editable strict default 0\n---\n%s", claudeBranch)
 	}
@@ -162,6 +170,19 @@ func TestSetupScriptRespectsEditableGatewayRuntimeOptions(t *testing.T) {
 	}
 }
 
+func TestSetupScriptCanDefaultClaudeStrictRuntime(t *testing.T) {
+	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "", "", "", CodexSetupScriptOptions{
+		StrictLinuxDefault:     true,
+		DisableNonessentialEnv: true,
+	})
+	if !strings.Contains(script, `POOL_CLIENT_RUNTIME="${POOL_CLIENT_RUNTIME:-strict}"`) {
+		t.Fatalf("strict option should default POOL_CLIENT_RUNTIME=strict\n---\n%s", script)
+	}
+	if !strings.Contains(script, `POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-1}"`) {
+		t.Fatalf("strict option should default POOL_STRICT_LINUX=1\n---\n%s", script)
+	}
+}
+
 func TestSetupScriptCodexAutomationWritesOnlyCodexConfig(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
@@ -170,6 +191,20 @@ func TestSetupScriptCodexAutomationWritesOnlyCodexConfig(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "", "", "")
 	p := filepath.Join(t.TempDir(), "setup.sh")
 	if err := os.WriteFile(p, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := `[mcp_servers.keep]
+command = "keep-mcp"
+
+[model_providers.other]
+name = "Other"
+base_url = "https://other.example/v1"
+`
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(existing), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("bash", p)
@@ -192,6 +227,11 @@ func TestSetupScriptCodexAutomationWritesOnlyCodexConfig(t *testing.T) {
 	for _, want := range []string{`model = "gpt-5.5"`, `base_url = "https://pool.example/v1"`, `wire_api = "responses"`, `experimental_bearer_token = "cap_abc123"`} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("codex config missing %q\n---\n%s", want, config)
+		}
+	}
+	for _, want := range []string{`[mcp_servers.keep]`, `command = "keep-mcp"`, `[model_providers.other]`} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("codex config merge dropped existing %q\n---\n%s", want, config)
 		}
 	}
 	for _, forbidden := range []string{".claude", ".claude-gateway"} {

@@ -17,10 +17,11 @@ import (
 // caller's api key (or its group default) imposes regardless of what the client
 // requested.
 type downstreamPolicy struct {
-	Group       string
-	ForceModel  string
-	ForceEffort string
-	KeyLabel    string
+	Group        string
+	ForceModel   string
+	ForceEffort  string
+	ProviderHint string
+	KeyLabel     string
 	// KeyHash / UserID identify the matched downstream api key and its owning portal
 	// user (both empty for an unauthenticated/legacy request). They are attributed onto
 	// each usage_records row so a user's own console can show their usage.
@@ -124,9 +125,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 	ctx := r.Context()
 	// Relay-internal calls (the moderation model call) bypass downstream-key enforcement.
 	if isInternalCall(ctx) {
-		return downstreamPolicy{Group: s.cfg.DefaultGroup, Authed: true}, true
+		return downstreamPolicy{Group: s.cfg.DefaultGroup, ProviderHint: "auto", Authed: true}, true
 	}
-	pol := downstreamPolicy{Group: s.cfg.DefaultGroup}
+	pol := downstreamPolicy{Group: s.cfg.DefaultGroup, ProviderHint: "auto"}
 	plain := downstreamBearer(r)
 	if plain != "" {
 		if key, found, _ := s.store.LookupAPIKey(ctx, hashAPIKey(plain)); found {
@@ -149,6 +150,7 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				}
 				pol.ForceModel = strings.TrimSpace(key.ForceModel)
 				pol.ForceEffort = strings.TrimSpace(key.ForceEffort)
+				pol.ProviderHint = normalizeProviderHintLoose(key.ProviderHint)
 			}
 		} else if isPoolImportKeyPlain(plain) {
 			writeError(w, http.StatusForbidden, errors.New("pool import key cannot be used for inference"))
@@ -173,6 +175,26 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	return pol, true
+}
+
+func normalizeProviderHintLoose(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return "auto"
+	}
+	return v
+}
+
+func normalizeProviderHint(v string) (string, bool) {
+	v = normalizeProviderHintLoose(v)
+	switch v {
+	case "auto", "codex", "claude":
+		return v, true
+	}
+	if strings.HasPrefix(v, "custom:") && strings.TrimPrefix(v, "custom:") != "" {
+		return v, true
+	}
+	return "", false
 }
 
 // setForcedModel rewrites the top-level "model" field of a request body. It is

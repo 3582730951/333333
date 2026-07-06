@@ -695,7 +695,7 @@ func Default() Config {
 		ClaudeGatewayBlockedHostPatterns:       DefaultClaudeGatewayBlockedHostPatterns(),
 		ClaudeGatewayUnknownTargetPolicy:       "forward",
 		ClaudeGatewayDisableNonessentialEnv:    true,
-		ClaudeGatewayStrictLinuxDefault:        true,
+		ClaudeGatewayStrictLinuxDefault:        false,
 		DefaultRegisterMethod:                  "node",
 		StrictStickyMaxCooldownSeconds:         DefaultStrictStickyMaxCooldownSeconds,
 		StatefulStickyWaitSeconds:              0,

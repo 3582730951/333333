@@ -30,6 +30,11 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	accounts, err := s.store.ListAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	officialModels := 0
 	rawModels := 0
@@ -49,8 +54,15 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 	}
 
 	providerViews := make([]map[string]interface{}, 0, len(providers))
+	nativeResponsesProviders := 0
+	chatBridgeProviders := 0
 	for _, p := range providers {
 		tier, label, reasons := customProviderCompatTier(p)
+		if p.UpstreamProtocol == storage.CustomProviderProtocolResponses {
+			nativeResponsesProviders++
+		} else {
+			chatBridgeProviders++
+		}
 		providerViews = append(providerViews, map[string]interface{}{
 			"id":                  p.ID,
 			"name":                p.Name,
@@ -62,6 +74,24 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 		})
 	}
 
+	activeCodexAccounts := 0
+	activeClaudeAccounts := 0
+	activeClaudeOAuthAccounts := 0
+	for _, a := range accounts {
+		if strings.ToLower(strings.TrimSpace(a.Status)) != "active" {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(a.Provider)) {
+		case "codex":
+			activeCodexAccounts++
+		case "claude":
+			activeClaudeAccounts++
+			if token, err := s.store.GetToken(r.Context(), a.ID); err == nil && claudeIsOAuth(token) {
+				activeClaudeOAuthAccounts++
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"strategy": "official_first",
 		"tiers": []map[string]interface{}{
@@ -70,11 +100,32 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 			{"tier": 3, "label": "custom_chat_completions_bridge", "compatibility": "function tools only; typed Responses tools/items return explicit compatibility errors"},
 		},
 		"checks": map[string]interface{}{
+			"official_codex_accounts": map[string]interface{}{
+				"active_accounts": activeCodexAccounts,
+				"status":          checkStatus(activeCodexAccounts > 0, "missing_official_codex_account"),
+				"fix_hint":        "Import at least one official Codex/OpenAI account for full Codex CLI skills/plugins/Browser Use behavior.",
+			},
+			"official_claude_oauth_accounts": map[string]interface{}{
+				"active_accounts":       activeClaudeAccounts,
+				"active_oauth_accounts": activeClaudeOAuthAccounts,
+				"status":                checkStatus(activeClaudeOAuthAccounts > 0, "missing_official_claude_oauth_account"),
+				"fix_hint":              "Import a Claude OAuth account for full Claude Code skills/plugins/MCP behavior.",
+			},
 			"official_raw_model_metadata": map[string]interface{}{
 				"official_models":              officialModels,
 				"models_with_raw_json":         rawModels,
 				"models_with_raw_capabilities": rawCapabilityModels,
 				"status":                       checkStatus(rawModels > 0, "missing_raw_model_json"),
+			},
+			"native_responses_providers": map[string]interface{}{
+				"count":  nativeResponsesProviders,
+				"status": checkStatus(nativeResponsesProviders > 0, "missing_native_responses_provider"),
+				"detail": "Tier 2 providers preserve typed Responses tools and future fields by forwarding /v1/responses natively.",
+			},
+			"chat_bridge_providers": map[string]interface{}{
+				"count":  chatBridgeProviders,
+				"status": checkStatus(chatBridgeProviders > 0, "no_chat_bridge_provider"),
+				"detail": "Tier 3 providers support basic Chat Completions/function tools only; official-only capabilities return capability_unavailable.",
 			},
 			"chat_bridge_explicit_errors": map[string]interface{}{
 				"status": "ok",
@@ -84,8 +135,27 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 				"status": "ok",
 				"detail": "providers declare upstream_protocol=chat_completions or responses",
 			},
+			"shared_endpoint_dispatch": map[string]interface{}{
+				"status": "ok",
+				"detail": "shared /v1/files and /v1/skills endpoints route by X-Pool-Provider, Anthropic/OpenAI headers, or downstream key provider_hint",
+			},
+			"claude_passthrough": map[string]interface{}{
+				"status": "ok",
+				"detail": "Claude passthrough preserves opaque bodies and client Anthropic headers for files/skills/agents/environments/sessions",
+			},
+			"codex_config_merge": map[string]interface{}{
+				"status": "ok",
+				"detail": "generated Codex installer filters only pool-managed keys/section and preserves existing MCP/plugin/settings TOML sections",
+			},
+			"claude_runtime_mode": map[string]interface{}{
+				"status":          "ok",
+				"default_runtime": "compat",
+				"strict_runtime":  "set POOL_CLIENT_RUNTIME=strict or POOL_STRICT_LINUX=1",
+				"detail":          "compat uses the real HOME so official Claude Code skills/plugins/MCP remain visible; strict keeps virtual HOME isolation",
+			},
 		},
-		"custom_providers": providerViews,
+		"custom_providers":         providerViews,
+		"recent_incompatibilities": s.recentCompatibilityIncompatibilities(),
 	})
 }
 

@@ -42,11 +42,15 @@ func handleProbeIdentity(configPath string) int {
 	fmt.Println("  cwd:", preservedRuntimeCWD(identity))
 	fmt.Println("  dns:", strings.Join(identity.Virtual.DNSServers, ","))
 
-	if err := runStrictRuntimeSelfCheck(cfg, identity); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	if strictLinuxRequested() {
+		if err := runStrictRuntimeSelfCheck(cfg, identity); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Println("  strict runtime: ok")
+	} else {
+		fmt.Println("  runtime: compat")
 	}
-	fmt.Println("  strict runtime: ok")
 	return 0
 }
 
@@ -54,10 +58,6 @@ func handleRunClaude(configPath string) int {
 	args := os.Args[2:]
 	if len(args) > 0 && args[0] == "--" {
 		args = args[1:]
-	}
-	if !strictLinuxRequested() {
-		fmt.Fprintln(os.Stderr, "Claude gateway only supports Linux strict mode; set POOL_STRICT_LINUX=1")
-		return 1
 	}
 	cfg, identity, err := loadRuntimeIdentity(configPath)
 	if err != nil {
@@ -72,6 +72,9 @@ func handleRunClaude(configPath string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
+	}
+	if !strictLinuxRequested() {
+		return runCompatClaude(cfg, realClaude, args)
 	}
 	if err := runStrictRuntimeSelfCheck(cfg, identity); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -146,8 +149,46 @@ func identityCachePresent() bool {
 }
 
 func strictLinuxRequested() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("POOL_CLIENT_RUNTIME"))) {
+	case "strict":
+		return true
+	case "compat":
+		return false
+	}
 	v := strings.TrimSpace(os.Getenv("POOL_STRICT_LINUX"))
-	return v == "" || v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+func runCompatClaude(cfg Config, realClaude string, args []string) int {
+	cmd := exec.Command(realClaude, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = compatRuntimeEnv(os.Environ(), cfg)
+	if err := cmd.Run(); err != nil {
+		return exitCode(err)
+	}
+	return 0
+}
+
+func compatRuntimeEnv(base []string, cfg Config) []string {
+	env := append([]string(nil), base...)
+	set := func(key, value string) {
+		prefix := key + "="
+		for i, item := range env {
+			if strings.HasPrefix(item, prefix) {
+				env[i] = prefix + value
+				return
+			}
+		}
+		env = append(env, prefix+value)
+	}
+	set("ANTHROPIC_BASE_URL", strings.TrimRight(strings.TrimSpace(cfg.PoolServerURL), "/"))
+	set("ANTHROPIC_AUTH_TOKEN", strings.TrimSpace(cfg.DownstreamKey))
+	set("CLAUDE_CODE_ENABLE_AUTO_MODE", "1")
+	set("POOL_CLIENT_RUNTIME", "compat")
+	set("POOL_STRICT_LINUX", "0")
+	return env
 }
 
 func checkStrictRuntimeSupport() error {

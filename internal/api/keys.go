@@ -3,6 +3,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -64,15 +65,16 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, keys)
 	case http.MethodPost:
 		var req struct {
-			Label       string `json:"label"`
-			KeyType     string `json:"key_type"`
-			GroupName   string `json:"group_name"`
-			ForceModel  string `json:"force_model"`
-			ForceEffort string `json:"force_effort"`
-			Enabled     *bool  `json:"enabled"`
-			ExpiresAt   int64  `json:"expires_at"`
-			TenantID    string `json:"tenant_id"`
-			ProjectID   string `json:"project_id"`
+			Label        string `json:"label"`
+			KeyType      string `json:"key_type"`
+			GroupName    string `json:"group_name"`
+			ForceModel   string `json:"force_model"`
+			ForceEffort  string `json:"force_effort"`
+			ProviderHint string `json:"provider_hint"`
+			Enabled      *bool  `json:"enabled"`
+			ExpiresAt    int64  `json:"expires_at"`
+			TenantID     string `json:"tenant_id"`
+			ProjectID    string `json:"project_id"`
 		}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -90,38 +92,45 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		providerHint, ok := normalizeProviderHint(req.ProviderHint)
+		if !ok {
+			writeError(w, http.StatusBadRequest, errors.New("provider_hint must be auto, codex, claude, or custom:<provider_id>"))
+			return
+		}
 		enabled := true
 		if req.Enabled != nil {
 			enabled = *req.Enabled
 		}
 		key := storage.APIKey{
-			KeyHash:     hashAPIKey(plain),
-			Label:       strings.TrimSpace(req.Label),
-			KeyType:     keyType,
-			GroupName:   strings.TrimSpace(req.GroupName),
-			ForceModel:  strings.TrimSpace(req.ForceModel),
-			ForceEffort: normalizeEffort(req.ForceEffort),
-			Enabled:     enabled,
-			ExpiresAt:   req.ExpiresAt,
-			TenantID:    strings.TrimSpace(req.TenantID),
-			ProjectID:   strings.TrimSpace(req.ProjectID),
-			Secret:      plain,
+			KeyHash:      hashAPIKey(plain),
+			Label:        strings.TrimSpace(req.Label),
+			KeyType:      keyType,
+			GroupName:    strings.TrimSpace(req.GroupName),
+			ForceModel:   strings.TrimSpace(req.ForceModel),
+			ForceEffort:  normalizeEffort(req.ForceEffort),
+			ProviderHint: providerHint,
+			Enabled:      enabled,
+			ExpiresAt:    req.ExpiresAt,
+			TenantID:     strings.TrimSpace(req.TenantID),
+			ProjectID:    strings.TrimSpace(req.ProjectID),
+			Secret:       plain,
 		}
 		if err := s.store.UpsertAPIKey(r.Context(), key); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
-			"key":          plain,
-			"key_hash":     key.KeyHash,
-			"label":        key.Label,
-			"key_type":     key.KeyType,
-			"group_name":   key.GroupName,
-			"force_model":  key.ForceModel,
-			"force_effort": key.ForceEffort,
-			"enabled":      key.Enabled,
-			"expires_at":   key.ExpiresAt,
-			"last_used_at": key.LastUsedAt,
+			"key":           plain,
+			"key_hash":      key.KeyHash,
+			"label":         key.Label,
+			"key_type":      key.KeyType,
+			"group_name":    key.GroupName,
+			"force_model":   key.ForceModel,
+			"force_effort":  key.ForceEffort,
+			"provider_hint": key.ProviderHint,
+			"enabled":       key.Enabled,
+			"expires_at":    key.ExpiresAt,
+			"last_used_at":  key.LastUsedAt,
 		})
 	default:
 		methodNotAllowed(w)
@@ -159,13 +168,14 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req struct {
-			Label       *string `json:"label"`
-			KeyType     *string `json:"key_type"`
-			GroupName   *string `json:"group_name"`
-			ForceModel  *string `json:"force_model"`
-			ForceEffort *string `json:"force_effort"`
-			Enabled     *bool   `json:"enabled"`
-			ExpiresAt   *int64  `json:"expires_at"`
+			Label        *string `json:"label"`
+			KeyType      *string `json:"key_type"`
+			GroupName    *string `json:"group_name"`
+			ForceModel   *string `json:"force_model"`
+			ForceEffort  *string `json:"force_effort"`
+			ProviderHint *string `json:"provider_hint"`
+			Enabled      *bool   `json:"enabled"`
+			ExpiresAt    *int64  `json:"expires_at"`
 		}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -185,6 +195,14 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.ForceEffort != nil {
 			key.ForceEffort = normalizeEffort(*req.ForceEffort)
+		}
+		if req.ProviderHint != nil {
+			hint, ok := normalizeProviderHint(*req.ProviderHint)
+			if !ok {
+				writeError(w, http.StatusBadRequest, errors.New("provider_hint must be auto, codex, claude, or custom:<provider_id>"))
+				return
+			}
+			key.ProviderHint = hint
 		}
 		if req.Enabled != nil {
 			key.Enabled = *req.Enabled
