@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/routing"
@@ -499,9 +501,18 @@ func TestNonMovableStrictStickyTokenBudgetStaysPinned(t *testing.T) {
 	}
 	defer held.Release()
 
-	_, err = s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
+	selectCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	_, err = s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
 	if !errors.Is(err, ErrStrictUnavailable) {
 		t.Fatalf("non-movable strict request err = %v, want ErrStrictUnavailable", err)
+	}
+	b, err := store.GetAffinityBinding(ctx, key.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.AccountID != "acc-1" {
+		t.Fatalf("affinity rebound to %q, want acc-1", b.AccountID)
 	}
 }
 
@@ -528,9 +539,257 @@ func TestServerSideStateStrictStickyTokenBudgetStaysPinned(t *testing.T) {
 	}
 	defer held.Release()
 
-	_, err = s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
+	selectCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	_, err = s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
 	if !errors.Is(err, ErrStrictUnavailable) {
 		t.Fatalf("server-side-state strict request err = %v, want ErrStrictUnavailable", err)
+	}
+	b, err := store.GetAffinityBinding(ctx, key.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.AccountID != "acc-1" {
+		t.Fatalf("affinity rebound to %q, want acc-1", b.AccountID)
+	}
+}
+
+func TestServerSideStateStrictStickyTokenBudgetWaitsForPinnedAccount(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-budget-stateful-wait", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	cfg.StickyWaitMillis = 1
+	cfg.StatefulStickyWaitSeconds = 1
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	if held.Account.ID != "acc-1" {
+		t.Fatalf("held account = %q, want acc-1", held.Account.ID)
+	}
+
+	result := make(chan struct {
+		lease Lease
+		err   error
+	}, 1)
+	selectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	go func() {
+		lease, err := s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
+		result <- struct {
+			lease Lease
+			err   error
+		}{lease: lease, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		if got.err == nil {
+			got.lease.Release()
+		}
+		t.Fatalf("stateful strict request returned before pinned account released: lease=%s err=%v", got.lease.Account.ID, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	held.Release()
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("stateful strict request after release: %v", got.err)
+		}
+		defer got.lease.Release()
+		if got.lease.Account.ID != "acc-1" {
+			t.Fatalf("stateful strict request selected %q, want pinned acc-1", got.lease.Account.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stateful strict request did not resume after pinned account release")
+	}
+}
+
+func TestServerSideStateStrictStickyTokenBudgetWaitTimeout(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-budget-stateful-timeout", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	cfg.StickyWaitMillis = 1
+	cfg.StatefulStickyWaitSeconds = 1
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	defer held.Release()
+
+	selectCtx, cancel := context.WithTimeout(ctx, 40*time.Millisecond)
+	defer cancel()
+	_, err = s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
+	if !errors.Is(err, ErrStrictUnavailable) {
+		t.Fatalf("stateful strict request err = %v, want ErrStrictUnavailable", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"stateful sticky wait timeout", "acc-1", "token budget"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("timeout error = %q, want substring %q", msg, want)
+		}
+	}
+}
+
+func TestServerSideStateStrictStickyConcurrencyWaitsForPinnedAccount(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profile, err := store.GetEgressProfile(ctx, storage.DefaultDirectEgressID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.MaxConcurrency = 1
+	if err := store.UpsertEgressProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	key := routing.AffinityKey{Hash: "h-concurrency-stateful-wait", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StickyWaitMillis = 1
+	cfg.StatefulStickyWaitSeconds = 1
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	if held.Account.ID != "acc-1" {
+		t.Fatalf("held account = %q, want acc-1", held.Account.ID)
+	}
+
+	result := make(chan struct {
+		lease Lease
+		err   error
+	}, 1)
+	selectCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	go func() {
+		lease, err := s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true})
+		result <- struct {
+			lease Lease
+			err   error
+		}{lease: lease, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		if got.err == nil {
+			got.lease.Release()
+		}
+		t.Fatalf("stateful strict request returned before pinned account concurrency released: lease=%s err=%v", got.lease.Account.ID, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	held.Release()
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("stateful strict request after release: %v", got.err)
+		}
+		defer got.lease.Release()
+		if got.lease.Account.ID != "acc-1" {
+			t.Fatalf("stateful strict request selected %q, want pinned acc-1", got.lease.Account.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stateful strict request did not resume after pinned account concurrency release")
+	}
+}
+
+func TestServerSideStateStrictStickyRateLimitDoesNotWait(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rl-stateful-no-wait", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 120, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StickyWaitMillis = 1
+	cfg.StatefulStickyWaitSeconds = 1
+	s := New(store, cfg)
+
+	start := time.Now()
+	_, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true, ServerSideState: true})
+	if !errors.Is(err, ErrStrictUnavailable) {
+		t.Fatalf("stateful strict request err = %v, want ErrStrictUnavailable", err)
+	}
+	if time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("stateful strict rate-limit path waited %v, want fast failure", time.Since(start))
+	}
+	if strings.Contains(err.Error(), "stateful sticky wait timeout") {
+		t.Fatalf("rate-limit error should not be a local-capacity wait timeout: %v", err)
+	}
+}
+
+func TestCompactionSkipsLocalTokenBudget(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	if err := store.UpsertAccount(ctx, storage.Account{ID: "acc-1", Label: "acc-1", GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	defer held.Release()
+
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Strict: true, Compaction: true, EstimatedTokens: 20})
+	if err != nil {
+		t.Fatalf("compaction select should bypass local token budget: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-1" {
+		t.Fatalf("compaction selected %q, want acc-1", lease.Account.ID)
+	}
+	inflight, tokens := s.currentLoad("acc-1")
+	if inflight != 2 || tokens != 110 {
+		t.Fatalf("load after compaction lease = inflight %d tokens %d, want 2 and 110", inflight, tokens)
 	}
 }
 

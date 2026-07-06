@@ -10,6 +10,7 @@
   "virtual_context_ledger_ttl_seconds": 3600,
   "sticky_wait_millis": 100,
   "strict_sticky_max_cooldown_seconds": 60,
+  "stateful_sticky_wait_seconds": 0,
   "cooldown_wait_max_seconds": 30,
   "request_timeout_seconds": 600,
   "shutdown_drain_seconds": 30,

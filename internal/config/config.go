@@ -341,6 +341,10 @@ type Config struct {
 	// blocking stateful conversations when other accounts are available.
 	// Default: 60 seconds. Set 0 to never allow strict-sticky failover (original behavior).
 	StrictStickyMaxCooldownSeconds int `json:"strict_sticky_max_cooldown_seconds"`
+	// StatefulStickyWaitSeconds bounds how long a request carrying server-side state
+	// waits for its already-bound account to free local capacity. 0 follows
+	// RequestTimeoutSeconds; the effective wait is always capped by request timeout.
+	StatefulStickyWaitSeconds int `json:"stateful_sticky_wait_seconds"`
 	// CooldownWaitMaxSeconds is the maximum time (in seconds) to wait for an account
 	// to come off cooldown when ALL accounts in the group are currently cooling down.
 	// When set to a positive value, if no accounts are immediately available but at
@@ -693,6 +697,7 @@ func Default() Config {
 		ClaudeGatewayStrictLinuxDefault:        true,
 		DefaultRegisterMethod:                  "node",
 		StrictStickyMaxCooldownSeconds:         DefaultStrictStickyMaxCooldownSeconds,
+		StatefulStickyWaitSeconds:              0,
 		CooldownWaitMaxSeconds:                 DefaultCooldownWaitMaxSeconds,
 		LeakScrubEnabled:                       true,
 		ModelProbeIntervalHours:                DefaultModelProbeIntervalHours,
@@ -750,6 +755,25 @@ func (c *Config) StickyWait() time.Duration {
 
 func (c *Config) RequestTimeout() time.Duration {
 	return time.Duration(c.RequestTimeoutSeconds) * time.Second
+}
+
+func (c *Config) StatefulStickyWait() time.Duration {
+	waitSeconds := c.StatefulStickyWaitSeconds
+	if waitSeconds <= 0 {
+		waitSeconds = c.RequestTimeoutSeconds
+	}
+	if waitSeconds <= 0 {
+		waitSeconds = DefaultRequestTimeoutSec
+	}
+	wait := time.Duration(waitSeconds) * time.Second
+	requestTimeout := c.RequestTimeout()
+	if requestTimeout <= 0 {
+		requestTimeout = time.Duration(DefaultRequestTimeoutSec) * time.Second
+	}
+	if wait > requestTimeout {
+		return requestTimeout
+	}
+	return wait
 }
 
 // ShutdownDrainTimeout bounds the graceful drain on SIGTERM/SIGINT: the server
@@ -937,6 +961,11 @@ func (c *Config) applyEnv() {
 			c.StickyWaitMillis = parsed
 		}
 	}
+	if v := os.Getenv("CODEX_POOL_STATEFUL_STICKY_WAIT_SECONDS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			c.StatefulStickyWaitSeconds = parsed
+		}
+	}
 	if v := os.Getenv("CODEX_POOL_SHUTDOWN_DRAIN_SECONDS"); v != "" {
 		if parsed, err := strconv.Atoi(v); err == nil {
 			c.ShutdownDrainSeconds = parsed
@@ -1069,6 +1098,9 @@ func (c *Config) normalize() {
 	}
 	if c.RequestTimeoutSeconds <= 0 {
 		c.RequestTimeoutSeconds = DefaultRequestTimeoutSec
+	}
+	if c.StatefulStickyWaitSeconds < 0 {
+		c.StatefulStickyWaitSeconds = 0
 	}
 	if c.ShutdownDrainSeconds <= 0 {
 		c.ShutdownDrainSeconds = DefaultShutdownDrainSec

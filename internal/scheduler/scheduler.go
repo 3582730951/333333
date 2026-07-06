@@ -27,6 +27,7 @@ type Scheduler struct {
 	mu             sync.Mutex
 	inflight       map[string]int
 	inflightTokens map[string]int64
+	loadChanged    chan struct{}
 	rr             int // round-robin cursor for spreading load across equal-load candidates
 
 	// accountCache caches the active accounts list per group with a short TTL to reduce
@@ -64,6 +65,21 @@ type candidate struct {
 	score   int // inflight count used for load-based selection
 }
 
+type leaseBlockReason string
+
+const (
+	leaseBlockNone              leaseBlockReason = ""
+	leaseBlockTokenBudget       leaseBlockReason = "token_budget"
+	leaseBlockConcurrency       leaseBlockReason = "concurrency"
+	leaseBlockRateLimitCooldown leaseBlockReason = "rate_limit_cooldown"
+	leaseBlockRecheckPending    leaseBlockReason = "recheck_pending"
+	leaseBlockEgressUnavailable leaseBlockReason = "egress_unavailable"
+	leaseBlockInactive          leaseBlockReason = "inactive"
+	leaseBlockQuarantined       leaseBlockReason = "quarantined"
+	leaseBlockNotFound          leaseBlockReason = "not_found"
+	leaseBlockGroupMismatch     leaseBlockReason = "group_mismatch"
+)
+
 // InvalidateAccountCache clears the account list cache so the next Select() call
 // re-reads from the DB. Call this after any operation that changes account state
 // (quarantine, enable/disable, group change, import/delete).
@@ -84,6 +100,7 @@ type Route struct {
 	Movable         bool
 	Model           string
 	EstimatedTokens int64
+	Compaction      bool
 	// Exclude lists account IDs that must not be selected for this call — the
 	// accounts this request already tried and failed on in the current failover
 	// loop. An excluded account is skipped even by the sticky/affinity path, so a
@@ -154,6 +171,7 @@ func New(store *storage.Store, cfg config.Config) *Scheduler {
 		store:            store,
 		inflight:         map[string]int{},
 		inflightTokens:   map[string]int64{},
+		loadChanged:      make(chan struct{}),
 		egressCacheTTL:   30 * time.Second,
 		providerCacheTTL: 5 * time.Minute,
 	}
@@ -186,12 +204,18 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 			// affinity to the fresh account so the conversation seamlessly continues
 			// on a healthy one instead of bouncing back to the broken account.
 			if (route.Provider == "" || s.providerOf(ctx, bound.AccountID) == route.Provider) && !route.Exclude[bound.AccountID] {
-				lease, ok := s.tryLeaseAccount(ctx, bound.AccountID, route, nil)
+				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
 				if ok {
 					return lease, nil
 				}
+				if route.Strict && route.ServerSideState {
+					if statefulStickyWaitReason(reason) {
+						return s.waitForStatefulStickyLease(ctx, bound.AccountID, route, reason)
+					}
+					return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, route)
+				}
 				if waitFor(ctx, cfg.StickyWait()) {
-					lease, ok = s.tryLeaseAccount(ctx, bound.AccountID, route, nil)
+					lease, reason, ok = s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
 					if ok {
 						return lease, nil
 					}
@@ -315,7 +339,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		// upstream's real context limit is the right place for that to fail. Virtual-
 		// context materialization (which runs after selection) then compresses an
 		// oversized body to the account's native window where possible.
-		if route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > cfg.AccountTokenBudget {
+		if !route.Compaction && route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > cfg.AccountTokenBudget {
 			counters.TokenBudget++
 			continue
 		}
@@ -367,7 +391,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		order = append(order, k)
 	}
 	for _, idx := range order {
-		if lease, ok := s.tryLeaseAccountFromCandidate(ctx, candidates[idx], route.EstimatedTokens); ok {
+		if lease, ok := s.tryLeaseAccountFromCandidate(ctx, candidates[idx], route); ok {
 			return lease, nil
 		}
 	}
@@ -375,39 +399,51 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 }
 
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
+	lease, _, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, egressCache)
+	return lease, ok
+}
+
+func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, leaseBlockReason, bool) {
 	cfg := s.Config()
 	account, err := s.store.GetAccount(ctx, accountID)
-	if err != nil || account.Status != "active" || account.QuarantineUntil > storage.Now() {
-		return Lease{}, false
+	if err != nil {
+		return Lease{}, leaseBlockNotFound, false
+	}
+	now := storage.Now()
+	if account.Status != "active" {
+		return Lease{}, leaseBlockInactive, false
+	}
+	if account.QuarantineUntil > now {
+		return Lease{}, leaseBlockQuarantined, false
 	}
 	if route.Group != "" && account.GroupName != route.Group {
-		return Lease{}, false
+		return Lease{}, leaseBlockGroupMismatch, false
 	}
-	if s.accountRateLimitedForRoute(ctx, account, route, storage.Now()) {
-		return Lease{}, false
+	if s.accountRateLimitedForRoute(ctx, account, route, now) {
+		return Lease{}, leaseBlockRateLimitCooldown, false
 	}
 	binding, err := s.store.GetEgressBinding(ctx, accountID)
 	if err != nil {
-		return Lease{}, false
+		return Lease{}, leaseBlockEgressUnavailable, false
 	}
 	// Benched-after-error accounts are ineligible until the recheck loop clears them,
 	// even via the sticky path (which calls this directly).
 	if binding.RecheckPending {
-		return Lease{}, false
+		return Lease{}, leaseBlockRecheckPending, false
 	}
-	egress, ok := s.selectEgress(ctx, binding, storage.Now(), egressCache)
+	egress, ok := s.selectEgress(ctx, binding, now, egressCache)
 	if !ok {
-		return Lease{}, false
+		return Lease{}, leaseBlockEgressUnavailable, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inflight[accountID] >= egress.MaxConcurrency {
-		return Lease{}, false
+		return Lease{}, leaseBlockConcurrency, false
 	}
 	// Budget gate applies only when stacking onto existing in-flight load (see the
 	// rationale in selectFresh): a solo request is always admitted.
-	if route.EstimatedTokens > 0 && s.inflight[accountID] > 0 && s.inflightTokens[accountID]+route.EstimatedTokens > cfg.AccountTokenBudget {
-		return Lease{}, false
+	if !route.Compaction && route.EstimatedTokens > 0 && s.inflight[accountID] > 0 && s.inflightTokens[accountID]+route.EstimatedTokens > cfg.AccountTokenBudget {
+		return Lease{}, leaseBlockTokenBudget, false
 	}
 	s.inflight[accountID]++
 	s.inflightTokens[accountID] += route.EstimatedTokens
@@ -428,14 +464,75 @@ func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route
 				s.inflightTokens[accountID] = 0
 			}
 		}
+		s.notifyLoadChangedLocked()
 	}
-	return Lease{Account: account, Binding: binding, Egress: egress, release: release}, true
+	return Lease{Account: account, Binding: binding, Egress: egress, release: release}, leaseBlockNone, true
 }
 
 func (s *Scheduler) currentLoad(accountID string) (int, int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.inflight[accountID], s.inflightTokens[accountID]
+}
+
+func (s *Scheduler) loadChangedChan() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadChanged
+}
+
+func (s *Scheduler) notifyLoadChangedLocked() {
+	close(s.loadChanged)
+	s.loadChanged = make(chan struct{})
+}
+
+func statefulStickyWaitReason(reason leaseBlockReason) bool {
+	return reason == leaseBlockTokenBudget || reason == leaseBlockConcurrency
+}
+
+func (reason leaseBlockReason) humanString() string {
+	if reason == leaseBlockNone {
+		return "unknown"
+	}
+	return strings.ReplaceAll(string(reason), "_", " ")
+}
+
+func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID string, route Route, initialReason leaseBlockReason) (Lease, error) {
+	cfg := s.Config()
+	wait := cfg.StatefulStickyWait()
+	if wait <= 0 {
+		return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, initialReason, 0, nil)
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	start := time.Now()
+	lastReason := initialReason
+	for {
+		loadChanged := s.loadChangedChan()
+		lease, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil)
+		if ok {
+			return lease, nil
+		}
+		lastReason = reason
+		if !statefulStickyWaitReason(reason) {
+			return Lease{}, s.diagnoseStickyUnavailability(ctx, accountID, route)
+		}
+		select {
+		case <-loadChanged:
+			continue
+		case <-ctx.Done():
+			return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, lastReason, time.Since(start), ctx.Err())
+		case <-timer.C:
+			return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, lastReason, wait, nil)
+		}
+	}
+}
+
+func (s *Scheduler) statefulStickyWaitTimeoutError(accountID string, route Route, reason leaseBlockReason, waited time.Duration, cause error) error {
+	if cause != nil {
+		return fmt.Errorf("%w: stateful sticky wait timeout for account %s after %s (last reason %s / %s): %v", ErrStrictUnavailable, accountID, waited.Round(time.Millisecond), reason, reason.humanString(), cause)
+	}
+	return fmt.Errorf("%w: stateful sticky wait timeout for account %s after %s (last reason %s / %s)", ErrStrictUnavailable, accountID, waited.Round(time.Millisecond), reason, reason.humanString())
 }
 
 func (s *Scheduler) accountRateLimitedForRoute(ctx context.Context, account storage.Account, route Route, now int64) bool {
@@ -502,7 +599,7 @@ func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID strin
 	if inflight >= egress.MaxConcurrency {
 		return true
 	}
-	if route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > s.Config().AccountTokenBudget {
+	if !route.Compaction && route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > s.Config().AccountTokenBudget {
 		return true
 	}
 	return route.Movable
@@ -556,7 +653,7 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 	if inflight >= egress.MaxConcurrency {
 		return fmt.Errorf("%w: account %s at max concurrency (%d/%d in-flight)", ErrStrictUnavailable, accountID, inflight, egress.MaxConcurrency)
 	}
-	if route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > cfg.AccountTokenBudget {
+	if !route.Compaction && route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > cfg.AccountTokenBudget {
 		return fmt.Errorf("%w: account %s token budget exceeded (in-flight %d + estimated %d > budget %d)", ErrStrictUnavailable, accountID, tokens, route.EstimatedTokens, cfg.AccountTokenBudget)
 	}
 
@@ -888,11 +985,12 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 // tryLeaseAccountFromCandidate attempts to acquire a lease using data already
 // loaded in the candidate struct (account + egress), avoiding the re-reads that
 // tryLeaseAccount does for data we already have.
-func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidate, estimatedTokens int64) (Lease, bool) {
+func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidate, route Route) (Lease, bool) {
 	cfg := s.Config()
 	account := c.account
 	egress := c.egress
 	accountID := account.ID
+	estimatedTokens := route.EstimatedTokens
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inflight[accountID] >= egress.MaxConcurrency {
@@ -900,7 +998,7 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 	}
 	// Budget gate applies only when stacking onto existing in-flight load (see the
 	// rationale in selectFresh): a solo request is always admitted.
-	if estimatedTokens > 0 && s.inflight[accountID] > 0 && s.inflightTokens[accountID]+estimatedTokens > cfg.AccountTokenBudget {
+	if !route.Compaction && estimatedTokens > 0 && s.inflight[accountID] > 0 && s.inflightTokens[accountID]+estimatedTokens > cfg.AccountTokenBudget {
 		return Lease{}, false
 	}
 	s.inflight[accountID]++
@@ -922,6 +1020,7 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 				s.inflightTokens[accountID] = 0
 			}
 		}
+		s.notifyLoadChangedLocked()
 	}
 	// Load binding for the lease (needed for cookie jar key, standby egress, etc.)
 	binding, err := s.store.GetEgressBinding(ctx, accountID)
@@ -936,6 +1035,7 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 				s.inflightTokens[accountID] = 0
 			}
 		}
+		s.notifyLoadChangedLocked()
 		return Lease{}, false
 	}
 	return Lease{Account: account, Binding: binding, Egress: egress, release: release}, true

@@ -96,6 +96,57 @@ func TestClaudeCCHSigningDefaultAndEnvOverride(t *testing.T) {
 	}
 }
 
+func TestStatefulStickyWaitDefaultsToRequestTimeout(t *testing.T) {
+	cfg := Default()
+	if cfg.StatefulStickyWaitSeconds != 0 {
+		t.Fatalf("StatefulStickyWaitSeconds default = %d, want 0", cfg.StatefulStickyWaitSeconds)
+	}
+	if got, want := cfg.StatefulStickyWait(), cfg.RequestTimeout(); got != want {
+		t.Fatalf("StatefulStickyWait() = %v, want request timeout %v", got, want)
+	}
+}
+
+func TestStatefulStickyWaitCapsAtRequestTimeoutAndNormalizesNegative(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := []byte(`{"request_timeout_seconds":10,"stateful_sticky_wait_seconds":30}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.StatefulStickyWait(), 10; int(got.Seconds()) != want {
+		t.Fatalf("StatefulStickyWait() = %v, want %ds", got, want)
+	}
+
+	raw = []byte(`{"request_timeout_seconds":10,"stateful_sticky_wait_seconds":-5}`)
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load negative: %v", err)
+	}
+	if cfg.StatefulStickyWaitSeconds != 0 {
+		t.Fatalf("StatefulStickyWaitSeconds = %d, want normalized 0", cfg.StatefulStickyWaitSeconds)
+	}
+	if got, want := cfg.StatefulStickyWait(), 10; int(got.Seconds()) != want {
+		t.Fatalf("StatefulStickyWait() after negative = %v, want %ds", got, want)
+	}
+}
+
+func TestStatefulStickyWaitEnvOverride(t *testing.T) {
+	t.Setenv("CODEX_POOL_STATEFUL_STICKY_WAIT_SECONDS", "7")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load env: %v", err)
+	}
+	if cfg.StatefulStickyWaitSeconds != 7 {
+		t.Fatalf("StatefulStickyWaitSeconds = %d, want env override 7", cfg.StatefulStickyWaitSeconds)
+	}
+}
+
 func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 	path := filepath.Join("..", "..", "config.example.json")
 	raw, err := os.ReadFile(path)
@@ -122,6 +173,7 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"seamless_failover":                     true,
 		"failover_max_attempts":                 float64(3),
 		"force_failover_on_429":                 false,
+		"stateful_sticky_wait_seconds":          float64(0),
 		"leak_scrub_enabled":                    true,
 		"token_save_enabled":                    false,
 		"codex_install_model":                   "gpt-5.5",

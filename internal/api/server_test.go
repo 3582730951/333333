@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/config"
@@ -825,6 +826,72 @@ func TestGatewayCompactUnary(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestGatewayCompactSkipsLocalTokenBudget(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses/compact" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"compact-1","output_text":"summary"}`))
+	})
+	h.importAccount(t, "a", "upstream-a", "access-a")
+	cfg := h.app.scheduler.Config()
+	cfg.AccountTokenBudget = 1
+	h.app.scheduler.UpdateConfig(cfg)
+	held, err := h.app.scheduler.Select(context.Background(), scheduler.Route{Group: "cyber", Provider: "codex", EstimatedTokens: 1})
+	if err != nil {
+		t.Fatalf("hold account: %v", err)
+	}
+	defer held.Release()
+
+	body := `{"model":"gpt","input":"` + strings.Repeat("x", 2000) + `"}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses/compact", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("compact status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	if reqs := h.requests(); len(reqs) != 1 {
+		t.Fatalf("upstream requests = %d, want 1", len(reqs))
+	}
+}
+
+func TestGatewayCompactionTriggerSkipsLocalTokenBudget(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-compact-trigger","output_text":"summary"}`))
+	})
+	h.importAccount(t, "a", "upstream-a", "access-a")
+	cfg := h.app.scheduler.Config()
+	cfg.AccountTokenBudget = 1
+	h.app.scheduler.UpdateConfig(cfg)
+	held, err := h.app.scheduler.Select(context.Background(), scheduler.Route{Group: "cyber", Provider: "codex", EstimatedTokens: 1})
+	if err != nil {
+		t.Fatalf("hold account: %v", err)
+	}
+	defer held.Release()
+
+	body := `{"model":"gpt","compaction_trigger":true,"input":"` + strings.Repeat("x", 2000) + `"}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("compaction-trigger status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	if reqs := h.requests(); len(reqs) != 1 {
+		t.Fatalf("upstream requests = %d, want 1", len(reqs))
 	}
 }
 
@@ -1775,6 +1842,75 @@ func TestStrictStickyDoesNotCrossAccount(t *testing.T) {
 	if resp.StatusCode != http.StatusConflict {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+}
+
+func TestStatefulStrictStickyWaitsForPinnedAccountCapacity(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
+	})
+	acc1 := h.importAccount(t, "a", "upstream-a", "access-a")
+	h.importAccount(t, "b", "upstream-b", "access-b")
+	cfg := h.app.scheduler.Config()
+	cfg.AccountTokenBudget = 1
+	cfg.StatefulStickyWaitSeconds = 1
+	h.app.scheduler.UpdateConfig(cfg)
+
+	reqBody := `{"model":"gpt","previous_response_id":"resp_1","prompt_cache_key":"stateful-wait","input":"` + strings.Repeat("x", 2000) + `"}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: acc1}); err != nil {
+		t.Fatal(err)
+	}
+	held, err := h.app.scheduler.Select(context.Background(), scheduler.Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, EstimatedTokens: 1})
+	if err != nil {
+		t.Fatalf("hold pinned account: %v", err)
+	}
+	if held.Account.ID != acc1 {
+		t.Fatalf("held account = %q, want %q", held.Account.ID, acc1)
+	}
+
+	type responseResult struct {
+		status int
+		body   string
+		err    error
+	}
+	result := make(chan responseResult, 1)
+	go func() {
+		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(reqBody))
+		if err != nil {
+			result <- responseResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		result <- responseResult{status: resp.StatusCode, body: string(raw)}
+	}()
+
+	select {
+	case got := <-result:
+		t.Fatalf("stateful request returned before capacity release: status=%d body=%s err=%v", got.status, got.body, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	held.Release()
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.status != http.StatusOK {
+			t.Fatalf("stateful status = %d, want 200: %s", got.status, got.body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stateful request did not resume after pinned account capacity release")
+	}
+	reqs := h.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("upstream requests = %d, want 1", len(reqs))
+	}
+	if reqs[0].AccountID != "upstream-a" {
+		t.Fatalf("stateful request went to %q, want upstream-a", reqs[0].AccountID)
 	}
 }
 

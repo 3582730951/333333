@@ -577,6 +577,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		Movable:         movable,
 		Model:           model,
 		EstimatedTokens: virtual.EstimateTokensJSON(raw),
+		Compaction:      routing.IsCompaction(path, raw),
 		Exclude:         exclude,
 	})
 	if err != nil {

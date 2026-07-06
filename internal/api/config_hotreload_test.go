@@ -287,7 +287,7 @@ func TestAdminConfigHotAppliesSchedulerFields(t *testing.T) {
 	})
 
 	rows := adminConfigRows(t, h)
-	for _, want := range []string{"sticky_wait_millis", "account_token_budget", "strict_sticky_max_cooldown_seconds", "cooldown_wait_max_seconds"} {
+	for _, want := range []string{"sticky_wait_millis", "account_token_budget", "strict_sticky_max_cooldown_seconds", "cooldown_wait_max_seconds", "stateful_sticky_wait_seconds"} {
 		row := findConfigRow(rows, want)
 		if row == nil {
 			t.Fatalf("/admin/config registry missing scheduler field %q", want)
@@ -297,7 +297,7 @@ func TestAdminConfigHotAppliesSchedulerFields(t *testing.T) {
 		}
 	}
 
-	patchConfig(t, h, `{"sticky_wait_millis":25,"account_token_budget":12345,"strict_sticky_max_cooldown_seconds":0,"cooldown_wait_max_seconds":2}`)
+	patchConfig(t, h, `{"sticky_wait_millis":25,"account_token_budget":12345,"strict_sticky_max_cooldown_seconds":0,"cooldown_wait_max_seconds":2,"stateful_sticky_wait_seconds":3}`)
 	cfg := h.app.scheduler.Config()
 	if cfg.StickyWaitMillis != 25 {
 		t.Fatalf("scheduler StickyWaitMillis = %d, want 25", cfg.StickyWaitMillis)
@@ -310,6 +310,15 @@ func TestAdminConfigHotAppliesSchedulerFields(t *testing.T) {
 	}
 	if cfg.CooldownWaitMaxSeconds != 2 {
 		t.Fatalf("scheduler CooldownWaitMaxSeconds = %d, want 2", cfg.CooldownWaitMaxSeconds)
+	}
+	if cfg.StatefulStickyWaitSeconds != 3 {
+		t.Fatalf("scheduler StatefulStickyWaitSeconds = %d, want 3", cfg.StatefulStickyWaitSeconds)
+	}
+
+	patchConfig(t, h, `{"stateful_sticky_wait_seconds":-1}`)
+	cfg = h.app.scheduler.Config()
+	if cfg.StatefulStickyWaitSeconds != 0 {
+		t.Fatalf("scheduler StatefulStickyWaitSeconds after negative = %d, want 0", cfg.StatefulStickyWaitSeconds)
 	}
 }
 

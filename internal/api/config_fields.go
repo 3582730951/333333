@@ -180,6 +180,8 @@ func configFields() []configField {
 			Help: "可选落盘目录；磁盘上限为 0 时忽略。可指向 tmpfs 或更大分区。", boot: func(c config.Config) interface{} { return c.StreamFailoverHoldTempDir }},
 		{Key: "sticky_wait_millis", Label: "Sticky 等待毫秒", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "同会话绑定账号暂不可用时短暂等待的毫秒数。", boot: func(c config.Config) interface{} { return c.StickyWaitMillis }},
+		{Key: "stateful_sticky_wait_seconds", Label: "Stateful Sticky 等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
+			Help: "仅用于 previous_response_id / X-Codex-Turn-State 等必须同账号请求等待本账号本地容量释放；0=跟随请求超时。", boot: func(c config.Config) interface{} { return c.StatefulStickyWaitSeconds }},
 		{Key: "account_token_budget", Label: "账号并发 Token 预算", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "同账号已有在途请求时允许叠加的估算输入 token 上限。", boot: func(c config.Config) interface{} { return int(c.AccountTokenBudget) }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
@@ -345,11 +347,15 @@ func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	c := s.cfg
 	c.StickyWaitMillis = s.settingInt(ctx, "sticky_wait_millis", c.StickyWaitMillis)
+	c.StatefulStickyWaitSeconds = s.settingInt(ctx, "stateful_sticky_wait_seconds", c.StatefulStickyWaitSeconds)
 	c.AccountTokenBudget = s.settingInt64(ctx, "account_token_budget", c.AccountTokenBudget)
 	c.StrictStickyMaxCooldownSeconds = s.settingInt(ctx, "strict_sticky_max_cooldown_seconds", c.StrictStickyMaxCooldownSeconds)
 	c.CooldownWaitMaxSeconds = s.settingInt(ctx, "cooldown_wait_max_seconds", c.CooldownWaitMaxSeconds)
 	if c.StickyWaitMillis <= 0 {
 		c.StickyWaitMillis = config.DefaultStickyWaitMillis
+	}
+	if c.StatefulStickyWaitSeconds < 0 {
+		c.StatefulStickyWaitSeconds = 0
 	}
 	if c.AccountTokenBudget <= 0 {
 		c.AccountTokenBudget = config.DefaultAccountTokenBudget
@@ -469,6 +475,16 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		n, _ := strconv.ParseInt(raw, 10, 64)
 		if n <= 0 {
 			return "", fmt.Errorf("must be greater than 0")
+		}
+		return raw, nil
+	case "stateful_sticky_wait_seconds":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.ParseInt(raw, 10, 64)
+		if n < 0 {
+			return "0", nil
 		}
 		return raw, nil
 	case "strict_sticky_max_cooldown_seconds", "cooldown_wait_max_seconds":

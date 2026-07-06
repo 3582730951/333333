@@ -89,22 +89,23 @@ func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 }
 
 func IsStrictSticky(path string, r *http.Request, body []byte) bool {
-	if strings.Contains(path, "/responses/compact") {
-		return true
-	}
 	if headerValue(r, "x-codex-turn-state") != "" {
 		return true
 	}
 	if JSONStringField(body, "previous_response_id") != "" {
 		return true
 	}
-	if bytes.Contains(body, []byte("compaction_trigger")) {
+	if IsCompaction(path, body) {
 		return true
 	}
 	if bytes.Contains(body, []byte("tool_result")) || bytes.Contains(body, []byte("function_call_output")) {
 		return true
 	}
 	return false
+}
+
+func IsCompaction(path string, body []byte) bool {
+	return strings.Contains(path, "/responses/compact") || bytes.Contains(body, []byte("compaction_trigger"))
 }
 
 // HasServerSideState reports whether a request depends on per-account server-side
