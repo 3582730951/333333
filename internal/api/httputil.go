@@ -329,12 +329,21 @@ func codexRetentionDiagnosticsForTransport(diag storage.UsageDiagnostics, respon
 
 func claudeRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, ttl string, injected bool) storage.UsageDiagnostics {
 	cacheDiag := prompt.InspectAnthropicCacheControl(body)
+	breakpointsJSON := ""
+	if len(cacheDiag.Breakpoints) > 0 {
+		if raw, err := json.Marshal(cacheDiag.Breakpoints); err == nil {
+			breakpointsJSON = string(raw)
+		}
+	}
 	return storage.UsageDiagnostics{
 		UsageProvider:                     "claude",
 		AffinitySource:                    affinity.Source,
 		ClaudeCacheTTL:                    ttl,
 		CacheControlInjected:              injected && cacheDiag.BreakpointCount > 0,
 		CacheBreakpointCount:              cacheDiag.BreakpointCount,
+		CacheBreakpointsJSON:              breakpointsJSON,
+		UnwrittenTailTokens:               cacheDiag.UnwrittenTailTokens,
+		MaxPossibleCacheReadTokens:        cacheDiag.MaxPossibleCacheReadTokens,
 		LatestUserCacheControl:            cacheDiag.LatestUserCacheControl,
 		LatestUserAutoContextCacheControl: cacheDiag.LatestUserAutoContextCacheControl,
 		LatestUserTailCacheControl:        cacheDiag.LatestUserTailCacheControl,

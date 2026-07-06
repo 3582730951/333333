@@ -1,6 +1,8 @@
 package prompt
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"time"
@@ -193,7 +195,25 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 	return EnsureAnthropicCacheControlWithPolicy(body, ttl, "legacy")
 }
 
+type AnthropicCacheControlOptions struct {
+	TTL                string
+	Policy             string
+	LatestTailWrite    bool
+	LosslessBlockSplit bool
+}
+
+func EnsureAnthropicCacheControlWithOptions(body []byte, opts AnthropicCacheControlOptions) []byte {
+	return ensureAnthropicCacheControlWithOptions(body, opts.TTL, opts.Policy, opts.LatestTailWrite, opts.LosslessBlockSplit)
+}
+
 func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []byte {
+	return ensureAnthropicCacheControlWithOptions(body, ttl, policy, true, false)
+}
+
+func ensureAnthropicCacheControlWithOptions(body []byte, ttl, policy string, latestTailWrite, losslessBlockSplit bool) []byte {
+	if losslessBlockSplit {
+		body = LosslessSplitAnthropicTextBlocks(body)
+	}
 	var root map[string]interface{}
 	if json.Unmarshal(body, &root) != nil {
 		return body
@@ -232,6 +252,12 @@ func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []by
 			m["ttl"] = "1h"
 		}
 		return m
+	}
+	if normalizeAnthropicCachePolicy(policy) == "max_hit" {
+		if planAnthropicMaxHitCacheControl(root, mk, latestTailWrite) {
+			changed = true
+		}
+		return finish()
 	}
 
 	// 1) End of the tool definition prefix. Tool schemas are stable across turns
@@ -275,19 +301,300 @@ func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []by
 
 func normalizeAnthropicCachePolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
-	case "coarse_safe", "stable_prefix_safe", "aggressive":
+	case "coarse_safe", "stable_prefix_safe", "aggressive", "max_hit":
 		return strings.ToLower(strings.TrimSpace(policy))
 	default:
 		return "balanced"
 	}
 }
 
+func planAnthropicMaxHitCacheControl(root map[string]interface{}, mk func() map[string]interface{}, latestTailWrite bool) bool {
+	changed := clearCacheControls(root)
+	budget := 4
+	if markListTail(root["tools"], mk) {
+		budget--
+		changed = true
+	}
+	if budget > 0 {
+		if sys, ok := markSystemTail(root["system"], mk); ok {
+			root["system"] = sys
+			budget--
+			changed = true
+		}
+	}
+	if budget > 0 {
+		if markClaudeNativeAutoContext(root["messages"], mk) {
+			budget--
+			changed = true
+		}
+	}
+	latestReserve := 0
+	if latestTailWrite && latestCacheableMessageIndex(root["messages"]) >= 0 {
+		latestReserve = 1
+	}
+	if budget > latestReserve {
+		used := markRollingHistoryAnchors(root["messages"], mk, budget-latestReserve)
+		if used > 0 {
+			budget -= used
+			changed = true
+		}
+	}
+	if latestTailWrite && budget > 0 {
+		if markLatestCacheableMessageTail(root["messages"], mk) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func clearCacheControls(root map[string]interface{}) bool {
+	changed := false
+	visit := func(v interface{}) {
+		arr, ok := v.([]interface{})
+		if !ok {
+			return
+		}
+		for _, item := range arr {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := block["cache_control"]; has {
+				delete(block, "cache_control")
+				changed = true
+			}
+		}
+	}
+	visit(root["tools"])
+	visit(root["system"])
+	if msgs, ok := root["messages"].([]interface{}); ok {
+		for _, msg := range msgs {
+			m, ok := msg.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := m["cache_control"]; has {
+				delete(m, "cache_control")
+				changed = true
+			}
+			visit(m["content"])
+		}
+	}
+	return changed
+}
+
+func markRollingHistoryAnchors(messages interface{}, mk func() map[string]interface{}, slots int) int {
+	if slots <= 0 {
+		return 0
+	}
+	msgs, ok := messages.([]interface{})
+	if !ok {
+		return 0
+	}
+	latest := latestCacheableMessageIndex(messages)
+	if latest <= 0 {
+		return 0
+	}
+	used := 0
+	for target := latest - 15; target >= 0 && used < slots; target -= 15 {
+		idx := nearestUnmarkedCacheableMessageAtOrBefore(msgs, target)
+		if idx < 0 {
+			continue
+		}
+		if markMessageTail(msgs[idx], mk) {
+			used++
+		}
+	}
+	return used
+}
+
+func nearestUnmarkedCacheableMessageAtOrBefore(msgs []interface{}, target int) int {
+	if target >= len(msgs) {
+		target = len(msgs) - 1
+	}
+	for i := target; i >= 0; i-- {
+		if !messageHasCacheableTail(msgs[i]) || messageHasCacheControl(msgs[i]) {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+func latestCacheableMessageIndex(messages interface{}) int {
+	msgs, ok := messages.([]interface{})
+	if !ok {
+		return -1
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if messageHasCacheableTail(msgs[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func markLatestCacheableMessageTail(messages interface{}, mk func() map[string]interface{}) bool {
+	msgs, ok := messages.([]interface{})
+	if !ok {
+		return false
+	}
+	idx := latestCacheableMessageIndex(messages)
+	if idx < 0 {
+		return false
+	}
+	return markMessageTail(msgs[idx], mk)
+}
+
+func messageHasCacheableTail(msg interface{}) bool {
+	m, ok := msg.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	switch c := m["content"].(type) {
+	case string:
+		return strings.TrimSpace(c) != ""
+	case []interface{}:
+		for i := len(c) - 1; i >= 0; i-- {
+			if _, ok := c[i].(map[string]interface{}); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func messageHasCacheControl(msg interface{}) bool {
+	m, ok := msg.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if _, has := m["cache_control"]; has {
+		return true
+	}
+	if blocks, ok := m["content"].([]interface{}); ok {
+		for _, item := range blocks {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := block["cache_control"]; has {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// LosslessSplitAnthropicTextBlocks splits a single text block into adjacent text
+// blocks only when their concatenated bytes are exactly identical to the original
+// text. It is intentionally narrow: it recognizes Claude Code's auto-context
+// system-reminder delimiter and does not summarize, drop, reorder, or edit bytes.
+func LosslessSplitAnthropicTextBlocks(body []byte) []byte {
+	var root map[string]interface{}
+	if json.Unmarshal(body, &root) != nil {
+		return body
+	}
+	changed := false
+	msgs, ok := root["messages"].([]interface{})
+	if !ok {
+		return body
+	}
+	for _, msg := range msgs {
+		m, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blocks, ok := m["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		out := make([]interface{}, 0, len(blocks)+1)
+		for _, item := range blocks {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				out = append(out, item)
+				continue
+			}
+			if _, has := block["cache_control"]; has {
+				out = append(out, item)
+				continue
+			}
+			text, ok := block["text"].(string)
+			if !ok {
+				out = append(out, item)
+				continue
+			}
+			left, right, split := losslessAutoContextSplit(text)
+			if !split || left+right != text {
+				out = append(out, item)
+				continue
+			}
+			first := cloneStringInterfaceMap(block)
+			second := cloneStringInterfaceMap(block)
+			first["text"] = left
+			second["text"] = right
+			out = append(out, first, second)
+			changed = true
+		}
+		if changed {
+			m["content"] = out
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func losslessAutoContextSplit(text string) (string, string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "<system-reminder>") ||
+		!strings.Contains(trimmed, "As you answer the user's questions, you can use the following context:") {
+		return "", "", false
+	}
+	for _, marker := range []string{"</system-reminder>\n\n", "</system-reminder>\r\n\r\n"} {
+		if idx := strings.Index(text, marker); idx >= 0 {
+			split := idx + len(marker)
+			if split > 0 && split < len(text) {
+				return text[:split], text[split:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func cloneStringInterfaceMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 type AnthropicCacheControlDiagnostics struct {
 	BreakpointCount                   int
+	Breakpoints                       []AnthropicCacheBreakpointDiagnostic
+	UnwrittenTailTokens               int64
+	MaxPossibleCacheReadTokens        int64
 	LatestUserCacheControl            bool
 	LatestUserAutoContextCacheControl bool
 	LatestUserTailCacheControl        bool
 	LatestUserToolResultCacheControl  bool
+}
+
+type AnthropicCacheBreakpointDiagnostic struct {
+	Section       string `json:"section"`
+	MessageIndex  int    `json:"message_index,omitempty"`
+	BlockIndex    int    `json:"block_index,omitempty"`
+	Type          string `json:"type"`
+	TokenEstimate int64  `json:"token_estimate"`
+	Hash          string `json:"hash"`
+	TTL           string `json:"ttl,omitempty"`
 }
 
 func InspectAnthropicCacheControl(body []byte) AnthropicCacheControlDiagnostics {
@@ -297,7 +604,159 @@ func InspectAnthropicCacheControl(body []byte) AnthropicCacheControlDiagnostics 
 	}
 	latest := latestUserCacheControlDetails(root["messages"])
 	latest.BreakpointCount = countCacheControl(root["system"]) + countCacheControl(root["tools"]) + countCacheControlMessages(root["messages"])
+	latest.Breakpoints, latest.UnwrittenTailTokens, latest.MaxPossibleCacheReadTokens = inspectAnthropicCacheBreakpoints(root)
 	return latest
+}
+
+func inspectAnthropicCacheBreakpoints(root map[string]interface{}) ([]AnthropicCacheBreakpointDiagnostic, int64, int64) {
+	type entry struct {
+		block     map[string]interface{}
+		section   string
+		msgIdx    int
+		blockIdx  int
+		tokens    int64
+		hasMarker bool
+	}
+	entries := []entry{}
+	addList := func(v interface{}, section string, msgIdx int) {
+		arr, ok := v.([]interface{})
+		if !ok {
+			return
+		}
+		for i, item := range arr {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			_, hasMarker := block["cache_control"]
+			entries = append(entries, entry{
+				block:     block,
+				section:   section,
+				msgIdx:    msgIdx,
+				blockIdx:  i,
+				tokens:    estimateAnthropicBlockTokens(block),
+				hasMarker: hasMarker,
+			})
+		}
+	}
+	addList(root["tools"], "tools", -1)
+	addList(root["system"], "system", -1)
+	if msgs, ok := root["messages"].([]interface{}); ok {
+		for msgIdx, item := range msgs {
+			msg, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := msg["cache_control"]; has {
+				entries = append(entries, entry{
+					block:     msg,
+					section:   "messages",
+					msgIdx:    msgIdx,
+					blockIdx:  -1,
+					tokens:    estimateAnthropicBlockTokens(msg),
+					hasMarker: true,
+				})
+			}
+			addList(msg["content"], "messages", msgIdx)
+		}
+	}
+
+	breakpoints := []AnthropicCacheBreakpointDiagnostic{}
+	total := int64(0)
+	maxRead := int64(0)
+	lastMarker := -1
+	for i, ent := range entries {
+		total += ent.tokens
+		if !ent.hasMarker {
+			continue
+		}
+		lastMarker = i
+		maxRead = total
+		breakpoints = append(breakpoints, AnthropicCacheBreakpointDiagnostic{
+			Section:       ent.section,
+			MessageIndex:  ent.msgIdx,
+			BlockIndex:    ent.blockIdx,
+			Type:          anthropicBlockType(ent.block),
+			TokenEstimate: ent.tokens,
+			Hash:          shortBlockHash(ent.block),
+			TTL:           cacheControlTTL(ent.block),
+		})
+	}
+	if lastMarker < 0 {
+		return breakpoints, total, 0
+	}
+	tail := int64(0)
+	for _, ent := range entries[lastMarker+1:] {
+		tail += ent.tokens
+	}
+	return breakpoints, tail, maxRead
+}
+
+func estimateAnthropicBlockTokens(block map[string]interface{}) int64 {
+	if text, ok := block["text"].(string); ok {
+		return estimateTextTokens(text)
+	}
+	if text, ok := block["content"].(string); ok {
+		return estimateTextTokens(text)
+	}
+	raw, err := json.Marshal(stripCacheControlForHash(block))
+	if err != nil {
+		return 1
+	}
+	if len(raw) == 0 {
+		return 1
+	}
+	return int64((len(raw) + 3) / 4)
+}
+
+func estimateTextTokens(text string) int64 {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 1
+	}
+	return int64((len(text) + 3) / 4)
+}
+
+func anthropicBlockType(block map[string]interface{}) string {
+	if typ, _ := block["type"].(string); typ != "" {
+		return typ
+	}
+	if _, has := block["role"]; has {
+		return "message"
+	}
+	if _, has := block["name"]; has {
+		return "tool"
+	}
+	return "block"
+}
+
+func shortBlockHash(block map[string]interface{}) string {
+	raw, err := json.Marshal(stripCacheControlForHash(block))
+	if err != nil {
+		raw = []byte(anthropicBlockType(block))
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+func stripCacheControlForHash(block map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(block))
+	for k, v := range block {
+		if k == "cache_control" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func cacheControlTTL(block map[string]interface{}) string {
+	cc, ok := block["cache_control"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	ttl, _ := cc["ttl"].(string)
+	return ttl
 }
 
 func countCacheControl(system interface{}) int {

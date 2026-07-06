@@ -868,6 +868,12 @@ CREATE TABLE IF NOT EXISTS usage_records(
   claude_cache_ttl TEXT NOT NULL DEFAULT '',
   cache_control_injected INTEGER NOT NULL DEFAULT 0,
   cache_breakpoint_count INTEGER NOT NULL DEFAULT 0,
+  cache_breakpoints_json TEXT NOT NULL DEFAULT '',
+  unwritten_tail_tokens INTEGER NOT NULL DEFAULT 0,
+  max_possible_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_hit_after_prewarm INTEGER NOT NULL DEFAULT 0,
+  singleflight_waited_requests INTEGER NOT NULL DEFAULT 0,
+  diagnostics_miss_reason TEXT NOT NULL DEFAULT '',
   latest_user_cache_control INTEGER NOT NULL DEFAULT 0,
   latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0,
   latest_user_tail_cache_control INTEGER NOT NULL DEFAULT 0,
@@ -1152,6 +1158,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN claude_cache_ttl TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN cache_control_injected INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_breakpoint_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_breakpoints_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN unwritten_tail_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN max_possible_cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_hit_after_prewarm INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN singleflight_waited_requests INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN diagnostics_miss_reason TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_tail_cache_control INTEGER NOT NULL DEFAULT 0`,
@@ -3864,6 +3876,13 @@ type UsageDiagnostics struct {
 	ClaudeCacheTTL                    string
 	CacheControlInjected              bool
 	CacheBreakpointCount              int
+	CacheBreakpointsJSON              string
+	UnwrittenTailTokens               int64
+	MaxPossibleCacheReadTokens        int64
+	CachePrewarmAttempted             bool
+	CacheHitAfterPrewarm              bool
+	SingleflightWaitedRequests        int64
+	DiagnosticsMissReason             string
 	LatestUserCacheControl            bool
 	LatestUserAutoContextCacheControl bool
 	LatestUserTailCacheControl        bool
@@ -3877,14 +3896,17 @@ func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID,
 account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
 affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
-retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control,
-latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
+retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
+cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
+latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
 		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
-		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount, boolInt(diag.LatestUserCacheControl),
+		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount,
+		diag.CacheBreakpointsJSON, diag.UnwrittenTailTokens, diag.MaxPossibleCacheReadTokens, boolInt(diag.CacheHitAfterPrewarm), diag.SingleflightWaitedRequests, diag.DiagnosticsMissReason,
+		boolInt(diag.LatestUserCacheControl),
 		boolInt(diag.LatestUserAutoContextCacheControl), boolInt(diag.LatestUserTailCacheControl), boolInt(diag.LatestUserToolResultCacheControl), diag.RouteEpoch,
 		string(raw), Now())
 	return err
@@ -4115,6 +4137,12 @@ type CacheUsageMetricRow struct {
 	PromptCacheKeyPresent             int64    `json:"prompt_cache_key_present"`
 	CacheControlInjected              int64    `json:"cache_control_injected"`
 	CacheBreakpointCount              int64    `json:"cache_breakpoint_count"`
+	CacheBreakpointsJSON              string   `json:"cache_breakpoints_json,omitempty"`
+	UnwrittenTailTokens               int64    `json:"unwritten_tail_tokens"`
+	MaxPossibleCacheReadTokens        int64    `json:"max_possible_cache_read_tokens"`
+	CacheHitAfterPrewarm              int64    `json:"cache_hit_after_prewarm"`
+	SingleflightWaitedRequests        int64    `json:"singleflight_waited_requests"`
+	DiagnosticsMissReason             string   `json:"diagnostics_miss_reason,omitempty"`
 	LatestUserCacheControl            int64    `json:"latest_user_cache_control"`
 	LatestUserAutoContextCacheControl int64    `json:"latest_user_auto_context_cache_control"`
 	LatestUserTailCacheControl        int64    `json:"latest_user_tail_cache_control"`
@@ -4379,6 +4407,12 @@ SELECT %s,
        COALESCE(SUM(prompt_cache_key_present),0),
        COALESCE(SUM(cache_control_injected),0),
        COALESCE(MAX(cache_breakpoint_count),0),
+       COALESCE(MAX(cache_breakpoints_json),''),
+       COALESCE(MAX(unwritten_tail_tokens),0),
+       COALESCE(MAX(max_possible_cache_read_tokens),0),
+       COALESCE(SUM(cache_hit_after_prewarm),0),
+       COALESCE(SUM(singleflight_waited_requests),0),
+       COALESCE(MAX(diagnostics_miss_reason),''),
        COALESCE(SUM(latest_user_cache_control),0),
        COALESCE(SUM(latest_user_auto_context_cache_control),0),
        COALESCE(SUM(latest_user_tail_cache_control),0),
@@ -4405,6 +4439,8 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 			&row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests,
 			&row.realCacheInputTokens, &row.realCacheReadTokens, &row.StablePrefixBytes,
 			&row.PromptCacheKeyPresent, &row.CacheControlInjected, &row.CacheBreakpointCount,
+			&row.CacheBreakpointsJSON, &row.UnwrittenTailTokens, &row.MaxPossibleCacheReadTokens,
+			&row.CacheHitAfterPrewarm, &row.SingleflightWaitedRequests, &row.DiagnosticsMissReason,
 			&row.LatestUserCacheControl, &row.LatestUserAutoContextCacheControl,
 			&row.LatestUserTailCacheControl, &row.LatestUserToolResultCacheControl, &row.RouteEpoch,
 		); err != nil {

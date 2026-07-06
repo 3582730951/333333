@@ -45,3 +45,20 @@ func TestClaudeCacheBreakpointDefaultIsStablePrefixSafe(t *testing.T) {
 		t.Fatalf("explicit aggressive policy = %q", policy)
 	}
 }
+
+func TestClaudeCacheModeMaxHitOverridesLegacyBreakpointPolicy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"resp"}`))
+	})
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, "claude_cache_breakpoint_policy", "stable_prefix_safe"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(ctx, "claude_cache_mode", "max_hit"); err != nil {
+		t.Fatal(err)
+	}
+	policy := h.app.claudeCacheBreakpointPolicy(ctx, routing.AffinityFromKey("stable", "cache_prefix_hash"), "acc", "cyber", "keyhash")
+	if policy != "max_hit" {
+		t.Fatalf("claude_cache_mode=max_hit selected policy %q, want max_hit", policy)
+	}
+}

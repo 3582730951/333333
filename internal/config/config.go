@@ -262,6 +262,11 @@ type Config struct {
 	// prompt caching). Default on; quality/behavior unchanged, only cached-token
 	// billing drops. Runtime-toggleable from the admin UI.
 	ClaudeCacheControlInject bool `json:"claude_cache_control_inject"`
+	// ClaudeCacheMode selects the prompt-cache planner. "stable_safe" keeps the
+	// conservative stable-prefix behavior; "max_hit" spends the four Anthropic
+	// breakpoints to maximize real cache reads, including a latest-tail write point
+	// for the next turn when enabled.
+	ClaudeCacheMode string `json:"claude_cache_mode"`
 	// ClaudeCacheAffinityPolicy controls Claude account affinity. "legacy" preserves
 	// the pre-optimization route key order; "balanced" prefers true Claude sessions
 	// and stable Anthropic cache prefixes before falling back to coarse routing.
@@ -282,6 +287,23 @@ type Config struct {
 	// marker budget. It never changes prompt text, tools, thinking, auth, or billing
 	// blocks. Default on. Runtime key: claude_native_cache_breakpoint_inject.
 	ClaudeNativeCacheBreakpointInject bool `json:"claude_native_cache_breakpoint_inject"`
+	// ClaudeCacheLatestTailWrite is used by claude_cache_mode=max_hit. When true,
+	// the newest cacheable message tail receives a cache_control marker so the next
+	// turn can read the full grown context. The current turn does not benefit from
+	// that newest marker.
+	ClaudeCacheLatestTailWrite bool `json:"claude_cache_latest_tail_write"`
+	// ClaudeCachePrewarmMode controls optional cache-write warmups before the real
+	// Claude request: "off", "async", or "sync_extreme".
+	ClaudeCachePrewarmMode string `json:"claude_cache_prewarm_mode"`
+	// ClaudeCacheDiagnosticsEnabled opts into Anthropic cache diagnostics headers and
+	// request diagnostics wiring when route-local previous message ids are available.
+	ClaudeCacheDiagnosticsEnabled bool `json:"claude_cache_diagnostics_enabled"`
+	// ClaudeCacheSingleflightEnabled makes concurrent requests with the same cache
+	// prefix wait behind the first writer to reduce parallel cold misses.
+	ClaudeCacheSingleflightEnabled bool `json:"claude_cache_singleflight_enabled"`
+	// ClaudeCacheLosslessBlockSplit enables byte-preserving text-block splitting in
+	// max-hit mode when the split can be round-tripped exactly.
+	ClaudeCacheLosslessBlockSplit bool `json:"claude_cache_lossless_block_split"`
 	// ClaudeCacheTTL selects the injected cache_control TTL: "" / "5m" = standard
 	// ephemeral (5 min), "1h" = extended (1 hour; higher hit rate across gaps, the
 	// cache write costs ~2x). Applies only to auto-injected breakpoints.
@@ -658,10 +680,16 @@ func Default() Config {
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
+		ClaudeCacheMode:                   "stable_safe",
 		ClaudeCacheAffinityPolicy:         "balanced",
 		ClaudeCacheBreakpointPolicy:       "stable_prefix_safe",
 		ClaudeCacheOptimizationRollout:    "{}",
 		ClaudeNativeCacheBreakpointInject: true,
+		ClaudeCacheLatestTailWrite:        true,
+		ClaudeCachePrewarmMode:            "off",
+		ClaudeCacheDiagnosticsEnabled:     false,
+		ClaudeCacheSingleflightEnabled:    false,
+		ClaudeCacheLosslessBlockSplit:     false,
 		ClaudeCacheTTL:                    "1h",
 		ClaudeCCHSigning:                  true,
 		BanDetectionEnabled:               true,
@@ -941,6 +969,9 @@ func (c *Config) applyEnv() {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.ClaudeCacheControlInject = parsed
 		}
+	}
+	if v := os.Getenv("CODEX_POOL_CLAUDE_CACHE_MODE"); v != "" {
+		c.ClaudeCacheMode = v
 	}
 	if v := os.Getenv("CODEX_POOL_CLAUDE_CCH_SIGNING"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {

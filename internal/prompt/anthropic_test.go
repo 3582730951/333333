@@ -2,6 +2,8 @@ package prompt
 
 import (
 	"encoding/json"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -383,6 +385,107 @@ func TestEnsureAnthropicCacheControlCoarseSafeSkipsUserHistoryBreakpoints(t *tes
 	}
 }
 
+func TestEnsureAnthropicCacheControlMaxHitWritesLatestTailWithinFour(t *testing.T) {
+	raw := []byte(`{"model":"claude","thinking":{"type":"enabled","budget_tokens":4096},"tool_choice":{"type":"auto"},"system":[` +
+		`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=12345;"},` +
+		`{"type":"text","text":"stable project instructions"}` +
+		`],"tools":[{"name":"Bash","input_schema":{"type":"object"}},{"name":"Read","input_schema":{"type":"object"}}],` +
+		`"messages":[` +
+		`{"role":"user","content":[` +
+		`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# repo\nstable files\n</system-reminder>\n\n"},` +
+		`{"type":"text","text":"first real request"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"ok"}]},` +
+		`{"role":"user","content":"latest real request with a long tool tail to write for the next turn"}` +
+		`]}`)
+	before := anthropicMessageTextSequence(t, raw)
+	out := EnsureAnthropicCacheControlWithPolicy(raw, "1h", "max_hit")
+	after := anthropicMessageTextSequence(t, out)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("max_hit changed message text sequence:\nbefore=%#v\nafter=%#v\nbody=%s", before, after, out)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["model"] != "claude" || m["thinking"] == nil || m["tool_choice"] == nil {
+		t.Fatalf("max_hit changed model/thinking/tool_choice: %v", m)
+	}
+	if n := cacheControlCount(t, out); n != 4 {
+		t.Fatalf("max_hit marker count = %d, want 4: %s", n, out)
+	}
+	diag := InspectAnthropicCacheControl(out)
+	if !diag.LatestUserTailCacheControl || !diag.LatestUserCacheControl || diag.LatestUserToolResultCacheControl {
+		t.Fatalf("max_hit should write latest text tail only, got diagnostics %+v\n%s", diag, out)
+	}
+	if len(diag.Breakpoints) != 4 {
+		t.Fatalf("expected four breakpoint diagnostics, got %+v", diag.Breakpoints)
+	}
+	for _, bp := range diag.Breakpoints {
+		if bp.Section == "" || bp.Type == "" || bp.Hash == "" || bp.TokenEstimate <= 0 {
+			t.Fatalf("breakpoint diagnostic missing metadata: %+v", bp)
+		}
+	}
+	if diag.MaxPossibleCacheReadTokens <= 0 {
+		t.Fatalf("max possible cache read tokens not estimated: %+v", diag)
+	}
+	sys := m["system"].([]interface{})
+	if _, has := sys[0].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("billing block must not carry cache_control: %v", sys[0])
+	}
+}
+
+func TestEnsureAnthropicCacheControlMaxHitAddsRollingAnchorPastTwentyBlocks(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"model":"claude","system":"stable system","messages":[`)
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		b.WriteString(`{"role":"`)
+		b.WriteString(role)
+		b.WriteString(`","content":[{"type":"text","text":"history block `)
+		b.WriteString(strconv.Itoa(i))
+		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`,{"role":"user","content":[{"type":"text","text":"latest request"}]}]}`)
+	out := EnsureAnthropicCacheControlWithPolicy([]byte(b.String()), "1h", "max_hit")
+	if n := cacheControlCount(t, out); n > 4 {
+		t.Fatalf("max_hit marker count = %d, want <= 4: %s", n, out)
+	}
+	anchors := messageIndexesWithCacheControl(t, out)
+	if len(anchors) < 2 {
+		t.Fatalf("max_hit should include a rolling history anchor plus latest tail, got anchors %v in %s", anchors, out)
+	}
+	if last := anchors[len(anchors)-1]; last != 24 {
+		t.Fatalf("latest user message should be the final write anchor, got anchors %v", anchors)
+	}
+	if prev := anchors[len(anchors)-2]; 24-prev > 20 {
+		t.Fatalf("rolling anchor too far behind latest for 20-block lookback: anchors %v", anchors)
+	}
+}
+
+func TestLosslessAnthropicBlockSplitPreservesTextBytes(t *testing.T) {
+	raw := []byte(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# repo\nstable\n</system-reminder>\n\nActual question"}]}]}`)
+	before := anthropicMessageTextSequence(t, raw)
+	out := LosslessSplitAnthropicTextBlocks(raw)
+	after := anthropicMessageTextSequence(t, out)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("lossless split changed concatenated text:\nbefore=%#v\nafter=%#v\nbody=%s", before, after, out)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	blocks := m["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
+	if len(blocks) != 2 {
+		t.Fatalf("lossless split should produce two text blocks, got %d: %v", len(blocks), blocks)
+	}
+}
+
 func TestEnsureAnthropicCacheControlMarksSecondToLastUserTurn(t *testing.T) {
 	raw := []byte(`{"model":"claude","messages":[` +
 		`{"role":"user","content":"first stable question"},` +
@@ -402,6 +505,66 @@ func TestEnsureAnthropicCacheControlMarksSecondToLastUserTurn(t *testing.T) {
 	if last := msgs[2].(map[string]interface{})["content"]; last != "final volatile question" {
 		t.Fatalf("final user turn should remain unmarked and unchanged: %v", last)
 	}
+}
+
+func anthropicMessageTextSequence(t *testing.T, body []byte) []string {
+	t.Helper()
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, msg := range m["messages"].([]interface{}) {
+		mm := msg.(map[string]interface{})
+		switch c := mm["content"].(type) {
+		case string:
+			out = append(out, c)
+		case []interface{}:
+			var sb strings.Builder
+			for _, item := range c {
+				block, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if txt, ok := block["text"].(string); ok {
+					sb.WriteString(txt)
+				}
+				if txt, ok := block["content"].(string); ok {
+					sb.WriteString(txt)
+				}
+			}
+			out = append(out, sb.String())
+		}
+	}
+	return out
+}
+
+func messageIndexesWithCacheControl(t *testing.T, body []byte) []int {
+	t.Helper()
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatal(err)
+	}
+	var out []int
+	for i, msg := range m["messages"].([]interface{}) {
+		mm := msg.(map[string]interface{})
+		if _, has := mm["cache_control"]; has {
+			out = append(out, i)
+			continue
+		}
+		blocks, _ := mm["content"].([]interface{})
+		for _, item := range blocks {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := block["cache_control"]; has {
+				out = append(out, i)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func cacheControlCount(t *testing.T, body []byte) int {

@@ -101,6 +101,11 @@ type Server struct {
 	asyncClosed bool
 	asyncBytes  int64
 
+	claudeCacheFlightsMu sync.Mutex
+	claudeCacheFlights   map[string]chan struct{}
+	claudeCacheDiagMu    sync.Mutex
+	claudeCacheDiagPrev  map[string]string
+
 	codexResetMu    sync.Mutex
 	codexResetLocks map[string]*sync.Mutex
 	compatMu        sync.Mutex
@@ -126,11 +131,13 @@ func NewServer(dep Dependencies) *Server {
 			clientErrorLogWindow,
 			clientErrorLogMaxClients,
 		),
-		relState:         reliability.NewStore(relStateTTL, relStateMax),
-		regHandler:       NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
-		lifecycleHandler: newServerLifecycleHandlers(dep.Store),
-		claudeRefresh:    newClaudeRefreshGates(),
-		codexResetLocks:  map[string]*sync.Mutex{},
+		relState:            reliability.NewStore(relStateTTL, relStateMax),
+		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
+		lifecycleHandler:    newServerLifecycleHandlers(dep.Store),
+		claudeRefresh:       newClaudeRefreshGates(),
+		claudeCacheFlights:  map[string]chan struct{}{},
+		claudeCacheDiagPrev: map[string]string{},
+		codexResetLocks:     map[string]*sync.Mutex{},
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
@@ -1438,6 +1445,9 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
 	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
 	diag.CacheCreation1hTokens = parsed.CacheCreation1hTokens
+	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
+		diag.CacheHitAfterPrewarm = true
+	}
 	// Defer the insert off the request path. Usage rows are read only by the admin
 	// dashboards (never by request processing), so eventual recording is correct; the
 	// closure captures only the small parsed usage + identity, and uses a detached
@@ -1517,6 +1527,9 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
 	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
 	diag.CacheCreation1hTokens = parsed.CacheCreation1hTokens
+	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
+		diag.CacheHitAfterPrewarm = true
+	}
 	s.enqueueWrite(func() {
 		wctx, cancel := bgWriteContext()
 		defer cancel()

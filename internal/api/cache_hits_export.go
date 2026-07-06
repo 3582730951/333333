@@ -173,7 +173,7 @@ func cacheMetricRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCode
 }
 
 func cacheRouteHeader(withAccountModel bool) []string {
-	prefix := []string{"route_code", "route_class", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "single_use_route", "risk_flags", "route_epoch"}
+	prefix := []string{"route_code", "route_class", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "single_use_route", "risk_flags", "route_epoch"}
 	if withAccountModel {
 		prefix = append([]string{"account_code", "model"}, prefix...)
 	}
@@ -197,6 +197,12 @@ func cacheRouteRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCodeb
 			itoa64(row.PromptCacheKeyPresent),
 			itoa64(row.CacheControlInjected),
 			itoa64(row.CacheBreakpointCount),
+			codebook.sanitize(row.CacheBreakpointsJSON),
+			itoa64(row.UnwrittenTailTokens),
+			itoa64(row.MaxPossibleCacheReadTokens),
+			itoa64(row.CacheHitAfterPrewarm),
+			itoa64(row.SingleflightWaitedRequests),
+			row.DiagnosticsMissReason,
 			itoa64(row.LatestUserCacheControl),
 			itoa64(row.LatestUserAutoContextCacheControl),
 			itoa64(row.LatestUserTailCacheControl),

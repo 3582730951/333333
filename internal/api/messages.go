@@ -256,13 +256,15 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	})
 	body := result.Body
 	if nativeCacheInject {
-		body = prompt.EnsureAnthropicCacheControlWithPolicy(body, claudeTTL, breakpointPolicy)
+		body = prompt.EnsureAnthropicCacheControlWithOptions(body, prompt.AnthropicCacheControlOptions{
+			TTL:                claudeTTL,
+			Policy:             breakpointPolicy,
+			LatestTailWrite:    s.claudeCacheLatestTailWriteEnabled(r.Context()),
+			LosslessBlockSplit: s.claudeCacheLosslessBlockSplitEnabled(r.Context()),
+		})
 	}
+	body = s.applyClaudeCacheDiagnostics(r.Context(), r.Header, body, affinity)
 
-	usageDiag := claudeRequestUsageDiagnostics(body, affinity, claudeTTL, nativeCacheInject)
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
-	// Session 33: Carry the billing hold id in the request context for usage fallback.
-	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	// Anthropic is not behind a CF challenge wall the way chatgpt.com is, so we
 	// call upstream directly rather than through the Codex CF-retry/egress-rotation
 	// path — and below we only treat an actual interstitial challenge as CF, never
@@ -281,7 +283,17 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			OSHint:         osHint,
 		}
 	}
+	usageDiag := claudeRequestUsageDiagnostics(body, affinity, claudeTTL, nativeCacheInject)
+	usageDiag.CachePrewarmAttempted = s.maybePrewarmClaudeCache(r.Context(), s.claudeCachePrewarmMode(r.Context()), requestForToken(token))
+	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), body, affinity)
+	if waitedForFlight {
+		usageDiag.SingleflightWaitedRequests = 1
+	}
+	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	// Session 33: Carry the billing hold id in the request context for usage fallback.
+	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
+	releaseFlight()
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
 		if allowRetry && movable {
@@ -426,6 +438,8 @@ claudeSuccess:
 		writeError(w, http.StatusBadGateway, err)
 		return outcomeDone
 	}
+	s.rememberClaudeCacheDiagnosticsMessageID(affinity, responseBody)
+	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), responseBody))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
 	_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))

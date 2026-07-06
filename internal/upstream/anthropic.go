@@ -24,8 +24,10 @@ import (
 const (
 	claudeAnthropicVersion = "2023-06-01"
 	// OAuth (Claude Pro/Max) carries the oauth beta; API keys must not.
-	claudeOAuthBetas  = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
-	claudeAPIKeyBetas = "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	claudeCacheDiagnosticsBeta   = "cache-diagnosis-2026-04-07"
+	claudeCacheDiagnosticsHeader = "X-Codex-Claude-Cache-Diagnostics"
 )
 
 func claudeBaseURL(cfg config.Config) string {
@@ -217,6 +219,9 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 			dst.Set("Authorization", "Bearer "+token)
 		}
 		dst.Set("Anthropic-Beta", mergeBetas(claudeOAuthBetas, spec.Headers, false))
+	}
+	if strings.TrimSpace(spec.Headers.Get(claudeCacheDiagnosticsHeader)) != "" {
+		appendClaudeBeta(dst, claudeCacheDiagnosticsBeta)
 	}
 	dst.Set("Anthropic-Version", claudeAnthropicVersion)
 	dst.Set("X-App", "cli")
@@ -429,6 +434,21 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+func appendClaudeBeta(h http.Header, beta string) {
+	beta = strings.TrimSpace(beta)
+	if beta == "" {
+		return
+	}
+	current := splitCSV(h.Get("Anthropic-Beta"))
+	for _, existing := range current {
+		if strings.EqualFold(existing, beta) {
+			return
+		}
+	}
+	current = append(current, beta)
+	h.Set("Anthropic-Beta", strings.Join(current, ","))
 }
 
 const claudeCCHSeed uint64 = 0x6E52736AC806831E

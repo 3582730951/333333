@@ -171,7 +171,15 @@ func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
 		"codex_install_approval_policy":         "never",
 		"codex_install_sandbox_mode":            "danger-full-access",
 		"claude_cache_control_inject":           true,
+		"claude_cache_mode":                     "max_hit",
+		"claude_cache_breakpoint_policy":        "max_hit",
 		"claude_native_cache_breakpoint_inject": true,
+		"claude_cache_latest_tail_write":        true,
+		"claude_cache_prewarm_mode":             "sync_extreme",
+		"claude_cache_diagnostics_enabled":      true,
+		"claude_cache_singleflight_enabled":     true,
+		"claude_cache_lossless_block_split":     true,
+		"claude_cache_ttl":                      "1h",
 	}
 	for key, want := range wants {
 		if values[key] != want {

@@ -129,7 +129,13 @@ func (s *Server) effectiveSettings(ctx context.Context) map[string]interface{} {
 	return map[string]interface{}{
 		"conversation_isolation":                s.isolationEnabled(ctx),
 		"claude_cache_control_inject":           s.cacheInjectEnabled(ctx),
+		"claude_cache_mode":                     firstNonEmpty(s.settingString(ctx, "claude_cache_mode", s.cfg.ClaudeCacheMode), "stable_safe"),
 		"claude_native_cache_breakpoint_inject": s.nativeCacheBreakpointInjectEnabled(ctx),
+		"claude_cache_latest_tail_write":        s.claudeCacheLatestTailWriteEnabled(ctx),
+		"claude_cache_prewarm_mode":             s.claudeCachePrewarmMode(ctx),
+		"claude_cache_diagnostics_enabled":      s.claudeCacheDiagnosticsEnabled(ctx),
+		"claude_cache_singleflight_enabled":     s.claudeCacheSingleflightEnabled(ctx),
+		"claude_cache_lossless_block_split":     s.claudeCacheLosslessBlockSplitEnabled(ctx),
 		"leak_scrub":                            s.leakScrubEnabled(ctx),
 		"require_downstream_key":                s.flagEnabled(ctx, "require_downstream_key", s.cfg.RequireDownstreamKey),
 		"claude_cache_ttl":                      s.claudeCacheTTL(ctx),

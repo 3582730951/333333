@@ -97,7 +97,12 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	// caches like native Claude Code. Quality/reasoning unchanged; only cached-token
 	// cost drops.
 	if cacheInject {
-		result.Body = prompt.EnsureAnthropicCacheControlWithPolicy(result.Body, claudeTTL, breakpointPolicy)
+		result.Body = prompt.EnsureAnthropicCacheControlWithOptions(result.Body, prompt.AnthropicCacheControlOptions{
+			TTL:                claudeTTL,
+			Policy:             breakpointPolicy,
+			LatestTailWrite:    s.claudeCacheLatestTailWriteEnabled(r.Context()),
+			LosslessBlockSplit: s.claudeCacheLosslessBlockSplitEnabled(r.Context()),
+		})
 	}
 	// Final body step (after cache_control injection): stamp the Claude Code
 	// x-anthropic-billing-header so OAuth traffic relayed from an OpenAI-compatible
@@ -106,10 +111,8 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	if claudeIsOAuth(token) {
 		result.Body = cloak.EnsureClaudeCodeBillingHeader(result.Body, s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion))
 	}
+	result.Body = s.applyClaudeCacheDiagnostics(r.Context(), r.Header, result.Body, affinity)
 
-	usageDiag := claudeRequestUsageDiagnostics(result.Body, affinity, claudeTTL, cacheInject)
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
-	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	requestForToken := func(t storage.AccountToken) upstream.Request {
 		return upstream.Request{
 			Method:         http.MethodPost,
@@ -124,7 +127,16 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			OSHint:         osHint,
 		}
 	}
+	usageDiag := claudeRequestUsageDiagnostics(result.Body, affinity, claudeTTL, cacheInject)
+	usageDiag.CachePrewarmAttempted = s.maybePrewarmClaudeCache(r.Context(), s.claudeCachePrewarmMode(r.Context()), requestForToken(token))
+	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), result.Body, affinity)
+	if waitedForFlight {
+		usageDiag.SingleflightWaitedRequests = 1
+	}
+	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
+	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
+	releaseFlight()
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
 		if refreshHeartbeat.writeError(err) {
@@ -236,6 +248,8 @@ chatClaudeSuccess:
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
+	s.rememberClaudeCacheDiagnosticsMessageID(affinity, anthResp)
+	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), anthResp))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, anthResp)
 	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
 	chatBody, err := prompt.AnthropicToChatCompletion(result.Scrubber.ReplaceAll(anthResp), model)

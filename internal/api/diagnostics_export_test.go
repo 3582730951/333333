@@ -52,19 +52,25 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route-secret", "api-key-hash", "user-1", "gpt-5.5", 10, 3, 13, 4, 4, 2,
 		json.RawMessage(`{"account":"acc-real-1","email":"sensitive@example.com","label":"Alpha Sensitive","upstream":"upstream-secret","chatgpt":"chatgpt-secret"}`),
 		storage.UsageDiagnostics{
-			AffinitySource:         "cache_prefix_hash",
-			PromptCacheKeyPresent:  true,
-			PromptCacheKeySource:   "auto_stable_prefix",
-			StablePrefixSource:     "anthropic_message_prefix",
-			StablePrefixReason:     "ok",
-			StablePrefixBytes:      4096,
-			RetentionEffective:     "24h",
-			RetentionSource:        "gateway_default",
-			ClaudeCacheTTL:         "1h",
-			CacheControlInjected:   true,
-			CacheBreakpointCount:   2,
-			LatestUserCacheControl: false,
-			RouteEpoch:             7,
+			AffinitySource:             "cache_prefix_hash",
+			PromptCacheKeyPresent:      true,
+			PromptCacheKeySource:       "auto_stable_prefix",
+			StablePrefixSource:         "anthropic_message_prefix",
+			StablePrefixReason:         "ok",
+			StablePrefixBytes:          4096,
+			RetentionEffective:         "24h",
+			RetentionSource:            "gateway_default",
+			ClaudeCacheTTL:             "1h",
+			CacheControlInjected:       true,
+			CacheBreakpointCount:       2,
+			CacheBreakpointsJSON:       `[{"section":"messages","message_index":2,"block_index":0,"type":"text","token_estimate":19,"hash":"abc123","ttl":"1h"}]`,
+			UnwrittenTailTokens:        123,
+			MaxPossibleCacheReadTokens: 456,
+			CacheHitAfterPrewarm:       true,
+			SingleflightWaitedRequests: 2,
+			DiagnosticsMissReason:      "messages_changed",
+			LatestUserCacheControl:     false,
+			RouteEpoch:                 7,
 		}); err != nil {
 		t.Fatal(err)
 	}
@@ -150,12 +156,12 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 	usageCSV := files["usage_records.csv"]
-	for _, want := range []string{"affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
+	for _, want := range []string{"affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
 		if !strings.Contains(usageCSV, want) {
 			t.Fatalf("usage_records.csv missing diagnostic column %q:\n%s", want, usageCSV)
 		}
 	}
-	for _, want := range []string{"cache_prefix_hash", "stable_prefix", "auto_stable_prefix", "anthropic_message_prefix", "4096", "24h", "1h", "7"} {
+	for _, want := range []string{"cache_prefix_hash", "stable_prefix", "auto_stable_prefix", "anthropic_message_prefix", "4096", "24h", "1h", "messages_changed", "456", "123", "7"} {
 		if !strings.Contains(usageCSV, want) {
 			t.Fatalf("usage_records.csv missing diagnostic value %q:\n%s", want, usageCSV)
 		}

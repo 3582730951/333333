@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,7 @@ type capturedRequest struct {
 	Method    string
 	AccountID string
 	Auth      string
+	Beta      string
 	Body      string
 	TurnState string
 }
@@ -57,6 +59,7 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 			Method:    r.Method,
 			AccountID: r.Header.Get("ChatGPT-Account-ID"),
 			Auth:      r.Header.Get("Authorization"),
+			Beta:      r.Header.Get("Anthropic-Beta"),
 			Body:      string(raw),
 			TurnState: r.Header.Get("X-Codex-Turn-State"),
 		})
@@ -124,6 +127,44 @@ func (h *testHarness) importAccount(t *testing.T, label, upstreamAccountID, acce
 
 func (h *testHarness) requests() []capturedRequest {
 	return append([]capturedRequest(nil), (*h.captured)...)
+}
+
+func cacheControlCountPrompt(t *testing.T, body []byte) int {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	countList := func(v interface{}) int {
+		n := 0
+		for _, item := range toInterfaceSlice(v) {
+			block, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, has := block["cache_control"]; has {
+				n++
+			}
+		}
+		return n
+	}
+	n := countList(root["system"]) + countList(root["tools"])
+	for _, item := range toInterfaceSlice(root["messages"]) {
+		msg, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, has := msg["cache_control"]; has {
+			n++
+		}
+		n += countList(msg["content"])
+	}
+	return n
+}
+
+func toInterfaceSlice(v interface{}) []interface{} {
+	arr, _ := v.([]interface{})
+	return arr
 }
 
 func setTestCapability(t *testing.T, h *testHarness, accountID, model string, nativeWindow int64) {
@@ -2986,6 +3027,204 @@ func TestChatCompletionsRoutesToClaudeByModel(t *testing.T) {
 	}
 	if usageProvider != "claude" || claudeTTL != "1h" || breakpointCount == 0 || latestUserCacheControl != 0 {
 		t.Fatalf("compat claude diagnostics wrong: provider=%q ttl=%q breakpoints=%d latest_user=%d", usageProvider, claudeTTL, breakpointCount, latestUserCacheControl)
+	}
+}
+
+func TestChatCompletionsClaudeMaxHitWritesLatestTail(t *testing.T) {
+	var upstreamBody string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody = readBody(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_max_hit","model":"claude-x","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1,"cache_creation_input_tokens":20}}`))
+	})
+	h.importAccount(t, "claude-max-hit", "", "sk-ant-oat-max-hit")
+	if err := h.store.SetSetting(context.Background(), "claude_cache_mode", "max_hit"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"claude-x","messages":[{"role":"system","content":"stable instructions"},{"role":"user","content":"first question"},{"role":"assistant","content":"first answer"},{"role":"user","content":"latest tail should be written"}]}`
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var sent map[string]interface{}
+	if err := json.Unmarshal([]byte(upstreamBody), &sent); err != nil {
+		t.Fatalf("decode upstream body: %v\n%s", err, upstreamBody)
+	}
+	msgs := sent["messages"].([]interface{})
+	latest := msgs[len(msgs)-1].(map[string]interface{})
+	latestBlocks, ok := latest["content"].([]interface{})
+	if !ok {
+		t.Fatalf("max_hit should convert latest tail into a marked text block, got %T in %s", latest["content"], upstreamBody)
+	}
+	if _, has := latestBlocks[len(latestBlocks)-1].(map[string]interface{})["cache_control"]; !has {
+		t.Fatalf("max_hit should write latest tail cache_control: %s", upstreamBody)
+	}
+	if got := cacheControlCountPrompt(t, []byte(upstreamBody)); got > 4 {
+		t.Fatalf("max_hit exceeded 4 breakpoints: %d in %s", got, upstreamBody)
+	}
+	h.app.WaitForAsyncWrites()
+	var latestUserCacheControl, latestUserTailCacheControl int
+	if err := h.store.DB().QueryRow(`SELECT latest_user_cache_control, latest_user_tail_cache_control FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(&latestUserCacheControl, &latestUserTailCacheControl); err != nil {
+		t.Fatalf("usage diagnostics missing: %v", err)
+	}
+	if latestUserCacheControl != 1 || latestUserTailCacheControl != 1 {
+		t.Fatalf("max_hit diagnostics latest_user=%d latest_tail=%d", latestUserCacheControl, latestUserTailCacheControl)
+	}
+}
+
+func TestChatCompletionsClaudeSyncPrewarmBeforeRealRequest(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw := readBody(t, r)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(raw, `"max_tokens":0`) {
+			_, _ = w.Write([]byte(`{"id":"msg_prewarm","model":"claude-x","content":[],"stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":100}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"msg_real","model":"claude-x","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":80}}`))
+	})
+	h.importAccount(t, "claude-prewarm", "", "sk-ant-oat-prewarm")
+	if err := h.store.SetSetting(context.Background(), "claude_cache_prewarm_mode", "sync_extreme"); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"claude-x","messages":[{"role":"system","content":"stable instructions"},{"role":"user","content":"ping"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("prewarm should send warmup + real request, got %d requests: %+v", len(reqs), reqs)
+	}
+	if !strings.Contains(reqs[0].Body, `"max_tokens":0`) {
+		t.Fatalf("first request should be max_tokens=0 prewarm: %s", reqs[0].Body)
+	}
+	if strings.Contains(reqs[1].Body, `"max_tokens":0`) {
+		t.Fatalf("real request should keep generation max_tokens: %s", reqs[1].Body)
+	}
+	h.app.WaitForAsyncWrites()
+	var cacheHitAfterPrewarm int
+	if err := h.store.DB().QueryRow(`SELECT cache_hit_after_prewarm FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(&cacheHitAfterPrewarm); err != nil {
+		t.Fatalf("usage diagnostics missing: %v", err)
+	}
+	if cacheHitAfterPrewarm != 1 {
+		t.Fatalf("cache_hit_after_prewarm = %d, want 1", cacheHitAfterPrewarm)
+	}
+}
+
+func TestChatCompletionsClaudeSingleflightSerializesSamePrefix(t *testing.T) {
+	var mu sync.Mutex
+	current := 0
+	maxConcurrent := 0
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		current++
+		if current > maxConcurrent {
+			maxConcurrent = current
+		}
+		mu.Unlock()
+		time.Sleep(120 * time.Millisecond)
+		mu.Lock()
+		current--
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_sf","model":"claude-x","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":20}}`))
+	})
+	h.importAccount(t, "claude-singleflight", "", "sk-ant-oat-singleflight")
+	if err := h.store.SetSetting(context.Background(), "claude_cache_singleflight_enabled", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"claude-x","messages":[{"role":"system","content":"stable instructions"},{"role":"user","content":"same request"}]}`
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+			if err != nil {
+				errs <- err
+				return
+			}
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				errs <- fmt.Errorf("status = %d", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	mu.Lock()
+	gotMax := maxConcurrent
+	mu.Unlock()
+	if gotMax > 1 {
+		t.Fatalf("singleflight allowed %d concurrent same-prefix upstream requests", gotMax)
+	}
+	h.app.WaitForAsyncWrites()
+	var waited int
+	if err := h.store.DB().QueryRow(`SELECT COALESCE(SUM(singleflight_waited_requests),0) FROM usage_records`).Scan(&waited); err != nil {
+		t.Fatal(err)
+	}
+	if waited != 1 {
+		t.Fatalf("singleflight_waited_requests sum = %d, want 1", waited)
+	}
+}
+
+func TestChatCompletionsClaudeCacheDiagnosticsSendsBetaAndPreviousMessage(t *testing.T) {
+	var n int
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_diag_` + strconv.Itoa(n) + `","model":"claude-x","content":[{"type":"text","text":"pong"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}`))
+	})
+	h.importAccount(t, "claude-diagnostics", "", "sk-ant-oat-diagnostics")
+	if err := h.store.SetSetting(context.Background(), "claude_cache_diagnostics_enabled", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"claude-x","messages":[{"role":"system","content":"stable instructions"},{"role":"user","content":"same route"}]}`
+	for i := 0; i < 2; i++ {
+		resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d", resp.StatusCode)
+		}
+	}
+	reqs := h.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d", len(reqs))
+	}
+	for _, req := range reqs {
+		if !strings.Contains(req.Beta, "cache-diagnosis-2026-04-07") {
+			t.Fatalf("diagnostics beta missing from Anthropic-Beta %q", req.Beta)
+		}
+	}
+	if strings.Contains(reqs[0].Body, "previous_message_id") {
+		t.Fatalf("first request should not have previous message diagnostics: %s", reqs[0].Body)
+	}
+	if !strings.Contains(reqs[1].Body, `"previous_message_id":"msg_diag_1"`) {
+		t.Fatalf("second request missing previous_message_id: %s", reqs[1].Body)
 	}
 }
 

@@ -115,6 +115,33 @@ func (s *Server) nativeCacheBreakpointInjectEnabled(ctx context.Context) bool {
 	return s.flagEnabled(ctx, "claude_native_cache_breakpoint_inject", s.cfg.ClaudeNativeCacheBreakpointInject)
 }
 
+func (s *Server) claudeCacheLatestTailWriteEnabled(ctx context.Context) bool {
+	return s.flagEnabled(ctx, "claude_cache_latest_tail_write", s.cfg.ClaudeCacheLatestTailWrite)
+}
+
+func (s *Server) claudeCacheLosslessBlockSplitEnabled(ctx context.Context) bool {
+	return s.flagEnabled(ctx, "claude_cache_lossless_block_split", s.cfg.ClaudeCacheLosslessBlockSplit)
+}
+
+func (s *Server) claudeCachePrewarmMode(ctx context.Context) string {
+	switch strings.ToLower(strings.TrimSpace(s.settingString(ctx, "claude_cache_prewarm_mode", s.cfg.ClaudeCachePrewarmMode))) {
+	case "async":
+		return "async"
+	case "sync_extreme":
+		return "sync_extreme"
+	default:
+		return "off"
+	}
+}
+
+func (s *Server) claudeCacheDiagnosticsEnabled(ctx context.Context) bool {
+	return s.flagEnabled(ctx, "claude_cache_diagnostics_enabled", s.cfg.ClaudeCacheDiagnosticsEnabled)
+}
+
+func (s *Server) claudeCacheSingleflightEnabled(ctx context.Context) bool {
+	return s.flagEnabled(ctx, "claude_cache_singleflight_enabled", s.cfg.ClaudeCacheSingleflightEnabled)
+}
+
 // leakScrubEnabled reports whether pool-internal upstream signals (quota/limit
 // headers, rate-limit SSE frames, limit/quota/overload error bodies, model-switch
 // suggestions) are hidden from the downstream client.

@@ -18,6 +18,8 @@ const (
 	claudeCachePolicyBalanced   = "balanced"
 	claudeCachePolicyCoarseSafe = "coarse_safe"
 	claudeCachePolicyStableSafe = "stable_prefix_safe"
+	claudeCachePolicyMaxHit     = "max_hit"
+	claudeCacheModeStableSafe   = "stable_safe"
 )
 
 type claudeCacheOptimizationRollout struct {
@@ -49,9 +51,13 @@ func (s *Server) claudeSelectionAffinity(ctx context.Context, r *http.Request, r
 }
 
 func (s *Server) claudeCacheBreakpointPolicy(ctx context.Context, affinity routing.AffinityKey, accountID, group, apiKeyHash string) string {
+	mode := normalizeClaudeCacheMode(s.settingString(ctx, "claude_cache_mode", s.cfg.ClaudeCacheMode))
 	policy := normalizeClaudeCacheBreakpointPolicy(s.settingString(ctx, "claude_cache_breakpoint_policy", s.cfg.ClaudeCacheBreakpointPolicy))
 	if policy == claudeCachePolicyLegacy || !s.claudeCacheRolloutAllows(ctx, group, apiKeyHash, accountID) {
 		return claudeCachePolicyLegacy
+	}
+	if mode == claudeCachePolicyMaxHit {
+		return claudeCachePolicyMaxHit
 	}
 	if policy == claudeCachePolicyCoarseSafe {
 		return claudeCachePolicyCoarseSafe
@@ -77,6 +83,17 @@ func normalizeClaudeCacheAffinityPolicy(policy string) string {
 	}
 }
 
+func normalizeClaudeCacheMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case claudeCachePolicyMaxHit:
+		return claudeCachePolicyMaxHit
+	case "", claudeCacheModeStableSafe, claudeCachePolicyStableSafe:
+		return claudeCacheModeStableSafe
+	default:
+		return claudeCacheModeStableSafe
+	}
+}
+
 func normalizeClaudeCacheBreakpointPolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
 	case claudeCachePolicyLegacy:
@@ -89,6 +106,8 @@ func normalizeClaudeCacheBreakpointPolicy(policy string) string {
 		return claudeCachePolicyAggressive
 	case claudeCachePolicyStableSafe:
 		return claudeCachePolicyStableSafe
+	case claudeCachePolicyMaxHit:
+		return claudeCachePolicyMaxHit
 	default:
 		return claudeCachePolicyStableSafe
 	}
