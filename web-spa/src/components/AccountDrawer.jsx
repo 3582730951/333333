@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ConfirmDialog, Drawer, Tag, Button, Typography, Spin, Select, Toast } from './pool/index.jsx';
-import { get, post } from '../api.js';
+import { ConfirmDialog, Drawer, Modal, Tag, Button, Typography, Spin, Select, Switch, Toast } from './pool/index.jsx';
+import { get, post, put } from '../api.js';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
 import { Panel } from './PageHeader.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
@@ -37,19 +37,27 @@ export default function AccountDrawer({
   const binding = account?.egress_binding || null;
   const [selectedEgress, setSelectedEgress] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
+  const [reauthForm, setReauthForm] = useState({ login_email: '', password: '', otp_url: '', target_workspace_id: '', auto_enabled: false });
+  const [oauthModal, setOauthModal] = useState({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' });
 
   const fetchDetails = useCallback(async ({ signal }) => {
     if (!account) return EMPTY_ACCOUNT_DETAIL;
-    const [data, profiles, groups] = await Promise.all([
+    const encodedID = encodeURIComponent(account.id);
+    const supportsCodexReauth = (account.provider || 'codex') === 'codex';
+    const [data, profiles, groups, codexReauth] = await Promise.all([
       get('/admin/audit', { account_id: account.id, limit: 10 }, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
       get('/admin/groups', undefined, { signal }),
+      supportsCodexReauth
+        ? get(`/admin/accounts/${encodedID}/codex-reauth-status`, undefined, { signal }).catch((err) => ({ error: err?.message || String(err) }))
+        : Promise.resolve(null),
     ]);
     const rows = Array.isArray(data) ? data : data?.rows || [];
     return {
       audit: rows,
       profiles: Array.isArray(profiles) ? profiles : profiles?.profiles || profiles?.egress_profiles || [],
       groups: Array.isArray(groups) ? groups : groups?.groups || [],
+      codexReauth,
     };
   }, [account]);
 
@@ -71,6 +79,17 @@ export default function AccountDrawer({
   useEffect(() => {
     setSelectedGroup(account?.group_name || '');
   }, [account?.id, account?.group_name]);
+
+  useEffect(() => {
+    const cfg = details.codexReauth?.config || {};
+    setReauthForm({
+      login_email: cfg.login_email || account?.email || '',
+      password: '',
+      otp_url: '',
+      target_workspace_id: cfg.target_workspace_id || account?.upstream_account_id || '',
+      auto_enabled: Boolean(cfg.auto_enabled),
+    });
+  }, [account?.id, account?.email, account?.upstream_account_id, details.codexReauth?.config?.updated_at]);
 
   const { run: saveDefaultEgress, running: savingDefaultEgress } = useAsyncAction(async () => {
     if (!account || !selectedEgress) return;
@@ -96,6 +115,67 @@ export default function AccountDrawer({
     }
   });
 
+  const updateReauthForm = (key, value) => setReauthForm((current) => ({ ...current, [key]: value }));
+
+  const { run: saveCodexReauth, running: savingCodexReauth } = useAsyncAction(async () => {
+    if (!account) return;
+    try {
+      await put(`/admin/accounts/${encodeURIComponent(account.id)}/codex-reauth-config`, {
+        login_email: reauthForm.login_email,
+        password: reauthForm.password,
+        otp_url: reauthForm.otp_url,
+        target_workspace_id: reauthForm.target_workspace_id,
+        auto_enabled: reauthForm.auto_enabled,
+      });
+      Toast.success('Codex 重登配置已保存');
+      setReauthForm((current) => ({ ...current, password: '', otp_url: '' }));
+      await reload();
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
+  const { run: runCodexReauth, running: runningCodexReauth } = useAsyncAction(async () => {
+    if (!account) return;
+    try {
+      await post(`/admin/accounts/${encodeURIComponent(account.id)}/codex-reauth/run`, {});
+      Toast.success('Codex 重登成功，授权凭据已更新');
+      await onUpdated?.(account.id, { status: 'active', quarantine_until: 0, quarantine_reason: '' });
+      await reload();
+    } catch (err) {
+      showErrorToast(err);
+      await reload();
+    }
+  });
+
+  const { run: startCodexReauthOAuth, running: startingCodexReauthOAuth } = useAsyncAction(async () => {
+    if (!account) return;
+    try {
+      const result = await post(`/admin/accounts/${encodeURIComponent(account.id)}/codex-reauth/oauth/start`, {
+        target_workspace_id: reauthForm.target_workspace_id,
+      });
+      setOauthModal({ open: true, session_id: result.session_id, auth_url: result.auth_url, redirected: '', target_workspace_id: result.target_workspace_id || reauthForm.target_workspace_id || '' });
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
+  const { run: completeCodexReauthOAuth, running: completingCodexReauthOAuth } = useAsyncAction(async () => {
+    if (!account || !oauthModal.session_id || !oauthModal.redirected.trim()) return;
+    try {
+      const updated = await post(`/admin/accounts/${encodeURIComponent(account.id)}/codex-reauth/oauth/complete`, {
+        session_id: oauthModal.session_id,
+        redirected: oauthModal.redirected,
+      });
+      Toast.success('OAuth 重登成功，已更新原账号');
+      setOauthModal({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' });
+      await onUpdated?.(account.id, updated);
+      await reload();
+    } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
   if (!account) return null;
   const u = usage;
   const audit = details.audit || [];
@@ -109,6 +189,10 @@ export default function AccountDrawer({
   const isActionLoading = (act) => Boolean(isActionLoadingProp?.(account.id, act));
   const isActionDisabled = (act) => actionDisabled || (actionRunning && !isActionLoading(act));
   const resetCredits = account.quota_summary?.reset_credits;
+  const supportsCodexReauth = (account.provider || 'codex') === 'codex';
+  const codexReauth = details.codexReauth || null;
+  const codexReauthConfig = codexReauth?.config || {};
+  const latestCodexReauthJob = codexReauth?.latest_job || null;
 
   return (
     <Drawer title={account.label || account.id} visible={!!account} onCancel={onClose} width={520} className="pool-account-drawer">
@@ -126,6 +210,54 @@ export default function AccountDrawer({
         <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
         <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
       </Panel>
+
+      {supportsCodexReauth ? (
+        <Panel title="Codex 重登配置" style={{ marginBottom: 14 }}>
+          {codexReauth?.error ? (
+            <Typography.Text type="danger">状态读取失败：{codexReauth.error}</Typography.Text>
+          ) : (
+            <>
+              <Row k="配置" v={codexReauth?.configured ? <Tag color="green" size="small">已配置</Tag> : <Tag color="amber" size="small">未配置</Tag>} />
+              <Row k="自动修复" v={codexReauthConfig.auto_enabled ? '开启' : '关闭'} />
+              <Row k="密码" v={codexReauthConfig.password_configured ? '已保存（加密）' : '未保存'} />
+              <Row k="OTP URL" v={codexReauthConfig.otp_url_configured ? '已保存（加密）' : '未保存'} />
+              <Row k="目标 workspace" v={codexReauthConfig.target_workspace_id || reauthForm.target_workspace_id || '—'} />
+              <Row k="最近状态" v={latestCodexReauthJob?.status || codexReauthConfig.last_status || (account.status === 'auth_expired' ? 'auth_expired' : '—')} />
+              {latestCodexReauthJob?.last_error || codexReauthConfig.last_error ? (
+                <Row k="最近错误" v={latestCodexReauthJob?.last_error || codexReauthConfig.last_error} />
+              ) : null}
+            </>
+          )}
+
+          <div style={{ display: 'grid', gap: 8, marginTop: 10 }}>
+            <label className="pool-field">
+              <span className="pool-field__label">登录邮箱</span>
+              <input className="pool-input" value={reauthForm.login_email} onChange={(event) => updateReauthForm('login_email', event.target.value)} placeholder={account.email || 'name@example.com'} />
+            </label>
+            <label className="pool-field">
+              <span className="pool-field__label">密码（留空保留已保存值）</span>
+              <input className="pool-input" type="password" value={reauthForm.password} onChange={(event) => updateReauthForm('password', event.target.value)} placeholder={codexReauthConfig.password_configured ? '已保存；需要轮换时填写' : '用于 worker 登录'} />
+            </label>
+            <label className="pool-field">
+              <span className="pool-field__label">OTP URL（留空保留已保存值）</span>
+              <input className="pool-input" value={reauthForm.otp_url} onChange={(event) => updateReauthForm('otp_url', event.target.value)} placeholder={codexReauthConfig.otp_url_configured ? '已保存；需要轮换时填写' : '验证码收件箱 API URL'} />
+            </label>
+            <label className="pool-field">
+              <span className="pool-field__label">K12 / 教师 workspace id</span>
+              <input className="pool-input pool-mono" value={reauthForm.target_workspace_id} onChange={(event) => updateReauthForm('target_workspace_id', event.target.value)} placeholder="可选；填写后 OAuth 会校验 id_token" />
+            </label>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+              <span className="pool-muted" style={{ fontSize: 13 }}>auth_expired 时自动排队修复</span>
+              <Switch checked={!!reauthForm.auto_enabled} onChange={(checked) => updateReauthForm('auto_enabled', checked)} />
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <Button size="small" loading={savingCodexReauth} onClick={saveCodexReauth}>保存配置</Button>
+              <Button size="small" loading={runningCodexReauth} disabled={!codexReauth?.configured} onClick={runCodexReauth}>自动修复 / 重登</Button>
+              <Button size="small" loading={startingCodexReauthOAuth} onClick={startCodexReauthOAuth}>重新登录 OAuth</Button>
+            </div>
+          </div>
+        </Panel>
+      ) : null}
 
       <Panel title="分组策略" style={{ marginBottom: 14 }}>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
@@ -207,6 +339,30 @@ export default function AccountDrawer({
           <Button type="danger" loading={isActionLoading('delete')} disabled={isActionDisabled('delete')}>删除</Button>
         </ConfirmDialog>
       </div>
+      <Modal
+        visible={oauthModal.open}
+        title="Codex OAuth 重新登录"
+        width={640}
+        okText="完成回写"
+        confirmLoading={completingCodexReauthOAuth}
+        onOk={completeCodexReauthOAuth}
+        onCancel={() => setOauthModal({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' })}
+      >
+        <Typography.Text as="p">
+          打开下面的官方 Codex OAuth 链接，登录目标账号后，将浏览器地址栏中的回调 URL 粘贴回来。
+          {oauthModal.target_workspace_id ? ` 本次会校验 workspace：${oauthModal.target_workspace_id}` : ''}
+        </Typography.Text>
+        <div style={{ display: 'grid', gap: 8 }}>
+          <a className="pool-mono" href={oauthModal.auth_url} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all' }}>{oauthModal.auth_url}</a>
+          <textarea
+            className="pool-textarea pool-mono"
+            rows={5}
+            value={oauthModal.redirected}
+            onChange={(event) => setOauthModal((current) => ({ ...current, redirected: event.target.value }))}
+            placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+          />
+        </div>
+      </Modal>
     </Drawer>
   );
 }

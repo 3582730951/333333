@@ -151,3 +151,235 @@
     max-width: 100%;
   }
 }
+
+/* Apple-like shell */
+.pool-app-layout {
+  background: var(--pool-bg-page);
+}
+
+.pool-main-layout {
+  background: var(--pool-bg-page);
+}
+
+.pool-sider {
+  background: color-mix(in srgb, var(--pool-bg-surface) 96%, transparent);
+  backdrop-filter: blur(20px);
+}
+
+.pool-header {
+  background: color-mix(in srgb, var(--pool-bg-surface) 86%, transparent);
+  border-bottom: 1px solid var(--pool-border);
+  backdrop-filter: blur(20px) saturate(1.3);
+}
+
+.pool-shell {
+  max-width: 1460px;
+  padding: 24px;
+}
+
+.pool-brand {
+  padding: 0 14px;
+  font-weight: 720;
+  letter-spacing: -0.018em;
+}
+
+.pool-sidebar-collapse {
+  height: 52px;
+  padding: 8px;
+  background: color-mix(in srgb, var(--pool-bg-surface) 92%, transparent);
+}
+
+.pool-shell-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: var(--pool-bg-overlay);
+  backdrop-filter: blur(12px);
+  animation: pool-fade-in var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-shell-sider {
+  transition: width var(--pool-motion-normal) var(--pool-motion-ease), transform var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-shell-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 56px;
+  padding: 0 20px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.pool-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.pool-topbar-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--pool-text);
+  font-weight: 700;
+  letter-spacing: -0.018em;
+}
+
+.pool-topbar-title-main {
+  font-size: 14px;
+}
+
+.pool-topbar-current {
+  color: var(--pool-text-2);
+  font-weight: 500;
+}
+
+.pool-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pool-topbar-icon-button {
+  border-radius: 999px;
+}
+
+.pool-account-menu-button {
+  max-width: 280px;
+  min-width: 0;
+  gap: 8px;
+  border-radius: 999px;
+}
+
+.pool-account-menu-ident {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-account-menu-caret {
+  width: 14px;
+  height: 14px;
+  color: var(--pool-text-3);
+}
+
+.pool-pagehead {
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.pool-pagehead-copy .pool-page-title {
+  font-size: 28px;
+}
+
+.pool-pagehead .sub {
+  max-width: 760px;
+  color: var(--pool-text-2);
+  font-size: 14px;
+}
+
+.pool-pagehead-actions,
+.pool-page-actions {
+  gap: 8px;
+}
+
+@media (max-width: 900px) {
+  .pool-app-mobile .pool-main-layout {
+    width: 100vw;
+  }
+
+  .pool-shell-header {
+    height: 52px;
+    padding: 0 10px;
+  }
+
+  .pool-shell {
+    padding: 18px 14px max(24px, env(safe-area-inset-bottom));
+  }
+
+  .pool-topbar-left {
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 8px;
+  }
+
+  .pool-topbar-title {
+    flex: 1 1 auto;
+    justify-content: center;
+    font-size: 15px;
+  }
+
+  .pool-topbar-title-main {
+    display: none;
+  }
+
+  .pool-topbar-divider,
+  .pool-desktop-only {
+    display: none !important;
+  }
+
+  .pool-topbar-current {
+    color: var(--pool-text);
+    font-weight: 720;
+  }
+
+  .pool-mobile-menu-btn {
+    flex: 0 0 auto;
+  }
+
+  .pool-account-menu-button {
+    min-width: var(--pool-hit-target);
+    padding: 0;
+  }
+
+  .pool-account-menu-ident,
+  .pool-account-menu-caret {
+    display: none;
+  }
+
+  .pool-pagehead {
+    display: block;
+    margin-bottom: 16px;
+  }
+
+  .pool-pagehead-copy .pool-page-title {
+    font-size: 34px;
+    line-height: 1.05;
+    letter-spacing: -0.035em;
+  }
+
+  .pool-pagehead .sub {
+    font-size: 14px;
+  }
+
+  .pool-pagehead-actions,
+  .pool-page-actions {
+    justify-content: flex-start;
+    width: 100%;
+    margin-top: 12px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 2px;
+  }
+
+  .pool-page-actions > * {
+    flex: 0 0 auto;
+  }
+
+  .pool-sider {
+    box-shadow: var(--pool-shadow-md);
+  }
+}
+
+@media (max-width: 640px) {
+  .pool-shell {
+    padding: 14px 12px max(22px, env(safe-area-inset-bottom));
+  }
+}

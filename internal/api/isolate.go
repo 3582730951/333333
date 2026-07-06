@@ -182,7 +182,7 @@ func stripCodexServerStateHeaders(header http.Header) http.Header {
 // It returns the verdict so the caller can decide whether to fail over.
 func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, status int, header http.Header, body []byte) ban.Verdict {
 	v := ban.Classify(false, status, header, body)
-	if s.flagEnabled(ctx, "ban_detection_enabled", s.cfg.BanDetectionEnabled) && v.IsBanned() {
+	if v.IsBanned() {
 		s.handleBannedAccount(ctx, account, v, status, body, "upstream_error")
 		return v
 	}
@@ -235,7 +235,20 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 		Detail:       fmt.Sprintf("source=%s provider=%s http=%d body=%s", source, account.PlanType, status, bodySnippet(body, 600)),
 	})
 	if s.flagEnabled(ctx, "ban_auto_delete", s.cfg.BanAutoDelete) {
-		_ = s.store.DeleteAccount(ctx, account.ID)
+		if err := s.store.DeleteAccount(ctx, account.ID); err != nil {
+			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+				AccountID:    account.ID,
+				AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+				Action:       "ban_delete_failed",
+				State:        string(v.State),
+				Reason:       v.Reason,
+				Detail:       fmt.Sprintf("source=%s provider=%s http=%d error=%v body=%s", source, account.PlanType, status, err, bodySnippet(body, 600)),
+			})
+			return
+		}
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+		}
 		return
 	}
 	// Quarantine duration is now configurable (default 72h). Set 0 to disable.

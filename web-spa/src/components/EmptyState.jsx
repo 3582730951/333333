@@ -37,44 +37,23 @@ export default function EmptyState({
   const displayDesc = desc || defaultDescs[type] || null;
 
   return (
-    <div style={{
-      padding: '48px 0',
-      textAlign: 'center',
-      background: 'var(--pool-bg-page)',
-      borderRadius: 8,
-      border: '1px dashed var(--pool-border)',
-      margin: '16px 0'
-    }}>
-      <div style={{
-        fontSize: 36,
-        color: 'var(--pool-text-3)',
-        marginBottom: 8,
-        lineHeight: 1.4,
-        display: 'flex',
-        justifyContent: 'center',
-        alignItems: 'center',
-        gap: 4
-      }}>
+    <div className="pool-empty pool-empty--panel">
+      <div className="pool-empty-icon">
         {getIcon()}
       </div>
-      <div style={{
-        fontSize: 15,
-        fontWeight: 600,
-        color: 'var(--pool-text)',
-        marginBottom: 4
-      }}>
+      <div className="pool-empty-title">
         {title}
       </div>
       {displayDesc ? (
-        <div className="pool-muted" style={{ fontSize: 13, marginTop: 4, maxWidth: 320, margin: '4px auto 0' }}>
+        <div className="pool-empty-desc">
           {displayDesc}
         </div>
       ) : null}
       {action ? (
-        <div style={{ marginTop: 16 }}>{action}</div>
+        <div style={{ marginTop: 8 }}>{action}</div>
       ) : (
         type === 'accounts' && !action && (
-          <div style={{ marginTop: 16 }}>
+          <div style={{ marginTop: 8 }}>
             <Button theme="solid" icon={<IconPlus />}>导入 auth.json</Button>
           </div>
         )

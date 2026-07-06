@@ -280,8 +280,8 @@ export function CacheRateBars({ data = [] }) {
 
 function Empty() {
   return (
-    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--pool-text-2)', fontSize: 13 }}>
-      暂无数据
+    <div className="pool-chart-empty">
+      暂无可展示的数据
     </div>
   );
 }

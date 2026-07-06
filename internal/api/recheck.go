@@ -102,7 +102,7 @@ func (s *Server) recheckPendingAccounts(ctx context.Context) {
 		res := s.probeAccountLiveness(cctx, account, token)
 		cancel()
 		switch {
-		case res.Verdict.IsBanned() && s.flagEnabled(ctx, "ban_detection_enabled", s.cfg.BanDetectionEnabled):
+		case res.Verdict.IsBanned():
 			// Confirmed ban surfaced by the probe → delete/quarantine via the standard
 			// path; clear the flag (the account is no longer poolable).
 			s.handleBannedAccount(ctx, account, res.Verdict, res.Status, res.Body, "recheck")

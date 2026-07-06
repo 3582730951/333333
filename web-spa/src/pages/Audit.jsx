@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { Button, Tag, Select, Typography, Toast } from '../components/pool/index.jsx';
 import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
-import api, { errMsg, get } from '../api.js';
+import api, { get } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';
@@ -13,6 +13,23 @@ const stateColor = (s) => {
   const m = { alive: 'green', banned: 'red', permission_denied: 'red', rate_limited: 'amber', unreachable: 'grey', unknown: 'grey' };
   return m[s] || 'blue';
 };
+const stateLabel = (s) => ({
+  alive: '正常',
+  banned: '封禁',
+  permission_denied: '权限受限',
+  rate_limited: '限流',
+  unreachable: '不可达',
+  unknown: '未知',
+}[s] || s || '—');
+const actionLabel = (s) => ({
+  permission_denied_no_quarantine: '权限受限未隔离',
+  usage_cache_stats_reset: '重置缓存统计',
+}[s] || s || '—');
+function clipText(value, max = 28) {
+  const text = String(value || '');
+  if (text.length <= max) return text || '—';
+  return `${text.slice(0, Math.max(8, max - 9))}…${text.slice(-6)}`;
+}
 
 const filenameFromDisposition = (value) => {
   const raw = String(value || '');
@@ -61,7 +78,7 @@ export default function Audit() {
       if (!downloadBlob(name, blob)) Toast.error('导出失败，请检查浏览器下载权限');
       else Toast.success('诊断包已导出');
     } catch (e) {
-      Toast.error(`导出诊断包失败：${errMsg(e)}`);
+      Toast.error('导出诊断包失败，请稍后重试或检查下载权限。');
     } finally {
       setDiagnosticsExporting(false);
     }
@@ -76,7 +93,7 @@ export default function Audit() {
       if (!downloadBlob(name, blob)) Toast.error('导出失败，请检查浏览器下载权限');
       else Toast.success('缓存命中 ZIP 已导出');
     } catch (e) {
-      Toast.error(`导出缓存命中 ZIP 失败：${errMsg(e)}`);
+      Toast.error('导出缓存命中 ZIP 失败，请稍后重试或检查下载权限。');
     } finally {
       setCacheExporting(false);
     }
@@ -91,11 +108,11 @@ export default function Audit() {
         </div>
       )
     },
-    { title: '账号', dataIndex: 'account_label', width: 150, render: (v, r) => v || r.account_id || '—' },
-    { title: '动作', dataIndex: 'action', width: 118, render: (v) => <Tag>{v}</Tag> },
-    { title: '结果', dataIndex: 'state', width: 108, render: (v) => (v ? <Tag color={stateColor(v)}>{v}</Tag> : '—') },
+    { title: '账号', dataIndex: 'account_label', width: 150, render: (v, r) => <span title={v || r.account_id || ''}>{clipText(v || r.account_id, 24)}</span> },
+    { title: '动作', dataIndex: 'action', width: 118, render: (v) => <Tag title={v}>{clipText(actionLabel(v), 16)}</Tag> },
+    { title: '结果', dataIndex: 'state', width: 108, render: (v) => (v ? <Tag color={stateColor(v)}>{stateLabel(v)}</Tag> : '—') },
     { title: '原因', dataIndex: 'reason', width: 116, render: (v) => v || '—' },
-    { title: '详情', dataIndex: 'detail', width: 220, render: (v) => <Typography.Text ellipsis={{ showTooltip: true }} className="pool-mono pool-audit-detail">{v || '—'}</Typography.Text> },
+    { title: '详情', dataIndex: 'detail', width: 220, render: (v) => <Typography.Text title={v || ''} className="pool-mono pool-audit-detail">{clipText(v, 22)}</Typography.Text> },
   ];
 
   return (
@@ -123,6 +140,8 @@ export default function Audit() {
         layout="fit"
         className="pool-audit-table"
         emptyTitle="暂无审计记录"
+        emptyDesc="当前筛选条件下没有可展示的审计事件。你可以调整动作筛选或稍后刷新。"
+        loadingTitle="正在加载审计日志…"
         skeletonRows={8}
         skeletonCols={6}
       />

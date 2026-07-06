@@ -96,6 +96,10 @@ func configFields() []configField {
 			Help: "开=按敏感词擦洗 Codex 请求体与响应流。", boot: func(c config.Config) interface{} { return c.CodexIdentityScrub }},
 		{Key: "codex_prefer_sidecar_ja3_over_ws", Label: "Codex 优先 sidecar JA3", Category: catIdentity, Type: fieldBool, Effect: effectHot,
 			Help: "开(默认)=sidecar 出口的 Codex 账号走 SSE 路径(保真 JA3)而非 WebSocket。", boot: func(c config.Config) interface{} { return c.CodexPreferSidecarJA3OverWS }},
+		{Key: "codex_reauth_worker_url", Label: "Codex 重登 worker URL", Category: catBoot, Type: fieldString, Effect: effectRestart,
+			Help: "默认 http://127.0.0.1:8802；账号详情的自动修复/重登会调用该 HTTP worker。", boot: func(c config.Config) interface{} { return c.CodexReauthWorkerURL }},
+		{Key: "codex_reauth_worker_concurrency", Label: "Codex 重登并发", Category: catBoot, Type: fieldInt, Effect: effectRestart,
+			Help: "独立 worker 的建议并发；默认 1，避免同时启动多个 Chromium。", boot: func(c config.Config) interface{} { return c.CodexReauthWorkerConcurrency }},
 
 		// ── 行为 / 缓存 ────────────────────────────────────────────────────────
 		{Key: "conversation_isolation", Label: "会话隔离 (串号隔离)", Category: catBehavior, Type: fieldBool, Effect: effectHot,

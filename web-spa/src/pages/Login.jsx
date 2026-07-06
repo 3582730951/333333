@@ -6,16 +6,19 @@ import useAsyncAction from '../hooks/useAsyncAction.js';
 
 export default function Login({ onSuccess }) {
   const [mode, setMode] = useState('login'); // user tab: login | register
+  const [adminError, setAdminError] = useState('');
 
   const { run: adminSubmit, running: adminLoading } = useAsyncAction(async (values) => {
+    setAdminError('');
     setToken((values.token || '').trim());
     try {
       await get('/admin/config', undefined, { suppressUnauthorizedEvent: true });
       Toast.success('登录成功');
       onSuccess();
-    } catch (e) {
+    } catch {
       clearToken();
-      showErrorToast(e, { prefix: 'Token 无效' });
+      setAdminError('无法登录。Token 无效或已过期。');
+      Toast.error('无法登录。Token 无效或已过期。');
     }
   });
 
@@ -32,21 +35,30 @@ export default function Login({ onSuccess }) {
 
   return (
     <div className="pool-login-wrap">
-      <Card className="pool-card" style={{ width: 420, boxShadow: 'var(--pool-shadow-hover)' }} bodyStyle={{ padding: 24 }}>
-        <div style={{ textAlign: 'center', marginBottom: 14 }}>
+      <Card className="pool-card pool-login-card">
+        <div className="pool-login-brand">
           <Avatar size="default" style={{ background: 'var(--pool-accent)' }}>P</Avatar>
-          <Typography.Title heading={4} style={{ marginTop: 10 }}>Pool 控制台</Typography.Title>
-          <Typography.Text type="tertiary" size="small">账号池中继 · 管理与用户门户</Typography.Text>
+          <Typography.Title heading={3}>登录 Pool 控制台</Typography.Title>
+          <Typography.Text type="tertiary" size="small">使用管理员凭据进入控制台。</Typography.Text>
         </div>
         <Tabs type="line" size="small">
           <TabPane tab="管理员" itemKey="admin">
             <Form onSubmit={adminSubmit} style={{ marginTop: 8 }}>
-              <Form.Input field="token" label="管理员 Token" mode="password" placeholder="admin_token"
-                rules={[{ required: true, message: '请输入 Token' }]} />
+              <Form.Input
+                field="token"
+                label="Token"
+                mode="password"
+                placeholder="admin_token"
+                rules={[{ required: true, message: '请输入 Token。' }]}
+                allowReveal
+                showClear
+                onChange={() => setAdminError('')}
+              />
+              {adminError ? <div className="pool-login-error" role="alert">{adminError}</div> : null}
               <Button htmlType="submit" theme="solid" block loading={adminLoading} style={{ marginTop: 14 }}>登录</Button>
             </Form>
             <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginTop: 12 }}>
-              使用服务端配置的 admin_token 登录。
+              管理员 Token 由服务端配置生成。
             </Typography.Text>
           </TabPane>
           <TabPane tab="用户登录" itemKey="user">

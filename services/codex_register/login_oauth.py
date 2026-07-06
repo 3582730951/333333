@@ -40,6 +40,7 @@ PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "d6kfytmo")
 EMAIL        = os.environ.get("REG_EMAIL", "")
 PASSWORD     = os.environ.get("REG_PASSWORD", "")
 OTP_URL      = os.environ.get("REG_OTP_URL", "")
+TARGET_WORKSPACE_ID = os.environ.get("REG_TARGET_WORKSPACE_ID", "")
 CHROME       = os.environ.get("REG_CHROME", os.environ.get("CHROME_PATH", ""))
 HEADLESS     = os.environ.get("REG_HEADLESS", "1") != "0"
 
@@ -122,6 +123,8 @@ def build_oauth_url(code_challenge: str, state: str) -> str:
         "codex_cli_simplified_flow": "true",
         "originator": "codex_cli_rs",
     }
+    if TARGET_WORKSPACE_ID:
+        params["allowed_workspace_id"] = TARGET_WORKSPACE_ID
     return f"{OAUTH_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 def exchange_code_for_tokens(code: str, code_verifier: str):

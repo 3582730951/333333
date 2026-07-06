@@ -28,7 +28,9 @@ export const Button = forwardRef(function Button({
         ? 'borderless'
         : theme === 'light'
           ? 'light'
-          : 'default';
+          : theme === 'outline' || type === 'tertiary'
+            ? 'outline'
+            : 'default';
   const iconOnly = !!icon && !children;
   return (
     <button
@@ -38,10 +40,11 @@ export const Button = forwardRef(function Button({
         `pool-button--${variant}`,
         size ? `pool-button--${size}` : '',
         block ? 'pool-button--block' : '',
-        iconOnly ? 'pool-icon-button' : '',
+        iconOnly ? 'pool-icon-button pool-button--icon-only' : '',
         className,
       )}
       disabled={disabled || loading}
+      aria-busy={loading || undefined}
       aria-label={ariaLabel || (iconOnly ? title : undefined)}
       title={title}
       onClick={onClick}
@@ -49,7 +52,7 @@ export const Button = forwardRef(function Button({
       {...props}
     >
       {loading ? <span className="pool-spinner" aria-hidden="true" /> : icon ? <span className="pool-button__icon">{icon}</span> : null}
-      {children ? <span>{children}</span> : null}
+      {children ? <span className="pool-button__label">{children}</span> : null}
     </button>
   );
 });

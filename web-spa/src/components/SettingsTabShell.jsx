@@ -1,9 +1,7 @@
 import React from 'react';
-import { Banner, Button, Spin, Tag, Typography } from './pool/index.jsx';
+import { Banner, Button, LoadingState, Tag, Typography } from './pool/index.jsx';
 import { IconUndo } from './pool/icons.jsx';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
-
-const initialTabSpinStyle = { width: '100%', marginTop: 80 };
 
 function settingsErrorEntries(errors) {
   if (!errors || typeof errors !== 'object') return [];
@@ -77,7 +75,7 @@ export default function SettingsTabShell({
   className = '',
   children,
 }) {
-  if (loading && !lastRefresh) return <Spin spinning style={initialTabSpinStyle} />;
+  if (loading && !lastRefresh) return <LoadingState title="正在加载设置…" />;
   return (
     <div className={className}>
       {toolbar ? <div className="pool-toolbar">{toolbar}</div> : null}

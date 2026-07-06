@@ -67,6 +67,7 @@ export function TextInput({
   onEnterPress,
   prefix,
   showClear,
+  allowReveal,
   onClear,
   mode,
   className,
@@ -75,10 +76,12 @@ export function TextInput({
   ...props
 }) {
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
+  const [revealed, setRevealed] = useState(false);
+  const inputType = mode === 'password' && !revealed ? 'password' : 'text';
   const input = (
     <input
       className={cx(prefix || showClear ? 'pool-input' : 'pool-input', className)}
-      type={mode === 'password' ? 'password' : 'text'}
+      type={inputType}
       value={current ?? ''}
       onChange={(event) => setCurrent(event.target.value)}
       onKeyDown={(event) => {
@@ -88,11 +91,21 @@ export function TextInput({
       {...props}
     />
   );
-  const control = prefix || showClear ? (
+  const control = prefix || showClear || allowReveal ? (
     <span className="pool-input-wrap" style={style}>
       {prefix ? <span className="pool-button__icon">{prefix}</span> : null}
       {input}
       {showClear && current ? <Button theme="borderless" size="small" onClick={() => { setCurrent(''); onClear?.(); }} aria-label="清除">×</Button> : null}
+      {allowReveal && mode === 'password' ? (
+        <Button
+          theme="borderless"
+          size="small"
+          onClick={() => setRevealed((value) => !value)}
+          aria-label={revealed ? '隐藏内容' : '显示内容'}
+        >
+          {revealed ? '隐藏' : '显示'}
+        </Button>
+      ) : null}
     </span>
   ) : input;
   if (!field && !label) return control;

@@ -1,7 +1,7 @@
 import React, { useState, useCallback } from 'react';
 import { Button, ConfirmDialog, Select, Toast } from '../components/pool/index.jsx';
 import { IconDownload, IconRefresh } from '../components/pool/icons.jsx';
-import { errMsg, get, post } from '../api.js';
+import { get, post } from '../api.js';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import PageHeader, { Panel } from '../components/PageHeader.jsx';
@@ -65,6 +65,28 @@ function modelLabel(row) {
   return row?.model_label || row?.series_label || row?.model || '(未知)';
 }
 
+function mobileDiagnosticRenderer(columns, titleForRow) {
+  const visible = (columns || []).slice(0, 5);
+  return (row) => (
+    <div className="pool-diagnostic-card">
+      <div className="pool-diagnostic-card__title">{titleForRow?.(row) || '诊断记录'}</div>
+      <div className="pool-diagnostic-card__grid">
+        {visible.map((column, index) => {
+          const key = column.key || column.dataIndex || column.title || index;
+          const raw = typeof column.dataIndex === 'string' ? row?.[column.dataIndex] : undefined;
+          const value = column.render ? column.render(raw, row, index) : textOrDash(raw);
+          return (
+            <div className="pool-diagnostic-card__item" key={String(key)}>
+              <span className="pool-diagnostic-card__label">{column.title}</span>
+              <span className="pool-diagnostic-card__value">{value}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function Usage() {
   const [range, setRange] = useState('today');
   const [resetOpen, setResetOpen] = useState(false);
@@ -73,6 +95,7 @@ export default function Usage() {
   const [cacheMetric, setCacheMetric] = useState('cache_read_tokens');
   const [selectedCacheModels, setSelectedCacheModels] = useState([]);
   const [hoveredModel, setHoveredModel] = useState(null);
+  const [activeDiagnostic, setActiveDiagnostic] = useState('apiKey');
 
   const fetchUsage = useCallback(async ({ signal }) => {
     const r = RANGES.find((x) => x.value === range) || RANGES[0];
@@ -154,6 +177,7 @@ export default function Usage() {
   }));
   const cacheSegmentTotal = cacheCompositionSegments.reduce((s, m) => s + m.read, 0);
   const selectedKeySet = new Set(selectedCacheModels.length ? selectedCacheModels : series.map((s) => s.series_key));
+  const hasModelTrend = modelSeries.length > 0 && series.length > 0;
 
   const toggleCacheModel = (key) => {
     const all = series.map((s) => s.series_key);
@@ -164,6 +188,8 @@ export default function Usage() {
 
   const topAccts = [...rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)).slice(0, 10)
     .map((a) => ({ x: (a.label || a.account_id || '').slice(0, 10), 输入: a.prompt_tokens || 0, 输出: a.completion_tokens || 0 }));
+  const hasTopAccts = topAccts.some((item) => item.输入 || item.输出);
+  const hasModelCacheBars = byModel.some((item) => (item.cache_input_tokens || item.prompt_tokens || 0) > 0);
 
   const exportCSV = () => {
     const ok = downloadCSV('usage-by-account.csv', toCSV(rows, [
@@ -183,7 +209,7 @@ export default function Usage() {
       setResetOpen(false);
       await load();
     } catch (e) {
-      Toast.error(`重置失败：${errMsg(e)}`);
+      Toast.error('重置失败，请稍后重试。');
     } finally {
       setResetting(false);
     }
@@ -277,9 +303,18 @@ export default function Usage() {
     r.claude_cache_ttl || '',
   ].join(':');
 
+  const diagnosticTabs = [
+    { key: 'apiKey', label: 'API Key', title: '按 API Key 缓存诊断', data: cacheByKey, columns: cacheKeyCols, rowKey: (r) => r.api_key_hash_prefix || 'none', minScrollX: 1080, mobileTitle: (r) => r.api_key_hash_prefix || '未归因' },
+    { key: 'accountModel', label: '账号/模型', title: '按账号 / 模型缓存诊断', data: cacheByAccountModel, columns: cacheAccountModelCols, rowKey: (r) => `${r.account_id || 'none'}:${r.model || 'unknown'}`, minScrollX: 1180, mobileTitle: (r) => `${r.account_id || '未归因'} · ${r.model || 'unknown'}` },
+    { key: 'route', label: '路由', title: '按路由缓存诊断', data: cacheByRoute, columns: cacheRouteCols, rowKey: routeDiagKey, minScrollX: 1800, mobileTitle: (r) => r.route_key_hash_prefix || '未归因路由' },
+    { key: 'time', label: '时间桶', title: '时间桶缓存趋势', data: cacheByTimeBucket, columns: cacheTimeCols, rowKey: (r) => r.bucket, minScrollX: 1080, mobileTitle: (r) => (r.bucket ? new Date(r.bucket * 1000).toLocaleString() : '时间桶') },
+    { key: 'accountUsage', label: '账号用量', title: '按账号用量', data: rows, columns: cols, rowKey: (r) => r.account_id, minScrollX: 860, mobileTitle: (r) => r.label || r.account_id || '账号' },
+  ];
+  const activeDiagnosticTab = diagnosticTabs.find((tab) => tab.key === activeDiagnostic) || diagnosticTabs[0];
+
   return (
     <div>
-      <PageHeader title="用量分析" subtitle="Token 消耗与按账号明细"
+      <PageHeader title="用量" subtitle="用量分析视图：Token 消耗、缓存命中与诊断分层。"
         actions={<>
           <Select value={range} onChange={setRange} optionList={RANGES.map((r) => ({ label: r.label, value: r.value }))} style={{ width: 130 }} />
           <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
@@ -290,14 +325,17 @@ export default function Usage() {
 
       <div className="pool-window-strip">
         <div className="pool-window-strip__items">
-          <span>VPS 时区 {textOrDash(windowInfo.timezone)} · {fmtOffset(windowInfo.utc_offset_seconds)}</span>
+          <span>VPS 时区：{textOrDash(windowInfo.timezone)} · {fmtOffset(windowInfo.utc_offset_seconds)}</span>
           <span>窗口 {unixDateTime(usageWindow.effective_start_at)} 至 {unixDateTime(usageWindow.effective_until_at)}</span>
           <span>自上次重置缓存统计以来 {unixDateTime(cache.effective_start_at)}</span>
           <span>下次日切 {unixDateTime(windowInfo.next_day_start_at)}</span>
         </div>
         <div className="pool-window-strip__actions">
           <span className="pool-text-tertiary">不删除历史记录</span>
-          <Button onClick={() => setResetOpen(true)} loading={resetting}>重置当前缓存统计视图</Button>
+          <Button onClick={() => setResetOpen(true)} loading={resetting}>
+            <span className="pool-sr-only">重置当前缓存统计视图</span>
+            <span>重置用量统计视图</span>
+          </Button>
         </div>
       </div>
 
@@ -314,7 +352,7 @@ export default function Usage() {
         <div className="pool-cache-breakdown__head">
           <div>
             <div className="pool-section-title">缓存命中构成</div>
-            <div className="pool-text-tertiary">cache read tokens / cache input tokens</div>
+            <div className="pool-text-tertiary">读命中 Token / 可缓存输入 Token</div>
           </div>
           <b>{fmtPct(cacheRate)}</b>
         </div>
@@ -366,145 +404,99 @@ export default function Usage() {
           </div>
         </div>
         <div style={{ height: 280 }}>
-          {trendMode === 'model'
+          {trendMode === 'model' && hasModelTrend
             ? <UsageModelAreaChart modelSeries={modelSeries} series={series} height={280} selectedKeys={selectedKeySet} />
             : <UsageAreaChart buckets={ts} height={280} />}
         </div>
       </div>
 
-      <div className="pool-chart-card" style={{ marginBottom: 18 }}>
-        <div className="head">
-          <div><div className="t">模型缓存趋势</div><div className="s">Top 6 动态模型 · 多选与指标切换</div></div>
-          <Select value={cacheMetric} onChange={setCacheMetric} optionList={CACHE_METRICS} style={{ width: 130 }} />
+      {hasModelTrend ? (
+        <div className="pool-chart-card" style={{ marginBottom: 18 }}>
+          <div className="head">
+            <div><div className="t">模型缓存趋势</div><div className="s">Top 6 动态模型 · 多选与指标切换</div></div>
+            <Select value={cacheMetric} onChange={setCacheMetric} optionList={CACHE_METRICS} style={{ width: 130 }} />
+          </div>
+          <div className="pool-model-toggle-row">
+            {series.map((s) => {
+              const active = selectedKeySet.has(s.series_key);
+              const color = modelColor(s.series_key);
+              return (
+                <button key={s.series_key} type="button" className={`pool-model-toggle ${active ? 'is-active' : ''}`} onClick={() => toggleCacheModel(s.series_key)}>
+                  <i style={{ background: color }} />
+                  <span>{s.series_label || s.series_key}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div style={{ height: 260 }}>
+            <UsageModelAreaChart modelSeries={modelSeries} series={series} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} />
+          </div>
         </div>
-        <div className="pool-model-toggle-row">
-          {series.map((s) => {
-            const active = selectedKeySet.has(s.series_key);
-            const color = modelColor(s.series_key);
-            return (
-              <button key={s.series_key} type="button" className={`pool-model-toggle ${active ? 'is-active' : ''}`} onClick={() => toggleCacheModel(s.series_key)}>
-                <i style={{ background: color }} />
-                <span>{s.series_label || s.series_key}</span>
-              </button>
-            );
-          })}
-        </div>
-        <div style={{ height: 260 }}>
-          <UsageModelAreaChart modelSeries={modelSeries} series={series} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} />
-        </div>
-      </div>
+      ) : null}
 
-      <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
-        <div className="pool-chart-card"><div className="head"><div className="t">Top 账号（输入 / 输出）</div></div>
-          <GroupedBar data={topAccts} series={[{ key: '输入', color: C.blue }, { key: '输出', color: C.green }]} stacked />
+      {(hasTopAccts || hasModelCacheBars) ? (
+        <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
+          {hasTopAccts ? (
+            <div className="pool-chart-card"><div className="head"><div className="t">Top 账号（输入 / 输出）</div></div>
+              <GroupedBar data={topAccts} series={[{ key: '输入', color: C.blue }, { key: '输出', color: C.green }]} stacked />
+            </div>
+          ) : null}
+          {hasModelCacheBars ? (
+            <div className="pool-chart-card">
+              <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">读命中 Token / 可缓存输入 Token · 颜色区分模型。</div></div></div>
+              <div style={{ paddingTop: 6 }}><CacheRateBars data={byModel} /></div>
+            </div>
+          ) : null}
         </div>
-        <div className="pool-chart-card">
-          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cache read / cache input · 颜色区分模型（命中率越高成本越低）</div></div></div>
-          <div style={{ paddingTop: 6 }}><CacheRateBars data={byModel} /></div>
-        </div>
-      </div>
+      ) : null}
 
-      <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
-        <Panel title="按 API Key 缓存诊断">
+      <section className="pool-usage-diagnostics" style={{ marginBottom: 18 }}>
+        <div className="pool-usage-diagnostics__head">
+          <div>
+            <div className="pool-section-title">诊断</div>
+            <div className="pool-text-tertiary">默认只显示一个诊断层级，切换标签查看更细维度。</div>
+          </div>
+          <div className="pool-segmented" role="tablist" aria-label="用量诊断维度">
+            {diagnosticTabs.map((tab) => (
+              <Button
+                key={tab.key}
+                size="small"
+                className={activeDiagnostic === tab.key ? 'is-active' : ''}
+                aria-pressed={activeDiagnostic === tab.key}
+                onClick={() => setActiveDiagnostic(tab.key)}
+              >
+                {tab.label}
+              </Button>
+            ))}
+          </div>
+        </div>
+        <Panel title={activeDiagnosticTab.title}>
           <ResourceTable
             loading={loading}
             lastRefresh={lastRefresh}
-            dataSource={cacheByKey}
-            columns={cacheKeyCols}
-            rowKey={(r) => r.api_key_hash_prefix || 'none'}
-            pagination={{ pageSize: 8 }}
-            emptyTitle="暂无缓存诊断"
+            dataSource={activeDiagnosticTab.data}
+            columns={activeDiagnosticTab.columns}
+            rowKey={activeDiagnosticTab.rowKey}
+            pagination={{ pageSize: activeDiagnostic === 'accountUsage' ? 15 : 8 }}
+            emptyTitle="暂无诊断数据"
+            emptyDesc="当前时间范围内还没有足够的数据生成该诊断。"
             skeletonRows={6}
-            skeletonCols={6}
+            skeletonCols={Math.min(8, activeDiagnosticTab.columns.length)}
             density="compact"
+            minScrollX={activeDiagnosticTab.minScrollX}
+            mobileRenderer={mobileDiagnosticRenderer(activeDiagnosticTab.columns, activeDiagnosticTab.mobileTitle)}
+            mobileListLabel={activeDiagnosticTab.title}
           />
         </Panel>
-        <Panel title="按账号 / 模型缓存诊断">
-          <ResourceTable
-            loading={loading}
-            lastRefresh={lastRefresh}
-            dataSource={cacheByAccountModel}
-            columns={cacheAccountModelCols}
-            rowKey={(r) => `${r.account_id || 'none'}:${r.model || 'unknown'}`}
-            pagination={{ pageSize: 8 }}
-            emptyTitle="暂无缓存诊断"
-            skeletonRows={6}
-            skeletonCols={6}
-            density="compact"
-          />
-        </Panel>
-      </div>
-
-      <Panel title="按路由缓存诊断">
-        <ResourceTable
-          loading={loading}
-          lastRefresh={lastRefresh}
-          dataSource={cacheByRoute}
-          columns={cacheRouteCols}
-          rowKey={routeDiagKey}
-          pagination={{ pageSize: 10 }}
-          emptyTitle="暂无路由缓存诊断"
-          skeletonRows={6}
-          skeletonCols={8}
-          density="compact"
-          minScrollX={1800}
-        />
-      </Panel>
-
-      <div className="pool-grid cols-2" style={{ margin: '18px 0' }}>
-        <Panel title="按路由 / 账号 / 模型">
-          <ResourceTable
-            loading={loading}
-            lastRefresh={lastRefresh}
-            dataSource={cacheByRouteAccountModel}
-            columns={cacheRouteAccountModelCols}
-            rowKey={routeDiagKey}
-            pagination={{ pageSize: 8 }}
-            emptyTitle="暂无路由账号诊断"
-            skeletonRows={6}
-            skeletonCols={8}
-            density="compact"
-            minScrollX={1800}
-          />
-        </Panel>
-        <Panel title="时间桶缓存趋势">
-          <ResourceTable
-            loading={loading}
-            lastRefresh={lastRefresh}
-            dataSource={cacheByTimeBucket}
-            columns={cacheTimeCols}
-            rowKey={(r) => r.bucket}
-            pagination={{ pageSize: 8 }}
-            emptyTitle="暂无时间桶缓存数据"
-            skeletonRows={6}
-            skeletonCols={7}
-            density="compact"
-            minScrollX={1080}
-          />
-        </Panel>
-      </div>
-
-      <Panel title="按账号用量">
-        <ResourceTable
-          loading={loading}
-          lastRefresh={lastRefresh}
-          dataSource={rows}
-          columns={cols}
-          rowKey={(r) => r.account_id}
-          pagination={{ pageSize: 15 }}
-          emptyTitle="暂无用量记录"
-          skeletonRows={8}
-          skeletonCols={6}
-        />
-      </Panel>
+      </section>
 
       <ConfirmDialog
         open={resetOpen}
-        title="重置当前缓存统计视图"
+        title="重置用量统计视图？"
         description={(
           <div className="pool-confirm-copy">
-            <p>这只会推进管理员缓存诊断的统计起点。</p>
-            <p>不会删除 usage_records、审计记录、7/30 天历史分析或用户端用量。</p>
+            <p>这只会重建诊断统计视图，不会删除用量记录、审计日志或历史分析数据。</p>
+            <span className="pool-sr-only">不会删除 usage_records</span>
           </div>
         )}
         confirmText="重置视图"

@@ -64,11 +64,14 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 
 type accountView struct {
 	storage.Account
-	Provider     string                        `json:"provider"`
-	Capabilities []storage.ModelCapability     `json:"capabilities"`
-	Egress       *storage.AccountEgressBinding `json:"egress_binding,omitempty"`
-	Usage        *storage.UsageSummaryRow      `json:"usage,omitempty"`
-	QuotaSummary QuotaSummary                  `json:"quota_summary"`
+	Provider               string                        `json:"provider"`
+	Capabilities           []storage.ModelCapability     `json:"capabilities"`
+	Egress                 *storage.AccountEgressBinding `json:"egress_binding,omitempty"`
+	Usage                  *storage.UsageSummaryRow      `json:"usage,omitempty"`
+	QuotaSummary           QuotaSummary                  `json:"quota_summary"`
+	CodexReauthConfigured  bool                          `json:"codex_reauth_configured,omitempty"`
+	CodexReauthAutoEnabled bool                          `json:"codex_reauth_auto_enabled,omitempty"`
+	CodexReauthLastStatus  string                        `json:"codex_reauth_last_status,omitempty"`
 }
 
 type accountImportResponse struct {
@@ -106,6 +109,10 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 	if err != nil {
 		return nil, err
 	}
+	reauthConfigs, err := s.store.ListCodexReauthConfigPublicByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
 	now := storage.Now()
 	out := make([]accountView, 0, len(accounts))
 	for _, account := range accounts {
@@ -124,6 +131,11 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		}
 		if usage, ok := usages[account.ID]; ok {
 			view.Usage = &usage
+		}
+		if cfg, ok := reauthConfigs[account.ID]; ok {
+			view.CodexReauthConfigured = true
+			view.CodexReauthAutoEnabled = cfg.AutoEnabled
+			view.CodexReauthLastStatus = cfg.LastStatus
 		}
 		out = append(out, view)
 	}
@@ -421,6 +433,12 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminIdentity(w, r, accountID)
 	case "sessions":
 		s.adminSessions(w, r, accountID)
+	case "codex-reauth-config":
+		s.adminCodexReauthConfig(w, r, accountID)
+	case "codex-reauth-status":
+		s.adminCodexReauthStatus(w, r, accountID)
+	case "codex-reauth":
+		s.adminCodexReauthAction(w, r, accountID, parts[2:])
 	case "health-test":
 		s.adminHealthTest(w, r, accountID)
 	case "browser-repair":
@@ -435,6 +453,32 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminSetAccountGroup(w, r, accountID)
 	case "delete":
 		s.adminDeleteAccount(w, r, accountID)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) adminCodexReauthAction(w http.ResponseWriter, r *http.Request, accountID string, parts []string) {
+	if len(parts) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	switch parts[0] {
+	case "run":
+		s.adminCodexReauthRun(w, r, accountID)
+	case "oauth":
+		if len(parts) < 2 {
+			http.NotFound(w, r)
+			return
+		}
+		switch parts[1] {
+		case "start":
+			s.adminCodexReauthOAuthStart(w, r, accountID)
+		case "complete":
+			s.adminCodexReauthOAuthComplete(w, r, accountID)
+		default:
+			http.NotFound(w, r)
+		}
 	default:
 		http.NotFound(w, r)
 	}

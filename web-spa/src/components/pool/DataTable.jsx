@@ -16,6 +16,13 @@ function valueFor(row, column) {
   return undefined;
 }
 
+function inferredAlign(column) {
+  if (column.align) return column.align;
+  const key = String(column.key || column.dataIndex || column.title || '').toLowerCase();
+  if (/(token|tokens|请求|数|total|count|rate|pct|percent|bytes|内存|磁盘|重启|panic|pid)/.test(key)) return 'right';
+  return undefined;
+}
+
 function rowKeyOf(row, rowKey, index) {
   if (typeof rowKey === 'function') return rowKey(row, index) ?? row?.id ?? row?.key ?? index;
   if (typeof rowKey === 'string') return row?.[rowKey] ?? row?.id ?? row?.key ?? index;
@@ -91,7 +98,7 @@ export function DataTable({
             const key = column.key || column.dataIndex || column.title;
             const active = sortState?.key === key ? sortState.order : '';
             return (
-              <th key={String(key)} style={{ width: column.width }} aria-sort={active === 'ascend' ? 'ascending' : active === 'descend' ? 'descending' : 'none'}>
+              <th key={String(key)} style={{ width: column.width }} data-align={inferredAlign(column)} aria-sort={active === 'ascend' ? 'ascending' : active === 'descend' ? 'descending' : 'none'}>
                 {column.sorter ? (
                   <button
                     type="button"
@@ -142,7 +149,7 @@ export function DataTable({
                     checked={checked}
                     disabled={checkboxProps.disabled}
                     onChange={(event) => toggleRow(key, event.target.checked)}
-                    aria-label="选择行"
+                    aria-label={`选择第 ${index + 1} 行`}
                   />
                 </td>
               ) : null}
@@ -150,7 +157,7 @@ export function DataTable({
                 const keyName = column.key || column.dataIndex || column.title;
                 const value = valueFor(row, column);
                 const label = typeof column.title === 'string' ? column.title.replace(/[↑↓↕]/g, '').trim() : '';
-                return <td key={String(keyName)} data-label={label}>{column.render ? column.render(value, row, index) : value}</td>;
+                return <td key={String(keyName)} data-label={label} data-align={inferredAlign(column)}>{column.render ? column.render(value, row, index) : value}</td>;
               })}
             </tr>
           );
@@ -163,7 +170,7 @@ export function DataTable({
 
   return (
     <div className={cx('pool-table-wrapper', className)} style={tableStyle}>
-      {loading && !rows.length ? <div className="pool-table-empty"><span className="pool-spinner" /></div> : content}
+      {loading && !rows.length ? <div className="pool-table-empty"><span className="pool-spinner" role="status" aria-label="正在加载数据" /></div> : content}
       {pagination && pagination !== false && total > pageSize ? (
         <div className="pool-pagination">
           <span>{currentPage} / {pageCount}</span>

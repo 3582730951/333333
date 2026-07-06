@@ -874,6 +874,32 @@ CREATE TABLE IF NOT EXISTS account_session_cookies(
   updated_at INTEGER NOT NULL,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS account_codex_reauth_config(
+  account_id TEXT PRIMARY KEY,
+  login_email TEXT NOT NULL DEFAULT '',
+  encrypted_password TEXT NOT NULL DEFAULT '',
+  encrypted_otp_url TEXT NOT NULL DEFAULT '',
+  target_workspace_id TEXT NOT NULL DEFAULT '',
+  auto_enabled INTEGER NOT NULL DEFAULT 0,
+  last_status TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS account_codex_reauth_jobs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  reason TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL DEFAULT 0,
+  finished_at INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_codex_reauth_jobs_account_status ON account_codex_reauth_jobs(account_id, status, created_at);
 CREATE TABLE IF NOT EXISTS account_injected_cookies(
   account_id TEXT NOT NULL,
   egress_id TEXT NOT NULL,
@@ -1174,6 +1200,32 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_egress_binding_cooldown ON account_egress_bindings(cooldown_until, recheck_pending)`,
 		// Covers account detail drawer audit lookups without scanning the global audit log.
 		`CREATE INDEX IF NOT EXISTS idx_audit_log_account ON audit_log(account_id, id DESC)`,
+		`CREATE TABLE IF NOT EXISTS account_codex_reauth_config(
+  account_id TEXT PRIMARY KEY,
+  login_email TEXT NOT NULL DEFAULT '',
+  encrypted_password TEXT NOT NULL DEFAULT '',
+  encrypted_otp_url TEXT NOT NULL DEFAULT '',
+  target_workspace_id TEXT NOT NULL DEFAULT '',
+  auto_enabled INTEGER NOT NULL DEFAULT 0,
+  last_status TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE TABLE IF NOT EXISTS account_codex_reauth_jobs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  reason TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL DEFAULT 0,
+  finished_at INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_codex_reauth_jobs_account_status ON account_codex_reauth_jobs(account_id, status, created_at)`,
 		`CREATE TABLE IF NOT EXISTS codex_reset_credit_consumptions(
   account_id TEXT NOT NULL,
   seven_day_reset_at INTEGER NOT NULL,
@@ -2163,8 +2215,33 @@ func (s *Store) SetAccountPlanType(ctx context.Context, id, planType string) err
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
-	return err
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DELETE FROM account_lifecycle_status WHERE account_id = ?`,
+		`DELETE FROM account_codex_reauth_jobs WHERE account_id = ?`,
+		`DELETE FROM account_codex_reauth_config WHERE account_id = ?`,
+		`DELETE FROM account_rate_limits WHERE account_id = ?`,
+		`DELETE FROM account_model_capabilities WHERE account_id = ?`,
+		`DELETE FROM affinity_bindings WHERE account_id = ?`,
+		`DELETE FROM account_egress_bindings WHERE account_id = ?`,
+		`DELETE FROM account_session_cookies WHERE account_id = ?`,
+		`DELETE FROM account_injected_cookies WHERE account_id = ?`,
+		`DELETE FROM codex_reset_credit_consumptions WHERE account_id = ?`,
+		`DELETE FROM accounts WHERE id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SetAccountQuarantine(ctx context.Context, id string, until int64, reason string) error {
@@ -4937,6 +5014,18 @@ func (s *Store) SettleBillingHold(ctx context.Context, id, status string) error 
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ?`, status, Now(), id)
 	return err
+}
+
+func (s *Store) ExpireStaleBillingHolds(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		olderThan = time.Hour
+	}
+	cutoff := Now() - int64(olderThan/time.Second)
+	res, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = 'expired_unsettled', updated_at = ? WHERE status = 'held' AND created_at < ?`, Now(), cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *Store) GetBillingHold(ctx context.Context, id string) (BillingHold, error) {

@@ -4,10 +4,10 @@
 package api
 
 import (
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
-	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
@@ -215,10 +215,7 @@ func (s *Server) upsertStaticClaudeModels(ctx context.Context, accountID string)
 // provider column and falling back to the credential-shape heuristic for legacy rows
 // imported before the provider column existed.
 func (s *Server) accountProvider(account storage.Account, token storage.AccountToken) string {
-	if p := strings.TrimSpace(account.Provider); p != "" {
-		return p
-	}
-	return scheduler.ProviderFromToken(token)
+	return accountprovider.EffectiveProvider(account.Provider, token, true)
 }
 
 // probeCustomModels discovers a custom OpenAI-compatible provider's models for an
@@ -349,6 +346,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 	// Cooldown→health-recheck loop runs independently of the model-probe sweep (it
 	// must work even when model probing is disabled).
 	s.startRecheckLoop(ctx)
+	s.startBillingHoldExpiryLoop(ctx)
 	interval := time.Duration(s.cfg.ModelProbeIntervalHours) * time.Hour
 	if interval <= 0 {
 		return
@@ -551,6 +549,7 @@ func (s *Server) refreshCodexToken(ctx context.Context, token storage.AccountTok
 		_ = s.store.UpdateToken(ctx, token)
 		result.Token = token
 		result.Reason = "no refresh_token and no session cookie to re-mint from"
+		s.enqueueCodexReauthIfEligible(ctx, token.AccountID, result.Reason)
 		return result, nil
 	}
 	// OAuth refresh (web-login or auth.json accounts). OpenAI requires client_id +
@@ -576,6 +575,22 @@ func (s *Server) refreshCodexToken(ctx context.Context, token storage.AccountTok
 		result.Header = resp.Header.Clone()
 		result.Body = raw
 		result.Reason, result.TerminalAuthFailure = codexRefreshFailureReason(resp.StatusCode, raw)
+		if result.TerminalAuthFailure {
+			if cookie, _ := s.store.GetSessionCookie(ctx, token.AccountID); cookie != "" {
+				if accessToken, ferr := fetchChatGPTSessionToken(ctx, cookie); ferr == nil && accessToken != "" {
+					token.AccessToken = accessToken
+					token.LastRefresh = storage.Now()
+					if err := s.store.UpdateToken(ctx, token); err != nil {
+						return result, err
+					}
+					result.Token = token
+					result.Refreshed = true
+					result.Method = "session_cookie"
+					return result, nil
+				}
+			}
+			s.enqueueCodexReauthIfEligible(ctx, token.AccountID, result.Reason)
+		}
 		return result, fmt.Errorf("openai token refresh failed (%d): %s", resp.StatusCode, bodySnippet(raw, 300))
 	}
 	var refreshed map[string]interface{}

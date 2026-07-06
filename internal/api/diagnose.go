@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
@@ -31,6 +32,11 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 	if lerr != nil {
 		return err
 	}
+	accountIDs := make([]string, 0, len(all))
+	for _, account := range all {
+		accountIDs = append(accountIDs, account.ID)
+	}
+	tokensByID, _ := s.store.ListTokensByAccountIDs(ctx, accountIDs)
 	type gcount struct{ active, parked, codex, claude, custom int }
 	byGroup := map[string]*gcount{}
 	now := storage.Now()
@@ -45,10 +51,11 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 			continue
 		}
 		g.active++
-		switch a.Provider {
+		token, tokenFound := tokensByID[a.ID]
+		switch accountprovider.EffectiveProvider(a.Provider, token, tokenFound) {
 		case "claude":
 			g.claude++
-		case "", "codex":
+		case "codex":
 			g.codex++
 		default:
 			g.custom++

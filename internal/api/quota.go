@@ -225,7 +225,7 @@ func (s *Server) captureQuota(ctx context.Context, accountID, provider, model st
 			}
 		}
 		// Log when NO rate-limit headers found (likely backend-api behavior).
-		if !hasAnyRateLimit {
+		if !hasAnyRateLimit && s.shouldAuditCodexNoRateLimitHeaders(ctx, accountID, provider, storage.Now()) {
 			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
 				AccountID: accountID,
 				Action:    "codex_no_ratelimit_headers",
@@ -244,4 +244,14 @@ func (s *Server) captureQuota(ctx context.Context, accountID, provider, model st
 		snap.LimiterType = snap.Source
 	}
 	_ = s.store.UpsertAccountRateLimit(ctx, snap)
+}
+
+func (s *Server) shouldAuditCodexNoRateLimitHeaders(ctx context.Context, accountID, provider string, now int64) bool {
+	var last int64
+	err := s.store.DB().QueryRowContext(ctx, `SELECT COALESCE(MAX(created_at), 0) FROM audit_log WHERE account_id = ? AND action = ? AND detail LIKE ?`,
+		accountID, "codex_no_ratelimit_headers", "%provider="+provider+"%").Scan(&last)
+	if err != nil {
+		return true
+	}
+	return last == 0 || now-last >= 3600
 }

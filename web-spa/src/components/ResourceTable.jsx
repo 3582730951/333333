@@ -1,5 +1,5 @@
 import React from 'react';
-import { Table } from './pool/index.jsx';
+import { Button, Table } from './pool/index.jsx';
 import EmptyState from './EmptyState.jsx';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
 import { TableSkeleton } from './Skeleton.jsx';
@@ -27,6 +27,12 @@ function defaultTableScrollX(columns, { minScrollX = 720, safeActionWidth = 128 
   return Math.max(declaredWidth, estimatedWidth);
 }
 
+function rowKeyOf(row, rowKey, index) {
+  if (typeof rowKey === 'function') return rowKey(row, index) ?? row?.id ?? row?.key ?? index;
+  if (typeof rowKey === 'string') return row?.[rowKey] ?? row?.id ?? row?.key ?? index;
+  return row?.id ?? row?.key ?? index;
+}
+
 const densityRowHeights = {
   compact: 56,
   default: 64,
@@ -51,8 +57,11 @@ export default function ResourceTable({
   emptyAction,
   skeletonRows = 6,
   skeletonCols,
+  loadingTitle = '正在加载数据…',
   scroll,
   mobileColumns,
+  mobileRenderer,
+  mobileListLabel = '列表',
   mobileScroll,
   density = 'default',
   layout = 'fluid',
@@ -97,11 +106,63 @@ export default function ResourceTable({
     />
   );
 
+  if (isMobile && typeof mobileRenderer === 'function') {
+    const pageSize = pagination && pagination !== false ? Number(pagination.pageSize) || rows.length || 1 : rows.length || 1;
+    const total = pagination && pagination !== false ? Number(pagination.total) || rows.length : rows.length;
+    const currentPage = Number(pagination?.currentPage || 1);
+    const localPage = pagination && pagination !== false && !pagination.total;
+    const visibleRows = localPage ? rows.slice((currentPage - 1) * pageSize, currentPage * pageSize) : rows;
+    const pageCount = Math.max(1, Math.ceil(total / pageSize));
+    const selected = new Set(tableProps.rowSelection?.selectedRowKeys || []);
+    const toggleSelected = (key, checked) => {
+      const next = new Set(selected);
+      if (checked) next.add(key);
+      else next.delete(key);
+      tableProps.rowSelection?.onChange?.([...next]);
+    };
+    return (
+      <>
+        <LoadErrorBanner error={error} onRetry={onRetry} title={errorTitle} />
+        {firstLoad ? (
+          <TableSkeleton rows={skeletonRows} cols={1} title={loadingTitle} />
+        ) : visibleRows.length ? (
+          <div className="pool-mobile-list" role="list" aria-label={mobileListLabel}>
+            {visibleRows.map((row, index) => {
+              const key = rowKeyOf(row, rowKey, index);
+              const isSelected = selected.has(key);
+              return (
+                <div key={String(key)} className="pool-mobile-list__item" role="listitem" aria-selected={isSelected}>
+                  {mobileRenderer(row, {
+                    index,
+                    key,
+                    selected: isSelected,
+                    toggleSelected: (checked = !isSelected) => toggleSelected(key, checked),
+                  })}
+                </div>
+              );
+            })}
+            {pagination && pagination !== false && total > pageSize ? (
+              <div className="pool-mobile-list__pager">
+                <span>{currentPage} / {pageCount}</span>
+                <span className="pool-inline">
+                  <Button size="small" onClick={() => pagination?.onPageChange?.(Math.max(1, currentPage - 1))} disabled={currentPage <= 1}>上一页</Button>
+                  <Button size="small" onClick={() => pagination?.onPageChange?.(Math.min(pageCount, currentPage + 1))} disabled={currentPage >= pageCount}>下一页</Button>
+                </span>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="pool-table-empty">{emptyNode}</div>
+        )}
+      </>
+    );
+  }
+
   return (
     <>
       <LoadErrorBanner error={error} onRetry={onRetry} title={errorTitle} />
       {firstLoad ? (
-        <TableSkeleton rows={skeletonRows} cols={skeletonCols || Math.max(1, activeColumns?.length || 5)} />
+        <TableSkeleton rows={skeletonRows} cols={skeletonCols || Math.max(1, activeColumns?.length || 5)} title={loadingTitle} />
       ) : (
         <Table
           loading={loading}

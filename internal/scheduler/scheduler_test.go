@@ -396,9 +396,9 @@ func TestRecheckPendingAccountIsNotSelected(t *testing.T) {
 	lease.Release()
 }
 
-// A strict request bound to a recheck-pending account must fail over (the sticky
-// account is unavailable) rather than return ErrStrictUnavailable, because the
-// alternative is pinning the conversation to a benched account.
+// A strict self-contained request bound to a recheck-pending account must fail over
+// and rebind rather than return ErrStrictUnavailable, because the request can be
+// resent to a healthy account without server-side state.
 func TestStrictStickyFailsOverWhenBoundAccountRecheckPending(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
@@ -416,20 +416,232 @@ func TestStrictStickyFailsOverWhenBoundAccountRecheckPending(t *testing.T) {
 	cfg := config.Default()
 	cfg.StickyWaitMillis = 1
 	s := New(store, cfg)
-	// Without Exclude, a strict turn on a recheck-pending bound account returns
-	// ErrStrictUnavailable (the bound account is benched); the request layer then
-	// retries with Exclude set, which fails over. Here we assert the diagnose is the
-	// recheck-pending reason, then confirm Exclude fails over.
-	_, err := s.Select(ctx, Route{Group: "cyber", Affinity: routing.AffinityKey{Hash: "h", Key: "k"}, Strict: true})
-	if !errors.Is(err, ErrStrictUnavailable) {
-		t.Fatalf("err = %v, want ErrStrictUnavailable", err)
-	}
-	lease, err := s.Select(ctx, Route{Group: "cyber", Affinity: routing.AffinityKey{Hash: "h", Key: "k"}, Strict: true, Exclude: map[string]bool{"acc-1": true}})
+	lease, err := s.Select(ctx, Route{Group: "cyber", Affinity: routing.AffinityKey{Hash: "h", Key: "k"}, Strict: true})
 	if err != nil {
-		t.Fatalf("with exclude should fail over: %v", err)
+		t.Fatalf("strict self-contained request should fail over: %v", err)
 	}
 	defer lease.Release()
 	if lease.Account.ID != "acc-2" {
 		t.Fatalf("failed over to %q, want acc-2", lease.Account.ID)
+	}
+	b, err := store.GetAffinityBinding(ctx, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.AccountID != "acc-2" {
+		t.Fatalf("affinity rebound to %q, want acc-2", b.AccountID)
+	}
+}
+
+func TestMovableStrictStickyTokenBudgetFailsOverAndRebinds(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-budget-movable", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	defer held.Release()
+	if held.Account.ID != "acc-1" {
+		t.Fatalf("held account = %q, want acc-1", held.Account.ID)
+	}
+
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, Movable: true, EstimatedTokens: 20})
+	if err != nil {
+		t.Fatalf("movable strict request should fail over on token budget: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-2" {
+		t.Fatalf("movable strict request selected %q, want acc-2", lease.Account.ID)
+	}
+	b, err := store.GetAffinityBinding(ctx, key.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.AccountID != "acc-2" {
+		t.Fatalf("affinity rebound to %q, want acc-2", b.AccountID)
+	}
+}
+
+func TestNonMovableStrictStickyTokenBudgetStaysPinned(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-budget-stateful", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	defer held.Release()
+
+	_, err = s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
+	if !errors.Is(err, ErrStrictUnavailable) {
+		t.Fatalf("non-movable strict request err = %v, want ErrStrictUnavailable", err)
+	}
+}
+
+func TestServerSideStateStrictStickyTokenBudgetStaysPinned(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-budget-stateful-server", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-1: %v", err)
+	}
+	defer held.Release()
+
+	_, err = s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Strict: true, ServerSideState: true, EstimatedTokens: 20})
+	if !errors.Is(err, ErrStrictUnavailable) {
+		t.Fatalf("server-side-state strict request err = %v, want ErrStrictUnavailable", err)
+	}
+}
+
+func TestMovableStrictStickyAccountRateLimitLongCooldownFailsOver(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rl-movable", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 120, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StrictStickyMaxCooldownSeconds = 60
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true, Movable: true})
+	if err != nil {
+		t.Fatalf("movable strict request should fail over on long account rate-limit cooldown: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-2" {
+		t.Fatalf("selected %q, want acc-2", lease.Account.ID)
+	}
+}
+
+func TestSelfContainedStrictStickyAccountRateLimitCooldownFailsOver(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := routing.AffinityKey{Hash: "h-rl-zero", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 120, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true})
+	if err != nil {
+		t.Fatalf("strict self-contained request should fail over on account rate-limit cooldown: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "acc-2" {
+		t.Fatalf("selected %q, want acc-2", lease.Account.ID)
+	}
+}
+
+func TestNoAccountErrorIncludesSkipCounters(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-model", "acc-rate", "acc-budget"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{
+		{AccountID: "acc-rate", ModelSlug: "gpt-5", NativeMaxContextWindow: 200000},
+		{AccountID: "acc-budget", ModelSlug: "gpt-5", NativeMaxContextWindow: 200000},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: "acc-rate", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 300, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	key := routing.AffinityKey{Hash: "h-budget-counter", Key: "k", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: "acc-budget"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AccountTokenBudget = 100
+	cfg.StickyWaitMillis = 1
+	s := New(store, cfg)
+	held, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, EstimatedTokens: 90})
+	if err != nil {
+		t.Fatalf("hold acc-budget: %v", err)
+	}
+	defer held.Release()
+
+	_, err = s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", EstimatedTokens: 20})
+	if !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("err = %v, want ErrNoAccount", err)
+	}
+	var noAccount *NoAccountError
+	if !errors.As(err, &noAccount) {
+		t.Fatalf("err type = %T, want *NoAccountError", err)
+	}
+	if noAccount.Counters.ModelUnsupported != 1 || noAccount.Counters.RateLimitCooldown != 1 || noAccount.Counters.TokenBudget != 1 {
+		t.Fatalf("skip counters = %+v, want model=1 rate-limit=1 token_budget=1", noAccount.Counters)
 	}
 }

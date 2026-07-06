@@ -269,7 +269,7 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 	v := res.Verdict
 	alive := res.Alive
 	deleted := false
-	if v.IsBanned() && s.flagEnabled(r.Context(), "ban_detection_enabled", s.cfg.BanDetectionEnabled) {
+	if v.IsBanned() {
 		s.handleBannedAccount(r.Context(), account, v, res.Status, res.Body, "health_test")
 		deleted = s.flagEnabled(r.Context(), "ban_auto_delete", s.cfg.BanAutoDelete)
 	} else if v.State == ban.PermissionDenied {
@@ -433,7 +433,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		// UA + version headers; it is "" (no-op) for models that don't gate on version.
 		req.CodexClientVersion = s.codexClientVersionForModel(model)
 		req.DownstreamPath = "/v1/responses"
-		req.Body = []byte(`{"model":"` + model + `","instructions":"You are a coding agent.","store":false,"input":[{"role":"user","content":"ping"}],"stream":true}`)
+		req.Body = codexLivenessProbeBody(model)
 	}
 	if provider == "claude" {
 		var perr error
@@ -464,6 +464,28 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			resp = retryResp
 		}
 	}
+	if provider == "codex" && model != "gpt-5.5" && codexHealthModelUnsupported(resp.StatusCode, body) {
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			AccountID:    account.ID,
+			AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+			Action:       "health_test_model_unsupported",
+			State:        "retry",
+			Reason:       "model_not_supported",
+			Detail:       fmt.Sprintf("provider=%s model=%s retry_model=gpt-5.5 http=%d body=%s", provider, model, resp.StatusCode, bodySnippet(body, 300)),
+		})
+		model = "gpt-5.5"
+		res.Model = model
+		req.CodexClientVersion = s.codexClientVersionForModel(model)
+		req.Body = codexLivenessProbeBody(model)
+		retryResp, retryErr := s.upstream.Do(ctx, req)
+		if retryErr != nil {
+			res.Err = retryErr
+			return res
+		}
+		defer retryResp.Body.Close()
+		body, _ = io.ReadAll(io.LimitReader(retryResp.Body, 1<<20))
+		resp = retryResp
+	}
 	res.Status = resp.StatusCode
 	res.Body = body
 	res.Verdict = ban.Classify(resp.StatusCode < 400, resp.StatusCode, resp.Header, body)
@@ -472,13 +494,8 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	return res
 }
 
-// probeModel returns a model slug to use for a liveness probe: a previously probed
-// capability if available, else a conservative provider default. A wrong guess
-// still proves account validity (it yields a non-ban model error, not a ban).
+// probeModel returns a provider-correct model slug to use for a liveness probe.
 func (s *Server) probeModel(ctx context.Context, accountID, provider string) string {
-	if caps, _ := s.store.ListCapabilities(ctx, accountID); len(caps) > 0 {
-		return caps[0].ModelSlug
-	}
 	if provider == "claude" {
 		return "claude-sonnet-4-5"
 	}
@@ -488,7 +505,56 @@ func (s *Server) probeModel(ctx context.Context, accountID, provider string) str
 		}
 		return provider
 	}
-	return "gpt-5-codex"
+	if configured := strings.TrimSpace(s.settingString(ctx, "codex_install_model", s.cfg.CodexInstallModel)); codexHealthProbeModelAllowed(configured) {
+		return configured
+	}
+	if caps, _ := s.store.ListCapabilities(ctx, accountID); len(caps) > 0 {
+		for _, cap := range caps {
+			if codexHealthProbeModelAllowed(cap.ModelSlug) && strings.HasPrefix(strings.TrimSpace(cap.ModelSlug), "gpt-5") {
+				return strings.TrimSpace(cap.ModelSlug)
+			}
+		}
+		for _, cap := range caps {
+			if codexHealthProbeModelAllowed(cap.ModelSlug) {
+				return strings.TrimSpace(cap.ModelSlug)
+			}
+		}
+	}
+	return "gpt-5.5"
+}
+
+func codexLivenessProbeBody(model string) []byte {
+	return []byte(`{"model":"` + model + `","instructions":"You are a coding agent.","store":false,"input":[{"role":"user","content":"ping"}],"stream":true}`)
+}
+
+func codexHealthProbeModelAllowed(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	if strings.HasSuffix(model, "-codex") {
+		return false
+	}
+	return true
+}
+
+func codexHealthModelUnsupported(status int, body []byte) bool {
+	if status < 400 {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	for _, sig := range []string{
+		"model not supported",
+		"unsupported model",
+		"does not support this model",
+		"doesn't support this model",
+		"not supported for this account",
+	} {
+		if strings.Contains(lower, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 // adminAudit returns the audit log (account lifecycle + automated ban actions).

@@ -10,12 +10,40 @@ export default function MobileResourceCell({
   title,
   subtitle,
   badges,
+  chips,
   details = [],
   actions,
+  selected = false,
+  selectable = false,
+  onSelect,
 }) {
   const visibleDetails = details.filter((item) => hasRenderableValue(item?.value));
   return (
-    <div className="pool-mobile-row">
+    <div
+      className="pool-mobile-row"
+      role={selectable ? 'button' : undefined}
+      tabIndex={selectable ? 0 : undefined}
+      aria-pressed={selectable ? selected : undefined}
+      onClick={selectable ? onSelect : undefined}
+      onKeyDown={selectable ? (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onSelect?.();
+        }
+      } : undefined}
+    >
+      {selectable ? (
+        <input
+          type="checkbox"
+          checked={selected}
+          readOnly
+          aria-label="选择此项"
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelect?.();
+          }}
+        />
+      ) : null}
       {avatar ? <div className="pool-mobile-row__avatar">{avatar}</div> : null}
       <div className="pool-mobile-row__main">
         <div className="pool-mobile-row__head">
@@ -27,6 +55,7 @@ export default function MobileResourceCell({
             {subtitle}
           </Typography.Text>
         ) : null}
+        {chips ? <div className="pool-mobile-row__chips">{chips}</div> : null}
         {visibleDetails.length > 0 ? (
           <div className="pool-mobile-row__details">
             {visibleDetails.map((item) => (
@@ -38,7 +67,7 @@ export default function MobileResourceCell({
           </div>
         ) : null}
       </div>
-      {actions ? <div className="pool-mobile-row__actions">{actions}</div> : null}
+      {actions ? <div className="pool-mobile-row__actions" onClick={(event) => event.stopPropagation()}>{actions}</div> : null}
     </div>
   );
 }

@@ -1,9 +1,14 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/storage"
 )
 
 func TestParseQuotaSnapshotAnthropicUnified(t *testing.T) {
@@ -138,5 +143,43 @@ func TestUsedPercentFromUnknown(t *testing.T) {
 	}
 	if v := usedPercentFrom(100, 0); v != 100 {
 		t.Fatalf("fully consumed should be 100, got %v", v)
+	}
+}
+
+func TestCaptureQuotaThrottlesCodexNoRateLimitHeaderAudit(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	app := &Server{cfg: config.Default(), store: store}
+	ctx := context.Background()
+	header := http.Header{}
+	header.Set("content-type", "text/event-stream")
+
+	app.captureQuota(ctx, "acc", "codex", "gpt-5.5", header)
+	app.captureQuota(ctx, "acc", "codex", "gpt-5.5", header)
+	rows, err := store.ListAuditLogForAccount(ctx, "acc", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("audit rows after duplicate capture = %d, want 1: %+v", len(rows), rows)
+	}
+
+	if _, err := store.DB().ExecContext(ctx, `UPDATE audit_log SET created_at = ? WHERE action = ?`, storage.Now()-3601, "codex_no_ratelimit_headers"); err != nil {
+		t.Fatal(err)
+	}
+	app.captureQuota(ctx, "acc", "codex", "gpt-5.5", header)
+	rows, err = store.ListAuditLogForAccount(ctx, "acc", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("audit rows after hourly window = %d, want 2: %+v", len(rows), rows)
 	}
 }

@@ -14,19 +14,31 @@ import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
+import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { loadResourceGroup } from '../lib/resource.js';
 import { fmtInt, fmtTokens } from '../lib/format.js';
 
 const now = () => Math.floor(Date.now() / 1000);
 
-function statusTag(a) {
+function statusInfo(a) {
   const n = now();
-  if ((a.quarantine_until || 0) > n) return <Tag color="red">隔离</Tag>;
-  if (a.egress_binding && a.egress_binding.recheck_pending) return <Tag color="orange">待测活</Tag>;
-  if (a.egress_binding && (a.egress_binding.cooldown_until || 0) > n) return <Tag color="amber">冷却</Tag>;
-  if (a.status === 'active') return <Tag color="green">可用</Tag>;
-  return <Tag color="grey">{a.status || '未知'}</Tag>;
+  if ((a.quarantine_until || 0) > n) return { label: '隔离中', color: 'red', hint: '暂不参与调度' };
+  if (a.egress_binding && a.egress_binding.recheck_pending) return { label: '待复测', color: 'orange', hint: '等待重新测活' };
+  if (a.egress_binding && (a.egress_binding.cooldown_until || 0) > n) return { label: '冷却中', color: 'amber', hint: '临时退避' };
+  const map = {
+    active: { label: '可用', color: 'green', hint: '可立即调度' },
+    permission_denied: { label: '权限受限', color: 'red', hint: '凭据或权限需要处理' },
+    unreachable: { label: '不可达', color: 'grey', hint: '网络或出口不可用' },
+    disabled: { label: '已停用', color: 'grey', hint: '不会参与调度' },
+    quarantine: { label: '隔离中', color: 'red', hint: '暂不参与调度' },
+  };
+  return map[a.status] || { label: a.status || '未知', color: 'grey', hint: '等待状态同步' };
+}
+
+function statusTag(a) {
+  const info = statusInfo(a);
+  return <Tag color={info.color}>{info.label}</Tag>;
 }
 
 function normalizeAccounts(data) {
@@ -36,6 +48,11 @@ function normalizeAccounts(data) {
 
 const EMPTY_ACCOUNT_DATA = { rows: [], total: 0, groups: [], error: null };
 const accountActionKey = (id, act) => `${id}:${act}`;
+const ACCOUNT_ACTION_LABEL = {
+  'health-test': '测活',
+  'clear-quarantine': '解除隔离',
+  delete: '删除',
+};
 
 function accountUsage(account) {
   return account?.usage || {};
@@ -69,13 +86,21 @@ function routeSummary(account) {
   return { primary, model, effort };
 }
 
+function middleEllipsis(value, head = 24, tail = 14) {
+  const text = String(value || '');
+  if (text.length <= head + tail + 1) return text;
+  return `${text.slice(0, head)}…${text.slice(-tail)}`;
+}
+
 export default function Accounts() {
+  const responsive = useResponsiveLayout();
   const [page, setPage] = useState(1);
   const [pageSize] = useState(50);
   const [importOpen, setImportOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [selected, setSelected] = useState([]);
+  const [selectMode, setSelectMode] = useState(false);
   const [drawerAcct, setDrawerAcct] = useState(null);
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveGroup, setMoveGroup] = useState('');
@@ -117,7 +142,7 @@ export default function Accounts() {
   } = useKeyedAsyncAction(async (_key, id, act) => {
     try {
       await post(`/admin/accounts/${id}/${act}`, {});
-      Toast.success(`${act} 已执行`);
+      Toast.success(`${ACCOUNT_ACTION_LABEL[act] || '操作'}已完成`);
       const nextData = await load();
       if (drawerAcct?.id === id) {
         if (act === 'delete') {
@@ -241,24 +266,34 @@ export default function Accounts() {
             <Tag size="small">{r.provider || 'codex'}</Tag>
           </div>
           <div className="pool-account-metaline">
-            <TextClamp muted className="pool-account-email">{r.email || r.id}</TextClamp>
-            <span className="pool-account-mini">{[r.group_name || '默认', r.plan_type || '未设置'].join(' / ')}</span>
+            <TextClamp muted className="pool-account-email" title={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
           </div>
         </div>
       ),
     },
-    { title: '健康', key: 'status', width: 136, render: (_, r) => statusTag(r) },
     {
-      title: '配额',
-      key: 'quota',
-      width: 132,
+      title: '健康',
+      key: 'status',
+      width: 160,
       render: (_, r) => {
-        const pct = quotaPercent(r);
-        const reason = quotaReason(r);
+        const info = statusInfo(r);
         return (
-          <div className="pool-quota-cell">
-            <span>{pct === null ? `未同步 · ${reason}` : `${pct}% 已用`}</span>
-            <TinyMeter value={pct ?? 0} label={pct === null ? '未同步' : `${pct}% 已用`} />
+          <div className="pool-resource-summary">
+            <div>{statusTag(r)}</div>
+            <div className="pool-resource-summary__meta">{info.hint}</div>
+          </div>
+        );
+      },
+    },
+    {
+      title: '分组 / 套餐',
+      key: 'group_plan',
+      width: 156,
+      render: (_, r) => {
+        return (
+          <div className="pool-resource-summary">
+            <TextClamp>{r.group_name || '默认'}</TextClamp>
+            <div className="pool-resource-summary__meta">{r.plan_type || '未设置套餐'}</div>
           </div>
         );
       },
@@ -283,38 +318,57 @@ export default function Accounts() {
     {
       title: '用量',
       key: 'usage',
-      width: 132,
+      width: 150,
+      align: 'right',
       render: (_, r) => {
         const usage = accountUsage(r);
         const requests = usage.requests ?? r.requests;
         const tokens = usage.total_tokens ?? r.total_tokens;
+        const pct = quotaPercent(r);
+        const reason = quotaReason(r);
         return (
-          <div className="pool-resource-summary">
+          <div className="pool-quota-cell">
             <TextClamp>{tokens == null ? '—' : fmtTokens(tokens)}</TextClamp>
             <div className="pool-resource-summary__meta">{requests == null ? '请求未同步' : `${fmtInt(requests)} 次请求`}</div>
+            <span className="pool-resource-summary__meta">{pct === null ? `配额未同步 · ${reason}` : `配额 ${pct}% 已用`}</span>
+            <TinyMeter value={pct ?? 0} label={pct === null ? '未同步' : `${pct}% 已用`} />
           </div>
         );
       },
     },
-    { title: '操作', key: 'ops', width: 236, render: (_, r) => renderAccountActions(r) },
+    { title: '操作', key: 'ops', width: 72, render: (_, r) => renderAccountActions(r) },
   ];
+  const mobileAccountCell = (r) => {
+    const route = routeSummary(r);
+    const usage = accountUsage(r);
+    const requests = usage.requests ?? r.requests;
+    const tokens = usage.total_tokens ?? r.total_tokens;
+    return (
+      <MobileResourceCell
+        title={selectMode
+          ? middleEllipsis(r.label || r.id, 20, 8)
+          : <Typography.Text link onClick={() => setDrawerAcct(r)}>{middleEllipsis(r.label || r.id, 20, 8)}</Typography.Text>}
+        subtitle={middleEllipsis(r.email || r.id, 22, 12)}
+        badges={statusTag(r)}
+        chips={<>
+          <Tag size="small">{r.provider || 'codex'}</Tag>
+          <Tag size="small">{r.group_name || '默认'}</Tag>
+          {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
+          <Tag size="small" color="blue">{route.primary}</Tag>
+        </>}
+        details={[
+          { label: '用量', value: tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token` },
+          { label: '请求', value: requests == null ? null : `${fmtInt(requests)} 次请求` },
+        ]}
+        actions={!selectMode ? renderAccountActions(r) : null}
+      />
+    );
+  };
   const mobileColumns = [
     {
       title: '账号',
       dataIndex: 'label',
-      render: (_, r) => (
-        <MobileResourceCell
-          title={<Typography.Text link onClick={() => setDrawerAcct(r)}>{r.label || r.id}</Typography.Text>}
-          subtitle={r.email}
-          badges={<>{statusTag(r)}<Tag>{r.provider || 'codex'}</Tag></>}
-          details={[
-            { label: '分组', value: r.group_name || '默认' },
-            { label: '套餐', value: r.plan_type || '未设置' },
-            { label: '出口', value: routeSummary(r).primary },
-          ]}
-          actions={renderAccountActions(r)}
-        />
-      ),
+      render: (_, r) => mobileAccountCell(r),
     },
   ];
 
@@ -323,11 +377,16 @@ export default function Accounts() {
       <PageHeader title="账号池" subtitle={`共 ${total} 个账号`}
         actions={<>
           <Input prefix={<IconSearch />} value={searchInput} onChange={setSearchInput}
-            onEnterPress={doSearch} style={{ width: 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />
+            onEnterPress={doSearch} style={{ width: responsive.isMobile ? 210 : 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />
           <Button icon={<IconSearch />} onClick={doSearch}>搜索</Button>
-          <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button>
+          {!responsive.isMobile ? <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button> : null}
           <Button icon={<IconRefresh />} onClick={() => load()}>刷新</Button>
-          <Button icon={<IconPlus />} theme="solid" onClick={() => setImportOpen(true)}>添加账号</Button>
+          {responsive.isMobile ? (
+            <Button onClick={() => { setSelectMode((value) => !value); if (selectMode) setSelected([]); }}>
+              {selectMode ? '完成' : '选择'}
+            </Button>
+          ) : null}
+          {!responsive.isMobile ? <Button icon={<IconPlus />} theme="solid" onClick={() => setImportOpen(true)}>添加账号</Button> : null}
         </>} />
 
       {selected.length > 0 && (
@@ -359,7 +418,7 @@ export default function Accounts() {
         rowKey="id"
         pagination={{ pageSize, total, currentPage: page, onPageChange: onPageChange }}
         size="middle"
-        rowSelection={{ selectedRowKeys: selected, onChange: (keys) => setSelected(keys) }}
+        rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: (keys) => setSelected(keys) } : undefined}
         className="pool-mobile-table pool-accounts-table"
         density="account"
         minScrollX={1092}
@@ -373,6 +432,12 @@ export default function Accounts() {
         skeletonRows={8}
         skeletonCols={6}
       />
+
+      {responsive.isMobile && !selectMode ? (
+        <div className="pool-sticky-mobile-action">
+          <Button icon={<IconPlus />} theme="solid" onClick={() => setImportOpen(true)}>添加账号</Button>
+        </div>
+      ) : null}
 
       <AccountDrawer account={drawerAcct} usage={drawerAcct ? drawerAcct.usage : null}
         statusTag={statusTag} onAction={action} actionRunning={accountActionRunning}

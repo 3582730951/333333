@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
@@ -77,6 +78,10 @@ type Route struct {
 	Provider        string // "" (any) / "codex" / "claude" — selects provider-matching accounts
 	Affinity        routing.AffinityKey
 	Strict          bool
+	ServerSideState bool
+	// Movable is kept for existing call sites/tests that already computed
+	// !ServerSideState. New callers should set ServerSideState directly.
+	Movable         bool
 	Model           string
 	EstimatedTokens int64
 	// Exclude lists account IDs that must not be selected for this call — the
@@ -85,6 +90,56 @@ type Route struct {
 	// just-failed account can never reappear in the same request's retry (the
 	// "有问题的账号不应该二次出现在下次的候选名单" requirement). A nil map excludes nothing.
 	Exclude map[string]bool
+}
+
+type NoAccountCounters struct {
+	Inactive          int
+	Quarantined       int
+	Excluded          int
+	ProviderMismatch  int
+	ModelUnsupported  int
+	RateLimitCooldown int
+	RecheckPending    int
+	EgressUnavailable int
+	Concurrency       int
+	TokenBudget       int
+}
+
+type NoAccountError struct {
+	Group    string
+	Provider string
+	Model    string
+	Counters NoAccountCounters
+}
+
+func (e *NoAccountError) Error() string {
+	if e == nil {
+		return ErrNoAccount.Error()
+	}
+	parts := []string{}
+	add := func(name string, n int) {
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", name, n))
+		}
+	}
+	add("inactive", e.Counters.Inactive)
+	add("quarantined", e.Counters.Quarantined)
+	add("excluded", e.Counters.Excluded)
+	add("provider_mismatch", e.Counters.ProviderMismatch)
+	add("model_unsupported", e.Counters.ModelUnsupported)
+	add("rate_limit_cooldown", e.Counters.RateLimitCooldown)
+	add("recheck_pending", e.Counters.RecheckPending)
+	add("egress_unavailable", e.Counters.EgressUnavailable)
+	add("concurrency", e.Counters.Concurrency)
+	add("token_budget", e.Counters.TokenBudget)
+	if len(parts) == 0 {
+		return ErrNoAccount.Error()
+	}
+	return fmt.Sprintf("%s: group=%q provider=%q model=%q skipped(%s)", ErrNoAccount, e.Group, e.Provider, e.Model, strings.Join(parts, " "))
+}
+
+func (e *NoAccountError) Unwrap() error {
+	return ErrNoAccount
 }
 
 type Lease struct {
@@ -142,27 +197,9 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 					}
 				}
 				if route.Strict {
-					// Check if cooldown exceeds the threshold for allowing failover.
-					// When an account is on a long cooldown (e.g., 30+ minutes), it's
-					// better to try another account than to return a 409 error.
-					cooldownExceeded := false
-					if cfg.StrictStickyMaxCooldownSeconds > 0 {
-						if binding, berr := s.store.GetEgressBinding(ctx, bound.AccountID); berr == nil {
-							now := storage.Now()
-							if binding.CooldownUntil > now {
-								cooldownRemaining := binding.CooldownUntil - now
-								if cooldownRemaining > int64(cfg.StrictStickyMaxCooldownSeconds) {
-									log.Printf("[SCHEDULER] strict-sticky cooldown exceeded threshold: account=%s, cooldown=%ds, threshold=%ds, allowing failover",
-										bound.AccountID, cooldownRemaining, cfg.StrictStickyMaxCooldownSeconds)
-									cooldownExceeded = true
-								}
-							}
-						}
-					}
-					if !cooldownExceeded {
+					if !s.strictStickyCanFailover(ctx, bound.AccountID, route) {
 						return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, route)
 					}
-					// Fall through to selectFresh when cooldown is too long.
 					log.Printf("[SCHEDULER] strict-sticky falling through to selectFresh for route affinity=%s", route.Affinity.Hash)
 				}
 			}
@@ -226,35 +263,48 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	}
 	reqEgressCache := make(map[string]storage.EgressProfile)
 	var candidates []candidate
+	var counters NoAccountCounters
 	for _, awe := range accountsWithEgress {
 		account := awe.Account
 		binding := awe.Binding
+		if account.Status != "active" {
+			counters.Inactive++
+			continue
+		}
 		if account.QuarantineUntil > now {
+			counters.Quarantined++
 			continue
 		}
 		if route.Exclude[account.ID] {
+			counters.Excluded++
 			continue
 		}
 		if capable != nil && !capable[account.ID] {
+			counters.ModelUnsupported++
 			continue
 		}
 		if route.Provider != "" && s.providerOfAccountCached(ctx, account) != route.Provider {
+			counters.ProviderMismatch++
 			continue
 		}
 		if s.accountRateLimitedForRoute(ctx, account, route, now) {
+			counters.RateLimitCooldown++
 			continue
 		}
 		// An account benched after an error stays out of the pool until the recheck
 		// loop confirms it is healthy again — even once its cooldown has elapsed.
 		if binding.RecheckPending {
+			counters.RecheckPending++
 			continue
 		}
 		egress, ok := s.selectEgressWithCache(ctx, binding, now, &reqEgressCache, egressCacheMutex, &egressCacheTime)
 		if !ok {
+			counters.EgressUnavailable++
 			continue
 		}
 		inflight, tokens := s.currentLoad(account.ID)
 		if inflight >= egress.MaxConcurrency {
+			counters.Concurrency++
 			continue
 		}
 		// Token budget guards CONCURRENT over-commit, not single-request size: only
@@ -266,6 +316,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		// context materialization (which runs after selection) then compresses an
 		// oversized body to the account's native window where possible.
 		if route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > cfg.AccountTokenBudget {
+			counters.TokenBudget++
 			continue
 		}
 		candidates = append(candidates, candidate{account: account, egress: egress, score: inflight})
@@ -285,7 +336,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 				}
 			}
 		}
-		return Lease{}, ErrNoAccount
+		return Lease{}, s.noAccountError(route, counters)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].score < candidates[j].score
@@ -320,7 +371,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			return lease, nil
 		}
 	}
-	return Lease{}, ErrNoAccount
+	return Lease{}, s.noAccountError(route, counters)
 }
 
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
@@ -407,6 +458,54 @@ func providerForRoute(s *Scheduler, ctx context.Context, account storage.Account
 		return p
 	}
 	return s.providerOfAccountCached(ctx, account)
+}
+
+func (s *Scheduler) noAccountError(route Route, counters NoAccountCounters) error {
+	if route.Provider == "" && route.Model == "" && route.Affinity.Hash == "" {
+		return ErrNoAccount
+	}
+	return &NoAccountError{
+		Group:    route.Group,
+		Provider: route.Provider,
+		Model:    route.Model,
+		Counters: counters,
+	}
+}
+
+func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID string, route Route) bool {
+	if route.ServerSideState {
+		return false
+	}
+	account, err := s.store.GetAccount(ctx, accountID)
+	if err != nil {
+		return true
+	}
+	now := storage.Now()
+	if account.Status != "active" || account.QuarantineUntil > now {
+		return false
+	}
+	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); ok && until > now {
+		return true
+	}
+	binding, err := s.store.GetEgressBinding(ctx, accountID)
+	if err != nil {
+		return true
+	}
+	if binding.RecheckPending || binding.CooldownUntil > now {
+		return true
+	}
+	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
+	if err != nil || !EgressHealthy(egress, now) {
+		return true
+	}
+	inflight, tokens := s.currentLoad(accountID)
+	if inflight >= egress.MaxConcurrency {
+		return true
+	}
+	if route.EstimatedTokens > 0 && inflight > 0 && tokens+route.EstimatedTokens > s.Config().AccountTokenBudget {
+		return true
+	}
+	return route.Movable
 }
 
 // diagnoseStickyUnavailability returns an ErrStrictUnavailable error annotated with the
@@ -633,7 +732,7 @@ func waitFor(ctx context.Context, duration time.Duration) bool {
 func (s *Scheduler) providerOf(ctx context.Context, accountID string) string {
 	acc, err := s.store.GetAccount(ctx, accountID)
 	if err != nil {
-		return "codex"
+		return accountprovider.UnknownProvider
 	}
 	return s.providerOfAccount(ctx, acc)
 }
@@ -649,17 +748,14 @@ func (s *Scheduler) providerOfAccount(ctx context.Context, acc storage.Account) 
 	}
 	token, err := s.store.GetToken(ctx, acc.ID)
 	if err != nil {
-		return "codex"
+		return accountprovider.UnknownProvider
 	}
-	return ProviderFromToken(token)
+	return accountprovider.EffectiveProvider(acc.Provider, token, true)
 }
 
 // ProviderFromToken maps a stored credential to its provider id.
 func ProviderFromToken(t storage.AccountToken) string {
-	if strings.HasPrefix(t.AccessToken, "sk-ant") || strings.HasPrefix(t.OpenAIAPIKey, "sk-ant") {
-		return "claude"
-	}
-	return "codex"
+	return accountprovider.InferProviderFromToken(t)
 }
 
 // selectEgressWithCache resolves the egress using both the process-level sync.Map
@@ -724,9 +820,9 @@ func (s *Scheduler) providerOfAccountCached(ctx context.Context, acc storage.Acc
 	token, err := s.store.GetToken(ctx, acc.ID)
 	var provider string
 	if err != nil {
-		provider = "codex"
+		provider = accountprovider.UnknownProvider
 	} else {
-		provider = ProviderFromToken(token)
+		provider = accountprovider.EffectiveProvider(acc.Provider, token, true)
 	}
 	s.providerCache.Store(acc.ID, provider)
 	return provider

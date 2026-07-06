@@ -1,12 +1,12 @@
 .pool-stack {
   display: grid;
-  gap: 12px;
+  gap: var(--pool-space-3);
 }
 
 .pool-inline {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--pool-space-2);
 }
 
 .pool-inline--wrap {
@@ -44,6 +44,19 @@
 
 .pool-success-text {
   color: var(--pool-success);
+}
+
+.pool-numeric,
+.pool-mono {
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-mono {
+  font-family: var(--pool-font-mono);
+}
+
+.pool-ios-safe-bottom {
+  padding-bottom: max(var(--pool-space-4), env(safe-area-inset-bottom));
 }
 
 .pool-sr-only {

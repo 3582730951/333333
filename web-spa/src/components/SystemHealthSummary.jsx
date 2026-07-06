@@ -6,6 +6,7 @@ import { fmtBytes, fmtDuration, fmtInt, fmtKB, fmtRelative } from '../lib/format
 
 const C = COLORS;
 const moduleColor = { running: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
+const moduleLabel = { running: '运行中', restarting: '重启中', panic: '异常', failed: '失败', stopped: '已停止' };
 const eventColor = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
 const meterColor = (p) => (p >= 90 ? C.red : p >= 70 ? C.amber : C.green);
 const problemStatuses = new Set(['panic', 'restarting', 'failed']);
@@ -22,7 +23,7 @@ function moduleHealth(modules = []) {
   const panicCount = problem.filter((module) => module.status === 'panic').length;
   const failedCount = problem.filter((module) => module.status === 'failed').length;
   const color = panicCount || failedCount ? 'red' : problem.length ? 'amber' : 'green';
-  const label = panicCount ? `${panicCount} 个 panic` : failedCount ? `${failedCount} 个失败` : problem.length ? `${problem.length} 个重启中` : '正常';
+  const label = panicCount ? `${panicCount} 个异常` : failedCount ? `${failedCount} 个失败` : problem.length ? `${problem.length} 个重启中` : '正常';
   return { problem, color, label };
 }
 
@@ -58,7 +59,7 @@ function ModuleStatusLine({ modules = [] }) {
         <div className="pool-muted" style={{ fontSize: 12.5 }}>
           <span className="pool-mono">{recent.name}</span>
           {' · '}
-          <Tag size="small" color={moduleColor[recent.status] || 'grey'}>{recent.status || 'unknown'}</Tag>
+          <Tag size="small" color={moduleColor[recent.status] || 'grey'}>{moduleLabel[recent.status] || recent.status || '未知'}</Tag>
           {recentDetail && recentDetail !== '—' ? ` · ${recentDetail}` : ''}
           {timingDetail ? ` · ${timingDetail}` : ''}
         </div>

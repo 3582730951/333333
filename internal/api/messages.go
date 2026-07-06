@@ -167,6 +167,8 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		Provider:        "claude",
 		Affinity:        affinity,
 		Strict:          strict,
+		ServerSideState: !movable,
+		Movable:         movable,
 		Model:           model,
 		EstimatedTokens: virtual.EstimateTokensJSON(raw),
 		Exclude:         exclude,

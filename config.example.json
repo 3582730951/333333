@@ -74,6 +74,8 @@
   "require_downstream_key": false,
   "model_probe_interval_hours": 12,
   "geo_probe_url": "https://ipapi.co/json/",
+  "codex_reauth_worker_url": "http://127.0.0.1:8802",
+  "codex_reauth_worker_concurrency": 1,
   "claude_gateway_intercept_hosts": [
     "api.anthropic.com"
   ],

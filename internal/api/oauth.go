@@ -45,10 +45,12 @@ const oauthSessionTTL = 15 * time.Minute
 // and state must never leave the server, and are matched back up when the
 // operator pastes the code.
 type oauthPending struct {
-	provider string
-	verifier string
-	state    string
-	created  time.Time
+	provider          string
+	verifier          string
+	state             string
+	created           time.Time
+	reauthAccountID   string
+	targetWorkspaceID string
 }
 
 // oauthStore is a tiny TTL map of in-flight logins keyed by an opaque session id.
@@ -140,7 +142,15 @@ func (s *Server) oauthProvider(name string) (oauthProviderDesc, error) {
 // the current Codex CLI sends (other_codex login/src/server.rs build_authorize_url);
 // Claude sends code=true so claude.ai also prints the code on screen for the
 // paste-back.
+type oauthAuthorizeOptions struct {
+	AllowedWorkspaceID string
+}
+
 func (d oauthProviderDesc) authorizeURL(challenge, state string) string {
+	return d.authorizeURLWithOptions(challenge, state, oauthAuthorizeOptions{})
+}
+
+func (d oauthProviderDesc) authorizeURLWithOptions(challenge, state string, opts oauthAuthorizeOptions) string {
 	params := url.Values{
 		"client_id":             {d.clientID},
 		"response_type":         {"code"},
@@ -170,6 +180,9 @@ func (d oauthProviderDesc) authorizeURL(challenge, state string) string {
 		params.Set("id_token_add_organizations", "true")
 		params.Set("codex_cli_simplified_flow", "true")
 		params.Set("originator", identity.CodexOriginator)
+		if allowed := strings.TrimSpace(opts.AllowedWorkspaceID); allowed != "" {
+			params.Set("allowed_workspace_id", allowed)
+		}
 	} else {
 		params.Set("code", "true")
 	}
@@ -276,7 +289,8 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Provider string `json:"provider"`
+		Provider           string `json:"provider"`
+		AllowedWorkspaceID string `json:"allowed_workspace_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -306,7 +320,7 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"session_id": sid,
 		"provider":   desc.provider,
-		"auth_url":   desc.authorizeURL(challenge, state),
+		"auth_url":   desc.authorizeURLWithOptions(challenge, state, oauthAuthorizeOptions{AllowedWorkspaceID: req.AllowedWorkspaceID}),
 		"expires_in": int(s.oauth.ttl.Seconds()),
 	})
 }

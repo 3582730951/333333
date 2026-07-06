@@ -67,6 +67,7 @@ const (
 	DefaultGopayDir             = "gopay/plus"
 	DefaultGopayPython          = "python3"
 	DefaultGopayOrchestratorURL = "http://127.0.0.1:8800"
+	DefaultCodexReauthWorkerURL = "http://127.0.0.1:8802"
 
 	legacyClaudeOAuthTokenURL = "https://console.anthropic.com/v1/oauth/token"
 )
@@ -450,6 +451,15 @@ type Config struct {
 	// default. The response is parsed for common fields (ip, country/countryCode,
 	// region, city).
 	GeoProbeURL string `json:"geo_probe_url"`
+	// ── Codex OAuth 自动重登 ──
+	// CodexReauthWorkerURL is the local HTTP worker used by manual/auto Codex reauth.
+	// The pool server stores encrypted credentials and calls POST /v1/codex/reauth
+	// only for Codex/ChatGPT accounts whose reauth config enables it.
+	CodexReauthWorkerURL string `json:"codex_reauth_worker_url"`
+	// CodexReauthWorkerConcurrency is surfaced for the standalone worker; the pool
+	// server itself uses per-account/job de-dupe. Default 1.
+	CodexReauthWorkerConcurrency int `json:"codex_reauth_worker_concurrency"`
+
 	// ── GoPay 自动订阅 (Part 4) ──
 	// GopayEnabled is the BOOT default for the bundled GoPay Plus auto-subscribe
 	// integration; default false (off). The live value is runtime-toggleable from
@@ -687,6 +697,8 @@ func Default() Config {
 		LeakScrubEnabled:                       true,
 		ModelProbeIntervalHours:                DefaultModelProbeIntervalHours,
 		GeoProbeURL:                            DefaultGeoProbeURL,
+		CodexReauthWorkerURL:                   DefaultCodexReauthWorkerURL,
+		CodexReauthWorkerConcurrency:           1,
 		GopayDir:                               DefaultGopayDir,
 		GopayPython:                            DefaultGopayPython,
 		GopayOrchestratorURL:                   DefaultGopayOrchestratorURL,
@@ -941,6 +953,14 @@ func (c *Config) applyEnv() {
 			c.ClaudeForceDirect = parsed
 		}
 	}
+	if v := os.Getenv("CODEX_POOL_CODEX_REAUTH_WORKER_URL"); v != "" {
+		c.CodexReauthWorkerURL = v
+	}
+	if v := os.Getenv("CODEX_POOL_CODEX_REAUTH_WORKER_CONCURRENCY"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			c.CodexReauthWorkerConcurrency = parsed
+		}
+	}
 	if v := os.Getenv("CODEX_POOL_GOPAY_ENABLED"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.GopayEnabled = parsed
@@ -1127,6 +1147,12 @@ func (c *Config) normalize() {
 	}
 	if c.GeoProbeURL == "" {
 		c.GeoProbeURL = DefaultGeoProbeURL
+	}
+	if c.CodexReauthWorkerURL == "" {
+		c.CodexReauthWorkerURL = DefaultCodexReauthWorkerURL
+	}
+	if c.CodexReauthWorkerConcurrency <= 0 {
+		c.CodexReauthWorkerConcurrency = 1
 	}
 	if c.GopayDir == "" {
 		c.GopayDir = DefaultGopayDir

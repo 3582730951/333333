@@ -8,6 +8,13 @@ body,
   min-height: 100%;
 }
 
+html {
+  background: var(--pool-bg-page);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 body {
   margin: 0;
   background: var(--pool-bg-page);
@@ -15,6 +22,8 @@ body {
   font-family: var(--pool-font-sans);
   font-size: 14px;
   line-height: 1.45;
+  letter-spacing: -0.006em;
+  font-variant-numeric: tabular-nums;
 }
 
 button,
@@ -26,6 +35,13 @@ select {
 
 button {
   color: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+input,
+textarea,
+select {
+  -webkit-tap-highlight-color: transparent;
 }
 
 a {
@@ -35,6 +51,16 @@ a {
 
 a:hover {
   text-decoration: underline;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p {
+  margin-top: 0;
 }
 
 ::selection {
@@ -59,4 +85,29 @@ a:hover {
   background: var(--pool-bg-surface-3);
   border-radius: 999px;
   border: 2px solid var(--pool-bg-page);
+}
+
+@media (max-width: 640px) {
+  body {
+    font-size: 15px;
+  }
+
+  button,
+  [role='button'],
+  input,
+  select,
+  textarea {
+    touch-action: manipulation;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+  }
 }

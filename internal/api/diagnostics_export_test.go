@@ -83,7 +83,19 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	files := readZipFiles(t, raw)
 	required := []string{
 		"manifest.json",
+		"diagnostic_summary.json",
 		"account_map.csv",
+		"account_auth_metadata.csv",
+		"account_model_capabilities.csv",
+		"account_rate_limits.csv",
+		"affinity_bindings.csv",
+		"settings.csv",
+		"custom_providers.csv",
+		"upstream_error_rules.csv",
+		"codex_reset_credit_consumptions.csv",
+		"account_lifecycle_status.csv",
+		"codex_reauth_config.csv",
+		"codex_reauth_jobs.csv",
 		"audit_log.csv",
 		"cf_events.csv",
 		"usage_records.csv",
@@ -94,6 +106,23 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	for _, name := range required {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("diagnostics zip missing %s; has %v", name, zipFileNames(files))
+		}
+	}
+
+	var manifest struct {
+		Format string         `json:"format"`
+		Files  []string       `json:"files"`
+		Rows   map[string]int `json:"row_counts"`
+	}
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatalf("manifest json: %v\n%s", err, files["manifest.json"])
+	}
+	if manifest.Format != "codex-pool-diagnostics-v2" {
+		t.Fatalf("manifest format = %q, want codex-pool-diagnostics-v2", manifest.Format)
+	}
+	for _, name := range required {
+		if _, ok := manifest.Rows[name]; !ok {
+			t.Fatalf("manifest missing row count for %s: %+v", name, manifest.Rows)
 		}
 	}
 
@@ -109,13 +138,13 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 			continue
 		}
 		text := files[name]
-		for _, forbidden := range []string{account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID} {
+		for _, forbidden := range []string{account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID, "access-secret"} {
 			if strings.Contains(text, forbidden) {
 				t.Fatalf("%s leaked %q:\n%s", name, forbidden, text)
 			}
 		}
 	}
-	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv"} {
+	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv", "account_auth_metadata.csv"} {
 		if !strings.Contains(files[name], "ACC-0001") {
 			t.Fatalf("%s should use stable account code ACC-0001:\n%s", name, files[name])
 		}
@@ -129,6 +158,23 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	for _, want := range []string{"cache_prefix_hash", "stable_prefix", "auto_stable_prefix", "anthropic_message_prefix", "4096", "24h", "1h", "7"} {
 		if !strings.Contains(usageCSV, want) {
 			t.Fatalf("usage_records.csv missing diagnostic value %q:\n%s", want, usageCSV)
+		}
+	}
+
+	authCSV := files["account_auth_metadata.csv"]
+	for _, want := range []string{"access_token_present", "access_token_len", "effective_provider", "codex"} {
+		if !strings.Contains(authCSV, want) {
+			t.Fatalf("account_auth_metadata.csv missing %q:\n%s", want, authCSV)
+		}
+	}
+
+	var summary map[string]interface{}
+	if err := json.Unmarshal([]byte(files["diagnostic_summary.json"]), &summary); err != nil {
+		t.Fatalf("diagnostic_summary.json: %v\n%s", err, files["diagnostic_summary.json"])
+	}
+	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups"} {
+		if _, ok := summary[key]; !ok {
+			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
 		}
 	}
 }

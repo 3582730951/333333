@@ -53,14 +53,15 @@ export default function PortalDashboard() {
 
   return (
     <div>
-      <PageHeader title="我的用量" subtitle="你的 API 调用与 token 消耗"
+      <PageHeader title="我的用量" subtitle="你的 API 调用与 Token 消耗"
         actions={<Button icon={<IconRefresh />} onClick={load} loading={loading}>刷新</Button>} />
 
       <LoadErrorBanner error={loadError} onRetry={load} />
 
       <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
+        <StatCard label="周期" value="过去 7 天" color={C.cyan} />
         <StatCard label="总 Token" value={fmtTokens(total)} color={C.violet} />
-        <StatCard label="总请求" value={fmtInt(reqs)} color={C.blue} />
+        <StatCard label="请求数" value={fmtInt(reqs)} color={C.blue} />
         <StatCard label="使用模型" value={fmtInt(usage.length)} color={C.green} />
       </div>
 
@@ -70,7 +71,7 @@ export default function PortalDashboard() {
       </div>
 
       <div className="pool-grid cols-2">
-        <div className="pool-chart-card"><div className="head"><div className="t">模型占比</div></div><DonutChart data={modelDonut} /></div>
+        <div className="pool-chart-card"><div className="head"><div className="t">模型占比</div></div><DonutChart data={modelDonut} valueFormatter={(value) => `${fmtTokens(value)} tokens`} /></div>
         <Panel title="按模型用量">
           <ResourceTable
             loading={loading}

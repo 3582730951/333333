@@ -351,10 +351,7 @@ export default function App() {
     >
       {/* Mobile overlay */}
       {mobileOpen && (
-        <div style={{
-          position: 'fixed', inset: 0, background: 'var(--pool-bg-overlay)', zIndex: 999,
-          backdropFilter: 'blur(4px)', transition: 'opacity 0.3s ease'
-        }} onClick={() => setMobileOpen(false)} />
+        <div className="pool-shell-drawer-overlay" onClick={() => setMobileOpen(false)} />
       )}
       <Sider
         style={{
@@ -368,10 +365,11 @@ export default function App() {
           position: 'fixed',
           height: '100vh',
           zIndex: 1000,
-          transition: responsive.isMobile ? 'transform 0.3s ease' : 'none',
+          transition: responsive.isMobile ? 'transform var(--pool-motion-normal) var(--pool-motion-ease)' : 'width var(--pool-motion-normal) var(--pool-motion-ease)',
           transform: responsive.isMobile ? (mobileOpen ? 'translateX(0)' : 'translateX(-100%)') : undefined,
         }}
         className={[
+          'pool-shell-sider',
           responsive.isMobile && !mobileOpen ? 'sider-collapsed-mobile' : '',
           navCollapsed ? 'pool-sider-collapsed' : 'pool-sider-expanded',
         ].filter(Boolean).join(' ')}
@@ -414,41 +412,29 @@ export default function App() {
         ) : null}
       </Sider>
       <Layout className="pool-main-layout" style={{ marginLeft: contentOffsetPx, transition: 'none' }}>
-        <Header style={{
-          background: 'var(--pool-bg-surface)',
-          borderBottom: '1px solid var(--pool-border)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          padding: '0 20px',
-          height: 56,
-          position: 'sticky',
-          top: 0,
-          zIndex: 100,
-          gap: 16
-        }}>
+        <Header className="pool-shell-header">
           {/* Mobile menu toggle */}
-          <div className="pool-topbar-left" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div className="pool-topbar-left">
             <Button
               theme="borderless"
               icon={<IconList />}
               onClick={() => setMobileOpen(!mobileOpen)}
-              className="mobile-menu-btn"
+              className="pool-mobile-menu-btn"
               style={{ display: responsive.isMobile ? 'flex' : 'none' }}
               aria-label="切换菜单"
             />
-            <div className="pool-topbar-title" style={{ fontWeight: 600, color: 'var(--pool-text)', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="pool-topbar-title">
               <span className="pool-topbar-title-main">{isAdmin ? t('app.admin') : t('app.portal')}</span>
               {pageLabel ? (
                 <>
-                  <span className="pool-topbar-divider" style={{ color: 'var(--pool-text-3)' }}>·</span>
-                  <span className="pool-topbar-current" style={{ color: 'var(--pool-text-2)', fontWeight: 400 }}>{pageLabel}</span>
+                  <span className="pool-topbar-divider">·</span>
+                  <span className="pool-topbar-current">{pageLabel}</span>
                 </>
               ) : null}
             </div>
           </div>
-          <div className="pool-topbar-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <span className="pool-topbar-tooltip" data-tooltip={locale === 'en' ? '切换到中文' : 'Switch to English'}>
+          <div className="pool-topbar-actions">
+            <span className="pool-topbar-tooltip pool-desktop-only" data-tooltip={locale === 'en' ? '切换到中文' : 'Switch to English'}>
               <Button
                 className="pool-topbar-icon-button"
                 theme="borderless"
@@ -458,7 +444,7 @@ export default function App() {
                 title={locale === 'en' ? '切换到中文' : 'Switch to English'}
               />
             </span>
-            <span className="pool-topbar-tooltip" data-tooltip={dark ? '切换浅色模式' : '切换深色模式'}>
+            <span className="pool-topbar-tooltip pool-desktop-only" data-tooltip={dark ? '切换浅色模式' : '切换深色模式'}>
               <Button
                 className="pool-topbar-icon-button"
                 theme="borderless"
@@ -487,6 +473,33 @@ export default function App() {
                     <span>{ident}</span>
                     <small>{isAdmin ? '管理员' : '用户'}</small>
                   </div>
+                  <div className="pool-account-menu-divider" />
+                  <button
+                    type="button"
+                    className="pool-account-menu-item"
+                    role="menuitem"
+                    onClick={() => {
+                      const l = locale === 'en' ? 'zh' : 'en';
+                      setLocale(l);
+                      setLocaleState(l);
+                      setAccountMenuOpen(false);
+                    }}
+                  >
+                    <IconLanguage />
+                    <span>{locale === 'en' ? '切换到中文' : 'Switch to English'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="pool-account-menu-item"
+                    role="menuitem"
+                    onClick={() => {
+                      setDark((d) => !d);
+                      setAccountMenuOpen(false);
+                    }}
+                  >
+                    {dark ? <IconSun /> : <IconMoon />}
+                    <span>{dark ? '浅色模式' : '深色模式'}</span>
+                  </button>
                   <div className="pool-account-menu-divider" />
                   <button
                     type="button"

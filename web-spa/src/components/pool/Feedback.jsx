@@ -36,36 +36,54 @@ export function ToastViewport() {
       setItems((value) => [...value, item].slice(-5));
       window.setTimeout(() => {
         setItems((value) => value.filter((entry) => entry.id !== item.id));
-      }, 4200);
+      }, Number(item.duration) ? Number(item.duration) * 1000 : 4200);
     };
     window.addEventListener(TOAST_EVENT, onToast);
     return () => window.removeEventListener(TOAST_EVENT, onToast);
   }, []);
+  const close = (id) => setItems((value) => value.filter((entry) => entry.id !== id));
+  const iconFor = (type) => {
+    if (type === 'success') return '✓';
+    if (type === 'error') return '!';
+    if (type === 'warning') return '!';
+    return 'i';
+  };
   return (
-    <div className="pool-toast-viewport" aria-live="polite" aria-relevant="additions">
+    <div className="pool-toast-viewport" aria-relevant="additions">
       {items.map((item) => (
-        <div key={item.id} className={cx('pool-toast', `pool-toast--${item.type}`)}>
-          {item.title ? <strong>{item.title}</strong> : null}
-          <div className="pool-toast-text">{item.content}</div>
+        <div
+          key={item.id}
+          className={cx('pool-toast', `pool-toast--${item.type}`)}
+          role={item.type === 'error' ? 'alert' : 'status'}
+          aria-live={item.type === 'error' ? 'assertive' : 'polite'}
+        >
+          <span className="pool-toast__icon" aria-hidden="true">{iconFor(item.type)}</span>
+          <div className="pool-toast__body">
+            {item.title ? <strong className="pool-toast__title">{item.title}</strong> : null}
+            <div className="pool-toast-text">{item.content}</div>
+          </div>
+          <Button className="pool-toast__close" theme="borderless" aria-label="关闭通知" onClick={() => close(item.id)}>×</Button>
         </div>
       ))}
     </div>
   );
 }
 
-export function Spin({ size }) {
-  return <span className={cx('pool-spinner', size === 'large' ? 'pool-spinner--large' : '')} role="status" aria-label="loading" />;
+export function Spin({ size, className, spinning, ...props }) {
+  return <span className={cx('pool-spinner', size === 'large' ? 'pool-spinner--large' : '', className)} role="status" aria-label="正在加载" {...props} />;
 }
 
-export function Banner({ type = 'info', title, description, children, closeIcon, className, ...props }) {
+export function Banner({ type = 'info', title, description, children, closeIcon, actions, onClose, className, ...props }) {
   return (
     <div className={cx('pool-banner', type ? `pool-banner--${type}` : '', className)} role={type === 'danger' ? 'alert' : 'status'} {...props}>
       <div>
         {title ? <div className="pool-text-strong">{title}</div> : null}
         {description ? <div className="pool-text-secondary">{description}</div> : null}
         {children}
+        {actions?.length ? <div className="pool-banner__actions">{actions}</div> : null}
       </div>
       {closeIcon}
+      {onClose ? <Button theme="borderless" aria-label="关闭提示" onClick={onClose}>×</Button> : null}
     </div>
   );
 }

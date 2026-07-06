@@ -16,6 +16,7 @@ const C = COLORS;
 const kindColor = { node: 'green', chrome: 'blue', xvfb: 'violet', other: 'grey' };
 const eventColor = { panic: 'red', panic_restart: 'red', failed: 'red', unexpected_exit: 'amber', event: 'blue' };
 const moduleColor = { running: 'green', restarting: 'amber', panic: 'red', failed: 'red', stopped: 'grey' };
+const moduleLabel = { running: '运行中', restarting: '重启中', panic: '异常', failed: '失败', stopped: '已停止' };
 const meterColor = (p) => (p >= 90 ? C.red : p >= 70 ? C.amber : C.green);
 const fmtMillis = (ms) => (ms ? fmtDuration(Math.ceil(Number(ms) / 1000)) : '—');
 const fmtModuleRuntime = (_, row) => fmtMillis(row.status === 'running' ? row.uptime_millis : (row.last_uptime_millis || row.uptime_millis));
@@ -51,24 +52,24 @@ export default function System() {
     { title: 'PID', dataIndex: 'pid', width: 90, render: (v) => <span className="pool-mono">{v}</span> },
     { title: '进程', dataIndex: 'comm' },
     { title: '类型', dataIndex: 'kind', width: 100, render: (k) => <Tag color={kindColor[k] || 'grey'}>{k}</Tag> },
-    { title: '内存 (RSS)', dataIndex: 'rss_kb', width: 140, sorter: (a, b) => a.rss_kb - b.rss_kb, defaultSortOrder: 'descend', render: (v) => fmtKB(v) },
+    { title: '内存 (RSS)', dataIndex: 'rss_kb', width: 140, align: 'right', sorter: (a, b) => a.rss_kb - b.rss_kb, defaultSortOrder: 'descend', render: (v) => fmtKB(v) },
   ];
   const eventCols = [
     { title: '时间', dataIndex: 'time_unix', width: 140, render: fmtDateTime },
     { title: '模块', dataIndex: 'module', width: 180, render: (v) => <span className="pool-mono">{v}</span> },
     { title: '类型', dataIndex: 'type', width: 130, render: (v) => <Tag color={eventColor[v] || 'grey'}>{v || 'event'}</Tag> },
     { title: '说明', dataIndex: 'message', render: (v, row) => row.panic ? `${v || 'panic'}: ${row.panic}` : (v || '—') },
-    { title: '运行时长', dataIndex: 'uptime_millis', width: 110, render: fmtMillis },
-    { title: '重试等待', dataIndex: 'backoff_millis', width: 110, render: fmtMillis },
+    { title: '运行时长', dataIndex: 'uptime_millis', width: 110, align: 'right', render: fmtMillis },
+    { title: '重试等待', dataIndex: 'backoff_millis', width: 110, align: 'right', render: fmtMillis },
   ];
   const moduleCols = [
     { title: '模块', dataIndex: 'name', width: 190, render: (v) => <span className="pool-mono">{v}</span> },
-    { title: '状态', dataIndex: 'status', width: 110, render: (v) => <Tag color={moduleColor[v] || 'grey'}>{v || 'unknown'}</Tag> },
-    { title: '重启', dataIndex: 'restart_count', width: 90, sorter: (a, b) => (a.restart_count || 0) - (b.restart_count || 0), render: fmtInt },
-    { title: 'panic', dataIndex: 'panic_count', width: 90, sorter: (a, b) => (a.panic_count || 0) - (b.panic_count || 0), render: fmtInt },
-    { title: '异常退出', dataIndex: 'unexpected_exit_count', width: 110, sorter: (a, b) => (a.unexpected_exit_count || 0) - (b.unexpected_exit_count || 0), render: fmtInt },
-    { title: '运行/上次', dataIndex: 'uptime_millis', width: 110, render: fmtModuleRuntime },
-    { title: '重试等待', dataIndex: 'restart_backoff_millis', width: 110, render: fmtMillis },
+    { title: '状态', dataIndex: 'status', width: 110, render: (v) => <Tag color={moduleColor[v] || 'grey'}>{moduleLabel[v] || v || '未知'}</Tag> },
+    { title: '重启', dataIndex: 'restart_count', width: 90, align: 'right', sorter: (a, b) => (a.restart_count || 0) - (b.restart_count || 0), render: fmtInt },
+    { title: 'panic', dataIndex: 'panic_count', width: 90, align: 'right', sorter: (a, b) => (a.panic_count || 0) - (b.panic_count || 0), render: fmtInt },
+    { title: '异常退出', dataIndex: 'unexpected_exit_count', width: 110, align: 'right', sorter: (a, b) => (a.unexpected_exit_count || 0) - (b.unexpected_exit_count || 0), render: fmtInt },
+    { title: '运行/上次', dataIndex: 'uptime_millis', width: 110, align: 'right', render: fmtModuleRuntime },
+    { title: '重试等待', dataIndex: 'restart_backoff_millis', width: 110, align: 'right', render: fmtMillis },
     { title: '下次重试', dataIndex: 'next_restart_unix', width: 140, render: fmtDateTime },
     { title: '最近状态', dataIndex: 'last_message', render: (v, row) => row.last_panic ? `${v || 'panic'}: ${row.last_panic}` : (v || '—') },
   ];

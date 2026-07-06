@@ -570,8 +570,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	path := r.URL.Path
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,
+		Provider:        "codex",
 		Affinity:        affinity,
 		Strict:          strict,
+		ServerSideState: !movable,
+		Movable:         movable,
 		Model:           model,
 		EstimatedTokens: virtual.EstimateTokensJSON(raw),
 		Exclude:         exclude,

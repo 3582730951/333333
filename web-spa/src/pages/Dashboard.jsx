@@ -149,16 +149,20 @@ export default function Dashboard() {
   const modelTokenDonut = (d.byModel || []).slice(0, 6).map((m) => ({ name: m.model_label || m.model || '(未知)', value: m.total_tokens || 0, color: modelColor(m.model_key || m.model) }));
   const modelTokenFormatter = (n) => {
     n = Number(n) || 0;
-    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B tok`;
-    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M tok`;
-    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K tok`;
-    return `${n} tok`;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B Token`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M Token`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k Token`;
+    return `${n} Token`;
   };
   const sys = d.sys;
+  const hasStatusDistribution = statusDonut.some((item) => item.value > 0);
+  const hasProviderDistribution = providerDonut.some((item) => item.value > 0);
+  const hasRegistrationTrend = regByDay.some((item) => item.成功 || item.失败);
+  const hasModelTokens = modelTokenDonut.some((item) => item.value > 0);
 
   return (
     <div>
-      <PageHeader title="总览" subtitle="账号池、用量与系统资源实时概览"
+      <PageHeader title="总览" subtitle="服务状态、需要关注的问题与过去 24 小时用量。"
         actions={<>
           {d.health?.ok ? <Tag color="green">服务正常</Tag> : <Tag color="red">服务异常</Tag>}
           <Button icon={<IconRefresh />} onClick={load} loading={loading}>刷新</Button>
@@ -191,10 +195,23 @@ export default function Dashboard() {
         <div className="pool-dashboard-command__side">
           <div className="pool-section-title">需要关注</div>
           <div className="pool-attention-list">
-            <div><span>隔离账号</span><b className={quarantined ? 'pool-danger-text' : ''}>{fmtInt(quarantined)}</b></div>
-            <div><span>待复测</span><b className={recheck ? 'pool-danger-text' : ''}>{fmtInt(recheck)}</b></div>
-            <div><span>冷却中</span><b>{fmtInt(cooling)}</b></div>
-            <div><span>模型覆盖</span><b>{fmtInt((d.byModel || []).length)}</b></div>
+            <div>
+              <span>隔离账号</span><b className={quarantined ? 'pool-danger-text' : ''}>{fmtInt(quarantined)}</b>
+              <p>{quarantined ? '有账号被暂停调度，建议查看原因并复测。' : '暂无需要解隔离的账号。'}</p>
+              {quarantined ? <Button size="small" theme="borderless" onClick={() => navigate('/accounts')}>查看账号</Button> : null}
+            </div>
+            <div>
+              <span>待复测</span><b className={recheck ? 'pool-danger-text' : ''}>{fmtInt(recheck)}</b>
+              <p>{recheck ? '出口或健康状态变化后等待重新验证。' : '暂无待复测项目。'}</p>
+            </div>
+            <div>
+              <span>冷却中</span><b>{fmtInt(cooling)}</b>
+              <p>{cooling ? '这些账号临时退避，冷却结束后会恢复调度。' : '没有账号处于冷却。'}</p>
+            </div>
+            <div>
+              <span>模型覆盖</span><b>{fmtInt((d.byModel || []).length)}</b>
+              <p>过去窗口内出现的模型数量。</p>
+            </div>
           </div>
         </div>
       </section>
@@ -229,9 +246,7 @@ export default function Dashboard() {
       <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
         <StatCard label="账号总数" value={fmtInt(accountSummary.total)} color={C.blue} sub={`Codex ${codex} · Claude ${claude}`} />
         <StatCard label="活跃账号" value={fmtInt(active)} color={C.green} sub="可立即调度" />
-        <StatCard label="冷却中" value={fmtInt(cooling)} color={C.cyan} sub="临时退避" />
-        <StatCard label="隔离 / 待复测" value={`${quarantined} / ${recheck}`} color={C.amber} sub="quarantine / recheck" />
-        <StatCard label="24h Token" value={fmtTokens(tokens)} color={C.violet} sub={`${fmtInt(reqs)} 次请求`} />
+        <StatCard label="24h 请求" value={fmtInt(reqs)} color={C.blue} sub={`${fmtTokens(tokens)} Token`} />
         <StatCard label="注册成功率" value={d.reg ? Math.round((d.reg.totals?.success_rate || 0) * 100) + '%' : '—'} color={C.green}
           sub={d.reg ? `${d.reg.totals?.succeeded || 0} 成功 / ${d.reg.totals?.failed || 0} 失败` : ''} />
       </div>
@@ -241,27 +256,35 @@ export default function Dashboard() {
         <div style={{ height: 280 }}><UsageAreaChart buckets={d.ts} height={280} /></div>
       </div>
 
-      <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
-        <div className="pool-chart-card"><div className="head"><div className="t">账号状态分布</div></div><DonutChart data={statusDonut} unit=" 个" /></div>
-        <div className="pool-chart-card"><div className="head"><div className="t">平台分布</div></div><DonutChart data={providerDonut} unit=" 个" /></div>
-        <div className="pool-chart-card"><div className="head"><div className="t">注册成功 / 失败（近 14 天）</div></div>
-          <GroupedBar data={regByDay} series={[{ key: '成功', color: C.green }, { key: '失败', color: C.red }]} stacked />
+      {(hasStatusDistribution || hasProviderDistribution || hasRegistrationTrend) ? (
+        <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
+          {hasStatusDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">账号状态分布</div></div><DonutChart data={statusDonut} unit=" 个" /></div> : null}
+          {hasProviderDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">平台分布</div></div><DonutChart data={providerDonut} unit=" 个" /></div> : null}
+          {hasRegistrationTrend ? (
+            <div className="pool-chart-card"><div className="head"><div className="t">注册成功 / 失败（近 14 天）</div></div>
+              <GroupedBar data={regByDay} series={[{ key: '成功', color: C.green }, { key: '失败', color: C.red }]} stacked />
+            </div>
+          ) : null}
         </div>
-      </div>
+      ) : null}
 
-      <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
-        <div className="pool-chart-card">
-          <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">cache read / cache input，重置后重新累计</div></div></div>
-          <div style={{ paddingTop: 6 }}><CacheRateBars data={cacheByModel} /></div>
+      {(cacheByModel.length || hasModelTokens) ? (
+        <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
+          {cacheByModel.length ? (
+            <div className="pool-chart-card">
+              <div className="head"><div><div className="t">模型缓存命中率</div><div className="s">读命中 / 可缓存输入，重置后重新累计。</div></div></div>
+              <div style={{ paddingTop: 6 }}><CacheRateBars data={cacheByModel} /></div>
+            </div>
+          ) : null}
+          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">模型 Token 占比</div></div><DonutChart data={modelTokenDonut} valueFormatter={modelTokenFormatter} /></div> : null}
         </div>
-        <div className="pool-chart-card"><div className="head"><div className="t">模型 Token 占比</div></div><DonutChart data={modelTokenDonut} valueFormatter={modelTokenFormatter} /></div>
-      </div>
+      ) : null}
 
       {sys?.supported && (
         <SystemHealthSummary
           system={sys}
           variant="compact"
-          action={<Button size="small" onClick={() => navigate('/system')}>系统监控</Button>}
+          action={<Button size="small" onClick={() => navigate('/system')}>查看系统监控</Button>}
         />
       )}
     </div>
