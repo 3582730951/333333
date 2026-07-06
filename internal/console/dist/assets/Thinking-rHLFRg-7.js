@@ -1,0 +1,1 @@
+import{j as t}from"./vendor-react-Yo7RVi3I.js";import{C as i}from"./ConfigForm-CyT1wZiZ.js";import"./index-DalOEAEi.js";import"./vendor-axios-DhXgJQ-f.js";import"./PageHeader-BnGbUqfz.js";import"./useAsyncAction-DCZmbx76.js";import"./useAsyncResource-rNVs-yuP.js";function u(){return t.jsx(i,{title:"思考 / 推理配置",subtitle:"思考模式与推理预算",url:"/admin/thinking"})}export{u as default};

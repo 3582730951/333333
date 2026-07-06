@@ -269,6 +269,7 @@ type Config struct {
 	// ClaudeCacheBreakpointPolicy controls injected Claude cache_control placement.
 	// "legacy" preserves the old full injection behavior; "balanced" keeps full
 	// breakpoints for true/stable routes and uses coarse_safe for coarse routes;
+	// "stable_prefix_safe" prefers stable prefixes without filling volatile tails;
 	// "coarse_safe" only marks stable tools and non-billing system prefixes.
 	ClaudeCacheBreakpointPolicy string `json:"claude_cache_breakpoint_policy"`
 	// ClaudeCacheOptimizationRollout is a JSON scope for Claude cache optimization
@@ -658,7 +659,7 @@ func Default() Config {
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
 		ClaudeCacheAffinityPolicy:         "balanced",
-		ClaudeCacheBreakpointPolicy:       "aggressive",
+		ClaudeCacheBreakpointPolicy:       "stable_prefix_safe",
 		ClaudeCacheOptimizationRollout:    "{}",
 		ClaudeNativeCacheBreakpointInject: true,
 		ClaudeCacheTTL:                    "1h",

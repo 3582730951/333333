@@ -198,15 +198,33 @@ func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []by
 	if json.Unmarshal(body, &root) != nil {
 		return body
 	}
+	changed := false
+	if anthropicwire.SanitizeVolatileCacheControls(root) {
+		changed = true
+	}
+	if anthropicwire.NormalizeCacheControlTTLForPolicy(root, ttl) {
+		changed = true
+	}
+	finish := func() []byte {
+		if anthropicwire.CapCacheControlBreakpoints(root, 4) {
+			changed = true
+		}
+		if anthropicwire.NormalizeCacheControlTTLForPolicy(root, ttl) {
+			changed = true
+		}
+		if !changed {
+			return body
+		}
+		out, err := json.Marshal(root)
+		if err != nil {
+			return body
+		}
+		return out
+	}
 	existing := countCacheControl(root["system"]) + countCacheControl(root["tools"]) + countCacheControlMessages(root["messages"])
 	budget := 4 - existing
 	if budget <= 0 {
-		if anthropicwire.NormalizeCacheControlTTL(root) {
-			if out, err := json.Marshal(root); err == nil {
-				return out
-			}
-		}
-		return body
+		return finish()
 	}
 	mk := func() map[string]interface{} {
 		m := map[string]interface{}{"type": "ephemeral"}
@@ -215,7 +233,6 @@ func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []by
 		}
 		return m
 	}
-	changed := false
 
 	// 1) End of the tool definition prefix. Tool schemas are stable across turns
 	// and should be preferred over marking volatile last-user content.
@@ -235,20 +252,7 @@ func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []by
 		}
 	}
 	if normalizeAnthropicCachePolicy(policy) == "coarse_safe" {
-		if !changed {
-			if anthropicwire.NormalizeCacheControlTTL(root) {
-				if out, err := json.Marshal(root); err == nil {
-					return out
-				}
-			}
-			return body
-		}
-		anthropicwire.NormalizeCacheControlTTL(root)
-		out, err := json.Marshal(root)
-		if err != nil {
-			return body
-		}
-		return out
+		return finish()
 	}
 	// 3) Claude Code native auto-context block: this is the stable prefix before
 	// the real user request in current Claude Code request shapes.
@@ -266,36 +270,24 @@ func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []by
 			changed = true
 		}
 	}
-	if !changed {
-		if anthropicwire.NormalizeCacheControlTTL(root) {
-			if out, err := json.Marshal(root); err == nil {
-				return out
-			}
-		}
-		return body
-	}
-	anthropicwire.NormalizeCacheControlTTL(root)
-	out, err := json.Marshal(root)
-	if err != nil {
-		return body
-	}
-	return out
+	return finish()
 }
 
 func normalizeAnthropicCachePolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
-	case "coarse_safe":
-		return "coarse_safe"
-	case "aggressive":
-		return "aggressive"
+	case "coarse_safe", "stable_prefix_safe", "aggressive":
+		return strings.ToLower(strings.TrimSpace(policy))
 	default:
 		return "balanced"
 	}
 }
 
 type AnthropicCacheControlDiagnostics struct {
-	BreakpointCount        int
-	LatestUserCacheControl bool
+	BreakpointCount                   int
+	LatestUserCacheControl            bool
+	LatestUserAutoContextCacheControl bool
+	LatestUserTailCacheControl        bool
+	LatestUserToolResultCacheControl  bool
 }
 
 func InspectAnthropicCacheControl(body []byte) AnthropicCacheControlDiagnostics {
@@ -303,10 +295,9 @@ func InspectAnthropicCacheControl(body []byte) AnthropicCacheControlDiagnostics 
 	if json.Unmarshal(body, &root) != nil {
 		return AnthropicCacheControlDiagnostics{}
 	}
-	return AnthropicCacheControlDiagnostics{
-		BreakpointCount:        countCacheControl(root["system"]) + countCacheControl(root["tools"]) + countCacheControlMessages(root["messages"]),
-		LatestUserCacheControl: latestUserCacheControl(root["messages"]),
-	}
+	latest := latestUserCacheControlDetails(root["messages"])
+	latest.BreakpointCount = countCacheControl(root["system"]) + countCacheControl(root["tools"]) + countCacheControlMessages(root["messages"])
+	return latest
 }
 
 func countCacheControl(system interface{}) int {
@@ -347,6 +338,9 @@ func countCacheControlMessages(messages interface{}) int {
 		if !ok {
 			continue
 		}
+		if _, has := m["cache_control"]; has {
+			n++
+		}
 		if blocks, ok := m["content"].([]interface{}); ok {
 			for _, b := range blocks {
 				if bm, ok := b.(map[string]interface{}); ok {
@@ -360,32 +354,48 @@ func countCacheControlMessages(messages interface{}) int {
 	return n
 }
 
-func latestUserCacheControl(messages interface{}) bool {
+func latestUserCacheControlDetails(messages interface{}) AnthropicCacheControlDiagnostics {
+	diag := AnthropicCacheControlDiagnostics{}
 	msgs, ok := messages.([]interface{})
 	if !ok {
-		return false
+		return diag
 	}
 	for i := len(msgs) - 1; i >= 0; i-- {
 		msg, ok := msgs[i].(map[string]interface{})
 		if !ok || msg["role"] != "user" {
 			continue
 		}
+		if _, has := msg["cache_control"]; has {
+			diag.LatestUserTailCacheControl = true
+		}
 		switch c := msg["content"].(type) {
 		case []interface{}:
-			for _, b := range c {
+			for idx, b := range c {
 				if bm, ok := b.(map[string]interface{}); ok {
 					if _, has := bm["cache_control"]; has {
-						return true
+						if idx == 0 && len(c) >= 2 && anthropicwire.IsClaudeCodeAutoContextBlock(c[0], c[1]) {
+							diag.LatestUserAutoContextCacheControl = true
+						} else if typ, _ := bm["type"].(string); typ == "tool_result" {
+							diag.LatestUserToolResultCacheControl = true
+						} else {
+							diag.LatestUserTailCacheControl = true
+						}
 					}
 				}
 			}
 		case map[string]interface{}:
-			_, has := c["cache_control"]
-			return has
+			if _, has := c["cache_control"]; has {
+				if typ, _ := c["type"].(string); typ == "tool_result" {
+					diag.LatestUserToolResultCacheControl = true
+				} else {
+					diag.LatestUserTailCacheControl = true
+				}
+			}
 		}
-		return false
+		diag.LatestUserCacheControl = diag.LatestUserTailCacheControl || diag.LatestUserToolResultCacheControl
+		return diag
 	}
-	return false
+	return diag
 }
 
 // markSystemTail puts a cache_control breakpoint at the end of the system prompt,
@@ -457,23 +467,7 @@ func markClaudeNativeAutoContext(messages interface{}, mk func() map[string]inte
 	if _, has := auto["cache_control"]; has {
 		return false
 	}
-	if typ, _ := auto["type"].(string); typ != "" && typ != "text" {
-		return false
-	}
-	text, _ := auto["text"].(string)
-	if !strings.HasPrefix(strings.TrimSpace(text), "<system-reminder>") ||
-		!strings.Contains(text, "As you answer the user's questions, you can use the following context:") {
-		return false
-	}
-	next, ok := blocks[1].(map[string]interface{})
-	if !ok {
-		return false
-	}
-	if typ, _ := next["type"].(string); typ != "" && typ != "text" {
-		return false
-	}
-	nextText, _ := next["text"].(string)
-	if strings.TrimSpace(nextText) == "" || strings.HasPrefix(strings.TrimSpace(nextText), "<system-reminder>") {
+	if !anthropicwire.IsClaudeCodeAutoContextBlock(blocks[0], blocks[1]) {
 		return false
 	}
 	auto["cache_control"] = mk()

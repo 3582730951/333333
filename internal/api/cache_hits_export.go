@@ -145,7 +145,7 @@ func cacheReportHasRows(report storage.CacheUsageReport) bool {
 }
 
 func cacheMetricHeader(prefix ...string) []string {
-	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate")
+	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_creation_5m_share", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate")
 }
 
 func cacheSummaryRows(row storage.CacheUsageMetricRow, win adminUsageWindow, hasData bool) [][]string {
@@ -173,7 +173,7 @@ func cacheMetricRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCode
 }
 
 func cacheRouteHeader(withAccountModel bool) []string {
-	prefix := []string{"route_code", "route_class", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "single_use_route", "risk_flags", "route_epoch"}
+	prefix := []string{"route_code", "route_class", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "single_use_route", "risk_flags", "route_epoch"}
 	if withAccountModel {
 		prefix = append([]string{"account_code", "model"}, prefix...)
 	}
@@ -198,6 +198,9 @@ func cacheRouteRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCodeb
 			itoa64(row.CacheControlInjected),
 			itoa64(row.CacheBreakpointCount),
 			itoa64(row.LatestUserCacheControl),
+			itoa64(row.LatestUserAutoContextCacheControl),
+			itoa64(row.LatestUserTailCacheControl),
+			itoa64(row.LatestUserToolResultCacheControl),
 			strconv.FormatBool(row.SingleUseRoute),
 			strings.Join(row.RiskFlags, "|"),
 			itoa64(row.RouteEpoch),
@@ -224,6 +227,7 @@ func cacheMetricFields(row storage.CacheUsageMetricRow) []string {
 		itoa64(row.CacheCreationTokens),
 		itoa64(row.CacheCreation5mTokens),
 		itoa64(row.CacheCreation1hTokens),
+		floatString(row.CacheCreation5mShare),
 		floatString(row.TokenHitRate),
 		floatString(row.CacheWriteShare),
 		floatString(row.EligibleHitRate),

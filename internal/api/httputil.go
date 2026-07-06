@@ -330,12 +330,15 @@ func codexRetentionDiagnosticsForTransport(diag storage.UsageDiagnostics, respon
 func claudeRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, ttl string, injected bool) storage.UsageDiagnostics {
 	cacheDiag := prompt.InspectAnthropicCacheControl(body)
 	return storage.UsageDiagnostics{
-		UsageProvider:          "claude",
-		AffinitySource:         affinity.Source,
-		ClaudeCacheTTL:         ttl,
-		CacheControlInjected:   injected && cacheDiag.BreakpointCount > 0,
-		CacheBreakpointCount:   cacheDiag.BreakpointCount,
-		LatestUserCacheControl: cacheDiag.LatestUserCacheControl,
+		UsageProvider:                     "claude",
+		AffinitySource:                    affinity.Source,
+		ClaudeCacheTTL:                    ttl,
+		CacheControlInjected:              injected && cacheDiag.BreakpointCount > 0,
+		CacheBreakpointCount:              cacheDiag.BreakpointCount,
+		LatestUserCacheControl:            cacheDiag.LatestUserCacheControl,
+		LatestUserAutoContextCacheControl: cacheDiag.LatestUserAutoContextCacheControl,
+		LatestUserTailCacheControl:        cacheDiag.LatestUserTailCacheControl,
+		LatestUserToolResultCacheControl:  cacheDiag.LatestUserToolResultCacheControl,
 	}
 }
 

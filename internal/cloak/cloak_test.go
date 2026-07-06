@@ -156,13 +156,23 @@ func TestVirtualizeClaudeCodeWithCacheMarksAutoContextPrefix(t *testing.T) {
 	if cc["ttl"] != "1h" {
 		t.Fatalf("native cache ttl not applied: %v", cc)
 	}
-	if got := countClaudeCacheControls(root); got != 4 {
-		t.Fatalf("cache_control count = %d, want 4", got)
+	if _, has := blocks[1].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("real latest user request marker should be stripped: %v", blocks[1])
+	}
+	sys := root["system"].([]interface{})
+	for _, idx := range []int{1, 2} {
+		cc, ok := sys[idx].(map[string]interface{})["cache_control"].(map[string]interface{})
+		if !ok || cc["ttl"] != "1h" {
+			t.Fatalf("system marker %d should be upgraded to 1h: %v", idx, sys[idx])
+		}
+	}
+	if got := countClaudeCacheControls(root); got != 3 {
+		t.Fatalf("cache_control count = %d, want identity+system+auto-context", got)
 	}
 	if text := blocks[1].(map[string]interface{})["text"]; text != "real user request" {
 		t.Fatalf("real user text changed: %v", text)
 	}
-	if _, has := root["system"].([]interface{})[0].(map[string]interface{})["cache_control"]; has {
+	if _, has := sys[0].(map[string]interface{})["cache_control"]; has {
 		t.Fatalf("billing block must not carry cache_control")
 	}
 }
@@ -188,8 +198,8 @@ func TestVirtualizeClaudeCodeWithCacheCoarseSafeDoesNotMarkAutoContextPrefix(t *
 	if _, has := blocks[0].(map[string]interface{})["cache_control"]; has {
 		t.Fatalf("coarse_safe must not mark auto-context user block: %v", blocks[0])
 	}
-	if got := countClaudeCacheControls(root); got != 3 {
-		t.Fatalf("coarse_safe cache_control count = %d, want existing 3", got)
+	if got := countClaudeCacheControls(root); got != 2 {
+		t.Fatalf("coarse_safe cache_control count = %d, want stable system markers only", got)
 	}
 }
 

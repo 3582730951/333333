@@ -110,8 +110,10 @@ func configFields() []configField {
 			Options: []string{"legacy", "balanced"},
 			Help:    "legacy=旧路由；balanced=优先 Claude session 与稳定前缀，减少粗路由缓存写入。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeCacheAffinityPolicy, "balanced") }},
 		{Key: "claude_cache_breakpoint_policy", Label: "Claude 缓存断点策略", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
-			Options: []string{"legacy", "aggressive", "balanced", "coarse_safe"},
-			Help:    "legacy=旧注入；aggressive=质量不变前提下尽量写入缓存；balanced=粗路由自动降级；coarse_safe=仅标记 tools 与非 billing system。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeCacheBreakpointPolicy, "aggressive") }},
+			Options: []string{"legacy", "stable_prefix_safe", "aggressive", "balanced", "coarse_safe"},
+			Help:    "stable_prefix_safe=优先稳定前缀并清理最新真实请求标记；aggressive=尽量补满稳定断点；coarse_safe=仅标记 tools 与非 billing system。", boot: func(c config.Config) interface{} {
+				return firstNonEmpty(c.ClaudeCacheBreakpointPolicy, "stable_prefix_safe")
+			}},
 		{Key: "claude_cache_optimization_rollout", Label: "Claude 缓存灰度 JSON", Category: catBehavior, Type: fieldString, Effect: effectHot,
 			Help: "JSON 灰度范围：groups/api_key_hash_prefixes/percent，断点还支持 account_ids。{}=全量；不支持按具体 Claude 模型灰度。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.ClaudeCacheOptimizationRollout, "{}") }},
 		{Key: "claude_native_cache_breakpoint_inject", Label: "Claude 原生缓存断点", Category: catBehavior, Type: fieldBool, Effect: effectHot,

@@ -259,6 +259,7 @@ export default function Usage() {
     { title: '前缀字节', dataIndex: 'stable_prefix_bytes', width: 110, sorter: (a, b) => (a.stable_prefix_bytes || 0) - (b.stable_prefix_bytes || 0), render: fmtInt },
     { title: 'Retention', dataIndex: 'retention_effective', width: 140, render: (v, r) => `${textOrDash(v)} / ${textOrDash(r.retention_source)}` },
     { title: 'Claude TTL', dataIndex: 'claude_cache_ttl', width: 110, render: textOrDash },
+    { title: '5m 写占比', dataIndex: 'cache_creation_5m_share', width: 110, render: fmtPct },
     { title: '请求', dataIndex: 'requests', width: 90, sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: '请求命中', dataIndex: 'request_hit_rate', width: 110, render: fmtPct },
     { title: 'Token 命中', dataIndex: 'real_token_hit_rate', width: 120, sorter: (a, b) => (a.real_token_hit_rate || 0) - (b.real_token_hit_rate || 0), render: fmtPct },
@@ -267,7 +268,10 @@ export default function Usage() {
     { title: '写缓存', dataIndex: 'cache_creation_tokens', width: 120, sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
     { title: '未命中', dataIndex: 'cache_miss_tokens', width: 120, sorter: (a, b) => (a.cache_miss_tokens || 0) - (b.cache_miss_tokens || 0), render: fmtTokens },
     { title: '断点', dataIndex: 'cache_breakpoint_count', width: 90, sorter: (a, b) => (a.cache_breakpoint_count || 0) - (b.cache_breakpoint_count || 0), render: fmtInt },
-    { title: '最新 User 标记', dataIndex: 'latest_user_cache_control', width: 130, render: (v) => (v ? '是' : '否') },
+    { title: '最新 User 风险', dataIndex: 'latest_user_cache_control', width: 130, render: (v) => (v ? '是' : '否') },
+    { title: 'Auto 上下文', dataIndex: 'latest_user_auto_context_cache_control', width: 110, render: fmtInt },
+    { title: 'User Tail', dataIndex: 'latest_user_tail_cache_control', width: 100, render: fmtInt },
+    { title: 'Tool Tail', dataIndex: 'latest_user_tool_result_cache_control', width: 100, render: fmtInt },
     { title: '风险', dataIndex: 'risk_flags', width: 180, render: (v) => (Array.isArray(v) && v.length ? v.join(' / ') : '—') },
   ];
 

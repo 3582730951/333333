@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"strings"
 
+	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/streamrewrite"
 )
@@ -122,10 +123,13 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 			normalizeClaudeCodeIdentityCacheTTL(root, cache.TTL)
 		}
 		normalizeSystemInfo(root, id)
+		anthropicwire.SanitizeVolatileCacheControls(root)
+		anthropicwire.NormalizeCacheControlTTLForPolicy(root, cache.TTL)
 		if oauth && nativeClaudeCode && cache.NativeBreakpoints && normalizeClaudeCodeBreakpointPolicy(cache.BreakpointPolicy) != "coarse_safe" {
 			injectClaudeNativeAutoContextBreakpoint(root, cache.TTL)
 		}
-		capCacheControlBreakpoints(root, 4)
+		anthropicwire.CapCacheControlBreakpoints(root, 4)
+		anthropicwire.NormalizeCacheControlTTLForPolicy(root, cache.TTL)
 		if oauth && strings.TrimSpace(billingVersion) != "" {
 			setClaudeBillingBlock(root, billingVersion)
 		}
@@ -502,22 +506,7 @@ func injectClaudeNativeAutoContextBreakpoint(root map[string]interface{}, ttl st
 	if _, has := auto["cache_control"]; has {
 		return false
 	}
-	if typ, _ := auto["type"].(string); typ != "" && typ != "text" {
-		return false
-	}
-	text, _ := auto["text"].(string)
-	if !strings.HasPrefix(strings.TrimSpace(text), "<system-reminder>") || !strings.Contains(text, "As you answer the user's questions, you can use the following context:") {
-		return false
-	}
-	next, ok := blocks[1].(map[string]interface{})
-	if !ok {
-		return false
-	}
-	if typ, _ := next["type"].(string); typ != "" && typ != "text" {
-		return false
-	}
-	nextText, _ := next["text"].(string)
-	if strings.TrimSpace(nextText) == "" || strings.HasPrefix(strings.TrimSpace(nextText), "<system-reminder>") {
+	if !anthropicwire.IsClaudeCodeAutoContextBlock(blocks[0], blocks[1]) {
 		return false
 	}
 	auto["cache_control"] = claudeCacheControl(ttl)

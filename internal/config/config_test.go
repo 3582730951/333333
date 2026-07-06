@@ -164,7 +164,7 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"codex_prompt_cache_retention":          "24h",
 		"claude_cache_control_inject":           true,
 		"claude_cache_affinity_policy":          "balanced",
-		"claude_cache_breakpoint_policy":        "balanced",
+		"claude_cache_breakpoint_policy":        "stable_prefix_safe",
 		"claude_cache_optimization_rollout":     "{}",
 		"claude_native_cache_breakpoint_inject": true,
 		"claude_cch_signing":                    true,

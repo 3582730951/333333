@@ -20,39 +20,42 @@ import (
 )
 
 type diagnosticUsageRecord struct {
-	ID                     int64
-	AccountID              string
-	RouteKeyHash           string
-	APIKeyHash             string
-	UserID                 string
-	Model                  string
-	PromptTokens           int64
-	CompletionTokens       int64
-	TotalTokens            int64
-	CachedTokens           int64
-	CacheReadTokens        int64
-	CacheCreationTokens    int64
-	UsageProvider          string
-	Estimated              int64
-	CacheMissTokens        int64
-	CacheTotalInputTokens  int64
-	CacheCreation5mTokens  int64
-	CacheCreation1hTokens  int64
-	AffinitySource         string
-	PromptCacheKeyPresent  int64
-	PromptCacheKeySource   string
-	StablePrefixSource     string
-	StablePrefixReason     string
-	StablePrefixBytes      int64
-	RetentionEffective     string
-	RetentionSource        string
-	ClaudeCacheTTL         string
-	CacheControlInjected   int64
-	CacheBreakpointCount   int64
-	LatestUserCacheControl int64
-	RouteEpoch             int64
-	RawUsageJSON           string
-	CreatedAt              int64
+	ID                                int64
+	AccountID                         string
+	RouteKeyHash                      string
+	APIKeyHash                        string
+	UserID                            string
+	Model                             string
+	PromptTokens                      int64
+	CompletionTokens                  int64
+	TotalTokens                       int64
+	CachedTokens                      int64
+	CacheReadTokens                   int64
+	CacheCreationTokens               int64
+	UsageProvider                     string
+	Estimated                         int64
+	CacheMissTokens                   int64
+	CacheTotalInputTokens             int64
+	CacheCreation5mTokens             int64
+	CacheCreation1hTokens             int64
+	AffinitySource                    string
+	PromptCacheKeyPresent             int64
+	PromptCacheKeySource              string
+	StablePrefixSource                string
+	StablePrefixReason                string
+	StablePrefixBytes                 int64
+	RetentionEffective                string
+	RetentionSource                   string
+	ClaudeCacheTTL                    string
+	CacheControlInjected              int64
+	CacheBreakpointCount              int64
+	LatestUserCacheControl            int64
+	LatestUserAutoContextCacheControl int64
+	LatestUserTailCacheControl        int64
+	LatestUserToolResultCacheControl  int64
+	RouteEpoch                        int64
+	RawUsageJSON                      string
+	CreatedAt                         int64
 }
 
 type diagnosticBillingHold struct {
@@ -297,7 +300,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_reauth_jobs.csv", []string{"id", "account_code", "status", "reason", "last_error", "created_at", "updated_at", "started_at", "finished_at"}, codexReauthJobRows(reauthJobs, codebook))
 	addCSV("audit_log.csv", []string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, auditLogRows(auditRows, codebook))
 	addCSV("cf_events.csv", []string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, cfEventRows(cfRows, codebook))
-	addCSV("usage_records.csv", []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "route_epoch", "raw_usage_json"}, usageRecordRows(usageRows, codebook))
+	addCSV("usage_records.csv", []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json"}, usageRecordRows(usageRows, codebook))
 	addCSV("billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status"}, billingHoldRows(holds, codebook))
 	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
 	addCSV("egress_snapshot.csv", []string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
@@ -377,7 +380,8 @@ func diagnosticUsageRecordSelectSQL() string {
 	return `SELECT id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
 affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
-retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control, route_epoch,
+retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control,
+latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at FROM usage_records`
 }
 
@@ -389,7 +393,8 @@ func scanDiagnosticUsageRecord(rows usageRecordScanner, r *diagnosticUsageRecord
 	return rows.Scan(&r.ID, &r.AccountID, &r.RouteKeyHash, &r.APIKeyHash, &r.UserID, &r.Model, &r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.CachedTokens, &r.CacheReadTokens, &r.CacheCreationTokens,
 		&r.UsageProvider, &r.Estimated, &r.CacheMissTokens, &r.CacheTotalInputTokens, &r.CacheCreation5mTokens, &r.CacheCreation1hTokens,
 		&r.AffinitySource, &r.PromptCacheKeyPresent, &r.PromptCacheKeySource, &r.StablePrefixSource, &r.StablePrefixReason, &r.StablePrefixBytes,
-		&r.RetentionEffective, &r.RetentionSource, &r.ClaudeCacheTTL, &r.CacheControlInjected, &r.CacheBreakpointCount, &r.LatestUserCacheControl, &r.RouteEpoch,
+		&r.RetentionEffective, &r.RetentionSource, &r.ClaudeCacheTTL, &r.CacheControlInjected, &r.CacheBreakpointCount, &r.LatestUserCacheControl,
+		&r.LatestUserAutoContextCacheControl, &r.LatestUserTailCacheControl, &r.LatestUserToolResultCacheControl, &r.RouteEpoch,
 		&r.RawUsageJSON, &r.CreatedAt)
 }
 
@@ -935,6 +940,9 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 			itoa64(row.CacheControlInjected),
 			itoa64(row.CacheBreakpointCount),
 			itoa64(row.LatestUserCacheControl),
+			itoa64(row.LatestUserAutoContextCacheControl),
+			itoa64(row.LatestUserTailCacheControl),
+			itoa64(row.LatestUserToolResultCacheControl),
 			itoa64(row.RouteEpoch),
 			codebook.sanitize(row.RawUsageJSON),
 		})

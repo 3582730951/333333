@@ -17,6 +17,7 @@ const (
 	claudeCachePolicyAggressive = "aggressive"
 	claudeCachePolicyBalanced   = "balanced"
 	claudeCachePolicyCoarseSafe = "coarse_safe"
+	claudeCachePolicyStableSafe = "stable_prefix_safe"
 )
 
 type claudeCacheOptimizationRollout struct {
@@ -55,8 +56,14 @@ func (s *Server) claudeCacheBreakpointPolicy(ctx context.Context, affinity routi
 	if policy == claudeCachePolicyCoarseSafe {
 		return claudeCachePolicyCoarseSafe
 	}
+	if policy == claudeCachePolicyStableSafe {
+		return claudeCachePolicyStableSafe
+	}
 	if policy == claudeCachePolicyBalanced && storage.RouteClassForAffinitySource(affinity.Source) == "coarse" {
 		return claudeCachePolicyCoarseSafe
+	}
+	if policy == claudeCachePolicyBalanced {
+		return claudeCachePolicyStableSafe
 	}
 	return claudeCachePolicyAggressive
 }
@@ -78,8 +85,12 @@ func normalizeClaudeCacheBreakpointPolicy(policy string) string {
 		return claudeCachePolicyCoarseSafe
 	case claudeCachePolicyBalanced:
 		return claudeCachePolicyBalanced
-	default:
+	case claudeCachePolicyAggressive:
 		return claudeCachePolicyAggressive
+	case claudeCachePolicyStableSafe:
+		return claudeCachePolicyStableSafe
+	default:
+		return claudeCachePolicyStableSafe
 	}
 }
 

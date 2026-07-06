@@ -154,10 +154,11 @@ func TestEnsureAnthropicCacheControl(t *testing.T) {
 		t.Fatalf("cache diagnostics = %+v, want one stable marker and no latest-user marker", diag)
 	}
 
-	// A body already at the 4-breakpoint limit must be left unchanged (never exceed).
+	// A body already at the 4-breakpoint limit must still shed volatile latest-user
+	// markers and never exceed the upstream limit.
 	full := []byte(`{"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}},{"type":"text","text":"b","cache_control":{"type":"ephemeral"}},{"type":"text","text":"c","cache_control":{"type":"ephemeral"}}]}]}`)
-	if n := cacheControlCount(t, EnsureAnthropicCacheControl(full, "")); n != 4 {
-		t.Fatalf("must not exceed 4 breakpoints, got %d", n)
+	if n := cacheControlCount(t, EnsureAnthropicCacheControl(full, "")); n != 1 {
+		t.Fatalf("latest-user markers should be stripped, got %d remaining breakpoints", n)
 	}
 
 	// The extended (1h) TTL is propagated onto injected breakpoints.
@@ -183,7 +184,7 @@ func TestEnsureAnthropicCacheControlDoesNotMarkSingleVolatileUserTurn(t *testing
 }
 
 func TestEnsureAnthropicCacheControlNormalizesTTLOrder(t *testing.T) {
-	raw := []byte(`{"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+	raw := []byte(`{"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral","ttl":"1h"}}]},{"role":"assistant","content":[{"type":"text","text":"answer"}]},{"role":"user","content":[{"type":"text","text":"latest"}]}]}`)
 	out := EnsureAnthropicCacheControl(raw, "")
 	var m map[string]interface{}
 	if err := json.Unmarshal(out, &m); err != nil {
@@ -197,6 +198,69 @@ func TestEnsureAnthropicCacheControlNormalizesTTLOrder(t *testing.T) {
 	block := msg["content"].([]interface{})[0].(map[string]interface{})
 	if _, has := block["cache_control"].(map[string]interface{})["ttl"]; has {
 		t.Fatalf("message ttl should be downgraded after an earlier default/5m marker: %v", block)
+	}
+}
+
+func TestEnsureAnthropicCacheControlUpgradesExistingMarkersToOneHour(t *testing.T) {
+	raw := []byte(`{"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"stable previous request","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"text","text":"answer"}]},{"role":"user","content":[{"type":"text","text":"latest request"}]}]}`)
+	out := EnsureAnthropicCacheControl(raw, "1h")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if n := cacheControlCount(t, out); n != 3 {
+		t.Fatalf("cache marker count = %d, want existing three retained: %s", n, out)
+	}
+	assertAllCacheControlsHaveTTL(t, m["tools"], "tools")
+	assertAllCacheControlsHaveTTL(t, m["system"], "system")
+	msgs := m["messages"].([]interface{})
+	assertAllCacheControlsHaveTTL(t, msgs[0].(map[string]interface{})["content"], "previous user")
+	if got := msgs[2].(map[string]interface{})["content"].([]interface{})[0].(map[string]interface{})["text"]; got != "latest request" {
+		t.Fatalf("latest request text changed: %v", got)
+	}
+}
+
+func TestEnsureAnthropicCacheControlStripsLatestUserVolatileMarkers(t *testing.T) {
+	raw := []byte(`{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# repo\nstable\n</system-reminder>\n\n","cache_control":{"type":"ephemeral"}},{"type":"text","text":"real user request","cache_control":{"type":"ephemeral"}},{"type":"tool_result","tool_use_id":"toolu_1","content":"tool output","cache_control":{"type":"ephemeral"}}]}]}`)
+	out := EnsureAnthropicCacheControl(raw, "1h")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	blocks := m["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
+	if cc, ok := blocks[0].(map[string]interface{})["cache_control"].(map[string]interface{}); !ok || cc["ttl"] != "1h" {
+		t.Fatalf("latest auto-context marker should be retained and upgraded: %v", blocks[0])
+	}
+	if _, has := blocks[1].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("latest real user request marker should be stripped: %v", blocks[1])
+	}
+	if _, has := blocks[2].(map[string]interface{})["cache_control"]; has {
+		t.Fatalf("latest tool_result marker should be stripped: %v", blocks[2])
+	}
+	if blocks[1].(map[string]interface{})["text"] != "real user request" || blocks[2].(map[string]interface{})["content"] != "tool output" {
+		t.Fatalf("latest user content changed: %v", blocks)
+	}
+	diag := InspectAnthropicCacheControl(out)
+	if !diag.LatestUserAutoContextCacheControl || diag.LatestUserTailCacheControl || diag.LatestUserToolResultCacheControl {
+		t.Fatalf("latest-user diagnostics = %+v, want only auto-context marked", diag)
+	}
+}
+
+func TestEnsureAnthropicCacheControlStripsLatestPlainUserMarkers(t *testing.T) {
+	raw := []byte(`{"model":"claude","messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"},"cache_control":{"type":"ephemeral"}},{"type":"text","text":"final question","cache_control":{"type":"ephemeral"}}]}]}`)
+	out := EnsureAnthropicCacheControl(raw, "1h")
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	blocks := m["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
+	for i, block := range blocks {
+		if _, has := block.(map[string]interface{})["cache_control"]; has {
+			t.Fatalf("latest plain user block %d should not carry cache_control: %v", i, block)
+		}
+	}
+	if blocks[0].(map[string]interface{})["source"].(map[string]interface{})["data"] != "abc" || blocks[1].(map[string]interface{})["text"] != "final question" {
+		t.Fatalf("latest plain user content changed: %v", blocks)
 	}
 }
 
@@ -347,6 +411,27 @@ func cacheControlCount(t *testing.T, body []byte) int {
 		t.Fatal(err)
 	}
 	return countCacheControl(m["system"]) + countCacheControl(m["tools"]) + countCacheControlMessages(m["messages"])
+}
+
+func assertAllCacheControlsHaveTTL(t *testing.T, blocks interface{}, label string) {
+	t.Helper()
+	arr, ok := blocks.([]interface{})
+	if !ok {
+		t.Fatalf("%s is not a block list: %v", label, blocks)
+	}
+	for _, block := range arr {
+		m, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cc, has := m["cache_control"].(map[string]interface{})
+		if !has {
+			continue
+		}
+		if cc["ttl"] != "1h" {
+			t.Fatalf("%s marker not upgraded to 1h: %v", label, cc)
+		}
+	}
 }
 
 func TestAnthropicToolUseToChatToolCalls(t *testing.T) {

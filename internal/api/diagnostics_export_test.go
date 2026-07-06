@@ -150,7 +150,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 	usageCSV := files["usage_records.csv"]
-	for _, want := range []string{"affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "route_epoch"} {
+	for _, want := range []string{"affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
 		if !strings.Contains(usageCSV, want) {
 			t.Fatalf("usage_records.csv missing diagnostic column %q:\n%s", want, usageCSV)
 		}

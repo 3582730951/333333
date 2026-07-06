@@ -863,6 +863,9 @@ CREATE TABLE IF NOT EXISTS usage_records(
   cache_control_injected INTEGER NOT NULL DEFAULT 0,
   cache_breakpoint_count INTEGER NOT NULL DEFAULT 0,
   latest_user_cache_control INTEGER NOT NULL DEFAULT 0,
+  latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0,
+  latest_user_tail_cache_control INTEGER NOT NULL DEFAULT 0,
+  latest_user_tool_result_cache_control INTEGER NOT NULL DEFAULT 0,
   route_epoch INTEGER NOT NULL DEFAULT 0,
   raw_usage_json TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
@@ -1143,6 +1146,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN cache_control_injected INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_breakpoint_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_cache_control INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN latest_user_tail_cache_control INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN latest_user_tool_result_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN route_epoch INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
 		// Cooldown→health-recheck gate: a benched account stays out of the candidate
@@ -3824,25 +3830,28 @@ func (s *Store) InsertUsageRecordWithCacheDetails(ctx context.Context, accountID
 }
 
 type UsageDiagnostics struct {
-	UsageProvider          string
-	Estimated              bool
-	CacheMissTokens        int64
-	CacheTotalInputTokens  int64
-	CacheCreation5mTokens  int64
-	CacheCreation1hTokens  int64
-	AffinitySource         string
-	PromptCacheKeyPresent  bool
-	PromptCacheKeySource   string
-	StablePrefixSource     string
-	StablePrefixReason     string
-	StablePrefixBytes      int
-	RetentionEffective     string
-	RetentionSource        string
-	ClaudeCacheTTL         string
-	CacheControlInjected   bool
-	CacheBreakpointCount   int
-	LatestUserCacheControl bool
-	RouteEpoch             int64
+	UsageProvider                     string
+	Estimated                         bool
+	CacheMissTokens                   int64
+	CacheTotalInputTokens             int64
+	CacheCreation5mTokens             int64
+	CacheCreation1hTokens             int64
+	AffinitySource                    string
+	PromptCacheKeyPresent             bool
+	PromptCacheKeySource              string
+	StablePrefixSource                string
+	StablePrefixReason                string
+	StablePrefixBytes                 int
+	RetentionEffective                string
+	RetentionSource                   string
+	ClaudeCacheTTL                    string
+	CacheControlInjected              bool
+	CacheBreakpointCount              int
+	LatestUserCacheControl            bool
+	LatestUserAutoContextCacheControl bool
+	LatestUserTailCacheControl        bool
+	LatestUserToolResultCacheControl  bool
+	RouteEpoch                        int64
 }
 
 func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) error {
@@ -3851,19 +3860,24 @@ func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID,
 account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
 affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
-retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control, route_epoch,
+retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count, latest_user_cache_control,
+latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
 		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
-		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount, boolInt(diag.LatestUserCacheControl), diag.RouteEpoch,
+		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount, boolInt(diag.LatestUserCacheControl),
+		boolInt(diag.LatestUserAutoContextCacheControl), boolInt(diag.LatestUserTailCacheControl), boolInt(diag.LatestUserToolResultCacheControl), diag.RouteEpoch,
 		string(raw), Now())
 	return err
 }
 
 func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) UsageDiagnostics {
 	usageMap := rawUsageMap(raw)
+	if diag.LatestUserTailCacheControl || diag.LatestUserToolResultCacheControl {
+		diag.LatestUserCacheControl = true
+	}
 	if diag.Estimated || rawEstimated(raw, usageMap) {
 		diag.Estimated = true
 	}
@@ -4044,49 +4058,53 @@ type CacheUsageReport struct {
 }
 
 type CacheUsageMetricRow struct {
-	AccountID              string   `json:"account_id,omitempty"`
-	Model                  string   `json:"model,omitempty"`
-	ModelKey               string   `json:"model_key,omitempty"`
-	ModelLabel             string   `json:"model_label,omitempty"`
-	APIKeyHashPrefix       string   `json:"api_key_hash_prefix,omitempty"`
-	RouteKeyHashPrefix     string   `json:"route_key_hash_prefix,omitempty"`
-	AffinitySource         string   `json:"affinity_source,omitempty"`
-	RouteClass             string   `json:"route_class,omitempty"`
-	PromptCacheKeySource   string   `json:"prompt_cache_key_source,omitempty"`
-	StablePrefixSource     string   `json:"stable_prefix_source,omitempty"`
-	StablePrefixReason     string   `json:"stable_prefix_reason,omitempty"`
-	RetentionEffective     string   `json:"retention_effective,omitempty"`
-	RetentionSource        string   `json:"retention_source,omitempty"`
-	ClaudeCacheTTL         string   `json:"claude_cache_ttl,omitempty"`
-	Requests               int64    `json:"requests"`
-	RealRequests           int64    `json:"real_requests"`
-	HitRequests            int64    `json:"hit_requests"`
-	RequestHitRate         float64  `json:"request_hit_rate"`
-	PromptTokens           int64    `json:"prompt_tokens"`
-	CachedTokens           int64    `json:"cached_tokens"`
-	CacheInputTokens       int64    `json:"cache_input_tokens"`
-	CacheMissTokens        int64    `json:"cache_miss_tokens"`
-	CacheReadTokens        int64    `json:"cache_read_tokens"`
-	CacheCreationTokens    int64    `json:"cache_creation_tokens"`
-	CacheCreation5mTokens  int64    `json:"cache_creation_5m_tokens"`
-	CacheCreation1hTokens  int64    `json:"cache_creation_1h_tokens"`
-	TokenHitRate           float64  `json:"token_hit_rate"`
-	CacheReadShare         float64  `json:"cache_read_share"`
-	CacheWriteShare        float64  `json:"cache_write_share"`
-	EligibleHitRate        float64  `json:"eligible_cache_hit_rate"`
-	RealTokenHitRate       float64  `json:"real_token_hit_rate"`
-	SingleUseRoute         bool     `json:"single_use_route"`
-	RiskFlags              []string `json:"risk_flags,omitempty"`
-	EstimatedRequests      int64    `json:"estimated_requests"`
-	EstimatedRate          float64  `json:"estimated_rate"`
-	StablePrefixBytes      int64    `json:"stable_prefix_bytes"`
-	PromptCacheKeyPresent  int64    `json:"prompt_cache_key_present"`
-	CacheControlInjected   int64    `json:"cache_control_injected"`
-	CacheBreakpointCount   int64    `json:"cache_breakpoint_count"`
-	LatestUserCacheControl int64    `json:"latest_user_cache_control"`
-	RouteEpoch             int64    `json:"route_epoch"`
-	realCacheInputTokens   int64
-	realCacheReadTokens    int64
+	AccountID                         string   `json:"account_id,omitempty"`
+	Model                             string   `json:"model,omitempty"`
+	ModelKey                          string   `json:"model_key,omitempty"`
+	ModelLabel                        string   `json:"model_label,omitempty"`
+	APIKeyHashPrefix                  string   `json:"api_key_hash_prefix,omitempty"`
+	RouteKeyHashPrefix                string   `json:"route_key_hash_prefix,omitempty"`
+	AffinitySource                    string   `json:"affinity_source,omitempty"`
+	RouteClass                        string   `json:"route_class,omitempty"`
+	PromptCacheKeySource              string   `json:"prompt_cache_key_source,omitempty"`
+	StablePrefixSource                string   `json:"stable_prefix_source,omitempty"`
+	StablePrefixReason                string   `json:"stable_prefix_reason,omitempty"`
+	RetentionEffective                string   `json:"retention_effective,omitempty"`
+	RetentionSource                   string   `json:"retention_source,omitempty"`
+	ClaudeCacheTTL                    string   `json:"claude_cache_ttl,omitempty"`
+	Requests                          int64    `json:"requests"`
+	RealRequests                      int64    `json:"real_requests"`
+	HitRequests                       int64    `json:"hit_requests"`
+	RequestHitRate                    float64  `json:"request_hit_rate"`
+	PromptTokens                      int64    `json:"prompt_tokens"`
+	CachedTokens                      int64    `json:"cached_tokens"`
+	CacheInputTokens                  int64    `json:"cache_input_tokens"`
+	CacheMissTokens                   int64    `json:"cache_miss_tokens"`
+	CacheReadTokens                   int64    `json:"cache_read_tokens"`
+	CacheCreationTokens               int64    `json:"cache_creation_tokens"`
+	CacheCreation5mTokens             int64    `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens             int64    `json:"cache_creation_1h_tokens"`
+	CacheCreation5mShare              float64  `json:"cache_creation_5m_share"`
+	TokenHitRate                      float64  `json:"token_hit_rate"`
+	CacheReadShare                    float64  `json:"cache_read_share"`
+	CacheWriteShare                   float64  `json:"cache_write_share"`
+	EligibleHitRate                   float64  `json:"eligible_cache_hit_rate"`
+	RealTokenHitRate                  float64  `json:"real_token_hit_rate"`
+	SingleUseRoute                    bool     `json:"single_use_route"`
+	RiskFlags                         []string `json:"risk_flags,omitempty"`
+	EstimatedRequests                 int64    `json:"estimated_requests"`
+	EstimatedRate                     float64  `json:"estimated_rate"`
+	StablePrefixBytes                 int64    `json:"stable_prefix_bytes"`
+	PromptCacheKeyPresent             int64    `json:"prompt_cache_key_present"`
+	CacheControlInjected              int64    `json:"cache_control_injected"`
+	CacheBreakpointCount              int64    `json:"cache_breakpoint_count"`
+	LatestUserCacheControl            int64    `json:"latest_user_cache_control"`
+	LatestUserAutoContextCacheControl int64    `json:"latest_user_auto_context_cache_control"`
+	LatestUserTailCacheControl        int64    `json:"latest_user_tail_cache_control"`
+	LatestUserToolResultCacheControl  int64    `json:"latest_user_tool_result_cache_control"`
+	RouteEpoch                        int64    `json:"route_epoch"`
+	realCacheInputTokens              int64
+	realCacheReadTokens               int64
 }
 
 func normalizeUsageModel(model string) (key, label string) {
@@ -4345,6 +4363,9 @@ SELECT %s,
        COALESCE(SUM(cache_control_injected),0),
        COALESCE(MAX(cache_breakpoint_count),0),
        COALESCE(SUM(latest_user_cache_control),0),
+       COALESCE(SUM(latest_user_auto_context_cache_control),0),
+       COALESCE(SUM(latest_user_tail_cache_control),0),
+       COALESCE(SUM(latest_user_tool_result_cache_control),0),
        COALESCE(MAX(route_epoch),0)
 FROM usage_records
 WHERE created_at >= ? AND created_at < ?
@@ -4367,7 +4388,8 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 			&row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests,
 			&row.realCacheInputTokens, &row.realCacheReadTokens, &row.StablePrefixBytes,
 			&row.PromptCacheKeyPresent, &row.CacheControlInjected, &row.CacheBreakpointCount,
-			&row.LatestUserCacheControl, &row.RouteEpoch,
+			&row.LatestUserCacheControl, &row.LatestUserAutoContextCacheControl,
+			&row.LatestUserTailCacheControl, &row.LatestUserToolResultCacheControl, &row.RouteEpoch,
 		); err != nil {
 			return nil, err
 		}
@@ -4417,6 +4439,9 @@ func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
 	if eligible > 0 {
 		row.EligibleHitRate = float64(row.CacheReadTokens) / float64(eligible)
 	}
+	if row.CacheCreationTokens > 0 {
+		row.CacheCreation5mShare = float64(row.CacheCreation5mTokens) / float64(row.CacheCreationTokens)
+	}
 	if row.realCacheInputTokens > 0 {
 		row.RealTokenHitRate = float64(row.realCacheReadTokens) / float64(row.realCacheInputTokens)
 		if row.RealTokenHitRate > 1 {
@@ -4455,6 +4480,9 @@ func CacheRiskFlags(row CacheUsageMetricRow) []string {
 	}
 	if row.RouteClass == "coarse" {
 		flags = append(flags, "coarse_route")
+	}
+	if row.LatestUserTailCacheControl > 0 || row.LatestUserToolResultCacheControl > 0 {
+		flags = append(flags, "volatile_latest_user_cache_control")
 	}
 	return flags
 }
