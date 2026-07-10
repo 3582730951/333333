@@ -22,10 +22,13 @@
 package cloak
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"codex-account-pool/internal/anthropicwire"
@@ -42,16 +45,16 @@ type Result struct {
 
 // claudeCodeIdentityLine is the exact first system block the official Claude
 // Code CLI sends. OAuth requests are expected to carry it verbatim.
-const claudeCodeIdentityLine = "You are Claude Code, Anthropic's official CLI for Claude."
+const (
+	claudeCodeIdentityLine       = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+	legacyClaudeCodeIdentityLine = "You are Claude Code, Anthropic's official CLI for Claude."
+)
 
 // claudeBillingHeaderPrefix marks the x-anthropic-billing-header system block that
 // real Claude Code prepends to every request (carrying cc_version + the per-request
-// cch "prompt fingerprint"). Captured ground truth: it is the FIRST system block,
-// type text, with NO cache_control. The real client rotates the fingerprint fields,
-// but those bytes live before every system/message cache breakpoint. We therefore
-// synthesize deterministic well-formed values here and let the upstream layer sign
-// cch against a stable cache prefix, so cacheable prefixes can survive different
-// final user questions.
+// per-request three-hex build suffix). Captured 2026-07-10 ground truth: it is the
+// FIRST system block, type text, has NO cache_control, and has NO cch member. The
+// suffix rotates independently on every request.
 const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
 
 // claudeCodeToolNames maps OpenCode/lowercase tool names to Claude Code's
@@ -85,8 +88,7 @@ type ClaudeCodeCacheOptions struct {
 // body. The billing block carries no cache_control and is placed at system[0] (ahead
 // of any identity block), matching the captured real client shape, and is added AFTER
 // capCacheControlBreakpoints so it neither consumes a breakpoint nor is affected by
-// the cap. Its placeholder fingerprint fields are deterministic; the upstream layer
-// rewrites cch after final sanitization.
+// the cap. Its three-hex suffix is generated afresh for this request.
 func VirtualizeClaudeCode(body []byte, id identity.Identity, sensitiveWords []string, oauth bool, billingVersion string) Result {
 	return VirtualizeClaudeCodeWithCache(body, id, sensitiveWords, oauth, billingVersion, ClaudeCodeCacheOptions{})
 }
@@ -96,17 +98,20 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 	out := body
 
 	var root map[string]interface{}
-	if json.Unmarshal(body, &root) == nil {
+	if decodeClaudeJSONObject(body, &root) == nil {
 		nativeClaudeCode := firstSystemIsClaudeCode(root)
 		if md, ok := root["metadata"].(map[string]interface{}); ok {
-			vid := claudeVirtualUserID(id, oauth)
+			vid := claudeVirtualUserID(id, oauth || nativeClaudeCode)
 			if orig, _ := md["user_id"].(string); orig != "" && orig != vid {
 				rules = append(rules, streamrewrite.Rule{Pattern: orig, Replacement: vid})
 			}
-			// Current Anthropic Messages rejects top-level `metadata` on this Claude
-			// Code/OAuth surface with "metadata: Extra inputs are not permitted".
-			// Do not forward telemetry; keep only the response scrub rule above.
-			delete(root, "metadata")
+			md["user_id"] = vid
+			stripMetadataTelemetry(md)
+			root["metadata"] = md
+		} else if oauth || nativeClaudeCode {
+			root["metadata"] = map[string]interface{}{
+				"user_id": claudeVirtualUserID(id, true),
+			}
 		}
 		if oauth {
 			// Only normalize tool names for requests that are GENUINELY Claude Code
@@ -130,7 +135,7 @@ func VirtualizeClaudeCodeWithCache(body []byte, id identity.Identity, sensitiveW
 		}
 		anthropicwire.CapCacheControlBreakpoints(root, 4)
 		anthropicwire.NormalizeCacheControlTTLForPolicy(root, cache.TTL)
-		if oauth && strings.TrimSpace(billingVersion) != "" {
+		if (oauth || nativeClaudeCode) && strings.TrimSpace(billingVersion) != "" {
 			setClaudeBillingBlock(root, billingVersion)
 		}
 		if b, err := json.Marshal(root); err == nil {
@@ -243,8 +248,7 @@ func ensureClaudeCodeSystem(root map[string]interface{}, ttl string) {
 				// x-anthropic-billing-header block (which itself precedes the identity
 				// line). Recognizing the billing prefix is essential: without it we fail
 				// to detect a genuine Claude Code request and prepend a SECOND identity
-				// block (double injection) — and the client's cch then no longer matches
-				// the body we forward. Either marker means "already Claude Code": no-op.
+				// block (double injection). Either marker means "already Claude Code": no-op.
 				if t, _ := first["text"].(string); isClaudeCodeFirstSystemText(t) {
 					return
 				}
@@ -255,9 +259,6 @@ func ensureClaudeCodeSystem(root map[string]interface{}, ttl string) {
 }
 
 func normalizeClaudeCodeIdentityCacheTTL(root map[string]interface{}, ttl string) {
-	if strings.TrimSpace(ttl) != "1h" {
-		return
-	}
 	sys, ok := root["system"].([]interface{})
 	if !ok {
 		return
@@ -268,11 +269,21 @@ func normalizeClaudeCodeIdentityCacheTTL(root map[string]interface{}, ttl string
 			continue
 		}
 		text, _ := m["text"].(string)
-		if strings.TrimSpace(text) != claudeCodeIdentityLine {
+		trimmed := strings.TrimSpace(text)
+		if strings.HasPrefix(trimmed, legacyClaudeCodeIdentityLine) {
+			// A downstream may still be an older Claude Code build. Keep any
+			// environment suffix but align the leading identity with the captured
+			// shipping client so the body agrees with the synthesized 2.1.206 UA.
+			trimmed = claudeCodeIdentityLine + strings.TrimPrefix(trimmed, legacyClaudeCodeIdentityLine)
+			m["text"] = trimmed
+		}
+		if !strings.HasPrefix(trimmed, claudeCodeIdentityLine) {
 			continue
 		}
-		if _, has := m["cache_control"]; has {
-			m["cache_control"] = claudeCacheControl(ttl)
+		if strings.TrimSpace(ttl) == "1h" {
+			if _, has := m["cache_control"]; has {
+				m["cache_control"] = claudeCacheControl(ttl)
+			}
 		}
 		return
 	}
@@ -283,7 +294,7 @@ func normalizeClaudeCodeIdentityCacheTTL(root map[string]interface{}, ttl string
 // x-anthropic-billing-header attribution block that precedes it.
 func isClaudeCodeFirstSystemText(text string) bool {
 	t := strings.TrimSpace(text)
-	return strings.HasPrefix(t, claudeCodeIdentityLine) || strings.HasPrefix(t, claudeBillingHeaderPrefix)
+	return strings.HasPrefix(t, claudeCodeIdentityLine) || strings.HasPrefix(t, legacyClaudeCodeIdentityLine) || strings.HasPrefix(t, claudeBillingHeaderPrefix)
 }
 
 // stripMetadataTelemetry removes known telemetry keys from the request metadata
@@ -305,16 +316,17 @@ func stripMetadataTelemetry(md map[string]interface{}) {
 }
 
 // claudeVirtualUserID returns the metadata.user_id to present. Real Claude Code 2.1.x
-// sends a JSON-STRING value (captured ground truth, capture/out_mock):
+// sends a JSON-STRING value (captured ground truth, capture/out_mock) on both
+// OAuth and API-key Claude Code paths:
 //
 //	{"device_id":"<64hex>","account_uuid":"<uuid|empty>","session_id":"<uuid>"}
 //
 // (NOT the older user_<hex>_account_<uuid>_session_<uuid> form some references still use).
-// account_uuid is empty when the credential is not a first-party account (our case);
+// account_uuid is empty for the captured third-party relay shape;
 // device_id and session_id are account-bound deterministic values. The key ORDER is
 // preserved to match the real client byte-shape. API-key/SDK callers keep the plain id.
-func claudeVirtualUserID(id identity.Identity, oauth bool) string {
-	if !oauth {
+func claudeVirtualUserID(id identity.Identity, claudeCode bool) string {
+	if !claudeCode {
 		return id.UserID
 	}
 	return fmt.Sprintf(`{"device_id":%q,"account_uuid":%q,"session_id":%q}`, id.UserID, "", id.ClaudeSessionID)
@@ -590,11 +602,10 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 // x-anthropic-billing-header system block as system[0], matching captured ground truth
 // (capture/out_v2): a text block, NO cache_control, of the form
 //
-//	x-anthropic-billing-header: cc_version=<version>.<buildHash>; cc_entrypoint=cli; cch=<5hex>;
+//	x-anthropic-billing-header: cc_version=<version>.<3hex>; cc_entrypoint=cli;
 //
-// It MUST run as the FINAL body step — after all other virtualization AND after any
-// cache_control injection — because cch is signed after final sanitization in the
-// upstream layer.
+// It runs after other virtualization/cache-control injection so the rotating
+// attribution block is the final request shape.
 // Behavior:
 //   - real Claude Code (block already present): the block is REPLACED so cc_version is
 //     realigned to our account-bound claude-cli version (the downstream's real version
@@ -606,7 +617,7 @@ func capCacheControlBreakpoints(root map[string]interface{}, max int) {
 // UA agree. Apply only to OAuth/Claude-Code traffic.
 func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	if decodeClaudeJSONObject(body, &root) != nil {
 		return body
 	}
 	if !setClaudeBillingBlock(root, version) {
@@ -618,6 +629,24 @@ func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 	return body
 }
 
+// decodeClaudeJSONObject keeps JSON numbers as json.Number so a request that is
+// normalized and re-marshaled cannot silently round integer tool inputs through
+// float64. The second decode preserves json.Unmarshal's single-value contract.
+func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(root); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
 // setClaudeBillingBlock injects/replaces the Claude Code x-anthropic-billing-header
 // system block on an already-parsed request root, returning whether root["system"] is
 // now a usable shape (false only for an unexpected non-string/array/nil system type, so
@@ -626,18 +655,22 @@ func EnsureClaudeCodeBillingHeader(body []byte, version string) []byte {
 // single parse/marshal pass without a second JSON round-trip. See
 // EnsureClaudeCodeBillingHeader for the fingerprint rationale.
 func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
-	billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderText(version)}
+	entrypoint := "cli"
 	switch sys := root["system"].(type) {
 	case []interface{}:
 		idx := -1
 		for i, blk := range sys {
 			if bm, ok := blk.(map[string]interface{}); ok {
 				if t, _ := bm["text"].(string); strings.HasPrefix(strings.TrimSpace(t), claudeBillingHeaderPrefix) {
+					if strings.Contains(t, "cc_entrypoint=sdk-cli") {
+						entrypoint = "sdk-cli"
+					}
 					idx = i
 					break
 				}
 			}
 		}
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForEntrypoint(version, entrypoint)}
 		if idx >= 0 {
 			sys[idx] = billing
 			root["system"] = sys
@@ -645,8 +678,10 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 			root["system"] = append([]interface{}{billing}, sys...)
 		}
 	case string:
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForEntrypoint(version, entrypoint)}
 		root["system"] = []interface{}{billing, map[string]interface{}{"type": "text", "text": sys}}
 	case nil:
+		billing := map[string]interface{}{"type": "text", "text": claudeBillingHeaderTextForEntrypoint(version, entrypoint)}
 		root["system"] = []interface{}{billing}
 	default:
 		return false
@@ -654,31 +689,34 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 	return true
 }
 
-// claudeBillingHeaderText builds the billing-header block for a claude-cli version:
-// cc_version=<version>.<stable3hex> and cch=<stable5hex>, with the cli entrypoint
-// matching our forced User-Agent. These values must be stable because the block is
-// before every system/message cache breakpoint; the upstream layer signs cch against
-// the final sanitized cache prefix.
+// claudeBillingHeaderText builds the billing-header block for a claude-cli version.
+// Shipping 2.1.206 emits a fresh three-hex suffix on every request and no cch field.
+// The launch entrypoint is projected from an existing native billing block.
 func claudeBillingHeaderText(version string) string {
+	return claudeBillingHeaderTextForEntrypoint(version, "cli")
+}
+
+func claudeBillingHeaderTextForEntrypoint(version, entrypoint string) string {
 	if version == "" {
 		version = identity.ClaudeCLIVersion
 	}
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;",
-		version, claudeStableHex(3, "cc-version", version), claudeStableHex(5, "cch", version))
+	if entrypoint != "sdk-cli" {
+		entrypoint = "cli"
+	}
+	build := claudeRandomHex(3)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;",
+		version, build, entrypoint)
 }
 
-func claudeStableHex(n int, parts ...string) string {
-	h := sha256.New()
-	for _, p := range parts {
-		_, _ = h.Write([]byte(p))
-		_, _ = h.Write([]byte{0})
+func claudeRandomHex(n int) string {
+	if n <= 0 {
+		return ""
 	}
-	sum := h.Sum(nil)
-	out := hex.EncodeToString(sum)
-	if n > len(out) {
-		n = len(out)
+	raw := make([]byte, (n+1)/2)
+	if _, err := rand.Read(raw); err != nil {
+		return strings.Repeat("0", n)
 	}
-	return out[:n]
+	return hex.EncodeToString(raw)[:n]
 }
 
 // nodePlatform maps a virtual OS name to the Node.js process.platform value

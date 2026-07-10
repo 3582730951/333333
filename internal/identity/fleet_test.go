@@ -2,10 +2,9 @@ package identity
 
 import "testing"
 
-// TestPerAccountVersionDiversity asserts that accounts do NOT all report the same
-// client-version tuple — the fleet-correlation signal this work targets. Across a
-// population we expect several distinct values on each version axis.
-func TestPerAccountVersionDiversity(t *testing.T) {
+// TestPerAccountVersionTupleMatchesCapturedRelease ensures independently-derived
+// accounts cannot combine stale version axes into a tuple no real release shipped.
+func TestPerAccountVersionTupleMatchesCapturedRelease(t *testing.T) {
 	secret := []byte("diversity-test")
 	node := map[string]bool{}
 	cli := map[string]bool{}
@@ -16,8 +15,11 @@ func TestPerAccountVersionDiversity(t *testing.T) {
 		cli[id.ClaudeCLIVersion] = true
 		sdk[id.StainlessPackageVersion] = true
 	}
-	if len(node) < 2 || len(cli) < 2 || len(sdk) < 2 {
-		t.Fatalf("insufficient version diversity: node=%d cli=%d sdk=%d (want >=2 each)", len(node), len(cli), len(sdk))
+	if len(node) != 1 || len(cli) != 1 || len(sdk) != 1 {
+		t.Fatalf("version tuple drift: node=%v cli=%v sdk=%v", node, cli, sdk)
+	}
+	if !node["v26.3.0"] || !cli[ClaudeCLIVersion] || !sdk["0.94.0"] {
+		t.Fatalf("version tuple does not match captured 2.1.206 release: node=%v cli=%v sdk=%v", node, cli, sdk)
 	}
 }
 

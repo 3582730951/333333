@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/tidwall/sjson"
+
 	"codex-account-pool/internal/storage"
 )
 
@@ -117,6 +119,24 @@ func downstreamBearer(r *http.Request) string {
 	return auth
 }
 
+// isAnthropicClient reports whether the request comes from an Anthropic-native client
+// (Claude Code, the Anthropic SDKs). It keys off headers only those clients send —
+// anthropic-version / anthropic-beta, or the Anthropic-style x-api-key credential — so
+// OpenAI/Codex clients (which authenticate via Authorization: Bearer and omit these) are
+// never misclassified. Used to serve the correct /v1/models schema per client family.
+func isAnthropicClient(r *http.Request) bool {
+	if strings.TrimSpace(r.Header.Get("anthropic-version")) != "" {
+		return true
+	}
+	if strings.TrimSpace(r.Header.Get("anthropic-beta")) != "" {
+		return true
+	}
+	if strings.TrimSpace(r.Header.Get("x-api-key")) != "" {
+		return true
+	}
+	return false
+}
+
 // resolveDownstreamPolicy authenticates the request's api key (if any) and
 // resolves the effective routing group + forced model/effort, folding in the
 // group-level defaults when the key sets none. When RequireDownstreamKey is on
@@ -135,12 +155,21 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				writeError(w, http.StatusForbidden, errors.New("pool import key cannot be used for inference"))
 				return downstreamPolicy{}, false
 			}
-			if !key.Enabled {
+			expired := key.ExpiresAt > 0 && key.ExpiresAt <= storage.Now()
+			if !key.Enabled || expired {
 				if s.flagEnabled(ctx, "require_downstream_key", s.cfg.RequireDownstreamKey) {
-					writeError(w, http.StatusUnauthorized, errors.New("api key disabled"))
+					if expired {
+						writeError(w, http.StatusUnauthorized, errors.New("api key expired"))
+					} else {
+						writeError(w, http.StatusUnauthorized, errors.New("api key disabled"))
+					}
 					return downstreamPolicy{}, false
 				}
 			} else {
+				// Authentication has succeeded. Usage attribution must not depend on this
+				// best-effort observability write, so a transient DB error cannot reject an
+				// otherwise valid inference request.
+				_ = s.store.MarkAPIKeyUsed(ctx, key.KeyHash, storage.Now())
 				pol.Authed = true
 				pol.KeyLabel = key.Label
 				pol.KeyHash = key.KeyHash
@@ -197,35 +226,33 @@ func normalizeProviderHint(v string) (string, bool) {
 	return "", false
 }
 
-// setForcedModel rewrites the top-level "model" field of a request body. It is
-// only invoked on the override path, so the full unmarshal/marshal round-trip
-// (which may reorder keys) is acceptable; the normal fast path leaves the raw
-// body untouched.
+// setForcedModel rewrites the top-level "model" field of a request body. It fires on
+// most Claude requests (every alias/auto normalization, plus forced-model keys), so it
+// uses a single-pass sjson edit rather than materializing the whole (often multi-MB
+// 1M-context) body as a map[string]interface{} and re-marshaling it — same result,
+// far less CPU/GC on the hot path. Returns raw unchanged on empty model or invalid JSON.
 func setForcedModel(raw []byte, model string) []byte {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return raw
 	}
-	var root map[string]interface{}
-	if json.Unmarshal(raw, &root) != nil {
-		return raw
-	}
-	root["model"] = model
-	if out, err := json.Marshal(root); err == nil {
+	if out, err := sjson.SetBytes(raw, "model", model); err == nil {
 		return out
 	}
 	return raw
 }
 
 // normalizeEffort canonicalizes a reasoning-effort string. Empty stays empty
-// (no override). Recognized tiers: minimal, low, medium, high, xhigh.
+// (no override). Recognized tiers: minimal, low, medium, high, xhigh, max, ultra.
 func normalizeEffort(effort string) string {
 	e := strings.ToLower(strings.TrimSpace(effort))
 	switch e {
 	case "":
 		return ""
-	case "x-high", "extra-high", "extra_high", "veryhigh", "very-high", "very_high", "max", "maximum":
+	case "x-high", "extra-high", "extra_high", "veryhigh", "very-high", "very_high":
 		return "xhigh"
+	case "maximum":
+		return "max"
 	case "min", "none":
 		return "minimal"
 	}
@@ -237,20 +264,13 @@ func normalizeEffort(effort string) string {
 // this runs, so it covers both entry paths.
 func applyForcedReasoningResponses(body []byte, effort string) []byte {
 	effort = normalizeEffort(effort)
-	if effort == "" {
+	if effort == "" || !json.Valid(body) {
 		return body
 	}
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
-		return body
-	}
-	reasoning, _ := root["reasoning"].(map[string]interface{})
-	if reasoning == nil {
-		reasoning = map[string]interface{}{}
-	}
-	reasoning["effort"] = effort
-	root["reasoning"] = reasoning
-	if out, err := json.Marshal(root); err == nil {
+	// This is a policy override of one leaf, not a request rewrite.  A targeted
+	// edit keeps input/instructions/tool payloads (including >2^53 integer IDs)
+	// byte-identical.
+	if out, err := sjson.SetBytes(body, "reasoning.effort", effort); err == nil {
 		return out
 	}
 	return body
@@ -271,6 +291,8 @@ func claudeThinkingBudget(effort string) (int, bool) {
 		return 24000, true
 	case "xhigh":
 		return 48000, true
+	case "max":
+		return 128000, true
 	}
 	return 0, false
 }

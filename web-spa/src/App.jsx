@@ -37,6 +37,7 @@ const pageLoaders = {
   UpstreamErrorRules: () => import('./pages/UpstreamErrorRules.jsx'),
   Lifecycle: () => import('./pages/Lifecycle.jsx'),
   Quota: () => import('./pages/Quota.jsx'),
+  ModelQuality: () => import('./pages/ModelQuality.jsx'),
   CFEvents: () => import('./pages/CFEvents.jsx'),
   Audit: () => import('./pages/Audit.jsx'),
   Users: () => import('./pages/Users.jsx'),
@@ -62,6 +63,7 @@ const Providers = lazy(pageLoaders.Providers);
 const UpstreamErrorRules = lazy(pageLoaders.UpstreamErrorRules);
 const Lifecycle = lazy(pageLoaders.Lifecycle);
 const Quota = lazy(pageLoaders.Quota);
+const ModelQuality = lazy(pageLoaders.ModelQuality);
 const CFEvents = lazy(pageLoaders.CFEvents);
 const Audit = lazy(pageLoaders.Audit);
 const Users = lazy(pageLoaders.Users);
@@ -122,6 +124,7 @@ const ADMIN_ROUTE_MODEL = [
   { key: 'g-mon', labelKey: 'nav.monitor', icon: <IconHistogram />, children: [
     { path: '/usage', labelKey: 'nav.usage', component: Usage },
     { path: '/quota', labelKey: 'nav.quota', component: Quota },
+    { path: '/model-quality', labelKey: 'nav.model_quality', component: ModelQuality },
     { path: '/system', labelKey: 'nav.system', component: System },
     { path: '/cf-events', labelKey: 'nav.cf_events', component: CFEvents },
     { path: '/audit', labelKey: 'nav.audit', component: Audit },

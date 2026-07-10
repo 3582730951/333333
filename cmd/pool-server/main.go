@@ -139,6 +139,10 @@ func run() int {
 	// x-ratelimit-* headers).
 	app.StartQuotaPoller(ctx)
 
+	// Low-cost group×model intelligence/degradation monitor. It is opt-in and
+	// never iterates accounts; one normal scheduler sample is used per combination.
+	app.StartModelQualityMonitor(ctx)
+
 	// GoPay auto-subscribe (default off). If an operator previously enabled it and
 	// auto-start is on, bring the managed Python services up now; failure is logged
 	// but never blocks the relay.

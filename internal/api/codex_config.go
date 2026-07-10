@@ -17,6 +17,8 @@ import (
 //
 // Config shape is verified against codex-rs (codex-model-provider-info):
 //   - wire_api MUST be "responses" ("chat" was removed upstream).
+//   - supports_websockets enables the current Responses WebSocket transport;
+//     pool_server accepts it and bridges to the selected upstream transport.
 //   - experimental_bearer_token carries the key as `Authorization: Bearer <token>`;
 //     it is the field codex documents for programmatic/self-hosted setups, so no
 //     env var, auth.json, or shell-rc edit is needed.
@@ -60,7 +62,7 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if model == "" {
-		// Operator-configured install default (gpt-5.5). Falls back to the best probed
+		// Operator-configured install default (gpt-5.6-sol). Falls back to the best probed
 		// codex model only if the configured default is blanked out.
 		model = strings.TrimSpace(s.settingString(r.Context(), "codex_install_model", s.cfg.CodexInstallModel))
 	}
@@ -425,6 +427,7 @@ model_provider = "$PROVIDER_ID"
 name = "Pool Server"
 base_url = "$ORIGIN/v1"
 wire_api = "responses"
+supports_websockets = true
 %s
 EOF
   mv "$TMP" "$CONFIG"

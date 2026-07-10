@@ -23,9 +23,9 @@ func TestFingerprintWarningsCleanByDefault(t *testing.T) {
 
 func TestFingerprintWarningsAllThreeCoherent(t *testing.T) {
 	c := &Config{
-		ClaudeCLIVersionOverride: "2.1.159",
-		ClaudeStainlessVersion:   "0.65.0",
-		ClaudeNodeVersion:        "v22.14.0",
+		ClaudeCLIVersionOverride: "2.1.206",
+		ClaudeStainlessVersion:   "0.94.0",
+		ClaudeNodeVersion:        "v26.3.0",
 	}
 	if ws := c.FingerprintWarnings(); len(ws) != 0 {
 		t.Fatalf("expected no warnings for three coherent axes, got %v", ws)
@@ -33,7 +33,7 @@ func TestFingerprintWarningsAllThreeCoherent(t *testing.T) {
 }
 
 func TestFingerprintWarningsPartialOverrideWarns(t *testing.T) {
-	c := &Config{ClaudeCLIVersionOverride: "2.1.159"} // only one axis pinned
+	c := &Config{ClaudeCLIVersionOverride: "2.1.206"} // only one axis pinned
 	ws := c.FingerprintWarnings()
 	if !hasWarning(ws, "only some of") {
 		t.Fatalf("expected a coherence warning, got %v", ws)
@@ -59,7 +59,7 @@ func TestFingerprintWarningsBadShapes(t *testing.T) {
 }
 
 func TestLooksLikeDotVersion(t *testing.T) {
-	good := []string{"2.1.159", "0.65.0", "1.0"}
+	good := []string{"2.1.206", "0.94.0", "1.0"}
 	bad := []string{"v2", "latest", "2", "2.", ".2", "2.x.1", ""}
 	for _, g := range good {
 		if !looksLikeDotVersion(g) {

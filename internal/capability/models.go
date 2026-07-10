@@ -57,6 +57,43 @@ func claudeWindow(slug string) int64 {
 	return 200000
 }
 
+// NormalizeClaudeModelAlias maps a Claude model alias that Anthropic's API would reject
+// — bare "sonnet"/"opus"/"haiku", "auto"/"default", or a family name without a version —
+// to a concrete current-generation model id of the SAME tier. It never crosses to a
+// lower tier, so model quality is never downgraded; "auto"/"default" resolve to the
+// strongest available model (opus). A value that is already a concrete claude-* id, or
+// any non-Claude model, is returned unchanged. This is what makes Claude Code's default/
+// auto model selection work against the pool without silently weakening the model.
+func NormalizeClaudeModelAlias(model string) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "auto", "default", "opus", "claude-opus":
+		if v := newestStaticClaudeByTier("opus"); v != "" {
+			return v
+		}
+	case "sonnet", "claude-sonnet":
+		if v := newestStaticClaudeByTier("sonnet"); v != "" {
+			return v
+		}
+	case "haiku", "claude-haiku":
+		if v := newestStaticClaudeByTier("haiku"); v != "" {
+			return v
+		}
+	}
+	return model
+}
+
+// newestStaticClaudeByTier returns the most-capable current-generation Claude model id
+// of a tier ("opus"/"sonnet"/"haiku"), or "" if none is known. claudeStaticModels is
+// ordered most-capable first, so the first tier match is the newest/strongest.
+func newestStaticClaudeByTier(tier string) string {
+	for _, slug := range claudeStaticModels {
+		if strings.Contains(slug, tier) {
+			return slug
+		}
+	}
+	return ""
+}
+
 // ParseClaudeModels parses Anthropic's GET /v1/models response (data[].id) into
 // capabilities, filling the context window from claudeModelWindows since the
 // endpoint omits it. Source is tagged "claude_probe" to distinguish a live probe
@@ -149,7 +186,11 @@ type codexStaticModel struct {
 	slug                  string
 	window                int64
 	maxWindow             int64
+	minimumClientVersion  string
 	requiresCurrentClient bool
+	preferWebSocket       bool
+	responsesLite         bool
+	reasoningLevels       []string
 }
 
 // codexStaticModels is the current-generation Codex model catalog advertised when
@@ -158,18 +199,69 @@ type codexStaticModel struct {
 // listed (the hidden codex-auto-review preset is omitted). Ordered most-capable
 // first. The live probe — when it works — is authoritative and supersedes this.
 var codexStaticModels = []codexStaticModel{
-	{slug: "gpt-5.5", window: 272000, maxWindow: 272000, requiresCurrentClient: true},
-	{slug: "gpt-5.4", window: 272000, maxWindow: 1000000},
-	{slug: "gpt-5.4-mini", window: 272000, maxWindow: 272000},
-	{slug: "gpt-5.3-codex", window: 272000, maxWindow: 272000},
-	{slug: "gpt-5.2", window: 272000, maxWindow: 272000},
+	{slug: "gpt-5.6-sol", window: 372000, maxWindow: 372000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-terra", window: 372000, maxWindow: 372000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-luna", window: 372000, maxWindow: 372000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
+	{slug: "gpt-5.5", window: 272000, maxWindow: 272000, minimumClientVersion: "0.124.0", requiresCurrentClient: true, preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
+	{slug: "gpt-5.4", window: 272000, maxWindow: 1000000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
+	{slug: "gpt-5.4-mini", window: 272000, maxWindow: 272000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
+	{slug: "gpt-5.2", window: 272000, maxWindow: 272000, minimumClientVersion: "0.0.1", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 }
 
-func CodexRequiresCurrentClientVersion(slug string) bool {
+func codexStaticModelForSlug(slug string) (codexStaticModel, bool) {
 	slug = strings.ToLower(strings.TrimSpace(slug))
 	for _, m := range codexStaticModels {
 		if strings.ToLower(m.slug) == slug {
-			return m.requiresCurrentClient
+			return m, true
+		}
+	}
+	return codexStaticModel{}, false
+}
+
+func CodexRequiresCurrentClientVersion(slug string) bool {
+	m, ok := codexStaticModelForSlug(slug)
+	return ok && m.requiresCurrentClient
+}
+
+// CodexMinimumClientVersion returns the minimum official CLI version declared by
+// the bundled Codex model catalog. An empty result means the model is not in the
+// curated fallback catalog.
+func CodexMinimumClientVersion(slug string) string {
+	m, ok := codexStaticModelForSlug(slug)
+	if !ok {
+		return ""
+	}
+	return m.minimumClientVersion
+}
+
+// CodexPrefersWebSocket mirrors model_info.prefer_websockets from the official
+// Codex catalog. It is deliberately independent of client-version gating: current
+// Codex models can prefer the Responses WebSocket transport without requiring the
+// newest possible CLI version.
+func CodexPrefersWebSocket(slug string) bool {
+	m, ok := codexStaticModelForSlug(slug)
+	return ok && m.preferWebSocket
+}
+
+// CodexUsesResponsesLite mirrors model_info.use_responses_lite. The upstream
+// transport uses it to attach the official HTTP header / WS client metadata.
+func CodexUsesResponsesLite(slug string) bool {
+	m, ok := codexStaticModelForSlug(slug)
+	return ok && m.responsesLite
+}
+
+// CodexSupportsReasoningEffort reports the exact reasoning-level matrix from the
+// official bundled catalog. Unknown models return false so callers never invent a
+// capability; the relay itself still preserves downstream reasoning verbatim.
+func CodexSupportsReasoningEffort(slug, effort string) bool {
+	m, ok := codexStaticModelForSlug(slug)
+	if !ok {
+		return false
+	}
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	for _, supported := range m.reasoningLevels {
+		if supported == effort {
+			return true
 		}
 	}
 	return false
@@ -187,7 +279,7 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 			ModelSlug:                     m.slug,
 			NativeContextWindow:           m.window,
 			NativeMaxContextWindow:        m.maxWindow,
-			EffectiveContextWindowPercent: 100,
+			EffectiveContextWindowPercent: 95,
 			Visibility:                    "list",
 			Source:                        "codex_static",
 			LastProbeAt:                   now,
@@ -265,7 +357,9 @@ func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability
 		}
 		percent := firstInt(model, "effective_context_window_percent")
 		if percent == 0 {
-			percent = 100
+			// Codex ModelInfo's serde default is 95, reserving headroom for the
+			// model/tool prefix even when an older /models response omits the field.
+			percent = 95
 		}
 		autoCompact := firstInt(model, "auto_compact_token_limit", "auto_compact_context_window", "compact_token_limit")
 		rawModel := ""
@@ -359,6 +453,14 @@ func providerKeyForSource(source string) string {
 
 func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Config) ([]byte, string, error) {
 	_ = cfg // kept for API compatibility; model responses now advertise only real native windows.
+	// A freshly imported Codex account has a short interval before its first live
+	// capability probe. Serve the same curated Codex floor used when that probe is
+	// unavailable instead of leaking the obsolete gpt-5.4-codex/unknown placeholder.
+	// Once stored probe data exists it remains authoritative and replaces this
+	// cold-start catalog, including any larger context window advertised upstream.
+	if len(capabilities) == 0 {
+		capabilities = StaticCodexModels("codex-static-cold-start")
+	}
 	// Group by provider so a mixed pool advertises EVERY provider's models. The old
 	// single pool-wide "richest account" pick hid all but one provider's models when
 	// codex/claude/custom accounts coexisted. Within each provider we still advertise
@@ -427,16 +529,6 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 		}
 		data = append(data, item)
 	}
-	if len(data) == 0 {
-		data = append(data, map[string]interface{}{
-			"id":                    "gpt-5.4-codex",
-			"object":                "model",
-			"owned_by":              "codex-pool",
-			"context_window":        0,
-			"native_context_window": 0,
-			"window_mode":           "unknown",
-		})
-	}
 	resp := map[string]interface{}{"object": "list", "data": data}
 	raw, err := json.Marshal(resp)
 	if err != nil {
@@ -446,10 +538,105 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
 }
 
-// rawOfficialModelItem returns the probed model JSON for official Codex accounts,
-// if present. Starting from the raw object preserves forward-compatible capability
-// metadata (future tools/features/capabilities) that the gateway does not yet
-// understand; BuildModelsResponse then overlays only the relay-required fields.
+// BuildAnthropicModelsResponse renders the pool's Claude capabilities in Anthropic's
+// native GET /v1/models schema — {data:[{type:"model",id,display_name,created_at}],
+// has_more:false,first_id,last_id}. Anthropic clients (Claude Code) enumerate models
+// from THIS shape and disable their model picker / "auto" selection when handed the
+// OpenAI-shaped list BuildModelsResponse returns. Only claude-* models are listed; the
+// curated current-generation set is unioned as a floor so a freshly shipped model (or an
+// OAuth token whose /models endpoint is rejected) still surfaces.
+func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byte, string, error) {
+	claudeCaps := make([]storage.ModelCapability, 0, len(capabilities))
+	for _, c := range capabilities {
+		if providerKeyForSource(c.Source) == "claude" {
+			claudeCaps = append(claudeCaps, c)
+		}
+	}
+	// Richest single Claude account's set, floored by the static current-gen list so the
+	// full sonnet/haiku/opus family Claude Code's auto mode expects is always present.
+	merged := MergeClaudeStatic("", richestAccountCaps(claudeCaps))
+	seen := make(map[string]bool, len(merged))
+	data := make([]interface{}, 0, len(merged))
+	appendModel := func(slug string) {
+		if slug == "" || seen[slug] {
+			return
+		}
+		seen[slug] = true
+		data = append(data, map[string]interface{}{
+			"type":         "model",
+			"id":           slug,
+			"display_name": claudeDisplayName(slug),
+			"created_at":   claudeCreatedAt(slug),
+		})
+	}
+	for _, c := range merged {
+		appendModel(c.ModelSlug)
+	}
+	if len(data) == 0 {
+		for _, slug := range claudeStaticModels {
+			appendModel(slug)
+		}
+	}
+	resp := map[string]interface{}{"data": data, "has_more": false}
+	if len(data) > 0 {
+		resp["first_id"] = data[0].(map[string]interface{})["id"]
+		resp["last_id"] = data[len(data)-1].(map[string]interface{})["id"]
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(raw)
+	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
+}
+
+// claudeDisplayName derives a human label for a Claude model id (Claude Code shows it in
+// the model picker). It strips a trailing -YYYYMMDD date and title-cases the remaining
+// tokens, so "claude-sonnet-4-5-20250929" → "Claude Sonnet 4 5".
+func claudeDisplayName(slug string) string {
+	s := slug
+	if d := trailingDate(s); d != "" {
+		s = s[:len(s)-len(d)-1] // drop "-YYYYMMDD"
+	}
+	parts := strings.Split(s, "-")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	label := strings.Join(parts, " ")
+	if label == "" {
+		return slug
+	}
+	return label
+}
+
+// claudeCreatedAt returns an ISO-8601 created_at for a Claude model id, derived from a
+// trailing -YYYYMMDD date when present, else a stable default. Deterministic so the
+// /v1/models ETag stays stable across requests.
+func claudeCreatedAt(slug string) string {
+	if d := trailingDate(slug); d != "" {
+		return d[0:4] + "-" + d[4:6] + "-" + d[6:8] + "T00:00:00Z"
+	}
+	return "2025-01-01T00:00:00Z"
+}
+
+// trailingDate returns the trailing 8-digit YYYYMMDD token of a "-YYYYMMDD"-suffixed
+// slug, or "" when absent.
+func trailingDate(slug string) string {
+	if len(slug) < 9 || slug[len(slug)-9] != '-' {
+		return ""
+	}
+	tail := slug[len(slug)-8:]
+	for i := 0; i < 8; i++ {
+		if tail[i] < '0' || tail[i] > '9' {
+			return ""
+		}
+	}
+	return tail
+}
+
 func rawOfficialModelItem(cap storage.ModelCapability) map[string]interface{} {
 	if providerKeyForSource(cap.Source) != "codex" || strings.TrimSpace(cap.RawModelJSON) == "" {
 		return map[string]interface{}{}

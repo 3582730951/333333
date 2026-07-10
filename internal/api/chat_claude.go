@@ -51,10 +51,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		EstimatedTokens: virtual.EstimateTokensJSON(raw),
 	})
 	if err != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(err, scheduler.ErrStrictUnavailable) {
-			status = http.StatusConflict
-		}
+		status, _ := noAccountHTTPStatus(err)
 		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "claude", model, err)
 		return
 	}
@@ -88,7 +85,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	osHint := s.osHint(raw, lease.Egress)
 	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 	cacheInject := s.cacheInjectEnabled(r.Context())
-	claudeTTL := s.claudeCacheTTL(r.Context())
+	claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
 	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, routeGroup, pol.KeyHash)
 	result := cloak.VirtualizeClaudeCodeWithCache(anthBody, id, s.cfg.SensitiveWordsFor("claude"), claudeIsOAuth(token), "", cloak.ClaudeCodeCacheOptions{TTL: claudeTTL})
 	// The OpenAI→Anthropic conversion emits no cache_control, so without this the
@@ -107,7 +104,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	// Final body step (after cache_control injection): stamp the Claude Code
 	// x-anthropic-billing-header so OAuth traffic relayed from an OpenAI-compatible
 	// client still carries the header every genuine Claude Code request has, with a
-	// cc_version coherent with our User-Agent and a fresh per-request cch.
+	// cc_version coherent with our User-Agent and a fresh three-hex suffix (no cch).
 	if claudeIsOAuth(token) {
 		result.Body = cloak.EnsureClaudeCodeBillingHeader(result.Body, s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion))
 	}
@@ -134,6 +131,9 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		usageDiag.SingleflightWaitedRequests = 1
 	}
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
+	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
+	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
+	defer func() { _ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
 	releaseFlight()

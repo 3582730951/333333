@@ -22,6 +22,7 @@ import (
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
+	"github.com/tidwall/sjson"
 )
 
 const upstreamErrorBodyLimit = 1 << 20
@@ -86,6 +87,19 @@ func isStreamRequest(raw []byte) bool {
 		return false
 	}
 	return v.Stream
+}
+
+func chatStreamUsageRequested(raw []byte) bool {
+	var v struct {
+		Stream        bool `json:"stream"`
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	return v.Stream && v.StreamOptions.IncludeUsage
 }
 
 func isEventStream(h http.Header) bool {
@@ -231,7 +245,7 @@ func (s *Server) codexClientVersionForModel(model string) string {
 }
 
 func (s *Server) codexResponsesWebSocketForModel(model string, isChat, isCompact bool, body []byte) bool {
-	return !isChat && !isCompact && isStreamRequest(body) && capability.CodexRequiresCurrentClientVersion(model)
+	return !isChat && !isCompact && isStreamRequest(body) && capability.CodexPrefersWebSocket(model)
 }
 
 func codexRequiresNewerVersion(body []byte) bool {
@@ -241,12 +255,11 @@ func codexRequiresNewerVersion(body []byte) bool {
 }
 
 func forceResponsesStream(raw []byte) []byte {
-	var root map[string]interface{}
+	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return raw
 	}
-	root["stream"] = true
-	out, err := json.Marshal(root)
+	out, err := sjson.SetBytes(raw, "stream", true)
 	if err != nil {
 		return raw
 	}
@@ -258,19 +271,140 @@ func ensureResponsesPromptCacheKey(raw []byte, key string) []byte {
 	if key == "" || routing.PromptCacheKey(raw) != "" {
 		return raw
 	}
-	var root map[string]interface{}
+	// Decode only the top-level field table so adding a routing hint cannot
+	// round-trip input/tool payload numbers through float64.  In particular, large
+	// integer IDs inside the conversation must remain byte-for-byte unchanged.
+	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return raw
 	}
 	if _, ok := root["prompt_cache_key"]; ok {
 		return raw
 	}
-	root["prompt_cache_key"] = key
-	out, err := json.Marshal(root)
+	out, err := sjson.SetBytes(raw, "prompt_cache_key", key)
 	if err != nil {
 		return raw
 	}
 	return out
+}
+
+// normalizeOfficialCodexPromptCacheKey replaces only Codex CLI's generated
+// per-thread UUID cache key with a model + stable-prefix key. Independent CLI
+// processes otherwise send identical 7–8K system/tool prefixes to different cache
+// shards and lose nearly every hit. prompt_cache_key is a routing hint, not context;
+// the input/instructions/tools/history bytes remain untouched, and explicit custom
+// keys from other clients are preserved verbatim.
+func normalizeOfficialCodexPromptCacheKey(r *http.Request, raw []byte, model string) ([]byte, bool) {
+	existing := routing.PromptCacheKey(raw)
+	if !looksLikeUUID(existing) || !isOfficialCodexCLIRequest(r) {
+		return raw, false
+	}
+	prefixHash := officialCodexBasePromptCacheHash(raw)
+	if prefixHash == "" {
+		prefixHash = automaticPromptCachePrefixHash(raw)
+	}
+	stable := automaticPromptCacheKey(model, prefixHash)
+	if stable == "" || stable == existing {
+		return raw, false
+	}
+	out, err := sjson.SetBytes(raw, "prompt_cache_key", stable)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
+
+// officialCodexBasePromptCacheHash fingerprints the large immutable prefix shared by
+// independent Codex roots and sibling sub-agents: tool schemas, developer messages,
+// instructions, and reasoning configuration before the first user item. Per-turn
+// metadata is deliberately omitted from the hint because Codex regenerates those UUIDs
+// on every process/thread. This function never edits the request; the upstream still
+// validates the exact prompt bytes before serving a cached prefix.
+func officialCodexBasePromptCacheHash(raw []byte) string {
+	var root map[string]interface{}
+	if json.Unmarshal(raw, &root) != nil {
+		return ""
+	}
+	stable := map[string]interface{}{}
+	for _, key := range []string{"instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning", "text"} {
+		if value, ok := root[key]; ok {
+			stable[key] = stripCodexVolatileCacheMetadata(value)
+		}
+	}
+	if input, ok := root["input"].([]interface{}); ok {
+		prefix := make([]interface{}, 0, len(input))
+		for _, item := range input {
+			if message, ok := item.(map[string]interface{}); ok {
+				if role, _ := message["role"].(string); strings.EqualFold(strings.TrimSpace(role), "user") {
+					break
+				}
+			}
+			prefix = append(prefix, stripCodexVolatileCacheMetadata(item))
+		}
+		if len(prefix) > 0 {
+			stable["input_prefix"] = prefix
+		}
+	}
+	encoded, err := json.Marshal(stable)
+	if err != nil || len(encoded) < 2048 {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return "official_codex_base:" + hex.EncodeToString(sum[:])
+}
+
+func stripCodexVolatileCacheMetadata(value interface{}) interface{} {
+	switch current := value.(type) {
+	case map[string]interface{}:
+		clean := make(map[string]interface{}, len(current))
+		for key, child := range current {
+			switch key {
+			case "internal_chat_message_metadata_passthrough", "client_metadata":
+				continue
+			}
+			clean[key] = stripCodexVolatileCacheMetadata(child)
+		}
+		return clean
+	case []interface{}:
+		clean := make([]interface{}, len(current))
+		for i, child := range current {
+			clean[i] = stripCodexVolatileCacheMetadata(child)
+		}
+		return clean
+	default:
+		return value
+	}
+}
+
+func isOfficialCodexCLIRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ua := strings.ToLower(strings.TrimSpace(r.Header.Get("User-Agent")))
+	originator := strings.ToLower(strings.TrimSpace(r.Header.Get("originator")))
+	return strings.HasPrefix(ua, "codex_exec/") || strings.HasPrefix(ua, "codex_cli_rs/") ||
+		originator == "codex_exec" || originator == "codex_cli_rs"
+}
+
+func looksLikeUUID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if value[i] != '-' {
+				return false
+			}
+		default:
+			c := value[i]
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func automaticPromptCacheKey(model, prefixHash string) string {
@@ -288,7 +422,42 @@ func automaticPromptCachePrefixHash(raw []byte) string {
 	if prefixHash == "" || !automaticPromptCacheKeySafe(raw) {
 		return ""
 	}
+	// The official Codex client keeps one prompt_cache_key for the lifetime of a
+	// thread. Mirror that behavior when a third-party client omitted the key: the
+	// first user turn is stable while later assistant/tool/user items accumulate.
+	// StablePromptPrefixHash above remains the eligibility gate (large reusable
+	// prefix required); the anchor only prevents needless key/shard churn between
+	// turns. automaticPromptCacheKey additionally isolates by model.
+	if hasHistoricalUserTurn(raw) {
+		if anchor := routing.ConversationAnchor(raw); anchor != "" {
+			return "conversation:" + anchor
+		}
+	}
 	return prefixHash
+}
+
+// hasHistoricalUserTurn distinguishes a growing conversation from a single
+// long, still-editable user input. In the latter case the stable 4 KiB text-head
+// fingerprint must remain authoritative so changing only the tail keeps one key.
+func hasHistoricalUserTurn(raw []byte) bool {
+	var root map[string]interface{}
+	if json.Unmarshal(raw, &root) != nil {
+		return false
+	}
+	seq := root["messages"]
+	if seq == nil {
+		seq = root["input"]
+	}
+	items, ok := seq.([]interface{})
+	if !ok || len(items) < 2 {
+		return false
+	}
+	for _, item := range items[:len(items)-1] {
+		if m, ok := item.(map[string]interface{}); ok && m["role"] == "user" {
+			return true
+		}
+	}
+	return false
 }
 
 func codexSelectionAffinity(r *http.Request, raw []byte, base routing.AffinityKey, group string) routing.AffinityKey {
@@ -319,11 +488,12 @@ func codexRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, pro
 }
 
 func codexRetentionDiagnosticsForTransport(diag storage.UsageDiagnostics, responsesWebSocket bool) storage.UsageDiagnostics {
-	if responsesWebSocket || diag.RetentionEffective == "" {
+	_ = responsesWebSocket
+	if diag.RetentionEffective == "" {
 		return diag
 	}
 	diag.RetentionEffective = ""
-	diag.RetentionSource = "stripped_http_transport"
+	diag.RetentionSource = "stripped_unsupported_transport"
 	return diag
 }
 
@@ -353,7 +523,7 @@ func claudeRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, tt
 
 func isTrueConversationAffinity(source string) bool {
 	switch source {
-	case "x-codex-parent-thread-id", "thread_id", "conversation_id",
+	case routing.CodexRootThreadAffinitySource, "x-codex-parent-thread-id", "thread_id", "conversation_id",
 		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
 		return true
 	}
@@ -394,7 +564,20 @@ func simplePromptMessage(v interface{}) bool {
 		return isText
 	}
 	if t, _ := m["type"].(string); strings.TrimSpace(t) != "" {
-		return false
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "message":
+			// Official Responses requests use type:"message" around the same
+			// role/content shape accepted below.
+		case "additional_tools", "reasoning", "function_call", "function_call_output",
+			"custom_tool_call", "custom_tool_call_output", "local_shell_call", "local_shell_call_output",
+			"computer_call", "computer_call_output", "web_search_call", "file_search_call",
+			"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response":
+			// These are self-contained official Responses history items. The
+			// cache key only selects a cache shard; the item bytes remain intact.
+			return true
+		default:
+			return false
+		}
 	}
 	role, _ := m["role"].(string)
 	switch role {
@@ -454,7 +637,7 @@ func cacheKeySafePromptContentPart(v interface{}) bool {
 	case map[string]interface{}:
 		t, _ := part["type"].(string)
 		switch t {
-		case "input_text", "text":
+		case "input_text", "output_text", "text":
 			_, ok := part["text"].(string)
 			return ok
 		case "input_image", "image_url", "image", "input_file", "file", "input_audio", "audio":

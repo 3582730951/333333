@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 	"github.com/gorilla/websocket"
 )
@@ -18,6 +20,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	var gotPath, gotMethod string
 	var gotHeaders http.Header
 	var gotPayload map[string]interface{}
+	var gotPayloadRaw []byte
 
 	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,6 +39,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 		if messageType != websocket.TextMessage {
 			t.Fatalf("message type = %d", messageType)
 		}
+		gotPayloadRaw = append([]byte(nil), raw...)
 		if err := json.Unmarshal(raw, &gotPayload); err != nil {
 			t.Fatalf("payload json: %v\n%s", err, raw)
 		}
@@ -50,7 +54,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath:          "/v1/responses",
 		Headers:                 http.Header{"Originator": []string{"codex_exec"}, "x-client-request-id": []string{"thread-123"}},
-		Body:                    []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":"hi"}],"stream":true,"prompt_cache_retention":"24h"}`),
+		Body:                    []byte(`{"model":"gpt-5.6-sol","instructions":"keep WS context","previous_response_id":"resp_keep","tools":[{"name":"keep","schema":{"const":900719925474099312345}}],"input":[{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"prompt_cache_retention":"24h"}`),
 		Account:                 storage.Account{ID: "acc-ws", UpstreamAccountID: "workspace-should-not-leak"},
 		Token:                   storage.AccountToken{AccessToken: "access-ws"},
 		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -63,7 +67,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 
-	if gotMethod != http.MethodGet || gotPath != "/v1/responses" {
+	if gotMethod != http.MethodGet || gotPath != "/backend-api/codex/responses" {
 		t.Fatalf("handshake = %s %s", gotMethod, gotPath)
 	}
 	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
@@ -78,8 +82,8 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if gotHeaders.Get("OpenAI-Beta") != codexResponsesWebSocketBeta {
 		t.Fatalf("OpenAI-Beta = %q", gotHeaders.Get("OpenAI-Beta"))
 	}
-	if v := gotHeaders.Get("version"); v != "" {
-		t.Fatalf("real Codex sends no `version` header; got %q", v)
+	if v := gotHeaders.Get("version"); v != config.DefaultClientVersion {
+		t.Fatalf("version = %q", v)
 	}
 	if ua := gotHeaders.Get("User-Agent"); !strings.Contains(ua, "codex_exec/"+config.DefaultClientVersion) {
 		t.Fatalf("UA = %q", ua)
@@ -87,8 +91,19 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if gotHeaders.Get("Originator") != "codex_exec" {
 		t.Fatalf("Originator = %q", gotHeaders.Get("Originator"))
 	}
-	if gotHeaders.Get("session-id") == "" || gotHeaders.Get("thread-id") != "thread-123" || gotHeaders.Get("x-codex-window-id") != "thread-123:0" {
+	virtualIdentity := identity.For(client.identitySecret, "acc-ws")
+	wantThread := identity.DerivedUUIDv7(virtualIdentity.MachineID+"\x00thread", "thread-123")
+	if gotHeaders.Get("session-id") != wantThread || gotHeaders.Get("thread-id") != wantThread || gotHeaders.Get("x-codex-window-id") != wantThread+":0" {
 		t.Fatalf("ws ids missing/mismatched: %+v", gotHeaders)
+	}
+	if gotHeaders.Get("x-codex-beta-features") != codexBetaFeaturesHeader {
+		t.Fatalf("remote compaction beta feature missing from handshake: %+v", gotHeaders)
+	}
+	if gotHeaders.Get(codexResponsesLiteHeader) != "" {
+		t.Fatalf("responses-lite is WS client metadata, not a handshake header: %+v", gotHeaders)
+	}
+	if gotHeaders.Get("Content-Type") != "" {
+		t.Fatalf("WebSocket handshake must not carry HTTP JSON Content-Type: %+v", gotHeaders)
 	}
 	// The real WS handshake uses lowercase session-id/thread-id (never a capitalized
 	// "Session_id") and DOES carry ChatGPT-Account-ID (it rides the auth headers).
@@ -99,21 +114,111 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 		t.Fatalf("WS handshake must carry ChatGPT-Account-ID via auth: %+v", gotHeaders)
 	}
 
-	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-5.5" || gotPayload["stream"] != true {
+	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-5.6-sol" || gotPayload["stream"] != true {
 		t.Fatalf("bad response.create payload: %+v", gotPayload)
 	}
-	if gotPayload["prompt_cache_retention"] != "24h" {
-		t.Fatalf("WS path should preserve prompt_cache_retention, got payload: %+v", gotPayload)
+	requestBody := []byte(`{"model":"gpt-5.6-sol","instructions":"keep WS context","previous_response_id":"resp_keep","tools":[{"name":"keep","schema":{"const":900719925474099312345}}],"input":[{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"prompt_cache_retention":"24h"}`)
+	assertCodexContextFieldsUnchanged(t, requestBody, gotPayloadRaw)
+	if _, stale := gotPayload["prompt_cache_retention"]; stale {
+		t.Fatalf("latest Codex WS payload must strip obsolete prompt_cache_retention: %+v", gotPayload)
 	}
 	metadata, _ := gotPayload["client_metadata"].(map[string]interface{})
-	if metadata["x-codex-window-id"] != "thread-123:0" || metadata["x-codex-turn-metadata"] == "" {
+	if metadata["x-codex-installation-id"] != virtualIdentity.MachineID ||
+		metadata["session_id"] != gotHeaders.Get("session-id") ||
+		metadata["thread_id"] != gotHeaders.Get("thread-id") ||
+		metadata["x-codex-window-id"] != wantThread+":0" ||
+		metadata["turn_id"] == "" || metadata["x-codex-turn-metadata"] == "" {
 		t.Fatalf("missing websocket client metadata: %+v", metadata)
+	}
+	if metadata[codexWSResponsesLiteMetadata] != "true" || metadata[codexWSRequestStartMetadata] == "" {
+		t.Fatalf("missing GPT-5.6 responses-lite/timing metadata: %+v", metadata)
+	}
+	if gotPayload["parallel_tool_calls"] != false {
+		t.Fatalf("responses-lite must disable parallel_tool_calls: %+v", gotPayload)
+	}
+	if gotPayload["instructions"] != "keep WS context" {
+		t.Fatalf("Responses Lite did not preserve supplied instructions: %+v", gotPayload)
+	}
+	if _, present := gotPayload["tools"]; !present {
+		t.Fatalf("Responses Lite did not preserve supplied tools: %+v", gotPayload)
+	}
+}
+
+func TestCodexWebSocketResponsesLiteDoesNotSynthesizeInstructionsOrTools(t *testing.T) {
+	payload, err := buildCodexWebSocketCreatePayload([]byte(`{"model":"gpt-5.6-sol","input":"hi"}`), codexWebSocketIDs{responsesLite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := root["instructions"]; present {
+		t.Fatalf("Responses Lite synthesized instructions: %+v", root)
+	}
+	if _, present := root["tools"]; present {
+		t.Fatalf("Responses Lite synthesized top-level tools: %+v", root)
+	}
+}
+
+func TestCodexWebSocketClassicResponsesStillDefaultsTools(t *testing.T) {
+	payload, err := buildCodexWebSocketCreatePayload([]byte(`{"model":"gpt-5.5","input":"hi"}`), codexWebSocketIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		t.Fatal(err)
+	}
+	tools, present := root["tools"].([]interface{})
+	if !present || len(tools) != 0 {
+		t.Fatalf("classic Responses must retain the tools:[] default: %+v", root)
+	}
+}
+
+func TestCodexResponsesWebSocketTerminalErrorFrameClosesCleanly(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Fatalf("read request: %v", err)
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"message":"invalid cache request"}}`))
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+	client := NewClient(cfg)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath:          "/v1/responses",
+		Body:                    []byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"low"},"input":"hi"}`),
+		Account:                 storage.Account{ID: "acc-ws-error", UpstreamAccountID: "workspace"},
+		Token:                   storage.AccountToken{AccessToken: "access"},
+		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
+		CodexResponsesWebSocket: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("terminal error frame became a transport error: %v", err)
+	}
+	if !strings.Contains(string(body), `"type":"error"`) || !strings.Contains(string(body), "data: [DONE]") {
+		t.Fatalf("terminal error frame was not preserved: %s", body)
 	}
 }
 
 func TestCodexWebSocketPayloadPreservesPreviousResponseID(t *testing.T) {
 	client := NewClient(config.Default())
-	payload, err := buildCodexWebSocketCreatePayload([]byte(`{"model":"gpt","previous_response_id":"resp_real","session_id":"downstream-session","thread_id":"downstream-thread","input":"hi"}`), codexWebSocketIDs{
+	original := []byte(`{"model":"gpt","instructions":"keep","previous_response_id":"resp_real","session_id":"downstream-session","thread_id":"downstream-thread","tools":[{"schema":{"const":900719925474099312345}}],"input":[{"exact_id":900719925474099312345}]}`)
+	payload, err := buildCodexWebSocketCreatePayload(original, codexWebSocketIDs{
 		installationID: "install-1",
 		sessionID:      "session-derived",
 		threadID:       "thread-derived",
@@ -130,10 +235,30 @@ func TestCodexWebSocketPayloadPreservesPreviousResponseID(t *testing.T) {
 	if err := json.Unmarshal(out, &root); err != nil {
 		t.Fatalf("payload json: %v\n%s", err, out)
 	}
-	if root["session_id"] != "session-derived" || root["thread_id"] != "thread-derived" {
-		t.Fatalf("session/thread ids should still be namespaced: %+v", root)
+	if _, present := root["session_id"]; present {
+		t.Fatalf("top-level session_id is not a Responses API parameter: %+v", root)
+	}
+	if _, present := root["thread_id"]; present {
+		t.Fatalf("top-level thread_id is not a Responses API parameter: %+v", root)
 	}
 	if root["previous_response_id"] != "resp_real" {
 		t.Fatalf("previous_response_id must pass through unchanged, got %+v", root)
+	}
+	assertCodexContextFieldsUnchanged(t, original, out)
+}
+
+func TestWriteSSEEventPrefixesEveryMultilineJSONLine(t *testing.T) {
+	raw := []byte("{\n  \"type\": \"response.completed\",\n  \"response\": {\"id\": \"resp_multiline\"}\n}")
+	var out bytes.Buffer
+	if err := writeSSEEvent(&out, "response.completed", raw); err != nil {
+		t.Fatal(err)
+	}
+	want := "event: response.completed\n" +
+		"data: {\n" +
+		"data:   \"type\": \"response.completed\",\n" +
+		"data:   \"response\": {\"id\": \"resp_multiline\"}\n" +
+		"data: }\n\n"
+	if out.String() != want {
+		t.Fatalf("multiline SSE event = %q, want %q", out.String(), want)
 	}
 }

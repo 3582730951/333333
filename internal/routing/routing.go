@@ -12,6 +12,11 @@ import (
 const (
 	cachePrefixAffinityMinBytes = 2048
 	cachePrefixTextHeadBytes    = 4096
+
+	// CodexRootThreadAffinitySource identifies the canonical conversation key
+	// shared by an official Codex root request (thread-id) and all of its spawned
+	// children (x-codex-parent-thread-id).
+	CodexRootThreadAffinitySource = "codex-root-thread-id"
 )
 
 type AffinityKey struct {
@@ -68,7 +73,10 @@ func ExtractClaudeTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 
 func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 	if v := headerValue(r, "x-codex-parent-thread-id"); v != "" {
-		return newKey("x-codex-parent-thread-id:"+v, "x-codex-parent-thread-id")
+		return codexRootThreadAffinity(v)
+	}
+	if v := headerValue(r, "thread-id"); v != "" {
+		return codexRootThreadAffinity(v)
 	}
 	if v := JSONStringField(body, "thread_id"); v != "" {
 		return newKey("thread_id:"+v, "thread_id")
@@ -86,6 +94,10 @@ func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 		return newKey("x-codex-turn-metadata:"+v, "x-codex-turn-metadata")
 	}
 	return AffinityKey{}
+}
+
+func codexRootThreadAffinity(threadID string) AffinityKey {
+	return newKey(CodexRootThreadAffinitySource+":"+threadID, CodexRootThreadAffinitySource)
 }
 
 func IsStrictSticky(path string, r *http.Request, body []byte) bool {

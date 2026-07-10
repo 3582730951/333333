@@ -526,7 +526,7 @@ func (s *Server) probeModel(ctx context.Context, accountID, provider string) str
 			}
 		}
 	}
-	return "gpt-5.5"
+	return "gpt-5.6-sol"
 }
 
 func codexLivenessProbeBody(model string) []byte {

@@ -17,11 +17,18 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-06-27 from capture/out_v3 (codex-cli 0.142.3).
-	DefaultClientVersion                  = "0.142.3"
+	// Refreshed 2026-07-10 from the installed shipping CLI (codex-cli 0.144.1)
+	// and other_codex's 0.144.0-gated GPT-5.6 catalog.
+	DefaultClientVersion                  = "0.144.1"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
+	// AdmissionWait: when every provider/model-matching account is momentarily at its
+	// concurrency cap or over its per-account token budget, a request waits this long
+	// for an in-flight slot to free (retrying selection each time a lease releases)
+	// before the pool reports saturation. This is backpressure/queueing, never a model
+	// or context downgrade — the request still lands on a full-quality account. 0 disables.
+	DefaultAdmissionWaitMillis = 2500
 	// Cooldown→health-recheck loop: how often to probe benched accounts, and how long
 	// to re-bench one whose probe still fails before the next attempt.
 	DefaultAccountRecheckIntervalSeconds  = 20
@@ -33,7 +40,11 @@ const (
 	DefaultStreamFailoverHoldDiskBytes    = 0
 	DefaultVirtualWindow                  = 2_000_000
 	DefaultVirtualContextLedgerTTLSeconds = 3600 // 1 hour
-	DefaultAccountTokenBudget             = 2_000_000
+	// AccountTokenBudget caps CONCURRENT estimated tokens stacked on one account (a
+	// smoothing gate against over-committing a single upstream, not a per-request limit).
+	// Sized for several concurrent 1M-context Claude Code turns per account; exceeding it
+	// now makes a request WAIT for headroom (see AdmissionWait), never fail downstream.
+	DefaultAccountTokenBudget = 8_000_000
 	// Standard Claude Code OAuth client (Claude Pro/Max). Operators may override
 	// via config if Anthropic rotates these.
 	DefaultClaudeOAuthTokenURL = "https://api.anthropic.com/v1/oauth/token"
@@ -54,11 +65,17 @@ const (
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
-	// Refreshed 2026-06-27 from capture/out_v3 (X-Stainless-Runtime-Version v26.3.0).
+	// Reconfirmed 2026-07-10 from Claude Code 2.1.206 Docker capture.
 	DefaultClaudeNodeVersion = "v26.3.0"
 	// DefaultModelProbeIntervalHours re-probes each account's upstream model list
 	// twice a day so the advertised /v1/models union stays fresh.
 	DefaultModelProbeIntervalHours = 12
+	// Model-quality monitoring is group×model (never per account). One compact
+	// primary probe runs per interval; confirmations are anomaly-only.
+	DefaultModelQualityIntervalMinutes   = 60
+	DefaultModelQualityReasoningEffort   = "low"
+	DefaultModelQualityDegradedThreshold = 2
+	DefaultModelQualityHistoryDays       = 30
 	// DefaultGeoProbeURL is the IP/geo echo used to auto-detect a proxy's exit
 	// region when none is configured. It returns JSON with ip/country/region/city.
 	DefaultGeoProbeURL = "https://ipapi.co/json/"
@@ -128,12 +145,16 @@ type Config struct {
 	VirtualContextWindow           int64  `json:"virtual_context_window"`
 	VirtualContextLedgerTTLSeconds int64  `json:"virtual_context_ledger_ttl_seconds"`
 	StickyWaitMillis               int    `json:"sticky_wait_millis"`
-	RequestTimeoutSeconds          int    `json:"request_timeout_seconds"`
-	ShutdownDrainSeconds           int    `json:"shutdown_drain_seconds"`
-	MaxBodyBytes                   int64  `json:"max_body_bytes"`
-	AccountTokenBudget             int64  `json:"account_token_budget"`
-	AdminToken                     string `json:"admin_token"`
-	SidecarTimeoutSeconds          int    `json:"sidecar_timeout_seconds"`
+	// AdmissionWaitMillis bounds the per-account concurrency/token-budget backpressure
+	// wait (see DefaultAdmissionWaitMillis). Unset (0) adopts the default; a negative
+	// value disables the wait (legacy fail-fast).
+	AdmissionWaitMillis   int    `json:"admission_wait_millis"`
+	RequestTimeoutSeconds int    `json:"request_timeout_seconds"`
+	ShutdownDrainSeconds  int    `json:"shutdown_drain_seconds"`
+	MaxBodyBytes          int64  `json:"max_body_bytes"`
+	AccountTokenBudget    int64  `json:"account_token_budget"`
+	AdminToken            string `json:"admin_token"`
+	SidecarTimeoutSeconds int    `json:"sidecar_timeout_seconds"`
 	// DefaultSidecarEndpoint, when set by install/runtime configuration, seeds a
 	// local curl_cffi_sidecar egress profile. Admins still decide whether accounts
 	// bind to it.
@@ -308,9 +329,16 @@ type Config struct {
 	// ephemeral (5 min), "1h" = extended (1 hour; higher hit rate across gaps, the
 	// cache write costs ~2x). Applies only to auto-injected breakpoints.
 	ClaudeCacheTTL string `json:"claude_cache_ttl"`
-	// ClaudeCCHSigning signs the Claude Code billing-header cch field over the final
-	// Messages body for OAuth traffic. Default on; disable only as an upstream
-	// compatibility escape hatch.
+	// ClaudeCacheTTLRouteAware, when enabled, reserves the configured 1h extended cache
+	// for true-conversation routes (a stable session/thread id) and lets collapsible
+	// routes (stable-prefix / coarse / anonymous) fall back to the 5m ephemeral cache —
+	// bounding staleness on prefixes several distinct requests can share and trimming the
+	// 1h write cost. Default OFF preserves the historical "configured TTL applies to every
+	// route" behavior. TTL is retention only; it never changes model, context, or reasoning.
+	ClaudeCacheTTLRouteAware bool `json:"claude_cache_ttl_route_aware"`
+	// ClaudeCCHSigning is retained only so older config files continue to parse.
+	// Claude Code 2.1.206 no longer emits cch, so the request path ignores this
+	// deprecated setting and the default is false.
 	ClaudeCCHSigning bool `json:"claude_cch_signing"`
 	// BanDetectionEnabled turns on automatic classification of upstream responses
 	// into ban / rate-limit / auth / region verdicts (heuristics ported from the
@@ -412,13 +440,10 @@ type Config struct {
 	// AccountRecheckBackoffSeconds is how long to re-bench an account whose recheck
 	// probe still fails, before the next probe attempt. Default 120s.
 	AccountRecheckBackoffSeconds int `json:"account_recheck_backoff_seconds"`
-	// CodexPromptCacheRetention sets the prompt_cache_retention policy injected on
-	// Codex /responses requests whose model supports extended retention (the gpt-5.x
-	// family + gpt-4.1). "24h" keeps the prompt-cache prefix warm for up to 24 hours
-	// instead of the ~5–10min in-memory default — the biggest lever on cache-hit rate
-	// for a rotating account pool (resumed conversations and switch-back to a prior
-	// account can still hit a warm cache). A downstream-supplied value always wins.
-	// Empty disables injection. Default "24h". Runtime key: codex_prompt_cache_retention.
+	// CodexPromptCacheRetention is retained only for config-file compatibility.
+	// Current codex-rs 0.144.x sends no prompt_cache_retention field on HTTP or WS,
+	// so the relay does not inject it and strips legacy downstream values. Cache
+	// affinity uses prompt_cache_key instead. Runtime key: codex_prompt_cache_retention.
 	CodexPromptCacheRetention string `json:"codex_prompt_cache_retention"`
 	// Codex install defaults written into the generated ~/.codex/config.toml by the
 	// one-shot setup script (GET /file/<key>). Together approval_policy="never" +
@@ -426,7 +451,7 @@ type Config struct {
 	// CLI runs every command without asking. These are the operator-requested defaults;
 	// set a more conservative value (e.g. sandbox "workspace-write", approval
 	// "on-request") to dial back. All are validated against codex-rs enums.
-	CodexInstallModel          string `json:"codex_install_model"`           // default "gpt-5.5"
+	CodexInstallModel          string `json:"codex_install_model"`           // default "gpt-5.6-sol"
 	CodexInstallEffort         string `json:"codex_install_effort"`          // default "xhigh"
 	CodexInstallApprovalPolicy string `json:"codex_install_approval_policy"` // default "never"
 	CodexInstallSandboxMode    string `json:"codex_install_sandbox_mode"`    // default "danger-full-access"
@@ -472,6 +497,15 @@ type Config struct {
 	// account's upstream-supported models (so /v1/models stays current without a
 	// manual probe). 0 disables the background refresh. Imports always probe once.
 	ModelProbeIntervalHours int `json:"model_probe_interval_hours"`
+	// ModelQualityMonitorEnabled is opt-in because every scheduled probe consumes a
+	// small amount of upstream quota. Models empty means all advertised models in
+	// every active group. Verdicts are group×model, not account-level.
+	ModelQualityMonitorEnabled    bool     `json:"model_quality_monitor_enabled"`
+	ModelQualityIntervalMinutes   int      `json:"model_quality_interval_minutes"`
+	ModelQualityReasoningEffort   string   `json:"model_quality_reasoning_effort"`
+	ModelQualityModels            []string `json:"model_quality_models"`
+	ModelQualityDegradedThreshold int      `json:"model_quality_degraded_threshold"`
+	ModelQualityHistoryDays       int      `json:"model_quality_history_days"`
 	// GeoProbeURL is the IP/geo echo endpoint used to auto-detect a proxy egress's
 	// exit IP + region (the request is made THROUGH the proxy, so it reflects the
 	// real exit location and doubles as a health check). Empty uses a sensible
@@ -592,13 +626,13 @@ type Config struct {
 	// When false, all thinking configuration is stripped. Default false (opt-in).
 	ThinkingEnabled bool `json:"thinking_enabled"`
 	// ThinkingDefaultMode selects the default thinking configuration mode:
-	// "level" (discrete levels: minimal/low/medium/high/xhigh/max),
+	// "level" (discrete levels: minimal/low/medium/high/xhigh/max/ultra),
 	// "budget" (numeric token budget), "auto" (dynamic), "none" (disabled).
 	// Only effective when ThinkingEnabled=true. Default "level".
 	ThinkingDefaultMode string `json:"thinking_default_mode"`
 	// ThinkingDefaultLevel is the default discrete thinking level when
 	// ThinkingDefaultMode="level". Examples: "minimal", "low", "medium", "high",
-	// "xhigh", "max". Default "medium".
+	// "xhigh", "max", "ultra". Default "medium".
 	ThinkingDefaultLevel string `json:"thinking_default_level"`
 	// ThinkingDefaultBudget is the default numeric thinking budget (token count)
 	// when ThinkingDefaultMode="budget". Default 8192.
@@ -653,7 +687,7 @@ type ThinkingOverride struct {
 	// Mode is the thinking mode: "level", "budget", "auto", or "none"
 	Mode string `json:"mode"`
 	// Level is the discrete thinking level (only used when Mode="level")
-	// Valid values: "minimal", "low", "medium", "high", "xhigh", "max"
+	// Valid values: "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
 	Level string `json:"level,omitempty"`
 	// Budget is the numeric thinking budget in tokens (only used when Mode="budget")
 	// Valid range: typically 512-128000, model-dependent
@@ -671,6 +705,7 @@ func Default() Config {
 		VirtualContextWindow:           DefaultVirtualWindow,
 		VirtualContextLedgerTTLSeconds: DefaultVirtualContextLedgerTTLSeconds,
 		StickyWaitMillis:               DefaultStickyWaitMillis,
+		AdmissionWaitMillis:            DefaultAdmissionWaitMillis,
 		RequestTimeoutSeconds:          DefaultRequestTimeoutSec,
 		ShutdownDrainSeconds:           DefaultShutdownDrainSec,
 		MaxBodyBytes:                   DefaultMaxBodyBytes,
@@ -691,7 +726,7 @@ func Default() Config {
 		ClaudeCacheSingleflightEnabled:    false,
 		ClaudeCacheLosslessBlockSplit:     false,
 		ClaudeCacheTTL:                    "1h",
-		ClaudeCCHSigning:                  true,
+		ClaudeCCHSigning:                  false,
 		BanDetectionEnabled:               true,
 		BanAutoDelete:                     true,
 		QuarantineDurationHours:           72,
@@ -713,8 +748,8 @@ func Default() Config {
 		AccountRecheckEnabled:                  true,
 		AccountRecheckIntervalSeconds:          DefaultAccountRecheckIntervalSeconds,
 		AccountRecheckBackoffSeconds:           DefaultAccountRecheckBackoffSeconds,
-		CodexPromptCacheRetention:              "24h",
-		CodexInstallModel:                      "gpt-5.5",
+		CodexPromptCacheRetention:              "",
+		CodexInstallModel:                      "gpt-5.6-sol",
 		CodexInstallEffort:                     "xhigh",
 		CodexInstallApprovalPolicy:             "never",
 		CodexInstallSandboxMode:                "danger-full-access",
@@ -730,6 +765,11 @@ func Default() Config {
 		CooldownWaitMaxSeconds:                 DefaultCooldownWaitMaxSeconds,
 		LeakScrubEnabled:                       true,
 		ModelProbeIntervalHours:                DefaultModelProbeIntervalHours,
+		ModelQualityMonitorEnabled:             false,
+		ModelQualityIntervalMinutes:            DefaultModelQualityIntervalMinutes,
+		ModelQualityReasoningEffort:            DefaultModelQualityReasoningEffort,
+		ModelQualityDegradedThreshold:          DefaultModelQualityDegradedThreshold,
+		ModelQualityHistoryDays:                DefaultModelQualityHistoryDays,
 		GeoProbeURL:                            DefaultGeoProbeURL,
 		CodexReauthWorkerURL:                   DefaultCodexReauthWorkerURL,
 		CodexReauthWorkerConcurrency:           1,
@@ -780,6 +820,16 @@ func Load(path string) (Config, error) {
 
 func (c *Config) StickyWait() time.Duration {
 	return time.Duration(c.StickyWaitMillis) * time.Millisecond
+}
+
+// AdmissionWait is the bounded backpressure window a request spends waiting for a
+// per-account concurrency / token-budget slot to free before the pool reports
+// saturation. 0 disables the wait (legacy fail-fast selection).
+func (c *Config) AdmissionWait() time.Duration {
+	if c.AdmissionWaitMillis <= 0 {
+		return 0
+	}
+	return time.Duration(c.AdmissionWaitMillis) * time.Millisecond
 }
 
 func (c *Config) RequestTimeout() time.Duration {
@@ -888,19 +938,19 @@ func (c *Config) FingerprintWarnings() []string {
 	}
 	// Shape: a set override must look like the real header value the client sends.
 	if cli != "" && !looksLikeDotVersion(cli) {
-		w = append(w, "claude_cli_version "+strconv.Quote(cli)+" does not look like a semver (e.g. 2.1.159)")
+		w = append(w, "claude_cli_version "+strconv.Quote(cli)+" does not look like a semver (e.g. 2.1.206)")
 	}
 	if sdk != "" && !looksLikeDotVersion(sdk) {
-		w = append(w, "claude_stainless_version "+strconv.Quote(sdk)+" does not look like a semver (e.g. 0.65.0)")
+		w = append(w, "claude_stainless_version "+strconv.Quote(sdk)+" does not look like a semver (e.g. 0.94.0)")
 	}
 	if node != "" && !strings.HasPrefix(node, "v") {
-		w = append(w, "claude_node_version "+strconv.Quote(node)+" should start with 'v' (Node convention, e.g. v22.14.0)")
+		w = append(w, "claude_node_version "+strconv.Quote(node)+" should start with 'v' (Node convention, e.g. v26.3.0)")
 	}
 	return w
 }
 
-// looksLikeDotVersion reports whether s is a dotted, digits-only version like "2.1.159"
-// or "0.65.0" (≥2 segments, every segment a non-empty run of digits).
+// looksLikeDotVersion reports whether s is a dotted, digits-only version like "2.1.206"
+// or "0.94.0" (≥2 segments, every segment a non-empty run of digits).
 func looksLikeDotVersion(s string) bool {
 	parts := strings.Split(s, ".")
 	if len(parts) < 2 {
@@ -1128,6 +1178,12 @@ func (c *Config) normalize() {
 	if c.StickyWaitMillis <= 0 {
 		c.StickyWaitMillis = DefaultStickyWaitMillis
 	}
+	// 0 (unset — e.g. a config predating this field) adopts the default so existing
+	// deployments get admission backpressure on update; a negative value is the explicit
+	// "disable" escape hatch (AdmissionWait() returns 0 for anything <= 0).
+	if c.AdmissionWaitMillis == 0 {
+		c.AdmissionWaitMillis = DefaultAdmissionWaitMillis
+	}
 	if c.RequestTimeoutSeconds <= 0 {
 		c.RequestTimeoutSeconds = DefaultRequestTimeoutSec
 	}
@@ -1211,6 +1267,21 @@ func (c *Config) normalize() {
 	}
 	if c.GeoProbeURL == "" {
 		c.GeoProbeURL = DefaultGeoProbeURL
+	}
+	if c.ModelQualityIntervalMinutes < 60 {
+		c.ModelQualityIntervalMinutes = DefaultModelQualityIntervalMinutes
+	}
+	switch strings.ToLower(strings.TrimSpace(c.ModelQualityReasoningEffort)) {
+	case "low", "medium", "high":
+		c.ModelQualityReasoningEffort = strings.ToLower(strings.TrimSpace(c.ModelQualityReasoningEffort))
+	default:
+		c.ModelQualityReasoningEffort = DefaultModelQualityReasoningEffort
+	}
+	if c.ModelQualityDegradedThreshold < 2 {
+		c.ModelQualityDegradedThreshold = DefaultModelQualityDegradedThreshold
+	}
+	if c.ModelQualityHistoryDays <= 0 {
+		c.ModelQualityHistoryDays = DefaultModelQualityHistoryDays
 	}
 	if c.CodexReauthWorkerURL == "" {
 		c.CodexReauthWorkerURL = DefaultCodexReauthWorkerURL

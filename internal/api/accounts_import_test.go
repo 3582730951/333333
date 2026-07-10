@@ -34,6 +34,10 @@ func TestImportTopLevelSessionJSONAndDuplicateDoesNotOverwrite(t *testing.T) {
 	if tok.AccessToken != "access-one" || tok.RefreshToken != "refresh-one" || tok.LastRefresh != 1750000000 {
 		t.Fatalf("top-level token not stored: %+v", tok)
 	}
+	caps, err := h.store.ListCapabilities(context.Background(), accountID)
+	if err != nil || len(caps) == 0 {
+		t.Fatalf("auth.json import must synchronously seed model capabilities: caps=%+v err=%v", caps, err)
+	}
 
 	dupBody := strings.ReplaceAll(body, "first", "second")
 	dupBody = strings.ReplaceAll(dupBody, "access-one", "access-two")

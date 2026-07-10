@@ -9,14 +9,14 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
-func TestProbeModelCodexDefaultsToGPT55(t *testing.T) {
+func TestProbeModelCodexDefaultsToGPT56Sol(t *testing.T) {
 	store := apiTestStore(t)
 	cfg := config.Default()
 	app := &Server{cfg: cfg, store: store}
 
 	got := app.probeModel(context.Background(), "acc", "codex")
-	if got != "gpt-5.5" {
-		t.Fatalf("probe model = %q, want gpt-5.5", got)
+	if got != "gpt-5.6-sol" {
+		t.Fatalf("probe model = %q, want gpt-5.6-sol", got)
 	}
 }
 
@@ -34,8 +34,8 @@ func TestProbeModelCodexNeverFallsBackToCodexDedicatedModel(t *testing.T) {
 	app := &Server{cfg: cfg, store: store}
 
 	got := app.probeModel(ctx, "acc", "codex")
-	if got != "gpt-5.5" {
-		t.Fatalf("probe model = %q, want gpt-5.5", got)
+	if got != "gpt-5.6-sol" {
+		t.Fatalf("probe model = %q, want gpt-5.6-sol", got)
 	}
 }
 

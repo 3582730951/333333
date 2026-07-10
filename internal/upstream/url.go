@@ -32,7 +32,7 @@ func ComputeURL(base, downstreamPath string) string {
 		query = path[idx+1:]
 		path = path[:idx]
 	}
-	if strings.Contains(u.Path, "/backend-api/codex") {
+	if strings.Contains(u.Path, "/backend-api/codex") || strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/v1") {
 		path = strings.TrimPrefix(path, "/v1")
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(path, "/")
@@ -41,24 +41,15 @@ func ComputeURL(base, downstreamPath string) string {
 }
 
 func ComputeCodexResponsesWebSocketURL(base, downstreamPath string) string {
-	base = NormalizeBaseURL(base)
-	u, err := url.Parse(base)
+	target := ComputeURL(base, downstreamPath)
+	u, err := url.Parse(target)
 	if err != nil || u.Host == "" {
-		return strings.TrimRight(base, "/") + downstreamPath
-	}
-	query := ""
-	if idx := strings.Index(downstreamPath, "?"); idx >= 0 {
-		query = downstreamPath[idx+1:]
+		return target
 	}
 	if u.Scheme == "http" {
 		u.Scheme = "ws"
 	} else {
 		u.Scheme = "wss"
 	}
-	if u.Host == "chatgpt.com" || u.Host == "chat.openai.com" {
-		u.Host = "api.openai.com"
-	}
-	u.Path = "/v1/responses"
-	u.RawQuery = query
 	return u.String()
 }

@@ -39,11 +39,45 @@ func TestAffinityPriorityParentThreadWins(t *testing.T) {
 	req.Header.Set("x-codex-parent-thread-id", "parent-1")
 	body := []byte(`{"thread_id":"thread-2","prompt_cache_key":"pc-3","model":"gpt"}`)
 	key := ExtractAffinityKey(req, body)
-	if key.Source != "x-codex-parent-thread-id" {
+	if key.Source != CodexRootThreadAffinitySource {
 		t.Fatalf("source = %q", key.Source)
 	}
 	if !strings.Contains(key.Key, "parent-1") {
 		t.Fatalf("key = %q", key.Key)
+	}
+}
+
+func TestOfficialCodexRootAndSubagentShareAffinity(t *testing.T) {
+	root, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	root.Header.Set("thread-id", "root-thread-1")
+	root.Header.Set("x-codex-window-id", "root-thread-1:1")
+	rootKey := ExtractAffinityKey(root, []byte(`{"thread_id":"body-root","prompt_cache_key":"root-thread-1"}`))
+
+	child, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	child.Header.Set("thread-id", "child-thread-1")
+	child.Header.Set("x-codex-parent-thread-id", "root-thread-1")
+	childKey := ExtractAffinityKey(child, []byte(`{"thread_id":"body-child","prompt_cache_key":"child-thread-1"}`))
+
+	if rootKey.Source != CodexRootThreadAffinitySource || childKey.Source != CodexRootThreadAffinitySource {
+		t.Fatalf("sources = root %q, child %q", rootKey.Source, childKey.Source)
+	}
+	if rootKey.Key != childKey.Key || rootKey.Hash != childKey.Hash {
+		t.Fatalf("root and child affinity differ: root=%+v child=%+v", rootKey, childKey)
+	}
+
+	otherRoot, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	otherRoot.Header.Set("thread-id", "root-thread-2")
+	otherRootKey := ExtractAffinityKey(otherRoot, []byte(`{"prompt_cache_key":"root-thread-2"}`))
+	if otherRootKey.Hash == rootKey.Hash {
+		t.Fatalf("different roots share affinity: first=%+v second=%+v", rootKey, otherRootKey)
+	}
+
+	// Body-only thread_id remains compatible for clients that do not send the
+	// official Codex thread-id header.
+	bodyOnly, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	bodyOnlyKey := ExtractAffinityKey(bodyOnly, []byte(`{"thread_id":"body-thread"}`))
+	if bodyOnlyKey.Source != "thread_id" || !strings.Contains(bodyOnlyKey.Key, "body-thread") {
+		t.Fatalf("body thread_id affinity changed: %+v", bodyOnlyKey)
 	}
 }
 

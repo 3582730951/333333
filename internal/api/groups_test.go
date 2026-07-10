@@ -68,11 +68,11 @@ func TestMultiGroupCRUDAndReassign(t *testing.T) {
 	if g := findGroup(listGroups(t, h), "team-a"); g == nil || g["force_model"] != "gpt-5" || g["force_effort"] != "high" {
 		t.Fatalf("team-a not created with forced fields: %v", g)
 	}
-	// Generic PATCH updates + normalizes effort on the new group ("max" → "xhigh").
+	// Generic PATCH updates the new group without lowering the model-native max tier.
 	if code, body := grpReq(t, h, http.MethodPatch, "/admin/groups/team-a", `{"force_effort":"max"}`); code != http.StatusOK {
 		t.Fatalf("patch group = %d: %s", code, body)
 	}
-	if g := findGroup(listGroups(t, h), "team-a"); g["force_effort"] != "xhigh" {
+	if g := findGroup(listGroups(t, h), "team-a"); g["force_effort"] != "max" {
 		t.Fatalf("force_effort not normalized/updated: %v", g["force_effort"])
 	}
 

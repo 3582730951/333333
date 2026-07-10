@@ -1,0 +1,13 @@
+# Non-secret Docker E2E profile: official Codex CLI -> local pool_server.
+model = "gpt-5.6-sol"
+model_provider = "poolserver"
+model_reasoning_effort = "low"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.poolserver]
+name = "Pool Server E2E"
+base_url = "http://127.0.0.1:18788/v1"
+wire_api = "responses"
+supports_websockets = true
+experimental_bearer_token = "e2e-non-secret-placeholder"

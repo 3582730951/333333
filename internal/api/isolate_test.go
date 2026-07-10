@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -19,6 +21,38 @@ func TestInferDownstreamOS(t *testing.T) {
 		if got := inferDownstreamOS([]byte(c[0])); got != c[1] {
 			t.Errorf("inferDownstreamOS(%q) = %q, want %q", c[0], got, c[1])
 		}
+	}
+}
+
+func TestIsolateCodexConversationOnlyChangesCorrelationFields(t *testing.T) {
+	id := identity.For(nil, "acc-isolation-exact")
+	correlator := "same-value-must-stay-in-context"
+	body := []byte(`{"model":"gpt","instructions":"` + correlator + `","prompt_cache_key":"` + correlator + `","conversation_id":"` + correlator + `","thread_id":"thread-real","session_id":"session-real","previous_response_id":"resp_keep","tools":[{"schema":{"const":900719925474099312345}}],"input":[{"role":"user","content":"` + correlator + `"}]}`)
+	header := http.Header{
+		"Conversation_id":   []string{"conv-real"},
+		"X-Codex-Window-Id": []string{"window-real:1"},
+		"X-Unrelated":       []string{"keep"},
+	}
+	after := isolateCodexConversation(header, body, id)
+	var beforeFields, afterFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &beforeFields); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(after, &afterFields); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"model", "instructions", "previous_response_id", "tools", "input"} {
+		if !bytes.Equal(beforeFields[key], afterFields[key]) {
+			t.Fatalf("context field %q changed\nbefore=%s\n after=%s", key, beforeFields[key], afterFields[key])
+		}
+	}
+	for _, key := range []string{"prompt_cache_key", "conversation_id", "thread_id", "session_id"} {
+		if bytes.Equal(beforeFields[key], afterFields[key]) {
+			t.Fatalf("correlation field %q was not isolated", key)
+		}
+	}
+	if header.Get("X-Unrelated") != "keep" {
+		t.Fatalf("unrelated header changed: %+v", header)
 	}
 }
 

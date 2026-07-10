@@ -7,6 +7,7 @@ import (
 )
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var uuidV7Re = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 func TestDeterministic(t *testing.T) {
 	a := For(nil, "acc_123")
@@ -78,6 +79,10 @@ func TestUserAgents(t *testing.T) {
 	if !strings.Contains(cua, id.OSName) || !strings.Contains(cua, id.Arch) || !strings.Contains(cua, id.Terminal) {
 		t.Fatalf("codex UA missing profile fields: %q", cua)
 	}
+	execUA := id.CodexUserAgentExecVersion(CodexCLIVersion)
+	if !strings.HasPrefix(execUA, "codex_exec/"+CodexCLIVersion+" (") || !strings.Contains(execUA, id.Terminal) {
+		t.Fatalf("unexpected codex exec UA: %q", execUA)
+	}
 	clua := id.ClaudeUserAgent()
 	if clua != "claude-cli/"+ClaudeCLIVersion+" (external, cli)" {
 		t.Fatalf("unexpected claude UA: %q", clua)
@@ -125,5 +130,44 @@ func TestForOSAndDerived(t *testing.T) {
 	}
 	if !uuidRe.MatchString(a1) {
 		t.Fatalf("DerivedUUID not v4-shaped: %s", a1)
+	}
+}
+
+func TestDerivedUUIDv7PreservesTimestampAndNamespacesRandomBits(t *testing.T) {
+	const raw = "019f4a5e-8611-79a2-83ef-4df5ab75b715"
+	a1 := DerivedUUIDv7("account-a", raw)
+	a2 := DerivedUUIDv7("account-a", raw)
+	b := DerivedUUIDv7("account-b", raw)
+	if a1 != a2 {
+		t.Fatal("DerivedUUIDv7 must be deterministic")
+	}
+	if a1 == b {
+		t.Fatal("DerivedUUIDv7 must differ per account seed")
+	}
+	if !uuidV7Re.MatchString(a1) || !uuidV7Re.MatchString(b) {
+		t.Fatalf("derived values are not UUIDv7: %q %q", a1, b)
+	}
+	wantMillis, _ := uuidV7TimestampMillis(raw)
+	gotMillis, ok := uuidV7TimestampMillis(a1)
+	if !ok || gotMillis != wantMillis {
+		t.Fatalf("UUIDv7 timestamp changed: got %d want %d", gotMillis, wantMillis)
+	}
+	if a1[13:] == raw[13:] {
+		t.Fatalf("UUIDv7 identifying bits were not replaced: %q", a1)
+	}
+}
+
+func TestDerivedUUIDv7AtUsesExplicitTimestampForOpaqueInput(t *testing.T) {
+	const wantMillis = int64(1783659136531)
+	got := DerivedUUIDv7At("account-a", "opaque-turn-id", wantMillis)
+	if !uuidV7Re.MatchString(got) {
+		t.Fatalf("DerivedUUIDv7At is not UUIDv7: %q", got)
+	}
+	gotMillis, ok := uuidV7TimestampMillis(got)
+	if !ok || gotMillis != wantMillis {
+		t.Fatalf("UUIDv7 timestamp = %d, want %d", gotMillis, wantMillis)
+	}
+	if repeat := DerivedUUIDv7At("account-a", "opaque-turn-id", wantMillis); repeat != got {
+		t.Fatalf("DerivedUUIDv7At is not deterministic: %q vs %q", got, repeat)
 	}
 }

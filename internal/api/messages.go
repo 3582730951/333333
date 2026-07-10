@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
@@ -118,6 +119,15 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	strict := routing.IsStrictSticky(path, r, raw)
 	model := routing.Model(raw)
+	// Normalize a Claude model alias (auto/default/sonnet/opus/haiku, or an undated family
+	// name) that Anthropic would reject into a concrete same-tier model id, and forward
+	// that id upstream. Same-tier only — never a downgrade — so Claude Code's default/auto
+	// selection works end-to-end. No-op for concrete claude-* ids (the common case) and
+	// when a downstream key already forced a concrete model above.
+	if norm := capability.NormalizeClaudeModelAlias(model); norm != model {
+		raw = setForcedModel(raw, norm)
+		model = norm
+	}
 	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
 
 	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is relayed to
@@ -183,10 +193,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		Exclude:         exclude,
 	})
 	if err != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(err, scheduler.ErrStrictUnavailable) {
-			status = http.StatusConflict
-		}
+		status, _ := noAccountHTTPStatus(err)
 		s.writePublicNoAccountError(r.Context(), w, status, group, "claude", model, err)
 		return outcomeDone
 	}
@@ -228,15 +235,12 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 	// Virtualize the request to a consistent first-party Claude Code client and, in the
 	// SAME single JSON parse/marshal pass, stamp the x-anthropic-billing-header for
-	// OAuth/Claude-Code traffic (cc_version coherent with our UA, fresh per-request cch).
+	// native Claude Code/OAuth traffic (cc_version coherent with our UA and a fresh
+	// per-request three-hex suffix; current 2.1.206 emits no cch field).
 	// Folding the billing stamp in here avoids a second full unmarshal+marshal over what
-	// is often a very large Claude Code request body. cch is random (not a body hash), so
-	// this is byte-equivalent to the old separate post-pass, only cheaper.
+	// is often a very large Claude Code request body.
 	oauth := claudeIsOAuth(token)
-	billingVer := ""
-	if oauth {
-		billingVer = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
-	}
+	billingVer := s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 	// Build the sensitive-word list with the virtual home directory auto-injected,
 	// so the real home directory prefix is replaced by the virtual one in both the
 	// request body and the response stream — without the operator needing to
@@ -247,7 +251,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	wordsForClaude := s.cfg.SensitiveWordsFor("claude")
 	wordsForClaude = appendVirtualHomeToWords(wordsForClaude, id.HomeDir)
 	nativeCacheInject := s.nativeCacheBreakpointInjectEnabled(r.Context())
-	claudeTTL := s.claudeCacheTTL(r.Context())
+	claudeTTL := s.claudeCacheTTLForRoute(r.Context(), affinity)
 	breakpointPolicy := s.claudeCacheBreakpointPolicy(r.Context(), affinity, lease.Account.ID, group, apiKeyHash)
 	result := cloak.VirtualizeClaudeCodeWithCache(raw, id, wordsForClaude, oauth, billingVer, cloak.ClaudeCodeCacheOptions{
 		NativeBreakpoints: nativeCacheInject,
@@ -290,6 +294,10 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		usageDiag.SingleflightWaitedRequests = 1
 	}
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	// Backstop: guarantee this attempt's hold reaches a terminal status no matter which
+	// branch returns (including a cancelled/streaming disconnect). Only fires while the
+	// hold is still 'held', so an explicit settle below always wins.
+	defer func() { _ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
@@ -430,11 +438,17 @@ claudeSuccess:
 		}
 		return outcomeDone
 	}
-	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
+	// Read the full upstream body BEFORE committing any status downstream: writing the
+	// 200 first and only then reading means a mid-body upstream failure would leave the
+	// client with a committed 200 followed by a pool error-envelope (a corrupt/truncated
+	// response — "Failed to parse JSON" downstream). Since native /v1/messages is movable,
+	// a pre-commit read failure fails over to a fresh account losslessly instead.
 	responseBody, err := s.readUpstreamResponseBody(resp.Body)
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_response_too_large")
+		if allowRetry && movable {
+			return retry()
+		}
 		writeError(w, http.StatusBadGateway, err)
 		return outcomeDone
 	}
@@ -442,6 +456,8 @@ claudeSuccess:
 	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), responseBody))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
+	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
 	return outcomeDone
 }

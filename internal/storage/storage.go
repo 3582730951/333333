@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-account-pool/internal/secretbox"
@@ -38,6 +39,17 @@ type Store struct {
 	// they are unaffected. Set via SetTokenEncryptionKey from main using the resolved
 	// deployment identity secret.
 	tokenKey []byte
+
+	// settings snapshot cache: a hot request reads ~15-20 distinct settings keys, each
+	// previously its own SELECT against the small WAL read pool. This caches the whole
+	// (tiny) settings table as one map behind an RWMutex, refreshed on a short TTL and
+	// invalidated on every write (SetSettings is the sole write path). Reads are
+	// byte-identical; a write is visible immediately, and the TTL bounds any missed
+	// invalidation. The map is only ever replaced wholesale (never mutated in place),
+	// so a reference handed to a caller stays safe for concurrent reads.
+	settingsMu       sync.RWMutex
+	settingsSnapshot map[string]string
+	settingsLoadedAt time.Time
 }
 
 type Group struct {
@@ -883,6 +895,50 @@ CREATE TABLE IF NOT EXISTS usage_records(
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model);
+CREATE TABLE IF NOT EXISTS model_quality_status(
+  group_name TEXT NOT NULL,
+  model_slug TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'unknown',
+  last_outcome TEXT NOT NULL DEFAULT '',
+  last_probe_at INTEGER NOT NULL DEFAULT 0,
+  last_pass_at INTEGER NOT NULL DEFAULT 0,
+  consecutive_anomalies INTEGER NOT NULL DEFAULT 0,
+  consecutive_errors INTEGER NOT NULL DEFAULT 0,
+  total_checks INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  last_probe_id TEXT NOT NULL DEFAULT '',
+  last_expected TEXT NOT NULL DEFAULT '',
+  last_actual TEXT NOT NULL DEFAULT '',
+  last_returned_model TEXT NOT NULL DEFAULT '',
+  last_latency_ms INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(group_name, model_slug, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_model_quality_status_state ON model_quality_status(state, last_probe_at);
+CREATE TABLE IF NOT EXISTS model_quality_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_name TEXT NOT NULL,
+  model_slug TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  probe_id TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  expected TEXT NOT NULL DEFAULT '',
+  actual TEXT NOT NULL DEFAULT '',
+  returned_model TEXT NOT NULL DEFAULT '',
+  http_status INTEGER NOT NULL DEFAULT 0,
+  error_kind TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_model_quality_runs_combo_time ON model_quality_runs(group_name, model_slug, provider, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_model_quality_runs_created_at ON model_quality_runs(created_at);
 CREATE TABLE IF NOT EXISTS account_session_cookies(
   account_id TEXT PRIMARY KEY,
   cookie TEXT NOT NULL DEFAULT '',
@@ -1569,6 +1625,21 @@ func (s *Store) LookupAPIKey(ctx context.Context, keyHash string) (APIKey, bool,
 		return APIKey{}, false, err
 	}
 	return k, true, nil
+}
+
+// MarkAPIKeyUsed records successful downstream authentication without rewriting the
+// key's routing policy or recoverable secret. The monotonic predicate avoids moving
+// last_used_at backwards when concurrent requests finish out of order.
+func (s *Store) MarkAPIKeyUsed(ctx context.Context, keyHash string, usedAt int64) error {
+	keyHash = strings.TrimSpace(keyHash)
+	if keyHash == "" {
+		return nil
+	}
+	if usedAt <= 0 {
+		usedAt = Now()
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE key_hash = ? AND last_used_at < ?`, usedAt, keyHash, usedAt)
+	return err
 }
 
 // ListAPIKeys returns all api keys (hash only, never plaintext), newest first.
@@ -3236,16 +3307,67 @@ func (s *Store) CountAffinityBindingsByAccount(ctx context.Context, accountID st
 // store admin-UI-toggleable flags (e.g. conversation_isolation) so they can be
 // changed without editing the config file or restarting; absence means "use the
 // config default".
-func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error) {
-	var v string
-	err := s.rdb.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+// settingsCacheTTL bounds how long the process-level settings snapshot is served
+// before a reload — short enough that a missed invalidation self-heals quickly,
+// long enough to amortize the ~15-20 settings reads a single request makes.
+const settingsCacheTTL = time.Second
+
+// settingsMap returns the whole settings table as a shared, immutable map, served
+// from the process-level snapshot when fresh and reloaded in ONE query otherwise.
+// The returned map must not be mutated by callers.
+func (s *Store) settingsMap(ctx context.Context) (map[string]string, error) {
+	s.settingsMu.RLock()
+	if s.settingsSnapshot != nil && time.Since(s.settingsLoadedAt) < settingsCacheTTL {
+		m := s.settingsSnapshot
+		s.settingsMu.RUnlock()
+		return m, nil
 	}
+	s.settingsMu.RUnlock()
+
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	// Double-check: another goroutine may have reloaded while we waited for the lock.
+	if s.settingsSnapshot != nil && time.Since(s.settingsLoadedAt) < settingsCacheTTL {
+		return s.settingsSnapshot, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT key, value FROM settings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	m := make(map[string]string)
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		m[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	s.settingsSnapshot = m
+	s.settingsLoadedAt = time.Now()
+	return m, nil
+}
+
+// InvalidateSettingsCache forces the next GetSetting to reload from the DB. Called
+// after any settings write (SetSettings and the few other paths that touch the
+// settings table) so an operator/runtime change is visible immediately; the short
+// TTL in settingsMap is only a backstop for any write path that forgets to call it.
+func (s *Store) InvalidateSettingsCache() {
+	s.settingsMu.Lock()
+	s.settingsSnapshot = nil
+	s.settingsMu.Unlock()
+}
+
+func (s *Store) GetSetting(ctx context.Context, key string) (string, bool, error) {
+	m, err := s.settingsMap(ctx)
 	if err != nil {
 		return "", false, err
 	}
-	return v, true, nil
+	v, ok := m[key]
+	return v, ok, nil
 }
 
 // SetSetting stores a runtime setting override.
@@ -3276,7 +3398,12 @@ func (s *Store) SetSettings(ctx context.Context, values map[string]string) error
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Make the write visible immediately (the TTL is only a backstop).
+	s.InvalidateSettingsCache()
+	return nil
 }
 
 const moderationSettingKey = "moderation_config"
@@ -3683,7 +3810,14 @@ WHERE settings.value <> excluded.value`, usageDailyResetDaySettingKey, localDay,
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if changed > 0 {
+		// This path also writes the settings table; keep the snapshot coherent.
+		s.InvalidateSettingsCache()
+	}
+	return nil
 }
 
 // ListAuditLog returns the most recent audit records, newest first.
@@ -4513,7 +4647,7 @@ func RouteClassForAffinitySource(source string) string {
 	switch source {
 	case "cache_prefix_hash", "stable_messages_hash":
 		return "stable_prefix"
-	case "x-claude-code-session-id", "x-codex-parent-thread-id", "thread_id", "conversation_id",
+	case "x-claude-code-session-id", "codex-root-thread-id", "x-codex-parent-thread-id", "thread_id", "conversation_id",
 		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
 		return "true_conversation"
 	case "downstream_api_project_model":
@@ -4950,19 +5084,67 @@ func (s *Store) ListAccountRateLimitsByAccountIDs(ctx context.Context, accountID
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id IN (`+sqlPlaceholders(len(ids))+`) ORDER BY updated_at DESC`, stringArgs(ids)...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		r, err := scanAccountRateLimit(rows.Scan)
+	// Keep each IN clause comfortably below SQLite's host-parameter limit. Large
+	// pools can contain thousands of accounts, and this method is used on the hot
+	// scheduler path where a parameter-limit failure must not disable quota routing.
+	const batchSize = 500
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		rows, err := s.rdb.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id IN (`+sqlPlaceholders(len(batch))+`) ORDER BY updated_at DESC`, stringArgs(batch)...)
 		if err != nil {
 			return nil, err
 		}
-		out[r.AccountID] = append(out[r.AccountID], r)
+		for rows.Next() {
+			r, err := scanAccountRateLimit(rows.Scan)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[r.AccountID] = append(out[r.AccountID], r)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
 	}
-	return out, rows.Err()
+	return out, nil
+}
+
+// AccountRateLimitCooldownUntilFromSnapshots applies the same provider/model and
+// exhaustion semantics as AccountRateLimitCooldownUntil to an already-loaded set of
+// snapshots. The scheduler uses this after one batch query, avoiding one SQLite query
+// per candidate while preserving account-wide (blank model/provider) limits.
+func AccountRateLimitCooldownUntilFromSnapshots(rows []AccountRateLimit, provider, model string, now int64) (int64, bool) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	var earliest int64
+	for _, r := range rows {
+		if r.ResetAt <= now {
+			continue
+		}
+		rowProvider := strings.TrimSpace(r.Provider)
+		if provider != "" && rowProvider != "" && rowProvider != provider {
+			continue
+		}
+		rowModel := strings.TrimSpace(r.Model)
+		if rowModel != "" && rowModel != model {
+			continue
+		}
+		if !accountRateLimitExhausted(r) {
+			continue
+		}
+		if earliest == 0 || r.ResetAt < earliest {
+			earliest = r.ResetAt
+		}
+	}
+	return earliest, earliest > 0
 }
 
 // AccountRateLimitCooldownUntil returns the reset time for an active exhausted
@@ -5093,7 +5275,32 @@ func (s *Store) SettleBillingHold(ctx context.Context, id, status string) error 
 	if status == "" {
 		status = "settled"
 	}
+	// Detach from ctx cancellation: a streaming downstream client that disconnects
+	// cancels the request context, and settling on that cancelled context makes the
+	// UPDATE fail silently — the historical `expired_unsettled` leak. WithoutCancel
+	// keeps request values but drops cancellation so the terminal status always lands.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	_, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ?`, status, Now(), id)
+	return err
+}
+
+// SettleBillingHoldIfHeld settles a hold ONLY while it is still in the 'held' state.
+// It is the deferred backstop each inference handler arms right after creating a hold:
+// whichever branch the handler returns through, the hold reaches a terminal status,
+// but a status already written by the handler (settled / failed_upstream / …) is never
+// overwritten because the WHERE clause no longer matches. Like SettleBillingHold it is
+// cancellation-proof so a disconnected client cannot leave a hold unsettled.
+func (s *Store) SettleBillingHoldIfHeld(ctx context.Context, id, status string) error {
+	if id == "" {
+		return nil
+	}
+	if status == "" {
+		status = "settled"
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ? AND status = 'held'`, status, Now(), id)
 	return err
 }
 

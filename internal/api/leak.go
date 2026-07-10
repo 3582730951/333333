@@ -66,6 +66,16 @@ func (sw *scannerResponseWriter) Write(p []byte) (int, error) {
 	return sw.ResponseWriter.Write(p)
 }
 
+// Flush preserves the streaming capability of the wrapped writer. Without this,
+// leakfilter.SSEFilter sees only an io.Writer and buffers small SSE frames in the
+// net/http server until a later write or EOF, defeating token-by-token delivery even
+// though the underlying responseRecorder supports http.Flusher.
+func (sw *scannerResponseWriter) Flush() {
+	if flusher, ok := sw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 // streamSSE forwards an upstream SSE stream to the client. When leak-scrub is on
 // it routes through the SSE frame filter (drops pool-internal rate-limit frames,
 // scrubs sensitive words); otherwise it uses the plain boundary-safe scrubbing
@@ -104,19 +114,20 @@ const (
 )
 
 func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, bool, error) {
-	return probeEarlySSEFailure(body, leakfilter.IsRetryableCodexFailureFrame, codexSSEFrameCommitsContent)
+	return probeEarlySSEFailure(body, leakfilter.IsRetryableCodexFailureFrame, codexSSEFrameCommitsContent, true)
 }
 
 func probeEarlyClaudeSSEFailure(body io.Reader) ([]byte, bool, error) {
-	return probeEarlySSEFailure(body, leakfilter.IsRetryableClaudeErrorFrame, claudeSSEFrameCommitsContent)
+	return probeEarlySSEFailure(body, leakfilter.IsRetryableClaudeErrorFrame, claudeSSEFrameCommitsContent, false)
 }
 
-func probeEarlySSEFailure(body io.Reader, retryableFrame func([]byte) bool, contentFrame func([]byte) bool) ([]byte, bool, error) {
+func probeEarlySSEFailure(body io.Reader, retryableFrame func([]byte) bool, contentFrame func([]byte) bool, scanBufferedAfterContent bool) ([]byte, bool, error) {
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
 	processed := 0
 	frames := 0
 	for len(buf) < earlySSEMaxBytes && frames < earlySSEMaxFrames {
+		committedInBatch := false
 		for {
 			idx := bytes.Index(buf[processed:], []byte("\n\n"))
 			if idx < 0 {
@@ -129,12 +140,24 @@ func probeEarlySSEFailure(body io.Reader, retryableFrame func([]byte) bool, cont
 				return buf, true, nil
 			}
 			if contentFrame(frame) {
-				return buf, false, nil
+				if !scanBufferedAfterContent {
+					return buf, false, nil
+				}
+				// Keep scanning complete frames that arrived in this same read. A
+				// retryable response.failed commonly follows the first delta in the
+				// same network batch; returning immediately would leak that partial
+				// answer and prevent safe account failover. We still never perform a
+				// subsequent blocking read after content, so TTFT remains bounded by
+				// the bytes already available from upstream.
+				committedInBatch = true
 			}
 			processed = end
 			if frames >= earlySSEMaxFrames {
 				return buf, false, nil
 			}
+		}
+		if committedInBatch {
+			return buf, false, nil
 		}
 		n, err := body.Read(tmp)
 		if n > 0 {

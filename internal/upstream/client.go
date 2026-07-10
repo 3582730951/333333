@@ -174,15 +174,23 @@ type Request struct {
 	// (the "downstream" identity source). Empty = use the detected host.
 	OSHint string
 	// CodexClientVersion, when set, overrides the synthesized Codex CLI version on
-	// THIS request's User-Agent (OAuth accounts only) — the version lives only in the
-	// UA (the real client sends no `version` header). Model discovery and version-gated
-	// live models use the current client version; empty keeps the normal per-account/
-	// default version. Has no effect on API-key traffic.
+	// THIS request's User-Agent and `version` header (OAuth accounts only). Model
+	// discovery and version-gated live models use the current client version; empty
+	// keeps the normal per-account/default version. Has no effect on API-key traffic.
 	CodexClientVersion string
 	// CodexResponsesWebSocket sends a Codex Responses turn over the official
 	// responses WebSocket beta transport, returning the upstream events as an SSE
 	// body to the gateway. It is intended for streaming /v1/responses turns only.
 	CodexResponsesWebSocket bool
+	// CodexWebSocketSession keeps one upstream WebSocket alive across sequential
+	// response.create frames from one downstream WebSocket. Codex 0.144.x performs
+	// a generate=false warmup, then references that response id on the same
+	// connection; opening a fresh upstream connection per frame loses that state.
+	CodexWebSocketSession *CodexResponsesWebSocketSession
+	// codexMetadata is an immutable, request-scoped snapshot generated at the Do
+	// choke point. HTTP headers, HTTP client_metadata and the WS handshake/body all
+	// consume the same snapshot so account-virtualized identifiers cannot drift.
+	codexMetadata *codexRequestMetadata
 	// PassThrough (Claude provider only) forwards the request to api.anthropic.com as a
 	// TRANSPARENT proxy: the client's own Content-Type / Accept / Anthropic-Beta are
 	// preserved verbatim and the body is NOT cloaked/virtualized. It is for the extra
@@ -316,10 +324,32 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	// store:true is corrected. This is the production-relay complement to the health-test
 	// probe at server.go:2243, and continues the Session-21 masked-bug chain.
 	if strings.Contains(req.DownstreamPath, "/responses") {
-		req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL)
-		if !req.CodexResponsesWebSocket {
-			req.Body = stripCodexResponsesPromptCacheRetention(req.Body)
+		isCompact := strings.Contains(strings.ToLower(req.DownstreamPath), "/responses/compact")
+		if !isCompact {
+			req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL)
 		}
+		// `ultra` is a client-side Codex capability: the official client enables
+		// automatic delegation locally, but serializes `max` on every Responses wire
+		// path (including /responses/compact). Keep the downstream/config value intact
+		// until this final upstream boundary, then mirror that wire contract.
+		req.Body = normalizeCodexReasoningEffortForWire(req.Body)
+		// Current codex-rs has no prompt_cache_retention request field on either
+		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
+		// cache-affinity control), but strip this obsolete extension consistently.
+		req.Body = stripCodexResponsesPromptCacheRetention(req.Body)
+		if !accountUsesAPIKey(req.Token) {
+			metadata := c.newCodexRequestMetadata(req)
+			req.codexMetadata = &metadata
+			// ApiCompactionInput projects the same identity through headers; only
+			// normal Responses turns serialize client_metadata in the request body.
+			if !isCompact {
+				req.Body = applyCodexClientMetadata(req.Body, metadata, req.CodexResponsesWebSocket)
+			}
+		}
+		// Downstream Codex WebSocket clients may include transport correlators at
+		// the request root. They are useful for routing/identity derivation above,
+		// but are not valid upstream Responses parameters.
+		req.Body = stripCodexTopLevelTransportCorrelators(req.Body)
 	}
 	if req.CodexResponsesWebSocket {
 		return c.doCodexResponsesWebSocket(ctx, req)
@@ -419,6 +449,13 @@ func (c *Client) transportForEgress(egress storage.EgressProfile) (*http.Transpo
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       90 * time.Second,
+		// Larger socket buffers than the 4KiB stdlib default: this proxy moves very large
+		// request bodies (multi-MB 1M-context turns) and long SSE streams, so 64KiB read/
+		// write buffers cut the syscall count per request substantially with negligible
+		// memory cost (bounded by the idle-conn caps above). Pure throughput — no behavior
+		// change to what is sent or received.
+		WriteBufferSize: 64 << 10,
+		ReadBufferSize:  64 << 10,
 		// Negotiate HTTP/2 over TLS like the official clients do. Full JA3/JA4
 		// mimicry requires a TLS-impersonating egress (curl_cffi sidecar); the
 		// stdlib transport at least presents a modern HTTP/2 + TLS 1.2+ profile
@@ -678,6 +715,7 @@ var codexProtocolHeaders = map[string]bool{
 	"x-codex-window-id":        true,
 	"x-codex-parent-thread-id": true,
 	"x-codex-beta-features":    true,
+	"x-openai-subagent":        true,
 	"x-client-request-id":      true,
 }
 
@@ -740,24 +778,48 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 		dst.Set("User-Agent", id.CodexUserAgentForOriginator(originator, version))
 	}
 	setIfEmptyPreserveCase(dst, "Originator", originator)
-	// Session identity. Verified against the open-source codex-rs (login default_client
-	// + codex-api build_session_headers): the real Codex client sends LOWERCASE
-	// `session-id` and `thread-id` headers and does NOT send a `version` header at all.
-	// We therefore synthesize account-bound `session-id`/`thread-id` (never the
-	// downstream's real machine values, which are not on the allowlist and so are
-	// already stripped), derived from the incoming run correlator (conversation_id /
-	// x-codex window/thread id) so all requests of one run/multi-agent fan-out share
-	// them while a new run rotates them — and seeded with MachineID for per-account
-	// isolation. x-client-request-id mirrors thread-id (the real client sets them
-	// equal). Absent any correlator, fall back to the account's stable id.
-	sessSeed := codexRunCorrelator(spec.Headers)
-	if sessSeed == "" {
-		sessSeed = id.SessionID
+	// The built-in OpenAI provider installs `version` as a provider-wide default,
+	// including on /models discovery. RemoteCompactionV2, by contrast, is a
+	// Responses-only session feature.
+	if spec.DownstreamPath == "" || strings.Contains(spec.DownstreamPath, "/responses") || strings.Contains(spec.DownstreamPath, "/models") {
+		setHeaderPreserveCase(dst, "version", version)
 	}
-	thread := identity.DerivedUUID(id.MachineID, "thread\x00"+sessSeed)
-	setHeaderPreserveCase(dst, "session-id", identity.DerivedUUID(id.MachineID, "session\x00"+sessSeed))
-	setHeaderPreserveCase(dst, "thread-id", thread)
-	setHeaderPreserveCase(dst, "x-client-request-id", thread)
+	if spec.DownstreamPath == "" || strings.Contains(spec.DownstreamPath, "/responses") {
+		setHeaderPreserveCase(dst, "x-codex-beta-features", codexBetaFeaturesHeader)
+	}
+	// Session identity and compatibility projections come from one canonical
+	// request snapshot, matching CodexResponsesMetadata in codex-rs. /models is not
+	// a turn and therefore carries only the default auth/UA/originator headers.
+	metadata := spec.codexMetadata
+	if metadata == nil && (spec.DownstreamPath == "" || strings.Contains(spec.DownstreamPath, "/responses")) {
+		generated := c.newCodexRequestMetadata(spec)
+		metadata = &generated
+	}
+	if metadata != nil {
+		setHeaderPreserveCase(dst, "session-id", metadata.sessionID)
+		setHeaderPreserveCase(dst, "thread-id", metadata.threadID)
+		setHeaderPreserveCase(dst, "x-client-request-id", metadata.threadID)
+		setHeaderPreserveCase(dst, "x-codex-window-id", metadata.windowID)
+		if metadata.turnMetadata != "" {
+			setHeaderPreserveCase(dst, "x-codex-turn-metadata", metadata.turnMetadata)
+		}
+		if metadata.parentThreadID != "" {
+			setHeaderPreserveCase(dst, "x-codex-parent-thread-id", metadata.parentThreadID)
+		} else {
+			deleteHeaderFold(dst, "x-codex-parent-thread-id")
+		}
+		if metadata.subagent != "" {
+			setHeaderPreserveCase(dst, codexSubagentHeader, metadata.subagent)
+		} else {
+			deleteHeaderFold(dst, codexSubagentHeader)
+		}
+		if strings.Contains(strings.ToLower(spec.DownstreamPath), "compact") {
+			setHeaderPreserveCase(dst, codexInstallationIDMetadataKey, metadata.installationID)
+		}
+		if metadata.responsesLite && !spec.CodexResponsesWebSocket {
+			setHeaderPreserveCase(dst, codexResponsesLiteHeader, "true")
+		}
+	}
 	if spec.Account.UpstreamAccountID != "" {
 		setIfEmptyPreserveCase(dst, "ChatGPT-Account-ID", spec.Account.UpstreamAccountID)
 	}

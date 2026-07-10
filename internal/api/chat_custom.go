@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -110,10 +109,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		Exclude:         exclude,
 	})
 	if err != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(err, scheduler.ErrStrictUnavailable) {
-			status = http.StatusConflict
-		}
+		status, _ := noAccountHTTPStatus(err)
 		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, provider.ID, model, err)
 		return customCall{}, false
 	}
@@ -130,6 +126,15 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	scrubber := scrub.Scrubber
 	osHint := s.osHint(body, lease.Egress)
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	// Backstop for THIS attempt's failure paths (several rule branches below return
+	// without settling). On success the hold is handed to the caller via cc.holdID, which
+	// settles it after streaming — so disarm the backstop before that hand-off.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned")
+		}
+	}()
 	resp, err := s.upstream.Do(r.Context(), upstream.Request{
 		Method:         http.MethodPost,
 		Provider:       provider.ID,
@@ -210,6 +215,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	}
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, provider.ID, model, resp.Header)
+	handedOff = true
 	return customCall{resp: resp, lease: lease, holdID: holdID, scrubber: scrubber, affinity: affinity}, true
 }
 
@@ -367,7 +373,7 @@ func (s *Server) handleChatViaNativeResponsesCustom(w http.ResponseWriter, r *ht
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
 		uscan := usage.NewStreamScanner("codex")
-		responsesStreamToChatSSE(w, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
+		responsesStreamToChatSSE(w, io.TeeReader(cc.resp.Body, uscan), model, chatStreamUsageRequested(raw), cc.scrubber)
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
 		}

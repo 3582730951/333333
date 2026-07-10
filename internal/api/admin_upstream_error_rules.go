@@ -372,6 +372,9 @@ func (s *Server) buildUpstreamErrorRuleModelOptions(ctx context.Context) (upstre
 	}
 	chatgpt := ensure("chatgpt", "ChatGPT / Codex")
 	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5", "GPT-5")
+	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5.6-sol", "GPT-5.6 Sol")
+	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5.6-terra", "GPT-5.6 Terra")
+	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5.6-luna", "GPT-5.6 Luna")
 	chatgpt.add("gpt-5", "GPT-5 系列", "gpt-5.5", "GPT-5.5")
 	chatgpt.add("gpt-4", "GPT-4 系列", "gpt-4.1", "GPT-4.1")
 	chatgpt.add("gpt-4", "GPT-4 系列", "gpt-4o", "GPT-4o")

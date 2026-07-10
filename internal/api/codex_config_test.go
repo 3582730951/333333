@@ -44,6 +44,7 @@ func TestCodexConfigScript(t *testing.T) {
 		`model = "$MODEL"`,
 		`model_provider = "$PROVIDER_ID"`,
 		`wire_api = "responses"`,
+		`supports_websockets = true`,
 		"experimental_bearer_token",
 		`API_KEY='` + plain + `'`,
 		`MODEL='gpt-5.4'`,

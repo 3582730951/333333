@@ -1102,7 +1102,7 @@ func optimalSystemTemplateValues() map[string]interface{} {
 	return map[string]interface{}{
 		"conversation_isolation":                  true,
 		"codex_prefer_sidecar_ja3_over_ws":        true,
-		"codex_prompt_cache_retention":            "24h",
+		"codex_prompt_cache_retention":            "",
 		"rate_limit_guard_enabled":                true,
 		"seamless_failover":                       true,
 		"failover_max_attempts":                   float64(3),
@@ -1124,7 +1124,7 @@ func optimalSystemTemplateValues() map[string]interface{} {
 		"claude_gateway_forward_hosts":            strings.Join(config.DefaultClaudeGatewayForwardHosts(), ","),
 		"claude_gateway_disable_nonessential_env": true,
 		"claude_gateway_strict_linux_default":     true,
-		"codex_install_model":                     "gpt-5.5",
+		"codex_install_model":                     "gpt-5.6-sol",
 		"codex_install_effort":                    "xhigh",
 		"codex_install_approval_policy":           "never",
 		"codex_install_sandbox_mode":              "danger-full-access",

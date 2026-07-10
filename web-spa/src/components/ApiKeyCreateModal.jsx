@@ -11,6 +11,8 @@ const EFFORT_OPTIONS = [
   { label: 'medium', value: 'medium' },
   { label: 'high', value: 'high' },
   { label: 'xhigh', value: 'xhigh' },
+  { label: 'max', value: 'max' },
+  { label: 'ultra', value: 'ultra' },
 ];
 
 function cleanValues(values, mode) {
@@ -75,7 +77,7 @@ export default function ApiKeyCreateModal({
           />
         ) : null}
         {admin ? <Form.Input field="group_name" label="分组" placeholder="可选" /> : null}
-        <Form.Input field="force_model" label="强制模型" placeholder="可选，如 gpt-5.5" />
+        <Form.Input field="force_model" label="强制模型" placeholder="可选，如 gpt-5.6-sol" />
         <Form.Select field="force_effort" label="推理强度" optionList={EFFORT_OPTIONS} initValue="" />
         {admin ? <Form.Input field="expires_at" label="过期时间" placeholder="可选，如 2026-12-31T23:59:59Z" /> : null}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>

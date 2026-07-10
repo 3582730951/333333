@@ -1114,7 +1114,13 @@ func (h *Handler) getDefaultsWithError(ctx context.Context) (map[string]string, 
 }
 
 func (h *Handler) saveDefaults(ctx context.Context, d map[string]interface{}) error {
-	return h.saveDefaultsWithExecutor(ctx, h.store.DB(), d)
+	if err := h.saveDefaultsWithExecutor(ctx, h.store.DB(), d); err != nil {
+		return err
+	}
+	// saveDefaultsWithExecutor writes the settings table directly (bypassing SetSettings),
+	// so invalidate the settings snapshot to make the change visible immediately.
+	h.store.InvalidateSettingsCache()
+	return nil
 }
 
 func (h *Handler) saveDefaultsWithExecutor(ctx context.Context, exec sqlExecutor, d map[string]interface{}) error {
@@ -1320,6 +1326,10 @@ func (h *Handler) saveProviderBatch(ctx context.Context, providers []providerInp
 		return err
 	}
 	committed = true
+	if len(defaults) > 0 {
+		// The transaction wrote the settings table directly; refresh the snapshot.
+		h.store.InvalidateSettingsCache()
+	}
 	return nil
 }
 

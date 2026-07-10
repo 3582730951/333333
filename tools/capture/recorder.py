@@ -17,6 +17,19 @@ ANTHROPIC_JSON = (b'{"id":"msg_01","type":"message","role":"assistant",'
                   b'"stop_reason":"end_turn","stop_sequence":null,'
                   b'"usage":{"input_tokens":1,"output_tokens":1}}')
 
+ANTHROPIC_SSE = (b'event: message_start\n'
+                 b'data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-opus-4-8","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+                 b'event: content_block_start\n'
+                 b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                 b'event: content_block_delta\n'
+                 b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
+                 b'event: content_block_stop\n'
+                 b'data: {"type":"content_block_stop","index":0}\n\n'
+                 b'event: message_delta\n'
+                 b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n'
+                 b'event: message_stop\n'
+                 b'data: {"type":"message_stop"}\n\n')
+
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -41,19 +54,23 @@ class H(BaseHTTPRequestHandler):
         with open(OUT, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
-    def _respond(self):
+        return rec.get("body_json") or {}
+
+    def _respond(self, body_json):
+        payload = ANTHROPIC_SSE if body_json.get("stream") else ANTHROPIC_JSON
+        content_type = "text/event-stream" if body_json.get("stream") else "application/json"
         self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(ANTHROPIC_JSON)))
+        self.send_header("content-type", content_type)
+        self.send_header("content-length", str(len(payload)))
         self.end_headers()
         try:
-            self.wfile.write(ANTHROPIC_JSON)
+            self.wfile.write(payload)
         except Exception:
             pass
 
     def do_POST(self):
-        self._record()
-        self._respond()
+        body_json = self._record()
+        self._respond(body_json)
 
     do_GET = do_POST
     do_PUT = do_POST

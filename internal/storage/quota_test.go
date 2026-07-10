@@ -152,6 +152,48 @@ func TestAccountRateLimitCompositeDimension(t *testing.T) {
 	}
 }
 
+func TestAccountRateLimitBatchLookupAndSnapshotFiltering(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := int64(1_700_000_000)
+	for _, id := range []string{"acc-1", "acc-2", "acc-3"} {
+		if err := store.UpsertAccount(ctx, Account{ID: id, Label: id, GroupName: "cyber", Status: "active"}, AccountToken{AccessToken: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := []AccountRateLimit{
+		{AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", RemainingTokens: 0, RemainingRequests: -1, ResetAt: now + 60, Status: "rejected"},
+		{AccountID: "acc-1", Provider: "codex", Model: "gpt-4", LimiterType: "tokens", RemainingTokens: 0, RemainingRequests: -1, ResetAt: now + 20, Status: "rejected"},
+		{AccountID: "acc-1", Provider: "", Model: "", LimiterType: "requests", RemainingTokens: -1, RemainingRequests: 0, ResetAt: now + 40},
+		{AccountID: "acc-2", Provider: "claude", Model: "", LimiterType: "unified", RemainingTokens: 100, RemainingRequests: -1, ResetAt: now + 10, Status: "allowed"},
+	}
+	for _, row := range rows {
+		if err := store.UpsertAccountRateLimit(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := store.ListAccountRateLimitsByAccountIDs(ctx, []string{"acc-1", "acc-2", "acc-1", "", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got["acc-1"]) != 3 || len(got["acc-2"]) != 1 || got["missing"] != nil {
+		t.Fatalf("batch snapshots = %#v", got)
+	}
+	if until, limited := AccountRateLimitCooldownUntilFromSnapshots(got["acc-1"], "codex", "gpt-5", now); !limited || until != now+40 {
+		t.Fatalf("gpt-5 cooldown = (%d,%v), want account-wide earliest %d", until, limited, now+40)
+	}
+	if until, limited := AccountRateLimitCooldownUntilFromSnapshots(got["acc-1"], "codex", "gpt-4", now); !limited || until != now+20 {
+		t.Fatalf("gpt-4 cooldown = (%d,%v), want model-specific earliest %d", until, limited, now+20)
+	}
+	if until, limited := AccountRateLimitCooldownUntilFromSnapshots(got["acc-2"], "claude", "claude-opus", now); limited || until != 0 {
+		t.Fatalf("allowed snapshot incorrectly limited account: (%d,%v)", until, limited)
+	}
+	if until, limited := AccountRateLimitCooldownUntilFromSnapshots(got["acc-1"], "codex", "gpt-5", now+120); limited || until != 0 {
+		t.Fatalf("expired snapshots incorrectly limited account: (%d,%v)", until, limited)
+	}
+}
+
 func TestAccountRateLimitMigrationAddsCompositeDimension(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
 	if err != nil {

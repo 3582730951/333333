@@ -1,17 +1,14 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 
-	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
-	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/storage"
 )
 
@@ -64,8 +61,10 @@ func TestMergeBetasFallsBackToCanonical(t *testing.T) {
 	for _, want := range []string{
 		"claude-code-20250219",
 		"oauth-2025-04-20",
-		"token-efficient-tools-2026-03-28",
 		"interleaved-thinking-2025-05-14",
+		"thinking-token-count-2026-05-13",
+		"mid-conversation-system-2026-04-07",
+		"effort-2025-11-24",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("canonical fallback missing %q: %s", want, got)
@@ -217,10 +216,22 @@ func TestClaudeMessagesFinalSanitizerBeforeSidecar(t *testing.T) {
 	if err := json.Unmarshal([]byte(cap.body), &got); err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"metadata", "betas", "thinking", "output_config"} {
+	for _, forbidden := range []string{"betas", "thinking", "output_config"} {
 		if _, ok := got[forbidden]; ok {
 			t.Fatalf("%s must be removed before Claude upstream: %s", forbidden, cap.body)
 		}
+	}
+	metadata, _ := got["metadata"].(map[string]interface{})
+	userID, _ := metadata["user_id"].(string)
+	var userIdentity map[string]interface{}
+	if len(metadata) != 1 || json.Unmarshal([]byte(userID), &userIdentity) != nil {
+		t.Fatalf("Claude metadata.user_id does not match captured JSON-string shape: %s", cap.body)
+	}
+	if userIdentity["session_id"] != cap.headers.Get("X-Claude-Code-Session-Id") || userIdentity["device_id"] == "" || userIdentity["account_uuid"] != "" {
+		t.Fatalf("Claude body/header identity drift: metadata=%+v headers=%+v", userIdentity, cap.headers)
+	}
+	if cap.headers.Get("x-client-request-id") != "" || cap.headers.Get("Accept") != "application/json" {
+		t.Fatalf("Claude 2.1.206 header fingerprint mismatch: %+v", cap.headers)
 	}
 	tools := got["tools"].([]interface{})
 	firstTool := tools[0].(map[string]interface{})
@@ -357,130 +368,54 @@ func TestClaudeMessagesFinalSanitizerNormalizesCacheControlTTL(t *testing.T) {
 	}
 }
 
-func TestClaudeCCHSigningIsDeterministicByDefaultAndConfigurable(t *testing.T) {
-	body := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
-	signedA := captureClaudeBody(t, config.Default(), body)
-	signedB := captureClaudeBody(t, config.Default(), body)
+func TestNormalizeClaudeMessagesSpecPreservesLargeToolInputInteger(t *testing.T) {
+	const largeInteger = "900719925474099312345"
+	const billing = "x-anthropic-billing-header: cc_version=2.1.206.abc; cc_entrypoint=cli;"
+	body := []byte(`{"model":"claude-x","metadata":{"user_id":"downstream-user","device_id":"downstream-device"},` +
+		`"system":[{"type":"text","text":"` + billing + `"},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}],` +
+		`"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_large","name":"Bash","input":{"request_id":` + largeInteger + `},"signature":"remove-me"}]}]}`)
 
-	cchA := extractCCH(t, signedA)
-	cchB := extractCCH(t, signedB)
-	if cchA == "fffff" {
-		t.Fatalf("cch was not signed: %s", signedA)
-	}
-	if cchA != cchB {
-		t.Fatalf("same final body must sign to the same cch: %q vs %q", cchA, cchB)
-	}
-
-	cfg := config.Default()
-	cfg.ClaudeCCHSigning = false
-	disabled := captureClaudeBody(t, cfg, body)
-	if got := extractCCH(t, disabled); got != "fffff" {
-		t.Fatalf("claude_cch_signing=false should leave cch unchanged, got %q body=%s", got, disabled)
-	}
-}
-
-func TestClaudeCCHSigningUsesStableCachePrefix(t *testing.T) {
-	bodyA := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what changed in file A?"}]}]}`)
-	bodyB := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what changed in file B?"}]}]}`)
-	bodyC := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"},{"type":"text","text":"different stable system","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"what changed in file A?"}]}]}`)
-
-	cchA := extractCCH(t, string(signClaudeBillingCCH(bodyA)))
-	cchB := extractCCH(t, string(signClaudeBillingCCH(bodyB)))
-	cchC := extractCCH(t, string(signClaudeBillingCCH(bodyC)))
-	if cchA != cchB {
-		t.Fatalf("same cacheable system prefix must sign to same cch despite final user tail: %q vs %q", cchA, cchB)
-	}
-	if cchA == cchC {
-		t.Fatalf("different cacheable system prefix should change cch, got %q for both", cchA)
-	}
-}
-
-func TestClaudeCCHSigningUsesStableMessageCachePrefix(t *testing.T) {
-	bodyA := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"text","text":"stable project context","cache_control":{"type":"ephemeral"}},{"type":"text","text":"tail A"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/workspace/a.go"}}]},{"role":"user","content":[{"type":"text","text":"final question A"}]}]}`)
-	bodyB := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"text","text":"stable project context","cache_control":{"type":"ephemeral"}},{"type":"text","text":"tail B"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/workspace/b.go"}}]},{"role":"user","content":[{"type":"text","text":"final question B"}]}]}`)
-	bodyC := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"DIFFERENT"}},{"type":"text","text":"stable project context","cache_control":{"type":"ephemeral"}},{"type":"text","text":"tail A"}]},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/workspace/a.go"}}]},{"role":"user","content":[{"type":"text","text":"final question A"}]}]}`)
-
-	cchA := extractCCH(t, string(signClaudeBillingCCH(bodyA)))
-	cchB := extractCCH(t, string(signClaudeBillingCCH(bodyB)))
-	cchC := extractCCH(t, string(signClaudeBillingCCH(bodyC)))
-	if cchA != cchB {
-		t.Fatalf("same cacheable multimodal message prefix must sign to same cch despite volatile tail: %q vs %q", cchA, cchB)
-	}
-	if cchA == cchC {
-		t.Fatalf("different cacheable multimodal prefix should change cch, got %q for both", cchA)
-	}
-}
-
-func TestClaudeNativeCachePrefixStableAfterVirtualizationAndSigning(t *testing.T) {
-	id := identity.For(nil, "acc-native-cache")
-	build := func(question string) []byte {
-		body := []byte(`{"model":"claude-x","stream":true,"system":[` +
-			`{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.180.abc; cc_entrypoint=cli; cch=deadb;"},` +
-			`{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral"}},` +
-			`{"type":"text","text":"stable repo instructions"}` +
-			`],"tools":[{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}],` +
-			`"messages":[{"role":"user","content":[` +
-			`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# Repo\nStable context.\n</system-reminder>\n\n"},` +
-			`{"type":"text","text":` + strconv.Quote(question) + `}` +
-			`]}]}`)
-		res := cloak.VirtualizeClaudeCodeWithCache(body, id, nil, true, "2.1.160", cloak.ClaudeCodeCacheOptions{
-			NativeBreakpoints: true,
-			TTL:               "1h",
-		})
-		withCache := prompt.EnsureAnthropicCacheControl(res.Body, "1h")
-		return signClaudeBillingCCH(withCache)
-	}
-
-	a := build("inspect file A")
-	b := build("inspect file B")
-	if got, want := extractCCH(t, string(a)), extractCCH(t, string(b)); got != want {
-		t.Fatalf("native Claude stable prefix should keep cch stable across final questions: %q vs %q\na=%s\nb=%s", got, want, a, b)
-	}
-	if !strings.Contains(string(a), "inspect file A") || !strings.Contains(string(b), "inspect file B") {
-		t.Fatalf("final user question was changed or removed\na=%s\nb=%s", a, b)
-	}
-}
-
-func TestClaudeCCHSigningIgnoresNestedSchemaCacheControlField(t *testing.T) {
-	bodyA := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"tools":[{"name":"Custom","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"final question A"}]}]}`)
-	bodyB := []byte(`{"model":"claude-x","stream":true,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.159.abc; cc_entrypoint=cli; cch=fffff;"}],"tools":[{"name":"Custom","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],"messages":[{"role":"user","content":[{"type":"text","text":"final question B"}]}]}`)
-
-	cchA := extractCCH(t, string(signClaudeBillingCCH(bodyA)))
-	cchB := extractCCH(t, string(signClaudeBillingCCH(bodyB)))
-	if cchA == cchB {
-		t.Fatalf("schema property named cache_control must not be treated as a prompt-cache breakpoint, got same cch %q", cchA)
-	}
-}
-
-func captureClaudeBody(t *testing.T, cfg config.Config, body []byte) string {
-	t.Helper()
-	var cap sidecarCapture
-	sidecar := newFakeSidecar(t, &cap)
-	defer sidecar.Close()
-
-	client := NewClient(cfg)
-	resp, err := client.Do(nilContext(t), Request{
-		Provider:       "claude",
-		DownstreamPath: "/v1/messages",
-		Body:           body,
-		Account:        storage.Account{ID: "acc-cch-sign"},
-		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
-		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
+	client, secret := fixedSecretClient(t, config.Default())
+	headers := http.Header{}
+	headers.Set("X-Claude-Code-Session-Id", "11111111-1111-4111-8111-111111111111")
+	spec := client.normalizeClaudeMessagesSpec(Request{
+		Provider: "claude",
+		Headers:  headers,
+		Body:     body,
+		Account:  storage.Account{ID: "acc-large-integer"},
+		Token:    storage.AccountToken{AccessToken: "sk-ant-oat-test"},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	return cap.body
-}
 
-var cchTestRe = regexp.MustCompile(`\bcch=([0-9a-f]{5});`)
-
-func extractCCH(t *testing.T, body string) string {
-	t.Helper()
-	m := cchTestRe.FindStringSubmatch(body)
-	if m == nil {
-		t.Fatalf("no cch in body: %s", body)
+	if !bytes.Contains(spec.Body, []byte(largeInteger)) {
+		t.Fatalf("large integer text changed during normalization: %s", spec.Body)
 	}
-	return m[1]
+	var root map[string]interface{}
+	if err := decodeClaudeJSONObject(spec.Body, &root); err != nil {
+		t.Fatalf("decode normalized body: %v", err)
+	}
+	content := root["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
+	toolUse := content[0].(map[string]interface{})
+	input := toolUse["input"].(map[string]interface{})
+	number, ok := input["request_id"].(json.Number)
+	if !ok || number.String() != largeInteger {
+		t.Fatalf("tool_use input integer = %T(%v), want exact %s", input["request_id"], input["request_id"], largeInteger)
+	}
+	if _, ok := toolUse["signature"]; ok {
+		t.Fatalf("history sanitizer stopped running: %v", toolUse)
+	}
+
+	metadata := root["metadata"].(map[string]interface{})
+	userID, _ := metadata["user_id"].(string)
+	var userIdentity map[string]interface{}
+	if len(metadata) != 1 || json.Unmarshal([]byte(userID), &userIdentity) != nil {
+		t.Fatalf("metadata fingerprint changed: %v", metadata)
+	}
+	id := identity.For(secret, "acc-large-integer")
+	if userIdentity["device_id"] != id.UserID || userIdentity["account_uuid"] != "" || userIdentity["session_id"] != claudeSessionID(headers, body, id) {
+		t.Fatalf("metadata identity mismatch: %v", userIdentity)
+	}
+	system := root["system"].([]interface{})
+	if len(system) != 2 || system[0].(map[string]interface{})["text"] != billing {
+		t.Fatalf("billing/system fingerprint changed: %v", system)
+	}
 }

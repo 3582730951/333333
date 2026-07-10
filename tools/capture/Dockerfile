@@ -23,7 +23,9 @@ RUN (timeout 5 mitmdump -p 8889 >/dev/null 2>&1 || true) \
 
 # The real shipping clients (latest). Pinning to @latest means the captured
 # fingerprint always reflects what end users actually run.
-RUN npm install -g @anthropic-ai/claude-code@latest @openai/codex@latest \
+ARG CLIENT_REFRESH=2026-07-10
+RUN echo "client refresh: ${CLIENT_REFRESH}" \
+ && npm install -g @anthropic-ai/claude-code@latest @openai/codex@latest \
  && (claude --version || true) && (codex --version || true)
 
 WORKDIR /cap

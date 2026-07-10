@@ -6,6 +6,7 @@ package api
 
 import (
 	authparse "codex-account-pool/internal/auth"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"context"
@@ -231,6 +232,10 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.seedImportedAccountCapabilities(r.Context(), account); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, accountImportResponse{Account: account, ImportStatus: "imported"})
 }
 
@@ -282,17 +287,39 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, egressID); err != nil {
 		return storage.Account{}, err
 	}
-	// Probe the new account's upstream model list once, in the background, so the
-	// advertised /v1/models union reflects it without waiting for the periodic
-	// sweep. Detached context + fire-and-forget so it never blocks the import
-	// response; it no-ops harmlessly if the egress binding isn't set yet.
+	if err := s.seedImportedAccountCapabilities(ctx, account); err != nil {
+		return storage.Account{}, err
+	}
+	s.probeImportedAccountAsync(account)
+	return account, nil
+}
+
+// seedImportedAccountCapabilities closes the import-to-first-request race. Static
+// provider capabilities are available synchronously; the detached live probe below
+// replaces/floors them with the account's actual model catalog.
+func (s *Server) seedImportedAccountCapabilities(ctx context.Context, account storage.Account) error {
+	var caps []storage.ModelCapability
+	switch strings.ToLower(strings.TrimSpace(account.Provider)) {
+	case "claude":
+		caps = capability.StaticClaudeModels(account.ID)
+	case "", "codex":
+		caps = capability.StaticCodexModels(account.ID)
+	default:
+		return nil
+	}
+	return s.store.UpsertCapabilities(ctx, caps)
+}
+
+// probeImportedAccountAsync refreshes the synchronous floor without delaying the
+// import response. Detached context keeps the probe alive after the HTTP handler
+// returns, while the timeout bounds cleanup on shutdown/network failure.
+func (s *Server) probeImportedAccountAsync(account storage.Account) {
 	go func(acc storage.Account) {
 		defer supervisor.Recover("account-import-probe")
 		cctx, cancel := context.WithTimeout(context.Background(), s.cfg.RequestTimeout())
 		defer cancel()
 		_, _ = s.probeAccountModels(cctx, acc)
 	}(account)
-	return account, nil
 }
 
 // adminImportToken imports a ChatGPT account from a bare access token ("AT"

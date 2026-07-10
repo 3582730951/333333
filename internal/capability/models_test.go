@@ -250,7 +250,7 @@ func TestMergeClaudeStaticFloorsNewestModels(t *testing.T) {
 }
 
 // TestStaticCodexModelsCurrent confirms the Codex static fallback advertises the
-// current-generation catalog (gpt-5.5 the flagship) with sane windows.
+// current-generation catalog (gpt-5.6-sol the flagship) with source-accurate windows.
 func TestStaticCodexModelsCurrent(t *testing.T) {
 	caps := StaticCodexModels("acc")
 	if len(caps) == 0 {
@@ -258,14 +258,57 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 	}
 	bySlug := map[string]storage.ModelCapability{}
 	for _, c := range caps {
-		if c.AccountID != "acc" || c.NativeMaxContextWindow == 0 || c.Source != "codex_static" {
+		if c.AccountID != "acc" || c.NativeMaxContextWindow == 0 || c.EffectiveContextWindowPercent != 95 || c.Source != "codex_static" {
 			t.Fatalf("malformed static Codex capability: %+v", c)
 		}
 		bySlug[c.ModelSlug] = c
 	}
-	if _, ok := bySlug["gpt-5.5"]; !ok {
-		t.Fatalf("current flagship gpt-5.5 missing from static Codex set: %v", bySlug)
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 {
+			t.Fatalf("current model %s missing or wrong window: %+v", slug, got)
+		}
 	}
+	if _, stale := bySlug["gpt-5.3-codex"]; stale {
+		t.Fatalf("removed gpt-5.3-codex must not remain in static catalog: %v", bySlug)
+	}
+}
+
+func TestBuildModelsResponseColdStartUsesCurrentCodexCatalog(t *testing.T) {
+	raw, _, err := BuildModelsResponse(nil, config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, model := range response.Data {
+		if model["id"] != "gpt-5.6-sol" {
+			continue
+		}
+		found = true
+		if model["context_window"] != float64(372000) || model["native_context_window"] != float64(372000) || model["effective_context_window_percent"] != float64(95) {
+			t.Fatalf("cold-start GPT-5.6 catalog entry is stale: %+v", model)
+		}
+	}
+	if !found {
+		t.Fatalf("cold-start catalog omitted gpt-5.6-sol: %s", raw)
+	}
+	if string(raw) == "" || containsModelID(response.Data, "gpt-5.4-codex") {
+		t.Fatalf("obsolete unknown-window placeholder leaked: %s", raw)
+	}
+}
+
+func containsModelID(models []map[string]interface{}, id string) bool {
+	for _, model := range models {
+		if model["id"] == id {
+			return true
+		}
+	}
+	return false
 }
 
 // TestMergeCodexStaticFloorsNewerModels locks in the version-gated Codex /models
@@ -282,30 +325,51 @@ func TestMergeCodexStaticFloorsNewerModels(t *testing.T) {
 	for _, c := range merged {
 		bySlug[c.ModelSlug] = c
 	}
-	if _, ok := bySlug["gpt-5.5"]; !ok {
-		t.Fatalf("gpt-5.5 was not floored into a gpt-5.4-only probe: %+v", merged)
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"} {
+		if _, ok := bySlug[slug]; !ok {
+			t.Fatalf("%s was not floored into a gpt-5.4-only probe: %+v", slug, merged)
+		}
 	}
 	if bySlug["gpt-5.4"].Source != "probe" {
 		t.Fatalf("probe entry must win on conflict, got %+v", bySlug["gpt-5.4"])
 	}
 
-	probe, err = Parse("acc", []byte(`{"models":[{"slug":"gpt-5.5","max_context_window":272000,"visibility":"list"}]}`), "")
+	probe, err = Parse("acc", []byte(`{"models":[{"slug":"gpt-5.6-sol","max_context_window":372000,"visibility":"list"}]}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	merged = MergeCodexStatic("acc", probe)
 	for _, c := range merged {
-		if c.ModelSlug == "gpt-5.4" {
-			t.Fatalf("older static gpt-5.4 must not be re-added when live probe has gpt-5.5: %+v", merged)
+		if c.ModelSlug == "gpt-5.5" || c.ModelSlug == "gpt-5.4" {
+			t.Fatalf("older static models must not be re-added when live probe has gpt-5.6-sol: %+v", merged)
 		}
 	}
 }
 
 func TestCodexRequiresCurrentClientVersion(t *testing.T) {
-	if !CodexRequiresCurrentClientVersion("gpt-5.5") {
-		t.Fatal("gpt-5.5 must use the current Codex client version on live requests")
+	if !CodexRequiresCurrentClientVersion("gpt-5.6-sol") {
+		t.Fatal("gpt-5.6-sol must use the current Codex client version on live requests")
 	}
 	if CodexRequiresCurrentClientVersion("gpt-5.4") {
 		t.Fatal("gpt-5.4 should keep the normal live request version")
+	}
+}
+
+func TestCodexStaticTransportAndReasoningFingerprint(t *testing.T) {
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.2"} {
+		if !CodexPrefersWebSocket(slug) {
+			t.Fatalf("%s should prefer WebSocket", slug)
+		}
+	}
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		if !CodexUsesResponsesLite(slug) || CodexMinimumClientVersion(slug) != "0.144.0" {
+			t.Fatalf("%s responses-lite/minimum-version fingerprint is stale", slug)
+		}
+	}
+	if !CodexSupportsReasoningEffort("gpt-5.6-sol", "ultra") || !CodexSupportsReasoningEffort("gpt-5.6-terra", "ultra") {
+		t.Fatal("Sol and Terra must preserve ultra reasoning")
+	}
+	if CodexSupportsReasoningEffort("gpt-5.6-luna", "ultra") || !CodexSupportsReasoningEffort("gpt-5.6-luna", "max") {
+		t.Fatal("Luna supports max but not ultra")
 	}
 }

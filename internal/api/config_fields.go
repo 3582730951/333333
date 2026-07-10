@@ -65,6 +65,7 @@ const (
 	catBehavior      = "行为 / 缓存"
 	catClaudeGateway = "本地 Gateway / Claude Code"
 	catLimits        = "限流 / 封禁"
+	catQuality       = "模型质量 / 降智检测"
 	catReg           = "注册 / 引擎"
 	catBoot          = "引导（需重启）"
 )
@@ -132,8 +133,8 @@ func configFields() []configField {
 			Help: "开=同前缀并发请求等待首个写缓存请求开始返回，减少并发冷启动 miss。", boot: func(c config.Config) interface{} { return c.ClaudeCacheSingleflightEnabled }},
 		{Key: "claude_cache_lossless_block_split", Label: "Claude 无损块拆分", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=仅在拼接后逐字节一致时拆分巨型 text block，便于标记稳定上下文。", boot: func(c config.Config) interface{} { return c.ClaudeCacheLosslessBlockSplit }},
-		{Key: "claude_cch_signing", Label: "Claude CCH 签名", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
-			Help: "开=OAuth Claude 请求按最终 body 生成确定性 cch。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
+		{Key: "claude_cch_signing", Label: "Claude CCH 签名（已弃用）", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
+			Help: "兼容旧配置；Claude Code 2.1.206 当前 wire 不含 cch，本设置不再改变请求。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
 		{Key: "claude_cache_ttl", Label: "Claude 缓存 TTL", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"", "1h"}, Help: "注入缓存的 TTL：空=标准(5m)，1h=长缓存。", boot: func(c config.Config) interface{} {
 				if strings.TrimSpace(c.ClaudeCacheTTL) == "1h" {
@@ -149,6 +150,23 @@ func configFields() []configField {
 			Help: "开=为非 compact 请求注入 web_search 工具。", boot: func(c config.Config) interface{} { return c.WebSearchEnabled }},
 		{Key: "require_downstream_key", Label: "要求下游密钥", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=下游请求必须带有效 API Key，否则 401。", boot: func(c config.Config) interface{} { return c.RequireDownstreamKey }},
+
+		// ── 模型质量 / 降智检测 ──────────────────────────────────────────────
+		{Key: "model_quality_monitor_enabled", Label: "启用分组模型降智检测", Category: catQuality, Type: fieldBool, Effect: effectHot,
+			Help: "按分组×模型检测，绝不逐账号遍历。每周期仅一条短答案主探针；答错才追加确认题。默认关闭以避免意外消耗额度。", boot: func(c config.Config) interface{} { return c.ModelQualityMonitorEnabled }},
+		{Key: "model_quality_interval_minutes", Label: "检测周期（分钟）", Category: catQuality, Type: fieldInt, Effect: effectHot,
+			Help: "最小 60 分钟；默认每小时一次。", boot: func(c config.Config) interface{} { return c.ModelQualityIntervalMinutes }},
+		{Key: "model_quality_reasoning_effort", Label: "主探针推理强度", Category: catQuality, Type: fieldSelect, Effect: effectHot,
+			Options: []string{"low", "medium", "high"},
+			Help:    "默认 low 以降低每小时成本；若主探针异常，确认题会自动至少使用 medium。只提供 Codex/Claude 共同支持的档位。", boot: func(c config.Config) interface{} {
+				return firstNonEmpty(c.ModelQualityReasoningEffort, config.DefaultModelQualityReasoningEffort)
+			}},
+		{Key: "model_quality_models", Label: "检测模型白名单", Category: catQuality, Type: fieldCSV, Effect: effectHot,
+			Help: "留空=检测各分组已发布的全部模型；填写逗号分隔模型名可进一步降低成本。", boot: func(c config.Config) interface{} { return c.ModelQualityModels }},
+		{Key: "model_quality_degraded_threshold", Label: "确认异常阈值", Category: catQuality, Type: fieldInt, Effect: effectHot,
+			Help: "连续多少轮主探针+确认题都失败才标记降智；最小/默认 2，避免单次随机误判。", boot: func(c config.Config) interface{} { return c.ModelQualityDegradedThreshold }},
+		{Key: "model_quality_history_days", Label: "历史保留天数", Category: catQuality, Type: fieldInt, Effect: effectHot,
+			Help: "探针历史自动清理，默认 30 天。", boot: func(c config.Config) interface{} { return c.ModelQualityHistoryDays }},
 
 		// ── 本地 Gateway / Claude Code ────────────────────────────────────────
 		{Key: "claude_gateway_intercept_hosts", Label: "Gateway 拦截主机", Category: catClaudeGateway, Type: fieldCSV, Effect: effectHot,
@@ -208,7 +226,7 @@ func configFields() []configField {
 			Help: "开=即使带服务端状态(previous_response_id)的请求遇 429 也尝试换号(自包含请求默认即会换号)。", boot: func(c config.Config) interface{} { return c.ForceFailoverOn429 }},
 		{Key: "codex_prompt_cache_retention", Label: "Codex 提示缓存保留", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"24h", "in_memory", ""},
-			Help:    "24h=扩展缓存(gpt-5.x/4.1 命中率最高)，in_memory=~5-10分钟，空=不注入。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexPromptCacheRetention, "24h") }},
+			Help:    "兼容旧配置；Codex 0.144.x 已不发送该字段，网关会清除它。缓存复用由 prompt_cache_key 与账号亲和保证。", boot: func(c config.Config) interface{} { return c.CodexPromptCacheRetention }},
 
 		// ── 注册 / 引擎 ───────────────────────────────────────────────────────
 		{Key: "default_register_method", Label: "默认注册引擎", Category: catReg, Type: fieldSelect, Effect: effectHot,
@@ -219,9 +237,9 @@ func configFields() []configField {
 		{Key: "registration_concurrency", Label: "注册并发上限", Category: catReg, Type: fieldInt, Effect: effectHot,
 			Help: "单批最多并行的注册数(每个浏览器独立隔离)。仅在轮换出口上提高，固定 IP 出口保持 1。", boot: func(c config.Config) interface{} { return c.RegistrationConcurrency }},
 		{Key: "codex_install_model", Label: "Codex 安装默认模型", Category: catReg, Type: fieldString, Effect: effectHot,
-			Help: "一键脚本写入 config.toml 的 model（默认 gpt-5.5）。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexInstallModel, "gpt-5.5") }},
+			Help: "一键脚本写入 config.toml 的 model（默认 gpt-5.6-sol）。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexInstallModel, "gpt-5.6-sol") }},
 		{Key: "codex_install_effort", Label: "Codex 安装推理强度", Category: catReg, Type: fieldSelect, Effect: effectHot,
-			Options: []string{"xhigh", "high", "medium", "low", "minimal", ""},
+			Options: []string{"ultra", "max", "xhigh", "high", "medium", "low", "minimal", ""},
 			Help:    "写入 model_reasoning_effort（默认 xhigh）。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexInstallEffort, "xhigh") }},
 		{Key: "codex_install_approval_policy", Label: "Codex 审批策略", Category: catReg, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"never", "on-request", "on-failure", "untrusted", ""},

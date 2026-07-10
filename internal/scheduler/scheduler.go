@@ -57,11 +57,14 @@ type Scheduler struct {
 	providerCacheMutex sync.Mutex
 }
 
-// candidate is a selection candidate combining account, egress, and load score.
-// Defined at package level so tryLeaseAccountFromCandidate can reference it.
+// candidate is a selection candidate combining account, egress, binding, and load
+// score. Defined at package level so tryLeaseAccountFromCandidate can reference it.
+// The binding is carried from the batch ListActiveAccountsWithEgress query so the
+// lease can be built without a second per-request DB read while holding s.mu.
 type candidate struct {
 	account storage.Account
 	egress  storage.EgressProfile
+	binding storage.AccountEgressBinding
 	score   int // inflight count used for load-based selection
 }
 
@@ -159,6 +162,30 @@ func (e *NoAccountError) Unwrap() error {
 	return ErrNoAccount
 }
 
+// Retryable reports whether this no-account condition is transient pool saturation —
+// matching accounts exist but were momentarily at their concurrency cap, over their
+// per-account token budget, or on a short rate-limit cooldown — rather than a terminal
+// misconfiguration (no account of the right provider/model exists at all). The API
+// layer maps a retryable failure to 429 + Retry-After (the client re-sends the SAME
+// request unchanged) instead of a hard 503, so quality/context/reasoning never degrade.
+func (e *NoAccountError) Retryable() bool {
+	if e == nil {
+		return false
+	}
+	c := e.Counters
+	return c.Concurrency+c.TokenBudget+c.RateLimitCooldown > 0
+}
+
+// transientlySaturated reports whether a scheduler selection error is retryable
+// transient load pressure (see NoAccountError.Retryable).
+func transientlySaturated(err error) bool {
+	var nae *NoAccountError
+	if errors.As(err, &nae) {
+		return nae.Retryable()
+	}
+	return false
+}
+
 type Lease struct {
 	Account storage.Account
 	Binding storage.AccountEgressBinding
@@ -237,6 +264,14 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		if waitFor(ctx, cfg.StickyWait()) {
 			lease, err = s.selectFresh(ctx, route)
 		}
+		// Admission backpressure: when the only obstacle is transient saturation (every
+		// matching account momentarily at its concurrency cap / over token budget), wait
+		// for an in-flight slot to free and retry selection instead of surfacing a
+		// downstream 503/409. This is pure queueing — the request still lands on a
+		// full-quality account with its exact model, full context and reasoning.
+		if err != nil && transientlySaturated(err) {
+			lease, err = s.selectFreshWithAdmissionWait(ctx, route, cfg.AdmissionWait())
+		}
 		if err != nil {
 			return Lease{}, err
 		}
@@ -267,6 +302,21 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		return Lease{}, err
 	}
 	now := storage.Now()
+	accountIDs := make([]string, 0, len(accountsWithEgress))
+	for _, awe := range accountsWithEgress {
+		accountIDs = append(accountIDs, awe.Account.ID)
+	}
+	// Load every candidate's quota snapshots in one query (chunked by storage for
+	// large pools). The old per-candidate AccountRateLimitCooldownUntil call made
+	// account selection O(N) SQLite round-trips under load.
+	rateLimitsByAccount, rateLimitsErr := s.store.ListAccountRateLimitsByAccountIDs(ctx, accountIDs)
+	if rateLimitsErr != nil {
+		// Preserve the historical fail-open behavior of accountRateLimitCooldownUntil:
+		// a diagnostics-table read failure is logged but does not take the whole pool
+		// offline. Upstream errors still bench/recheck an exhausted account normally.
+		log.Printf("[SCHEDULER] batch rate-limit snapshot lookup failed: group=%s err=%v", route.Group, rateLimitsErr)
+		rateLimitsByAccount = nil
+	}
 	// Process-level egress profile cache with 30s TTL.
 	// The request-scoped map (below) still handles per-selection deduplication,
 	// but for standby egress lookups (which happen per-candidate, not just once)
@@ -307,11 +357,14 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.ModelUnsupported++
 			continue
 		}
-		if route.Provider != "" && s.providerOfAccountCached(ctx, account) != route.Provider {
+		accountProvider := strings.TrimSpace(route.Provider)
+		if actualProvider := s.providerOfAccountCached(ctx, account); accountProvider != "" && actualProvider != accountProvider {
 			counters.ProviderMismatch++
 			continue
+		} else if accountProvider == "" {
+			accountProvider = actualProvider
 		}
-		if s.accountRateLimitedForRoute(ctx, account, route, now) {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited {
 			counters.RateLimitCooldown++
 			continue
 		}
@@ -343,13 +396,13 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.TokenBudget++
 			continue
 		}
-		candidates = append(candidates, candidate{account: account, egress: egress, score: inflight})
+		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, score: inflight})
 	}
 	if len(candidates) == 0 {
 		// No accounts available — check if any will come off cooldown soon.
 		// If so, wait for the shortest cooldown instead of failing immediately.
 		if cfg.CooldownWaitMaxSeconds > 0 {
-			if waitDur, ok := s.shortestCooldownBatch(ctx, route.Group, route.Provider, route.Model, accountsWithEgress); ok {
+			if waitDur, ok := s.shortestCooldownBatch(ctx, route.Group, route.Provider, route.Model, accountsWithEgress, rateLimitsByAccount); ok {
 				if waitDur > 0 && waitDur <= time.Duration(cfg.CooldownWaitMaxSeconds)*time.Second {
 					log.Printf("[SCHEDULER] all accounts cooling, waiting %v for shortest cooldown (group=%s, provider=%s)",
 						waitDur.Round(time.Second), route.Group, route.Provider)
@@ -396,6 +449,36 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		}
 	}
 	return Lease{}, s.noAccountError(route, counters)
+}
+
+// selectFreshWithAdmissionWait retries selectFresh, blocking on the load-changed
+// signal (fired whenever any lease is released) up to a total budget, so a request
+// that found every matching account momentarily saturated queues for the next freed
+// slot instead of failing. It returns the moment selection succeeds, the error is no
+// longer transient saturation, the request is cancelled, or the budget elapses. The
+// channel is captured BEFORE each attempt so a release racing with a failed attempt is
+// never lost (same pattern as waitForStatefulStickyLease).
+func (s *Scheduler) selectFreshWithAdmissionWait(ctx context.Context, route Route, budget time.Duration) (Lease, error) {
+	if budget <= 0 {
+		return s.selectFresh(ctx, route)
+	}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	for {
+		loadChanged := s.loadChangedChan()
+		lease, err := s.selectFresh(ctx, route)
+		if err == nil || !transientlySaturated(err) {
+			return lease, err
+		}
+		select {
+		case <-loadChanged:
+			// a lease was released somewhere — retry selection immediately
+		case <-ctx.Done():
+			return Lease{}, err
+		case <-timer.C:
+			return lease, err
+		}
+	}
 }
 
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
@@ -929,7 +1012,7 @@ func (s *Scheduler) providerOfAccountCached(ctx context.Context, acc storage.Acc
 // accountsWithEgress data (from ListActiveAccountsWithEgress), avoiding a
 // second DB query just for cooldown-waiting. Returns (duration, true) if
 // at least one account is cooling; (0, false) if none.
-func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, model string, accountsWithEgress []storage.AccountWithEgress) (time.Duration, bool) {
+func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, model string, accountsWithEgress []storage.AccountWithEgress, rateLimitsByAccount map[string][]storage.AccountRateLimit) (time.Duration, bool) {
 	now := storage.Now()
 	var capable map[string]bool
 	if model != "" {
@@ -948,10 +1031,13 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 		if capable != nil && !capable[account.ID] {
 			continue
 		}
-		if provider != "" && s.providerOfAccountCached(ctx, account) != provider {
+		accountProvider := strings.TrimSpace(provider)
+		if actualProvider := s.providerOfAccountCached(ctx, account); accountProvider != "" && actualProvider != accountProvider {
 			continue
+		} else if accountProvider == "" {
+			accountProvider = actualProvider
 		}
-		if until, limited := s.accountRateLimitCooldownUntil(ctx, account, Route{Provider: provider, Model: model}, now); limited {
+		if until, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, model, now); limited {
 			remaining := until - now
 			if remaining > 0 && (!found || remaining < minCooldown) {
 				minCooldown = remaining
@@ -1022,21 +1108,9 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 		}
 		s.notifyLoadChangedLocked()
 	}
-	// Load binding for the lease (needed for cookie jar key, standby egress, etc.)
-	binding, err := s.store.GetEgressBinding(ctx, accountID)
-	if err != nil {
-		// Rollback the inflight increment
-		if s.inflight[accountID] > 0 {
-			s.inflight[accountID]--
-		}
-		if estimatedTokens > 0 {
-			s.inflightTokens[accountID] -= estimatedTokens
-			if s.inflightTokens[accountID] < 0 {
-				s.inflightTokens[accountID] = 0
-			}
-		}
-		s.notifyLoadChangedLocked()
-		return Lease{}, false
-	}
-	return Lease{Account: account, Binding: binding, Egress: egress, release: release}, true
+	// The binding was already loaded by selectFresh's batch query and carried on the
+	// candidate, so the lease is built without a second DB read while holding s.mu —
+	// keeping the hot critical section to map ops only (the previous GetEgressBinding
+	// here serialized every lease grant and release behind a SQLite round-trip).
+	return Lease{Account: account, Binding: c.binding, Egress: egress, release: release}, true
 }

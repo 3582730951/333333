@@ -22,15 +22,21 @@ func TestComputeURLForChatGPTCodexBackend(t *testing.T) {
 
 func TestComputeCodexResponsesWebSocketURL(t *testing.T) {
 	got := ComputeCodexResponsesWebSocketURL("https://chatgpt.com/backend-api/codex", "/v1/responses?trace=1")
-	want := "wss://api.openai.com/v1/responses?trace=1"
+	want := "wss://chatgpt.com/backend-api/codex/responses?trace=1"
 	if got != want {
 		t.Fatalf("url = %q, want %q", got, want)
 	}
 
 	got = ComputeCodexResponsesWebSocketURL("http://127.0.0.1:8787/backend-api/codex", "/v1/responses")
-	want = "ws://127.0.0.1:8787/v1/responses"
+	want = "ws://127.0.0.1:8787/backend-api/codex/responses"
 	if got != want {
 		t.Fatalf("local url = %q, want %q", got, want)
+	}
+
+	got = ComputeCodexResponsesWebSocketURL("https://api.openai.com/v1", "/v1/responses")
+	want = "wss://api.openai.com/v1/responses"
+	if got != want {
+		t.Fatalf("API url = %q, want %q", got, want)
 	}
 }
 

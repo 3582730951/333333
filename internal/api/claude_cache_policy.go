@@ -50,6 +50,33 @@ func (s *Server) claudeSelectionAffinity(ctx context.Context, r *http.Request, r
 	return routing.ExtractAffinityKey(r, raw)
 }
 
+// claudeCacheTTLForRoute picks the Claude prompt-cache TTL for a specific route. The
+// configured 1h extended cache is used ONLY for true-conversation routes (a stable
+// session / thread id) — long-lived turns that genuinely benefit from the longer
+// retention. Collapsible routes (stable-prefix / coarse / anonymous, where several
+// distinct requests can share a prefix) fall back to the 5m ephemeral cache: it bounds
+// how long a shared prefix stays warm (limiting any staleness that could bleed context
+// between distinct requests) and costs less to write (5m writes bill 1.25x vs 1h 2x),
+// trimming the high_write_share the diagnostics flag on those routes. TTL is retention
+// only — it never changes the model, the context sent, or reasoning — so real
+// conversations keep their full 1h hit rate while collapsible routes get safer.
+func (s *Server) claudeCacheTTLForRoute(ctx context.Context, affinity routing.AffinityKey) string {
+	ttl := s.claudeCacheTTL(ctx)
+	if ttl != "1h" {
+		return ttl
+	}
+	// Route-aware differentiation is opt-in. Default OFF keeps the historical contract
+	// (the configured TTL applies to every route). When enabled, only true-conversation
+	// routes keep 1h; collapsible routes fall back to 5m to bound staleness / write cost.
+	if !s.flagEnabled(ctx, "claude_cache_ttl_route_aware", s.cfg.ClaudeCacheTTLRouteAware) {
+		return "1h"
+	}
+	if storage.RouteClassForAffinitySource(affinity.Source) == "true_conversation" {
+		return "1h"
+	}
+	return ""
+}
+
 func (s *Server) claudeCacheBreakpointPolicy(ctx context.Context, affinity routing.AffinityKey, accountID, group, apiKeyHash string) string {
 	mode := normalizeClaudeCacheMode(s.settingString(ctx, "claude_cache_mode", s.cfg.ClaudeCacheMode))
 	policy := normalizeClaudeCacheBreakpointPolicy(s.settingString(ctx, "claude_cache_breakpoint_policy", s.cfg.ClaudeCacheBreakpointPolicy))

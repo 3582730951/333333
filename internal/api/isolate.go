@@ -12,6 +12,7 @@ import (
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
+	"github.com/tidwall/sjson"
 )
 
 // osHint returns the OS family to present for a request, honoring the configured
@@ -76,7 +77,7 @@ func inferDownstreamOS(raw []byte) string {
 // reconstructed context (the multi-agent context-contamination guard).
 func ledgerKey(a routing.AffinityKey) string {
 	switch a.Source {
-	case "x-codex-parent-thread-id", "thread_id", "conversation_id",
+	case routing.CodexRootThreadAffinitySource, "x-codex-parent-thread-id", "thread_id", "conversation_id",
 		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
 		return a.Hash
 	}
@@ -178,7 +179,9 @@ func isolateCodexConversation(header http.Header, body []byte, id identity.Ident
 	}
 	if orig := routing.PromptCacheKey(body); orig != "" {
 		ns := "cp_" + identity.DerivedKey(seed, orig)
-		body = bytes.Replace(body, []byte(`"`+orig+`"`), []byte(`"`+ns+`"`), -1)
+		if updated, err := sjson.SetBytes(body, "prompt_cache_key", ns); err == nil {
+			body = updated
+		}
 	}
 	// Also namespace any conversation correlators carried in the BODY (some clients
 	// put them there rather than in headers). A value the header and body share maps
@@ -189,7 +192,9 @@ func isolateCodexConversation(header http.Header, body []byte, id identity.Ident
 	for _, key := range []string{"conversation_id", "thread_id", "session_id"} {
 		if orig := routing.JSONStringField(body, key); orig != "" {
 			ns := identity.DerivedUUID(seed, orig)
-			body = bytes.Replace(body, []byte(`"`+orig+`"`), []byte(`"`+ns+`"`), -1)
+			if updated, err := sjson.SetBytes(body, key, ns); err == nil {
+				body = updated
+			}
 		}
 	}
 	return body

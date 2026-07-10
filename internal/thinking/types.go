@@ -57,6 +57,10 @@ const (
 	// LevelMax sets maximum thinking effort.
 	// This is currently used by Claude 4.8 adaptive thinking (opus supports "max").
 	LevelMax ThinkingLevel = "max"
+	// LevelUltra is the GPT-5.6 Sol/Terra maximum reasoning mode with automatic
+	// task delegation. It must remain distinct from max; collapsing it silently
+	// lowers an explicitly requested reasoning strength.
+	LevelUltra ThinkingLevel = "ultra"
 )
 
 // ThinkingConfig represents a unified thinking configuration.

@@ -114,6 +114,44 @@ func TestChatCompletionToResponsesPlainTextUnchanged(t *testing.T) {
 	}
 }
 
+func TestChatCompletionToResponsesTranslatesReasoningEffort(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high","stream":true,"stream_options":{"include_usage":true}}`)
+	out, err := ChatCompletionToResponses(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := root["reasoning_effort"]; ok {
+		t.Fatal("Chat-only reasoning_effort should not reach the Responses API")
+	}
+	if _, ok := root["stream_options"]; ok {
+		t.Fatal("Chat-only stream_options should not reach the Responses API")
+	}
+	reasoning, ok := root["reasoning"].(map[string]interface{})
+	if !ok || reasoning["effort"] != "high" {
+		t.Fatalf("reasoning = %#v, want effort high", root["reasoning"])
+	}
+}
+
+func TestChatCompletionToResponsesPreservesNativeReasoningOptions(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"low","reasoning":{"effort":"xhigh","summary":"detailed","context":"all_turns"}}`)
+	out, err := ChatCompletionToResponses(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	reasoning := root["reasoning"].(map[string]interface{})
+	if reasoning["effort"] != "xhigh" || reasoning["summary"] != "detailed" || reasoning["context"] != "all_turns" {
+		t.Fatalf("native reasoning options were not preserved: %#v", reasoning)
+	}
+}
+
 func TestResponsesToChatCompletionMapsIncompleteToLength(t *testing.T) {
 	raw := []byte(`{"id":"resp_length","model":"gpt","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}]}`)
 	out, err := ResponsesToChatCompletion(raw, "", "gpt")

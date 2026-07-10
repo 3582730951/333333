@@ -160,14 +160,14 @@ func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
 	wants := map[string]interface{}{
 		"conversation_isolation":                true,
 		"codex_prefer_sidecar_ja3_over_ws":      true,
-		"codex_prompt_cache_retention":          "24h",
+		"codex_prompt_cache_retention":          "",
 		"rate_limit_guard_enabled":              true,
 		"seamless_failover":                     true,
 		"force_failover_on_429":                 false,
 		"leak_scrub":                            true,
 		"token_save_enabled":                    false,
 		"codex_install_effort":                  "xhigh",
-		"codex_install_model":                   "gpt-5.5",
+		"codex_install_model":                   "gpt-5.6-sol",
 		"codex_install_approval_policy":         "never",
 		"codex_install_sandbox_mode":            "danger-full-access",
 		"claude_cache_control_inject":           true,
@@ -572,6 +572,9 @@ func TestAdminConfigReportsSettingsReadErrors(t *testing.T) {
 	if _, err := h.store.DB().ExecContext(context.Background(), `DROP TABLE settings`); err != nil {
 		t.Fatal(err)
 	}
+	// The settings snapshot is warmed by harness setup; clear it so the next read hits
+	// the now-dropped table and surfaces the read error this test asserts.
+	h.store.InvalidateSettingsCache()
 
 	rows := adminConfigRows(t, h)
 	row := findConfigRow(rows, "require_downstream_key")
@@ -930,6 +933,9 @@ func TestSettingsCenterRuntimeSectionsReportSettingsReadErrors(t *testing.T) {
 	if _, err := h.store.DB().ExecContext(context.Background(), `DROP TABLE settings`); err != nil {
 		t.Fatal(err)
 	}
+	// The settings snapshot is warmed by harness setup; clear it so the next read hits
+	// the now-dropped table and surfaces the read error this test asserts.
+	h.store.InvalidateSettingsCache()
 
 	status, got, raw := getSettingsCenter(t, h, "?sections=logging,memory")
 	if status != http.StatusOK {
@@ -1184,6 +1190,9 @@ func TestSettingsCenterLifecycleReportsDefaultsReadErrors(t *testing.T) {
 	if _, err := h.store.DB().ExecContext(context.Background(), `DROP TABLE settings`); err != nil {
 		t.Fatal(err)
 	}
+	// The settings snapshot is warmed by harness setup; clear it so the next read hits
+	// the now-dropped table and surfaces the read error this test asserts.
+	h.store.InvalidateSettingsCache()
 
 	status, got, raw := getSettingsCenter(t, h, "?section=lifecycle")
 	if status != http.StatusOK {

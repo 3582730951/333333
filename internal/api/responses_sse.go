@@ -17,7 +17,7 @@ import (
 // can parse — including streamed tool calls — instead of raw Responses events. Text
 // deltas are scrubbed. It mirrors anthropicStreamToChatSSE (the Claude path), keeping
 // the two compat streams consistent.
-func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher) {
+func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model string, includeUsage bool, scrubber *streamrewrite.Matcher) {
 	flusher, _ := w.(http.Flusher)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -45,18 +45,44 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			flusher.Flush()
 		}
 	}
+	emitUsage := func(response map[string]interface{}) {
+		if !includeUsage {
+			return
+		}
+		usage, ok := responsesUsageToChat(response["usage"])
+		if !ok {
+			return
+		}
+		chunk := map[string]interface{}{
+			"id":      chatID,
+			"object":  "chat.completion.chunk",
+			"model":   model,
+			"choices": []interface{}{},
+			"usage":   usage,
+		}
+		b, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 	ensureRole := func() {
 		if !roleSent {
 			emit(map[string]interface{}{"role": "assistant"}, nil)
 			roleSent = true
 		}
 	}
-	done := func() {
+	done := func(response map[string]interface{}) {
 		finish := "stop"
 		if sawToolCall {
 			finish = "tool_calls"
 		}
 		emit(map[string]interface{}{}, finish)
+		if response != nil {
+			emitUsage(response)
+		}
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 		if flusher != nil {
 			flusher.Flush()
@@ -135,12 +161,36 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 				},
 			}}}, nil)
 		case "response.completed", "response.incomplete":
-			done()
+			response, _ := ev["response"].(map[string]interface{})
+			done(response)
 			return
 		case "response.failed", "error", "response.error":
-			done()
+			done(nil)
 			return
 		}
 	}
-	done()
+	done(nil)
+}
+
+func responsesUsageToChat(value interface{}) (map[string]interface{}, bool) {
+	source, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	usage := map[string]interface{}{
+		"prompt_tokens":     source["input_tokens"],
+		"completion_tokens": source["output_tokens"],
+		"total_tokens":      source["total_tokens"],
+	}
+	if details, ok := source["input_tokens_details"].(map[string]interface{}); ok {
+		if cached, exists := details["cached_tokens"]; exists {
+			usage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": cached}
+		}
+	}
+	if details, ok := source["output_tokens_details"].(map[string]interface{}); ok {
+		if reasoning, exists := details["reasoning_tokens"]; exists {
+			usage["completion_tokens_details"] = map[string]interface{}{"reasoning_tokens": reasoning}
+		}
+	}
+	return usage, true
 }

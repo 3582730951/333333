@@ -9,14 +9,22 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/upstream"
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/sjson"
 )
 
 type forceCodexResponsesWebSocketKey struct{}
+type codexResponsesWebSocketSessionKey struct{}
 
 func forceCodexResponsesWebSocket(ctx context.Context) bool {
 	force, _ := ctx.Value(forceCodexResponsesWebSocketKey{}).(bool)
 	return force
+}
+
+func codexResponsesWebSocketSession(ctx context.Context) *upstream.CodexResponsesWebSocketSession {
+	session, _ := ctx.Value(codexResponsesWebSocketSessionKey{}).(*upstream.CodexResponsesWebSocketSession)
+	return session
 }
 
 func isResponsesWebSocketUpgrade(r *http.Request) bool {
@@ -32,6 +40,9 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer conn.Close()
+	session := upstream.NewCodexResponsesWebSocketSession()
+	defer session.Close()
+	baseCtx := context.WithValue(r.Context(), codexResponsesWebSocketSessionKey{}, session)
 
 	for {
 		messageType, raw, err := conn.ReadMessage()
@@ -49,9 +60,13 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 		}
 		switch kind {
 		case "response.processed":
+			if err := session.ForwardProcessed(raw); err != nil {
+				_ = writeWebSocketError(conn, http.StatusBadGateway, err.Error())
+				return
+			}
 			continue
 		case "response.create":
-			req := r.Clone(context.WithValue(r.Context(), forceCodexResponsesWebSocketKey{}, true))
+			req := r.Clone(context.WithValue(baseCtx, forceCodexResponsesWebSocketKey{}, true))
 			req.Method = http.MethodPost
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
@@ -70,11 +85,14 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 }
 
 func responsesWebSocketRequestToBody(raw []byte) (string, []byte, error) {
-	var root map[string]interface{}
+	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return "", nil, err
 	}
-	kind, _ := root["type"].(string)
+	var kind string
+	if typeRaw, ok := root["type"]; ok {
+		_ = json.Unmarshal(typeRaw, &kind)
+	}
 	kind = strings.TrimSpace(kind)
 	if kind == "" {
 		return "", nil, fmt.Errorf("missing websocket request type")
@@ -82,13 +100,15 @@ func responsesWebSocketRequestToBody(raw []byte) (string, []byte, error) {
 	if kind != "response.create" {
 		return kind, nil, nil
 	}
-	delete(root, "type")
-	if _, ok := root["stream"]; !ok {
-		root["stream"] = true
-	}
-	body, err := json.Marshal(root)
+	body, err := sjson.DeleteBytes(raw, "type")
 	if err != nil {
 		return "", nil, err
+	}
+	if _, ok := root["stream"]; !ok {
+		body, err = sjson.SetBytes(body, "stream", true)
+		if err != nil {
+			return "", nil, err
+		}
 	}
 	return kind, body, nil
 }

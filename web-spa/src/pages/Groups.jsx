@@ -284,7 +284,7 @@ export default function Groups() {
         <Form onSubmit={create}>
           <Form.Input field="name" label="分组名" rules={[{ required: true }]} />
           <Form.Input field="force_model" label="强制模型 (可选)" />
-          <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((x) => ({ label: x || '不强制', value: x }))} />
+          <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((x) => ({ label: x || '不强制', value: x }))} />
           <Form.Select field="default_egress_id" label="默认出口" optionList={egressOptions} />
           <Form.Switch field="model_instructions_enabled" label="启用模型指令文件" />
           <Form.Input
@@ -315,7 +315,7 @@ export default function Groups() {
           >
             <Form.Input field="name" label="分组名" disabled />
             <Form.Input field="force_model" label="强制模型 (可选)" />
-            <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh'].map((x) => ({ label: x || '不强制', value: x }))} />
+            <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((x) => ({ label: x || '不强制', value: x }))} />
             <Form.Select field="default_egress_id" label="默认出口" optionList={egressOptions} />
             <Button htmlType="submit" theme="solid" loading={savingGroupPolicy} style={{ marginTop: 12 }}>保存</Button>
           </Form>

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -11,45 +12,70 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
-	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/sjson"
 	"golang.org/x/net/proxy"
 )
 
 const (
-	codexResponsesWebSocketBeta         = "responses_websockets=2026-02-06"
-	codexResponsesWebSocketBetaFeatures = "terminal_resize_reflow"
+	codexResponsesWebSocketBeta = "responses_websockets=2026-02-06"
 )
 
-type codexWebSocketIDs struct {
-	installationID string
-	sessionID      string
-	threadID       string
-	windowID       string
-	parentThreadID string
-	turnMetadata   string
+// CodexResponsesWebSocketSession owns the persistent upstream connection for one
+// downstream Responses WebSocket. Requests on a Codex connection are sequential,
+// so requestMu stays held until the terminal event for the current response.
+type CodexResponsesWebSocketSession struct {
+	requestMu sync.Mutex
+	connMu    sync.Mutex
+	conn      *websocket.Conn
+	target    string
+	accountID string
+	closed    bool
+}
+
+func NewCodexResponsesWebSocketSession() *CodexResponsesWebSocketSession {
+	return &CodexResponsesWebSocketSession{}
+}
+
+func (s *CodexResponsesWebSocketSession) Close() error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.closed = true
+	if s.conn == nil {
+		return nil
+	}
+	err := s.conn.Close()
+	s.conn = nil
+	return err
+}
+
+// ForwardProcessed relays Codex's response.processed acknowledgement on the same
+// upstream connection that produced the response being acknowledged.
+func (s *CodexResponsesWebSocketSession) ForwardProcessed(raw []byte) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closed {
+		return errors.New("codex websocket session is closed")
+	}
+	if s.conn == nil {
+		return errors.New("codex websocket session is not connected")
+	}
+	return s.conn.WriteMessage(websocket.TextMessage, raw)
 }
 
 func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*Response, error) {
-	target := ComputeCodexResponsesWebSocketURL(c.cfg.UpstreamBaseURL, spec.DownstreamPath)
-	headers := http.Header{}
-	c.applyCodexHeaders(headers, spec)
-	ids := c.codexWebSocketIDs(spec)
-	applyCodexWebSocketHeaders(headers, ids)
-	payload, err := buildCodexWebSocketCreatePayload(spec.Body, ids)
+	if spec.CodexWebSocketSession != nil {
+		return spec.CodexWebSocketSession.do(ctx, c, spec)
+	}
+	target, headers, payload, err := c.prepareCodexResponsesWebSocket(spec)
 	if err != nil {
 		return nil, err
 	}
-	// Namespace any downstream-original session/thread identifiers that survived
-	// into the payload body (outside client_metadata, which is already virtualized
-	// above). The downstream's real session_id/thread_id/previous_response_id are
-	// account-correlatable signals; replace them with the per-account derived
-	// equivalents so the upstream cannot link one account's session to another's.
-	payload = c.codexWSNamespacePayload(spec, ids, payload)
 	dialer, err := c.codexWebSocketDialerForEgress(spec.Egress)
 	if err != nil {
 		return nil, err
@@ -67,6 +93,7 @@ func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
+	payload = stampCodexWebSocketRequestStart(payload)
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		_ = conn.Close()
 		guard.Fail()
@@ -88,6 +115,122 @@ func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*
 	header.Set("Content-Type", "text/event-stream")
 	header.Set("Cache-Control", "no-cache")
 	return &Response{StatusCode: http.StatusOK, Header: header, Body: guard.Wrap(pr)}, nil
+}
+
+func (c *Client) prepareCodexResponsesWebSocket(spec Request) (string, http.Header, []byte, error) {
+	target := ComputeCodexResponsesWebSocketURL(c.cfg.UpstreamBaseURL, spec.DownstreamPath)
+	headers := http.Header{}
+	c.applyCodexHeaders(headers, spec)
+	metadata := spec.codexMetadata
+	if metadata == nil {
+		generated := c.newCodexRequestMetadata(spec)
+		metadata = &generated
+	}
+	ids := *metadata
+	applyCodexWebSocketHeaders(headers, ids)
+	payload, err := buildCodexWebSocketCreatePayload(spec.Body, ids)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	// Remove any downstream-original transport correlators that survived into the
+	// payload body (outside client_metadata, which is already virtualized above).
+	// previous_response_id is conversation state rather than a transport
+	// correlator, so it must remain byte-for-byte intact to preserve context.
+	payload = c.codexWSNamespacePayload(spec, ids, payload)
+	return target, headers, payload, nil
+}
+
+func (s *CodexResponsesWebSocketSession) do(ctx context.Context, c *Client, spec Request) (*Response, error) {
+	s.requestMu.Lock()
+	target, headers, payload, err := c.prepareCodexResponsesWebSocket(spec)
+	if err != nil {
+		s.requestMu.Unlock()
+		return nil, err
+	}
+	requestCtx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
+	conn, handshake, err := s.connection(requestCtx, c, spec, target, headers)
+	if err != nil {
+		s.requestMu.Unlock()
+		if handshake != nil && handshake.Body != nil {
+			return &Response{StatusCode: handshake.StatusCode, Header: handshake.Header.Clone(), Body: guard.Wrap(handshake.Body)}, nil
+		}
+		guard.Fail()
+		return nil, err
+	}
+	payload = stampCodexWebSocketRequestStart(payload)
+	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+		s.invalidate(conn)
+		s.requestMu.Unlock()
+		guard.Fail()
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	terminal := make(chan struct{})
+	go func() {
+		defer supervisor.Recover("codex-persistent-websocket-context")
+		select {
+		case <-requestCtx.Done():
+			s.invalidate(conn)
+			_ = pw.CloseWithError(requestCtx.Err())
+		case <-terminal:
+		}
+	}()
+	go func() {
+		defer supervisor.Recover("codex-persistent-websocket-sse-pipe")
+		kind := pipeCodexWebSocketSSEFrames(conn, pw, false)
+		if kind != "response.completed" {
+			s.invalidate(conn)
+		}
+		close(terminal)
+		_ = pw.Close()
+		s.requestMu.Unlock()
+	}()
+
+	header := http.Header{}
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	return &Response{StatusCode: http.StatusOK, Header: header, Body: guard.Wrap(pr)}, nil
+}
+
+func (s *CodexResponsesWebSocketSession) connection(ctx context.Context, c *Client, spec Request, target string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closed {
+		return nil, nil, errors.New("codex websocket session is closed")
+	}
+	if s.conn != nil && s.target == target && s.accountID == spec.Account.ID {
+		return s.conn, nil, nil
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	dialer, err := c.codexWebSocketDialerForEgress(spec.Egress)
+	if err != nil {
+		return nil, nil, err
+	}
+	conn, resp, err := dialer.DialContext(ctx, target, headers)
+	if err != nil {
+		return nil, resp, err
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	s.conn = conn
+	s.target = target
+	s.accountID = spec.Account.ID
+	return conn, nil, nil
+}
+
+func (s *CodexResponsesWebSocketSession) invalidate(conn *websocket.Conn) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.conn != conn {
+		return
+	}
+	_ = s.conn.Close()
+	s.conn = nil
 }
 
 func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*websocket.Dialer, error) {
@@ -134,53 +277,13 @@ func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*w
 	}
 }
 
-func (c *Client) codexWebSocketIDs(spec Request) codexWebSocketIDs {
-	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
-	windowID := firstNonEmpty(
-		getHeaderFold(spec.Headers, "x-codex-window-id"),
-	)
-	threadID := firstNonEmpty(
-		getHeaderFold(spec.Headers, "thread-id"),
-		getHeaderFold(spec.Headers, "x-client-request-id"),
-		threadIDFromWindowID(windowID),
-	)
-	if threadID == "" {
-		if seed := firstNonEmpty(
-			codexBodyString(spec.Body, "prompt_cache_key"),
-			codexBodyString(spec.Body, "previous_response_id"),
-			codexRunCorrelator(spec.Headers),
-		); seed != "" {
-			threadID = identity.DerivedUUID(id.MachineID, "thread:"+seed)
-		}
-	}
-	if threadID == "" {
-		threadID = identity.DerivedUUID(id.MachineID, fmt.Sprintf("thread:%s:%d", spec.Account.ID, time.Now().UnixNano()))
-	}
-	if windowID == "" {
-		windowID = threadID + ":0"
-	}
-	sessionID := firstNonEmpty(
-		getHeaderFold(spec.Headers, "session-id"),
-		getHeaderFold(spec.Headers, "Session_id"),
-		threadID,
-	)
-	ids := codexWebSocketIDs{
-		installationID: id.MachineID,
-		sessionID:      sessionID,
-		threadID:       threadID,
-		windowID:       windowID,
-		parentThreadID: strings.TrimSpace(getHeaderFold(spec.Headers, "x-codex-parent-thread-id")),
-	}
-	ids.turnMetadata = codexWebSocketTurnMetadata(spec.Headers, ids)
-	return ids
-}
-
 func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
-	// The WebSocket handshake carries no Accept header (verified vs codex-rs
-	// build_websocket_headers). Strip any stale capitalized "Session_id" (the real
-	// client uses lowercase session-id/thread-id, set below). ChatGPT-Account-ID is
-	// deliberately KEPT — the real WS sends it via the auth headers.
+	// The WebSocket handshake carries neither Accept nor Content-Type (verified vs
+	// codex-rs build_websocket_headers). Strip any stale capitalized "Session_id"
+	// (the real client uses lowercase session-id/thread-id, set below).
+	// ChatGPT-Account-ID is deliberately KEPT — real WS auth sends it.
 	dst.Del("Accept")
+	deleteHeaderFold(dst, "Content-Type")
 	deleteHeaderFold(dst, "Session_id")
 
 	setHeaderPreserveCase(dst, "OpenAI-Beta", codexResponsesWebSocketBeta)
@@ -188,15 +291,13 @@ func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
 	setHeaderPreserveCase(dst, "thread-id", ids.threadID)
 	setHeaderPreserveCase(dst, "x-client-request-id", ids.threadID)
 	setHeaderPreserveCase(dst, "x-codex-window-id", ids.windowID)
-	// NOTE: no `version` request header. The canonical codex-rs client sets only
-	// `originator` + `User-Agent` as default headers (login/src/auth/default_client.rs
-	// default_headers(), shared by the HTTP and WS transports); it never sends a
-	// `version` header on any path. A capture once showed `version` on the WS upgrade,
-	// but the source is authoritative and Session 18 deliberately removed the spurious
-	// `version` injection as a relay tell — re-adding it would reintroduce that tell.
-	setIfEmptyPreserveCase(dst, "x-codex-beta-features", codexResponsesWebSocketBetaFeatures)
+	// `version` and `x-codex-beta-features` are installed by applyCodexHeaders and
+	// deliberately survive here; both are present in a real 0.144.1 WS capture.
 	if ids.parentThreadID != "" {
 		setHeaderPreserveCase(dst, "x-codex-parent-thread-id", ids.parentThreadID)
+	}
+	if ids.subagent != "" {
+		setHeaderPreserveCase(dst, codexSubagentHeader, ids.subagent)
 	}
 	if ids.turnMetadata != "" {
 		setHeaderPreserveCase(dst, "x-codex-turn-metadata", ids.turnMetadata)
@@ -204,104 +305,99 @@ func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
 }
 
 func buildCodexWebSocketCreatePayload(body []byte, ids codexWebSocketIDs) ([]byte, error) {
-	var payload map[string]interface{}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
 		return nil, err
 	}
-	payload["type"] = "response.create"
-	payload["stream"] = true
-	setJSONDefault(payload, "instructions", "")
-	setJSONDefault(payload, "tools", []interface{}{})
-	setJSONDefault(payload, "tool_choice", "auto")
-	setJSONDefault(payload, "parallel_tool_calls", false)
-	setJSONDefault(payload, "store", false)
-	setJSONDefault(payload, "include", []interface{}{})
-
-	metadata, _ := payload["client_metadata"].(map[string]interface{})
-	if metadata == nil {
-		metadata = map[string]interface{}{}
+	payload := body
+	set := func(path string, value interface{}) error {
+		var err error
+		payload, err = sjson.SetBytes(payload, path, value)
+		return err
 	}
-	metadata["x-codex-installation-id"] = ids.installationID
-	metadata["x-codex-window-id"] = ids.windowID
-	if ids.parentThreadID != "" {
-		metadata["x-codex-parent-thread-id"] = ids.parentThreadID
+	setDefault := func(path string, value interface{}) error {
+		if _, exists := fields[path]; exists {
+			return nil
+		}
+		return set(path, value)
 	}
-	if ids.turnMetadata != "" {
-		metadata["x-codex-turn-metadata"] = ids.turnMetadata
+	if err := set("type", "response.create"); err != nil {
+		return nil, err
 	}
-	payload["client_metadata"] = metadata
-
-	return json.Marshal(payload)
-}
-
-// codexWSNamespacePayload replaces any downstream-original session_id / thread_id
-// that survived into the WS create payload body with the per-account derived
-// equivalents. This is the WS-frame analogue of the HTTP-header conversation
-// isolation: the upstream must not see a session id that originated on a
-// different account. The replacement is byte-level (json re-marshal), so it does
-// not disturb WS frame boundaries. client_metadata is already virtualized by
-// buildCodexWebSocketCreatePayload, so we only touch top-level string fields that
-// carry a downstream session/thread id.
-func (c *Client) codexWSNamespacePayload(spec Request, ids codexWebSocketIDs, payload []byte) []byte {
-	var root map[string]interface{}
-	if err := json.Unmarshal(payload, &root); err != nil {
-		return payload // leave untouched on parse failure (do not break the request)
+	if err := set("stream", true); err != nil {
+		return nil, err
 	}
-	changed := false
-	// session_id / thread_id at the top level: replace with the derived per-account
-	// value (same one used in client_metadata and the handshake headers), keeping
-	// everything coherent.
-	for _, key := range []string{"session_id", "thread_id"} {
-		if v, ok := root[key].(string); ok && v != "" {
-			var repl string
-			if key == "session_id" {
-				repl = ids.sessionID
-			} else {
-				repl = ids.threadID
-			}
-			if repl != "" && repl != v {
-				root[key] = repl
-				changed = true
-			}
+	// Responses Lite carries tools in the leading `additional_tools` input item and
+	// omits the top-level tools member. Preserve a caller-supplied member, but never
+	// invent tools:[] for Lite. Classic Responses keeps its historical default.
+	if !ids.responsesLite {
+		if err := setDefault("tools", []interface{}{}); err != nil {
+			return nil, err
 		}
 	}
-	if !changed {
-		return payload
+	for _, field := range []struct {
+		path  string
+		value interface{}
+	}{
+		{"tool_choice", "auto"},
+		{"parallel_tool_calls", false},
+		{"store", false},
+		{"include", []interface{}{}},
+	} {
+		if err := setDefault(field.path, field.value); err != nil {
+			return nil, err
+		}
 	}
-	if out, err := json.Marshal(root); err == nil {
-		return out
+	if ids.responsesLite {
+		if err := set("parallel_tool_calls", false); err != nil {
+			return nil, err
+		}
 	}
-	return payload
+	return applyCodexClientMetadata(payload, ids, true), nil
+}
+
+// codexWSNamespacePayload is a final defensive schema guard for WS frames. The
+// downstream correlators were already consumed when canonical metadata was built;
+// the live Responses backend rejects them as top-level request parameters.
+func (c *Client) codexWSNamespacePayload(spec Request, ids codexWebSocketIDs, payload []byte) []byte {
+	return stripCodexTopLevelTransportCorrelators(payload)
 }
 
 func pipeCodexWebSocketSSE(conn *websocket.Conn, pw *io.PipeWriter) {
-	defer conn.Close()
-	defer pw.Close()
+	_ = pipeCodexWebSocketSSEFrames(conn, pw, true)
+	_ = pw.Close()
+}
+
+func pipeCodexWebSocketSSEFrames(conn *websocket.Conn, pw *io.PipeWriter, closeConn bool) string {
+	if closeConn {
+		defer conn.Close()
+	}
 	for {
 		messageType, raw, err := conn.ReadMessage()
 		if err != nil {
 			_ = pw.CloseWithError(err)
-			return
+			return ""
 		}
 		if messageType != websocket.TextMessage {
 			if messageType == websocket.CloseMessage {
 				_ = pw.CloseWithError(errors.New("websocket closed before response.completed"))
-				return
+				return ""
 			}
 			if messageType == websocket.BinaryMessage {
 				_ = pw.CloseWithError(errors.New("unexpected binary websocket event"))
-				return
+				return ""
 			}
 			continue
 		}
 		kind := jsonTypeField(raw)
 		if err := writeSSEEvent(pw, kind, raw); err != nil {
 			_ = pw.CloseWithError(err)
-			return
+			return ""
 		}
-		if kind == "response.completed" {
+		switch kind {
+		case "response.completed", "response.failed", "response.incomplete", "error":
 			_, _ = pw.Write([]byte("data: [DONE]\n\n"))
-			return
+			return kind
 		}
 	}
 }
@@ -312,7 +408,17 @@ func writeSSEEvent(w io.Writer, kind string, raw []byte) error {
 			return err
 		}
 	}
-	_, err := fmt.Fprintf(w, "data: %s\n\n", raw)
+	// A WebSocket text frame may contain pretty-printed JSON with literal
+	// newlines. SSE requires every physical payload line to carry its own data:
+	// prefix; prefixing only the first line makes an SSE parser see just "{" and
+	// later fails when the downstream WebSocket adapter reconstructs the event.
+	raw = bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "\n")
 	return err
 }
 
@@ -327,25 +433,6 @@ func jsonTypeField(raw []byte) string {
 		return ""
 	}
 	return event.Type
-}
-
-func codexWebSocketTurnMetadata(headers http.Header, ids codexWebSocketIDs) string {
-	if v := strings.TrimSpace(getHeaderFold(headers, "x-codex-turn-metadata")); v != "" {
-		return v
-	}
-	meta := map[string]interface{}{
-		"session_id":    ids.sessionID,
-		"thread_id":     ids.threadID,
-		"thread_source": "user",
-		"turn_id":       "",
-		"request_kind":  "turn",
-		"window_id":     ids.windowID,
-	}
-	raw, err := json.Marshal(meta)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
 }
 
 func codexBodyString(body []byte, key string) string {
@@ -366,12 +453,6 @@ func threadIDFromWindowID(windowID string) string {
 		return windowID[:idx]
 	}
 	return ""
-}
-
-func setJSONDefault(payload map[string]interface{}, key string, value interface{}) {
-	if _, ok := payload[key]; !ok {
-		payload[key] = value
-	}
 }
 
 func deleteHeaderFold(h http.Header, key string) {

@@ -25,8 +25,9 @@ func TestVirtualizeReplacesUserIDInjectsSystemAndRenamesTools(t *testing.T) {
 	res := Virtualize(body, id, nil, true)
 	root := mustRoot(t, res.Body)
 
-	if _, ok := root["metadata"]; ok {
-		t.Fatalf("metadata must not be forwarded to Anthropic messages: %s", res.Body)
+	metadata, ok := root["metadata"].(map[string]interface{})
+	if !ok || len(metadata) != 1 || !userIDShape.MatchString(metadata["user_id"].(string)) {
+		t.Fatalf("metadata.user_id must use the captured Claude Code shape: %s", res.Body)
 	}
 	sys := root["system"].([]interface{})
 	if sys[0].(map[string]interface{})["text"] != claudeCodeIdentityLine {

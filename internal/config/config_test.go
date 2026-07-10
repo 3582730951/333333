@@ -77,22 +77,22 @@ func TestCodexCLIVersionEnvOverride(t *testing.T) {
 	}
 }
 
-func TestClaudeCCHSigningDefaultAndEnvOverride(t *testing.T) {
+func TestDeprecatedClaudeCCHSigningDefaultsOffAndStillParses(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("Load default: %v", err)
 	}
-	if !cfg.ClaudeCCHSigning {
-		t.Fatal("ClaudeCCHSigning default must be true")
+	if cfg.ClaudeCCHSigning {
+		t.Fatal("ClaudeCCHSigning default must be false for the cch-free current wire")
 	}
 
-	t.Setenv("CODEX_POOL_CLAUDE_CCH_SIGNING", "false")
+	t.Setenv("CODEX_POOL_CLAUDE_CCH_SIGNING", "true")
 	cfg, err = Load("")
 	if err != nil {
 		t.Fatalf("Load env: %v", err)
 	}
-	if cfg.ClaudeCCHSigning {
-		t.Fatal("CODEX_POOL_CLAUDE_CCH_SIGNING=false was not applied")
+	if !cfg.ClaudeCCHSigning {
+		t.Fatal("deprecated CODEX_POOL_CLAUDE_CCH_SIGNING setting must still parse")
 	}
 }
 
@@ -161,7 +161,7 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 	wants := map[string]interface{}{
 		"conversation_isolation":                true,
 		"codex_prefer_sidecar_ja3_over_ws":      true,
-		"codex_prompt_cache_retention":          "24h",
+		"codex_prompt_cache_retention":          "",
 		"claude_cache_control_inject":           true,
 		"claude_cache_mode":                     "max_hit",
 		"claude_cache_affinity_policy":          "balanced",
@@ -173,7 +173,7 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"claude_cache_diagnostics_enabled":      true,
 		"claude_cache_singleflight_enabled":     true,
 		"claude_cache_lossless_block_split":     true,
-		"claude_cch_signing":                    true,
+		"claude_cch_signing":                    false,
 		"claude_cache_ttl":                      "1h",
 		"rate_limit_guard_enabled":              true,
 		"seamless_failover":                     true,
@@ -182,7 +182,7 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"stateful_sticky_wait_seconds":          float64(0),
 		"leak_scrub_enabled":                    true,
 		"token_save_enabled":                    false,
-		"codex_install_model":                   "gpt-5.5",
+		"codex_install_model":                   "gpt-5.6-sol",
 		"codex_install_effort":                  "xhigh",
 	}
 	for key, want := range wants {
@@ -198,14 +198,14 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 	if cfg.ClaudeCacheTTL != "1h" {
 		t.Fatalf("ClaudeCacheTTL = %q, want 1h", cfg.ClaudeCacheTTL)
 	}
-	if cfg.CodexPromptCacheRetention != "24h" {
-		t.Fatalf("CodexPromptCacheRetention = %q, want 24h", cfg.CodexPromptCacheRetention)
+	if cfg.CodexPromptCacheRetention != "" {
+		t.Fatalf("CodexPromptCacheRetention = %q, want empty for Codex 0.144.x", cfg.CodexPromptCacheRetention)
 	}
 	if cfg.TokenSaveEnabled {
 		t.Fatal("TokenSaveEnabled must stay false by default because it rewrites request content")
 	}
-	if cfg.CodexInstallModel != "gpt-5.5" {
-		t.Fatalf("CodexInstallModel = %q, want gpt-5.5", cfg.CodexInstallModel)
+	if cfg.CodexInstallModel != "gpt-5.6-sol" {
+		t.Fatalf("CodexInstallModel = %q, want gpt-5.6-sol", cfg.CodexInstallModel)
 	}
 	if cfg.CodexInstallEffort != "xhigh" {
 		t.Fatalf("CodexInstallEffort = %q, want xhigh", cfg.CodexInstallEffort)

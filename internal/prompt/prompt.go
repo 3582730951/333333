@@ -103,11 +103,29 @@ func ChatCompletionToResponses(raw []byte) ([]byte, error) {
 	if v, ok := root["max_completion_tokens"]; ok {
 		root["max_output_tokens"] = v
 	}
-	for _, drop := range []string{"n", "logprobs", "top_logprobs"} {
+	// Chat Completions clients express reasoning effort as a top-level
+	// reasoning_effort field. The Responses API expects the value nested under
+	// reasoning.effort and rejects the Chat-only field when it is forwarded as-is.
+	// Preserve any Responses-native reasoning options a compatible client already
+	// supplied; the nested effort is the more specific value and therefore wins.
+	if v, ok := root["reasoning_effort"]; ok {
+		if effort, ok := v.(string); ok && strings.TrimSpace(effort) != "" {
+			reasoning, _ := root["reasoning"].(map[string]interface{})
+			if reasoning == nil {
+				reasoning = make(map[string]interface{})
+			}
+			if _, exists := reasoning["effort"]; !exists {
+				reasoning["effort"] = effort
+			}
+			root["reasoning"] = reasoning
+		}
+	}
+	for _, drop := range []string{"n", "logprobs", "top_logprobs", "stream_options"} {
 		delete(root, drop)
 	}
 	delete(root, "max_tokens")
 	delete(root, "max_completion_tokens")
+	delete(root, "reasoning_effort")
 	return json.Marshal(root)
 }
 

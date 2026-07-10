@@ -30,13 +30,14 @@ import (
 )
 
 type capturedRequest struct {
-	Path      string
-	Method    string
-	AccountID string
-	Auth      string
-	Beta      string
-	Body      string
-	TurnState string
+	Path          string
+	Method        string
+	AccountID     string
+	Auth          string
+	Beta          string
+	Body          string
+	TurnState     string
+	ClaudeSession string
 }
 
 type testHarness struct {
@@ -55,13 +56,14 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 		raw, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		captured = append(captured, capturedRequest{
-			Path:      r.URL.Path,
-			Method:    r.Method,
-			AccountID: r.Header.Get("ChatGPT-Account-ID"),
-			Auth:      r.Header.Get("Authorization"),
-			Beta:      r.Header.Get("Anthropic-Beta"),
-			Body:      string(raw),
-			TurnState: r.Header.Get("X-Codex-Turn-State"),
+			Path:          r.URL.Path,
+			Method:        r.Method,
+			AccountID:     r.Header.Get("ChatGPT-Account-ID"),
+			Auth:          r.Header.Get("Authorization"),
+			Beta:          r.Header.Get("Anthropic-Beta"),
+			Body:          string(raw),
+			TurnState:     r.Header.Get("X-Codex-Turn-State"),
+			ClaudeSession: r.Header.Get("X-Claude-Code-Session-Id"),
 		})
 		mu.Unlock()
 		r.Body = io.NopCloser(bytes.NewReader(raw))
@@ -270,7 +272,7 @@ func TestGatewayAutoPromptCacheKeyForLargeStablePrefix(t *testing.T) {
 	})
 	h.importAccount(t, "auto-pck", "upstream-auto-pck", "access-auto-pck")
 	instructions := strings.Repeat("stable repository context for automatic prompt cache key. ", 80)
-	body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"instructions":` + strconv.Quote(instructions) + `,"input":[{"role":"user","content":"final question"}]}`
+	body := `{"model":"gpt-cache-test","stream":true,"reasoning":{"effort":"high"},"instructions":` + strconv.Quote(instructions) + `,"input":[{"role":"user","content":"final question"}]}`
 	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -297,7 +299,7 @@ func TestGatewayAutoPromptCacheKeyForStablePrefixInsideFinalUserText(t *testing.
 	h.importAccount(t, "auto-pck-text-prefix", "upstream-auto-pck-text-prefix", "access-auto-pck-text-prefix")
 	prefix := strings.Repeat("stable repository snapshot line for prompt cache reuse. ", 140)
 	for _, question := range []string{"Question: summarize file A", "Question: summarize file B"} {
-		body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prefix+question) + `}]}]}`
+		body := `{"model":"gpt-cache-test","stream":true,"reasoning":{"effort":"high"},"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prefix+question) + `}]}]}`
 		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
@@ -334,7 +336,7 @@ func TestGatewayAutoPromptCacheKeyForStablePrefixInsideTopLevelInputText(t *test
 	h.importAccount(t, "auto-pck-input-text-prefix", "upstream-auto-pck-input-text-prefix", "access-auto-pck-input-text-prefix")
 	prefix := strings.Repeat("stable repository snapshot line for top level text cache reuse. ", 120)
 	for _, question := range []string{"Question: summarize file A", "Question: summarize file B"} {
-		body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"input":` + strconv.Quote(prefix+question) + `}`
+		body := `{"model":"gpt-cache-test","stream":true,"reasoning":{"effort":"high"},"input":` + strconv.Quote(prefix+question) + `}`
 		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
@@ -370,7 +372,7 @@ func TestGatewayCanonicalAutoPromptCacheAffinityPinsStablePrefixBeforeAccountSel
 
 	prefix := strings.Repeat("stable repository snapshot line for cross-account cache affinity. ", 130)
 	for _, question := range []string{"Question: summarize module A", "Question: summarize module B"} {
-		body := `{"model":"gpt-5.4","stream":true,"input":` + strconv.Quote(prefix+question) + `}`
+		body := `{"model":"gpt-cache-test","stream":true,"input":` + strconv.Quote(prefix+question) + `}`
 		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
@@ -408,7 +410,7 @@ func TestGatewayCanonicalAutoPromptCacheAffinityPinsStablePrefixBeforeAccountSel
 	if stablePrefixSource != "text_prefix" || stablePrefixReason != "ok" || stablePrefixBytes <= 2048 {
 		t.Fatalf("stable prefix diagnostics wrong: source=%q reason=%q bytes=%d", stablePrefixSource, stablePrefixReason, stablePrefixBytes)
 	}
-	if retentionEffective != "" || retentionSource != "stripped_http_transport" {
+	if retentionEffective != "" || retentionSource != "unsupported_current_codex" {
 		t.Fatalf("retention diagnostics wrong: effective=%q source=%q", retentionEffective, retentionSource)
 	}
 }
@@ -432,7 +434,7 @@ func TestGatewayAutoPromptCacheKeyForStablePrefixInsideMultimodalToolRequest(t *
 		{"AAAA", "Question: inspect image A"},
 		{"BBBB", "Question: inspect image B"},
 	} {
-		body := `{"model":"gpt-5.4","stream":true,"reasoning":{"effort":"high"},"tools":` + tools + `,"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prefix) + `},{"type":"input_image","image_url":"data:image/png;base64,` + tc.image + `"},{"type":"input_text","text":` + strconv.Quote(tc.question) + `}]}]}`
+		body := `{"model":"gpt-cache-test","stream":true,"reasoning":{"effort":"high"},"tools":` + tools + `,"input":[{"role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prefix) + `},{"type":"input_image","image_url":"data:image/png;base64,` + tc.image + `"},{"type":"input_text","text":` + strconv.Quote(tc.question) + `}]}]}`
 		resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
 		if err != nil {
 			t.Fatal(err)
@@ -472,7 +474,7 @@ func promptCacheKeyFromBody(t *testing.T, body string) string {
 	return key
 }
 
-func equalJSONIgnoringPromptCacheKey(t *testing.T, want, got string) bool {
+func equalJSONIgnoringCodexTransportMetadata(t *testing.T, want, got string) bool {
 	t.Helper()
 	var wm map[string]interface{}
 	var gm map[string]interface{}
@@ -484,6 +486,8 @@ func equalJSONIgnoringPromptCacheKey(t *testing.T, want, got string) bool {
 	}
 	delete(wm, "prompt_cache_key")
 	delete(gm, "prompt_cache_key")
+	delete(wm, "client_metadata")
+	delete(gm, "client_metadata")
 	return reflect.DeepEqual(wm, gm)
 }
 
@@ -496,7 +500,7 @@ func TestGatewayDoesNotAutoPromptCacheKeyForSmallRequest(t *testing.T) {
 			"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"total_tokens\":11}}}\n\n"))
 	})
 	h.importAccount(t, "small-no-pck", "upstream-small-no-pck", "access-small-no-pck")
-	body := `{"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":"hello"}]}`
+	body := `{"model":"gpt-cache-test","stream":true,"input":[{"role":"user","content":"hello"}]}`
 	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -637,17 +641,24 @@ func TestGatewayStreamingRecordsUsageWithoutEventStreamContentType(t *testing.T)
 
 func TestGatewayChatStreamConvertsResponsesSSEWithoutEventStreamContentType(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody := readBody(t, r)
+		if strings.Contains(upstreamBody, "stream_options") || strings.Contains(upstreamBody, "reasoning_effort") {
+			t.Fatalf("Chat-only fields leaked to Responses upstream: %s", upstreamBody)
+		}
+		if !strings.Contains(upstreamBody, `"reasoning":{"effort":"high"`) {
+			t.Fatalf("reasoning effort was not translated: %s", upstreamBody)
+		}
 		_, _ = w.Write([]byte("event: response.created\n" +
 			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chat_stream\",\"model\":\"gpt-5.4\"}}\n\n" +
 			"event: response.output_text.delta\n" +
 			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"chat stream ok\"}\n\n" +
 			"event: response.completed\n" +
-			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_chat_stream\",\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8}}}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_chat_stream\",\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3,\"total_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n" +
 			"data: [DONE]\n\n"))
 	})
 	h.importAccount(t, "chat-stream-no-ct", "upstream-chat-stream-no-ct", "access-chat-stream-no-ct")
 
-	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-5.4","messages":[{"role":"user","content":"reply exactly: chat stream ok"}],"stream":true}`))
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"gpt-5.4","messages":[{"role":"user","content":"reply exactly: chat stream ok"}],"reasoning_effort":"high","stream":true,"stream_options":{"include_usage":true}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,6 +673,11 @@ func TestGatewayChatStreamConvertsResponsesSSEWithoutEventStreamContentType(t *t
 	}
 	if strings.Contains(body, "response.output_text.delta") {
 		t.Fatalf("raw Responses SSE leaked to chat downstream:\n%s", body)
+	}
+	for _, want := range []string{`"choices":[]`, `"prompt_tokens":5`, `"completion_tokens":3`, `"cached_tokens":2`, `"reasoning_tokens":1`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("requested Chat stream usage is incomplete (%s):\n%s", want, body)
+		}
 	}
 }
 
@@ -766,7 +782,7 @@ func TestGatewayNonStreamingChatUpstreamBodyStableAcrossIdenticalRequests(t *tes
 	if len(reqs) != 2 {
 		t.Fatalf("captured requests = %d", len(reqs))
 	}
-	if reqs[0].Body != reqs[1].Body {
+	if !equalJSONIgnoringCodexTransportMetadata(t, reqs[0].Body, reqs[1].Body) {
 		t.Fatalf("identical downstream chat requests produced different upstream bodies\nfirst:  %s\nsecond: %s", reqs[0].Body, reqs[1].Body)
 	}
 }
@@ -806,7 +822,7 @@ func TestGatewayPreservesResponsesToolItemsWhenVirtual2MEnabled(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("gateway status = %d", resp.StatusCode)
 	}
-	if upstreamBody != body {
+	if !equalJSONIgnoringCodexTransportMetadata(t, body, upstreamBody) {
 		t.Fatalf("tool/reasoning Responses input changed before upstream\nwant: %s\n got: %s", body, upstreamBody)
 	}
 }
@@ -845,7 +861,7 @@ func TestGatewayPreservesResponsesAttachmentsWhenVirtual2MEnabled(t *testing.T) 
 	if promptCacheKeyFromBody(t, upstreamBody) == "" {
 		t.Fatalf("attachment request with large stable prefix did not get prompt_cache_key:\n%s", upstreamBody)
 	}
-	if !equalJSONIgnoringPromptCacheKey(t, body, upstreamBody) {
+	if !equalJSONIgnoringCodexTransportMetadata(t, body, upstreamBody) {
 		t.Fatalf("attachment Responses input changed before upstream\nwant: %s\n got: %s", body, upstreamBody)
 	}
 }
@@ -1397,8 +1413,11 @@ func TestGatewayUsesCurrentCodexVersionForGatedModel(t *testing.T) {
 		if r.URL.Path != "/backend-api/codex/responses" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-		if got := r.Header.Get("version"); got != "" {
-			t.Fatalf("version header must not be sent, got %q", got)
+		if got := r.Header.Get("version"); got != config.DefaultClientVersion {
+			t.Fatalf("version header = %q, want %q", got, config.DefaultClientVersion)
+		}
+		if got := r.Header.Get("x-codex-beta-features"); got != "remote_compaction_v2" {
+			t.Fatalf("beta features = %q", got)
 		}
 		if ua := r.Header.Get("User-Agent"); !strings.Contains(ua, "/"+config.DefaultClientVersion+" ") {
 			t.Fatalf("UA = %q, want current Codex version %s", ua, config.DefaultClientVersion)
@@ -1422,7 +1441,7 @@ func TestGatewayUsesResponsesWebSocketForGatedStreamingModel(t *testing.T) {
 	var gotPayload map[string]interface{}
 	upgrader := websocket.Upgrader{}
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/responses" {
+		if r.URL.Path != "/backend-api/codex/responses" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 		if r.Method != http.MethodGet {
@@ -1460,14 +1479,17 @@ func TestGatewayUsesResponsesWebSocketForGatedStreamingModel(t *testing.T) {
 		t.Fatalf("gateway SSE body missing completed event:\n%s", got)
 	}
 	reqs := h.requests()
-	if len(reqs) != 1 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/v1/responses" {
+	if len(reqs) != 1 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/backend-api/codex/responses" {
 		t.Fatalf("upstream requests = %+v", reqs)
 	}
 	if gotHeaders.Get("OpenAI-Beta") != "responses_websockets=2026-02-06" {
 		t.Fatalf("OpenAI-Beta = %q", gotHeaders.Get("OpenAI-Beta"))
 	}
-	if gotHeaders.Get("version") != "" {
-		t.Fatalf("version header must not be sent on WS, got %q", gotHeaders.Get("version"))
+	if gotHeaders.Get("version") != config.DefaultClientVersion {
+		t.Fatalf("WS version = %q", gotHeaders.Get("version"))
+	}
+	if gotHeaders.Get("x-codex-beta-features") != "remote_compaction_v2" {
+		t.Fatalf("WS beta features = %q", gotHeaders.Get("x-codex-beta-features"))
 	}
 	if ua := gotHeaders.Get("User-Agent"); !strings.Contains(ua, "/"+config.DefaultClientVersion+" ") {
 		t.Fatalf("WS UA = %q, want current Codex version %s", ua, config.DefaultClientVersion)
@@ -1482,7 +1504,7 @@ func TestGatewayFallsBackToHTTPSSEWhenGatedModelWebSocketMissingScope(t *testing
 	var httpHits int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/responses":
+		case r.Method == http.MethodGet && r.URL.Path == "/backend-api/codex/responses":
 			atomic.AddInt32(&wsHits, 1)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -1523,7 +1545,7 @@ func TestGatewayFallsBackToHTTPSSEWhenGatedModelWebSocketMissingScope(t *testing
 		t.Fatalf("wsHits=%d httpHits=%d", wsHits, httpHits)
 	}
 	reqs := h.requests()
-	if len(reqs) != 2 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/v1/responses" ||
+	if len(reqs) != 2 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/backend-api/codex/responses" ||
 		reqs[1].Method != http.MethodPost || reqs[1].Path != "/backend-api/codex/responses" {
 		t.Fatalf("upstream requests = %+v", reqs)
 	}
@@ -1540,7 +1562,7 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 	var gotPayload map[string]interface{}
 	upgrader := websocket.Upgrader{}
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/responses" || r.Method != http.MethodGet {
+		if r.URL.Path != "/backend-api/codex/responses" || r.Method != http.MethodGet {
 			t.Fatalf("upstream request = %s %s", r.Method, r.URL.Path)
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -1571,7 +1593,7 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	request := `{"type":"response.create","model":"gpt-5.5","input":[{"role":"user","content":"hi"}],"stream":true}`
+	request := `{"type":"response.create","model":"gpt-5.5","thread_id":"downstream-thread","session_id":"downstream-session","conversation_id":"downstream-conversation","input":[{"role":"user","content":"hi"}],"stream":true}`
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 		t.Fatalf("write downstream ws request: %v", err)
 	}
@@ -1592,10 +1614,120 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-5.5" || gotPayload["stream"] != true {
 		t.Fatalf("bad upstream websocket payload: %+v", gotPayload)
 	}
+	for _, unsupported := range []string{"thread_id", "session_id", "conversation_id"} {
+		if _, present := gotPayload[unsupported]; present {
+			t.Fatalf("unsupported top-level transport field %q leaked upstream: %+v", unsupported, gotPayload)
+		}
+	}
+}
+
+func TestGatewayDownstreamWebSocketKeepsWarmupStateOnOneUpstreamConnection(t *testing.T) {
+	var connections atomic.Int32
+	var sawProcessed atomic.Bool
+	upgrader := websocket.Upgrader{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" || r.Method != http.MethodGet {
+			t.Fatalf("upstream request = %s %s", r.Method, r.URL.Path)
+		}
+		connections.Add(1)
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upstream upgrade: %v", err)
+		}
+		defer conn.Close()
+
+		_, warmRaw, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read warmup: %v", err)
+		}
+		var warm map[string]interface{}
+		if json.Unmarshal(warmRaw, &warm) != nil || warm["type"] != "response.create" || warm["generate"] != false {
+			t.Fatalf("bad warmup payload: %s", warmRaw)
+		}
+		// Pretty-printed frames exercise the WS->SSE->WS multiline path too.
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("{\n  \"type\": \"response.completed\",\n  \"response\": {\"id\": \"resp_warm\", \"model\": \"gpt-5.6-sol\", \"output\": [], \"usage\": {\"input_tokens\": 5, \"output_tokens\": 0, \"total_tokens\": 5}}\n}"))
+
+		_, processedRaw, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read response.processed: %v", err)
+		}
+		var processed map[string]interface{}
+		if json.Unmarshal(processedRaw, &processed) != nil || processed["type"] != "response.processed" {
+			t.Fatalf("response.processed was not forwarded: %s", processedRaw)
+		}
+		sawProcessed.Store(true)
+
+		_, actualRaw, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read actual request: %v", err)
+		}
+		var actual map[string]interface{}
+		if json.Unmarshal(actualRaw, &actual) != nil || actual["type"] != "response.create" || actual["previous_response_id"] != "resp_warm" {
+			t.Fatalf("warmup state was not reused on the same connection: %s", actualRaw)
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_actual","model":"gpt-5.6-sol"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"PERSISTENT_WS_OK"}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte("{\n  \"type\": \"response.completed\",\n  \"response\": {\"id\": \"resp_actual\", \"model\": \"gpt-5.6-sol\", \"usage\": {\"input_tokens\": 7, \"output_tokens\": 3, \"total_tokens\": 10}}\n}"))
+	})
+	h.importAccount(t, "downstream-ws-persistent", "acct-downstream-ws-persistent", "access-downstream-ws-persistent")
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","generate":false,"input":[{"role":"developer","content":"stable context"}],"stream":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	readUntilType := func(want string) []byte {
+		t.Helper()
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read %s: %v", want, err)
+			}
+			var event map[string]interface{}
+			if json.Unmarshal(raw, &event) == nil && event["type"] == want {
+				return raw
+			}
+		}
+	}
+	readUntilType("response.completed")
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.processed","response_id":"resp_warm"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","previous_response_id":"resp_warm","input":[{"role":"user","content":"reply"}],"stream":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	readUntilType("response.completed")
+	if connections.Load() != 1 || !sawProcessed.Load() {
+		t.Fatalf("persistent WS connections=%d processed=%v, want 1/true", connections.Load(), sawProcessed.Load())
+	}
+}
+
+func TestSSEDataPayloadReassemblesMultilineJSON(t *testing.T) {
+	block := []byte("event: response.completed\n" +
+		"data: {\n" +
+		"data:   \"type\": \"response.completed\",\n" +
+		"data:   \"response\": {\"id\": \"resp_multiline\"}\n" +
+		"data: }")
+	payload := sseDataPayload(block)
+	var event map[string]interface{}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		t.Fatalf("reassembled payload is invalid JSON: %v\n%s", err, payload)
+	}
+	if event["type"] != "response.completed" {
+		t.Fatalf("event = %#v", event)
+	}
 }
 
 // uaCodexVersion extracts the version from a Codex User-Agent (codex_cli_rs/<ver> (..)).
-// The real client carries the version ONLY in the UA — there is no `version` header.
+// The real client sends the same value in its User-Agent and `version` header; these
+// retry fixtures parse the UA to exercise the older-version branch independently.
 func uaCodexVersion(ua string) string {
 	i := strings.Index(ua, "/")
 	if i < 0 {
@@ -1680,7 +1812,7 @@ func TestGatewayRetriesVersionGateStreamingRequestOverWebSocket(t *testing.T) {
 			_, _ = w.Write([]byte(`{"detail":"The 'gpt-future' model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again."}`))
 			return
 		}
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/responses" {
+		if r.Method != http.MethodGet || r.URL.Path != "/backend-api/codex/responses" {
 			t.Fatalf("retry request = %s %s", r.Method, r.URL.Path)
 		}
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -1728,7 +1860,7 @@ func TestGatewayRetriesVersionGateStreamingRequestOverWebSocket(t *testing.T) {
 	if len(seen) != 2 {
 		t.Fatalf("expected HTTP attempt + WS retry, saw %v", seen)
 	}
-	if seen[0] != "POST:/backend-api/codex/responses:0.130.0" || seen[1] != "GET:/v1/responses:"+config.DefaultClientVersion {
+	if seen[0] != "POST:/backend-api/codex/responses:0.130.0" || seen[1] != "GET:/backend-api/codex/responses:"+config.DefaultClientVersion {
 		t.Fatalf("unexpected retry sequence: %v", seen)
 	}
 	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-future" || gotPayload["stream"] != true {
@@ -2883,14 +3015,25 @@ func TestClaudeMessagesRelayVirtualizesAndScrubs(t *testing.T) {
 	if usageProvider != "claude" || claudeTTL != "1h" || cacheControlInjected != 1 || breakpointCount == 0 || latestUserCacheControl != 0 {
 		t.Fatalf("claude cache diagnostics wrong: provider=%q ttl=%q injected=%d breakpoints=%d latest_user=%d", usageProvider, claudeTTL, cacheControlInjected, breakpointCount, latestUserCacheControl)
 	}
-	if !strings.Contains(up.Body, "You are Claude Code") {
+	if !strings.Contains(up.Body, "Anthropic's Claude Agent SDK") {
 		t.Fatalf("claude code system block not injected: %s", up.Body)
 	}
 	if strings.Contains(up.Body, "real-user") {
 		t.Fatalf("user_id not virtualized: %s", up.Body)
 	}
-	if strings.Contains(up.Body, `"metadata"`) {
-		t.Fatalf("metadata must not be forwarded to Anthropic messages: %s", up.Body)
+	var claudeBody map[string]interface{}
+	if err := json.Unmarshal([]byte(up.Body), &claudeBody); err != nil {
+		t.Fatalf("invalid Claude upstream body: %v", err)
+	}
+	metadata, _ := claudeBody["metadata"].(map[string]interface{})
+	userID, _ := metadata["user_id"].(string)
+	var userIdentity map[string]interface{}
+	if len(metadata) != 1 || json.Unmarshal([]byte(userID), &userIdentity) != nil {
+		t.Fatalf("Claude 2.1.206 metadata must contain only JSON-string user_id: %s", up.Body)
+	}
+	deviceID, _ := userIdentity["device_id"].(string)
+	if len(deviceID) != 64 || userIdentity["account_uuid"] != "" || userIdentity["session_id"] != up.ClaudeSession || up.ClaudeSession == "" {
+		t.Fatalf("Claude metadata/header identity drift: metadata=%+v session=%q", userIdentity, up.ClaudeSession)
 	}
 	// Paths are preserved in the request too (policy: never rewrite cwd/paths).
 	if !strings.Contains(up.Body, "/Users/realbob") {
@@ -3175,7 +3318,12 @@ func TestChatCompletionsClaudeSingleflightSerializesSamePrefix(t *testing.T) {
 	gotMax := maxConcurrent
 	mu.Unlock()
 	if gotMax > 1 {
-		t.Fatalf("singleflight allowed %d concurrent same-prefix upstream requests", gotMax)
+		reqs := h.requests()
+		prefixes := make([]string, 0, len(reqs))
+		for _, req := range reqs {
+			prefixes = append(prefixes, routing.AnthropicStablePromptPrefixHash([]byte(req.Body)))
+		}
+		t.Fatalf("singleflight allowed %d concurrent same-prefix upstream requests; upstream prefix hashes=%q", gotMax, prefixes)
 	}
 	h.app.WaitForAsyncWrites()
 	var waited int
@@ -3353,7 +3501,7 @@ func TestHealthTestClaudeUsesCloakedCountTokens(t *testing.T) {
 		t.Fatalf("count_tokens auth = %q", probe.Auth)
 	}
 	// OAuth liveness MUST carry the Claude Code identity block, else Anthropic 400/429.
-	if !strings.Contains(probe.Body, "You are Claude Code") {
+	if !strings.Contains(probe.Body, "Anthropic's Claude Agent SDK") {
 		t.Fatalf("count_tokens body missing cloak identity block: %s", probe.Body)
 	}
 	// count_tokens counts input only — it must not request generation tokens.
@@ -3450,10 +3598,12 @@ func TestProbeClaudeModelsFallsBackToStatic(t *testing.T) {
 func TestProbeCodexModelsSendsCurrentClientVersion(t *testing.T) {
 	var mu sync.Mutex
 	var gotClientVersion string
+	var gotVersionHeader string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			mu.Lock()
 			gotClientVersion = r.URL.Query().Get("client_version")
+			gotVersionHeader = r.Header.Get("version")
 			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"models":[{"slug":"gpt-5.5","context_window":272000,"max_context_window":272000,"visibility":"list"}]}`))
@@ -3476,12 +3626,16 @@ func TestProbeCodexModelsSendsCurrentClientVersion(t *testing.T) {
 
 	mu.Lock()
 	cv := gotClientVersion
+	versionHeader := gotVersionHeader
 	mu.Unlock()
 	if cv != config.DefaultClientVersion {
 		t.Fatalf("probe client_version = %q, want current %q", cv, config.DefaultClientVersion)
 	}
 	if cv == "0.118.0" {
 		t.Fatalf("probe still reports the stale 0.118.0 that version-gates away new models")
+	}
+	if versionHeader != config.DefaultClientVersion {
+		t.Fatalf("probe version header = %q, want current %q", versionHeader, config.DefaultClientVersion)
 	}
 	var hasFlagship bool
 	for _, c := range res.Capabilities {

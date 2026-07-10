@@ -29,12 +29,12 @@ import (
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
-// Refreshed 2026-06-27 from capture/out_v3/manifest.json (claude-cli 2.1.195,
-// codex-cli 0.142.3, X-Stainless-Runtime-Version v26.3.0,
-// X-Stainless-Package-Version 0.94.0).
+// Refreshed 2026-07-10 from Docker captures of Claude Code 2.1.206 and Codex
+// 0.144.1 plus the matching local open-source Codex tree. Claude's captured tuple
+// is Node v26.3.0 with Stainless package 0.94.0.
 const (
-	CodexCLIVersion  = "0.142.3"
-	ClaudeCLIVersion = "2.1.195"
+	CodexCLIVersion  = "0.144.1"
+	ClaudeCLIVersion = "2.1.206"
 	// CodexOriginator is the interactive Codex CLI entrypoint id; CodexOriginatorExec
 	// is the `codex exec` (non-interactive) entrypoint. The official client sends one
 	// or the other depending on how it was launched, so the relay mirrors whichever
@@ -42,8 +42,9 @@ const (
 	CodexOriginator     = "codex_cli_rs"
 	CodexOriginatorExec = "codex_exec"
 	// CodexJA3 is the TLS ClientHello fingerprint (ja3 string) captured from the real
-	// Codex (Rust) binary against api.openai.com — ja3 hash b35e01cf2e977caff29a2c7ceb523df9
-	// (capture/out_v3/manifest.json, codex-cli 0.142.3, 2026-06-27).
+	// Codex (Rust) binary against api.openai.com — ja3 hash 69d274b521896ab1d71737c4d804e22c
+	// (/tmp/pool-capture-20260710/manifest.json; the 0.144.1 source still uses stock
+	// reqwest/rustls without ClientHello customization).
 	// It is REFERENCE DATA, not a default or an alias target: verified against the Codex
 	// source (other_codex), the real client does NO JA3 spoofing — it builds a stock
 	// reqwest 0.12 + rustls 0.23 client with zero TLS customization, so this is simply
@@ -54,7 +55,7 @@ const (
 	// the "real Codex" aliases resolve to Chrome too (see upstream.resolveCodexJA3); an
 	// operator can still paste this string into codex_ja3 to force a best-effort
 	// (SCSV-sanitized) replay, which degrades to Chrome if curl_cffi still can't reproduce it.
-	CodexJA3 = "771,4866-4865-4867-49196-49195-52393-49200-49199-52392-255,5-45-11-10-23-13-43-51-35-0,4588-29-23-24,0"
+	CodexJA3 = "771,4866-4865-4867-49196-49195-52393-49200-49199-52392-255,11-51-13-35-5-23-43-10-0-45,4588-29-23-24,0"
 	// ClaudeJA3 is the TLS ClientHello fingerprint (ja3 string) of the real Claude
 	// Code CLI (Node/undici) captured against api.anthropic.com — ja3 hash
 	// d871d02cecbde59abbf8f4806134addf (capture/out_v2/manifest.json). It is an OPT-IN
@@ -187,7 +188,7 @@ func detectTerminal() string {
 		}
 		return tp
 	}
-	return "tmux/3.4"
+	return "unknown"
 }
 
 func readTrim(path string) string {
@@ -218,15 +219,14 @@ type Identity struct {
 	StainlessOS   string
 	StainlessArch string
 
-	// Per-account client versions, drawn from plausible recent pools so accounts
-	// do NOT all report a byte-identical client (which makes N accounts look like
-	// one orchestrated fleet). A config override, when set, takes precedence over
-	// these at the upstream layer.
+	// Client versions come from the one coherent shipping tuple captured for this
+	// release. Per-account OS/device/session axes still differ; a config override,
+	// when set, takes precedence at the upstream layer.
 	NodeVersion      string // X-Stainless-Runtime-Version (Claude)
 	ClaudeCLIVersion string // claude-cli/<v> (User-Agent)
 	// StainlessPackageVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
-	// version (the real client sends e.g. claude-cli/2.1.159 with SDK 0.94.0), so
+	// version (the real client sends claude-cli/2.1.206 with SDK 0.94.0), so
 	// it must not be conflated with ClaudeCLIVersion.
 	StainlessPackageVersion string
 	CodexCLIVersion         string // codex_cli_rs/<v>
@@ -260,24 +260,24 @@ var macProfiles = []profile{
 	{"Mac OS", "26.1", "arm64", "iTerm.app/3.5.13", "Darwin 25.1.0", "MacOS", "arm64"},
 	{"Mac OS", "26.2", "arm64", "Apple_Terminal/455", "Darwin 25.2.0", "MacOS", "arm64"},
 	{"Mac OS", "15.6.1", "arm64", "iTerm.app/3.5.14", "Darwin 24.6.0", "MacOS", "arm64"},
-	{"Mac OS", "15.5", "arm64", "ghostty/1.1.3", "Darwin 24.5.0", "MacOS", "arm64"},
+	{"Mac OS", "15.5", "arm64", "Ghostty/1.1.3", "Darwin 24.5.0", "MacOS", "arm64"},
 	{"Mac OS", "14.7.4", "arm64", "iTerm.app/3.5.11", "Darwin 23.6.0", "MacOS", "arm64"},
 	{"Mac OS", "26.1", "x86_64", "iTerm.app/3.5.13", "Darwin 25.1.0", "MacOS", "x64"},
 }
 
 var linuxProfiles = []profile{
-	{"Linux", "6.8.0-51-generic", "x86_64", "tmux/3.4", "Linux 6.8.0-51-generic", "Linux", "x64"},
-	{"Linux", "6.11.0-19-generic", "x86_64", "tmux/3.5a", "Linux 6.11.0-19-generic", "Linux", "x64"},
+	{"Linux", "6.8.0-51-generic", "x86_64", "unknown", "Linux 6.8.0-51-generic", "Linux", "x64"},
+	{"Linux", "6.11.0-19-generic", "x86_64", "xterm-256color", "Linux 6.11.0-19-generic", "Linux", "x64"},
 	{"Linux", "6.14.0-15-generic", "x86_64", "gnome-terminal", "Linux 6.14.0-15-generic", "Linux", "x64"},
-	{"Linux", "6.6.87.2-microsoft-standard-WSL2", "x86_64", "Windows Terminal", "Linux 6.6.87.2-microsoft-standard-WSL2", "Linux", "x64"},
-	{"Linux", "6.12.10-arch1-1", "x86_64", "alacritty", "Linux 6.12.10-arch1-1", "Linux", "x64"},
-	{"Linux", "6.8.0-51-generic", "aarch64", "tmux/3.4", "Linux 6.8.0-51-generic", "Linux", "arm64"},
+	{"Linux", "6.6.87.2-microsoft-standard-WSL2", "x86_64", "WindowsTerminal", "Linux 6.6.87.2-microsoft-standard-WSL2", "Linux", "x64"},
+	{"Linux", "6.12.10-arch1-1", "x86_64", "Alacritty", "Linux 6.12.10-arch1-1", "Linux", "x64"},
+	{"Linux", "6.8.0-51-generic", "aarch64", "unknown", "Linux 6.8.0-51-generic", "Linux", "arm64"},
 }
 
 var windowsProfiles = []profile{
-	{"Windows", "10.0.26100", "x86_64", "Windows Terminal", "Windows 10.0.26100", "Windows", "x64"},
-	{"Windows", "10.0.22631", "x86_64", "Windows Terminal", "Windows 10.0.22631", "Windows", "x64"},
-	{"Windows", "10.0.26100", "arm64", "Windows Terminal", "Windows 10.0.26100", "Windows", "arm64"},
+	{"Windows", "10.0.26100", "x86_64", "WindowsTerminal", "Windows 10.0.26100", "Windows", "x64"},
+	{"Windows", "10.0.22631", "x86_64", "WindowsTerminal", "Windows 10.0.22631", "Windows", "x64"},
+	{"Windows", "10.0.26100", "arm64", "WindowsTerminal", "Windows 10.0.26100", "Windows", "arm64"},
 }
 
 // allProfiles is weighted toward macOS/Linux, which dominate the real Claude Code
@@ -296,16 +296,18 @@ var allProfiles = func() []profile {
 // tail = plausible lag where the upstream allows lag. A config override, when set,
 // supersedes these.
 var (
-	claudeCLIVersionPool = []string{ClaudeCLIVersion, "2.1.159", "2.1.130", "2.1.96", "2.0.44"}
+	// Keep the three coupled Claude version axes on the one combination captured
+	// from the shipping 2.1.206 binary. Independently rotating stale values can
+	// create a cli/runtime/SDK tuple that no real Claude Code release ever shipped.
+	claudeCLIVersionPool = []string{ClaudeCLIVersion}
 	// Newer Codex models are actively client-version gated, so the Codex UA/version
 	// axis must not lag behind the current client by default.
 	codexCLIVersionPool = []string{CodexCLIVersion}
-	nodeVersionPool     = []string{"v26.3.0", "v24.3.0", "v22.22.3", "v22.20.0", "v22.14.0", "v20.18.1"}
+	nodeVersionPool     = []string{"v26.3.0"}
 	// stainlessVersionPool is the @anthropic-ai/sdk (Stainless) version axis,
-	// reported in X-Stainless-Package-Version. Head = captured ground truth from
-	// the real Claude Code client; tail models the natural version lag of a real
-	// population. This is independent of the claude-cli version.
-	stainlessVersionPool = []string{"0.94.0", "0.93.0", "0.92.0", "0.91.0"}
+	// reported in X-Stainless-Package-Version. It is captured ground truth from
+	// the real Claude Code client and is independent of the claude-cli version.
+	stainlessVersionPool = []string{"0.94.0"}
 )
 
 func poolForFamily(osName string) []profile {
@@ -435,6 +437,69 @@ func DerivedUUID(seed, original string) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
+// DerivedUUIDv7 returns a deterministic, per-seed UUIDv7 replacement. When the
+// downstream value is already UUIDv7, its 48-bit millisecond timestamp is kept
+// while all identifying/random bits are replaced. That preserves Codex's
+// chronological UUID shape without allowing the upstream to correlate the real
+// downstream identifier across pool accounts.
+//
+// Non-Codex/legacy callers sometimes supply an opaque correlator rather than a
+// UUID. For those values a deterministic historical timestamp is used so the
+// replacement remains stable across requests and process restarts. Shipping
+// Codex clients always take the timestamp-preserving path.
+func DerivedUUIDv7(seed, original string) string {
+	sum := sha256.Sum256([]byte(seed + "\x02" + original))
+	unixMilli, ok := uuidV7TimestampMillis(original)
+	if !ok {
+		const (
+			fallbackEpochMillis = int64(1735689600000) // 2025-01-01T00:00:00Z
+			fallbackSpanMillis  = int64(365 * 24 * 60 * 60 * 1000)
+		)
+		unixMilli = fallbackEpochMillis + int64(binary.BigEndian.Uint64(sum[16:24])%uint64(fallbackSpanMillis))
+	}
+	return formatDerivedUUIDv7(sum, unixMilli)
+}
+
+// DerivedUUIDv7At is DerivedUUIDv7 with an explicit timestamp fallback. A valid
+// UUIDv7 input still wins so callers can preserve the original chronological
+// shape; unixMilli is used for newly-created IDs such as a turn that arrived
+// without a downstream turn_id.
+func DerivedUUIDv7At(seed, original string, unixMilli int64) string {
+	sum := sha256.Sum256([]byte(seed + "\x02" + original))
+	if originalMillis, ok := uuidV7TimestampMillis(original); ok {
+		unixMilli = originalMillis
+	}
+	if unixMilli <= 0 {
+		return DerivedUUIDv7(seed, original)
+	}
+	return formatDerivedUUIDv7(sum, unixMilli)
+}
+
+func formatDerivedUUIDv7(sum [sha256.Size]byte, unixMilli int64) string {
+	var u [16]byte
+	copy(u[:], sum[:16])
+	var timestamp [8]byte
+	binary.BigEndian.PutUint64(timestamp[:], uint64(unixMilli))
+	copy(u[:6], timestamp[2:])
+	u[6] = (u[6] & 0x0f) | 0x70
+	u[8] = (u[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+func uuidV7TimestampMillis(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value[14] != '7' {
+		return 0, false
+	}
+	raw, err := hex.DecodeString(strings.ReplaceAll(value, "-", ""))
+	if err != nil || len(raw) != 16 || raw[6]>>4 != 7 || raw[8]>>6 != 2 {
+		return 0, false
+	}
+	var timestamp [8]byte
+	copy(timestamp[2:], raw[:6])
+	return int64(binary.BigEndian.Uint64(timestamp[:])), true
+}
+
 // DerivedKey returns a deterministic opaque key from (seed, original), used to
 // namespace a downstream prompt_cache_key per account.
 func DerivedKey(seed, original string) string {
@@ -459,15 +524,13 @@ func (i Identity) CodexUserAgentVersion(version string) string {
 }
 
 // CodexUserAgentExecVersion is the User-Agent shape the `codex exec` entrypoint
-// sends, e.g. "codex_exec/0.135.0 (Mac OS 26.3.1; arm64) unknown (codex_exec; 0.135.0)".
-// Unlike the interactive CLI it carries no terminal-app token; the slot is the
-// literal "unknown" followed by a "(codex_exec; <version>)" tail (captured from
-// the real binary). The OS/arch tuple stays account-bound like the CLI UA.
+// sends. The exec/app-server initialize handshake sets the official client suffix
+// to "codex_exec; <version>" in addition to changing the originator prefix.
 func (i Identity) CodexUserAgentExecVersion(version string) string {
 	if version == "" {
 		version = CodexCLIVersion
 	}
-	return fmt.Sprintf("codex_exec/%s (%s %s; %s) unknown (codex_exec; %s)", version, i.OSName, i.OSVersion, i.Arch, version)
+	return fmt.Sprintf("codex_exec/%s (%s %s; %s) %s (codex_exec; %s)", version, i.OSName, i.OSVersion, i.Arch, i.Terminal, version)
 }
 
 // CodexUserAgentForOriginator returns the entrypoint-correct User-Agent for the
@@ -482,17 +545,27 @@ func (i Identity) CodexUserAgentForOriginator(originator, version string) string
 }
 
 // ClaudeUserAgent returns the Claude Code CLI User-Agent, e.g.
-// "claude-cli/2.1.63 (external, cli)".
+// "claude-cli/2.1.206 (external, cli)".
 func (i Identity) ClaudeUserAgent() string {
 	return i.ClaudeUserAgentVersion(ClaudeCLIVersion)
 }
 
 // ClaudeUserAgentVersion is ClaudeUserAgent with an explicit CLI version.
 func (i Identity) ClaudeUserAgentVersion(version string) string {
+	return i.ClaudeUserAgentVersionForEntrypoint(version, "cli")
+}
+
+// ClaudeUserAgentVersionForEntrypoint mirrors Claude Code's launch mode. Native
+// interactive requests use "cli" while `claude -p` / Agent SDK requests use
+// "sdk-cli". Relays should project the downstream mode instead of forcing one.
+func (i Identity) ClaudeUserAgentVersionForEntrypoint(version, entrypoint string) string {
 	if version == "" {
 		version = ClaudeCLIVersion
 	}
-	return fmt.Sprintf("claude-cli/%s (external, cli)", version)
+	if entrypoint != "sdk-cli" {
+		entrypoint = "cli"
+	}
+	return fmt.Sprintf("claude-cli/%s (external, %s)", version, entrypoint)
 }
 
 func (i Identity) homeDir() string {

@@ -110,6 +110,8 @@ type Server struct {
 	codexResetLocks map[string]*sync.Mutex
 	compatMu        sync.Mutex
 	compatRecent    []compatIncompatibilityRecord
+	qualityMu       sync.Mutex
+	qualityRunning  bool
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -258,6 +260,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/cf-events", s.adminCFEvents)
 	s.mux.HandleFunc("/admin/usage", s.adminUsage)
 	s.mux.HandleFunc("/admin/usage/window", s.adminUsageWindowEndpoint)
+	s.mux.HandleFunc("/admin/model-quality", s.adminModelQuality)
+	s.mux.HandleFunc("/admin/model-quality/run", s.adminModelQualityRun)
+	s.mux.HandleFunc("/admin/model-quality/reset", s.adminModelQualityReset)
 	s.mux.HandleFunc("/admin/usage/cache", s.adminUsageCache)
 	s.mux.HandleFunc("/admin/usage/cache/reset", s.adminUsageCacheReset)
 	s.mux.HandleFunc("/admin/usage/timeseries", s.adminUsageTimeseries)
@@ -356,6 +361,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	caps, err := s.store.ListCapabilities(r.Context(), "")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Content-negotiate by client family: an Anthropic client (Claude Code) needs the
+	// native Anthropic /v1/models schema or its model picker / "auto" selection breaks;
+	// every other client keeps the OpenAI-shaped list. Detection keys off headers only
+	// Anthropic clients send (anthropic-version / anthropic-beta / x-api-key).
+	if isAnthropicClient(r) {
+		body, etag, err := capability.BuildAnthropicModelsResponse(caps)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write(body)
 		return
 	}
 	cfg := s.cfg
@@ -579,6 +603,7 @@ type codexAttemptResult struct {
 // added to it before any outcomeRetry so the next attempt selects a different one.
 func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, forceFailoverOn429 bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
+	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:           routeGroup,
 		Provider:        "codex",
@@ -592,10 +617,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		Exclude:         exclude,
 	})
 	if err != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(err, scheduler.ErrStrictUnavailable) {
-			status = http.StatusConflict
-		}
+		status, _ := noAccountHTTPStatus(err)
 		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "", model, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
@@ -632,9 +654,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		promptCacheKeySource = "downstream"
 	}
 	retentionEffective := routing.JSONStringField(body, "prompt_cache_retention")
-	retentionSource := "none"
+	retentionSource := "unsupported_current_codex"
 	if retentionEffective != "" {
-		retentionSource = "downstream"
+		retentionSource = "downstream_unsupported"
 	}
 	group, err := s.store.GetGroup(r.Context(), lease.Account.GroupName)
 	if err != nil {
@@ -700,30 +722,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}
 
-	// Prompt-cache retention: request OpenAI's extended ("24h") cache policy for models
-	// that support it (the gpt-5.x family + gpt-4.1), keeping the prompt-cache prefix
-	// warm far longer than the ~5–10min in-memory default. This is the Codex analogue of
-	// the Claude path's cache_control injection and the key lever for cache hits across
-	// a rotating pool: a conversation that resumes after a gap, or fails over and later
-	// returns to a previously-used account, can still hit a warm cache. A
-	// downstream-supplied prompt_cache_retention always wins; the field is not part of
-	// the cacheable prefix, so this never disturbs existing hits.
+	// Current codex-rs (0.144.x) has no prompt_cache_retention field on HTTP or
+	// Responses-over-WebSocket. The upstream choke point strips any legacy value;
+	// do not inject one here or report an unsupported 24h policy as effective. Cache
+	// reuse is driven by the supported prompt_cache_key + stable account affinity.
 	if !prepared {
-		ret := strings.TrimSpace(s.settingString(r.Context(), "codex_prompt_cache_retention", s.cfg.CodexPromptCacheRetention))
-		switch {
-		case retentionEffective != "":
-		case ret == "":
-			retentionSource = "disabled"
-		case !prompt.SupportsExtendedPromptCache(model):
-			retentionSource = "unsupported_model"
-		default:
-			body = prompt.EnsureResponsesPromptCacheRetention(body, ret)
-			if after := routing.JSONStringField(body, "prompt_cache_retention"); after != "" {
-				retentionEffective = after
-				retentionSource = "gateway_default"
-			} else {
-				retentionSource = "invalid_gateway_default"
-			}
+		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model); normalized {
+			body = updated
+			promptCacheKeySource = "official_codex_stable_prefix"
 		}
 	}
 	if !prepared && routing.PromptCacheKey(body) == "" {
@@ -793,10 +799,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			OSHint:                  osHint,
 			CodexClientVersion:      codexClientVersion,
 			CodexResponsesWebSocket: codexUseWebSocket,
+			CodexWebSocketSession:   codexResponsesWebSocketSession(r.Context()),
 		}
 	}
 
 	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
+	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
+	defer func() { _ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	// Session 33: Carry the billing hold id in the request context so deferred
 	// usage recording (recordUsage / recordParsedUsage) can fall back to
 	// estimated_tokens when the response body lacks countable usage data.
@@ -1120,19 +1130,21 @@ codexSuccess:
 			w.Header().Set("Cache-Control", "no-cache")
 			w.WriteHeader(resp.StatusCode)
 			uscan := usage.NewStreamScanner("codex")
-			responsesStreamToChatSSE(w, io.TeeReader(resp.Body, uscan), model, codexScrubber)
+			responsesStreamToChatSSE(w, io.TeeReader(resp.Body, uscan), model, includeChatStreamUsage, codexScrubber)
 			if parsed, ok := uscan.Parsed(); ok {
 				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
 			}
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
-		captured, retryableStream, captureErr := captureCodexSSEForFailover(resp.Body, s.streamFailoverCaptureOptions(r.Context()))
-		if captured != nil {
-			defer captured.Close()
-		}
-		if captureErr != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_capture_failed")
+		// Hold back only a bounded early prefix so a retryable failure frame can still
+		// fail over before any downstream bytes are committed. As soon as real content
+		// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
+		// full-response capture destroyed TTFT and manufactured 503s once a successful
+		// stream exceeded its memory/disk capture cap.
+		prefix, retryableStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
+		if probeErr != nil {
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
 				return retry()
 			}
@@ -1143,8 +1155,11 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		if retryableStream {
-			if !codexResetRetried && codexResetTriggerAllowed(200, captured.Head(64*1024)) &&
-				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, captured.Head(64*1024), "stream_retryable_limit") {
+			// This response will never be forwarded; close it before a reset-credit retry
+			// can replace resp, otherwise the old connection/body would leak.
+			_ = resp.Body.Close()
+			if !codexResetRetried && codexResetTriggerAllowed(200, prefix) &&
+				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, prefix, "stream_retryable_limit") {
 				codexResetRetried = true
 				if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
 					token = latest
@@ -1162,7 +1177,7 @@ codexSuccess:
 					log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
 				}
 			}
-			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, captured.Head(64*1024))
+			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, prefix)
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if allowRetry && movable {
 				return retry()
@@ -1173,12 +1188,7 @@ codexSuccess:
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
-		streamBody, err := captured.Reader()
-		if err != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_capture_replay_failed")
-			writePublicUnavailable(w, http.StatusServiceUnavailable)
-			return codexAttemptResult{Outcome: outcomeDone}
-		}
+		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
 		streamRecorder := newCodexStreamLedgerRecorder()
 		recordingStream := io.TeeReader(streamBody, streamRecorder)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)

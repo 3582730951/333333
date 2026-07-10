@@ -7,12 +7,30 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
+
+// noAccountHTTPStatus maps a scheduler selection failure to a downstream HTTP status
+// and a Retry-After hint in seconds (0 = none). Transient pool saturation becomes
+// 429 + Retry-After so the client transparently re-sends the SAME request — no model,
+// context, or reasoning change — instead of treating it as a hard server error. A busy
+// server-side-state pin stays 409 (also retryable, short hint). Only a genuinely
+// unroutable request (no matching account exists at all) stays 503.
+func noAccountHTTPStatus(err error) (int, int) {
+	if errors.Is(err, scheduler.ErrStrictUnavailable) {
+		return http.StatusConflict, 2
+	}
+	var nae *scheduler.NoAccountError
+	if errors.As(err, &nae) && nae.Retryable() {
+		return http.StatusTooManyRequests, 3
+	}
+	return http.StatusServiceUnavailable, 0
+}
 
 // describeNoAccount turns the scheduler's opaque "no active account available" into
 // an actionable 503 message. The overwhelmingly common cause of "I have GPT accounts
@@ -118,6 +136,11 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
 	detail := err.Error()
 	if d := s.describeNoAccount(ctx, group, provider, model, err); d != nil {
 		detail = d.Error()
+	}
+	// Advertise a short Retry-After on retryable saturation so well-behaved clients
+	// (Claude Code / Codex CLI both honor it) back off and re-send the identical request.
+	if _, retryAfter := noAccountHTTPStatus(err); retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	}
 	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
 		Action: "routing_unavailable",

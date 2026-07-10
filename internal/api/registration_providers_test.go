@@ -90,6 +90,9 @@ func TestRegisterProvidersReportsDefaultsReadErrors(t *testing.T) {
 	if _, err := h.store.DB().ExecContext(context.Background(), `DROP TABLE settings`); err != nil {
 		t.Fatal(err)
 	}
+	// The settings snapshot is warmed by harness setup; clear it so the next read hits
+	// the now-dropped table and surfaces the read error this test asserts.
+	h.store.InvalidateSettingsCache()
 
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/register/providers", "")
 	if code != http.StatusInternalServerError {

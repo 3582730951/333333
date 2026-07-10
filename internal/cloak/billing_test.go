@@ -1,6 +1,7 @@
 package cloak
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -23,8 +24,8 @@ func TestClaudeVirtualUserIDMatchesRealShape(t *testing.T) {
 	}
 }
 
-// billingRe extracts the three fields of the billing header.
-var billingRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=(\S+)\.([0-9a-f]{3}); cc_entrypoint=cli; cch=([0-9a-f]{5});$`)
+// billingRe extracts the current version, rotating three-hex suffix, and entrypoint.
+var billingRe = regexp.MustCompile(`^x-anthropic-billing-header: cc_version=([0-9.]+)\.([0-9a-f]{3}); cc_entrypoint=(cli|sdk-cli);$`)
 
 func firstSystemText(t *testing.T, body []byte) string {
 	t.Helper()
@@ -51,8 +52,10 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 	if m[1] != "2.1.159" {
 		t.Fatalf("cc_version not aligned to our version: %q", first)
 	}
-	// buildHash (m[2]) + cch (m[3]) are stable hex of the captured shape.
-	// The billing block must carry NO cache_control.
+	// The billing block must carry neither cch nor cache_control.
+	if strings.Contains(first, "cch=") {
+		t.Fatalf("current Claude Code billing header must omit cch: %q", first)
+	}
 	var root map[string]interface{}
 	_ = json.Unmarshal(out, &root)
 	if _, has := root["system"].([]interface{})[0].(map[string]interface{})["cache_control"]; has {
@@ -60,12 +63,28 @@ func TestBillingHeaderInjectedForNonClaudeCodeClient(t *testing.T) {
 	}
 }
 
-func TestBillingHeaderIsStableForSameVersion(t *testing.T) {
+func TestCurrentBillingHeaderMatchesCapturedBuildAndSDKEntrypoint(t *testing.T) {
+	body := []byte(`{"model":"claude","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.100.123; cc_entrypoint=sdk-cli;"}],"messages":[]}`)
+	got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, identity.ClaudeCLIVersion))
+	m := billingRe.FindStringSubmatch(got)
+	if m == nil || m[1] != identity.ClaudeCLIVersion || m[3] != "sdk-cli" {
+		t.Fatalf("shipping billing fingerprint changed: %q", got)
+	}
+}
+
+func TestBillingHeaderSuffixRotatesForSameVersion(t *testing.T) {
 	body := []byte(`{"model":"claude","system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`)
-	first := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
-	second := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
-	if first != second {
-		t.Fatalf("billing header must be stable for cacheable prefixes:\nfirst =%s\nsecond=%s", first, second)
+	seen := map[string]bool{}
+	for i := 0; i < 16; i++ {
+		got := firstSystemText(t, EnsureClaudeCodeBillingHeader(body, "2.1.159"))
+		m := billingRe.FindStringSubmatch(got)
+		if m == nil {
+			t.Fatalf("invalid rotating billing header: %q", got)
+		}
+		seen[m[2]] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("billing suffix did not rotate across requests: %v", seen)
 	}
 }
 
@@ -89,9 +108,8 @@ func TestBillingHeaderRealignedInPlaceForRealClaudeCode(t *testing.T) {
 	if m == nil || m[1] != "2.1.160" {
 		t.Fatalf("billing header not realigned to our version: %v", sys[0])
 	}
-	// cch must be regenerated (no longer the client's stale value).
-	if m[3] == "deadb" {
-		t.Fatalf("cch should be regenerated, still has client's stale value")
+	if strings.Contains(sys[0].(map[string]interface{})["text"].(string), "cch=") {
+		t.Fatalf("legacy cch must be removed: %v", sys[0])
 	}
 }
 
@@ -137,7 +155,7 @@ func canonicalizeForCompare(t *testing.T, body []byte) string {
 				continue
 			}
 			if txt, _ := bm["text"].(string); strings.HasPrefix(strings.TrimSpace(txt), claudeBillingHeaderPrefix) {
-				bm["text"] = billingRe.ReplaceAllString(txt, "x-anthropic-billing-header: cc_version=$1.NNN; cc_entrypoint=cli; cch=NNNNN;")
+				bm["text"] = billingRe.ReplaceAllString(txt, "x-anthropic-billing-header: cc_version=$1.NNN; cc_entrypoint=$3;")
 			}
 		}
 	}
@@ -191,5 +209,64 @@ func TestVirtualizeClaudeCodeNoBillingMatchesVirtualize(t *testing.T) {
 	folded := VirtualizeClaudeCode(body, id, nil, true, "").Body
 	if string(plain) != string(folded) {
 		t.Fatalf("empty billingVersion must equal Virtualize\n plain =%s\n folded=%s", plain, folded)
+	}
+}
+
+func TestClaudeBodyRewritersPreserveLargeToolInputInteger(t *testing.T) {
+	const largeInteger = "900719925474099312345"
+	body := []byte(`{"model":"claude","metadata":{"user_id":"real-user","device_id":"real-device"},` +
+		`"system":[{"type":"text","text":"` + claudeCodeIdentityLine + `"}],` +
+		`"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_large","name":"Bash","input":{"request_id":` + largeInteger + `}}]}]}`)
+	id := identity.For(nil, "acc-large-integer")
+
+	tests := []struct {
+		name        string
+		body        []byte
+		virtualized bool
+	}{
+		{
+			name:        "virtualize and billing in one pass",
+			body:        VirtualizeClaudeCode(body, id, nil, true, "2.1.206").Body,
+			virtualized: true,
+		},
+		{
+			name: "billing-only pass",
+			body: EnsureClaudeCodeBillingHeader(body, "2.1.206"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !bytes.Contains(tt.body, []byte(largeInteger)) {
+				t.Fatalf("large integer text changed during rewrite: %s", tt.body)
+			}
+			var root map[string]interface{}
+			if err := decodeClaudeJSONObject(tt.body, &root); err != nil {
+				t.Fatalf("decode rewritten body: %v", err)
+			}
+			content := root["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
+			input := content[0].(map[string]interface{})["input"].(map[string]interface{})
+			number, ok := input["request_id"].(json.Number)
+			if !ok || number.String() != largeInteger {
+				t.Fatalf("tool_use input integer = %T(%v), want exact %s", input["request_id"], input["request_id"], largeInteger)
+			}
+
+			system := root["system"].([]interface{})
+			if len(system) < 2 || billingRe.FindStringSubmatch(system[0].(map[string]interface{})["text"].(string)) == nil {
+				t.Fatalf("billing block missing or malformed: %v", system)
+			}
+			if system[1].(map[string]interface{})["text"] != claudeCodeIdentityLine {
+				t.Fatalf("Claude Code identity system block changed: %v", system)
+			}
+
+			metadata := root["metadata"].(map[string]interface{})
+			if tt.virtualized {
+				if len(metadata) != 1 || !userIDShape.MatchString(metadata["user_id"].(string)) {
+					t.Fatalf("virtualized metadata fingerprint changed: %v", metadata)
+				}
+			} else if metadata["user_id"] != "real-user" || metadata["device_id"] != "real-device" {
+				t.Fatalf("billing-only pass changed metadata: %v", metadata)
+			}
+		})
 	}
 }

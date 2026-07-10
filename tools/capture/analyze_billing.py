@@ -7,32 +7,30 @@ so out_v2/requests.jsonl contains genuine api.anthropic.com /v1/messages request
     python3 analyze_billing.py [requests.jsonl ...]
 
 For each request that carries an `x-anthropic-billing-header:` system block it extracts
-`cc_version=<ver>.<buildHash>; cc_entrypoint=<ep>; cch=<cch>;` and then:
+`cc_version=<ver>.<buildSuffix>; cc_entrypoint=<ep>;` (plus historical optional
+`cch=<cch>;`) and then:
 
-  1. tabulates buildHash per (version, entrypoint, identity-line) — flagging whether
-     buildHash is truly constant per version (our assumption in cloak.claudeBuildHashByVersion);
-  2. brute-forces the buildHash FORMULA over (messageText, version) across hash funcs,
+  1. tabulates the three-character build suffix per (version, entrypoint, identity-line);
+  2. brute-forces a possible suffix FORMULA over (messageText, version) across hash funcs,
      salts, and char-index tuples — needs ≥2 DISTINCT versions to be meaningful;
-  3. brute-forces the per-request cch over candidate content slices × hashes ×
+  3. for historical samples that contain cch, brute-forces it over candidate content slices × hashes ×
      JSON serializations × head/tail, and detects "identical body, different cch"
      (⇒ cch carries a nonce and is not a pure content hash);
-  4. prints Go lines to paste into cloak.claudeBuildHashByVersion.
+  4. prints constant observed suffixes for comparison with the shipping manifest.
 
-Findings (live capture of real claude-cli 2.1.160 via mock_relay.py, out_mock):
-  - buildHash (the 3-hex cc_version suffix) AND cch (5-hex) are BOTH per-request content
-    fingerprints: they change every request ("say hi"->cc_version 2.1.160.f01/cch c511f,
-    "what is 2+2"->.268/8c02b, ...). out_v2 only LOOKED version-constant because capture.sh
-    always sends "say hi". So a version->buildHash table is WRONG; they are not reproducible
-    from the wire (obfuscated client-side; other_cpa's salted-index formula is for an older
-    build and does not match). pool_server therefore emits fresh random hex of the right shape.
+Current findings (repeat Docker capture of shipping claude-cli 2.1.206 on 2026-07-10):
+  - the three-hex cc_version suffix rotates per request (observed `.a5e`, `.2e4`).
+  - current requests contain no cch member.
   - cc_entrypoint tracks the UA suffix: sdk-cli for `claude -p`, cli for interactive.
+  - the current identity line is "You are a Claude agent, built on Anthropic's
+    Claude Agent SDK."; the old official-CLI line is accepted and upgraded.
   - metadata.user_id is a JSON STRING: {"device_id":"<64hex>","account_uuid":"","session_id":"<uuid>"}.
-Re-run with more samples / RAW bytes (mitm_addon now records body_b64) to attempt a crack;
-this tool brute-forces formulas and flags the per-request/nonce nature.
+Historical 2.1.160 samples used hexadecimal-looking variable suffixes, so this tool
+continues to accept both forms when comparing older captures.
 """
 import sys, os, json, re, hashlib, itertools, copy, base64
 
-BILLING_RE = re.compile(r'cc_version=([0-9.]+)\.([0-9a-f]{3});\s*cc_entrypoint=([^;]+);\s*cch=([0-9a-f]+);')
+BILLING_RE = re.compile(r'cc_version=([0-9.]+)\.([0-9a-f]{3});\s*cc_entrypoint=([^;]+);(?:\s*cch=([0-9a-f]+);)?')
 HASHES = {"sha256": hashlib.sha256, "sha1": hashlib.sha1, "md5": hashlib.md5}
 SALTS = ["", "59cf53e54c78"]  # other_cpa's salt + none
 
@@ -68,6 +66,8 @@ def samples_from(rows):
     out = []
     for r in rows:
         body = r.get("body_json") or {}
+        if not isinstance(body, dict):
+            continue
         sysv = body.get("system")
         text0 = ""
         if isinstance(sysv, list) and sysv and isinstance(sysv[0], dict):
@@ -146,6 +146,10 @@ def cch_candidates(body):
 
 
 def crack_cch(samples):
+    samples = [s for s in samples if s.get("cch")]
+    if not samples:
+        print("  current samples omit cch; nothing to crack")
+        return
     have_raw = sum(1 for s in samples if s.get("raw"))
     print(f"  samples with exact raw bytes (body_b64): {have_raw}/{len(samples)}"
           + ("" if have_raw == len(samples) else "  <-- recapture with the updated mitm_addon for a byte-exact crack"))
@@ -215,7 +219,7 @@ def main():
     crack_buildhash(samples)
     print("\n[cch crack]")
     crack_cch(samples)
-    print("\n[paste into cloak.claudeBuildHashByVersion]")
+    print("\n[constant observed build suffixes]")
     for ver, hs in sorted(table.items()):
         if len(hs) == 1:
             print(f'\t"{ver}": "{next(iter(hs))}",')

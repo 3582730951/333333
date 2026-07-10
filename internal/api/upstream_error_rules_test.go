@@ -97,7 +97,7 @@ func TestAdminUpstreamErrorRuleModelOptionsMergeSources(t *testing.T) {
 		t.Fatalf("model-options=%d: %s", code, raw)
 	}
 	body := string(raw)
-	for _, want := range []string{"chatgpt", "claude", "openrouter", "gpt-5.5", "claude-sonnet", "openrouter/auto"} {
+	for _, want := range []string{"chatgpt", "claude", "openrouter", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "claude-sonnet", "openrouter/auto"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("model-options missing %q in %s", want, body)
 		}

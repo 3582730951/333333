@@ -75,9 +75,10 @@ def request(flow):
             bj = None
     rec["body_json"] = bj
     rec["body_text"] = None if bj else (body[:4000] if body else None)
-    # EXACT decoded request bytes (untruncated), so analyze_billing.py can recompute
-    # content hashes like the per-request cch byte-for-byte — body_json/body_text lose
-    # the original key order / whitespace and are truncated, which defeats hashing.
+    # EXACT decoded request bytes (untruncated), so analyze_billing.py can audit
+    # current billing fields and, when supplied, recompute historical cch samples
+    # byte-for-byte. body_json/body_text lose the original key order / whitespace
+    # and are truncated, which defeats historical hashing analysis.
     try:
         raw = req.content  # transfer/content-decoded, i.e. what the client serialized
         if raw:

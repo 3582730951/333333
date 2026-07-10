@@ -1,0 +1,20 @@
+{
+  "listen_addr": "0.0.0.0:8787",
+  "database_path": "/var/lib/codex-pool/live-e2e.sqlite3",
+  "upstream_base_url": "https://chatgpt.com/backend-api/codex",
+  "client_version": "0.144.1",
+  "default_group": "cyber",
+  "admin_token": "pool-live-e2e-local-admin-20260710",
+  "virtual_2m_enabled": false,
+  "request_timeout_seconds": 300,
+  "shutdown_drain_seconds": 10,
+  "require_downstream_key": false,
+  "model_probe_interval_hours": 0,
+  "account_recheck_enabled": false,
+  "ban_detection_enabled": false,
+  "leak_scrub_enabled": false,
+  "model_quality_monitor_enabled": false,
+  "model_quality_interval_minutes": 60,
+  "model_quality_reasoning_effort": "low",
+  "codex_prefer_sidecar_ja3_over_ws": false
+}

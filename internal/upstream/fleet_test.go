@@ -178,20 +178,20 @@ func TestCodexSessionIDSeededFromCorrelator(t *testing.T) {
 	convA := "conv-aaaa"
 	convB := "conv-bbbb"
 
-	// The real Codex client (verified vs codex-rs) uses LOWERCASE session-id/thread-id,
-	// never a capitalized "Session_id", and sends no `version` header.
+	// The real Codex client uses LOWERCASE session-id/thread-id and advertises its
+	// version plus the default-enabled remote compaction feature on Responses calls.
 	hA := build(convA)
 	if getHeaderFold(hA, "Session_id") != "" {
 		t.Fatal("must not emit capitalized Session_id")
 	}
-	if getHeaderFold(hA, "version") != "" {
-		t.Fatal("must not emit a version header")
+	if getHeaderFold(hA, "version") != config.DefaultClientVersion || getHeaderFold(hA, "x-codex-beta-features") != codexBetaFeaturesHeader {
+		t.Fatalf("responses version fingerprint missing: %+v", hA)
 	}
 	if getHeaderFold(hA, "session-id") == "" || getHeaderFold(hA, "thread-id") == "" {
 		t.Fatal("session-id/thread-id missing")
 	}
-	if getHeaderFold(hA, "session-id") == getHeaderFold(hA, "thread-id") {
-		t.Fatal("session-id and thread-id must be distinct values")
+	if getHeaderFold(hA, "session-id") != getHeaderFold(hA, "thread-id") {
+		t.Fatal("official Codex session-id and thread-id must be the same UUIDv7")
 	}
 	if threadOf(convA) != threadOf(convA) {
 		t.Fatal("same correlator produced different thread-id")
@@ -199,10 +199,10 @@ func TestCodexSessionIDSeededFromCorrelator(t *testing.T) {
 	if threadOf(convA) == threadOf(convB) {
 		t.Fatal("different correlators collapsed to the same thread-id")
 	}
-	if got, want := threadOf(convA), identity.DerivedUUID(id.MachineID, "thread\x00"+convA); got != want {
+	if got, want := threadOf(convA), identity.DerivedUUIDv7(id.MachineID+"\x00thread", convA); got != want {
 		t.Fatalf("thread-id = %q, want %q", got, want)
 	}
-	if got, want := threadOf(""), identity.DerivedUUID(id.MachineID, "thread\x00"+id.SessionID); got != want {
+	if got, want := threadOf(""), identity.DerivedUUIDv7(id.MachineID+"\x00thread", id.SessionID); got != want {
 		t.Fatalf("fallback thread-id = %q, want seeded-by-stable-id %q", got, want)
 	}
 	// x-client-request-id mirrors thread-id (the real client sets them equal).
@@ -255,30 +255,28 @@ func TestCodexEntrypointAdaptive(t *testing.T) {
 	if o != identity.CodexOriginatorExec {
 		t.Fatalf("exec originator = %q, want codex_exec", o)
 	}
-	if !strings.HasPrefix(ua, "codex_exec/") || !strings.Contains(ua, "unknown (codex_exec;") {
-		t.Fatalf("exec UA = %q, want codex_exec shape with trailing unknown (codex_exec; ...)", ua)
+	if !strings.HasPrefix(ua, "codex_exec/") || !strings.Contains(ua, id.Terminal) {
+		t.Fatalf("exec UA = %q, want codex_exec source shape with terminal %q", ua, id.Terminal)
 	}
 	if ua != id.CodexUserAgentExecVersion(identity.CodexCLIVersion) {
 		t.Fatalf("exec UA = %q, want %q (account-bound OS/arch)", ua, id.CodexUserAgentExecVersion(identity.CodexCLIVersion))
 	}
 	// Downstream User-Agent prefix alone (no Originator header) is enough to detect exec.
 	uaOnly := http.Header{}
-	uaOnly.Set("User-Agent", "codex_exec/0.135.0 (Debian 12.0.0; x86_64) unknown (codex_exec; 0.135.0)")
+	uaOnly.Set("User-Agent", "codex_exec/0.144.1 (Debian 12.0.0; x86_64) unknown")
 	if o, _ := build(uaOnly); o != identity.CodexOriginatorExec {
 		t.Fatalf("UA-only exec detection: originator = %q, want codex_exec", o)
 	}
 }
 
-// --- Codex: NO `version` header (the real client never sends one), version lives in the UA ---
+// --- Codex: the Responses version header and UA must use the same version ---
 
-func TestCodexNoVersionHeaderVersionInUA(t *testing.T) {
+func TestCodexVersionHeaderMatchesUA(t *testing.T) {
 	cfg := config.Default()
 	cfg.CodexCLIVersionOverride = "0.130.0"
 	c, _ := fixedSecretClient(t, cfg)
 
-	// Even when a downstream forwards version: 0.135.0, we must NOT emit a `version`
-	// header (verified vs codex-rs: no such request header exists). The account-bound
-	// version appears only in the User-Agent.
+	// An untrusted downstream version must not override the account-bound version.
 	downstream := http.Header{}
 	downstream.Set("version", "0.135.0")
 	h := http.Header{}
@@ -287,8 +285,8 @@ func TestCodexNoVersionHeaderVersionInUA(t *testing.T) {
 		Token:   storage.AccountToken{AccessToken: "oauth-access-token"},
 		Headers: downstream,
 	})
-	if got := getHeaderFold(h, "version"); got != "" {
-		t.Fatalf("version header must not be sent, got %q", got)
+	if got := getHeaderFold(h, "version"); got != "0.130.0" {
+		t.Fatalf("version header = %q, want account-bound 0.130.0", got)
 	}
 	if ua := h.Get("User-Agent"); !strings.Contains(ua, "/0.130.0 ") {
 		t.Fatalf("UA = %q, want account-bound version 0.130.0", ua)
@@ -298,7 +296,7 @@ func TestCodexNoVersionHeaderVersionInUA(t *testing.T) {
 // TestCodexClientVersionOverrideCoherent locks in the model-probe fix: a per-request
 // CodexClientVersion override drives the UA (and the `?client_version=` query the probe
 // sends), so the newest models are not version-gated away. The override must win over
-// the config default AND there must still be no `version` header.
+// the config default and drive both version-bearing fingerprint fields.
 func TestCodexClientVersionOverrideCoherent(t *testing.T) {
 	cfg := config.Default()
 	cfg.CodexCLIVersionOverride = "0.118.0" // deliberately stale to prove the per-request override wins
@@ -313,8 +311,8 @@ func TestCodexClientVersionOverrideCoherent(t *testing.T) {
 		Headers:            downstream,
 		CodexClientVersion: "0.135.0",
 	})
-	if got := getHeaderFold(h, "version"); got != "" {
-		t.Fatalf("version header must not be sent, got %q", got)
+	if got := getHeaderFold(h, "version"); got != "0.135.0" {
+		t.Fatalf("version header = %q, want probe override 0.135.0", got)
 	}
 	if ua := h.Get("User-Agent"); !strings.Contains(ua, "/0.135.0 ") {
 		t.Fatalf("UA = %q, want probe override version 0.135.0", ua)

@@ -3,29 +3,24 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"regexp"
 	"strings"
 
 	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
-
-	xxHash64 "github.com/pierrec/xxHash/xxHash64"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Official Claude Code anti-fingerprint constants (see cliproxyapi-reference).
 const (
 	claudeAnthropicVersion = "2023-06-01"
 	// OAuth (Claude Pro/Max) carries the oauth beta; API keys must not.
-	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
-	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24"
+	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24"
 	claudeCacheDiagnosticsBeta   = "cache-diagnosis-2026-04-07"
 	claudeCacheDiagnosticsHeader = "X-Codex-Claude-Cache-Diagnostics"
 )
@@ -212,7 +207,6 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 		// sending the SDK-correct header here is the closest faithful shape and is
 		// what the reference relay does. Prefer OAuth (sk-ant-oat) accounts when full
 		// Claude Code mimicry matters.
-		dst.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 		dst.Set("Anthropic-Beta", mergeBetas(claudeAPIKeyBetas, spec.Headers, true))
 	} else {
 		if token != "" {
@@ -220,6 +214,9 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 		}
 		dst.Set("Anthropic-Beta", mergeBetas(claudeOAuthBetas, spec.Headers, false))
 	}
+	// Claude Code 2.1.206 sends this in both API-key and third-party Bearer
+	// configurations (verified through ANTHROPIC_BASE_URL captures).
+	dst.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	if strings.TrimSpace(spec.Headers.Get(claudeCacheDiagnosticsHeader)) != "" {
 		appendClaudeBeta(dst, claudeCacheDiagnosticsBeta)
 	}
@@ -231,24 +228,20 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 	dst.Set("X-Stainless-Timeout", "600")
 	dst.Set("X-Stainless-OS", id.StainlessOS)
 	dst.Set("X-Stainless-Arch", id.StainlessArch)
-	// Per-account version axes: an explicit operator override (config) still wins
-	// globally, but absent one each account presents its own diverse, self-consistent
-	// values so N accounts are not byte-identical (a fleet signal). The claude-cli
-	// version (UA) and the @anthropic-ai/sdk "Stainless" package version are SEPARATE
-	// axes — the real client sends e.g. claude-cli/2.1.159 with X-Stainless-Package-
-	// Version: 0.94.0 — so they must not be conflated.
+	// Version axes use the captured self-consistent shipping tuple; account-bound
+	// OS/device/session axes still provide fleet diversity. An explicit operator
+	// override wins globally. The claude-cli version (UA) and the @anthropic-ai/sdk
+	// "Stainless" package version are separate axes — the real client sends
+	// claude-cli/2.1.206 with X-Stainless-Package-Version: 0.94.0.
 	claudeVer := c.cfgSnapshot().ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
 	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, spec.Body, id))
-	dst.Set("x-client-request-id", randomUUID())
-	dst.Set("User-Agent", id.ClaudeUserAgentVersion(claudeVer))
+	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, spec.Body)))
+	dst.Set("Accept", "application/json")
 	if stream {
-		dst.Set("Accept", "text/event-stream")
 		// Uncompressed so the downstream SSE scanner can read it line-by-line.
 		dst.Set("Accept-Encoding", "identity")
-	} else {
-		dst.Set("Accept", "application/json")
 	}
 }
 
@@ -272,10 +265,10 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	// Auth, per credential type (mirrors applyClaudeHeaders).
 	if apiKey {
 		dst.Set("x-api-key", token)
-		dst.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	} else if token != "" {
 		dst.Set("Authorization", "Bearer "+token)
 	}
+	dst.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 
 	// Forward the client's content negotiation verbatim. Content-Type MUST be preserved
 	// byte-for-byte — a multipart/form-data upload carries its boundary= parameter there,
@@ -347,8 +340,18 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
 	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, nil, id))
-	dst.Set("x-client-request-id", randomUUID())
-	dst.Set("User-Agent", id.ClaudeUserAgentVersion(claudeVer))
+	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, spec.Body)))
+}
+
+// claudeEntrypoint projects the real downstream launch mode while discarding
+// the downstream version. Claude 2.1.206 uses sdk-cli for `claude -p`/Agent SDK
+// and cli for the interactive terminal.
+func claudeEntrypoint(headers http.Header, body []byte) string {
+	if strings.Contains(strings.ToLower(headers.Get("User-Agent")), "(external, sdk-cli)") ||
+		bytes.Contains(body, []byte("cc_entrypoint=sdk-cli")) {
+		return "sdk-cli"
+	}
+	return "cli"
 }
 
 // mergeBetas decides the Anthropic-Beta header to send upstream. It PREFERS the
@@ -451,22 +454,15 @@ func appendClaudeBeta(h http.Header, beta string) {
 	h.Set("Anthropic-Beta", strings.Join(current, ","))
 }
 
-const claudeCCHSeed uint64 = 0x6E52736AC806831E
 const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
-
-var claudeBillingHeaderCCHPattern = regexp.MustCompile(`\bcch=([0-9a-f]{5});`)
 
 func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
 	var root map[string]interface{}
-	if json.Unmarshal(spec.Body, &root) != nil {
+	if decodeClaudeJSONObject(spec.Body, &root) != nil {
 		return spec
 	}
 
-	changed := false
-	if _, ok := root["metadata"]; ok {
-		delete(root, "metadata")
-		changed = true
-	}
+	changed := c.normalizeClaudeMessagesMetadata(root, spec)
 	if betas := extractClaudeBodyBetas(root["betas"]); len(betas) > 0 {
 		delete(root, "betas")
 		spec.Headers = cloneHeaders(spec.Headers)
@@ -496,11 +492,83 @@ func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
 			body = marshaled
 		}
 	}
-	if c.claudeCCHSigningEnabled(spec) {
-		body = signClaudeBillingCCH(body)
-	}
 	spec.Body = body
 	return spec
+}
+
+// decodeClaudeJSONObject keeps arbitrary-precision JSON number text intact for
+// the messages normalizers below. They mutate maps and may re-marshal the entire
+// request, so decoding through float64 would corrupt large integer tool inputs.
+// The trailing decode matches json.Unmarshal's requirement of one JSON value.
+func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(root); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+// normalizeClaudeMessagesMetadata preserves the exact current Claude Code
+// metadata surface while replacing downstream identity. Captured 2.1.206 sends
+// exactly metadata.user_id, whose value is a JSON string; its session_id is the
+// same UUID as X-Claude-Code-Session-Id. Generic API-key SDK traffic keeps a plain
+// opaque user id, while OAuth and native Claude Code requests use the JSON shape.
+func (c *Client) normalizeClaudeMessagesMetadata(root map[string]interface{}, spec Request) bool {
+	metadata, hasMetadata := root["metadata"].(map[string]interface{})
+	token := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey)
+	claudeCode := (token != "" && !claudeUsesAPIKey(token)) || claudeRootHasCodeIdentity(root)
+	if !hasMetadata && !claudeCode {
+		return false
+	}
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	userID := id.UserID
+	if claudeCode {
+		sessionID := claudeSessionID(spec.Headers, spec.Body, id)
+		userID = fmt.Sprintf(`{"device_id":%q,"account_uuid":%q,"session_id":%q}`, id.UserID, "", sessionID)
+	}
+	changed := !hasMetadata || metadata["user_id"] != userID || len(metadata) != 1
+	for key := range metadata {
+		if key != "user_id" {
+			delete(metadata, key)
+		}
+	}
+	metadata["user_id"] = userID
+	root["metadata"] = metadata
+	return changed
+}
+
+func claudeRootHasCodeIdentity(root map[string]interface{}) bool {
+	system, ok := root["system"].([]interface{})
+	if !ok {
+		return false
+	}
+	for i, block := range system {
+		if i >= 2 {
+			break
+		}
+		item, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		text, _ := item["text"].(string)
+		text = strings.TrimSpace(text)
+		if strings.HasPrefix(text, claudeBillingHeaderPrefix) ||
+			strings.HasPrefix(text, "You are a Claude agent, built on Anthropic's Claude Agent SDK.") ||
+			strings.HasPrefix(text, "You are Claude Code, Anthropic's official CLI for Claude.") {
+			return true
+		}
+	}
+	return false
 }
 
 func extractClaudeBodyBetas(v interface{}) []string {
@@ -657,7 +725,7 @@ func normalizeClaudeThinkingCompatibility(root map[string]interface{}) bool {
 	}
 	switch typ, _ := thinking["type"].(string); typ {
 	case "enabled", "adaptive", "auto":
-		if temp, ok := root["temperature"].(float64); !ok || temp != 1 {
+		if !claudeNumericValueIsOne(root["temperature"]) {
 			root["temperature"] = 1.0
 			changed = true
 		}
@@ -669,6 +737,18 @@ func normalizeClaudeThinkingCompatibility(root map[string]interface{}) bool {
 		}
 	}
 	return changed
+}
+
+func claudeNumericValueIsOne(value interface{}) bool {
+	switch number := value.(type) {
+	case json.Number:
+		parsed, err := number.Float64()
+		return err == nil && parsed == 1
+	case float64:
+		return number == 1
+	default:
+		return false
+	}
 }
 
 func removeOutputConfigEffort(root map[string]interface{}) bool {
@@ -686,140 +766,6 @@ func removeOutputConfigEffort(root map[string]interface{}) bool {
 		changed = true
 	}
 	return changed
-}
-
-func (c *Client) claudeCCHSigningEnabled(spec Request) bool {
-	if !c.cfgSnapshot().ClaudeCCHSigning {
-		return false
-	}
-	token := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey)
-	return token != "" && !claudeUsesAPIKey(token)
-}
-
-func signClaudeBillingCCH(body []byte) []byte {
-	billingHeader := gjson.GetBytes(body, "system.0.text").String()
-	if !strings.HasPrefix(strings.TrimSpace(billingHeader), claudeBillingHeaderPrefix) {
-		return body
-	}
-	if !claudeBillingHeaderCCHPattern.MatchString(billingHeader) {
-		return body
-	}
-	unsignedBillingHeader := claudeBillingHeaderCCHPattern.ReplaceAllString(billingHeader, "cch=00000;")
-	unsignedBody, err := sjson.SetBytes(body, "system.0.text", unsignedBillingHeader)
-	if err != nil {
-		return body
-	}
-	cch := fmt.Sprintf("%05x", xxHash64.Checksum(claudeCCHSigningBody(unsignedBody), claudeCCHSeed)&0xFFFFF)
-	signedBillingHeader := claudeBillingHeaderCCHPattern.ReplaceAllString(unsignedBillingHeader, "cch="+cch+";")
-	signedBody, err := sjson.SetBytes(unsignedBody, "system.0.text", signedBillingHeader)
-	if err != nil {
-		return unsignedBody
-	}
-	return signedBody
-}
-
-func claudeCCHSigningBody(unsignedBody []byte) []byte {
-	var root map[string]interface{}
-	if json.Unmarshal(unsignedBody, &root) != nil {
-		return unsignedBody
-	}
-	hasToolOrSystemCache := claudeBlockListHasCacheControl(root["tools"]) || claudeBlockListHasCacheControl(root["system"])
-	hasMessageCache := claudeMessagesHaveCacheControl(root["messages"])
-	if !hasToolOrSystemCache && !hasMessageCache {
-		return unsignedBody
-	}
-
-	if hasToolOrSystemCache {
-		delete(root, "messages")
-	} else if prefix, ok := claudeMessagesPrefixThroughCacheControl(root["messages"]); ok {
-		root["messages"] = prefix
-	} else {
-		return unsignedBody
-	}
-	if out, err := json.Marshal(root); err == nil {
-		return out
-	}
-	return unsignedBody
-}
-
-func claudeBlockListHasCacheControl(v interface{}) bool {
-	blocks, ok := v.([]interface{})
-	if !ok {
-		return false
-	}
-	for _, block := range blocks {
-		if bm, ok := block.(map[string]interface{}); ok {
-			if _, has := bm["cache_control"]; has {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func claudeMessagesHaveCacheControl(v interface{}) bool {
-	msgs, ok := v.([]interface{})
-	if !ok {
-		return false
-	}
-	for _, msg := range msgs {
-		m, ok := msg.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if _, has := m["cache_control"]; has {
-			return true
-		}
-		if blocks, ok := m["content"].([]interface{}); ok {
-			for _, block := range blocks {
-				if bm, ok := block.(map[string]interface{}); ok {
-					if _, has := bm["cache_control"]; has {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func claudeMessagesPrefixThroughCacheControl(v interface{}) ([]interface{}, bool) {
-	msgs, ok := v.([]interface{})
-	if !ok {
-		return nil, false
-	}
-	out := make([]interface{}, 0, len(msgs))
-	for _, msg := range msgs {
-		m, ok := msg.(map[string]interface{})
-		if !ok {
-			out = append(out, msg)
-			continue
-		}
-		if _, has := m["cache_control"]; has {
-			out = append(out, m)
-			return out, true
-		}
-		blocks, ok := m["content"].([]interface{})
-		if !ok {
-			out = append(out, m)
-			continue
-		}
-		for i, block := range blocks {
-			if bm, ok := block.(map[string]interface{}); ok {
-				if _, has := bm["cache_control"]; has {
-					cp := make(map[string]interface{}, len(m))
-					for k, v := range m {
-						cp[k] = v
-					}
-					cp["content"] = blocks[:i+1]
-					out = append(out, cp)
-					return out, true
-				}
-			}
-		}
-		out = append(out, m)
-	}
-	return nil, false
 }
 
 // claudeSessionID derives the virtual X-Claude-Code-Session-Id, bound to the account.
@@ -860,14 +806,4 @@ func bodyStreamTrue(body []byte) bool {
 		}
 	}
 	return false
-}
-
-func randomUUID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "00000000-0000-4000-8000-000000000000"
-	}
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

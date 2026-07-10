@@ -4,7 +4,7 @@
 # carries the complete fingerprint even though it 401s), stop sniffing, parse.
 set -u
 
-OUT=/cap/out
+OUT="${CAPTURE_OUT:-/cap/out}"
 mkdir -p "$OUT"
 PCAP="$OUT/cap.pcap"
 KEYS="$OUT/keys.log"
@@ -56,10 +56,18 @@ RP2=$!
 sleep 1
 
 echo "[*] recording Claude Code request via ANTHROPIC_BASE_URL…"
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
 ANTHROPIC_BASE_URL="http://127.0.0.1:9100" \
 ANTHROPIC_API_KEY="sk-ant-api03-capture-dummy-0000000000000000000000000000000000000000000000000000000000000000AA" \
-  timeout 45 claude -p "say hi" --output-format text \
+  timeout 45 claude -p "say hi" --model claude-opus-4-8 --output-format text \
   >"$OUT/claude2.stdout" 2>"$OUT/claude2.stderr" || true
+
+echo "[*] recording Claude Code third-party relay auth via ANTHROPIC_AUTH_TOKEN…"
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+ANTHROPIC_BASE_URL="http://127.0.0.1:9100" \
+ANTHROPIC_AUTH_TOKEN="sk-ant-oat-capture-third-party-token" \
+  timeout 45 claude -p "say hi" --model claude-opus-4-8 --output-format text \
+  >"$OUT/claude_auth_token.stdout" 2>"$OUT/claude_auth_token.stderr" || true
 
 echo "[*] recording Codex request via OPENAI_BASE_URL…"
 OPENAI_BASE_URL="http://127.0.0.1:9101/v1" \
