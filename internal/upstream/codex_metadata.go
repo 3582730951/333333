@@ -42,6 +42,11 @@ type codexRequestMetadata struct {
 type codexWebSocketIDs = codexRequestMetadata
 
 func (c *Client) newCodexRequestMetadata(spec Request) codexRequestMetadata {
+	responsesLite := !AccountUsesAPIKey(spec.Token) && CodexRequestUsesResponsesLite(spec.Body)
+	return c.newCodexRequestMetadataWithResponsesLite(spec, responsesLite)
+}
+
+func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, responsesLite bool) codexRequestMetadata {
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
 	bodyMetadata := codexBodyClientMetadata(spec.Body)
 	incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
@@ -118,10 +123,39 @@ func (c *Client) newCodexRequestMetadata(spec Request) codexRequestMetadata {
 			getHeaderFold(spec.Headers, "x-codex-turn-state"),
 			codexMetadataString(bodyMetadata, "x-codex-turn-state"),
 		),
-		responsesLite: capability.CodexUsesResponsesLite(codexBodyString(spec.Body, "model")),
+		responsesLite: responsesLite,
 	}
 	metadata.turnMetadata = buildCodexTurnMetadata(metadata, incomingTurn, requestKind, startedAt)
 	return metadata
+}
+
+// CodexRequestUsesResponsesLite opts in only requests already carrying the official
+// Lite envelope. A classic/older client can send hosted tools such as web_search or
+// image_generation; adding the Lite header to that body is precisely what triggers
+// the upstream unsupported_value error. Keeping classic bodies on the classic wire
+// also avoids an incomplete protocol upgrade (Lite has additional image/tool rules).
+func CodexRequestUsesResponsesLite(raw []byte) bool {
+	if !capability.CodexUsesResponsesLite(codexBodyString(raw, "model")) {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return false
+	}
+	input, ok := codexResponsesInputItems(fields["input"])
+	if !ok || len(input) == 0 {
+		return false
+	}
+	var first struct {
+		Type  string          `json:"type"`
+		Role  string          `json:"role"`
+		Tools json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(input[0], &first); err != nil || first.Type != "additional_tools" || first.Role != "developer" {
+		return false
+	}
+	var tools []json.RawMessage
+	return json.Unmarshal(first.Tools, &tools) == nil
 }
 
 func applyCodexClientMetadata(raw []byte, metadata codexRequestMetadata, websocket bool) []byte {

@@ -173,6 +173,37 @@ func setResponsesInstructions(raw []byte, instructions string) []byte {
 	if !ok {
 		return raw
 	}
+	// Current Codex Lite requests carry base instructions as the item immediately
+	// after the leading additional_tools prefix. Model-instruction files are an
+	// override, so replace that item instead of adding a second, conflicting
+	// developer instruction through a temporary top-level field.
+	if input, ok := root["input"].([]interface{}); ok && len(input) > 0 {
+		first, _ := input[0].(map[string]interface{})
+		if first["type"] == "additional_tools" && first["role"] == "developer" {
+			developer := map[string]interface{}{
+				"type": "message",
+				"role": "developer",
+				"content": []interface{}{map[string]interface{}{
+					"type": "input_text",
+					"text": instructions,
+				}},
+			}
+			if len(input) > 1 {
+				second, _ := input[1].(map[string]interface{})
+				if second["type"] == "message" && second["role"] == "developer" {
+					input[1] = developer
+					root["input"] = input
+					delete(root, "instructions")
+					return marshalObjectOrRaw(root, raw)
+				}
+			}
+			withDeveloper := make([]interface{}, 0, len(input)+1)
+			withDeveloper = append(withDeveloper, input[0], developer)
+			root["input"] = append(withDeveloper, input[1:]...)
+			delete(root, "instructions")
+			return marshalObjectOrRaw(root, raw)
+		}
+	}
 	root["instructions"] = instructions
 	return marshalObjectOrRaw(root, raw)
 }

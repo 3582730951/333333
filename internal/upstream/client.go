@@ -325,8 +325,11 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	// probe at server.go:2243, and continues the Session-21 masked-bug chain.
 	if strings.Contains(req.DownstreamPath, "/responses") {
 		isCompact := strings.Contains(strings.ToLower(req.DownstreamPath), "/responses/compact")
-		if !isCompact {
-			req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL)
+		responsesLite := !AccountUsesAPIKey(req.Token) && CodexRequestUsesResponsesLite(req.Body)
+		if isCompact && responsesLite {
+			req.Body = normalizeCodexResponsesLiteCompactBody(req.Body)
+		} else if !isCompact {
+			req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL, responsesLite)
 		}
 		// `ultra` is a client-side Codex capability: the official client enables
 		// automatic delegation locally, but serializes `max` on every Responses wire
@@ -337,8 +340,8 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
 		// cache-affinity control), but strip this obsolete extension consistently.
 		req.Body = stripCodexResponsesPromptCacheRetention(req.Body)
-		if !accountUsesAPIKey(req.Token) {
-			metadata := c.newCodexRequestMetadata(req)
+		if !AccountUsesAPIKey(req.Token) {
+			metadata := c.newCodexRequestMetadataWithResponsesLite(req, responsesLite)
 			req.codexMetadata = &metadata
 			// ApiCompactionInput projects the same identity through headers; only
 			// normal Responses turns serialize client_metadata in the request body.
@@ -523,7 +526,7 @@ func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error)
 	// would carry a Codex fingerprint at all (API-key accounts are plain SDK clients),
 	// so an API-key request always keeps the generic impersonation.
 	ja3 := ""
-	if !accountUsesAPIKey(spec.Token) {
+	if !AccountUsesAPIKey(spec.Token) {
 		ja3 = resolveCodexJA3(c.cfgSnapshot().CodexJA3Override)
 	}
 	return c.postViaSidecar(ctx, spec, target, built, c.cfg.SidecarTimeout(), ja3)
@@ -723,7 +726,7 @@ var codexProtocolHeaders = map[string]bool{
 // scratch: it forwards only allowlisted downstream protocol headers, then sets
 // the auth + account-bound identity headers that the official client carries.
 func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
-	usesAPIKey := accountUsesAPIKey(spec.Token)
+	usesAPIKey := AccountUsesAPIKey(spec.Token)
 
 	for k, values := range spec.Headers {
 		if !codexProtocolHeaders[strings.ToLower(strings.TrimSpace(k))] {
@@ -895,8 +898,19 @@ func setIfEmptyPreserveCase(h http.Header, key, value string) {
 	h[key] = []string{value}
 }
 
-func accountUsesAPIKey(token storage.AccountToken) bool {
-	return strings.TrimSpace(token.AccessToken) == "" && strings.TrimSpace(token.OpenAIAPIKey) != ""
+// AccountUsesAPIKey recognizes both the direct stored form (OpenAIAPIKey only)
+// and auth.json imports, whose parser mirrors that key into AccessToken. A distinct
+// access token still means OAuth even if an auxiliary API-key field is present.
+func AccountUsesAPIKey(token storage.AccountToken) bool {
+	access := strings.TrimSpace(token.AccessToken)
+	key := strings.TrimSpace(token.OpenAIAPIKey)
+	if key == "" || (access != "" && access != key) {
+		return false
+	}
+	if strings.TrimSpace(token.RefreshToken) != "" || strings.TrimSpace(token.IDTokenRaw) != "" || strings.TrimSpace(token.Scopes) != "" {
+		return false
+	}
+	return true
 }
 
 func addAuthHeaders(h http.Header, token storage.AccountToken) {

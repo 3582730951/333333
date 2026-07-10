@@ -2823,8 +2823,7 @@ func TestHealthTestPermissionDeniedDoesNotQuarantine(t *testing.T) {
 // TestHealthTestCodexProbeSendsInstructions locks in the request-shape fixes for the
 // synthetic Codex /responses liveness probe against the streaming-only WHAM backend:
 //
-//   - non-empty top-level "instructions" — else 400 {"detail":"Instructions are required"}
-//     (other_codex: ResponsesApiRequest.instructions);
+//   - non-empty top-level "instructions" on the synthetic classic probe;
 //   - "store":false — the chatgpt.com WHAM backend rejects store:true;
 //   - "stream":true — THE REAL CODEX CLIENT ALWAYS STREAMS (buildCodexWebSocketCreatePayload
 //     hard-sets it; the Session-9 capture shows every real /responses call is an SSE/WS
@@ -2834,7 +2833,8 @@ func TestHealthTestPermissionDeniedDoesNotQuarantine(t *testing.T) {
 //     present — i.e. stream:false, not the store value, was the real trigger of that 400.
 //
 // The live relay forwards the client's own (always-streaming) request, so this only bites
-// the synthetic probe body, which must therefore set all three itself.
+// the synthetic probe body, which must therefore set all three itself. Unlike a
+// current Codex client turn, this classic-shaped probe does not opt into Lite.
 func TestHealthTestCodexProbeSendsInstructions(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"pong"}`))
@@ -2860,7 +2860,7 @@ func TestHealthTestCodexProbeSendsInstructions(t *testing.T) {
 		t.Fatalf("probe body is not valid JSON: %v (%s)", err, probe.Body)
 	}
 	if instr, _ := body["instructions"].(string); strings.TrimSpace(instr) == "" {
-		t.Fatalf("Codex probe missing non-empty instructions (would 400 'Instructions are required'); body=%s", probe.Body)
+		t.Fatalf("Codex probe missing non-empty instructions; body=%s", probe.Body)
 	}
 	if store, ok := body["store"].(bool); !ok || store {
 		t.Fatalf("Codex probe must send store:false for the chatgpt.com WHAM backend; body=%s", probe.Body)

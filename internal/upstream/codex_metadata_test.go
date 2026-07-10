@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,6 +13,50 @@ import (
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 )
+
+func TestCodexRequestUsesResponsesLiteRequiresNativeEnvelope(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"native Lite", `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]}]}`, true},
+		{"classic function tools", `{"model":"gpt-5.6-sol","tools":[{"type":"function","name":"run"}],"input":"hi"}`, false},
+		{"classic hosted tool", `{"model":"gpt-5.6-sol","tools":[{"type":"web_search"}],"input":"hi"}`, false},
+		{"wrong additional tools role", `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"user","tools":[]}]}`, false},
+		{"malformed additional tools", `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":{}}]}`, false},
+		{"classic model with Lite envelope", `{"model":"gpt-5.5","input":[{"type":"additional_tools","role":"developer","tools":[]}]}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CodexRequestUsesResponsesLite([]byte(tt.body)); got != tt.want {
+				t.Fatalf("CodexRequestUsesResponsesLite() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAccountUsesAPIKeyRecognizesImportedShape(t *testing.T) {
+	tests := []struct {
+		name  string
+		token storage.AccountToken
+		want  bool
+	}{
+		{"key only", storage.AccountToken{OpenAIAPIKey: "sk-key"}, true},
+		{"key mirrored to access", storage.AccountToken{AccessToken: "sk-key", OpenAIAPIKey: "sk-key"}, true},
+		{"OAuth access", storage.AccountToken{AccessToken: "oauth-access"}, false},
+		{"distinct OAuth access and key", storage.AccountToken{AccessToken: "oauth-access", OpenAIAPIKey: "sk-key"}, false},
+		{"mirrored value with refresh evidence", storage.AccountToken{AccessToken: "same", OpenAIAPIKey: "same", RefreshToken: "refresh"}, false},
+		{"mirrored value with scopes evidence", storage.AccountToken{AccessToken: "same", OpenAIAPIKey: "same", Scopes: "openid"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AccountUsesAPIKey(tt.token); got != tt.want {
+				t.Fatalf("AccountUsesAPIKey() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	var gotHeader http.Header
@@ -28,7 +73,7 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
 	client := NewClient(cfg)
 	rawTurn := `{"installation_id":"real-install","session_id":"real-session","thread_id":"real-thread","turn_id":"real-turn","window_id":"real-thread:7","request_kind":"turn","thread_source":"user","sandbox":"workspace-write"}`
-	body := []byte(`{"model":"gpt-5.6-sol","instructions":"keep exact context","store":false,"stream":true,"reasoning":{"effort":"ultra"},"previous_response_id":"resp_keep","tools":[{"name":"keep","schema":{"const":900719925474099312345}}],"input":[{"role":"user","content":"do not truncate","exact_id":900719925474099312345}],"client_metadata":{"session_id":"real-session","thread_id":"real-thread","turn_id":"real-turn","x-codex-window-id":"real-thread:7","x-codex-turn-metadata":` + strconvJSON(rawTurn) + `,"custom-safe-key":"keep","custom_exact_id":900719925474099312345}}`)
+	body := []byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"ultra","context":"all_turns"},"previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep exact context"}]},{"role":"user","content":"do not truncate","exact_id":900719925474099312345}],"client_metadata":{"session_id":"real-session","thread_id":"real-thread","turn_id":"real-turn","x-codex-window-id":"real-thread:7","x-codex-turn-metadata":` + strconvJSON(rawTurn) + `,"custom-safe-key":"keep","custom_exact_id":900719925474099312345}}`)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",
 		Headers: http.Header{
@@ -62,10 +107,22 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	if err := json.Unmarshal(gotBody, &payload); err != nil {
 		t.Fatalf("upstream body: %v\n%s", err, gotBody)
 	}
-	if payload["model"] != "gpt-5.6-sol" || payload["instructions"] != "keep exact context" {
+	if payload["model"] != "gpt-5.6-sol" || payload["previous_response_id"] != "resp_keep" {
 		t.Fatalf("model/context changed: %+v", payload)
 	}
-	assertCodexContextFieldsUnchanged(t, body, gotBody)
+	if _, present := payload["instructions"]; present {
+		t.Fatalf("Responses Lite retained top-level instructions: %s", gotBody)
+	}
+	if _, present := payload["tools"]; present {
+		t.Fatalf("Responses Lite retained top-level tools: %s", gotBody)
+	}
+	items, _ := payload["input"].([]interface{})
+	if len(items) != 3 || items[0].(map[string]interface{})["type"] != "additional_tools" || items[1].(map[string]interface{})["role"] != "developer" || items[2].(map[string]interface{})["role"] != "user" {
+		t.Fatalf("Responses Lite input envelope malformed: %s", gotBody)
+	}
+	if !strings.Contains(string(gotBody), `900719925474099312345`) {
+		t.Fatalf("Responses Lite context integer was rounded: %s", gotBody)
+	}
 	reasoning, _ := payload["reasoning"].(map[string]interface{})
 	if reasoning["effort"] != "max" {
 		t.Fatalf("official wire must map client-side ultra to max: %+v", reasoning)
@@ -95,12 +152,50 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T) {
+	var gotHeader http.Header
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, `{"id":"resp","status":"completed"}`)
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+	client := NewClient(cfg)
+	body := []byte(`{"model":"gpt-5.6-sol","instructions":"classic client","store":false,"stream":true,"tools":[{"type":"web_search"}],"input":"search"}`)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses",
+		Body:           body,
+		Account:        storage.Account{ID: "acc-classic-hosted", UpstreamAccountID: "workspace"},
+		Token:          storage.AccountToken{AccessToken: "oauth-access", RefreshToken: "oauth-refresh"},
+		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotHeader.Get(codexResponsesLiteHeader) != "" {
+		t.Fatalf("classic hosted-tool request received Lite header: %+v", gotHeader)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := payload["tools"].([]interface{})
+	if payload["instructions"] != "classic client" || len(tools) != 1 || tools[0].(map[string]interface{})["type"] != "web_search" || payload["input"] != "search" {
+		t.Fatalf("classic hosted-tool body was rewritten as Lite: %s", gotBody)
+	}
+}
+
 func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	client := NewClient(config.Default())
 	metadata := client.newCodexRequestMetadata(Request{
 		DownstreamPath: "/v1/responses",
 		Headers:        http.Header{"x-client-request-id": []string{"019f4a5e-85d5-7ff2-b047-d392ac030c3d"}},
-		Body:           []byte(`{"model":"gpt-5.6-sol","generate":false}`),
+		Body:           []byte(`{"model":"gpt-5.6-sol","generate":false,"input":[{"type":"additional_tools","role":"developer","tools":[]}]}`),
 		Account:        storage.Account{ID: "acc-prewarm"},
 	})
 	if metadata.sessionID != metadata.threadID || !looksLikeUUIDv7(metadata.threadID) {
@@ -125,7 +220,7 @@ func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	if _, present := turn["turn_started_at_unix_ms"]; present {
 		t.Fatalf("prewarm must omit turn_started_at_unix_ms: %+v", turn)
 	}
-	original := []byte(`{"model":"gpt-5.6-sol","instructions":"keep prewarm","generate":false,"previous_response_id":"resp_keep","tools":[{"schema":{"const":900719925474099312345}}],"input":[{"exact_id":900719925474099312345}]}`)
+	original := []byte(`{"model":"gpt-5.6-sol","generate":false,"previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep prewarm"}]},{"role":"user","content":"hi","exact_id":900719925474099312345}]}`)
 	body := applyCodexClientMetadata(original, metadata, true)
 	assertCodexContextFieldsUnchanged(t, original, body)
 	var payload map[string]interface{}
@@ -140,9 +235,25 @@ func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertCodexContextFieldsUnchanged(t, original, payloadBody)
+	var payloadRoot map[string]interface{}
+	if err := json.Unmarshal(payloadBody, &payloadRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := payloadRoot["instructions"]; present {
+		t.Fatalf("prewarm Lite payload retained top-level instructions: %s", payloadBody)
+	}
+	if _, present := payloadRoot["tools"]; present {
+		t.Fatalf("prewarm Lite payload retained top-level tools: %s", payloadBody)
+	}
+	items, _ := payloadRoot["input"].([]interface{})
+	if len(items) != 3 || items[0].(map[string]interface{})["type"] != "additional_tools" {
+		t.Fatalf("prewarm Lite input envelope malformed: %s", payloadBody)
+	}
+	if !strings.Contains(string(payloadBody), `900719925474099312345`) {
+		t.Fatalf("prewarm Lite context integer was rounded: %s", payloadBody)
+	}
 	stamped := stampCodexWebSocketRequestStart(payloadBody)
-	assertCodexContextFieldsUnchanged(t, original, stamped)
+	assertCodexContextFieldsUnchanged(t, payloadBody, stamped)
 	var stampedRoot map[string]interface{}
 	if err := json.Unmarshal(stamped, &stampedRoot); err != nil {
 		t.Fatal(err)
@@ -184,7 +295,7 @@ func TestCodexCompactFingerprintKeepsMetadataOutOfBody(t *testing.T) {
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
 	client := NewClient(cfg)
-	original := []byte(`{"model":"gpt-5.6-sol","input":[],"instructions":"","parallel_tool_calls":false}`)
+	original := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]}],"parallel_tool_calls":false,"reasoning":{"context":"all_turns"}}`)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses/compact",
 		Body:           original,
@@ -204,6 +315,39 @@ func TestCodexCompactFingerprintKeepsMetadataOutOfBody(t *testing.T) {
 	}
 	if gotHeader.Get(codexResponsesLiteHeader) != "true" {
 		t.Fatalf("compact responses-lite header = %q", gotHeader.Get(codexResponsesLiteHeader))
+	}
+}
+
+func TestCodexClassicCompactDoesNotOptIntoResponsesLite(t *testing.T) {
+	var gotHeader http.Header
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, `{"output":[]}`)
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+	client := NewClient(cfg)
+	original := []byte(`{"model":"gpt-5.6-sol","input":[],"instructions":"classic compact","tools":[{"type":"web_search"}]}`)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses/compact",
+		Body:           original,
+		Account:        storage.Account{ID: "acc-classic-compact"},
+		Token:          storage.AccountToken{AccessToken: "access-classic-compact"},
+		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !bytes.Equal(gotBody, original) {
+		t.Fatalf("classic compact body changed:\nwant %s\n got %s", original, gotBody)
+	}
+	if gotHeader.Get(codexResponsesLiteHeader) != "" {
+		t.Fatalf("classic compact unexpectedly opted into Responses Lite: %+v", gotHeader)
 	}
 }
 

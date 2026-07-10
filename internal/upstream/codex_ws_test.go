@@ -54,7 +54,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath:          "/v1/responses",
 		Headers:                 http.Header{"Originator": []string{"codex_exec"}, "x-client-request-id": []string{"thread-123"}},
-		Body:                    []byte(`{"model":"gpt-5.6-sol","instructions":"keep WS context","previous_response_id":"resp_keep","tools":[{"name":"keep","schema":{"const":900719925474099312345}}],"input":[{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"prompt_cache_retention":"24h"}`),
+		Body:                    []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep WS context"}]},{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"prompt_cache_retention":"24h"}`),
 		Account:                 storage.Account{ID: "acc-ws", UpstreamAccountID: "workspace-should-not-leak"},
 		Token:                   storage.AccountToken{AccessToken: "access-ws"},
 		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -117,8 +117,12 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if gotPayload["type"] != "response.create" || gotPayload["model"] != "gpt-5.6-sol" || gotPayload["stream"] != true {
 		t.Fatalf("bad response.create payload: %+v", gotPayload)
 	}
-	requestBody := []byte(`{"model":"gpt-5.6-sol","instructions":"keep WS context","previous_response_id":"resp_keep","tools":[{"name":"keep","schema":{"const":900719925474099312345}}],"input":[{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"prompt_cache_retention":"24h"}`)
-	assertCodexContextFieldsUnchanged(t, requestBody, gotPayloadRaw)
+	if gotPayload["previous_response_id"] != "resp_keep" {
+		t.Fatalf("Responses Lite lost previous_response_id: %+v", gotPayload)
+	}
+	if !bytes.Contains(gotPayloadRaw, []byte(`900719925474099312345`)) {
+		t.Fatalf("Responses Lite rounded tool/input context: %s", gotPayloadRaw)
+	}
 	if _, stale := gotPayload["prompt_cache_retention"]; stale {
 		t.Fatalf("latest Codex WS payload must strip obsolete prompt_cache_retention: %+v", gotPayload)
 	}
@@ -136,11 +140,15 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if gotPayload["parallel_tool_calls"] != false {
 		t.Fatalf("responses-lite must disable parallel_tool_calls: %+v", gotPayload)
 	}
-	if gotPayload["instructions"] != "keep WS context" {
-		t.Fatalf("Responses Lite did not preserve supplied instructions: %+v", gotPayload)
+	if _, present := gotPayload["instructions"]; present {
+		t.Fatalf("Responses Lite retained top-level instructions: %+v", gotPayload)
 	}
-	if _, present := gotPayload["tools"]; !present {
-		t.Fatalf("Responses Lite did not preserve supplied tools: %+v", gotPayload)
+	if _, present := gotPayload["tools"]; present {
+		t.Fatalf("Responses Lite retained top-level tools: %+v", gotPayload)
+	}
+	items, _ := gotPayload["input"].([]interface{})
+	if len(items) != 3 || items[0].(map[string]interface{})["type"] != "additional_tools" || items[1].(map[string]interface{})["role"] != "developer" || items[2].(map[string]interface{})["role"] != "user" {
+		t.Fatalf("Responses Lite input envelope malformed: %+v", gotPayload)
 	}
 }
 
@@ -173,6 +181,41 @@ func TestCodexWebSocketClassicResponsesStillDefaultsTools(t *testing.T) {
 	tools, present := root["tools"].([]interface{})
 	if !present || len(tools) != 0 {
 		t.Fatalf("classic Responses must retain the tools:[] default: %+v", root)
+	}
+}
+
+func TestCodexWebSocketClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T) {
+	client := NewClient(config.Default())
+	spec := Request{
+		DownstreamPath:          "/v1/responses",
+		Body:                    []byte(`{"model":"gpt-5.6-sol","instructions":"classic client","tools":[{"type":"web_search"}],"input":"search"}`),
+		Account:                 storage.Account{ID: "acc-classic-hosted-ws"},
+		Token:                   storage.AccountToken{AccessToken: "oauth-access", RefreshToken: "oauth-refresh"},
+		CodexResponsesWebSocket: true,
+	}
+	metadata := client.newCodexRequestMetadata(spec)
+	if metadata.responsesLite {
+		t.Fatal("classic hosted-tool request was classified as Responses Lite")
+	}
+	spec.codexMetadata = &metadata
+	_, headers, payload, err := client.prepareCodexResponsesWebSocket(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headers.Get(codexResponsesLiteHeader) != "" {
+		t.Fatalf("classic hosted-tool WS handshake received Lite header: %+v", headers)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := root["tools"].([]interface{})
+	if root["instructions"] != "classic client" || len(tools) != 1 || tools[0].(map[string]interface{})["type"] != "web_search" {
+		t.Fatalf("classic hosted-tool WS body was rewritten as Lite: %s", payload)
+	}
+	clientMetadata, _ := root["client_metadata"].(map[string]interface{})
+	if clientMetadata[codexWSResponsesLiteMetadata] != nil {
+		t.Fatalf("classic hosted-tool WS body received Lite metadata: %s", payload)
 	}
 }
 

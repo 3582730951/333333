@@ -1,10 +1,10 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
-	"codex-account-pool/internal/capability"
 	"github.com/tidwall/sjson"
 )
 
@@ -88,14 +88,21 @@ func codexStoreValue(upstreamBaseURL string) bool {
 // unmarshal/marshal round-trip that would reorder JSON keys or normalize whitespace (the
 // relay's byte-for-byte forwarding contract — TestGatewayPreservesResponsesToolItemsWhenVirtual2MEnabled).
 // We decide via a cheap two-field probe decode and only re-marshal when we must mutate.
-func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string) []byte {
+func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLite bool) []byte {
+	// The Lite header changes more than validation flags: the official client moves
+	// the model-visible tool schemas and base instructions into developer input items
+	// and omits both top-level members. Fold gateway-added fields back into a native
+	// Lite envelope before the leaf normalizations below. Classic bodies never set
+	// responsesLite and are deliberately left on the classic contract.
+	if responsesLite {
+		raw = normalizeCodexResponsesLiteEnvelope(raw)
+	}
 	wantStore := codexStoreValue(upstreamBaseURL)
 
-	// Probe ONLY the two validated fields to decide whether any mutation is needed. The
+	// Probe only the validated fields to decide whether any mutation is needed. The
 	// struct decode correctly handles JSON escapes (e.g. "\n" → real newline) that a
 	// string scan cannot, and ignores all other keys.
 	var probe struct {
-		Model             string  `json:"model"`
 		Instructions      *string `json:"instructions"`
 		Store             *bool   `json:"store"`
 		ParallelToolCalls *bool   `json:"parallel_tool_calls"`
@@ -109,13 +116,12 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string) []byte {
 		return raw
 	}
 
-	responsesLite := capability.CodexUsesResponsesLite(probe.Model)
 	instructionsOK := responsesLite || (probe.Instructions != nil && strings.TrimSpace(*probe.Instructions) != "")
 	storeOK := probe.Store != nil && *probe.Store == wantStore
 	parallelOK := !responsesLite || (probe.ParallelToolCalls != nil && !*probe.ParallelToolCalls)
 	reasoningContextOK := !responsesLite || (probe.Reasoning != nil && probe.Reasoning.Context == "all_turns")
 	if instructionsOK && storeOK && parallelOK && reasoningContextOK {
-		// Already matches the real-client shape on both fields: forward byte-identical.
+		// Already matches the real-client shape: forward byte-identical.
 		return raw
 	}
 
@@ -154,6 +160,171 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string) []byte {
 		}
 	}
 	return out
+}
+
+// normalizeCodexResponsesLiteCompactBody applies only the Lite fields shared by
+// normal and compact requests. Compact has its own schema, so it must not gain
+// normal-turn fields such as store or client_metadata.
+func normalizeCodexResponsesLiteCompactBody(raw []byte) []byte {
+	raw = normalizeCodexResponsesLiteEnvelope(raw)
+	var probe struct {
+		ParallelToolCalls *bool `json:"parallel_tool_calls"`
+		Reasoning         *struct {
+			Context string `json:"context"`
+		} `json:"reasoning"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return raw
+	}
+	out := raw
+	var err error
+	if probe.ParallelToolCalls == nil || *probe.ParallelToolCalls {
+		out, err = sjson.SetBytes(out, "parallel_tool_calls", false)
+		if err != nil {
+			return raw
+		}
+	}
+	if probe.Reasoning == nil || probe.Reasoning.Context != "all_turns" {
+		out, err = sjson.SetBytes(out, "reasoning.context", "all_turns")
+		if err != nil {
+			return raw
+		}
+	}
+	return out
+}
+
+// normalizeCodexResponsesLiteEnvelope folds gateway-added top-level instructions or
+// tools back into an already-Lite request. The Lite transport starts input with:
+//
+//	{"type":"additional_tools","role":"developer","tools":[...]}
+//
+// followed by a developer message carrying non-empty base instructions. Classic
+// requests are deliberately not upgraded here; they remain on the non-Lite contract.
+func normalizeCodexResponsesLiteEnvelope(raw []byte) []byte {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
+	}
+
+	input, ok := codexResponsesInputItems(fields["input"])
+	if !ok || len(input) == 0 || codexResponseItemType(input[0]) != "additional_tools" {
+		return raw
+	}
+
+	topToolsRaw, hasTopTools := fields["tools"]
+	var topTools []json.RawMessage
+	if hasTopTools && !bytes.Equal(bytes.TrimSpace(topToolsRaw), []byte("null")) {
+		if err := json.Unmarshal(topToolsRaw, &topTools); err != nil {
+			return raw
+		}
+	}
+
+	instructionsRaw, hasInstructions := fields["instructions"]
+	var instructions *string
+	if hasInstructions {
+		if err := json.Unmarshal(instructionsRaw, &instructions); err != nil {
+			return raw
+		}
+	}
+
+	// This is the official shape already. Returning the original bytes is important
+	// for cache-prefix stability and for exact passthrough of future input item fields.
+	if !hasTopTools && !hasInstructions {
+		return raw
+	}
+
+	if hasTopTools && len(topTools) > 0 {
+		var firstFields map[string]json.RawMessage
+		if err := json.Unmarshal(input[0], &firstFields); err != nil {
+			return raw
+		}
+		var existing []json.RawMessage
+		if existingRaw, present := firstFields["tools"]; present {
+			if err := json.Unmarshal(existingRaw, &existing); err != nil {
+				return raw
+			}
+		}
+		merged := append(existing, topTools...)
+		updated, err := sjson.SetRawBytes(input[0], "tools", marshalCodexRawArray(merged))
+		if err != nil {
+			return raw
+		}
+		input[0] = updated
+	}
+
+	if instructions != nil && *instructions != "" {
+		developer, err := json.Marshal(struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		}{
+			Type: "message",
+			Role: "developer",
+			Content: []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{{Type: "input_text", Text: *instructions}},
+		})
+		if err != nil {
+			return raw
+		}
+		withDeveloper := make([]json.RawMessage, 0, len(input)+1)
+		withDeveloper = append(withDeveloper, input[0], developer)
+		input = append(withDeveloper, input[1:]...)
+	}
+
+	out, err := sjson.SetRawBytes(raw, "input", marshalCodexRawArray(input))
+	if err != nil {
+		return raw
+	}
+	for _, key := range []string{"instructions", "tools"} {
+		if _, present := fields[key]; !present {
+			continue
+		}
+		out, err = sjson.DeleteBytes(out, key)
+		if err != nil {
+			return raw
+		}
+	}
+	return out
+}
+
+func codexResponsesInputItems(raw json.RawMessage) ([]json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(trimmed, &items); err != nil {
+		return nil, false
+	}
+	return items, true
+}
+
+func codexResponseItemType(raw json.RawMessage) string {
+	var item struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &item) != nil {
+		return ""
+	}
+	return item.Type
+}
+
+func marshalCodexRawArray(items []json.RawMessage) json.RawMessage {
+	var out bytes.Buffer
+	out.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			out.WriteByte(',')
+		}
+		out.Write(bytes.TrimSpace(item))
+	}
+	out.WriteByte(']')
+	return out.Bytes()
 }
 
 // normalizeCodexReasoningEffortForWire mirrors codex-rs'

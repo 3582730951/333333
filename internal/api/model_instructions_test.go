@@ -109,6 +109,30 @@ func TestGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
 	}
 }
 
+func TestSetResponsesInstructionsReplacesLiteDeveloperBase(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	got := setResponsesInstructions(raw, "new compiled instructions")
+	var root map[string]interface{}
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := root["instructions"]; present {
+		t.Fatalf("Lite override leaked a top-level instructions field: %s", got)
+	}
+	input, _ := root["input"].([]interface{})
+	if len(input) != 3 {
+		t.Fatalf("Lite override changed input item count: %s", got)
+	}
+	developer, _ := input[1].(map[string]interface{})
+	content, _ := developer["content"].([]interface{})
+	if len(content) != 1 || content[0].(map[string]interface{})["text"] != "new compiled instructions" {
+		t.Fatalf("Lite developer base was not replaced: %s", got)
+	}
+	if strings.Contains(string(got), "old base") {
+		t.Fatalf("old Lite base instructions survived override: %s", got)
+	}
+}
+
 func TestGroupModelInstructionsMissingFileIsConfigurationError(t *testing.T) {
 	var upstreamCalls int
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

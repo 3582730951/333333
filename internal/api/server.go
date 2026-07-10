@@ -590,6 +590,13 @@ type codexAttemptResult struct {
 	Retry   codexRetryRequest
 }
 
+// shouldInjectCodexHostedWebSearch keeps hosted search for classic Responses and
+// API-key upstreams. Only a request already carrying the official Lite input
+// envelope must skip it, because Lite rejects hosted web_search tools.
+func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, body []byte) bool {
+	return upstream.AccountUsesAPIKey(token) || !capability.CodexUsesResponsesLite(model) || !upstream.CodexRequestUsesResponsesLite(body)
+}
+
 // codexAttempt serves one account's attempt at a Codex/Responses request. It
 // returns outcomeRetry when the caller should transparently retry on a fresh
 // account (a recoverable error on a self-contained, non-strict request) and
@@ -716,7 +723,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 
 	// 联网搜索 (AT path): ensure a web_search tool is present so the account
 	// session serves it without API-key/org verification. Skipped for compact.
-	if !prepared && !isCompact && s.flagEnabled(r.Context(), "web_search_enabled", s.cfg.WebSearchEnabled) {
+	if !prepared && !isCompact && shouldInjectCodexHostedWebSearch(model, token, body) &&
+		s.flagEnabled(r.Context(), "web_search_enabled", s.cfg.WebSearchEnabled) {
 		if injected, werr := prompt.EnsureResponsesWebSearchTool(body, s.cfg.WebSearchToolType); werr == nil {
 			body = injected
 		}

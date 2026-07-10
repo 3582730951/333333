@@ -305,6 +305,12 @@ func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
 }
 
 func buildCodexWebSocketCreatePayload(body []byte, ids codexWebSocketIDs) ([]byte, error) {
+	// Do normally applies this at the shared HTTP/WS choke point. Keep the frame
+	// builder defensive as well because a persistent WebSocket can switch from a
+	// classic model to a Lite model without changing the connection.
+	if ids.responsesLite {
+		body = normalizeCodexResponsesLiteEnvelope(body)
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
 		return nil, err
@@ -328,8 +334,8 @@ func buildCodexWebSocketCreatePayload(body []byte, ids codexWebSocketIDs) ([]byt
 		return nil, err
 	}
 	// Responses Lite carries tools in the leading `additional_tools` input item and
-	// omits the top-level tools member. Preserve a caller-supplied member, but never
-	// invent tools:[] for Lite. Classic Responses keeps its historical default.
+	// omits the top-level tools member. Classic Responses keeps its historical
+	// top-level tools:[] default.
 	if !ids.responsesLite {
 		if err := setDefault("tools", []interface{}{}); err != nil {
 			return nil, err
