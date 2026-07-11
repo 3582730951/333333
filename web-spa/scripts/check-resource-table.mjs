@@ -4,11 +4,11 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const managedPages = ['Groups.jsx', 'Users.jsx', 'Egress.jsx', 'Providers.jsx', 'Audit.jsx', 'CFEvents.jsx', 'Quota.jsx', 'Gopay.jsx', 'Accounts.jsx'];
-const tableOnlyPages = ['Usage.jsx', 'System.jsx', 'Lifecycle.jsx', 'Registration.jsx'];
-const portalTableOnlyPages = ['PortalDashboard.jsx'];
-const managedComponents = ['DataPage.jsx', 'ApiKeysTable.jsx'];
-const highValueMobilePages = ['Accounts.jsx', 'Providers.jsx', 'Users.jsx'];
+const managedPages = ['Groups.jsx', 'Users.tsx', 'Egress.jsx', 'Providers.jsx', 'Audit.tsx', 'CFEvents.tsx', 'Quota.tsx', 'Gopay.jsx', 'Accounts.jsx'];
+const tableOnlyPages = ['Usage.tsx', 'System.tsx', 'Lifecycle.tsx', 'Registration.tsx'];
+const portalTableOnlyPages = ['PortalDashboard.tsx'];
+const managedComponents = ['DataPage.jsx', 'ApiKeysTable.tsx'];
+const highValueMobilePages = ['Accounts.jsx', 'Providers.jsx', 'Users.tsx'];
 const problems = [];
 
 function checkResourceTableUsage(name, source, importPath) {
@@ -18,7 +18,9 @@ function checkResourceTableUsage(name, source, importPath) {
   if (/import\s+\{[^}]*\bTable\b[^}]*\}\s+from\s+['"]@douyinfe\/semi-ui['"]/.test(source)) {
     problems.push(`${name} must not import Semi Table directly; use ResourceTable.`);
   }
-  if (!/<ResourceTable\b/.test(source)) {
+  const rendersImportedTable = /<ResourceTable\b/.test(source)
+    || (/\b(?:const|let)\s+DataTable\s*=\s*ResourceTable\b/.test(source) && /<DataTable\b/.test(source));
+  if (!rendersImportedTable) {
     problems.push(`${name} must include a ResourceTable element.`);
   }
 }
@@ -31,7 +33,8 @@ function readPage(page) {
 for (const page of managedPages) {
   const source = readPage(page);
   checkResourceTableUsage(page, source, '../components/ResourceTable.jsx');
-  if (/LoadErrorBanner/.test(source) || /TableSkeleton/.test(source)) {
+  const hasFirstLoadFailureBoundary = /if\s*\(\s*error\s*&&\s*!lastRefresh/.test(source);
+  if ((/LoadErrorBanner/.test(source) && !hasFirstLoadFailureBoundary) || /TableSkeleton/.test(source)) {
     problems.push(`${page} must not duplicate list error or first-load skeleton UI.`);
   }
 }
@@ -87,10 +90,10 @@ for (const required of ['mobileColumns', 'mobileScroll', 'activeColumns']) {
   }
 }
 
-const apiKeysTableSource = fs.readFileSync(path.join(root, 'src', 'components', 'ApiKeysTable.jsx'), 'utf8');
+const apiKeysTableSource = fs.readFileSync(path.join(root, 'src', 'components', 'ApiKeysTable.tsx'), 'utf8');
 for (const required of ['mobileColumns={mobileColumns}', 'mobileScroll={false}', 'pool-key-table']) {
   if (!apiKeysTableSource.includes(required)) {
-    problems.push(`ApiKeysTable.jsx must use ResourceTable mobile table support via ${required}.`);
+    problems.push(`ApiKeysTable.tsx must use ResourceTable mobile table support via ${required}.`);
   }
 }
 

@@ -3,6 +3,8 @@ import * as TooltipPrimitive from '@radix-ui/react-tooltip';
 import * as AvatarPrimitive from '@radix-ui/react-avatar';
 
 import { Button } from './Button.jsx';
+import { dispatchBrowserEvent } from '../../lib/browserEvents.js';
+import { addWindowListener, setBrowserTimeout } from '../../lib/browserLifecycle.js';
 
 const TOAST_EVENT = 'pool-ui-toast';
 
@@ -18,7 +20,7 @@ function normalizeContent(content) {
 
 function pushToast(type, message) {
   if (typeof window === 'undefined') return;
-  window.dispatchEvent(new CustomEvent(TOAST_EVENT, { detail: { id: `${Date.now()}:${Math.random()}`, type, ...normalizeContent(message) } }));
+  dispatchBrowserEvent(TOAST_EVENT, { id: `${Date.now()}:${Math.random()}`, type, ...normalizeContent(message) });
 }
 
 export const Toast = {
@@ -34,12 +36,11 @@ export function ToastViewport() {
     const onToast = (event) => {
       const item = event.detail;
       setItems((value) => [...value, item].slice(-5));
-      window.setTimeout(() => {
+      setBrowserTimeout(() => {
         setItems((value) => value.filter((entry) => entry.id !== item.id));
       }, Number(item.duration) ? Number(item.duration) * 1000 : 4200);
     };
-    window.addEventListener(TOAST_EVENT, onToast);
-    return () => window.removeEventListener(TOAST_EVENT, onToast);
+    return addWindowListener(TOAST_EVENT, onToast);
   }, []);
   const close = (id) => setItems((value) => value.filter((entry) => entry.id !== id));
   const iconFor = (type) => {

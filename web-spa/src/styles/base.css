@@ -6,6 +6,7 @@ html,
 body,
 #root {
   min-height: 100%;
+  max-width: 100%;
 }
 
 html {
@@ -24,6 +25,13 @@ body {
   line-height: 1.45;
   letter-spacing: -0.006em;
   font-variant-numeric: tabular-nums;
+  overflow-x: hidden;
+}
+
+img,
+svg,
+canvas {
+  max-width: 100%;
 }
 
 button,
@@ -87,7 +95,7 @@ p {
   border: 2px solid var(--pool-bg-page);
 }
 
-@media (max-width: 640px) {
+@media (max-width: 767px) {
   body {
     font-size: 15px;
   }

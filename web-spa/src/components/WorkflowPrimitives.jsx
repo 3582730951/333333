@@ -5,6 +5,7 @@ import { Banner, Drawer, Tag, Typography } from './pool/index.jsx';
 import { ProgressBar } from './pool/Progress.jsx';
 import { TextClamp } from './DisplayPrimitives.jsx';
 import { fmtDateTime } from '../lib/format.js';
+import { t } from '../lib/i18n.js';
 
 function numberOf(value) {
   const next = Number(value);
@@ -43,11 +44,11 @@ export function TaskProgress({
     <div className={['pool-task-progress', className].filter(Boolean).join(' ')}>
       <div className="pool-task-progress__stats">
         <b>{pct}%</b>
-        <span className="pool-success-text">成功 {success}</span>
-        <span className="pool-danger-text">失败 {failed}</span>
-        <span>完成 {done}/{denominator}</span>
+        <span className="pool-success-text">{t('workflow.success')} {success}</span>
+        <span className="pool-danger-text">{t('workflow.failed')} {failed}</span>
+        <span>{t('workflow.completed')} {done}/{denominator}</span>
       </div>
-      <ProgressBar percent={pct} label={`完成 ${done}/${denominator}`} />
+      <ProgressBar percent={pct} label={`${t('workflow.completed')} ${done}/${denominator}`} />
     </div>
   );
 }
@@ -64,7 +65,7 @@ export function ReadinessPanel({
       <Banner
         className="pool-readiness-panel"
         type="danger"
-        title="依赖检查失败"
+        title={t('workflow.readiness_failed')}
         description={readinessError}
         closeIcon={null}
       />
@@ -76,8 +77,8 @@ export function ReadinessPanel({
       <Banner
         className="pool-readiness-panel"
         type="info"
-        title="正在读取依赖状态"
-        description="请稍候，注册依赖状态读取完成后即可启动任务。"
+        title={t('workflow.readiness_loading')}
+        description={t('workflow.readiness_wait')}
         closeIcon={null}
       />
     );
@@ -88,22 +89,22 @@ export function ReadinessPanel({
     <Banner
       className="pool-readiness-panel"
       type={blocked ? 'warning' : 'success'}
-      title={blocked ? '启动前检查未通过' : '启动前检查通过'}
+      title={blocked ? t('workflow.readiness_blocked') : t('workflow.readiness_ready')}
       description={(
         <div className="pool-readiness-panel__body">
           <div>
             {blocked
               ? blockers.join('; ')
               : readiness.policy_error
-                ? '当前身份模式所需依赖可用；自动化策略需要处理。'
-                : '当前身份模式所需依赖可用。'}
+                ? t('workflow.policy_warning')
+                : t('workflow.dependencies_ready')}
           </div>
           <div className="pool-readiness-panel__tags">
             {providerSummary.map(([key, value]) => (
               <Tag key={key} color={Number(value) > 0 ? 'green' : 'grey'}>{key}: {Number(value) || 0}</Tag>
             ))}
-            <Tag color={(numberOf(pool.deficit) || 0) > 0 ? 'amber' : 'green'}>缺口: {numberOf(pool.deficit) || 0}</Tag>
-            {readiness.policy_error ? <Tag color="orange">automation: 异常</Tag> : null}
+            <Tag color={(numberOf(pool.deficit) || 0) > 0 ? 'amber' : 'green'}>{t('workflow.deficit')}: {numberOf(pool.deficit) || 0}</Tag>
+            {readiness.policy_error ? <Tag color="orange">{t('workflow.automation_abnormal')}</Tag> : null}
           </div>
         </div>
       )}
@@ -116,16 +117,22 @@ export function ServiceHealthStrip({ services = [], renderStatus }) {
   const list = Array.isArray(services) ? services.filter(Boolean) : [];
   if (!list.length) return null;
   return (
-    <section className="pool-service-health-strip" aria-label="外部服务状态">
-      <Typography.Text strong>外部服务</Typography.Text>
+    <section className="pool-service-health-strip" aria-label={t('workflow.services')}>
+      <Typography.Text strong>{t('workflow.services')}</Typography.Text>
       <div className="pool-service-health-strip__items">
-        {list.map((service) => (
-          <div key={service.name || service.service || service.id} className="pool-service-health-strip__item">
-            <span>{service.name || service.service || service.id || 'service'}</span>
-            {renderStatus ? renderStatus(service.status) : <Tag>{service.status || 'unknown'}</Tag>}
-            {service.last_error ? <Typography.Text type="danger" size="small">{service.last_error}</Typography.Text> : null}
-          </div>
-        ))}
+        {list.map((rawService, index) => {
+          const service = rawService && typeof rawService === 'object'
+            ? rawService
+            : { name: String(rawService || `service-${index + 1}`), status: rawService };
+          const identity = service.name || service.service || service.id || `service-${index + 1}`;
+          return (
+            <div key={`${identity}:${index}`} className="pool-service-health-strip__item">
+              <span>{identity}</span>
+              {renderStatus ? renderStatus(service.status) : <Tag>{service.status || 'unknown'}</Tag>}
+              {service.last_error ? <Typography.Text type="danger" size="small">{service.last_error}</Typography.Text> : null}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -135,11 +142,11 @@ export function LogStream({ logs = [], streaming = false, error, onRetry }) {
   const list = Array.isArray(logs) ? logs : [];
   return (
     <div className="pool-log-stream">
-      <LoadErrorBanner error={error} onRetry={onRetry} title="任务日志读取失败" />
+      <LoadErrorBanner error={error} onRetry={onRetry} title={t('workflow.log_failed')} />
       <div className="pool-log-stream__state">
-        <Tag color={streaming ? 'green' : 'grey'}>{streaming ? '实时连接中' : '实时连接断开'}</Tag>
+        <Tag color={streaming ? 'green' : 'grey'}>{streaming ? t('workflow.streaming') : t('workflow.disconnected')}</Tag>
       </div>
-      {!list.length ? <Typography.Text type="tertiary">暂无日志</Typography.Text> : null}
+      {!list.length ? <Typography.Text type="tertiary">{t('workflow.no_logs')}</Typography.Text> : null}
       <div className="pool-log-stream__lines pool-mono">
         {list.map((entry, index) => {
           const key = entry.id || `${entry.timestamp || 0}:${entry.level || ''}:${index}`;
@@ -172,23 +179,23 @@ export function TaskDetailDrawer({
 }) {
   const active = open ?? visible ?? !!task;
   const details = task && typeof task === 'object' ? [
-    ['ID', task.id],
-    ['类型', task.task_type || task.method],
-    ['平台', task.platform],
-    ['分组', task.group_name],
-    ['出口', task.egress_id || task.registration_egress_pool_id],
-    ['目标', task.total ?? task.target_count],
-    ['成功', task.succeeded ?? task.success_count],
-    ['失败', task.failed ?? task.failed_count],
-    ['创建时间', fmtDateTime(task.created_at)],
-    ['更新时间', fmtDateTime(task.updated_at)],
+    [t('workflow.task_id'), task.id],
+    [t('lifecycle.type'), task.task_type || task.method],
+    [t('lifecycle.platform'), task.platform],
+    [t('lifecycle.group'), task.group_name],
+    [t('lifecycle.egress'), task.egress_id || task.registration_egress_pool_id],
+    [t('workflow.target'), task.total ?? task.target_count],
+    [t('workflow.success'), task.succeeded ?? task.success_count],
+    [t('workflow.failed'), task.failed ?? task.failed_count],
+    [t('lifecycle.created_at'), fmtDateTime(task.created_at)],
+    [t('common.updated_at'), fmtDateTime(task.updated_at)],
   ].filter(([, value]) => value !== undefined && value !== null && value !== '') : [];
 
   return (
     <Drawer
       visible={active}
       onCancel={onClose}
-      title={title || (task ? `任务详情 · ${task.id || task.task_type || 'task'}` : '任务详情')}
+      title={title || (task ? `${t('workflow.task_title')} · ${task.id || task.task_type || 'task'}` : t('workflow.task_title'))}
       width={width}
     >
       {task ? (

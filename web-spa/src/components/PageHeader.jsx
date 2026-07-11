@@ -4,13 +4,13 @@ import { Typography } from './pool/index.jsx';
 // Consistent page header: title + optional subtitle on the left, actions on the right.
 export default function PageHeader({ title, subtitle, actions }) {
   return (
-    <div className="pool-pagehead">
+    <header className="pool-pagehead">
       <div className="pool-pagehead-copy">
-        <Typography.Title heading={4} style={{ margin: 0 }}>{title}</Typography.Title>
+        <Typography.Title heading={1} className="pool-page-title" style={{ margin: 0 }}>{title}</Typography.Title>
         {subtitle ? <div className="sub">{subtitle}</div> : null}
       </div>
       {actions ? <div className="actions pool-page-actions">{actions}</div> : null}
-    </div>
+    </header>
   );
 }
 

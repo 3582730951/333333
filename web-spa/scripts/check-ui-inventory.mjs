@@ -10,7 +10,10 @@ const traverse = traverseModule.default ?? traverseModule;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = path.resolve(root, '..');
 const srcRoot = path.join(root, 'src');
-const appFile = path.join(srcRoot, 'App.jsx');
+const appFile = path.join(srcRoot, 'app', 'routeDefinitions.ts');
+const appShellFile = path.join(srcRoot, 'App.tsx');
+const authFile = path.join(srcRoot, 'app', 'AuthProvider.tsx');
+const themeFile = path.join(srcRoot, 'app', 'useTheme.ts');
 const apiFile = path.join(srcRoot, 'api.js');
 const i18nFile = path.join(srcRoot, 'lib', 'i18n.js');
 
@@ -20,11 +23,13 @@ const expectedAdminRoutes = [
   '/groups',
   '/egress',
   '/providers',
+  '/upstream-error-rules',
   '/registration',
   '/lifecycle',
   '/gopay',
   '/usage',
   '/quota',
+  '/model-quality',
   '/system',
   '/cf-events',
   '/audit',
@@ -60,14 +65,14 @@ function read(file) {
 function parseSource(file) {
   return parser.parse(read(file), {
     sourceType: 'module',
-    plugins: ['jsx', 'importMeta', 'dynamicImport'],
+    plugins: ['jsx', 'typescript', 'importMeta', 'dynamicImport'],
     errorRecovery: true,
   });
 }
 
 function collectSemiImports() {
   const files = [
-    ...listFiles(srcRoot, (name) => /\.[cm]?jsx?$/.test(name)),
+    ...listFiles(srcRoot, (name) => /\.[cm]?[jt]sx?$/.test(name)),
     path.join(root, 'vite.config.js'),
     path.join(root, 'package.json'),
   ].filter((file) => fs.existsSync(file));
@@ -92,7 +97,7 @@ function collectRoutePaths() {
       const { node } = pathRef;
       const key = node.key;
       const value = node.value;
-      const isPathKey = key.type === 'Identifier' && (key.name === 'path' || key.name === 'navPath' || key.name === 'redirectTo');
+      const isPathKey = key.type === 'Identifier' && (key.name === 'path' || key.name === 'navPath' || key.name === 'redirectTo' || key.name === 'to');
       if (isPathKey && value.type === 'StringLiteral') routes.add(value.value);
     },
   });
@@ -100,7 +105,7 @@ function collectRoutePaths() {
 }
 
 function collectApiCalls() {
-  const files = listFiles(srcRoot, (name) => /\.[cm]?jsx?$/.test(name));
+  const files = listFiles(srcRoot, (name) => /\.[cm]?[jt]sx?$/.test(name));
   const calls = [];
   for (const file of files) {
     const ast = parseSource(file);
@@ -122,7 +127,7 @@ function collectApiCalls() {
 }
 
 function collectStorageKeys() {
-  const files = listFiles(srcRoot, (name) => /\.[cm]?jsx?$/.test(name));
+  const files = listFiles(srcRoot, (name) => /\.[cm]?[jt]sx?$/.test(name));
   const keys = new Set();
   for (const file of files) {
     const source = read(file);
@@ -141,7 +146,7 @@ function collectComponentUsage() {
     toast: /\bToast\./g,
     popover: /\b(?:Popover|Popconfirm|DropdownMenu|ActionMenu|Tooltip)\b/g,
   };
-  const files = listFiles(srcRoot, (name) => /\.[cm]?jsx?$/.test(name));
+  const files = listFiles(srcRoot, (name) => /\.[cm]?[jt]sx?$/.test(name));
   const usage = Object.fromEntries(Object.keys(buckets).map((key) => [key, []]));
   for (const file of files) {
     const source = read(file);
@@ -162,7 +167,7 @@ function assertAnchors({ routes, storageKeys }) {
     if (!storageKeys.includes(key)) failures.push(`missing storage key ${key}`);
   }
   const apiSource = read(apiFile);
-  const appSource = read(appFile);
+  const appSource = `${read(appShellFile)}\n${read(authFile)}\n${read(themeFile)}`;
   const i18nSource = read(i18nFile);
   const requiredSources = [
     { label: 'auth probe /auth/me', ok: apiSource.includes("'/auth/me'") },

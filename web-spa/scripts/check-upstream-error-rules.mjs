@@ -5,8 +5,8 @@ const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
 const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
 
-const app = read('src/App.jsx');
-assert(app.includes('UpstreamErrorRules'), 'App.jsx must lazy-load UpstreamErrorRules page');
+const app = read('src/app/routeDefinitions.ts');
+assert(app.includes('UpstreamErrorRules'), 'routeDefinitions.ts must lazy-load UpstreamErrorRules page');
 assert(app.includes("/upstream-error-rules"), 'admin route /upstream-error-rules must be registered');
 assert(app.includes('nav.upstream_error_rules'), 'navigation label key must be present');
 

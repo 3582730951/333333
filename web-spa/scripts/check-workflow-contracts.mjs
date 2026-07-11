@@ -23,15 +23,15 @@ if (!fs.existsSync(workflowFile)) {
   }
 }
 
-const registration = read('pages/Registration.jsx');
-const lifecycle = read('pages/Lifecycle.jsx');
-for (const [label, source] of [['Registration.jsx', registration], ['Lifecycle.jsx', lifecycle]]) {
+const registration = read('pages/Registration.tsx');
+const lifecycle = read('pages/Lifecycle.tsx');
+for (const [label, source] of [['Registration.tsx', registration], ['Lifecycle.tsx', lifecycle]]) {
   if (!source.includes('TaskDetailDrawer')) problems.push(`${label} must use shared TaskDetailDrawer`);
   if (!source.includes('TaskProgress')) problems.push(`${label} must use shared TaskProgress`);
 }
-if (!registration.includes('ReadinessPanel')) problems.push('Registration.jsx must use shared ReadinessPanel');
-if (!lifecycle.includes('ServiceHealthStrip')) problems.push('Lifecycle.jsx must use shared ServiceHealthStrip');
-if (!lifecycle.includes('LogStream')) problems.push('Lifecycle.jsx must use shared LogStream');
+if (!registration.includes('ReadinessPanel')) problems.push('Registration.tsx must use shared ReadinessPanel');
+if (!lifecycle.includes('ServiceHealthStrip')) problems.push('Lifecycle.tsx must use shared ServiceHealthStrip');
+if (!lifecycle.includes('LogStream')) problems.push('Lifecycle.tsx must use shared LogStream');
 
 const gopay = read('pages/Gopay.jsx');
 if (!/subscriptions/.test(gopay)) problems.push('Gopay.jsx must handle subscriptions from /admin/gopay');

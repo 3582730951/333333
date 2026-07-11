@@ -28,6 +28,7 @@ html[data-theme='dark'] {
   --pool-shadow: var(--pool-shadow-md);
 
   --pool-accent: #0a84ff;
+  --pool-accent-text: #66b5ff;
   --pool-accent-hover: #2997ff;
   --pool-accent-pressed: #0071e3;
   --pool-accent-soft: rgba(10, 132, 255, 0.18);
@@ -117,8 +118,8 @@ html[data-theme='light'] {
   --pool-bg-selected: rgba(0, 122, 255, 0.11);
 
   --pool-text: rgba(0, 0, 0, 0.88);
-  --pool-text-2: rgba(60, 60, 67, 0.68);
-  --pool-text-3: rgba(60, 60, 67, 0.46);
+  --pool-text-2: rgba(60, 60, 67, 0.78);
+  --pool-text-3: rgba(60, 60, 67, 0.74);
   --pool-text-disabled: rgba(60, 60, 67, 0.32);
   --pool-border: rgba(60, 60, 67, 0.16);
   --pool-border-strong: rgba(60, 60, 67, 0.24);
@@ -129,12 +130,13 @@ html[data-theme='light'] {
   --pool-shadow: var(--pool-shadow-md);
 
   --pool-accent: #007aff;
+  --pool-accent-text: #005eb8;
   --pool-accent-hover: #0a84ff;
   --pool-accent-pressed: #0066cc;
   --pool-accent-soft: rgba(0, 122, 255, 0.12);
-  --pool-success: #248a3d;
+  --pool-success: #1f7a36;
   --pool-success-soft: rgba(52, 199, 89, 0.14);
-  --pool-warning: #b26a00;
+  --pool-warning: #875100;
   --pool-warning-soft: rgba(255, 149, 0, 0.14);
   --pool-danger: #d70015;
   --pool-danger-soft: rgba(255, 59, 48, 0.12);

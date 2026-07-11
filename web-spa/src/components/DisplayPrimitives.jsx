@@ -75,7 +75,7 @@ export function MetricRail({ items = [], className = '' }) {
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return null;
   return (
-    <aside className={['pool-metric-rail', className].filter(Boolean).join(' ')}>
+    <aside className={['pool-metric-rail', className].filter(Boolean).join(' ')} tabIndex={0} aria-label="指标摘要">
       {list.map((item) => (
         <div key={item.key || item.label} className={['pool-metric-card', item.tone ? `pool-metric-card--${item.tone}` : ''].filter(Boolean).join(' ')}>
           <span className="pool-metric-card__label">{item.label}</span>

@@ -38,6 +38,25 @@ export function setDocumentBodyAttribute(name, value) {
   }
 }
 
+export function documentBodyStyle(name) {
+  try {
+    if (!name || typeof document === 'undefined' || !document.body) return '';
+    return document.body.style[name] || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setDocumentBodyStyle(name, value) {
+  try {
+    if (!name || typeof document === 'undefined' || !document.body) return false;
+    document.body.style[name] = value == null ? '' : String(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function documentElementAttribute(name) {
   try {
     if (!name || typeof document === 'undefined' || !document.documentElement) return '';

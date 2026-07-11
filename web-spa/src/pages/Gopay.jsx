@@ -5,6 +5,7 @@ import { get } from '../api.js';
 import EmptyState from '../components/EmptyState.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
+import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { fmtDateTime } from '../lib/format.js';
 
@@ -70,6 +71,15 @@ export default function Gopay() {
     const pending = rows.filter(r => r.status === 'pending').length;
     return { total, active, pending, count: rows.length };
   }, [rows]);
+
+  if (error && !lastRefresh && !loading) {
+    return (
+      <div>
+        <PageHeader title="GoPay" subtitle="支付服务状态与订阅任务" actions={<Button icon={<IconRefresh />} onClick={load}>重试</Button>} />
+        <LoadErrorBanner error={error} onRetry={load} title="GoPay 数据读取失败" />
+      </div>
+    );
+  }
 
   // Smart column detection with known fields prioritized
   const base = rows[0] || {};

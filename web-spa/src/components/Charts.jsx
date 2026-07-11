@@ -268,7 +268,7 @@ export function CacheRateBars({ data = [] }) {
                 <span style={{ width: 9, height: 9, borderRadius: 3, background: c, display: 'inline-block' }} />
                 {r.model}
               </span>
-              <span style={{ fontWeight: 600, color: c }}>{r.rate}%</span>
+              <span style={{ fontWeight: 600, color: 'var(--pool-text)' }}>{r.rate}%</span>
             </div>
             <div className="pool-meter"><span style={{ width: r.rate + '%', background: c }} /></div>
           </div>

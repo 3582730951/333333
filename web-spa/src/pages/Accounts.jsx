@@ -3,7 +3,7 @@ import {
   ActionMenu, Button, ConfirmDialog, Tag, Toast, Modal, Form, Typography, Input, Select,
 } from '../components/pool/index.jsx';
 import { IconRefresh, IconPlus, IconSearch, IconDownload } from '../components/pool/icons.jsx';
-import { get, post, batchOp } from '../api.js';
+import { post, batchOp } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import AccountDrawer from '../components/AccountDrawer.jsx';
@@ -13,11 +13,10 @@ import { TextClamp, TinyMeter } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
-import useAsyncResource from '../hooks/useAsyncResource.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
-import { loadResourceGroup } from '../lib/resource.js';
 import { fmtInt, fmtTokens } from '../lib/format.js';
+import { useAccountsPage } from '../features/accounts/queries/accounts.ts';
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -39,11 +38,6 @@ function statusInfo(a) {
 function statusTag(a) {
   const info = statusInfo(a);
   return <Tag color={info.color}>{info.label}</Tag>;
-}
-
-function normalizeAccounts(data) {
-  if (Array.isArray(data)) return { rows: data, total: data.length };
-  return { rows: data?.accounts || [], total: data?.total || 0 };
 }
 
 const EMPTY_ACCOUNT_DATA = { rows: [], total: 0, groups: [], error: null };
@@ -106,27 +100,13 @@ export default function Accounts() {
   const [moveGroup, setMoveGroup] = useState('');
   const [moveIDs, setMoveIDs] = useState([]);
 
-  const fetchAccountData = useCallback(async ({ signal }) => {
-    const { values, error } = await loadResourceGroup({
-      accounts: { label: '账号列表', load: () => get('/admin/accounts', { page, pageSize, search }, { signal }) },
-      groups: { label: '分组选项', load: () => get('/admin/groups', undefined, { signal }) },
-    });
-    if (error?.failures?.some((failure) => failure.key === 'accounts')) throw error;
-    const accountData = normalizeAccounts(values.accounts);
-    return {
-      ...accountData,
-      groups: Array.isArray(values.groups) ? values.groups : values.groups?.groups || [],
-      error,
-    };
-  }, [page, pageSize, search]);
-
   const {
     data = EMPTY_ACCOUNT_DATA,
     loading,
     error,
     lastRefresh,
     reload: load,
-  } = useAsyncResource(fetchAccountData, [fetchAccountData], { initialData: EMPTY_ACCOUNT_DATA });
+  } = useAccountsPage({ page, pageSize, search });
   const rows = data.rows || [];
   const total = data.total || 0;
   const groups = data.groups || [];
@@ -374,7 +354,9 @@ export default function Accounts() {
 
   return (
     <div>
-      <PageHeader title="账号池" subtitle={`共 ${total} 个账号`}
+      <PageHeader
+        title="账号池"
+        subtitle={!lastRefresh && loading ? '正在读取账号…' : !lastRefresh && loadError ? '账号数据暂时不可用' : `共 ${total} 个账号`}
         actions={<>
           <Input prefix={<IconSearch />} value={searchInput} onChange={setSearchInput}
             onEnterPress={doSearch} style={{ width: responsive.isMobile ? 210 : 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />

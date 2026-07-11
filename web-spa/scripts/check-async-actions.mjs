@@ -18,7 +18,7 @@ const actionFiles = [
     bannedStateNames: ['saving', 'setSaving'],
   },
   {
-    file: 'src/pages/Users.jsx',
+    file: 'src/pages/Users.tsx',
     bannedStateNames: ['saving', 'setSaving'],
   },
   {
@@ -26,7 +26,7 @@ const actionFiles = [
     bannedStateNames: [],
   },
   {
-    file: 'src/pages/Keys.jsx',
+    file: 'src/pages/Keys.tsx',
     bannedStateNames: [],
   },
   {
@@ -38,11 +38,11 @@ const actionFiles = [
     bannedStateNames: ['generating', 'setGenerating', 'completing', 'setCompleting', 'manualLoading', 'setManualLoading'],
   },
   {
-    file: 'src/components/ConfigForm.jsx',
+    file: 'src/components/ConfigForm.tsx',
     bannedStateNames: ['saving', 'setSaving'],
   },
   {
-    file: 'src/components/ApiKeyCreateModal.jsx',
+    file: 'src/components/ApiKeyCreateModal.tsx',
     bannedStateNames: ['submitting', 'setSubmitting'],
   },
   {
@@ -50,19 +50,19 @@ const actionFiles = [
     bannedStateNames: ['saving', 'setSaving'],
   },
   {
-    file: 'src/pages/portal/PortalKeys.jsx',
+    file: 'src/pages/portal/PortalKeys.tsx',
     bannedStateNames: [],
   },
   {
-    file: 'src/pages/Lifecycle.jsx',
+    file: 'src/pages/Lifecycle.tsx',
     bannedStateNames: ['creating', 'setCreating'],
   },
   {
-    file: 'src/pages/SettingsV2.jsx',
+    file: 'src/pages/SettingsV2.tsx',
     bannedStateNames: ['saving', 'setSaving'],
   },
   {
-    file: 'src/pages/Registration.jsx',
+    file: 'src/pages/Registration.tsx',
     bannedStateNames: ['starting', 'setStarting'],
   },
   {
@@ -74,7 +74,7 @@ const actionFiles = [
 function parseFile(file) {
   return parser.parse(fs.readFileSync(file, 'utf8'), {
     sourceType: 'module',
-    plugins: ['jsx', 'importMeta', 'dynamicImport'],
+    plugins: ['jsx', 'typescript', 'importMeta', 'dynamicImport'],
     errorRecovery: true,
   });
 }
@@ -90,6 +90,8 @@ function checkFile({ fullPath: file, bannedStateNames }) {
   const bannedStateNameSet = new Set(bannedStateNames);
   let importsUseAsyncAction = false;
   let callsUseAsyncAction = false;
+  let importsUseQueryMutation = false;
+  let callsUseQueryMutation = false;
 
   traverse(ast, {
     ImportDeclaration(pathRef) {
@@ -101,10 +103,18 @@ function checkFile({ fullPath: file, bannedStateNames }) {
       ) {
         importsUseAsyncAction = true;
       }
+      if (/features\/[^/]+\/queries\//.test(String(pathRef.node.source.value))) {
+        importsUseQueryMutation = pathRef.node.specifiers.some((specifier) => (
+          specifier.imported?.name && /^use[A-Z].*Mutation$/.test(specifier.imported.name)
+        )) || importsUseQueryMutation;
+      }
     },
     CallExpression(pathRef) {
       if (pathRef.node.callee?.name === 'useAsyncAction' || pathRef.node.callee?.name === 'useKeyedAsyncAction') {
         callsUseAsyncAction = true;
+      }
+      if (pathRef.node.callee?.name && /^use[A-Z].*Mutation$/.test(pathRef.node.callee.name)) {
+        callsUseQueryMutation = true;
       }
       if (pathRef.node.callee?.name !== 'useState') return;
       const parent = pathRef.parentPath?.node;
@@ -119,8 +129,10 @@ function checkFile({ fullPath: file, bannedStateNames }) {
     },
   });
 
-  if (!importsUseAsyncAction || !callsUseAsyncAction) {
-    problems.push(`${path.relative(root, file)}:1:1 operation-heavy page must use useAsyncAction for submit/dedup state`);
+  const usesGuardedMutation = (importsUseAsyncAction && callsUseAsyncAction)
+    || (importsUseQueryMutation && callsUseQueryMutation);
+  if (!usesGuardedMutation) {
+    problems.push(`${path.relative(root, file)}:1:1 operation-heavy page must use useAsyncAction or a domain mutation for submit/dedup state`);
   }
   return problems;
 }

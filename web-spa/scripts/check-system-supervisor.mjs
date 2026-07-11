@@ -4,7 +4,7 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const systemSource = fs.readFileSync(path.join(root, 'src', 'pages', 'System.jsx'), 'utf8');
+const systemSource = fs.readFileSync(path.join(root, 'src', 'pages', 'System.tsx'), 'utf8');
 const summarySource = fs.readFileSync(path.join(root, 'src', 'components', 'SystemHealthSummary.jsx'), 'utf8');
 const problems = [];
 
@@ -12,12 +12,12 @@ function requireSnippet(source, snippet, message) {
   if (!source.includes(snippet)) problems.push(message);
 }
 
-requireSnippet(systemSource, "failed: 'red'", 'System.jsx must render failed supervisor modules/events as red.');
-requireSnippet(systemSource, 'unexpected_exit_count', 'System.jsx must expose supervisor unexpected_exit_count in the module table.');
-requireSnippet(systemSource, 'last_uptime_millis', 'System.jsx must expose supervisor last_uptime_millis in the module table.');
-requireSnippet(systemSource, 'restart_backoff_millis', 'System.jsx must expose supervisor restart_backoff_millis in the module table.');
-requireSnippet(systemSource, 'supervisor_events', 'System.jsx must read supervisor_events from /admin/system.');
-requireSnippet(systemSource, 'supervisor_modules', 'System.jsx must read supervisor_modules from /admin/system.');
+requireSnippet(systemSource, "failed: 'red'", 'System.tsx must render failed supervisor modules/events as red.');
+requireSnippet(systemSource, 'unexpected_exit_count', 'System.tsx must expose supervisor unexpected_exit_count in the module table.');
+requireSnippet(systemSource, 'last_uptime_millis', 'System.tsx must expose supervisor last_uptime_millis in the module table.');
+requireSnippet(systemSource, 'restart_backoff_millis', 'System.tsx must expose supervisor restart_backoff_millis in the module table.');
+requireSnippet(systemSource, 'supervisor_events', 'System.tsx must read supervisor_events from /admin/system.');
+requireSnippet(systemSource, 'supervisor_modules', 'System.tsx must read supervisor_modules from /admin/system.');
 requireSnippet(summarySource, "failed: 'red'", 'SystemHealthSummary.jsx must render failed supervisor state as red.');
 requireSnippet(summarySource, 'last_message', 'SystemHealthSummary.jsx must include failed/restarting module messages in the health summary.');
 requireSnippet(summarySource, 'problemStatuses.has(recent.status)', 'SystemHealthSummary.jsx must only promote module messages for problematic states.');

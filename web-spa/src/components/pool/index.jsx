@@ -59,7 +59,12 @@ function NavItem({ item, selected, collapsed, onClick }) {
   if (item.items?.length) {
     return (
       <div className="pool-nav-section">
-        <button type="button" className="pool-nav-group-label" title={collapsed ? item.text : undefined}>
+        <button
+          type="button"
+          className="pool-nav-group-label"
+          title={collapsed ? item.text : undefined}
+          onClick={() => onClick?.({ itemKey: item.itemKey, group: true })}
+        >
           {item.icon}
           <span className="pool-nav-text">{item.text}</span>
         </button>

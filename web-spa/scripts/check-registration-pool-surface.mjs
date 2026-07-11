@@ -8,12 +8,12 @@ const read = (rel) => fs.readFileSync(path.join(root, rel), 'utf8');
 
 const failures = [];
 const egress = read('src/pages/Egress.jsx');
-const registration = read('src/pages/Registration.jsx');
+const registration = read('src/pages/Registration.tsx');
 const vite = read('vite.config.js');
 
 for (const [label, source] of [
   ['Egress.jsx', egress],
-  ['Registration.jsx', registration],
+  ['Registration.tsx', registration],
 ]) {
   if (/出口池/.test(source)) {
     failures.push(`${label} still exposes the generic 出口池 term; use 注册池/注册代理池 only.`);

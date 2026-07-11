@@ -26,6 +26,15 @@ export default function PortalProfile() {
     } catch (e) { showErrorToast(e); }
   });
 
+  if (error && !user && !loading) {
+    return (
+      <div>
+        <PageHeader title="我的资料" subtitle="账户信息与密码" />
+        <LoadErrorBanner error={error} onRetry={load} title="资料读取失败" />
+      </div>
+    );
+  }
+
   return (
     <div>
       <PageHeader title="我的资料" subtitle="账户信息与密码" />

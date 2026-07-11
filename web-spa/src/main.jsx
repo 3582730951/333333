@@ -1,7 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import ReactDOM from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';
-import App from './App.jsx';
+import { QueryClientProvider } from '@tanstack/react-query';
+import App from './App.tsx';
+import { AuthProvider } from './app/AuthProvider.tsx';
+import { queryClient } from './app/queryClient.ts';
 import AppErrorBoundary, { installGlobalErrorHandlers } from './components/AppErrorBoundary.jsx';
 import AppUpdateNotice from './components/AppUpdateNotice.jsx';
 import { ToastViewport } from './components/pool/index.jsx';
@@ -27,9 +30,16 @@ function Root() {
   }, []);
   return (
     <AppErrorBoundary>
-      <BrowserRouter basename="/console">
-        <App />
-      </BrowserRouter>
+      <QueryClientProvider client={queryClient}>
+        <AuthProvider>
+          <BrowserRouter
+            basename="/console"
+            future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
+          >
+            <App />
+          </BrowserRouter>
+        </AuthProvider>
+      </QueryClientProvider>
       <AppUpdateNotice />
       <ToastViewport />
     </AppErrorBoundary>

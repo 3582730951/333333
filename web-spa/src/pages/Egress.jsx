@@ -351,7 +351,7 @@ export default function Egress() {
           emptyType="egress"
           skeletonRows={6}
         />
-        <MetricRail items={egressMetrics} />
+        {!error || lastRefresh ? <MetricRail items={egressMetrics} /> : null}
       </div>
       <ResourceTable
         error={data.error}

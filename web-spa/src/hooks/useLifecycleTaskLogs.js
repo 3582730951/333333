@@ -4,6 +4,7 @@ import { abortController, abortSignal, createAbortController } from '../lib/brow
 import { addDocumentListener, clearBrowserTimeout, isDocumentVisible, setBrowserTimeout } from '../lib/browserLifecycle.js';
 import { sameOriginWebSocketURL } from '../lib/browserNavigation.js';
 import { closeWebSocket, createWebSocket, isWebSocketClosed, isWebSocketConnectingOrOpen } from '../lib/browserRealtime.js';
+import { t } from '../lib/i18n.js';
 
 const reconnectDelays = [1000, 2000, 5000];
 const maxLogRows = 1000;
@@ -110,7 +111,7 @@ export default function useLifecycleTaskLogs(taskID) {
       if (stopped || reconnectTimer || !isDocumentVisible()) return;
       const delay = reconnectDelays[Math.min(reconnectAttempt, reconnectDelays.length - 1)];
       reconnectAttempt += 1;
-      setError(new Error(`日志流连接已断开，${Math.round(delay / 1000)} 秒后重试`));
+      setError(new Error(t('workflow.log_reconnect').replace('{seconds}', String(Math.round(delay / 1000)))));
       scheduleFallbackPoll(0);
       reconnectTimer = setBrowserTimeout(() => {
         reconnectTimer = 0;
@@ -123,7 +124,7 @@ export default function useLifecycleTaskLogs(taskID) {
       if (isWebSocketConnectingOrOpen(socket)) return;
       try {
         const { socket: nextSocket, error: connectError } = createWebSocket(lifecycleLogStreamURL(taskID, sinceID));
-        if (!nextSocket) throw connectError || new Error('日志流连接不可用');
+        if (!nextSocket) throw connectError || new Error(t('workflow.log_unavailable'));
         socket = nextSocket;
         nextSocket.onopen = () => {
           if (!stopped) {
@@ -137,7 +138,7 @@ export default function useLifecycleTaskLogs(taskID) {
           try {
             const payload = JSON.parse(event.data);
             if (payload?.error) {
-              setError(new Error(payload.error.message || '日志流读取失败'));
+              setError(new Error(payload.error.message || t('workflow.log_read_failed')));
               return;
             }
             const entries = Array.isArray(payload) ? payload : payload?.logs;
@@ -150,7 +151,7 @@ export default function useLifecycleTaskLogs(taskID) {
           }
         };
         nextSocket.onerror = () => {
-          if (!stopped) setError(new Error('日志流连接失败'));
+          if (!stopped) setError(new Error(t('workflow.log_connect_failed')));
         };
         nextSocket.onclose = () => {
           if (stopped) return;

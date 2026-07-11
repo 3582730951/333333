@@ -2,6 +2,7 @@ import React from 'react';
 import { Banner, Button, LoadingState, Tag, Typography } from './pool/index.jsx';
 import { IconUndo } from './pool/icons.jsx';
 import LoadErrorBanner from './LoadErrorBanner.jsx';
+import { t } from '../lib/i18n.js';
 
 function settingsErrorEntries(errors) {
   if (!errors || typeof errors !== 'object') return [];
@@ -36,13 +37,13 @@ function SettingsErrorBanner({ title, section, errors }) {
 function SavedDiffPanel({ diffs, onUndo, undoLoading = false, onClose }) {
   if (!diffs || diffs.length === 0) return null;
   const actions = [
-    onUndo ? <Button key="undo" size="small" icon={<IconUndo />} loading={undoLoading} onClick={onUndo}>撤销</Button> : null,
-    <Button key="close" size="small" theme="borderless" onClick={onClose}>关闭</Button>,
+    onUndo ? <Button key="undo" size="small" icon={<IconUndo />} loading={undoLoading} onClick={onUndo}>{t('settings.undo')}</Button> : null,
+    <Button key="close" size="small" theme="borderless" onClick={onClose}>{t('common.close')}</Button>,
   ].filter(Boolean);
   return (
     <Banner
       type="success"
-      title={`已保存 ${diffs.length} 项变更`}
+      title={`${t('settings.saved_prefix')} ${diffs.length} ${t('settings.saved_changes_suffix')}`}
       description={
         <div style={{ maxHeight: 120, overflow: 'auto', fontSize: 12, fontFamily: 'monospace', lineHeight: 1.6 }}>
           {diffs.map((d, i) => (
@@ -75,11 +76,12 @@ export default function SettingsTabShell({
   className = '',
   children,
 }) {
-  if (loading && !lastRefresh) return <LoadingState title="正在加载设置…" />;
+  if (loading && !lastRefresh) return <LoadingState title={t('settings.loading')} />;
+  if (error && !lastRefresh) return <LoadErrorBanner error={error} onRetry={onRetry} title={settingsErrorTitle || undefined} />;
   return (
     <div className={className}>
       {toolbar ? <div className="pool-toolbar">{toolbar}</div> : null}
-      <LoadErrorBanner error={error} onRetry={onRetry} />
+      <LoadErrorBanner error={error} onRetry={onRetry} title={error ? t('settings.refresh_stale') : undefined} />
       <SavedDiffPanel diffs={diffs} onUndo={onUndo} undoLoading={undoLoading} onClose={onClearDiffs} />
       {settingsErrorTitle ? (
         <SettingsErrorBanner title={settingsErrorTitle} section={settingsErrorSection} errors={settingsErrors} />

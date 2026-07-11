@@ -8,19 +8,23 @@ import traverseModule from '@babel/traverse';
 
 const traverse = traverseModule.default ?? traverseModule;
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dashboardFile = path.join(root, 'src', 'pages', 'Dashboard.jsx');
+const dashboardFile = path.join(root, 'src', 'features', 'observability', 'api', 'dashboard.ts');
 const source = fs.readFileSync(dashboardFile, 'utf8');
 const problems = [];
 
 const ast = parser.parse(source, {
   sourceType: 'module',
-  plugins: ['jsx', 'importMeta'],
+  plugins: ['jsx', 'typescript', 'importMeta'],
   errorRecovery: true,
 });
 
 const loaderNodes = new Map();
 
 traverse(ast, {
+  FunctionDeclaration(pathRef) {
+    const name = pathRef.node.id?.name;
+    if (name === 'fetchDashboardCore' || name === 'fetchDashboardSecondary') loaderNodes.set(name, pathRef.node);
+  },
   VariableDeclarator(pathRef) {
     const name = pathRef.node.id?.name;
     if (name === 'fetchDashboardCore' || name === 'fetchDashboardSecondary') {
@@ -48,29 +52,38 @@ function collectStringValues(node, values = []) {
 function assertLoader(name, { required = [], forbidden = [] }) {
   const loader = loaderNodes.get(name);
   if (!loader) {
-    problems.push(`Dashboard.jsx must define ${name}.`);
+    problems.push(`dashboard.ts must define ${name}.`);
     return;
   }
-  const strings = new Set(collectStringValues(loader));
-  for (const endpoint of required) {
-    if (!strings.has(endpoint)) problems.push(`${name} must load ${endpoint}.`);
+  const identifiers = new Set();
+  traverse(ast, {
+    Identifier(pathRef) {
+      if (pathRef.findParent((parent) => parent.node === loader)) identifiers.add(pathRef.node.name);
+    },
+  });
+  for (const helper of required) {
+    if (!identifiers.has(helper)) problems.push(`${name} must call ${helper}.`);
   }
-  for (const endpoint of forbidden) {
-    if (strings.has(endpoint)) problems.push(`${name} must not load secondary endpoint ${endpoint}.`);
+  for (const helper of forbidden) {
+    if (identifiers.has(helper)) problems.push(`${name} must not call secondary helper ${helper}.`);
   }
 }
 
 assertLoader('fetchDashboardCore', {
-  required: ['/healthz', '/admin/accounts/summary', '/admin/usage/timeseries'],
-  forbidden: ['/admin/accounts', '/admin/register/stats', '/admin/system', '/admin/usage/by-model'],
+  required: ['fetchHealth', 'fetchAccountSummary', 'fetchDashboardTimeseries'],
+  forbidden: ['fetchRegistrationStats', 'fetchDashboardSystem', 'fetchDashboardModels', 'fetchDashboardCache'],
 });
 
 assertLoader('fetchDashboardSecondary', {
-  required: ['/admin/register/stats', '/admin/system', '/admin/usage/by-model', '/admin/usage/cache'],
+  required: ['fetchRegistrationStats', 'fetchDashboardSystem', 'fetchDashboardModels', 'fetchDashboardCache'],
 });
 
 if (/const\s+fetchDashboard\s*=/.test(source)) {
-  problems.push('Dashboard.jsx must keep core and secondary loaders split instead of a single fetchDashboard aggregator.');
+  problems.push('dashboard.ts must keep core and secondary loaders split instead of a single fetchDashboard aggregator.');
+}
+
+for (const endpoint of ['/healthz', '/admin/accounts/summary', '/admin/usage/timeseries', '/admin/register/stats', '/admin/system', '/admin/usage/by-model', '/admin/usage/cache']) {
+  if (!source.includes(endpoint)) problems.push(`dashboard.ts must retain endpoint ${endpoint}.`);
 }
 
 if (problems.length > 0) {

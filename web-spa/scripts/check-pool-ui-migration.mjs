@@ -54,12 +54,12 @@ const viteSource = read(path.join(root, 'vite.config.js'));
 if (packageSource.includes('@douyinfe/semi')) failures.push('package.json still declares Semi dependencies.');
 if (/semi-vite-plugin|SemiPlugin|vendor-semi-ui/.test(viteSource)) failures.push('vite.config.js still includes Semi plugin/chunk configuration.');
 
-for (const file of listFiles(srcRoot, (name) => /\.[cm]?jsx?$|\.css$/.test(name))) {
+for (const file of listFiles(srcRoot, (name) => /\.[cm]?[jt]sx?$|\.css$/.test(name))) {
   const source = read(file);
   if (source.includes('@douyinfe/semi')) failures.push(`${rel(file)} imports or references Semi.`);
 }
 
-for (const file of listFiles(srcRoot, (name) => /\.[cm]?jsx?$/.test(name))) {
+for (const file of listFiles(srcRoot, (name) => /\.[cm]?[jt]sx?$/.test(name))) {
   const fileRel = rel(file);
   const source = read(file);
   if (/\bPopconfirm\b/.test(source)) failures.push(`${fileRel} still uses Popconfirm; use ActionMenu or ConfirmDialog.`);
@@ -81,11 +81,11 @@ for (const name of requiredStyleFiles) {
   if (!mainSource.includes(`./styles/${name}`)) failures.push(`main.jsx does not import src/styles/${name}.`);
 }
 
-const appSource = read(path.join(srcRoot, 'App.jsx'));
+const appSource = `${read(path.join(srcRoot, 'App.tsx'))}\n${read(path.join(srcRoot, 'app', 'useTheme.ts'))}`;
 if (!appSource.includes('data-theme')) failures.push('App shell does not set html[data-theme].');
 if (appSource.includes('theme-mode')) failures.push('App shell still uses body[theme-mode] instead of html[data-theme].');
 
-for (const file of listFiles(srcRoot, (name) => /\.(?:css|jsx|js)$/.test(name))) {
+for (const file of listFiles(srcRoot, (name) => /\.(?:css|jsx|js|tsx|ts)$/.test(name))) {
   if (rel(file).startsWith('src/assets/')) continue;
   if (rel(file) === 'src/styles/tokens.css') continue;
   const source = read(file);

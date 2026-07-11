@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from 'react';
 import * as SwitchPrimitive from '@radix-ui/react-switch';
 
 import { Button } from './Button.jsx';
@@ -18,21 +18,37 @@ function validateField(value, rules = []) {
     if (rule?.required && (value === undefined || value === null || value === '')) {
       return rule.message || '必填';
     }
+    if (value === undefined || value === null || value === '') continue;
+    const text = String(value);
+    if (rule?.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
+      return rule.message || '邮箱格式无效';
+    }
+    if (Number.isFinite(rule?.min) && text.length < rule.min) {
+      return rule.message || `至少输入 ${rule.min} 个字符`;
+    }
+    if (Number.isFinite(rule?.max) && text.length > rule.max) {
+      return rule.message || `最多输入 ${rule.max} 个字符`;
+    }
+    if (rule?.pattern instanceof RegExp && !rule.pattern.test(text)) {
+      return rule.message || '格式无效';
+    }
   }
   return '';
 }
 
-function FieldShell({ field, label, help, rules, children }) {
+function FieldShell({ field, label, help, rules, controlId, children }) {
   const form = useContext(FormContext);
   const error = form?.errors?.[field] || '';
   return (
-    <label className={cx('pool-field', form?.labelPosition === 'left' ? 'pool-field--left' : '')}>
-      {label ? <span className="pool-field__label">{label}</span> : null}
+    <div className={cx('pool-field', form?.labelPosition === 'left' ? 'pool-field--left' : '')}>
+      {label ? controlId
+        ? <label className="pool-field__label" htmlFor={controlId}>{label}</label>
+        : <span className="pool-field__label">{label}</span> : null}
       <span>
         {children}
         {error ? <div className="pool-field__error">{error}</div> : help ? <div className="pool-field__help">{help}</div> : null}
       </span>
-    </label>
+    </div>
   );
 }
 
@@ -75,12 +91,15 @@ export function TextInput({
   initValue,
   ...props
 }) {
+  const generatedId = useId();
+  const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   const [revealed, setRevealed] = useState(false);
   const inputType = mode === 'password' && !revealed ? 'password' : 'text';
   const input = (
     <input
       className={cx(prefix || showClear ? 'pool-input' : 'pool-input', className)}
+      id={controlId}
       type={inputType}
       value={current ?? ''}
       onChange={(event) => setCurrent(event.target.value)}
@@ -109,15 +128,18 @@ export function TextInput({
     </span>
   ) : input;
   if (!field && !label) return control;
-  return <FieldShell field={field} label={label} help={help} rules={rules}>{control}</FieldShell>;
+  return <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>{control}</FieldShell>;
 }
 
 export function NumberInput({ field, label, help, rules, value, onChange, min, max, className, initValue, ...props }) {
+  const generatedId = useId();
+  const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   return (
-    <FieldShell field={field} label={label} help={help} rules={rules}>
+    <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>
       <input
         className={cx('pool-input', className)}
+        id={controlId}
         type="number"
         value={current ?? ''}
         min={min}
@@ -133,11 +155,14 @@ export function NumberInput({ field, label, help, rules, value, onChange, min, m
 }
 
 export function Textarea({ field, label, help, rules, value, onChange, autosize, className, initValue, ...props }) {
+  const generatedId = useId();
+  const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   return (
-    <FieldShell field={field} label={label} help={help} rules={rules}>
+    <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>
       <textarea
         className={cx('pool-textarea', className)}
+        id={controlId}
         value={current ?? ''}
         onChange={(event) => setCurrent(event.target.value)}
         rows={autosize ? 4 : props.rows}
@@ -154,13 +179,16 @@ function normalizeOptions(optionList = []) {
   });
 }
 
-export function SelectInput({ field, label, help, rules, value, onChange, optionList = [], placeholder, className, style, children, initValue, ...props }) {
+export function SelectInput({ field, label, help, rules, value, onChange, optionList = [], placeholder, className, style, children, initValue, filter, emptyContent, ...props }) {
+  const generatedId = useId();
+  const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const options = normalizeOptions(optionList);
   const [current, setCurrent] = useField(field, rules, value, onChange, initValue);
   const valueMap = new Map(options.map((option) => [String(option.value), option.value]));
   const select = (
     <select
       className={cx('pool-select', className)}
+      id={controlId}
       value={current === undefined || current === null ? '' : String(current)}
       onChange={(event) => {
         const raw = event.target.value;
@@ -170,6 +198,7 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
       {...props}
     >
       {placeholder ? <option value="">{placeholder}</option> : null}
+      {!options.length && emptyContent ? <option value="" disabled>{emptyContent}</option> : null}
       {children}
       {options.map((option) => (
         <option key={String(option.value)} value={String(option.value)} disabled={option.disabled}>
@@ -179,10 +208,12 @@ export function SelectInput({ field, label, help, rules, value, onChange, option
     </select>
   );
   if (!field && !label) return select;
-  return <FieldShell field={field} label={label} help={help} rules={rules}>{select}</FieldShell>;
+  return <FieldShell field={field} label={label} help={help} rules={rules} controlId={controlId}>{select}</FieldShell>;
 }
 
 export function Toggle({ field, label, help, value, checked, onChange, disabled, className, initValue, ...props }) {
+  const generatedId = useId();
+  const controlId = props.id || (field ? `pool-field-${field}-${generatedId}` : generatedId);
   const form = useContext(FormContext);
   useEffect(() => {
     if (!form || !field || initValue === undefined) return;
@@ -197,6 +228,7 @@ export function Toggle({ field, label, help, value, checked, onChange, disabled,
   const control = (
     <SwitchPrimitive.Root
       className={cx('pool-switch', className)}
+      id={controlId}
       checked={!!current}
       disabled={disabled}
       onCheckedChange={setCurrent}
@@ -206,7 +238,7 @@ export function Toggle({ field, label, help, value, checked, onChange, disabled,
     </SwitchPrimitive.Root>
   );
   if (!field && !label) return control;
-  return <FieldShell field={field} label={label} help={help}>{control}</FieldShell>;
+  return <FieldShell field={field} label={label} help={help} controlId={controlId}>{control}</FieldShell>;
 }
 
 export function Form({

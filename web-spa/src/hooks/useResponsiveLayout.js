@@ -5,13 +5,10 @@ import {
   cancelBrowserAnimationFrame,
   requestBrowserAnimationFrame,
 } from '../lib/browserLifecycle.js';
+import { responsiveState } from '../lib/breakpoints.ts';
 
 function readViewport() {
-  const width = browserViewportWidth();
-  return {
-    collapsedByWidth: width < 920,
-    isMobile: width < 768,
-  };
+  return responsiveState(browserViewportWidth());
 }
 
 export default function useResponsiveLayout() {

@@ -48,22 +48,26 @@ for (const label of ['Token', '请求数', '请求命中率', '真实 Token 命�
   if (!charts.includes(label)) problems.push(`ModelMetricsTooltip must render metric label ${label}.`);
 }
 
-const usage = read('pages/Usage.jsx');
-if (!/series_dimension:\s*'model'/.test(usage) || !/series_limit:\s*6/.test(usage)) {
+const usage = read('pages/Usage.tsx');
+const usageApi = read('features/observability/api/usage.ts');
+const usageSurface = `${usage}\n${usageApi}`;
+if (!/series_dimension:\s*'model'/.test(usageSurface) || !/series_limit:\s*6/.test(usageSurface)) {
   problems.push('Usage Token trend must request model series by default.');
 }
-if (!/FULL_CACHE_FIELDS\s*=\s*'summary,by_account,by_model,by_api_key,by_account_model,by_route,by_route_account_model,by_time_bucket'/.test(usage) || !/fields:\s*FULL_CACHE_FIELDS/.test(usage)) {
+if (!/FULL_CACHE_FIELDS\s*=\s*'summary,by_account,by_model,by_api_key,by_account_model,by_route,by_route_account_model,by_time_bucket'/.test(usageSurface) || !/fields:\s*FULL_CACHE_FIELDS/.test(usageSurface)) {
   problems.push('Usage cache diagnostics must request the full reset-aware cache field set explicitly.');
 }
 if (!/UsageModelAreaChart/.test(usage) || !/cacheCompositionSegments/.test(usage) || !/selectedCacheModels/.test(usage)) {
   problems.push('Usage must include model hover metrics, cache composition model hover segments, and model cache trend selection.');
 }
 
-const dashboard = read('pages/Dashboard.jsx');
-if (!/\/admin\/usage\/cache/.test(dashboard) || !/fields:\s*'summary,by_model'/.test(dashboard)) {
+const dashboard = read('pages/Dashboard.tsx');
+const dashboardApi = read('features/observability/api/dashboard.ts');
+const dashboardSurface = `${dashboard}\n${dashboardApi}`;
+if (!/\/admin\/usage\/cache/.test(dashboardSurface) || !/fields:\s*'summary,by_model'/.test(dashboardSurface)) {
   problems.push('Dashboard cache modules must use reset-aware /admin/usage/cache with lightweight fields.');
 }
-if (!/modelTokenFormatter/.test(dashboard) || !/DonutChart[^>]*valueFormatter=\{modelTokenFormatter\}/.test(dashboard)) {
+if (!/modelTokenFormatter/.test(dashboard) || !/(?:DonutChart|Donut)[^>]*valueFormatter=\{modelTokenFormatter\}/.test(dashboard)) {
   problems.push('Dashboard model token donut must use a local token formatter instead of changing fmtTokens globally.');
 }
 

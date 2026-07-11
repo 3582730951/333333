@@ -106,6 +106,10 @@ export default function ResourceTable({
     />
   );
 
+  if (error && !lastRefresh && !loading) {
+    return <LoadErrorBanner error={error} onRetry={onRetry} title={errorTitle} />;
+  }
+
   if (isMobile && typeof mobileRenderer === 'function') {
     const pageSize = pagination && pagination !== false ? Number(pagination.pageSize) || rows.length || 1 : rows.length || 1;
     const total = pagination && pagination !== false ? Number(pagination.total) || rows.length : rows.length;
@@ -122,7 +126,7 @@ export default function ResourceTable({
     };
     return (
       <>
-        <LoadErrorBanner error={error} onRetry={onRetry} title={errorTitle} />
+        <LoadErrorBanner error={error} onRetry={onRetry} title={lastRefresh ? (errorTitle || '刷新失败，正在显示上次数据') : errorTitle} />
         {firstLoad ? (
           <TableSkeleton rows={skeletonRows} cols={1} title={loadingTitle} />
         ) : visibleRows.length ? (
@@ -131,7 +135,7 @@ export default function ResourceTable({
               const key = rowKeyOf(row, rowKey, index);
               const isSelected = selected.has(key);
               return (
-                <div key={String(key)} className="pool-mobile-list__item" role="listitem" aria-selected={isSelected}>
+                <div key={String(key)} className="pool-mobile-list__item" role="listitem">
                   {mobileRenderer(row, {
                     index,
                     key,
@@ -160,7 +164,7 @@ export default function ResourceTable({
 
   return (
     <>
-      <LoadErrorBanner error={error} onRetry={onRetry} title={errorTitle} />
+      <LoadErrorBanner error={error} onRetry={onRetry} title={lastRefresh ? (errorTitle || '刷新失败，正在显示上次数据') : errorTitle} />
       {firstLoad ? (
         <TableSkeleton rows={skeletonRows} cols={skeletonCols || Math.max(1, activeColumns?.length || 5)} title={loadingTitle} />
       ) : (

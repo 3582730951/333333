@@ -6,6 +6,7 @@ import { errMsg, get, post } from '../api.js';
 import PageHeader, { Panel } from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import StatCard from '../components/StatCard.jsx';
+import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { fmtDateTime, fmtInt, fmtRelative, fmtTokens } from '../lib/format.js';
 
@@ -61,6 +62,15 @@ export default function ModelQuality() {
     acc[state] = (acc[state] || 0) + 1;
     return acc;
   }, {}), [statuses]);
+
+  if (error && !lastRefresh && !loading) {
+    return (
+      <div>
+        <PageHeader title="模型质量" subtitle="模型可用性与质量检测" actions={<Button icon={<IconRefresh />} onClick={reload}>重试</Button>} />
+        <LoadErrorBanner error={error} onRetry={reload} title="模型质量数据读取失败" />
+      </div>
+    );
+  }
 
   const runOne = async (row) => {
     const key = qualityKey(row);

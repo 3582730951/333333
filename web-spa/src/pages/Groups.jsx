@@ -71,6 +71,7 @@ function normalizedFileList(values = []) {
 
 export default function Groups() {
   const [open, setOpen] = useState(false);
+  const [instructionLibraryOpen, setInstructionLibraryOpen] = useState(false);
   const [instructionName, setInstructionName] = useState('');
   const [instructionContent, setInstructionContent] = useState('');
   const [editingGroup, setEditingGroup] = useState(null);
@@ -242,6 +243,7 @@ export default function Groups() {
       <PageHeader title="分组" subtitle="按分组下发强制模型 / 推理强度 / Codex 模型指令文件"
         actions={<>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
+          <Button onClick={() => setInstructionLibraryOpen(true)}>模型指令文件</Button>
           <Button icon={<IconPlus />} theme="solid" disabled={removing} onClick={() => setOpen(true)}>新建分组</Button>
         </>} />
       <div className="pool-resource-split">
@@ -263,23 +265,20 @@ export default function Groups() {
           emptyType="groups"
           skeletonRows={5}
         />
-        <div style={{ display: 'grid', gap: 12 }}>
-          <MetricRail items={groupMetrics} />
-          <div className="pool-card" style={{ padding: 14 }}>
-            <div style={{ fontWeight: 600, marginBottom: 8 }}>模型指令文件</div>
-            <Form onSubmit={saveInstruction}>
-              <Form.Input field="instruction_name" label="保存名称" value={instructionName} onChange={setInstructionName} placeholder="coding-style.md" />
-              <Form.TextArea field="instruction_content" label="内容" value={instructionContent} onChange={setInstructionContent} rows={6} />
-              <Button htmlType="submit" theme="solid" loading={savingInstruction} disabled={!instructionName.trim()}>Save</Button>
-            </Form>
-            <div style={{ marginTop: 10, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              {instructionFiles.length ? instructionFiles.map((file) => (
-                <Tag key={file.name} size="small" color={file.error ? 'red' : 'blue'}>{file.name}</Tag>
-              )) : <Tag size="small">暂无文件</Tag>}
-            </div>
-          </div>
-        </div>
+        {!error || lastRefresh ? <MetricRail items={groupMetrics} /> : null}
       </div>
+      <Modal title="模型指令文件" visible={instructionLibraryOpen} onCancel={() => { if (!savingInstruction) setInstructionLibraryOpen(false); }} footer={null} maskClosable={!savingInstruction}>
+        <Form onSubmit={saveInstruction} labelPosition="top">
+          <Form.Input field="instruction_name" label="保存名称" value={instructionName} onChange={setInstructionName} placeholder="coding-style.md" />
+          <Form.TextArea field="instruction_content" label="内容" value={instructionContent} onChange={setInstructionContent} rows={10} />
+          <Button htmlType="submit" theme="solid" loading={savingInstruction} disabled={!instructionName.trim()}>保存文件</Button>
+        </Form>
+        <div className="pool-instruction-files">
+          {instructionFiles.length ? instructionFiles.map((file) => (
+            <Tag key={file.name} size="small" color={file.error ? 'red' : 'blue'}>{file.name}</Tag>
+          )) : <Tag size="small">暂无文件</Tag>}
+        </div>
+      </Modal>
       <Modal title="新建分组" visible={open} onCancel={() => { if (!creating) setOpen(false); }} footer={null} maskClosable={!creating}>
         <Form onSubmit={create}>
           <Form.Input field="name" label="分组名" rules={[{ required: true }]} />

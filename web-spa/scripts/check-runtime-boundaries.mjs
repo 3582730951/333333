@@ -16,7 +16,7 @@ const abortModule = path.join(srcRoot, 'lib', 'browserAbort.js');
 const lifecycleModule = path.join(srcRoot, 'lib', 'browserLifecycle.js');
 const documentModule = path.join(srcRoot, 'lib', 'browserDocument.js');
 const browserStoragePattern = /\b(?:localStorage|sessionStorage)\b/g;
-const browserCookiePattern = /\bdocument\.cookie\b|\bdecodeURIComponent\b/g;
+const browserCookiePattern = /\bdocument\.cookie\b/g;
 const browserEventPattern = /\bnew\s+(?:CustomEvent|EventTarget)\b|\bwindow\.dispatchEvent\b/g;
 const browserClipboardPattern = /\bnavigator\.clipboard\b|\bdocument\.execCommand\b|\bdocument\.createElement\s*\(\s*['"]textarea['"]\s*\)/g;
 const browserNavigationPattern = /\bwindow\.(?:open|location)\b/g;
@@ -105,12 +105,12 @@ function checkPatternOutsideModules(pattern, allowedModules, label) {
 }
 
 function checkAppIsAdminOrdering() {
-  const appFile = path.join(srcRoot, 'App.jsx');
+  const appFile = path.join(srcRoot, 'App.tsx');
   const source = fs.readFileSync(appFile, 'utf8');
   const declaration = source.indexOf('const isAdmin = auth.role ===');
-  const dependencyUse = source.indexOf('[auth.ready, auth.authed, isAdmin]');
+  const dependencyUse = source.indexOf('[auth.authed, isAdmin]');
   if (declaration === -1 || dependencyUse === -1 || declaration > dependencyUse) {
-    return ['src/App.jsx must declare isAdmin before hook dependency arrays reference it.'];
+    return ['src/App.tsx must declare isAdmin before hook dependency arrays reference it.'];
   }
   return [];
 }

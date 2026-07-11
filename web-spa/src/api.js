@@ -3,6 +3,7 @@ import { getCookie } from './lib/browserCookies.js';
 import { dispatchBrowserEvent } from './lib/browserEvents.js';
 import { clearBrowserTimeout, setBrowserTimeout } from './lib/browserLifecycle.js';
 import { getLocalItem, removeLocalItem, setLocalItem } from './lib/browserStorage.js';
+import { normalizeApiError } from './api/errors.ts';
 
 // Admin token (legacy Bearer) lives in safe browser storage; user sessions use the cp_session
 // cookie (same-origin, sent automatically). Mutations on a session need the double-submit
@@ -31,7 +32,7 @@ api.interceptors.response.use(
   (r) => r,
   (err) => {
     const status = err?.response?.status;
-    if ((status === 401 || status === 403) && !err?.config?.suppressUnauthorizedEvent) {
+    if (status === 401 && !err?.config?.suppressUnauthorizedEvent) {
       dispatchBrowserEvent('pool-unauthorized');
     }
     return Promise.reject(err);
@@ -64,6 +65,7 @@ export const oauthComplete = (sessionId, redirected, label, groupName, egressId)
   });
 
 export const errMsg = (e) => {
+  if (e?.name === 'ApiError' && typeof e?.userMessage === 'string') return e.userMessage;
   const data = e?.response?.data;
   if (typeof data?.error === 'string') return data.error;
   if (typeof data?.error?.message === 'string') return data.error.message;
@@ -72,6 +74,7 @@ export const errMsg = (e) => {
 };
 
 export const errRequestID = (e) => {
+  if (e?.name === 'ApiError' && typeof e?.requestId === 'string') return e.requestId;
   const data = e?.response?.data;
   const bodyID = typeof data?.error?.request_id === 'string' ? data.error.request_id : '';
   const headerID = typeof e?.response?.headers?.['x-request-id'] === 'string' ? e.response.headers['x-request-id'] : '';
@@ -84,53 +87,7 @@ export const isUnauthorizedError = (e) => {
   return status === 401 || status === 403;
 };
 
-export const isAbortError = (e) => e?.code === 'ERR_CANCELED' || e?.name === 'CanceledError' || e?.name === 'AbortError';
-
-// ── Loading state management ──
-let loadingCount = 0;
-let loadingState = false;
-const loadingSubscribers = new Set();
-
-export const isLoading = () => loadingCount > 0;
-
-const emitLoadingIfChanged = () => {
-  const nextLoading = isLoading();
-  if (nextLoading === loadingState) return;
-  loadingState = nextLoading;
-  for (const callback of [...loadingSubscribers]) {
-    try {
-      callback(nextLoading);
-    } catch (error) {
-      if (import.meta.env?.DEV) console.debug('loading subscriber failed', error);
-    }
-  }
-};
-
-export const showLoading = () => {
-  loadingCount++;
-  emitLoadingIfChanged();
-};
-
-export const hideLoading = () => {
-  if (loadingCount === 0) return;
-  loadingCount = Math.max(0, loadingCount - 1);
-  emitLoadingIfChanged();
-};
-
-export const subscribeLoading = (callback) => {
-  loadingSubscribers.add(callback);
-  return () => loadingSubscribers.delete(callback);
-};
-
-// ── Request wrapper with loading indicator ──
-export const withLoading = async (work) => {
-  showLoading();
-  try { return await (typeof work === 'function' ? work() : work); }
-  finally { hideLoading(); }
-};
-
-export const loadingGet = (url, params) => withLoading(() => get(url, params));
-export const loadingPost = (url, body) => withLoading(() => post(url, body));
+export const isAbortError = (e) => normalizeApiError(e).code === 'REQUEST_ABORTED';
 
 // ── Batch operations with progress ──
 export const batchOp = async (label, ids, fn, onProgress) => {

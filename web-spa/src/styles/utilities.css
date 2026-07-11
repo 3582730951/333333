@@ -71,7 +71,7 @@
   border: 0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 767px) {
   .pool-grid-4,
   .pool-grid-3,
   .pool-grid-2 {

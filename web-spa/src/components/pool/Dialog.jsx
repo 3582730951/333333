@@ -4,6 +4,7 @@ import * as AlertDialogPrimitive from '@radix-ui/react-alert-dialog';
 
 import { Button } from './Button.jsx';
 import { X } from './icons.jsx';
+import { documentBodyStyle, setDocumentBodyStyle } from '../../lib/browserDocument.js';
 
 function cx(...parts) {
   return parts.filter(Boolean).join(' ');
@@ -23,11 +24,11 @@ function useOpenProps({ open, visible, onOpenChange, onCancel, onClose }) {
 
 function useBodyScrollLock(isOpen) {
   useEffect(() => {
-    if (!isOpen || typeof document === 'undefined') return undefined;
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    if (!isOpen) return undefined;
+    const previous = documentBodyStyle('overflow');
+    setDocumentBodyStyle('overflow', 'hidden');
     return () => {
-      document.body.style.overflow = previous;
+      setDocumentBodyStyle('overflow', previous);
     };
   }, [isOpen]);
 }
