@@ -195,7 +195,7 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
     if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/usage/cache') {
       return route.fulfill({ json: {
         summary: { requests: 12, hit_requests: 8, request_hit_rate: 0.6667, prompt_tokens: 1000, cache_input_tokens: 500, cache_read_tokens: 400, cache_creation_tokens: 100, cache_miss_tokens: 0, real_token_hit_rate: 0.4, eligible_cache_hit_rate: 0.8, cache_write_share: 0.1 },
-        by_model: [{ model: 'gpt-5', model_key: 'gpt-5', model_label: 'GPT-5', requests: 12, cache_input_tokens: 500, cache_read_tokens: 400, total_tokens: 1234 }],
+        by_model: [{ model: 'gpt-5', model_key: 'gpt-5', model_label: 'GPT-5', requests: 12, cache_input_tokens: 500, cache_read_tokens: 400, total_tokens: 1234, latest_user_cache_control: 2 }],
         by_api_key: [{ api_key_hash_prefix: 'key-e2e', requests: 12, hit_requests: 8, request_hit_rate: 0.6667, cache_read_tokens: 400 }],
         by_account_model: [], by_route: [], by_route_account_model: [], by_time_bucket: [],
         effective_start_at: 1_700_000_000,

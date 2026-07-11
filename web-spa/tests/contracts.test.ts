@@ -156,8 +156,8 @@ describe('API contracts', () => {
       effective_start_at: 1_700_000_000,
     });
     expect(parseApiResponse(usageMetricRowSchema, {
-      model: 'gpt-5', cache_read_share: '0.25', latest_user_cache_control: true,
-    })).toMatchObject({ model: 'gpt-5', cache_read_share: 0.25, latest_user_cache_control: true });
+      model: 'gpt-5', cache_read_share: '0.25', latest_user_cache_control: 3,
+    })).toMatchObject({ model: 'gpt-5', cache_read_share: 0.25, latest_user_cache_control: 3 });
     expect(parseApiResponse(usageTimeseriesSchema, {
       buckets: [{ bucket: '1700000000', total_tokens: '10' }],
       model_series: [{ bucket: '1700000000', series_key: 'gpt-5', total_tokens: '8' }],
@@ -169,6 +169,18 @@ describe('API contracts', () => {
     });
     expect(() => parseApiResponse(usageCacheSchema, { by_route: 'broken' }))
       .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
+    expect(parseApiResponse(usageCacheSchema, {
+      summary: { latest_user_cache_control: 2 },
+      by_account: null,
+      by_model: null,
+      by_api_key: null,
+      by_account_model: null,
+      by_route: null,
+      by_route_account_model: null,
+      by_time_bucket: null,
+    })).toMatchObject({ summary: { latest_user_cache_control: 2 } });
+    expect(parseApiResponse(usageTimeseriesSchema, { buckets: null, model_series: null, series: null }))
+      .toEqual({ buckets: [], modelSeries: [], series: [] });
   });
 
   it('normalizes settings sections and preserves unknown configuration fields', () => {

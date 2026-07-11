@@ -189,6 +189,40 @@ func TestAdminUsageInvalidResetFallsBackAndAudits(t *testing.T) {
 	t.Fatalf("missing usage_cache_stats_reset_invalid audit, logs=%+v", logs)
 }
 
+func TestAdminUsageCacheEmptyCollectionsAreArrays(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/usage/cache", "")
+	if code != http.StatusOK {
+		t.Fatalf("/admin/usage/cache = %d: %s", code, raw)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode cache response: %v (%s)", err, raw)
+	}
+	for _, field := range []string{
+		"by_account",
+		"by_model",
+		"by_api_key",
+		"by_account_model",
+		"by_route",
+		"by_route_account_model",
+		"by_time_bucket",
+	} {
+		if got := strings.TrimSpace(string(payload[field])); got != "[]" {
+			t.Errorf("empty %s = %s, want []", field, got)
+		}
+	}
+	var summary struct {
+		LatestUserCacheControl int64 `json:"latest_user_cache_control"`
+	}
+	if err := json.Unmarshal(payload["summary"], &summary); err != nil {
+		t.Fatalf("decode cache summary: %v (%s)", err, payload["summary"])
+	}
+	if summary.LatestUserCacheControl != 0 {
+		t.Fatalf("empty latest_user_cache_control = %d, want numeric zero", summary.LatestUserCacheControl)
+	}
+}
+
 func TestAdminUsageDailyResetAuditDedupes(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	for _, path := range []string{"/admin/usage/window", "/admin/usage", "/admin/usage/cache"} {

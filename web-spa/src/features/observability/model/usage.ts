@@ -38,7 +38,7 @@ export interface UsageMetricRow {
   cache_creation_5m_share?: number;
   stable_prefix_bytes?: number;
   cache_breakpoint_count?: number;
-  latest_user_cache_control?: boolean;
+  latest_user_cache_control?: number;
   latest_user_auto_context_cache_control?: number;
   latest_user_tail_cache_control?: number;
   latest_user_tool_result_cache_control?: number;

@@ -262,7 +262,7 @@ export default function Usage() {
     { title: t('usage.cache_write'), dataIndex: 'cache_creation_tokens', width: 120, sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
     { title: t('usage.cache_miss'), dataIndex: 'cache_miss_tokens', width: 120, sorter: (a, b) => (a.cache_miss_tokens || 0) - (b.cache_miss_tokens || 0), render: fmtTokens },
     { title: t('usage.breakpoint'), dataIndex: 'cache_breakpoint_count', width: 90, sorter: (a, b) => (a.cache_breakpoint_count || 0) - (b.cache_breakpoint_count || 0), render: fmtInt },
-    { title: t('usage.latest_user_risk'), dataIndex: 'latest_user_cache_control', width: 130, render: (v) => (v ? t('usage.yes') : t('usage.no')) },
+    { title: t('usage.latest_user_risk'), dataIndex: 'latest_user_cache_control', width: 130, render: (v) => (Number(v) > 0 ? t('usage.yes') : t('usage.no')) },
     { title: t('usage.auto_context'), dataIndex: 'latest_user_auto_context_cache_control', width: 110, render: fmtInt },
     { title: t('usage.user_tail'), dataIndex: 'latest_user_tail_cache_control', width: 100, render: fmtInt },
     { title: t('usage.tool_tail'), dataIndex: 'latest_user_tool_result_cache_control', width: 100, render: fmtInt },

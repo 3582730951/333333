@@ -13,6 +13,7 @@ const numericKeys = [
   'eligible_cache_hit_rate', 'cache_write_share', 'cache_read_share', 'prompt_tokens', 'completion_tokens', 'total_tokens',
   'cached_tokens', 'cache_input_tokens', 'cache_read_tokens', 'cache_creation_tokens', 'cache_miss_tokens',
   'cache_creation_5m_share', 'stable_prefix_bytes', 'cache_breakpoint_count', 'estimated_rate', 'bucket',
+  'latest_user_cache_control',
   'latest_user_auto_context_cache_control', 'latest_user_tail_cache_control', 'latest_user_tool_result_cache_control',
 ] as const;
 
@@ -27,8 +28,12 @@ export const usageMetricRowSchema = z.object({
   series_key: z.string().optional(),
   series_label: z.string().optional(),
   risk_flags: z.array(z.string()).optional(),
-  latest_user_cache_control: z.boolean().optional(),
 }).passthrough();
+
+const optionalUsageRowsSchema = z.preprocess(
+  (value) => (value === null ? undefined : value),
+  z.array(usageMetricRowSchema).optional(),
+);
 
 const windowSchema = z.object({
   timezone: z.string().optional(),
@@ -39,10 +44,10 @@ const windowSchema = z.object({
 export const usageEnvelopeSchema = z.union([
   z.array(usageMetricRowSchema).transform((rows) => ({ rows })),
   z.object({
-    rows: z.array(usageMetricRowSchema).optional(),
-    usage: z.array(usageMetricRowSchema).optional(),
-    data: z.array(usageMetricRowSchema).optional(),
-    accounts: z.array(usageMetricRowSchema).optional(),
+    rows: optionalUsageRowsSchema,
+    usage: optionalUsageRowsSchema,
+    data: optionalUsageRowsSchema,
+    accounts: optionalUsageRowsSchema,
     window: windowSchema.optional(),
     effective_start_at: z.coerce.number().optional(),
     effective_until_at: z.coerce.number().optional(),
@@ -56,9 +61,9 @@ const seriesDescriptorSchema = z.object({
   series_label: z.string().optional(),
 }).passthrough();
 export const usageTimeseriesSchema = z.object({
-  buckets: z.array(usageBucketSchema).optional(),
-  model_series: z.array(usageMetricRowSchema).optional(),
-  series: z.array(seriesDescriptorSchema).optional(),
+  buckets: z.preprocess((value) => (value === null ? undefined : value), z.array(usageBucketSchema).optional()),
+  model_series: optionalUsageRowsSchema,
+  series: z.preprocess((value) => (value === null ? undefined : value), z.array(seriesDescriptorSchema).optional()),
 }).passthrough().transform((value) => ({
   buckets: value.buckets ?? [],
   modelSeries: value.model_series ?? [],
@@ -67,18 +72,18 @@ export const usageTimeseriesSchema = z.object({
 
 export const usageByModelSchema = z.union([
   z.array(usageMetricRowSchema),
-  z.object({ models: z.array(usageMetricRowSchema).optional() }).passthrough().transform((value) => value.models ?? []),
+  z.object({ models: optionalUsageRowsSchema }).passthrough().transform((value) => value.models ?? []),
 ]);
 
 export const usageCacheSchema = z.object({
-  summary: usageMetricRowSchema.optional(),
-  by_account: z.array(usageMetricRowSchema).optional(),
-  by_model: z.array(usageMetricRowSchema).optional(),
-  by_api_key: z.array(usageMetricRowSchema).optional(),
-  by_account_model: z.array(usageMetricRowSchema).optional(),
-  by_route: z.array(usageMetricRowSchema).optional(),
-  by_route_account_model: z.array(usageMetricRowSchema).optional(),
-  by_time_bucket: z.array(usageMetricRowSchema).optional(),
+  summary: z.preprocess((value) => (value === null ? undefined : value), usageMetricRowSchema.optional()),
+  by_account: optionalUsageRowsSchema,
+  by_model: optionalUsageRowsSchema,
+  by_api_key: optionalUsageRowsSchema,
+  by_account_model: optionalUsageRowsSchema,
+  by_route: optionalUsageRowsSchema,
+  by_route_account_model: optionalUsageRowsSchema,
+  by_time_bucket: optionalUsageRowsSchema,
   window: windowSchema.optional(),
   effective_start_at: z.coerce.number().optional(),
 }).passthrough();

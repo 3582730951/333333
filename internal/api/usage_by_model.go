@@ -97,27 +97,41 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 		body["summary"] = report.Summary
 	}
 	if includeField("by_account") {
-		body["by_account"] = report.ByAccount
+		body["by_account"] = nonNilCacheUsageRows(report.ByAccount)
 	}
 	if includeField("by_model") {
-		body["by_model"] = report.ByModel
+		body["by_model"] = nonNilCacheUsageRows(report.ByModel)
 	}
 	if includeField("by_api_key") {
-		body["by_api_key"] = report.ByAPIKey
+		body["by_api_key"] = nonNilCacheUsageRows(report.ByAPIKey)
 	}
 	if includeField("by_account_model") {
-		body["by_account_model"] = report.ByAccountModel
+		body["by_account_model"] = nonNilCacheUsageRows(report.ByAccountModel)
 	}
 	if includeField("by_route") {
-		body["by_route"] = report.ByRoute
+		body["by_route"] = nonNilCacheUsageRows(report.ByRoute)
 	}
 	if includeField("by_route_account_model") {
-		body["by_route_account_model"] = report.ByRouteAccountModel
+		body["by_route_account_model"] = nonNilCacheUsageRows(report.ByRouteAccountModel)
 	}
 	if includeField("by_time_bucket") {
-		body["by_time_bucket"] = report.ByTimeBucket
+		body["by_time_bucket"] = nonNilCacheUsageBuckets(report.ByTimeBucket)
 	}
 	writeJSON(w, http.StatusOK, mergeWindowFields(body, win))
+}
+
+func nonNilCacheUsageRows(rows []storage.CacheUsageMetricRow) []storage.CacheUsageMetricRow {
+	if rows == nil {
+		return []storage.CacheUsageMetricRow{}
+	}
+	return rows
+}
+
+func nonNilCacheUsageBuckets(rows []storage.CacheUsageBucket) []storage.CacheUsageBucket {
+	if rows == nil {
+		return []storage.CacheUsageBucket{}
+	}
+	return rows
 }
 
 func parseCacheUsageFields(raw string) (map[string]bool, error) {
