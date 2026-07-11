@@ -252,11 +252,15 @@ type Config struct {
 	ClaudeNodeVersion string `json:"claude_node_version"`
 	// Kiro IDE fingerprint and regional endpoints. These are hot-reloadable through
 	// the settings registry; endpoint overrides on an individual credential win.
-	KiroVersion               string `json:"kiro_version"`
-	KiroNodeVersion           string `json:"kiro_node_version"`
-	KiroDefaultAuthRegion     string `json:"kiro_default_auth_region"`
-	KiroDefaultAPIRegion      string `json:"kiro_default_api_region"`
-	SchedulerHeartbeatSeconds int    `json:"scheduler_heartbeat_seconds"`
+	KiroVersion           string `json:"kiro_version"`
+	KiroNodeVersion       string `json:"kiro_node_version"`
+	KiroDefaultAuthRegion string `json:"kiro_default_auth_region"`
+	KiroDefaultAPIRegion  string `json:"kiro_default_api_region"`
+	// KiroDefaultThinking enables Kiro's model-level adaptive thinking whenever
+	// the downstream request does not explicitly disable thinking. Unlike the
+	// global thinking override, this only affects the Kiro compatibility path.
+	KiroDefaultThinking       bool `json:"kiro_default_thinking"`
+	SchedulerHeartbeatSeconds int  `json:"scheduler_heartbeat_seconds"`
 	// ClaudeStainlessVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
 	// version. Empty = the built-in/ per-account default.
@@ -721,6 +725,7 @@ func Default() Config {
 		KiroNodeVersion:                "22.22.0",
 		KiroDefaultAuthRegion:          "us-east-1",
 		KiroDefaultAPIRegion:           "us-east-1",
+		KiroDefaultThinking:            true,
 		SchedulerHeartbeatSeconds:      15,
 		ConversationIsolation:          true,
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so

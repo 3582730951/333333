@@ -20,9 +20,19 @@ type Conversion struct {
 	WebSearch   *WebSearchRequest
 }
 
+// ConversionOptions controls Kiro-only compatibility defaults. Explicit
+// downstream request fields always take precedence over these defaults.
+type ConversionOptions struct {
+	DefaultThinking bool
+}
+
 type WebSearchRequest struct{ Query, ToolUseID string }
 
 func ConvertAnthropicRequest(raw []byte, affinity string) (Conversion, error) {
+	return ConvertAnthropicRequestWithOptions(raw, affinity, ConversionOptions{})
+}
+
+func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options ConversionOptions) (Conversion, error) {
 	var req map[string]interface{}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return Conversion{}, err
@@ -56,31 +66,38 @@ func ConvertAnthropicRequest(raw []byte, affinity string) (Conversion, error) {
 			history = append(history, convertHistory(m, canonical, toolMap, toolUses, pairedUses))
 		}
 	}
-	last, _ := messages[len(messages)-1].(map[string]interface{})
-	content, images, results := contentParts(last["content"], toolUses)
-	prefix := contentText(req["system"])
-	if thinking, ok := req["thinking"].(map[string]interface{}); ok {
-		typ := stringValue(thinking["type"])
-		if typ == "enabled" {
-			prefix += fmt.Sprintf("\n<thinking_mode>enabled</thinking_mode><max_thinking_length>%v</max_thinking_length>", thinking["budget_tokens"])
-		}
-		if typ == "adaptive" {
-			effort := "high"
-			if out, ok := req["output_config"].(map[string]interface{}); ok && stringValue(out["effort"]) != "" {
-				effort = stringValue(out["effort"])
-			}
-			prefix += "\n<thinking_mode>adaptive</thinking_mode><thinking_effort>" + effort + "</thinking_effort>"
+	// Kiro requires history to begin with a user message. Anthropic-compatible
+	// clients may legally send an assistant prefill as the first historical item.
+	if len(history) > 0 {
+		if first, ok := history[0].(map[string]interface{}); ok && first["assistantResponseMessage"] != nil {
+			history = append([]interface{}{map[string]interface{}{
+				"userInputMessage": map[string]interface{}{"content": "Begin conversation", "modelId": canonical, "origin": "AI_EDITOR"},
+			}}, history...)
 		}
 	}
+	last, _ := messages[len(messages)-1].(map[string]interface{})
+	content, images, results := contentParts(last["content"], toolUses)
+	systemPrompt := strings.TrimSpace(contentText(req["system"]))
 	if out, ok := req["output_config"].(map[string]interface{}); ok {
 		if format := out["format"]; format != nil {
 			if b, e := json.Marshal(format); e == nil {
-				prefix += "\nReturn output that strictly satisfies this JSON format: " + string(b)
+				if systemPrompt != "" {
+					systemPrompt += "\n"
+				}
+				systemPrompt += "Return output that strictly satisfies this JSON format: " + string(b)
 			}
 		}
 	}
-	if prefix != "" {
-		content = "<system>\n" + strings.TrimSpace(prefix) + "\n</system>\n\n" + content
+	// Kiro's official clients represent a system instruction as a leading
+	// Human/AI history pair. Embedding it in the current user message as XML makes
+	// Claude treat it as an attempted prompt injection and also pollutes the stable
+	// context prefix.
+	if systemPrompt != "" {
+		systemHistory := []interface{}{
+			map[string]interface{}{"userInputMessage": map[string]interface{}{"content": systemPrompt, "origin": "AI_EDITOR", "userInputMessageContext": map[string]interface{}{}}},
+			map[string]interface{}{"assistantResponseMessage": map[string]interface{}{"content": "I will follow these instructions."}},
+		}
+		history = append(systemHistory, history...)
 	}
 	ctx := map[string]interface{}{}
 	if len(tools) > 0 {
@@ -100,11 +117,35 @@ func ConvertAnthropicRequest(raw []byte, affinity string) (Conversion, error) {
 		state["history"] = history
 	}
 	out := map[string]interface{}{"conversationState": state}
+	thinkingEnabled := options.DefaultThinking && supportsDefaultKiroThinking(canonical)
+	if thinking, ok := req["thinking"].(map[string]interface{}); ok {
+		switch strings.ToLower(strings.TrimSpace(stringValue(thinking["type"]))) {
+		case "disabled", "none":
+			thinkingEnabled = false
+		case "enabled", "adaptive", "auto":
+			thinkingEnabled = true
+		}
+	}
+	if thinkingEnabled {
+		// generateAssistantResponse accepts model-level request fields. Using the
+		// native field avoids injecting <thinking_mode> text into user content.
+		out["additionalModelRequestFields"] = map[string]interface{}{
+			"thinking": map[string]interface{}{"type": "adaptive"},
+		}
+	}
 	b, err := json.Marshal(out)
 	if err != nil {
 		return Conversion{}, err
 	}
 	return Conversion{Body: b, Model: canonical, ToolNameMap: toolMap, InputTokens: max64(1, int64(len(raw)/4)), WebSearch: webSearch}, nil
+}
+
+func supportsDefaultKiroThinking(model string) bool {
+	return strings.HasPrefix(model, "claude-opus-4.6") ||
+		strings.HasPrefix(model, "claude-opus-4.7") ||
+		strings.HasPrefix(model, "claude-opus-4.8") ||
+		strings.HasPrefix(model, "claude-sonnet-4.6") ||
+		strings.HasPrefix(model, "claude-sonnet-5")
 }
 
 func pureWebSearchRequest(toolsValue interface{}, messages []interface{}, affinity string) *WebSearchRequest {

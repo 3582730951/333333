@@ -22,7 +22,8 @@ import (
 
 func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	defer lease.Release()
-	converted, err := kirowire.ConvertAnthropicRequest(raw, affinity.Hash)
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	converted, err := kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{DefaultThinking: kiroCfg.KiroDefaultThinking})
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
@@ -52,7 +53,8 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 
 func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthBody []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	defer lease.Release()
-	converted, err := kirowire.ConvertAnthropicRequest(anthBody, affinity.Hash)
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	converted, err := kirowire.ConvertAnthropicRequestWithOptions(anthBody, affinity.Hash, kirowire.ConversionOptions{DefaultThinking: kiroCfg.KiroDefaultThinking})
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
@@ -190,6 +192,7 @@ func (s *Server) effectiveKiroConfig(ctx context.Context) config.Config {
 	cfg.KiroNodeVersion = s.settingString(ctx, "kiro_node_version", cfg.KiroNodeVersion)
 	cfg.KiroDefaultAuthRegion = s.settingString(ctx, "kiro_default_auth_region", cfg.KiroDefaultAuthRegion)
 	cfg.KiroDefaultAPIRegion = s.settingString(ctx, "kiro_default_api_region", cfg.KiroDefaultAPIRegion)
+	cfg.KiroDefaultThinking = s.flagEnabled(ctx, "kiro_default_thinking", cfg.KiroDefaultThinking)
 	return cfg
 }
 

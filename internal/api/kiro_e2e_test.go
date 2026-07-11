@@ -44,6 +44,13 @@ func TestKiroImportAndMessagesEndToEnd(t *testing.T) {
 			if r.Header.Get("Authorization") != "Bearer kiro-access" {
 				t.Errorf("authorization=%q", r.Header.Get("Authorization"))
 			}
+			requestBody, _ := io.ReadAll(r.Body)
+			if !bytes.Contains(requestBody, []byte(`"additionalModelRequestFields":{"thinking":{"type":"adaptive"}}`)) {
+				t.Errorf("Kiro default thinking missing from request: %s", requestBody)
+			}
+			if bytes.Contains(requestBody, []byte("<thinking_mode>")) || bytes.Contains(requestBody, []byte("<system>")) {
+				t.Errorf("legacy compatibility prompt leaked into request content: %s", requestBody)
+			}
 			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"hello from kiro"}`)))
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":7,"outputTokens":3}`)))

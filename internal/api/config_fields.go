@@ -232,6 +232,8 @@ func configFields() []configField {
 			Help: "凭证未指定时使用的认证区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAuthRegion }},
 		{Key: "kiro_default_api_region", Label: "Kiro 默认 API 区域", Category: catBehavior, Type: fieldString, Effect: effectHot,
 			Help: "凭证未指定时使用的推理区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAPIRegion }},
+		{Key: "kiro_default_thinking", Label: "Kiro 默认深度思考", Category: catBehavior, Type: fieldBool, Effect: effectHot,
+			Help: "下游未明确关闭 thinking 时，通过 Kiro 模型参数默认启用 adaptive thinking；不会向用户消息插入思考提示词。", boot: func(c config.Config) interface{} { return c.KiroDefaultThinking }},
 		{Key: "force_failover_on_429", Label: "429 强制换号", Category: catLimits, Type: fieldBool, Effect: effectHot,
 			Help: "开=即使带服务端状态(previous_response_id)的请求遇 429 也尝试换号(自包含请求默认即会换号)。", boot: func(c config.Config) interface{} { return c.ForceFailoverOn429 }},
 		{Key: "codex_prompt_cache_retention", Label: "Codex 提示缓存保留", Category: catBehavior, Type: fieldSelect, Effect: effectHot,

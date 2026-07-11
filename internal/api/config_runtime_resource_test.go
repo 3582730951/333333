@@ -98,6 +98,20 @@ func TestRuntimeSettingsCacheIsRequestScoped(t *testing.T) {
 	}
 }
 
+func TestKiroDefaultThinkingHotOverride(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if !h.app.effectiveKiroConfig(ctx).KiroDefaultThinking {
+		t.Fatal("Kiro adaptive thinking should be enabled by default")
+	}
+	if err := h.store.SetSetting(ctx, "kiro_default_thinking", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if h.app.effectiveKiroConfig(contextWithRuntimeSettingsCache(ctx)).KiroDefaultThinking {
+		t.Fatal("Kiro default thinking hot override was ignored")
+	}
+}
+
 func TestRegistrationSettingsDoNotIgnoreStoreErrors(t *testing.T) {
 	regSource := readAPISource(t, "registration.go")
 	for _, fn := range []string{"resolveConcurrency", "failureThreshold", "flagEnabledStr", "resolveMethod", "logEventDetail"} {
