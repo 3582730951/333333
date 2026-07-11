@@ -357,6 +357,31 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	res.Provider = provider
 	model := s.probeModel(ctx, account.ID, provider)
 	res.Model = model
+	if provider == "kiro" {
+		cred, kerr := s.store.GetKiroCredentials(ctx, account.ID)
+		if kerr != nil {
+			res.Err = kerr
+			return res
+		}
+		s.kiro.UpdateConfig(s.effectiveKiroConfig(ctx))
+		bearer, _, cred, kerr := s.kiro.Prepare(ctx, account, cred, token, egress, false)
+		if kerr != nil {
+			res.Err = kerr
+			return res
+		}
+		usage, kerr := s.kiro.UsageLimits(ctx, account, cred, bearer, egress)
+		if kerr != nil {
+			res.Err = kerr
+			return res
+		}
+		body, _ := json.Marshal(usage)
+		res.Status = http.StatusOK
+		res.Body = body
+		res.Verdict = ban.Classify(true, http.StatusOK, http.Header{}, body)
+		res.Alive = true
+		res.Ready = true
+		return res
+	}
 	req := upstream.Request{
 		Method:       http.MethodPost,
 		Headers:      http.Header{},
@@ -504,6 +529,9 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 func (s *Server) probeModel(ctx context.Context, accountID, provider string) string {
 	if provider == "claude" {
 		return "claude-sonnet-4-5"
+	}
+	if provider == "kiro" {
+		return "claude-sonnet-4.6"
 	}
 	if upstream.IsCustomProvider(provider) {
 		if prov, ok := s.customProviderByID(ctx, provider); ok && len(prov.Models) > 0 {

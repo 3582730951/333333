@@ -45,6 +45,12 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 	switch provider := s.accountProvider(account, token); provider {
 	case "claude":
 		return s.probeClaudeModels(ctx, account, token, binding, egress)
+	case "kiro":
+		caps := capability.StaticKiroModels(account.ID)
+		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+			return nil, err
+		}
+		return caps, nil
 	case "codex":
 		// fall through to the Codex /models probe below
 	default:
@@ -491,6 +497,29 @@ func (s *Server) adminRefresh(w http.ResponseWriter, r *http.Request, accountID 
 	switch provider := s.accountProvider(account, token); {
 	case provider == "claude":
 		s.refreshClaude(w, r, token)
+		return
+	case provider == "kiro":
+		cred, err := s.store.GetKiroCredentials(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		binding, err := s.store.GetEgressBinding(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		egress, err := s.store.GetEgressProfile(r.Context(), binding.PrimaryEgressID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		s.kiro.UpdateConfig(s.effectiveKiroConfig(r.Context()))
+		if _, _, _, err = s.kiro.Prepare(r.Context(), account, cred, token, egress, true); err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "refreshed": true, "method": "kiro"})
 		return
 	case upstream.IsCustomProvider(provider):
 		// Custom OpenAI-compatible providers authenticate with a static API key — there

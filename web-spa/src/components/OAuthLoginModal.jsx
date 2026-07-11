@@ -50,6 +50,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [copied, setCopied] = useState(false);
   const [manualRaw, setManualRaw] = useState('');
   const [kiroRaw, setKiroRaw] = useState('');
+  const [kiroClientRaw, setKiroClientRaw] = useState('');
   const [kiroResult, setKiroResult] = useState(null);
   const [egressId, setEgressId] = useState('egress_direct');
   const [egressProfiles, setEgressProfiles] = useState([]);
@@ -115,6 +116,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setCopied(false);
     setManualRaw('');
     setKiroRaw('');
+    setKiroClientRaw('');
     setKiroResult(null);
     setLabel('');
     setGroupName('');
@@ -244,6 +246,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     try {
       const result = await post('/admin/accounts/import-kiro-json', {
         kiro_json_text: kiroRaw,
+        kiro_client_json_text: kiroClientRaw,
         label,
         group_name: groupName,
         egress_id: egressId,
@@ -374,15 +377,32 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         <Form.Slot label="分组 (可选)"><Input value={groupName} onChange={setGroupName} placeholder="留空使用默认分组" /></Form.Slot>
         <Form.Slot label="账号默认出口"><Select value={egressId} onChange={setEgressId} optionList={egressOptions} /></Form.Slot>
       </Form>
-      <textarea
-        className="pool-textarea"
-        value={kiroRaw}
-        onChange={(e) => { setKiroRaw(e.target.value); setKiroResult(null); }}
-        placeholder={'粘贴单个对象、数组或 { "accounts": [...] }\n敏感字段仅加密保存，不会回传前端。'}
-        style={{ width: '100%', minHeight: 190, padding: 12, borderRadius: 6, border: '1px solid var(--pool-border)', fontFamily: 'monospace', resize: 'vertical', background: 'var(--pool-bg-surface)', color: 'var(--pool-text)' }}
-      />
+      <div style={{ display: 'grid', gap: 12 }}>
+        <div>
+          <Text strong>Token / 账号 JSON</Text>
+          <Text type="tertiary" style={{ marginLeft: 8 }}>必填</Text>
+          <textarea
+            className="pool-textarea"
+            value={kiroRaw}
+            onChange={(e) => { setKiroRaw(e.target.value); setKiroResult(null); }}
+            placeholder={'粘贴 kiro-auth-token.json、单个账号、数组或 { "accounts": [...] }'}
+            style={{ width: '100%', minHeight: 135, marginTop: 6, padding: 12, borderRadius: 6, border: '1px solid var(--pool-border)', fontFamily: 'monospace', resize: 'vertical', background: 'var(--pool-bg-surface)', color: 'var(--pool-text)' }}
+          />
+        </div>
+        <div>
+          <Text strong>客户端注册 JSON</Text>
+          <Text type="tertiary" style={{ marginLeft: 8 }}>Builder ID / IdC / Enterprise 必填，Social 与 API Key 可留空</Text>
+          <textarea
+            className="pool-textarea"
+            value={kiroClientRaw}
+            onChange={(e) => { setKiroClientRaw(e.target.value); setKiroResult(null); }}
+            placeholder={'粘贴与 clientIdHash 对应的 <hash>.json，后端会自动合并 clientId/clientSecret'}
+            style={{ width: '100%', minHeight: 120, marginTop: 6, padding: 12, borderRadius: 6, border: '1px solid var(--pool-border)', fontFamily: 'monospace', resize: 'vertical', background: 'var(--pool-bg-surface)', color: 'var(--pool-text)' }}
+          />
+        </div>
+      </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
-        <Text type="tertiary">识别账号：{recognizedKiroCount}</Text>
+        <Text type="tertiary">识别账号：{recognizedKiroCount}；两份 JSON 仅在服务端内存中合并，敏感字段加密保存</Text>
         <Button type="primary" theme="solid" loading={kiroLoading} disabled={!kiroRaw.trim()} onClick={handleKiroImport}>导入并验活</Button>
       </div>
       {kiroResult?.results?.length ? (

@@ -1,1 +1,0 @@
-import{N as e,U as t}from"./index-D6SCJzGg.js";function n(n){return t(e,n)}export{n as t};

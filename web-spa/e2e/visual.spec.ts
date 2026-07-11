@@ -310,6 +310,9 @@ test('account import provider marks stay bounded and model donut has one readabl
   expect(boundedMarks.every((mark) => mark.width <= 40 && mark.height <= 40)).toBe(true);
   await dialog.getByRole('tab').filter({ hasText: 'Kiro' }).click();
   await expect(dialog.getByText('Kiro 凭证 JSON', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('Token / 账号 JSON', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('客户端注册 JSON', { exact: true })).toBeVisible();
+  await expect(dialog.locator('textarea.pool-textarea')).toHaveCount(2);
   await expect.poll(() => dialog.locator('.pool-modal-body').evaluate((body) => body.scrollWidth <= body.clientWidth)).toBe(true);
   await accountPage.close();
 

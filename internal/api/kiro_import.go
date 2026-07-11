@@ -17,10 +17,16 @@ import (
 )
 
 type kiroImportItem struct {
-	AuthMethod, RefreshToken, AccessToken, ClientID, ClientSecret, ProfileARN, AuthRegion, APIRegion, MachineID, APIKey, Endpoint, Email, Plan string
-	ExpiresAt                                                                                                                                  int64
-	ProxyIgnored                                                                                                                               bool
-	ParseError                                                                                                                                 string
+	AuthMethod, RefreshToken, AccessToken, ClientID, ClientSecret, ClientIDHash, ProfileARN, AuthRegion, APIRegion, MachineID, APIKey, Endpoint, Email, Plan string
+	ExpiresAt                                                                                                                                                int64
+	ProxyIgnored                                                                                                                                             bool
+	ParseError                                                                                                                                               string
+}
+
+type kiroClientRegistration struct {
+	ClientIDHash string
+	ClientID     string
+	ClientSecret string
 }
 type kiroImportResult struct {
 	Index      int      `json:"index"`
@@ -41,10 +47,11 @@ func (s *Server) adminImportKiroJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		KiroJSONText string `json:"kiro_json_text"`
-		Label        string `json:"label"`
-		GroupName    string `json:"group_name"`
-		EgressID     string `json:"egress_id"`
+		KiroJSONText       string `json:"kiro_json_text"`
+		KiroClientJSONText string `json:"kiro_client_json_text"`
+		Label              string `json:"label"`
+		GroupName          string `json:"group_name"`
+		EgressID           string `json:"egress_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -54,6 +61,12 @@ func (s *Server) adminImportKiroJSON(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	if strings.TrimSpace(req.KiroClientJSONText) != "" {
+		if err := mergeKiroClientRegistrationJSON(items, []byte(req.KiroClientJSONText)); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid Kiro client registration JSON: %w", err))
+			return
+		}
 	}
 	if req.GroupName == "" {
 		req.GroupName = s.cfg.DefaultGroup
@@ -218,11 +231,11 @@ func parseKiroImportJSON(raw []byte) ([]kiroImportItem, error) {
 			return ""
 		}
 		method := normalizeKiroAuthMethod(get("authMethod", "auth_method", "method"))
-		item := kiroImportItem{AuthMethod: method, RefreshToken: get("refreshToken", "refresh_token"), AccessToken: get("accessToken", "access_token", "idToken", "id_token"), ClientID: get("clientId", "client_id"), ClientSecret: get("clientSecret", "client_secret"), ProfileARN: get("profileArn", "profile_arn"), AuthRegion: get("authRegion", "auth_region", "region"), APIRegion: get("apiRegion", "api_region"), MachineID: get("machineId", "machine_id"), APIKey: get("kiroApiKey", "kiro_api_key", "apiKey"), Endpoint: get("endpoint"), Email: get("email"), Plan: get("subscriptionTitle", "subscription_title", "plan")}
+		item := kiroImportItem{AuthMethod: method, RefreshToken: get("refreshToken", "refresh_token"), AccessToken: get("accessToken", "access_token", "idToken", "id_token"), ClientID: get("clientId", "client_id"), ClientSecret: get("clientSecret", "client_secret"), ClientIDHash: get("clientIdHash", "client_id_hash"), ProfileARN: get("profileArn", "profile_arn"), AuthRegion: get("authRegion", "auth_region", "region"), APIRegion: get("apiRegion", "api_region"), MachineID: get("machineId", "machine_id"), APIKey: get("kiroApiKey", "kiro_api_key", "apiKey"), Endpoint: get("endpoint"), Email: get("email"), Plan: get("subscriptionTitle", "subscription_title", "plan")}
 		if item.AuthMethod == "" {
 			if item.APIKey != "" {
 				item.AuthMethod = "api_key"
-			} else if item.ClientID != "" || item.ClientSecret != "" {
+			} else if item.ClientID != "" || item.ClientSecret != "" || item.ClientIDHash != "" {
 				item.AuthMethod = "idc"
 			} else {
 				item.AuthMethod = "social"
@@ -240,6 +253,127 @@ func parseKiroImportJSON(raw []byte) ([]kiroImportItem, error) {
 		out = append(out, item)
 	}
 	return out, nil
+}
+
+// mergeKiroClientRegistrationJSON joins Kiro IDE's two-file IdC credential
+// layout: kiro-auth-token.json contains clientIdHash while <hash>.json contains
+// clientId/clientSecret. A single registration is paired with a single missing
+// IdC account; arrays pair by order; keyed objects or explicit clientIdHash fields
+// pair by hash for batch imports.
+func mergeKiroClientRegistrationJSON(items []kiroImportItem, raw []byte) error {
+	registrations, err := parseKiroClientRegistrations(raw)
+	if err != nil {
+		return err
+	}
+	missing := make([]int, 0)
+	for i := range items {
+		if items[i].AuthMethod == "idc" && (items[i].ClientID == "" || items[i].ClientSecret == "") {
+			missing = append(missing, i)
+		}
+	}
+	used := make(map[int]bool)
+	for _, itemIndex := range missing {
+		registrationIndex := -1
+		if hash := strings.TrimSpace(items[itemIndex].ClientIDHash); hash != "" {
+			for i := range registrations {
+				if !used[i] && registrations[i].ClientIDHash != "" && strings.EqualFold(registrations[i].ClientIDHash, hash) {
+					registrationIndex = i
+					break
+				}
+			}
+		}
+		if registrationIndex < 0 && len(missing) == 1 && len(registrations) == 1 {
+			registrationIndex = 0
+		}
+		if registrationIndex < 0 && len(registrations) == len(items) && itemIndex < len(registrations) && !used[itemIndex] {
+			registrationIndex = itemIndex
+		}
+		if registrationIndex < 0 && len(registrations) == len(missing) {
+			for i := range registrations {
+				if !used[i] {
+					registrationIndex = i
+					break
+				}
+			}
+		}
+		if registrationIndex >= 0 {
+			registration := registrations[registrationIndex]
+			items[itemIndex].ClientID = registration.ClientID
+			items[itemIndex].ClientSecret = registration.ClientSecret
+			used[registrationIndex] = true
+		}
+		items[itemIndex].ParseError = ""
+		if err := validateKiroItem(items[itemIndex]); err != nil {
+			items[itemIndex].ParseError = err.Error()
+		}
+	}
+	return nil
+}
+
+func parseKiroClientRegistrations(raw []byte) ([]kiroClientRegistration, error) {
+	var root interface{}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, err
+	}
+	type candidate struct {
+		hash  string
+		value interface{}
+	}
+	candidates := make([]candidate, 0)
+	switch value := root.(type) {
+	case []interface{}:
+		for _, item := range value {
+			candidates = append(candidates, candidate{value: item})
+		}
+	case map[string]interface{}:
+		for _, key := range []string{"clients", "registrations", "accounts"} {
+			if values, ok := lookup(value, key).([]interface{}); ok {
+				for _, item := range values {
+					candidates = append(candidates, candidate{value: item})
+				}
+				break
+			}
+		}
+		if len(candidates) == 0 && (lookup(value, "clientId") != nil || lookup(value, "clientSecret") != nil) {
+			candidates = append(candidates, candidate{value: value})
+		}
+		if len(candidates) == 0 {
+			for hash, item := range value {
+				if _, ok := item.(map[string]interface{}); ok {
+					candidates = append(candidates, candidate{hash: hash, value: item})
+				}
+			}
+		}
+	default:
+		return nil, errors.New("client registration JSON must be an object or array")
+	}
+	registrations := make([]kiroClientRegistration, 0, len(candidates))
+	for i, candidate := range candidates {
+		value, ok := candidate.value.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("client registration %d must be an object", i+1)
+		}
+		get := func(name string) string {
+			field := lookup(value, name)
+			if field == nil {
+				return ""
+			}
+			return strings.TrimSpace(fmt.Sprint(field))
+		}
+		registration := kiroClientRegistration{
+			ClientIDHash: firstNonEmpty(get("clientIdHash"), candidate.hash),
+			ClientID:     get("clientId"),
+			ClientSecret: get("clientSecret"),
+		}
+		if registration.ClientID == "" || registration.ClientSecret == "" {
+			return nil, fmt.Errorf("client registration %d requires clientId and clientSecret", i+1)
+		}
+		registrations = append(registrations, registration)
+	}
+	if len(registrations) == 0 {
+		return nil, errors.New("client registration JSON contains no credentials")
+	}
+	return registrations, nil
 }
 func normalizeKiroAuthMethod(v string) string {
 	v = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(v), "-", "_"))

@@ -29,3 +29,41 @@ func TestKiroCredentialHashStableAndAuthAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeKiroTwoFileIdCCredentials(t *testing.T) {
+	items, err := parseKiroImportJSON([]byte(`{"authMethod":"IdC","refreshToken":"refresh-placeholder","clientIdHash":"hash-one","region":"us-east-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ParseError == "" {
+		t.Fatalf("token-only IdC input should require its registration file: %+v", items)
+	}
+	registration := []byte(`{"clientId":"client-placeholder","clientSecret":"secret-placeholder","expiresAt":"2099-01-01T00:00:00Z"}`)
+	if err := mergeKiroClientRegistrationJSON(items, registration); err != nil {
+		t.Fatal(err)
+	}
+	if items[0].ParseError != "" || items[0].ClientID != "client-placeholder" || items[0].ClientSecret != "secret-placeholder" {
+		t.Fatalf("two-file credentials were not merged: %+v", items[0])
+	}
+}
+
+func TestMergeKiroClientRegistrationsByHash(t *testing.T) {
+	items, err := parseKiroImportJSON([]byte(`[{"authMethod":"idc","refreshToken":"r1","clientIdHash":"hash-a"},{"authMethod":"idc","refreshToken":"r2","clientIdHash":"hash-b"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrations := []byte(`{"hash-b":{"clientId":"client-b","clientSecret":"secret-b"},"hash-a":{"clientId":"client-a","clientSecret":"secret-a"}}`)
+	if err := mergeKiroClientRegistrationJSON(items, registrations); err != nil {
+		t.Fatal(err)
+	}
+	if items[0].ClientID != "client-a" || items[1].ClientID != "client-b" || items[0].ParseError != "" || items[1].ParseError != "" {
+		t.Fatalf("hash registrations were mismatched: %+v", items)
+	}
+}
+
+func TestMergeKiroClientRegistrationRejectsIncompleteJSON(t *testing.T) {
+	items, _ := parseKiroImportJSON([]byte(`{"authMethod":"idc","refreshToken":"r","clientIdHash":"hash"}`))
+	if err := mergeKiroClientRegistrationJSON(items, []byte(`{"clientId":"client-only"}`)); err == nil {
+		t.Fatal("incomplete client registration must fail")
+	}
+}
