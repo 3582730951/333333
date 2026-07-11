@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
@@ -145,11 +146,13 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 	}
 	codex, missingTokens := codexQuotaPollTargets(accounts, tokens, now)
 	claude := claudeQuotaPollTargets(accounts, tokens, now)
-	if len(codex) == 0 && len(claude) == 0 && missingTokens == 0 {
+	kiro := kiroQuotaPollTargets(accounts, tokens, now)
+	if len(codex) == 0 && len(claude) == 0 && len(kiro) == 0 && missingTokens == 0 {
 		return
 	}
 	s.attachQuotaPollEgresses(ctx, codex)
 	s.attachQuotaPollEgresses(ctx, claude)
+	s.attachQuotaPollEgresses(ctx, kiro)
 	updated := 0
 	failed := missingTokens
 	// Concurrency-capped worker pool so we never open N connections at once.
@@ -228,10 +231,118 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 			}
 		}()
 	}
+	for i := range kiro {
+		target := kiro[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer supervisor.Recover("quota-poller-kiro-worker")
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				mu.Lock()
+				failed++
+				mu.Unlock()
+				return
+			}
+			defer func() { <-sem }()
+			if err := s.pollOneKiroQuota(ctx, target.Account, target.Token, target.Egress); err != nil {
+				s.recordQuotaPollError(ctx, target.Account, "kiro", err)
+				mu.Lock()
+				failed++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				updated++
+				mu.Unlock()
+			}
+		}()
+	}
 	wg.Wait()
+	if updated > 0 && s.scheduler != nil {
+		s.scheduler.NotifyStateChanged()
+	}
 	if updated > 0 || failed > 0 {
 		log.Printf("[QUOTA-POLL] tick complete: updated=%d failed=%d total_codex=%d total_claude=%d", updated, failed, len(codex), len(claude))
 	}
+}
+
+func kiroQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.AccountToken, now int64) []quotaPollTarget {
+	var out []quotaPollTarget
+	for _, account := range accounts {
+		if isQuotaPollCandidate(account, now) && strings.TrimSpace(account.Provider) == "kiro" {
+			if token, ok := tokens[account.ID]; ok {
+				out = append(out, quotaPollTarget{Account: account, Token: token})
+			}
+		}
+	}
+	return out
+}
+
+func (s *Server) pollOneKiroQuota(ctx context.Context, acc storage.Account, token storage.AccountToken, egress storage.EgressProfile) error {
+	s.kiro.UpdateConfig(s.effectiveKiroConfig(ctx))
+	cred, err := s.store.GetKiroCredentials(ctx, acc.ID)
+	if err != nil {
+		return err
+	}
+	bearer, token, cred, err := s.kiro.Prepare(ctx, acc, cred, token, egress, false)
+	if err != nil {
+		if errors.Is(err, kirowire.ErrInvalidGrant) {
+			s.scheduler.InvalidateAccountCache()
+		}
+		return err
+	}
+	limits, err := s.kiro.UsageLimits(ctx, acc, cred, bearer, egress)
+	if err != nil {
+		return err
+	}
+	if plan := kiroPlan(limits); plan != "" {
+		_ = s.store.SetAccountPlanType(ctx, acc.ID, plan)
+	}
+	list, _ := lookup(limits, "usageBreakdownList").([]interface{})
+	if len(list) == 0 {
+		return newQuotaPollError("partial", 0, nil, errors.New("kiro usage breakdown missing"))
+	}
+	base, _ := list[0].(map[string]interface{})
+	current := kiroJSONFloat(base, "currentUsageWithPrecision", "currentUsage")
+	limit := kiroJSONFloat(base, "usageLimitWithPrecision", "usageLimit")
+	if trial, ok := lookup(base, "freeTrialInfo").(map[string]interface{}); ok && strings.EqualFold(fmt.Sprint(lookup(trial, "freeTrialStatus")), "ACTIVE") {
+		current += kiroJSONFloat(trial, "currentUsageWithPrecision", "currentUsage")
+		limit += kiroJSONFloat(trial, "usageLimitWithPrecision", "usageLimit")
+	}
+	if bonuses, ok := lookup(base, "bonuses").([]interface{}); ok {
+		for _, v := range bonuses {
+			if b, ok := v.(map[string]interface{}); ok && strings.EqualFold(fmt.Sprint(lookup(b, "status")), "ACTIVE") {
+				current += kiroJSONFloat(b, "currentUsage")
+				limit += kiroJSONFloat(b, "usageLimit")
+			}
+		}
+	}
+	used := -1.0
+	if limit > 0 {
+		used = current / limit * 100
+	}
+	reset := int64(kiroJSONFloat(base, "nextDateReset"))
+	if reset == 0 {
+		reset = int64(kiroJSONFloat(limits, "nextDateReset"))
+	}
+	raw, _ := json.Marshal(limits)
+	return s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{AccountID: acc.ID, Provider: "kiro", LimiterType: "kiro_usage", Source: "kiro_usage", UsedPercent: used, LimitTokens: int64(limit), RemainingTokens: int64(limit - current), LimitRequests: -1, RemainingRequests: -1, ResetAt: reset, Status: "allowed", Raw: string(raw), UpdatedAt: storage.Now()})
+}
+
+func kiroJSONFloat(m map[string]interface{}, keys ...string) float64 {
+	for _, k := range keys {
+		if v := lookup(m, k); v != nil {
+			switch n := v.(type) {
+			case float64:
+				return n
+			case json.Number:
+				f, _ := n.Float64()
+				return f
+			}
+		}
+	}
+	return 0
 }
 
 func quotaPollCandidateAccountIDs(accounts []storage.Account, now int64) []string {

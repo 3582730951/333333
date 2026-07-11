@@ -287,6 +287,9 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 	if s.cfg.QuarantineDurationHours > 0 {
 		until := storage.Now() + int64(s.cfg.QuarantineDurationHours*3600)
 		_ = s.store.SetAccountQuarantine(ctx, account.ID, until, "ban: "+v.Reason)
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+		}
 	}
 }
 
@@ -343,6 +346,9 @@ func (s *Server) guardRateLimit(ctx context.Context, accountID string, header ht
 	if cd := exhaustedCooldown(header, storage.Now()); cd > 0 {
 		log.Printf("[RATE-GUARD] COOLDOWN: account=%s, duration=%ds, reason=exhausted", accountID, cd)
 		_ = s.store.SetBindingCooldown(ctx, accountID, storage.Now()+cd)
+		if s.scheduler != nil {
+			s.scheduler.NotifyStateChanged()
+		}
 	}
 }
 
@@ -376,10 +382,9 @@ func usageLimitCooldown(status int, body []byte) int64 {
 }
 
 // benchOnLimit cools the account's egress binding when the upstream signals a
-// usage/rate limit, so the pool stops routing to it: non-strict conversations
-// fail over to a fresh (namespaced) account, strict ones return 409 and the
-// downstream restarts the conversation. When a Retry-After / rate-limit reset is
-// present it is honored in preference to the heuristic window.
+// usage/rate limit, so movable conversations fail over to a fresh account while
+// requests carrying server-side state remain pinned and wait for recovery. When a
+// Retry-After / rate-limit reset is present it is honored over the heuristic window.
 func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int, header http.Header, body []byte) {
 	cd := usageLimitCooldown(status, body)
 	if cd == 0 {
@@ -393,4 +398,7 @@ func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int,
 	// pass a liveness probe before it re-enters the pool, so it can never silently
 	// resurface still-limited the instant its cooldown elapses.
 	_ = s.store.BenchBindingForRecheck(ctx, accountID, storage.Now()+cd)
+	if s.scheduler != nil {
+		s.scheduler.NotifyStateChanged()
+	}
 }

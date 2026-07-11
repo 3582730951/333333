@@ -727,7 +727,7 @@ func TestServerSideStateStrictStickyConcurrencyWaitsForPinnedAccount(t *testing.
 	}
 }
 
-func TestServerSideStateStrictStickyRateLimitDoesNotWait(t *testing.T) {
+func TestServerSideStateStrictStickyRateLimitWaitsForPinnedAccount(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	for _, id := range []string{"acc-1", "acc-2"} {
@@ -741,7 +741,7 @@ func TestServerSideStateStrictStickyRateLimitDoesNotWait(t *testing.T) {
 	}
 	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
 		AccountID: "acc-1", Provider: "codex", Model: "gpt-5", LimiterType: "tokens", Source: "tokens",
-		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 120, Status: "rejected",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1, ResetAt: storage.Now() + 1, Status: "rejected",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -750,16 +750,18 @@ func TestServerSideStateStrictStickyRateLimitDoesNotWait(t *testing.T) {
 	cfg.StatefulStickyWaitSeconds = 1
 	s := New(store, cfg)
 
+	selectCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+	defer cancel()
 	start := time.Now()
-	_, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true, ServerSideState: true})
+	_, err := s.Select(selectCtx, Route{Group: "cyber", Provider: "codex", Model: "gpt-5", Affinity: key, Strict: true, ServerSideState: true})
 	if !errors.Is(err, ErrStrictUnavailable) {
 		t.Fatalf("stateful strict request err = %v, want ErrStrictUnavailable", err)
 	}
-	if time.Since(start) > 200*time.Millisecond {
-		t.Fatalf("stateful strict rate-limit path waited %v, want fast failure", time.Since(start))
+	if time.Since(start) < 60*time.Millisecond {
+		t.Fatalf("stateful strict rate-limit path returned without waiting: %v", time.Since(start))
 	}
-	if strings.Contains(err.Error(), "stateful sticky wait timeout") {
-		t.Fatalf("rate-limit error should not be a local-capacity wait timeout: %v", err)
+	if !strings.Contains(err.Error(), "stateful sticky wait timeout") || !strings.Contains(err.Error(), "rate limit cooldown") {
+		t.Fatalf("rate-limit wait error should identify the pinned-account wait: %v", err)
 	}
 }
 

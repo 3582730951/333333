@@ -222,6 +222,16 @@ func configFields() []configField {
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "全组账号都在冷却时最多等待最短冷却的秒数；0=不等待。", boot: func(c config.Config) interface{} { return c.CooldownWaitMaxSeconds }},
+		{Key: "scheduler_heartbeat_seconds", Label: "调度等待心跳秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
+			Help: "流式推理在等待账号容量时发送 SSE 注释的间隔。", boot: func(c config.Config) interface{} { return c.SchedulerHeartbeatSeconds }},
+		{Key: "kiro_version", Label: "Kiro IDE 版本", Category: catBehavior, Type: fieldString, Effect: effectHot,
+			Help: "Kiro 上游请求指纹中的 IDE 版本。", boot: func(c config.Config) interface{} { return c.KiroVersion }},
+		{Key: "kiro_node_version", Label: "Kiro Node 版本", Category: catBehavior, Type: fieldString, Effect: effectHot,
+			Help: "Kiro 上游请求指纹中的 Node 版本。", boot: func(c config.Config) interface{} { return c.KiroNodeVersion }},
+		{Key: "kiro_default_auth_region", Label: "Kiro 默认认证区域", Category: catBehavior, Type: fieldString, Effect: effectHot,
+			Help: "凭证未指定时使用的认证区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAuthRegion }},
+		{Key: "kiro_default_api_region", Label: "Kiro 默认 API 区域", Category: catBehavior, Type: fieldString, Effect: effectHot,
+			Help: "凭证未指定时使用的推理区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAPIRegion }},
 		{Key: "force_failover_on_429", Label: "429 强制换号", Category: catLimits, Type: fieldBool, Effect: effectHot,
 			Help: "开=即使带服务端状态(previous_response_id)的请求遇 429 也尝试换号(自包含请求默认即会换号)。", boot: func(c config.Config) interface{} { return c.ForceFailoverOn429 }},
 		{Key: "codex_prompt_cache_retention", Label: "Codex 提示缓存保留", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
@@ -273,8 +283,6 @@ func configFields() []configField {
 			Help: "SQLite 路径，改后需重启。", boot: func(c config.Config) interface{} { return c.DatabasePath }},
 		{Key: "default_sidecar_chain_proxy", Label: "Sidecar 链式代理", Category: catBoot, Type: fieldString, Effect: effectRestart,
 			Help: "curl_cffi sidecar 出口链接的上游代理(仅本地测试需要，如 http://127.0.0.1:7897)。VPS 上必须留空。改后需重启。", boot: func(c config.Config) interface{} { return c.DefaultSidecarChainProxy }},
-		{Key: "max_concurrent_upstream", Label: "最大并发上游", Category: catBoot, Type: fieldInt, Effect: effectRestart,
-			Help: "全局在途上游请求上限(信号量在启动时构建)，改后需重启。", boot: func(c config.Config) interface{} { return c.MaxConcurrentUpstream }},
 	}
 }
 
@@ -377,7 +385,8 @@ func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 
 // effectiveSchedulerConfig builds the scheduler's live selection config from boot
 // defaults plus DB overrides. It intentionally covers only scheduler-owned knobs;
-// bootstrap-only limits such as max_concurrent_upstream still require restart.
+// Bootstrap-only listener/database fields still require restart; the deprecated
+// max_concurrent_upstream field is intentionally absent from this registry.
 func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	c := s.cfg
 	c.StickyWaitMillis = s.settingInt(ctx, "sticky_wait_millis", c.StickyWaitMillis)
@@ -385,6 +394,7 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	c.AccountTokenBudget = s.settingInt64(ctx, "account_token_budget", c.AccountTokenBudget)
 	c.StrictStickyMaxCooldownSeconds = s.settingInt(ctx, "strict_sticky_max_cooldown_seconds", c.StrictStickyMaxCooldownSeconds)
 	c.CooldownWaitMaxSeconds = s.settingInt(ctx, "cooldown_wait_max_seconds", c.CooldownWaitMaxSeconds)
+	c.SchedulerHeartbeatSeconds = s.settingInt(ctx, "scheduler_heartbeat_seconds", c.SchedulerHeartbeatSeconds)
 	if c.StickyWaitMillis <= 0 {
 		c.StickyWaitMillis = config.DefaultStickyWaitMillis
 	}
@@ -399,6 +409,9 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	}
 	if c.CooldownWaitMaxSeconds < 0 {
 		c.CooldownWaitMaxSeconds = 0
+	}
+	if c.SchedulerHeartbeatSeconds <= 0 {
+		c.SchedulerHeartbeatSeconds = 15
 	}
 	return c
 }
@@ -501,7 +514,7 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		default:
 			return "", fmt.Errorf("expected comma-separated ISO-2 country list")
 		}
-	case "sticky_wait_millis", "account_token_budget":
+	case "sticky_wait_millis", "account_token_budget", "scheduler_heartbeat_seconds":
 		raw, err := validateIntegerSetting(v)
 		if err != nil {
 			return "", err

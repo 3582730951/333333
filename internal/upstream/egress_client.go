@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/cookiejar"
@@ -10,6 +11,33 @@ import (
 
 	"codex-account-pool/internal/storage"
 )
+
+// DoRaw performs a provider-neutral request while retaining the pool's egress and
+// idle-timeout behavior. It is used by native adapters such as Kiro whose endpoint
+// and wire protocol are neither Codex nor Anthropic HTTP.
+func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
+	if strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
+		return c.DoViaSidecar(ctx, egress, method, rawURL, headers, body, cookieJarKey)
+	}
+	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, bytes.NewReader(body))
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	req.Header = headers.Clone()
+	client, err := c.httpClientForEgress(Request{Egress: egress})
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
+}
 
 // EgressHTTPClient returns a transparent *http.Client whose transport routes
 // through the given egress (direct / http(s)_proxy / warp_proxy / socks5(h)_proxy),

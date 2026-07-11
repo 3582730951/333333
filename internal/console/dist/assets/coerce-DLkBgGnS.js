@@ -1,0 +1,1 @@
+import{N as e,U as t}from"./index-BQmsqi5u.js";function n(n){return t(e,n)}export{n as t};

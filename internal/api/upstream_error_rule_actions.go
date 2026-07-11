@@ -14,21 +14,6 @@ import (
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 )
 
-type upstreamSlotReleaseKey struct{}
-
-func withUpstreamSlotRelease(ctx context.Context, release func()) context.Context {
-	if release == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, upstreamSlotReleaseKey{}, release)
-}
-
-func releaseUpstreamSlot(ctx context.Context) {
-	if fn, ok := ctx.Value(upstreamSlotReleaseKey{}).(func()); ok && fn != nil {
-		fn()
-	}
-}
-
 type upstreamErrorRuleDecision struct {
 	Rule  storage.UpstreamErrorRule
 	Match upstreamrules.MatchResult
@@ -52,9 +37,11 @@ func (s *Server) applyRuleAccountAction(ctx context.Context, account storage.Acc
 		return ban.Classify(false, status, header, body)
 	case upstreamrules.AccountActionCooldown:
 		_ = s.store.SetBindingCooldown(ctx, account.ID, storage.Now()+ruleCooldownSeconds(decision.Rule, status, header, body))
+		s.scheduler.NotifyStateChanged()
 		return ban.Classify(false, status, header, body)
 	case upstreamrules.AccountActionCooldownRecheck:
 		_ = s.store.BenchBindingForRecheck(ctx, account.ID, storage.Now()+ruleCooldownSeconds(decision.Rule, status, header, body))
+		s.scheduler.NotifyStateChanged()
 		return ban.Classify(false, status, header, body)
 	case upstreamrules.AccountActionQuarantine:
 		seconds := decision.Rule.CooldownSeconds

@@ -49,6 +49,8 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [redirected, setRedirected] = useState('');
   const [copied, setCopied] = useState(false);
   const [manualRaw, setManualRaw] = useState('');
+  const [kiroRaw, setKiroRaw] = useState('');
+  const [kiroResult, setKiroResult] = useState(null);
   const [egressId, setEgressId] = useState('egress_direct');
   const [egressProfiles, setEgressProfiles] = useState([]);
   const countdownRef = useRef(null);
@@ -112,6 +114,8 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setRedirected('');
     setCopied(false);
     setManualRaw('');
+    setKiroRaw('');
+    setKiroResult(null);
     setLabel('');
     setGroupName('');
     setNote('');
@@ -226,6 +230,32 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     }
   });
 
+  const recognizedKiroCount = useMemo(() => {
+    try {
+      const parsed = JSON.parse(kiroRaw || 'null');
+      if (Array.isArray(parsed)) return parsed.length;
+      if (Array.isArray(parsed?.accounts)) return parsed.accounts.length;
+      return parsed && typeof parsed === 'object' ? 1 : 0;
+    } catch (_) { return 0; }
+  }, [kiroRaw]);
+
+  const { run: handleKiroImport, running: kiroLoading } = useAsyncAction(async () => {
+    if (!kiroRaw.trim()) { Toast.warning('请粘贴 Kiro 凭证 JSON'); return; }
+    try {
+      const result = await post('/admin/accounts/import-kiro-json', {
+        kiro_json_text: kiroRaw,
+        label,
+        group_name: groupName,
+        egress_id: egressId,
+      }, { timeout: 120000 });
+      setKiroResult(result);
+      if (result.imported > 0) {
+        Toast.success(`已导入 ${result.imported} 个 Kiro 账号`);
+        if (onSuccess) onSuccess(result);
+      } else if (result.failed > 0) Toast.warning('没有账号导入成功，请查看逐项结果');
+    } catch (e) { showErrorToast(e, { prefix: 'Kiro 导入失败' }); }
+  });
+
   // Provider display info
   const providerInfo = {
     chatgpt: {
@@ -238,6 +268,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       desc: '使用 Anthropic 账号授权登录',
       vendor: 'claude',
     },
+    kiro: { name: 'Kiro', desc: '粘贴 Kiro IDE / KAM 导出的凭证 JSON', vendor: 'kiro' },
   };
 
   const currentInfo = providerInfo[tab] || providerInfo.chatgpt;
@@ -326,6 +357,43 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
           导入账号
         </Button>
       </div>
+    </div>
+  );
+
+  const kiroTabContent = (
+    <div className="pool-oauth-tab">
+      <div className="pool-oauth-identity pool-oauth-identity--provider">
+        <VendorLogo vendor="kiro" size={40} />
+        <div className="pool-oauth-identity__copy">
+          <Text strong className="pool-oauth-identity__name">Kiro 凭证 JSON</Text>
+          <Text type="tertiary" className="pool-oauth-identity__desc">支持 Social、Builder ID / IdC、API Key 与 KAM 批量格式</Text>
+        </div>
+      </div>
+      <Form>
+        <Form.Slot label="标签 (可选)"><Input value={label} onChange={setLabel} placeholder="批量导入时会自动追加序号" /></Form.Slot>
+        <Form.Slot label="分组 (可选)"><Input value={groupName} onChange={setGroupName} placeholder="留空使用默认分组" /></Form.Slot>
+        <Form.Slot label="账号默认出口"><Select value={egressId} onChange={setEgressId} optionList={egressOptions} /></Form.Slot>
+      </Form>
+      <textarea
+        className="pool-textarea"
+        value={kiroRaw}
+        onChange={(e) => { setKiroRaw(e.target.value); setKiroResult(null); }}
+        placeholder={'粘贴单个对象、数组或 { "accounts": [...] }\n敏感字段仅加密保存，不会回传前端。'}
+        style={{ width: '100%', minHeight: 190, padding: 12, borderRadius: 6, border: '1px solid var(--pool-border)', fontFamily: 'monospace', resize: 'vertical', background: 'var(--pool-bg-surface)', color: 'var(--pool-text)' }}
+      />
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
+        <Text type="tertiary">识别账号：{recognizedKiroCount}</Text>
+        <Button type="primary" theme="solid" loading={kiroLoading} disabled={!kiroRaw.trim()} onClick={handleKiroImport}>导入并验活</Button>
+      </div>
+      {kiroResult?.results?.length ? (
+        <div style={{ marginTop: 16, maxHeight: 180, overflow: 'auto' }}>
+          {kiroResult.results.map((item) => (
+            <div key={item.index} style={{ padding: '8px 0', borderTop: '1px solid var(--pool-border)', display: 'flex', gap: 8 }}>
+              <Text strong>#{item.index + 1}</Text><Text>{item.status}</Text><Text type="tertiary">{item.label || item.error || ''}</Text>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 
@@ -541,6 +609,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
           itemKey="chatgpt"
         >
           {oauthTabContent}
+        </TabPane>
+        <TabPane
+          tab={(<span className="pool-vendor-tab"><VendorLogo vendor="kiro" size={18} /><span>Kiro</span></span>)}
+          itemKey="kiro"
+        >
+          {kiroTabContent}
         </TabPane>
         <TabPane
           tab={(

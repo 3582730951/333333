@@ -161,6 +161,7 @@ func (s *Server) adminBrowserRepair(w http.ResponseWriter, r *http.Request, acco
 		return
 	}
 	_ = s.store.SetBindingCooldown(r.Context(), accountID, 0)
+	s.scheduler.NotifyStateChanged()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_id": accountID,
 		"egress_id":  egressID,

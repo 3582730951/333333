@@ -10,6 +10,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,6 +74,7 @@ type accountView struct {
 	CodexReauthConfigured  bool                          `json:"codex_reauth_configured,omitempty"`
 	CodexReauthAutoEnabled bool                          `json:"codex_reauth_auto_enabled,omitempty"`
 	CodexReauthLastStatus  string                        `json:"codex_reauth_last_status,omitempty"`
+	KiroAuth               *storage.KiroAuthSummary      `json:"kiro_auth,omitempty"`
 }
 
 type accountImportResponse struct {
@@ -137,6 +139,13 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 			view.CodexReauthConfigured = true
 			view.CodexReauthAutoEnabled = cfg.AutoEnabled
 			view.CodexReauthLastStatus = cfg.LastStatus
+		}
+		if providers[account.ID] == "kiro" {
+			if summary, err := s.store.KiroAuthSummary(ctx, account.ID); err == nil {
+				view.KiroAuth = &summary
+			} else if !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
 		}
 		out = append(out, view)
 	}
@@ -302,6 +311,8 @@ func (s *Server) seedImportedAccountCapabilities(ctx context.Context, account st
 	switch strings.ToLower(strings.TrimSpace(account.Provider)) {
 	case "claude":
 		caps = capability.StaticClaudeModels(account.ID)
+	case "kiro":
+		caps = capability.StaticKiroModels(account.ID)
 	case "", "codex":
 		caps = capability.StaticCodexModels(account.ID)
 	default:

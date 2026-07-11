@@ -2878,11 +2878,38 @@ func TestRateLimitGivesNoBanDelete(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":{"message":"You've hit your usage limit."}}`))
 	})
 	acc := h.importAccount(t, "limited", "upstream-l", "access-l")
-	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","input":"hi"}`))
-	if err != nil {
-		t.Fatal(err)
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	done := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		binding, _ := h.store.GetEgressBinding(context.Background(), acc)
+		if binding.CooldownUntil > storage.Now() {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("rate-limited account should be on cooldown")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	resp.Body.Close()
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("queued inference should end only after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancel did not release queued request")
+	}
 	if _, err := h.store.GetAccount(context.Background(), acc); err != nil {
 		t.Fatalf("rate-limited account must not be deleted: %v", err)
 	}

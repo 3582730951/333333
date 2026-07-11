@@ -42,18 +42,39 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 
 	routeGroup := pol.Group
-	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, anthBody, routeGroup, pol.KeyHash, model)
-	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:           routeGroup,
-		Provider:        "claude",
-		Affinity:        affinity,
-		Model:           model,
-		EstimatedTokens: virtual.EstimateTokensJSON(raw),
-	})
+	allowedProviders, err := claudeAllowedProviders(r, pol)
 	if err != nil {
-		status, _ := noAccountHTTPStatus(err)
-		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "claude", model, err)
+		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	r = r.WithContext(withSchedulerWait(r.Context(), w, stream, "openai"))
+	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, anthBody, routeGroup, pol.KeyHash, model)
+	exclude := map[string]bool{}
+	var lease scheduler.Lease
+	for {
+		lease, err = s.scheduler.Select(r.Context(), scheduler.Route{
+			Group:            routeGroup,
+			AllowedProviders: allowedProviders,
+			Affinity:         affinity,
+			Model:            model,
+			EstimatedTokens:  virtual.EstimateTokensJSON(raw),
+			Exclude:          exclude,
+			OnWait:           schedulerWaitCallback(r.Context()),
+		})
+		if err != nil {
+			if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
+				return
+			}
+			status, _ := noAccountHTTPStatus(err)
+			s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "claude", model, err)
+			return
+		}
+		if lease.Account.Provider != "kiro" {
+			break
+		}
+		if s.kiroChatWithLease(w, r, anthBody, model, affinity, lease, true, exclude) != outcomeRetry {
+			return
+		}
 	}
 	leaseReleased := false
 	releaseLease := func() {
@@ -76,7 +97,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 	token, err = s.prepareClaudeTokenWithHeartbeat(r.Context(), lease.Account, token, "chat_claude_preflight", refreshHeartbeat.beat)
 	if err != nil {
-		if refreshHeartbeat.writeError(err) {
+		if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, err)
@@ -139,7 +160,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	releaseFlight()
 	if err != nil {
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
-		if refreshHeartbeat.writeError(err) {
+		if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 			return
 		}
 		writeError(w, http.StatusBadGateway, err)
@@ -156,7 +177,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
 				if err != nil {
 					_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_refresh")
-					if refreshHeartbeat.writeError(err) {
+					if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 						return
 					}
 					writeError(w, http.StatusBadGateway, err)
@@ -167,7 +188,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 					goto chatClaudeSuccess
 				}
 				errBody = readUpstreamErrorBody(resp.Body)
-			} else if refreshHeartbeat.writeError(rerr) {
+			} else if writeClaudeWaitError(r.Context(), refreshHeartbeat, rerr) {
 				return
 			}
 		}
@@ -186,7 +207,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
 		}
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
-		if refreshHeartbeat.writeError(errors.New("claude upstream returned an error after authentication refresh")) {
+		if writeClaudeWaitError(r.Context(), refreshHeartbeat, errors.New("claude upstream returned an error after authentication refresh")) {
 			return
 		}
 		if ruleMatched {
@@ -195,7 +216,6 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				if stream {
 					resp.Body.Close()
 					releaseLease()
-					releaseUpstreamSlot(r.Context())
 				}
 				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errBody, result.Scrubber, decision, stream) {
 					return

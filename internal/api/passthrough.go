@@ -3,6 +3,7 @@ package api
 import (
 	"io"
 	"net/http"
+	"strings"
 
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/routing"
@@ -54,25 +55,18 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		raw = b
 	}
 
-	release, ok := s.acquire(r.Context())
-	if !ok {
-		return
-	}
-	released := false
-	releaseOnce := func() {
-		if released {
-			return
-		}
-		released = true
-		release()
-	}
-	defer releaseOnce()
-	r = r.WithContext(withUpstreamSlotRelease(r.Context(), releaseOnce))
-
 	// Authenticate + resolve the routing group (honors RequireDownstreamKey). The
 	// force-model/effort overrides are irrelevant here and never touch the opaque body.
 	pol, ok := s.resolveDownstreamPolicy(w, r)
 	if !ok {
+		return
+	}
+	hint := normalizeProviderHintLoose(r.Header.Get("X-Pool-Provider"))
+	if strings.TrimSpace(r.Header.Get("X-Pool-Provider")) == "" {
+		hint = normalizeProviderHintLoose(pol.ProviderHint)
+	}
+	if hint == "kiro" {
+		s.writeCapabilityUnavailable(w, http.StatusBadRequest, "Kiro does not support this Anthropic passthrough endpoint", []string{"kiro_unsupported_endpoint:" + r.URL.Path}, "official_claude_passthrough", "kiro", "Use provider_hint=\"claude\" for Files, Skills, Agents and related endpoints.")
 		return
 	}
 
@@ -171,7 +165,6 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 				if isEventStream(resp.Header) {
 					resp.Body.Close()
 					releaseLease()
-					releaseUpstreamSlot(r.Context())
 				}
 				if s.writeRuleDownstream(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, nil, decision, isEventStream(resp.Header)) {
 					return

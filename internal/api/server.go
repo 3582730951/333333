@@ -22,6 +22,7 @@ import (
 	"codex-account-pool/internal/console"
 	"codex-account-pool/internal/gopay"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/payment"
 	"codex-account-pool/internal/prompt"
@@ -69,10 +70,6 @@ type Server struct {
 	// oauth holds in-flight web-login (paste-back) PKCE sessions for the
 	// /admin/oauth/* import flow. In-memory + TTL'd; see oauth.go.
 	oauth *oauthStore
-	// sem bounds total in-flight upstream requests across the process (nil =
-	// unlimited). It is backpressure that protects VPS memory and NIC under
-	// 1M-context × many downstream connections; it engages only under flood.
-	sem chan struct{}
 	// identitySecretCached is the resolved identity secret, computed once in
 	// NewServer. ResolveSecret reads /etc/machine-id from disk on the common
 	// (unconfigured) path, so resolving it per request would be a syscall on every
@@ -91,6 +88,7 @@ type Server struct {
 	regHandler       *Handler
 	lifecycleHandler *LifecycleHandlers
 	claudeRefresh    *claudeRefreshGates
+	kiro             *kiro.Manager
 	// asyncWrites carries fire-and-forget DB writes (usage rows, virtual-ledger rows)
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
@@ -137,6 +135,7 @@ func NewServer(dep Dependencies) *Server {
 		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		lifecycleHandler:    newServerLifecycleHandlers(dep.Store),
 		claudeRefresh:       newClaudeRefreshGates(),
+		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
 		claudeCacheFlights:  map[string]chan struct{}{},
 		claudeCacheDiagPrev: map[string]string{},
 		codexResetLocks:     map[string]*sync.Mutex{},
@@ -144,9 +143,6 @@ func NewServer(dep Dependencies) *Server {
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
 	s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
-	if dep.Config.MaxConcurrentUpstream > 0 {
-		s.sem = make(chan struct{}, dep.Config.MaxConcurrentUpstream)
-	}
 	s.startAsyncWriter()
 	// Apply any persisted runtime overrides for the upstream-consumed fingerprint /
 	// identity fields to the upstream client at boot, so admin settings survive a
@@ -159,23 +155,6 @@ func NewServer(dep Dependencies) *Server {
 	}
 	s.routes()
 	return s
-}
-
-// acquire takes a global in-flight slot, blocking (with backpressure) until one is
-// free or the request is cancelled. The returned release MUST be called. When no
-// cap is configured it is a zero-cost no-op, so the normal-load latency is
-// unchanged (the /fast streaming path is never slowed unless the process is at the
-// configured ceiling).
-func (s *Server) acquire(ctx context.Context) (func(), bool) {
-	if s.sem == nil {
-		return func() {}, true
-	}
-	select {
-	case s.sem <- struct{}{}:
-		return func() { <-s.sem }, true
-	case <-ctx.Done():
-		return func() {}, false
-	}
 }
 
 func (s *Server) routes() {
@@ -238,6 +217,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/accounts/import-token", s.adminImportToken)
 	s.mux.HandleFunc("/admin/accounts/import-cookie", s.adminImportCookie)
 	s.mux.HandleFunc("/admin/accounts/import-key", s.adminImportKey)
+	s.mux.HandleFunc("/admin/accounts/import-kiro-json", s.adminImportKiroJSON)
 	// Bulk-reassign accounts to a group (exact path; takes precedence over the
 	// /admin/accounts/ subtree handler). Single reassign is /admin/accounts/<id>/group.
 	s.mux.HandleFunc("/admin/accounts/assign-group", s.adminAccountsAssignGroup)
@@ -346,7 +326,11 @@ func (s *Server) routes() {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "time": storage.Now()})
+	body := map[string]interface{}{"ok": true, "time": storage.Now()}
+	if s.scheduler != nil {
+		body["scheduler"] = s.scheduler.Metrics()
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -362,6 +346,29 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if hint, ok := s.modelsProviderHint(r); !ok {
+		writeError(w, http.StatusBadRequest, errors.New("provider hint must be auto, codex, claude, or kiro"))
+		return
+	} else if hint != "auto" {
+		accounts, listErr := s.store.ListAccounts(r.Context())
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, listErr)
+			return
+		}
+		allowed := map[string]bool{}
+		for _, account := range accounts {
+			if strings.EqualFold(strings.TrimSpace(account.Provider), hint) {
+				allowed[account.ID] = true
+			}
+		}
+		filtered := caps[:0]
+		for _, c := range caps {
+			if allowed[c.AccountID] {
+				filtered = append(filtered, c)
+			}
+		}
+		caps = filtered
 	}
 	// Content-negotiate by client family: an Anthropic client (Claude Code) needs the
 	// native Anthropic /v1/models schema or its model picker / "auto" selection breaks;
@@ -400,6 +407,22 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+func (s *Server) modelsProviderHint(r *http.Request) (string, bool) {
+	if raw := strings.TrimSpace(r.Header.Get("X-Pool-Provider")); raw != "" {
+		return normalizeProviderHint(raw)
+	}
+	if plain := downstreamBearer(r); plain != "" {
+		if key, found, _ := s.store.LookupAPIKey(r.Context(), hashAPIKey(plain)); found {
+			hint := normalizeProviderHintLoose(key.ProviderHint)
+			if hint == "auto" || hint == "codex" || hint == "claude" || hint == "kiro" {
+				return hint, true
+			}
+			return "", false
+		}
+	}
+	return "auto", true
+}
+
 func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if isResponsesWebSocketUpgrade(r) {
 		s.handleGatewayWebSocket(w, r)
@@ -414,26 +437,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, err)
 		return
 	}
-	// Global in-flight backpressure (NIC/memory protection under 1M-context load).
-	// Covers the Claude-compat delegation below too, so it never double-acquires. A
-	// relay-internal call (the moderation model, nested inside another request) must
-	// NOT acquire a second slot or it could deadlock against the parent at the cap.
-	if !isInternalCall(r.Context()) {
-		release, ok := s.acquire(r.Context())
-		if !ok {
-			return
-		}
-		released := false
-		releaseOnce := func() {
-			if released {
-				return
-			}
-			released = true
-			release()
-		}
-		defer releaseOnce()
-		r = r.WithContext(withUpstreamSlotRelease(r.Context(), releaseOnce))
-	}
+	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "openai"))
 	// Authenticate the downstream api key (if any) and resolve its routing group +
 	// forced model/effort policy. The forced model is applied to the body BEFORE
 	// affinity/capability routing so the request lands on an account that has the
@@ -622,8 +626,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		EstimatedTokens: virtual.EstimateTokensJSON(raw),
 		Compaction:      routing.IsCompaction(path, raw),
 		Exclude:         exclude,
+		OnWait:          schedulerWaitCallback(r.Context()),
 	})
 	if err != nil {
+		if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		status, _ := noAccountHTTPStatus(err)
 		s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "", model, err)
 		return codexAttemptResult{Outcome: outcomeDone}
@@ -982,7 +990,6 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 						resp.Body = nil
 					}
 					releaseLease()
-					releaseUpstreamSlot(r.Context())
 				}
 				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, isStreamRequest(raw)) {
 					return codexAttemptResult{Outcome: outcomeDone}
@@ -1414,6 +1421,7 @@ func (s *Server) solveAndInject(ctx context.Context, account storage.Account, eg
 		_ = s.upstream.SeedSidecarCookies(ctx, sc, account.ID, egress.ID, upstreamHost, fallbackKey, upstream.CookieMapFromHeader(sol.CookieHeader))
 	}
 	_ = s.store.SetBindingCooldown(ctx, account.ID, 0)
+	s.scheduler.NotifyStateChanged()
 	return nil
 }
 

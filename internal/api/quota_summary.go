@@ -92,6 +92,7 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 			out.Supported = false
 			return out
 		}
+	case "kiro":
 	default:
 		out.SyncReason = "unsupported_provider"
 		out.Supported = false
@@ -138,6 +139,8 @@ func selectQuotaPrimary(provider string, snapshots []storage.AccountRateLimit) *
 	preferred := []string{"5h_polled", "tokens", "unified"}
 	if provider == "claude" {
 		preferred = []string{"5h_oauth_usage", "unified"}
+	} else if provider == "kiro" {
+		preferred = []string{"kiro_usage", "unified"}
 	}
 	for _, limiter := range preferred {
 		if snap := latestSnapshotWithLimiter(snapshots, limiter); snap != nil {

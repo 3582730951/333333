@@ -129,6 +129,9 @@ func (s *Server) recheckPendingAccounts(ctx context.Context) {
 		}
 	}
 	if restored+benched+removed > 0 {
+		if s.scheduler != nil {
+			s.scheduler.NotifyStateChanged()
+		}
 		log.Printf("[RECHECK] sweep: restored=%d re-benched=%d removed=%d", restored, benched, removed)
 	}
 }

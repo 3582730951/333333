@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"sort"
@@ -183,6 +184,7 @@ type AccountPoolSummary struct {
 	Recheck     int `json:"recheck"`
 	Codex       int `json:"codex"`
 	Claude      int `json:"claude"`
+	Kiro        int `json:"kiro"`
 	Other       int `json:"other"`
 }
 
@@ -198,6 +200,37 @@ type AccountToken struct {
 	OAuthRateLimitTier string `json:"oauth_rate_limit_tier,omitempty"`
 	CreatedAt          int64  `json:"created_at"`
 	UpdatedAt          int64  `json:"updated_at"`
+}
+
+// KiroCredentials contains the non-token portion of a Kiro IDE credential. Access
+// and refresh tokens remain in AccountToken so rotation uses the existing atomic
+// token update path. ClientSecret and KiroAPIKey are transparently encrypted at rest.
+type KiroCredentials struct {
+	AccountID      string `json:"account_id"`
+	AuthMethod     string `json:"auth_method"`
+	ClientID       string `json:"client_id,omitempty"`
+	ClientSecret   string `json:"-"`
+	ProfileARN     string `json:"profile_arn,omitempty"`
+	AuthRegion     string `json:"auth_region"`
+	APIRegion      string `json:"api_region"`
+	MachineID      string `json:"machine_id,omitempty"`
+	KiroAPIKey     string `json:"-"`
+	Endpoint       string `json:"endpoint,omitempty"`
+	CredentialHash string `json:"-"`
+	CreatedAt      int64  `json:"created_at"`
+	UpdatedAt      int64  `json:"updated_at"`
+}
+
+type KiroAuthSummary struct {
+	AuthMethod      string `json:"auth_method"`
+	AuthRegion      string `json:"auth_region"`
+	APIRegion       string `json:"api_region"`
+	Endpoint        string `json:"endpoint,omitempty"`
+	HasClientID     bool   `json:"has_client_id"`
+	HasClientSecret bool   `json:"has_client_secret"`
+	HasProfileARN   bool   `json:"has_profile_arn"`
+	HasMachineID    bool   `json:"has_machine_id"`
+	HasAPIKey       bool   `json:"has_api_key"`
 }
 
 type ModelCapability struct {
@@ -720,6 +753,23 @@ CREATE TABLE IF NOT EXISTS account_auth_tokens(
   updated_at INTEGER NOT NULL,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS account_kiro_credentials(
+  account_id TEXT PRIMARY KEY,
+  auth_method TEXT NOT NULL,
+  client_id TEXT NOT NULL DEFAULT '',
+  client_secret TEXT NOT NULL DEFAULT '',
+  profile_arn TEXT NOT NULL DEFAULT '',
+  auth_region TEXT NOT NULL DEFAULT 'us-east-1',
+  api_region TEXT NOT NULL DEFAULT 'us-east-1',
+  machine_id TEXT NOT NULL DEFAULT '',
+  kiro_api_key TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  credential_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kiro_credential_hash ON account_kiro_credentials(credential_hash) WHERE credential_hash <> '';
 CREATE TABLE IF NOT EXISTS account_model_capabilities(
   account_id TEXT NOT NULL,
   model_slug TEXT NOT NULL,
@@ -1277,6 +1327,23 @@ func (s *Store) migrate(ctx context.Context) error {
 		// New indexes for query optimization (idempotent CREATE INDEX IF NOT EXISTS)
 		// Covers the model capability JOIN used by capability-aware routing
 		`CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id)`,
+		`CREATE TABLE IF NOT EXISTS account_kiro_credentials(
+  account_id TEXT PRIMARY KEY,
+  auth_method TEXT NOT NULL,
+  client_id TEXT NOT NULL DEFAULT '',
+  client_secret TEXT NOT NULL DEFAULT '',
+  profile_arn TEXT NOT NULL DEFAULT '',
+  auth_region TEXT NOT NULL DEFAULT 'us-east-1',
+  api_region TEXT NOT NULL DEFAULT 'us-east-1',
+  machine_id TEXT NOT NULL DEFAULT '',
+  kiro_api_key TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  credential_hash TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_kiro_credential_hash ON account_kiro_credentials(credential_hash) WHERE credential_hash <> ''`,
 		// Covers egress binding cooldown queries used by shortestCooldown
 		`CREATE INDEX IF NOT EXISTS idx_egress_binding_cooldown ON account_egress_bindings(cooldown_until, recheck_pending)`,
 		// Covers account detail drawer audit lookups without scanning the global audit log.
@@ -1865,6 +1932,7 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 	}
 	defer tx.Rollback()
 	for _, stmt := range []string{
+		`DELETE FROM account_kiro_credentials WHERE account_id = ?`,
 		`DELETE FROM user_sessions WHERE user_id = ?`,
 		`DELETE FROM api_keys WHERE user_id = ?`,
 		`DELETE FROM users WHERE id = ?`,
@@ -2043,6 +2111,8 @@ LEFT JOIN account_auth_tokens t ON t.account_id = a.id
 			summary.Codex++
 		case "claude":
 			summary.Claude++
+		case "kiro":
+			summary.Kiro++
 		default:
 			summary.Other++
 		}
@@ -2409,6 +2479,57 @@ func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
 	return err
 }
 
+func (s *Store) UpsertKiroCredentials(ctx context.Context, c KiroCredentials) error {
+	if strings.TrimSpace(c.AccountID) == "" {
+		return errors.New("kiro account id required")
+	}
+	now := Now()
+	if c.CreatedAt == 0 {
+		c.CreatedAt = now
+	}
+	c.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_kiro_credentials(account_id, auth_method, client_id, client_secret, profile_arn, auth_region, api_region, machine_id, kiro_api_key, endpoint, credential_hash, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET auth_method=excluded.auth_method, client_id=excluded.client_id, client_secret=excluded.client_secret, profile_arn=excluded.profile_arn, auth_region=excluded.auth_region, api_region=excluded.api_region, machine_id=excluded.machine_id, kiro_api_key=excluded.kiro_api_key, endpoint=excluded.endpoint, credential_hash=excluded.credential_hash, updated_at=excluded.updated_at`,
+		c.AccountID, c.AuthMethod, c.ClientID, s.sealToken(c.ClientSecret), c.ProfileARN, c.AuthRegion, c.APIRegion, c.MachineID, s.sealToken(c.KiroAPIKey), c.Endpoint, c.CredentialHash, c.CreatedAt, c.UpdatedAt)
+	return err
+}
+
+func (s *Store) GetKiroCredentials(ctx context.Context, accountID string) (KiroCredentials, error) {
+	var c KiroCredentials
+	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, client_id, client_secret, profile_arn, auth_region, api_region, machine_id, kiro_api_key, endpoint, credential_hash, created_at, updated_at FROM account_kiro_credentials WHERE account_id=?`, accountID).
+		Scan(&c.AccountID, &c.AuthMethod, &c.ClientID, &c.ClientSecret, &c.ProfileARN, &c.AuthRegion, &c.APIRegion, &c.MachineID, &c.KiroAPIKey, &c.Endpoint, &c.CredentialHash, &c.CreatedAt, &c.UpdatedAt)
+	c.ClientSecret = s.openToken(c.ClientSecret)
+	c.KiroAPIKey = s.openToken(c.KiroAPIKey)
+	return c, err
+}
+
+func (s *Store) KiroCredentialHashExists(ctx context.Context, hash string) (bool, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_kiro_credentials WHERE credential_hash=?`, hash).Scan(&n)
+	return n > 0, err
+}
+
+func (s *Store) KiroAuthSummary(ctx context.Context, accountID string) (KiroAuthSummary, error) {
+	c, err := s.GetKiroCredentials(ctx, accountID)
+	if err != nil {
+		return KiroAuthSummary{}, err
+	}
+	return KiroAuthSummary{AuthMethod: c.AuthMethod, AuthRegion: c.AuthRegion, APIRegion: c.APIRegion, Endpoint: publicKiroEndpoint(c.Endpoint),
+		HasClientID: c.ClientID != "", HasClientSecret: c.ClientSecret != "", HasProfileARN: c.ProfileARN != "", HasMachineID: c.MachineID != "", HasAPIKey: c.KiroAPIKey != ""}, nil
+}
+
+func publicKiroEndpoint(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
 // SetTokenEncryptionKey enables transparent at-rest encryption of secret columns using
 // a 32-byte key derived from the deployment secret (identity.ResolveSecret in main).
 // Call once after Open/Init and before serving. An empty secret leaves encryption off.
@@ -2499,6 +2620,32 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 	}
 	for _, r := range keyPending {
 		if _, err := s.db.ExecContext(ctx, `UPDATE api_keys SET secret = ?, updated_at = ? WHERE key_hash = ?`, s.sealToken(r.secret), Now(), r.hash); err != nil {
+			return n, err
+		}
+		n++
+	}
+	kiroRows, err := s.rdb.QueryContext(ctx, `SELECT account_id, client_secret, kiro_api_key FROM account_kiro_credentials`)
+	if err != nil {
+		return n, err
+	}
+	type kiroRec struct{ id, secret, apiKey string }
+	var kiroPending []kiroRec
+	for kiroRows.Next() {
+		var r kiroRec
+		if err := kiroRows.Scan(&r.id, &r.secret, &r.apiKey); err != nil {
+			kiroRows.Close()
+			return n, err
+		}
+		if anyPlaintextSecret(r.secret, r.apiKey) {
+			kiroPending = append(kiroPending, r)
+		}
+	}
+	kiroRows.Close()
+	if err := kiroRows.Err(); err != nil {
+		return n, err
+	}
+	for _, r := range kiroPending {
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_kiro_credentials SET client_secret=?, kiro_api_key=? WHERE account_id=?`, s.sealToken(r.secret), s.sealToken(r.apiKey), r.id); err != nil {
 			return n, err
 		}
 		n++

@@ -195,7 +195,6 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			case upstreamrules.DownstreamActionIdleStream:
 				if isStreamRequest(body) {
 					lease.Release()
-					releaseUpstreamSlot(r.Context())
 				} else {
 					lease.Release()
 				}

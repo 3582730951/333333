@@ -20,6 +20,11 @@ func (s *Server) handleSharedEndpoint(w http.ResponseWriter, r *http.Request) {
 			"official_codex_shared_endpoint",
 			"codex_shared_endpoint",
 			"Use an upstream that supports this OpenAI endpoint directly, or set provider_hint=\"claude\" for Claude Code passthrough requests.")
+	case target == "kiro":
+		s.writeCapabilityUnavailable(w, http.StatusBadRequest,
+			"Kiro does not expose this passthrough endpoint",
+			[]string{"kiro_unsupported_endpoint:" + r.URL.Path},
+			"official_claude_passthrough", "kiro", "Route Files, Skills, Agents and related endpoints to provider_hint=\"claude\".")
 	case strings.HasPrefix(target, "custom:"):
 		s.writeCapabilityUnavailable(w, http.StatusBadRequest,
 			"custom providers do not advertise this shared endpoint through the pool",
@@ -50,7 +55,7 @@ func (s *Server) resolveSharedEndpointTarget(w http.ResponseWriter, r *http.Requ
 				[]string{"shared_endpoint:" + r.URL.Path},
 				"valid_provider_hint",
 				"shared_endpoint:"+explicit,
-				"Use X-Pool-Provider: codex, claude, or custom:<provider_id>.")
+				"Use X-Pool-Provider: codex, claude, kiro, or custom:<provider_id>.")
 			return "", false
 		}
 		return hint, true

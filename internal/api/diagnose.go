@@ -55,7 +55,7 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 		accountIDs = append(accountIDs, account.ID)
 	}
 	tokensByID, _ := s.store.ListTokensByAccountIDs(ctx, accountIDs)
-	type gcount struct{ active, parked, codex, claude, custom int }
+	type gcount struct{ active, parked, codex, claude, kiro, custom int }
 	byGroup := map[string]*gcount{}
 	now := storage.Now()
 	for _, a := range all {
@@ -75,6 +75,8 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 			g.claude++
 		case "codex":
 			g.codex++
+		case "kiro":
+			g.kiro++
 		default:
 			g.custom++
 		}
@@ -96,11 +98,13 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 	case cur.active == 0:
 		fmt.Fprintf(&b, "Group %q has %d account(s) but all are quarantined or disabled. ", group, cur.parked)
 	default:
-		fmt.Fprintf(&b, "Group %q: %d active (codex=%d claude=%d custom=%d), %d quarantined/disabled. ", group, cur.active, cur.codex, cur.claude, cur.custom, cur.parked)
+		fmt.Fprintf(&b, "Group %q: %d active (codex=%d claude=%d kiro=%d custom=%d), %d quarantined/disabled. ", group, cur.active, cur.codex, cur.claude, cur.kiro, cur.custom, cur.parked)
 		if provider == "codex" && cur.codex == 0 {
 			b.WriteString("None of the active accounts are Codex/GPT accounts. ")
 		} else if provider == "claude" && cur.claude == 0 {
 			b.WriteString("None of the active accounts are Claude accounts. ")
+		} else if provider == "kiro" && cur.kiro == 0 {
+			b.WriteString("None of the active accounts are Kiro accounts. ")
 		}
 	}
 	// Where ARE the usable accounts? The smoking gun for a group mismatch.

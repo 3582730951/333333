@@ -94,7 +94,7 @@ func (s *Server) adminAPIKeys(w http.ResponseWriter, r *http.Request) {
 		}
 		providerHint, ok := normalizeProviderHint(req.ProviderHint)
 		if !ok {
-			writeError(w, http.StatusBadRequest, errors.New("provider_hint must be auto, codex, claude, or custom:<provider_id>"))
+			writeError(w, http.StatusBadRequest, errors.New("provider_hint must be auto, codex, claude, kiro, or custom:<provider_id>"))
 			return
 		}
 		enabled := true
@@ -199,7 +199,7 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 		if req.ProviderHint != nil {
 			hint, ok := normalizeProviderHint(*req.ProviderHint)
 			if !ok {
-				writeError(w, http.StatusBadRequest, errors.New("provider_hint must be auto, codex, claude, or custom:<provider_id>"))
+				writeError(w, http.StatusBadRequest, errors.New("provider_hint must be auto, codex, claude, kiro, or custom:<provider_id>"))
 				return
 			}
 			key.ProviderHint = hint

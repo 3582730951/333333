@@ -48,6 +48,57 @@ var claudeStaticModels = []string{
 	"claude-haiku-4-5-20251001",
 }
 
+var kiroStaticModels = []string{
+	"claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5",
+	"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5",
+	"claude-haiku-4.5", "claude-fable-5",
+}
+
+// KiroCanonicalModel maps Claude aliases and dated Anthropic identifiers onto the
+// model ids accepted by generateAssistantResponse. Non-Claude families are rejected.
+func KiroCanonicalModel(model string) (string, bool) {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(m, "fable"):
+		return "claude-fable-5", true
+	case strings.Contains(m, "sonnet"):
+		if strings.Contains(m, "5") && !strings.Contains(m, "4-5") && !strings.Contains(m, "4.5") {
+			return "claude-sonnet-5", true
+		}
+		if strings.Contains(m, "4-6") || strings.Contains(m, "4.6") {
+			return "claude-sonnet-4.6", true
+		}
+		return "claude-sonnet-4.5", true
+	case strings.Contains(m, "opus"):
+		for _, version := range []string{"4.8", "4.7", "4.6", "4.5"} {
+			if strings.Contains(m, version) || strings.Contains(m, strings.ReplaceAll(version, ".", "-")) {
+				return "claude-opus-" + version, true
+			}
+		}
+		return "claude-opus-4.8", true
+	case strings.Contains(m, "haiku"):
+		return "claude-haiku-4.5", true
+	case m == "auto" || m == "default":
+		return "claude-opus-4.8", true
+	default:
+		return "", false
+	}
+}
+
+func StaticKiroModels(accountID string) []storage.ModelCapability {
+	now := storage.Now()
+	out := make([]storage.ModelCapability, 0, len(kiroStaticModels))
+	for _, slug := range kiroStaticModels {
+		window := int64(1000000)
+		if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
+			window = 200000
+		}
+		out = append(out, storage.ModelCapability{AccountID: accountID, ModelSlug: slug, NativeContextWindow: window,
+			NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100, Source: "kiro_static", LastProbeAt: now})
+	}
+	return out
+}
+
 // claudeWindow returns the native context window for a Claude model id, falling
 // back to the standard 200k window every current Claude model supports.
 func claudeWindow(slug string) int64 {
@@ -446,6 +497,8 @@ func providerKeyForSource(source string) string {
 		return source
 	case strings.HasPrefix(s, "claude"):
 		return "claude"
+	case strings.HasPrefix(s, "kiro"):
+		return "kiro"
 	default:
 		return "codex"
 	}
@@ -547,14 +600,21 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 // OAuth token whose /models endpoint is rejected) still surfaces.
 func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byte, string, error) {
 	claudeCaps := make([]storage.ModelCapability, 0, len(capabilities))
+	kiroCaps := make([]storage.ModelCapability, 0, len(capabilities))
 	for _, c := range capabilities {
-		if providerKeyForSource(c.Source) == "claude" {
+		switch providerKeyForSource(c.Source) {
+		case "claude":
 			claudeCaps = append(claudeCaps, c)
+		case "kiro":
+			kiroCaps = append(kiroCaps, c)
 		}
 	}
 	// Richest single Claude account's set, floored by the static current-gen list so the
 	// full sonnet/haiku/opus family Claude Code's auto mode expects is always present.
-	merged := MergeClaudeStatic("", richestAccountCaps(claudeCaps))
+	merged := append([]storage.ModelCapability(nil), richestAccountCaps(kiroCaps)...)
+	if len(claudeCaps) > 0 {
+		merged = append(merged, MergeClaudeStatic("", richestAccountCaps(claudeCaps))...)
+	}
 	seen := make(map[string]bool, len(merged))
 	data := make([]interface{}, 0, len(merged))
 	appendModel := func(slug string) {
@@ -572,7 +632,7 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 	for _, c := range merged {
 		appendModel(c.ModelSlug)
 	}
-	if len(data) == 0 {
+	if len(data) == 0 && len(kiroCaps) == 0 {
 		for _, slug := range claudeStaticModels {
 			appendModel(slug)
 		}

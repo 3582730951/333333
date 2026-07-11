@@ -250,6 +250,13 @@ type Config struct {
 	// ClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version (real Claude Code runs on Node). Empty = default.
 	ClaudeNodeVersion string `json:"claude_node_version"`
+	// Kiro IDE fingerprint and regional endpoints. These are hot-reloadable through
+	// the settings registry; endpoint overrides on an individual credential win.
+	KiroVersion               string `json:"kiro_version"`
+	KiroNodeVersion           string `json:"kiro_node_version"`
+	KiroDefaultAuthRegion     string `json:"kiro_default_auth_region"`
+	KiroDefaultAPIRegion      string `json:"kiro_default_api_region"`
+	SchedulerHeartbeatSeconds int    `json:"scheduler_heartbeat_seconds"`
 	// ClaudeStainlessVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
 	// version. Empty = the built-in/ per-account default.
@@ -359,10 +366,9 @@ type Config struct {
 	// operators don't have to manually unquarantine after fixing the underlying
 	// issue (e.g. re-login, scope update). Set false to require manual review.
 	HealthTestClearsQuarantine bool `json:"health_test_clears_quarantine"`
-	// MaxConcurrentUpstream bounds the number of in-flight upstream requests across
-	// the whole process — backpressure that protects VPS memory and NIC under
-	// 1M-context × many downstream connections. 0 = unlimited. The cap is high
-	// enough never to add latency in normal operation (only engages under flood).
+	// MaxConcurrentUpstream is retained solely so older configuration files continue
+	// to parse. Process-wide admission limiting was removed; account/egress capacity
+	// is handled by the scheduler's unbounded, cancellation-aware wait queue.
 	MaxConcurrentUpstream int `json:"max_concurrent_upstream"`
 	// RateLimitGuardEnabled enables proactive rate-limit avoidance: honor
 	// Retry-After on 429 and pre-emptively cool an account whose x-ratelimit-
@@ -711,6 +717,11 @@ func Default() Config {
 		MaxBodyBytes:                   DefaultMaxBodyBytes,
 		AccountTokenBudget:             DefaultAccountTokenBudget,
 		SidecarTimeoutSeconds:          120,
+		KiroVersion:                    "0.11.107",
+		KiroNodeVersion:                "22.22.0",
+		KiroDefaultAuthRegion:          "us-east-1",
+		KiroDefaultAPIRegion:           "us-east-1",
+		SchedulerHeartbeatSeconds:      15,
 		ConversationIsolation:          true,
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
 		// that path benefits from prompt caching like native Claude Code does.
@@ -820,6 +831,14 @@ func Load(path string) (Config, error) {
 
 func (c *Config) StickyWait() time.Duration {
 	return time.Duration(c.StickyWaitMillis) * time.Millisecond
+}
+
+func (c Config) SchedulerHeartbeat() time.Duration {
+	seconds := c.SchedulerHeartbeatSeconds
+	if seconds <= 0 {
+		seconds = 15
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // AdmissionWait is the bounded backpressure window a request spends waiting for a
@@ -1201,6 +1220,21 @@ func (c *Config) normalize() {
 	}
 	if c.SidecarTimeoutSeconds <= 0 {
 		c.SidecarTimeoutSeconds = 120
+	}
+	if strings.TrimSpace(c.KiroVersion) == "" {
+		c.KiroVersion = "0.11.107"
+	}
+	if strings.TrimSpace(c.KiroNodeVersion) == "" {
+		c.KiroNodeVersion = "22.22.0"
+	}
+	if strings.TrimSpace(c.KiroDefaultAuthRegion) == "" {
+		c.KiroDefaultAuthRegion = "us-east-1"
+	}
+	if strings.TrimSpace(c.KiroDefaultAPIRegion) == "" {
+		c.KiroDefaultAPIRegion = "us-east-1"
+	}
+	if c.SchedulerHeartbeatSeconds <= 0 {
+		c.SchedulerHeartbeatSeconds = 15
 	}
 	if c.FailoverMaxAttempts <= 0 {
 		c.FailoverMaxAttempts = 3

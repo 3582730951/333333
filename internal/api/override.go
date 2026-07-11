@@ -217,13 +217,30 @@ func normalizeProviderHintLoose(v string) string {
 func normalizeProviderHint(v string) (string, bool) {
 	v = normalizeProviderHintLoose(v)
 	switch v {
-	case "auto", "codex", "claude":
+	case "auto", "codex", "claude", "kiro":
 		return v, true
 	}
 	if strings.HasPrefix(v, "custom:") && strings.TrimPrefix(v, "custom:") != "" {
 		return v, true
 	}
 	return "", false
+}
+
+func claudeAllowedProviders(r *http.Request, pol downstreamPolicy) ([]string, error) {
+	hint := normalizeProviderHintLoose(r.Header.Get("X-Pool-Provider"))
+	if strings.TrimSpace(r.Header.Get("X-Pool-Provider")) == "" {
+		hint = normalizeProviderHintLoose(pol.ProviderHint)
+	}
+	switch hint {
+	case "auto", "":
+		return []string{"claude", "kiro"}, nil
+	case "claude":
+		return []string{"claude"}, nil
+	case "kiro":
+		return []string{"kiro"}, nil
+	default:
+		return nil, errors.New("Claude-family inference provider must be auto, claude, or kiro")
+	}
 }
 
 // setForcedModel rewrites the top-level "model" field of a request body. It fires on

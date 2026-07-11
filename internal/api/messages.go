@@ -70,20 +70,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, err)
 		return
 	}
-	release, ok := s.acquire(r.Context())
-	if !ok {
-		return
-	}
-	released := false
-	releaseOnce := func() {
-		if released {
-			return
-		}
-		released = true
-		release()
-	}
-	defer releaseOnce()
-	r = r.WithContext(withUpstreamSlotRelease(r.Context(), releaseOnce))
 	path := r.URL.Path
 
 	// Resolve the downstream api key's policy (routing group + forced model /
@@ -95,6 +81,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// RequireDownstreamKey here, which this handler previously bypassed.
 	pol, ok := s.resolveDownstreamPolicy(w, r)
 	if !ok {
+		return
+	}
+	allowedProviders, err := claudeAllowedProviders(r, pol)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
@@ -129,6 +120,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		model = norm
 	}
 	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
+	if strings.HasSuffix(path, "/count_tokens") {
+		count := virtual.EstimateTokensJSON(raw)
+		if count < 1 {
+			count = 1
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": count})
+		return
+	}
 
 	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is relayed to
 	// that provider, converting Anthropic Messages ↔ Chat Completions both ways. Claude
@@ -165,8 +164,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	exclude := map[string]bool{}
-	for attempt := 0; attempt < attempts; attempt++ {
-		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, attempt < attempts-1, exclude) != outcomeRetry {
+	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "anthropic"))
+	_ = attempts // retained as a parsed compatibility knob; transient retries are scheduler-bound now.
+	for {
+		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, true, exclude) != outcomeRetry {
 			return
 		}
 	}
@@ -179,23 +180,30 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // account is added to exclude before any retry so it is not re-selected. Mirrors the
 // Codex path's codexAttempt; a benched account is held out of the pool until the
 // recheck loop re-validates it.
-func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	streamReq := isStreamRequest(raw)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:           group,
-		Provider:        "claude",
-		Affinity:        affinity,
-		Strict:          strict,
-		ServerSideState: !movable,
-		Movable:         movable,
-		Model:           model,
-		EstimatedTokens: virtual.EstimateTokensJSON(raw),
-		Exclude:         exclude,
+		Group:            group,
+		AllowedProviders: allowedProviders,
+		Affinity:         affinity,
+		Strict:           strict,
+		ServerSideState:  !movable,
+		Movable:          movable,
+		Model:            model,
+		EstimatedTokens:  virtual.EstimateTokensJSON(raw),
+		Exclude:          exclude,
+		OnWait:           schedulerWaitCallback(r.Context()),
 	})
 	if err != nil {
+		if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
+			return outcomeDone
+		}
 		status, _ := noAccountHTTPStatus(err)
 		s.writePublicNoAccountError(r.Context(), w, status, group, "claude", model, err)
 		return outcomeDone
+	}
+	if lease.Account.Provider == "kiro" {
+		return s.kiroMessagesWithLease(w, r, raw, model, affinity, lease, allowRetry, exclude)
 	}
 	leaseReleased := false
 	releaseLease := func() {
@@ -224,7 +232,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 	token, err = s.prepareClaudeTokenWithHeartbeat(r.Context(), lease.Account, token, "messages_preflight", refreshHeartbeat.beat)
 	if err != nil {
-		if refreshHeartbeat.writeError(err) {
+		if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 			return outcomeDone
 		}
 		writeError(w, http.StatusBadGateway, err)
@@ -307,7 +315,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		if allowRetry && movable {
 			return retry() // transport error — a fresh account/egress may succeed
 		}
-		if refreshHeartbeat.writeError(err) {
+		if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 			return outcomeDone
 		}
 		writeError(w, http.StatusBadGateway, err)
@@ -327,7 +335,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 					if allowRetry && movable {
 						return retry()
 					}
-					if refreshHeartbeat.writeError(err) {
+					if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 						return outcomeDone
 					}
 					writeError(w, http.StatusBadGateway, err)
@@ -340,7 +348,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 				errorBody = readUpstreamErrorBody(resp.Body)
 			} else {
 				log.Printf("claude auth refresh %s: %v", lease.Account.ID, rerr)
-				if refreshHeartbeat.writeError(rerr) {
+				if writeClaudeWaitError(r.Context(), refreshHeartbeat, rerr) {
 					return outcomeDone
 				}
 			}
@@ -374,7 +382,6 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 				if isStreamRequest(raw) {
 					resp.Body.Close()
 					releaseLease()
-					releaseUpstreamSlot(r.Context())
 				}
 				if s.writeRuleDownstream(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber, decision, isStreamRequest(raw)) {
 					return outcomeDone
@@ -391,7 +398,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		if allowRetry && movable && retryableForFailover(v, resp.StatusCode) {
 			return retry()
 		}
-		if refreshHeartbeat.writeError(errors.New("claude upstream returned an error after authentication refresh")) {
+		if writeClaudeWaitError(r.Context(), refreshHeartbeat, errors.New("claude upstream returned an error after authentication refresh")) {
 			return outcomeDone
 		}
 		s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber)
@@ -408,7 +415,7 @@ claudeSuccess:
 			if allowRetry && movable {
 				return retry()
 			}
-			if refreshHeartbeat.writeError(probeErr) {
+			if writeClaudeWaitError(r.Context(), refreshHeartbeat, probeErr) {
 				return outcomeDone
 			}
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
@@ -420,7 +427,7 @@ claudeSuccess:
 			if allowRetry && movable {
 				return retry()
 			}
-			if refreshHeartbeat.writeError(errors.New("claude stream returned retryable error after authentication refresh")) {
+			if writeClaudeWaitError(r.Context(), refreshHeartbeat, errors.New("claude stream returned retryable error after authentication refresh")) {
 				return outcomeDone
 			}
 			writePublicUnavailable(w, http.StatusServiceUnavailable)

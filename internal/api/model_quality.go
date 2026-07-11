@@ -518,12 +518,7 @@ func (s *Server) executeModelQualityProbe(ctx context.Context, combo modelQualit
 	if err != nil {
 		return qualityProbeError(result, "request", err, started)
 	}
-	release, ok := s.acquire(probeCtx)
-	if !ok {
-		return qualityProbeError(result, "admission", probeCtx.Err(), started)
-	}
 	resp, err := s.upstream.Do(probeCtx, spec)
-	defer release()
 	if err != nil {
 		return qualityProbeError(result, "transport", err, started)
 	}

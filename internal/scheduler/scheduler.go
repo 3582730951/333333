@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
@@ -29,6 +30,9 @@ type Scheduler struct {
 	inflightTokens map[string]int64
 	loadChanged    chan struct{}
 	rr             int // round-robin cursor for spreading load across equal-load candidates
+	queueMu        sync.Mutex
+	waitQueues     map[string][]*waiter
+	metrics        SchedulerMetrics
 
 	// accountCache caches the active accounts list per group with a short TTL to reduce
 	// DB queries on the hot path. The cache is invalidated when an account's status
@@ -65,7 +69,29 @@ type candidate struct {
 	account storage.Account
 	egress  storage.EgressProfile
 	binding storage.AccountEgressBinding
-	score   int // inflight count used for load-based selection
+	score   float64 // normalized account/token/egress load; lower is better
+}
+
+type waiter struct {
+	id      uint64
+	started time.Time
+}
+
+// SchedulerMetrics is a cheap runtime snapshot used by diagnostics and tests. Values
+// are process-local and intentionally monotonic except Queued, which is a gauge.
+type SchedulerMetrics struct {
+	Queued          int64 `json:"queued"`
+	Waited          int64 `json:"waited"`
+	Cancelled       int64 `json:"cancelled"`
+	AccountSwitches int64 `json:"account_switches"`
+	WaitConcurrency int64 `json:"wait_concurrency"`
+	WaitTokenBudget int64 `json:"wait_token_budget"`
+	WaitCooldown    int64 `json:"wait_cooldown"`
+	WaitRecheck     int64 `json:"wait_recheck"`
+	WaitEgress      int64 `json:"wait_egress"`
+	CooldownWakeups int64 `json:"cooldown_wakeups"`
+	StateWakeups    int64 `json:"state_wakeups"`
+	WaitNanos       int64 `json:"wait_nanos"`
 }
 
 type leaseBlockReason string
@@ -76,6 +102,7 @@ const (
 	leaseBlockConcurrency       leaseBlockReason = "concurrency"
 	leaseBlockRateLimitCooldown leaseBlockReason = "rate_limit_cooldown"
 	leaseBlockRecheckPending    leaseBlockReason = "recheck_pending"
+	leaseBlockEgressCooldown    leaseBlockReason = "egress_cooldown"
 	leaseBlockEgressUnavailable leaseBlockReason = "egress_unavailable"
 	leaseBlockInactive          leaseBlockReason = "inactive"
 	leaseBlockQuarantined       leaseBlockReason = "quarantined"
@@ -88,16 +115,21 @@ const (
 // (quarantine, enable/disable, group change, import/delete).
 func (s *Scheduler) InvalidateAccountCache() {
 	s.accountCacheMutex.Lock()
-	defer s.accountCacheMutex.Unlock()
 	s.accountCache = nil
+	s.accountCacheMutex.Unlock()
+	s.NotifyStateChanged()
 }
 
 type Route struct {
-	Group           string
-	Provider        string // "" (any) / "codex" / "claude" — selects provider-matching accounts
-	Affinity        routing.AffinityKey
-	Strict          bool
-	ServerSideState bool
+	Group    string
+	Provider string // "" (any) / "codex" / "claude" — selects provider-matching accounts
+	// AllowedProviders is the provider union eligible for this request. It supersedes
+	// Provider when non-empty and lets Claude-family traffic mix official Claude and
+	// Kiro accounts without assigning either a fixed priority.
+	AllowedProviders []string
+	Affinity         routing.AffinityKey
+	Strict           bool
+	ServerSideState  bool
 	// Movable is kept for existing call sites/tests that already computed
 	// !ServerSideState. New callers should set ServerSideState directly.
 	Movable         bool
@@ -110,6 +142,10 @@ type Route struct {
 	// just-failed account can never reappear in the same request's retry (the
 	// "有问题的账号不应该二次出现在下次的候选名单" requirement). A nil map excludes nothing.
 	Exclude map[string]bool
+	// OnWait is called at most once per scheduler heartbeat while the request is
+	// queued. Streaming HTTP callers use it for a legal SSE comment; non-streaming
+	// callers leave it nil and no response bytes are committed.
+	OnWait func(reason string, waited time.Duration)
 }
 
 type NoAccountCounters struct {
@@ -121,6 +157,7 @@ type NoAccountCounters struct {
 	RateLimitCooldown int
 	RecheckPending    int
 	EgressUnavailable int
+	EgressCooldown    int
 	Concurrency       int
 	TokenBudget       int
 }
@@ -150,6 +187,7 @@ func (e *NoAccountError) Error() string {
 	add("rate_limit_cooldown", e.Counters.RateLimitCooldown)
 	add("recheck_pending", e.Counters.RecheckPending)
 	add("egress_unavailable", e.Counters.EgressUnavailable)
+	add("egress_cooldown", e.Counters.EgressCooldown)
 	add("concurrency", e.Counters.Concurrency)
 	add("token_budget", e.Counters.TokenBudget)
 	if len(parts) == 0 {
@@ -164,16 +202,15 @@ func (e *NoAccountError) Unwrap() error {
 
 // Retryable reports whether this no-account condition is transient pool saturation —
 // matching accounts exist but were momentarily at their concurrency cap, over their
-// per-account token budget, or on a short rate-limit cooldown — rather than a terminal
-// misconfiguration (no account of the right provider/model exists at all). The API
-// layer maps a retryable failure to 429 + Retry-After (the client re-sends the SAME
-// request unchanged) instead of a hard 503, so quality/context/reasoning never degrade.
+// per-account token budget, or on a short cooldown — rather than a terminal
+// misconfiguration. Cancellable inference requests keep these conditions inside the
+// scheduler and wait; the error is exposed only to non-request diagnostics.
 func (e *NoAccountError) Retryable() bool {
 	if e == nil {
 		return false
 	}
 	c := e.Counters
-	return c.Concurrency+c.TokenBudget+c.RateLimitCooldown > 0
+	return c.Concurrency+c.TokenBudget+c.RateLimitCooldown+c.RecheckPending+c.EgressCooldown > 0
 }
 
 // transientlySaturated reports whether a scheduler selection error is retryable
@@ -199,6 +236,7 @@ func New(store *storage.Store, cfg config.Config) *Scheduler {
 		inflight:         map[string]int{},
 		inflightTokens:   map[string]int64{},
 		loadChanged:      make(chan struct{}),
+		waitQueues:       map[string][]*waiter{},
 		egressCacheTTL:   30 * time.Second,
 		providerCacheTTL: 5 * time.Minute,
 	}
@@ -217,10 +255,31 @@ func (s *Scheduler) Config() config.Config {
 // UpdateConfig hot-swaps scheduler knobs used on the selection path.
 func (s *Scheduler) UpdateConfig(cfg config.Config) {
 	s.cfg.Store(cfg)
+	s.NotifyStateChanged()
+}
+
+// NotifyStateChanged wakes queued selections after any account, quota, cooldown or
+// egress mutation. Polling remains as a safety net for callers outside the API layer.
+func (s *Scheduler) NotifyStateChanged() {
+	s.mu.Lock()
+	s.notifyLoadChangedLocked()
+	s.mu.Unlock()
+}
+
+func (s *Scheduler) Metrics() SchedulerMetrics {
+	return SchedulerMetrics{
+		Queued: atomic.LoadInt64(&s.metrics.Queued), Waited: atomic.LoadInt64(&s.metrics.Waited),
+		Cancelled: atomic.LoadInt64(&s.metrics.Cancelled), AccountSwitches: atomic.LoadInt64(&s.metrics.AccountSwitches),
+		WaitConcurrency: atomic.LoadInt64(&s.metrics.WaitConcurrency), WaitTokenBudget: atomic.LoadInt64(&s.metrics.WaitTokenBudget),
+		WaitCooldown: atomic.LoadInt64(&s.metrics.WaitCooldown), WaitRecheck: atomic.LoadInt64(&s.metrics.WaitRecheck),
+		WaitEgress: atomic.LoadInt64(&s.metrics.WaitEgress), CooldownWakeups: atomic.LoadInt64(&s.metrics.CooldownWakeups),
+		StateWakeups: atomic.LoadInt64(&s.metrics.StateWakeups), WaitNanos: atomic.LoadInt64(&s.metrics.WaitNanos),
+	}
 }
 
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	cfg := s.Config()
+	hadExclusions := len(route.Exclude) > 0
 	if route.Group == "" {
 		route.Group = cfg.DefaultGroup
 	}
@@ -230,7 +289,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 			// failed on it (Exclude) — fall through to selectFresh, which rebinds the
 			// affinity to the fresh account so the conversation seamlessly continues
 			// on a healthy one instead of bouncing back to the broken account.
-			if (route.Provider == "" || s.providerOf(ctx, bound.AccountID) == route.Provider) && !route.Exclude[bound.AccountID] {
+			if routeAllowsProvider(route, s.providerOf(ctx, bound.AccountID)) && !route.Exclude[bound.AccountID] {
 				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
 				if ok {
 					return lease, nil
@@ -259,22 +318,40 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		}
 	}
 
-	lease, err := s.selectFresh(ctx, route)
-	if err != nil {
-		if waitFor(ctx, cfg.StickyWait()) {
+	var lease Lease
+	var err error
+	// Once a route has queued work, new requests join behind it instead of racing
+	// the head waiter for a newly released lease. Affinity selections above retain
+	// priority because they preserve an existing conversation's account binding.
+	if ctx.Done() != nil && s.routeHasWaiters(route) {
+		lease, err = s.waitForFreshLease(ctx, route, &NoAccountError{
+			Group: route.Group, Provider: route.Provider, Model: route.Model,
+			Counters: NoAccountCounters{Concurrency: 1},
+		})
+	} else {
+		lease, err = s.selectFresh(ctx, route)
+	}
+	// Once every compatible account in a retry round has failed, begin the next
+	// round with a clean exclusion set. The failed accounts have already been cooled
+	// or invalidated by the API layer, so this transitions into the normal wait queue
+	// instead of leaking a synthetic no-account response.
+	if err != nil && len(route.Exclude) > 0 {
+		var nae *NoAccountError
+		if errors.As(err, &nae) && nae.Counters.Excluded > 0 {
+			for id := range route.Exclude {
+				delete(route.Exclude, id)
+			}
 			lease, err = s.selectFresh(ctx, route)
 		}
-		// Admission backpressure: when the only obstacle is transient saturation (every
-		// matching account momentarily at its concurrency cap / over token budget), wait
-		// for an in-flight slot to free and retry selection instead of surfacing a
-		// downstream 503/409. This is pure queueing — the request still lands on a
-		// full-quality account with its exact model, full context and reasoning.
-		if err != nil && transientlySaturated(err) {
-			lease, err = s.selectFreshWithAdmissionWait(ctx, route, cfg.AdmissionWait())
-		}
-		if err != nil {
-			return Lease{}, err
-		}
+	}
+	if err != nil && transientlySaturated(err) && ctx.Done() != nil {
+		lease, err = s.waitForFreshLease(ctx, route, err)
+	}
+	if err != nil {
+		return Lease{}, err
+	}
+	if hadExclusions {
+		atomic.AddInt64(&s.metrics.AccountSwitches, 1)
 	}
 	if route.Affinity.Hash != "" {
 		_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
@@ -285,6 +362,164 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		})
 	}
 	return lease, nil
+}
+
+func routeAllowsProvider(route Route, provider string) bool {
+	provider = strings.TrimSpace(provider)
+	if len(route.AllowedProviders) == 0 {
+		return strings.TrimSpace(route.Provider) == "" || strings.EqualFold(strings.TrimSpace(route.Provider), provider)
+	}
+	for _, allowed := range route.AllowedProviders {
+		if strings.EqualFold(strings.TrimSpace(allowed), provider) {
+			return true
+		}
+	}
+	return false
+}
+
+func routeProvidersKey(route Route) string {
+	providers := append([]string(nil), route.AllowedProviders...)
+	if len(providers) == 0 && strings.TrimSpace(route.Provider) != "" {
+		providers = []string{strings.TrimSpace(route.Provider)}
+	}
+	for i := range providers {
+		providers[i] = strings.ToLower(strings.TrimSpace(providers[i]))
+	}
+	sort.Strings(providers)
+	return strings.Join(providers, ",")
+}
+
+func schedulerQueueKey(route Route) string {
+	return route.Group + "\x00" + route.Model + "\x00" + routeProvidersKey(route)
+}
+
+func (s *Scheduler) enqueue(route Route, reason string) (string, *waiter) {
+	w := &waiter{id: uint64(time.Now().UnixNano()), started: time.Now()}
+	key := schedulerQueueKey(route)
+	s.queueMu.Lock()
+	s.waitQueues[key] = append(s.waitQueues[key], w)
+	s.queueMu.Unlock()
+	atomic.AddInt64(&s.metrics.Queued, 1)
+	atomic.AddInt64(&s.metrics.Waited, 1)
+	s.recordWaitReason(reason)
+	return key, w
+}
+
+func (s *Scheduler) recordWaitReason(reason string) {
+	switch reason {
+	case "concurrency":
+		atomic.AddInt64(&s.metrics.WaitConcurrency, 1)
+	case "token_budget":
+		atomic.AddInt64(&s.metrics.WaitTokenBudget, 1)
+	case "cooldown":
+		atomic.AddInt64(&s.metrics.WaitCooldown, 1)
+	case "recheck":
+		atomic.AddInt64(&s.metrics.WaitRecheck, 1)
+	case "egress_cooldown":
+		atomic.AddInt64(&s.metrics.WaitEgress, 1)
+	}
+}
+
+func (s *Scheduler) removeWaiter(key string, target *waiter) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q := s.waitQueues[key]
+	for i, w := range q {
+		if w == target {
+			s.waitQueues[key] = append(q[:i], q[i+1:]...)
+			if len(s.waitQueues[key]) == 0 {
+				delete(s.waitQueues, key)
+			}
+			atomic.AddInt64(&s.metrics.Queued, -1)
+			return i == 0
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) waiterIsHead(key string, target *waiter) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q := s.waitQueues[key]
+	return len(q) > 0 && q[0] == target
+}
+
+func (s *Scheduler) routeHasWaiters(route Route) bool {
+	key := schedulerQueueKey(route)
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	return len(s.waitQueues[key]) > 0
+}
+
+// waitForFreshLease is the central unbounded admission queue. There is deliberately
+// no queue length or scheduler timeout: only downstream cancellation removes a waiter.
+func (s *Scheduler) waitForFreshLease(ctx context.Context, route Route, lastErr error) (Lease, error) {
+	key, w := s.enqueue(route, waitReason(lastErr))
+	removed := false
+	defer func() {
+		if !removed {
+			if s.removeWaiter(key, w) {
+				s.NotifyStateChanged()
+			}
+		}
+		atomic.AddInt64(&s.metrics.WaitNanos, time.Since(w.started).Nanoseconds())
+	}()
+	heartbeatEvery := s.Config().SchedulerHeartbeat()
+	heartbeat := time.NewTicker(heartbeatEvery)
+	poll := time.NewTicker(time.Second)
+	defer heartbeat.Stop()
+	defer poll.Stop()
+	for {
+		if s.waiterIsHead(key, w) {
+			lease, err := s.selectFresh(ctx, route)
+			if err == nil {
+				s.removeWaiter(key, w)
+				removed = true
+				s.NotifyStateChanged()
+				return lease, nil
+			}
+			lastErr = err
+			if !transientlySaturated(err) {
+				return Lease{}, err
+			}
+		}
+		changed := s.loadChangedChan()
+		select {
+		case <-ctx.Done():
+			atomic.AddInt64(&s.metrics.Cancelled, 1)
+			return Lease{}, ctx.Err()
+		case <-changed:
+			atomic.AddInt64(&s.metrics.StateWakeups, 1)
+		case <-poll.C:
+			atomic.AddInt64(&s.metrics.CooldownWakeups, 1)
+		case <-heartbeat.C:
+			if route.OnWait != nil {
+				route.OnWait(waitReason(lastErr), time.Since(w.started))
+			}
+		}
+	}
+}
+
+func waitReason(err error) string {
+	var nae *NoAccountError
+	if !errors.As(err, &nae) {
+		return "scheduler_wait"
+	}
+	c := nae.Counters
+	switch {
+	case c.Concurrency > 0:
+		return "concurrency"
+	case c.TokenBudget > 0:
+		return "token_budget"
+	case c.RateLimitCooldown > 0:
+		return "cooldown"
+	case c.RecheckPending > 0:
+		return "recheck"
+	case c.EgressCooldown > 0:
+		return "egress_cooldown"
+	default:
+		return "scheduler_wait"
+	}
 }
 
 func (l Lease) Release() {
@@ -330,9 +565,17 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	s.egressCacheMutex.Unlock()
 
 	var capable map[string]bool
+	var kiroCapable map[string]bool
+	var kiroModelKnown bool
 	if route.Model != "" {
 		if m, err := s.store.AccountsWithModel(ctx, route.Group, route.Model); err == nil && len(m) > 0 {
 			capable = m
+		}
+		if canonical, ok := capability.KiroCanonicalModel(route.Model); ok {
+			kiroModelKnown = true
+			if m, err := s.store.AccountsWithModel(ctx, route.Group, canonical); err == nil {
+				kiroCapable = m
+			}
 		}
 	}
 	reqEgressCache := make(map[string]storage.EgressProfile)
@@ -353,16 +596,19 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.Excluded++
 			continue
 		}
-		if capable != nil && !capable[account.ID] {
-			counters.ModelUnsupported++
-			continue
-		}
-		accountProvider := strings.TrimSpace(route.Provider)
-		if actualProvider := s.providerOfAccountCached(ctx, account); accountProvider != "" && actualProvider != accountProvider {
+		accountProvider := s.providerOfAccountCached(ctx, account)
+		if !routeAllowsProvider(route, accountProvider) {
 			counters.ProviderMismatch++
 			continue
-		} else if accountProvider == "" {
-			accountProvider = actualProvider
+		}
+		if accountProvider == "kiro" && route.Model != "" {
+			if !kiroModelKnown || !kiroCapable[account.ID] {
+				counters.ModelUnsupported++
+				continue
+			}
+		} else if capable != nil && !capable[account.ID] {
+			counters.ModelUnsupported++
+			continue
 		}
 		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited {
 			counters.RateLimitCooldown++
@@ -376,7 +622,11 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		}
 		egress, ok := s.selectEgressWithCache(ctx, binding, now, &reqEgressCache, egressCacheMutex, &egressCacheTime)
 		if !ok {
-			counters.EgressUnavailable++
+			if s.egressTemporarilyUnavailable(ctx, binding, now) {
+				counters.EgressCooldown++
+			} else {
+				counters.EgressUnavailable++
+			}
 			continue
 		}
 		inflight, tokens := s.currentLoad(account.ID)
@@ -396,23 +646,12 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.TokenBudget++
 			continue
 		}
-		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, score: inflight})
+		concurrencyLoad := float64(inflight) / float64(maxInt(1, egress.MaxConcurrency))
+		tokenLoad := float64(tokens) / float64(maxInt64(1, cfg.AccountTokenBudget))
+		latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
+		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, score: concurrencyLoad + tokenLoad + latencyPenalty})
 	}
 	if len(candidates) == 0 {
-		// No accounts available — check if any will come off cooldown soon.
-		// If so, wait for the shortest cooldown instead of failing immediately.
-		if cfg.CooldownWaitMaxSeconds > 0 {
-			if waitDur, ok := s.shortestCooldownBatch(ctx, route.Group, route.Provider, route.Model, accountsWithEgress, rateLimitsByAccount); ok {
-				if waitDur > 0 && waitDur <= time.Duration(cfg.CooldownWaitMaxSeconds)*time.Second {
-					log.Printf("[SCHEDULER] all accounts cooling, waiting %v for shortest cooldown (group=%s, provider=%s)",
-						waitDur.Round(time.Second), route.Group, route.Provider)
-					if waitFor(ctx, waitDur) {
-						// Retry after waiting
-						return s.selectFresh(ctx, route)
-					}
-				}
-			}
-		}
 		return Lease{}, s.noAccountError(route, counters)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -451,34 +690,17 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	return Lease{}, s.noAccountError(route, counters)
 }
 
-// selectFreshWithAdmissionWait retries selectFresh, blocking on the load-changed
-// signal (fired whenever any lease is released) up to a total budget, so a request
-// that found every matching account momentarily saturated queues for the next freed
-// slot instead of failing. It returns the moment selection succeeds, the error is no
-// longer transient saturation, the request is cancelled, or the budget elapses. The
-// channel is captured BEFORE each attempt so a release racing with a failed attempt is
-// never lost (same pattern as waitForStatefulStickyLease).
-func (s *Scheduler) selectFreshWithAdmissionWait(ctx context.Context, route Route, budget time.Duration) (Lease, error) {
-	if budget <= 0 {
-		return s.selectFresh(ctx, route)
+func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding storage.AccountEgressBinding, now int64) bool {
+	if binding.CooldownUntil > now {
+		return true
 	}
-	timer := time.NewTimer(budget)
-	defer timer.Stop()
-	for {
-		loadChanged := s.loadChangedChan()
-		lease, err := s.selectFresh(ctx, route)
-		if err == nil || !transientlySaturated(err) {
-			return lease, err
-		}
-		select {
-		case <-loadChanged:
-			// a lease was released somewhere — retry selection immediately
-		case <-ctx.Done():
-			return Lease{}, err
-		case <-timer.C:
-			return lease, err
+	ids := append([]string{binding.PrimaryEgressID}, binding.StandbyIDs()...)
+	for _, id := range ids {
+		if e, err := s.store.GetEgressProfile(ctx, id); err == nil && (e.CooldownUntil > now || e.Health == "cooldown" || e.Health == "tripped") {
+			return true
 		}
 	}
+	return false
 }
 
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
@@ -516,6 +738,9 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	}
 	egress, ok := s.selectEgress(ctx, binding, now, egressCache)
 	if !ok {
+		if s.egressTemporarilyUnavailable(ctx, binding, now) {
+			return Lease{}, leaseBlockEgressCooldown, false
+		}
 		return Lease{}, leaseBlockEgressUnavailable, false
 	}
 	s.mu.Lock()
@@ -570,7 +795,9 @@ func (s *Scheduler) notifyLoadChangedLocked() {
 }
 
 func statefulStickyWaitReason(reason leaseBlockReason) bool {
-	return reason == leaseBlockTokenBudget || reason == leaseBlockConcurrency
+	return reason == leaseBlockTokenBudget || reason == leaseBlockConcurrency ||
+		reason == leaseBlockRateLimitCooldown || reason == leaseBlockRecheckPending ||
+		reason == leaseBlockEgressCooldown
 }
 
 func (reason leaseBlockReason) humanString() string {
@@ -581,15 +808,19 @@ func (reason leaseBlockReason) humanString() string {
 }
 
 func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID string, route Route, initialReason leaseBlockReason) (Lease, error) {
-	cfg := s.Config()
-	wait := cfg.StatefulStickyWait()
-	if wait <= 0 {
-		return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, initialReason, 0, nil)
-	}
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
 	start := time.Now()
+	atomic.AddInt64(&s.metrics.Queued, 1)
+	atomic.AddInt64(&s.metrics.Waited, 1)
+	s.recordWaitReason(waitReasonForBlock(initialReason))
+	defer func() {
+		atomic.AddInt64(&s.metrics.Queued, -1)
+		atomic.AddInt64(&s.metrics.WaitNanos, time.Since(start).Nanoseconds())
+	}()
 	lastReason := initialReason
+	heartbeat := time.NewTicker(s.Config().SchedulerHeartbeat())
+	poll := time.NewTicker(time.Second)
+	defer heartbeat.Stop()
+	defer poll.Stop()
 	for {
 		loadChanged := s.loadChangedChan()
 		lease, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil)
@@ -602,12 +833,36 @@ func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID st
 		}
 		select {
 		case <-loadChanged:
+			atomic.AddInt64(&s.metrics.StateWakeups, 1)
 			continue
+		case <-poll.C:
+			atomic.AddInt64(&s.metrics.CooldownWakeups, 1)
+			continue
+		case <-heartbeat.C:
+			if route.OnWait != nil {
+				route.OnWait(lastReason.humanString(), time.Since(start))
+			}
 		case <-ctx.Done():
+			atomic.AddInt64(&s.metrics.Cancelled, 1)
 			return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, lastReason, time.Since(start), ctx.Err())
-		case <-timer.C:
-			return Lease{}, s.statefulStickyWaitTimeoutError(accountID, route, lastReason, wait, nil)
 		}
+	}
+}
+
+func waitReasonForBlock(reason leaseBlockReason) string {
+	switch reason {
+	case leaseBlockConcurrency:
+		return "concurrency"
+	case leaseBlockTokenBudget:
+		return "token_budget"
+	case leaseBlockRateLimitCooldown:
+		return "cooldown"
+	case leaseBlockRecheckPending:
+		return "recheck"
+	case leaseBlockEgressCooldown:
+		return "egress_cooldown"
+	default:
+		return "scheduler_wait"
 	}
 }
 
@@ -634,10 +889,26 @@ func (s *Scheduler) accountRateLimitCooldownUntil(ctx context.Context, account s
 }
 
 func providerForRoute(s *Scheduler, ctx context.Context, account storage.Account, route Route) string {
+	if len(route.AllowedProviders) > 0 {
+		return s.providerOfAccountCached(ctx, account)
+	}
 	if p := strings.TrimSpace(route.Provider); p != "" {
 		return p
 	}
 	return s.providerOfAccountCached(ctx, account)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *Scheduler) noAccountError(route Route, counters NoAccountCounters) error {

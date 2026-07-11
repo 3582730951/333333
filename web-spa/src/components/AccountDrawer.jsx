@@ -206,6 +206,16 @@ export default function AccountDrawer({
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
       </Panel>
 
+      {account.kiro_auth ? (
+        <Panel title="Kiro 认证" style={{ marginBottom: 14 }}>
+          <Row k="认证方式" v={account.kiro_auth.auth_method || '—'} />
+          <Row k="认证区域" v={account.kiro_auth.auth_region || '—'} />
+          <Row k="API 区域" v={account.kiro_auth.api_region || '—'} />
+          <Row k="端点" v={account.kiro_auth.endpoint || 'Kiro IDE'} />
+          <Row k="敏感凭证" v={[account.kiro_auth.has_client_secret && 'Client Secret', account.kiro_auth.has_api_key && 'API Key'].filter(Boolean).join(' / ') || 'OAuth Token'} />
+        </Panel>
+      ) : null}
+
       <Panel title="账号额度" style={{ marginBottom: 14 }}>
         <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
         <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />

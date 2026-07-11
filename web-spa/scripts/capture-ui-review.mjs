@@ -125,7 +125,6 @@ const fixtures = {
     { key: 'require_downstream_key', label: '下游 Key 必填', category: '访问控制', type: 'bool', effect: 'hot', options: [], help: '要求普通请求携带用户 API Key。', value: true, overridden: true },
     { key: 'conversation_isolation', label: '会话隔离', category: '访问控制', type: 'bool', effect: 'hot', options: [], help: '按账号隔离上游会话标识。', value: true, overridden: false },
     { key: 'claude_cache_ttl', label: 'Claude 缓存 TTL', category: '缓存', type: 'select', effect: 'hot', options: ['', '5m', '1h'], help: 'Claude prompt cache control TTL。', value: '1h', overridden: true },
-    { key: 'max_concurrent_upstream', label: '上游最大并发', category: '性能', type: 'int', effect: 'restart', options: [], help: '限制同时访问上游的请求数。', value: 64, overridden: false },
   ],
 };
 
