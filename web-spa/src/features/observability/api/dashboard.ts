@@ -90,7 +90,14 @@ export async function fetchDashboardSecondary(signal?: AbortSignal): Promise<Das
   const results = await Promise.allSettled([
     fetchRegistrationStats(signal), fetchDashboardSystem(signal), fetchDashboardModels(signal), fetchDashboardCache(signal),
   ]);
-  const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+  // Registration and host metrics are optional dashboard enhancements. A deployment
+  // without the registration subsystem, or a transient /admin/system failure, should
+  // hide only that card rather than presenting a page-wide red diagnostic alarm.
+  // Model/cache failures surface only when both sources are unavailable. If either
+  // source still has useful data, its card remains visible without a duplicate global
+  // alarm—the unavailable card is already omitted by its availability flag.
+  const diagnosticFailures = results.slice(2).filter((result) => result.status === 'rejected').map((result) => result.reason);
+  const usageDiagnosticsUnavailable = results[2].status === 'rejected' && results[3].status === 'rejected';
   return {
     registration: results[0].status === 'fulfilled' ? results[0].value : null,
     system: results[1].status === 'fulfilled' ? results[1].value : null,
@@ -100,6 +107,6 @@ export async function fetchDashboardSecondary(signal?: AbortSignal): Promise<Das
     systemAvailable: results[1].status === 'fulfilled',
     modelAvailable: results[2].status === 'fulfilled',
     cacheAvailable: results[3].status === 'fulfilled',
-    error: failures.length ? partialError('DASHBOARD_SECONDARY_PARTIAL', '部分诊断数据暂时不可用。', failures) : null,
+    error: usageDiagnosticsUnavailable ? partialError('DASHBOARD_SECONDARY_UNAVAILABLE', '用量诊断暂时不可用。', diagnosticFailures) : null,
   };
 }

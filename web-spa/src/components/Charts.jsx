@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   ResponsiveContainer, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
-  XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, Label,
 } from 'recharts';
 import { documentElementAttribute, observeDocumentElementAttributes } from '../lib/browserDocument.js';
 import { fmtTokens, fmtTime } from '../lib/format.js';
@@ -93,29 +93,20 @@ export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal
   if (!items.length) return <Empty />;
   const total = items.reduce((s, d) => s + (d.value || 0), 0);
   const formatValue = (v) => valueFormatter?.(v) ?? v;
-  const centerLabel = (props) => {
-    const { cx, cy } = props;
-    return showCenterTotal ? (
-      <>
-        <text x={cx} y={cy - 10} textAnchor="middle" dominantBaseline="middle"
-          fontSize={22} fontWeight={700} fill={c.tick}>
-          {formatValue(total)}
-        </text>
-        <text x={cx} y={cy + 14} textAnchor="middle" dominantBaseline="middle"
-          fontSize={11} fill={c.tick}>
-          {unit || ''}
-        </text>
-      </>
-    ) : null;
-  };
+  const formattedTotal = String(formatValue(total));
+  const centerFontSize = formattedTotal.length > 10 ? 14 : formattedTotal.length > 7 ? 17 : 22;
   return (
     <ResponsiveContainer width="100%" height={height}>
       <PieChart>
         <Pie data={items} dataKey="value" nameKey="name" innerRadius="58%" outerRadius="82%"
-          paddingAngle={2} stroke="none" label={centerLabel} labelLine={false} isAnimationActive={false}>
+          paddingAngle={2} stroke="none" isAnimationActive={false}>
           {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
+          {showCenterTotal ? <Label position="center" value={formattedTotal} fill={c.tick}
+            fontSize={centerFontSize} fontWeight={700} dy={unit ? -8 : 0} /> : null}
+          {showCenterTotal && unit ? <Label position="center" value={unit} fill={c.tick}
+            fontSize={11} fontWeight={500} dy={12} /> : null}
         </Pie>
-        <Tooltip {...tooltipStyle(c)} formatter={(v, n) => [`${formatValue(v)}${unit}`, n]} />
+        <Tooltip {...tooltipStyle(c)} formatter={(v, n) => [`${formatValue(v)}${unit ? ` ${unit}` : ''}`, n]} />
         <Legend wrapperStyle={{ fontSize: 12 }} />
       </PieChart>
     </ResponsiveContainer>

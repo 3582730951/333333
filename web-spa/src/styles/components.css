@@ -1006,6 +1006,139 @@
   color: var(--pool-text);
 }
 
+/* Provider marks must never inherit an SVG's intrinsic canvas size. Some vendor
+   assets (notably Kiro) use a 1200×1200 source viewBox, so the mark owns the size
+   and clips the image instead of allowing it to expand a tab or modal. */
+.pool-vendor-logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 0 0 auto;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.pool-vendor-logo__mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--vendor-logo-size, 32px);
+  width: var(--vendor-logo-size, 32px);
+  height: var(--vendor-logo-size, 32px);
+  flex: 0 0 var(--vendor-logo-size, 32px);
+  overflow: hidden;
+}
+
+.pool-vendor-logo__mark > img,
+.pool-vendor-logo__mark > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.pool-vendor-logo__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-vendor-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pool-vendor-tab > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-oauth-tab,
+.pool-oauth-identity__copy {
+  min-width: 0;
+}
+
+.pool-oauth-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  margin-bottom: 16px;
+  padding: 13px 14px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-lg);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-oauth-identity--compact {
+  padding: 9px 11px;
+}
+
+.pool-oauth-identity__name,
+.pool-oauth-identity__desc {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.pool-oauth-identity__desc {
+  margin-top: 3px;
+}
+
+.pool-oauth-manual-icon,
+.pool-oauth-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.pool-oauth-manual-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--pool-radius-md);
+  background: var(--pool-bg-selected);
+  color: var(--pool-text-2);
+}
+
+.pool-oauth-tab-icon {
+  width: 18px;
+  height: 18px;
+}
+
+.pool-account-import-tabs > .pool-tabs-list {
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
+
+.pool-account-import-tabs > .pool-tabs-list .pool-tab-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: max-content;
+}
+
+@media (min-width: 620px) {
+  .pool-account-import-tabs > .pool-tabs-list {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .pool-account-import-tabs > .pool-tabs-list .pool-tab-trigger {
+    min-width: 0;
+  }
+}
+
 .pool-tabs-panels,
 .pool-tabs-panels > [role='tabpanel'] {
   min-width: 0;

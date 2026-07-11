@@ -113,6 +113,12 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
     if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/accounts') {
       return route.fulfill({ json: { accounts: [{ id: 'account-with-a-very-long-identifier-001', label: 'Primary production account', email: 'operator.with.long.alias@example.test', provider: 'codex', status: 'active', group_name: 'default', usage: { requests: 12, total_tokens: 3456 } }], total: 1 } });
     }
+    if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/usage/by-model') {
+      return route.fulfill({ json: { models: [
+        { model: 'gpt-5.5', total_tokens: 3_000_000_000 },
+        { model: 'claude-opus-4-8', total_tokens: 220_000_000 },
+      ] } });
+    }
     if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/api-keys') {
       return route.fulfill({ json: [] });
     }
@@ -287,6 +293,31 @@ test('submit, success, download, batch selection, and confirmation remain usable
   await expect(batchPage.getByText('删除选中的 1 个账号？')).toBeVisible();
   await batchPage.getByRole('button', { name: '取消' }).click();
   await batchPage.close();
+});
+
+test('account import provider marks stay bounded and model donut has one readable center label', async ({ browser }) => {
+  const accountPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await mockBackend(accountPage, 'admin', 'interactive');
+  await accountPage.goto('/console/accounts');
+  await accountPage.getByRole('button', { name: '添加账号', exact: true }).click();
+  const dialog = accountPage.getByRole('dialog', { name: '添加账号' });
+  await expect(dialog).toBeVisible();
+  const boundedMarks = await dialog.locator('.pool-vendor-logo__mark').evaluateAll((marks) => marks.map((mark) => {
+    const box = mark.getBoundingClientRect();
+    return { width: box.width, height: box.height };
+  }));
+  expect(boundedMarks.length).toBeGreaterThanOrEqual(4);
+  expect(boundedMarks.every((mark) => mark.width <= 40 && mark.height <= 40)).toBe(true);
+  await dialog.getByRole('tab').filter({ hasText: 'Kiro' }).click();
+  await expect(dialog.getByText('Kiro 凭证 JSON', { exact: true })).toBeVisible();
+  await expect.poll(() => dialog.locator('.pool-modal-body').evaluate((body) => body.scrollWidth <= body.clientWidth)).toBe(true);
+  await accountPage.close();
+
+  const dashboardPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await mockBackend(dashboardPage, 'admin', 'interactive');
+  await dashboardPage.goto('/console/');
+  await expect(dashboardPage.getByText('3.22B', { exact: true })).toHaveCount(1);
+  await dashboardPage.close();
 });
 
 test('access and audit pages switch locale without remounting', async ({ browser }) => {
@@ -548,7 +579,7 @@ test('dashboard and portal usage distinguish primary and partial failures', asyn
   const dashboardPartial = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await mockBackend(dashboardPartial, 'admin', 'partial');
   await dashboardPartial.goto('/console/');
-  await expect(dashboardPartial.getByRole('alert')).toContainText('部分诊断数据暂时不可用');
+  await expect(dashboardPartial.getByRole('alert')).toHaveCount(0);
   await expect(dashboardPartial.getByText('可调度账号', { exact: true })).toBeVisible();
   await expect(dashboardPartial.locator('.pool-dashboard-command__metric strong')).toHaveText('2');
   await dashboardPartial.close();

@@ -42,9 +42,12 @@ export default function VendorLogo({
 
   return (
     <span className={classes} style={style} title={resolvedLabel} aria-label={resolvedLabel}>
-      <span className="pool-vendor-logo__mark">
+      <span
+        className="pool-vendor-logo__mark"
+        style={{ width: size, height: size, flexBasis: size }}
+      >
         {info ? (
-          <img src={info.asset} alt="" aria-hidden="true" />
+          <img src={info.asset} alt="" aria-hidden="true" width={size} height={size} />
         ) : (
           <IconGlobe aria-hidden="true" />
         )}

@@ -123,10 +123,10 @@ export default function Dashboard() {
   }));
   const modelTokenFormatter = (value: unknown) => {
     const number = Number(value) || 0;
-    if (number >= 1e9) return `${(number / 1e9).toFixed(2)}B Token`;
-    if (number >= 1e6) return `${(number / 1e6).toFixed(2)}M Token`;
-    if (number >= 1e3) return `${(number / 1e3).toFixed(1)}k Token`;
-    return `${number} Token`;
+    if (number >= 1e9) return `${(number / 1e9).toFixed(2)}B`;
+    if (number >= 1e6) return `${(number / 1e6).toFixed(2)}M`;
+    if (number >= 1e3) return `${(number / 1e3).toFixed(1)}k`;
+    return `${number}`;
   };
   const partialError = core?.error || secondary?.error || secondaryQuery.error;
   const hasStatusDistribution = statusDonut.some((item) => item.value > 0);
@@ -219,7 +219,7 @@ export default function Dashboard() {
             <div className="head"><div><div className="t">{t('dashboard.model_cache_rate')}</div><div className="s">{t('dashboard.model_cache_desc')}</div></div></div>
             <div style={{ paddingTop: 6 }}><CacheBars data={cacheByModel} /></div>
           </div> : null}
-          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} valueFormatter={modelTokenFormatter} /></div> : null}
+          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} /></div> : null}
         </div>
       ) : null}
 

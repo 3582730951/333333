@@ -584,14 +584,15 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   return (
     <Modal
       title="添加账号"
+      className="pool-account-import-modal"
       visible={isVisible}
       onCancel={handleClose}
       footer={null}
-      width={560}
+      width={620}
       maskClosable={false}
-      destroyOnClose
     >
       <Tabs
+        className="pool-account-import-tabs"
         activeKey={tab}
         onChange={(k) => {
           setTab(k);

@@ -84,7 +84,7 @@ export default function PortalDashboard() {
       ) : null}
 
       <div className="pool-grid cols-2">
-        <div className="pool-chart-card"><div className="head"><div className="t">{t('portal_usage.model_share')}</div></div><ModelDonut data={modelDonut} valueFormatter={(value: unknown) => `${fmtTokens(value)} tokens`} /></div>
+        <div className="pool-chart-card"><div className="head"><div className="t">{t('portal_usage.model_share')}</div></div><ModelDonut data={modelDonut} unit="tokens" valueFormatter={fmtTokens} /></div>
         <Panel title={t('portal_usage.by_model')}>
           <DataTable
             loading={loading}
