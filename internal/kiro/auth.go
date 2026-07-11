@@ -69,7 +69,10 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 	}
 	var endpoint string
 	var payload interface{}
-	region := first(cred.AuthRegion, cfg.KiroDefaultAuthRegion, "us-east-1")
+	region := normalizeRegion(first(cred.AuthRegion, cfg.KiroDefaultAuthRegion, "us-east-1"))
+	if strings.TrimSpace(cred.Endpoint) == "" && !validRegion(region) {
+		return "", token, cred, ErrEndpointNotAllowed
+	}
 	if cred.AuthMethod == "idc" {
 		endpoint = fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
 		payload = map[string]string{"clientId": cred.ClientID, "clientSecret": cred.ClientSecret, "refreshToken": token.RefreshToken, "grantType": "refresh_token"}
@@ -77,8 +80,12 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 		endpoint = fmt.Sprintf("https://prod.%s.auth.desktop.kiro.dev/refreshToken", region)
 		payload = map[string]string{"refreshToken": token.RefreshToken}
 	}
-	if strings.HasPrefix(cred.Endpoint, "http://") || strings.HasPrefix(cred.Endpoint, "https://") {
-		base := strings.TrimSuffix(strings.TrimRight(cred.Endpoint, "/"), "/generateAssistantResponse")
+	if strings.TrimSpace(cred.Endpoint) != "" {
+		allowed, validationErr := ValidateEndpoint(cred.Endpoint, first(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1"), cfg.KiroEndpointAllowlist)
+		if validationErr != nil {
+			return "", token, cred, validationErr
+		}
+		base := strings.TrimSuffix(strings.TrimRight(allowed, "/"), "/generateAssistantResponse")
 		if cred.AuthMethod == "idc" {
 			endpoint = base + "/token"
 		} else {
@@ -147,12 +154,9 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 func (m *Manager) UsageLimits(ctx context.Context, account storage.Account, cred storage.KiroCredentials, bearer string, egress storage.EgressProfile) (map[string]interface{}, error) {
 	cfg := m.Config()
 	region := first(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1")
-	base := ""
-	if strings.HasPrefix(cred.Endpoint, "http://") || strings.HasPrefix(cred.Endpoint, "https://") {
-		base = strings.TrimRight(cred.Endpoint, "/")
-	}
-	if base == "" {
-		base = "https://q." + region + ".amazonaws.com"
+	base, err := ValidateEndpoint(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
+	if err != nil {
+		return nil, err
 	}
 	if strings.HasSuffix(base, "/generateAssistantResponse") {
 		base = strings.TrimSuffix(base, "/generateAssistantResponse")

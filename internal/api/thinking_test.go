@@ -28,7 +28,7 @@ func TestThinkingAdminErrorsUseJSONEnvelope(t *testing.T) {
 			method:      http.MethodGet,
 			path:        "/admin/thinking",
 			wantStatus:  http.StatusUnauthorized,
-			wantMessage: "unauthorized",
+			wantMessage: "admin token required",
 		},
 		{
 			name:        "method not allowed",

@@ -101,7 +101,7 @@ func TestAdminUsageCacheMetricsEndpoint(t *testing.T) {
 	if got.Summary.CacheMissTokens != 890 {
 		t.Fatalf("cache_miss_tokens = %d, want 890", got.Summary.CacheMissTokens)
 	}
-	if math.Abs(got.Summary.RequestHitRate-0.6) > 0.0001 {
+	if math.Abs(got.Summary.RequestHitRate-0.75) > 0.0001 {
 		t.Fatalf("request_hit_rate = %v", got.Summary.RequestHitRate)
 	}
 	if math.Abs(got.Summary.TokenHitRate-(860.0/1960.0)) > 0.0001 {

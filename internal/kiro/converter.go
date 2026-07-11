@@ -1,164 +1,347 @@
 package kiro
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"codex-account-pool/internal/capability"
 )
 
+const (
+	LossAssistantFirstPadded           = "assistant_first_padded"
+	LossAssistantPrefillEmulated       = "assistant_prefill_emulated"
+	LossThinkingHistoryTextualized     = "thinking_history_textualized"
+	LossUnpairedToolUseTextualized     = "unpaired_tool_use_textualized"
+	LossUnsupportedBlockTextualized    = "unsupported_block_textualized"
+	LossToolDescriptionTruncated       = "tool_description_truncated"
+	LossOutputFormatPromptEmulated     = "output_format_prompt_emulated"
+	LossCacheControlNotForwarded       = "cache_control_not_forwarded"
+	LossGenerationControlsNotForwarded = "generation_controls_not_forwarded"
+	LossThinkingBudgetMappedToAdaptive = "thinking_budget_mapped_to_adaptive"
+	LossToolSchemaRefBounded           = "tool_schema_ref_bounded"
+)
+
+const (
+	kiroToolDescriptionRunes = 10_000
+	kiroSchemaRefMaxDepth    = 32
+	systemAcknowledgement    = "Acknowledged."
+	prefillContinuation      = "Continue."
+	assistantFirstPadding    = "Continue the conversation."
+)
+
+var (
+	ErrReasoningUnavailable     = errors.New("kiro reasoning unavailable")
+	ErrVerifiedModelUnavailable = errors.New("verified Kiro model unavailable")
+	ErrUnsupportedModel         = errors.New("unsupported Kiro model")
+)
+
 type Conversion struct {
-	Body        []byte
-	Model       string
-	ToolNameMap map[string]string
-	InputTokens int64
-	WebSearch   *WebSearchRequest
+	Body                  []byte
+	Model                 string
+	ToolNameMap           map[string]string
+	ToolDescriptionHashes map[string]string
+	EstimatedInputTokens  int64
+	// InputTokens remains as a compatibility alias for callers that only need a
+	// local estimate (notably the MCP web-search bridge). It must never be reported
+	// as upstream metering.
+	InputTokens         int64
+	WebSearch           *WebSearchRequest
+	CompatibilityLosses []string
+	ThinkingEnabled     bool
 }
 
 // ConversionOptions controls Kiro-only compatibility defaults. Explicit
 // downstream request fields always take precedence over these defaults.
 type ConversionOptions struct {
 	DefaultThinking bool
+	// VerifiedModels is the selected account's successfully observed model set.
+	// It is required to resolve family/auto aliases; concrete versions never use a
+	// different verified version as a substitute.
+	VerifiedModels []string
 }
 
 type WebSearchRequest struct{ Query, ToolUseID string }
+
+type anthropicRequest struct {
+	Model         string             `json:"model"`
+	System        json.RawMessage    `json:"system"`
+	Messages      []anthropicMessage `json:"messages"`
+	Tools         []json.RawMessage  `json:"tools"`
+	Thinking      *anthropicThinking `json:"thinking"`
+	OutputConfig  *anthropicOutput   `json:"output_config"`
+	Metadata      json.RawMessage    `json:"metadata"`
+	ToolChoice    json.RawMessage    `json:"tool_choice"`
+	MaxTokens     json.RawMessage    `json:"max_tokens"`
+	Temperature   json.RawMessage    `json:"temperature"`
+	TopP          json.RawMessage    `json:"top_p"`
+	TopK          json.RawMessage    `json:"top_k"`
+	StopSequences json.RawMessage    `json:"stop_sequences"`
+}
+
+type anthropicMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+type anthropicThinking struct {
+	Type   string          `json:"type"`
+	Budget json.RawMessage `json:"budget_tokens"`
+}
+
+type anthropicOutput struct {
+	Format json.RawMessage `json:"format"`
+}
+
+type contentBlock struct {
+	Type      string
+	Text      string
+	Thinking  string
+	ID        json.RawMessage
+	Name      string
+	Input     json.RawMessage
+	ToolUseID json.RawMessage
+	IsError   bool
+	Source    json.RawMessage
+	Content   json.RawMessage
+	Raw       json.RawMessage
+	HasCache  bool
+}
+
+type toolDefinition struct {
+	Type        string          `json:"type"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+	Cache       json.RawMessage `json:"cache_control"`
+}
+
+type lossSet map[string]struct{}
+
+func (l lossSet) add(code string) {
+	if code != "" {
+		l[code] = struct{}{}
+	}
+}
+
+func (l lossSet) sorted() []string {
+	out := make([]string, 0, len(l))
+	for code := range l {
+		out = append(out, code)
+	}
+	sort.Strings(out)
+	return out
+}
 
 func ConvertAnthropicRequest(raw []byte, affinity string) (Conversion, error) {
 	return ConvertAnthropicRequestWithOptions(raw, affinity, ConversionOptions{})
 }
 
 func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options ConversionOptions) (Conversion, error) {
-	var req map[string]interface{}
-	if err := json.Unmarshal(raw, &req); err != nil {
+	var req anthropicRequest
+	if err := decodeUseNumber(raw, &req); err != nil {
 		return Conversion{}, err
 	}
-	model, _ := req["model"].(string)
-	canonical, ok := capability.KiroCanonicalModel(model)
+	canonical, ok := capability.ResolveKiroModel(req.Model, options.VerifiedModels)
 	if !ok {
-		return Conversion{}, fmt.Errorf("unsupported Kiro model %q", model)
+		if capability.KiroModelAlias(req.Model) {
+			return Conversion{}, fmt.Errorf("%w for alias %q", ErrVerifiedModelUnavailable, req.Model)
+		}
+		return Conversion{}, fmt.Errorf("%w %q", ErrUnsupportedModel, req.Model)
 	}
-	messages, _ := req["messages"].([]interface{})
-	if len(messages) == 0 {
+	if len(req.Messages) == 0 {
 		return Conversion{}, errors.New("messages required")
 	}
-	for len(messages) > 0 {
-		m, _ := messages[len(messages)-1].(map[string]interface{})
-		if stringValue(m["role"]) == "user" {
+
+	losses := lossSet{}
+	toolNames := map[string]string{}
+	descriptionHashes := map[string]string{}
+	tools, err := convertTools(req.Tools, toolNames, descriptionHashes, losses)
+	if err != nil {
+		return Conversion{}, err
+	}
+	webSearch := pureWebSearchRequest(req.Tools, req.Messages, affinity)
+	uses, paired, err := collectToolPairs(req.Messages)
+	if err != nil {
+		return Conversion{}, err
+	}
+
+	history := make([]any, 0, len(req.Messages)+4)
+	systemPrompt, systemPresent, err := systemContent(req.System, losses)
+	if err != nil {
+		return Conversion{}, err
+	}
+	if req.OutputConfig != nil && len(bytes.TrimSpace(req.OutputConfig.Format)) > 0 && !bytes.Equal(bytes.TrimSpace(req.OutputConfig.Format), []byte("null")) {
+		format, err := canonicalJSON(req.OutputConfig.Format)
+		if err != nil {
+			return Conversion{}, fmt.Errorf("output_config.format: %w", err)
+		}
+		if systemPresent {
+			systemPrompt += "\n"
+		}
+		systemPrompt += "Return output that strictly satisfies this JSON format: " + string(format)
+		systemPresent = true
+		losses.add(LossOutputFormatPromptEmulated)
+	}
+	for _, field := range []struct {
+		name string
+		raw  json.RawMessage
+	}{{"metadata", req.Metadata}, {"tool_choice", req.ToolChoice}} {
+		if len(bytes.TrimSpace(field.raw)) == 0 || bytes.Equal(bytes.TrimSpace(field.raw), []byte("null")) {
+			continue
+		}
+		value, err := canonicalValue(field.raw, nil)
+		if err != nil {
+			return Conversion{}, fmt.Errorf("%s: %w", field.name, err)
+		}
+		encoded, _ := json.Marshal(map[string]any{"name": field.name, "value": value})
+		if systemPresent {
+			systemPrompt += "\n"
+		}
+		systemPrompt += "<unsupported_request_field>" + string(encoded) + "</unsupported_request_field>"
+		systemPresent = true
+		losses.add(LossUnsupportedBlockTextualized)
+	}
+	for _, control := range []json.RawMessage{req.MaxTokens, req.Temperature, req.TopP, req.TopK, req.StopSequences} {
+		if len(bytes.TrimSpace(control)) > 0 && !bytes.Equal(bytes.TrimSpace(control), []byte("null")) {
+			losses.add(LossGenerationControlsNotForwarded)
 			break
 		}
-		messages = messages[:len(messages)-1]
 	}
-	if len(messages) == 0 {
-		return Conversion{}, errors.New("a user message is required")
+	if systemPresent {
+		history = append(history,
+			map[string]any{"userInputMessage": map[string]any{"content": systemPrompt, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}},
+			map[string]any{"assistantResponseMessage": map[string]any{"content": systemAcknowledgement}},
+		)
 	}
-	toolMap := map[string]string{}
-	tools := convertTools(req["tools"], toolMap)
-	webSearch := pureWebSearchRequest(req["tools"], messages, affinity)
-	history := make([]interface{}, 0, len(messages)-1)
-	toolUses, pairedUses := collectToolPairs(messages)
-	for _, v := range messages[:len(messages)-1] {
-		if m, ok := v.(map[string]interface{}); ok {
-			history = append(history, convertHistory(m, canonical, toolMap, toolUses, pairedUses))
+
+	lastIsUser := strings.EqualFold(strings.TrimSpace(req.Messages[len(req.Messages)-1].Role), "user")
+	historyEnd := len(req.Messages) - 1
+	if !lastIsUser {
+		historyEnd = len(req.Messages)
+		losses.add(LossAssistantPrefillEmulated)
+	}
+	for i := 0; i < historyEnd; i++ {
+		converted, role, err := convertHistory(req.Messages[i], canonical, toolNames, uses, paired, losses)
+		if err != nil {
+			return Conversion{}, err
 		}
-	}
-	// Kiro requires history to begin with a user message. Anthropic-compatible
-	// clients may legally send an assistant prefill as the first historical item.
-	if len(history) > 0 {
-		if first, ok := history[0].(map[string]interface{}); ok && first["assistantResponseMessage"] != nil {
-			history = append([]interface{}{map[string]interface{}{
-				"userInputMessage": map[string]interface{}{"content": "Begin conversation", "modelId": canonical, "origin": "AI_EDITOR"},
-			}}, history...)
+		if role == "assistant" && (len(history) == 0 || historyItemRole(history[len(history)-1]) == "assistant") {
+			history = append(history, map[string]any{
+				"userInputMessage": map[string]any{"content": assistantFirstPadding, "modelId": canonical, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}},
+			})
+			losses.add(LossAssistantFirstPadded)
 		}
+		history = append(history, converted)
 	}
-	last, _ := messages[len(messages)-1].(map[string]interface{})
-	content, images, results := contentParts(last["content"], toolUses)
-	systemPrompt := strings.TrimSpace(contentText(req["system"]))
-	if out, ok := req["output_config"].(map[string]interface{}); ok {
-		if format := out["format"]; format != nil {
-			if b, e := json.Marshal(format); e == nil {
-				if systemPrompt != "" {
-					systemPrompt += "\n"
-				}
-				systemPrompt += "Return output that strictly satisfies this JSON format: " + string(b)
-			}
+
+	var current map[string]any
+	if lastIsUser {
+		current, err = convertUserMessage(req.Messages[len(req.Messages)-1], canonical, uses, losses)
+		if err != nil {
+			return Conversion{}, err
 		}
+	} else {
+		current = map[string]any{"content": prefillContinuation, "modelId": canonical, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}
 	}
-	// Kiro's official clients represent a system instruction as a leading
-	// Human/AI history pair. Embedding it in the current user message as XML makes
-	// Claude treat it as an attempted prompt injection and also pollutes the stable
-	// context prefix.
-	if systemPrompt != "" {
-		systemHistory := []interface{}{
-			map[string]interface{}{"userInputMessage": map[string]interface{}{"content": systemPrompt, "origin": "AI_EDITOR", "userInputMessageContext": map[string]interface{}{}}},
-			map[string]interface{}{"assistantResponseMessage": map[string]interface{}{"content": "I will follow these instructions."}},
-		}
-		history = append(systemHistory, history...)
+	ctx, _ := current["userInputMessageContext"].(map[string]any)
+	if ctx == nil {
+		ctx = map[string]any{}
+		current["userInputMessageContext"] = ctx
 	}
-	ctx := map[string]interface{}{}
 	if len(tools) > 0 {
 		ctx["tools"] = tools
 	}
-	if len(results) > 0 {
-		ctx["toolResults"] = results
+
+	state := map[string]any{
+		"conversationId":      stableUUID("conversation", affinity),
+		"agentContinuationId": stableUUID("continuation", affinity),
+		"agentTaskType":       "vibe",
+		"chatTriggerType":     "MANUAL",
+		"currentMessage":      map[string]any{"userInputMessage": current},
 	}
-	user := map[string]interface{}{"content": content, "modelId": canonical, "origin": "AI_EDITOR", "userInputMessageContext": ctx}
-	if len(images) > 0 {
-		user["images"] = images
-	}
-	convID := stableUUID("conversation", affinity)
-	continuation := stableUUID("continuation", affinity)
-	state := map[string]interface{}{"conversationId": convID, "agentContinuationId": continuation, "agentTaskType": "vibe", "chatTriggerType": "MANUAL", "currentMessage": map[string]interface{}{"userInputMessage": user}}
 	if len(history) > 0 {
 		state["history"] = history
 	}
-	out := map[string]interface{}{"conversationState": state}
-	thinkingEnabled := options.DefaultThinking && supportsDefaultKiroThinking(canonical)
-	if thinking, ok := req["thinking"].(map[string]interface{}); ok {
-		switch strings.ToLower(strings.TrimSpace(stringValue(thinking["type"]))) {
+	out := map[string]any{"conversationState": state}
+
+	thinkingEnabled := options.DefaultThinking
+	if req.Thinking != nil {
+		switch strings.ToLower(strings.TrimSpace(req.Thinking.Type)) {
 		case "disabled", "none":
 			thinkingEnabled = false
 		case "enabled", "adaptive", "auto":
 			thinkingEnabled = true
 		}
 	}
-	if thinkingEnabled {
-		// generateAssistantResponse accepts model-level request fields. Using the
-		// native field avoids injecting <thinking_mode> text into user content.
-		out["additionalModelRequestFields"] = map[string]interface{}{
-			"thinking": map[string]interface{}{"type": "adaptive"},
-		}
+	if thinkingEnabled && !capability.KiroSupportsAdaptiveThinking(canonical) {
+		return Conversion{}, fmt.Errorf("%w: model %s does not support adaptive thinking", ErrReasoningUnavailable, canonical)
 	}
-	b, err := json.Marshal(out)
+	if thinkingEnabled {
+		if req.Thinking != nil && len(bytes.TrimSpace(req.Thinking.Budget)) > 0 && !bytes.Equal(bytes.TrimSpace(req.Thinking.Budget), []byte("null")) {
+			losses.add(LossThinkingBudgetMappedToAdaptive)
+		}
+		out["additionalModelRequestFields"] = map[string]any{"thinking": map[string]any{"type": "adaptive"}}
+	}
+	body, err := json.Marshal(out)
 	if err != nil {
 		return Conversion{}, err
 	}
-	return Conversion{Body: b, Model: canonical, ToolNameMap: toolMap, InputTokens: max64(1, int64(len(raw)/4)), WebSearch: webSearch}, nil
+	estimate := max64(1, int64(len(raw)/4))
+	return Conversion{
+		Body:                  body,
+		Model:                 canonical,
+		ToolNameMap:           toolNames,
+		ToolDescriptionHashes: descriptionHashes,
+		EstimatedInputTokens:  estimate,
+		InputTokens:           estimate,
+		WebSearch:             webSearch,
+		CompatibilityLosses:   losses.sorted(),
+		ThinkingEnabled:       thinkingEnabled,
+	}, nil
 }
 
-func supportsDefaultKiroThinking(model string) bool {
-	return strings.HasPrefix(model, "claude-opus-4.6") ||
-		strings.HasPrefix(model, "claude-opus-4.7") ||
-		strings.HasPrefix(model, "claude-opus-4.8") ||
-		strings.HasPrefix(model, "claude-sonnet-4.6") ||
-		strings.HasPrefix(model, "claude-sonnet-5")
+func historyItemRole(v any) string {
+	m, _ := v.(map[string]any)
+	if m["assistantResponseMessage"] != nil {
+		return "assistant"
+	}
+	if m["userInputMessage"] != nil {
+		return "user"
+	}
+	return ""
 }
 
-func pureWebSearchRequest(toolsValue interface{}, messages []interface{}, affinity string) *WebSearchRequest {
-	tools, _ := toolsValue.([]interface{})
-	if len(tools) != 1 {
+func pureWebSearchRequest(toolsRaw []json.RawMessage, messages []anthropicMessage, affinity string) *WebSearchRequest {
+	if len(toolsRaw) != 1 {
 		return nil
 	}
-	tool, _ := tools[0].(map[string]interface{})
-	if !strings.EqualFold(stringValue(tool["name"]), "web_search") {
+	var tool toolDefinition
+	if decodeUseNumber(toolsRaw[0], &tool) != nil {
 		return nil
 	}
-	first, _ := messages[0].(map[string]interface{})
-	query := strings.TrimSpace(contentText(first["content"]))
+	name := tool.Name
+	if name == "" && strings.HasPrefix(strings.ToLower(tool.Type), "web_search") {
+		name = "web_search"
+	}
+	if !strings.EqualFold(name, "web_search") {
+		return nil
+	}
+	var query string
+	for i := len(messages) - 1; i >= 0; i-- {
+		if !strings.EqualFold(strings.TrimSpace(messages[i].Role), "user") {
+			continue
+		}
+		query = strings.TrimSpace(contentText(messages[i].Content))
+		break
+	}
 	query = strings.TrimSpace(strings.TrimPrefix(query, "Perform a web search for the query: "))
 	if query == "" {
 		return nil
@@ -174,36 +357,45 @@ func stableUUID(kind, key string) string {
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
-func stringValue(v interface{}) string { s, _ := v.(string); return s }
 
-func convertTools(v interface{}, names map[string]string) []interface{} {
-	arr, _ := v.([]interface{})
-	out := make([]interface{}, 0, len(arr))
-	for _, raw := range arr {
-		t, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
+func convertTools(rawTools []json.RawMessage, names, descriptionHashes map[string]string, losses lossSet) ([]any, error) {
+	out := make([]any, 0, len(rawTools))
+	for _, raw := range rawTools {
+		var tool toolDefinition
+		if err := decodeUseNumber(raw, &tool); err != nil {
+			return nil, fmt.Errorf("tool: %w", err)
 		}
-		nameValue := stringValue(t["name"])
-		if nameValue == "" && strings.HasPrefix(strings.ToLower(stringValue(t["type"])), "web_search") {
+		nameValue := tool.Name
+		if nameValue == "" && strings.HasPrefix(strings.ToLower(tool.Type), "web_search") {
 			nameValue = "web_search"
-			t["description"] = "Search the web through Kiro MCP"
-			t["input_schema"] = map[string]interface{}{"type": "object", "properties": map[string]interface{}{"query": map[string]interface{}{"type": "string"}}, "required": []interface{}{"query"}}
+			tool.Description = "Search the web through Kiro MCP"
+			tool.InputSchema = json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`)
+		}
+		if len(bytes.TrimSpace(tool.Cache)) > 0 && !bytes.Equal(bytes.TrimSpace(tool.Cache), []byte("null")) {
+			losses.add(LossCacheControlNotForwarded)
 		}
 		name := shortToolName(nameValue, names)
-		schema := t["input_schema"]
-		if schema == nil {
-			schema = map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+		var schema any = map[string]any{"type": "object", "properties": map[string]any{}}
+		if len(bytes.TrimSpace(tool.InputSchema)) > 0 && !bytes.Equal(bytes.TrimSpace(tool.InputSchema), []byte("null")) {
+			if err := decodeUseNumber(tool.InputSchema, &schema); err != nil {
+				return nil, fmt.Errorf("tool %q input_schema: %w", nameValue, err)
+			}
 		}
-		schema = expandRefs(schema, schema)
-		desc := stringValue(t["description"])
-		if utf8.RuneCountInString(desc) > 10000 {
-			desc = string([]rune(desc)[:10000])
+		schema = expandRefs(schema, schema, 0, map[string]bool{}, losses)
+		description := tool.Description
+		if utf8.RuneCountInString(description) > kiroToolDescriptionRunes {
+			sum := sha256.Sum256([]byte(description))
+			descriptionHashes[nameValue] = hex.EncodeToString(sum[:])
+			description = string([]rune(description)[:kiroToolDescriptionRunes])
+			losses.add(LossToolDescriptionTruncated)
 		}
-		out = append(out, map[string]interface{}{"toolSpecification": map[string]interface{}{"name": name, "description": desc, "inputSchema": map[string]interface{}{"json": schema}}})
+		out = append(out, map[string]any{"toolSpecification": map[string]any{
+			"name": name, "description": description, "inputSchema": map[string]any{"json": schema},
+		}})
 	}
-	return out
+	return out, nil
 }
+
 func shortToolName(name string, names map[string]string) string {
 	if len(name) <= 63 {
 		return name
@@ -218,153 +410,440 @@ func shortToolName(name string, names map[string]string) string {
 	return short
 }
 
-func expandRefs(v, root interface{}) interface{} {
-	m, ok := v.(map[string]interface{})
-	if !ok {
-		if a, ok := v.([]interface{}); ok {
-			for i := range a {
-				a[i] = expandRefs(a[i], root)
-			}
+func expandRefs(v, root any, depth int, visiting map[string]bool, losses lossSet) any {
+	if depth >= kiroSchemaRefMaxDepth {
+		losses.add(LossToolSchemaRefBounded)
+		return map[string]any{}
+	}
+	switch value := v.(type) {
+	case []any:
+		out := make([]any, len(value))
+		for i := range value {
+			out[i] = expandRefs(value[i], root, depth+1, visiting, losses)
 		}
+		return out
+	case map[string]any:
+		if ref, ok := value["$ref"].(string); ok && strings.HasPrefix(ref, "#/") {
+			if visiting[ref] {
+				losses.add(LossToolSchemaRefBounded)
+				return map[string]any{}
+			}
+			resolved, ok := resolveLocalRef(root, ref)
+			if !ok {
+				losses.add(LossToolSchemaRefBounded)
+				return map[string]any{"$ref": ref}
+			}
+			next := cloneStringBoolMap(visiting)
+			next[ref] = true
+			return expandRefs(resolved, root, depth+1, next, losses)
+		}
+		out := make(map[string]any, len(value))
+		for key, child := range value {
+			if key == "$defs" || key == "definitions" {
+				continue
+			}
+			out[key] = expandRefs(child, root, depth+1, visiting, losses)
+		}
+		return out
+	default:
 		return v
 	}
-	if ref, ok := m["$ref"].(string); ok && strings.HasPrefix(ref, "#/") {
-		cur := root
-		for _, p := range strings.Split(strings.TrimPrefix(ref, "#/"), "/") {
-			mm, ok := cur.(map[string]interface{})
-			if !ok {
-				return v
-			}
-			cur = mm[strings.ReplaceAll(strings.ReplaceAll(p, "~1", "/"), "~0", "~")]
+}
+
+func resolveLocalRef(root any, ref string) (any, bool) {
+	cur := root
+	for _, part := range strings.Split(strings.TrimPrefix(ref, "#/"), "/") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil, false
 		}
-		return expandRefs(cur, root)
+		part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
+		cur, ok = m[part]
+		if !ok {
+			return nil, false
+		}
 	}
-	out := map[string]interface{}{}
-	for k, x := range m {
-		if k != "$defs" && k != "definitions" {
-			out[k] = expandRefs(x, root)
-		}
+	return cur, true
+}
+
+func cloneStringBoolMap(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in)+1)
+	for key, value := range in {
+		out[key] = value
 	}
 	return out
 }
 
-func convertHistory(m map[string]interface{}, model string, names map[string]string, uses, paired map[string]bool) interface{} {
-	role := stringValue(m["role"])
-	text, images, results := contentParts(m["content"], uses)
+func convertHistory(message anthropicMessage, model string, names map[string]string, uses, paired map[string]bool, losses lossSet) (any, string, error) {
+	role := strings.ToLower(strings.TrimSpace(message.Role))
 	if role == "assistant" {
-		var tus []interface{}
-		if arr, ok := m["content"].([]interface{}); ok {
-			for _, x := range arr {
-				b, _ := x.(map[string]interface{})
-				if stringValue(b["type"]) == "tool_use" {
-					id := stringValue(b["id"])
-					if !paired[id] {
-						continue
-					}
-					tus = append(tus, map[string]interface{}{"toolUseId": id, "name": shortToolName(stringValue(b["name"]), names), "input": b["input"]})
-				}
+		text, _, _, blocks, err := contentParts(message.Content, uses, losses)
+		if err != nil {
+			return nil, role, err
+		}
+		var toolUses []any
+		for _, block := range blocks {
+			if block.Type != "tool_use" {
+				continue
 			}
+			id := rawScalarString(block.ID)
+			if !paired[id] {
+				text = appendText(text, textualizedBlock("unpaired_tool_use", block.Raw))
+				losses.add(LossUnpairedToolUseTextualized)
+				continue
+			}
+			input, err := canonicalValue(block.Input, map[string]any{})
+			if err != nil {
+				return nil, role, fmt.Errorf("tool_use %s input: %w", id, err)
+			}
+			toolUses = append(toolUses, map[string]any{"toolUseId": id, "name": shortToolName(block.Name, names), "input": input})
 		}
-		msg := map[string]interface{}{"content": text}
-		if len(tus) > 0 {
-			msg["toolUses"] = tus
+		response := map[string]any{"content": text}
+		if len(toolUses) > 0 {
+			response["toolUses"] = toolUses
 		}
-		return map[string]interface{}{"assistantResponseMessage": msg}
+		return map[string]any{"assistantResponseMessage": response}, role, nil
 	}
-	ctx := map[string]interface{}{}
+	user, err := convertUserMessage(message, model, uses, losses)
+	if err != nil {
+		return nil, role, err
+	}
+	return map[string]any{"userInputMessage": user}, "user", nil
+}
+
+func convertUserMessage(message anthropicMessage, model string, uses map[string]bool, losses lossSet) (map[string]any, error) {
+	text, images, results, _, err := contentParts(message.Content, uses, losses)
+	if err != nil {
+		return nil, err
+	}
+	ctx := map[string]any{}
 	if len(results) > 0 {
 		ctx["toolResults"] = results
 	}
-	msg := map[string]interface{}{"content": text, "modelId": model, "origin": "AI_EDITOR", "userInputMessageContext": ctx}
+	user := map[string]any{"content": text, "modelId": model, "origin": "AI_EDITOR", "userInputMessageContext": ctx}
 	if len(images) > 0 {
-		msg["images"] = images
+		user["images"] = images
 	}
-	return map[string]interface{}{"userInputMessage": msg}
+	return user, nil
 }
 
-func collectToolPairs(messages []interface{}) (map[string]bool, map[string]bool) {
+func collectToolPairs(messages []anthropicMessage) (map[string]bool, map[string]bool, error) {
 	uses, results := map[string]bool{}, map[string]bool{}
-	for _, raw := range messages {
-		m, _ := raw.(map[string]interface{})
-		blocks, _ := m["content"].([]interface{})
-		for _, v := range blocks {
-			b, _ := v.(map[string]interface{})
-			switch stringValue(b["type"]) {
+	for _, message := range messages {
+		blocks, _, err := parseContentBlocks(message.Content)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, block := range blocks {
+			switch block.Type {
 			case "tool_use":
-				uses[stringValue(b["id"])] = true
+				uses[rawScalarString(block.ID)] = true
 			case "tool_result":
-				results[stringValue(b["tool_use_id"])] = true
+				results[rawScalarString(block.ToolUseID)] = true
 			}
 		}
 	}
 	paired := map[string]bool{}
 	for id := range uses {
-		if results[id] {
+		if id != "" && results[id] {
 			paired[id] = true
 		}
 	}
-	return uses, paired
+	return uses, paired, nil
 }
 
-func contentParts(v interface{}, uses map[string]bool) (string, []interface{}, []interface{}) {
-	var texts []string
-	var images, results []interface{}
-	switch x := v.(type) {
-	case string:
-		texts = append(texts, x)
-	case []interface{}:
-		for _, raw := range x {
-			b, _ := raw.(map[string]interface{})
-			switch stringValue(b["type"]) {
-			case "text", "thinking":
-				texts = append(texts, stringValue(b["text"]), stringValue(b["thinking"]))
-			case "image":
-				src, _ := b["source"].(map[string]interface{})
-				mt := stringValue(src["media_type"])
-				format := strings.TrimPrefix(mt, "image/")
-				if format == "jpg" {
-					format = "jpeg"
-				}
-				images = append(images, map[string]interface{}{"format": format, "source": map[string]interface{}{"bytes": stringValue(src["data"])}})
-			case "tool_result":
-				id := stringValue(b["tool_use_id"])
-				if uses == nil || uses[id] {
-					status := "success"
-					if e, _ := b["is_error"].(bool); e {
-						status = "error"
-					}
-					results = append(results, map[string]interface{}{"toolUseId": id, "content": []interface{}{map[string]interface{}{"text": contentText(b["content"])}}, "status": status, "isError": status == "error"})
-				}
+func contentParts(raw json.RawMessage, uses map[string]bool, losses lossSet) (string, []any, []any, []contentBlock, error) {
+	blocks, plain, err := parseContentBlocks(raw)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	text := plain
+	var images, results []any
+	for _, block := range blocks {
+		if block.HasCache {
+			losses.add(LossCacheControlNotForwarded)
+		}
+		switch block.Type {
+		case "text":
+			text = appendText(text, block.Text)
+		case "thinking", "redacted_thinking":
+			thinking := block.Thinking
+			if thinking == "" {
+				thinking = block.Text
 			}
-		}
-	}
-	var clean []string
-	for _, s := range texts {
-		if s != "" {
-			clean = append(clean, s)
-		}
-	}
-	return strings.Join(clean, "\n"), images, results
-}
-func contentText(v interface{}) string {
-	switch x := v.(type) {
-	case string:
-		return x
-	case []interface{}:
-		var p []string
-		for _, r := range x {
-			if m, ok := r.(map[string]interface{}); ok {
-				if s := stringValue(m["text"]); s != "" {
-					p = append(p, s)
-				}
+			text = appendText(text, "<thinking>\n"+thinking+"\n</thinking>")
+			losses.add(LossThinkingHistoryTextualized)
+		case "image":
+			image, ok, err := convertImage(block.Source)
+			if err != nil {
+				return "", nil, nil, nil, err
 			}
+			if ok {
+				images = append(images, image)
+			} else {
+				text = appendText(text, textualizedBlock("unsupported_block", block.Raw))
+				losses.add(LossUnsupportedBlockTextualized)
+			}
+		case "tool_result":
+			id := rawScalarString(block.ToolUseID)
+			if uses != nil && !uses[id] {
+				text = appendText(text, textualizedBlock("unsupported_block", block.Raw))
+				losses.add(LossUnsupportedBlockTextualized)
+				continue
+			}
+			status := "success"
+			if block.IsError {
+				status = "error"
+			}
+			resultText, err := toolResultContent(block.Content, losses)
+			if err != nil {
+				return "", nil, nil, nil, err
+			}
+			results = append(results, map[string]any{
+				"toolUseId": id,
+				"content":   []any{map[string]any{"text": resultText}},
+				"status":    status,
+				"isError":   block.IsError,
+			})
+		case "tool_use":
+			// Assistant tool uses are emitted natively by convertHistory. A tool-use
+			// block in user content has no Kiro representation and is preserved here.
+			if uses == nil {
+				text = appendText(text, textualizedBlock("unpaired_tool_use", block.Raw))
+				losses.add(LossUnpairedToolUseTextualized)
+			}
+		default:
+			text = appendText(text, textualizedBlock("unsupported_block", block.Raw))
+			losses.add(LossUnsupportedBlockTextualized)
 		}
-		return strings.Join(p, "\n")
-	default:
-		b, _ := json.Marshal(v)
-		return string(b)
 	}
+	return text, images, results, blocks, nil
 }
+
+func parseContentBlocks(raw json.RawMessage) ([]contentBlock, string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, "", nil
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return nil, "", err
+		}
+		return nil, text, nil
+	}
+	var rawBlocks []json.RawMessage
+	if err := decodeUseNumber(trimmed, &rawBlocks); err != nil {
+		return nil, "", err
+	}
+	out := make([]contentBlock, 0, len(rawBlocks))
+	for _, rawBlock := range rawBlocks {
+		block, err := parseContentBlock(rawBlock)
+		if err != nil {
+			return nil, "", err
+		}
+		out = append(out, block)
+	}
+	return out, "", nil
+}
+
+func parseContentBlock(raw json.RawMessage) (contentBlock, error) {
+	var fields map[string]json.RawMessage
+	if err := decodeUseNumber(raw, &fields); err != nil {
+		return contentBlock{}, err
+	}
+	block := contentBlock{Raw: canonicalRawOrOriginal(raw)}
+	_ = json.Unmarshal(fields["type"], &block.Type)
+	_ = json.Unmarshal(fields["text"], &block.Text)
+	_ = json.Unmarshal(fields["thinking"], &block.Thinking)
+	_ = json.Unmarshal(fields["name"], &block.Name)
+	_ = json.Unmarshal(fields["is_error"], &block.IsError)
+	block.ID = canonicalRawOrOriginal(fields["id"])
+	block.Input = canonicalRawOrOriginal(fields["input"])
+	block.ToolUseID = canonicalRawOrOriginal(fields["tool_use_id"])
+	block.Source = canonicalRawOrOriginal(fields["source"])
+	block.Content = canonicalRawOrOriginal(fields["content"])
+	cache := bytes.TrimSpace(fields["cache_control"])
+	block.HasCache = len(cache) > 0 && !bytes.Equal(cache, []byte("null"))
+	return block, nil
+}
+
+func convertImage(raw json.RawMessage) (map[string]any, bool, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, false, nil
+	}
+	var source struct {
+		Type      string `json:"type"`
+		MediaType string `json:"media_type"`
+		Data      string `json:"data"`
+	}
+	if err := decodeUseNumber(raw, &source); err != nil {
+		return nil, false, err
+	}
+	if source.Type != "base64" || !strings.HasPrefix(source.MediaType, "image/") || source.Data == "" {
+		return nil, false, nil
+	}
+	format := strings.TrimPrefix(source.MediaType, "image/")
+	if format == "jpg" {
+		format = "jpeg"
+	}
+	return map[string]any{"format": format, "source": map[string]any{"bytes": source.Data}}, true, nil
+}
+
+func toolResultContent(raw json.RawMessage, losses lossSet) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return "", err
+		}
+		return text, nil
+	}
+	blocks, plain, err := parseContentBlocks(trimmed)
+	if err != nil {
+		// Tool results may legally be arbitrary JSON rather than Anthropic blocks.
+		canonical, canonicalErr := canonicalJSON(trimmed)
+		if canonicalErr != nil {
+			return "", err
+		}
+		losses.add(LossUnsupportedBlockTextualized)
+		return textualizedBlock("unsupported_block", canonical), nil
+	}
+	text := plain
+	for _, block := range blocks {
+		if block.HasCache {
+			losses.add(LossCacheControlNotForwarded)
+		}
+		if block.Type == "text" {
+			text = appendText(text, block.Text)
+			continue
+		}
+		text = appendText(text, textualizedBlock("unsupported_block", block.Raw))
+		losses.add(LossUnsupportedBlockTextualized)
+	}
+	return text, nil
+}
+
+func systemContent(raw json.RawMessage, losses lossSet) (string, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", false, nil
+	}
+	if trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return "", false, err
+		}
+		return text, true, nil
+	}
+	blocks, _, err := parseContentBlocks(trimmed)
+	if err != nil {
+		return "", false, err
+	}
+	parts := make([]string, 0, len(blocks))
+	for _, block := range blocks {
+		if block.HasCache {
+			losses.add(LossCacheControlNotForwarded)
+		}
+		if block.Type == "text" {
+			parts = append(parts, block.Text)
+			continue
+		}
+		parts = append(parts, textualizedBlock("unsupported_block", block.Raw))
+		losses.add(LossUnsupportedBlockTextualized)
+	}
+	return strings.Join(parts, "\n"), true, nil
+}
+
+func textualizedBlock(kind string, raw json.RawMessage) string {
+	canonical := canonicalRawOrOriginal(raw)
+	return "<" + kind + ">" + string(canonical) + "</" + kind + ">"
+}
+
+func appendText(existing, next string) string {
+	if next == "" {
+		return existing
+	}
+	if existing == "" {
+		return next
+	}
+	return existing + "\n" + next
+}
+
+func contentText(raw json.RawMessage) string {
+	blocks, plain, err := parseContentBlocks(raw)
+	if err != nil {
+		return ""
+	}
+	text := plain
+	for _, block := range blocks {
+		if block.Type == "text" {
+			text = appendText(text, block.Text)
+		}
+	}
+	return text
+}
+
+func rawScalarString(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	if trimmed[0] == '"' {
+		var value string
+		if json.Unmarshal(trimmed, &value) == nil {
+			return value
+		}
+	}
+	return string(trimmed)
+}
+
+func canonicalValue(raw json.RawMessage, fallback any) (any, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fallback, nil
+	}
+	var value any
+	if err := decodeUseNumber(raw, &value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func canonicalJSON(raw json.RawMessage) ([]byte, error) {
+	var value any
+	if err := decodeUseNumber(raw, &value); err != nil {
+		return nil, err
+	}
+	return json.Marshal(value)
+}
+
+func canonicalRawOrOriginal(raw json.RawMessage) json.RawMessage {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	canonical, err := canonicalJSON(raw)
+	if err != nil {
+		return append(json.RawMessage(nil), raw...)
+	}
+	return canonical
+}
+
+func decodeUseNumber(raw []byte, dst any) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("JSON must contain one value")
+	}
+	return nil
+}
+
 func max64(a, b int64) int64 {
 	if a > b {
 		return a

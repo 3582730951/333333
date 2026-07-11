@@ -101,3 +101,85 @@ func TestConvertAnthropicThinkingExplicitChoiceWinsDefault(t *testing.T) {
 		t.Fatalf("explicit thinking did not use native Kiro fields: %s", got.Body)
 	}
 }
+
+func TestConvertAnthropicPreservesPrefillThinkingUnknownBlocksAndLosses(t *testing.T) {
+	raw := []byte(`{
+  "model":"claude-opus-4-9-20270101",
+  "system":[{"type":"text","text":" first "},{"type":"future_system","value":9007199254740993,"cache_control":{"type":"ephemeral"}}],
+  "messages":[
+    {"role":"assistant","content":[{"type":"thinking","thinking":"private"},{"type":"future_block","constant":9007199254740993},{"type":"tool_use","id":9007199254740993,"name":"tool","input":{"constant":9007199254740993}}]},
+    {"role":"assistant","content":"tail prefill"}
+  ],
+  "tools":[{"name":"tool","description":"d","input_schema":{"type":"object","properties":{"n":{"const":9007199254740993}}}}],
+  "output_config":{"format":{"type":"object","properties":{"n":{"const":9007199254740993}}}}
+}`)
+	got, err := ConvertAnthropicRequest(raw, "prefill-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "claude-opus-4.9" {
+		t.Fatalf("concrete unknown model drifted to another version: %q", got.Model)
+	}
+	wantLosses := []string{LossAssistantFirstPadded, LossAssistantPrefillEmulated, LossCacheControlNotForwarded, LossOutputFormatPromptEmulated, LossThinkingHistoryTextualized, LossUnpairedToolUseTextualized, LossUnsupportedBlockTextualized}
+	for _, want := range wantLosses {
+		if !containsString(got.CompatibilityLosses, want) {
+			t.Fatalf("missing loss %q in %v", want, got.CompatibilityLosses)
+		}
+	}
+	body := string(got.Body)
+	for _, want := range []string{`"content":"Continue."`, `\u003cthinking\u003e\nprivate\n\u003c/thinking\u003e`, `9007199254740993`, `tail prefill`, `future_block`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("converted body lost %q: %s", want, body)
+		}
+	}
+}
+
+func TestConvertAnthropicPairedToolIDsAndRecursiveSchemaAreStable(t *testing.T) {
+	raw := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"assistant","content":[{"type":"tool_use","id":9007199254740993,"name":"calc","input":{"n":9007199254740993}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":9007199254740993,"is_error":true,"content":[{"type":"text","text":"failed"}]},{"type":"text","text":"continue"}]}],"tools":[{"name":"calc","description":"d","input_schema":{"$defs":{"node":{"type":"object","properties":{"next":{"$ref":"#/$defs/node"}}}},"$ref":"#/$defs/node"}}]}`)
+	got, err := ConvertAnthropicRequest(raw, "tool-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(got.Body)
+	if !strings.Contains(body, `"toolUseId":"9007199254740993"`) || !strings.Contains(body, `"n":9007199254740993`) || !strings.Contains(body, `"status":"error"`) {
+		t.Fatalf("tool identity/input/status was reconstructed lossily: %s", body)
+	}
+	if len(body) > 100_000 {
+		t.Fatalf("recursive schema expansion was unbounded: %d bytes", len(body))
+	}
+	if !containsString(got.CompatibilityLosses, LossToolSchemaRefBounded) || strings.Contains(body, `"$ref"`) {
+		t.Fatalf("recursive schema cycle was not bounded transparently: losses=%v body=%s", got.CompatibilityLosses, body)
+	}
+}
+
+func TestConvertAnthropicWebSearchUsesLatestUserTurn(t *testing.T) {
+	raw := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"old query"},{"role":"assistant","content":"ok"},{"role":"user","content":"Perform a web search for the query: current query"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
+	got, err := ConvertAnthropicRequest(raw, "search-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WebSearch == nil || got.WebSearch.Query != "current query" {
+		t.Fatalf("web search query = %+v", got.WebSearch)
+	}
+}
+
+func TestConvertAnthropicLongToolDescriptionRecordsHash(t *testing.T) {
+	description := strings.Repeat("界", kiroToolDescriptionRunes+1)
+	raw, _ := json.Marshal(map[string]any{"model": "claude-sonnet-4-6", "messages": []any{map[string]any{"role": "user", "content": "x"}}, "tools": []any{map[string]any{"name": "long", "description": description}}})
+	got, err := ConvertAnthropicRequest(raw, "long-tool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(got.CompatibilityLosses, LossToolDescriptionTruncated) || len(got.ToolDescriptionHashes["long"]) != 64 {
+		t.Fatalf("truncation diagnostics missing: losses=%v hashes=%v", got.CompatibilityLosses, got.ToolDescriptionHashes)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}

@@ -461,6 +461,12 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 	}
 	accountID, action := parts[0], parts[1]
 	switch action {
+	case "kiro":
+		if len(parts) == 3 && parts[2] == "cache-probe" {
+			s.adminKiroCacheProbe(w, r, accountID)
+			return
+		}
+		http.NotFound(w, r)
 	case "probe-models":
 		s.adminProbeModels(w, r, accountID)
 	case "refresh":

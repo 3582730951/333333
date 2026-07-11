@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/scheduler"
@@ -49,19 +52,38 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 	r = r.WithContext(withSchedulerWait(r.Context(), w, stream, "openai"))
 	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, anthBody, routeGroup, pol.KeyHash, model)
+	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
+	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
 	exclude := map[string]bool{}
+	explicitKiro := len(allowedProviders) == 1 && allowedProviders[0] == "kiro"
+	immutableAffinity := affinityEstablished && (explicitKiro || len(allowedProviders) > 1)
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	thinkingRequired := kiroThinkingRequested(anthBody, kiroCfg.KiroDefaultThinking)
 	var lease scheduler.Lease
 	for {
 		lease, err = s.scheduler.Select(r.Context(), scheduler.Route{
-			Group:            routeGroup,
-			AllowedProviders: allowedProviders,
-			Affinity:         affinity,
-			Model:            model,
-			EstimatedTokens:  virtual.EstimateTokensJSON(raw),
-			Exclude:          exclude,
-			OnWait:           schedulerWaitCallback(r.Context()),
+			Group:                 routeGroup,
+			AllowedProviders:      allowedProviders,
+			Affinity:              affinity,
+			ImmutableAffinity:     immutableAffinity,
+			ExplicitProvider:      explicitKiro,
+			ThinkingRequired:      thinkingRequired,
+			KiroEndpointAllowlist: kiroCfg.KiroEndpointAllowlist,
+			KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
+			Model:                 model,
+			EstimatedTokens:       virtual.EstimateTokensJSON(raw),
+			Exclude:               exclude,
+			OnWait:                schedulerWaitCallback(r.Context()),
 		})
 		if err != nil {
+			if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
+				writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
+				return
+			}
+			if explicitKiro && capability.KiroModelAlias(model) {
+				writeKiroError(w, r, http.StatusServiceUnavailable, fmt.Errorf("%w: %s", kirowire.ErrVerifiedModelUnavailable, model))
+				return
+			}
 			if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
 				return
 			}
@@ -72,10 +94,16 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		if lease.Account.Provider != "kiro" {
 			break
 		}
-		if s.kiroChatWithLease(w, r, anthBody, model, affinity, lease, true, exclude) != outcomeRetry {
-			return
-		}
+		s.kiroChatWithLease(w, r, anthBody, model, affinity, lease, false, nil)
+		return
 	}
+	resolvedModel := firstNonEmpty(lease.ResolvedModel, model)
+	if resolvedModel != model {
+		anthBody = setForcedModel(anthBody, resolvedModel)
+		model = resolvedModel
+	}
+	w.Header().Set("X-Pool-Resolved-Provider", "claude")
+	w.Header().Set("X-Pool-Resolved-Model", resolvedModel)
 	leaseReleased := false
 	releaseLease := func() {
 		if leaseReleased {

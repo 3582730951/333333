@@ -204,6 +204,45 @@ func TestStaticClaudeModelsNonEmpty(t *testing.T) {
 	}
 }
 
+func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
+	cases := map[string]string{
+		"claude-opus-4-8":          "claude-opus-4.8",
+		"claude-opus-4.8":          "claude-opus-4.8",
+		"claude-opus-4-8-20260701": "claude-opus-4.8",
+		"claude-sonnet-4-9":        "claude-sonnet-4.9",
+	}
+	for input, want := range cases {
+		got, ok := KiroCanonicalModel(input)
+		if !ok || got != want {
+			t.Fatalf("KiroCanonicalModel(%q)=(%q,%v), want %q", input, got, ok, want)
+		}
+	}
+	if got, ok := KiroCanonicalModel("claude-opus-4-9-preview"); ok || got != "" {
+		t.Fatalf("unknown suffix was attracted to a known version: %q %v", got, ok)
+	}
+}
+
+func TestKiroAliasesUseOnlyVerifiedModels(t *testing.T) {
+	if _, ok := ResolveKiroModel("auto", nil); ok {
+		t.Fatal("auto resolved without a verified model")
+	}
+	verified := []string{"claude-sonnet-4.6", "claude-opus-4.7", "claude-opus-4.8"}
+	if got, ok := ResolveKiroModel("auto", verified); !ok || got != "claude-opus-4.8" {
+		t.Fatalf("auto=(%q,%v)", got, ok)
+	}
+	if got, ok := ResolveKiroModel("sonnet", verified); !ok || got != "claude-sonnet-4.6" {
+		t.Fatalf("sonnet=(%q,%v)", got, ok)
+	}
+	if got, ok := ResolveKiroModel("claude-opus-4-9", verified); !ok || got != "claude-opus-4.9" {
+		t.Fatalf("concrete version drifted: (%q,%v)", got, ok)
+	}
+	for _, capability := range StaticKiroModels("account") {
+		if capability.Source != "kiro_static_unknown" {
+			t.Fatalf("static Kiro capability is schedulable-looking: %+v", capability)
+		}
+	}
+}
+
 // TestStaticClaudeModelsIncludesOpus48 locks in the user-reported fix: the current
 // flagship claude-opus-4-8 must be in the static set with its 1M context window, so
 // an OAuth account whose /v1/models probe is rejected still advertises it.

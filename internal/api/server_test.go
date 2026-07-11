@@ -2730,11 +2730,12 @@ func TestCodexStreamingStatefulTurnDoesNotUseRemovedLedger(t *testing.T) {
 	}
 }
 
-func TestHealthTestDetectsBanDeletesAndAudits(t *testing.T) {
+func TestHealthTestDetectsBanDeletesAndAuditsWhenEnabled(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`{"error":{"code":"account_deactivated","message":"Your account was deactivated for a policy violation"}}`))
 	})
+	h.app.cfg.BanAutoDelete = true
 	acc := h.importAccount(t, "dead", "upstream-dead", "access-dead")
 	resp, err := http.Post(h.pool.URL+"/admin/accounts/"+acc+"/health-test", "application/json", nil)
 	if err != nil {
@@ -2775,6 +2776,43 @@ func TestHealthTestAliveDoesNotDelete(t *testing.T) {
 	}
 	if _, err := h.store.GetAccount(context.Background(), acc); err != nil {
 		t.Fatalf("healthy account must not be deleted: %v", err)
+	}
+}
+
+func TestClaudeCountTokensUsesFinalUpstreamRequestWithoutUsageRecord(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages/count_tokens" {
+			t.Errorf("upstream path=%q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"input_tokens":321}`))
+	})
+	account := storage.Account{ID: "claude-count", Label: "claude", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{AccessToken: "sk-ant-api-test"}); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages/count_tokens", strings.NewReader(`{"model":"claude-sonnet-4-6","system":"count final body","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "claude")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"input_tokens":321`)) {
+		t.Fatalf("count_tokens status=%d body=%s", response.StatusCode, body)
+	}
+	if response.Header.Get("X-Pool-Resolved-Provider") != "claude" || response.Header.Get("X-Pool-Resolved-Model") != "claude-sonnet-4-6" {
+		t.Fatalf("resolved headers=%v", response.Header)
+	}
+	requests := h.requests()
+	if len(requests) != 1 || !strings.Contains(requests[0].Body, "count final body") || requests[0].Body == `{"model":"claude-sonnet-4-6","system":"count final body","messages":[{"role":"user","content":"hello"}]}` {
+		t.Fatalf("count_tokens did not use final transformed upstream body: %+v", requests)
+	}
+	var usageRows int
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM usage_records WHERE account_id=?`, account.ID).Scan(&usageRows); err != nil || usageRows != 0 {
+		t.Fatalf("count_tokens usage rows=%d err=%v", usageRows, err)
 	}
 }
 
@@ -3895,5 +3933,57 @@ func TestProbeReplacesStaleCapabilities(t *testing.T) {
 	}
 	if !got["gpt-5.5"] {
 		t.Fatalf("re-probe should store the new gpt-5.5: %v", got)
+	}
+}
+
+func TestResponsesPreviousResponseBindingPersistsWithoutPromptKey(t *testing.T) {
+	var auths []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		raw, _ := io.ReadAll(r.Body)
+		id := "resp_state_root"
+		if bytes.Contains(raw, []byte("previous_response_id")) {
+			id = "resp_state_next"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":%q,"object":"response","model":"gpt","status":"completed","output_text":"ok","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, id)
+	})
+	h.importAccount(t, "a", "upstream-a", "access-a")
+	h.importAccount(t, "b", "upstream-b", "access-b")
+
+	first, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","input":[{"role":"user","content":"start"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBody, _ := io.ReadAll(first.Body)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK || !bytes.Contains(firstBody, []byte("resp_state_root")) || len(auths) != 1 {
+		t.Fatalf("first response status=%d auths=%v body=%s", first.StatusCode, auths, firstBody)
+	}
+	stateKey := routing.ResponseAffinityKey("resp_state_root")
+	bound, err := h.store.GetAffinityBinding(context.Background(), stateKey.Hash)
+	if err != nil || bound.Provider != "codex" || bound.Model != "gpt" || bound.EgressID == "" {
+		t.Fatalf("response state binding=%+v err=%v", bound, err)
+	}
+
+	second, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","previous_response_id":"resp_state_root","input":[{"role":"user","content":"next"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody, _ := io.ReadAll(second.Body)
+	second.Body.Close()
+	if second.StatusCode != http.StatusOK || len(auths) != 2 || auths[1] != auths[0] || !bytes.Contains(secondBody, []byte("resp_state_next")) {
+		t.Fatalf("stateful continuation switched account: status=%d auths=%v body=%s", second.StatusCode, auths, secondBody)
+	}
+
+	callsBeforeMissing := len(auths)
+	missing, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","previous_response_id":"resp_unknown","input":"next"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingBody, _ := io.ReadAll(missing.Body)
+	missing.Body.Close()
+	if missing.StatusCode != http.StatusConflict || len(auths) != callsBeforeMissing || !bytes.Contains(missingBody, []byte(`"code":"state_binding_missing"`)) {
+		t.Fatalf("missing state binding status=%d calls=%d body=%s", missing.StatusCode, len(auths), missingBody)
 	}
 }

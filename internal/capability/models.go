@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,35 +55,95 @@ var kiroStaticModels = []string{
 	"claude-haiku-4.5", "claude-fable-5",
 }
 
-// KiroCanonicalModel maps Claude aliases and dated Anthropic identifiers onto the
-// model ids accepted by generateAssistantResponse. Non-Claude families are rejected.
+var kiroConcreteModelRE = regexp.MustCompile(`^claude-(opus|sonnet|haiku|fable)-([0-9]+)(?:[.-]([0-9]+))?(?:-([0-9]{8}))?$`)
+
+// KiroModelAlias reports whether model needs account-specific capability
+// resolution. Aliases are deliberately not resolved from the static catalog: those
+// rows are only a discovery hint and do not prove that a particular account can use
+// the model.
+func KiroModelAlias(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "auto", "default", "opus", "claude-opus", "sonnet", "claude-sonnet", "haiku", "claude-haiku", "fable", "claude-fable":
+		return true
+	default:
+		return false
+	}
+}
+
+// KiroCanonicalModel canonicalizes only a concrete Claude model identifier. Dot
+// and hyphen spellings, and an optional dated suffix, map to the same numeric
+// version. A different or previously unknown version is never attracted to a
+// nearby static model (for example 4.9 can never become 4.8).
 func KiroCanonicalModel(model string) (string, bool) {
 	m := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(m, "fable"):
-		return "claude-fable-5", true
-	case strings.Contains(m, "sonnet"):
-		if strings.Contains(m, "5") && !strings.Contains(m, "4-5") && !strings.Contains(m, "4.5") {
-			return "claude-sonnet-5", true
-		}
-		if strings.Contains(m, "4-6") || strings.Contains(m, "4.6") {
-			return "claude-sonnet-4.6", true
-		}
-		return "claude-sonnet-4.5", true
-	case strings.Contains(m, "opus"):
-		for _, version := range []string{"4.8", "4.7", "4.6", "4.5"} {
-			if strings.Contains(m, version) || strings.Contains(m, strings.ReplaceAll(version, ".", "-")) {
-				return "claude-opus-" + version, true
-			}
-		}
-		return "claude-opus-4.8", true
-	case strings.Contains(m, "haiku"):
-		return "claude-haiku-4.5", true
-	case m == "auto" || m == "default":
-		return "claude-opus-4.8", true
-	default:
+	match := kiroConcreteModelRE.FindStringSubmatch(m)
+	if match == nil {
 		return "", false
 	}
+	version := match[2]
+	if match[3] != "" {
+		version += "." + match[3]
+	}
+	return "claude-" + match[1] + "-" + version, true
+}
+
+// ResolveKiroModel resolves aliases against models that were verified for the
+// selected account and endpoint. Concrete requests do not require a prior probe;
+// they are sent without changing their version and become verified only after a
+// successful upstream response.
+func ResolveKiroModel(model string, verified []string) (string, bool) {
+	if concrete, ok := KiroCanonicalModel(model); ok {
+		return concrete, true
+	}
+	if !KiroModelAlias(model) {
+		return "", false
+	}
+	wantedFamily := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model)), "claude-")
+	if wantedFamily == "auto" || wantedFamily == "default" {
+		wantedFamily = ""
+	}
+	best := ""
+	bestScore := int64(-1)
+	for _, candidate := range verified {
+		canonical, ok := KiroCanonicalModel(candidate)
+		if !ok {
+			continue
+		}
+		family, score := kiroModelRank(canonical)
+		if wantedFamily != "" && family != wantedFamily {
+			continue
+		}
+		if score > bestScore || (score == bestScore && canonical > best) {
+			best, bestScore = canonical, score
+		}
+	}
+	return best, best != ""
+}
+
+func kiroModelRank(model string) (string, int64) {
+	match := kiroConcreteModelRE.FindStringSubmatch(model)
+	if match == nil {
+		return "", -1
+	}
+	familyRank := map[string]int64{"haiku": 1, "fable": 2, "sonnet": 3, "opus": 4}[match[1]]
+	major, _ := strconv.ParseInt(match[2], 10, 64)
+	minor, _ := strconv.ParseInt(match[3], 10, 64)
+	return match[1], familyRank*1_000_000_000 + major*1_000_000 + minor*1_000
+}
+
+// KiroSupportsAdaptiveThinking is intentionally explicit. Unknown future models
+// do not inherit reasoning support merely because their name contains Claude.
+func KiroSupportsAdaptiveThinking(model string) bool {
+	canonical, ok := KiroCanonicalModel(model)
+	if !ok {
+		return false
+	}
+	for _, prefix := range []string{"claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-sonnet-4.6", "claude-sonnet-5"} {
+		if canonical == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 func StaticKiroModels(accountID string) []storage.ModelCapability {
@@ -94,7 +155,7 @@ func StaticKiroModels(accountID string) []storage.ModelCapability {
 			window = 200000
 		}
 		out = append(out, storage.ModelCapability{AccountID: accountID, ModelSlug: slug, NativeContextWindow: window,
-			NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100, Source: "kiro_static", LastProbeAt: now})
+			NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100, Source: "kiro_static_unknown", LastProbeAt: now})
 	}
 	return out
 }

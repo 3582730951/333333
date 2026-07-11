@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit and integration tests
+        run: go test ./...
+      - name: Race tests for stateful Kiro paths
+        run: go test -race ./internal/kiro ./internal/storage ./internal/scheduler
+      - name: Static analysis
+        run: go vet ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build non-root production image
+        run: docker build --tag codex-pool-server:ci .

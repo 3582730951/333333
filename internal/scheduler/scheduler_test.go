@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/config"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 )
@@ -49,6 +50,79 @@ func TestAffinityBindsSameAccount(t *testing.T) {
 	defer second.Release()
 	if second.Account.ID != firstID {
 		t.Fatalf("second account = %q, want %q", second.Account.ID, firstID)
+	}
+}
+
+func TestLegacyAffinityBindingIsCompletedAfterStickySelection(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "acc-legacy", Label: "legacy", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	key := routing.AffinityKey{Key: "legacy-session", Hash: "legacy-session-hash", Source: "test"}
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: account.ID}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Affinity: key, Model: "gpt-5.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	bound, err := store.GetAffinityBinding(ctx, key.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bound.Provider != "codex" || bound.Model != "gpt-5.4" || bound.EgressID == "" {
+		t.Fatalf("legacy affinity was not completed: %+v", bound)
+	}
+}
+
+func TestClaudeKiroAutoAffinityCannotSwitchProviderAfterFirstSelection(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	claude := storage.Account{ID: "auto-claude", Label: "claude", GroupName: "cyber", Provider: "claude", Status: "active"}
+	kiroAccount := storage.Account{ID: "auto-kiro", Label: "kiro", GroupName: "cyber", Provider: "kiro", Status: "active"}
+	for _, account := range []storage.Account{claude, kiroAccount} {
+		if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	model := "claude-sonnet-4.6"
+	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{{AccountID: claude.ID, ModelSlug: model, Source: "test"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertKiroCredentials(ctx, storage.KiroCredentials{AccountID: kiroAccount.ID, AuthMethod: "api_key", KiroAPIKey: "key", APIRegion: "us-east-1"}); err != nil {
+		t.Fatal(err)
+	}
+	endpointHash, err := kirowire.EndpointHash("", "us-east-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ObserveKiroCapability(ctx, kiroAccount.ID, endpointHash, model, storage.KiroCapabilityObservation{ModelSucceeded: true, ThinkingRequested: true}); err != nil {
+		t.Fatal(err)
+	}
+	key := routing.AffinityKey{Key: "auto-mixed", Hash: "auto-mixed-hash", Source: "test"}
+	route := Route{Group: "cyber", AllowedProviders: []string{"claude", "kiro"}, Affinity: key, Model: model, ThinkingRequired: true}
+	s := New(store, config.Default())
+	first, err := s.Select(ctx, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedID, selectedProvider := first.Account.ID, first.Account.Provider
+	first.Release()
+	bound, err := store.GetAffinityBinding(ctx, key.Hash)
+	if err != nil || bound.AccountID != selectedID || bound.Provider != selectedProvider || bound.Model != model || bound.EgressID == "" {
+		t.Fatalf("first auto binding=%+v err=%v selected=%s/%s", bound, err, selectedProvider, selectedID)
+	}
+	if err := store.SetAccountStatus(ctx, selectedID, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	s.InvalidateAccountCache()
+	route.ImmutableAffinity = true
+	if _, err := s.Select(ctx, route); !errors.Is(err, ErrBoundAccountUnavailable) {
+		t.Fatalf("immutable mixed-provider affinity err=%v, want ErrBoundAccountUnavailable", err)
 	}
 }
 

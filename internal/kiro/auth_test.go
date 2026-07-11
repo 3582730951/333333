@@ -38,6 +38,7 @@ func kiroAuthHarness(t *testing.T, handler http.HandlerFunc, method string) (*Ma
 	token, _ = store.GetToken(context.Background(), account.ID)
 	egress, _ := store.GetEgressProfile(context.Background(), storage.DefaultDirectEgressID)
 	cfg := config.Default()
+	cfg.KiroEndpointAllowlist = []string{srv.URL}
 	return NewManager(store, upstream.NewClient(cfg), cfg), store, account, cred, token, egress
 }
 

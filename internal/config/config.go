@@ -40,6 +40,7 @@ const (
 	DefaultStreamFailoverHoldDiskBytes    = 0
 	DefaultVirtualWindow                  = 2_000_000
 	DefaultVirtualContextLedgerTTLSeconds = 3600 // 1 hour
+	DefaultKiroCacheUnreportedThreshold   = 20
 	// AccountTokenBudget caps CONCURRENT estimated tokens stacked on one account (a
 	// smoothing gate against over-committing a single upstream, not a per-request limit).
 	// Sized for several concurrent 1M-context Claude Code turns per account; exceeding it
@@ -141,9 +142,9 @@ type Config struct {
 	OAuthTokenURL                  string `json:"oauth_token_url"`
 	ClientVersion                  string `json:"client_version"`
 	DefaultGroup                   string `json:"default_group"`
-	Virtual2MEnabled               bool   `json:"virtual_2m_enabled"`
-	VirtualContextWindow           int64  `json:"virtual_context_window"`
-	VirtualContextLedgerTTLSeconds int64  `json:"virtual_context_ledger_ttl_seconds"`
+	Virtual2MEnabled               bool   `json:"-"`
+	VirtualContextWindow           int64  `json:"-"`
+	VirtualContextLedgerTTLSeconds int64  `json:"-"`
 	StickyWaitMillis               int    `json:"sticky_wait_millis"`
 	// AdmissionWaitMillis bounds the per-account concurrency/token-budget backpressure
 	// wait (see DefaultAdmissionWaitMillis). Unset (0) adopts the default; a negative
@@ -154,7 +155,11 @@ type Config struct {
 	MaxBodyBytes          int64  `json:"max_body_bytes"`
 	AccountTokenBudget    int64  `json:"account_token_budget"`
 	AdminToken            string `json:"admin_token"`
-	SidecarTimeoutSeconds int    `json:"sidecar_timeout_seconds"`
+	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
+	// cookie security, or generated public URLs. Direct internet clients cannot
+	// spoof X-Forwarded-* unless their immediate peer is in this list.
+	TrustedProxyCIDRs     []string `json:"trusted_proxy_cidrs"`
+	SidecarTimeoutSeconds int      `json:"sidecar_timeout_seconds"`
 	// DefaultSidecarEndpoint, when set by install/runtime configuration, seeds a
 	// local curl_cffi_sidecar egress profile. Admins still decide whether accounts
 	// bind to it.
@@ -259,8 +264,11 @@ type Config struct {
 	// KiroDefaultThinking enables Kiro's model-level adaptive thinking whenever
 	// the downstream request does not explicitly disable thinking. Unlike the
 	// global thinking override, this only affects the Kiro compatibility path.
-	KiroDefaultThinking       bool `json:"kiro_default_thinking"`
-	SchedulerHeartbeatSeconds int  `json:"scheduler_heartbeat_seconds"`
+	KiroDefaultThinking          bool     `json:"kiro_default_thinking"`
+	KiroCacheMode                string   `json:"kiro_cache_mode"`
+	KiroEndpointAllowlist        []string `json:"kiro_endpoint_allowlist"`
+	KiroCacheUnreportedThreshold int      `json:"kiro_cache_unreported_threshold"`
+	SchedulerHeartbeatSeconds    int      `json:"scheduler_heartbeat_seconds"`
 	// ClaudeStainlessVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
 	// version. Empty = the built-in/ per-account default.
@@ -413,31 +421,22 @@ type Config struct {
 	// instead of returning an error. This reduces 429 cascades during burst rate-limiting.
 	// Default: 30 seconds. Set 0 to disable waiting (original behavior).
 	CooldownWaitMaxSeconds int `json:"cooldown_wait_max_seconds"`
-	// ForceFailoverOn429 forces failover even for requests that carry per-account
-	// server-side state (previous_response_id / x-codex-turn-state), which normally
-	// stay pinned because a fresh account cannot reconstruct that state. Self-contained
-	// requests (including strict-sticky tool_result/function_call_output turns) already
-	// fail over on a recoverable error regardless of this flag — they carry their full
-	// input, so the switch is lossless. Default: false (a stateful turn surfaces the
-	// limit rather than switching to an account that lacks its state). Set true to also
-	// attempt a best-effort switch for stateful turns on 429.
-	ForceFailoverOn429 bool `json:"force_failover_on_429"`
 	// FailoverMaxAttempts bounds how many accounts a single request may try before
 	// surfacing the error (incl. the first). Default 3.
 	FailoverMaxAttempts int `json:"failover_max_attempts"`
 	// StreamFailoverHoldMemoryBytes bounds how much successful-looking SSE data is
 	// buffered in memory while the gateway waits to prove a stream did not end in a
 	// retryable account error. Default 8MiB.
-	StreamFailoverHoldMemoryBytes int64 `json:"stream_failover_hold_memory_bytes"`
+	StreamFailoverHoldMemoryBytes int64 `json:"-"`
 	// StreamFailoverHoldDiskBytes is an OPTIONAL spill budget for the same hold-back
 	// buffer. Default 0 disables disk spill entirely; set a positive value only when
 	// the deployment has a known-safe temp volume. When memory+disk budgets are
 	// exceeded before a clean stream completes, the request tries another account
 	// instead of writing partial output downstream.
-	StreamFailoverHoldDiskBytes int64 `json:"stream_failover_hold_disk_bytes"`
+	StreamFailoverHoldDiskBytes int64 `json:"-"`
 	// StreamFailoverHoldTempDir selects the directory for optional spill files. Empty
 	// uses os.TempDir. Ignored when StreamFailoverHoldDiskBytes is 0.
-	StreamFailoverHoldTempDir string `json:"stream_failover_hold_temp_dir"`
+	StreamFailoverHoldTempDir string `json:"-"`
 	// AccountRecheckEnabled turns on the cooldown→health-recheck loop: an account
 	// benched after an upstream error stays out of the candidate pool until a
 	// background liveness probe ("测活") confirms it recovered. Default on. With it
@@ -720,12 +719,15 @@ func Default() Config {
 		ShutdownDrainSeconds:           DefaultShutdownDrainSec,
 		MaxBodyBytes:                   DefaultMaxBodyBytes,
 		AccountTokenBudget:             DefaultAccountTokenBudget,
+		TrustedProxyCIDRs:              []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:          120,
 		KiroVersion:                    "0.11.107",
 		KiroNodeVersion:                "22.22.0",
 		KiroDefaultAuthRegion:          "us-east-1",
 		KiroDefaultAPIRegion:           "us-east-1",
 		KiroDefaultThinking:            true,
+		KiroCacheMode:                  "auto",
+		KiroCacheUnreportedThreshold:   DefaultKiroCacheUnreportedThreshold,
 		SchedulerHeartbeatSeconds:      15,
 		ConversationIsolation:          true,
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
@@ -744,7 +746,7 @@ func Default() Config {
 		ClaudeCacheTTL:                    "1h",
 		ClaudeCCHSigning:                  false,
 		BanDetectionEnabled:               true,
-		BanAutoDelete:                     true,
+		BanAutoDelete:                     false,
 		QuarantineDurationHours:           72,
 		HealthTestClearsQuarantine:        true,
 		MaxConcurrentUpstream:             64,
@@ -760,7 +762,6 @@ func Default() Config {
 		FailoverMaxAttempts:                    3,
 		StreamFailoverHoldMemoryBytes:          DefaultStreamFailoverHoldMemoryBytes,
 		StreamFailoverHoldDiskBytes:            DefaultStreamFailoverHoldDiskBytes,
-		ForceFailoverOn429:                     false,
 		AccountRecheckEnabled:                  true,
 		AccountRecheckIntervalSeconds:          DefaultAccountRecheckIntervalSeconds,
 		AccountRecheckBackoffSeconds:           DefaultAccountRecheckBackoffSeconds,
@@ -1021,17 +1022,15 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("CODEX_POOL_ADMIN_TOKEN"); v != "" {
 		c.AdminToken = v
 	}
+	if v := os.Getenv("CODEX_POOL_TRUSTED_PROXY_CIDRS"); v != "" {
+		c.TrustedProxyCIDRs = strings.Split(v, ",")
+	}
 	if v := os.Getenv("CODEX_POOL_IDENTITY_SECRET"); v != "" {
 		c.IdentitySecret = v
 	}
 	if v := os.Getenv("CODEX_POOL_WEB_SEARCH"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.WebSearchEnabled = parsed
-		}
-	}
-	if v := os.Getenv("CODEX_POOL_VIRTUAL_2M"); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			c.Virtual2MEnabled = parsed
 		}
 	}
 	if v := os.Getenv("CODEX_POOL_CONVERSATION_ISOLATION"); v != "" {
@@ -1237,6 +1236,15 @@ func (c *Config) normalize() {
 	}
 	if strings.TrimSpace(c.KiroDefaultAPIRegion) == "" {
 		c.KiroDefaultAPIRegion = "us-east-1"
+	}
+	switch strings.ToLower(strings.TrimSpace(c.KiroCacheMode)) {
+	case "auto", "observe", "off":
+		c.KiroCacheMode = strings.ToLower(strings.TrimSpace(c.KiroCacheMode))
+	default:
+		c.KiroCacheMode = "auto"
+	}
+	if c.KiroCacheUnreportedThreshold <= 0 {
+		c.KiroCacheUnreportedThreshold = DefaultKiroCacheUnreportedThreshold
 	}
 	if c.SchedulerHeartbeatSeconds <= 0 {
 		c.SchedulerHeartbeatSeconds = 15

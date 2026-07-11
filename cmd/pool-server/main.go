@@ -179,6 +179,9 @@ func run() int {
 		Addr:              cfg.ListenAddr,
 		Handler:           app,
 		ReadHeaderTimeout: 15 * time.Second,
+		// Bound slow request-body uploads without imposing a WriteTimeout on SSE or
+		// WebSocket responses. Individual upstream calls still use their own context.
+		ReadTimeout: cfg.RequestTimeout(),
 	}
 
 	serveErr := make(chan error, 1)

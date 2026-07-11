@@ -1,6 +1,9 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -71,12 +74,28 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 	}
 
 	affinity := routing.ExtractAffinityKey(r, raw)
+	resourceAffinity, resourceKind, resourceID := claudeResourceAffinity(r.URL.Path)
+	immutableResource := false
+	if resourceAffinity.Hash != "" {
+		if _, bindingErr := s.store.GetAffinityBinding(r.Context(), resourceAffinity.Hash); bindingErr == nil {
+			affinity = resourceAffinity
+			immutableResource = true
+		} else if !storage.NotFound(bindingErr) {
+			writeError(w, http.StatusInternalServerError, bindingErr)
+			return
+		}
+	}
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:    pol.Group,
-		Provider: "claude",
-		Affinity: affinity,
+		Group:             pol.Group,
+		Provider:          "claude",
+		Affinity:          affinity,
+		ImmutableAffinity: immutableResource,
 	})
 	if err != nil {
+		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
+			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this resource is unavailable")
+			return
+		}
 		s.writePublicNoAccountError(r.Context(), w, http.StatusServiceUnavailable, pol.Group, "claude", "", err)
 		return
 	}
@@ -185,12 +204,65 @@ passthroughSuccess:
 
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", "", resp.Header)
+	if resourceAffinity.Hash != "" {
+		s.persistClaudeResourceBinding(r.Context(), resourceAffinity, resourceKind, lease)
+	}
 
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
+	w.Header().Set("X-Pool-Resolved-Provider", "claude")
 	if isEventStream(resp.Header) {
+		w.WriteHeader(resp.StatusCode)
 		_ = streamCopy(w, resp.Body)
 		return
 	}
+	if resourceID == "" && (r.Method == http.MethodPost || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "json")) {
+		responseBody, readErr := s.readUpstreamResponseBody(resp.Body)
+		if readErr != nil {
+			writeError(w, http.StatusBadGateway, readErr)
+			return
+		}
+		var created struct {
+			ID string `json:"id"`
+		}
+		if json.Unmarshal(responseBody, &created) == nil && strings.TrimSpace(created.ID) != "" {
+			createdAffinity := routing.AffinityFromKey("claude_resource:"+resourceKind+":"+strings.TrimSpace(created.ID), "claude_resource")
+			s.persistClaudeResourceBinding(r.Context(), createdAffinity, resourceKind, lease)
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(responseBody)
+		return
+	}
+	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func claudeResourceAffinity(path string) (routing.AffinityKey, string, string) {
+	parts := strings.Split(strings.Trim(strings.TrimSpace(path), "/"), "/")
+	if len(parts) < 2 || parts[0] != "v1" {
+		return routing.AffinityKey{}, "", ""
+	}
+	kind := strings.ToLower(strings.TrimSpace(parts[1]))
+	switch kind {
+	case "files", "skills", "agents", "environments", "sessions":
+	default:
+		return routing.AffinityKey{}, "", ""
+	}
+	if len(parts) < 3 {
+		return routing.AffinityKey{}, kind, ""
+	}
+	id := strings.TrimSpace(parts[2])
+	if id == "" {
+		return routing.AffinityKey{}, kind, ""
+	}
+	return routing.AffinityFromKey("claude_resource:"+kind+":"+id, "claude_resource"), kind, id
+}
+
+func (s *Server) persistClaudeResourceBinding(ctx context.Context, affinity routing.AffinityKey, kind string, lease scheduler.Lease) {
+	if affinity.Hash == "" {
+		return
+	}
+	_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		RouteKeyHash: affinity.Hash, RouteKey: affinity.Key, Source: affinity.Source,
+		AccountID: lease.Account.ID, Provider: "claude", Model: "resource:" + kind, EgressID: lease.Egress.ID,
+	})
 }

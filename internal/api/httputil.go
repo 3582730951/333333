@@ -524,7 +524,7 @@ func claudeRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, tt
 func isTrueConversationAffinity(source string) bool {
 	switch source {
 	case routing.CodexRootThreadAffinitySource, "x-codex-parent-thread-id", "thread_id", "conversation_id",
-		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
+		"x-codex-window-id", "prompt_cache_key", "previous_response_id", "x-codex-turn-metadata":
 		return true
 	}
 	return false

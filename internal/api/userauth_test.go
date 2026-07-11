@@ -1,13 +1,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"codex-account-pool/internal/config"
@@ -105,6 +108,78 @@ func TestAuthFirstUserIsAdminRegisterLoginLogout(t *testing.T) {
 	resp, body = doReq(t, c, http.MethodPost, h.pool.URL+"/auth/login", `{"email":"admin@x.io","password":"hunter2hunter"}`, nil)
 	if resp.StatusCode != http.StatusOK || body["role"] != "admin" {
 		t.Fatalf("login failed: %d %v", resp.StatusCode, body)
+	}
+}
+
+func TestAuthConcurrentBootstrapCreatesExactlyOneAdmin(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	const registrations = 4
+	statuses := make(chan int, registrations)
+	var wg sync.WaitGroup
+	for i := 0; i < registrations; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf(`{"email":"bootstrap-%d@example.test","password":"password-%d-safe"}`, i, i)
+			response, err := http.Post(h.pool.URL+"/auth/register", "application/json", strings.NewReader(body))
+			if err != nil {
+				statuses <- 0
+				return
+			}
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			statuses <- response.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	close(statuses)
+	for status := range statuses {
+		if status != http.StatusOK {
+			t.Fatalf("concurrent registration status=%d", status)
+		}
+	}
+	users, err := h.store.ListUsers(context.Background())
+	if err != nil || len(users) != registrations {
+		t.Fatalf("users=%+v err=%v", users, err)
+	}
+	admins := 0
+	for _, user := range users {
+		if user.Role == "admin" {
+			admins++
+		}
+	}
+	if admins != 1 {
+		t.Fatalf("concurrent bootstrap created %d admins, want exactly one: %+v", admins, users)
+	}
+}
+
+func TestForwardedHeadersRequireTrustedImmediateProxy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	untrusted := httptest.NewRequest(http.MethodGet, "http://internal.example/auth/me", nil)
+	untrusted.RemoteAddr = "198.51.100.10:4321"
+	untrusted.Header.Set("X-Forwarded-For", "203.0.113.7")
+	untrusted.Header.Set("X-Forwarded-Proto", "https")
+	untrusted.Header.Set("X-Forwarded-Host", "pool.example")
+	if got := h.app.clientIP(untrusted); got != "198.51.100.10" {
+		t.Fatalf("untrusted proxy spoofed client IP: %q", got)
+	}
+	if h.app.requestIsHTTPS(untrusted) {
+		t.Fatal("untrusted proxy spoofed HTTPS")
+	}
+	if got := h.app.externalOrigin(untrusted); got != "http://internal.example" {
+		t.Fatalf("untrusted proxy spoofed external origin: %q", got)
+	}
+
+	trusted := httptest.NewRequest(http.MethodGet, "http://internal.example/auth/me", nil)
+	trusted.RemoteAddr = "127.0.0.1:4321"
+	trusted.Header.Set("X-Forwarded-For", "203.0.113.7")
+	trusted.Header.Set("X-Forwarded-Proto", "https")
+	trusted.Header.Set("X-Forwarded-Host", "pool.example")
+	if got := h.app.clientIP(trusted); got != "203.0.113.7" {
+		t.Fatalf("trusted proxy client IP=%q", got)
+	}
+	if !h.app.requestIsHTTPS(trusted) || h.app.externalOrigin(trusted) != "https://pool.example" {
+		t.Fatalf("trusted forwarding not honored: https=%v origin=%q", h.app.requestIsHTTPS(trusted), h.app.externalOrigin(trusted))
 	}
 }
 

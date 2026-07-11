@@ -178,7 +178,6 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 		"rate_limit_guard_enabled":              true,
 		"seamless_failover":                     true,
 		"failover_max_attempts":                 float64(3),
-		"force_failover_on_429":                 false,
 		"stateful_sticky_wait_seconds":          float64(0),
 		"leak_scrub_enabled":                    true,
 		"token_save_enabled":                    false,

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/registry"
@@ -137,21 +136,7 @@ func (s *Server) handlePreviewThinking(w http.ResponseWriter, r *http.Request) {
 
 // checkAdminAuth checks admin authorization.
 func (s *Server) checkAdminAuth(w http.ResponseWriter, r *http.Request) bool {
-	token := r.Header.Get("Authorization")
-	if token == "" {
-		token = r.Header.Get("X-Admin-Token")
-	}
-
-	if strings.HasPrefix(token, "Bearer ") {
-		token = strings.TrimPrefix(token, "Bearer ")
-	}
-
-	if s.cfg.AdminToken != "" && token != s.cfg.AdminToken {
-		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
-		return false
-	}
-
-	return true
+	return s.adminAllowed(w, r)
 }
 
 // determineConfigSource determines where the configuration came from.

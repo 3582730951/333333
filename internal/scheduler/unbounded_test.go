@@ -8,6 +8,7 @@ import (
 
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 )
 
@@ -168,6 +169,16 @@ func TestMixedClaudeKiroChoosesLeastLoaded(t *testing.T) {
 		}
 	}
 	if err := store.UpsertCapabilities(ctx, capability.StaticKiroModels("k")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertKiroCredentials(ctx, storage.KiroCredentials{AccountID: "k", AuthMethod: "api_key", APIRegion: "us-east-1"}); err != nil {
+		t.Fatal(err)
+	}
+	endpointHash, err := kirowire.EndpointHash("", "us-east-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ObserveKiroCapability(ctx, "k", endpointHash, "claude-sonnet-4.6", storage.KiroCapabilityObservation{ModelSucceeded: true, ThinkingRequested: true}); err != nil {
 		t.Fatal(err)
 	}
 	s := New(store, config.Default())

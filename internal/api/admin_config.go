@@ -734,7 +734,6 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 		SystemPrompt                  *string  `json:"system_prompt"`
 		PromptMode                    *string  `json:"prompt_mode"`
 		SystemPromptApplyToCompaction *bool    `json:"system_prompt_apply_to_compaction"`
-		Virtual2MEnabled              *bool    `json:"virtual_2m_enabled"`
 		ModelInstructionsEnabled      *bool    `json:"model_instructions_enabled"`
 		ModelInstructionsFiles        []string `json:"model_instructions_files"`
 		ForceModel                    *string  `json:"force_model"`
@@ -752,9 +751,6 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	}
 	if req.SystemPromptApplyToCompaction != nil {
 		g.SystemPromptApplyToCompaction = *req.SystemPromptApplyToCompaction
-	}
-	if req.Virtual2MEnabled != nil {
-		g.Virtual2MEnabled = *req.Virtual2MEnabled
 	}
 	if req.ModelInstructionsEnabled != nil {
 		g.ModelInstructionsEnabled = *req.ModelInstructionsEnabled

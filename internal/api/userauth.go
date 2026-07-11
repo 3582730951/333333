@@ -5,8 +5,8 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +35,10 @@ var dummyPasswordHash, _ = hashPassword("cp-constant-time-dummy")
 
 // hasAdminUser reports whether the portal has been bootstrapped with an admin (used
 // to lock down anonymous open-mode /admin once a real admin exists). Fails open
-// (false) on a DB error to preserve zero-config bootstrap.
+// (true) on a DB error so an unavailable authorization database fails closed.
 func (s *Server) hasAdminUser(ctx context.Context) bool {
 	ok, err := s.store.HasAdminUser(ctx)
-	return err == nil && ok
+	return err != nil || ok
 }
 
 // ── login throttle (per-IP) ──
@@ -93,25 +93,79 @@ func (l *loginThrottle) reset(ip string) {
 // requestIsHTTPS reports whether the request reached us over TLS (directly or via a
 // terminating reverse proxy), so session cookies are marked Secure only when they
 // will actually be sent back (the panel is often served over plain HTTP).
-func requestIsHTTPS(r *http.Request) bool {
+func (s *Server) requestIsHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+	if !s.isTrustedProxyRequest(r) {
+		return false
+	}
+	proto := lastForwardedValue(r.Header.Get("X-Forwarded-Proto"))
+	return strings.EqualFold(proto, "https")
 }
 
-func clientIP(r *http.Request) string {
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		if i := strings.IndexByte(xff, ','); i >= 0 {
-			return strings.TrimSpace(xff[:i])
+func (s *Server) clientIP(r *http.Request) string {
+	remote := remoteIP(r.RemoteAddr)
+	if remote == nil {
+		return strings.TrimSpace(r.RemoteAddr)
+	}
+	if !s.isTrustedProxyIP(remote) {
+		return remote.String()
+	}
+	values := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	candidate := remote
+	for i := len(values) - 1; i >= 0; i-- {
+		ip := net.ParseIP(strings.TrimSpace(values[i]))
+		if ip == nil {
+			return remote.String()
 		}
-		return xff
+		candidate = ip
+		if !s.isTrustedProxyIP(ip) {
+			return ip.String()
+		}
 	}
-	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i >= 0 {
-		host = host[:i]
+	return candidate.String()
+}
+
+func (s *Server) isTrustedProxyRequest(r *http.Request) bool {
+	return s.isTrustedProxyIP(remoteIP(r.RemoteAddr))
+}
+
+func (s *Server) isTrustedProxyIP(ip net.IP) bool {
+	if ip == nil {
+		return false
 	}
-	return host
+	for _, entry := range s.cfg.TrustedProxyCIDRs {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if trustedIP := net.ParseIP(entry); trustedIP != nil && trustedIP.Equal(ip) {
+			return true
+		}
+		if _, network, err := net.ParseCIDR(entry); err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(remoteAddr), "[]")
+	}
+	return net.ParseIP(host)
+}
+
+func lastForwardedValue(raw string) string {
+	values := strings.Split(raw, ",")
+	for i := len(values) - 1; i >= 0; i-- {
+		if value := strings.TrimSpace(values[i]); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // userView is the JSON shape returned to the SPA for the authenticated identity.
@@ -189,7 +243,7 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, u storage.
 	}); err != nil {
 		return err
 	}
-	secure := requestIsHTTPS(r)
+	secure := s.requestIsHTTPS(r)
 	maxAge := int(sessionTTL / time.Second)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookieName, Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: secure, MaxAge: maxAge})
 	http.SetCookie(w, &http.Cookie{Name: csrfCookieName, Value: csrf, Path: "/", HttpOnly: false, SameSite: http.SameSiteLaxMode, Secure: secure, MaxAge: maxAge})
@@ -225,42 +279,25 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("password must be at least %d characters", minPasswordLen))
 		return
 	}
-	count, err := s.store.CountUsers(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	// The very first user always bootstraps (and becomes admin); afterwards, honor the
-	// admin's allow_registration toggle.
-	if count > 0 && !s.flagEnabled(r.Context(), "allow_registration", true) {
-		writeError(w, http.StatusForbidden, errors.New("registration is disabled"))
-		return
-	}
-	if _, exists, err := s.store.GetUserByEmail(r.Context(), email); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	} else if exists {
-		writeError(w, http.StatusConflict, errors.New("email already registered"))
-		return
-	}
 	ph, err := hashPassword(req.Password)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	role := "user"
-	if count == 0 {
-		role = "admin"
-	}
-	u := storage.User{ID: generatedID("usr"), Email: email, Name: strings.TrimSpace(req.Name), Role: role, Status: "active", PasswordHash: ph}
-	if err := s.store.UpsertUser(r.Context(), u); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+	u, err := s.store.CreateUserWithBootstrap(r.Context(), storage.User{
+		ID: generatedID("usr"), Email: email, Name: strings.TrimSpace(req.Name), Status: "active", PasswordHash: ph,
+	}, s.flagEnabled(r.Context(), "allow_registration", true))
+	if errors.Is(err, storage.ErrUserEmailExists) {
+		writeError(w, http.StatusConflict, errors.New("email already registered"))
 		return
 	}
-	// Save first admin credentials to passwd.txt
-	if count == 0 {
-		line := fmt.Sprintf("Admin: %s\nPassword: %s\n", email, req.Password)
-		_ = os.WriteFile("passwd.txt", []byte(line), 0600)
+	if errors.Is(err, storage.ErrRegistrationClosed) {
+		writeError(w, http.StatusForbidden, errors.New("registration is disabled"))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	if err := s.startSession(w, r, u); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -274,7 +311,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	if !s.login.allow(ip) {
 		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; try again later"))
 		return
@@ -321,7 +358,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
 		_ = s.store.DeleteUserSession(r.Context(), hashAPIKey(c.Value))
 	}
-	secure := requestIsHTTPS(r)
+	secure := s.requestIsHTTPS(r)
 	clearCookie(w, sessionCookieName, secure)
 	clearCookie(w, csrfCookieName, secure)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
@@ -338,7 +375,7 @@ func (s *Server) handleAuthMe(w http.ResponseWriter, r *http.Request) {
 	}
 	allowReg := s.flagEnabled(r.Context(), "allow_registration", true)
 	if s.cfg.AdminToken != "" {
-		if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == s.cfg.AdminToken {
+		if subtle.ConstantTimeCompare([]byte(adminBearerToken(r)), []byte(s.cfg.AdminToken)) == 1 {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"id": "", "email": "admin", "name": "Admin", "role": "admin", "via": "admin_token", "authed": true})
 			return
 		}

@@ -103,6 +103,8 @@ type Server struct {
 	claudeCacheFlights   map[string]chan struct{}
 	claudeCacheDiagMu    sync.Mutex
 	claudeCacheDiagPrev  map[string]string
+	kiroCacheFlightsMu   sync.Mutex
+	kiroCacheFlights     map[string]chan struct{}
 
 	codexResetMu    sync.Mutex
 	codexResetLocks map[string]*sync.Mutex
@@ -138,6 +140,7 @@ func NewServer(dep Dependencies) *Server {
 		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
 		claudeCacheFlights:  map[string]chan struct{}{},
 		claudeCacheDiagPrev: map[string]string{},
+		kiroCacheFlights:    map[string]chan struct{}{},
 		codexResetLocks:     map[string]*sync.Mutex{},
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
@@ -523,6 +526,20 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// genuine server-side-state turns (previous_response_id / x-codex-turn-state) are
 	// non-movable, because a fresh account cannot continue from state it never created.
 	movable := !routing.HasServerSideState(path, r, raw)
+	if !movable {
+		if affinity.Hash == "" {
+			writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
+			return
+		}
+		if _, bindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindingErr != nil {
+			if storage.NotFound(bindingErr) {
+				writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
+			} else {
+				writeError(w, http.StatusInternalServerError, bindingErr)
+			}
+			return
+		}
+	}
 
 	// Transparent seamless failover. A movable request (no per-account server-side
 	// state) carries its full input, so if the chosen account is rate-limited /
@@ -535,13 +552,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// rather than leak it. Genuine stateful turns (previous_response_id /
 	// x-codex-turn-state) are non-movable and surface the error instead, because a fresh
 	// account has no such state to continue from.
-	//
-	// Exception: when force_failover_on_429 is true, even non-movable (stateful) turns
-	// attempt a best-effort switch on 429, since the alternative is an error anyway.
 	attempts := 1
-	forceFailoverOn429 := s.flagEnabled(r.Context(), "force_failover_on_429", s.cfg.ForceFailoverOn429)
-	stateful := !movable
-	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && (movable || stateful || forceFailoverOn429) {
+	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
 		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
 			attempts = 1
 		}
@@ -566,7 +578,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attempt < attempts-1, forceFailoverOn429, exclude)
+		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attempt < attempts-1, exclude)
 		if result.Outcome != outcomeRetry {
 			return
 		}
@@ -574,6 +586,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			current = result.Retry
 		}
 	}
+	writePoolCodeError(w, http.StatusBadGateway, "retry_exhausted", "upstream retry limit exhausted")
 }
 
 type attemptOutcome int
@@ -609,26 +622,30 @@ func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, 
 // — is derived fresh inside this call, so a retry on account B can never reuse
 // account A's session identifiers.
 //
-// forceFailoverOn429 enables immediate failover on 429 even for strict requests.
 // exclude carries the accounts this request already failed on; the leased account is
 // added to it before any outcomeRetry so the next attempt selects a different one.
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, forceFailoverOn429 bool, exclude map[string]bool) codexAttemptResult {
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:           routeGroup,
-		Provider:        "codex",
-		Affinity:        affinity,
-		Strict:          strict,
-		ServerSideState: !movable,
-		Movable:         movable,
-		Model:           model,
-		EstimatedTokens: virtual.EstimateTokensJSON(raw),
-		Compaction:      routing.IsCompaction(path, raw),
-		Exclude:         exclude,
-		OnWait:          schedulerWaitCallback(r.Context()),
+		Group:             routeGroup,
+		Provider:          "codex",
+		Affinity:          affinity,
+		Strict:            strict,
+		ServerSideState:   !movable,
+		ImmutableAffinity: !movable,
+		Movable:           movable,
+		Model:             model,
+		EstimatedTokens:   virtual.EstimateTokensJSON(raw),
+		Compaction:        routing.IsCompaction(path, raw),
+		Exclude:           exclude,
+		OnWait:            schedulerWaitCallback(r.Context()),
 	})
 	if err != nil {
+		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
+			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
@@ -1109,6 +1126,7 @@ codexSuccess:
 		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
 			responseBody = responseJSON
 		}
+		s.persistCodexStateBindings(r.Context(), affinity, responseBody, lease, finalEgress, model)
 		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 		_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
 		// A soft 200 "failed" response carrying limit/quota/switch-model state must
@@ -1208,7 +1226,9 @@ codexSuccess:
 		recordingStream := io.TeeReader(streamBody, streamRecorder)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		if err := s.streamSSE(r.Context(), w, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash); err != nil {
+		streamErr := s.streamSSE(r.Context(), w, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
+		s.persistCodexBindingAliases(r.Context(), affinity, streamRecorder.id, streamRecorder.model, lease, finalEgress, model)
+		if streamErr != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
@@ -1277,6 +1297,7 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
+	s.persistCodexStateBindings(r.Context(), affinity, responseBody, lease, finalEgress, model)
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
@@ -1286,6 +1307,31 @@ codexSuccess:
 	responseBody = s.reliabilityGuardResponsesBody(r.Context(), responseBody, relTurn)
 	_, _ = w.Write(codexScrubber.ReplaceAll(responseBody))
 	return codexAttemptResult{Outcome: outcomeDone}
+}
+
+func (s *Server) persistCodexStateBindings(ctx context.Context, affinity routing.AffinityKey, responseBody []byte, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
+	var response struct {
+		ID    string `json:"id"`
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(responseBody, &response)
+	s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
+}
+
+func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routing.AffinityKey, responseID, actualModel string, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
+	model := firstNonEmpty(actualModel, lease.ResolvedModel, requestedModel)
+	egressID := firstNonEmpty(egress.ID, lease.Egress.ID)
+	upsert := func(key routing.AffinityKey) {
+		if key.Hash == "" {
+			return
+		}
+		_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+			RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source,
+			AccountID: lease.Account.ID, Provider: "codex", Model: model, EgressID: egressID,
+		})
+	}
+	upsert(affinity)
+	upsert(routing.ResponseAffinityKey(responseID))
 }
 
 func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease scheduler.Lease, strict bool) (*upstream.Response, storage.EgressProfile, error) {

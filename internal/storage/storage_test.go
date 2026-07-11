@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 )
@@ -359,5 +360,55 @@ END`); err != nil {
 	}
 	if got, ok, err := store.GetSetting(ctx, "zzz_runtime_key"); err != nil || ok {
 		t.Fatalf("zzz_runtime_key = %q ok=%v err=%v, want absent after rollback", got, ok, err)
+	}
+}
+
+func TestKiroRuntimeCapabilityPresenceAndUnreportedThreshold(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "kiro-cap", Label: "kiro", GroupName: "cyber", Provider: "kiro", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureKiroRuntimeModels(ctx, account.ID, "endpoint", []string{"claude-sonnet-4.6"}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 19, UnreportedThreshold: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ModelState != "verified" || state.CacheCapability != "unknown" || state.ConsecutiveUnreported != 19 {
+		t.Fatalf("after 19 = %+v", state)
+	}
+	state, err = store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{MeteringEvents: 1, UnreportedThreshold: 20})
+	if err != nil || state.CacheCapability != "unreported" || state.ConsecutiveUnreported != 20 {
+		t.Fatalf("after 20 = %+v err=%v", state, err)
+	}
+	state, err = store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{MeteringEvents: 1, CacheReadPresent: true, CacheReadTokens: 0})
+	if err != nil || state.CacheCapability != "reported" || state.ConsecutiveUnreported != 0 {
+		t.Fatalf("reported zero = %+v err=%v", state, err)
+	}
+	state, err = store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{MeteringEvents: 1, CacheReadPresent: true, CacheReadTokens: 5})
+	if err != nil || state.CacheCapability != "hit_observed" || state.CacheHitObservations != 1 {
+		t.Fatalf("hit = %+v err=%v", state, err)
+	}
+}
+
+func TestKiroUnreportedUsageIsNotCacheMiss(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "kiro-usage", Label: "kiro", GroupName: "cyber", Provider: "kiro", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route", "", "", "claude-sonnet-4.6", 100, 10, 110, 0, 0, 0, json.RawMessage(`{"input_tokens":100,"output_tokens":10}`), UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream"}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := store.CacheUsageMetricsWindowFullRoutes(ctx, 0, Now()+10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.Requests != 1 || report.Summary.RealRequests != 0 || report.Summary.CacheMissTokens != 0 || report.Summary.CacheInputTokens != 0 {
+		t.Fatalf("unreported Kiro usage counted as cache miss: %+v", report.Summary)
 	}
 }

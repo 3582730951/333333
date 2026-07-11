@@ -281,3 +281,13 @@ func TestSmallRequestsKeepConversationAnchorAffinity(t *testing.T) {
 		t.Fatal("small independent requests should keep conversation-anchor separation")
 	}
 }
+
+func TestPreviousResponseIDHasDurableAffinityKey(t *testing.T) {
+	body := []byte(`{"model":"gpt","previous_response_id":"resp_123","input":"next"}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	key := ExtractAffinityKey(req, body)
+	want := ResponseAffinityKey("resp_123")
+	if key.Hash == "" || key != want || key.Source != "previous_response_id" {
+		t.Fatalf("previous response affinity=%+v want=%+v", key, want)
+	}
+}

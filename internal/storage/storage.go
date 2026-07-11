@@ -22,6 +22,11 @@ import (
 
 const DefaultDirectEgressID = "egress_direct"
 
+var (
+	ErrUserEmailExists    = errors.New("user email already exists")
+	ErrRegistrationClosed = errors.New("user registration is disabled")
+)
+
 type Store struct {
 	// db is the single-connection WRITE pool. SQLite permits only one writer at a
 	// time, so funneling every write through one connection means our own
@@ -58,7 +63,7 @@ type Group struct {
 	SystemPrompt                  string   `json:"system_prompt"`
 	PromptMode                    string   `json:"prompt_mode"`
 	SystemPromptApplyToCompaction bool     `json:"system_prompt_apply_to_compaction"`
-	Virtual2MEnabled              bool     `json:"virtual_2m_enabled"`
+	Virtual2MEnabled              bool     `json:"-"`
 	ModelInstructionsEnabled      bool     `json:"model_instructions_enabled"`
 	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
 	// ForceModel / ForceEffort, when set, are the group-level default override that
@@ -248,6 +253,35 @@ type ModelCapability struct {
 	LastProbeAt                   int64  `json:"last_probe_at"`
 }
 
+type KiroRuntimeCapability struct {
+	AccountID                 string `json:"account_id"`
+	EndpointHash              string `json:"endpoint_hash"`
+	Model                     string `json:"model"`
+	ModelState                string `json:"model_state"`
+	ThinkingState             string `json:"thinking_state"`
+	CacheCapability           string `json:"cache_capability"`
+	Observations              int64  `json:"observations"`
+	MeteringEvents            int64  `json:"metering_events"`
+	CacheReportedObservations int64  `json:"cache_reported_observations"`
+	CacheHitObservations      int64  `json:"cache_hit_observations"`
+	ConsecutiveUnreported     int64  `json:"consecutive_unreported"`
+	UnknownCacheSchemaJSON    string `json:"unknown_cache_schema_json,omitempty"`
+	UpdatedAt                 int64  `json:"updated_at"`
+}
+
+type KiroCapabilityObservation struct {
+	ModelSucceeded         bool
+	ThinkingRequested      bool
+	MeteringEvents         int
+	CacheReadPresent       bool
+	CacheReadTokens        int64
+	CacheCreationPresent   bool
+	CacheCreationTokens    int64
+	ExplicitlyUnsupported  bool
+	UnknownCacheSchemaJSON string
+	UnreportedThreshold    int
+}
+
 type EgressProfile struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
@@ -386,6 +420,9 @@ type AffinityBinding struct {
 	RouteKey     string `json:"route_key"`
 	Source       string `json:"source"`
 	AccountID    string `json:"account_id"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+	EgressID     string `json:"egress_id,omitempty"`
 	Epoch        int64  `json:"epoch"`
 	CreatedAt    int64  `json:"created_at"`
 	UpdatedAt    int64  `json:"updated_at"`
@@ -790,11 +827,32 @@ CREATE TABLE IF NOT EXISTS account_model_capabilities(
 -- SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id
 -- WHERE a.group_name = ? AND a.status = 'active' AND c.model_slug = ?
 CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id);
+CREATE TABLE IF NOT EXISTS kiro_runtime_capabilities(
+  account_id TEXT NOT NULL,
+  endpoint_hash TEXT NOT NULL,
+  model TEXT NOT NULL,
+  model_state TEXT NOT NULL DEFAULT 'unknown',
+  thinking_state TEXT NOT NULL DEFAULT 'unknown',
+  cache_capability TEXT NOT NULL DEFAULT 'unknown',
+  observations INTEGER NOT NULL DEFAULT 0,
+  metering_events INTEGER NOT NULL DEFAULT 0,
+  cache_reported_observations INTEGER NOT NULL DEFAULT 0,
+  cache_hit_observations INTEGER NOT NULL DEFAULT 0,
+  consecutive_unreported INTEGER NOT NULL DEFAULT 0,
+  unknown_cache_schema_json TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, endpoint_hash, model),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_kiro_runtime_verified ON kiro_runtime_capabilities(account_id, endpoint_hash, model_state, model);
 CREATE TABLE IF NOT EXISTS affinity_bindings(
   route_key_hash TEXT PRIMARY KEY,
   route_key TEXT NOT NULL,
   source TEXT NOT NULL,
   account_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  egress_id TEXT NOT NULL DEFAULT '',
   epoch INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -914,6 +972,11 @@ CREATE TABLE IF NOT EXISTS usage_records(
   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
   cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
   usage_provider TEXT NOT NULL DEFAULT '',
+  usage_source TEXT NOT NULL DEFAULT '',
+  cache_read_present INTEGER NOT NULL DEFAULT 0,
+  cache_creation_present INTEGER NOT NULL DEFAULT 0,
+  compatibility_losses_json TEXT NOT NULL DEFAULT '',
+  cache_capability TEXT NOT NULL DEFAULT '',
   estimated INTEGER NOT NULL DEFAULT 0,
   cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
   cache_total_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1235,6 +1298,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE account_auth_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN oauth_rate_limit_tier TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_model_capabilities ADD COLUMN raw_model_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE affinity_bindings ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE affinity_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE affinity_bindings ADD COLUMN egress_id TEXT NOT NULL DEFAULT ''`,
 		// Multi-user portal: end-user credentials/roles, key ownership, and per-user
 		// usage attribution (older DBs created before the portal existed).
 		`ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
@@ -1248,6 +1314,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN usage_provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN usage_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN cache_read_present INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_present INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN compatibility_losses_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN cache_capability TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_miss_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_total_input_tokens INTEGER NOT NULL DEFAULT 0`,
@@ -1327,6 +1398,24 @@ func (s *Store) migrate(ctx context.Context) error {
 		// New indexes for query optimization (idempotent CREATE INDEX IF NOT EXISTS)
 		// Covers the model capability JOIN used by capability-aware routing
 		`CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id)`,
+		`CREATE TABLE IF NOT EXISTS kiro_runtime_capabilities(
+  account_id TEXT NOT NULL,
+  endpoint_hash TEXT NOT NULL,
+  model TEXT NOT NULL,
+  model_state TEXT NOT NULL DEFAULT 'unknown',
+  thinking_state TEXT NOT NULL DEFAULT 'unknown',
+  cache_capability TEXT NOT NULL DEFAULT 'unknown',
+  observations INTEGER NOT NULL DEFAULT 0,
+  metering_events INTEGER NOT NULL DEFAULT 0,
+  cache_reported_observations INTEGER NOT NULL DEFAULT 0,
+  cache_hit_observations INTEGER NOT NULL DEFAULT 0,
+  consecutive_unreported INTEGER NOT NULL DEFAULT 0,
+  unknown_cache_schema_json TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, endpoint_hash, model),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_kiro_runtime_verified ON kiro_runtime_capabilities(account_id, endpoint_hash, model_state, model)`,
 		`CREATE TABLE IF NOT EXISTS account_kiro_credentials(
   account_id TEXT PRIMARY KEY,
   auth_method TEXT NOT NULL,
@@ -1855,6 +1944,52 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 	var n int
 	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
 	return n, err
+}
+
+// CreateUserWithBootstrap atomically assigns the first registered user the admin
+// role. The role decision, registration gate, duplicate-email check, and insert are
+// one SQLite write statement, so concurrent first registrations cannot both observe
+// an empty users table and become administrators.
+func (s *Store) CreateUserWithBootstrap(ctx context.Context, item User, allowRegistration bool) (User, error) {
+	now := Now()
+	if item.CreatedAt == 0 {
+		item.CreatedAt = now
+	}
+	item.UpdatedAt = now
+	if item.Status == "" {
+		item.Status = "active"
+	}
+	result, err := s.db.ExecContext(ctx, `INSERT INTO users(id, tenant_id, email, name, role, status, password_hash, created_at, updated_at)
+SELECT ?, ?, ?, ?,
+       CASE WHEN NOT EXISTS(SELECT 1 FROM users) THEN 'admin' ELSE 'user' END,
+       ?, ?, ?, ?
+WHERE (? OR NOT EXISTS(SELECT 1 FROM users))
+  AND NOT EXISTS(SELECT 1 FROM users WHERE email = ? COLLATE NOCASE)`,
+		item.ID, item.TenantID, strings.TrimSpace(item.Email), item.Name, item.Status, item.PasswordHash, item.CreatedAt, item.UpdatedAt,
+		boolInt(allowRegistration), strings.TrimSpace(item.Email))
+	if err != nil {
+		return User{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return User{}, err
+	}
+	if affected == 0 {
+		if _, exists, lookupErr := s.GetUserByEmail(ctx, item.Email); lookupErr != nil {
+			return User{}, lookupErr
+		} else if exists {
+			return User{}, ErrUserEmailExists
+		}
+		return User{}, ErrRegistrationClosed
+	}
+	created, ok, err := s.GetUser(ctx, item.ID)
+	if err != nil {
+		return User{}, err
+	}
+	if !ok {
+		return User{}, errors.New("created user could not be read back")
+	}
+	return created, nil
 }
 
 // HasAdminUser reports whether at least one active admin user exists. Once true, an
@@ -2842,6 +2977,176 @@ func (s *Store) AccountsWithModel(ctx context.Context, group, model string) (map
 	return out, rows.Err()
 }
 
+func (s *Store) EnsureKiroRuntimeModels(ctx context.Context, accountID, endpointHash string, models []string) error {
+	if strings.TrimSpace(accountID) == "" || strings.TrimSpace(endpointHash) == "" {
+		return errors.New("kiro runtime capability account and endpoint are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, updated_at)
+VALUES(?, ?, ?, 'unknown', 'unknown', 'unknown', ?)
+ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET updated_at=excluded.updated_at`, accountID, endpointHash, model, Now()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) GetKiroRuntimeCapability(ctx context.Context, accountID, endpointHash, model string) (KiroRuntimeCapability, error) {
+	var capability KiroRuntimeCapability
+	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability,
+observations, metering_events, cache_reported_observations, cache_hit_observations, consecutive_unreported,
+unknown_cache_schema_json, updated_at
+FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=?`, accountID, endpointHash, model).Scan(
+		&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability,
+		&capability.Observations, &capability.MeteringEvents, &capability.CacheReportedObservations, &capability.CacheHitObservations,
+		&capability.ConsecutiveUnreported, &capability.UnknownCacheSchemaJSON, &capability.UpdatedAt)
+	return capability, err
+}
+
+func (s *Store) ListKiroRuntimeCapabilities(ctx context.Context, accountID string) ([]KiroRuntimeCapability, error) {
+	query := `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability,
+observations, metering_events, cache_reported_observations, cache_hit_observations, consecutive_unreported,
+unknown_cache_schema_json, updated_at FROM kiro_runtime_capabilities`
+	args := []any{}
+	if strings.TrimSpace(accountID) != "" {
+		query += ` WHERE account_id=?`
+		args = append(args, accountID)
+	}
+	query += ` ORDER BY account_id, endpoint_hash, model`
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KiroRuntimeCapability
+	for rows.Next() {
+		var capability KiroRuntimeCapability
+		if err := rows.Scan(&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability,
+			&capability.Observations, &capability.MeteringEvents, &capability.CacheReportedObservations, &capability.CacheHitObservations,
+			&capability.ConsecutiveUnreported, &capability.UnknownCacheSchemaJSON, &capability.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, capability)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) VerifiedKiroModels(ctx context.Context, accountID, endpointHash string, thinkingRequired bool) ([]string, error) {
+	query := `SELECT model FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model_state='verified'`
+	args := []any{accountID, endpointHash}
+	if thinkingRequired {
+		query += ` AND thinking_state='verified'`
+	}
+	query += ` ORDER BY model`
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var model string
+		if err := rows.Scan(&model); err != nil {
+			return nil, err
+		}
+		out = append(out, model)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ObserveKiroCapability(ctx context.Context, accountID, endpointHash, model string, observation KiroCapabilityObservation) (KiroRuntimeCapability, error) {
+	if observation.UnreportedThreshold <= 0 {
+		observation.UnreportedThreshold = 20
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return KiroRuntimeCapability{}, err
+	}
+	defer tx.Rollback()
+	capability := KiroRuntimeCapability{
+		AccountID: accountID, EndpointHash: endpointHash, Model: model,
+		ModelState: "unknown", ThinkingState: "unknown", CacheCapability: "unknown",
+	}
+	err = tx.QueryRowContext(ctx, `SELECT model_state, thinking_state, cache_capability, observations, metering_events,
+cache_reported_observations, cache_hit_observations, consecutive_unreported, unknown_cache_schema_json, updated_at
+FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=?`, accountID, endpointHash, model).Scan(
+		&capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.Observations, &capability.MeteringEvents,
+		&capability.CacheReportedObservations, &capability.CacheHitObservations, &capability.ConsecutiveUnreported,
+		&capability.UnknownCacheSchemaJSON, &capability.UpdatedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return KiroRuntimeCapability{}, err
+	}
+	if observation.ModelSucceeded {
+		capability.ModelState = "verified"
+		capability.Observations++
+		if observation.ThinkingRequested {
+			capability.ThinkingState = "verified"
+		}
+	}
+	if observation.MeteringEvents > 0 {
+		capability.MeteringEvents += int64(observation.MeteringEvents)
+	}
+	cacheReported := observation.CacheReadPresent || observation.CacheCreationPresent
+	switch {
+	case observation.CacheReadPresent && observation.CacheReadTokens > 0:
+		capability.CacheCapability = "hit_observed"
+		capability.CacheHitObservations++
+		capability.CacheReportedObservations++
+		capability.ConsecutiveUnreported = 0
+	case cacheReported:
+		if capability.CacheCapability != "hit_observed" {
+			capability.CacheCapability = "reported"
+		}
+		capability.CacheReportedObservations++
+		capability.ConsecutiveUnreported = 0
+	case observation.ExplicitlyUnsupported:
+		if capability.CacheCapability != "hit_observed" {
+			capability.CacheCapability = "explicitly_unsupported"
+		}
+		capability.ConsecutiveUnreported = 0
+	case observation.MeteringEvents > 0:
+		capability.ConsecutiveUnreported += int64(observation.MeteringEvents)
+		if capability.ConsecutiveUnreported >= int64(observation.UnreportedThreshold) && capability.CacheCapability == "unknown" {
+			capability.CacheCapability = "unreported"
+		}
+	}
+	_ = observation.CacheCreationTokens // presence is capability-significant; the usage row stores the value.
+	if strings.TrimSpace(observation.UnknownCacheSchemaJSON) != "" {
+		capability.UnknownCacheSchemaJSON = observation.UnknownCacheSchemaJSON
+	}
+	capability.UpdatedAt = Now()
+	_, err = tx.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, observations, metering_events,
+cache_reported_observations, cache_hit_observations, consecutive_unreported, unknown_cache_schema_json, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET
+model_state=excluded.model_state, thinking_state=excluded.thinking_state, cache_capability=excluded.cache_capability,
+observations=excluded.observations, metering_events=excluded.metering_events,
+cache_reported_observations=excluded.cache_reported_observations, cache_hit_observations=excluded.cache_hit_observations,
+consecutive_unreported=excluded.consecutive_unreported, unknown_cache_schema_json=excluded.unknown_cache_schema_json,
+updated_at=excluded.updated_at`, capability.AccountID, capability.EndpointHash, capability.Model, capability.ModelState,
+		capability.ThinkingState, capability.CacheCapability, capability.Observations, capability.MeteringEvents,
+		capability.CacheReportedObservations, capability.CacheHitObservations, capability.ConsecutiveUnreported,
+		capability.UnknownCacheSchemaJSON, capability.UpdatedAt)
+	if err != nil {
+		return KiroRuntimeCapability{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return KiroRuntimeCapability{}, err
+	}
+	return capability, nil
+}
+
 func (s *Store) UpsertEgressProfile(ctx context.Context, p EgressProfile) error {
 	now := Now()
 	if p.ID == "" {
@@ -3393,9 +3698,9 @@ func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding,
 }
 
 func (s *Store) GetAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash, route_key, source, account_id, epoch, created_at, updated_at FROM affinity_bindings WHERE route_key_hash = ?`, routeKeyHash)
+	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at FROM affinity_bindings WHERE route_key_hash = ?`, routeKeyHash)
 	var b AffinityBinding
-	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt)
+	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt)
 	return b, err
 }
 
@@ -3406,15 +3711,18 @@ func (s *Store) UpsertAffinityBinding(ctx context.Context, b AffinityBinding) er
 	}
 	b.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO affinity_bindings(route_key_hash, route_key, source, account_id, epoch, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?)
+INSERT INTO affinity_bindings(route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(route_key_hash) DO UPDATE SET
  account_id = excluded.account_id,
  source = excluded.source,
  route_key = excluded.route_key,
+ provider = excluded.provider,
+ model = excluded.model,
+ egress_id = excluded.egress_id,
  epoch = affinity_bindings.epoch + 1,
  updated_at = excluded.updated_at`,
-		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Epoch, b.CreatedAt, b.UpdatedAt)
+		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Provider, b.Model, b.EgressID, b.Epoch, b.CreatedAt, b.UpdatedAt)
 	return err
 }
 
@@ -3426,7 +3734,7 @@ func (s *Store) ListAffinityBindingsByAccount(ctx context.Context, accountID str
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT route_key_hash, route_key, source, account_id, epoch, created_at, updated_at FROM affinity_bindings WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?`, accountID, limit)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at FROM affinity_bindings WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?`, accountID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -3434,7 +3742,7 @@ func (s *Store) ListAffinityBindingsByAccount(ctx context.Context, accountID str
 	var out []AffinityBinding
 	for rows.Next() {
 		var b AffinityBinding
-		if err := rows.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -4141,6 +4449,11 @@ func (s *Store) InsertUsageRecordWithCacheDetails(ctx context.Context, accountID
 
 type UsageDiagnostics struct {
 	UsageProvider                     string
+	UsageSource                       string
+	CacheReadPresent                  bool
+	CacheCreationPresent              bool
+	CompatibilityLossesJSON           string
+	CacheCapability                   string
 	Estimated                         bool
 	CacheMissTokens                   int64
 	CacheTotalInputTokens             int64
@@ -4175,15 +4488,17 @@ func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID,
 	diag = finalizeUsageDiagnostics(model, prompt, cached, cacheRead, cacheCreation, raw, diag)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(
 account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
-usage_provider, estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
+usage_provider, usage_source, cache_read_present, cache_creation_present, compatibility_losses_json, cache_capability,
+estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
 affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
 retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
 cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
-		diag.UsageProvider, boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
+		diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CompatibilityLossesJSON, diag.CacheCapability,
+		boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
 		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
 		diag.RetentionEffective, diag.RetentionSource, diag.ClaudeCacheTTL, boolInt(diag.CacheControlInjected), diag.CacheBreakpointCount,
 		diag.CacheBreakpointsJSON, diag.UnwrittenTailTokens, diag.MaxPossibleCacheReadTokens, boolInt(diag.CacheHitAfterPrewarm), diag.SingleflightWaitedRequests, diag.DiagnosticsMissReason,
@@ -4204,13 +4519,31 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 	if diag.UsageProvider == "" {
 		diag.UsageProvider = usageProvider(model, usageMap, cacheCreation)
 	}
+	if _, ok := usageMap["cache_read_input_tokens"]; ok {
+		diag.CacheReadPresent = true
+	}
+	if _, ok := usageMap["cache_creation_input_tokens"]; ok {
+		diag.CacheCreationPresent = true
+	}
+	if diag.UsageSource == "" {
+		if diag.Estimated {
+			diag.UsageSource = "estimated"
+		} else {
+			diag.UsageSource = "upstream"
+		}
+	}
 	if diag.CacheCreation5mTokens == 0 {
 		diag.CacheCreation5mTokens = nestedUsageInt(usageMap, "cache_creation", "ephemeral_5m_input_tokens")
 	}
 	if diag.CacheCreation1hTokens == 0 {
 		diag.CacheCreation1hTokens = nestedUsageInt(usageMap, "cache_creation", "ephemeral_1h_input_tokens")
 	}
-	if diag.CacheTotalInputTokens <= 0 || diag.CacheMissTokens < 0 {
+	if strings.EqualFold(diag.UsageProvider, "kiro") && !diag.CacheReadPresent && !diag.CacheCreationPresent {
+		// No Kiro cache field means the upstream did not report a cache metric. It
+		// is not a zero-token miss and must not enter the calculable denominator.
+		diag.CacheMissTokens = 0
+		diag.CacheTotalInputTokens = 0
+	} else if diag.CacheTotalInputTokens <= 0 || diag.CacheMissTokens < 0 {
 		if isAnthropicUsageMap(usageMap, cacheCreation) {
 			diag.CacheMissTokens = prompt
 			diag.CacheTotalInputTokens = prompt + cacheRead + cacheCreation
@@ -4307,7 +4640,7 @@ func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
 
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT id, model, prompt_tokens, cached_tokens,
+SELECT id, model, usage_provider, usage_source, cache_read_present, cache_creation_present, prompt_tokens, cached_tokens,
        CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END,
        cache_creation_tokens, raw_usage_json
 FROM usage_records
@@ -4319,13 +4652,14 @@ WHERE cache_total_input_tokens = 0
 	}
 	type row struct {
 		id                                int64
-		model, raw                        string
+		model, provider, source, raw      string
+		cacheReadPresent, createPresent   int
 		prompt, cached, cacheRead, create int64
 	}
 	var items []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.id, &r.model, &r.prompt, &r.cached, &r.cacheRead, &r.create, &r.raw); err != nil {
+		if err := rows.Scan(&r.id, &r.model, &r.provider, &r.source, &r.cacheReadPresent, &r.createPresent, &r.prompt, &r.cached, &r.cacheRead, &r.create, &r.raw); err != nil {
 			rows.Close()
 			return err
 		}
@@ -4337,13 +4671,16 @@ WHERE cache_total_input_tokens = 0
 	}
 	rows.Close()
 	for _, r := range items {
-		diag := finalizeUsageDiagnostics(r.model, r.prompt, r.cached, r.cacheRead, r.create, json.RawMessage(r.raw), UsageDiagnostics{})
+		diag := finalizeUsageDiagnostics(r.model, r.prompt, r.cached, r.cacheRead, r.create, json.RawMessage(r.raw), UsageDiagnostics{
+			UsageProvider: r.provider, UsageSource: r.source,
+			CacheReadPresent: r.cacheReadPresent != 0, CacheCreationPresent: r.createPresent != 0,
+		})
 		if _, err := s.db.ExecContext(ctx, `
 UPDATE usage_records
-SET usage_provider = ?, estimated = ?, cache_miss_tokens = ?, cache_total_input_tokens = ?,
+SET usage_provider = ?, usage_source = ?, cache_read_present = ?, cache_creation_present = ?, estimated = ?, cache_miss_tokens = ?, cache_total_input_tokens = ?,
     cache_creation_5m_tokens = ?, cache_creation_1h_tokens = ?
 WHERE id = ?`,
-			diag.UsageProvider, boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens,
+			diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens,
 			diag.CacheCreation5mTokens, diag.CacheCreation1hTokens, r.id); err != nil {
 			return err
 		}
@@ -4476,12 +4813,13 @@ type CacheUsageBucket struct {
 
 const (
 	cacheReadTokensSQL       = "(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END)"
-	cacheTotalInputTokensSQL = "(CASE WHEN cache_total_input_tokens > 0 THEN cache_total_input_tokens ELSE prompt_tokens END)"
-	cacheMissTokensSQL       = "(CASE WHEN cache_miss_tokens > 0 THEN cache_miss_tokens ELSE MAX(prompt_tokens - " + cacheReadTokensSQL + ", 0) END)"
+	kiroCacheUnreportedSQL   = "(usage_provider = 'kiro' AND cache_read_present = 0 AND cache_creation_present = 0)"
+	cacheTotalInputTokensSQL = "(CASE WHEN " + kiroCacheUnreportedSQL + " THEN 0 WHEN cache_total_input_tokens > 0 THEN cache_total_input_tokens ELSE prompt_tokens END)"
+	cacheMissTokensSQL       = "(CASE WHEN " + kiroCacheUnreportedSQL + " THEN 0 WHEN cache_miss_tokens > 0 THEN cache_miss_tokens ELSE MAX(prompt_tokens - " + cacheReadTokensSQL + ", 0) END)"
 	estimatedUsageRecordSQL  = "(CASE WHEN estimated > 0 THEN 1 ELSE 0 END)"
-	realUsageRecordSQL       = "(CASE WHEN estimated > 0 THEN 0 ELSE 1 END)"
-	realCacheInputTokensSQL  = "(CASE WHEN estimated > 0 THEN 0 ELSE " + cacheTotalInputTokensSQL + " END)"
-	realCacheReadTokensSQL   = "(CASE WHEN estimated > 0 THEN 0 ELSE " + cacheReadTokensSQL + " END)"
+	realUsageRecordSQL       = "(CASE WHEN estimated > 0 OR " + kiroCacheUnreportedSQL + " THEN 0 ELSE 1 END)"
+	realCacheInputTokensSQL  = "(CASE WHEN estimated > 0 OR " + kiroCacheUnreportedSQL + " THEN 0 ELSE " + cacheTotalInputTokensSQL + " END)"
+	realCacheReadTokensSQL   = "(CASE WHEN estimated > 0 OR " + kiroCacheUnreportedSQL + " THEN 0 ELSE " + cacheReadTokensSQL + " END)"
 )
 
 // UsageByUser aggregates a single user's usage per model, most-used first.
@@ -4737,12 +5075,17 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 }
 
 func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
+	if row.RealRequests > 0 {
+		// Estimated usage and Kiro rows whose upstream omitted cache fields are not
+		// misses. Only requests with calculable upstream cache metering belong in
+		// the hit-rate denominator.
+		row.RequestHitRate = float64(row.HitRequests) / float64(row.RealRequests)
+	}
 	if row.Requests > 0 {
-		row.RequestHitRate = float64(row.HitRequests) / float64(row.Requests)
 		row.EstimatedRate = float64(row.EstimatedRequests) / float64(row.Requests)
 	}
 	denominator := row.CacheInputTokens
-	if denominator <= 0 {
+	if denominator <= 0 && row.RealRequests > 0 {
 		denominator = row.PromptTokens
 		row.CacheInputTokens = row.PromptTokens
 	}
@@ -4795,7 +5138,7 @@ func RouteClassForAffinitySource(source string) string {
 	case "cache_prefix_hash", "stable_messages_hash":
 		return "stable_prefix"
 	case "x-claude-code-session-id", "codex-root-thread-id", "x-codex-parent-thread-id", "thread_id", "conversation_id",
-		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
+		"x-codex-window-id", "prompt_cache_key", "previous_response_id", "claude_resource", "x-codex-turn-metadata":
 		return "true_conversation"
 	case "downstream_api_project_model":
 		return "coarse"

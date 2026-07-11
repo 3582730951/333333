@@ -8,6 +8,7 @@ import (
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
@@ -48,6 +49,22 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 	case "kiro":
 		caps := capability.StaticKiroModels(account.ID)
 		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+			return nil, err
+		}
+		cred, err := s.store.GetKiroCredentials(ctx, account.ID)
+		if err != nil {
+			return nil, err
+		}
+		cfg := s.effectiveKiroConfig(ctx)
+		endpointHash, err := kirowire.EndpointHash(cred.Endpoint, firstNonEmpty(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1"), cfg.KiroEndpointAllowlist)
+		if err != nil {
+			return nil, err
+		}
+		models := make([]string, 0, len(caps))
+		for _, model := range caps {
+			models = append(models, model.ModelSlug)
+		}
+		if err := s.store.EnsureKiroRuntimeModels(ctx, account.ID, endpointHash, models); err != nil {
 			return nil, err
 		}
 		return caps, nil

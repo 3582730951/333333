@@ -66,7 +66,7 @@ func TestGatewayWindowsDownloadBinaryBuilds(t *testing.T) {
 		t.Skip("go toolchain not available")
 	}
 	out := filepath.Join(t.TempDir(), "gateway-windows-amd64.exe")
-	cmd := exec.Command(goBin, "build", "-trimpath", "-o", out, ".")
+	cmd := exec.Command(goBin, "build", "-buildvcs=false", "-trimpath", "-o", out, ".")
 	cmd.Env = append(os.Environ(),
 		"CGO_ENABLED=0",
 		"GOOS=windows",

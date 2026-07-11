@@ -1106,7 +1106,6 @@ func optimalSystemTemplateValues() map[string]interface{} {
 		"rate_limit_guard_enabled":                true,
 		"seamless_failover":                       true,
 		"failover_max_attempts":                   float64(3),
-		"force_failover_on_429":                   false,
 		"leak_scrub":                              true,
 		"token_save_enabled":                      false,
 		"claude_cache_control_inject":             true,

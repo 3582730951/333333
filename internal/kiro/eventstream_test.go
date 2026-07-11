@@ -3,7 +3,9 @@ package kiro
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
+	"strings"
 	"testing"
 )
 
@@ -102,5 +104,79 @@ func TestDecodeWebSearchResponseProducesAnthropicBlocks(t *testing.T) {
 		if !bytes.Contains(jsonBody, []byte(want)) || !bytes.Contains(streamBody, []byte(want)) {
 			t.Fatalf("missing %q in web search output", want)
 		}
+	}
+}
+
+func TestKiroMeteringDistinguishesMissingZeroNestedAndUnknown(t *testing.T) {
+	missingRaw := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":7,"outputTokens":0}`))
+	missing, err := DecodeResponse(bytes.NewReader(missingRaw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Metering.CacheReadTokens.Present || missing.Metering.CacheCreationTokens.Present {
+		t.Fatalf("missing cache fields became reported zero: %+v", missing.Metering)
+	}
+	if strings.Contains(string(AnthropicJSON(missing, "claude-sonnet-4.6", "m")), "cache_read_input_tokens") {
+		t.Fatal("unreported cache field leaked into downstream usage")
+	}
+
+	reportedRaw := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"usage":{"inputTokenCount":9,"cacheReadInputTokens":0,"cacheCreationInputTokens":3},"cacheFooTokens":12}`))
+	reported, err := DecodeResponse(bytes.NewReader(reportedRaw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reported.Metering.CacheReadTokens.Present || reported.Metering.CacheReadTokens.Value != 0 || !reported.Metering.CacheCreationTokens.Present || reported.CacheCreationTokens != 3 {
+		t.Fatalf("nested/present metering lost: %+v", reported.Metering)
+	}
+	if len(reported.Metering.UnknownCacheFields) != 1 || reported.Metering.UnknownCacheFields[0].Name != "cacheFooTokens" || reported.Metering.UnknownCacheFields[0].SchemaHash == "" {
+		t.Fatalf("unknown cache schema metadata = %+v", reported.Metering.UnknownCacheFields)
+	}
+	usageBody := string(AnthropicJSON(reported, "claude-sonnet-4.6", "m"))
+	if !strings.Contains(usageBody, `"cache_read_input_tokens":0`) || !strings.Contains(usageBody, `"cache_creation_input_tokens":3`) {
+		t.Fatalf("explicit cache values missing: %s", usageBody)
+	}
+}
+
+func TestKiroMeteringRejectsNegativeAndFractionalTokenCounts(t *testing.T) {
+	raw := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":-1,"outputTokens":1.5,"cacheReadTokens":-2}`))
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metering.InputTokens.Present || got.Metering.OutputTokens.Present || got.Metering.CacheReadTokens.Present {
+		t.Fatalf("invalid metering values were accepted: %+v", got.Metering)
+	}
+}
+
+func TestDecodeResponseRejectsInvalidToolJSON(t *testing.T) {
+	raw := testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"name":"bad","toolUseId":"t1","input":"{not-json"}`))
+	_, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if !errors.Is(err, ErrInvalidToolInput) {
+		t.Fatalf("err=%v, want ErrInvalidToolInput", err)
+	}
+}
+
+func TestDecodeResponseThinkingNativeAndTagFallback(t *testing.T) {
+	raw := bytes.Join([][]byte{
+		testFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"thinking":"native","content":"before<think"}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"ing>fallback</thinking>after"}`)),
+	}, nil)
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Thinking != "nativefallback" || got.Text != "beforeafter" || !containsString(got.CompatibilityLosses, LossThinkingTagFallback) {
+		t.Fatalf("thinking fallback/native priority result = %+v", got)
+	}
+}
+
+func TestDecodeResponseCanonicalizesActualModelWithoutVersionDrift(t *testing.T) {
+	raw := testFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"modelId":"claude-opus-4-9-20270101","content":"ok"}`))
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "claude-opus-4.9" {
+		t.Fatalf("actual model=%q, want same-version canonical id", got.Model)
 	}
 }

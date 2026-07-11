@@ -15,12 +15,14 @@ import (
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 )
 
 var ErrNoAccount = errors.New("no active account available")
 var ErrStrictUnavailable = errors.New("strict sticky account unavailable")
+var ErrBoundAccountUnavailable = errors.New("bound account unavailable")
 
 type Scheduler struct {
 	store          *storage.Store
@@ -66,10 +68,11 @@ type Scheduler struct {
 // The binding is carried from the batch ListActiveAccountsWithEgress query so the
 // lease can be built without a second per-request DB read while holding s.mu.
 type candidate struct {
-	account storage.Account
-	egress  storage.EgressProfile
-	binding storage.AccountEgressBinding
-	score   float64 // normalized account/token/egress load; lower is better
+	account       storage.Account
+	egress        storage.EgressProfile
+	binding       storage.AccountEgressBinding
+	resolvedModel string
+	score         float64 // normalized account/token/egress load; lower is better
 }
 
 type waiter struct {
@@ -108,6 +111,8 @@ const (
 	leaseBlockQuarantined       leaseBlockReason = "quarantined"
 	leaseBlockNotFound          leaseBlockReason = "not_found"
 	leaseBlockGroupMismatch     leaseBlockReason = "group_mismatch"
+	leaseBlockProviderMismatch  leaseBlockReason = "provider_mismatch"
+	leaseBlockModelUnsupported  leaseBlockReason = "model_unsupported"
 )
 
 // InvalidateAccountCache clears the account list cache so the next Select() call
@@ -130,6 +135,17 @@ type Route struct {
 	Affinity         routing.AffinityKey
 	Strict           bool
 	ServerSideState  bool
+	// ImmutableAffinity pins provider, account, resolved model and egress after
+	// the first selection. Kiro and Claude/Kiro auto sessions use this mode.
+	ImmutableAffinity bool
+	// ExplicitProvider permits a concrete, not-yet-verified Kiro model to be tried
+	// on the explicitly requested account. Auto scheduling only considers verified
+	// runtime capabilities.
+	ExplicitProvider      bool
+	ThinkingRequired      bool
+	RequiredEgressID      string
+	KiroEndpointAllowlist []string
+	KiroDefaultRegion     string
 	// Movable is kept for existing call sites/tests that already computed
 	// !ServerSideState. New callers should set ServerSideState directly.
 	Movable         bool
@@ -224,10 +240,11 @@ func transientlySaturated(err error) bool {
 }
 
 type Lease struct {
-	Account storage.Account
-	Binding storage.AccountEgressBinding
-	Egress  storage.EgressProfile
-	release func()
+	Account       storage.Account
+	Binding       storage.AccountEgressBinding
+	Egress        storage.EgressProfile
+	ResolvedModel string
+	release       func()
 }
 
 func New(store *storage.Store, cfg config.Config) *Scheduler {
@@ -280,11 +297,50 @@ func (s *Scheduler) Metrics() SchedulerMetrics {
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	cfg := s.Config()
 	hadExclusions := len(route.Exclude) > 0
+	hadBinding := false
 	if route.Group == "" {
 		route.Group = cfg.DefaultGroup
 	}
 	if route.Affinity.Hash != "" {
 		if bound, err := s.store.GetAffinityBinding(ctx, route.Affinity.Hash); err == nil {
+			hadBinding = true
+			if route.ImmutableAffinity {
+				boundProvider := firstRouteValue(bound.Provider, s.providerOf(ctx, bound.AccountID))
+				if !routeAllowsProvider(route, boundProvider) || route.Exclude[bound.AccountID] {
+					return Lease{}, fmt.Errorf("%w: provider=%s account=%s", ErrBoundAccountUnavailable, boundProvider, bound.AccountID)
+				}
+				boundRoute := route
+				boundRoute.Provider = boundProvider
+				boundRoute.AllowedProviders = []string{boundProvider}
+				boundRoute.RequiredEgressID = bound.EgressID
+				if bound.Model != "" {
+					boundRoute.Model = bound.Model
+				}
+				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, boundRoute, nil)
+				if ok {
+					if bound.Model != "" {
+						lease.ResolvedModel = bound.Model
+					}
+					if bound.Provider == "" || bound.Model == "" || bound.EgressID == "" {
+						_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+							RouteKeyHash: bound.RouteKeyHash, RouteKey: bound.RouteKey, Source: bound.Source,
+							AccountID: bound.AccountID, Provider: boundProvider,
+							Model: firstRouteValue(lease.ResolvedModel, boundRoute.Model), EgressID: lease.Egress.ID,
+						})
+					}
+					return lease, nil
+				}
+				if statefulStickyWaitReason(reason) {
+					lease, waitErr := s.waitForStatefulStickyLease(ctx, bound.AccountID, boundRoute, reason)
+					if waitErr == nil && bound.Model != "" {
+						lease.ResolvedModel = bound.Model
+					}
+					if waitErr == nil {
+						return lease, nil
+					}
+				}
+				return Lease{}, fmt.Errorf("%w: provider=%s account=%s model=%s egress=%s reason=%s", ErrBoundAccountUnavailable, boundProvider, bound.AccountID, bound.Model, bound.EgressID, reason.humanString())
+			}
 			// Skip the sticky account entirely when this request already tried and
 			// failed on it (Exclude) — fall through to selectFresh, which rebinds the
 			// affinity to the fresh account so the conversation seamlessly continues
@@ -292,6 +348,13 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 			if routeAllowsProvider(route, s.providerOf(ctx, bound.AccountID)) && !route.Exclude[bound.AccountID] {
 				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
 				if ok {
+					if bound.Provider == "" || bound.Model == "" || bound.EgressID == "" {
+						_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+							RouteKeyHash: bound.RouteKeyHash, RouteKey: bound.RouteKey, Source: bound.Source,
+							AccountID: bound.AccountID, Provider: s.providerOfAccount(ctx, lease.Account),
+							Model: firstRouteValue(lease.ResolvedModel, route.Model), EgressID: lease.Egress.ID,
+						})
+					}
 					return lease, nil
 				}
 				if route.Strict && route.ServerSideState {
@@ -354,14 +417,29 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		atomic.AddInt64(&s.metrics.AccountSwitches, 1)
 	}
 	if route.Affinity.Hash != "" {
-		_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		binding := storage.AffinityBinding{
 			RouteKeyHash: route.Affinity.Hash,
 			RouteKey:     route.Affinity.Key,
 			Source:       route.Affinity.Source,
 			AccountID:    lease.Account.ID,
-		})
+			Provider:     s.providerOfAccount(ctx, lease.Account),
+			Model:        firstRouteValue(lease.ResolvedModel, route.Model),
+			EgressID:     lease.Egress.ID,
+		}
+		if !hadBinding || !route.ImmutableAffinity {
+			_ = s.store.UpsertAffinityBinding(ctx, binding)
+		}
 	}
 	return lease, nil
+}
+
+func firstRouteValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func routeAllowsProvider(route Route, provider string) bool {
@@ -565,17 +643,9 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	s.egressCacheMutex.Unlock()
 
 	var capable map[string]bool
-	var kiroCapable map[string]bool
-	var kiroModelKnown bool
 	if route.Model != "" {
 		if m, err := s.store.AccountsWithModel(ctx, route.Group, route.Model); err == nil && len(m) > 0 {
 			capable = m
-		}
-		if canonical, ok := capability.KiroCanonicalModel(route.Model); ok {
-			kiroModelKnown = true
-			if m, err := s.store.AccountsWithModel(ctx, route.Group, canonical); err == nil {
-				kiroCapable = m
-			}
 		}
 	}
 	reqEgressCache := make(map[string]storage.EgressProfile)
@@ -601,14 +671,19 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.ProviderMismatch++
 			continue
 		}
+		resolvedModel := route.Model
 		if accountProvider == "kiro" && route.Model != "" {
-			if !kiroModelKnown || !kiroCapable[account.ID] {
+			var modelOK bool
+			resolvedModel, modelOK = s.resolveKiroRouteModel(ctx, account, route)
+			if !modelOK {
 				counters.ModelUnsupported++
 				continue
 			}
 		} else if capable != nil && !capable[account.ID] {
 			counters.ModelUnsupported++
 			continue
+		} else if accountProvider == "claude" {
+			resolvedModel = capability.NormalizeClaudeModelAlias(route.Model)
 		}
 		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited {
 			counters.RateLimitCooldown++
@@ -649,7 +724,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		concurrencyLoad := float64(inflight) / float64(maxInt(1, egress.MaxConcurrency))
 		tokenLoad := float64(tokens) / float64(maxInt64(1, cfg.AccountTokenBudget))
 		latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
-		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, score: concurrencyLoad + tokenLoad + latencyPenalty})
+		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, score: concurrencyLoad + tokenLoad + latencyPenalty})
 	}
 	if len(candidates) == 0 {
 		return Lease{}, s.noAccountError(route, counters)
@@ -703,6 +778,43 @@ func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding st
 	return false
 }
 
+func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.Account, route Route) (string, bool) {
+	credentials, err := s.store.GetKiroCredentials(ctx, account.ID)
+	if err != nil {
+		return "", false
+	}
+	region := firstRouteValue(credentials.APIRegion, route.KiroDefaultRegion, s.Config().KiroDefaultAPIRegion, "us-east-1")
+	allowlist := route.KiroEndpointAllowlist
+	if allowlist == nil {
+		allowlist = s.Config().KiroEndpointAllowlist
+	}
+	endpointHash, err := kirowire.EndpointHash(credentials.Endpoint, region, allowlist)
+	if err != nil {
+		return "", false
+	}
+	verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, route.ThinkingRequired)
+	if err != nil {
+		return "", false
+	}
+	resolved, ok := capability.ResolveKiroModel(route.Model, verified)
+	if !ok {
+		return "", false
+	}
+	if route.ThinkingRequired && !capability.KiroSupportsAdaptiveThinking(resolved) {
+		return "", false
+	}
+	if route.ExplicitProvider && !capability.KiroModelAlias(route.Model) {
+		return resolved, true
+	}
+	for _, model := range verified {
+		canonical, modelOK := capability.KiroCanonicalModel(model)
+		if modelOK && canonical == resolved {
+			return resolved, true
+		}
+	}
+	return "", false
+}
+
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
 	lease, _, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, egressCache)
 	return lease, ok
@@ -724,6 +836,20 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if route.Group != "" && account.GroupName != route.Group {
 		return Lease{}, leaseBlockGroupMismatch, false
 	}
+	accountProvider := s.providerOfAccount(ctx, account)
+	if !routeAllowsProvider(route, accountProvider) {
+		return Lease{}, leaseBlockProviderMismatch, false
+	}
+	resolvedModel := route.Model
+	if accountProvider == "kiro" && route.Model != "" {
+		var ok bool
+		resolvedModel, ok = s.resolveKiroRouteModel(ctx, account, route)
+		if !ok {
+			return Lease{}, leaseBlockModelUnsupported, false
+		}
+	} else if accountProvider == "claude" && route.Model != "" {
+		resolvedModel = capability.NormalizeClaudeModelAlias(route.Model)
+	}
 	if s.accountRateLimitedForRoute(ctx, account, route, now) {
 		return Lease{}, leaseBlockRateLimitCooldown, false
 	}
@@ -736,7 +862,17 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if binding.RecheckPending {
 		return Lease{}, leaseBlockRecheckPending, false
 	}
-	egress, ok := s.selectEgress(ctx, binding, now, egressCache)
+	var egress storage.EgressProfile
+	var ok bool
+	if route.RequiredEgressID != "" {
+		if !bindingContainsEgress(binding, route.RequiredEgressID) {
+			return Lease{}, leaseBlockEgressUnavailable, false
+		}
+		egress, err = s.egressProfile(ctx, route.RequiredEgressID, egressCache)
+		ok = err == nil && EgressHealthy(egress, now) && binding.CooldownUntil <= now
+	} else {
+		egress, ok = s.selectEgress(ctx, binding, now, egressCache)
+	}
 	if !ok {
 		if s.egressTemporarilyUnavailable(ctx, binding, now) {
 			return Lease{}, leaseBlockEgressCooldown, false
@@ -774,7 +910,19 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		}
 		s.notifyLoadChangedLocked()
 	}
-	return Lease{Account: account, Binding: binding, Egress: egress, release: release}, leaseBlockNone, true
+	return Lease{Account: account, Binding: binding, Egress: egress, ResolvedModel: resolvedModel, release: release}, leaseBlockNone, true
+}
+
+func bindingContainsEgress(binding storage.AccountEgressBinding, egressID string) bool {
+	if binding.PrimaryEgressID == egressID {
+		return true
+	}
+	for _, standby := range binding.StandbyIDs() {
+		if standby == egressID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scheduler) currentLoad(accountID string) (int, int64) {
@@ -1383,5 +1531,5 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 	// candidate, so the lease is built without a second DB read while holding s.mu —
 	// keeping the hot critical section to map ops only (the previous GetEgressBinding
 	// here serialized every lease grant and release behind a SQLite round-trip).
-	return Lease{Account: account, Binding: c.binding, Egress: egress, release: release}, true
+	return Lease{Account: account, Binding: c.binding, Egress: egress, ResolvedModel: c.resolvedModel, release: release}, true
 }

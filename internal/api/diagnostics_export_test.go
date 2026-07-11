@@ -93,6 +93,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		"account_map.csv",
 		"account_auth_metadata.csv",
 		"account_model_capabilities.csv",
+		"kiro_runtime_capabilities.csv",
 		"account_rate_limits.csv",
 		"affinity_bindings.csv",
 		"settings.csv",
@@ -156,7 +157,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 	usageCSV := files["usage_records.csv"]
-	for _, want := range []string{"affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
+	for _, want := range []string{"usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "affinity_source", "route_class", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_bytes", "retention_effective", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch"} {
 		if !strings.Contains(usageCSV, want) {
 			t.Fatalf("usage_records.csv missing diagnostic column %q:\n%s", want, usageCSV)
 		}

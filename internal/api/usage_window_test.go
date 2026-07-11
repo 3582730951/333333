@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -449,13 +450,17 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 		t.Fatalf("response is not a zip: %v\n%s", err, raw)
 	}
 	files := readZipFiles(t, raw)
-	for _, name := range []string{"manifest.json", "summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "route_map.csv", "account_map.csv"} {
+	for _, name := range []string{"manifest.json", "summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "route_map.csv", "account_map.csv", "kiro_capabilities.csv", "usage_sources.csv"} {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("cache hit zip missing %s; has %v", name, zipFileNames(files))
 		}
 	}
-	if !strings.Contains(files["manifest.json"], "codex-pool-cache-hits-v1") {
+	if !strings.Contains(files["manifest.json"], "codex-pool-cache-hits-v2") || !strings.Contains(files["manifest.json"], "excluded from calculable hit-rate denominators") {
 		t.Fatalf("manifest format missing:\n%s", files["manifest.json"])
+	}
+	legacyCode, legacyRaw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0&version=v1", "")
+	if legacyCode != http.StatusOK || !strings.Contains(readZipFiles(t, legacyRaw)["manifest.json"], "codex-pool-cache-hits-v1") {
+		t.Fatalf("v1 migration export unavailable: status=%d", legacyCode)
 	}
 	if !strings.Contains(files["summary.csv"], "token_hit_rate") || !strings.Contains(files["summary.csv"], "80") {
 		t.Fatalf("summary.csv missing expected metrics:\n%s", files["summary.csv"])
@@ -479,6 +484,43 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 				t.Fatalf("%s leaked %q:\n%s", name, forbidden, text)
 			}
 		}
+	}
+}
+
+func TestAdminCacheHitsV2RendersKiroUnreportedRatesAsUnknown(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	account := storage.Account{ID: "kiro-unreported-export", Label: "Kiro", Provider: "kiro", GroupName: "cyber", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.ObserveKiroCapability(ctx, account.ID, "endpoint-hash", "claude-sonnet-4.6", storage.KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 20, UnreportedThreshold: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route", "", "", "claude-sonnet-4.6", 100, 1, 101, 0, 0, 0, json.RawMessage(`{"input_tokens":100}`), storage.UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream"}); err != nil {
+		t.Fatal(err)
+	}
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0", "")
+	if code != http.StatusOK {
+		t.Fatalf("cache hit export = %d: %s", code, raw)
+	}
+	files := readZipFiles(t, raw)
+	records, err := csv.NewReader(strings.NewReader(files["by_account_model.csv"])).ReadAll()
+	if err != nil || len(records) != 2 {
+		t.Fatalf("by_account_model.csv records=%v err=%v\n%s", records, err, files["by_account_model.csv"])
+	}
+	columns := map[string]int{}
+	for i, name := range records[0] {
+		columns[name] = i
+	}
+	row := records[1]
+	for _, name := range []string{"request_hit_rate", "token_hit_rate", "real_token_hit_rate"} {
+		if row[columns[name]] != "" {
+			t.Fatalf("%s=%q, want blank for unreported Kiro metering: %v", name, row[columns[name]], row)
+		}
+	}
+	if row[columns["provider"]] != "kiro" || row[columns["cache_capability"]] != "unreported" || row[columns["real_requests"]] != "0" || row[columns["cache_miss_tokens"]] != "0" {
+		t.Fatalf("unreported Kiro export row=%v", row)
 	}
 }
 

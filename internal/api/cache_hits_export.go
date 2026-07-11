@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,8 +49,18 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	kiroCapabilities, err := s.store.ListKiroRuntimeCapabilities(r.Context(), "")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	codebook := buildDiagnosticCodebook(accounts, nil, nil, usageRows, nil, nil)
-	files, order, err := buildCacheHitsZipFiles(report, win, codebook, now)
+	version := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("version")))
+	if version == "" {
+		version = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	}
+	legacyV1 := version == "v1" || version == "codex-pool-cache-hits-v1"
+	files, order, err := buildCacheHitsZipFiles(report, win, codebook, usageRows, kiroCapabilities, now, legacyV1)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -73,13 +84,17 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	filename := fmt.Sprintf("codex-pool-cache-hits-%s.zip", now.In(time.Local).Format("20060102-150405"))
+	filenameVersion := "v2"
+	if legacyV1 {
+		filenameVersion = "v1"
+	}
+	filename := fmt.Sprintf("codex-pool-cache-hits-%s-%s.zip", filenameVersion, now.In(time.Local).Format("20060102-150405"))
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	_, _ = w.Write(buf.Bytes())
 }
 
-func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindow, codebook diagnosticCodebook, generatedAt time.Time) (map[string]string, []string, error) {
+func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindow, codebook diagnosticCodebook, usageRows []diagnosticUsageRecord, kiroCapabilities []storage.KiroRuntimeCapability, generatedAt time.Time, legacyV1 bool) (map[string]string, []string, error) {
 	order := []string{
 		"manifest.json",
 		"summary.csv",
@@ -91,9 +106,16 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"route_map.csv",
 		"account_map.csv",
 	}
+	if !legacyV1 {
+		order = append(order, "kiro_capabilities.csv", "usage_sources.csv")
+	}
+	format := "codex-pool-cache-hits-v2"
+	if legacyV1 {
+		format = "codex-pool-cache-hits-v1"
+	}
 	manifest := map[string]interface{}{
 		"generated_at":        generatedAt.Unix(),
-		"format":              "codex-pool-cache-hits-v1",
+		"format":              format,
 		"window_mode":         win.WindowMode,
 		"effective_start_at":  win.EffectiveStartAt,
 		"effective_until_at":  win.EffectiveUntilAt,
@@ -106,6 +128,10 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"token_hit_rate":      "clamp(hit_tokens / cache_input_tokens)",
 		"eligible_hit_rate":   "cache_read_tokens / (cache_read_tokens + cache_creation_tokens)",
 		"cache_input_formula": "cache_total_input_tokens with prompt_tokens fallback",
+	}
+	if !legacyV1 {
+		manifest["kiro_unreported_policy"] = "Kiro requests without upstream cache fields are excluded from calculable hit-rate denominators; they are not cache misses"
+		manifest["usage_source_policy"] = "only usage_source=upstream and cache fields explicitly present contribute to Kiro cache hit rates"
 	}
 	rawManifest, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -129,6 +155,11 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 	files["by_route.csv"] = csvString(cacheRouteHeader(false), cacheRouteRows(report.ByRoute, codebook, routes, false))
 	files["by_route_account_model.csv"] = csvString(cacheRouteHeader(true), cacheRouteRows(report.ByRouteAccountModel, codebook, routes, true))
 	files["route_map.csv"] = csvString([]string{"route_code", "route_key_hash_prefix", "route_class", "affinity_source"}, routes.rows())
+	if !legacyV1 {
+		files["by_account_model.csv"] = csvString(cacheMetricHeader("account_code", "provider", "model", "cache_capability", "usage_sources"), cacheMetricRowsV2(report.ByAccountModel, codebook, usageRows, kiroCapabilities))
+		files["kiro_capabilities.csv"] = csvString([]string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "updated_at"}, cacheKiroCapabilityRows(kiroCapabilities, codebook))
+		files["usage_sources.csv"] = csvString([]string{"provider", "usage_source", "requests", "cache_read_reported", "cache_creation_reported"}, cacheUsageSourceRows(usageRows))
+	}
 	return files, order, nil
 }
 
@@ -168,6 +199,100 @@ func cacheMetricRows(rows []storage.CacheUsageMetricRow, codebook diagnosticCode
 			prefix = append(prefix, row.Model)
 		}
 		out = append(out, append(prefix, cacheMetricFields(row)...))
+	}
+	return out
+}
+
+func cacheMetricRowsV2(rows []storage.CacheUsageMetricRow, codebook diagnosticCodebook, usageRows []diagnosticUsageRecord, capabilities []storage.KiroRuntimeCapability) [][]string {
+	sources := map[string]map[string]bool{}
+	for _, usageRow := range usageRows {
+		key := usageRow.AccountID + "\x00" + usageRow.Model
+		if sources[key] == nil {
+			sources[key] = map[string]bool{}
+		}
+		source := strings.TrimSpace(usageRow.UsageSource)
+		if source == "" {
+			if usageRow.Estimated != 0 {
+				source = "estimated"
+			} else {
+				source = "upstream"
+			}
+		}
+		sources[key][source] = true
+	}
+	cacheState := map[string]string{}
+	priority := map[string]int{"": 0, "unknown": 1, "unreported": 2, "explicitly_unsupported": 3, "reported": 4, "hit_observed": 5}
+	for _, capability := range capabilities {
+		key := capability.AccountID + "\x00" + capability.Model
+		if priority[capability.CacheCapability] > priority[cacheState[key]] {
+			cacheState[key] = capability.CacheCapability
+		}
+	}
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		provider := ""
+		if identity, ok := codebook.byID[row.AccountID]; ok {
+			provider = identity.Provider
+		}
+		key := row.AccountID + "\x00" + row.Model
+		usageSources := make([]string, 0, len(sources[key]))
+		for source := range sources[key] {
+			usageSources = append(usageSources, source)
+		}
+		sort.Strings(usageSources)
+		prefix := []string{codebook.code(row.AccountID), provider, row.Model, cacheState[key], strings.Join(usageSources, "|")}
+		out = append(out, append(prefix, cacheMetricFieldsV2(row)...))
+	}
+	return out
+}
+
+func cacheKiroCapabilityRows(rows []storage.KiroRuntimeCapability, codebook diagnosticCodebook) [][]string {
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, []string{
+			codebook.code(row.AccountID), row.EndpointHash, row.Model, row.ModelState, row.ThinkingState, row.CacheCapability,
+			itoa64(row.Observations), itoa64(row.MeteringEvents), itoa64(row.CacheReportedObservations),
+			itoa64(row.CacheHitObservations), itoa64(row.ConsecutiveUnreported), itoa64(row.UpdatedAt),
+		})
+	}
+	return out
+}
+
+func cacheUsageSourceRows(rows []diagnosticUsageRecord) [][]string {
+	type count struct{ requests, read, creation int64 }
+	counts := map[string]*count{}
+	for _, row := range rows {
+		provider := firstNonEmpty(row.UsageProvider, "unknown")
+		source := strings.TrimSpace(row.UsageSource)
+		if source == "" {
+			if row.Estimated != 0 {
+				source = "estimated"
+			} else {
+				source = "upstream"
+			}
+		}
+		key := provider + "\x00" + source
+		if counts[key] == nil {
+			counts[key] = &count{}
+		}
+		counts[key].requests++
+		if row.CacheReadPresent != 0 {
+			counts[key].read++
+		}
+		if row.CacheCreationPresent != 0 {
+			counts[key].creation++
+		}
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([][]string, 0, len(keys))
+	for _, key := range keys {
+		parts := strings.SplitN(key, "\x00", 2)
+		value := counts[key]
+		out = append(out, []string{parts[0], parts[1], itoa64(value.requests), itoa64(value.read), itoa64(value.creation)})
 	}
 	return out
 }
@@ -241,6 +366,28 @@ func cacheMetricFields(row storage.CacheUsageMetricRow) []string {
 		itoa64(row.EstimatedRequests),
 		floatString(row.EstimatedRate),
 	}
+}
+
+// cacheMetricFieldsV2 leaves rates blank when their upstream denominator is not
+// available. In particular, a Kiro model with cache_capability=unreported must not
+// appear as a numeric 0% cache miss merely because CSV has no null type.
+func cacheMetricFieldsV2(row storage.CacheUsageMetricRow) []string {
+	fields := cacheMetricFields(row)
+	if row.RealRequests == 0 {
+		fields[3] = ""  // request_hit_rate
+		fields[16] = "" // real_token_hit_rate
+	}
+	if row.CacheInputTokens == 0 {
+		fields[13] = "" // token_hit_rate
+		fields[14] = "" // cache_write_share
+	}
+	if row.CacheReadTokens+row.CacheCreationTokens == 0 {
+		fields[15] = "" // eligible_cache_hit_rate
+	}
+	if row.CacheCreationTokens == 0 {
+		fields[12] = "" // cache_creation_5m_share
+	}
+	return fields
 }
 
 type routeExportCodebook struct {

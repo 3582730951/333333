@@ -130,3 +130,52 @@ func TestSharedEndpointAutoWithoutProviderSignalIsExplicitError(t *testing.T) {
 		t.Fatalf("unexpected upstream calls: %+v", h.requests())
 	}
 }
+
+func TestClaudeResourceIDRemainsBoundToOriginalAccountAndEgress(t *testing.T) {
+	upstreamCalls := 0
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"file_bound"}`))
+	})
+	for _, account := range []storage.Account{
+		{ID: "claude-resource-a", Label: "a", GroupName: "cyber", Provider: "claude", Status: "active"},
+		{ID: "claude-resource-b", Label: "b", GroupName: "cyber", Provider: "claude", Status: "active"},
+	} {
+		if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{AccessToken: "sk-ant-api-" + account.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	create, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/files", strings.NewReader("opaque"))
+	create.Header.Set("X-Pool-Provider", "claude")
+	create.Header.Set("Content-Type", "application/octet-stream")
+	response, err := http.DefaultClient.Do(create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || upstreamCalls != 1 {
+		t.Fatalf("create status=%d calls=%d", response.StatusCode, upstreamCalls)
+	}
+	affinity, _, _ := claudeResourceAffinity("/v1/files/file_bound")
+	bound, err := h.store.GetAffinityBinding(context.Background(), affinity.Hash)
+	if err != nil || bound.Provider != "claude" || bound.Model != "resource:files" || bound.EgressID == "" {
+		t.Fatalf("resource binding=%+v err=%v", bound, err)
+	}
+	if err := h.store.SetAccountStatus(context.Background(), bound.AccountID, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+	get, _ := http.NewRequest(http.MethodGet, h.pool.URL+"/v1/files/file_bound", nil)
+	get.Header.Set("X-Pool-Provider", "claude")
+	response, err = http.DefaultClient.Do(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict || upstreamCalls != 1 || !strings.Contains(string(body), "bound_account_unavailable") {
+		t.Fatalf("bound resource switched account: status=%d calls=%d body=%s", response.StatusCode, upstreamCalls, body)
+	}
+}

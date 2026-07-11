@@ -89,18 +89,18 @@ func newCapturedSSEStream(opts sseCaptureOptions) *capturedSSEStream {
 }
 
 func (s *Server) streamFailoverCaptureOptions(ctx context.Context) sseCaptureOptions {
-	mem := s.settingInt64(ctx, "stream_failover_hold_memory_bytes", s.cfg.StreamFailoverHoldMemoryBytes)
+	mem := s.cfg.StreamFailoverHoldMemoryBytes
 	if mem <= 0 {
 		mem = config.DefaultStreamFailoverHoldMemoryBytes
 	}
-	disk := s.settingInt64(ctx, "stream_failover_hold_disk_bytes", s.cfg.StreamFailoverHoldDiskBytes)
+	disk := s.cfg.StreamFailoverHoldDiskBytes
 	if disk < 0 {
 		disk = 0
 	}
 	return sseCaptureOptions{
 		MemoryLimit: mem,
 		DiskLimit:   disk,
-		TempDir:     s.settingString(ctx, "stream_failover_hold_temp_dir", s.cfg.StreamFailoverHoldTempDir),
+		TempDir:     s.cfg.StreamFailoverHoldTempDir,
 	}
 }
 

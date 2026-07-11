@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -115,20 +117,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// that id upstream. Same-tier only — never a downgrade — so Claude Code's default/auto
 	// selection works end-to-end. No-op for concrete claude-* ids (the common case) and
 	// when a downstream key already forced a concrete model above.
-	if norm := capability.NormalizeClaudeModelAlias(model); norm != model {
-		raw = setForcedModel(raw, norm)
-		model = norm
+	if len(allowedProviders) == 1 && allowedProviders[0] == "claude" {
+		norm := capability.NormalizeClaudeModelAlias(model)
+		if norm != model {
+			raw = setForcedModel(raw, norm)
+			model = norm
+		}
 	}
 	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
-	if strings.HasSuffix(path, "/count_tokens") {
-		count := virtual.EstimateTokensJSON(raw)
-		if count < 1 {
-			count = 1
-		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": count})
-		return
-	}
-
+	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
+	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
 	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is relayed to
 	// that provider, converting Anthropic Messages ↔ Chat Completions both ways. Claude
 	// Code drives this by requesting a provider model (e.g. ANTHROPIC_MODEL=deepseek-chat
@@ -165,12 +163,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	exclude := map[string]bool{}
 	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "anthropic"))
-	_ = attempts // retained as a parsed compatibility knob; transient retries are scheduler-bound now.
-	for {
-		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, true, exclude) != outcomeRetry {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, affinityEstablished, true, exclude) != outcomeRetry {
 			return
 		}
 	}
+	writePoolCodeError(w, http.StatusBadGateway, "retry_exhausted", "upstream retry limit exhausted")
 }
 
 // claudeMessagesAttempt serves one account's attempt at a native Anthropic
@@ -180,21 +178,49 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // account is added to exclude before any retry so it is not re-selected. Mirrors the
 // Codex path's codexAttempt; a benched account is held out of the pool until the
 // recheck loop re-validates it.
-func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, affinityEstablished, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	streamReq := isStreamRequest(raw)
+	countTokens := strings.HasSuffix(path, "/count_tokens")
+	explicitKiro := len(allowedProviders) == 1 && allowedProviders[0] == "kiro"
+	immutableAffinity := affinityEstablished && (explicitKiro || len(allowedProviders) > 1)
+	if !movable && !affinityEstablished {
+		writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
+		return outcomeDone
+	}
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	thinkingRequired := kiroThinkingRequested(raw, kiroCfg.KiroDefaultThinking)
+	if explicitKiro {
+		if canonical, ok := capability.KiroCanonicalModel(model); ok && thinkingRequired && !capability.KiroSupportsAdaptiveThinking(canonical) {
+			writeKiroError(w, r, http.StatusBadRequest, fmt.Errorf("%w: model %s", kirowire.ErrReasoningUnavailable, canonical))
+			return outcomeDone
+		}
+	}
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
-		Group:            group,
-		AllowedProviders: allowedProviders,
-		Affinity:         affinity,
-		Strict:           strict,
-		ServerSideState:  !movable,
-		Movable:          movable,
-		Model:            model,
-		EstimatedTokens:  virtual.EstimateTokensJSON(raw),
-		Exclude:          exclude,
-		OnWait:           schedulerWaitCallback(r.Context()),
+		Group:                 group,
+		AllowedProviders:      allowedProviders,
+		Affinity:              affinity,
+		Strict:                strict,
+		ServerSideState:       !movable,
+		ImmutableAffinity:     immutableAffinity,
+		ExplicitProvider:      explicitKiro,
+		ThinkingRequired:      thinkingRequired,
+		KiroEndpointAllowlist: kiroCfg.KiroEndpointAllowlist,
+		KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
+		Movable:               movable,
+		Model:                 model,
+		EstimatedTokens:       virtual.EstimateTokensJSON(raw),
+		Exclude:               exclude,
+		OnWait:                schedulerWaitCallback(r.Context()),
 	})
 	if err != nil {
+		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
+			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
+			return outcomeDone
+		}
+		if explicitKiro && capability.KiroModelAlias(model) {
+			writeKiroError(w, r, http.StatusServiceUnavailable, fmt.Errorf("%w: %s", kirowire.ErrVerifiedModelUnavailable, model))
+			return outcomeDone
+		}
 		if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
 			return outcomeDone
 		}
@@ -203,8 +229,18 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		return outcomeDone
 	}
 	if lease.Account.Provider == "kiro" {
-		return s.kiroMessagesWithLease(w, r, raw, model, affinity, lease, allowRetry, exclude)
+		if countTokens {
+			return s.kiroCountTokensWithLease(w, r, raw, affinity, lease)
+		}
+		return s.kiroMessagesWithLease(w, r, raw, model, affinity, lease, false, nil)
 	}
+	resolvedModel := firstNonEmpty(lease.ResolvedModel, model)
+	if resolvedModel != model {
+		raw = setForcedModel(raw, resolvedModel)
+		model = resolvedModel
+	}
+	w.Header().Set("X-Pool-Resolved-Provider", "claude")
+	w.Header().Set("X-Pool-Resolved-Model", resolvedModel)
 	leaseReleased := false
 	releaseLease := func() {
 		if leaseReleased {
@@ -294,6 +330,61 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			CookieJarKey:   lease.Binding.CookieJarKey,
 			OSHint:         osHint,
 		}
+	}
+	if countTokens {
+		resp, requestErr := s.upstream.Do(r.Context(), requestForToken(token))
+		if requestErr != nil {
+			if allowRetry && movable {
+				return retry()
+			}
+			writeError(w, http.StatusBadGateway, requestErr)
+			return outcomeDone
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			errorBody := readUpstreamErrorBody(resp.Body)
+			if claudeAuthError(resp.StatusCode, resp.Header, errorBody) && claudeTokenCanRefresh(token) {
+				if refreshed, refreshErr := s.forceRefreshClaudeToken(r.Context(), lease.Account, "count_tokens_auth_error"); refreshErr == nil {
+					token = refreshed
+					resp.Body.Close()
+					resp, requestErr = s.upstream.Do(r.Context(), requestForToken(token))
+					if requestErr != nil {
+						if allowRetry && movable {
+							return retry()
+						}
+						writeError(w, http.StatusBadGateway, requestErr)
+						return outcomeDone
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode >= 400 {
+						errorBody = readUpstreamErrorBody(resp.Body)
+					} else {
+						errorBody = nil
+					}
+				}
+			}
+			if resp.StatusCode >= 400 {
+				verdict := s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
+				if allowRetry && movable && retryableForFailover(verdict, resp.StatusCode) {
+					return retry()
+				}
+				s.writeFilteredError(r.Context(), w, "claude", resp.StatusCode, resp.Header, errorBody, result.Scrubber)
+				return outcomeDone
+			}
+		}
+		responseBody, readErr := s.readUpstreamResponseBody(resp.Body)
+		if readErr != nil {
+			if allowRetry && movable {
+				return retry()
+			}
+			writeError(w, http.StatusBadGateway, readErr)
+			return outcomeDone
+		}
+		s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
+		return outcomeDone
 	}
 	usageDiag := claudeRequestUsageDiagnostics(body, affinity, claudeTTL, nativeCacheInject)
 	usageDiag.CachePrewarmAttempted = s.maybePrewarmClaudeCache(r.Context(), s.claudeCachePrewarmMode(r.Context()), requestForToken(token))

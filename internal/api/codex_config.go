@@ -70,7 +70,7 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 		model = s.pickDefaultCodexModel(r.Context(), group)
 	}
 
-	origin := externalOrigin(r)
+	origin := s.externalOrigin(r)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=setup-pool-cli.sh")
 	if r.Method == http.MethodHead {
@@ -90,19 +90,29 @@ func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request)
 // externalOrigin reconstructs the publicly reachable scheme://host for this request,
 // honoring the X-Forwarded-Proto/Host set by a fronting reverse proxy (where r.TLS
 // is nil and r.Host may be the internal address). Falls back to the direct values.
-func externalOrigin(r *http.Request) string {
+func (s *Server) externalOrigin(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if xf := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xf != "" {
-		scheme = strings.TrimSpace(strings.Split(xf, ",")[0])
-	}
 	host := r.Host
-	if xh := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); xh != "" {
-		host = strings.TrimSpace(strings.Split(xh, ",")[0])
+	if s.isTrustedProxyRequest(r) {
+		if xf := lastForwardedValue(r.Header.Get("X-Forwarded-Proto")); strings.EqualFold(xf, "http") || strings.EqualFold(xf, "https") {
+			scheme = strings.ToLower(xf)
+		}
+		if xh := lastForwardedValue(r.Header.Get("X-Forwarded-Host")); validForwardedHost(xh) {
+			host = xh
+		}
 	}
 	return scheme + "://" + strings.TrimSpace(host)
+}
+
+func validForwardedHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || strings.ContainsAny(host, "/\\@?#\r\n\t ") {
+		return false
+	}
+	return true
 }
 
 // pickDefaultCodexModel chooses a reasonable `model` for the generated config: the

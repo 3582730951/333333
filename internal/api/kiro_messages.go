@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"sort"
 	"strings"
 
 	"codex-account-pool/internal/config"
@@ -15,65 +19,240 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
+	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
-	"codex-account-pool/internal/usage"
+	"codex-account-pool/internal/virtual"
 	"github.com/google/uuid"
+	"github.com/tidwall/sjson"
 )
 
-func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, _ bool, _ map[string]bool) attemptOutcome {
 	defer lease.Release()
-	kiroCfg := s.effectiveKiroConfig(r.Context())
-	converted, err := kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{DefaultThinking: kiroCfg.KiroDefaultThinking})
+	converted, err := s.convertKiroRequest(r.Context(), raw, affinity, lease)
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
 	}
-	data, outcome := s.doKiroAttempt(w, r, converted, lease, allowRetry, exclude)
-	if outcome == outcomeRetry {
+	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+	releaseFlight, waitedForFlight := func() (func(), bool) {
+		if converted.WebSearch != nil {
+			return func() {}, false
+		}
+		return s.enterKiroCacheSingleflight(r.Context(), raw, affinity, lease, resolvedModel)
+	}()
+	defer releaseFlight()
+	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if converted.WebSearch != nil {
+		data, _, outcome := s.doKiroAttempt(w, r, converted, lease)
+		if data == nil {
+			return outcome
+		}
+		data.Model = resolvedModel
+		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+		setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, storage.KiroRuntimeCapability{})
+		if isStreamRequest(raw) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			_, _ = w.Write(kirowire.AnthropicSSE(*data, data.Model, id))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return outcomeDone
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(kirowire.AnthropicJSON(*data, data.Model, id))
+		return outcomeDone
+	}
+	if isStreamRequest(raw) {
+		response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
+		if response == nil {
+			return outcome
+		}
+		defer response.Body.Close()
+		emitter := newKiroAnthropicEmitter(w, func(metering kirowire.KiroMetering, actualModel string) {
+			declareKiroTrailers(w)
+			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, metering.UsageSource())
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+		}, resolvedModel, id)
+		data, streamErr := streamKiroResponse(response.Body, converted.ToolNameMap, emitter)
+		data.Model = firstNonEmpty(data.Model, resolvedModel)
+		if data.UsageSource == "" {
+			data.UsageSource = data.Metering.UsageSource()
+		}
+		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+		s.persistKiroResolvedBinding(r.Context(), affinity, lease, data.Model)
+		data.SingleflightWaited = waitedForFlight
+		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+		if streamErr != nil {
+			if emitter.started {
+				capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
+				setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+				s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+				emitter.fail(kiroErrorCode(streamErr), streamErr)
+			} else {
+				writeKiroError(w, r, http.StatusBadGateway, streamErr)
+			}
+			return outcomeDone
+		}
+		capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
+		emitter.finish(data)
+		setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+		return outcomeDone
+	}
+
+	data, endpointHash, outcome := s.doKiroAttempt(w, r, converted, lease)
+	if data == nil {
 		return outcome
 	}
-	if data == nil {
-		return outcomeDone
-	}
-	s.recordKiroUsage(r, lease.Account.ID, affinity, model, *data)
-	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if isStreamRequest(raw) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		_, _ = w.Write(kirowire.AnthropicSSE(*data, model, id))
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		return outcomeDone
-	}
+	data.Model = firstNonEmpty(data.Model, resolvedModel)
+	data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+	s.persistKiroResolvedBinding(r.Context(), affinity, lease, data.Model)
+	data.SingleflightWaited = waitedForFlight
+	data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+	capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, *data)
+	setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+	s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, capabilityState)
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(kirowire.AnthropicJSON(*data, model, id))
+	_, _ = w.Write(kirowire.AnthropicJSON(*data, data.Model, id))
 	return outcomeDone
 }
 
-func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthBody []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) kiroCountTokensWithLease(w http.ResponseWriter, r *http.Request, raw []byte, affinity routing.AffinityKey, lease scheduler.Lease) attemptOutcome {
 	defer lease.Release()
-	kiroCfg := s.effectiveKiroConfig(r.Context())
-	converted, err := kirowire.ConvertAnthropicRequestWithOptions(anthBody, affinity.Hash, kirowire.ConversionOptions{DefaultThinking: kiroCfg.KiroDefaultThinking})
+	converted, err := s.convertKiroRequest(r.Context(), raw, affinity, lease)
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
 	}
-	data, outcome := s.doKiroAttempt(w, r, converted, lease, allowRetry, exclude)
-	if outcome == outcomeRetry {
-		return outcomeRetry
+	model := firstNonEmpty(converted.Model, lease.ResolvedModel, routing.Model(raw))
+	s.persistKiroResolvedBinding(r.Context(), affinity, lease, model)
+	count := virtual.EstimateTokensJSON(converted.Body)
+	if count < 1 {
+		count = 1
 	}
-	if data == nil {
+	setKiroHeaders(w, model, converted.CompatibilityLosses, kirowire.UsageSourceEstimated)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"input_tokens": count, "estimated": true, "usage_source": kirowire.UsageSourceEstimated,
+	})
+	return outcomeDone
+}
+
+func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthBody []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, _ bool, _ map[string]bool) attemptOutcome {
+	defer lease.Release()
+	converted, err := s.convertKiroRequest(r.Context(), anthBody, affinity, lease)
+	if err != nil {
+		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
 	}
-	s.recordKiroUsage(r, lease.Account.ID, affinity, model, *data)
+	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+	releaseFlight, waitedForFlight := func() (func(), bool) {
+		if converted.WebSearch != nil {
+			return func() {}, false
+		}
+		return s.enterKiroCacheSingleflight(r.Context(), anthBody, affinity, lease, resolvedModel)
+	}()
+	defer releaseFlight()
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if isStreamRequest(anthBody) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		anthropicStreamToChatSSE(w, bytes.NewReader(kirowire.AnthropicSSE(*data, model, id)), model, streamrewrite.New(nil))
+	if converted.WebSearch != nil {
+		data, _, outcome := s.doKiroAttempt(w, r, converted, lease)
+		if data == nil {
+			return outcome
+		}
+		data.Model = resolvedModel
+		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+		setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, storage.KiroRuntimeCapability{})
+		if isStreamRequest(anthBody) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			anthropicStreamToChatSSE(w, bytes.NewReader(kirowire.AnthropicSSE(*data, data.Model, id)), data.Model, streamrewrite.New(nil))
+			return outcomeDone
+		}
+		body, err := prompt.AnthropicToChatCompletion(kirowire.AnthropicJSON(*data, data.Model, id), data.Model)
+		if err != nil {
+			writeKiroError(w, r, http.StatusBadGateway, err)
+			return outcomeDone
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
 		return outcomeDone
 	}
-	body, err := prompt.AnthropicToChatCompletion(kirowire.AnthropicJSON(*data, model, id), model)
+	if isStreamRequest(anthBody) {
+		response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
+		if response == nil {
+			return outcome
+		}
+		defer response.Body.Close()
+		reader, writer := io.Pipe()
+		convertedDone := make(chan struct{})
+		started := false
+		startChat := func(metering kirowire.KiroMetering, actualModel string) {
+			if started {
+				return
+			}
+			started = true
+			declareKiroTrailers(w)
+			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, metering.UsageSource())
+			w.Header().Set("Content-Type", "text/event-stream")
+			go func() {
+				defer supervisor.Recover("kiro-chat-stream")
+				defer close(convertedDone)
+				defer reader.Close()
+				anthropicStreamToChatSSE(w, reader, resolvedModel, streamrewrite.New(nil))
+			}()
+		}
+		emitter := newKiroAnthropicEmitter(writer, startChat, resolvedModel, id)
+		data, streamErr := streamKiroResponse(response.Body, converted.ToolNameMap, emitter)
+		data.Model = firstNonEmpty(data.Model, resolvedModel)
+		if data.UsageSource == "" {
+			data.UsageSource = data.Metering.UsageSource()
+		}
+		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+		s.persistKiroResolvedBinding(r.Context(), affinity, lease, data.Model)
+		data.SingleflightWaited = waitedForFlight
+		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+		if streamErr != nil {
+			if emitter.started {
+				capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
+				setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+				s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+				emitter.fail(kiroErrorCode(streamErr), streamErr)
+				_ = writer.Close()
+				<-convertedDone
+			} else {
+				_ = writer.CloseWithError(streamErr)
+				writeKiroError(w, r, http.StatusBadGateway, streamErr)
+			}
+			return outcomeDone
+		}
+		capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
+		emitter.finish(data)
+		_ = writer.Close()
+		if started {
+			<-convertedDone
+		}
+		setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+		return outcomeDone
+	}
+
+	data, endpointHash, outcome := s.doKiroAttempt(w, r, converted, lease)
+	if data == nil {
+		return outcome
+	}
+	data.Model = firstNonEmpty(data.Model, resolvedModel)
+	data.ToolDescriptionHashes = converted.ToolDescriptionHashes
+	s.persistKiroResolvedBinding(r.Context(), affinity, lease, data.Model)
+	data.SingleflightWaited = waitedForFlight
+	data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
+	capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, *data)
+	setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
+	s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, capabilityState)
+	body, err := prompt.AnthropicToChatCompletion(kirowire.AnthropicJSON(*data, data.Model, id), data.Model)
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadGateway, err)
 		return outcomeDone
@@ -83,107 +262,408 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 	return outcomeDone
 }
 
-func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted kirowire.Conversion, lease scheduler.Lease, allowRetry bool, exclude map[string]bool) (*kirowire.ResponseData, attemptOutcome) {
-	kiroCfg := s.effectiveKiroConfig(r.Context())
-	s.kiro.UpdateConfig(kiroCfg)
-	cred, err := s.store.GetKiroCredentials(r.Context(), lease.Account.ID)
+func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity routing.AffinityKey, lease scheduler.Lease) (kirowire.Conversion, error) {
+	kiroCfg := s.effectiveKiroConfig(ctx)
+	if lease.ResolvedModel != "" {
+		raw = setForcedModel(raw, lease.ResolvedModel)
+	}
+	credentials, err := s.store.GetKiroCredentials(ctx, lease.Account.ID)
+	if err != nil {
+		return kirowire.Conversion{}, err
+	}
+	endpointHash, err := kirowire.EndpointHash(credentials.Endpoint, firstNonEmpty(credentials.APIRegion, kiroCfg.KiroDefaultAPIRegion, "us-east-1"), kiroCfg.KiroEndpointAllowlist)
+	if err != nil {
+		return kirowire.Conversion{}, err
+	}
+	verified, err := s.store.VerifiedKiroModels(ctx, lease.Account.ID, endpointHash, false)
+	if err != nil {
+		return kirowire.Conversion{}, err
+	}
+	return kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{
+		DefaultThinking: kiroCfg.KiroDefaultThinking,
+		VerifiedModels:  verified,
+	})
+}
+
+func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted kirowire.Conversion, lease scheduler.Lease) (*kirowire.ResponseData, string, attemptOutcome) {
+	response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
+	if response == nil {
+		return nil, endpointHash, outcome
+	}
+	defer response.Body.Close()
+	var data kirowire.ResponseData
+	var err error
+	if converted.WebSearch != nil {
+		var raw []byte
+		raw, err = readLimited(response.Body, s.cfg.MaxBodyBytes)
+		if err == nil {
+			data, err = kirowire.DecodeWebSearchResponse(raw, *converted.WebSearch, converted.EstimatedInputTokens)
+		}
+	} else {
+		data, err = kirowire.DecodeResponse(response.Body, converted.ToolNameMap)
+	}
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadGateway, err)
-		return nil, outcomeDone
+		return nil, endpointHash, outcomeDone
+	}
+	return &data, endpointHash, outcomeDone
+}
+
+func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, converted kirowire.Conversion, lease scheduler.Lease) (*upstream.Response, string, attemptOutcome) {
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	s.kiro.UpdateConfig(kiroCfg)
+	credentials, err := s.store.GetKiroCredentials(r.Context(), lease.Account.ID)
+	if err != nil {
+		writeKiroError(w, r, http.StatusBadGateway, err)
+		return nil, "", outcomeDone
+	}
+	region := firstNonEmpty(credentials.APIRegion, kiroCfg.KiroDefaultAPIRegion, "us-east-1")
+	base, err := kirowire.ValidateEndpoint(credentials.Endpoint, region, kiroCfg.KiroEndpointAllowlist)
+	if err != nil {
+		writeKiroError(w, r, http.StatusBadRequest, err)
+		return nil, "", outcomeDone
+	}
+	endpointHash, err := kirowire.EndpointHash(credentials.Endpoint, region, kiroCfg.KiroEndpointAllowlist)
+	if err != nil {
+		writeKiroError(w, r, http.StatusBadRequest, err)
+		return nil, "", outcomeDone
 	}
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadGateway, err)
-		return nil, outcomeDone
+		return nil, endpointHash, outcomeDone
 	}
-	bearer, token, cred, err := s.kiro.Prepare(r.Context(), lease.Account, cred, token, lease.Egress, false)
+	bearer, token, credentials, err := s.kiro.Prepare(r.Context(), lease.Account, credentials, token, lease.Egress, false)
 	if err != nil {
 		if errors.Is(err, kirowire.ErrInvalidGrant) {
 			s.scheduler.InvalidateAccountCache()
 		}
-		return nil, s.kiroAttemptError(w, r, lease, 0, nil, []byte(err.Error()), allowRetry, exclude, err)
+		s.kiroAttemptError(w, r, lease, 0, nil, []byte(err.Error()), false, nil, err)
+		return nil, endpointHash, outcomeDone
 	}
 	body := converted.Body
-	if cred.ProfileARN != "" {
-		var root map[string]interface{}
-		if json.Unmarshal(body, &root) == nil {
-			root["profileArn"] = cred.ProfileARN
-			body, _ = json.Marshal(root)
+	if credentials.ProfileARN != "" {
+		if updated, updateErr := sjson.SetBytes(body, "profileArn", credentials.ProfileARN); updateErr == nil {
+			body = updated
 		}
 	}
-	region := firstNonEmpty(cred.APIRegion, s.cfg.KiroDefaultAPIRegion, "us-east-1")
-	target := "https://q." + region + ".amazonaws.com/generateAssistantResponse"
-	if strings.HasPrefix(cred.Endpoint, "http://") || strings.HasPrefix(cred.Endpoint, "https://") {
-		target = strings.TrimRight(cred.Endpoint, "/")
-		if !strings.HasSuffix(target, "/generateAssistantResponse") {
-			target += "/generateAssistantResponse"
-		}
+	target := strings.TrimRight(base, "/")
+	if !strings.HasSuffix(target, "/generateAssistantResponse") {
+		target += "/generateAssistantResponse"
 	}
-	requestHeaders := kirowire.Headers(kiroCfg, cred, bearer, true)
+	requestHeaders := kirowire.Headers(kiroCfg, credentials, bearer, true)
 	if converted.WebSearch != nil {
 		target = strings.TrimSuffix(target, "/generateAssistantResponse") + "/mcp"
-		body, _ = json.Marshal(map[string]interface{}{
+		body, _ = json.Marshal(map[string]any{
 			"jsonrpc": "2.0", "id": converted.WebSearch.ToolUseID, "method": "tools/call",
-			"params": map[string]interface{}{"name": "web_search", "arguments": map[string]interface{}{"query": converted.WebSearch.Query}},
+			"params": map[string]any{"name": "web_search", "arguments": map[string]any{"query": converted.WebSearch.Query}},
 		})
 		requestHeaders.Set("accept", "application/json")
 	}
-	send := func(b string) (*upstream.Response, error) {
+	send := func(accessToken string) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
-		headers.Set("authorization", "Bearer "+b)
+		headers.Set("authorization", "Bearer "+accessToken)
 		return s.upstream.DoRaw(r.Context(), lease.Egress, http.MethodPost, target, headers, body, lease.Binding.CookieJarKey)
 	}
-	resp, err := send(bearer)
+	response, err := send(bearer)
 	if err != nil {
-		return nil, s.kiroAttemptError(w, r, lease, 0, nil, nil, allowRetry, exclude, err)
+		s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+		return nil, endpointHash, outcomeDone
 	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		rawErr := readUpstreamErrorBody(resp.Body)
-		resp.Body.Close()
-		if refreshed, _, updated, e := s.kiro.Prepare(r.Context(), lease.Account, cred, token, lease.Egress, true); e == nil {
-			cred = updated
-			resp, err = send(refreshed)
-			if err != nil {
-				return nil, s.kiroAttemptError(w, r, lease, 0, nil, nil, allowRetry, exclude, err)
-			}
-		} else {
-			return nil, s.kiroAttemptError(w, r, lease, resp.StatusCode, resp.Header, rawErr, allowRetry, exclude, e)
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		rawError := readUpstreamErrorBody(response.Body)
+		response.Body.Close()
+		refreshed, _, updated, refreshErr := s.kiro.Prepare(r.Context(), lease.Account, credentials, token, lease.Egress, true)
+		if refreshErr != nil {
+			s.kiroAttemptError(w, r, lease, response.StatusCode, response.Header, rawError, false, nil, refreshErr)
+			return nil, endpointHash, outcomeDone
+		}
+		credentials = updated
+		response, err = send(refreshed)
+		if err != nil {
+			s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+			return nil, endpointHash, outcomeDone
 		}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		rawErr := readUpstreamErrorBody(resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		rawError := readUpstreamErrorBody(response.Body)
+		response.Body.Close()
+		downstreamStatus := response.StatusCode
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
 			_ = s.store.SetAccountStatus(r.Context(), lease.Account.ID, "invalid")
 			s.scheduler.InvalidateAccountCache()
+			downstreamStatus = http.StatusServiceUnavailable
 		}
-		return nil, s.kiroAttemptError(w, r, lease, resp.StatusCode, resp.Header, rawErr, allowRetry, exclude, nil)
+		s.kiroAttemptError(w, r, lease, downstreamStatus, response.Header, rawError, false, nil, nil)
+		return nil, endpointHash, outcomeDone
 	}
-	var data kirowire.ResponseData
-	if converted.WebSearch != nil {
-		raw, readErr := readLimited(resp.Body, s.cfg.MaxBodyBytes)
-		if readErr == nil {
-			data, readErr = kirowire.DecodeWebSearchResponse(raw, *converted.WebSearch, converted.InputTokens)
+	return response, endpointHash, outcomeDone
+}
+
+func streamKiroResponse(reader io.Reader, names map[string]string, emitter *kiroAnthropicEmitter) (kirowire.ResponseData, error) {
+	decoder := kirowire.NewDecoder()
+	processor := kirowire.NewResponseProcessor(names)
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := reader.Read(buffer)
+		if n > 0 {
+			frames, err := decoder.Feed(buffer[:n])
+			if err != nil {
+				return processor.Data(), err
+			}
+			for _, frame := range frames {
+				deltas, err := processor.ProcessFrame(frame)
+				if err != nil {
+					return processor.Data(), err
+				}
+				state := processor.Data()
+				if state.Model != "" {
+					emitter.model = state.Model
+				}
+				for _, delta := range deltas {
+					emitter.delta(delta, state.Metering)
+				}
+			}
 		}
-		err = readErr
+		if readErr == io.EOF {
+			if err := decoder.Finish(); err != nil {
+				return processor.Data(), err
+			}
+			break
+		}
+		if readErr != nil {
+			return processor.Data(), readErr
+		}
+	}
+	deltas, err := processor.Finish()
+	for _, delta := range deltas {
+		emitter.delta(delta, processor.Data().Metering)
+	}
+	return processor.Data(), err
+}
+
+type kiroAnthropicEmitter struct {
+	w           io.Writer
+	onStart     func(kirowire.KiroMetering, string)
+	flusher     interface{ Flush() }
+	model       string
+	id          string
+	started     bool
+	blockOpen   bool
+	blockKind   string
+	blockToolID string
+	index       int
+}
+
+func newKiroAnthropicEmitter(writer io.Writer, onStart func(kirowire.KiroMetering, string), model, id string) *kiroAnthropicEmitter {
+	emitter := &kiroAnthropicEmitter{w: writer, onStart: onStart, model: model, id: id}
+	if flusher, ok := writer.(interface{ Flush() }); ok {
+		emitter.flusher = flusher
+	}
+	return emitter
+}
+
+func (e *kiroAnthropicEmitter) emit(event string, value any) {
+	raw, _ := json.Marshal(value)
+	_, _ = fmt.Fprintf(e.w, "event: %s\ndata: %s\n\n", event, raw)
+	if e.flusher != nil {
+		e.flusher.Flush()
+	}
+}
+
+func (e *kiroAnthropicEmitter) start(metering kirowire.KiroMetering) {
+	if e.started {
+		return
+	}
+	e.started = true
+	if e.onStart != nil {
+		e.onStart(metering, e.model)
+	}
+	usage := map[string]any{"input_tokens": metering.InputTokens.Value, "output_tokens": 0}
+	addKiroCacheUsage(usage, metering)
+	e.emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{
+		"id": e.id, "type": "message", "role": "assistant", "model": e.model, "content": []any{},
+		"stop_reason": nil, "stop_sequence": nil, "usage": usage,
+	}})
+}
+
+func (e *kiroAnthropicEmitter) closeBlock() {
+	if !e.blockOpen {
+		return
+	}
+	e.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": e.index})
+	e.index++
+	e.blockOpen = false
+	e.blockKind = ""
+	e.blockToolID = ""
+}
+
+func (e *kiroAnthropicEmitter) delta(delta kirowire.ResponseDelta, metering kirowire.KiroMetering) {
+	e.start(metering)
+	switch delta.Kind {
+	case "thinking", "text":
+		if e.blockOpen && e.blockKind != delta.Kind {
+			e.closeBlock()
+		}
+		if !e.blockOpen {
+			e.blockOpen = true
+			e.blockKind = delta.Kind
+			block := map[string]any{"type": delta.Kind}
+			block[delta.Kind] = ""
+			e.emit("content_block_start", map[string]any{"type": "content_block_start", "index": e.index, "content_block": block})
+		}
+		deltaType := "text_delta"
+		payload := map[string]any{"type": deltaType, "text": delta.Text}
+		if delta.Kind == "thinking" {
+			payload = map[string]any{"type": "thinking_delta", "thinking": delta.Text}
+		}
+		e.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": e.index, "delta": payload})
+	case "tool":
+		if e.blockOpen && (e.blockKind != "tool" || e.blockToolID != delta.ToolID) {
+			e.closeBlock()
+		}
+		if !e.blockOpen {
+			e.blockOpen = true
+			e.blockKind = "tool"
+			e.blockToolID = delta.ToolID
+			e.emit("content_block_start", map[string]any{"type": "content_block_start", "index": e.index, "content_block": map[string]any{
+				"type": "tool_use", "id": delta.ToolID, "name": delta.ToolName, "input": map[string]any{},
+			}})
+		}
+		if delta.ToolInput != "" {
+			e.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": e.index, "delta": map[string]any{
+				"type": "input_json_delta", "partial_json": delta.ToolInput,
+			}})
+		}
+	}
+}
+
+func (e *kiroAnthropicEmitter) finish(data kirowire.ResponseData) {
+	e.start(data.Metering)
+	e.closeBlock()
+	usage := map[string]any{"output_tokens": data.OutputTokens}
+	addKiroCacheUsage(usage, data.Metering)
+	if data.WebSearch != nil {
+		usage["server_tool_use"] = map[string]any{"web_search_requests": 1}
+	}
+	e.emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": data.StopReason, "stop_sequence": nil}, "usage": usage})
+	e.emit("message_stop", map[string]any{"type": "message_stop"})
+}
+
+func (e *kiroAnthropicEmitter) fail(code string, err error) {
+	e.start(kirowire.KiroMetering{})
+	e.closeBlock()
+	e.emit("error", map[string]any{"type": "error", "error": map[string]any{"type": code, "message": err.Error()}})
+	e.emit("message_stop", map[string]any{"type": "message_stop"})
+}
+
+func addKiroCacheUsage(usage map[string]any, metering kirowire.KiroMetering) {
+	if metering.CacheReadTokens.Present {
+		usage["cache_read_input_tokens"] = metering.CacheReadTokens.Value
+	}
+	if metering.CacheCreationTokens.Present {
+		usage["cache_creation_input_tokens"] = metering.CacheCreationTokens.Value
+	}
+}
+
+func setKiroHeaders(w http.ResponseWriter, model string, losses []string, usageSource string) {
+	w.Header().Set("X-Pool-Resolved-Provider", "kiro")
+	w.Header().Set("X-Pool-Resolved-Model", model)
+	if len(losses) == 0 {
+		w.Header().Set("X-Pool-Kiro-Compatibility", "none")
 	} else {
-		data, err = kirowire.DecodeResponse(resp.Body, converted.ToolNameMap)
-		if data.InputTokens <= 1 && converted.InputTokens > data.InputTokens {
-			data.InputTokens = converted.InputTokens
+		w.Header().Set("X-Pool-Kiro-Compatibility", strings.Join(mergeCompatibilityLosses(losses), ","))
+	}
+	if usageSource == "" {
+		usageSource = kirowire.UsageSourceUnreported
+	}
+	w.Header().Set("X-Pool-Usage-Source", usageSource)
+}
+
+func declareKiroTrailers(w http.ResponseWriter) {
+	w.Header().Add("Trailer", "X-Pool-Resolved-Model")
+	w.Header().Add("Trailer", "X-Pool-Kiro-Compatibility")
+	w.Header().Add("Trailer", "X-Pool-Usage-Source")
+}
+
+func setKiroTrailers(w http.ResponseWriter, model string, losses []string, usageSource string) {
+	compatibility := "none"
+	if merged := mergeCompatibilityLosses(losses); len(merged) > 0 {
+		compatibility = strings.Join(merged, ",")
+	}
+	if usageSource == "" {
+		usageSource = kirowire.UsageSourceUnreported
+	}
+	w.Header().Set(http.TrailerPrefix+"X-Pool-Resolved-Model", model)
+	w.Header().Set(http.TrailerPrefix+"X-Pool-Kiro-Compatibility", compatibility)
+	w.Header().Set(http.TrailerPrefix+"X-Pool-Usage-Source", usageSource)
+}
+
+func mergeCompatibilityLosses(sets ...[]string) []string {
+	seen := map[string]bool{}
+	for _, values := range sets {
+		for _, value := range values {
+			if strings.TrimSpace(value) != "" {
+				seen[strings.TrimSpace(value)] = true
+			}
 		}
 	}
-	resp.Body.Close()
-	if err != nil {
-		return nil, s.kiroAttemptError(w, r, lease, 0, resp.Header, nil, allowRetry, exclude, err)
+	out := make([]string, 0, len(seen))
+	for value := range seen {
+		out = append(out, value)
 	}
-	return &data, outcomeDone
+	sort.Strings(out)
+	return out
 }
 
 func writeKiroError(w http.ResponseWriter, r *http.Request, status int, err error) {
 	if schedulerWaitTerminal(r.Context(), err.Error()) {
 		return
 	}
-	writeError(w, status, err)
+	code := kiroErrorCode(err)
+	writeJSON(w, status, map[string]any{"error": map[string]any{
+		"message": err.Error(), "type": "codex_pool_error", "code": code,
+	}})
+}
+
+func writePoolCodeError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{
+		"message": message, "type": "codex_pool_error", "code": code,
+	}})
+}
+
+func kiroThinkingRequested(raw []byte, defaultEnabled bool) bool {
+	var request struct {
+		Thinking *struct {
+			Type string `json:"type"`
+		} `json:"thinking"`
+	}
+	if json.Unmarshal(raw, &request) != nil || request.Thinking == nil {
+		return defaultEnabled
+	}
+	switch strings.ToLower(strings.TrimSpace(request.Thinking.Type)) {
+	case "disabled", "none":
+		return false
+	case "enabled", "adaptive", "auto":
+		return true
+	default:
+		return defaultEnabled
+	}
+}
+
+func kiroErrorCode(err error) string {
+	switch {
+	case errors.Is(err, kirowire.ErrReasoningUnavailable):
+		return "kiro_reasoning_unavailable"
+	case errors.Is(err, kirowire.ErrInvalidToolInput):
+		return "kiro_invalid_tool_input"
+	case errors.Is(err, kirowire.ErrVerifiedModelUnavailable):
+		return "verified_model_unavailable"
+	case errors.Is(err, kirowire.ErrEndpointNotAllowed):
+		return "kiro_endpoint_not_allowed"
+	default:
+		return "kiro_upstream_error"
+	}
 }
 
 func (s *Server) effectiveKiroConfig(ctx context.Context) config.Config {
@@ -193,44 +673,129 @@ func (s *Server) effectiveKiroConfig(ctx context.Context) config.Config {
 	cfg.KiroDefaultAuthRegion = s.settingString(ctx, "kiro_default_auth_region", cfg.KiroDefaultAuthRegion)
 	cfg.KiroDefaultAPIRegion = s.settingString(ctx, "kiro_default_api_region", cfg.KiroDefaultAPIRegion)
 	cfg.KiroDefaultThinking = s.flagEnabled(ctx, "kiro_default_thinking", cfg.KiroDefaultThinking)
+	cfg.KiroCacheMode = s.settingString(ctx, "kiro_cache_mode", cfg.KiroCacheMode)
+	cfg.KiroEndpointAllowlist = s.settingCSV(ctx, "kiro_endpoint_allowlist", cfg.KiroEndpointAllowlist)
+	cfg.KiroCacheUnreportedThreshold = s.settingInt(ctx, "kiro_cache_unreported_threshold", cfg.KiroCacheUnreportedThreshold)
+	if cfg.KiroCacheUnreportedThreshold <= 0 {
+		cfg.KiroCacheUnreportedThreshold = config.DefaultKiroCacheUnreportedThreshold
+	}
 	return cfg
 }
 
-func (s *Server) kiroAttemptError(w http.ResponseWriter, r *http.Request, lease scheduler.Lease, status int, header http.Header, body []byte, allowRetry bool, exclude map[string]bool, cause error) attemptOutcome {
-	transient := status == 0 || status == 408 || status == 429 || status == 503 || status >= 500
-	if status == 401 || status == 403 {
+func (s *Server) kiroAttemptError(w http.ResponseWriter, r *http.Request, lease scheduler.Lease, status int, header http.Header, body []byte, _ bool, _ map[string]bool, cause error) attemptOutcome {
+	transient := status == 0 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable || status >= 500
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		transient = true
 	}
 	if transient {
 		s.onUpstreamError(r.Context(), lease.Account, status, header, body)
-		if allowRetry {
-			if exclude != nil {
-				exclude[lease.Account.ID] = true
-			}
-			return outcomeRetry
-		}
 	}
 	if cause != nil {
 		if schedulerWaitTerminal(r.Context(), cause.Error()) {
 			return outcomeDone
 		}
-		writeError(w, http.StatusBadGateway, cause)
-	} else {
-		code := status
-		if code == 0 {
-			code = http.StatusBadGateway
-		}
-		message := strings.TrimSpace(string(body))
-		if schedulerWaitTerminal(r.Context(), message) {
-			return outcomeDone
-		}
-		writeError(w, code, errors.New(message))
+		writeKiroError(w, r, http.StatusBadGateway, cause)
+		return outcomeDone
 	}
+	code := status
+	if code == 0 {
+		code = http.StatusBadGateway
+	}
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		message = http.StatusText(code)
+	}
+	if schedulerWaitTerminal(r.Context(), message) {
+		return outcomeDone
+	}
+	writeKiroError(w, r, code, errors.New(message))
 	return outcomeDone
 }
 
-func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity routing.AffinityKey, model string, d kirowire.ResponseData) {
-	raw, _ := json.Marshal(map[string]interface{}{"input_tokens": d.InputTokens, "output_tokens": d.OutputTokens, "cache_read_input_tokens": d.CacheReadTokens, "cache_creation_input_tokens": d.CacheCreationTokens})
-	ctx := withUsageDiagnostics(r.Context(), storage.UsageDiagnostics{UsageProvider: "kiro", AffinitySource: affinity.Source})
-	s.recordParsedUsage(ctx, accountID, affinity.Hash, usage.Parsed{Model: model, PromptTokens: d.InputTokens, CompletionTokens: d.OutputTokens, TotalTokens: d.InputTokens + d.OutputTokens, CachedTokens: d.CacheReadTokens, CacheReadTokens: d.CacheReadTokens, CacheCreationTokens: d.CacheCreationTokens, RawUsage: raw})
+func (s *Server) observeKiroResponse(ctx context.Context, accountID, endpointHash string, conversion kirowire.Conversion, data kirowire.ResponseData) storage.KiroRuntimeCapability {
+	unknownSchema, _ := json.Marshal(data.Metering.UnknownCacheFields)
+	cfg := s.effectiveKiroConfig(ctx)
+	observedModel := firstNonEmpty(data.Model, conversion.Model)
+	state, err := s.store.ObserveKiroCapability(ctx, accountID, endpointHash, observedModel, storage.KiroCapabilityObservation{
+		ModelSucceeded:         true,
+		ThinkingRequested:      conversion.ThinkingEnabled,
+		MeteringEvents:         data.Metering.EventCount,
+		CacheReadPresent:       data.Metering.CacheReadTokens.Present,
+		CacheReadTokens:        data.Metering.CacheReadTokens.Value,
+		CacheCreationPresent:   data.Metering.CacheCreationTokens.Present,
+		CacheCreationTokens:    data.Metering.CacheCreationTokens.Value,
+		ExplicitlyUnsupported:  data.Metering.ExplicitUnsupported,
+		UnknownCacheSchemaJSON: string(unknownSchema),
+		UnreportedThreshold:    cfg.KiroCacheUnreportedThreshold,
+	})
+	if err != nil {
+		log.Printf("[KIRO-CAPABILITY] account=%s model=%s observation failed: %v", accountID, observedModel, err)
+	}
+	return state
+}
+
+func (s *Server) persistKiroResolvedBinding(ctx context.Context, affinity routing.AffinityKey, lease scheduler.Lease, model string) {
+	if affinity.Hash == "" || strings.TrimSpace(model) == "" {
+		return
+	}
+	bound, err := s.store.GetAffinityBinding(ctx, affinity.Hash)
+	if err == nil && bound.AccountID == lease.Account.ID && bound.Provider == "kiro" && bound.Model == model && bound.EgressID == lease.Egress.ID {
+		return
+	}
+	if err != nil && !storage.NotFound(err) {
+		return
+	}
+	_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		RouteKeyHash: affinity.Hash, RouteKey: affinity.Key, Source: affinity.Source,
+		AccountID: lease.Account.ID, Provider: "kiro", Model: model, EgressID: lease.Egress.ID,
+	})
+}
+
+func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity routing.AffinityKey, model string, data kirowire.ResponseData, capabilityState storage.KiroRuntimeCapability) {
+	rawUsage := map[string]any{
+		"input_tokens": data.InputTokens, "output_tokens": data.OutputTokens,
+		"usage_source": data.UsageSource, "metering_event_count": data.Metering.EventCount,
+		"cache_read_present":     data.Metering.CacheReadTokens.Present,
+		"cache_creation_present": data.Metering.CacheCreationTokens.Present,
+	}
+	if len(data.ToolDescriptionHashes) > 0 {
+		rawUsage["tool_description_hashes"] = data.ToolDescriptionHashes
+	}
+	if data.Metering.CacheReadTokens.Present {
+		rawUsage["cache_read_input_tokens"] = data.CacheReadTokens
+	}
+	if data.Metering.CacheCreationTokens.Present {
+		rawUsage["cache_creation_input_tokens"] = data.CacheCreationTokens
+	}
+	if data.UsageSource == kirowire.UsageSourceEstimated {
+		rawUsage["estimated"] = true
+	}
+	raw, _ := json.Marshal(rawUsage)
+	lossesJSON, _ := json.Marshal(data.CompatibilityLosses)
+	keyHash, userID := downstreamFromCtx(r.Context())
+	diagnostics := storage.UsageDiagnostics{
+		UsageProvider:           "kiro",
+		UsageSource:             data.UsageSource,
+		CacheReadPresent:        data.Metering.CacheReadTokens.Present,
+		CacheCreationPresent:    data.Metering.CacheCreationTokens.Present,
+		CompatibilityLossesJSON: string(lossesJSON),
+		CacheCapability:         capabilityState.CacheCapability,
+		Estimated:               data.UsageSource == kirowire.UsageSourceEstimated,
+		AffinitySource:          affinity.Source,
+		SingleflightWaitedRequests: func() int64 {
+			if data.SingleflightWaited {
+				return 1
+			}
+			return 0
+		}(),
+	}
+	s.enqueueWrite(func() {
+		ctx, cancel := bgWriteContext()
+		defer cancel()
+		if err := s.store.InsertUsageRecordWithDiagnostics(ctx, accountID, affinity.Hash, keyHash, userID, model,
+			data.InputTokens, data.OutputTokens, data.InputTokens+data.OutputTokens, data.CacheReadTokens,
+			data.CacheReadTokens, data.CacheCreationTokens, raw, diagnostics); err != nil {
+			log.Printf("[USAGE-ERROR] Kiro usage insert failed: account=%s model=%s err=%v", accountID, model, err)
+		}
+	})
 }

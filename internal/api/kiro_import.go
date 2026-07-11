@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/capability"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 )
 
@@ -131,7 +132,12 @@ func safeKiroImportError(err error, item kiroImportItem) string {
 }
 
 func (s *Server) importAndValidateKiro(ctx context.Context, account storage.Account, token storage.AccountToken, cred storage.KiroCredentials, egressID string) error {
-	s.kiro.UpdateConfig(s.effectiveKiroConfig(ctx))
+	kiroCfg := s.effectiveKiroConfig(ctx)
+	s.kiro.UpdateConfig(kiroCfg)
+	endpointHash, err := kirowire.EndpointHash(cred.Endpoint, firstNonEmpty(cred.APIRegion, kiroCfg.KiroDefaultAPIRegion, "us-east-1"), kiroCfg.KiroEndpointAllowlist)
+	if err != nil {
+		return err
+	}
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return err
 	}
@@ -142,6 +148,14 @@ func (s *Server) importAndValidateKiro(ctx context.Context, account storage.Acco
 		return err
 	}
 	if err := s.store.UpsertCapabilities(ctx, capability.StaticKiroModels(account.ID)); err != nil {
+		return err
+	}
+	staticModels := capability.StaticKiroModels(account.ID)
+	modelNames := make([]string, 0, len(staticModels))
+	for _, model := range staticModels {
+		modelNames = append(modelNames, model.ModelSlug)
+	}
+	if err := s.store.EnsureKiroRuntimeModels(ctx, account.ID, endpointHash, modelNames); err != nil {
 		return err
 	}
 	binding, err := s.store.GetEgressBinding(ctx, account.ID)

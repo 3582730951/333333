@@ -1,13 +1,64 @@
 package kiro
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"codex-account-pool/internal/capability"
 )
+
+const (
+	UsageSourceUpstream     = "upstream"
+	UsageSourceEstimated    = "estimated"
+	UsageSourceUnreported   = "unreported"
+	LossThinkingTagFallback = "thinking_tag_fallback"
+)
+
+var ErrInvalidToolInput = errors.New("kiro invalid tool input")
+
+type MeteredInt struct {
+	Value   int64 `json:"value"`
+	Present bool  `json:"present"`
+}
+
+type UnknownCacheField struct {
+	Name       string `json:"name"`
+	NumberType string `json:"number_type"`
+	SchemaHash string `json:"schema_hash"`
+}
+
+// KiroMetering preserves both values and wire presence. A reported zero is not
+// interchangeable with a field that never appeared.
+type KiroMetering struct {
+	InputTokens         MeteredInt          `json:"input_tokens"`
+	OutputTokens        MeteredInt          `json:"output_tokens"`
+	CacheReadTokens     MeteredInt          `json:"cache_read_tokens"`
+	CacheCreationTokens MeteredInt          `json:"cache_creation_tokens"`
+	EventCount          int                 `json:"event_count"`
+	ExplicitUnsupported bool                `json:"explicitly_unsupported"`
+	UnknownCacheFields  []UnknownCacheField `json:"unknown_cache_fields,omitempty"`
+}
+
+func (m KiroMetering) CacheFieldsPresent() bool {
+	return m.CacheReadTokens.Present || m.CacheCreationTokens.Present
+}
+
+func (m KiroMetering) UsageSource() string {
+	if m.EventCount > 0 || m.InputTokens.Present || m.OutputTokens.Present || m.CacheFieldsPresent() {
+		return UsageSourceUpstream
+	}
+	return UsageSourceUnreported
+}
 
 type ToolCall struct{ ID, Name, Input string }
 type WebSearchResult struct {
@@ -24,11 +75,26 @@ type ResponseData struct {
 	WebSearch                                                       *WebSearchData
 	InputTokens, OutputTokens, CacheReadTokens, CacheCreationTokens int64
 	StopReason                                                      string
+	Model                                                           string
+	Metering                                                        KiroMetering
+	UsageSource                                                     string
+	CompatibilityLosses                                             []string
+	SingleflightWaited                                              bool
+	ToolDescriptionHashes                                           map[string]string
+}
+
+type ResponseDelta struct {
+	Kind      string
+	Text      string
+	ToolID    string
+	ToolName  string
+	ToolInput string
+	NewTool   bool
 }
 
 func DecodeWebSearchResponse(raw []byte, request WebSearchRequest, inputTokens int64) (ResponseData, error) {
 	var envelope struct {
-		Error  interface{} `json:"error"`
+		Error  any `json:"error"`
 		Result struct {
 			Content []struct {
 				Type string `json:"type"`
@@ -36,7 +102,7 @@ func DecodeWebSearchResponse(raw []byte, request WebSearchRequest, inputTokens i
 			} `json:"content"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	if err := decodeUseNumber(raw, &envelope); err != nil {
 		return ResponseData{}, err
 	}
 	if envelope.Error != nil {
@@ -55,14 +121,18 @@ func DecodeWebSearchResponse(raw []byte, request WebSearchRequest, inputTokens i
 				PublishedDate int64  `json:"publishedDate"`
 			} `json:"results"`
 		}
-		if json.Unmarshal([]byte(content.Text), &decoded) == nil {
+		if decodeUseNumber([]byte(content.Text), &decoded) == nil {
 			for _, result := range decoded.Results {
 				data.Results = append(data.Results, WebSearchResult{Title: result.Title, URL: result.URL, Snippet: result.Snippet, PublishedAt: result.PublishedDate})
 			}
 		}
 	}
 	summary := webSearchSummary(data)
-	return ResponseData{Text: summary, WebSearch: data, InputTokens: max64(1, inputTokens), OutputTokens: max64(1, int64(len(summary)/4)), StopReason: "end_turn"}, nil
+	return ResponseData{
+		Text: summary, WebSearch: data,
+		InputTokens: max64(1, inputTokens), OutputTokens: max64(1, int64(len(summary)/4)),
+		StopReason: "end_turn", UsageSource: UsageSourceEstimated,
+	}, nil
 }
 
 func webSearchSummary(data *WebSearchData) string {
@@ -83,217 +153,524 @@ func webSearchSummary(data *WebSearchData) string {
 	return b.String()
 }
 
+type ResponseProcessor struct {
+	names     map[string]string
+	data      ResponseData
+	toolIndex map[string]int
+	tagParser thinkingTagParser
+	losses    map[string]struct{}
+}
+
+func NewResponseProcessor(names map[string]string) *ResponseProcessor {
+	return &ResponseProcessor{names: names, toolIndex: map[string]int{}, losses: map[string]struct{}{}}
+}
+
+func (p *ResponseProcessor) Data() ResponseData {
+	out := p.data
+	out.CompatibilityLosses = sortedStringSet(p.losses)
+	return out
+}
+
+func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
+	if p.toolIndex == nil {
+		p.toolIndex = map[string]int{}
+	}
+	messageType := frame.HeaderString(":message-type")
+	if messageType == "error" || messageType == "exception" {
+		if messageType == "exception" && frame.HeaderString(":exception-type") == "ContentLengthExceededException" {
+			p.data.StopReason = "max_tokens"
+			return nil, nil
+		}
+		return nil, fmt.Errorf("kiro %s %s: %s", messageType, first(frame.HeaderString(":error-code"), frame.HeaderString(":exception-type")), strings.TrimSpace(string(frame.Payload)))
+	}
+	eventType := frame.HeaderString(":event-type")
+	var fields map[string]json.RawMessage
+	if len(frame.Payload) > 0 {
+		if err := decodeUseNumber(frame.Payload, &fields); err != nil {
+			return nil, errors.New("kiro event payload is not JSON")
+		}
+	}
+	switch eventType {
+	case "assistantResponseEvent":
+		content := rawJSONString(fields["content"])
+		thinking := rawJSONString(fields["thinking"])
+		if model := first(rawJSONString(fields["modelId"]), rawJSONString(fields["model"])); model != "" {
+			if canonical, ok := capability.KiroCanonicalModel(model); ok {
+				model = canonical
+			}
+			p.data.Model = model
+		}
+		var deltas []ResponseDelta
+		if thinking != "" {
+			p.data.Thinking += thinking
+			deltas = append(deltas, ResponseDelta{Kind: "thinking", Text: thinking})
+		}
+		if content != "" {
+			parsed, usedFallback := p.tagParser.Feed(content)
+			if usedFallback {
+				p.losses[LossThinkingTagFallback] = struct{}{}
+			}
+			for _, delta := range parsed {
+				p.appendTextDelta(delta)
+				deltas = append(deltas, delta)
+			}
+		}
+		return deltas, nil
+	case "toolUseEvent":
+		id := rawJSONString(fields["toolUseId"])
+		if id == "" {
+			id = rawScalarString(fields["toolUseId"])
+		}
+		index, exists := p.toolIndex[id]
+		name := rawJSONString(fields["name"])
+		if original := p.names[name]; original != "" {
+			name = original
+		}
+		if !exists {
+			index = len(p.data.Tools)
+			p.toolIndex[id] = index
+			p.data.Tools = append(p.data.Tools, ToolCall{ID: id, Name: name})
+		} else if p.data.Tools[index].Name == "" && name != "" {
+			p.data.Tools[index].Name = name
+		}
+		input := rawJSONString(fields["input"])
+		p.data.Tools[index].Input += input
+		return []ResponseDelta{{Kind: "tool", ToolID: id, ToolName: p.data.Tools[index].Name, ToolInput: input, NewTool: !exists}}, nil
+	case "meteringEvent":
+		p.data.Metering.EventCount++
+		observeMetering(fields, &p.data.Metering)
+		p.syncMeteringFields()
+		return nil, nil
+	case "contextUsageEvent":
+		if rawJSONNumberFloat(fields["contextUsagePercentage"]) >= 100 || rawJSONNumberFloat(fields["contextUsage"]) >= 100 {
+			p.data.StopReason = "model_context_window_exceeded"
+		}
+		return nil, nil
+	default:
+		return nil, nil
+	}
+}
+
+func (p *ResponseProcessor) appendTextDelta(delta ResponseDelta) {
+	if delta.Kind == "thinking" {
+		p.data.Thinking += delta.Text
+	} else if delta.Kind == "text" {
+		p.data.Text += delta.Text
+	}
+}
+
+func (p *ResponseProcessor) syncMeteringFields() {
+	p.data.InputTokens = p.data.Metering.InputTokens.Value
+	p.data.OutputTokens = p.data.Metering.OutputTokens.Value
+	p.data.CacheReadTokens = p.data.Metering.CacheReadTokens.Value
+	p.data.CacheCreationTokens = p.data.Metering.CacheCreationTokens.Value
+	p.data.UsageSource = p.data.Metering.UsageSource()
+}
+
+func (p *ResponseProcessor) Finish() ([]ResponseDelta, error) {
+	var deltas []ResponseDelta
+	parsed, usedFallback := p.tagParser.Finish()
+	if usedFallback {
+		p.losses[LossThinkingTagFallback] = struct{}{}
+	}
+	for _, delta := range parsed {
+		p.appendTextDelta(delta)
+		deltas = append(deltas, delta)
+	}
+	for _, tool := range p.data.Tools {
+		if strings.TrimSpace(tool.Input) == "" || !json.Valid([]byte(tool.Input)) {
+			return deltas, fmt.Errorf("%w: tool_use_id=%s", ErrInvalidToolInput, tool.ID)
+		}
+	}
+	if len(p.data.Tools) > 0 {
+		p.data.StopReason = "tool_use"
+	} else if p.data.StopReason == "" {
+		p.data.StopReason = "end_turn"
+	}
+	if p.data.UsageSource == "" {
+		p.data.UsageSource = p.data.Metering.UsageSource()
+	}
+	return deltas, nil
+}
+
 func DecodeResponse(r io.Reader, names map[string]string) (ResponseData, error) {
-	d := NewDecoder()
-	var out ResponseData
-	tools := map[string]int{}
+	decoder := NewDecoder()
+	processor := NewResponseProcessor(names)
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := r.Read(buf)
+		n, readErr := r.Read(buf)
 		if n > 0 {
-			frames, e := d.Feed(buf[:n])
-			if e != nil {
-				return out, e
+			frames, err := decoder.Feed(buf[:n])
+			if err != nil {
+				return processor.Data(), err
 			}
-			for _, f := range frames {
-				if e := applyFrame(&out, f, names, tools); e != nil {
-					return out, e
+			for _, frame := range frames {
+				if _, err := processor.ProcessFrame(frame); err != nil {
+					return processor.Data(), err
 				}
 			}
 		}
-		if err == io.EOF {
-			if e := d.Finish(); e != nil {
-				return out, e
+		if readErr == io.EOF {
+			if err := decoder.Finish(); err != nil {
+				return processor.Data(), err
 			}
 			break
 		}
-		if err != nil {
-			return out, err
+		if readErr != nil {
+			return processor.Data(), readErr
 		}
 	}
-	out.Thinking, out.Text = extractThinking(out.Text)
-	if out.InputTokens < 1 {
-		out.InputTokens = 1
+	if _, err := processor.Finish(); err != nil {
+		return processor.Data(), err
 	}
-	if out.OutputTokens < 1 {
-		out.OutputTokens = int64(len(out.Text) / 4)
-		if out.OutputTokens < 1 {
-			out.OutputTokens = 1
-		}
-	}
-	if len(out.Tools) > 0 {
-		out.StopReason = "tool_use"
-	} else if out.StopReason == "" {
-		out.StopReason = "end_turn"
-	}
-	return out, nil
+	return processor.Data(), nil
 }
-func applyFrame(out *ResponseData, f Frame, names map[string]string, tools map[string]int) error {
-	mt := f.HeaderString(":message-type")
-	if mt == "error" || mt == "exception" {
-		if mt == "exception" && f.HeaderString(":exception-type") == "ContentLengthExceededException" {
-			out.StopReason = "max_tokens"
-			return nil
+
+// applyFrame is retained for package-level compatibility tests and small callers.
+// Stateful decoding should use ResponseProcessor so fragmented thinking tags and
+// tool inputs are validated at stream completion.
+func applyFrame(out *ResponseData, frame Frame, names map[string]string, tools map[string]int) error {
+	processor := NewResponseProcessor(names)
+	processor.data = *out
+	processor.toolIndex = tools
+	_, err := processor.ProcessFrame(frame)
+	*out = processor.Data()
+	return err
+}
+
+type thinkingTagParser struct {
+	pending    string
+	inThinking bool
+	sawTag     bool
+}
+
+func (p *thinkingTagParser) Feed(text string) ([]ResponseDelta, bool) {
+	p.pending += text
+	var out []ResponseDelta
+	for {
+		tag := "<thinking>"
+		kind := "text"
+		if p.inThinking {
+			tag = "</thinking>"
+			kind = "thinking"
 		}
-		return fmt.Errorf("kiro %s %s: %s", mt, first(f.HeaderString(":error-code"), f.HeaderString(":exception-type")), strings.TrimSpace(string(f.Payload)))
-	}
-	et := f.HeaderString(":event-type")
-	var p map[string]interface{}
-	if len(f.Payload) > 0 && json.Unmarshal(f.Payload, &p) != nil {
-		return errors.New("kiro event payload is not JSON")
-	}
-	switch et {
-	case "assistantResponseEvent":
-		out.Text += stringValue(p["content"])
-		if t := stringValue(p["thinking"]); t != "" {
-			out.Thinking += t
-		}
-	case "toolUseEvent":
-		id := stringValue(p["toolUseId"])
-		idx, ok := tools[id]
-		if !ok {
-			name := stringValue(p["name"])
-			if original := names[name]; original != "" {
-				name = original
+		if index := strings.Index(p.pending, tag); index >= 0 {
+			if index > 0 {
+				out = append(out, ResponseDelta{Kind: kind, Text: p.pending[:index]})
 			}
-			idx = len(out.Tools)
-			tools[id] = idx
-			out.Tools = append(out.Tools, ToolCall{ID: id, Name: name})
+			p.pending = p.pending[index+len(tag):]
+			p.inThinking = !p.inThinking
+			p.sawTag = true
+			if p.inThinking && strings.HasPrefix(p.pending, "\n") {
+				p.pending = p.pending[1:]
+			}
+			continue
 		}
-		out.Tools[idx].Input += stringValue(p["input"])
-	case "meteringEvent":
-		out.InputTokens = max64(out.InputTokens, numberAny(p, "inputTokens", "inputTokenCount"))
-		out.OutputTokens = max64(out.OutputTokens, numberAny(p, "outputTokens", "outputTokenCount"))
-		out.CacheReadTokens += numberAny(p, "cacheReadInputTokens", "cacheReadTokens")
-		out.CacheCreationTokens += numberAny(p, "cacheCreationInputTokens", "cacheWriteTokens")
-	case "contextUsageEvent":
-		if percentageAny(p, "contextUsagePercentage", "contextUsage") >= 100 {
-			out.StopReason = "model_context_window_exceeded"
+		keep := longestTagPrefixSuffix(p.pending, tag)
+		emitLen := len(p.pending) - keep
+		if emitLen > 0 {
+			out = append(out, ResponseDelta{Kind: kind, Text: p.pending[:emitLen]})
+			p.pending = p.pending[emitLen:]
+		}
+		return out, p.sawTag
+	}
+}
+
+func (p *thinkingTagParser) Finish() ([]ResponseDelta, bool) {
+	if p.pending == "" {
+		return nil, p.sawTag
+	}
+	kind := "text"
+	if p.inThinking {
+		kind = "thinking"
+	}
+	out := []ResponseDelta{{Kind: kind, Text: p.pending}}
+	p.pending = ""
+	return out, p.sawTag
+}
+
+func longestTagPrefixSuffix(text, tag string) int {
+	max := len(tag) - 1
+	if len(text) < max {
+		max = len(text)
+	}
+	for size := max; size > 0; size-- {
+		if strings.HasSuffix(text, tag[:size]) {
+			return size
 		}
 	}
-	return nil
+	return 0
 }
-func percentageAny(m map[string]interface{}, keys ...string) float64 {
+
+var meteringAliases = map[string]string{
+	"inputTokens": "input", "inputTokenCount": "input", "input_tokens": "input",
+	"outputTokens": "output", "outputTokenCount": "output", "output_tokens": "output",
+	"cacheReadInputTokens": "cache_read", "cacheReadTokens": "cache_read", "cache_read_input_tokens": "cache_read", "cache_read_tokens": "cache_read",
+	"cacheCreationInputTokens": "cache_creation", "cacheWriteTokens": "cache_creation", "cache_creation_input_tokens": "cache_creation", "cache_write_tokens": "cache_creation",
+}
+
+func observeMetering(fields map[string]json.RawMessage, metering *KiroMetering) {
+	if metering == nil {
+		return
+	}
+	unknown := map[string]UnknownCacheField{}
+	observeMeteringObject(fields, "", metering, unknown)
+	if len(unknown) > 0 {
+		byKey := map[string]UnknownCacheField{}
+		for _, field := range metering.UnknownCacheFields {
+			byKey[field.Name+"\x00"+field.NumberType] = field
+		}
+		for key, field := range unknown {
+			byKey[key] = field
+		}
+		metering.UnknownCacheFields = metering.UnknownCacheFields[:0]
+		for _, field := range byKey {
+			metering.UnknownCacheFields = append(metering.UnknownCacheFields, field)
+		}
+		sort.Slice(metering.UnknownCacheFields, func(i, j int) bool {
+			if metering.UnknownCacheFields[i].Name == metering.UnknownCacheFields[j].Name {
+				return metering.UnknownCacheFields[i].NumberType < metering.UnknownCacheFields[j].NumberType
+			}
+			return metering.UnknownCacheFields[i].Name < metering.UnknownCacheFields[j].Name
+		})
+	}
+}
+
+func observeMeteringObject(fields map[string]json.RawMessage, prefix string, metering *KiroMetering, unknown map[string]UnknownCacheField) {
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	for _, key := range keys {
-		switch value := m[key].(type) {
-		case float64:
-			return value
-		case json.Number:
-			f, _ := value.Float64()
-			return f
+		raw := fields[key]
+		path := key
+		if prefix != "" {
+			path = prefix + "." + key
+		}
+		if target := meteringAliases[key]; target != "" {
+			if value, present := rawJSONInt(raw); present {
+				switch target {
+				case "input":
+					observeMeteredInt(&metering.InputTokens, value)
+				case "output":
+					observeMeteredInt(&metering.OutputTokens, value)
+				case "cache_read":
+					observeMeteredInt(&metering.CacheReadTokens, value)
+				case "cache_creation":
+					observeMeteredInt(&metering.CacheCreationTokens, value)
+				}
+			}
+			continue
+		}
+		lower := strings.ToLower(key)
+		if (lower == "cachesupported" || lower == "promptcachesupported" || lower == "cache_supported") && bytes.Equal(bytes.TrimSpace(raw), []byte("false")) {
+			metering.ExplicitUnsupported = true
+		}
+		if (lower == "cachestatus" || lower == "cache_status") && strings.EqualFold(rawJSONString(raw), "unsupported") {
+			metering.ExplicitUnsupported = true
+		}
+		var nested map[string]json.RawMessage
+		if len(bytes.TrimSpace(raw)) > 0 && bytes.TrimSpace(raw)[0] == '{' && decodeUseNumber(raw, &nested) == nil {
+			observeMeteringObject(nested, path, metering, unknown)
+			continue
+		}
+		if strings.Contains(lower, "cache") {
+			if numberType := rawNumberType(raw); numberType != "" {
+				sum := sha256.Sum256([]byte(path + "\x00" + numberType))
+				field := UnknownCacheField{Name: path, NumberType: numberType, SchemaHash: hex.EncodeToString(sum[:])}
+				unknown[path+"\x00"+numberType] = field
+			}
 		}
 	}
-	return 0
 }
-func numberAny(m map[string]interface{}, keys ...string) int64 {
-	for _, k := range keys {
-		switch v := m[k].(type) {
-		case float64:
-			return int64(v)
-		case json.Number:
-			n, _ := v.Int64()
-			return n
+
+func observeMeteredInt(field *MeteredInt, value int64) {
+	if !field.Present || value > field.Value {
+		field.Value = value
+	}
+	field.Present = true
+}
+
+func rawJSONInt(raw json.RawMessage) (int64, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return 0, false
+	}
+	if strings.HasPrefix(trimmed, "\"") {
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			return 0, false
 		}
+		value, err := strconv.ParseInt(text, 10, 64)
+		return value, err == nil && value >= 0
 	}
-	return 0
+	number := json.Number(trimmed)
+	value, err := number.Int64()
+	if err == nil {
+		return value, value >= 0
+	}
+	floatValue, err := number.Float64()
+	if err != nil {
+		return 0, false
+	}
+	if math.IsNaN(floatValue) || math.IsInf(floatValue, 0) || floatValue < 0 || math.Trunc(floatValue) != floatValue || floatValue >= 9223372036854775808.0 {
+		return 0, false
+	}
+	return int64(floatValue), true
 }
-func extractThinking(text string) (string, string) {
-	start := strings.Index(text, "<thinking>")
-	if start < 0 {
-		return "", text
+
+func rawJSONNumberFloat(raw json.RawMessage) float64 {
+	trimmed := strings.Trim(strings.TrimSpace(string(raw)), "\"")
+	value, _ := strconv.ParseFloat(trimmed, 64)
+	return value
+}
+
+func rawNumberType(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
 	}
-	end := strings.Index(text[start+10:], "</thinking>")
-	if end < 0 {
-		return "", text
+	if strings.HasPrefix(trimmed, "\"") {
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			if _, err := strconv.ParseInt(text, 10, 64); err == nil {
+				return "string_integer"
+			}
+			if _, err := strconv.ParseFloat(text, 64); err == nil {
+				return "string_number"
+			}
+		}
+		return ""
 	}
-	end += start + 10
-	thinking := strings.TrimPrefix(text[start+10:end], "\n")
-	remaining := text[:start] + strings.TrimLeft(text[end+11:], "\n")
-	return thinking, remaining
+	if _, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return "integer"
+	}
+	if _, err := strconv.ParseFloat(trimmed, 64); err == nil {
+		return "number"
+	}
+	return ""
+}
+
+func rawJSONString(raw json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func AnthropicJSON(data ResponseData, model, id string) []byte {
 	blocks := contentBlocks(data)
-	body := map[string]interface{}{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": data.StopReason, "stop_sequence": nil, "usage": usageMap(data)}
-	b, _ := json.Marshal(body)
-	return b
+	body := map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": data.StopReason, "stop_sequence": nil, "usage": usageMap(data)}
+	raw, _ := json.Marshal(body)
+	return raw
 }
+
 func AnthropicSSE(data ResponseData, model, id string) []byte {
 	var b strings.Builder
-	emit := func(event string, v interface{}) {
-		raw, _ := json.Marshal(v)
+	emit := func(event string, value any) {
+		raw, _ := json.Marshal(value)
 		fmt.Fprintf(&b, "event: %s\ndata: %s\n\n", event, raw)
 	}
-	emit("message_start", map[string]interface{}{"type": "message_start", "message": map[string]interface{}{"id": id, "type": "message", "role": "assistant", "model": model, "content": []interface{}{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]interface{}{"input_tokens": data.InputTokens, "output_tokens": 0}}})
-	idx := 0
+	startUsage := map[string]any{"input_tokens": data.InputTokens, "output_tokens": 0}
+	addCacheUsageFields(startUsage, data.Metering)
+	emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": startUsage}})
+	index := 0
 	if data.Thinking != "" {
-		emit("content_block_start", map[string]interface{}{"type": "content_block_start", "index": idx, "content_block": map[string]interface{}{"type": "thinking", "thinking": ""}})
-		emit("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": idx, "delta": map[string]interface{}{"type": "thinking_delta", "thinking": data.Thinking}})
-		emit("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": idx})
-		idx++
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "thinking", "thinking": ""}})
+		emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "thinking_delta", "thinking": data.Thinking}})
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		index++
 	}
 	if data.WebSearch != nil {
-		emit("content_block_start", map[string]interface{}{"type": "content_block_start", "index": idx, "content_block": map[string]interface{}{"type": "server_tool_use", "id": data.WebSearch.ToolUseID, "name": "web_search", "input": map[string]interface{}{"query": data.WebSearch.Query}}})
-		emit("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": idx})
-		idx++
-		emit("content_block_start", map[string]interface{}{"type": "content_block_start", "index": idx, "content_block": map[string]interface{}{"type": "web_search_tool_result", "content": webSearchResultBlocks(data.WebSearch)}})
-		emit("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": idx})
-		idx++
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "server_tool_use", "id": data.WebSearch.ToolUseID, "name": "web_search", "input": map[string]any{"query": data.WebSearch.Query}}})
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		index++
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "web_search_tool_result", "content": webSearchResultBlocks(data.WebSearch)}})
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		index++
 	}
 	if data.Text != "" {
-		emit("content_block_start", map[string]interface{}{"type": "content_block_start", "index": idx, "content_block": map[string]interface{}{"type": "text", "text": ""}})
-		emit("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": idx, "delta": map[string]interface{}{"type": "text_delta", "text": data.Text}})
-		emit("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": idx})
-		idx++
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "text", "text": ""}})
+		emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "text_delta", "text": data.Text}})
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		index++
 	}
 	for _, tool := range data.Tools {
-		emit("content_block_start", map[string]interface{}{"type": "content_block_start", "index": idx, "content_block": map[string]interface{}{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": map[string]interface{}{}}})
-		emit("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": idx, "delta": map[string]interface{}{"type": "input_json_delta", "partial_json": tool.Input}})
-		emit("content_block_stop", map[string]interface{}{"type": "content_block_stop", "index": idx})
-		idx++
+		emit("content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": map[string]any{}}})
+		emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": tool.Input}})
+		emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		index++
 	}
-	deltaUsage := map[string]interface{}{"output_tokens": data.OutputTokens}
+	deltaUsage := map[string]any{"output_tokens": data.OutputTokens}
+	addCacheUsageFields(deltaUsage, data.Metering)
 	if data.WebSearch != nil {
-		deltaUsage["server_tool_use"] = map[string]interface{}{"web_search_requests": 1}
+		deltaUsage["server_tool_use"] = map[string]any{"web_search_requests": 1}
 	}
-	emit("message_delta", map[string]interface{}{"type": "message_delta", "delta": map[string]interface{}{"stop_reason": data.StopReason, "stop_sequence": nil}, "usage": deltaUsage})
-	emit("message_stop", map[string]interface{}{"type": "message_stop"})
+	emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": data.StopReason, "stop_sequence": nil}, "usage": deltaUsage})
+	emit("message_stop", map[string]any{"type": "message_stop"})
 	return []byte(b.String())
 }
-func contentBlocks(d ResponseData) []interface{} {
-	var out []interface{}
-	if d.Thinking != "" {
-		out = append(out, map[string]interface{}{"type": "thinking", "thinking": d.Thinking, "signature": ""})
+
+func contentBlocks(data ResponseData) []any {
+	var out []any
+	if data.Thinking != "" {
+		out = append(out, map[string]any{"type": "thinking", "thinking": data.Thinking, "signature": ""})
 	}
-	if d.WebSearch != nil {
-		out = append(out, map[string]interface{}{"type": "server_tool_use", "id": d.WebSearch.ToolUseID, "name": "web_search", "input": map[string]interface{}{"query": d.WebSearch.Query}})
-		out = append(out, map[string]interface{}{"type": "web_search_tool_result", "content": webSearchResultBlocks(d.WebSearch)})
+	if data.WebSearch != nil {
+		out = append(out, map[string]any{"type": "server_tool_use", "id": data.WebSearch.ToolUseID, "name": "web_search", "input": map[string]any{"query": data.WebSearch.Query}})
+		out = append(out, map[string]any{"type": "web_search_tool_result", "content": webSearchResultBlocks(data.WebSearch)})
 	}
-	if d.Text != "" {
-		out = append(out, map[string]interface{}{"type": "text", "text": d.Text})
+	if data.Text != "" {
+		out = append(out, map[string]any{"type": "text", "text": data.Text})
 	}
-	for _, t := range d.Tools {
-		var input interface{} = map[string]interface{}{}
-		_ = json.Unmarshal([]byte(t.Input), &input)
-		out = append(out, map[string]interface{}{"type": "tool_use", "id": t.ID, "name": t.Name, "input": input})
+	for _, tool := range data.Tools {
+		var input any
+		if err := decodeUseNumber([]byte(tool.Input), &input); err != nil {
+			// DecodeResponse/ResponseProcessor already rejects this. Keep a null
+			// sentinel here rather than manufacturing an empty object if a caller
+			// bypasses the decoder.
+			input = nil
+		}
+		out = append(out, map[string]any{"type": "tool_use", "id": tool.ID, "name": tool.Name, "input": input})
 	}
 	return out
 }
-func webSearchResultBlocks(data *WebSearchData) []interface{} {
-	out := make([]interface{}, 0, len(data.Results))
+
+func webSearchResultBlocks(data *WebSearchData) []any {
+	out := make([]any, 0, len(data.Results))
 	for _, result := range data.Results {
-		var pageAge interface{}
+		var pageAge any
 		if result.PublishedAt > 0 {
 			pageAge = time.UnixMilli(result.PublishedAt).UTC().Format("January 2, 2006")
 		}
-		out = append(out, map[string]interface{}{"type": "web_search_result", "title": result.Title, "url": result.URL, "encrypted_content": result.Snippet, "page_age": pageAge})
+		out = append(out, map[string]any{"type": "web_search_result", "title": result.Title, "url": result.URL, "encrypted_content": result.Snippet, "page_age": pageAge})
 	}
 	return out
 }
-func usageMap(d ResponseData) map[string]interface{} {
-	usage := map[string]interface{}{"input_tokens": d.InputTokens, "output_tokens": d.OutputTokens, "cache_read_input_tokens": d.CacheReadTokens, "cache_creation_input_tokens": d.CacheCreationTokens}
-	if d.WebSearch != nil {
-		usage["server_tool_use"] = map[string]interface{}{"web_search_requests": 1}
+
+func usageMap(data ResponseData) map[string]any {
+	usage := map[string]any{"input_tokens": data.InputTokens, "output_tokens": data.OutputTokens}
+	addCacheUsageFields(usage, data.Metering)
+	if data.WebSearch != nil {
+		usage["server_tool_use"] = map[string]any{"web_search_requests": 1}
 	}
 	return usage
+}
+
+func addCacheUsageFields(usage map[string]any, metering KiroMetering) {
+	if metering.CacheReadTokens.Present {
+		usage["cache_read_input_tokens"] = metering.CacheReadTokens.Value
+	}
+	if metering.CacheCreationTokens.Present {
+		usage["cache_creation_input_tokens"] = metering.CacheCreationTokens.Value
+	}
 }

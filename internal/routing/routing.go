@@ -90,10 +90,25 @@ func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 	if v := JSONStringField(body, "prompt_cache_key"); v != "" {
 		return newKey("prompt_cache_key:"+v, "prompt_cache_key")
 	}
+	if v := JSONStringField(body, "previous_response_id"); v != "" {
+		return ResponseAffinityKey(v)
+	}
 	if v := headerValue(r, "x-codex-turn-metadata"); v != "" {
 		return newKey("x-codex-turn-metadata:"+v, "x-codex-turn-metadata")
 	}
 	return AffinityKey{}
+}
+
+// ResponseAffinityKey is the durable lookup key for a Responses continuation.
+// The API stores this alias as soon as an upstream response ID is observed, so a
+// later request containing only previous_response_id returns to the same account,
+// model, and egress even after a process restart.
+func ResponseAffinityKey(responseID string) AffinityKey {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return AffinityKey{}
+	}
+	return newKey("previous_response_id:"+responseID, "previous_response_id")
 }
 
 func codexRootThreadAffinity(threadID string) AffinityKey {

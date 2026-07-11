@@ -120,6 +120,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w, r)
 
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+	if r.Body != nil && s.cfg.MaxBodyBytes > 0 {
+		// Enforce one process-wide request budget before route-specific decoders add
+		// their usually smaller limits. This also covers multipart/resource handlers
+		// that do not call readLimited directly.
+		r.Body = http.MaxBytesReader(rec, r.Body, s.cfg.MaxBodyBytes)
+	}
 	ctx := contextWithRequestID(r.Context(), requestID)
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
@@ -200,7 +206,7 @@ func (s *Server) handleClientError(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	remote := clientIP(r)
+	remote := s.clientIP(r)
 	if s.clientErrors != nil {
 		allowed, logLimited := s.clientErrors.allowWithLimitLog(remote, time.Now())
 		if !allowed {

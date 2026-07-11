@@ -163,7 +163,6 @@ func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
 		"codex_prompt_cache_retention":          "",
 		"rate_limit_guard_enabled":              true,
 		"seamless_failover":                     true,
-		"force_failover_on_429":                 false,
 		"leak_scrub":                            true,
 		"token_save_enabled":                    false,
 		"codex_install_effort":                  "xhigh",
