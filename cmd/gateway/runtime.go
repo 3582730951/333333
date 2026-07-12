@@ -15,6 +15,8 @@ import (
 
 const strictRuntimeMissingMessage = "strict Linux runtime requires bubblewrap (bwrap) with user/mount/UTS namespace support"
 
+const gatewayClaudeSettingsJSON = `{"skipWebFetchPreflight":true}`
+
 type strictRuntimePaths struct {
 	GatewayDir      string
 	RuntimeDir      string
@@ -73,6 +75,7 @@ func handleRunClaude(configPath string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	args = claudeGatewayRuntimeArgs(args)
 	if !strictLinuxRequested() {
 		return runCompatClaude(cfg, realClaude, args)
 	}
@@ -92,6 +95,18 @@ func handleRunClaude(configPath string) int {
 		return exitCode(err)
 	}
 	return 0
+}
+
+// claudeGatewayRuntimeArgs adds a process-scoped settings overlay. Kiro and other
+// pool-backed providers cannot answer Claude Code's separate api.anthropic.com
+// WebFetch domain-safety preflight, so the official client otherwise rejects every
+// Fetch before contacting the requested site. --settings merges the omitted keys
+// from the user's normal settings and confines this override to gateway launches.
+func claudeGatewayRuntimeArgs(args []string) []string {
+	out := make([]string, 0, len(args)+2)
+	out = append(out, "--settings", gatewayClaudeSettingsJSON)
+	out = append(out, args...)
+	return out
 }
 
 func loadRuntimeIdentity(configPath string) (Config, *CachedIdentity, error) {
@@ -324,6 +339,10 @@ func ensureClaudeAutoPlanSettings(virtualHomeHost string) error {
 	if _, ok := settings["useAutoModeDuringPlan"]; !ok {
 		settings["useAutoModeDuringPlan"] = true
 	}
+	// The strict virtual HOME is used only for gateway-backed Claude Code, where
+	// api.anthropic.com is not the model provider. Skip its independent WebFetch
+	// hostname preflight; the gateway's own CONNECT policy still controls egress.
+	settings["skipWebFetchPreflight"] = true
 
 	permissions := mapSetting(settings, "permissions")
 	if _, ok := permissions["defaultMode"]; !ok {

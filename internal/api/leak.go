@@ -113,8 +113,16 @@ const (
 	earlySSEMaxFrames = 8
 )
 
-func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, bool, error) {
-	return probeEarlySSEFailure(body, leakfilter.IsRetryableCodexFailureFrame, codexSSEFrameCommitsContent, true)
+func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureFrame, bool, error) {
+	var failure leakfilter.CodexFailureFrame
+	prefix, retryable, err := probeEarlySSEFailure(body, func(frame []byte) bool {
+		parsed, ok := leakfilter.ParseRetryableCodexFailureFrame(frame)
+		if ok {
+			failure = parsed
+		}
+		return ok
+	}, codexSSEFrameCommitsContent, true)
+	return prefix, failure, retryable, err
 }
 
 func probeEarlyClaudeSSEFailure(body io.Reader) ([]byte, bool, error) {

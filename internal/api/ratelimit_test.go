@@ -235,6 +235,16 @@ func TestResetSeconds(t *testing.T) {
 			headers: map[string]string{},
 			want:    0,
 		},
+		{
+			name: "Codex embedded primary window uses exhausted reset",
+			headers: map[string]string{
+				"x-codex-primary-used-percent":          "100",
+				"x-codex-primary-reset-after-seconds":   "12091",
+				"x-codex-secondary-used-percent":        "94",
+				"x-codex-secondary-reset-after-seconds": "484265",
+			},
+			want: 12091,
+		},
 	}
 
 	for _, tt := range tests {

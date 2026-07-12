@@ -1155,28 +1155,14 @@ codexSuccess:
 	}
 
 	if isEventStream(resp.Header) {
-		if isChat {
-			// Third-party OpenAI client streaming against a GPT model: convert the
-			// upstream Responses SSE into chat.completion.chunk frames it can parse
-			// (incl. streamed tool calls), teeing through a usage scanner so streamed
-			// chat traffic records tokens like the native path.
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.WriteHeader(resp.StatusCode)
-			uscan := usage.NewStreamScanner("codex")
-			responsesStreamToChatSSE(w, io.TeeReader(resp.Body, uscan), model, includeChatStreamUsage, codexScrubber)
-			if parsed, ok := uscan.Parsed(); ok {
-				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
-			}
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
-			return codexAttemptResult{Outcome: outcomeDone}
-		}
 		// Hold back only a bounded early prefix so a retryable failure frame can still
 		// fail over before any downstream bytes are committed. As soon as real content
 		// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
 		// full-response capture destroyed TTFT and manufactured 503s once a successful
-		// stream exceeded its memory/disk capture cap.
-		prefix, retryableStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
+		// stream exceeded its memory/disk capture cap. This probe runs before both the
+		// native Responses and Chat Completions adapters; once either writes HTTP 200,
+		// transparent account failover is no longer possible.
+		prefix, streamFailure, retryableStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
 		if probeErr != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
@@ -1189,11 +1175,40 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		if retryableStream {
-			// This response will never be forwarded; close it before a reset-credit retry
-			// can replace resp, otherwise the old connection/body would leak.
-			_ = resp.Body.Close()
-			if !codexResetRetried && codexResetTriggerAllowed(200, prefix) &&
-				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, prefix, "stream_retryable_limit") {
+			failureHeader := resp.Header.Clone()
+			for name, values := range streamFailure.Header {
+				failureHeader.Del(name)
+				for _, value := range values {
+					failureHeader.Add(name, value)
+				}
+			}
+			failureStatus := streamFailure.StatusCode
+			failureBody := streamFailure.Body
+			entrypoint := "responses"
+			if isChat {
+				entrypoint = "chat_completions"
+			}
+			decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+				Provider:   "codex",
+				Entrypoint: entrypoint,
+				Model:      model,
+				Status:     failureStatus,
+				Header:     failureHeader,
+				Body:       failureBody,
+				Streaming:  true,
+			})
+			shouldRetry := !ruleMatched || decision.Match.DownstreamAction == upstreamrules.DownstreamActionBuiltin || decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
+
+			// A reset credit is an in-place recovery on the same account and therefore
+			// precedes cooldown/failover. Explicit pass/custom/neutralize/idle rules do
+			// not consume credits behind the operator's back.
+			if shouldRetry {
+				// The WebSocket-to-SSE pipe is unbuffered. Closing before another request
+				// prevents its terminal [DONE] write from retaining the WS request mutex.
+				_ = resp.Body.Close()
+			}
+			if shouldRetry && !codexResetRetried && codexResetTriggerAllowed(failureStatus, failureBody) &&
+				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
 				codexResetRetried = true
 				if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
 					token = latest
@@ -1211,8 +1226,29 @@ codexSuccess:
 					log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
 				}
 			}
-			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, prefix)
+			if ruleMatched {
+				s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
+			} else {
+				s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
+			}
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
+			if ruleMatched {
+				switch decision.Match.DownstreamAction {
+				case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream:
+					_ = resp.Body.Close()
+					if s.writeRuleDownstream(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber, decision, true) {
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
+				case upstreamrules.DownstreamActionFailover:
+					_ = resp.Body.Close()
+					if allowRetry && movable {
+						return retry()
+					}
+					s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+			}
+			_ = resp.Body.Close()
 			if allowRetry && movable {
 				return retry()
 			}
@@ -1223,6 +1259,22 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
+		if isChat {
+			// Third-party OpenAI client streaming against a GPT model: convert the
+			// upstream Responses SSE into chat.completion.chunk frames it can parse
+			// (incl. streamed tool calls), teeing through a usage scanner so streamed
+			// chat traffic records tokens like the native path.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(resp.StatusCode)
+			uscan := usage.NewStreamScanner("codex")
+			responsesStreamToChatSSE(w, io.TeeReader(streamBody, uscan), model, includeChatStreamUsage, codexScrubber)
+			if parsed, ok := uscan.Parsed(); ok {
+				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
+			}
+			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		streamRecorder := newCodexStreamLedgerRecorder()
 		recordingStream := io.TeeReader(streamBody, streamRecorder)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)

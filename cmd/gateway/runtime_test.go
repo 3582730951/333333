@@ -132,6 +132,23 @@ func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
 	}
 }
 
+func TestClaudeGatewayRuntimeArgsSkipUnavailableWebFetchPreflight(t *testing.T) {
+	args := claudeGatewayRuntimeArgs([]string{"--model", "opus", "fetch docs"})
+	if len(args) < 2 || args[0] != "--settings" || args[1] != gatewayClaudeSettingsJSON {
+		t.Fatalf("gateway settings overlay missing: %q", args)
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal([]byte(args[1]), &settings); err != nil {
+		t.Fatalf("settings overlay is invalid JSON: %v", err)
+	}
+	if settings["skipWebFetchPreflight"] != true {
+		t.Fatalf("WebFetch preflight is not disabled: %v", settings)
+	}
+	if got := strings.Join(args[2:], "\x00"); got != "--model\x00opus\x00fetch docs" {
+		t.Fatalf("caller args changed: %q", args)
+	}
+}
+
 func TestStrictRuntimeEnvBypassesCodexAndAdvisoryHosts(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ListenAddr = "127.0.0.1:8765"
@@ -191,6 +208,9 @@ func TestPrepareStrictRuntimePathsWritesClaudeAutoPlanSettings(t *testing.T) {
 	}
 	if settings["useAutoModeDuringPlan"] != true {
 		t.Fatalf("settings must enable auto mode during plan: %s", raw)
+	}
+	if settings["skipWebFetchPreflight"] != true {
+		t.Fatalf("strict gateway settings must skip unavailable WebFetch preflight: %s", raw)
 	}
 	permissions, _ := settings["permissions"].(map[string]interface{})
 	if permissions["defaultMode"] != "auto" {

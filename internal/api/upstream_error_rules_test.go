@@ -150,6 +150,114 @@ func TestCodexUpstreamErrorRuleFailoverOnNonDefaultStatus(t *testing.T) {
 	}
 }
 
+func TestCodexUpstreamErrorRuleFailoverOnWebSocketSSEUsageLimit(t *testing.T) {
+	var bCalled bool
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-a":
+			_, _ = w.Write([]byte("event: error\n" +
+				`data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_in_seconds":12090},"status_code":429,"headers":{"X-Codex-Primary-Used-Percent":"100","X-Codex-Secondary-Used-Percent":"94","X-Codex-Primary-Reset-After-Seconds":"12091"}}` + "\n\n" +
+				"data: [DONE]\n\n"))
+		case "Bearer access-b":
+			bCalled = true
+			_, _ = w.Write([]byte("event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":"ok-from-b"}` + "\n\n" +
+				"event: response.completed\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_b","model":"gpt-5.5","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n" +
+				"data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
+		}
+	})
+	accA := h.importAccount(t, "a", "upstream-a", "access-a")
+	accB := h.importAccount(t, "b", "upstream-b", "access-b")
+	setTestCapability(t, h, accA, "gpt-5.5", 1024)
+	setTestCapability(t, h, accB, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "ws-usage-limit",
+		Name:             "WebSocket usage limit",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		BodyKeywords:     []string{"The usage limit has been reached"},
+		AccountAction:    "builtin",
+		DownstreamAction: "failover",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reqBody := `{"model":"gpt-5.5","stream":true,"prompt_cache_key":"ws-rule-failover","input":"hi"}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bCalled || !strings.Contains(string(body), "ok-from-b") {
+		t.Fatalf("SSE rule failover did not succeed: status=%d bCalled=%v body=%s", resp.StatusCode, bCalled, body)
+	}
+	if strings.Contains(string(body), "usage_limit_reached") || strings.Contains(string(body), "access-a") {
+		t.Fatalf("account A limit event leaked downstream: %s", body)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), accA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !binding.RecheckPending || binding.CooldownUntil < storage.Now()+3500 {
+		t.Fatalf("embedded Codex reset window was not applied: %+v", binding)
+	}
+}
+
+func TestCodexChatStreamingWebSocketUsageLimitRetriesBeforeHTTP200(t *testing.T) {
+	var bCalled bool
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-a":
+			_, _ = w.Write([]byte("event: error\n" +
+				`data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"},"status_code":429}` + "\n\n" +
+				"data: [DONE]\n\n"))
+		case "Bearer access-b":
+			bCalled = true
+			_, _ = w.Write([]byte("event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":"chat-ok-from-b"}` + "\n\n" +
+				"event: response.completed\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_b","model":"gpt-5.5","status":"completed"}}` + "\n\n" +
+				"data: [DONE]\n\n"))
+		default:
+			t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
+		}
+	})
+	accA := h.importAccount(t, "a", "upstream-a", "access-a")
+	accB := h.importAccount(t, "b", "upstream-b", "access-b")
+	setTestCapability(t, h, accA, "gpt-5.5", 1024)
+	setTestCapability(t, h, accB, "gpt-5.5", 1024)
+	reqBody := `{"model":"gpt-5.5","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/chat/completions", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bCalled || !strings.Contains(string(body), "chat-ok-from-b") {
+		t.Fatalf("chat SSE failover did not succeed: status=%d bCalled=%v body=%s", resp.StatusCode, bCalled, body)
+	}
+	if strings.Contains(string(body), "usage_limit_reached") {
+		t.Fatalf("account A limit event leaked into chat stream: %s", body)
+	}
+}
+
 func TestCodexUpstreamErrorRuleCustomErrorOverridesDefault(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)

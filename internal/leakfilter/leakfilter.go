@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -255,15 +256,108 @@ func NewSSEFilter(provider string, words *streamrewrite.Matcher) *SSEFilter {
 	return &SSEFilter{provider: provider, words: words}
 }
 
-func IsRetryableCodexFailureFrame(frame []byte) bool {
+// CodexFailureFrame is a terminal, account-retryable error carried inside a
+// successful HTTP SSE response. The Responses HTTP transport normally emits
+// response.failed, while the official Responses-over-WebSocket transport emits
+// type:error with the real status and quota headers embedded in the JSON body.
+type CodexFailureFrame struct {
+	EventType  string
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+// ParseRetryableCodexFailureFrame recognizes both Codex terminal error envelopes.
+// It deliberately requires either an account-retryable HTTP status or a known
+// limit/overload signature so a genuine client error (for example an invalid
+// request or invalid cache key) is never moved to another account.
+func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	eventType, data := parseSSEFrame(frame)
 	if len(data) == 0 {
-		return false
+		return CodexFailureFrame{}, false
 	}
-	if eventType != "response.failed" && jsonStringField(data, "type") != "response.failed" {
-		return false
+	var envelope struct {
+		Type       string                     `json:"type"`
+		StatusCode json.RawMessage            `json:"status_code"`
+		Headers    map[string]json.RawMessage `json:"headers"`
 	}
-	return containsAnyFold(strings.ToLower(string(data)), codexFailedLeakSignatures)
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return CodexFailureFrame{}, false
+	}
+	kind := strings.ToLower(strings.TrimSpace(eventType))
+	bodyKind := strings.ToLower(strings.TrimSpace(envelope.Type))
+	if kind != "response.failed" && kind != "error" {
+		kind = bodyKind
+	}
+	if kind != "response.failed" && kind != "error" {
+		return CodexFailureFrame{}, false
+	}
+
+	lower := strings.ToLower(string(data))
+	status := jsonInt(envelope.StatusCode)
+	statusRetryable := status == http.StatusUnauthorized || status == http.StatusForbidden ||
+		status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
+		status == http.StatusServiceUnavailable || status >= 500
+	signatureRetryable := containsAnyFold(lower, codexFailedLeakSignatures)
+	if !statusRetryable && !signatureRetryable {
+		return CodexFailureFrame{}, false
+	}
+	if status == 0 {
+		if containsAnyFold(lower, []string{"server_is_overloaded", "slow_down", "at capacity", "try a different model"}) {
+			status = http.StatusServiceUnavailable
+		} else {
+			status = http.StatusTooManyRequests
+		}
+	}
+
+	header := http.Header{}
+	for name, raw := range envelope.Headers {
+		if value := jsonScalarString(raw); value != "" {
+			header.Set(name, value)
+		}
+	}
+	return CodexFailureFrame{
+		EventType:  kind,
+		StatusCode: status,
+		Header:     header,
+		Body:       append([]byte(nil), data...),
+	}, true
+}
+
+func IsRetryableCodexFailureFrame(frame []byte) bool {
+	_, ok := ParseRetryableCodexFailureFrame(frame)
+	return ok
+}
+
+func jsonInt(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		n, _ = strconv.Atoi(strings.TrimSpace(text))
+	}
+	return n
+}
+
+func jsonScalarString(raw json.RawMessage) string {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return strings.TrimSpace(text)
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err == nil {
+		return number.String()
+	}
+	var boolean bool
+	if err := json.Unmarshal(raw, &boolean); err == nil {
+		return strconv.FormatBool(boolean)
+	}
+	return ""
 }
 
 var claudeRetryableErrorSignatures = []string{
@@ -421,8 +515,8 @@ func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 	switch jsonStringField(data, "type") {
 	case "codex.rate_limits":
 		return true
-	case "response.failed":
-		return containsAnyFold(lowerData, codexFailedLeakSignatures)
+	case "response.failed", "error":
+		return IsRetryableCodexFailureFrame(frame)
 	case "response.metadata":
 		return strings.Contains(lowerData, "openai_verification_recommendation")
 	}

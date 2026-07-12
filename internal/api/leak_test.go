@@ -10,12 +10,28 @@ func TestProbeEarlyCodexSSEFailureDetectsFailedAfterCreated(t *testing.T) {
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n" +
 		"event: response.failed\n" +
 		"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"You've hit your usage limit.\"}}}\n\n"
-	prefix, retry, err := probeEarlyCodexSSEFailure(strings.NewReader(stream))
+	prefix, failure, retry, err := probeEarlyCodexSSEFailure(strings.NewReader(stream))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !retry {
 		t.Fatalf("retry=false prefix=%q", prefix)
+	}
+	if failure.StatusCode != 429 {
+		t.Fatalf("failure=%+v", failure)
+	}
+}
+
+func TestProbeEarlyCodexSSEFailureDetectsWebSocketError(t *testing.T) {
+	stream := "event: error\n" +
+		`data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"},"status_code":429,"headers":{"X-Codex-Primary-Used-Percent":"100"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	prefix, failure, retry, err := probeEarlyCodexSSEFailure(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !retry || failure.StatusCode != 429 || failure.Header.Get("X-Codex-Primary-Used-Percent") != "100" {
+		t.Fatalf("retry=%v failure=%+v prefix=%q", retry, failure, prefix)
 	}
 }
 

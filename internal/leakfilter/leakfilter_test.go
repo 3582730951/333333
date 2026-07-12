@@ -162,6 +162,39 @@ func TestSSEFilterDropsResponseFailedLimit(t *testing.T) {
 	}
 }
 
+func TestRetryableCodexFailureFrameAcceptsWebSocketUsageLimitError(t *testing.T) {
+	frame := []byte("event: error\n" +
+		`data: {"type":"error","error":{"type":"usage_limit_reached","message":"The usage limit has been reached"},"status_code":429,"headers":{"X-Codex-Primary-Used-Percent":"100","X-Codex-Primary-Reset-After-Seconds":"12091"}}` + "\n\n")
+	failure, ok := ParseRetryableCodexFailureFrame(frame)
+	if !ok {
+		t.Fatal("WebSocket type:error usage limit was not recognized")
+	}
+	if failure.EventType != "error" || failure.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("failure = %+v", failure)
+	}
+	if got := failure.Header.Get("X-Codex-Primary-Reset-After-Seconds"); got != "12091" {
+		t.Fatalf("embedded reset header = %q", got)
+	}
+	if !strings.Contains(string(failure.Body), "The usage limit has been reached") {
+		t.Fatalf("failure body = %s", failure.Body)
+	}
+	got := runSSE(t, "codex", string(frame), 7)
+	if strings.TrimSpace(got) != "" {
+		t.Fatalf("retryable WebSocket error frame should be filtered, got %q", got)
+	}
+}
+
+func TestRetryableCodexFailureFrameRejectsWebSocketClientError(t *testing.T) {
+	frame := []byte("event: error\n" +
+		`data: {"type":"error","error":{"type":"invalid_request_error","message":"invalid cache request"},"status_code":400}` + "\n\n")
+	if failure, ok := ParseRetryableCodexFailureFrame(frame); ok {
+		t.Fatalf("genuine client error must not be retried: %+v", failure)
+	}
+	if got := runSSE(t, "codex", string(frame), 5); !strings.Contains(got, "invalid cache request") {
+		t.Fatalf("genuine client error was dropped: %q", got)
+	}
+}
+
 func TestSSEFilterNeutralizesClaudeError(t *testing.T) {
 	// A Claude streaming error must be NEUTRALIZED (rewritten to a generic error
 	// event), NOT dropped: dropping it leaves an empty/truncated 200 stream that

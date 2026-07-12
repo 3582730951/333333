@@ -71,6 +71,29 @@ func resetSeconds(header http.Header, now int64) int64 {
 	} {
 		consider(parseResetTimestamp(header.Get(h), now))
 	}
+	// Codex Responses-over-WebSocket carries its quota state inside a terminal
+	// type:error frame instead of normal HTTP headers. The SSE parser promotes
+	// those embedded values into http.Header before reaching this function. Only
+	// honor a window whose used percentage is actually exhausted; a secondary 7d
+	// reset must not override an exhausted primary 5h window (or vice versa).
+	codexWindowSeen := false
+	for _, window := range []string{"primary", "secondary"} {
+		used, err := strconv.ParseFloat(strings.TrimSpace(header.Get("x-codex-"+window+"-used-percent")), 64)
+		if err != nil || used < 100 {
+			continue
+		}
+		codexWindowSeen = true
+		consider(parseDurationSeconds(header.Get("x-codex-" + window + "-reset-after-seconds")))
+		consider(parseResetTimestamp(header.Get("x-codex-"+window+"-reset-at"), now))
+	}
+	// Some upstream variants omit used-percent on the terminal 429 but still carry
+	// reset windows. Prefer the soonest one as a conservative fallback.
+	if !codexWindowSeen {
+		for _, window := range []string{"primary", "secondary"} {
+			consider(parseDurationSeconds(header.Get("x-codex-" + window + "-reset-after-seconds")))
+			consider(parseResetTimestamp(header.Get("x-codex-"+window+"-reset-at"), now))
+		}
+	}
 	return best
 }
 
