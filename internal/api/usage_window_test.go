@@ -459,8 +459,12 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 		t.Fatalf("manifest format missing:\n%s", files["manifest.json"])
 	}
 	legacyCode, legacyRaw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0&version=v1", "")
-	if legacyCode != http.StatusOK || !strings.Contains(readZipFiles(t, legacyRaw)["manifest.json"], "codex-pool-cache-hits-v1") {
+	if legacyCode != http.StatusOK {
 		t.Fatalf("v1 migration export unavailable: status=%d", legacyCode)
+	}
+	legacyFiles := readZipFiles(t, legacyRaw)
+	if !strings.Contains(legacyFiles["manifest.json"], "codex-pool-cache-hits-v1") {
+		t.Fatalf("v1 migration manifest missing: %s", legacyFiles["manifest.json"])
 	}
 	if !strings.Contains(files["summary.csv"], "token_hit_rate") || !strings.Contains(files["summary.csv"], "80") {
 		t.Fatalf("summary.csv missing expected metrics:\n%s", files["summary.csv"])
@@ -474,14 +478,22 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 	if !strings.Contains(files["route_map.csv"], "route_key_hash_prefix") || !strings.Contains(files["route_map.csv"], "route-secret") || !strings.Contains(files["route_map.csv"], "route_class") {
 		t.Fatalf("route_map.csv must expose the zip-level route codebook:\n%s", files["route_map.csv"])
 	}
-	if !strings.Contains(files["account_map.csv"], account.ID) || !strings.Contains(files["account_map.csv"], account.Email) {
-		t.Fatalf("account_map.csv should contain local admin mapping:\n%s", files["account_map.csv"])
-	}
-	for _, name := range []string{"summary.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv"} {
-		text := files[name]
-		for _, forbidden := range []string{account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID} {
-			if strings.Contains(text, forbidden) {
-				t.Fatalf("%s leaked %q:\n%s", name, forbidden, text)
+	for version, archiveFiles := range map[string]map[string]string{"v2": files, "v1": legacyFiles} {
+		accountMap, err := csv.NewReader(strings.NewReader(archiveFiles["account_map.csv"])).ReadAll()
+		if err != nil {
+			t.Fatalf("%s account_map.csv: %v", version, err)
+		}
+		if len(accountMap) != 2 || len(accountMap[0]) != 2 || accountMap[0][0] != "account_code" || accountMap[0][1] != "account_id" || accountMap[1][0] != "ACC-0001" || accountMap[1][1] != account.ID {
+			t.Fatalf("%s account_map.csv must contain only account_code and account_id: %v", version, accountMap)
+		}
+		for name, text := range archiveFiles {
+			for _, forbidden := range []string{account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID, "access-cache-secret"} {
+				if strings.Contains(text, forbidden) {
+					t.Fatalf("%s %s leaked %q:\n%s", version, name, forbidden, text)
+				}
+			}
+			if name != "account_map.csv" && strings.Contains(text, account.ID) {
+				t.Fatalf("%s %s leaked raw account id %q:\n%s", version, name, account.ID, text)
 			}
 		}
 	}

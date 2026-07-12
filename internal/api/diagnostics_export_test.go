@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -133,22 +134,23 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 
-	accountMap := files["account_map.csv"]
-	for _, want := range []string{"ACC-0001", account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID} {
-		if !strings.Contains(accountMap, want) {
-			t.Fatalf("account_map.csv missing %q:\n%s", want, accountMap)
-		}
+	accountMap, err := csv.NewReader(strings.NewReader(files["account_map.csv"])).ReadAll()
+	if err != nil {
+		t.Fatalf("account_map.csv: %v", err)
+	}
+	if len(accountMap) != 2 || len(accountMap[0]) != 2 || accountMap[0][0] != "account_code" || accountMap[0][1] != "account_id" || accountMap[1][0] != "ACC-0001" || accountMap[1][1] != account.ID {
+		t.Fatalf("account_map.csv must contain only account_code and account_id: %v", accountMap)
 	}
 
 	for _, name := range required {
-		if name == "account_map.csv" {
-			continue
-		}
 		text := files[name]
-		for _, forbidden := range []string{account.ID, account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID, "access-secret"} {
+		for _, forbidden := range []string{account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID, "access-secret"} {
 			if strings.Contains(text, forbidden) {
 				t.Fatalf("%s leaked %q:\n%s", name, forbidden, text)
 			}
+		}
+		if name != "account_map.csv" && strings.Contains(text, account.ID) {
+			t.Fatalf("%s leaked raw account id %q:\n%s", name, account.ID, text)
 		}
 	}
 	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv", "account_auth_metadata.csv"} {

@@ -303,7 +303,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 		return nil
 	}
 
-	addCSV("account_map.csv", []string{"account_code", "account_id", "email", "label", "upstream_account_id", "chatgpt_user_id", "declared_provider", "group_name", "status"}, accountMapRows(codebook))
+	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
 	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "token_provider_hint", "access_token_present", "access_token_len", "access_token_type", "refresh_token_present", "refresh_token_len", "openai_api_key_present", "openai_api_key_len", "openai_api_key_type", "id_token_present", "id_token_len", "scopes", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "native_context_window", "native_max_context_window", "effective_context_window_percent", "auto_compact_token_limit", "visibility", "etag", "raw_model_json_hash", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
@@ -332,7 +332,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 		"account_count":       len(codebook.byID),
 		"files":               diagnosticFileOrder(),
 		"row_counts":          rowCounts,
-		"account_redaction":   "business files use account_code; real account identifiers are only in account_map.csv",
+		"account_redaction":   "business files use account_code; account_map.csv contains only account_code and local account_id; email, label, and upstream identity columns are omitted",
 		"account_code_format": "ACC-0001",
 	}
 	rawManifest, err := json.MarshalIndent(manifest, "", "  ")
@@ -649,7 +649,7 @@ func accountMapRows(codebook diagnosticCodebook) [][]string {
 	out := make([][]string, 0, len(ids))
 	for _, id := range ids {
 		info := codebook.byID[id]
-		out = append(out, []string{info.Code, info.AccountID, info.Email, info.Label, info.UpstreamAccountID, info.ChatGPTUserID, info.Provider, info.GroupName, info.Status})
+		out = append(out, []string{info.Code, info.AccountID})
 	}
 	return out
 }

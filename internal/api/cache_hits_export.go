@@ -122,7 +122,7 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"timezone":            win.Window.Timezone,
 		"utc_offset_seconds":  win.Window.UTCOffsetSeconds,
 		"files":               order,
-		"account_redaction":   "business files use account_code; real account identifiers are only in account_map.csv",
+		"account_redaction":   "business files use account_code; account_map.csv contains only account_code and local account_id; email, label, and upstream identity columns are omitted",
 		"api_key_redaction":   "api key hashes are truncated to 12-character prefixes",
 		"hit_tokens_formula":  "cache_read_tokens",
 		"token_hit_rate":      "clamp(hit_tokens / cache_input_tokens)",
@@ -147,7 +147,7 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"by_route_account_model.csv": "",
 		"by_time_bucket.csv":         csvString(cacheBucketHeader(), cacheBucketRows(report.ByTimeBucket)),
 		"route_map.csv":              "",
-		"account_map.csv":            csvString([]string{"account_code", "account_id", "email", "label", "upstream_account_id", "chatgpt_user_id", "provider", "group_name", "status"}, accountMapRows(codebook)),
+		"account_map.csv":            csvString([]string{"account_code", "account_id"}, accountMapRows(codebook)),
 	}
 	routes := newRouteExportCodebook()
 	routes.addRows(report.ByRoute)
