@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
+	"github.com/google/uuid"
 )
 
 type kiroCacheProbeAttempt struct {
@@ -91,11 +93,13 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 		writeKiroError(w, r, http.StatusBadRequest, fmt.Errorf("%w: %s", kirowire.ErrVerifiedModelUnavailable, request.Model))
 		return
 	}
-	// A fixed, public synthetic prefix makes both billable requests byte-identical
-	// without including any account, prompt, user, or credential data. Keep it long
-	// enough to cross common prompt-cache minimums; a tiny "Reply OK" request can
-	// falsely look unsupported even on an endpoint that caches realistic prompts.
-	stableProbePrefix := strings.Repeat("Kiro cache capability probe stable public prefix. ", 900)
+	// A per-run public synthetic prefix makes the two attempts byte-identical while
+	// preventing a previous probe run from warming attempt one. Without the nonce,
+	// repeated probes eventually become read/read and can no longer prove the
+	// required write/read transition. Keep it long enough to cross common prompt-
+	// cache minimums; no account, prompt, user, or credential data is included.
+	probeRunID := uuid.NewString()
+	stableProbePrefix := "Kiro cache capability probe run " + probeRunID + ". " + strings.Repeat("Kiro cache capability probe stable public prefix. ", 900)
 	probeRaw, _ := json.Marshal(map[string]any{
 		"model": resolved,
 		"system": []any{map[string]any{
@@ -107,7 +111,7 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 		"thinking":      map[string]any{"type": "adaptive"},
 		"output_config": map[string]any{"effort": "max"},
 	})
-	affinity := routing.AffinityFromKey("kiro-cache-probe-v1:"+accountID+":"+endpointHash+":"+resolved, "kiro_cache_probe")
+	affinity := routing.AffinityFromKey("kiro-cache-probe-v2:"+accountID+":"+endpointHash+":"+resolved+":"+probeRunID, "kiro_cache_probe")
 	converted, err := kirowire.ConvertAnthropicRequestWithOptions(probeRaw, affinity.Hash, kirowire.ConversionOptions{ForceMaxQuality: true, EnableCachePoints: true, VerifiedModels: verified})
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
@@ -141,15 +145,33 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 	}
 	cacheVerified := len(attempts) == 2 && attempts[0].CacheCreationTokens.Present && attempts[0].CacheCreationTokens.Value > 0 &&
 		attempts[1].CacheReadTokens.Present && attempts[1].CacheReadTokens.Value > 0
+	creditReductionPercent, creditReuseObserved := kiroCacheProbeCreditEvidence(attempts)
+	cacheEvidence := "none"
+	if creditReuseObserved {
+		cacheEvidence = "credits_reduction"
+	}
+	if cacheVerified {
+		cacheEvidence = "token_metadata"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"account_id": accountID, "model": resolved, "endpoint_hash": endpointHash,
 		"egress_id": egress.ID, "session_affinity": affinity.Hash,
 		"stable_request_hash": shortHash(string(converted.Body)),
 		"thinking":            "adaptive", "effort": converted.ThinkingEffort, "max_output_tokens": converted.MaxOutputTokens,
 		"attempts": attempts, "capability": capabilityState,
-		"cache_verified":   cacheVerified,
-		"success_criteria": "first request cache write > 0 and second request cache read > 0",
+		"cache_verified": cacheVerified, "cache_reuse_observed": cacheVerified || creditReuseObserved,
+		"cache_evidence": cacheEvidence, "credit_reduction_percent": creditReductionPercent,
+		"success_criteria": "token metadata: first write > 0 and second read > 0; credits-only endpoints: second request costs at least 10% less",
 	})
+}
+
+func kiroCacheProbeCreditEvidence(attempts []kiroCacheProbeAttempt) (float64, bool) {
+	if len(attempts) != 2 || !attempts[0].Credits.Present || !attempts[1].Credits.Present || attempts[0].Credits.Value <= 0 {
+		return 0, false
+	}
+	reduction := (attempts[0].Credits.Value - attempts[1].Credits.Value) / attempts[0].Credits.Value
+	percent := math.Round(reduction*10000) / 100
+	return percent, reduction >= 0.10
 }
 
 type probeResponseRecorder struct {

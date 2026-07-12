@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"codex-account-pool/internal/prompt"
 )
 
 func TestConvertAnthropicRequestStableAffinityAndLongTool(t *testing.T) {
@@ -282,6 +284,72 @@ func TestConvertAnthropicMapsCacheControlsToKiroCachePoints(t *testing.T) {
 	if len(got.BodyWithoutCachePoints) == 0 || strings.Contains(string(got.BodyWithoutCachePoints), "cachePoint") {
 		t.Fatalf("fallback body still contains cachePoint: %s", got.BodyWithoutCachePoints)
 	}
+	removed, changed, err := RemoveKiroCachePoints(got.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutPoints, err := canonicalJSON(got.BodyWithoutCachePoints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removedCanonical, err := canonicalJSON(removed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || string(removedCanonical) != string(withoutPoints) {
+		t.Fatalf("cachePoint insertion changed non-cache context:\nwith points removed=%s\nfallback=%s", removedCanonical, withoutPoints)
+	}
+}
+
+func TestKiroRollingCachePlanningPreservesConvertedConversation(t *testing.T) {
+	raw := []byte(`{"model":"claude-opus-4.8","system":"stable system","tools":[{"name":"lookup","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"large previous request"},{"role":"assistant","content":"previous response"},{"role":"user","content":"current request"}]}`)
+	marked := prompt.EnsureAnthropicCacheControlWithOptions(raw, prompt.AnthropicCacheControlOptions{
+		Policy: "max_hit", LatestTailWrite: true, PreferRecentTurnRead: true,
+	})
+	cached, err := ConvertAnthropicRequestWithOptions(marked, "rolling-context", ConversionOptions{
+		ForceMaxQuality: true, EnableCachePoints: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := ConvertAnthropicRequestWithOptions(raw, "rolling-context", ConversionOptions{ForceMaxQuality: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.CachePointCount != 4 {
+		t.Fatalf("cache points=%d breakpoints=%+v", cached.CachePointCount, cached.CachePointBreakpoints)
+	}
+	wantBreakpoints := []KiroCachePointBreakpoint{
+		{Section: "tools", ToolIndex: 0}, {Section: "system"},
+		{Section: "messages", MessageIndex: 0}, {Section: "messages", MessageIndex: 2},
+	}
+	if encoded, _ := json.Marshal(cached.CachePointBreakpoints); string(encoded) != mustJSON(t, wantBreakpoints) {
+		t.Fatalf("breakpoints=%s want=%s", encoded, mustJSON(t, wantBreakpoints))
+	}
+	stripped, changed, err := RemoveKiroCachePoints(cached.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strippedCanonical, err := canonicalJSON(stripped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineCanonical, err := canonicalJSON(baseline.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || string(strippedCanonical) != string(baselineCanonical) {
+		t.Fatalf("rolling cache markers changed Kiro context:\nstripped=%s\nbaseline=%s", strippedCanonical, baselineCanonical)
+	}
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func TestConvertAnthropicCachePointCapUsesToolsSystemMessagesOrder(t *testing.T) {

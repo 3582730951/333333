@@ -322,7 +322,7 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 		// Reuse the established max-hit planner, then translate its at-most-four
 		// Anthropic markers into native Kiro cachePoint objects below.
 		raw = prompt.EnsureAnthropicCacheControlWithOptions(raw, prompt.AnthropicCacheControlOptions{
-			Policy: "max_hit", LatestTailWrite: true,
+			Policy: "max_hit", LatestTailWrite: true, PreferRecentTurnRead: true,
 		})
 	}
 	return kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{

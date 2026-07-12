@@ -434,6 +434,43 @@ func TestEnsureAnthropicCacheControlMaxHitWritesLatestTailWithinFour(t *testing.
 	}
 }
 
+func TestEnsureAnthropicCacheControlMaxHitPrefersPreviousTurnForRollingRead(t *testing.T) {
+	raw := []byte(`{"model":"claude","system":[{"type":"text","text":"stable system"}],` +
+		`"tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[` +
+		`{"role":"user","content":[` +
+		`{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# repo\nstable\n</system-reminder>\n\n"},` +
+		`{"type":"text","text":"first request"}]},` +
+		`{"role":"assistant","content":"first response"},` +
+		`{"role":"user","content":"latest request"}]}`)
+	before := anthropicMessageTextSequence(t, raw)
+	out := EnsureAnthropicCacheControlWithOptions(raw, AnthropicCacheControlOptions{
+		Policy: "max_hit", LatestTailWrite: true, PreferRecentTurnRead: true,
+	})
+	after := anthropicMessageTextSequence(t, out)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rolling-read planning changed message text:\nbefore=%#v\nafter=%#v\nbody=%s", before, after, out)
+	}
+	if count := cacheControlCount(t, out); count != 4 {
+		t.Fatalf("rolling-read marker count=%d, want tool+system+previous+latest: %s", count, out)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatal(err)
+	}
+	messages := root["messages"].([]interface{})
+	previous := messages[0].(map[string]interface{})["content"].([]interface{})
+	if _, marked := previous[0].(map[string]interface{})["cache_control"]; marked {
+		t.Fatalf("early auto-context consumed the rolling-turn slot: %v", previous[0])
+	}
+	if _, marked := previous[len(previous)-1].(map[string]interface{})["cache_control"]; !marked {
+		t.Fatalf("previous latest-user boundary was not recreated: %v", previous)
+	}
+	latest := messages[len(messages)-1].(map[string]interface{})["content"].([]interface{})
+	if _, marked := latest[len(latest)-1].(map[string]interface{})["cache_control"]; !marked {
+		t.Fatalf("current latest tail was not written for the next turn: %v", latest)
+	}
+}
+
 func TestEnsureAnthropicCacheControlMaxHitAddsRollingAnchorPastTwentyBlocks(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(`{"model":"claude","system":"stable system","messages":[`)

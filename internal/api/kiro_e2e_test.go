@@ -548,7 +548,7 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 			generateBodies = append(generateBodies, append([]byte(nil), body...))
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"OK"}`)))
 			metadata := `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":1,"cacheReadInputTokens":0,"cacheWriteInputTokens":5,"totalTokens":16}}`
-			if len(generateBodies) == 2 {
+			if len(generateBodies)%2 == 0 {
 				metadata = `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":1,"cacheReadInputTokens":5,"cacheWriteInputTokens":0,"totalTokens":16}}`
 			}
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(metadata)))
@@ -602,11 +602,36 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 			t.Fatalf("cache probe disabled mandatory Kiro quality field %s: %s", required, generateBodies[0])
 		}
 	}
-	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) || !bytes.Contains(probeBody, []byte(`"cache_verified":true`)) || !bytes.Contains(probeBody, []byte(`"credits":{"value":0.5,"present":true}`)) {
+	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) || !bytes.Contains(probeBody, []byte(`"cache_verified":true`)) || !bytes.Contains(probeBody, []byte(`"cache_reuse_observed":true`)) || !bytes.Contains(probeBody, []byte(`"cache_evidence":"token_metadata"`)) || !bytes.Contains(probeBody, []byte(`"credits":{"value":0.5,"present":true}`)) {
 		t.Fatalf("probe did not report real metering: %s", probeBody)
 	}
 	if !bytes.Contains(probeBody, []byte(`"thinking":"adaptive"`)) || !bytes.Contains(probeBody, []byte(`"effort":"max"`)) || !bytes.Contains(probeBody, []byte(`"max_output_tokens":64000`)) {
 		t.Fatalf("cache probe response omitted mandatory quality controls: %s", probeBody)
+	}
+	response, err = http.Post(probeURL, "application/json", strings.NewReader(`{"model":"claude-sonnet-4-6","confirm_cost":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || len(generateBodies) != 4 || !bytes.Equal(generateBodies[2], generateBodies[3]) || bytes.Equal(generateBodies[0], generateBodies[2]) {
+		t.Fatalf("repeated probe did not use a fresh stable pair: status=%d calls=%d", response.StatusCode, len(generateBodies))
+	}
+}
+
+func TestKiroCacheProbeCreditsOnlyEvidenceRequiresMaterialReduction(t *testing.T) {
+	attempt := func(value float64, present bool) kiroCacheProbeAttempt {
+		return kiroCacheProbeAttempt{Credits: kirowire.MeteredFloat{Value: value, Present: present}}
+	}
+	percent, observed := kiroCacheProbeCreditEvidence([]kiroCacheProbeAttempt{attempt(0.20, true), attempt(0.10, true)})
+	if !observed || percent != 50 {
+		t.Fatalf("material credit reduction percent=%v observed=%v", percent, observed)
+	}
+	if percent, observed = kiroCacheProbeCreditEvidence([]kiroCacheProbeAttempt{attempt(0.20, true), attempt(0.19, true)}); observed || percent != 5 {
+		t.Fatalf("noise-level credit reduction percent=%v observed=%v", percent, observed)
+	}
+	if _, observed = kiroCacheProbeCreditEvidence([]kiroCacheProbeAttempt{attempt(0.20, true), attempt(0, false)}); observed {
+		t.Fatal("missing credits became cache evidence")
 	}
 }
 

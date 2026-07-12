@@ -196,21 +196,22 @@ func EnsureAnthropicCacheControl(body []byte, ttl string) []byte {
 }
 
 type AnthropicCacheControlOptions struct {
-	TTL                string
-	Policy             string
-	LatestTailWrite    bool
-	LosslessBlockSplit bool
+	TTL                  string
+	Policy               string
+	LatestTailWrite      bool
+	LosslessBlockSplit   bool
+	PreferRecentTurnRead bool
 }
 
 func EnsureAnthropicCacheControlWithOptions(body []byte, opts AnthropicCacheControlOptions) []byte {
-	return ensureAnthropicCacheControlWithOptions(body, opts.TTL, opts.Policy, opts.LatestTailWrite, opts.LosslessBlockSplit)
+	return ensureAnthropicCacheControlWithOptions(body, opts.TTL, opts.Policy, opts.LatestTailWrite, opts.LosslessBlockSplit, opts.PreferRecentTurnRead)
 }
 
 func EnsureAnthropicCacheControlWithPolicy(body []byte, ttl, policy string) []byte {
-	return ensureAnthropicCacheControlWithOptions(body, ttl, policy, true, false)
+	return ensureAnthropicCacheControlWithOptions(body, ttl, policy, true, false, false)
 }
 
-func ensureAnthropicCacheControlWithOptions(body []byte, ttl, policy string, latestTailWrite, losslessBlockSplit bool) []byte {
+func ensureAnthropicCacheControlWithOptions(body []byte, ttl, policy string, latestTailWrite, losslessBlockSplit, preferRecentTurnRead bool) []byte {
 	if losslessBlockSplit {
 		body = LosslessSplitAnthropicTextBlocks(body)
 	}
@@ -254,7 +255,7 @@ func ensureAnthropicCacheControlWithOptions(body []byte, ttl, policy string, lat
 		return m
 	}
 	if normalizeAnthropicCachePolicy(policy) == "max_hit" {
-		if planAnthropicMaxHitCacheControl(root, mk, latestTailWrite) {
+		if planAnthropicMaxHitCacheControl(root, mk, latestTailWrite, preferRecentTurnRead) {
 			changed = true
 		}
 		return finish()
@@ -308,7 +309,7 @@ func normalizeAnthropicCachePolicy(policy string) string {
 	}
 }
 
-func planAnthropicMaxHitCacheControl(root map[string]interface{}, mk func() map[string]interface{}, latestTailWrite bool) bool {
+func planAnthropicMaxHitCacheControl(root map[string]interface{}, mk func() map[string]interface{}, latestTailWrite, preferRecentTurnRead bool) bool {
 	changed := clearCacheControls(root)
 	budget := 4
 	if markListTail(root["tools"], mk) {
@@ -322,7 +323,7 @@ func planAnthropicMaxHitCacheControl(root map[string]interface{}, mk func() map[
 			changed = true
 		}
 	}
-	if budget > 0 {
+	if budget > 0 && !preferRecentTurnRead {
 		if markClaudeNativeAutoContext(root["messages"], mk) {
 			budget--
 			changed = true
@@ -331,6 +332,24 @@ func planAnthropicMaxHitCacheControl(root map[string]interface{}, mk func() map[
 	latestReserve := 0
 	if latestTailWrite && latestCacheableMessageIndex(root["messages"]) >= 0 {
 		latestReserve = 1
+	}
+	// Kiro can reuse a cache written at the previous request's latest-user
+	// boundary only if the next request recreates a cachePoint at that same
+	// boundary after it moves into history. Prefer that rolling read over an
+	// extra early auto-context marker while still reserving one slot to write the
+	// current tail for the following turn. This changes markers only; message
+	// bytes, roles, ordering, tool results, and generation controls are untouched.
+	if preferRecentTurnRead && budget > latestReserve {
+		if markSecondToLastUserTurn(root["messages"], mk) {
+			budget--
+			changed = true
+		}
+	}
+	if preferRecentTurnRead && budget > latestReserve {
+		if markClaudeNativeAutoContext(root["messages"], mk) {
+			budget--
+			changed = true
+		}
 	}
 	if budget > latestReserve {
 		used := markRollingHistoryAnchors(root["messages"], mk, budget-latestReserve)
