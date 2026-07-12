@@ -438,6 +438,36 @@ func TestKiroStreamingForwardsFirstSemanticFrameBeforeUpstreamCompletes(t *testi
 	}
 }
 
+func TestKiroStreamingReassemblesIDlessObjectToolFrames(t *testing.T) {
+	const toolID = "toolu_bdrk_01EEWdCWVs59fnqL8QSH9cxw"
+	upstream := bytes.Join([][]byte{
+		kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"name":"Fetch","toolUseId":"`+toolID+`"}`)),
+		kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"input":{"url":"https://www.elsevier.support/example","prompt":"Extract the answer"}}`)),
+		kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"stop":true}`)),
+	}, nil)
+
+	var downstream bytes.Buffer
+	emitter := newKiroAnthropicEmitter(&downstream, nil, "claude-opus-4.8", "msg_tool")
+	data, err := streamKiroResponse(bytes.NewReader(upstream), nil, emitter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emitter.finish(data)
+	body := downstream.String()
+	if len(data.Tools) != 1 || data.Tools[0].ID != toolID {
+		t.Fatalf("tools=%+v", data.Tools)
+	}
+	if strings.Count(body, `"type":"tool_use"`) != 1 || !strings.Contains(body, `"id":"`+toolID+`"`) {
+		t.Fatalf("tool block was split or lost:\n%s", body)
+	}
+	if !strings.Contains(body, `"partial_json":"{\"url\":\"https://www.elsevier.support/example\",\"prompt\":\"Extract the answer\"}"`) {
+		t.Fatalf("complete object input was not forwarded:\n%s", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Fatalf("unexpected downstream error:\n%s", body)
+	}
+}
+
 func TestKiroAutoSessionNeverSwitchesBoundAccount(t *testing.T) {
 	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

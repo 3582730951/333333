@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/capability"
+	"github.com/google/uuid"
 )
 
 const (
@@ -175,27 +176,28 @@ func webSearchSummary(data *WebSearchData) string {
 }
 
 type ResponseProcessor struct {
-	names     map[string]string
-	data      ResponseData
-	toolIndex map[string]int
-	tagParser thinkingTagParser
-	losses    map[string]struct{}
+	names      map[string]string
+	data       ResponseData
+	activeTool ToolCall
+	toolActive bool
+	tagParser  thinkingTagParser
+	losses     map[string]struct{}
 }
 
 func NewResponseProcessor(names map[string]string) *ResponseProcessor {
-	return &ResponseProcessor{names: names, toolIndex: map[string]int{}, losses: map[string]struct{}{}}
+	return &ResponseProcessor{names: names, losses: map[string]struct{}{}}
 }
 
 func (p *ResponseProcessor) Data() ResponseData {
 	out := p.data
+	if p.toolActive {
+		out.Tools = append(append([]ToolCall(nil), out.Tools...), p.activeTool)
+	}
 	out.CompatibilityLosses = sortedStringSet(p.losses)
 	return out
 }
 
 func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
-	if p.toolIndex == nil {
-		p.toolIndex = map[string]int{}
-	}
 	messageType := frame.HeaderString(":message-type")
 	if messageType == "error" || messageType == "exception" {
 		if messageType == "exception" && frame.HeaderString(":exception-type") == "ContentLengthExceededException" {
@@ -237,25 +239,7 @@ func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
 		}
 		return deltas, nil
 	case "toolUseEvent":
-		id := rawJSONString(fields["toolUseId"])
-		if id == "" {
-			id = rawScalarString(fields["toolUseId"])
-		}
-		index, exists := p.toolIndex[id]
-		name := rawJSONString(fields["name"])
-		if original := p.names[name]; original != "" {
-			name = original
-		}
-		if !exists {
-			index = len(p.data.Tools)
-			p.toolIndex[id] = index
-			p.data.Tools = append(p.data.Tools, ToolCall{ID: id, Name: name})
-		} else if p.data.Tools[index].Name == "" && name != "" {
-			p.data.Tools[index].Name = name
-		}
-		input := rawJSONString(fields["input"])
-		p.data.Tools[index].Input += input
-		return []ResponseDelta{{Kind: "tool", ToolID: id, ToolName: p.data.Tools[index].Name, ToolInput: input, NewTool: !exists}}, nil
+		return p.processToolUseEvent(fields)
 	case "metadataEvent":
 		p.data.Metering.EventCount++
 		p.data.Metering.MetadataEventCount++
@@ -295,6 +279,123 @@ func (p *ResponseProcessor) syncMeteringFields() {
 	p.data.UsageSource = p.data.Metering.UsageSource()
 }
 
+// processToolUseEvent follows Kiro's stateful tool event protocol. Only the
+// opening frame is guaranteed to carry name/toolUseId; input and stop frames
+// commonly omit both. Input may be either JSON text fragments or a complete JSON
+// object. Buffer until the tool is complete so a replacement object or malformed
+// fragment can never be forwarded as an irreversible downstream SSE delta.
+func (p *ResponseProcessor) processToolUseEvent(fields map[string]json.RawMessage) ([]ResponseDelta, error) {
+	id := rawJSONString(fields["toolUseId"])
+	if id == "" {
+		id = rawScalarString(fields["toolUseId"])
+	}
+	name := rawJSONString(fields["name"])
+	if original := p.names[name]; original != "" {
+		name = original
+	}
+
+	var deltas []ResponseDelta
+	if id != "" && p.toolActive && id != p.activeTool.ID {
+		delta, err := p.finishActiveTool()
+		if err != nil {
+			return nil, err
+		}
+		deltas = append(deltas, delta)
+	}
+	if !p.toolActive && (id != "" || name != "") {
+		if id == "" {
+			id = newSyntheticToolID()
+		}
+		p.activeTool = ToolCall{ID: id, Name: name}
+		p.toolActive = true
+	} else if p.toolActive && p.activeTool.Name == "" && name != "" {
+		p.activeTool.Name = name
+	}
+
+	if raw, present := fields["input"]; present {
+		if !p.toolActive {
+			return nil, fmt.Errorf("%w: tool input arrived before tool start", ErrInvalidToolInput)
+		}
+		input, replace, err := decodeToolInput(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: tool_use_id=%s: %v", ErrInvalidToolInput, p.activeTool.ID, err)
+		}
+		if replace {
+			p.activeTool.Input = input
+		} else {
+			p.activeTool.Input += input
+		}
+	}
+
+	var stop bool
+	_ = json.Unmarshal(fields["stop"], &stop)
+	if stop && p.toolActive {
+		delta, err := p.finishActiveTool()
+		if err != nil {
+			return nil, err
+		}
+		deltas = append(deltas, delta)
+	}
+	return deltas, nil
+}
+
+func (p *ResponseProcessor) finishActiveTool() (ResponseDelta, error) {
+	tool := p.activeTool
+	input, err := normalizeToolInput(tool.Input)
+	if err != nil {
+		return ResponseDelta{}, fmt.Errorf("%w: tool_use_id=%s: %v", ErrInvalidToolInput, tool.ID, err)
+	}
+	tool.Input = input
+	p.data.Tools = append(p.data.Tools, tool)
+	p.activeTool = ToolCall{}
+	p.toolActive = false
+	return ResponseDelta{Kind: "tool", ToolID: tool.ID, ToolName: tool.Name, ToolInput: tool.Input, NewTool: true}, nil
+}
+
+func newSyntheticToolID() string {
+	return "toolu_kiro_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+}
+
+func decodeToolInput(raw json.RawMessage) (input string, replace bool, err error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "", false, errors.New("empty input field")
+	}
+	if trimmed[0] == '"' {
+		if err := json.Unmarshal(trimmed, &input); err != nil {
+			return "", false, errors.New("input string is not valid JSON")
+		}
+		return input, false, nil
+	}
+	// A non-string input is a complete value, not a stream fragment. Kiro uses
+	// this shape for native tool calls, so it replaces any partial text collected
+	// before it instead of being concatenated with it.
+	return string(trimmed), true, nil
+}
+
+func normalizeToolInput(input string) (string, error) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return "{}", nil
+	}
+	// Some endpoint versions wrap the completed JSON object in one additional
+	// JSON string. Unwrap it without guessing at or repairing malformed content.
+	if strings.HasPrefix(trimmed, `"`) {
+		var nested string
+		if err := json.Unmarshal([]byte(trimmed), &nested); err == nil {
+			trimmed = strings.TrimSpace(nested)
+		}
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
+		return "", errors.New("input is not valid JSON")
+	}
+	if object == nil {
+		return "", errors.New("input must be a JSON object")
+	}
+	return trimmed, nil
+}
+
 func (p *ResponseProcessor) Finish() ([]ResponseDelta, error) {
 	var deltas []ResponseDelta
 	parsed, usedFallback := p.tagParser.Finish()
@@ -305,10 +406,19 @@ func (p *ResponseProcessor) Finish() ([]ResponseDelta, error) {
 		p.appendTextDelta(delta)
 		deltas = append(deltas, delta)
 	}
-	for _, tool := range p.data.Tools {
-		if strings.TrimSpace(tool.Input) == "" || !json.Valid([]byte(tool.Input)) {
-			return deltas, fmt.Errorf("%w: tool_use_id=%s", ErrInvalidToolInput, tool.ID)
+	if p.toolActive {
+		delta, err := p.finishActiveTool()
+		if err != nil {
+			return deltas, err
 		}
+		deltas = append(deltas, delta)
+	}
+	for i := range p.data.Tools {
+		input, err := normalizeToolInput(p.data.Tools[i].Input)
+		if err != nil {
+			return deltas, fmt.Errorf("%w: tool_use_id=%s: %v", ErrInvalidToolInput, p.data.Tools[i].ID, err)
+		}
+		p.data.Tools[i].Input = input
 	}
 	if len(p.data.Tools) > 0 {
 		p.data.StopReason = "tool_use"
@@ -360,9 +470,29 @@ func DecodeResponse(r io.Reader, names map[string]string) (ResponseData, error) 
 func applyFrame(out *ResponseData, frame Frame, names map[string]string, tools map[string]int) error {
 	processor := NewResponseProcessor(names)
 	processor.data = *out
-	processor.toolIndex = tools
+	// applyFrame predates the stateful processor and has no production callers.
+	// Preserve state through a private sentinel for package-local compatibility;
+	// streaming and non-streaming production decoders keep one processor instead.
+	const activeToolIndexKey = "\x00kiro-active-tool"
+	if index, ok := tools[activeToolIndexKey]; ok && index >= 0 && index < len(processor.data.Tools) {
+		processor.activeTool = processor.data.Tools[index]
+		processor.data.Tools = append(processor.data.Tools[:index], processor.data.Tools[index+1:]...)
+		processor.toolActive = true
+	}
 	_, err := processor.ProcessFrame(frame)
-	*out = processor.Data()
+	result := processor.Data()
+	if tools != nil {
+		for key := range tools {
+			delete(tools, key)
+		}
+		for index, tool := range result.Tools {
+			tools[tool.ID] = index
+		}
+		if processor.toolActive {
+			tools[activeToolIndexKey] = len(result.Tools) - 1
+		}
+	}
+	*out = result
 	return err
 }
 

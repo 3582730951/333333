@@ -93,6 +93,76 @@ func TestDecodeResponseToolAndUsage(t *testing.T) {
 	}
 }
 
+func TestDecodeResponseToolUsesStateAcrossIDlessObjectAndStopFrames(t *testing.T) {
+	const toolID = "toolu_bdrk_01EEWdCWVs59fnqL8QSH9cxw"
+	raw := bytes.Join([][]byte{
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"name":"Fetch","toolUseId":"`+toolID+`"}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"input":{"url":"https://www.elsevier.support/publishing/answer/how-do-i-include-highlights-with-my-manuscript","prompt":"Extract the answer"}}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"stop":true}`)),
+	}, nil)
+
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tools) != 1 {
+		t.Fatalf("tools=%+v", got.Tools)
+	}
+	tool := got.Tools[0]
+	if tool.ID != toolID || tool.Name != "Fetch" || tool.Input != `{"url":"https://www.elsevier.support/publishing/answer/how-do-i-include-highlights-with-my-manuscript","prompt":"Extract the answer"}` {
+		t.Fatalf("tool=%+v", tool)
+	}
+	if got.StopReason != "tool_use" {
+		t.Fatalf("stop_reason=%q", got.StopReason)
+	}
+}
+
+func TestResponseProcessorBuffersToolUntilStopAndEmitsCompleteJSON(t *testing.T) {
+	processor := NewResponseProcessor(nil)
+	decoder := NewDecoder()
+	raw := bytes.Join([][]byte{
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"name":"Fetch","toolUseId":"toolu_1"}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"input":"{\"url\":"}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"input":"\"https://example.test\"}"}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"stop":true}`)),
+	}, nil)
+	frames, err := decoder.Feed(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deltas []ResponseDelta
+	for _, frame := range frames {
+		frameDeltas, frameErr := processor.ProcessFrame(frame)
+		if frameErr != nil {
+			t.Fatal(frameErr)
+		}
+		deltas = append(deltas, frameDeltas...)
+	}
+	if len(deltas) != 1 {
+		t.Fatalf("deltas=%+v", deltas)
+	}
+	if deltas[0].ToolID != "toolu_1" || deltas[0].ToolInput != `{"url":"https://example.test"}` || !deltas[0].NewTool {
+		t.Fatalf("delta=%+v", deltas[0])
+	}
+	if _, err := processor.Finish(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDecodeResponseSynthesizesIDAndNormalizesEmptyToolInput(t *testing.T) {
+	raw := bytes.Join([][]byte{
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"name":"ExitPlanMode"}`)),
+		testFrame(map[string]string{":message-type": "event", ":event-type": "toolUseEvent"}, []byte(`{"stop":true}`)),
+	}, nil)
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Tools) != 1 || !strings.HasPrefix(got.Tools[0].ID, "toolu_kiro_") || got.Tools[0].Input != `{}` {
+		t.Fatalf("tools=%+v", got.Tools)
+	}
+}
+
 func TestDecodeWebSearchResponseProducesAnthropicBlocks(t *testing.T) {
 	raw := []byte(`{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{\"results\":[{\"title\":\"Kiro\",\"url\":\"https://example.test\",\"snippet\":\"result\"}]}"}]}}`)
 	data, err := DecodeWebSearchResponse(raw, WebSearchRequest{Query: "kiro", ToolUseID: "srvtoolu_1"}, 9)
