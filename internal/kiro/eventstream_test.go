@@ -76,6 +76,10 @@ func TestDecodeResponseRejectsTruncatedAndExceptionFrames(t *testing.T) {
 	if _, err := DecodeResponse(bytes.NewReader(exception), nil); err == nil {
 		t.Fatal("expected exception frame error")
 	}
+	tooLong := testFrame(map[string]string{":message-type": "exception", ":exception-type": "ContentLengthExceededException"}, []byte(`{"message":"Input is too long."}`))
+	if _, err := DecodeResponse(bytes.NewReader(tooLong), nil); !errors.Is(err, ErrContextTooLong) {
+		t.Fatalf("content length exception = %v, want ErrContextTooLong", err)
+	}
 }
 
 func TestDecodeResponseToolAndUsage(t *testing.T) {
@@ -145,6 +149,69 @@ func TestKiroMeteringRejectsNegativeAndFractionalTokenCounts(t *testing.T) {
 	}
 	if got.Metering.InputTokens.Present || got.Metering.OutputTokens.Present || got.Metering.CacheReadTokens.Present {
 		t.Fatalf("invalid metering values were accepted: %+v", got.Metering)
+	}
+}
+
+func TestKiroMetadataTokenUsageAndCreditsAreIndependent(t *testing.T) {
+	metadata := testFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":11,"cacheReadInputTokens":7,"cacheWriteInputTokens":3,"outputTokens":5,"totalTokens":26}}`))
+	metering := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"usage":1.25}`))
+	for _, raw := range [][]byte{bytes.Join([][]byte{metadata, metering}, nil), bytes.Join([][]byte{metering, metadata}, nil)} {
+		got, err := DecodeResponse(bytes.NewReader(raw), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := got.Metering
+		if got.UsageSource != UsageSourceUpstream || got.InputTokens != 11 || got.OutputTokens != 5 || got.CacheReadTokens != 7 || got.CacheCreationTokens != 3 {
+			t.Fatalf("metadata token buckets = %+v data=%+v", m, got)
+		}
+		if !m.TotalInputTokens.Present || m.TotalInputTokens.Value != 21 || !m.TotalTokens.Present || m.TotalTokens.Value != 26 {
+			t.Fatalf("metadata totals = %+v", m)
+		}
+		if !m.Credits.Present || m.Credits.Value != 1.25 || m.MetadataEventCount != 1 || m.MeteringEventCount != 1 || m.EventCount != 2 {
+			t.Fatalf("event/credit metadata = %+v", m)
+		}
+	}
+}
+
+func TestKiroMetadataOverridesLegacyMeteringRegardlessOfOrder(t *testing.T) {
+	metadata := testFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"usage":{"uncachedInputTokens":0,"cacheReadInputTokens":9,"cacheWriteInputTokens":2,"outputTokens":4}}`))
+	legacy := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":999,"outputTokens":888,"cacheReadTokens":777}`))
+	for _, raw := range [][]byte{bytes.Join([][]byte{metadata, legacy}, nil), bytes.Join([][]byte{legacy, metadata}, nil)} {
+		got, err := DecodeResponse(bytes.NewReader(raw), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Metering.InputTokens.Present || got.InputTokens != 0 || got.OutputTokens != 4 || got.CacheReadTokens != 9 || got.CacheCreationTokens != 2 || got.Metering.TotalInputTokens.Value != 11 {
+			t.Fatalf("metadata did not override legacy fields: %+v", got.Metering)
+		}
+	}
+}
+
+func TestKiroCreditsOnlyIsNotUpstreamZeroTokenUsage(t *testing.T) {
+	raw := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"usage":0}`))
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UsageSource != UsageSourceUnreported || got.Metering.UsageSource() != UsageSourceUnreported {
+		t.Fatalf("credits-only event became token usage: %+v", got.Metering)
+	}
+	if !got.Metering.Credits.Present || got.Metering.Credits.Value != 0 {
+		t.Fatalf("reported zero credits lost presence: %+v", got.Metering.Credits)
+	}
+}
+
+func TestKiroNestedMeteringCredits(t *testing.T) {
+	raw := testFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"meteringEvent":{"usage":0.75}}`))
+	got, err := DecodeResponse(bytes.NewReader(raw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Metering.Credits.Present || got.Metering.Credits.Value != 0.75 {
+		t.Fatalf("nested credits were not parsed: %+v", got.Metering.Credits)
+	}
+	if got.Metering.UsageSource() != UsageSourceUnreported {
+		t.Fatalf("nested credits became token usage: %+v", got.Metering)
 	}
 }
 

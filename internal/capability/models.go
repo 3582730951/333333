@@ -146,6 +146,27 @@ func KiroSupportsAdaptiveThinking(model string) bool {
 	return false
 }
 
+// KiroContextWindow returns the conservative context window used by the Kiro
+// request planner when the account capability table has no exact value. Keep
+// this aligned with StaticKiroModels: the generateAssistantResponse catalogue
+// exposes one-million-token windows for the newer families, while 4.5/Haiku
+// models retain the 200k window. Unknown future versions use 200k until a live
+// capability proves otherwise.
+func KiroContextWindow(model string) int64 {
+	canonical, ok := KiroCanonicalModel(model)
+	if !ok {
+		return 200000
+	}
+	switch canonical {
+	case "claude-sonnet-5", "claude-sonnet-4.6",
+		"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6",
+		"claude-fable-5":
+		return 1000000
+	default:
+		return 200000
+	}
+}
+
 // KiroPlanAllowsBootstrap reports whether an unverified concrete model may be
 // attempted for the account's current subscription. Runtime-verified models are
 // handled separately by the scheduler; this guard stops a stale static capability

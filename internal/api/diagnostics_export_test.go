@@ -7,6 +7,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -118,15 +119,22 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}
 
 	var manifest struct {
-		Format string         `json:"format"`
-		Files  []string       `json:"files"`
-		Rows   map[string]int `json:"row_counts"`
+		Format             string                 `json:"format"`
+		Files              []string               `json:"files"`
+		Rows               map[string]int         `json:"row_counts"`
+		CurrentAccounts    int                    `json:"current_account_count"`
+		HistoricalAccounts int                    `json:"historical_reference_account_count"`
+		Build              map[string]interface{} `json:"build"`
+		TableTimeRanges    map[string]interface{} `json:"table_time_ranges"`
 	}
 	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
 		t.Fatalf("manifest json: %v\n%s", err, files["manifest.json"])
 	}
 	if manifest.Format != "codex-pool-diagnostics-v2" {
 		t.Fatalf("manifest format = %q, want codex-pool-diagnostics-v2", manifest.Format)
+	}
+	if manifest.CurrentAccounts != 1 || manifest.HistoricalAccounts != 1 || manifest.Build == nil || manifest.TableTimeRanges["usage_records.csv"] == nil {
+		t.Fatalf("manifest account/build/range metadata = %+v", manifest)
 	}
 	for _, name := range required {
 		if _, ok := manifest.Rows[name]; !ok {
@@ -185,6 +193,144 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		if _, ok := summary[key]; !ok {
 			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
 		}
+	}
+}
+
+func TestDiagnosticSummaryUsesSchedulerExhaustionAndSeparatesWindows(t *testing.T) {
+	now := storage.Now()
+	accounts := []storage.Account{
+		{ID: "allowed", GroupName: "g", Provider: "codex", Status: "active"},
+		{ID: "exhausted", GroupName: "g", Provider: "codex", Status: "active"},
+	}
+	rateLimits := []storage.AccountRateLimit{
+		{AccountID: "allowed", Provider: "codex", LimiterType: "5h_polled", RemainingTokens: -1, RemainingRequests: 0, ResetAt: now + 3600, Status: "allowed_warning"},
+		{AccountID: "exhausted", Provider: "codex", LimiterType: "5h_polled", RemainingTokens: 0, RemainingRequests: -1, ResetAt: now + 3600, Status: "rejected"},
+	}
+	audit := []storage.AuditLogRow{
+		{AccountID: "allowed", Action: "routing_unavailable", Detail: "status=409 cooldown", CreatedAt: now - 48*3600},
+		{AccountID: "allowed", Action: "routing_unavailable", Detail: "status=409 pending health re-check", CreatedAt: now - 60},
+		{AccountID: "allowed", State: "banned", CreatedAt: now - 30},
+		{AccountID: "allowed", Action: "ban_delete_failed", CreatedAt: now - 20},
+	}
+	holds := []diagnosticBillingHold{
+		{Status: "held", CreatedAt: now - 30},
+		{Status: "held", CreatedAt: now - 2*3600},
+		{Status: "expired_unsettled", CreatedAt: now - 3*3600},
+	}
+	summary := diagnosticSummary(accounts, map[string]storage.AccountToken{}, audit, holds, nil, rateLimits)
+	raw, _ := json.Marshal(summary)
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	groups := decoded["groups"].(map[string]interface{})
+	group := groups["g"].(map[string]interface{})
+	if group["rate_limit_cooldown"] != float64(1) {
+		t.Fatalf("allowed_warning was counted as cooldown: %s", raw)
+	}
+	lifetime := decoded["lifetime"].(map[string]interface{})
+	last24h := decoded["last_24h"].(map[string]interface{})
+	if lifetime["routing_409_events"].(map[string]interface{})["rate_limit_cooldown"] != float64(1) {
+		t.Fatalf("lifetime 409 events missing: %s", raw)
+	}
+	if _, found := last24h["routing_409_events"].(map[string]interface{})["rate_limit_cooldown"]; found {
+		t.Fatalf("historical 409 leaked into last-24h/current view: %s", raw)
+	}
+	banned := last24h["banned_accounts"].(map[string]interface{})
+	if banned["events"].(map[string]interface{})["discovered"] != float64(1) || banned["unique_accounts"].(map[string]interface{})["discovered"] != float64(1) {
+		t.Fatalf("ban event/unique counts = %s", raw)
+	}
+	holdSummary := decoded["billing_holds"].(map[string]interface{})
+	if holdSummary["current_fresh_held"] != float64(1) || holdSummary["historical_stale_held"] != float64(1) {
+		t.Fatalf("fresh/stale holds were conflated: %s", raw)
+	}
+}
+
+func TestApplyDiagnosticAuditSummaryUsesSQLAggregates(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	now := storage.Now()
+	rows := []storage.AuditLogRow{
+		{AccountID: "acc-a", Action: "routing_unavailable", Detail: "status=409 rate-limit cooldown"},
+		{AccountID: "acc-a", Action: "health_test", Detail: "model=claude-opus-4.8 result=ok"},
+		{AccountID: "acc-a", State: "banned"},
+		{AccountID: "acc-a", State: "banned"},
+	}
+	for _, row := range rows {
+		if err := h.store.InsertAuditLog(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.store.DB().ExecContext(ctx, `UPDATE audit_log SET created_at=? WHERE action='routing_unavailable'`, now-48*3600); err != nil {
+		t.Fatal(err)
+	}
+	summary := diagnosticSummary(nil, nil, nil, nil, nil, nil)
+	if err := applyDiagnosticAuditSummary(ctx, h.store.DB(), summary); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(summary)
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	lifetime := decoded["lifetime"].(map[string]interface{})
+	last24h := decoded["last_24h"].(map[string]interface{})
+	if lifetime["routing_409_events"].(map[string]interface{})["rate_limit_cooldown"] != float64(1) {
+		t.Fatalf("SQL routing aggregate missing: %s", raw)
+	}
+	if _, ok := last24h["routing_409_events"].(map[string]interface{})["rate_limit_cooldown"]; ok {
+		t.Fatalf("old SQL routing event leaked into recent window: %s", raw)
+	}
+	if last24h["health_test_events_by_model"].(map[string]interface{})["claude-opus-4.8"] != float64(1) {
+		t.Fatalf("SQL health aggregate missing: %s", raw)
+	}
+	banned := last24h["banned_accounts"].(map[string]interface{})
+	if banned["events"].(map[string]interface{})["discovered"] != float64(2) || banned["unique_accounts"].(map[string]interface{})["discovered"] != float64(1) {
+		t.Fatalf("SQL ban event/unique aggregate mismatch: %s", raw)
+	}
+}
+
+type discardDiagnosticResponseWriter struct {
+	header   http.Header
+	writes   int
+	bytes    int64
+	maxWrite int
+}
+
+func (w *discardDiagnosticResponseWriter) Header() http.Header { return w.header }
+func (w *discardDiagnosticResponseWriter) WriteHeader(int)     {}
+func (w *discardDiagnosticResponseWriter) Write(p []byte) (int, error) {
+	w.writes++
+	w.bytes += int64(len(p))
+	if len(p) > w.maxWrite {
+		w.maxWrite = len(p)
+	}
+	return len(p), nil
+}
+
+func TestDiagnosticsExportStreamsLargeUsageTableInBoundedWrites(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	account := storage.Account{ID: "stream-export", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 8*1024)
+	for i := 0; i < 400; i++ {
+		raw := json.RawMessage(`{"row":"` + strconv.Itoa(i) + `","payload":"` + large + `"}`)
+		if err := h.store.InsertUsageRecord(ctx, account.ID, "route-"+strconv.Itoa(i), "hash", "user", "gpt-5.5", 10, 1, 11, 0, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := &discardDiagnosticResponseWriter{header: http.Header{}}
+	if err := h.app.streamDiagnosticsExport(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	if w.header.Get("Content-Type") != "application/zip" || w.bytes == 0 || w.writes < 4 {
+		t.Fatalf("stream output header=%v bytes=%d writes=%d", w.header, w.bytes, w.writes)
+	}
+	if w.maxWrite >= 1<<20 {
+		t.Fatalf("export buffered an oversized archive chunk: max write=%d", w.maxWrite)
 	}
 }
 

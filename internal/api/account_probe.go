@@ -370,6 +370,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 	// must work even when model probing is disabled).
 	s.startRecheckLoop(ctx)
 	s.startBillingHoldExpiryLoop(ctx)
+	s.startLogRetentionLoop(ctx)
 	interval := time.Duration(s.cfg.ModelProbeIntervalHours) * time.Hour
 	if interval <= 0 {
 		return

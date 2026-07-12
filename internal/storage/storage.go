@@ -260,6 +260,7 @@ type KiroRuntimeCapability struct {
 	ModelState                string `json:"model_state"`
 	ThinkingState             string `json:"thinking_state"`
 	CacheCapability           string `json:"cache_capability"`
+	CachePointState           string `json:"cache_point_state"`
 	Observations              int64  `json:"observations"`
 	MeteringEvents            int64  `json:"metering_events"`
 	CacheReportedObservations int64  `json:"cache_reported_observations"`
@@ -834,6 +835,7 @@ CREATE TABLE IF NOT EXISTS kiro_runtime_capabilities(
   model_state TEXT NOT NULL DEFAULT 'unknown',
   thinking_state TEXT NOT NULL DEFAULT 'unknown',
   cache_capability TEXT NOT NULL DEFAULT 'unknown',
+	cache_point_state TEXT NOT NULL DEFAULT 'unknown',
   observations INTEGER NOT NULL DEFAULT 0,
   metering_events INTEGER NOT NULL DEFAULT 0,
   cache_reported_observations INTEGER NOT NULL DEFAULT 0,
@@ -936,6 +938,7 @@ CREATE TABLE IF NOT EXISTS cf_events(
 );
 CREATE INDEX IF NOT EXISTS idx_cf_events_account_egress_time ON cf_events(account_id, egress_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cf_events_egress_time ON cf_events(egress_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cf_events_created_at ON cf_events(created_at);
 CREATE TABLE IF NOT EXISTS virtual_context_ledger(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   route_key_hash TEXT NOT NULL,
@@ -960,6 +963,7 @@ CREATE TABLE IF NOT EXISTS billing_holds(
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_billing_holds_status_updated ON billing_holds(status, updated_at);
 CREATE TABLE IF NOT EXISTS usage_records(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL,
@@ -1221,6 +1225,7 @@ CREATE TABLE IF NOT EXISTS registration_task_events(
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reg_events_task ON registration_task_events(task_id);
+CREATE INDEX IF NOT EXISTS idx_reg_events_created_at ON registration_task_events(created_at);
 
 CREATE TABLE IF NOT EXISTS provider_settings(
   id TEXT PRIMARY KEY,
@@ -1340,6 +1345,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN max_possible_cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_hit_after_prewarm INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN singleflight_waited_requests INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_point_state TEXT NOT NULL DEFAULT 'unknown'`,
 		`ALTER TABLE usage_records ADD COLUMN diagnostics_miss_reason TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0`,
@@ -1405,6 +1411,7 @@ func (s *Store) migrate(ctx context.Context) error {
   model_state TEXT NOT NULL DEFAULT 'unknown',
   thinking_state TEXT NOT NULL DEFAULT 'unknown',
   cache_capability TEXT NOT NULL DEFAULT 'unknown',
+	cache_point_state TEXT NOT NULL DEFAULT 'unknown',
   observations INTEGER NOT NULL DEFAULT 0,
   metering_events INTEGER NOT NULL DEFAULT 0,
   cache_reported_observations INTEGER NOT NULL DEFAULT 0,
@@ -2992,8 +2999,8 @@ func (s *Store) EnsureKiroRuntimeModels(ctx context.Context, accountID, endpoint
 			continue
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
-account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, updated_at)
-VALUES(?, ?, ?, 'unknown', 'unknown', 'unknown', ?)
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state, updated_at)
+VALUES(?, ?, ?, 'unknown', 'unknown', 'unknown', 'unknown', ?)
 ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET updated_at=excluded.updated_at`, accountID, endpointHash, model, Now()); err != nil {
 			return err
 		}
@@ -3003,18 +3010,18 @@ ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET updated_at=excluded.
 
 func (s *Store) GetKiroRuntimeCapability(ctx context.Context, accountID, endpointHash, model string) (KiroRuntimeCapability, error) {
 	var capability KiroRuntimeCapability
-	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability,
+	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
 observations, metering_events, cache_reported_observations, cache_hit_observations, consecutive_unreported,
 unknown_cache_schema_json, updated_at
 FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=?`, accountID, endpointHash, model).Scan(
-		&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability,
+		&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState,
 		&capability.Observations, &capability.MeteringEvents, &capability.CacheReportedObservations, &capability.CacheHitObservations,
 		&capability.ConsecutiveUnreported, &capability.UnknownCacheSchemaJSON, &capability.UpdatedAt)
 	return capability, err
 }
 
 func (s *Store) ListKiroRuntimeCapabilities(ctx context.Context, accountID string) ([]KiroRuntimeCapability, error) {
-	query := `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability,
+	query := `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
 observations, metering_events, cache_reported_observations, cache_hit_observations, consecutive_unreported,
 unknown_cache_schema_json, updated_at FROM kiro_runtime_capabilities`
 	args := []any{}
@@ -3031,7 +3038,7 @@ unknown_cache_schema_json, updated_at FROM kiro_runtime_capabilities`
 	var out []KiroRuntimeCapability
 	for rows.Next() {
 		var capability KiroRuntimeCapability
-		if err := rows.Scan(&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability,
+		if err := rows.Scan(&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState,
 			&capability.Observations, &capability.MeteringEvents, &capability.CacheReportedObservations, &capability.CacheHitObservations,
 			&capability.ConsecutiveUnreported, &capability.UnknownCacheSchemaJSON, &capability.UpdatedAt); err != nil {
 			return nil, err
@@ -3075,12 +3082,12 @@ func (s *Store) ObserveKiroCapability(ctx context.Context, accountID, endpointHa
 	defer tx.Rollback()
 	capability := KiroRuntimeCapability{
 		AccountID: accountID, EndpointHash: endpointHash, Model: model,
-		ModelState: "unknown", ThinkingState: "unknown", CacheCapability: "unknown",
+		ModelState: "unknown", ThinkingState: "unknown", CacheCapability: "unknown", CachePointState: "unknown",
 	}
-	err = tx.QueryRowContext(ctx, `SELECT model_state, thinking_state, cache_capability, observations, metering_events,
+	err = tx.QueryRowContext(ctx, `SELECT model_state, thinking_state, cache_capability, cache_point_state, observations, metering_events,
 cache_reported_observations, cache_hit_observations, consecutive_unreported, unknown_cache_schema_json, updated_at
 FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=?`, accountID, endpointHash, model).Scan(
-		&capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.Observations, &capability.MeteringEvents,
+		&capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState, &capability.Observations, &capability.MeteringEvents,
 		&capability.CacheReportedObservations, &capability.CacheHitObservations, &capability.ConsecutiveUnreported,
 		&capability.UnknownCacheSchemaJSON, &capability.UpdatedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -3114,8 +3121,10 @@ FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=
 			capability.CacheCapability = "explicitly_unsupported"
 		}
 		capability.ConsecutiveUnreported = 0
-	case observation.MeteringEvents > 0:
-		capability.ConsecutiveUnreported += int64(observation.MeteringEvents)
+	case observation.ModelSucceeded:
+		// Count successful responses, not the number of event envelopes in a
+		// response. A provider may emit multiple metering events for one request.
+		capability.ConsecutiveUnreported++
 		if capability.ConsecutiveUnreported >= int64(observation.UnreportedThreshold) && capability.CacheCapability == "unknown" {
 			capability.CacheCapability = "unreported"
 		}
@@ -3126,16 +3135,16 @@ FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=
 	}
 	capability.UpdatedAt = Now()
 	_, err = tx.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
-account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, observations, metering_events,
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state, observations, metering_events,
 cache_reported_observations, cache_hit_observations, consecutive_unreported, unknown_cache_schema_json, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET
-model_state=excluded.model_state, thinking_state=excluded.thinking_state, cache_capability=excluded.cache_capability,
+model_state=excluded.model_state, thinking_state=excluded.thinking_state, cache_capability=excluded.cache_capability, cache_point_state=excluded.cache_point_state,
 observations=excluded.observations, metering_events=excluded.metering_events,
 cache_reported_observations=excluded.cache_reported_observations, cache_hit_observations=excluded.cache_hit_observations,
 consecutive_unreported=excluded.consecutive_unreported, unknown_cache_schema_json=excluded.unknown_cache_schema_json,
 updated_at=excluded.updated_at`, capability.AccountID, capability.EndpointHash, capability.Model, capability.ModelState,
-		capability.ThinkingState, capability.CacheCapability, capability.Observations, capability.MeteringEvents,
+		capability.ThinkingState, capability.CacheCapability, capability.CachePointState, capability.Observations, capability.MeteringEvents,
 		capability.CacheReportedObservations, capability.CacheHitObservations, capability.ConsecutiveUnreported,
 		capability.UnknownCacheSchemaJSON, capability.UpdatedAt)
 	if err != nil {
@@ -3145,6 +3154,25 @@ updated_at=excluded.updated_at`, capability.AccountID, capability.EndpointHash, 
 		return KiroRuntimeCapability{}, err
 	}
 	return capability, nil
+}
+
+// SetKiroCachePointState records request-side cachePoint protocol support. This is
+// deliberately independent from CacheCapability, which describes whether token
+// cache buckets were reported in successful responses.
+func (s *Store) SetKiroCachePointState(ctx context.Context, accountID, endpointHash, model, state string) error {
+	state = strings.ToLower(strings.TrimSpace(state))
+	if state != "unknown" && state != "verified" && state != "unsupported" {
+		return fmt.Errorf("invalid Kiro cache point state %q", state)
+	}
+	if strings.TrimSpace(accountID) == "" || strings.TrimSpace(endpointHash) == "" || strings.TrimSpace(model) == "" {
+		return errors.New("kiro cache point state account, endpoint, and model are required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state, updated_at)
+VALUES(?, ?, ?, 'unknown', 'unknown', 'unknown', ?, ?)
+ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET cache_point_state=excluded.cache_point_state, updated_at=excluded.updated_at`,
+		accountID, endpointHash, model, state, Now())
+	return err
 }
 
 func (s *Store) UpsertEgressProfile(ctx context.Context, p EgressProfile) error {
@@ -4525,6 +4553,9 @@ func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCrea
 	if _, ok := usageMap["cache_creation_input_tokens"]; ok {
 		diag.CacheCreationPresent = true
 	}
+	if cacheCreation > 0 {
+		diag.CacheCreationPresent = true
+	}
 	if diag.UsageSource == "" {
 		if diag.Estimated {
 			diag.UsageSource = "estimated"
@@ -4639,6 +4670,27 @@ func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
 }
 
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
+	// Older Kiro converters used the wire spelling as the persisted model while
+	// newer responses use the canonical dotted version. Keep one reporting key.
+	if _, err := s.db.ExecContext(ctx, `UPDATE usage_records SET model='claude-opus-4.8' WHERE usage_provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE affinity_bindings SET model='claude-opus-4.8' WHERE provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
+		return err
+	}
+	// A historical meteringEvent containing only credits was previously treated as
+	// authoritative zero-token usage. Preserve the original raw payload for audit,
+	// but mark the derived row unreported rather than fabricating token values.
+	if _, err := s.db.ExecContext(ctx, `
+UPDATE usage_records
+SET usage_source='unreported', cache_capability=CASE WHEN cache_capability='' OR cache_capability='unknown' THEN 'unreported' ELSE cache_capability END,
+    cache_miss_tokens=0, cache_total_input_tokens=0
+WHERE usage_provider='kiro' AND usage_source='upstream'
+  AND prompt_tokens=0 AND completion_tokens=0 AND total_tokens=0
+  AND cached_tokens=0 AND cache_read_tokens=0 AND cache_creation_tokens=0
+  AND cache_read_present=0 AND cache_creation_present=0`); err != nil {
+		return err
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT id, model, usage_provider, usage_source, cache_read_present, cache_creation_present, prompt_tokens, cached_tokens,
        CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END,
@@ -4739,6 +4791,7 @@ type CacheUsageMetricRow struct {
 	CacheMissTokens                   int64    `json:"cache_miss_tokens"`
 	CacheReadTokens                   int64    `json:"cache_read_tokens"`
 	CacheCreationTokens               int64    `json:"cache_creation_tokens"`
+	CacheCreationReportedRequests     int64    `json:"cache_creation_reported_requests"`
 	CacheCreation5mTokens             int64    `json:"cache_creation_5m_tokens"`
 	CacheCreation1hTokens             int64    `json:"cache_creation_1h_tokens"`
 	CacheCreation5mShare              float64  `json:"cache_creation_5m_share"`
@@ -4775,8 +4828,13 @@ func normalizeUsageModel(model string) (key, label string) {
 	if label == "" {
 		return "__unknown__", "(未知)"
 	}
+	if strings.EqualFold(label, "claude-opus-4-8") {
+		label = "claude-opus-4.8"
+	}
 	return label, label
 }
+
+const normalizedUsageModelSQL = `(CASE WHEN lower(TRIM(COALESCE(model,'')))='claude-opus-4-8' THEN 'claude-opus-4.8' ELSE TRIM(COALESCE(model,'')) END)`
 
 func applyUsageModelFields(model string, keyOut, labelOut *string) string {
 	key, label := normalizeUsageModel(model)
@@ -4793,22 +4851,23 @@ func applyUsageModelFields(model string, keyOut, labelOut *string) string {
 }
 
 type CacheUsageBucket struct {
-	Bucket                int64   `json:"bucket"`
-	Requests              int64   `json:"requests"`
-	RealRequests          int64   `json:"real_requests"`
-	HitRequests           int64   `json:"hit_requests"`
-	PromptTokens          int64   `json:"prompt_tokens"`
-	CacheInputTokens      int64   `json:"cache_input_tokens"`
-	CacheMissTokens       int64   `json:"cache_miss_tokens"`
-	CacheReadTokens       int64   `json:"cache_read_tokens"`
-	CacheCreationTokens   int64   `json:"cache_creation_tokens"`
-	CacheCreation5mTokens int64   `json:"cache_creation_5m_tokens"`
-	CacheCreation1hTokens int64   `json:"cache_creation_1h_tokens"`
-	CacheReadShare        float64 `json:"cache_read_share"`
-	CacheWriteShare       float64 `json:"cache_write_share"`
-	EligibleHitRate       float64 `json:"eligible_cache_hit_rate"`
-	EstimatedRequests     int64   `json:"estimated_requests"`
-	EstimatedRate         float64 `json:"estimated_rate"`
+	Bucket                        int64   `json:"bucket"`
+	Requests                      int64   `json:"requests"`
+	RealRequests                  int64   `json:"real_requests"`
+	HitRequests                   int64   `json:"hit_requests"`
+	PromptTokens                  int64   `json:"prompt_tokens"`
+	CacheInputTokens              int64   `json:"cache_input_tokens"`
+	CacheMissTokens               int64   `json:"cache_miss_tokens"`
+	CacheReadTokens               int64   `json:"cache_read_tokens"`
+	CacheCreationTokens           int64   `json:"cache_creation_tokens"`
+	CacheCreationReportedRequests int64   `json:"cache_creation_reported_requests"`
+	CacheCreation5mTokens         int64   `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens         int64   `json:"cache_creation_1h_tokens"`
+	CacheReadShare                float64 `json:"cache_read_share"`
+	CacheWriteShare               float64 `json:"cache_write_share"`
+	EligibleHitRate               float64 `json:"eligible_cache_hit_rate"`
+	EstimatedRequests             int64   `json:"estimated_requests"`
+	EstimatedRate                 float64 `json:"estimated_rate"`
 }
 
 const (
@@ -4825,12 +4884,12 @@ const (
 // UsageByUser aggregates a single user's usage per model, most-used first.
 func (s *Store) UsageByUser(ctx context.Context, userID string) ([]UserUsageRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT TRIM(COALESCE(model,'')), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
+SELECT `+normalizedUsageModelSQL+`, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
        COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
-FROM usage_records WHERE user_id = ? GROUP BY TRIM(COALESCE(model,'')) ORDER BY SUM(total_tokens) DESC`, userID)
+FROM usage_records WHERE user_id = ? GROUP BY `+normalizedUsageModelSQL+` ORDER BY SUM(total_tokens) DESC`, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -4856,12 +4915,12 @@ func (s *Store) UsageByModel(ctx context.Context, since int64) ([]UserUsageRow, 
 
 func (s *Store) UsageByModelWindow(ctx context.Context, since, until int64) ([]UserUsageRow, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT TRIM(COALESCE(model,'')), COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
+SELECT `+normalizedUsageModelSQL+`, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
        COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
-FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY TRIM(COALESCE(model,'')) ORDER BY SUM(total_tokens) DESC, COUNT(*) DESC, TRIM(COALESCE(model,'')) ASC`, since, until)
+FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY `+normalizedUsageModelSQL+` ORDER BY SUM(total_tokens) DESC, COUNT(*) DESC, `+normalizedUsageModelSQL+` ASC`, since, until)
 	if err != nil {
 		return nil, err
 	}
@@ -4968,9 +5027,10 @@ SELECT COUNT(*),
        COALESCE(SUM(cache_creation_1h_tokens),0),
        COALESCE(SUM(`+estimatedUsageRecordSQL+`),0),
        COALESCE(SUM(`+realCacheInputTokensSQL+`),0),
-       COALESCE(SUM(`+realCacheReadTokensSQL+`),0)
+       COALESCE(SUM(`+realCacheReadTokensSQL+`),0),
+       COALESCE(SUM(cache_creation_present),0)
 FROM usage_records
-WHERE created_at >= ? AND created_at < ?`, since, until).Scan(&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests, &row.realCacheInputTokens, &row.realCacheReadTokens)
+WHERE created_at >= ? AND created_at < ?`, since, until).Scan(&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests, &row.realCacheInputTokens, &row.realCacheReadTokens, &row.CacheCreationReportedRequests)
 	if err != nil {
 		return CacheUsageMetricRow{}, err
 	}
@@ -4984,20 +5044,20 @@ func (s *Store) cacheUsageRows(ctx context.Context, since, until int64, dimensio
 	switch dimension {
 	case "account":
 	case "model":
-		selectCols = "'', TRIM(COALESCE(model,'')), '', '', '', '', '', '', '', '', ''"
-		groupBy = "TRIM(COALESCE(model,''))"
+		selectCols = "'', " + normalizedUsageModelSQL + ", '', '', '', '', '', '', '', '', ''"
+		groupBy = normalizedUsageModelSQL
 	case "api_key":
 		selectCols = "'', '', CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END, '', '', '', '', '', '', '', ''"
 		groupBy = "CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END"
 	case "account_model":
-		selectCols = "COALESCE(account_id,''), TRIM(COALESCE(model,'')), '', '', '', '', '', '', '', '', ''"
-		groupBy = "account_id, TRIM(COALESCE(model,''))"
+		selectCols = "COALESCE(account_id,''), " + normalizedUsageModelSQL + ", '', '', '', '', '', '', '', '', ''"
+		groupBy = "account_id, " + normalizedUsageModelSQL
 	case "route":
 		selectCols = "'', '', '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
 		groupBy = "CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
 	case "route_account_model":
-		selectCols = "COALESCE(account_id,''), TRIM(COALESCE(model,'')), '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
-		groupBy = "account_id, TRIM(COALESCE(model,'')), CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
+		selectCols = "COALESCE(account_id,''), " + normalizedUsageModelSQL + ", '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
+		groupBy = "account_id, " + normalizedUsageModelSQL + ", CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
 	default:
 		return nil, fmt.Errorf("unknown cache usage dimension %q", dimension)
 	}
@@ -5022,6 +5082,7 @@ SELECT %s,
        COALESCE(SUM(%s),0),
        COALESCE(SUM(%s),0),
        COALESCE(SUM(%s),0),
+       COALESCE(SUM(cache_creation_present),0),
        COALESCE(MAX(stable_prefix_bytes),0),
        COALESCE(SUM(prompt_cache_key_present),0),
        COALESCE(SUM(cache_control_injected),0),
@@ -5056,7 +5117,7 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 			&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens,
 			&row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens,
 			&row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests,
-			&row.realCacheInputTokens, &row.realCacheReadTokens, &row.StablePrefixBytes,
+			&row.realCacheInputTokens, &row.realCacheReadTokens, &row.CacheCreationReportedRequests, &row.StablePrefixBytes,
 			&row.PromptCacheKeyPresent, &row.CacheControlInjected, &row.CacheBreakpointCount,
 			&row.CacheBreakpointsJSON, &row.UnwrittenTailTokens, &row.MaxPossibleCacheReadTokens,
 			&row.CacheHitAfterPrewarm, &row.SingleflightWaitedRequests, &row.DiagnosticsMissReason,
@@ -5092,7 +5153,9 @@ func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
 	if denominator > 0 {
 		row.TokenHitRate = float64(row.CacheReadTokens) / float64(denominator)
 		row.CacheReadShare = row.TokenHitRate
-		row.CacheWriteShare = float64(row.CacheCreationTokens) / float64(denominator)
+		if row.CacheCreationReportedRequests > 0 {
+			row.CacheWriteShare = float64(row.CacheCreationTokens) / float64(denominator)
+		}
 		if row.TokenHitRate > 1 {
 			row.TokenHitRate = 1
 		}
@@ -5113,7 +5176,7 @@ func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
 		}
 	}
 	eligible := row.CacheReadTokens + row.CacheCreationTokens
-	if eligible > 0 {
+	if row.CacheCreationReportedRequests > 0 && eligible > 0 {
 		row.EligibleHitRate = float64(row.CacheReadTokens) / float64(eligible)
 	}
 	if row.CacheCreationTokens > 0 {
@@ -5184,7 +5247,8 @@ SELECT (created_at / ?) * ? AS bucket,
        COALESCE(SUM(cache_creation_tokens),0),
        COALESCE(SUM(cache_creation_5m_tokens),0),
        COALESCE(SUM(cache_creation_1h_tokens),0),
-       COALESCE(SUM(`+estimatedUsageRecordSQL+`),0)
+       COALESCE(SUM(`+estimatedUsageRecordSQL+`),0),
+       COALESCE(SUM(cache_creation_present),0)
 FROM usage_records
 WHERE created_at >= ? AND created_at < ?
 GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since, until)
@@ -5195,7 +5259,7 @@ GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since, until)
 	var out []CacheUsageBucket
 	for rows.Next() {
 		var b CacheUsageBucket
-		if err := rows.Scan(&b.Bucket, &b.Requests, &b.RealRequests, &b.HitRequests, &b.PromptTokens, &b.CacheInputTokens, &b.CacheMissTokens, &b.CacheReadTokens, &b.CacheCreationTokens, &b.CacheCreation5mTokens, &b.CacheCreation1hTokens, &b.EstimatedRequests); err != nil {
+		if err := rows.Scan(&b.Bucket, &b.Requests, &b.RealRequests, &b.HitRequests, &b.PromptTokens, &b.CacheInputTokens, &b.CacheMissTokens, &b.CacheReadTokens, &b.CacheCreationTokens, &b.CacheCreation5mTokens, &b.CacheCreation1hTokens, &b.EstimatedRequests, &b.CacheCreationReportedRequests); err != nil {
 			return nil, err
 		}
 		finalizeCacheUsageBucket(&b)
@@ -5210,7 +5274,9 @@ func finalizeCacheUsageBucket(b *CacheUsageBucket) {
 	}
 	if b.CacheInputTokens > 0 {
 		b.CacheReadShare = float64(b.CacheReadTokens) / float64(b.CacheInputTokens)
-		b.CacheWriteShare = float64(b.CacheCreationTokens) / float64(b.CacheInputTokens)
+		if b.CacheCreationReportedRequests > 0 {
+			b.CacheWriteShare = float64(b.CacheCreationTokens) / float64(b.CacheInputTokens)
+		}
 		if b.CacheReadShare > 1 {
 			b.CacheReadShare = 1
 		}
@@ -5225,7 +5291,7 @@ func finalizeCacheUsageBucket(b *CacheUsageBucket) {
 		}
 	}
 	eligible := b.CacheReadTokens + b.CacheCreationTokens
-	if eligible > 0 {
+	if b.CacheCreationReportedRequests > 0 && eligible > 0 {
 		b.EligibleHitRate = float64(b.CacheReadTokens) / float64(eligible)
 	}
 }

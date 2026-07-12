@@ -8,8 +8,10 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,6 +123,13 @@ type diagnosticCodebook struct {
 	replacer     *strings.Replacer
 }
 
+type diagnosticEventWindow struct {
+	Routing409   map[string]int         `json:"routing_409_events"`
+	HealthModels map[string]int         `json:"health_test_events_by_model"`
+	Banned       map[string]interface{} `json:"banned_accounts"`
+	BillingHolds map[string]int         `json:"billing_hold_events_by_status"`
+}
+
 func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -129,135 +138,15 @@ func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) 
 		methodNotAllowed(w)
 		return
 	}
-	ctx := r.Context()
-	accounts, err := s.store.ListAccounts(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	auditRows, err := listDiagnosticAuditRows(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	cfRows, err := listDiagnosticCFEvents(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	usageRows, err := listDiagnosticUsageRecords(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	holds, err := listDiagnosticBillingHolds(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	bindings, err := s.store.ListEgressBindings(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	egressProfiles, err := s.store.ListEgressProfiles(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	accountIDs := accountIDsForDiagnostics(accounts)
-	tokensByID, err := s.store.ListTokensByAccountIDs(ctx, accountIDs)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	capabilities, err := s.store.ListCapabilities(ctx, "")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	kiroRuntimeCapabilities, err := s.store.ListKiroRuntimeCapabilities(ctx, "")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	rateLimits, err := s.store.ListAccountRateLimits(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	affinityBindings, err := listDiagnosticAffinityBindings(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	settings, err := listDiagnosticSettings(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	customProviders, err := s.store.ListCustomProviders(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	upstreamRules, err := s.store.ListUpstreamErrorRules(ctx)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	resetConsumptions, err := listDiagnosticCodexResetCreditConsumptions(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	lifecycleStatuses, err := listDiagnosticLifecycleStatuses(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	reauthConfigs, err := listDiagnosticCodexReauthConfigs(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	reauthJobs, err := listDiagnosticCodexReauthJobs(ctx, s.store.DB())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	codebook := buildDiagnosticCodebook(accounts, auditRows, cfRows, usageRows, holds, bindings)
-	files, err := buildDiagnosticsZipFiles(accounts, tokensByID, auditRows, cfRows, usageRows, holds, bindings, egressProfiles, capabilities, kiroRuntimeCapabilities, rateLimits, affinityBindings, settings, customProviders, upstreamRules, resetConsumptions, lifecycleStatuses, reauthConfigs, reauthJobs, codebook)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for _, name := range diagnosticFileOrder() {
-		content, ok := files[name]
-		if !ok {
-			continue
-		}
-		fw, err := zw.Create(name)
-		if err != nil {
-			_ = zw.Close()
+	if err := s.streamDiagnosticsExport(r.Context(), w); err != nil {
+		// All database reads and manifest construction happen before headers are
+		// committed. A later error means the client receives a truncated ZIP, which
+		// is preferable to retaining the entire export in memory just to rewrite an
+		// HTTP status after streaming has begun.
+		if w.Header().Get("Content-Type") == "" {
 			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if _, err := fw.Write([]byte(content)); err != nil {
-			_ = zw.Close()
-			writeError(w, http.StatusInternalServerError, err)
-			return
 		}
 	}
-	if err := zw.Close(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="codex-pool-diagnostics-v2.zip"`)
-	_, _ = w.Write(buf.Bytes())
 }
 
 func diagnosticFileOrder() []string {
@@ -286,6 +175,570 @@ func diagnosticFileOrder() []string {
 	}
 }
 
+type diagnosticExportStat struct {
+	Rows int64
+	Min  int64
+	Max  int64
+}
+
+func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWriter) error {
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return err
+	}
+	bindings, err := s.store.ListEgressBindings(ctx)
+	if err != nil {
+		return err
+	}
+	egressProfiles, err := s.store.ListEgressProfiles(ctx)
+	if err != nil {
+		return err
+	}
+	tokensByID, err := s.store.ListTokensByAccountIDs(ctx, accountIDsForDiagnostics(accounts))
+	if err != nil {
+		return err
+	}
+	capabilities, err := s.store.ListCapabilities(ctx, "")
+	if err != nil {
+		return err
+	}
+	kiroCapabilities, err := s.store.ListKiroRuntimeCapabilities(ctx, "")
+	if err != nil {
+		return err
+	}
+	rateLimits, err := s.store.ListAccountRateLimits(ctx)
+	if err != nil {
+		return err
+	}
+	affinityBindings, err := listDiagnosticAffinityBindings(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	settings, err := listDiagnosticSettings(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	customProviders, err := s.store.ListCustomProviders(ctx)
+	if err != nil {
+		return err
+	}
+	upstreamRules, err := s.store.ListUpstreamErrorRules(ctx)
+	if err != nil {
+		return err
+	}
+	resetConsumptions, err := listDiagnosticCodexResetCreditConsumptions(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	lifecycleStatuses, err := listDiagnosticLifecycleStatuses(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	reauthConfigs, err := listDiagnosticCodexReauthConfigs(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	reauthJobs, err := listDiagnosticCodexReauthJobs(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	codebook, err := buildStreamingDiagnosticCodebook(ctx, s.store.DB(), accounts, bindings)
+	if err != nil {
+		return err
+	}
+	summary := diagnosticSummary(accounts, tokensByID, nil, nil, bindings, rateLimits)
+	if err := applyDiagnosticAuditSummary(ctx, s.store.DB(), summary); err != nil {
+		return err
+	}
+	if err := applyDiagnosticBillingHoldSummary(ctx, s.store.DB(), summary); err != nil {
+		return err
+	}
+	stats, err := diagnosticLargeTableStats(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+
+	small := map[string]string{}
+	rowCounts := map[string]int64{}
+	addCSV := func(name string, header []string, rows [][]string) {
+		small[name] = csvString(header, rows)
+		rowCounts[name] = int64(len(rows))
+	}
+	addJSON := func(name string, value interface{}) error {
+		raw, marshalErr := json.MarshalIndent(value, "", "  ")
+		if marshalErr != nil {
+			return marshalErr
+		}
+		small[name] = string(raw) + "\n"
+		rowCounts[name] = 1
+		return nil
+	}
+	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
+	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "token_provider_hint", "access_token_present", "access_token_len", "access_token_type", "refresh_token_present", "refresh_token_len", "openai_api_key_present", "openai_api_key_len", "openai_api_key_type", "id_token_present", "id_token_len", "scopes", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
+	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "native_context_window", "native_max_context_window", "effective_context_window_percent", "auto_compact_token_limit", "visibility", "etag", "raw_model_json_hash", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
+	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
+	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
+	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
+	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
+	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "enabled", "auto_discover_models", "models", "created_at", "updated_at"}, customProviderRows(customProviders))
+	addCSV("upstream_error_rules.csv", []string{"id", "name", "enabled", "priority", "providers", "entrypoints", "model_patterns", "status_codes", "body_keywords", "match_mode", "account_action", "downstream_action", "response_status", "custom_message", "cooldown_seconds", "prefer_retry_after", "idle_seconds", "idle_ping_seconds", "skip_log", "description", "created_at", "updated_at"}, upstreamErrorRuleRows(upstreamRules))
+	addCSV("codex_reset_credit_consumptions.csv", []string{"account_code", "seven_day_reset_at", "redeem_request_id", "status", "created_at", "updated_at"}, codexResetCreditRows(resetConsumptions, codebook))
+	addCSV("account_lifecycle_status.csv", []string{"account_code", "validity_status", "subscription_tier", "subscription_expires_at", "last_health_check_at", "last_token_refresh_at", "health_check_fail_count", "summary_json", "created_at", "updated_at"}, lifecycleStatusRows(lifecycleStatuses, codebook))
+	addCSV("codex_reauth_config.csv", []string{"account_code", "login_email_present", "password_configured", "otp_url_configured", "target_workspace_id", "auto_enabled", "last_status", "last_error", "created_at", "updated_at"}, codexReauthConfigRows(reauthConfigs, codebook))
+	addCSV("codex_reauth_jobs.csv", []string{"id", "account_code", "status", "reason", "last_error", "created_at", "updated_at", "started_at", "finished_at"}, codexReauthJobRows(reauthJobs, codebook))
+	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
+	addCSV("egress_snapshot.csv", []string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
+	if err := addJSON("diagnostic_summary.json", summary); err != nil {
+		return err
+	}
+	for name, stat := range stats {
+		rowCounts[name] = stat.Rows
+	}
+	rowCounts["manifest.json"] = 1
+	timeRanges := map[string]interface{}{}
+	for name, stat := range stats {
+		timeRanges[name] = map[string]int64{"min_created_at": stat.Min, "max_created_at": stat.Max}
+	}
+	addRange := func(name string, values []int64) {
+		var minValue, maxValue int64
+		for _, value := range values {
+			if value <= 0 {
+				continue
+			}
+			if minValue == 0 || value < minValue {
+				minValue = value
+			}
+			if value > maxValue {
+				maxValue = value
+			}
+		}
+		timeRanges[name] = map[string]int64{"min_created_at": minValue, "max_created_at": maxValue}
+	}
+	accountTimes := make([]int64, 0, len(accounts))
+	for _, row := range accounts {
+		accountTimes = append(accountTimes, row.CreatedAt)
+	}
+	addRange("account_map.csv", accountTimes)
+	addRange("accounts_snapshot.csv", accountTimes)
+	tokenTimes := make([]int64, 0, len(tokensByID))
+	for _, row := range tokensByID {
+		tokenTimes = append(tokenTimes, row.CreatedAt)
+	}
+	addRange("account_auth_metadata.csv", tokenTimes)
+	modelTimes := make([]int64, 0, len(capabilities))
+	for _, row := range capabilities {
+		modelTimes = append(modelTimes, row.LastProbeAt)
+	}
+	addRange("account_model_capabilities.csv", modelTimes)
+	kiroTimes := make([]int64, 0, len(kiroCapabilities))
+	for _, row := range kiroCapabilities {
+		kiroTimes = append(kiroTimes, row.UpdatedAt)
+	}
+	addRange("kiro_runtime_capabilities.csv", kiroTimes)
+	rateTimes := make([]int64, 0, len(rateLimits))
+	for _, row := range rateLimits {
+		rateTimes = append(rateTimes, row.UpdatedAt)
+	}
+	addRange("account_rate_limits.csv", rateTimes)
+	affinityTimes := make([]int64, 0, len(affinityBindings))
+	for _, row := range affinityBindings {
+		affinityTimes = append(affinityTimes, row.CreatedAt)
+	}
+	addRange("affinity_bindings.csv", affinityTimes)
+	settingTimes := make([]int64, 0, len(settings))
+	for _, row := range settings {
+		settingTimes = append(settingTimes, row.UpdatedAt)
+	}
+	addRange("settings.csv", settingTimes)
+	providerTimes := make([]int64, 0, len(customProviders))
+	for _, row := range customProviders {
+		providerTimes = append(providerTimes, row.CreatedAt)
+	}
+	addRange("custom_providers.csv", providerTimes)
+	ruleTimes := make([]int64, 0, len(upstreamRules))
+	for _, row := range upstreamRules {
+		ruleTimes = append(ruleTimes, row.CreatedAt)
+	}
+	addRange("upstream_error_rules.csv", ruleTimes)
+	resetTimes := make([]int64, 0, len(resetConsumptions))
+	for _, row := range resetConsumptions {
+		resetTimes = append(resetTimes, row.CreatedAt)
+	}
+	addRange("codex_reset_credit_consumptions.csv", resetTimes)
+	lifecycleTimes := make([]int64, 0, len(lifecycleStatuses))
+	for _, row := range lifecycleStatuses {
+		lifecycleTimes = append(lifecycleTimes, row.CreatedAt)
+	}
+	addRange("account_lifecycle_status.csv", lifecycleTimes)
+	reauthConfigTimes := make([]int64, 0, len(reauthConfigs))
+	for _, row := range reauthConfigs {
+		reauthConfigTimes = append(reauthConfigTimes, row.CreatedAt)
+	}
+	addRange("codex_reauth_config.csv", reauthConfigTimes)
+	reauthJobTimes := make([]int64, 0, len(reauthJobs))
+	for _, row := range reauthJobs {
+		reauthJobTimes = append(reauthJobTimes, row.CreatedAt)
+	}
+	addRange("codex_reauth_jobs.csv", reauthJobTimes)
+	egressTimes := make([]int64, 0, len(egressProfiles))
+	for _, row := range egressProfiles {
+		egressTimes = append(egressTimes, row.CreatedAt)
+	}
+	addRange("egress_snapshot.csv", egressTimes)
+	manifest := map[string]interface{}{
+		"generated_at": time.Now().Unix(), "format": "codex-pool-diagnostics-v2",
+		"account_count": len(accounts), "current_account_count": len(accounts),
+		"historical_reference_account_count": len(codebook.byID),
+		"files":                              diagnosticFileOrder(), "row_counts": rowCounts,
+		"build": diagnosticBuildInfo(), "table_time_ranges": timeRanges,
+		"account_redaction":   "business files use account_code; account_map.csv preserves the complete local account id mapping; route/session hashes, user ids, exit IPs and correlation fields remain complete",
+		"account_code_format": "ACC-0001",
+	}
+	if err := addJSON("manifest.json", manifest); err != nil {
+		return err
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="codex-pool-diagnostics-v2.zip"`)
+	zw := zip.NewWriter(w)
+	for _, name := range diagnosticFileOrder() {
+		switch name {
+		case "audit_log.csv":
+			err = streamDiagnosticAuditCSV(ctx, s.store.DB(), zw, codebook)
+		case "cf_events.csv":
+			err = streamDiagnosticCFCSV(ctx, s.store.DB(), zw, codebook)
+		case "usage_records.csv":
+			err = streamDiagnosticUsageCSV(ctx, s.store.DB(), zw, codebook)
+		case "billing_holds.csv":
+			err = streamDiagnosticBillingHoldsCSV(ctx, s.store.DB(), zw, codebook)
+		default:
+			content, ok := small[name]
+			if !ok {
+				continue
+			}
+			var writer io.Writer
+			writer, err = zw.Create(name)
+			if err == nil {
+				_, err = io.WriteString(writer, content)
+			}
+		}
+		if err != nil {
+			_ = zw.Close()
+			return err
+		}
+	}
+	return zw.Close()
+}
+
+func buildStreamingDiagnosticCodebook(ctx context.Context, db *sql.DB, accounts []storage.Account, bindings []storage.AccountEgressBinding) (diagnosticCodebook, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT account_id, MAX(account_label) FROM audit_log WHERE account_id <> '' GROUP BY account_id
+UNION SELECT account_id, '' FROM cf_events WHERE account_id <> ''
+UNION SELECT account_id, '' FROM usage_records WHERE account_id <> ''
+UNION SELECT account_id, '' FROM billing_holds WHERE account_id <> ''
+UNION SELECT account_id, '' FROM affinity_bindings WHERE account_id <> ''`)
+	if err != nil {
+		return diagnosticCodebook{}, err
+	}
+	defer rows.Close()
+	historical := []storage.AuditLogRow{}
+	for rows.Next() {
+		var accountID, label string
+		if err := rows.Scan(&accountID, &label); err != nil {
+			return diagnosticCodebook{}, err
+		}
+		historical = append(historical, storage.AuditLogRow{AccountID: accountID, AccountLabel: label})
+	}
+	if err := rows.Err(); err != nil {
+		return diagnosticCodebook{}, err
+	}
+	return buildDiagnosticCodebook(accounts, historical, nil, nil, nil, bindings), nil
+}
+
+func applyDiagnosticAuditSummary(ctx context.Context, db *sql.DB, summary map[string]interface{}) error {
+	cutoff := storage.Now() - 24*60*60
+	lifetime, _ := summary["lifetime"].(diagnosticEventWindow)
+	last24h, _ := summary["last_24h"].(diagnosticEventWindow)
+	lifetime.Routing409, last24h.Routing409 = map[string]int{}, map[string]int{}
+	lifetime.HealthModels, last24h.HealthModels = map[string]int{}, map[string]int{}
+
+	rows, err := db.QueryContext(ctx, `SELECT
+CASE
+  WHEN lower(detail) LIKE '%token budget%' THEN 'token_budget_exceeded'
+  WHEN lower(detail) LIKE '%pending health re-check%' OR lower(detail) LIKE '%recheck%' THEN 'pending_health_recheck'
+  WHEN lower(detail) LIKE '%rate-limit cooldown%' OR lower(detail) LIKE '%cooldown%' THEN 'rate_limit_cooldown'
+  WHEN lower(detail) LIKE '%quarantined%' THEN 'quarantined'
+  ELSE 'other'
+END AS category,
+COUNT(*), COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0)
+FROM audit_log
+WHERE action='routing_unavailable' AND detail LIKE '%status=409%'
+GROUP BY category`, cutoff)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var category string
+		var total, recent int
+		if err := rows.Scan(&category, &total, &recent); err != nil {
+			rows.Close()
+			return err
+		}
+		lifetime.Routing409[category] = total
+		if recent > 0 {
+			last24h.Routing409[category] = recent
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	rows, err = db.QueryContext(ctx, `SELECT detail, COUNT(*),
+COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0)
+FROM audit_log
+WHERE action IN ('health_test','health_test_model_unsupported') AND detail LIKE '%model=%'
+GROUP BY detail`, cutoff)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var detail string
+		var total, recent int
+		if err := rows.Scan(&detail, &total, &recent); err != nil {
+			rows.Close()
+			return err
+		}
+		model := extractDiagnosticDetailValue(detail, "model")
+		if model == "" {
+			continue
+		}
+		lifetime.HealthModels[model] += total
+		if recent > 0 {
+			last24h.HealthModels[model] += recent
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	banEvents := map[string]int{"discovered": 0, "deleted": 0, "delete_failed": 0}
+	banUnique := map[string]int{"discovered": 0, "deleted": 0, "delete_failed": 0}
+	recentBanEvents := map[string]int{"discovered": 0, "deleted": 0, "delete_failed": 0}
+	recentBanUnique := map[string]int{"discovered": 0, "deleted": 0, "delete_failed": 0}
+	rows, err = db.QueryContext(ctx, `SELECT
+CASE WHEN action='ban_delete' THEN 'deleted'
+     WHEN action='ban_delete_failed' THEN 'delete_failed'
+     ELSE 'discovered' END AS category,
+COUNT(*), COUNT(DISTINCT CASE WHEN account_id <> '' THEN account_id END),
+COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),0),
+COUNT(DISTINCT CASE WHEN created_at >= ? AND account_id <> '' THEN account_id END)
+FROM audit_log
+WHERE state='banned' OR action IN ('ban_delete','ban_delete_failed')
+GROUP BY category`, cutoff, cutoff)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var category string
+		var total, unique, recent, recentUnique int
+		if err := rows.Scan(&category, &total, &unique, &recent, &recentUnique); err != nil {
+			rows.Close()
+			return err
+		}
+		banEvents[category], banUnique[category] = total, unique
+		recentBanEvents[category], recentBanUnique[category] = recent, recentUnique
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	lifetime.Banned = map[string]interface{}{"events": banEvents, "unique_accounts": banUnique}
+	last24h.Banned = map[string]interface{}{"events": recentBanEvents, "unique_accounts": recentBanUnique}
+	summary["lifetime"], summary["last_24h"] = lifetime, last24h
+	summary["routing_409"] = lifetime.Routing409
+	summary["health_test_models"] = lifetime.HealthModels
+	summary["banned_accounts"] = lifetime.Banned
+	return nil
+}
+
+func applyDiagnosticBillingHoldSummary(ctx context.Context, db *sql.DB, summary map[string]interface{}) error {
+	now := storage.Now()
+	rows, err := db.QueryContext(ctx, `SELECT status, COUNT(*),
+SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),
+SUM(CASE WHEN status='held' AND created_at >= ? THEN 1 ELSE 0 END),
+SUM(CASE WHEN status='held' AND created_at < ? THEN 1 ELSE 0 END),
+MIN(CASE WHEN status='held' AND created_at >= ? THEN created_at END)
+FROM billing_holds GROUP BY status`, now-24*60*60, now-60*60, now-60*60, now-60*60)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	lifetime, last24h := map[string]int{}, map[string]int{}
+	fresh, stale, expired, oldestFresh := int64(0), int64(0), int64(0), int64(0)
+	for rows.Next() {
+		var status string
+		var total, day, freshForStatus, staleForStatus int64
+		var oldest sql.NullInt64
+		if err := rows.Scan(&status, &total, &day, &freshForStatus, &staleForStatus, &oldest); err != nil {
+			return err
+		}
+		lifetime[firstNonEmpty(status, "unknown")] = int(total)
+		last24h[firstNonEmpty(status, "unknown")] = int(day)
+		fresh += freshForStatus
+		stale += staleForStatus
+		if status == "expired_unsettled" {
+			expired = total
+		}
+		if oldest.Valid && now-oldest.Int64 > oldestFresh {
+			oldestFresh = now - oldest.Int64
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if window, ok := summary["lifetime"].(diagnosticEventWindow); ok {
+		window.BillingHolds = lifetime
+		summary["lifetime"] = window
+	}
+	if window, ok := summary["last_24h"].(diagnosticEventWindow); ok {
+		window.BillingHolds = last24h
+		summary["last_24h"] = window
+	}
+	summary["billing_holds"] = map[string]interface{}{
+		"current_fresh_held": fresh, "historical_stale_held": stale,
+		"expired_unsettled": expired, "oldest_fresh_held_age_seconds": oldestFresh,
+	}
+	if current, ok := summary["current_state"].(map[string]interface{}); ok {
+		current["fresh_billing_holds"] = fresh
+		current["stale_historical_holds"] = stale
+	}
+	return nil
+}
+
+func diagnosticLargeTableStats(ctx context.Context, db *sql.DB) (map[string]diagnosticExportStat, error) {
+	tables := map[string]string{
+		"audit_log.csv": "audit_log", "cf_events.csv": "cf_events",
+		"usage_records.csv": "usage_records", "billing_holds.csv": "billing_holds",
+	}
+	out := map[string]diagnosticExportStat{}
+	for file, table := range tables {
+		var stat diagnosticExportStat
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM `+table).Scan(&stat.Rows, &stat.Min, &stat.Max); err != nil {
+			return nil, err
+		}
+		out[file] = stat
+	}
+	return out, nil
+}
+
+func streamDiagnosticCSV(zw *zip.Writer, name string, header []string, writeRows func(*csv.Writer) error) error {
+	writer, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+	cw := csv.NewWriter(writer)
+	if err := cw.Write(header); err != nil {
+		return err
+	}
+	if err := writeRows(cw); err != nil {
+		return err
+	}
+	cw.Flush()
+	return cw.Error()
+}
+
+func streamDiagnosticAuditCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
+	return streamDiagnosticCSV(zw, "audit_log.csv", []string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, func(cw *csv.Writer) error {
+		rows, err := db.QueryContext(ctx, `SELECT id, account_id, account_label, action, state, reason, detail, created_at FROM audit_log ORDER BY id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var row storage.AuditLogRow
+			if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.Action, &row.State, &row.Reason, &row.Detail, &row.CreatedAt); err != nil {
+				return err
+			}
+			if err := cw.Write(auditLogRows([]storage.AuditLogRow{row}, codebook)[0]); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+}
+
+func streamDiagnosticCFCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
+	return streamDiagnosticCSV(zw, "cf_events.csv", []string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, func(cw *csv.Writer) error {
+		rows, err := db.QueryContext(ctx, `SELECT id, account_id, egress_id, status, cf_ray, category, message, created_at FROM cf_events ORDER BY id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var row storage.CFEvent
+			if err := rows.Scan(&row.ID, &row.AccountID, &row.EgressID, &row.Status, &row.CFRay, &row.Category, &row.Message, &row.CreatedAt); err != nil {
+				return err
+			}
+			if err := cw.Write(cfEventRows([]storage.CFEvent{row}, codebook)[0]); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+}
+
+func streamDiagnosticUsageCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
+	header := []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json"}
+	return streamDiagnosticCSV(zw, "usage_records.csv", header, func(cw *csv.Writer) error {
+		rows, err := db.QueryContext(ctx, diagnosticUsageRecordSelectSQL()+` ORDER BY id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var row diagnosticUsageRecord
+			if err := scanDiagnosticUsageRecord(rows, &row); err != nil {
+				return err
+			}
+			if err := cw.Write(usageRecordRows([]diagnosticUsageRecord{row}, codebook)[0]); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+}
+
+func streamDiagnosticBillingHoldsCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
+	return streamDiagnosticCSV(zw, "billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status"}, func(cw *csv.Writer) error {
+		rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at FROM billing_holds ORDER BY created_at, id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var row diagnosticBillingHold
+			if err := rows.Scan(&row.ID, &row.RouteKeyHash, &row.AccountID, &row.EstimatedTokens, &row.Status, &row.CreatedAt, &row.UpdatedAt); err != nil {
+				return err
+			}
+			if err := cw.Write(billingHoldRows([]diagnosticBillingHold{row}, codebook)[0]); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	})
+}
+
 func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]storage.AccountToken, auditRows []storage.AuditLogRow, cfRows []storage.CFEvent, usageRows []diagnosticUsageRecord, holds []diagnosticBillingHold, bindings []storage.AccountEgressBinding, egressProfiles []storage.EgressProfile, capabilities []storage.ModelCapability, kiroRuntimeCapabilities []storage.KiroRuntimeCapability, rateLimits []storage.AccountRateLimit, affinityBindings []storage.AffinityBinding, settings []diagnosticSetting, customProviders []storage.CustomProvider, upstreamRules []storage.UpstreamErrorRule, resetConsumptions []storage.CodexResetCreditConsumption, lifecycleStatuses []diagnosticLifecycleStatus, reauthConfigs []storage.AccountCodexReauthConfig, reauthJobs []storage.AccountCodexReauthJob, codebook diagnosticCodebook) (map[string]string, error) {
 	files := map[string]string{}
 	rowCounts := map[string]int{}
@@ -306,7 +759,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
 	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "token_provider_hint", "access_token_present", "access_token_len", "access_token_type", "refresh_token_present", "refresh_token_len", "openai_api_key_present", "openai_api_key_len", "openai_api_key_type", "id_token_present", "id_token_len", "scopes", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "native_context_window", "native_max_context_window", "effective_context_window_percent", "auto_compact_token_limit", "visibility", "etag", "raw_model_json_hash", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
-	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
+	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
 	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
@@ -327,13 +780,17 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	}
 	rowCounts["manifest.json"] = 1
 	manifest := map[string]interface{}{
-		"generated_at":        time.Now().Unix(),
-		"format":              "codex-pool-diagnostics-v2",
-		"account_count":       len(codebook.byID),
-		"files":               diagnosticFileOrder(),
-		"row_counts":          rowCounts,
-		"account_redaction":   "business files use account_code; account_map.csv contains only account_code and local account_id; email, label, and upstream identity columns are omitted",
-		"account_code_format": "ACC-0001",
+		"generated_at":                       time.Now().Unix(),
+		"format":                             "codex-pool-diagnostics-v2",
+		"account_count":                      len(accounts),
+		"current_account_count":              len(accounts),
+		"historical_reference_account_count": len(codebook.byID),
+		"build":                              diagnosticBuildInfo(),
+		"table_time_ranges":                  diagnosticTableTimeRanges(accounts, auditRows, cfRows, usageRows, holds),
+		"files":                              diagnosticFileOrder(),
+		"row_counts":                         rowCounts,
+		"account_redaction":                  "business files use account_code; account_map.csv contains only account_code and local account_id; email, label, and upstream identity columns are omitted",
+		"account_code_format":                "ACC-0001",
 	}
 	rawManifest, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -341,6 +798,74 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	}
 	files["manifest.json"] = string(rawManifest) + "\n"
 	return files, nil
+}
+
+func diagnosticBuildInfo() map[string]interface{} {
+	out := map[string]interface{}{"version": "devel", "revision": "", "modified": false}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return out
+	}
+	if strings.TrimSpace(info.Main.Version) != "" {
+		out["version"] = info.Main.Version
+	}
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			out["revision"] = setting.Value
+		case "vcs.time":
+			out["vcs_time"] = setting.Value
+		case "vcs.modified":
+			out["modified"] = setting.Value == "true"
+		}
+	}
+	return out
+}
+
+func diagnosticTableTimeRanges(accounts []storage.Account, auditRows []storage.AuditLogRow, cfRows []storage.CFEvent, usageRows []diagnosticUsageRecord, holds []diagnosticBillingHold) map[string]interface{} {
+	type bounds struct{ min, max int64 }
+	add := func(values []int64) map[string]int64 {
+		b := bounds{}
+		for _, value := range values {
+			if value <= 0 {
+				continue
+			}
+			if b.min == 0 || value < b.min {
+				b.min = value
+			}
+			if value > b.max {
+				b.max = value
+			}
+		}
+		return map[string]int64{"min_created_at": b.min, "max_created_at": b.max}
+	}
+	accountTimes := make([]int64, 0, len(accounts))
+	for _, row := range accounts {
+		accountTimes = append(accountTimes, row.CreatedAt)
+	}
+	auditTimes := make([]int64, 0, len(auditRows))
+	for _, row := range auditRows {
+		auditTimes = append(auditTimes, row.CreatedAt)
+	}
+	cfTimes := make([]int64, 0, len(cfRows))
+	for _, row := range cfRows {
+		cfTimes = append(cfTimes, row.CreatedAt)
+	}
+	usageTimes := make([]int64, 0, len(usageRows))
+	for _, row := range usageRows {
+		usageTimes = append(usageTimes, row.CreatedAt)
+	}
+	holdTimes := make([]int64, 0, len(holds))
+	for _, row := range holds {
+		holdTimes = append(holdTimes, row.CreatedAt)
+	}
+	return map[string]interface{}{
+		"accounts_snapshot.csv": add(accountTimes),
+		"audit_log.csv":         add(auditTimes),
+		"cf_events.csv":         add(cfTimes),
+		"usage_records.csv":     add(usageTimes),
+		"billing_holds.csv":     add(holdTimes),
+	}
 }
 
 func listDiagnosticAuditRows(ctx context.Context, db *sql.DB) ([]storage.AuditLogRow, error) {
@@ -744,7 +1269,7 @@ func kiroRuntimeCapabilityRows(rows []storage.KiroRuntimeCapability, codebook di
 			codebook.code(row.AccountID), row.EndpointHash, row.Model, row.ModelState, row.ThinkingState, row.CacheCapability,
 			itoa64(row.Observations), itoa64(row.MeteringEvents), itoa64(row.CacheReportedObservations),
 			itoa64(row.CacheHitObservations), itoa64(row.ConsecutiveUnreported),
-			codebook.sanitize(row.UnknownCacheSchemaJSON), itoa64(row.UpdatedAt),
+			codebook.sanitize(row.UnknownCacheSchemaJSON), itoa64(row.UpdatedAt), row.CachePointState,
 		})
 	}
 	return out
@@ -1070,37 +1595,71 @@ func egressSnapshotRows(profiles []storage.EgressProfile, bindings []storage.Acc
 
 func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage.AccountToken, auditRows []storage.AuditLogRow, holds []diagnosticBillingHold, bindings []storage.AccountEgressBinding, rateLimits []storage.AccountRateLimit) map[string]interface{} {
 	now := storage.Now()
-	routing409 := map[string]int{}
-	healthModels := map[string]int{}
-	banned := map[string]int{"discovered": 0, "deleted": 0, "delete_failed": 0}
-	for _, row := range auditRows {
-		if row.Action == "routing_unavailable" && strings.Contains(row.Detail, "status=409") {
-			routing409[classifyRouting409Detail(row.Detail)]++
-		}
-		if row.Action == "health_test" || row.Action == "health_test_model_unsupported" {
-			if model := extractDiagnosticDetailValue(row.Detail, "model"); model != "" {
-				healthModels[model]++
+	buildWindow := func(since int64) diagnosticEventWindow {
+		routing409 := map[string]int{}
+		healthModels := map[string]int{}
+		banEvents := map[string]int{"discovered": 0, "deleted": 0, "delete_failed": 0}
+		banAccounts := map[string]map[string]bool{"discovered": {}, "deleted": {}, "delete_failed": {}}
+		for _, row := range auditRows {
+			if row.CreatedAt < since {
+				continue
+			}
+			if row.Action == "routing_unavailable" && strings.Contains(row.Detail, "status=409") {
+				routing409[classifyRouting409Detail(row.Detail)]++
+			}
+			if row.Action == "health_test" || row.Action == "health_test_model_unsupported" {
+				if model := extractDiagnosticDetailValue(row.Detail, "model"); model != "" {
+					healthModels[model]++
+				}
+			}
+			kind := ""
+			if row.State == "banned" {
+				kind = "discovered"
+			}
+			switch row.Action {
+			case "ban_delete":
+				kind = "deleted"
+			case "ban_delete_failed":
+				kind = "delete_failed"
+			}
+			if kind != "" {
+				banEvents[kind]++
+				if row.AccountID != "" {
+					banAccounts[kind][row.AccountID] = true
+				}
 			}
 		}
-		if row.State == "banned" {
-			banned["discovered"]++
+		unique := map[string]int{}
+		for kind, ids := range banAccounts {
+			unique[kind] = len(ids)
 		}
-		switch row.Action {
-		case "ban_delete":
-			banned["deleted"]++
-		case "ban_delete_failed":
-			banned["delete_failed"]++
+		holdEvents := map[string]int{}
+		for _, hold := range holds {
+			if hold.CreatedAt >= since {
+				holdEvents[firstNonEmpty(hold.Status, "unknown")]++
+			}
+		}
+		return diagnosticEventWindow{
+			Routing409: routing409, HealthModels: healthModels,
+			Banned:       map[string]interface{}{"events": banEvents, "unique_accounts": unique},
+			BillingHolds: holdEvents,
 		}
 	}
-	heldCount := 0
-	expiredCount := 0
-	oldestHeldAge := int64(0)
+	lifetime := buildWindow(0)
+	last24h := buildWindow(now - 24*60*60)
+	freshHeld, staleHeld, expiredCount := 0, 0, 0
+	oldestFreshHeldAge := int64(0)
 	for _, hold := range holds {
 		switch hold.Status {
 		case "held":
-			heldCount++
-			if age := now - hold.CreatedAt; age > oldestHeldAge {
-				oldestHeldAge = age
+			age := now - hold.CreatedAt
+			if age <= int64(time.Hour/time.Second) {
+				freshHeld++
+				if age > oldestFreshHeldAge {
+					oldestFreshHeldAge = age
+				}
+			} else {
+				staleHeld++
 			}
 		case "expired_unsettled":
 			expiredCount++
@@ -1111,11 +1670,9 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 	for _, binding := range bindings {
 		bindingByAccount[binding.AccountID] = binding
 	}
-	rateLimitByAccount := map[string]int{}
+	rateLimitsByAccount := map[string][]storage.AccountRateLimit{}
 	for _, snap := range rateLimits {
-		if snap.ResetAt > now {
-			rateLimitByAccount[snap.AccountID]++
-		}
+		rateLimitsByAccount[snap.AccountID] = append(rateLimitsByAccount[snap.AccountID], snap)
 	}
 	type groupSummary struct {
 		Active            int            `json:"active"`
@@ -1146,20 +1703,41 @@ func diagnosticSummary(accounts []storage.Account, tokensByID map[string]storage
 				g.RecheckPending++
 			}
 		}
-		if rateLimitByAccount[account.ID] > 0 {
+		limited := false
+		if _, ok := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], provider, "", now); ok {
+			limited = true
+		} else {
+			for _, snap := range rateLimitsByAccount[account.ID] {
+				if _, ok := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], provider, snap.Model, now); ok {
+					limited = true
+					break
+				}
+			}
+		}
+		if limited {
 			g.RateLimitCooldown++
 		}
 	}
 	return map[string]interface{}{
-		"routing_409":        routing409,
-		"health_test_models": healthModels,
-		"banned_accounts":    banned,
+		// Retain the legacy top-level keys while making their event nature explicit
+		// in the two windowed sections below.
+		"routing_409":        lifetime.Routing409,
+		"health_test_models": lifetime.HealthModels,
+		"banned_accounts":    lifetime.Banned,
 		"billing_holds": map[string]interface{}{
-			"held":                    heldCount,
-			"expired_unsettled":       expiredCount,
-			"oldest_held_age_seconds": oldestHeldAge,
+			"current_fresh_held":            freshHeld,
+			"historical_stale_held":         staleHeld,
+			"expired_unsettled":             expiredCount,
+			"oldest_fresh_held_age_seconds": oldestFreshHeldAge,
 		},
-		"groups": groups,
+		"groups":   groups,
+		"lifetime": lifetime,
+		"last_24h": last24h,
+		"current_state": map[string]interface{}{
+			"groups":                 groups,
+			"fresh_billing_holds":    freshHeld,
+			"stale_historical_holds": staleHeld,
+		},
 	}
 }
 

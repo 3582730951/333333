@@ -31,6 +31,11 @@ type MeteredInt struct {
 	Present bool  `json:"present"`
 }
 
+type MeteredFloat struct {
+	Value   float64 `json:"value"`
+	Present bool    `json:"present"`
+}
+
 type UnknownCacheField struct {
 	Name       string `json:"name"`
 	NumberType string `json:"number_type"`
@@ -40,13 +45,27 @@ type UnknownCacheField struct {
 // KiroMetering preserves both values and wire presence. A reported zero is not
 // interchangeable with a field that never appeared.
 type KiroMetering struct {
-	InputTokens         MeteredInt          `json:"input_tokens"`
-	OutputTokens        MeteredInt          `json:"output_tokens"`
-	CacheReadTokens     MeteredInt          `json:"cache_read_tokens"`
-	CacheCreationTokens MeteredInt          `json:"cache_creation_tokens"`
+	InputTokens         MeteredInt   `json:"input_tokens"`
+	OutputTokens        MeteredInt   `json:"output_tokens"`
+	CacheReadTokens     MeteredInt   `json:"cache_read_tokens"`
+	CacheCreationTokens MeteredInt   `json:"cache_creation_tokens"`
+	TotalInputTokens    MeteredInt   `json:"cache_total_input_tokens"`
+	TotalTokens         MeteredInt   `json:"total_tokens"`
+	Credits             MeteredFloat `json:"credits"`
+	// EventCount is retained for compatibility and is the total number of token or
+	// credit-bearing event envelopes observed. The two explicit counters below
+	// distinguish the modern metadata event from the legacy credits event.
 	EventCount          int                 `json:"event_count"`
+	MetadataEventCount  int                 `json:"metadata_event_count"`
+	MeteringEventCount  int                 `json:"metering_event_count"`
 	ExplicitUnsupported bool                `json:"explicitly_unsupported"`
 	UnknownCacheFields  []UnknownCacheField `json:"unknown_cache_fields,omitempty"`
+
+	metadataInputPresent         bool
+	metadataOutputPresent        bool
+	metadataCacheReadPresent     bool
+	metadataCacheCreationPresent bool
+	metadataTotalPresent         bool
 }
 
 func (m KiroMetering) CacheFieldsPresent() bool {
@@ -54,7 +73,7 @@ func (m KiroMetering) CacheFieldsPresent() bool {
 }
 
 func (m KiroMetering) UsageSource() string {
-	if m.EventCount > 0 || m.InputTokens.Present || m.OutputTokens.Present || m.CacheFieldsPresent() {
+	if m.InputTokens.Present || m.OutputTokens.Present || m.CacheFieldsPresent() || m.TotalTokens.Present {
 		return UsageSourceUpstream
 	}
 	return UsageSourceUnreported
@@ -81,6 +100,8 @@ type ResponseData struct {
 	CompatibilityLosses                                             []string
 	SingleflightWaited                                              bool
 	ToolDescriptionHashes                                           map[string]string
+	CachePointCount                                                 int
+	CachePointBreakpoints                                           []KiroCachePointBreakpoint
 }
 
 type ResponseDelta struct {
@@ -178,8 +199,7 @@ func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
 	messageType := frame.HeaderString(":message-type")
 	if messageType == "error" || messageType == "exception" {
 		if messageType == "exception" && frame.HeaderString(":exception-type") == "ContentLengthExceededException" {
-			p.data.StopReason = "max_tokens"
-			return nil, nil
+			return nil, fmt.Errorf("%w: %s", ErrContextTooLong, strings.TrimSpace(string(frame.Payload)))
 		}
 		return nil, fmt.Errorf("kiro %s %s: %s", messageType, first(frame.HeaderString(":error-code"), frame.HeaderString(":exception-type")), strings.TrimSpace(string(frame.Payload)))
 	}
@@ -236,9 +256,17 @@ func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
 		input := rawJSONString(fields["input"])
 		p.data.Tools[index].Input += input
 		return []ResponseDelta{{Kind: "tool", ToolID: id, ToolName: p.data.Tools[index].Name, ToolInput: input, NewTool: !exists}}, nil
+	case "metadataEvent":
+		p.data.Metering.EventCount++
+		p.data.Metering.MetadataEventCount++
+		observeMeteringWithSource(fields, &p.data.Metering, true)
+		p.syncMeteringFields()
+		return nil, nil
 	case "meteringEvent":
 		p.data.Metering.EventCount++
-		observeMetering(fields, &p.data.Metering)
+		p.data.Metering.MeteringEventCount++
+		observeKiroCredits(fields, &p.data.Metering)
+		observeMeteringWithSource(fields, &p.data.Metering, false)
 		p.syncMeteringFields()
 		return nil, nil
 	case "contextUsageEvent":
@@ -403,18 +431,25 @@ func longestTagPrefixSuffix(text, tag string) int {
 }
 
 var meteringAliases = map[string]string{
+	"uncachedInputTokens": "input", "uncached_input_tokens": "input",
 	"inputTokens": "input", "inputTokenCount": "input", "input_tokens": "input",
 	"outputTokens": "output", "outputTokenCount": "output", "output_tokens": "output",
 	"cacheReadInputTokens": "cache_read", "cacheReadTokens": "cache_read", "cache_read_input_tokens": "cache_read", "cache_read_tokens": "cache_read",
-	"cacheCreationInputTokens": "cache_creation", "cacheWriteTokens": "cache_creation", "cache_creation_input_tokens": "cache_creation", "cache_write_tokens": "cache_creation",
+	"cacheCreationInputTokens": "cache_creation", "cacheWriteInputTokens": "cache_creation", "cacheWriteTokens": "cache_creation", "cache_creation_input_tokens": "cache_creation", "cache_write_input_tokens": "cache_creation", "cache_write_tokens": "cache_creation",
+	"totalTokens": "total", "totalTokenCount": "total", "total_tokens": "total",
 }
 
 func observeMetering(fields map[string]json.RawMessage, metering *KiroMetering) {
+	observeMeteringWithSource(fields, metering, false)
+}
+
+func observeMeteringWithSource(fields map[string]json.RawMessage, metering *KiroMetering, metadata bool) {
 	if metering == nil {
 		return
 	}
 	unknown := map[string]UnknownCacheField{}
-	observeMeteringObject(fields, "", metering, unknown)
+	observeMeteringObject(fields, "", metering, unknown, metadata)
+	refreshKiroInputTotal(metering)
 	if len(unknown) > 0 {
 		byKey := map[string]UnknownCacheField{}
 		for _, field := range metering.UnknownCacheFields {
@@ -436,7 +471,7 @@ func observeMetering(fields map[string]json.RawMessage, metering *KiroMetering) 
 	}
 }
 
-func observeMeteringObject(fields map[string]json.RawMessage, prefix string, metering *KiroMetering, unknown map[string]UnknownCacheField) {
+func observeMeteringObject(fields map[string]json.RawMessage, prefix string, metering *KiroMetering, unknown map[string]UnknownCacheField, metadata bool) {
 	keys := make([]string, 0, len(fields))
 	for key := range fields {
 		keys = append(keys, key)
@@ -452,13 +487,15 @@ func observeMeteringObject(fields map[string]json.RawMessage, prefix string, met
 			if value, present := rawJSONInt(raw); present {
 				switch target {
 				case "input":
-					observeMeteredInt(&metering.InputTokens, value)
+					observeKiroToken(&metering.InputTokens, &metering.metadataInputPresent, value, metadata)
 				case "output":
-					observeMeteredInt(&metering.OutputTokens, value)
+					observeKiroToken(&metering.OutputTokens, &metering.metadataOutputPresent, value, metadata)
 				case "cache_read":
-					observeMeteredInt(&metering.CacheReadTokens, value)
+					observeKiroToken(&metering.CacheReadTokens, &metering.metadataCacheReadPresent, value, metadata)
 				case "cache_creation":
-					observeMeteredInt(&metering.CacheCreationTokens, value)
+					observeKiroToken(&metering.CacheCreationTokens, &metering.metadataCacheCreationPresent, value, metadata)
+				case "total":
+					observeKiroToken(&metering.TotalTokens, &metering.metadataTotalPresent, value, metadata)
 				}
 			}
 			continue
@@ -472,7 +509,7 @@ func observeMeteringObject(fields map[string]json.RawMessage, prefix string, met
 		}
 		var nested map[string]json.RawMessage
 		if len(bytes.TrimSpace(raw)) > 0 && bytes.TrimSpace(raw)[0] == '{' && decodeUseNumber(raw, &nested) == nil {
-			observeMeteringObject(nested, path, metering, unknown)
+			observeMeteringObject(nested, path, metering, unknown, metadata)
 			continue
 		}
 		if strings.Contains(lower, "cache") {
@@ -481,6 +518,66 @@ func observeMeteringObject(fields map[string]json.RawMessage, prefix string, met
 				field := UnknownCacheField{Name: path, NumberType: numberType, SchemaHash: hex.EncodeToString(sum[:])}
 				unknown[path+"\x00"+numberType] = field
 			}
+		}
+	}
+}
+
+func observeKiroToken(field *MeteredInt, metadataPresent *bool, value int64, metadata bool) {
+	if field == nil || metadataPresent == nil {
+		return
+	}
+	if metadata {
+		if !*metadataPresent || value > field.Value {
+			field.Value = value
+		}
+		field.Present = true
+		*metadataPresent = true
+		return
+	}
+	// Modern metadataEvent tokenUsage is authoritative regardless of whether it
+	// arrives before or after the legacy meteringEvent.
+	if *metadataPresent {
+		return
+	}
+	observeMeteredInt(field, value)
+}
+
+func refreshKiroInputTotal(metering *KiroMetering) {
+	if metering == nil {
+		return
+	}
+	if !metering.InputTokens.Present && !metering.CacheReadTokens.Present && !metering.CacheCreationTokens.Present {
+		return
+	}
+	metering.TotalInputTokens = MeteredInt{
+		Value:   metering.InputTokens.Value + metering.CacheReadTokens.Value + metering.CacheCreationTokens.Value,
+		Present: true,
+	}
+}
+
+func observeKiroCredits(fields map[string]json.RawMessage, metering *KiroMetering) {
+	if metering == nil {
+		return
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		raw := fields[key]
+		if key == "usage" || key == "credits" {
+			if value, present := rawJSONFloat(raw); present {
+				if !metering.Credits.Present || value > metering.Credits.Value {
+					metering.Credits.Value = value
+				}
+				metering.Credits.Present = true
+			}
+		}
+		trimmed := bytes.TrimSpace(raw)
+		var nested map[string]json.RawMessage
+		if len(trimmed) > 0 && trimmed[0] == '{' && decodeUseNumber(raw, &nested) == nil {
+			observeKiroCredits(nested, metering)
 		}
 	}
 }
@@ -518,6 +615,25 @@ func rawJSONInt(raw json.RawMessage) (int64, bool) {
 		return 0, false
 	}
 	return int64(floatValue), true
+}
+
+func rawJSONFloat(raw json.RawMessage) (float64, bool) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" || strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return 0, false
+	}
+	if strings.HasPrefix(trimmed, "\"") {
+		var text string
+		if json.Unmarshal(raw, &text) != nil {
+			return 0, false
+		}
+		trimmed = text
+	}
+	value, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, false
+	}
+	return value, true
 }
 
 func rawJSONNumberFloat(raw json.RawMessage) float64 {

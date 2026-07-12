@@ -588,7 +588,7 @@ func (s *Server) executeKiroModelQualityProbe(ctx context.Context, combo modelQu
 	}
 	recorder := &probeResponseRecorder{header: http.Header{}}
 	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://kiro.internal/model-quality", nil)
-	data, endpointHash, _ := s.doKiroAttempt(recorder, request, converted, lease)
+	data, endpointHash, _ := s.doKiroAttempt(recorder, request, &converted, lease)
 	result.Run.LatencyMS = time.Since(started).Milliseconds()
 	if data == nil {
 		status := recorder.status

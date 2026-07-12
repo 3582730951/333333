@@ -506,8 +506,10 @@ func TestAdminCacheHitsV2RendersKiroUnreportedRatesAsUnknown(t *testing.T) {
 	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.ObserveKiroCapability(ctx, account.ID, "endpoint-hash", "claude-sonnet-4.6", storage.KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 20, UnreportedThreshold: 20}); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 20; i++ {
+		if _, err := h.store.ObserveKiroCapability(ctx, account.ID, "endpoint-hash", "claude-sonnet-4.6", storage.KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 1, UnreportedThreshold: 20}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route", "", "", "claude-sonnet-4.6", 100, 1, 101, 0, 0, 0, json.RawMessage(`{"input_tokens":100}`), storage.UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream"}); err != nil {
 		t.Fatal(err)
@@ -533,6 +535,35 @@ func TestAdminCacheHitsV2RendersKiroUnreportedRatesAsUnknown(t *testing.T) {
 	}
 	if row[columns["provider"]] != "kiro" || row[columns["cache_capability"]] != "unreported" || row[columns["real_requests"]] != "0" || row[columns["cache_miss_tokens"]] != "0" {
 		t.Fatalf("unreported Kiro export row=%v", row)
+	}
+}
+
+func TestAdminCacheHitsLeavesCreationRatesBlankWhenProviderDidNotReportWrites(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	account := storage.Account{ID: "codex-no-write-metric", Provider: "codex", GroupName: "cyber", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.InsertUsageRecord(ctx, account.ID, "route", "", "", "gpt-5.6", 100, 1, 101, 80, json.RawMessage(`{"input_tokens":100,"input_tokens_details":{"cached_tokens":80}}`)); err != nil {
+		t.Fatal(err)
+	}
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0", "")
+	if code != http.StatusOK {
+		t.Fatalf("cache hit export = %d: %s", code, raw)
+	}
+	records, err := csv.NewReader(strings.NewReader(readZipFiles(t, raw)["by_account_model.csv"])).ReadAll()
+	if err != nil || len(records) != 2 {
+		t.Fatalf("records=%v err=%v", records, err)
+	}
+	columns := map[string]int{}
+	for i, name := range records[0] {
+		columns[name] = i
+	}
+	for _, field := range []string{"cache_write_share", "eligible_cache_hit_rate"} {
+		if got := records[1][columns[field]]; got != "" {
+			t.Fatalf("%s=%q, want blank without explicit cache creation metering: %v", field, got, records[1])
+		}
 	}
 }
 

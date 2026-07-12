@@ -172,9 +172,9 @@ func (h *Handler) handleJobLogsExport(w http.ResponseWriter, r *http.Request) {
 	_ = enc.Encode(export)
 }
 
-// LogRetentionCleanup deletes registration_task_events older than the configured
-// retention window (default 7 days). Called from the automation scheduler tick
-// so it runs periodically without a separate goroutine.
+// LogRetentionCleanup is retained as a compatibility entry point for registration
+// callers. The server-level retention loop now invokes the same unified policy for
+// registration events and the other disposable observability tables.
 func (h *Handler) LogRetentionCleanup(ctx context.Context) {
 	if h == nil || h.store == nil {
 		return
@@ -189,6 +189,5 @@ func (h *Handler) LogRetentionCleanup(ctx context.Context) {
 		}
 	}
 	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).Unix()
-	_, _ = h.store.DB().ExecContext(ctx,
-		`DELETE FROM registration_task_events WHERE created_at < ?`, cutoff)
+	_, _ = h.store.PurgeLogRecordsBefore(ctx, cutoff, logCleanupBatchSize)
 }

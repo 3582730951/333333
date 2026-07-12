@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { get, post } from '../../../api.js';
+import { del, get, post } from '../../../api.js';
 import { createApiError, parseApiResponse } from '../../../api/contracts';
 import type {
   AdvancedSettings, AdvancedSettingsKind, AdvancedSettingsSaveInput, AutomationSettings, ConfigField, LifecycleSettings, ProviderOptions, ProviderSetting,
-  RegistrarSaveInput, RegistrarSettings, SettingsEgress, SettingsGroup, SettingsPatch,
+  LogClearResponse, RegistrarSaveInput, RegistrarSettings, SettingsEgress, SettingsGroup, SettingsPatch,
   SettingsSaveResponse, SettingsSection, SettingsTemplate, SettingsValues, SharedSettingsOptions,
 } from '../model/settings';
 
@@ -17,6 +17,26 @@ const settingsDiffSchema = z.object({
 export const settingsSaveResponseSchema = z.object({
   saved: z.array(settingsDiffSchema).optional(),
 }).passthrough().transform((value) => ({ ...value, saved: value.saved ?? [] }));
+
+const logRecordCountsSchema = z.object({
+  audit_log: z.coerce.number().int().nonnegative(),
+  cf_events: z.coerce.number().int().nonnegative(),
+  usage_records: z.coerce.number().int().nonnegative(),
+  registration_task_events: z.coerce.number().int().nonnegative(),
+  lifecycle_task_logs: z.coerce.number().int().nonnegative(),
+  lifecycle_events: z.coerce.number().int().nonnegative(),
+  proxy_usage_records: z.coerce.number().int().nonnegative(),
+  terminal_billing_holds: z.coerce.number().int().nonnegative(),
+});
+export const logClearResponseSchema = z.object({
+  ok: z.boolean(),
+  deleted: logRecordCountsSchema,
+  deleted_total: z.coerce.number().int().nonnegative(),
+  preserved_active_billing_holds: z.coerce.number().int().nonnegative(),
+  space_reclaimed: z.boolean(),
+  reclaim_warning: z.string().optional().default(''),
+  retention_days: z.coerce.number().int().positive(),
+}).passthrough();
 
 const configFieldSchema = z.object({
   key: z.string(),
@@ -258,6 +278,10 @@ export async function fetchSharedSettingsOptions(signal?: AbortSignal): Promise<
 
 export async function saveSettingsPatches(patches: SettingsPatch[]): Promise<SettingsSaveResponse> {
   return parseApiResponse(settingsSaveResponseSchema, await post('/admin/settings-center', patches));
+}
+
+export async function clearLogRecords(): Promise<LogClearResponse> {
+  return parseApiResponse(logClearResponseSchema, await del('/admin/logs', undefined, { timeout: 30 * 60 * 1000 })) as LogClearResponse;
 }
 
 export async function applySettingsTemplate(templateId: string): Promise<SettingsTemplate> {

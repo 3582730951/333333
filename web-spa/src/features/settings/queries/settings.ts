@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import {
-  applySettingsTemplate, fetchAdvancedSettings, fetchAutomationSettings, fetchConfigSettings, fetchLifecycleSettings,
+  applySettingsTemplate, clearLogRecords, fetchAdvancedSettings, fetchAutomationSettings, fetchConfigSettings, fetchLifecycleSettings,
   fetchLoggingSettings, fetchMemorySettings, fetchRegistrarSettings, fetchSharedSettingsOptions,
   saveAdvancedSettings, saveRegistrarSettings, saveSettingsPatches,
 } from '../api/settings';
@@ -64,6 +64,12 @@ export function useSaveSettingsMutation() {
   return useApiMutation<SettingsPatch[], Awaited<ReturnType<typeof saveSettingsPatches>>>({
     mutationFn: saveSettingsPatches,
     invalidate: [settingsQueryKeys.all],
+  });
+}
+
+export function useClearLogRecordsMutation() {
+  return useApiMutation<void, Awaited<ReturnType<typeof clearLogRecords>>>({
+    mutationFn: clearLogRecords,
   });
 }
 

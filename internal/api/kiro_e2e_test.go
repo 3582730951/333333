@@ -66,9 +66,13 @@ func TestKiroImportAndMessagesEndToEnd(t *testing.T) {
 			if bytes.Contains(requestBody, []byte("<thinking_mode>")) || bytes.Contains(requestBody, []byte("<system>")) {
 				t.Errorf("legacy compatibility prompt leaked into request content: %s", requestBody)
 			}
+			if !bytes.Contains(requestBody, []byte(`"cachePoint":{"type":"default"}`)) {
+				t.Errorf("auto mode did not send a planned Kiro cachePoint: %s", requestBody)
+			}
 			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"hello from kiro"}`)))
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":7,"outputTokens":3}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":7,"cacheReadInputTokens":5,"cacheWriteInputTokens":2,"outputTokens":3,"totalTokens":17}}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"usage":0.75}`)))
 		default:
 			http.NotFound(w, r)
 		}
@@ -122,8 +126,18 @@ func TestKiroImportAndMessagesEndToEnd(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("hello from kiro")) {
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("hello from kiro")) || !bytes.Contains(body, []byte(`"input_tokens":7`)) || !bytes.Contains(body, []byte(`"cache_read_input_tokens":5`)) || !bytes.Contains(body, []byte(`"cache_creation_input_tokens":2`)) {
 		t.Fatalf("messages status=%d body=%s", resp.StatusCode, body)
+	}
+	h.app.FlushWrites()
+	var promptTokens, completionTokens, totalTokens, cacheRead, cacheCreation, cacheTotal int64
+	var usageSource, rawUsage string
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_creation_tokens, cache_total_input_tokens, usage_source, raw_usage_json FROM usage_records ORDER BY id DESC LIMIT 1`).Scan(
+		&promptTokens, &completionTokens, &totalTokens, &cacheRead, &cacheCreation, &cacheTotal, &usageSource, &rawUsage); err != nil {
+		t.Fatal(err)
+	}
+	if promptTokens != 7 || completionTokens != 3 || totalTokens != 17 || cacheRead != 5 || cacheCreation != 2 || cacheTotal != 14 || usageSource != "upstream" || !strings.Contains(rawUsage, `"kiro_credits":0.75`) {
+		t.Fatalf("persisted Kiro metadata usage = prompt=%d output=%d total=%d read=%d write=%d cache_total=%d source=%s raw=%s", promptTokens, completionTokens, totalTokens, cacheRead, cacheCreation, cacheTotal, usageSource, rawUsage)
 	}
 
 	resp, err = http.Post(h.pool.URL+"/admin/accounts/import-kiro-json", "application/json", bytes.NewReader(payload))
@@ -355,7 +369,8 @@ func TestKiroStreamingForwardsFirstSemanticFrameBeforeUpstreamCompletes(t *testi
 			close(firstWritten)
 			<-releaseSecond
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":" second"}`)))
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":7,"outputTokens":2,"cacheReadTokens":0}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":7,"outputTokens":2,"cacheReadInputTokens":0,"cacheWriteInputTokens":0,"totalTokens":9}}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"usage":0.25}`)))
 		default:
 			http.NotFound(w, r)
 		}
@@ -407,6 +422,9 @@ func TestKiroStreamingForwardsFirstSemanticFrameBeforeUpstreamCompletes(t *testi
 		if !strings.Contains(got, "first") {
 			t.Fatalf("first downstream data=%q", got)
 		}
+		if strings.Contains(got, `"input_tokens":0`) {
+			t.Fatalf("stream waited for metadata by emitting a fake zero instead of a provisional estimate: %q", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("Kiro stream buffered until completion")
 	}
@@ -415,7 +433,7 @@ func TestKiroStreamingForwardsFirstSemanticFrameBeforeUpstreamCompletes(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(rest, []byte(" second")) || !bytes.Contains(rest, []byte(`"cache_read_input_tokens":0`)) {
+	if !bytes.Contains(rest, []byte(" second")) || !bytes.Contains(rest, []byte(`"input_tokens":7`)) || !bytes.Contains(rest, []byte(`"cache_read_input_tokens":0`)) || !bytes.Contains(rest, []byte(`"cache_creation_input_tokens":0`)) {
 		t.Fatalf("terminal stream=%s", rest)
 	}
 }
@@ -499,11 +517,12 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 			body, _ := io.ReadAll(r.Body)
 			generateBodies = append(generateBodies, append([]byte(nil), body...))
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"OK"}`)))
-			metering := `{"inputTokens":10,"outputTokens":1,"cacheCreationInputTokens":5}`
+			metadata := `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":1,"cacheReadInputTokens":0,"cacheWriteInputTokens":5,"totalTokens":16}}`
 			if len(generateBodies) == 2 {
-				metering = `{"inputTokens":10,"outputTokens":1,"cacheReadInputTokens":5}`
+				metadata = `{"tokenUsage":{"uncachedInputTokens":10,"outputTokens":1,"cacheReadInputTokens":5,"cacheWriteInputTokens":0,"totalTokens":16}}`
 			}
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(metering)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(metadata)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"usage":0.5}`)))
 		default:
 			http.NotFound(w, r)
 		}
@@ -542,15 +561,18 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 	if response.StatusCode != http.StatusOK || len(generateBodies) != 2 || !bytes.Equal(generateBodies[0], generateBodies[1]) {
 		t.Fatalf("probe status=%d calls=%d stable=%v body=%s", response.StatusCode, len(generateBodies), len(generateBodies) == 2 && bytes.Equal(generateBodies[0], generateBodies[1]), probeBody)
 	}
-	if len(generateBodies[0]) < 4096 {
+	if len(generateBodies[0]) < 32*1024 {
 		t.Fatalf("probe prefix too short to exercise realistic cache eligibility: %d bytes", len(generateBodies[0]))
+	}
+	if !bytes.Contains(generateBodies[0], []byte(`"cachePoint":{"type":"default"}`)) {
+		t.Fatalf("probe did not send a real cachePoint: %s", generateBodies[0])
 	}
 	for _, required := range []string{`"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"max"}`, `"max_tokens":64000`} {
 		if !bytes.Contains(generateBodies[0], []byte(required)) {
 			t.Fatalf("cache probe disabled mandatory Kiro quality field %s: %s", required, generateBodies[0])
 		}
 	}
-	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) {
+	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) || !bytes.Contains(probeBody, []byte(`"cache_verified":true`)) || !bytes.Contains(probeBody, []byte(`"credits":{"value":0.5,"present":true}`)) {
 		t.Fatalf("probe did not report real metering: %s", probeBody)
 	}
 	if !bytes.Contains(probeBody, []byte(`"thinking":"adaptive"`)) || !bytes.Contains(probeBody, []byte(`"effort":"max"`)) || !bytes.Contains(probeBody, []byte(`"max_output_tokens":64000`)) {
@@ -558,7 +580,207 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 	}
 }
 
-func TestKiroCacheSingleflightOnlyAfterReportedCapability(t *testing.T) {
+func TestKiroCachePointRejectionFallsBackOnceAndPersistsUnsupported(t *testing.T) {
+	var bodies [][]byte
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, append([]byte(nil), body...))
+			if bytes.Contains(body, []byte(`"cachePoint"`)) {
+				http.Error(w, `{"message":"cachePoint is not supported"}`, http.StatusUnprocessableEntity)
+				return
+			}
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"ok"}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":4,"outputTokens":1,"cacheReadInputTokens":0,"cacheWriteInputTokens":0,"totalTokens":5}}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	allowKiroTestEndpoint(t, h, kiroMock.URL)
+	credential, _ := json.Marshal(map[string]any{"authMethod": "api_key", "kiroApiKey": "fallback-key", "endpoint": kiroMock.URL})
+	payload, _ := json.Marshal(map[string]any{"kiro_json_text": string(credential), "group_name": "cyber", "egress_id": "egress_direct"})
+	response, err := http.Post(h.pool.URL+"/admin/accounts/import-kiro-json", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	accounts, _ := h.store.ListAccounts(context.Background())
+	if len(accounts) != 1 {
+		t.Fatalf("accounts=%+v", accounts)
+	}
+	send := func() []byte {
+		request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-6","system":"`+strings.Repeat("stable ", 800)+`","messages":[{"role":"user","content":"hello"}]}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Pool-Provider", "kiro")
+		request.Header.Set("X-Claude-Code-Session-Id", "cachepoint-fallback")
+		resp, requestErr := http.DefaultClient.Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+		}
+		return body
+	}
+	first := send()
+	if len(bodies) != 2 || !bytes.Contains(bodies[0], []byte(`"cachePoint"`)) || bytes.Contains(bodies[1], []byte(`"cachePoint"`)) {
+		t.Fatalf("fallback requests=%d bodies=%q", len(bodies), bodies)
+	}
+	if !bytes.Contains(first, []byte(`"input_tokens":4`)) {
+		t.Fatalf("fallback response lost metadata usage: %s", first)
+	}
+	endpointHash, _ := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
+	capabilityState, err := h.store.GetKiroRuntimeCapability(context.Background(), accounts[0].ID, endpointHash, "claude-sonnet-4.6")
+	if err != nil || capabilityState.CachePointState != "unsupported" {
+		t.Fatalf("cachePoint capability=%+v err=%v", capabilityState, err)
+	}
+	_ = send()
+	if len(bodies) != 3 || bytes.Contains(bodies[2], []byte(`"cachePoint"`)) {
+		t.Fatalf("unsupported cachePoint was retried on next request: %q", bodies)
+	}
+}
+
+func TestKiroContentLengthRegressionRetriesWithReducedOutputBeforeHistory(t *testing.T) {
+	var bodies [][]byte
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, append([]byte(nil), body...))
+			if bytes.Contains(body, []byte(`"max_tokens":64000`)) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`))
+				return
+			}
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"ok"}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":20,"outputTokens":1,"cacheReadInputTokens":0,"cacheWriteInputTokens":0,"totalTokens":21}}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	account := importKiroEndpointForTest(t, h, kiroMock.URL, "context-retry-key")
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-6","max_tokens":32,"messages":[{"role":"user","content":"preserve this request"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "kiro")
+	request.Header.Set("X-Claude-Code-Session-Id", "context-output-retry")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || len(bodies) != 2 {
+		t.Fatalf("status=%d requests=%d body=%s", response.StatusCode, len(bodies), responseBody)
+	}
+	if !bytes.Contains(bodies[0], []byte(`"max_tokens":64000`)) || !bytes.Contains(bodies[1], []byte(`"max_tokens":4096`)) {
+		t.Fatalf("adaptive output retry bodies=%q", bodies)
+	}
+	if !bytes.Contains(bodies[1], []byte("preserve this request")) || response.Header.Get("X-Pool-Kiro-Max-Output-Tokens") != "4096" {
+		t.Fatalf("retry lost input or diagnostics: headers=%v body=%s", response.Header, bodies[1])
+	}
+	endpointHash, _ := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
+	state, stateErr := h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-sonnet-4.6")
+	if stateErr != nil || state.CachePointState == "unsupported" {
+		t.Fatalf("content error poisoned cachePoint state: state=%+v err=%v", state, stateErr)
+	}
+}
+
+func TestKiroContentLengthRetryTrimsOldestTurnOnlyAfterReducedOutputFails(t *testing.T) {
+	var bodies [][]byte
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, append([]byte(nil), body...))
+			if len(bodies) < 3 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`))
+				return
+			}
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"trimmed-ok"}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":30,"outputTokens":2,"totalTokens":32}}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	_ = importKiroEndpointForTest(t, h, kiroMock.URL, "history-retry-key")
+	payload, _ := json.Marshal(map[string]any{
+		"model": "claude-sonnet-4-6",
+		"messages": []any{
+			map[string]any{"role": "user", "content": strings.Repeat("old-context-", 4_000)},
+			map[string]any{"role": "assistant", "content": "old-answer"},
+			map[string]any{"role": "user", "content": "recent-context"},
+			map[string]any{"role": "assistant", "content": "recent-answer"},
+			map[string]any{"role": "user", "content": "current-context"},
+		},
+	})
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "kiro")
+	request.Header.Set("X-Claude-Code-Session-Id", "context-history-retry")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || len(bodies) != 3 {
+		t.Fatalf("status=%d requests=%d body=%s", response.StatusCode, len(bodies), responseBody)
+	}
+	if !bytes.Contains(bodies[1], []byte("old-context-")) || bytes.Contains(bodies[2], []byte("old-context-")) || bytes.Contains(bodies[2], []byte("old-answer")) {
+		t.Fatalf("oldest turn retry sequence=%q", bodies)
+	}
+	for _, required := range [][]byte{[]byte("recent-context"), []byte("recent-answer"), []byte("current-context")} {
+		if !bytes.Contains(bodies[2], required) {
+			t.Fatalf("trimmed retry lost %q: %s", required, bodies[2])
+		}
+	}
+	if response.Header.Get("X-Pool-Kiro-History-Messages-Dropped") == "" {
+		t.Fatalf("trim diagnostics missing: %v", response.Header)
+	}
+}
+
+func importKiroEndpointForTest(t *testing.T, h *testHarness, endpoint, apiKey string) storage.Account {
+	t.Helper()
+	allowKiroTestEndpoint(t, h, endpoint)
+	credential, _ := json.Marshal(map[string]any{"authMethod": "api_key", "kiroApiKey": apiKey, "endpoint": endpoint})
+	payload, _ := json.Marshal(map[string]any{"kiro_json_text": string(credential), "group_name": "cyber", "egress_id": "egress_direct"})
+	response, err := http.Post(h.pool.URL+"/admin/accounts/import-kiro-json", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("Kiro import status=%d body=%s", response.StatusCode, body)
+	}
+	accounts, err := h.store.ListAccounts(context.Background())
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("Kiro accounts=%+v err=%v", accounts, err)
+	}
+	return accounts[0]
+}
+
+func TestKiroCacheSingleflightForUnknownCachePointCapabilityAndCancellation(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
 	ctx := context.Background()
 	account := storage.Account{ID: "kiro-flight", Label: "kiro", GroupName: "cyber", Provider: "kiro", Status: "active"}
@@ -588,7 +810,7 @@ func TestKiroCacheSingleflightOnlyAfterReportedCapability(t *testing.T) {
 	if prefix := routing.AnthropicStablePromptPrefixHash(raw); prefix == "" {
 		t.Fatal("stable prompt prefix hash is empty")
 	}
-	releaseFirst, waited := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model)
+	releaseFirst, waited := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
 	if waited {
 		t.Fatal("first request unexpectedly waited")
 	}
@@ -599,7 +821,7 @@ func TestKiroCacheSingleflightOnlyAfterReportedCapability(t *testing.T) {
 	second := make(chan result, 1)
 	go func() {
 		defer supervisor.Recover("kiro-singleflight-test")
-		release, didWait := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model)
+		release, didWait := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
 		second <- result{release: release, waited: didWait}
 	}()
 	select {
@@ -616,6 +838,35 @@ func TestKiroCacheSingleflightOnlyAfterReportedCapability(t *testing.T) {
 		got.release()
 	case <-time.After(time.Second):
 		t.Fatal("singleflight waiter did not resume")
+	}
+
+	releaseLeader, _ := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancelResult := make(chan result, 1)
+	go func() {
+		release, didWait := h.app.enterKiroCacheSingleflight(cancelled, raw, affinity, lease, model, 1)
+		cancelResult <- result{release: release, waited: didWait}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	cancelledWaiter := <-cancelResult
+	cancelledWaiter.release()
+	if !cancelledWaiter.waited {
+		t.Fatal("cancelled waiter did not record that it encountered an active flight")
+	}
+	releaseLeader()
+	releaseAfterCancel, waitedAfterCancel := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
+	if waitedAfterCancel {
+		t.Fatal("cancelled waiter left a stale Kiro cache flight")
+	}
+	releaseAfterCancel()
+}
+
+func TestFinalizeKiroUsageCreditsOnlyUsesExplicitEstimate(t *testing.T) {
+	data := kirowire.ResponseData{Text: "ok", Metering: kirowire.KiroMetering{Credits: kirowire.MeteredFloat{Value: 0, Present: true}}}
+	finalizeKiroUsage(&data, kirowire.Conversion{EstimatedInputTokens: 42})
+	if data.UsageSource != kirowire.UsageSourceEstimated || data.InputTokens != 42 || data.OutputTokens <= 0 || data.Metering.InputTokens.Present {
+		t.Fatalf("credits-only fallback was not clearly estimated: %+v", data)
 	}
 }
 

@@ -28,6 +28,27 @@ export interface SettingsSaveResponse {
   saved: SettingsDiff[];
 }
 
+export interface LogRecordCounts {
+  audit_log: number;
+  cf_events: number;
+  usage_records: number;
+  registration_task_events: number;
+  lifecycle_task_logs: number;
+  lifecycle_events: number;
+  proxy_usage_records: number;
+  terminal_billing_holds: number;
+}
+
+export interface LogClearResponse {
+  ok: boolean;
+  deleted: LogRecordCounts;
+  deleted_total: number;
+  preserved_active_billing_holds: number;
+  space_reclaimed: boolean;
+  reclaim_warning: string;
+  retention_days: number;
+}
+
 export interface SettingsPatch {
   section: SettingsSection;
   key?: string;

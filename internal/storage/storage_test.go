@@ -373,14 +373,18 @@ func TestKiroRuntimeCapabilityPresenceAndUnreportedThreshold(t *testing.T) {
 	if err := store.EnsureKiroRuntimeModels(ctx, account.ID, "endpoint", []string{"claude-sonnet-4.6"}); err != nil {
 		t.Fatal(err)
 	}
-	state, err := store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 19, UnreportedThreshold: 20})
-	if err != nil {
-		t.Fatal(err)
+	var state KiroRuntimeCapability
+	var err error
+	for i := 0; i < 19; i++ {
+		state, err = store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 1, UnreportedThreshold: 20})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if state.ModelState != "verified" || state.CacheCapability != "unknown" || state.ConsecutiveUnreported != 19 {
 		t.Fatalf("after 19 = %+v", state)
 	}
-	state, err = store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{MeteringEvents: 1, UnreportedThreshold: 20})
+	state, err = store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6", KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 1, UnreportedThreshold: 20})
 	if err != nil || state.CacheCapability != "unreported" || state.ConsecutiveUnreported != 20 {
 		t.Fatalf("after 20 = %+v err=%v", state, err)
 	}
@@ -410,5 +414,46 @@ func TestKiroUnreportedUsageIsNotCacheMiss(t *testing.T) {
 	}
 	if report.Summary.Requests != 1 || report.Summary.RealRequests != 0 || report.Summary.CacheMissTokens != 0 || report.Summary.CacheInputTokens != 0 {
 		t.Fatalf("unreported Kiro usage counted as cache miss: %+v", report.Summary)
+	}
+}
+
+func TestKiroHistoricalZeroUsageBackfillAndModelAggregation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "kiro-history", GroupName: "cyber", Provider: "kiro", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "zero", "", "", "claude-opus-4-8", 0, 0, 0, 0, 0, 0,
+		json.RawMessage(`{"metering_event_count":1,"usage_source":"upstream"}`),
+		UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "a", "", "", "claude-opus-4-8", 10, 1, 11, 0, 0, 0,
+		json.RawMessage(`{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`),
+		UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream", CacheReadPresent: true, CacheCreationPresent: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "b", "", "", "claude-opus-4.8", 12, 1, 13, 0, 0, 0,
+		json.RawMessage(`{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`),
+		UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream", CacheReadPresent: true, CacheCreationPresent: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillUsageCacheDiagnostics(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var source, model string
+	if err := store.DB().QueryRowContext(ctx, `SELECT usage_source, model FROM usage_records WHERE route_key_hash='zero'`).Scan(&source, &model); err != nil {
+		t.Fatal(err)
+	}
+	if source != "unreported" || model != "claude-opus-4.8" {
+		t.Fatalf("historical zero/model backfill = source %q model %q", source, model)
+	}
+	report, err := store.CacheUsageMetricsWindowFullRoutes(ctx, 0, Now()+10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.ByModel) != 1 || report.ByModel[0].Model != "claude-opus-4.8" || report.ByModel[0].Requests != 3 {
+		t.Fatalf("normalized model aggregation = %+v", report.ByModel)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/capability"
 	kirowire "codex-account-pool/internal/kiro"
@@ -15,12 +16,18 @@ import (
 )
 
 type kiroCacheProbeAttempt struct {
-	InputTokens         kirowire.MeteredInt `json:"input_tokens"`
-	OutputTokens        kirowire.MeteredInt `json:"output_tokens"`
-	CacheReadTokens     kirowire.MeteredInt `json:"cache_read_tokens"`
-	CacheCreationTokens kirowire.MeteredInt `json:"cache_creation_tokens"`
-	MeteringEvents      int                 `json:"metering_events"`
-	UsageSource         string              `json:"usage_source"`
+	InputTokens           kirowire.MeteredInt   `json:"input_tokens"`
+	OutputTokens          kirowire.MeteredInt   `json:"output_tokens"`
+	CacheReadTokens       kirowire.MeteredInt   `json:"cache_read_tokens"`
+	CacheCreationTokens   kirowire.MeteredInt   `json:"cache_creation_tokens"`
+	CacheTotalInputTokens kirowire.MeteredInt   `json:"cache_total_input_tokens"`
+	TotalTokens           kirowire.MeteredInt   `json:"total_tokens"`
+	Credits               kirowire.MeteredFloat `json:"credits"`
+	MetadataEvents        int                   `json:"metadata_events"`
+	MeteringEvents        int                   `json:"metering_events"`
+	UsageSource           string                `json:"usage_source"`
+	CachePointState       string                `json:"cache_point_state"`
+	ElapsedMillis         int64                 `json:"elapsed_millis"`
 }
 
 func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, accountID string) {
@@ -88,17 +95,20 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 	// without including any account, prompt, user, or credential data. Keep it long
 	// enough to cross common prompt-cache minimums; a tiny "Reply OK" request can
 	// falsely look unsupported even on an endpoint that caches realistic prompts.
-	stableProbePrefix := strings.Repeat("Kiro cache capability probe stable public prefix. ", 180)
+	stableProbePrefix := strings.Repeat("Kiro cache capability probe stable public prefix. ", 900)
 	probeRaw, _ := json.Marshal(map[string]any{
-		"model":         resolved,
-		"system":        stableProbePrefix,
+		"model": resolved,
+		"system": []any{map[string]any{
+			"type": "text", "text": stableProbePrefix,
+			"cache_control": map[string]any{"type": "ephemeral"},
+		}},
 		"messages":      []any{map[string]any{"role": "user", "content": "Reply with OK."}},
 		"max_tokens":    8,
 		"thinking":      map[string]any{"type": "adaptive"},
 		"output_config": map[string]any{"effort": "max"},
 	})
 	affinity := routing.AffinityFromKey("kiro-cache-probe-v1:"+accountID+":"+endpointHash+":"+resolved, "kiro_cache_probe")
-	converted, err := kirowire.ConvertAnthropicRequestWithOptions(probeRaw, affinity.Hash, kirowire.ConversionOptions{ForceMaxQuality: true, VerifiedModels: verified})
+	converted, err := kirowire.ConvertAnthropicRequestWithOptions(probeRaw, affinity.Hash, kirowire.ConversionOptions{ForceMaxQuality: true, EnableCachePoints: true, VerifiedModels: verified})
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return
@@ -108,7 +118,9 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 	var capabilityState storage.KiroRuntimeCapability
 	for i := 0; i < 2; i++ {
 		recorder := &probeResponseRecorder{header: http.Header{}}
-		data, observedEndpointHash, _ := s.doKiroAttempt(recorder, r, converted, lease)
+		startedAt := time.Now()
+		data, observedEndpointHash, _ := s.doKiroAttempt(recorder, r, &converted, lease)
+		elapsed := time.Since(startedAt).Milliseconds()
 		if data == nil {
 			message := strings.TrimSpace(recorder.body.String())
 			if message == "" {
@@ -121,15 +133,22 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 		attempts = append(attempts, kiroCacheProbeAttempt{
 			InputTokens: data.Metering.InputTokens, OutputTokens: data.Metering.OutputTokens,
 			CacheReadTokens: data.Metering.CacheReadTokens, CacheCreationTokens: data.Metering.CacheCreationTokens,
-			MeteringEvents: data.Metering.EventCount, UsageSource: data.UsageSource,
+			CacheTotalInputTokens: data.Metering.TotalInputTokens, TotalTokens: data.Metering.TotalTokens,
+			Credits: data.Metering.Credits, MetadataEvents: data.Metering.MetadataEventCount,
+			MeteringEvents: data.Metering.MeteringEventCount, UsageSource: data.UsageSource,
+			CachePointState: capabilityState.CachePointState, ElapsedMillis: elapsed,
 		})
 	}
+	cacheVerified := len(attempts) == 2 && attempts[0].CacheCreationTokens.Present && attempts[0].CacheCreationTokens.Value > 0 &&
+		attempts[1].CacheReadTokens.Present && attempts[1].CacheReadTokens.Value > 0
 	writeJSON(w, http.StatusOK, map[string]any{
 		"account_id": accountID, "model": resolved, "endpoint_hash": endpointHash,
 		"egress_id": egress.ID, "session_affinity": affinity.Hash,
 		"stable_request_hash": shortHash(string(converted.Body)),
 		"thinking":            "adaptive", "effort": converted.ThinkingEffort, "max_output_tokens": converted.MaxOutputTokens,
 		"attempts": attempts, "capability": capabilityState,
+		"cache_verified":   cacheVerified,
+		"success_criteria": "first request cache write > 0 and second request cache read > 0",
 	})
 }
 

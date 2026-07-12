@@ -7,11 +7,12 @@ import (
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
+	"codex-account-pool/internal/storage"
 )
 
-func (s *Server) enterKiroCacheSingleflight(ctx context.Context, raw []byte, affinity routing.AffinityKey, lease scheduler.Lease, model string) (func(), bool) {
+func (s *Server) enterKiroCacheSingleflight(ctx context.Context, raw []byte, affinity routing.AffinityKey, lease scheduler.Lease, model string, cachePointCount int) (func(), bool) {
 	cfg := s.effectiveKiroConfig(ctx)
-	if strings.ToLower(strings.TrimSpace(cfg.KiroCacheMode)) != "auto" {
+	if strings.ToLower(strings.TrimSpace(cfg.KiroCacheMode)) != "auto" || cachePointCount <= 0 {
 		return func() {}, false
 	}
 	credentials, err := s.store.GetKiroCredentials(ctx, lease.Account.ID)
@@ -23,7 +24,10 @@ func (s *Server) enterKiroCacheSingleflight(ctx context.Context, raw []byte, aff
 		return func() {}, false
 	}
 	capability, err := s.store.GetKiroRuntimeCapability(ctx, lease.Account.ID, endpointHash, model)
-	if err != nil || (capability.CacheCapability != "reported" && capability.CacheCapability != "hit_observed") {
+	if err != nil && !storage.NotFound(err) {
+		return func() {}, false
+	}
+	if err == nil && capability.CachePointState == "unsupported" {
 		return func() {}, false
 	}
 	prefix := routing.AnthropicStablePromptPrefixHash(raw)

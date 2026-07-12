@@ -28,6 +28,8 @@ const (
 	LossThinkingBudgetMappedToAdaptive = "thinking_budget_mapped_to_adaptive"
 	LossThinkingForcedAdaptive         = "thinking_forced_adaptive"
 	LossThinkingEffortForcedMax        = "thinking_effort_forced_max"
+	LossMaxOutputReducedForContext     = "max_output_tokens_reduced_for_context"
+	LossContextHistoryTruncated        = "context_history_truncated"
 	LossToolSchemaRefBounded           = "tool_schema_ref_bounded"
 )
 
@@ -37,38 +39,60 @@ const (
 	systemAcknowledgement    = "Acknowledged."
 	prefillContinuation      = "Continue."
 	assistantFirstPadding    = "Continue the conversation."
+	kiroContextMinOutput     = int64(4096)
+	kiroContextMinHeadroom   = int64(8192)
 )
 
 var (
 	ErrReasoningUnavailable     = errors.New("kiro reasoning unavailable")
 	ErrVerifiedModelUnavailable = errors.New("verified Kiro model unavailable")
 	ErrUnsupportedModel         = errors.New("unsupported Kiro model")
+	ErrContextTooLong           = errors.New("Kiro input context is too long")
 )
 
 type Conversion struct {
-	Body                  []byte
-	Model                 string
-	ToolNameMap           map[string]string
-	ToolDescriptionHashes map[string]string
-	EstimatedInputTokens  int64
+	Body                   []byte
+	BodyWithoutCachePoints []byte
+	Model                  string
+	ToolNameMap            map[string]string
+	ToolDescriptionHashes  map[string]string
+	EstimatedInputTokens   int64
 	// InputTokens remains as a compatibility alias for callers that only need a
 	// local estimate (notably the MCP web-search bridge). It must never be reported
 	// as upstream metering.
-	InputTokens         int64
-	WebSearch           *WebSearchRequest
-	CompatibilityLosses []string
-	ThinkingEnabled     bool
-	ThinkingEffort      string
-	MaxOutputTokens     int64
+	InputTokens            int64
+	WebSearch              *WebSearchRequest
+	CompatibilityLosses    []string
+	ThinkingEnabled        bool
+	ThinkingEffort         string
+	MaxOutputTokens        int64
+	ContextWindow          int64
+	OriginalInputTokens    int64
+	HistoryMessagesDropped int
+	CachePointCount        int
+	CachePointBreakpoints  []KiroCachePointBreakpoint
+}
+
+type KiroCachePointBreakpoint struct {
+	Section      string `json:"section"`
+	ToolIndex    int    `json:"tool_index,omitempty"`
+	MessageIndex int    `json:"message_index,omitempty"`
 }
 
 // ConversionOptions controls Kiro-only compatibility defaults. Explicit downstream
 // fields take precedence over DefaultThinking. ForceMaxQuality is the production
 // relay policy: native adaptive thinking, maximum supported effort, and the model's
-// maximum output ceiling cannot be lowered by a downstream request.
+// maximum output ceiling. The ceiling is reduced only when required to keep the
+// converted input plus output reserve inside ContextWindow.
 type ConversionOptions struct {
 	DefaultThinking bool
 	ForceMaxQuality bool
+	// EnableCachePoints maps Anthropic cache_control markers into Kiro/Bedrock
+	// cachePoint objects. TTL is intentionally not forwarded; Kiro uses its default.
+	EnableCachePoints bool
+	// ContextWindow is the selected account/model's maximum input+output window.
+	// Zero uses the conservative static Kiro catalogue value.
+	ContextWindow int64
 	// VerifiedModels is the selected account's successfully observed model set.
 	// It is required to resolve family/auto aliases; concrete versions never use a
 	// different verified version as a substitute.
@@ -96,6 +120,7 @@ type anthropicRequest struct {
 type anthropicMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	Cache   json.RawMessage `json:"cache_control"`
 }
 
 type anthropicThinking struct {
@@ -169,6 +194,13 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	}
 
 	losses := lossSet{}
+	cachePlan, cacheMarkersPresent, err := planKiroCachePoints(req, options.EnableCachePoints)
+	if err != nil {
+		return Conversion{}, err
+	}
+	if cacheMarkersPresent && !options.EnableCachePoints {
+		losses.add(LossCacheControlNotForwarded)
+	}
 	toolNames := map[string]string{}
 	descriptionHashes := map[string]string{}
 	tools, err := convertTools(req.Tools, toolNames, descriptionHashes, losses)
@@ -176,12 +208,16 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		return Conversion{}, err
 	}
 	webSearch := pureWebSearchRequest(req.Tools, req.Messages, affinity)
+	if webSearch != nil {
+		cachePlan = kiroCachePointPlan{tools: map[int]bool{}, messages: map[int]bool{}}
+	}
 	uses, paired, err := collectToolPairs(req.Messages)
 	if err != nil {
 		return Conversion{}, err
 	}
 
 	history := make([]any, 0, len(req.Messages)+4)
+	historySpans := make([]kiroHistorySpan, 0, len(req.Messages))
 	systemPrompt, systemPresent, err := systemContent(req.System, losses)
 	if err != nil {
 		return Conversion{}, err
@@ -227,11 +263,15 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 			break
 		}
 	}
+	systemAcknowledgementHistoryIndex := -1
+	systemHistoryLen := 0
 	if systemPresent {
 		history = append(history,
 			map[string]any{"userInputMessage": map[string]any{"content": systemPrompt, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}},
 			map[string]any{"assistantResponseMessage": map[string]any{"content": systemAcknowledgement}},
 		)
+		systemAcknowledgementHistoryIndex = len(history) - 1
+		systemHistoryLen = len(history)
 	}
 
 	lastIsUser := strings.EqualFold(strings.TrimSpace(req.Messages[len(req.Messages)-1].Role), "user")
@@ -240,7 +280,9 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		historyEnd = len(req.Messages)
 		losses.add(LossAssistantPrefillEmulated)
 	}
+	messageHistoryIndexes := map[int]int{}
 	for i := 0; i < historyEnd; i++ {
+		spanStart := len(history)
 		converted, role, err := convertHistory(req.Messages[i], canonical, toolNames, uses, paired, losses)
 		if err != nil {
 			return Conversion{}, err
@@ -251,7 +293,18 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 			})
 			losses.add(LossAssistantFirstPadded)
 		}
+		messageHistoryIndexes[i] = len(history)
 		history = append(history, converted)
+		startsTurn, err := anthropicMessageStartsTurn(req.Messages[i])
+		if err != nil {
+			return Conversion{}, fmt.Errorf("message %d: %w", i, err)
+		}
+		historySpans = append(historySpans, kiroHistorySpan{
+			messageIndex: i,
+			start:        spanStart,
+			end:          len(history),
+			startsTurn:   startsTurn,
+		})
 	}
 
 	var current map[string]any
@@ -332,24 +385,344 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	if len(additionalFields) > 0 {
 		out["additionalModelRequestFields"] = additionalFields
 	}
+	bodyWithoutCachePoints, err := json.Marshal(out)
+	if err != nil {
+		return Conversion{}, err
+	}
+	contextWindow := options.ContextWindow
+	if contextWindow <= 0 {
+		contextWindow = capability.KiroContextWindow(canonical)
+	}
+	originalInputTokens := estimateKiroTokens(bodyWithoutCachePoints)
+	estimatedInputTokens := originalInputTokens
+	historyMessagesDropped := 0
+	if maxOutputTokens > 0 && webSearch == nil {
+		headroom := max64(kiroContextMinHeadroom, contextWindow/100)
+		minimumOutput := min64(kiroContextMinOutput, maxOutputTokens)
+		targetInput := contextWindow - headroom - minimumOutput
+		if targetInput <= 0 {
+			return Conversion{}, fmt.Errorf("%w: model=%s context_window=%d output_headroom=%d", ErrContextTooLong, canonical, contextWindow, minimumOutput+headroom)
+		}
+		if estimatedInputTokens > targetInput && len(historySpans) > 0 {
+			protectLastGroup := !lastIsUser
+			if lastIsUser {
+				startsNewTurn, startErr := anthropicMessageStartsTurn(req.Messages[len(req.Messages)-1])
+				if startErr != nil {
+					return Conversion{}, fmt.Errorf("current message: %w", startErr)
+				}
+				protectLastGroup = !startsNewTurn
+			}
+			trimmedHistory, cutoff, dropped, trimmedBody, trimmedEstimate, trimErr := trimKiroHistoryToBudget(
+				out, state, history, historySpans, systemHistoryLen, targetInput, protectLastGroup,
+			)
+			if trimErr != nil {
+				return Conversion{}, trimErr
+			}
+			if cutoff > systemHistoryLen {
+				history = trimmedHistory
+				bodyWithoutCachePoints = trimmedBody
+				estimatedInputTokens = trimmedEstimate
+				historyMessagesDropped = dropped
+				losses.add(LossContextHistoryTruncated)
+				adjustKiroMessageIndexes(messageHistoryIndexes, systemHistoryLen, cutoff)
+				dropKiroCachePlanMessages(&cachePlan, historySpans, cutoff)
+			}
+		}
+		if estimatedInputTokens > targetInput {
+			return Conversion{}, fmt.Errorf("%w: model=%s input_tokens~%d limit=%d current/system/tools cannot be safely truncated", ErrContextTooLong, canonical, estimatedInputTokens, targetInput)
+		}
+		availableOutput := contextWindow - headroom - estimatedInputTokens
+		if availableOutput < minimumOutput {
+			return Conversion{}, fmt.Errorf("%w: model=%s input_tokens~%d leaves %d output tokens", ErrContextTooLong, canonical, estimatedInputTokens, availableOutput)
+		}
+		if maxOutputTokens > availableOutput {
+			maxOutputTokens = availableOutput
+			additionalFields["max_tokens"] = maxOutputTokens
+			losses.add(LossMaxOutputReducedForContext)
+			bodyWithoutCachePoints, err = json.Marshal(out)
+			if err != nil {
+				return Conversion{}, err
+			}
+			estimatedInputTokens = estimateKiroTokens(bodyWithoutCachePoints)
+		}
+	}
+	if options.EnableCachePoints && cachePlan.count > 0 {
+		if len(cachePlan.tools) > 0 {
+			ctx["tools"] = insertKiroToolCachePoints(tools, cachePlan.tools)
+		}
+		if cachePlan.system && systemAcknowledgementHistoryIndex >= 0 {
+			setKiroHistoryCachePoint(history[systemAcknowledgementHistoryIndex])
+		}
+		for messageIndex := range cachePlan.messages {
+			if historyIndex, ok := messageHistoryIndexes[messageIndex]; ok {
+				setKiroHistoryCachePoint(history[historyIndex])
+			}
+		}
+		if lastIsUser && cachePlan.messages[len(req.Messages)-1] {
+			current["cachePoint"] = defaultKiroCachePoint()
+		}
+	}
 	body, err := json.Marshal(out)
 	if err != nil {
 		return Conversion{}, err
 	}
-	estimate := max64(1, int64(len(raw)/4))
+	if cachePlan.count == 0 {
+		bodyWithoutCachePoints = nil
+	}
+	if options.EnableCachePoints && !cachePlan.dropped {
+		delete(losses, LossCacheControlNotForwarded)
+	}
 	return Conversion{
-		Body:                  body,
-		Model:                 canonical,
-		ToolNameMap:           toolNames,
-		ToolDescriptionHashes: descriptionHashes,
-		EstimatedInputTokens:  estimate,
-		InputTokens:           estimate,
-		WebSearch:             webSearch,
-		CompatibilityLosses:   losses.sorted(),
-		ThinkingEnabled:       thinkingEnabled,
-		ThinkingEffort:        thinkingEffort,
-		MaxOutputTokens:       maxOutputTokens,
+		Body:                   body,
+		BodyWithoutCachePoints: bodyWithoutCachePoints,
+		Model:                  canonical,
+		ToolNameMap:            toolNames,
+		ToolDescriptionHashes:  descriptionHashes,
+		EstimatedInputTokens:   estimatedInputTokens,
+		InputTokens:            estimatedInputTokens,
+		WebSearch:              webSearch,
+		CompatibilityLosses:    losses.sorted(),
+		ThinkingEnabled:        thinkingEnabled,
+		ThinkingEffort:         thinkingEffort,
+		MaxOutputTokens:        maxOutputTokens,
+		ContextWindow:          contextWindow,
+		OriginalInputTokens:    originalInputTokens,
+		HistoryMessagesDropped: historyMessagesDropped,
+		CachePointCount:        cachePlan.count,
+		CachePointBreakpoints:  append([]KiroCachePointBreakpoint(nil), cachePlan.breakpoints...),
 	}, nil
+}
+
+type kiroHistorySpan struct {
+	messageIndex int
+	start        int
+	end          int
+	startsTurn   bool
+}
+
+type kiroHistoryGroup struct {
+	start int
+	end   int
+}
+
+func anthropicMessageStartsTurn(message anthropicMessage) (bool, error) {
+	if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+		return false, nil
+	}
+	blocks, _, err := parseContentBlocks(message.Content)
+	if err != nil {
+		return false, err
+	}
+	for _, block := range blocks {
+		if block.Type == "tool_result" {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func trimKiroHistoryToBudget(out, state map[string]any, history []any, spans []kiroHistorySpan, systemHistoryLen int, targetInput int64, protectLastGroup bool) ([]any, int, int, []byte, int64, error) {
+	groups := make([]kiroHistoryGroup, 0, len(spans))
+	for _, span := range spans {
+		if len(groups) == 0 || span.startsTurn {
+			groups = append(groups, kiroHistoryGroup{start: span.start, end: span.end})
+			continue
+		}
+		groups[len(groups)-1].end = span.end
+	}
+	removable := len(groups)
+	if protectLastGroup && removable > 0 {
+		removable--
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		return history, systemHistoryLen, 0, nil, 0, err
+	}
+	estimate := estimateKiroTokens(body)
+	cutoff := systemHistoryLen
+	dropped := 0
+	trimmed := history
+	for i := 0; i < removable && estimate > targetInput; i++ {
+		cutoff = groups[i].end
+		dropped = 0
+		for _, span := range spans {
+			if span.end <= cutoff {
+				dropped++
+			}
+		}
+		trimmed = make([]any, 0, systemHistoryLen+len(history)-cutoff)
+		trimmed = append(trimmed, history[:systemHistoryLen]...)
+		trimmed = append(trimmed, history[cutoff:]...)
+		if len(trimmed) == 0 {
+			delete(state, "history")
+		} else {
+			state["history"] = trimmed
+		}
+		body, err = json.Marshal(out)
+		if err != nil {
+			return history, systemHistoryLen, 0, nil, 0, err
+		}
+		estimate = estimateKiroTokens(body)
+	}
+	return trimmed, cutoff, dropped, body, estimate, nil
+}
+
+func adjustKiroMessageIndexes(indexes map[int]int, systemHistoryLen, cutoff int) {
+	removed := cutoff - systemHistoryLen
+	for messageIndex, historyIndex := range indexes {
+		if historyIndex >= systemHistoryLen && historyIndex < cutoff {
+			delete(indexes, messageIndex)
+			continue
+		}
+		if historyIndex >= cutoff {
+			indexes[messageIndex] = historyIndex - removed
+		}
+	}
+}
+
+func dropKiroCachePlanMessages(plan *kiroCachePointPlan, spans []kiroHistorySpan, cutoff int) {
+	if plan == nil || cutoff <= 0 {
+		return
+	}
+	dropped := map[int]bool{}
+	for _, span := range spans {
+		if span.end <= cutoff {
+			dropped[span.messageIndex] = true
+			if plan.messages[span.messageIndex] {
+				delete(plan.messages, span.messageIndex)
+				plan.count--
+			}
+		}
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	breakpoints := plan.breakpoints[:0]
+	for _, breakpoint := range plan.breakpoints {
+		if breakpoint.Section == "messages" && dropped[breakpoint.MessageIndex] {
+			continue
+		}
+		breakpoints = append(breakpoints, breakpoint)
+	}
+	plan.breakpoints = breakpoints
+}
+
+func estimateKiroTokens(body []byte) int64 {
+	return max64(1, int64(utf8.RuneCount(body)/4+1))
+}
+
+type kiroCachePointPlan struct {
+	tools       map[int]bool
+	system      bool
+	messages    map[int]bool
+	count       int
+	dropped     bool
+	breakpoints []KiroCachePointBreakpoint
+}
+
+func planKiroCachePoints(req anthropicRequest, enabled bool) (kiroCachePointPlan, bool, error) {
+	plan := kiroCachePointPlan{tools: map[int]bool{}, messages: map[int]bool{}}
+	toolMarkers := make([]bool, len(req.Tools))
+	markersPresent := false
+	for i, raw := range req.Tools {
+		var tool toolDefinition
+		if err := decodeUseNumber(raw, &tool); err != nil {
+			return plan, false, fmt.Errorf("tool: %w", err)
+		}
+		toolMarkers[i] = jsonFieldPresent(tool.Cache)
+		markersPresent = markersPresent || toolMarkers[i]
+	}
+	systemMarker, err := rawContentHasCacheControl(req.System)
+	if err != nil {
+		return plan, false, fmt.Errorf("system: %w", err)
+	}
+	markersPresent = markersPresent || systemMarker
+	messageMarkers := make([]bool, len(req.Messages))
+	for i, message := range req.Messages {
+		messageMarkers[i] = jsonFieldPresent(message.Cache)
+		contentMarker, err := rawContentHasCacheControl(message.Content)
+		if err != nil {
+			return plan, false, fmt.Errorf("message %d: %w", i, err)
+		}
+		messageMarkers[i] = messageMarkers[i] || contentMarker
+		markersPresent = markersPresent || messageMarkers[i]
+	}
+	if !enabled {
+		return plan, markersPresent, nil
+	}
+	add := func(breakpoint KiroCachePointBreakpoint, selectPoint func()) {
+		if plan.count >= 4 {
+			plan.dropped = true
+			return
+		}
+		selectPoint()
+		plan.count++
+		plan.breakpoints = append(plan.breakpoints, breakpoint)
+	}
+	for i, marked := range toolMarkers {
+		if !marked {
+			continue
+		}
+		index := i
+		add(KiroCachePointBreakpoint{Section: "tools", ToolIndex: i}, func() { plan.tools[index] = true })
+	}
+	if systemMarker {
+		add(KiroCachePointBreakpoint{Section: "system"}, func() { plan.system = true })
+	}
+	for i, marked := range messageMarkers {
+		if !marked {
+			continue
+		}
+		index := i
+		add(KiroCachePointBreakpoint{Section: "messages", MessageIndex: i}, func() { plan.messages[index] = true })
+	}
+	return plan, markersPresent, nil
+}
+
+func jsonFieldPresent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
+func rawContentHasCacheControl(raw json.RawMessage) (bool, error) {
+	blocks, _, err := parseContentBlocks(raw)
+	if err != nil {
+		return false, err
+	}
+	for _, block := range blocks {
+		if block.HasCache {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func defaultKiroCachePoint() map[string]any {
+	return map[string]any{"type": "default"}
+}
+
+func insertKiroToolCachePoints(tools []any, selected map[int]bool) []any {
+	out := make([]any, 0, len(tools)+len(selected))
+	for i, tool := range tools {
+		out = append(out, tool)
+		if selected[i] {
+			out = append(out, map[string]any{"cachePoint": defaultKiroCachePoint()})
+		}
+	}
+	return out
+}
+
+func setKiroHistoryCachePoint(item any) {
+	wrapper, _ := item.(map[string]any)
+	if wrapper == nil {
+		return
+	}
+	for _, key := range []string{"userInputMessage", "assistantResponseMessage"} {
+		if message, ok := wrapper[key].(map[string]any); ok {
+			message["cachePoint"] = defaultKiroCachePoint()
+			return
+		}
+	}
 }
 
 func normalizeKiroThinkingEffort(effort string) string {
@@ -906,6 +1279,13 @@ func decodeUseNumber(raw []byte, dst any) error {
 
 func max64(a, b int64) int64 {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
 		return a
 	}
 	return b

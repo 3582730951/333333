@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS proxy_usage_records(
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_config ON proxy_usage_records(proxy_config_id);
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_task ON proxy_usage_records(task_id);
+CREATE INDEX IF NOT EXISTS idx_proxy_usage_created_at ON proxy_usage_records(created_at);
 
 -- Mailbox providers
 CREATE TABLE IF NOT EXISTS mailbox_providers(
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS lifecycle_task_logs(
   FOREIGN KEY(task_id) REFERENCES lifecycle_tasks(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_logs_task_time ON lifecycle_task_logs(task_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_logs_timestamp ON lifecycle_task_logs(timestamp);
 
 -- GoPay accounts pool
 CREATE TABLE IF NOT EXISTS gopay_accounts(
@@ -162,4 +164,5 @@ CREATE TABLE IF NOT EXISTS lifecycle_events(
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_events_account ON lifecycle_events(account_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_events_type ON lifecycle_events(event_type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_events_timestamp ON lifecycle_events(timestamp);
 `

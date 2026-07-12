@@ -120,6 +120,52 @@ func TestConvertAnthropicThinkingExplicitChoiceWinsDefault(t *testing.T) {
 	}
 }
 
+func TestConvertAnthropicBudgetsForcedOutputAgainstRemainingContext(t *testing.T) {
+	raw := []byte(`{"model":"claude-opus-4-8","messages":[{"role":"user","content":"keep the complete current request"}]}`)
+	got, err := ConvertAnthropicRequestWithOptions(raw, "budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 20_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxOutputTokens >= 128_000 || got.MaxOutputTokens < kiroContextMinOutput {
+		t.Fatalf("max output was not fitted to context: %+v", got)
+	}
+	if got.HistoryMessagesDropped != 0 || !containsString(got.CompatibilityLosses, LossMaxOutputReducedForContext) {
+		t.Fatalf("current input should be preserved while output reserve shrinks: %+v", got)
+	}
+	if got.EstimatedInputTokens+got.MaxOutputTokens+kiroContextMinHeadroom > got.ContextWindow {
+		t.Fatalf("planned request exceeds window: input=%d output=%d headroom=%d window=%d", got.EstimatedInputTokens, got.MaxOutputTokens, kiroContextMinHeadroom, got.ContextWindow)
+	}
+}
+
+func TestConvertAnthropicDropsOldestCompleteTurnsOnlyWhenInputCannotFit(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"model": "claude-opus-4-8",
+		"messages": []any{
+			map[string]any{"role": "user", "content": strings.Repeat("old-history-", 10_000)},
+			map[string]any{"role": "assistant", "content": "old-answer"},
+			map[string]any{"role": "user", "content": "recent-history"},
+			map[string]any{"role": "assistant", "content": "recent-answer"},
+			map[string]any{"role": "user", "content": "current-message"},
+		},
+	})
+	got, err := ConvertAnthropicRequestWithOptions(raw, "trim-budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 30_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(got.Body)
+	if got.HistoryMessagesDropped != 2 || !containsString(got.CompatibilityLosses, LossContextHistoryTruncated) {
+		t.Fatalf("oldest turn was not trimmed as a unit: %+v", got)
+	}
+	if strings.Contains(body, "old-history-") || strings.Contains(body, "old-answer") {
+		t.Fatalf("oldest turn remains in budgeted body: %s", body[:min(len(body), 1000)])
+	}
+	for _, required := range []string{"recent-history", "recent-answer", "current-message"} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("recent/current content %q was dropped: %s", required, body)
+		}
+	}
+}
+
 func TestConvertAnthropicPreservesPrefillThinkingUnknownBlocksAndLosses(t *testing.T) {
 	raw := []byte(`{
   "model":"claude-opus-4-9-20270101",
@@ -190,6 +236,83 @@ func TestConvertAnthropicLongToolDescriptionRecordsHash(t *testing.T) {
 	}
 	if !containsString(got.CompatibilityLosses, LossToolDescriptionTruncated) || len(got.ToolDescriptionHashes["long"]) != 64 {
 		t.Fatalf("truncation diagnostics missing: losses=%v hashes=%v", got.CompatibilityLosses, got.ToolDescriptionHashes)
+	}
+}
+
+func TestConvertAnthropicMapsCacheControlsToKiroCachePoints(t *testing.T) {
+	raw := []byte(`{
+  "model":"claude-sonnet-4-6",
+  "system":[{"type":"text","text":"stable system","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+  "messages":[
+    {"role":"user","content":[{"type":"text","text":"history","cache_control":{"type":"ephemeral"}}]},
+    {"role":"assistant","content":"answer"},
+    {"role":"user","content":[{"type":"text","text":"current","cache_control":{"type":"ephemeral"}}]}
+  ],
+  "tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}]
+}`)
+	got, err := ConvertAnthropicRequestWithOptions(raw, "cache-session", ConversionOptions{EnableCachePoints: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CachePointCount != 4 || containsString(got.CompatibilityLosses, LossCacheControlNotForwarded) {
+		t.Fatalf("cache conversion diagnostics = %+v", got)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(got.Body, &root); err != nil {
+		t.Fatal(err)
+	}
+	state := root["conversationState"].(map[string]interface{})
+	current := state["currentMessage"].(map[string]interface{})["userInputMessage"].(map[string]interface{})
+	if point, _ := current["cachePoint"].(map[string]interface{}); point["type"] != "default" || point["ttl"] != nil {
+		t.Fatalf("current cachePoint = %#v", point)
+	}
+	tools := current["userInputMessageContext"].(map[string]interface{})["tools"].([]interface{})
+	if len(tools) != 2 || tools[0].(map[string]interface{})["toolSpecification"] == nil || tools[1].(map[string]interface{})["cachePoint"] == nil {
+		t.Fatalf("tool cachePoint was not inserted after its tool: %#v", tools)
+	}
+	history := state["history"].([]interface{})
+	ack := history[1].(map[string]interface{})["assistantResponseMessage"].(map[string]interface{})
+	if ack["cachePoint"] == nil {
+		t.Fatalf("system cachePoint was not attached after acknowledgement: %#v", history)
+	}
+	historyUser := history[2].(map[string]interface{})["userInputMessage"].(map[string]interface{})
+	if historyUser["cachePoint"] == nil {
+		t.Fatalf("history block marker was not folded onto its Kiro message: %#v", historyUser)
+	}
+	if len(got.BodyWithoutCachePoints) == 0 || strings.Contains(string(got.BodyWithoutCachePoints), "cachePoint") {
+		t.Fatalf("fallback body still contains cachePoint: %s", got.BodyWithoutCachePoints)
+	}
+}
+
+func TestConvertAnthropicCachePointCapUsesToolsSystemMessagesOrder(t *testing.T) {
+	raw := []byte(`{
+  "model":"claude-sonnet-4-6",
+  "system":[{"type":"text","text":"system","cache_control":{"type":"ephemeral"}}],
+  "messages":[{"role":"user","content":[{"type":"text","text":"current","cache_control":{"type":"ephemeral"}}]}],
+  "tools":[
+    {"name":"a","cache_control":{"type":"ephemeral"}},
+    {"name":"b","cache_control":{"type":"ephemeral"}},
+    {"name":"c","cache_control":{"type":"ephemeral"}}
+  ]
+}`)
+	got, err := ConvertAnthropicRequestWithOptions(raw, "cache-cap", ConversionOptions{EnableCachePoints: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CachePointCount != 4 || !containsString(got.CompatibilityLosses, LossCacheControlNotForwarded) {
+		t.Fatalf("cap diagnostics = count=%d losses=%v", got.CachePointCount, got.CompatibilityLosses)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(got.Body, &root); err != nil {
+		t.Fatal(err)
+	}
+	state := root["conversationState"].(map[string]interface{})
+	current := state["currentMessage"].(map[string]interface{})["userInputMessage"].(map[string]interface{})
+	if current["cachePoint"] != nil {
+		t.Fatalf("messages must be dropped after tools+system consume four slots: %#v", current)
+	}
+	if count := strings.Count(string(got.Body), `"cachePoint"`); count != 4 {
+		t.Fatalf("cachePoint count in body = %d: %s", count, got.Body)
 	}
 }
 

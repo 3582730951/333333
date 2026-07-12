@@ -8,7 +8,7 @@ import SettingsTabShellBase from '../components/SettingsTabShell.jsx';
 import ConfigFormBase from '../components/ConfigForm';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import {
-  useApplySettingsTemplateMutation, useAutomationSettingsData, useConfigSettingsData,
+  useApplySettingsTemplateMutation, useAutomationSettingsData, useClearLogRecordsMutation, useConfigSettingsData,
   useLifecycleSettingsData, useLoggingSettingsData, useMemorySettingsData,
   useRegistrarSettingsData, useSaveRegistrarMutation, useSaveSettingsMutation,
   useSharedSettingsOptions,
@@ -21,7 +21,7 @@ import type {
 import { t } from '../lib/i18n.js';
 
 const {
-  Tabs, TabPane, Card, Toast, Typography, Button, Switch, Select,
+  Tabs, TabPane, Card, Toast, Typography, Button, Switch, Select, ConfirmDialog,
   InputNumber, Input, Tag, Banner, Form,
 } = PoolUI as any;
 const PageHeader = PageHeaderBase as any;
@@ -716,6 +716,7 @@ function LifecycleTab({ groups, egresses, providerOpts }: { groups: SettingsGrou
 
 function LoggingTab() {
   const [diffs, setDiffs] = useState<SettingsDiff[] | null>(null);
+  const [clearOpen, setClearOpen] = useState(false);
 
   const {
     data: logging = {},
@@ -725,6 +726,7 @@ function LoggingTab() {
     reload: load,
   } = useLoggingSettingsData();
   const saveMutation = useSaveSettingsMutation();
+  const clearMutation = useClearLogRecordsMutation();
 
   const save = async (values: SettingsValues) => {
     try {
@@ -734,6 +736,16 @@ function LoggingTab() {
     } catch (e) { showErrorToast(e); }
   };
   const saving = saveMutation.isPending;
+
+  const clearLogs = async () => {
+    try {
+      const result = await clearMutation.mutateAsync(undefined);
+      setClearOpen(false);
+      const reclaimed = result.space_reclaimed ? '，数据库空间已回收' : '，记录已删除但数据库压缩未完成';
+      Toast.success(`已清空 ${result.deleted_total.toLocaleString()} 条日志${reclaimed}`);
+      if (result.reclaim_warning) Toast.warning(result.reclaim_warning);
+    } catch (e) { showErrorToast(e); }
+  };
 
   const loggingValues = runtimePatchValues(logging);
 
@@ -749,7 +761,7 @@ function LoggingTab() {
       settingsErrorSection={logging}
     >
       <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
-        description="控制注册任务日志的详细程度、失败阈值和保留策略。日志过于详细可能在低配 VPS 上占用较多磁盘空间。" />
+        description="控制结构化日志的详细程度、失败阈值和统一保留策略。系统每天清理超过保留天数的审计、用量、代理、注册、生命周期和已结束计费记录，并每 7 天压缩一次数据库。" />
       <Form key={settingsFormKey('logging', loggingValues)} onSubmit={save} initValues={loggingValues} labelPosition="left" labelWidth={140} style={{ maxWidth: 600 }}>
         <Form.Switch field="verbose_logging" label="详尽日志" />
         <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginBottom: 12, marginLeft: 140 }}>
@@ -761,7 +773,7 @@ function LoggingTab() {
         </Typography.Text>
         <Form.InputNumber field="log_retention_days" label="日志保留天数" min={1} max={90} style={{ width: 120 }} />
         <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginBottom: 12, marginLeft: 140 }}>
-          超过此天数的注册事件日志将被自动清理。
+          默认 7 天。超过此天数的审计、Cloudflare、用量、代理、注册、生命周期日志及已结束计费记录会被自动清理；进行中的计费 hold 不受影响。
         </Typography.Text>
         <div style={{ marginTop: 8 }}>
           {Boolean(logging.degraded) && <Tag color="red" style={{ marginBottom: 8 }}>系统已自动降级 — 注册失败率超标</Tag>}
@@ -769,6 +781,27 @@ function LoggingTab() {
           {Boolean(logging.degraded) && <Button style={{ marginLeft: 8 }} loading={saving} onClick={() => save({ ...loggingValues, degraded: false })}>清除降级状态</Button>}
         </div>
       </Form>
+      <Card title="磁盘空间清理" className="pool-card" style={{ maxWidth: 600, marginTop: 20 }}>
+        <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginBottom: 12 }}>
+          立即删除全部可清理日志并执行 SQLite WAL 截断和 VACUUM。进行中的请求计费 hold 会保留，账号、配置和凭据不会删除。
+        </Typography.Text>
+        <Button type="danger" loading={clearMutation.isPending} onClick={() => setClearOpen(true)}>清空全部日志</Button>
+      </Card>
+      <ConfirmDialog
+        open={clearOpen}
+        title="确认清空全部日志？"
+        description={(
+          <div className="pool-confirm-copy">
+            <p>此操作不可撤销，将删除全部审计、Cloudflare、用量、代理、注册和生命周期日志，以及已结束的计费 hold。</p>
+            <p>进行中的计费 hold、账号、配置、凭据和模型能力数据会保留。</p>
+          </div>
+        )}
+        confirmText="确认清空"
+        cancelText="取消"
+        destructive
+        onCancel={() => setClearOpen(false)}
+        onConfirm={clearLogs}
+      />
     </SettingsTabShell>
   );
 }

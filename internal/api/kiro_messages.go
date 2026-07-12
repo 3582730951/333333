@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/prompt"
@@ -26,6 +27,8 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const kiroContextMinRetryOutputTokens int64 = 4096
+
 func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, _ bool, _ map[string]bool) attemptOutcome {
 	defer lease.Release()
 	converted, err := s.convertKiroRequest(r.Context(), raw, affinity, lease)
@@ -39,12 +42,12 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		if converted.WebSearch != nil {
 			return func() {}, false
 		}
-		return s.enterKiroCacheSingleflight(r.Context(), raw, affinity, lease, resolvedModel)
+		return s.enterKiroCacheSingleflight(r.Context(), raw, affinity, lease, resolvedModel, converted.CachePointCount)
 	}()
 	defer releaseFlight()
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if converted.WebSearch != nil {
-		data, _, outcome := s.doKiroAttempt(w, r, converted, lease)
+		data, _, outcome := s.doKiroAttempt(w, r, &converted, lease)
 		if data == nil {
 			return outcome
 		}
@@ -67,18 +70,24 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		return outcomeDone
 	}
 	if isStreamRequest(raw) {
-		response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
+		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
 		if response == nil {
 			return outcome
 		}
 		defer response.Body.Close()
 		emitter := newKiroAnthropicEmitter(w, func(metering kirowire.KiroMetering, actualModel string) {
 			declareKiroTrailers(w)
-			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, metering.UsageSource())
+			usageSource := metering.UsageSource()
+			if usageSource == kirowire.UsageSourceUnreported {
+				usageSource = kirowire.UsageSourceEstimated
+			}
+			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, usageSource)
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 		}, resolvedModel, id)
+		emitter.estimatedInputTokens = converted.EstimatedInputTokens
 		data, streamErr := streamKiroResponse(response.Body, converted.ToolNameMap, emitter)
+		finalizeKiroUsage(&data, converted)
 		data.Model = firstNonEmpty(data.Model, resolvedModel)
 		if data.UsageSource == "" {
 			data.UsageSource = data.Metering.UsageSource()
@@ -105,7 +114,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		return outcomeDone
 	}
 
-	data, endpointHash, outcome := s.doKiroAttempt(w, r, converted, lease)
+	data, endpointHash, outcome := s.doKiroAttempt(w, r, &converted, lease)
 	if data == nil {
 		return outcome
 	}
@@ -157,12 +166,12 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 		if converted.WebSearch != nil {
 			return func() {}, false
 		}
-		return s.enterKiroCacheSingleflight(r.Context(), anthBody, affinity, lease, resolvedModel)
+		return s.enterKiroCacheSingleflight(r.Context(), anthBody, affinity, lease, resolvedModel, converted.CachePointCount)
 	}()
 	defer releaseFlight()
 	id := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if converted.WebSearch != nil {
-		data, _, outcome := s.doKiroAttempt(w, r, converted, lease)
+		data, _, outcome := s.doKiroAttempt(w, r, &converted, lease)
 		if data == nil {
 			return outcome
 		}
@@ -186,7 +195,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 		return outcomeDone
 	}
 	if isStreamRequest(anthBody) {
-		response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
+		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
 		if response == nil {
 			return outcome
 		}
@@ -200,7 +209,11 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 			}
 			started = true
 			declareKiroTrailers(w)
-			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, metering.UsageSource())
+			usageSource := metering.UsageSource()
+			if usageSource == kirowire.UsageSourceUnreported {
+				usageSource = kirowire.UsageSourceEstimated
+			}
+			setKiroHeaders(w, actualModel, converted.CompatibilityLosses, usageSource)
 			w.Header().Set("Content-Type", "text/event-stream")
 			go func() {
 				defer supervisor.Recover("kiro-chat-stream")
@@ -210,7 +223,9 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 			}()
 		}
 		emitter := newKiroAnthropicEmitter(writer, startChat, resolvedModel, id)
+		emitter.estimatedInputTokens = converted.EstimatedInputTokens
 		data, streamErr := streamKiroResponse(response.Body, converted.ToolNameMap, emitter)
+		finalizeKiroUsage(&data, converted)
 		data.Model = firstNonEmpty(data.Model, resolvedModel)
 		if data.UsageSource == "" {
 			data.UsageSource = data.Metering.UsageSource()
@@ -244,7 +259,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 		return outcomeDone
 	}
 
-	data, endpointHash, outcome := s.doKiroAttempt(w, r, converted, lease)
+	data, endpointHash, outcome := s.doKiroAttempt(w, r, &converted, lease)
 	if data == nil {
 		return outcome
 	}
@@ -283,14 +298,43 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 	if err != nil {
 		return kirowire.Conversion{}, err
 	}
+	capabilityModel, _ := capability.ResolveKiroModel(firstNonEmpty(lease.ResolvedModel, routing.Model(raw)), verified)
+	contextWindow := capability.KiroContextWindow(capabilityModel)
+	if capabilityModel != "" {
+		storedWindow, windowErr := s.store.BestNativeWindow(ctx, lease.Account.ID, capabilityModel)
+		if windowErr != nil {
+			return kirowire.Conversion{}, windowErr
+		}
+		if storedWindow > 0 {
+			contextWindow = storedWindow
+		}
+	}
+	cachePointsEnabled := strings.EqualFold(strings.TrimSpace(kiroCfg.KiroCacheMode), "auto")
+	if cachePointsEnabled {
+		capabilityState, capabilityErr := s.store.GetKiroRuntimeCapability(ctx, lease.Account.ID, endpointHash, capabilityModel)
+		if capabilityErr == nil && capabilityState.CachePointState == "unsupported" {
+			cachePointsEnabled = false
+		} else if capabilityErr != nil && !storage.NotFound(capabilityErr) {
+			return kirowire.Conversion{}, capabilityErr
+		}
+	}
+	if cachePointsEnabled {
+		// Reuse the established max-hit planner, then translate its at-most-four
+		// Anthropic markers into native Kiro cachePoint objects below.
+		raw = prompt.EnsureAnthropicCacheControlWithOptions(raw, prompt.AnthropicCacheControlOptions{
+			Policy: "max_hit", LatestTailWrite: true,
+		})
+	}
 	return kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{
-		DefaultThinking: kiroCfg.KiroDefaultThinking,
-		ForceMaxQuality: true,
-		VerifiedModels:  verified,
+		DefaultThinking:   kiroCfg.KiroDefaultThinking,
+		ForceMaxQuality:   true,
+		EnableCachePoints: cachePointsEnabled,
+		ContextWindow:     contextWindow,
+		VerifiedModels:    verified,
 	})
 }
 
-func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted kirowire.Conversion, lease scheduler.Lease) (*kirowire.ResponseData, string, attemptOutcome) {
+func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted *kirowire.Conversion, lease scheduler.Lease) (*kirowire.ResponseData, string, attemptOutcome) {
 	response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
 	if response == nil {
 		return nil, endpointHash, outcome
@@ -311,10 +355,47 @@ func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted
 		writeKiroError(w, r, http.StatusBadGateway, err)
 		return nil, endpointHash, outcomeDone
 	}
+	finalizeKiroUsage(&data, *converted)
 	return &data, endpointHash, outcomeDone
 }
 
-func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, converted kirowire.Conversion, lease scheduler.Lease) (*upstream.Response, string, attemptOutcome) {
+func finalizeKiroUsage(data *kirowire.ResponseData, converted kirowire.Conversion) {
+	if data == nil {
+		return
+	}
+	data.CachePointCount = converted.CachePointCount
+	data.CachePointBreakpoints = append([]kirowire.KiroCachePointBreakpoint(nil), converted.CachePointBreakpoints...)
+	if data.Metering.UsageSource() == kirowire.UsageSourceUpstream {
+		data.UsageSource = kirowire.UsageSourceUpstream
+		return
+	}
+	if data.UsageSource == kirowire.UsageSourceEstimated && data.InputTokens > 0 {
+		return
+	}
+	data.InputTokens = maxKiroInt64(1, converted.EstimatedInputTokens)
+	outputBytes := len(data.Text) + len(data.Thinking)
+	for _, tool := range data.Tools {
+		outputBytes += len(tool.Name) + len(tool.Input)
+	}
+	data.OutputTokens = maxKiroInt64(1, int64((outputBytes+3)/4))
+	data.UsageSource = kirowire.UsageSourceEstimated
+}
+
+func maxKiroInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minKiroInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, converted *kirowire.Conversion, lease scheduler.Lease) (*upstream.Response, string, attemptOutcome) {
 	// Defense in depth: no present or future call site may reach Kiro generation
 	// without the mandatory native max-quality controls. MCP web search is not a
 	// model-generation request and is therefore intentionally exempt.
@@ -354,9 +435,15 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		return nil, endpointHash, outcomeDone
 	}
 	body := converted.Body
+	fallbackBody := converted.BodyWithoutCachePoints
 	if credentials.ProfileARN != "" {
 		if updated, updateErr := sjson.SetBytes(body, "profileArn", credentials.ProfileARN); updateErr == nil {
 			body = updated
+		}
+		if len(fallbackBody) > 0 {
+			if updated, updateErr := sjson.SetBytes(fallbackBody, "profileArn", credentials.ProfileARN); updateErr == nil {
+				fallbackBody = updated
+			}
 		}
 	}
 	target := strings.TrimRight(base, "/")
@@ -372,12 +459,12 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		})
 		requestHeaders.Set("accept", "application/json")
 	}
-	send := func(accessToken string) (*upstream.Response, error) {
+	send := func(accessToken string, requestBody []byte) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
 		headers.Set("authorization", "Bearer "+accessToken)
-		return s.upstream.DoRaw(r.Context(), lease.Egress, http.MethodPost, target, headers, body, lease.Binding.CookieJarKey)
+		return s.upstream.DoRaw(r.Context(), lease.Egress, http.MethodPost, target, headers, requestBody, lease.Binding.CookieJarKey)
 	}
-	response, err := send(bearer)
+	response, err := send(bearer, body)
 	if err != nil {
 		s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
 		return nil, endpointHash, outcomeDone
@@ -391,23 +478,129 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 			return nil, endpointHash, outcomeDone
 		}
 		credentials = updated
-		response, err = send(refreshed)
+		bearer = refreshed
+		response, err = send(bearer, body)
 		if err != nil {
 			s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
 			return nil, endpointHash, outcomeDone
 		}
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
+	activeBody := body
+	activeFallbackBody := fallbackBody
+	contextRetryStage := 0
+	cacheFallbackUsed := false
+	for response.StatusCode < 200 || response.StatusCode >= 300 {
+		status := response.StatusCode
+		header := response.Header
 		rawError := readUpstreamErrorBody(response.Body)
 		response.Body.Close()
-		downstreamStatus := response.StatusCode
-		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+
+		if kirowire.ContentLengthExceeded(rawError) {
+			log.Printf("[KIRO-CONTEXT] account=%s model=%s retry_stage=%d body_bytes=%d input_tokens~%d max_output_tokens=%d context_window=%d history_messages_dropped=%d",
+				lease.Account.ID, converted.Model, contextRetryStage, len(activeBody), converted.EstimatedInputTokens, converted.MaxOutputTokens, converted.ContextWindow, converted.HistoryMessagesDropped)
+			var retryBody []byte
+			var retryFallback []byte
+			var changed bool
+			var adjustErr error
+			for contextRetryStage < 3 && !changed {
+				switch contextRetryStage {
+				case 0:
+					contextRetryStage++
+					retryBody, changed, adjustErr = kirowire.ReduceKiroMaxOutput(activeBody, kiroContextMinRetryOutputTokens)
+					if adjustErr == nil && changed && len(activeFallbackBody) > 0 {
+						retryFallback, _, adjustErr = kirowire.RemoveKiroCachePoints(retryBody)
+					}
+					if changed {
+						converted.MaxOutputTokens = minKiroInt64(converted.MaxOutputTokens, kiroContextMinRetryOutputTokens)
+						converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossMaxOutputReducedForContext})
+					}
+				case 1:
+					contextRetryStage++
+					var dropped int
+					retryBody, dropped, changed, adjustErr = kirowire.TrimOldestKiroHistory(activeBody, 3, 4)
+					if adjustErr == nil && changed && len(activeFallbackBody) > 0 {
+						retryFallback, _, adjustErr = kirowire.RemoveKiroCachePoints(retryBody)
+					}
+					if changed {
+						converted.HistoryMessagesDropped += dropped
+						converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossContextHistoryTruncated})
+					}
+				case 2:
+					contextRetryStage++
+					var dropped int
+					retryBody, dropped, changed, adjustErr = kirowire.TrimOldestKiroHistory(activeBody, 2, 3)
+					if adjustErr == nil && changed && len(activeFallbackBody) > 0 {
+						retryFallback, _, adjustErr = kirowire.RemoveKiroCachePoints(retryBody)
+					}
+					if changed {
+						converted.HistoryMessagesDropped += dropped
+						converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossContextHistoryTruncated})
+					}
+				}
+			}
+			if adjustErr != nil {
+				writeKiroError(w, r, http.StatusBadGateway, adjustErr)
+				return nil, endpointHash, outcomeDone
+			}
+			if changed {
+				activeBody = retryBody
+				if len(activeFallbackBody) > 0 {
+					activeFallbackBody = retryFallback
+				}
+				converted.Body = activeBody
+				converted.BodyWithoutCachePoints = activeFallbackBody
+				converted.EstimatedInputTokens = virtual.EstimateTokensJSON(activeBody)
+				log.Printf("[KIRO-CONTEXT] account=%s model=%s action=retry body_bytes=%d input_tokens~%d max_output_tokens=%d history_messages_dropped=%d",
+					lease.Account.ID, converted.Model, len(activeBody), converted.EstimatedInputTokens, converted.MaxOutputTokens, converted.HistoryMessagesDropped)
+				setKiroQualityHeaders(w, *converted)
+				response, err = send(bearer, activeBody)
+				if err != nil {
+					s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+					return nil, endpointHash, outcomeDone
+				}
+				continue
+			}
+			writeKiroError(w, r, http.StatusBadRequest, fmt.Errorf("%w after adaptive retries: model=%s input_tokens~%d context_window=%d", kirowire.ErrContextTooLong, converted.Model, converted.EstimatedInputTokens, converted.ContextWindow))
+			return nil, endpointHash, outcomeDone
+		}
+
+		if (status == http.StatusBadRequest || status == http.StatusUnprocessableEntity) && converted.CachePointCount > 0 && len(activeFallbackBody) > 0 && kirowire.CachePointRejected(rawError) {
+			// Unknown endpoint/model capabilities are optimistic. Retry only when the
+			// validation response actually identifies cachePoint; an unrelated 400 must
+			// never poison the account/model capability state.
+			cacheFallbackUsed = true
+			activeBody = activeFallbackBody
+			activeFallbackBody = nil
+			converted.Body = activeBody
+			converted.BodyWithoutCachePoints = nil
+			converted.CachePointCount = 0
+			converted.CachePointBreakpoints = nil
+			converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossCacheControlNotForwarded})
+			response, err = send(bearer, activeBody)
+			if err != nil {
+				s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+				return nil, endpointHash, outcomeDone
+			}
+			continue
+		}
+
+		downstreamStatus := status
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			_ = s.store.SetAccountStatus(r.Context(), lease.Account.ID, "invalid")
 			s.scheduler.InvalidateAccountCache()
 			downstreamStatus = http.StatusServiceUnavailable
 		}
-		s.kiroAttemptError(w, r, lease, downstreamStatus, response.Header, rawError, false, nil, nil)
+		s.kiroAttemptError(w, r, lease, downstreamStatus, header, rawError, false, nil, nil)
 		return nil, endpointHash, outcomeDone
+	}
+	if cacheFallbackUsed {
+		if stateErr := s.store.SetKiroCachePointState(r.Context(), lease.Account.ID, endpointHash, converted.Model, "unsupported"); stateErr != nil {
+			log.Printf("[KIRO-CAPABILITY] account=%s model=%s cachePoint fallback persistence failed: %v", lease.Account.ID, converted.Model, stateErr)
+		}
+	} else if converted.CachePointCount > 0 {
+		if stateErr := s.store.SetKiroCachePointState(r.Context(), lease.Account.ID, endpointHash, converted.Model, "verified"); stateErr != nil {
+			log.Printf("[KIRO-CAPABILITY] account=%s model=%s cachePoint verification persistence failed: %v", lease.Account.ID, converted.Model, stateErr)
+		}
 	}
 	return response, endpointHash, outcomeDone
 }
@@ -455,16 +648,17 @@ func streamKiroResponse(reader io.Reader, names map[string]string, emitter *kiro
 }
 
 type kiroAnthropicEmitter struct {
-	w           io.Writer
-	onStart     func(kirowire.KiroMetering, string)
-	flusher     interface{ Flush() }
-	model       string
-	id          string
-	started     bool
-	blockOpen   bool
-	blockKind   string
-	blockToolID string
-	index       int
+	w                    io.Writer
+	onStart              func(kirowire.KiroMetering, string)
+	flusher              interface{ Flush() }
+	model                string
+	id                   string
+	started              bool
+	blockOpen            bool
+	blockKind            string
+	blockToolID          string
+	index                int
+	estimatedInputTokens int64
 }
 
 func newKiroAnthropicEmitter(writer io.Writer, onStart func(kirowire.KiroMetering, string), model, id string) *kiroAnthropicEmitter {
@@ -491,7 +685,11 @@ func (e *kiroAnthropicEmitter) start(metering kirowire.KiroMetering) {
 	if e.onStart != nil {
 		e.onStart(metering, e.model)
 	}
-	usage := map[string]any{"input_tokens": metering.InputTokens.Value, "output_tokens": 0}
+	inputTokens := metering.InputTokens.Value
+	if !metering.InputTokens.Present {
+		inputTokens = maxKiroInt64(1, e.estimatedInputTokens)
+	}
+	usage := map[string]any{"input_tokens": inputTokens, "output_tokens": 0}
 	addKiroCacheUsage(usage, metering)
 	e.emit("message_start", map[string]any{"type": "message_start", "message": map[string]any{
 		"id": e.id, "type": "message", "role": "assistant", "model": e.model, "content": []any{},
@@ -553,7 +751,10 @@ func (e *kiroAnthropicEmitter) delta(delta kirowire.ResponseDelta, metering kiro
 func (e *kiroAnthropicEmitter) finish(data kirowire.ResponseData) {
 	e.start(data.Metering)
 	e.closeBlock()
-	usage := map[string]any{"output_tokens": data.OutputTokens}
+	// metadataEvent commonly arrives after content has already started. Repeat the
+	// authoritative input value in the final delta so streaming clients can replace
+	// the provisional message_start estimate without delaying the first token.
+	usage := map[string]any{"input_tokens": data.InputTokens, "output_tokens": data.OutputTokens}
 	addKiroCacheUsage(usage, data.Metering)
 	if data.WebSearch != nil {
 		usage["server_tool_use"] = map[string]any{"web_search_requests": 1}
@@ -606,6 +807,15 @@ func setKiroQualityHeaders(w http.ResponseWriter, conversion kirowire.Conversion
 	w.Header().Set("X-Pool-Kiro-Effort", firstNonEmpty(conversion.ThinkingEffort, "unspecified"))
 	if conversion.MaxOutputTokens > 0 {
 		w.Header().Set("X-Pool-Kiro-Max-Output-Tokens", fmt.Sprintf("%d", conversion.MaxOutputTokens))
+	}
+	if conversion.ContextWindow > 0 {
+		w.Header().Set("X-Pool-Kiro-Context-Window", fmt.Sprintf("%d", conversion.ContextWindow))
+	}
+	if conversion.EstimatedInputTokens > 0 {
+		w.Header().Set("X-Pool-Kiro-Estimated-Input-Tokens", fmt.Sprintf("%d", conversion.EstimatedInputTokens))
+	}
+	if conversion.HistoryMessagesDropped > 0 {
+		w.Header().Set("X-Pool-Kiro-History-Messages-Dropped", fmt.Sprintf("%d", conversion.HistoryMessagesDropped))
 	}
 }
 
@@ -671,6 +881,8 @@ func kiroErrorCode(err error) string {
 		return "verified_model_unavailable"
 	case errors.Is(err, kirowire.ErrEndpointNotAllowed):
 		return "kiro_endpoint_not_allowed"
+	case errors.Is(err, kirowire.ErrContextTooLong):
+		return "context_length_exceeded"
 	default:
 		return "kiro_upstream_error"
 	}
@@ -766,9 +978,26 @@ func (s *Server) persistKiroResolvedBinding(ctx context.Context, affinity routin
 func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity routing.AffinityKey, model string, data kirowire.ResponseData, capabilityState storage.KiroRuntimeCapability) {
 	rawUsage := map[string]any{
 		"input_tokens": data.InputTokens, "output_tokens": data.OutputTokens,
-		"usage_source": data.UsageSource, "metering_event_count": data.Metering.EventCount,
+		"usage_source":           data.UsageSource,
+		"event_count":            data.Metering.EventCount,
+		"metadata_event_count":   data.Metering.MetadataEventCount,
+		"metering_event_count":   data.Metering.MeteringEventCount,
 		"cache_read_present":     data.Metering.CacheReadTokens.Present,
 		"cache_creation_present": data.Metering.CacheCreationTokens.Present,
+		"total_tokens_present":   data.Metering.TotalTokens.Present,
+		"credits_present":        data.Metering.Credits.Present,
+	}
+	if data.Metering.TotalInputTokens.Present {
+		rawUsage["cache_total_input_tokens"] = data.Metering.TotalInputTokens.Value
+	}
+	if data.Metering.TotalTokens.Present {
+		rawUsage["upstream_total_tokens"] = data.Metering.TotalTokens.Value
+	}
+	if data.Metering.Credits.Present {
+		rawUsage["kiro_credits"] = data.Metering.Credits.Value
+	}
+	if capabilityState.CachePointState != "" {
+		rawUsage["cache_point_state"] = capabilityState.CachePointState
 	}
 	if len(data.ToolDescriptionHashes) > 0 {
 		rawUsage["tool_description_hashes"] = data.ToolDescriptionHashes
@@ -784,6 +1013,7 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	}
 	raw, _ := json.Marshal(rawUsage)
 	lossesJSON, _ := json.Marshal(data.CompatibilityLosses)
+	breakpointsJSON, _ := json.Marshal(data.CachePointBreakpoints)
 	keyHash, userID := downstreamFromCtx(r.Context())
 	diagnostics := storage.UsageDiagnostics{
 		UsageProvider:           "kiro",
@@ -793,7 +1023,12 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 		CompatibilityLossesJSON: string(lossesJSON),
 		CacheCapability:         capabilityState.CacheCapability,
 		Estimated:               data.UsageSource == kirowire.UsageSourceEstimated,
+		CacheMissTokens:         data.InputTokens,
+		CacheTotalInputTokens:   data.Metering.TotalInputTokens.Value,
 		AffinitySource:          affinity.Source,
+		CacheControlInjected:    data.CachePointCount > 0,
+		CacheBreakpointCount:    data.CachePointCount,
+		CacheBreakpointsJSON:    string(breakpointsJSON),
 		SingleflightWaitedRequests: func() int64 {
 			if data.SingleflightWaited {
 				return 1
@@ -804,8 +1039,12 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	s.enqueueWrite(func() {
 		ctx, cancel := bgWriteContext()
 		defer cancel()
+		totalInput := data.InputTokens
+		if data.Metering.TotalInputTokens.Present {
+			totalInput = data.Metering.TotalInputTokens.Value
+		}
 		if err := s.store.InsertUsageRecordWithDiagnostics(ctx, accountID, affinity.Hash, keyHash, userID, model,
-			data.InputTokens, data.OutputTokens, data.InputTokens+data.OutputTokens, data.CacheReadTokens,
+			data.InputTokens, data.OutputTokens, totalInput+data.OutputTokens, data.CacheReadTokens,
 			data.CacheReadTokens, data.CacheCreationTokens, raw, diagnostics); err != nil {
 			log.Printf("[USAGE-ERROR] Kiro usage insert failed: account=%s model=%s err=%v", accountID, model, err)
 		}

@@ -61,6 +61,10 @@ function fmtPct(v: unknown) {
   return Math.round(n * 100) + '%';
 }
 
+function fmtOptionalPct(v: unknown) {
+  return v == null || v === '' ? '—' : fmtPct(v);
+}
+
 function textOrDash(v: unknown) {
   return v == null || v === '' ? '—' : String(v);
 }
@@ -155,8 +159,9 @@ export default function Usage() {
   const cacheMiss = cacheSummary.cache_miss_tokens ?? Math.max(0, promptForCache - cacheRead);
   const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cacheRead / promptForCache : 0);
   const realTokenHitRate = cacheSummary.real_token_hit_rate ?? cacheRate;
-  const eligibleHitRate = cacheSummary.eligible_cache_hit_rate ?? (cacheRead + cacheCreation > 0 ? cacheRead / (cacheRead + cacheCreation) : 0);
-  const cacheWriteShare = cacheSummary.cache_write_share ?? (promptForCache ? cacheCreation / promptForCache : 0);
+  const cacheCreationReported = Number(cacheSummary.cache_creation_reported_requests || 0) > 0;
+  const eligibleHitRate = cacheCreationReported ? (cacheSummary.eligible_cache_hit_rate ?? (cacheRead + cacheCreation > 0 ? cacheRead / (cacheRead + cacheCreation) : 0)) : null;
+  const cacheWriteShare = cacheCreationReported ? (cacheSummary.cache_write_share ?? (promptForCache ? cacheCreation / promptForCache : 0)) : null;
   const requestHitRate = cacheSummary.request_hit_rate ?? 0;
   const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / promptForCache) * 100))) : 0;
   const cacheWritePct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheCreation / promptForCache) * 100))) : 0;
@@ -169,8 +174,8 @@ export default function Usage() {
     requests: m.requests,
     request_hit_rate: m.request_hit_rate,
     real_token_hit_rate: m.real_token_hit_rate,
-    eligible_cache_hit_rate: m.eligible_cache_hit_rate,
-    cache_write_share: m.cache_write_share,
+    eligible_cache_hit_rate: Number(m.cache_creation_reported_requests || 0) > 0 ? m.eligible_cache_hit_rate : null,
+    cache_write_share: Number(m.cache_creation_reported_requests || 0) > 0 ? m.cache_write_share : null,
     total_tokens: m.total_tokens,
   }));
   const cacheSegmentTotal = cacheCompositionSegments.reduce((s, m) => s + m.read, 0);
@@ -257,7 +262,7 @@ export default function Usage() {
     { title: t('usage.request_unit'), dataIndex: 'requests', width: 90, sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: t('usage.request_hit'), dataIndex: 'request_hit_rate', width: 110, render: fmtPct },
     { title: t('usage.token_hit'), dataIndex: 'real_token_hit_rate', width: 120, sorter: (a, b) => (a.real_token_hit_rate || 0) - (b.real_token_hit_rate || 0), render: fmtPct },
-    { title: t('usage.write_share'), dataIndex: 'cache_write_share', width: 110, sorter: (a, b) => (a.cache_write_share || 0) - (b.cache_write_share || 0), render: fmtPct },
+    { title: t('usage.write_share'), dataIndex: 'cache_write_share', width: 110, sorter: (a, b) => (a.cache_write_share || 0) - (b.cache_write_share || 0), render: (v, row) => Number(row.cache_creation_reported_requests || 0) > 0 ? fmtPct(v) : '—' },
     { title: t('usage.cache_read'), dataIndex: 'cache_read_tokens', width: 120, sorter: (a, b) => (a.cache_read_tokens || 0) - (b.cache_read_tokens || 0), render: fmtTokens },
     { title: t('usage.cache_write'), dataIndex: 'cache_creation_tokens', width: 120, sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
     { title: t('usage.cache_miss'), dataIndex: 'cache_miss_tokens', width: 120, sorter: (a, b) => (a.cache_miss_tokens || 0) - (b.cache_miss_tokens || 0), render: fmtTokens },
@@ -280,7 +285,7 @@ export default function Usage() {
     { title: t('usage.request_unit'), dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: t('usage.real_requests'), dataIndex: 'real_requests', sorter: (a, b) => (a.real_requests || 0) - (b.real_requests || 0), render: fmtInt },
     { title: t('usage.read_share'), dataIndex: 'cache_read_share', sorter: (a, b) => (a.cache_read_share || 0) - (b.cache_read_share || 0), render: fmtPct },
-    { title: t('usage.write_share'), dataIndex: 'cache_write_share', sorter: (a, b) => (a.cache_write_share || 0) - (b.cache_write_share || 0), render: fmtPct },
+    { title: t('usage.write_share'), dataIndex: 'cache_write_share', sorter: (a, b) => (a.cache_write_share || 0) - (b.cache_write_share || 0), render: (v, row) => Number(row.cache_creation_reported_requests || 0) > 0 ? fmtPct(v) : '—' },
     { title: t('usage.cache_read'), dataIndex: 'cache_read_tokens', sorter: (a, b) => (a.cache_read_tokens || 0) - (b.cache_read_tokens || 0), render: fmtTokens },
     { title: t('usage.cache_write'), dataIndex: 'cache_creation_tokens', sorter: (a, b) => (a.cache_creation_tokens || 0) - (b.cache_creation_tokens || 0), render: fmtTokens },
     { title: t('usage.cache_miss'), dataIndex: 'cache_miss_tokens', sorter: (a, b) => (a.cache_miss_tokens || 0) - (b.cache_miss_tokens || 0), render: fmtTokens },
@@ -342,8 +347,8 @@ export default function Usage() {
         <MetricCard label={t('usage.requests')} value={fmtInt(totalReqs)} color={C.blue} />
         <MetricCard label={t('usage.request_hit_probability')} value={fmtPct(requestHitRate)} color={C.green} sub={`${fmtInt(cacheSummary.hit_requests || 0)} / ${fmtInt(cacheSummary.requests || 0)} ${t('usage.request_unit')}`} />
         <MetricCard label={t('usage.real_token_hit')} value={fmtPct(realTokenHitRate)} color={C.cyan} sub={`${fmtTokens(cacheRead)} / ${fmtTokens(promptForCache)} ${t('usage.input_short')}`} />
-        <MetricCard label={t('usage.eligible_hit')} value={fmtPct(eligibleHitRate)} color={C.teal} sub="read / (read + write)" />
-        <MetricCard label={t('usage.write_share')} value={fmtPct(cacheWriteShare)} color={C.amber} sub={fmtTokens(cacheCreation)} />
+        <MetricCard label={t('usage.eligible_hit')} value={fmtOptionalPct(eligibleHitRate)} color={C.teal} sub="read / (read + write)" />
+        <MetricCard label={t('usage.write_share')} value={fmtOptionalPct(cacheWriteShare)} color={C.amber} sub={fmtTokens(cacheCreation)} />
       </div>
 
       <div className="pool-cache-breakdown" style={{ marginBottom: 18 }}>
@@ -379,8 +384,8 @@ export default function Usage() {
                 <span>{t('usage.requests')} {fmtInt(hoveredModel.requests)}</span>
                 <span>{t('usage.request_hit')} {fmtPct(hoveredModel.request_hit_rate)}</span>
                 <span>{t('usage.real_token_hit')} {fmtPct(hoveredModel.real_token_hit_rate)}</span>
-                <span>{t('usage.eligible_hit')} {fmtPct(hoveredModel.eligible_cache_hit_rate)}</span>
-                <span>{t('usage.write_share')} {fmtPct(hoveredModel.cache_write_share)}</span>
+                <span>{t('usage.eligible_hit')} {fmtOptionalPct(hoveredModel.eligible_cache_hit_rate)}</span>
+                <span>{t('usage.write_share')} {fmtOptionalPct(hoveredModel.cache_write_share)}</span>
               </div>
             ) : null}
           </div>

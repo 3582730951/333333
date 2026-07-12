@@ -34,6 +34,7 @@ export interface UsageMetricRow {
   cache_input_tokens?: number;
   cache_read_tokens?: number;
   cache_creation_tokens?: number;
+  cache_creation_reported_requests?: number;
   cache_miss_tokens?: number;
   cache_creation_5m_share?: number;
   stable_prefix_bytes?: number;
