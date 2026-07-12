@@ -214,6 +214,9 @@ func TestKiroCapabilityRemovalPreventsStaticFallback(t *testing.T) {
 	if err := store.UpsertCapabilities(ctx, filtered); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpsertKiroCredentials(ctx, storage.KiroCredentials{AccountID: account.ID, AuthMethod: "api_key", KiroAPIKey: "key", APIRegion: "us-east-1"}); err != nil {
+		t.Fatal(err)
+	}
 	s := New(store, config.Default())
 	_, err := s.Select(ctx, Route{Group: "cyber", Provider: "kiro", Model: "claude-opus-4-8"})
 	var noAccount *NoAccountError

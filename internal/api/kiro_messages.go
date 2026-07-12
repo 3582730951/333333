@@ -33,6 +33,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
 	}
+	setKiroQualityHeaders(w, converted)
 	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
 	releaseFlight, waitedForFlight := func() (func(), bool) {
 		if converted.WebSearch != nil {
@@ -128,6 +129,8 @@ func (s *Server) kiroCountTokensWithLease(w http.ResponseWriter, r *http.Request
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
 	}
+	w.Header().Set("X-Pool-Kiro-Thinking", "not_applicable")
+	w.Header().Set("X-Pool-Kiro-Effort", "not_applicable")
 	model := firstNonEmpty(converted.Model, lease.ResolvedModel, routing.Model(raw))
 	s.persistKiroResolvedBinding(r.Context(), affinity, lease, model)
 	count := virtual.EstimateTokensJSON(converted.Body)
@@ -148,6 +151,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return outcomeDone
 	}
+	setKiroQualityHeaders(w, converted)
 	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
 	releaseFlight, waitedForFlight := func() (func(), bool) {
 		if converted.WebSearch != nil {
@@ -275,12 +279,13 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 	if err != nil {
 		return kirowire.Conversion{}, err
 	}
-	verified, err := s.store.VerifiedKiroModels(ctx, lease.Account.ID, endpointHash, false)
+	verified, err := s.store.VerifiedKiroModels(ctx, lease.Account.ID, endpointHash, true)
 	if err != nil {
 		return kirowire.Conversion{}, err
 	}
 	return kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{
 		DefaultThinking: kiroCfg.KiroDefaultThinking,
+		ForceMaxQuality: true,
 		VerifiedModels:  verified,
 	})
 }
@@ -310,6 +315,13 @@ func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted
 }
 
 func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, converted kirowire.Conversion, lease scheduler.Lease) (*upstream.Response, string, attemptOutcome) {
+	// Defense in depth: no present or future call site may reach Kiro generation
+	// without the mandatory native max-quality controls. MCP web search is not a
+	// model-generation request and is therefore intentionally exempt.
+	if converted.WebSearch == nil && (!converted.ThinkingEnabled || converted.ThinkingEffort != "max" || converted.MaxOutputTokens <= 0) {
+		writeKiroError(w, r, http.StatusInternalServerError, errors.New("mandatory Kiro adaptive thinking/max-effort invariant was not applied"))
+		return nil, "", outcomeDone
+	}
 	kiroCfg := s.effectiveKiroConfig(r.Context())
 	s.kiro.UpdateConfig(kiroCfg)
 	credentials, err := s.store.GetKiroCredentials(r.Context(), lease.Account.ID)
@@ -580,6 +592,23 @@ func setKiroHeaders(w http.ResponseWriter, model string, losses []string, usageS
 	w.Header().Set("X-Pool-Usage-Source", usageSource)
 }
 
+func setKiroQualityHeaders(w http.ResponseWriter, conversion kirowire.Conversion) {
+	if conversion.WebSearch != nil {
+		w.Header().Set("X-Pool-Kiro-Thinking", "not_applicable")
+		w.Header().Set("X-Pool-Kiro-Effort", "not_applicable")
+		return
+	}
+	if conversion.ThinkingEnabled {
+		w.Header().Set("X-Pool-Kiro-Thinking", "adaptive")
+	} else {
+		w.Header().Set("X-Pool-Kiro-Thinking", "disabled")
+	}
+	w.Header().Set("X-Pool-Kiro-Effort", firstNonEmpty(conversion.ThinkingEffort, "unspecified"))
+	if conversion.MaxOutputTokens > 0 {
+		w.Header().Set("X-Pool-Kiro-Max-Output-Tokens", fmt.Sprintf("%d", conversion.MaxOutputTokens))
+	}
+}
+
 func declareKiroTrailers(w http.ResponseWriter) {
 	w.Header().Add("Trailer", "X-Pool-Resolved-Model")
 	w.Header().Add("Trailer", "X-Pool-Kiro-Compatibility")
@@ -632,25 +661,6 @@ func writePoolCodeError(w http.ResponseWriter, status int, code, message string)
 	}})
 }
 
-func kiroThinkingRequested(raw []byte, defaultEnabled bool) bool {
-	var request struct {
-		Thinking *struct {
-			Type string `json:"type"`
-		} `json:"thinking"`
-	}
-	if json.Unmarshal(raw, &request) != nil || request.Thinking == nil {
-		return defaultEnabled
-	}
-	switch strings.ToLower(strings.TrimSpace(request.Thinking.Type)) {
-	case "disabled", "none":
-		return false
-	case "enabled", "adaptive", "auto":
-		return true
-	default:
-		return defaultEnabled
-	}
-}
-
 func kiroErrorCode(err error) string {
 	switch {
 	case errors.Is(err, kirowire.ErrReasoningUnavailable):
@@ -672,7 +682,9 @@ func (s *Server) effectiveKiroConfig(ctx context.Context) config.Config {
 	cfg.KiroNodeVersion = s.settingString(ctx, "kiro_node_version", cfg.KiroNodeVersion)
 	cfg.KiroDefaultAuthRegion = s.settingString(ctx, "kiro_default_auth_region", cfg.KiroDefaultAuthRegion)
 	cfg.KiroDefaultAPIRegion = s.settingString(ctx, "kiro_default_api_region", cfg.KiroDefaultAPIRegion)
-	cfg.KiroDefaultThinking = s.flagEnabled(ctx, "kiro_default_thinking", cfg.KiroDefaultThinking)
+	// Mandatory quality invariant: legacy config/settings values cannot turn Kiro
+	// thinking off. Request conversion additionally enforces native max-quality fields.
+	cfg.KiroDefaultThinking = true
 	cfg.KiroCacheMode = s.settingString(ctx, "kiro_cache_mode", cfg.KiroCacheMode)
 	cfg.KiroEndpointAllowlist = s.settingCSV(ctx, "kiro_endpoint_allowlist", cfg.KiroEndpointAllowlist)
 	cfg.KiroCacheUnreportedThreshold = s.settingInt(ctx, "kiro_cache_unreported_threshold", cfg.KiroCacheUnreportedThreshold)

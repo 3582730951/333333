@@ -146,6 +146,22 @@ func KiroSupportsAdaptiveThinking(model string) bool {
 	return false
 }
 
+// KiroPlanAllowsBootstrap reports whether an unverified concrete model may be
+// attempted for the account's current subscription. Runtime-verified models are
+// handled separately by the scheduler; this guard stops a stale static capability
+// row from granting a model that the current plan cannot use. KIRO FREE is known
+// not to include Opus.
+func KiroPlanAllowsBootstrap(plan, model string) bool {
+	canonical, ok := KiroCanonicalModel(model)
+	if !ok {
+		return false
+	}
+	if strings.Contains(strings.ToUpper(strings.TrimSpace(plan)), "FREE") && strings.Contains(canonical, "-opus-") {
+		return false
+	}
+	return true
+}
+
 func StaticKiroModels(accountID string) []storage.ModelCapability {
 	now := storage.Now()
 	out := make([]storage.ModelCapability, 0, len(kiroStaticModels))

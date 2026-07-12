@@ -58,7 +58,9 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	explicitKiro := len(allowedProviders) == 1 && allowedProviders[0] == "kiro"
 	immutableAffinity := affinityEstablished && (explicitKiro || len(allowedProviders) > 1)
 	kiroCfg := s.effectiveKiroConfig(r.Context())
-	thinkingRequired := kiroThinkingRequested(anthBody, kiroCfg.KiroDefaultThinking)
+	// Kiro is never allowed to run with thinking disabled. The flag is harmless
+	// for official Claude candidates and filters Kiro to thinking-capable models.
+	thinkingRequired := true
 	var lease scheduler.Lease
 	for {
 		lease, err = s.scheduler.Select(r.Context(), scheduler.Route{
@@ -88,7 +90,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				return
 			}
 			status, _ := noAccountHTTPStatus(err)
-			s.writePublicNoAccountError(r.Context(), w, status, routeGroup, "claude", model, err)
+			s.writePublicNoAccountError(r.Context(), w, status, routeGroup, strings.Join(allowedProviders, ","), model, err)
 			return
 		}
 		if lease.Account.Provider != "kiro" {

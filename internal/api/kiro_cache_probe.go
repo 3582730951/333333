@@ -74,7 +74,7 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	verified, err := s.store.VerifiedKiroModels(r.Context(), accountID, endpointHash, false)
+	verified, err := s.store.VerifiedKiroModels(r.Context(), accountID, endpointHash, true)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -90,14 +90,15 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 	// falsely look unsupported even on an endpoint that caches realistic prompts.
 	stableProbePrefix := strings.Repeat("Kiro cache capability probe stable public prefix. ", 180)
 	probeRaw, _ := json.Marshal(map[string]any{
-		"model":      resolved,
-		"system":     stableProbePrefix,
-		"messages":   []any{map[string]any{"role": "user", "content": "Reply with OK."}},
-		"max_tokens": 8,
-		"thinking":   map[string]any{"type": "disabled"},
+		"model":         resolved,
+		"system":        stableProbePrefix,
+		"messages":      []any{map[string]any{"role": "user", "content": "Reply with OK."}},
+		"max_tokens":    8,
+		"thinking":      map[string]any{"type": "adaptive"},
+		"output_config": map[string]any{"effort": "max"},
 	})
 	affinity := routing.AffinityFromKey("kiro-cache-probe-v1:"+accountID+":"+endpointHash+":"+resolved, "kiro_cache_probe")
-	converted, err := kirowire.ConvertAnthropicRequestWithOptions(probeRaw, affinity.Hash, kirowire.ConversionOptions{VerifiedModels: verified})
+	converted, err := kirowire.ConvertAnthropicRequestWithOptions(probeRaw, affinity.Hash, kirowire.ConversionOptions{ForceMaxQuality: true, VerifiedModels: verified})
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return
@@ -127,7 +128,8 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 		"account_id": accountID, "model": resolved, "endpoint_hash": endpointHash,
 		"egress_id": egress.ID, "session_affinity": affinity.Hash,
 		"stable_request_hash": shortHash(string(converted.Body)),
-		"attempts":            attempts, "capability": capabilityState,
+		"thinking":            "adaptive", "effort": converted.ThinkingEffort, "max_output_tokens": converted.MaxOutputTokens,
+		"attempts": attempts, "capability": capabilityState,
 	})
 }
 

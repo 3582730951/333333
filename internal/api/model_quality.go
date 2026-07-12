@@ -20,6 +20,7 @@ import (
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
@@ -31,6 +32,7 @@ const (
 	qualityErrorUnavailableThreshold = 3
 	qualityProbeResponseLimit        = 2 << 20
 	qualityActualLimit               = 256
+	modelQualityCommonInstruction    = "Integrity check: solve exactly. Return only the requested compact answer; no explanation or formatting."
 )
 
 type modelQualityProbe struct {
@@ -322,6 +324,9 @@ func (s *Server) modelQualityCombos(ctx context.Context) ([]modelQualityCombo, e
 			if model == "" || len(allowed) > 0 && !allowed[strings.ToLower(model)] {
 				continue
 			}
+			if provider == "kiro" && (!capability.KiroSupportsAdaptiveThinking(model) || !capability.KiroPlanAllowsBootstrap(account.PlanType, model)) {
+				continue
+			}
 			combo := modelQualityCombo{Group: account.GroupName, Model: model, Provider: provider}
 			seen[combo.key()] = combo
 		}
@@ -493,7 +498,14 @@ func (s *Server) executeModelQualityProbe(ctx context.Context, combo modelQualit
 	result := modelQualityProbeResult{Run: run}
 	probeCtx, cancel := context.WithTimeout(ctx, s.modelQualityProbeTimeout())
 	defer cancel()
-	lease, err := s.scheduler.Select(probeCtx, scheduler.Route{Group: combo.Group, Provider: combo.Provider, Model: combo.Model, EstimatedTokens: 256, Exclude: exclude})
+	route := scheduler.Route{Group: combo.Group, Provider: combo.Provider, Model: combo.Model, EstimatedTokens: 256, Exclude: exclude}
+	if combo.Provider == "kiro" {
+		kiroCfg := s.effectiveKiroConfig(probeCtx)
+		route.ThinkingRequired = true
+		route.KiroEndpointAllowlist = kiroCfg.KiroEndpointAllowlist
+		route.KiroDefaultRegion = kiroCfg.KiroDefaultAPIRegion
+	}
+	lease, err := s.scheduler.Select(probeCtx, route)
 	if err != nil {
 		result.Err = err
 		result.Run.Outcome = "error"
@@ -504,6 +516,9 @@ func (s *Server) executeModelQualityProbe(ctx context.Context, combo modelQualit
 	}
 	defer lease.Release()
 	result.Run.AccountID = lease.Account.ID
+	if combo.Provider == "kiro" {
+		return s.executeKiroModelQualityProbe(probeCtx, combo, probe, phase, lease, result, started)
+	}
 	token, err := s.store.GetToken(probeCtx, lease.Account.ID)
 	if err != nil {
 		return qualityProbeError(result, "token", err, started)
@@ -557,6 +572,62 @@ func (s *Server) executeModelQualityProbe(ctx context.Context, combo modelQualit
 	return result
 }
 
+func (s *Server) executeKiroModelQualityProbe(ctx context.Context, combo modelQualityCombo, probe modelQualityProbe, phase string, lease scheduler.Lease, result modelQualityProbeResult, started time.Time) modelQualityProbeResult {
+	payload := map[string]interface{}{
+		"model": combo.Model, "max_tokens": 64, "stream": false,
+		"system":        modelQualityCommonInstruction,
+		"messages":      []interface{}{map[string]interface{}{"role": "user", "content": probe.Prompt}},
+		"thinking":      map[string]interface{}{"type": "adaptive"},
+		"output_config": map[string]interface{}{"effort": "max"},
+	}
+	raw, _ := json.Marshal(payload)
+	affinity := routing.AffinityFromKey("model-quality:"+combo.key()+":"+probe.ID+":"+phase, "model_quality")
+	converted, err := s.convertKiroRequest(ctx, raw, affinity, lease)
+	if err != nil {
+		return qualityProbeError(result, "request", err, started)
+	}
+	recorder := &probeResponseRecorder{header: http.Header{}}
+	request, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://kiro.internal/model-quality", nil)
+	data, endpointHash, _ := s.doKiroAttempt(recorder, request, converted, lease)
+	result.Run.LatencyMS = time.Since(started).Milliseconds()
+	if data == nil {
+		status := recorder.status
+		if status <= 0 {
+			status = http.StatusBadGateway
+		}
+		result.Run.HTTPStatus = status
+		message := strings.TrimSpace(recorder.body.String())
+		if message == "" {
+			message = "Kiro model-quality request failed"
+		}
+		return qualityProbeError(result, "kiro_upstream", errors.New(message), started)
+	}
+	result.Run.HTTPStatus = http.StatusOK
+	data.Model = firstNonEmpty(data.Model, converted.Model, combo.Model)
+	s.observeKiroResponse(ctx, lease.Account.ID, endpointHash, converted, *data)
+	result.Run.Actual = qualitySnippet(strings.TrimSpace(data.Text), qualityActualLimit)
+	result.Run.ReturnedModel = qualitySnippet(data.Model, 128)
+	result.Run.PromptTokens = data.InputTokens
+	result.Run.CompletionTokens = data.OutputTokens
+	result.Run.TotalTokens = data.InputTokens + data.OutputTokens
+	result.Pass = qualityAnswerMatches(data.Text, probe.Expected)
+	result.ModelMatch = qualityModelMatches(combo.Model, data.Model)
+	switch {
+	case strings.TrimSpace(data.Text) == "":
+		result.Err = errors.New("empty model response")
+		result.Run.Outcome = "error"
+		result.Run.ErrorKind = "empty_response"
+		result.Run.ErrorMessage = "empty model response"
+	case !result.ModelMatch:
+		result.Run.Outcome = "model_mismatch"
+	case !result.Pass:
+		result.Run.Outcome = "incorrect"
+	default:
+		result.Run.Outcome = "pass"
+	}
+	return result
+}
+
 func qualityProbeError(result modelQualityProbeResult, kind string, err error, started time.Time) modelQualityProbeResult {
 	result.Err = err
 	result.Run.Outcome = "error"
@@ -569,7 +640,7 @@ func qualityProbeError(result modelQualityProbeResult, kind string, err error, s
 }
 
 func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQualityCombo, probe modelQualityProbe, phase string, lease scheduler.Lease, token storage.AccountToken) (upstream.Request, error) {
-	commonInstruction := "Integrity check: solve exactly. Return only the requested compact answer; no explanation or formatting."
+	commonInstruction := modelQualityCommonInstruction
 	effort := s.modelQualityReasoningEffortForPhase(ctx, phase)
 	spec := upstream.Request{Method: http.MethodPost, Provider: combo.Provider, Headers: http.Header{}, Account: lease.Account, Token: token, Egress: lease.Egress, CookieJarKey: lease.Binding.CookieJarKey, Model: combo.Model}
 	switch combo.Provider {

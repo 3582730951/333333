@@ -98,7 +98,7 @@ func TestRuntimeSettingsCacheIsRequestScoped(t *testing.T) {
 	}
 }
 
-func TestKiroDefaultThinkingHotOverride(t *testing.T) {
+func TestKiroThinkingCannotBeDisabledByLegacyHotOverride(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	ctx := context.Background()
 	if !h.app.effectiveKiroConfig(ctx).KiroDefaultThinking {
@@ -107,8 +107,15 @@ func TestKiroDefaultThinkingHotOverride(t *testing.T) {
 	if err := h.store.SetSetting(ctx, "kiro_default_thinking", "false"); err != nil {
 		t.Fatal(err)
 	}
-	if h.app.effectiveKiroConfig(contextWithRuntimeSettingsCache(ctx)).KiroDefaultThinking {
-		t.Fatal("Kiro default thinking hot override was ignored")
+	if !h.app.effectiveKiroConfig(contextWithRuntimeSettingsCache(ctx)).KiroDefaultThinking {
+		t.Fatal("legacy false override disabled mandatory Kiro thinking")
+	}
+	field, ok := configFieldByKey("kiro_default_thinking")
+	if !ok {
+		t.Fatal("Kiro thinking field missing")
+	}
+	if _, err := validateSettingValue(field, false); err == nil {
+		t.Fatal("runtime config accepted disabling mandatory Kiro thinking")
 	}
 }
 

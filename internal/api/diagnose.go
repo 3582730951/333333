@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -55,6 +56,7 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 		accountIDs = append(accountIDs, account.ID)
 	}
 	tokensByID, _ := s.store.ListTokensByAccountIDs(ctx, accountIDs)
+	allowedProviders, normalizedModel, counters := noAccountRouteDiagnostics(provider, model, err)
 	type gcount struct{ active, parked, codex, claude, kiro, custom int }
 	byGroup := map[string]*gcount{}
 	now := storage.Now()
@@ -81,14 +83,14 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 			g.custom++
 		}
 	}
-	prov := provider
+	prov := strings.Join(allowedProviders, ",")
 	if prov == "" {
 		prov = "any"
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "no available account for this request (group=%s, provider=%s", group, prov)
-	if model != "" {
-		fmt.Fprintf(&b, ", model=%s", model)
+	if normalizedModel != "" {
+		fmt.Fprintf(&b, ", model=%s", normalizedModel)
 	}
 	b.WriteString("). ")
 	cur := byGroup[group]
@@ -99,33 +101,98 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 		fmt.Fprintf(&b, "Group %q has %d account(s) but all are quarantined or disabled. ", group, cur.parked)
 	default:
 		fmt.Fprintf(&b, "Group %q: %d active (codex=%d claude=%d kiro=%d custom=%d), %d quarantined/disabled. ", group, cur.active, cur.codex, cur.claude, cur.kiro, cur.custom, cur.parked)
-		if provider == "codex" && cur.codex == 0 {
+		if len(allowedProviders) == 1 && allowedProviders[0] == "codex" && cur.codex == 0 {
 			b.WriteString("None of the active accounts are Codex/GPT accounts. ")
-		} else if provider == "claude" && cur.claude == 0 {
+		} else if len(allowedProviders) == 1 && allowedProviders[0] == "claude" && cur.claude == 0 {
 			b.WriteString("None of the active accounts are Claude accounts. ")
-		} else if provider == "kiro" && cur.kiro == 0 {
+		} else if len(allowedProviders) == 1 && allowedProviders[0] == "kiro" && cur.kiro == 0 {
 			b.WriteString("None of the active accounts are Kiro accounts. ")
 		}
 	}
-	// Where ARE the usable accounts? The smoking gun for a group mismatch.
-	var others []string
-	for g, c := range byGroup {
-		if g == group || c.active == 0 {
-			continue
+	modelFiltered := counters.ModelUnsupported > 0
+	if modelFiltered {
+		kiroCount := 0
+		if cur != nil {
+			kiroCount = cur.kiro
 		}
-		others = append(others, fmt.Sprintf("%q(%d active)", g, c.active))
-	}
-	if len(others) > 0 {
-		sort.Strings(others)
-		fmt.Fprintf(&b, "Active accounts ARE present in other group(s): %s. Point this API key's group there, or import accounts into %q.", strings.Join(others, ", "), group)
+		fmt.Fprintf(&b, "Routing rejected normalized model %q for %d in-group Kiro account(s); model_unsupported=%d. ", normalizedModel, kiroCount, counters.ModelUnsupported)
+	} else {
+		// Where ARE the usable accounts? The smoking gun for a genuine group mismatch.
+		var others []string
+		for g, c := range byGroup {
+			if g == group || c.active == 0 {
+				continue
+			}
+			others = append(others, fmt.Sprintf("%q(%d active)", g, c.active))
+		}
+		if len(others) > 0 {
+			sort.Strings(others)
+			fmt.Fprintf(&b, "Active accounts ARE present in other group(s): %s. Point this API key's group there, or import accounts into %q.", strings.Join(others, ", "), group)
+		}
 	}
 	// Capability hint: accounts present in-group but none advertise the requested model.
-	if model != "" && cur != nil && cur.active > 0 {
-		if m, e := s.store.AccountsWithModel(ctx, group, model); e == nil && len(m) == 0 {
-			fmt.Fprintf(&b, " Note: no account in %q has model %q probed (other models may still work).", group, model)
+	if !modelFiltered && normalizedModel != "" && cur != nil && cur.active > 0 {
+		if m, e := s.store.AccountsWithModel(ctx, group, normalizedModel); e == nil && len(m) == 0 {
+			fmt.Fprintf(&b, " Note: no account in %q has model %q probed (other models may still work).", group, normalizedModel)
 		}
 	}
 	return errors.New(strings.TrimSpace(b.String()))
+}
+
+func noAccountRouteDiagnostics(provider, model string, err error) ([]string, string, scheduler.NoAccountCounters) {
+	providers := []string{}
+	normalizedModel := strings.TrimSpace(model)
+	var counters scheduler.NoAccountCounters
+	var noAccount *scheduler.NoAccountError
+	if errors.As(err, &noAccount) {
+		providers = append(providers, noAccount.AllowedProviders...)
+		if len(providers) == 0 && strings.TrimSpace(noAccount.Provider) != "" {
+			providers = append(providers, noAccount.Provider)
+		}
+		if strings.TrimSpace(noAccount.Model) != "" {
+			normalizedModel = strings.TrimSpace(noAccount.Model)
+		}
+		counters = noAccount.Counters
+	}
+	if len(providers) == 0 && strings.TrimSpace(provider) != "" {
+		providers = append(providers, strings.Split(provider, ",")...)
+	}
+	seen := map[string]bool{}
+	clean := providers[:0]
+	for _, candidate := range providers {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "" || seen[candidate] {
+			continue
+		}
+		seen[candidate] = true
+		clean = append(clean, candidate)
+	}
+	sort.Strings(clean)
+	return clean, normalizedModel, counters
+}
+
+func (s *Server) activeKiroAccountsInGroup(ctx context.Context, group string) int {
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return 0
+	}
+	ids := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		ids = append(ids, account.ID)
+	}
+	tokensByID, _ := s.store.ListTokensByAccountIDs(ctx, ids)
+	now := storage.Now()
+	count := 0
+	for _, account := range accounts {
+		if account.GroupName != group || account.Status != "active" || account.QuarantineUntil > now {
+			continue
+		}
+		token, found := tokensByID[account.ID]
+		if accountprovider.EffectiveProvider(account.Provider, token, found) == "kiro" {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseWriter, status int, group, provider, model string, err error) {
@@ -146,11 +213,18 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
 	if _, retryAfter := noAccountHTTPStatus(err); retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 	}
+	allowedProviders, normalizedModel, counters := noAccountRouteDiagnostics(provider, model, err)
+	counterJSON, _ := json.Marshal(counters)
+	reason := "no_public_account_detail"
+	if counters.ModelUnsupported > 0 {
+		reason = "model_unsupported"
+	}
 	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
 		Action: "routing_unavailable",
-		Reason: "no_public_account_detail",
-		Detail: fmt.Sprintf("group_hash=%s provider=%s model=%s status=%d detail=%s",
-			shortHash(group), provider, model, status, bodySnippet([]byte(detail), 600)),
+		State:  "unavailable",
+		Reason: reason,
+		Detail: fmt.Sprintf("group_hash=%s allowed_providers=%s requested_model=%s normalized_model=%s kiro_accounts=%d status=%d counters=%s detail=%s",
+			shortHash(group), strings.Join(allowedProviders, ","), model, normalizedModel, s.activeKiroAccountsInGroup(ctx, group), status, counterJSON, bodySnippet([]byte(detail), 600)),
 	})
 	writePublicUnavailable(w, status)
 }

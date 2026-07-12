@@ -226,8 +226,8 @@ func configFields() []configField {
 			Help: "凭证未指定时使用的认证区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAuthRegion }},
 		{Key: "kiro_default_api_region", Label: "Kiro 默认 API 区域", Category: catBehavior, Type: fieldString, Effect: effectHot,
 			Help: "凭证未指定时使用的推理区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAPIRegion }},
-		{Key: "kiro_default_thinking", Label: "Kiro 默认深度思考", Category: catBehavior, Type: fieldBool, Effect: effectHot,
-			Help: "下游未明确关闭 thinking 时，通过 Kiro 模型参数默认启用 adaptive thinking；不会向用户消息插入思考提示词。", boot: func(c config.Config) interface{} { return c.KiroDefaultThinking }},
+		{Key: "kiro_default_thinking", Label: "Kiro 强制深度思考", Category: catBehavior, Type: fieldBool, Effect: effectHot,
+			Help: "强制开启且不可关闭：所有 Kiro 推理使用原生 adaptive thinking、max effort；不会用提示词伪装思考。", boot: func(config.Config) interface{} { return true }},
 		{Key: "kiro_cache_mode", Label: "Kiro 缓存模式", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"auto", "observe", "off"}, Help: "auto=仅在真实上游已报告缓存字段后对同前缀请求 singleflight；observe=只观测；off=关闭缓存协调。", boot: func(c config.Config) interface{} { return c.KiroCacheMode }},
 		{Key: "kiro_endpoint_allowlist", Label: "Kiro 自定义端点白名单", Category: catBehavior, Type: fieldCSV, Effect: effectHot,
@@ -493,6 +493,27 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 // the settings table, rejecting type/option mismatches.
 func validateSettingValue(f configField, v interface{}) (string, error) {
 	switch f.Key {
+	case "kiro_default_thinking":
+		enabled := false
+		switch value := v.(type) {
+		case bool:
+			enabled = value
+		case string:
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "1", "true", "on", "yes":
+				enabled = true
+			case "0", "false", "off", "no", "":
+				enabled = false
+			default:
+				return "", fmt.Errorf("expected boolean")
+			}
+		default:
+			return "", fmt.Errorf("expected boolean")
+		}
+		if !enabled {
+			return "", fmt.Errorf("Kiro adaptive thinking is mandatory and cannot be disabled")
+		}
+		return "true", nil
 	case "sms_manual_country":
 		str, ok := v.(string)
 		if !ok {

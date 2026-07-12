@@ -92,6 +92,24 @@ func TestConvertAnthropicThinkingExplicitChoiceWinsDefault(t *testing.T) {
 		t.Fatalf("explicitly disabled thinking was re-enabled: %s", got.Body)
 	}
 
+	forced, err := ConvertAnthropicRequestWithOptions(disabled, "a", ConversionOptions{ForceMaxQuality: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forcedBody map[string]interface{}
+	if err := json.Unmarshal(forced.Body, &forcedBody); err != nil {
+		t.Fatal(err)
+	}
+	fields := forcedBody["additionalModelRequestFields"].(map[string]interface{})
+	thinking := fields["thinking"].(map[string]interface{})
+	effort := fields["output_config"].(map[string]interface{})
+	if thinking["type"] != "adaptive" || effort["effort"] != "max" || fields["max_tokens"] != float64(128000) {
+		t.Fatalf("forced max-quality fields=%#v", fields)
+	}
+	if !forced.ThinkingEnabled || forced.ThinkingEffort != "max" || forced.MaxOutputTokens != 128000 || !containsString(forced.CompatibilityLosses, LossThinkingForcedAdaptive) {
+		t.Fatalf("forced max-quality conversion=%+v", forced)
+	}
+
 	enabled := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":12000},"messages":[{"role":"user","content":"x"}]}`)
 	got, err = ConvertAnthropicRequestWithOptions(enabled, "a", ConversionOptions{})
 	if err != nil {

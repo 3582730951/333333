@@ -243,6 +243,18 @@ func TestKiroAliasesUseOnlyVerifiedModels(t *testing.T) {
 	}
 }
 
+func TestKiroFreePlanCannotBootstrapOpus(t *testing.T) {
+	if KiroPlanAllowsBootstrap("KIRO FREE", "claude-opus-4-8") {
+		t.Fatal("KIRO FREE must not bootstrap Opus from a stale static capability")
+	}
+	if !KiroPlanAllowsBootstrap("KIRO FREE", "claude-sonnet-4-6") {
+		t.Fatal("KIRO FREE non-Opus concrete model was over-restricted")
+	}
+	if !KiroPlanAllowsBootstrap("KIRO PRO", "claude-opus-4-8") {
+		t.Fatal("KIRO PRO Opus bootstrap was rejected")
+	}
+}
+
 // TestStaticClaudeModelsIncludesOpus48 locks in the user-reported fix: the current
 // flagship claude-opus-4-8 must be in the static set with its 1M context window, so
 // an OAuth account whose /v1/models probe is rejected still advertises it.

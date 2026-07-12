@@ -72,6 +72,7 @@ type candidate struct {
 	egress        storage.EgressProfile
 	binding       storage.AccountEgressBinding
 	resolvedModel string
+	bootstrap     bool    // concrete Kiro model is static-known but not runtime-verified
 	score         float64 // normalized account/token/egress load; lower is better
 }
 
@@ -138,10 +139,12 @@ type Route struct {
 	// ImmutableAffinity pins provider, account, resolved model and egress after
 	// the first selection. Kiro and Claude/Kiro auto sessions use this mode.
 	ImmutableAffinity bool
-	// ExplicitProvider permits a concrete, not-yet-verified Kiro model to be tried
-	// on the explicitly requested account. Auto scheduling only considers verified
-	// runtime capabilities.
-	ExplicitProvider      bool
+	// ExplicitProvider records that the downstream explicitly selected Kiro.
+	// Concrete-model bootstrap is also available to auto routing; aliases still
+	// require a runtime-verified model in both modes.
+	ExplicitProvider bool
+	// ThinkingRequired is retained for route diagnostics/call-site compatibility.
+	// Kiro scheduling always enforces adaptive-thinking support, even when false.
 	ThinkingRequired      bool
 	RequiredEgressID      string
 	KiroEndpointAllowlist []string
@@ -165,24 +168,25 @@ type Route struct {
 }
 
 type NoAccountCounters struct {
-	Inactive          int
-	Quarantined       int
-	Excluded          int
-	ProviderMismatch  int
-	ModelUnsupported  int
-	RateLimitCooldown int
-	RecheckPending    int
-	EgressUnavailable int
-	EgressCooldown    int
-	Concurrency       int
-	TokenBudget       int
+	Inactive          int `json:"inactive"`
+	Quarantined       int `json:"quarantined"`
+	Excluded          int `json:"excluded"`
+	ProviderMismatch  int `json:"provider_mismatch"`
+	ModelUnsupported  int `json:"model_unsupported"`
+	RateLimitCooldown int `json:"rate_limit_cooldown"`
+	RecheckPending    int `json:"recheck_pending"`
+	EgressUnavailable int `json:"egress_unavailable"`
+	EgressCooldown    int `json:"egress_cooldown"`
+	Concurrency       int `json:"concurrency"`
+	TokenBudget       int `json:"token_budget"`
 }
 
 type NoAccountError struct {
-	Group    string
-	Provider string
-	Model    string
-	Counters NoAccountCounters
+	Group            string
+	Provider         string
+	AllowedProviders []string
+	Model            string
+	Counters         NoAccountCounters
 }
 
 func (e *NoAccountError) Error() string {
@@ -209,7 +213,11 @@ func (e *NoAccountError) Error() string {
 	if len(parts) == 0 {
 		return ErrNoAccount.Error()
 	}
-	return fmt.Sprintf("%s: group=%q provider=%q model=%q skipped(%s)", ErrNoAccount, e.Group, e.Provider, e.Model, strings.Join(parts, " "))
+	providers := strings.Join(e.AllowedProviders, ",")
+	if providers == "" {
+		providers = e.Provider
+	}
+	return fmt.Sprintf("%s: group=%q providers=%q model=%q skipped(%s)", ErrNoAccount, e.Group, providers, e.Model, strings.Join(parts, " "))
 }
 
 func (e *NoAccountError) Unwrap() error {
@@ -388,7 +396,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	// priority because they preserve an existing conversation's account binding.
 	if ctx.Done() != nil && s.routeHasWaiters(route) {
 		lease, err = s.waitForFreshLease(ctx, route, &NoAccountError{
-			Group: route.Group, Provider: route.Provider, Model: route.Model,
+			Group: route.Group, Provider: route.Provider, AllowedProviders: append([]string(nil), route.AllowedProviders...), Model: route.Model,
 			Counters: NoAccountCounters{Concurrency: 1},
 		})
 	} else {
@@ -672,9 +680,10 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			continue
 		}
 		resolvedModel := route.Model
+		bootstrap := false
 		if accountProvider == "kiro" && route.Model != "" {
 			var modelOK bool
-			resolvedModel, modelOK = s.resolveKiroRouteModel(ctx, account, route)
+			resolvedModel, bootstrap, modelOK = s.resolveKiroRouteModel(ctx, account, route)
 			if !modelOK {
 				counters.ModelUnsupported++
 				continue
@@ -724,12 +733,15 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		concurrencyLoad := float64(inflight) / float64(maxInt(1, egress.MaxConcurrency))
 		tokenLoad := float64(tokens) / float64(maxInt64(1, cfg.AccountTokenBudget))
 		latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
-		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, score: concurrencyLoad + tokenLoad + latencyPenalty})
+		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, bootstrap: bootstrap, score: concurrencyLoad + tokenLoad + latencyPenalty})
 	}
 	if len(candidates) == 0 {
 		return Lease{}, s.noAccountError(route, counters)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].bootstrap != candidates[j].bootstrap {
+			return !candidates[i].bootstrap
+		}
 		return candidates[i].score < candidates[j].score
 	})
 	// Round-robin among the LEAST-loaded candidates so new conversations spread evenly
@@ -740,7 +752,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	// rotated order so a lease race just falls through to the next candidate.
 	minScore := candidates[0].score
 	nEq := 0
-	for nEq < len(candidates) && candidates[nEq].score == minScore {
+	for nEq < len(candidates) && candidates[nEq].bootstrap == candidates[0].bootstrap && candidates[nEq].score == minScore {
 		nEq++
 	}
 	start := 0
@@ -778,10 +790,15 @@ func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding st
 	return false
 }
 
-func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.Account, route Route) (string, bool) {
+// resolveKiroRouteModel returns a canonical Kiro model plus whether selecting it
+// would be a bootstrap attempt. Aliases are resolved exclusively from runtime-
+// verified capabilities. A concrete model may bootstrap only when the account's
+// persisted static capability table contains the same canonical model, its current
+// plan permits it, and any requested thinking mode is statically known to work.
+func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.Account, route Route) (string, bool, bool) {
 	credentials, err := s.store.GetKiroCredentials(ctx, account.ID)
 	if err != nil {
-		return "", false
+		return "", false, false
 	}
 	region := firstRouteValue(credentials.APIRegion, route.KiroDefaultRegion, s.Config().KiroDefaultAPIRegion, "us-east-1")
 	allowlist := route.KiroEndpointAllowlist
@@ -790,29 +807,45 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 	}
 	endpointHash, err := kirowire.EndpointHash(credentials.Endpoint, region, allowlist)
 	if err != nil {
-		return "", false
+		return "", false, false
 	}
-	verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, route.ThinkingRequired)
+	// Kiro inference is a mandatory-thinking path. Only capabilities that have
+	// successfully completed a thinking request qualify as verified; concrete
+	// bootstrap below is likewise limited to statically confirmed thinking models.
+	verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, true)
 	if err != nil {
-		return "", false
+		return "", false, false
 	}
 	resolved, ok := capability.ResolveKiroModel(route.Model, verified)
 	if !ok {
-		return "", false
+		return "", false, false
 	}
-	if route.ThinkingRequired && !capability.KiroSupportsAdaptiveThinking(resolved) {
-		return "", false
-	}
-	if route.ExplicitProvider && !capability.KiroModelAlias(route.Model) {
-		return resolved, true
+	if capability.KiroModelAlias(route.Model) {
+		return resolved, false, true
 	}
 	for _, model := range verified {
 		canonical, modelOK := capability.KiroCanonicalModel(model)
 		if modelOK && canonical == resolved {
-			return resolved, true
+			return resolved, false, true
 		}
 	}
-	return "", false
+	if !capability.KiroSupportsAdaptiveThinking(resolved) {
+		return "", false, false
+	}
+	if !capability.KiroPlanAllowsBootstrap(account.PlanType, resolved) {
+		return "", false, false
+	}
+	capabilities, err := s.store.ListCapabilities(ctx, account.ID)
+	if err != nil {
+		return "", false, false
+	}
+	for _, staticCapability := range capabilities {
+		canonical, modelOK := capability.KiroCanonicalModel(staticCapability.ModelSlug)
+		if modelOK && canonical == resolved {
+			return resolved, true, true
+		}
+	}
+	return "", false, false
 }
 
 func (s *Scheduler) tryLeaseAccount(ctx context.Context, accountID string, route Route, egressCache map[string]storage.EgressProfile) (Lease, bool) {
@@ -843,7 +876,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	resolvedModel := route.Model
 	if accountProvider == "kiro" && route.Model != "" {
 		var ok bool
-		resolvedModel, ok = s.resolveKiroRouteModel(ctx, account, route)
+		resolvedModel, _, ok = s.resolveKiroRouteModel(ctx, account, route)
 		if !ok {
 			return Lease{}, leaseBlockModelUnsupported, false
 		}
@@ -1060,14 +1093,21 @@ func maxInt64(a, b int64) int64 {
 }
 
 func (s *Scheduler) noAccountError(route Route, counters NoAccountCounters) error {
-	if route.Provider == "" && route.Model == "" && route.Affinity.Hash == "" {
+	if route.Provider == "" && len(route.AllowedProviders) == 0 && route.Model == "" && route.Affinity.Hash == "" {
 		return ErrNoAccount
 	}
+	model := route.Model
+	if routeAllowsProvider(route, "kiro") {
+		if canonical, ok := capability.KiroCanonicalModel(model); ok {
+			model = canonical
+		}
+	}
 	return &NoAccountError{
-		Group:    route.Group,
-		Provider: route.Provider,
-		Model:    route.Model,
-		Counters: counters,
+		Group:            route.Group,
+		Provider:         route.Provider,
+		AllowedProviders: append([]string(nil), route.AllowedProviders...),
+		Model:            model,
+		Counters:         counters,
 	}
 }
 

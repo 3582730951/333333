@@ -244,11 +244,9 @@ func correlatorValue(routeKey string) string {
 	return routeKey
 }
 
-// adminHealthTest sends a minimal real generation request upstream through the
-// account and classifies the response (the operator "一键测试存活"). A 2xx — or any
-// non-ban error such as a model-name 400 or a rate-limit — means the account/token
-// is alive; only a high-confidence ban verdict marks it dead, in which case the
-// configured auto-action (audit + delete/quarantine) runs immediately.
+// adminHealthTest sends a provider-correct account probe upstream and classifies
+// the response (the operator "一键测试存活"). Kiro's probe is deliberately limited
+// to authentication + UsageLimits and therefore does not claim to test a model.
 func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, accountID string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -266,8 +264,15 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 	}
 	res := s.probeAccountLiveness(r.Context(), account, token)
 	if res.Err != nil {
-		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{AccountID: accountID, AccountLabel: firstNonEmpty(account.Label, account.Email, accountID), Action: "health_test", State: "unreachable", Reason: res.Err.Error()})
-		writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "alive": false, "state": "unreachable", "error": res.Err.Error()})
+		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+			AccountID: accountID, AccountLabel: firstNonEmpty(account.Label, account.Email, accountID),
+			Action: "health_test", State: "unreachable", Reason: res.Err.Error(),
+			Detail: fmt.Sprintf("provider=%s probe_scope=%s model_checked=%v model=%s", res.Provider, res.ProbeScope, res.ModelChecked, res.Model),
+		})
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"account_id": accountID, "alive": false, "state": "unreachable", "error": res.Err.Error(),
+			"provider": res.Provider, "model": res.Model, "probe_scope": res.ProbeScope, "model_checked": res.ModelChecked,
+		})
 		return
 	}
 	provider := res.Provider
@@ -285,7 +290,7 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		// WHY a probe failed (e.g. a sidecar 502 carries {"error":"..."} naming an
 		// unreachable proxy or an unreplayable JA3) — otherwise an unknown/502 verdict
 		// is opaque in the audit log and the UI.
-		detail := fmt.Sprintf("http=%d alive=%v model=%s", res.Status, alive, model)
+		detail := fmt.Sprintf("http=%d alive=%v probe_scope=%s model_checked=%v model=%s", res.Status, alive, res.ProbeScope, res.ModelChecked, model)
 		if res.Status >= 400 {
 			detail += " body=" + bodySnippet(res.Body, 200)
 		}
@@ -308,15 +313,17 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"account_id":  accountID,
-		"alive":       alive,
-		"state":       string(v.State),
-		"reason":      v.Reason,
-		"http_status": res.Status,
-		"provider":    provider,
-		"model":       model,
-		"deleted":     deleted,
-		"snippet":     bodySnippet(res.Body, 300),
+		"account_id":    accountID,
+		"alive":         alive,
+		"state":         string(v.State),
+		"reason":        v.Reason,
+		"http_status":   res.Status,
+		"provider":      provider,
+		"model":         model,
+		"probe_scope":   res.ProbeScope,
+		"model_checked": res.ModelChecked,
+		"deleted":       deleted,
+		"snippet":       bodySnippet(res.Body, 300),
 	})
 }
 
@@ -326,14 +333,16 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 // right now" (a clean 2xx only). The admin health-test uses Alive; the background
 // recheck loop uses Ready, so it never re-admits an account that is still rate-limited.
 type livenessResult struct {
-	Provider string
-	Model    string
-	Status   int
-	Body     []byte
-	Verdict  ban.Verdict
-	Alive    bool
-	Ready    bool
-	Err      error
+	Provider     string
+	Model        string
+	ProbeScope   string
+	ModelChecked bool
+	Status       int
+	Body         []byte
+	Verdict      ban.Verdict
+	Alive        bool
+	Ready        bool
+	Err          error
 }
 
 // probeAccountLiveness runs a provider-correct liveness probe ("测活") against one
@@ -342,7 +351,12 @@ type livenessResult struct {
 // and the background recheck loop. A setup/transport failure is returned in Err
 // (treated as unreachable); otherwise Status/Body/Verdict/Alive/Ready are populated.
 func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Account, token storage.AccountToken) livenessResult {
-	res := livenessResult{}
+	provider := s.accountProvider(account, token)
+	res := livenessResult{Provider: provider, ProbeScope: "model_request", ModelChecked: true}
+	if provider == "kiro" {
+		res.ProbeScope = "account_auth_usage"
+		res.ModelChecked = false
+	}
 	binding, err := s.store.GetEgressBinding(ctx, account.ID)
 	if err != nil {
 		res.Err = err
@@ -353,9 +367,10 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		res.Err = err
 		return res
 	}
-	provider := s.accountProvider(account, token)
-	res.Provider = provider
-	model := s.probeModel(ctx, account.ID, provider)
+	model := ""
+	if provider != "kiro" {
+		model = s.probeModel(ctx, account.ID, provider)
+	}
 	res.Model = model
 	if provider == "kiro" {
 		cred, kerr := s.store.GetKiroCredentials(ctx, account.ID)
@@ -531,7 +546,8 @@ func (s *Server) probeModel(ctx context.Context, accountID, provider string) str
 		return "claude-sonnet-4-5"
 	}
 	if provider == "kiro" {
-		return "claude-sonnet-4.6"
+		// Kiro liveness uses UsageLimits and does not execute a model request.
+		return ""
 	}
 	if upstream.IsCustomProvider(provider) {
 		if prov, ok := s.customProviderByID(ctx, provider); ok && len(prov.Models) > 0 {

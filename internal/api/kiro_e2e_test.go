@@ -60,8 +60,8 @@ func TestKiroImportAndMessagesEndToEnd(t *testing.T) {
 				t.Errorf("authorization=%q", r.Header.Get("Authorization"))
 			}
 			requestBody, _ := io.ReadAll(r.Body)
-			if !bytes.Contains(requestBody, []byte(`"additionalModelRequestFields":{"thinking":{"type":"adaptive"}}`)) {
-				t.Errorf("Kiro default thinking missing from request: %s", requestBody)
+			if !bytes.Contains(requestBody, []byte(`"thinking":{"type":"adaptive"}`)) || !bytes.Contains(requestBody, []byte(`"output_config":{"effort":"max"}`)) || !bytes.Contains(requestBody, []byte(`"max_tokens":64000`)) {
+				t.Errorf("mandatory Kiro max-quality fields missing from request: %s", requestBody)
 			}
 			if bytes.Contains(requestBody, []byte("<thinking_mode>")) || bytes.Contains(requestBody, []byte("<system>")) {
 				t.Errorf("legacy compatibility prompt leaked into request content: %s", requestBody)
@@ -134,6 +134,116 @@ func TestKiroImportAndMessagesEndToEnd(t *testing.T) {
 	resp.Body.Close()
 	if !bytes.Contains(duplicateBody, []byte(`"duplicate":1`)) {
 		t.Fatalf("duplicate import body=%s", duplicateBody)
+	}
+}
+
+func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.T) {
+	var generateCalls int
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO","usageBreakdownList":[{"resourceType":"AGENTIC_REQUEST","usageLimitWithPrecision":100,"currentUsageWithPrecision":1}]}`))
+		case "/generateAssistantResponse":
+			generateCalls++
+			body, _ := io.ReadAll(r.Body)
+			if !bytes.Contains(body, []byte(`"modelId":"claude-opus-4.8"`)) {
+				t.Errorf("bootstrap request did not use canonical Kiro model: %s", body)
+			}
+			for _, required := range []string{`"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"max"}`, `"max_tokens":128000`} {
+				if !bytes.Contains(body, []byte(required)) {
+					t.Errorf("mandatory Kiro max-quality field %s missing: %s", required, body)
+				}
+			}
+			if bytes.Contains(body, []byte(`"type":"disabled"`)) {
+				t.Errorf("downstream disabled mandatory Kiro thinking: %s", body)
+			}
+			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"modelId":"claude-opus-4.8","content":"bootstrap ok"}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":4,"outputTokens":2}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	allowKiroTestEndpoint(t, h, kiroMock.URL)
+	credential, _ := json.Marshal(map[string]any{"authMethod": "api_key", "kiroApiKey": "bootstrap-key", "endpoint": kiroMock.URL})
+	payload, _ := json.Marshal(map[string]any{"kiro_json_text": string(credential), "group_name": "cyber", "egress_id": "egress_direct"})
+	response, err := http.Post(h.pool.URL+"/admin/accounts/import-kiro-json", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("import status=%d", response.StatusCode)
+	}
+	accounts, err := h.store.ListAccounts(context.Background())
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("accounts=%+v err=%v", accounts, err)
+	}
+	account := accounts[0]
+	endpointHash, err := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8")
+	if err != nil || state.ModelState != "unknown" {
+		t.Fatalf("runtime state before first request=%+v err=%v", state, err)
+	}
+
+	health, err := http.Post(h.pool.URL+"/admin/accounts/"+account.ID+"/health-test", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var healthBody map[string]any
+	if err := json.NewDecoder(health.Body).Decode(&healthBody); err != nil {
+		t.Fatal(err)
+	}
+	health.Body.Close()
+	if healthBody["probe_scope"] != "account_auth_usage" || healthBody["model_checked"] != false || healthBody["model"] != "" {
+		t.Fatalf("Kiro health probe overstated model coverage: %#v", healthBody)
+	}
+	auditRows, err := h.store.ListAuditLog(context.Background(), 10)
+	if err != nil || len(auditRows) == 0 {
+		t.Fatalf("health audit=%+v err=%v", auditRows, err)
+	}
+	if auditRows[0].Action != "health_test" || !strings.Contains(auditRows[0].Detail, "probe_scope=account_auth_usage") || !strings.Contains(auditRows[0].Detail, "model_checked=false") || strings.Contains(auditRows[0].Detail, "claude-sonnet") {
+		t.Fatalf("Kiro health audit overstated model coverage: %+v", auditRows[0])
+	}
+	state, err = h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8")
+	if err != nil || state.ModelState != "unknown" {
+		t.Fatalf("health probe unexpectedly verified model: %+v err=%v", state, err)
+	}
+
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(`{"model":"claude-opus-4-8","max_tokens":32,"thinking":{"type":"disabled"},"output_config":{"effort":"low"},"messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("bootstrap ok")) {
+		t.Fatalf("auto bootstrap status=%d body=%s", response.StatusCode, body)
+	}
+	if response.Header.Get("X-Pool-Resolved-Provider") != "kiro" || response.Header.Get("X-Pool-Resolved-Model") != "claude-opus-4.8" {
+		t.Fatalf("resolved headers=%v", response.Header)
+	}
+	if response.Header.Get("X-Pool-Kiro-Thinking") != "adaptive" || response.Header.Get("X-Pool-Kiro-Effort") != "max" || response.Header.Get("X-Pool-Kiro-Max-Output-Tokens") != "128000" {
+		t.Fatalf("mandatory Kiro quality headers=%v", response.Header)
+	}
+	compatibility := response.Header.Get("X-Pool-Kiro-Compatibility")
+	if !strings.Contains(compatibility, kirowire.LossThinkingForcedAdaptive) || !strings.Contains(compatibility, kirowire.LossThinkingEffortForcedMax) {
+		t.Fatalf("quality overrides not reported: %q", compatibility)
+	}
+	if generateCalls != 1 {
+		t.Fatalf("generate calls=%d", generateCalls)
+	}
+	state, err = h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8")
+	if err != nil || state.ModelState != "verified" || state.ThinkingState != "verified" {
+		t.Fatalf("runtime state after first request=%+v err=%v", state, err)
 	}
 }
 
@@ -435,8 +545,16 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 	if len(generateBodies[0]) < 4096 {
 		t.Fatalf("probe prefix too short to exercise realistic cache eligibility: %d bytes", len(generateBodies[0]))
 	}
+	for _, required := range []string{`"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"max"}`, `"max_tokens":64000`} {
+		if !bytes.Contains(generateBodies[0], []byte(required)) {
+			t.Fatalf("cache probe disabled mandatory Kiro quality field %s: %s", required, generateBodies[0])
+		}
+	}
 	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) {
 		t.Fatalf("probe did not report real metering: %s", probeBody)
+	}
+	if !bytes.Contains(probeBody, []byte(`"thinking":"adaptive"`)) || !bytes.Contains(probeBody, []byte(`"effort":"max"`)) || !bytes.Contains(probeBody, []byte(`"max_output_tokens":64000`)) {
+		t.Fatalf("cache probe response omitted mandatory quality controls: %s", probeBody)
 	}
 }
 

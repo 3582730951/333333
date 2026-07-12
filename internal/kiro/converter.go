@@ -26,6 +26,8 @@ const (
 	LossCacheControlNotForwarded       = "cache_control_not_forwarded"
 	LossGenerationControlsNotForwarded = "generation_controls_not_forwarded"
 	LossThinkingBudgetMappedToAdaptive = "thinking_budget_mapped_to_adaptive"
+	LossThinkingForcedAdaptive         = "thinking_forced_adaptive"
+	LossThinkingEffortForcedMax        = "thinking_effort_forced_max"
 	LossToolSchemaRefBounded           = "tool_schema_ref_bounded"
 )
 
@@ -56,12 +58,17 @@ type Conversion struct {
 	WebSearch           *WebSearchRequest
 	CompatibilityLosses []string
 	ThinkingEnabled     bool
+	ThinkingEffort      string
+	MaxOutputTokens     int64
 }
 
-// ConversionOptions controls Kiro-only compatibility defaults. Explicit
-// downstream request fields always take precedence over these defaults.
+// ConversionOptions controls Kiro-only compatibility defaults. Explicit downstream
+// fields take precedence over DefaultThinking. ForceMaxQuality is the production
+// relay policy: native adaptive thinking, maximum supported effort, and the model's
+// maximum output ceiling cannot be lowered by a downstream request.
 type ConversionOptions struct {
 	DefaultThinking bool
+	ForceMaxQuality bool
 	// VerifiedModels is the selected account's successfully observed model set.
 	// It is required to resolve family/auto aliases; concrete versions never use a
 	// different verified version as a substitute.
@@ -98,6 +105,7 @@ type anthropicThinking struct {
 
 type anthropicOutput struct {
 	Format json.RawMessage `json:"format"`
+	Effort string          `json:"effort"`
 }
 
 type contentBlock struct {
@@ -209,7 +217,11 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		systemPresent = true
 		losses.add(LossUnsupportedBlockTextualized)
 	}
-	for _, control := range []json.RawMessage{req.MaxTokens, req.Temperature, req.TopP, req.TopK, req.StopSequences} {
+	controls := []json.RawMessage{req.Temperature, req.TopP, req.TopK, req.StopSequences}
+	if !options.ForceMaxQuality {
+		controls = append(controls, req.MaxTokens)
+	}
+	for _, control := range controls {
 		if len(bytes.TrimSpace(control)) > 0 && !bytes.Equal(bytes.TrimSpace(control), []byte("null")) {
 			losses.add(LossGenerationControlsNotForwarded)
 			break
@@ -273,22 +285,52 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	out := map[string]any{"conversationState": state}
 
 	thinkingEnabled := options.DefaultThinking
+	explicitlyDisabled := false
 	if req.Thinking != nil {
 		switch strings.ToLower(strings.TrimSpace(req.Thinking.Type)) {
 		case "disabled", "none":
 			thinkingEnabled = false
+			explicitlyDisabled = true
 		case "enabled", "adaptive", "auto":
 			thinkingEnabled = true
 		}
 	}
+	if options.ForceMaxQuality {
+		if explicitlyDisabled {
+			losses.add(LossThinkingForcedAdaptive)
+		}
+		thinkingEnabled = true
+	}
 	if thinkingEnabled && !capability.KiroSupportsAdaptiveThinking(canonical) {
 		return Conversion{}, fmt.Errorf("%w: model %s does not support adaptive thinking", ErrReasoningUnavailable, canonical)
 	}
+	thinkingEffort := ""
+	if req.OutputConfig != nil {
+		thinkingEffort = normalizeKiroThinkingEffort(req.OutputConfig.Effort)
+	}
+	if options.ForceMaxQuality {
+		if thinkingEffort != "" && thinkingEffort != "max" {
+			losses.add(LossThinkingEffortForcedMax)
+		}
+		thinkingEffort = "max"
+	}
+	additionalFields := map[string]any{}
 	if thinkingEnabled {
 		if req.Thinking != nil && len(bytes.TrimSpace(req.Thinking.Budget)) > 0 && !bytes.Equal(bytes.TrimSpace(req.Thinking.Budget), []byte("null")) {
 			losses.add(LossThinkingBudgetMappedToAdaptive)
 		}
-		out["additionalModelRequestFields"] = map[string]any{"thinking": map[string]any{"type": "adaptive"}}
+		additionalFields["thinking"] = map[string]any{"type": "adaptive"}
+		if thinkingEffort != "" {
+			additionalFields["output_config"] = map[string]any{"effort": thinkingEffort}
+		}
+	}
+	maxOutputTokens := int64(0)
+	if options.ForceMaxQuality {
+		maxOutputTokens = kiroMaxOutputTokens(canonical)
+		additionalFields["max_tokens"] = maxOutputTokens
+	}
+	if len(additionalFields) > 0 {
+		out["additionalModelRequestFields"] = additionalFields
 	}
 	body, err := json.Marshal(out)
 	if err != nil {
@@ -305,7 +347,25 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		WebSearch:             webSearch,
 		CompatibilityLosses:   losses.sorted(),
 		ThinkingEnabled:       thinkingEnabled,
+		ThinkingEffort:        thinkingEffort,
+		MaxOutputTokens:       maxOutputTokens,
 	}, nil
+}
+
+func normalizeKiroThinkingEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low", "medium", "high", "xhigh", "max":
+		return strings.ToLower(strings.TrimSpace(effort))
+	default:
+		return ""
+	}
+}
+
+func kiroMaxOutputTokens(model string) int64 {
+	if canonical, ok := capability.KiroCanonicalModel(model); ok && canonical == "claude-opus-4.8" {
+		return 128000
+	}
+	return 64000
 }
 
 func historyItemRole(v any) string {

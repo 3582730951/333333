@@ -188,7 +188,9 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		return outcomeDone
 	}
 	kiroCfg := s.effectiveKiroConfig(r.Context())
-	thinkingRequired := kiroThinkingRequested(raw, kiroCfg.KiroDefaultThinking)
+	// Kiro is a mandatory native-thinking path. Official Claude ignores this
+	// scheduler flag; every Kiro candidate must support adaptive thinking.
+	thinkingRequired := true
 	if explicitKiro {
 		if canonical, ok := capability.KiroCanonicalModel(model); ok && thinkingRequired && !capability.KiroSupportsAdaptiveThinking(canonical) {
 			writeKiroError(w, r, http.StatusBadRequest, fmt.Errorf("%w: model %s", kirowire.ErrReasoningUnavailable, canonical))
@@ -225,7 +227,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			return outcomeDone
 		}
 		status, _ := noAccountHTTPStatus(err)
-		s.writePublicNoAccountError(r.Context(), w, status, group, "claude", model, err)
+		s.writePublicNoAccountError(r.Context(), w, status, group, strings.Join(allowedProviders, ","), model, err)
 		return outcomeDone
 	}
 	if lease.Account.Provider == "kiro" {

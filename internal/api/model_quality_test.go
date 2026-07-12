@@ -1,14 +1,18 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"codex-account-pool/internal/capability"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 )
 
@@ -86,6 +90,60 @@ func TestModelQualityChecksOncePerGroupModelNotPerAccount(t *testing.T) {
 	}
 	if statuses[0].TotalTokens != 42 {
 		t.Fatalf("quality token accounting = %d, want 42", statuses[0].TotalTokens)
+	}
+}
+
+func TestModelQualityKiroUsesMandatoryMaxQualityPath(t *testing.T) {
+	var generated []byte
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/generateAssistantResponse":
+			generated, _ = io.ReadAll(r.Body)
+			answer := qualityTestAnswer(string(generated), false)
+			assistant, _ := json.Marshal(map[string]any{"modelId": "claude-sonnet-4.6", "content": answer})
+			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, assistant))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":40,"outputTokens":2}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	allowKiroTestEndpoint(t, h, kiroMock.URL)
+	ctx := context.Background()
+	account := storage.Account{ID: "quality-kiro", Label: "quality-kiro", GroupName: "cyber", Provider: "kiro", PlanType: "KIRO PRO", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "kiro-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertCapabilities(ctx, capability.StaticKiroModels(account.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertKiroCredentials(ctx, storage.KiroCredentials{AccountID: account.ID, AuthMethod: "api_key", KiroAPIKey: "quality-key", APIRegion: "us-east-1", Endpoint: kiroMock.URL}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+	statuses, err := h.app.runModelQualityChecks(ctx, modelQualityRunRequest{Group: "cyber", Model: "claude-sonnet-4.6", Provider: "kiro"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 || statuses[0].State != "healthy" || statuses[0].TotalChecks != 1 {
+		runs, _ := h.store.ListModelQualityRuns(ctx, "cyber", "claude-sonnet-4.6", 10)
+		t.Fatalf("Kiro quality statuses=%+v runs=%+v", statuses, runs)
+	}
+	for _, required := range []string{`"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"max"}`, `"max_tokens":64000`} {
+		if !bytes.Contains(generated, []byte(required)) {
+			t.Fatalf("Kiro quality probe missing %s: %s", required, generated)
+		}
+	}
+	endpointHash, err := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := h.store.GetKiroRuntimeCapability(ctx, account.ID, endpointHash, "claude-sonnet-4.6")
+	if err != nil || state.ModelState != "verified" || state.ThinkingState != "verified" {
+		t.Fatalf("Kiro quality probe capability=%+v err=%v", state, err)
 	}
 }
 

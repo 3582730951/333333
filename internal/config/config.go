@@ -261,9 +261,9 @@ type Config struct {
 	KiroNodeVersion       string `json:"kiro_node_version"`
 	KiroDefaultAuthRegion string `json:"kiro_default_auth_region"`
 	KiroDefaultAPIRegion  string `json:"kiro_default_api_region"`
-	// KiroDefaultThinking enables Kiro's model-level adaptive thinking whenever
-	// the downstream request does not explicitly disable thinking. Unlike the
-	// global thinking override, this only affects the Kiro compatibility path.
+	// KiroDefaultThinking is retained for config-file compatibility. Kiro inference
+	// now enforces native adaptive thinking at maximum effort; false is ignored so
+	// neither a legacy setting nor a downstream request can silently lower quality.
 	KiroDefaultThinking          bool     `json:"kiro_default_thinking"`
 	KiroCacheMode                string   `json:"kiro_cache_mode"`
 	KiroEndpointAllowlist        []string `json:"kiro_endpoint_allowlist"`
