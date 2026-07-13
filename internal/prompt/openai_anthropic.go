@@ -35,9 +35,22 @@ func AnthropicRequestToChatCompletion(raw []byte) ([]byte, error) {
 	}
 	if v, ok := root["stream"].(bool); ok && v {
 		out["stream"] = true
+		// The Codex bridge ultimately speaks Responses, but it deliberately reuses the
+		// mature Chat -> Responses adapter. Ask that adapter's Chat-facing response path
+		// to retain the terminal usage chunk so the Anthropic SSE message_delta can report
+		// output/cache token counts too.
+		out["stream_options"] = map[string]interface{}{"include_usage": true}
 	}
 	if ss := toStringSlice(root["stop_sequences"]); len(ss) > 0 {
 		out["stop"] = ss
+	}
+	// Current Claude Code sends `/effort` through Messages as
+	// output_config.effort. Preserve that control across the intermediate Chat shape;
+	// ChatCompletionToResponses maps reasoning_effort to reasoning.effort. Older
+	// clients may only send a manual thinking budget, so derive the nearest tier as a
+	// compatibility fallback.
+	if effort := anthropicReasoningEffort(root); effort != "" {
+		out["reasoning_effort"] = effort
 	}
 
 	messages := make([]interface{}, 0, 8)
@@ -65,6 +78,42 @@ func AnthropicRequestToChatCompletion(raw []byte) ([]byte, error) {
 		out["tool_choice"] = tc
 	}
 	return json.Marshal(out)
+}
+
+func anthropicReasoningEffort(root map[string]interface{}) string {
+	if output, ok := root["output_config"].(map[string]interface{}); ok {
+		if effort, _ := output["effort"].(string); validReasoningEffort(effort) {
+			return strings.ToLower(strings.TrimSpace(effort))
+		}
+	}
+	thinking, _ := root["thinking"].(map[string]interface{})
+	if thinking == nil || stringOr(thinking["type"], "") == "disabled" {
+		return ""
+	}
+	budget := toInt64(thinking["budget_tokens"])
+	switch {
+	case budget <= 0:
+		return ""
+	case budget <= 4096:
+		return "low"
+	case budget <= 12000:
+		return "medium"
+	case budget <= 24000:
+		return "high"
+	case budget <= 48000:
+		return "xhigh"
+	default:
+		return "max"
+	}
+}
+
+func validReasoningEffort(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
 }
 
 // anthropicSystemToText flattens an Anthropic `system` (string or array of text

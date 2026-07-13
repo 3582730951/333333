@@ -317,6 +317,21 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 		if !ok {
 			continue
 		}
+		// The process-local Codex bridge can commit an SSE wait heartbeat before the
+		// scheduler later reports a terminal error. Preserve that error as a real
+		// Anthropic SSE error event instead of interpreting the frame as an empty Chat
+		// chunk and ending with a misleading successful message_stop.
+		var envelope map[string]interface{}
+		if json.Unmarshal([]byte(data), &envelope) == nil {
+			if upstreamError, ok := envelope["error"].(map[string]interface{}); ok {
+				message, _ := upstreamError["message"].(string)
+				if message == "" {
+					message = "Codex upstream error"
+				}
+				emit("error", map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": message}})
+				return usage
+			}
+		}
 		var c chatChunk
 		if json.Unmarshal([]byte(data), &c) != nil {
 			continue

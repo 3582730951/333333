@@ -85,11 +85,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	allowedProviders, err := claudeAllowedProviders(r, pol)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
 	if pol.ForceModel != "" {
 		raw = setForcedModel(raw, pol.ForceModel)
@@ -112,26 +107,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	strict := routing.IsStrictSticky(path, r, raw)
 	model := routing.Model(raw)
-	// Normalize a Claude model alias (auto/default/sonnet/opus/haiku, or an undated family
-	// name) that Anthropic would reject into a concrete same-tier model id, and forward
-	// that id upstream. Same-tier only — never a downgrade — so Claude Code's default/auto
-	// selection works end-to-end. No-op for concrete claude-* ids (the common case) and
-	// when a downstream key already forced a concrete model above.
-	if len(allowedProviders) == 1 && allowedProviders[0] == "claude" {
-		norm := capability.NormalizeClaudeModelAlias(model)
-		if norm != model {
-			raw = setForcedModel(raw, norm)
-			model = norm
-		}
-	}
-	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
-	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
-	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
-	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is relayed to
-	// that provider, converting Anthropic Messages ↔ Chat Completions both ways. Claude
-	// Code drives this by requesting a provider model (e.g. ANTHROPIC_MODEL=deepseek-chat
-	// or a DeepSeek-forced key). count_tokens has no chat-completions equivalent, so it
-	// is answered locally with an estimate rather than proxied.
+	// Custom models and built-in GPT/Codex models are resolved before Claude-family
+	// provider validation. This lets the same Anthropic Messages endpoint serve Claude
+	// Code through either a custom Chat provider or the pool's native Codex/Responses
+	// accounts instead of restricting every request to Claude/Kiro up front.
 	if prov, ok := s.customProviderForModel(r.Context(), model); ok {
 		if strings.HasSuffix(path, "/count_tokens") {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
@@ -149,7 +128,31 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		s.handleMessagesViaCustom(w, r, raw, model, pol.Group, prov)
 		return
 	}
+	if isCodexMessagesModel(model) {
+		s.handleMessagesViaCodex(w, r, raw, model)
+		return
+	}
 
+	allowedProviders, err := claudeAllowedProviders(r, pol)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// Normalize a Claude model alias (auto/default/sonnet/opus/haiku, or an undated family
+	// name) that Anthropic would reject into a concrete same-tier model id, and forward
+	// that id upstream. Same-tier only — never a downgrade — so Claude Code's default/auto
+	// selection works end-to-end. No-op for concrete claude-* ids (the common case) and
+	// when a downstream key already forced a concrete model above.
+	if len(allowedProviders) == 1 && allowedProviders[0] == "claude" {
+		norm := capability.NormalizeClaudeModelAlias(model)
+		if norm != model {
+			raw = setForcedModel(raw, norm)
+			model = norm
+		}
+	}
+	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
+	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
+	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
 	// Native Anthropic Messages requests are always self-contained (the full
 	// conversation is in `messages`; there is no server-side previous_response_id), so
 	// they are movable and fail over to a fresh account on a recoverable error instead

@@ -13,6 +13,7 @@
   - `POST /v1/chat/completions`（含工具调用完整透传，第三方客户端 Cline/Roo/opencode/Cursor 可直接接入）
 - Anthropic/Claude 原生入口：
   - `POST /v1/messages`、`POST /v1/messages/count_tokens`（账号绑定身份虚拟化 + 敏感词擦除 + 官方 Claude Code 指纹）
+  - **Claude Code → Codex/GPT 桥**：当 `/v1/messages` 的 `model` 为 `gpt-*`/`codex-*` 时，自动执行 Anthropic Messages → Codex Responses 转换并路由到内置 Codex 账号池；文本、函数工具、tool result、流式 SSE、usage 与 Claude Code `output_config.effort` 均做双向适配。
   - **Skills / code-execution 透传**：`/v1/files`（含 multipart 上传/下载）、`/v1/skills`、`/v1/agents`、`/v1/environments`、`/v1/sessions`（及其子路径）。这些不是消息轮次，**body 原样透传不改写**（保留客户端自己的 `Content-Type`/`Anthropic-Beta`/`Anthropic-Version`），仅附加账号鉴权 + Claude Code 身份头并走账号出口（含 sidecar JA3 / WARP）。解决「无法访问官方 skills」（端点 404）。同一下游 key 的透传请求会黏在同一账号上，使 `file_id` 等账号作用域资源在其生命周期内一致。
 - SQLite WAL 存储，初始化默认 `cyber` 分组，系统提示词为空。
 - 官方 ChatGPT Codex upstream 默认：`https://chatgpt.com/backend-api/codex`。
@@ -171,6 +172,46 @@ experimental_bearer_token = "local-downstream-key"
 ```
 
 > 兼容提示：上面的 Codex CLI 配置始终使用 `wire_api = "responses"`。完整官方 Codex skills / plugins / Browser Use 体验需要下游模型路由到官方 Codex 账号池；第三方 API 供应商按 `upstream_protocol` 分层 best-effort。
+
+### Claude Code 使用内置 Codex/GPT 模型
+
+Claude Code 的网关模型发现只展示 `claude*`/`anthropic*` ID，因此 GPT 模型用自定义模型项加入选择器：
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+export ANTHROPIC_AUTH_TOKEN="<downstream-key>"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-5.6-sol"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 Sol via Pool"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Anthropic Messages → Codex Responses"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES="effort,xhigh_effort,max_effort"
+claude
+```
+
+进入 Claude Code 后：
+
+```text
+/model gpt-5.6-sol
+/effort xhigh
+```
+
+`/effort` 可选 `low`、`medium`、`high`、`xhigh`、`max`；桥接层把 Claude Code 的
+`output_config.effort` 映射为 Codex Responses 的 `reasoning.effort`。持久化配置可写入
+`~/.claude/settings.json`：
+
+```json
+{
+  "model": "gpt-5.6-sol",
+  "effortLevel": "xhigh",
+  "env": {
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "gpt-5.6-sol",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "GPT-5.6 Sol via Pool",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES": "effort,xhigh_effort,max_effort"
+  }
+}
+```
+
+`max` 是单会话档位，用 `/effort max` 或 `claude --effort max`；持久化 `effortLevel` 使用
+`low`、`medium`、`high`、`xhigh`。
 
 ## 自测
 

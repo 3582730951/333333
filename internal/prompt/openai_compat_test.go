@@ -209,6 +209,52 @@ func TestAnthropicRequestToChatCompletion(t *testing.T) {
 	}
 }
 
+func TestAnthropicRequestToChatCompletionPreservesClaudeCodeEffort(t *testing.T) {
+	in := []byte(`{
+	  "model":"gpt-5.6-sol","max_tokens":64000,"stream":true,
+	  "output_config":{"effort":"xhigh"},
+	  "thinking":{"type":"adaptive"},
+	  "messages":[{"role":"user","content":"solve it"}]
+	}`)
+	chat, err := AnthropicRequestToChatCompletion(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatRoot := mustUnmarshal(t, chat)
+	if chatRoot["reasoning_effort"] != "xhigh" {
+		t.Fatalf("Claude Code effort not mapped to Chat intermediate: %v", chatRoot)
+	}
+	streamOptions, _ := chatRoot["stream_options"].(map[string]interface{})
+	if streamOptions["include_usage"] != true {
+		t.Fatalf("stream usage option missing: %v", chatRoot)
+	}
+
+	responses, err := ChatCompletionToResponses(chat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responsesRoot := mustUnmarshal(t, responses)
+	reasoning, _ := responsesRoot["reasoning"].(map[string]interface{})
+	if reasoning["effort"] != "xhigh" {
+		t.Fatalf("Claude Code effort not mapped to Responses reasoning: %v", responsesRoot)
+	}
+	if _, leaked := responsesRoot["reasoning_effort"]; leaked {
+		t.Fatalf("Chat-only reasoning_effort leaked to Responses: %v", responsesRoot)
+	}
+}
+
+func TestAnthropicRequestToChatCompletionMapsLegacyThinkingBudget(t *testing.T) {
+	in := []byte(`{"model":"gpt-5.6-sol","thinking":{"type":"enabled","budget_tokens":48000},"messages":[{"role":"user","content":"solve it"}]}`)
+	out, err := AnthropicRequestToChatCompletion(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, out)
+	if root["reasoning_effort"] != "xhigh" {
+		t.Fatalf("legacy thinking budget mapped to %v, want xhigh", root["reasoning_effort"])
+	}
+}
+
 func TestAnthropicRequestToChatCompletionRejectsTypedServerTools(t *testing.T) {
 	in := []byte(`{
 	  "model":"deepseek-chat",
