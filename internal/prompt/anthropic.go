@@ -1274,6 +1274,9 @@ func toInt64(v interface{}) int64 {
 		return t
 	case int:
 		return int64(t)
+	case json.Number:
+		n, _ := t.Int64()
+		return n
 	}
 	return 0
 }

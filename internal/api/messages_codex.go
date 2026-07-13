@@ -23,21 +23,17 @@ func isCodexMessagesModel(model string) bool {
 		strings.HasPrefix(model, "o3") || strings.HasPrefix(model, "o4")
 }
 
-// handleMessagesViaCodex bridges Claude Code to the built-in Codex channel without
-// duplicating the account scheduler, failover, isolation, usage, or upstream transport
-// machinery:
-//
-//	Anthropic Messages -> Chat-compatible intermediate -> existing Codex/Responses path
-//	existing Chat response/SSE -> Anthropic Messages response/SSE
-//
-// The intermediate shape is process-local; the actual upstream request is Responses.
+// handleMessagesViaCodex bridges Claude Code directly to the built-in Codex Responses
+// channel without duplicating the account scheduler, failover, isolation, usage, or
+// upstream transport machinery. Avoiding a Chat Completions intermediate preserves
+// encrypted reasoning, typed content, and tool-call identity across agent turns.
 func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, raw []byte, model string) {
 	if strings.HasSuffix(r.URL.Path, "/count_tokens") {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 		return
 	}
 
-	chatBody, err := prompt.AnthropicRequestToChatCompletion(raw)
+	converted, err := prompt.AnthropicRequestToResponses(raw)
 	if err != nil {
 		if s.writePromptCompatibilityError(w, err,
 			"official_claude_or_codex_function_tools",
@@ -51,18 +47,18 @@ func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, 
 
 	inner := r.Clone(r.Context())
 	urlCopy := *r.URL
-	urlCopy.Path = "/v1/chat/completions"
+	urlCopy.Path = "/v1/responses"
 	urlCopy.RawPath = ""
 	urlCopy.RawQuery = ""
 	inner.URL = &urlCopy
 	inner.RequestURI = ""
-	inner.Body = io.NopCloser(bytes.NewReader(chatBody))
-	inner.ContentLength = int64(len(chatBody))
+	inner.Body = io.NopCloser(bytes.NewReader(converted.Body))
+	inner.ContentLength = int64(len(converted.Body))
 	inner.Header = r.Header.Clone()
 	inner.Header.Set("Content-Type", "application/json")
 	inner.Header.Del("Content-Length")
 
-	bridge := newCodexMessagesResponseWriter(w, isStreamRequest(raw), model)
+	bridge := newCodexMessagesResponseWriter(w, isStreamRequest(raw), model, converted.ToolNames)
 	s.handleGatewayPost(bridge, inner)
 	bridge.finish()
 }
@@ -74,28 +70,29 @@ const (
 	codexMessagesResponseSSE
 )
 
-// codexMessagesResponseWriter lets the existing Chat-compatible Codex handler stream
-// into the Anthropic SSE converter in real time. Non-streaming Chat JSON is buffered
-// and converted after the inner handler returns; error bodies keep their original
-// status/envelope.
+// codexMessagesResponseWriter lets the Codex Responses handler stream into the
+// Anthropic SSE converter in real time. A non-streaming Claude request still uses the
+// streaming Codex backend and is aggregated into one Messages JSON response.
 type codexMessagesResponseWriter struct {
 	downstream      http.ResponseWriter
 	header          http.Header
 	status          int
 	streamRequested bool
 	model           string
+	toolNames       map[string]string
 	mode            codexMessagesResponseMode
 	buffer          bytes.Buffer
 	pipeWriter      *io.PipeWriter
 	pipeDone        chan struct{}
 }
 
-func newCodexMessagesResponseWriter(downstream http.ResponseWriter, stream bool, model string) *codexMessagesResponseWriter {
+func newCodexMessagesResponseWriter(downstream http.ResponseWriter, stream bool, model string, toolNames map[string]string) *codexMessagesResponseWriter {
 	return &codexMessagesResponseWriter{
 		downstream:      downstream,
 		header:          make(http.Header),
 		streamRequested: stream,
 		model:           model,
+		toolNames:       toolNames,
 		mode:            codexMessagesResponseBuffered,
 	}
 }
@@ -123,7 +120,7 @@ func (w *codexMessagesResponseWriter) WriteHeader(status int) {
 			defer supervisor.Recover("messages-codex-sse")
 			defer close(w.pipeDone)
 			defer reader.Close()
-			chatStreamToAnthropicSSE(w.downstream, reader, w.model, streamrewrite.New(nil))
+			responsesStreamToAnthropicSSE(w.downstream, reader, w.model, w.toolNames, streamrewrite.New(nil))
 		}()
 	}
 }
@@ -167,9 +164,24 @@ func (w *codexMessagesResponseWriter) finish() {
 		_, _ = w.downstream.Write(w.buffer.Bytes())
 		return
 	}
-	out, err := prompt.ChatCompletionToAnthropicResponse(w.buffer.Bytes(), w.model)
+	responsesBody := w.buffer.Bytes()
+	if strings.Contains(strings.ToLower(w.header.Get("Content-Type")), "text/event-stream") {
+		responsesBody = codexSSEToResponseJSON(responsesBody)
+		if len(responsesBody) == 0 {
+			writeError(w.downstream, http.StatusBadGateway, io.ErrUnexpectedEOF)
+			return
+		}
+	}
+	out, err := prompt.ResponsesToAnthropicResponse(responsesBody, w.model, w.toolNames)
 	if err != nil {
 		writeError(w.downstream, http.StatusBadGateway, err)
+		return
+	}
+	if w.streamRequested {
+		w.downstream.Header().Set("Content-Type", "text/event-stream")
+		w.downstream.Header().Set("Cache-Control", "no-cache")
+		w.downstream.WriteHeader(w.status)
+		_ = anthropicMessageJSONToSSE(w.downstream, out)
 		return
 	}
 	w.downstream.Header().Set("Content-Type", "application/json")

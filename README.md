@@ -13,7 +13,7 @@
   - `POST /v1/chat/completions`（含工具调用完整透传，第三方客户端 Cline/Roo/opencode/Cursor 可直接接入）
 - Anthropic/Claude 原生入口：
   - `POST /v1/messages`、`POST /v1/messages/count_tokens`（账号绑定身份虚拟化 + 敏感词擦除 + 官方 Claude Code 指纹）
-  - **Claude Code → Codex/GPT 桥**：当 `/v1/messages` 的 `model` 为 `gpt-*`/`codex-*` 时，自动执行 Anthropic Messages → Codex Responses 转换并路由到内置 Codex 账号池；文本、函数工具、tool result、流式 SSE、usage 与 Claude Code `output_config.effort` 均做双向适配。
+  - **Claude Code → Codex/GPT 原生桥**：当 `/v1/messages` 的 `model` 为 `gpt-*`/`codex-*` 时，直接执行 Anthropic Messages ↔ Codex Responses 转换并路由到内置 Codex 账号池，不经过 Chat Completions 中间格式；保留 typed 文本/图片/文件、并行函数工具、tool result/error、Responses WebSocket/SSE、cache usage，以及可跨 Claude Code 多轮回放的 encrypted reasoning signature。
   - **Skills / code-execution 透传**：`/v1/files`（含 multipart 上传/下载）、`/v1/skills`、`/v1/agents`、`/v1/environments`、`/v1/sessions`（及其子路径）。这些不是消息轮次，**body 原样透传不改写**（保留客户端自己的 `Content-Type`/`Anthropic-Beta`/`Anthropic-Version`），仅附加账号鉴权 + Claude Code 身份头并走账号出口（含 sidecar JA3 / WARP）。解决「无法访问官方 skills」（端点 404）。同一下游 key 的透传请求会黏在同一账号上，使 `file_id` 等账号作用域资源在其生命周期内一致。
 - SQLite WAL 存储，初始化默认 `cyber` 分组，系统提示词为空。
 - 官方 ChatGPT Codex upstream 默认：`https://chatgpt.com/backend-api/codex`。
@@ -195,12 +195,14 @@ claude
 ```
 
 `/effort` 可选 `low`、`medium`、`high`、`xhigh`、`max`；桥接层把 Claude Code 的
-`output_config.effort` 映射为 Codex Responses 的 `reasoning.effort`。持久化配置可写入
+`output_config.effort` 映射为 Codex Responses 的 `reasoning.effort`，其中 Claude Code
+的 `max` 会钳到 Codex 的最高合法档 `xhigh`。持久化配置可写入
 `~/.claude/settings.json`：
 
-Claude Code 固定发送的 Anthropic `max_tokens` 会在协议转换中保留；使用内置 ChatGPT/Codex
-OAuth 账号时，最终上游边界会移除其对应的 `max_output_tokens`（WHAM 不接受该参数），使用
-OpenAI API Key 的标准 Responses 上游时则继续保留输出上限。
+Claude Code 固定发送的 Anthropic `max_tokens` 不会写入内置 Codex Responses 请求；因此
+`xhigh`/`max` 不再连带产生 WHAM 的 `Unsupported parameter: max_output_tokens`。桥接请求固定
+使用 `stream:true`、`store:false` 与 `include:["reasoning.encrypted_content"]`，非流式 Claude
+请求由网关在返回前聚合为一个 Messages JSON。
 
 ```json
 {

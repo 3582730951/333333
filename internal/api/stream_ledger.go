@@ -82,7 +82,9 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 			root["output_text"] = text
 		}
 	}
-	if !hasNonEmptyArray(root["output"]) && strings.TrimSpace(streamString(root["output_text"])) == "" {
+	status := strings.ToLower(streamString(root["status"]))
+	if !hasNonEmptyArray(root["output"]) && strings.TrimSpace(streamString(root["output_text"])) == "" &&
+		status != "failed" && status != "incomplete" {
 		return nil
 	}
 	out, err := json.Marshal(root)
@@ -123,33 +125,59 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		if item := cloneJSONValue(ev["item"]); item != nil {
 			r.done = append(r.done, item)
 		}
-	case "response.completed":
+	case "response.completed", "response.incomplete", "response.failed":
 		if resp, ok := ev["response"].(map[string]interface{}); ok {
 			r.completed = cloneJSONMap(resp)
 			r.id = firstNonEmpty(r.id, streamString(resp["id"]))
 			r.model = firstNonEmpty(r.model, streamString(resp["model"]))
+		} else if typ == "response.failed" {
+			r.completed = cloneJSONMap(ev)
+			r.completed["status"] = "failed"
 		}
 	}
 }
 
 func (r *codexStreamLedgerRecorder) outputItems(text string) []interface{} {
+	var items []interface{}
 	if len(r.done) > 0 {
-		return cloneJSONArray(r.done)
+		items = cloneJSONArray(r.done)
+	} else if len(r.added) > 0 {
+		items = cloneJSONArray(r.added)
 	}
 	if strings.TrimSpace(text) != "" {
-		return []interface{}{map[string]interface{}{
+		for _, rawItem := range items {
+			item, _ := rawItem.(map[string]interface{})
+			if streamString(item["type"]) != "message" {
+				continue
+			}
+			if strings.TrimSpace(responsesOutputItemText(item)) == "" {
+				item["content"] = []interface{}{map[string]interface{}{"type": "output_text", "text": text}}
+			}
+			return items
+		}
+		message := map[string]interface{}{
 			"type": "message",
 			"role": "assistant",
 			"content": []interface{}{map[string]interface{}{
 				"type": "output_text",
 				"text": text,
 			}},
-		}}
+		}
+		// Responses ordering is reasoning -> assistant message -> function calls.
+		// Insert the delta-only message before the first non-reasoning item.
+		insertAt := len(items)
+		for index, rawItem := range items {
+			item, _ := rawItem.(map[string]interface{})
+			if streamString(item["type"]) != "reasoning" {
+				insertAt = index
+				break
+			}
+		}
+		items = append(items, nil)
+		copy(items[insertAt+1:], items[insertAt:])
+		items[insertAt] = message
 	}
-	if len(r.added) > 0 {
-		return cloneJSONArray(r.added)
-	}
-	return nil
+	return items
 }
 
 func sseFrameEventData(frame []byte) (string, []byte) {
