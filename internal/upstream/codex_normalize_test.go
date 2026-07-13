@@ -309,3 +309,31 @@ func TestCodexResponseNormalizationAndRetentionStripPreserveContext(t *testing.T
 		t.Fatalf("Lite normalization lost context: %s", stripped)
 	}
 }
+
+func TestStripCodexResponsesMaxOutputTokensPreservesContext(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","max_output_tokens":64000,"reasoning":{"effort":"max"},"previous_response_id":"resp_keep","tools":[{"parameters":{"const":900719925474099312345}}],"input":[{"value":900719925474099312345}]}`)
+	got := stripCodexResponsesMaxOutputTokens(raw)
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := payload["max_output_tokens"]; present {
+		t.Fatalf("WHAM payload retained max_output_tokens: %s", got)
+	}
+	if !bytes.Equal(payload["model"], json.RawMessage(`"gpt-5.6-sol"`)) ||
+		!bytes.Equal(payload["reasoning"], json.RawMessage(`{"effort":"max"}`)) ||
+		!bytes.Equal(payload["previous_response_id"], json.RawMessage(`"resp_keep"`)) ||
+		!bytes.Contains(got, []byte(`900719925474099312345`)) {
+		t.Fatalf("max_output_tokens strip changed unrelated context: %s", got)
+	}
+
+	for _, unchanged := range [][]byte{
+		[]byte(`{"model":"gpt-5.6-sol","input":"keep spacing"}`),
+		[]byte(`{broken`),
+	} {
+		if out := stripCodexResponsesMaxOutputTokens(unchanged); !bytes.Equal(out, unchanged) {
+			t.Fatalf("body without a valid output limit changed:\nwant %s\n got %s", unchanged, out)
+		}
+	}
+}

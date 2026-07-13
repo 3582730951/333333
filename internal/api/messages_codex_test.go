@@ -21,6 +21,9 @@ func TestMessagesRoutesGPTToBuiltInCodexNonStreaming(t *testing.T) {
 		if body["model"] != "gpt-5.6-sol" || body["stream"] != true {
 			t.Fatalf("unexpected Responses request: %s", raw)
 		}
+		if _, present := body["max_output_tokens"]; present {
+			t.Fatalf("ChatGPT Codex upstream rejects max_output_tokens: %s", raw)
+		}
 		reasoning, _ := body["reasoning"].(map[string]interface{})
 		if reasoning["effort"] != "xhigh" {
 			t.Fatalf("Claude Code effort missing from Responses request: %s", raw)
@@ -71,6 +74,10 @@ func TestMessagesRoutesGPTToBuiltInCodexStreamingTools(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/codex/responses" {
 			t.Fatalf("Codex bridge upstream path = %s", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(raw), `"max_output_tokens"`) {
+			t.Fatalf("ChatGPT Codex upstream rejects max_output_tokens: %s", raw)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w,

@@ -325,7 +325,8 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	// probe at server.go:2243, and continues the Session-21 masked-bug chain.
 	if strings.Contains(req.DownstreamPath, "/responses") {
 		isCompact := strings.Contains(strings.ToLower(req.DownstreamPath), "/responses/compact")
-		responsesLite := !AccountUsesAPIKey(req.Token) && CodexRequestUsesResponsesLite(req.Body)
+		usesAPIKey := AccountUsesAPIKey(req.Token)
+		responsesLite := !usesAPIKey && CodexRequestUsesResponsesLite(req.Body)
 		if isCompact && responsesLite {
 			req.Body = normalizeCodexResponsesLiteCompactBody(req.Body)
 		} else if !isCompact {
@@ -340,7 +341,13 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
 		// cache-affinity control), but strip this obsolete extension consistently.
 		req.Body = stripCodexResponsesPromptCacheRetention(req.Body)
-		if !AccountUsesAPIKey(req.Token) {
+		if !usesAPIKey {
+			// The ChatGPT Codex/WHAM contract does not accept the public Responses API's
+			// max_output_tokens field. Claude Code always sends Anthropic max_tokens;
+			// the Messages -> Chat -> Responses bridge preserves it until this transport
+			// boundary, where an OAuth account must mirror the official Codex client and
+			// omit the unsupported field. API-key Responses endpoints keep the limit.
+			req.Body = stripCodexResponsesMaxOutputTokens(req.Body)
 			metadata := c.newCodexRequestMetadataWithResponsesLite(req, responsesLite)
 			req.codexMetadata = &metadata
 			// ApiCompactionInput projects the same identity through headers; only

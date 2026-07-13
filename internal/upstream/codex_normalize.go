@@ -363,3 +363,22 @@ func stripCodexResponsesPromptCacheRetention(raw []byte) []byte {
 	}
 	return out
 }
+
+// stripCodexResponsesMaxOutputTokens removes the public Responses API output limit
+// at the ChatGPT Codex transport boundary. The OAuth/WHAM endpoint rejects this field
+// with "Unsupported parameter: max_output_tokens", while the official Codex client
+// simply omits it. Callers deliberately apply this only to non-API-key accounts.
+// sjson deletes the one leaf without round-tripping large tool/context integers.
+func stripCodexResponsesMaxOutputTokens(raw []byte) []byte {
+	var probe struct {
+		MaxOutputTokens *json.RawMessage `json:"max_output_tokens"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil || probe.MaxOutputTokens == nil {
+		return raw
+	}
+	out, err := sjson.DeleteBytes(raw, "max_output_tokens")
+	if err != nil {
+		return raw
+	}
+	return out
+}

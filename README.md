@@ -198,6 +198,10 @@ claude
 `output_config.effort` 映射为 Codex Responses 的 `reasoning.effort`。持久化配置可写入
 `~/.claude/settings.json`：
 
+Claude Code 固定发送的 Anthropic `max_tokens` 会在协议转换中保留；使用内置 ChatGPT/Codex
+OAuth 账号时，最终上游边界会移除其对应的 `max_output_tokens`（WHAM 不接受该参数），使用
+OpenAI API Key 的标准 Responses 上游时则继续保留输出上限。
+
 ```json
 {
   "model": "gpt-5.6-sol",

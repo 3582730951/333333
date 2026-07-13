@@ -190,6 +190,38 @@ func TestCodexHTTPClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPAPIKeyPreservesMaxOutputTokens(t *testing.T) {
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, `{"id":"resp","status":"completed"}`)
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/v1"
+	client := NewClient(cfg)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses",
+		Body:           []byte(`{"model":"gpt-5.6-sol","instructions":"API request","store":false,"stream":true,"max_output_tokens":64000,"input":"hi"}`),
+		Account:        storage.Account{ID: "acc-api-key"},
+		Token:          storage.AccountToken{AccessToken: "sk-api-key", OpenAIAPIKey: "sk-api-key"},
+		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["max_output_tokens"] != float64(64000) {
+		t.Fatalf("standard API-key Responses request lost max_output_tokens: %s", gotBody)
+	}
+}
+
 func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	client := NewClient(config.Default())
 	metadata := client.newCodexRequestMetadata(Request{
