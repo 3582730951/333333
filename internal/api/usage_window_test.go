@@ -511,7 +511,12 @@ func TestAdminCacheHitsV2RendersKiroUnreportedRatesAsUnknown(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route", "", "", "claude-sonnet-4.6", 100, 1, 101, 0, 0, 0, json.RawMessage(`{"input_tokens":100}`), storage.UsageDiagnostics{UsageProvider: "kiro", UsageSource: "upstream"}); err != nil {
+	if err := h.store.SetKiroCachePointState(ctx, account.ID, "endpoint-hash", "claude-sonnet-4.6", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "route", "", "", "claude-sonnet-4.6", 100, 1, 101, 0, 0, 0,
+		json.RawMessage(`{"input_tokens":100,"metadata_event_count":0,"metering_event_count":1,"credits_present":true,"kiro_credits":0.25,"cache_point_state":"verified"}`),
+		storage.UsageDiagnostics{UsageProvider: "kiro", UsageSource: "estimated", Estimated: true, CacheControlInjected: true, CacheBreakpointCount: 4}); err != nil {
 		t.Fatal(err)
 	}
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/cache-hits?since=0", "")
@@ -535,6 +540,68 @@ func TestAdminCacheHitsV2RendersKiroUnreportedRatesAsUnknown(t *testing.T) {
 	}
 	if row[columns["provider"]] != "kiro" || row[columns["cache_capability"]] != "unreported" || row[columns["real_requests"]] != "0" || row[columns["cache_miss_tokens"]] != "0" {
 		t.Fatalf("unreported Kiro export row=%v", row)
+	}
+	for _, name := range []string{"summary.csv", "by_api_key.csv", "by_route.csv", "by_route_account_model.csv"} {
+		records, err := csv.NewReader(strings.NewReader(files[name])).ReadAll()
+		if err != nil || len(records) != 2 {
+			t.Fatalf("%s records=%v err=%v", name, records, err)
+		}
+		columns := map[string]int{}
+		for i, column := range records[0] {
+			columns[column] = i
+		}
+		for _, field := range []string{"request_hit_rate", "token_hit_rate", "real_token_hit_rate"} {
+			if got := records[1][columns[field]]; got != "" {
+				t.Fatalf("%s %s=%q, want blank without a measured denominator: %v", name, field, got, records[1])
+			}
+		}
+	}
+	buckets, err := csv.NewReader(strings.NewReader(files["by_time_bucket.csv"])).ReadAll()
+	if err != nil || len(buckets) != 2 {
+		t.Fatalf("by_time_bucket.csv records=%v err=%v", buckets, err)
+	}
+	bucketColumns := map[string]int{}
+	for i, column := range buckets[0] {
+		bucketColumns[column] = i
+	}
+	if got := buckets[1][bucketColumns["cache_read_share"]]; got != "" {
+		t.Fatalf("by_time_bucket cache_read_share=%q, want blank without a measured denominator: %v", got, buckets[1])
+	}
+	usageSources, err := csv.NewReader(strings.NewReader(files["usage_sources.csv"])).ReadAll()
+	if err != nil || len(usageSources) != 2 {
+		t.Fatalf("usage_sources.csv records=%v err=%v", usageSources, err)
+	}
+	usageColumns := map[string]int{}
+	for i, column := range usageSources[0] {
+		usageColumns[column] = i
+	}
+	usageRow := usageSources[1]
+	for field, want := range map[string]string{
+		"provider": "kiro", "usage_source": "estimated", "metadata_events": "0", "metering_events": "1",
+		"credits_reported_requests": "1", "credits_total": "0.250000", "token_metadata_reported_requests": "0",
+		"cache_point_injected_requests": "1", "cache_point_accepted_requests": "1",
+	} {
+		if got := usageRow[usageColumns[field]]; got != want {
+			t.Fatalf("usage_sources %s=%q, want %q: %v", field, got, want, usageRow)
+		}
+	}
+	capabilities, err := csv.NewReader(strings.NewReader(files["kiro_capabilities.csv"])).ReadAll()
+	if err != nil || len(capabilities) != 2 {
+		t.Fatalf("kiro_capabilities.csv records=%v err=%v", capabilities, err)
+	}
+	capabilityColumns := map[string]int{}
+	for i, column := range capabilities[0] {
+		capabilityColumns[column] = i
+	}
+	capabilityRow := capabilities[1]
+	for field, want := range map[string]string{
+		"cache_point_state": "verified", "cache_reuse_state": "unknown", "window_account_model_requests": "1",
+		"window_account_model_metadata_events": "0", "window_account_model_metering_events": "1", "window_account_model_credits_reported_requests": "1",
+		"window_account_model_cache_point_injected_requests": "1", "window_account_model_cache_point_accepted_requests": "1",
+	} {
+		if got := capabilityRow[capabilityColumns[field]]; got != want {
+			t.Fatalf("kiro_capabilities %s=%q, want %q: %v", field, got, want, capabilityRow)
+		}
 	}
 }
 
@@ -564,6 +631,19 @@ func TestAdminCacheHitsLeavesCreationRatesBlankWhenProviderDidNotReportWrites(t 
 		if got := records[1][columns[field]]; got != "" {
 			t.Fatalf("%s=%q, want blank without explicit cache creation metering: %v", field, got, records[1])
 		}
+	}
+}
+
+func TestCacheMetricRowsV2UsesHistoricalUsageProviderAndCapability(t *testing.T) {
+	accountID := "historical-kiro-account"
+	codebook := buildDiagnosticCodebook(nil, nil, nil, []diagnosticUsageRecord{{AccountID: accountID}}, nil, nil)
+	rows := cacheMetricRowsV2([]storage.CacheUsageMetricRow{{AccountID: accountID, Model: "claude-opus-4-8", Requests: 1, EstimatedRequests: 1}}, codebook,
+		[]diagnosticUsageRecord{{AccountID: accountID, Model: "claude-opus-4.8", UsageProvider: "kiro", UsageSource: "estimated", CacheCapability: "unreported", Estimated: 1}}, nil)
+	if len(rows) != 1 || len(rows[0]) < 5 {
+		t.Fatalf("historical Kiro rows=%v", rows)
+	}
+	if rows[0][1] != "kiro" || rows[0][3] != "unreported" || rows[0][4] != "estimated" {
+		t.Fatalf("historical Kiro identity was lost: %v", rows[0])
 	}
 }
 

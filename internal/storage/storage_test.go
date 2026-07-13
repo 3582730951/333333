@@ -398,6 +398,48 @@ func TestKiroRuntimeCapabilityPresenceAndUnreportedThreshold(t *testing.T) {
 	}
 }
 
+func TestKiroCacheReuseProbeIsIndependentAndVerifiedIsMonotonic(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "kiro-cache-reuse", GroupName: "cyber", Provider: "kiro", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetKiroCachePointState(ctx, account.ID, "endpoint", "claude-opus-4.8", "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetKiroCacheReuseProbe(ctx, account.ID, "endpoint", "claude-opus-4.8", "verified", "credits_reduction", 47.5, 1234); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.GetKiroRuntimeCapability(ctx, account.ID, "endpoint", "claude-opus-4.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.CachePointState != "verified" || state.CacheCapability != "unknown" || state.CacheReuseState != "verified" || state.CacheReuseEvidence != "credits_reduction" || state.CacheReuseReductionPct != 47.5 || state.CacheReuseProbedAt != 1234 {
+		t.Fatalf("persisted cache reuse state=%+v", state)
+	}
+	if _, err := store.ObserveKiroCapability(ctx, account.ID, "endpoint", "claude-opus-4.8", KiroCapabilityObservation{ModelSucceeded: true, MeteringEvents: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetKiroCacheReuseProbe(ctx, account.ID, "endpoint", "claude-opus-4.8", "not_observed", "none", 0, 2345); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.GetKiroRuntimeCapability(ctx, account.ID, "endpoint", "claude-opus-4.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.CacheReuseState != "verified" || state.CacheReuseEvidence != "credits_reduction" || state.CacheReuseProbedAt != 1234 {
+		t.Fatalf("inconclusive probe downgraded verified evidence: %+v", state)
+	}
+	if err := store.SetKiroCacheReuseProbe(ctx, account.ID, "endpoint", "claude-sonnet-4.6", "not_observed", "none", 0, 3456); err != nil {
+		t.Fatal(err)
+	}
+	notObserved, err := store.GetKiroRuntimeCapability(ctx, account.ID, "endpoint", "claude-sonnet-4.6")
+	if err != nil || notObserved.CacheReuseState != "not_observed" || notObserved.CacheReuseProbedAt != 3456 {
+		t.Fatalf("not-observed cache probe=%+v err=%v", notObserved, err)
+	}
+}
+
 func TestKiroUnreportedUsageIsNotCacheMiss(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -455,5 +497,42 @@ func TestKiroHistoricalZeroUsageBackfillAndModelAggregation(t *testing.T) {
 	}
 	if len(report.ByModel) != 1 || report.ByModel[0].Model != "claude-opus-4.8" || report.ByModel[0].Requests != 3 {
 		t.Fatalf("normalized model aggregation = %+v", report.ByModel)
+	}
+}
+
+func TestCacheUsageAggregateKeepsBreakpointsJSONFromMaximumCount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "cache-breakpoints", GroupName: "cyber", Provider: "kiro", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		count int
+		json  string
+	}{
+		{count: 2, json: `[{"section":"system"},{"section":"messages"}]`},
+		{count: 3, json: `[{"section":"system"},{"section":"messages"},{"section":"messages","message_index":2}]`},
+	} {
+		if err := store.InsertUsageRecordWithDiagnostics(ctx, account.ID, "same-route", "", "", "claude-opus-4.8", 100, 10, 110, 0, 0, 0, nil, UsageDiagnostics{
+			UsageProvider:        "kiro",
+			UsageSource:          "estimated",
+			Estimated:            true,
+			CacheBreakpointCount: tc.count,
+			CacheBreakpointsJSON: tc.json,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report, err := store.CacheUsageMetricsWindowFullRoutes(ctx, 0, Now()+10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.ByRoute) != 1 {
+		t.Fatalf("by-route rows = %+v", report.ByRoute)
+	}
+	row := report.ByRoute[0]
+	if row.CacheBreakpointCount != 3 || row.CacheBreakpointsJSON != `[{"section":"system"},{"section":"messages"},{"section":"messages","message_index":2}]` {
+		t.Fatalf("breakpoint aggregate count/json mismatch: count=%d json=%s", row.CacheBreakpointCount, row.CacheBreakpointsJSON)
 	}
 }

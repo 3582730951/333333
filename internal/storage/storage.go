@@ -254,20 +254,24 @@ type ModelCapability struct {
 }
 
 type KiroRuntimeCapability struct {
-	AccountID                 string `json:"account_id"`
-	EndpointHash              string `json:"endpoint_hash"`
-	Model                     string `json:"model"`
-	ModelState                string `json:"model_state"`
-	ThinkingState             string `json:"thinking_state"`
-	CacheCapability           string `json:"cache_capability"`
-	CachePointState           string `json:"cache_point_state"`
-	Observations              int64  `json:"observations"`
-	MeteringEvents            int64  `json:"metering_events"`
-	CacheReportedObservations int64  `json:"cache_reported_observations"`
-	CacheHitObservations      int64  `json:"cache_hit_observations"`
-	ConsecutiveUnreported     int64  `json:"consecutive_unreported"`
-	UnknownCacheSchemaJSON    string `json:"unknown_cache_schema_json,omitempty"`
-	UpdatedAt                 int64  `json:"updated_at"`
+	AccountID                 string  `json:"account_id"`
+	EndpointHash              string  `json:"endpoint_hash"`
+	Model                     string  `json:"model"`
+	ModelState                string  `json:"model_state"`
+	ThinkingState             string  `json:"thinking_state"`
+	CacheCapability           string  `json:"cache_capability"`
+	CachePointState           string  `json:"cache_point_state"`
+	CacheReuseState           string  `json:"cache_reuse_state"`
+	CacheReuseEvidence        string  `json:"cache_reuse_evidence,omitempty"`
+	CacheReuseReductionPct    float64 `json:"cache_reuse_credit_reduction_percent,omitempty"`
+	CacheReuseProbedAt        int64   `json:"cache_reuse_probed_at,omitempty"`
+	Observations              int64   `json:"observations"`
+	MeteringEvents            int64   `json:"metering_events"`
+	CacheReportedObservations int64   `json:"cache_reported_observations"`
+	CacheHitObservations      int64   `json:"cache_hit_observations"`
+	ConsecutiveUnreported     int64   `json:"consecutive_unreported"`
+	UnknownCacheSchemaJSON    string  `json:"unknown_cache_schema_json,omitempty"`
+	UpdatedAt                 int64   `json:"updated_at"`
 }
 
 type KiroCapabilityObservation struct {
@@ -836,6 +840,10 @@ CREATE TABLE IF NOT EXISTS kiro_runtime_capabilities(
   thinking_state TEXT NOT NULL DEFAULT 'unknown',
   cache_capability TEXT NOT NULL DEFAULT 'unknown',
 	cache_point_state TEXT NOT NULL DEFAULT 'unknown',
+  cache_reuse_state TEXT NOT NULL DEFAULT 'unknown',
+  cache_reuse_evidence TEXT NOT NULL DEFAULT '',
+  cache_reuse_credit_reduction_percent REAL NOT NULL DEFAULT 0,
+  cache_reuse_probed_at INTEGER NOT NULL DEFAULT 0,
   observations INTEGER NOT NULL DEFAULT 0,
   metering_events INTEGER NOT NULL DEFAULT 0,
   cache_reported_observations INTEGER NOT NULL DEFAULT 0,
@@ -1346,6 +1354,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN cache_hit_after_prewarm INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN singleflight_waited_requests INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_point_state TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_state TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_evidence TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_credit_reduction_percent REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE kiro_runtime_capabilities ADD COLUMN cache_reuse_probed_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN diagnostics_miss_reason TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_auto_context_cache_control INTEGER NOT NULL DEFAULT 0`,
@@ -1412,6 +1424,10 @@ func (s *Store) migrate(ctx context.Context) error {
   thinking_state TEXT NOT NULL DEFAULT 'unknown',
   cache_capability TEXT NOT NULL DEFAULT 'unknown',
 	cache_point_state TEXT NOT NULL DEFAULT 'unknown',
+  cache_reuse_state TEXT NOT NULL DEFAULT 'unknown',
+  cache_reuse_evidence TEXT NOT NULL DEFAULT '',
+  cache_reuse_credit_reduction_percent REAL NOT NULL DEFAULT 0,
+  cache_reuse_probed_at INTEGER NOT NULL DEFAULT 0,
   observations INTEGER NOT NULL DEFAULT 0,
   metering_events INTEGER NOT NULL DEFAULT 0,
   cache_reported_observations INTEGER NOT NULL DEFAULT 0,
@@ -3011,10 +3027,12 @@ ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET updated_at=excluded.
 func (s *Store) GetKiroRuntimeCapability(ctx context.Context, accountID, endpointHash, model string) (KiroRuntimeCapability, error) {
 	var capability KiroRuntimeCapability
 	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
+cache_reuse_state, cache_reuse_evidence, cache_reuse_credit_reduction_percent, cache_reuse_probed_at,
 observations, metering_events, cache_reported_observations, cache_hit_observations, consecutive_unreported,
 unknown_cache_schema_json, updated_at
 FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=?`, accountID, endpointHash, model).Scan(
 		&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState,
+		&capability.CacheReuseState, &capability.CacheReuseEvidence, &capability.CacheReuseReductionPct, &capability.CacheReuseProbedAt,
 		&capability.Observations, &capability.MeteringEvents, &capability.CacheReportedObservations, &capability.CacheHitObservations,
 		&capability.ConsecutiveUnreported, &capability.UnknownCacheSchemaJSON, &capability.UpdatedAt)
 	return capability, err
@@ -3022,6 +3040,7 @@ FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=
 
 func (s *Store) ListKiroRuntimeCapabilities(ctx context.Context, accountID string) ([]KiroRuntimeCapability, error) {
 	query := `SELECT account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
+cache_reuse_state, cache_reuse_evidence, cache_reuse_credit_reduction_percent, cache_reuse_probed_at,
 observations, metering_events, cache_reported_observations, cache_hit_observations, consecutive_unreported,
 unknown_cache_schema_json, updated_at FROM kiro_runtime_capabilities`
 	args := []any{}
@@ -3039,6 +3058,7 @@ unknown_cache_schema_json, updated_at FROM kiro_runtime_capabilities`
 	for rows.Next() {
 		var capability KiroRuntimeCapability
 		if err := rows.Scan(&capability.AccountID, &capability.EndpointHash, &capability.Model, &capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState,
+			&capability.CacheReuseState, &capability.CacheReuseEvidence, &capability.CacheReuseReductionPct, &capability.CacheReuseProbedAt,
 			&capability.Observations, &capability.MeteringEvents, &capability.CacheReportedObservations, &capability.CacheHitObservations,
 			&capability.ConsecutiveUnreported, &capability.UnknownCacheSchemaJSON, &capability.UpdatedAt); err != nil {
 			return nil, err
@@ -3082,12 +3102,15 @@ func (s *Store) ObserveKiroCapability(ctx context.Context, accountID, endpointHa
 	defer tx.Rollback()
 	capability := KiroRuntimeCapability{
 		AccountID: accountID, EndpointHash: endpointHash, Model: model,
-		ModelState: "unknown", ThinkingState: "unknown", CacheCapability: "unknown", CachePointState: "unknown",
+		ModelState: "unknown", ThinkingState: "unknown", CacheCapability: "unknown", CachePointState: "unknown", CacheReuseState: "unknown",
 	}
-	err = tx.QueryRowContext(ctx, `SELECT model_state, thinking_state, cache_capability, cache_point_state, observations, metering_events,
+	err = tx.QueryRowContext(ctx, `SELECT model_state, thinking_state, cache_capability, cache_point_state,
+cache_reuse_state, cache_reuse_evidence, cache_reuse_credit_reduction_percent, cache_reuse_probed_at, observations, metering_events,
 cache_reported_observations, cache_hit_observations, consecutive_unreported, unknown_cache_schema_json, updated_at
 FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=?`, accountID, endpointHash, model).Scan(
-		&capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState, &capability.Observations, &capability.MeteringEvents,
+		&capability.ModelState, &capability.ThinkingState, &capability.CacheCapability, &capability.CachePointState,
+		&capability.CacheReuseState, &capability.CacheReuseEvidence, &capability.CacheReuseReductionPct, &capability.CacheReuseProbedAt,
+		&capability.Observations, &capability.MeteringEvents,
 		&capability.CacheReportedObservations, &capability.CacheHitObservations, &capability.ConsecutiveUnreported,
 		&capability.UnknownCacheSchemaJSON, &capability.UpdatedAt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -3135,16 +3158,21 @@ FROM kiro_runtime_capabilities WHERE account_id=? AND endpoint_hash=? AND model=
 	}
 	capability.UpdatedAt = Now()
 	_, err = tx.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
-account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state, observations, metering_events,
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
+cache_reuse_state, cache_reuse_evidence, cache_reuse_credit_reduction_percent, cache_reuse_probed_at, observations, metering_events,
 cache_reported_observations, cache_hit_observations, consecutive_unreported, unknown_cache_schema_json, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET
 model_state=excluded.model_state, thinking_state=excluded.thinking_state, cache_capability=excluded.cache_capability, cache_point_state=excluded.cache_point_state,
+cache_reuse_state=excluded.cache_reuse_state, cache_reuse_evidence=excluded.cache_reuse_evidence,
+cache_reuse_credit_reduction_percent=excluded.cache_reuse_credit_reduction_percent, cache_reuse_probed_at=excluded.cache_reuse_probed_at,
 observations=excluded.observations, metering_events=excluded.metering_events,
 cache_reported_observations=excluded.cache_reported_observations, cache_hit_observations=excluded.cache_hit_observations,
 consecutive_unreported=excluded.consecutive_unreported, unknown_cache_schema_json=excluded.unknown_cache_schema_json,
 updated_at=excluded.updated_at`, capability.AccountID, capability.EndpointHash, capability.Model, capability.ModelState,
-		capability.ThinkingState, capability.CacheCapability, capability.CachePointState, capability.Observations, capability.MeteringEvents,
+		capability.ThinkingState, capability.CacheCapability, capability.CachePointState,
+		capability.CacheReuseState, capability.CacheReuseEvidence, capability.CacheReuseReductionPct, capability.CacheReuseProbedAt,
+		capability.Observations, capability.MeteringEvents,
 		capability.CacheReportedObservations, capability.CacheHitObservations, capability.ConsecutiveUnreported,
 		capability.UnknownCacheSchemaJSON, capability.UpdatedAt)
 	if err != nil {
@@ -3172,6 +3200,57 @@ account_id, endpoint_hash, model, model_state, thinking_state, cache_capability,
 VALUES(?, ?, ?, 'unknown', 'unknown', 'unknown', ?, ?)
 ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET cache_point_state=excluded.cache_point_state, updated_at=excluded.updated_at`,
 		accountID, endpointHash, model, state, Now())
+	return err
+}
+
+// SetKiroCacheReuseProbe records the outcome of the explicit two-request paid
+// cache probe. It is deliberately separate from CachePointState (the endpoint
+// accepted the request syntax) and CacheCapability (the endpoint reported token
+// cache buckets). A verified result is monotonic: one later noisy or inconclusive
+// probe must not erase earlier positive write/read or credits-reduction evidence.
+func (s *Store) SetKiroCacheReuseProbe(ctx context.Context, accountID, endpointHash, model, state, evidence string, reductionPercent float64, probedAt int64) error {
+	state = strings.ToLower(strings.TrimSpace(state))
+	evidence = strings.ToLower(strings.TrimSpace(evidence))
+	if state != "unknown" && state != "verified" && state != "not_observed" {
+		return fmt.Errorf("invalid Kiro cache reuse state %q", state)
+	}
+	if evidence == "" {
+		evidence = "none"
+	}
+	if evidence != "none" && evidence != "token_metadata" && evidence != "credits_reduction" {
+		return fmt.Errorf("invalid Kiro cache reuse evidence %q", evidence)
+	}
+	if state == "verified" && evidence == "none" {
+		return errors.New("verified Kiro cache reuse requires evidence")
+	}
+	if state != "verified" && evidence != "none" {
+		return errors.New("non-verified Kiro cache reuse cannot carry positive evidence")
+	}
+	if strings.TrimSpace(accountID) == "" || strings.TrimSpace(endpointHash) == "" || strings.TrimSpace(model) == "" {
+		return errors.New("kiro cache reuse probe account, endpoint, and model are required")
+	}
+	if probedAt <= 0 {
+		probedAt = Now()
+	}
+	updatedAt := Now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO kiro_runtime_capabilities(
+account_id, endpoint_hash, model, model_state, thinking_state, cache_capability, cache_point_state,
+cache_reuse_state, cache_reuse_evidence, cache_reuse_credit_reduction_percent, cache_reuse_probed_at, updated_at)
+VALUES(?, ?, ?, 'unknown', 'unknown', 'unknown', 'unknown', ?, ?, ?, ?, ?)
+ON CONFLICT(account_id, endpoint_hash, model) DO UPDATE SET
+cache_reuse_state=CASE
+  WHEN kiro_runtime_capabilities.cache_reuse_state='verified' AND excluded.cache_reuse_state<>'verified'
+  THEN kiro_runtime_capabilities.cache_reuse_state ELSE excluded.cache_reuse_state END,
+cache_reuse_evidence=CASE
+  WHEN kiro_runtime_capabilities.cache_reuse_state='verified' AND excluded.cache_reuse_state<>'verified'
+  THEN kiro_runtime_capabilities.cache_reuse_evidence ELSE excluded.cache_reuse_evidence END,
+cache_reuse_credit_reduction_percent=CASE
+  WHEN kiro_runtime_capabilities.cache_reuse_state='verified' AND excluded.cache_reuse_state<>'verified'
+  THEN kiro_runtime_capabilities.cache_reuse_credit_reduction_percent ELSE excluded.cache_reuse_credit_reduction_percent END,
+cache_reuse_probed_at=CASE
+  WHEN kiro_runtime_capabilities.cache_reuse_state='verified' AND excluded.cache_reuse_state<>'verified'
+  THEN kiro_runtime_capabilities.cache_reuse_probed_at ELSE excluded.cache_reuse_probed_at END,
+updated_at=excluded.updated_at`, accountID, endpointHash, model, state, evidence, reductionPercent, probedAt, updatedAt)
 	return err
 }
 
@@ -5087,7 +5166,7 @@ SELECT %s,
        COALESCE(SUM(prompt_cache_key_present),0),
        COALESCE(SUM(cache_control_injected),0),
        COALESCE(MAX(cache_breakpoint_count),0),
-       COALESCE(MAX(cache_breakpoints_json),''),
+       COALESCE(substr(MAX(printf('%%020d', cache_breakpoint_count) || COALESCE(cache_breakpoints_json,'')),21),''),
        COALESCE(MAX(unwritten_tail_tokens),0),
        COALESCE(MAX(max_possible_cache_read_tokens),0),
        COALESCE(SUM(cache_hit_after_prewarm),0),

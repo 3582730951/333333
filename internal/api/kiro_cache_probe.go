@@ -153,13 +153,25 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 	if cacheVerified {
 		cacheEvidence = "token_metadata"
 	}
+	cacheReuseState := "not_observed"
+	if cacheVerified || creditReuseObserved {
+		cacheReuseState = "verified"
+	}
+	if err := s.store.SetKiroCacheReuseProbe(r.Context(), accountID, endpointHash, resolved, cacheReuseState, cacheEvidence, creditReductionPercent, time.Now().Unix()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if persisted, err := s.store.GetKiroRuntimeCapability(r.Context(), accountID, endpointHash, resolved); err == nil {
+		capabilityState = persisted
+		cacheReuseState = firstNonEmpty(persisted.CacheReuseState, cacheReuseState)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"account_id": accountID, "model": resolved, "endpoint_hash": endpointHash,
 		"egress_id": egress.ID, "session_affinity": affinity.Hash,
 		"stable_request_hash": shortHash(string(converted.Body)),
 		"thinking":            "adaptive", "effort": converted.ThinkingEffort, "max_output_tokens": converted.MaxOutputTokens,
 		"attempts": attempts, "capability": capabilityState,
-		"cache_verified": cacheVerified, "cache_reuse_observed": cacheVerified || creditReuseObserved,
+		"cache_verified": cacheVerified, "cache_reuse_observed": cacheVerified || creditReuseObserved, "cache_reuse_state": cacheReuseState,
 		"cache_evidence": cacheEvidence, "credit_reduction_percent": creditReductionPercent,
 		"success_criteria": "token metadata: first write > 0 and second read > 0; credits-only endpoints: second request costs at least 10% less",
 	})

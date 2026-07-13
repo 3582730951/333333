@@ -602,8 +602,19 @@ func TestKiroCacheProbeRequiresCostConfirmationAndUsesStableRequest(t *testing.T
 			t.Fatalf("cache probe disabled mandatory Kiro quality field %s: %s", required, generateBodies[0])
 		}
 	}
-	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) || !bytes.Contains(probeBody, []byte(`"cache_verified":true`)) || !bytes.Contains(probeBody, []byte(`"cache_reuse_observed":true`)) || !bytes.Contains(probeBody, []byte(`"cache_evidence":"token_metadata"`)) || !bytes.Contains(probeBody, []byte(`"credits":{"value":0.5,"present":true}`)) {
+	if !bytes.Contains(probeBody, []byte(`"cache_capability":"hit_observed"`)) || !bytes.Contains(probeBody, []byte(`"cache_read_tokens":{"value":5,"present":true}`)) || !bytes.Contains(probeBody, []byte(`"cache_verified":true`)) || !bytes.Contains(probeBody, []byte(`"cache_reuse_observed":true`)) || !bytes.Contains(probeBody, []byte(`"cache_reuse_state":"verified"`)) || !bytes.Contains(probeBody, []byte(`"cache_reuse_evidence":"token_metadata"`)) || !bytes.Contains(probeBody, []byte(`"cache_evidence":"token_metadata"`)) || !bytes.Contains(probeBody, []byte(`"credits":{"value":0.5,"present":true}`)) {
 		t.Fatalf("probe did not report real metering: %s", probeBody)
+	}
+	capabilityStates, err := h.store.ListKiroRuntimeCapabilities(context.Background(), accounts[0].ID)
+	var persistedReuse *storage.KiroRuntimeCapability
+	for i := range capabilityStates {
+		if capabilityStates[i].Model == "claude-sonnet-4.6" {
+			persistedReuse = &capabilityStates[i]
+			break
+		}
+	}
+	if err != nil || persistedReuse == nil || persistedReuse.CacheReuseState != "verified" || persistedReuse.CacheReuseEvidence != "token_metadata" || persistedReuse.CacheReuseProbedAt == 0 {
+		t.Fatalf("cache probe evidence was not persisted: states=%+v err=%v", capabilityStates, err)
 	}
 	if !bytes.Contains(probeBody, []byte(`"thinking":"adaptive"`)) || !bytes.Contains(probeBody, []byte(`"effort":"max"`)) || !bytes.Contains(probeBody, []byte(`"max_output_tokens":64000`)) {
 		t.Fatalf("cache probe response omitted mandatory quality controls: %s", probeBody)

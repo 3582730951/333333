@@ -982,6 +982,8 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 		"event_count":            data.Metering.EventCount,
 		"metadata_event_count":   data.Metering.MetadataEventCount,
 		"metering_event_count":   data.Metering.MeteringEventCount,
+		"input_tokens_present":   data.Metering.InputTokens.Present,
+		"output_tokens_present":  data.Metering.OutputTokens.Present,
 		"cache_read_present":     data.Metering.CacheReadTokens.Present,
 		"cache_creation_present": data.Metering.CacheCreationTokens.Present,
 		"total_tokens_present":   data.Metering.TotalTokens.Present,
