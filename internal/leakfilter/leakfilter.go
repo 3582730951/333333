@@ -460,6 +460,10 @@ func (f *SSEFilter) processFrame(frame []byte) []byte {
 	return frame
 }
 
+// ProcessFrameForRelay applies the same frame policy as Copy to one complete
+// SSE frame. It is used by the upstream-rule filter pipeline.
+func (f *SSEFilter) ProcessFrameForRelay(frame []byte) []byte { return f.processFrame(frame) }
+
 // neutralizeClaudeError rewrites a Claude SSE "error" frame that carries
 // pool-internal limit/quota/overload/billing/model-switch state into a generic
 // Anthropic error event, preserving SSE framing so the client still receives a

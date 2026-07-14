@@ -495,28 +495,30 @@ type CodexResetCreditClaim struct {
 // interpreted and surfaced. The lists are stored as JSON arrays so future providers,
 // entrypoints, and model families can be added without schema churn.
 type UpstreamErrorRule struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Enabled          bool     `json:"enabled"`
-	Priority         int      `json:"priority"`
-	Providers        []string `json:"providers"`
-	Entrypoints      []string `json:"entrypoints"`
-	ModelPatterns    []string `json:"model_patterns"`
-	StatusCodes      []int    `json:"status_codes"`
-	BodyKeywords     []string `json:"body_keywords"`
-	MatchMode        string   `json:"match_mode"`
-	AccountAction    string   `json:"account_action"`
-	DownstreamAction string   `json:"downstream_action"`
-	ResponseStatus   int      `json:"response_status,omitempty"`
-	CustomMessage    string   `json:"custom_message,omitempty"`
-	CooldownSeconds  int64    `json:"cooldown_seconds,omitempty"`
-	PreferRetryAfter bool     `json:"prefer_retry_after"`
-	IdleSeconds      int64    `json:"idle_seconds,omitempty"`
-	IdlePingSeconds  int64    `json:"idle_ping_seconds,omitempty"`
-	SkipLog          bool     `json:"skip_log"`
-	Description      string   `json:"description,omitempty"`
-	CreatedAt        int64    `json:"created_at"`
-	UpdatedAt        int64    `json:"updated_at"`
+	ID                   string   `json:"id"`
+	Name                 string   `json:"name"`
+	Enabled              bool     `json:"enabled"`
+	Priority             int      `json:"priority"`
+	Providers            []string `json:"providers"`
+	Entrypoints          []string `json:"entrypoints"`
+	ModelPatterns        []string `json:"model_patterns"`
+	StatusCodes          []int    `json:"status_codes"`
+	BodyKeywords         []string `json:"body_keywords"`
+	MatchMode            string   `json:"match_mode"`
+	AccountAction        string   `json:"account_action"`
+	DownstreamAction     string   `json:"downstream_action"`
+	ResponseStatus       int      `json:"response_status,omitempty"`
+	CustomMessage        string   `json:"custom_message,omitempty"`
+	CooldownSeconds      int64    `json:"cooldown_seconds,omitempty"`
+	PreferRetryAfter     bool     `json:"prefer_retry_after"`
+	IdleSeconds          int64    `json:"idle_seconds,omitempty"`
+	IdlePingSeconds      int64    `json:"idle_ping_seconds,omitempty"`
+	SkipLog              bool     `json:"skip_log"`
+	FilterAccountAction  bool     `json:"filter_account_action"`
+	KeywordCaseSensitive bool     `json:"keyword_case_sensitive"`
+	Description          string   `json:"description,omitempty"`
+	CreatedAt            int64    `json:"created_at"`
+	UpdatedAt            int64    `json:"updated_at"`
 }
 
 // CustomProvider is an OpenAI-compatible upstream provider (Chat Completions by
@@ -1171,6 +1173,8 @@ CREATE TABLE IF NOT EXISTS upstream_error_rules(
   idle_seconds INTEGER NOT NULL DEFAULT 0,
   idle_ping_seconds INTEGER NOT NULL DEFAULT 15,
   skip_log INTEGER NOT NULL DEFAULT 0,
+  filter_account_action INTEGER NOT NULL DEFAULT 0,
+  keyword_case_sensitive INTEGER NOT NULL DEFAULT 0,
   description TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -1520,6 +1524,8 @@ func (s *Store) migrate(ctx context.Context) error {
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 )`,
+		`ALTER TABLE upstream_error_rules ADD COLUMN filter_account_action INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE upstream_error_rules ADD COLUMN keyword_case_sensitive INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_upstream_error_rules_enabled_priority ON upstream_error_rules(enabled, priority, created_at)`,
 	}
 	for _, stmt := range stmts {
@@ -4132,7 +4138,7 @@ func (s *Store) DeleteCustomProvider(ctx context.Context, id string) error {
 
 // ── Upstream error rules ──
 
-const upstreamErrorRuleCols = `id, name, enabled, priority, providers_json, entrypoints_json, model_patterns_json, status_codes_json, body_keywords_json, match_mode, account_action, downstream_action, response_status, custom_message, cooldown_seconds, prefer_retry_after, idle_seconds, idle_ping_seconds, skip_log, description, created_at, updated_at`
+const upstreamErrorRuleCols = `id, name, enabled, priority, providers_json, entrypoints_json, model_patterns_json, status_codes_json, body_keywords_json, match_mode, account_action, downstream_action, response_status, custom_message, cooldown_seconds, prefer_retry_after, idle_seconds, idle_ping_seconds, skip_log, filter_account_action, keyword_case_sensitive, description, created_at, updated_at`
 
 func encodeStringListJSON(values []string) string {
 	clean := decodeProviderModelsFromSlice(values)
@@ -4190,13 +4196,13 @@ func decodeIntListJSON(raw string) []int {
 
 func scanUpstreamErrorRule(scan func(...interface{}) error) (UpstreamErrorRule, error) {
 	var r UpstreamErrorRule
-	var enabled, preferRetryAfter, skipLog int
+	var enabled, preferRetryAfter, skipLog, filterAccountAction, keywordCaseSensitive int
 	var providersJSON, entrypointsJSON, modelPatternsJSON, statusCodesJSON, bodyKeywordsJSON string
 	if err := scan(
 		&r.ID, &r.Name, &enabled, &r.Priority,
 		&providersJSON, &entrypointsJSON, &modelPatternsJSON, &statusCodesJSON, &bodyKeywordsJSON,
 		&r.MatchMode, &r.AccountAction, &r.DownstreamAction, &r.ResponseStatus, &r.CustomMessage,
-		&r.CooldownSeconds, &preferRetryAfter, &r.IdleSeconds, &r.IdlePingSeconds, &skipLog,
+		&r.CooldownSeconds, &preferRetryAfter, &r.IdleSeconds, &r.IdlePingSeconds, &skipLog, &filterAccountAction, &keywordCaseSensitive,
 		&r.Description, &r.CreatedAt, &r.UpdatedAt,
 	); err != nil {
 		return UpstreamErrorRule{}, err
@@ -4204,6 +4210,8 @@ func scanUpstreamErrorRule(scan func(...interface{}) error) (UpstreamErrorRule, 
 	r.Enabled = enabled != 0
 	r.PreferRetryAfter = preferRetryAfter != 0
 	r.SkipLog = skipLog != 0
+	r.FilterAccountAction = filterAccountAction != 0
+	r.KeywordCaseSensitive = keywordCaseSensitive != 0
 	r.Providers = decodeStringListJSON(providersJSON)
 	r.Entrypoints = decodeStringListJSON(entrypointsJSON)
 	r.ModelPatterns = decodeStringListJSON(modelPatternsJSON)
@@ -4283,8 +4291,8 @@ func (s *Store) UpsertUpstreamErrorRule(ctx context.Context, r UpstreamErrorRule
 	}
 	r.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO upstream_error_rules(id, name, enabled, priority, providers_json, entrypoints_json, model_patterns_json, status_codes_json, body_keywords_json, match_mode, account_action, downstream_action, response_status, custom_message, cooldown_seconds, prefer_retry_after, idle_seconds, idle_ping_seconds, skip_log, description, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO upstream_error_rules(id, name, enabled, priority, providers_json, entrypoints_json, model_patterns_json, status_codes_json, body_keywords_json, match_mode, account_action, downstream_action, response_status, custom_message, cooldown_seconds, prefer_retry_after, idle_seconds, idle_ping_seconds, skip_log, filter_account_action, keyword_case_sensitive, description, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name = excluded.name,
  enabled = excluded.enabled,
@@ -4304,11 +4312,13 @@ ON CONFLICT(id) DO UPDATE SET
  idle_seconds = excluded.idle_seconds,
  idle_ping_seconds = excluded.idle_ping_seconds,
  skip_log = excluded.skip_log,
+	filter_account_action = excluded.filter_account_action,
+	keyword_case_sensitive = excluded.keyword_case_sensitive,
  description = excluded.description,
  updated_at = excluded.updated_at`,
 		r.ID, r.Name, boolInt(r.Enabled), r.Priority,
 		encodeStringListJSON(r.Providers), encodeStringListJSON(r.Entrypoints), encodeStringListJSON(r.ModelPatterns), encodeIntListJSON(r.StatusCodes), encodeStringListJSON(r.BodyKeywords),
-		r.MatchMode, r.AccountAction, r.DownstreamAction, r.ResponseStatus, r.CustomMessage, r.CooldownSeconds, boolInt(r.PreferRetryAfter), r.IdleSeconds, r.IdlePingSeconds, boolInt(r.SkipLog), r.Description, r.CreatedAt, r.UpdatedAt)
+		r.MatchMode, r.AccountAction, r.DownstreamAction, r.ResponseStatus, r.CustomMessage, r.CooldownSeconds, boolInt(r.PreferRetryAfter), r.IdleSeconds, r.IdlePingSeconds, boolInt(r.SkipLog), boolInt(r.FilterAccountAction), boolInt(r.KeywordCaseSensitive), r.Description, r.CreatedAt, r.UpdatedAt)
 	return err
 }
 

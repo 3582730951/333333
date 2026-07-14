@@ -20,6 +20,7 @@ type Config struct {
 	ListenAddr    string        `json:"listen_addr"`
 	PoolServerURL string        `json:"pool_server_url"`
 	DownstreamKey string        `json:"downstream_key"`
+	ClaudeModel   string        `json:"claude_model"`
 	Providers     []string      `json:"providers"`
 	IdentityTTL   time.Duration `json:"identity_ttl_seconds"`
 	LogLevel      string        `json:"log_level"`
@@ -35,6 +36,7 @@ type gatewayConfigDisk struct {
 	ListenAddr         string     `json:"listen_addr"`
 	PoolServerURL      string     `json:"pool_server_url"`
 	DownstreamKey      string     `json:"downstream_key"`
+	ClaudeModel        string     `json:"claude_model"`
 	Providers          []string   `json:"providers"`
 	IdentityTTLSeconds int64      `json:"identity_ttl_seconds"`
 	LogLevel           string     `json:"log_level"`
@@ -45,6 +47,7 @@ type gatewayConfigPatch struct {
 	ListenAddr         *string     `json:"listen_addr"`
 	PoolServerURL      *string     `json:"pool_server_url"`
 	DownstreamKey      *string     `json:"downstream_key"`
+	ClaudeModel        *string     `json:"claude_model"`
 	Providers          []string    `json:"providers"`
 	IdentityTTLSeconds *int64      `json:"identity_ttl_seconds"`
 	LogLevel           *string     `json:"log_level"`
@@ -135,6 +138,9 @@ func applyGatewayConfigJSON(cfg *Config, data []byte) error {
 	if patch.DownstreamKey != nil {
 		cfg.DownstreamKey = *patch.DownstreamKey
 	}
+	if patch.ClaudeModel != nil {
+		cfg.ClaudeModel = *patch.ClaudeModel
+	}
 	if patch.Providers != nil {
 		cfg.Providers = patch.Providers
 	}
@@ -159,6 +165,7 @@ func gatewayConfigForDisk(cfg Config) gatewayConfigDisk {
 		ListenAddr:         cfg.ListenAddr,
 		PoolServerURL:      cfg.PoolServerURL,
 		DownstreamKey:      cfg.DownstreamKey,
+		ClaudeModel:        cfg.ClaudeModel,
 		Providers:          cfg.Providers,
 		IdentityTTLSeconds: ttlSeconds,
 		LogLevel:           cfg.LogLevel,
@@ -237,7 +244,8 @@ func printUsage() {
 	fmt.Println(`Claude Gateway - Local MITM proxy for pool_server
 
 Usage:
-  gateway init [--pool-url URL] [--key KEY]    初始化配置和 CA
+  gateway init [--pool-url URL] [--key KEY] [--model MODEL]
+                                                初始化配置和 CA
   gateway start                                 启动代理服务器
   gateway start-background                      nohup 后台启动代理服务器（写入 PID/log）
   gateway stop                                  停止后台/旧版代理服务器
@@ -248,14 +256,14 @@ Usage:
   gateway trust-ca [--print-commands]           信任 CA 证书
   gateway install-wrapper                       安装 claude 命令包装器
   gateway uninstall                             完整卸载
-  gateway quick-install                         一键安装（推荐）
+  gateway quick-install [--model MODEL]         一键安装（推荐）
 
 Examples:
   # 一键安装
-  gateway quick-install --pool-url https://your-vps.com:1455 --key cap_xxx
+  gateway quick-install --pool-url https://your-vps.com:1455 --key cap_xxx --model gpt-5.6-sol
 
   # 手动安装
-  gateway init --pool-url https://your-vps.com:1455 --key cap_xxx
+  gateway init --pool-url https://your-vps.com:1455 --key cap_xxx --model gpt-5.6-sol
   gateway trust-ca
   gateway install-wrapper
   gateway start-background
@@ -268,6 +276,7 @@ Examples:
 func handleInit(configPath string) {
 	poolURL := flag.String("pool-url", "", "Pool server URL")
 	key := flag.String("key", "", "Downstream API key")
+	model := flag.String("model", "", "Claude Code model routed through the pool")
 	flag.CommandLine.Parse(os.Args[2:])
 
 	cfg := DefaultConfig()
@@ -276,6 +285,9 @@ func handleInit(configPath string) {
 	}
 	if *key != "" {
 		cfg.DownstreamKey = *key
+	}
+	if *model != "" {
+		cfg.ClaudeModel = strings.TrimSpace(*model)
 	}
 
 	// 保存配置
@@ -322,6 +334,7 @@ type gatewayStatusReport struct {
 	ListenAddr              string
 	PoolServerURL           string
 	DownstreamKeyConfigured bool
+	ClaudeModel             string
 	CACertPresent           bool
 	CAKeyPresent            bool
 	GatewayReachable        bool
@@ -357,6 +370,7 @@ func inspectGatewayStatus(ctx context.Context, configPath string) gatewayStatusR
 	report.ListenAddr = cfg.ListenAddr
 	report.PoolServerURL = cfg.PoolServerURL
 	report.DownstreamKeyConfigured = cfg.DownstreamKey != ""
+	report.ClaudeModel = strings.TrimSpace(cfg.ClaudeModel)
 	report.CACertPresent = fileExists(cfg.MITM.CACert)
 	report.CAKeyPresent = fileExists(cfg.MITM.CAKey)
 	report.IdentityCachePresent = identityCachePresent()
@@ -397,6 +411,11 @@ func printGatewayStatus(report gatewayStatusReport) {
 	fmt.Println("  Listen:", report.ListenAddr)
 	fmt.Println("  Pool:", report.PoolServerURL)
 	fmt.Println("  Downstream key:", yesNo(report.DownstreamKeyConfigured))
+	if report.ClaudeModel == "" {
+		fmt.Println("  Claude model:", "not configured")
+	} else {
+		fmt.Println("  Claude model:", report.ClaudeModel)
+	}
 	fmt.Println("  CA cert:", yesNo(report.CACertPresent))
 	fmt.Println("  CA key:", yesNo(report.CAKeyPresent))
 	fmt.Println("  Identity cache:", yesNo(report.IdentityCachePresent))
@@ -499,10 +518,11 @@ func handleUninstall() {
 func handleQuickInstall(configPath string) {
 	poolURL := flag.String("pool-url", "", "Pool server URL (required)")
 	key := flag.String("key", "", "Downstream API key (required)")
+	model := flag.String("model", "", "Claude Code model routed through the pool")
 	flag.CommandLine.Parse(os.Args[2:])
 
 	if *poolURL == "" || *key == "" {
-		log.Fatal("Usage: gateway quick-install --pool-url URL --key KEY")
+		log.Fatal("Usage: gateway quick-install --pool-url URL --key KEY [--model MODEL]")
 	}
 
 	fmt.Println("🚀 Claude Gateway 一键安装")
@@ -513,6 +533,7 @@ func handleQuickInstall(configPath string) {
 	cfg := DefaultConfig()
 	cfg.PoolServerURL = *poolURL
 	cfg.DownstreamKey = *key
+	cfg.ClaudeModel = strings.TrimSpace(*model)
 	if err := SaveConfig(configPath, cfg); err != nil {
 		log.Fatalf("Save config failed: %v", err)
 	}
@@ -529,7 +550,11 @@ func handleQuickInstall(configPath string) {
 	if err := TrustCA(cfg.MITM.CACert); err != nil {
 		fmt.Printf("  ❌ 自动信任失败，请手动执行:\n")
 		PrintTrustInstructions(cfg.MITM.CACert)
-		fmt.Println("\n执行完成后，运行: gateway quick-install --pool-url", *poolURL, "--key", *key)
+		fmt.Print("\n执行完成后，运行: gateway quick-install --pool-url ", *poolURL, " --key ", *key)
+		if cfg.ClaudeModel != "" {
+			fmt.Print(" --model ", cfg.ClaudeModel)
+		}
+		fmt.Println()
 		os.Exit(1)
 	}
 	fmt.Println("  ✓ CA 已信任")

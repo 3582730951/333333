@@ -34,7 +34,7 @@ type responsesAnthropicReasoningStream struct {
 // stream bridge. Unlike the old Responses -> Chat -> Messages chain, it preserves
 // encrypted reasoning, parallel tool identity, complete tool arguments, cache usage,
 // incomplete status, and upstream error events.
-func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, requestedModel string, toolNames map[string]string, scrubber *streamrewrite.Matcher) map[string]interface{} {
+func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, requestedModel string, toolNames map[string]string, inheritModelTools map[string]bool, scrubber *streamrewrite.Matcher) map[string]interface{} {
 	flusher, _ := w.(http.Flusher)
 	emit := func(event string, payload map[string]interface{}) {
 		payload["type"] = event
@@ -159,7 +159,7 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if arguments == "" {
 			arguments = "{}"
 		}
-		arguments = sanitizeAnthropicStreamToolArguments(state.name, arguments)
+		arguments = sanitizeAnthropicStreamToolArguments(state.name, arguments, inheritModelTools)
 		emit("content_block_delta", map[string]interface{}{
 			"index": state.blockIndex, "delta": map[string]interface{}{"type": "input_json_delta", "partial_json": scrubber.ReplaceString(arguments)},
 		})
@@ -461,8 +461,8 @@ func responsesOutputItemText(item map[string]interface{}) string {
 	return out.String()
 }
 
-func sanitizeAnthropicStreamToolArguments(name, raw string) string {
-	if name != "Read" || strings.TrimSpace(raw) == "" {
+func sanitizeAnthropicStreamToolArguments(name, raw string, inheritModelTools map[string]bool) string {
+	if (name != "Read" && !inheritModelTools[name]) || strings.TrimSpace(raw) == "" {
 		return raw
 	}
 	var input map[string]interface{}
@@ -471,6 +471,9 @@ func sanitizeAnthropicStreamToolArguments(name, raw string) string {
 	}
 	if pages, ok := input["pages"].(string); ok && pages == "" {
 		delete(input, "pages")
+	}
+	if inheritModelTools[name] {
+		delete(input, "model")
 	}
 	encoded, err := json.Marshal(input)
 	if err != nil {

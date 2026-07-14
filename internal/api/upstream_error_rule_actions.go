@@ -19,9 +19,47 @@ type upstreamErrorRuleDecision struct {
 	Match upstreamrules.MatchResult
 }
 
-func (s *Server) matchUpstreamErrorRule(ctx context.Context, input upstreamrules.MatchInput) (upstreamErrorRuleDecision, bool) {
+func (s *Server) upstreamErrorRules(ctx context.Context) []storage.UpstreamErrorRule {
+	s.upstreamRulesMu.RLock()
+	cached, at := s.upstreamRulesCache, s.upstreamRulesCachedAt
+	s.upstreamRulesMu.RUnlock()
+	if cached != nil && time.Since(at) < 10*time.Second {
+		return cached
+	}
 	rules, err := s.store.ListUpstreamErrorRules(ctx)
-	if err != nil || len(rules) == 0 {
+	if err != nil {
+		return nil
+	}
+	s.upstreamRulesMu.Lock()
+	s.upstreamRulesCache = rules
+	s.upstreamRulesCachedAt = time.Now()
+	s.upstreamRulesMu.Unlock()
+	return rules
+}
+func (s *Server) invalidateUpstreamErrorRules() {
+	s.upstreamRulesMu.Lock()
+	s.upstreamRulesCache = nil
+	s.upstreamRulesCachedAt = time.Time{}
+	s.upstreamRulesMu.Unlock()
+}
+
+func (s *Server) responseRuleFilter(ctx context.Context, provider, entrypoint, model string, status int) *responseRuleFilter {
+	rules := s.upstreamErrorRules(ctx)
+	for _, rule := range rules {
+		if !rule.Enabled || strings.ToLower(strings.TrimSpace(rule.DownstreamAction)) != upstreamrules.DownstreamActionIntercept || len(rule.BodyKeywords) == 0 {
+			continue
+		}
+		probe := upstreamrules.MatchInput{Provider: provider, Entrypoint: entrypoint, Model: model, Status: status, Body: []byte(rule.BodyKeywords[0]), Streaming: true}
+		if m, ok := upstreamrules.Match([]storage.UpstreamErrorRule{rule}, probe); ok && m.DownstreamAction == upstreamrules.DownstreamActionIntercept {
+			return &responseRuleFilter{Keywords: append([]string(nil), rule.BodyKeywords...), CaseSensitive: rule.KeywordCaseSensitive, Rule: &rule}
+		}
+	}
+	return nil
+}
+
+func (s *Server) matchUpstreamErrorRule(ctx context.Context, input upstreamrules.MatchInput) (upstreamErrorRuleDecision, bool) {
+	rules := s.upstreamErrorRules(ctx)
+	if len(rules) == 0 {
 		return upstreamErrorRuleDecision{}, false
 	}
 	match, ok := upstreamrules.Match(rules, input)

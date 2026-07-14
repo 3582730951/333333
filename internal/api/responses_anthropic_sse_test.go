@@ -36,7 +36,7 @@ func TestResponsesStreamToAnthropicSSEPreservesReasoningAndParallelTools(t *test
 	w := httptest.NewRecorder()
 	responsesStreamToAnthropicSSE(w, strings.NewReader(stream), "gpt-5.6-sol", map[string]string{
 		"wire_read": "Read", "wire_grep": "Grep",
-	}, streamrewrite.New(nil))
+	}, nil, streamrewrite.New(nil))
 	got := w.Body.String()
 	for _, want := range []string{
 		`"type":"thinking"`,
@@ -53,6 +53,36 @@ func TestResponsesStreamToAnthropicSSEPreservesReasoningAndParallelTools(t *test
 		if !strings.Contains(got, want) {
 			t.Fatalf("native Anthropic SSE missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestResponsesStreamToAnthropicSSERemovesBuiltInAgentModelOverride(t *testing.T) {
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_agent","model":"gpt-5.6-sol"}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_agent","call_id":"call_agent","name":"wire_agent","arguments":""}}` + "\n\n" +
+		"event: response.function_call_arguments.delta\n" +
+		`data: {"type":"response.function_call_arguments.delta","item_id":"fc_agent","output_index":0,"delta":"{\"description\":\"scan\",\"prompt\":\"inspect\",\"subagent_type\":\"general-purpose\",\"model\":\"haiku\"}"}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_agent","call_id":"call_agent","name":"wire_agent","arguments":"{\"description\":\"scan\",\"prompt\":\"inspect\",\"subagent_type\":\"general-purpose\",\"model\":\"haiku\"}"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_agent","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}` + "\n\n"
+
+	w := httptest.NewRecorder()
+	responsesStreamToAnthropicSSE(
+		w,
+		strings.NewReader(stream),
+		"gpt-5.6-sol",
+		map[string]string{"wire_agent": "Agent"},
+		map[string]bool{"Agent": true},
+		streamrewrite.New(nil),
+	)
+	got := w.Body.String()
+	if !strings.Contains(got, `"name":"Agent"`) || !strings.Contains(got, `\"subagent_type\":\"general-purpose\"`) {
+		t.Fatalf("Agent tool call was not preserved:\n%s", got)
+	}
+	if strings.Contains(got, `\"model\":\"haiku\"`) {
+		t.Fatalf("Agent model override leaked into Claude Code stream:\n%s", got)
 	}
 }
 
@@ -92,7 +122,7 @@ func TestResponsesStreamToAnthropicSSEUsesRedactedThinkingWithoutSummary(t *test
 		"event: response.completed\n" +
 		`data: {"type":"response.completed","response":{"id":"resp_hidden","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n"
 	w := httptest.NewRecorder()
-	responsesStreamToAnthropicSSE(w, strings.NewReader(stream), "gpt-5.6-sol", nil, streamrewrite.New(nil))
+	responsesStreamToAnthropicSSE(w, strings.NewReader(stream), "gpt-5.6-sol", nil, nil, streamrewrite.New(nil))
 	got := w.Body.String()
 	if !strings.Contains(got, `"type":"redacted_thinking"`) ||
 		!strings.Contains(got, `"data":"pool-openai-reasoning-v1:`) ||

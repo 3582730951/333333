@@ -25,6 +25,7 @@ const (
 	DownstreamActionCustomError = "custom_error"
 	DownstreamActionNeutralize  = "neutralize"
 	DownstreamActionIdleStream  = "idle_stream"
+	DownstreamActionIntercept   = "intercept"
 )
 
 type MatchInput struct {
@@ -119,7 +120,7 @@ func normalizeAccountAction(action string) string {
 
 func normalizeDownstreamAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case DownstreamActionFailover, DownstreamActionPass, DownstreamActionCustomError, DownstreamActionNeutralize, DownstreamActionIdleStream:
+	case DownstreamActionFailover, DownstreamActionPass, DownstreamActionCustomError, DownstreamActionNeutralize, DownstreamActionIdleStream, DownstreamActionIntercept:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return DownstreamActionBuiltin
@@ -180,9 +181,15 @@ func conditionsMatch(rule storage.UpstreamErrorRule, in MatchInput) bool {
 	}
 	keywordOK := false
 	if keywordConfigured {
-		body := strings.ToLower(string(in.Body))
+		body := string(in.Body)
+		if !rule.KeywordCaseSensitive {
+			body = strings.ToLower(body)
+		}
 		for _, kw := range rule.BodyKeywords {
-			kw = strings.ToLower(strings.TrimSpace(kw))
+			kw = strings.TrimSpace(kw)
+			if !rule.KeywordCaseSensitive {
+				kw = strings.ToLower(kw)
+			}
 			if kw != "" && strings.Contains(body, kw) {
 				keywordOK = true
 				break

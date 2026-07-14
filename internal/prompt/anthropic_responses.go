@@ -22,8 +22,9 @@ const (
 // Messages endpoint. Body is already a Responses request; ToolNames reverses any
 // deterministic shortening required by the Codex wire contract.
 type AnthropicResponsesRequest struct {
-	Body      []byte
-	ToolNames map[string]string // wire name -> original Claude Code name
+	Body              []byte
+	ToolNames         map[string]string // wire name -> original Claude Code name
+	InheritModelTools map[string]bool   // original tool name -> drop child model override
 }
 
 // AnthropicRequestToResponses converts a Claude Messages request directly to the
@@ -41,13 +42,14 @@ func AnthropicRequestToResponses(raw []byte) (AnthropicResponsesRequest, error) 
 	if err != nil {
 		return AnthropicResponsesRequest{}, err
 	}
+	tools, inheritModelTools := anthropicResponsesTools(root["tools"], originalToWire)
 
 	model, _ := root["model"].(string)
 	out := map[string]interface{}{
 		"model":               model,
 		"instructions":        anthropicResponsesSystem(root["system"]),
 		"input":               input,
-		"tools":               anthropicResponsesTools(root["tools"], originalToWire),
+		"tools":               tools,
 		"parallel_tool_calls": anthropicResponsesParallelTools(root["tool_choice"]),
 		"reasoning": map[string]interface{}{
 			"effort":  anthropicResponsesEffort(root),
@@ -70,7 +72,11 @@ func AnthropicRequestToResponses(raw []byte) (AnthropicResponsesRequest, error) 
 	if err != nil {
 		return AnthropicResponsesRequest{}, err
 	}
-	return AnthropicResponsesRequest{Body: body, ToolNames: wireToOriginal}, nil
+	return AnthropicResponsesRequest{
+		Body:              body,
+		ToolNames:         wireToOriginal,
+		InheritModelTools: inheritModelTools,
+	}, nil
 }
 
 func decodeJSONMapUseNumber(raw []byte) (map[string]interface{}, error) {
@@ -331,9 +337,10 @@ func anthropicToolResultToResponsesOutput(block map[string]interface{}) interfac
 	return output
 }
 
-func anthropicResponsesTools(value interface{}, names map[string]string) []interface{} {
+func anthropicResponsesTools(value interface{}, names map[string]string) ([]interface{}, map[string]bool) {
 	tools, _ := value.([]interface{})
 	out := make([]interface{}, 0, len(tools))
+	inheritModelTools := map[string]bool{}
 	for _, item := range tools {
 		tool, _ := item.(map[string]interface{})
 		if tool == nil || stringOr(tool["type"], "") == "BatchTool" {
@@ -351,23 +358,76 @@ func anthropicResponsesTools(value interface{}, names map[string]string) []inter
 			out = append(out, web)
 			continue
 		}
-		name := stringOr(tool["name"], "")
-		if name == "" {
+		originalName := stringOr(tool["name"], "")
+		if originalName == "" {
 			continue
 		}
+		name := originalName
 		if wire := names[name]; wire != "" {
 			name = wire
 		}
+		parameters := cleanAnthropicResponsesSchema(tool["input_schema"])
+		if schema, ok := parameters.(map[string]interface{}); ok && isClaudeCodeAgentToolSchema(originalName, schema) {
+			properties, _ := schema["properties"].(map[string]interface{})
+			delete(properties, "model")
+			inheritModelTools[originalName] = true
+		}
 		definition := map[string]interface{}{
 			"type": "function", "name": name, "strict": false,
-			"parameters": cleanAnthropicResponsesSchema(tool["input_schema"]),
+			"parameters": parameters,
 		}
 		if description := stringOr(tool["description"], ""); description != "" {
 			definition["description"] = description
 		}
 		out = append(out, definition)
 	}
-	return out
+	return out, inheritModelTools
+}
+
+// isClaudeCodeAgentToolSchema deliberately recognizes the built-in Agent tool
+// instead of every custom function that happens to use the same name. Claude Code's
+// optional model tier is unsafe across the Codex bridge: if Codex returns
+// model="haiku", the client starts the child request as claude-haiku-* and leaves the
+// Codex account pool. Omitting this optional property makes the child inherit the
+// already-selected GPT/Codex model while preserving every other Agent capability.
+func isClaudeCodeAgentToolSchema(name string, schema map[string]interface{}) bool {
+	if name != "Agent" || stringOr(schema["type"], "") != "object" {
+		return false
+	}
+	properties, _ := schema["properties"].(map[string]interface{})
+	if properties == nil || !schemaHasRequiredStrings(schema, "description", "prompt") {
+		return false
+	}
+	for _, property := range []string{"description", "prompt", "subagent_type"} {
+		definition, _ := properties[property].(map[string]interface{})
+		if definition == nil || stringOr(definition["type"], "") != "string" {
+			return false
+		}
+	}
+	model, _ := properties["model"].(map[string]interface{})
+	if model == nil || stringOr(model["type"], "") != "string" {
+		return false
+	}
+	values, _ := model["enum"].([]interface{})
+	tiers := make(map[string]bool, len(values))
+	for _, value := range values {
+		tiers[stringOr(value, "")] = true
+	}
+	return tiers["sonnet"] && tiers["opus"] && tiers["haiku"]
+}
+
+func schemaHasRequiredStrings(schema map[string]interface{}, required ...string) bool {
+	values, _ := schema["required"].([]interface{})
+	present := make(map[string]bool, len(values))
+	for _, value := range values {
+		present[stringOr(value, "")] = true
+	}
+	for _, name := range required {
+		if !present[name] {
+			return false
+		}
+	}
+	return true
 }
 
 func cleanAnthropicResponsesSchema(value interface{}) interface{} {
@@ -589,7 +649,7 @@ func openAIReasoningSummaryText(item map[string]interface{}) string {
 
 // ResponsesToAnthropicResponse converts a complete Responses object to a Claude
 // Messages object, preserving reasoning as an opaque replayable thinking envelope.
-func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames map[string]string) ([]byte, error) {
+func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames map[string]string, inheritModelTools map[string]bool) ([]byte, error) {
 	root, err := decodeJSONMapUseNumber(raw)
 	if err != nil {
 		return nil, err
@@ -639,7 +699,7 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 				}
 				input = map[string]interface{}{}
 			}
-			input = sanitizeClaudeToolInput(name, input)
+			input = sanitizeClaudeToolInput(name, input, inheritModelTools)
 			callID := stringOr(firstPresent(item["call_id"], item["id"]), "")
 			content = append(content, map[string]interface{}{
 				"type": "tool_use", "id": shortenCodexCallID(callID), "name": name, "input": input,
@@ -693,9 +753,12 @@ func responsesFunctionArguments(value interface{}) (map[string]interface{}, erro
 	return decoded, nil
 }
 
-func sanitizeClaudeToolInput(name string, input map[string]interface{}) map[string]interface{} {
+func sanitizeClaudeToolInput(name string, input map[string]interface{}, inheritModelTools map[string]bool) map[string]interface{} {
 	if name == "Read" && stringOr(input["pages"], "-") == "" {
 		delete(input, "pages")
+	}
+	if inheritModelTools[name] {
+		delete(input, "model")
 	}
 	return input
 }

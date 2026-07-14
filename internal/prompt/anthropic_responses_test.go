@@ -91,6 +91,115 @@ func TestAnthropicRequestToResponsesNativeClaudeCodeShape(t *testing.T) {
 	}
 }
 
+func TestAnthropicRequestToResponsesMakesBuiltInAgentInheritCodexModel(t *testing.T) {
+	in := []byte(`{
+	  "model":"gpt-5.6-sol",
+	  "messages":[{"role":"user","content":"delegate"}],
+	  "tools":[
+	    {
+	      "name":"Agent",
+	      "description":"Launch a new agent",
+	      "input_schema":{
+	        "$schema":"https://json-schema.org/draft/2020-12/schema",
+	        "type":"object",
+	        "properties":{
+	          "description":{"type":"string"},
+	          "prompt":{"type":"string"},
+	          "subagent_type":{"type":"string"},
+	          "model":{"type":"string","enum":["sonnet","opus","haiku","fable"]},
+	          "run_in_background":{"type":"boolean"},
+	          "isolation":{"type":"string","enum":["worktree","remote"]}
+	        },
+	        "required":["description","prompt"],
+	        "additionalProperties":false
+	      }
+	    },
+	    {
+	      "name":"Workflow",
+	      "input_schema":{
+	        "type":"object",
+	        "properties":{"name":{"type":"string"},"model":{"type":"string"}},
+	        "required":["name"]
+	      }
+	    }
+	  ]
+	}`)
+
+	converted, err := AnthropicRequestToResponses(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !converted.InheritModelTools["Agent"] || converted.InheritModelTools["Workflow"] {
+		t.Fatalf("inherit-model tool detection wrong: %v", converted.InheritModelTools)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	tools := root["tools"].([]interface{})
+	if len(tools) != 2 {
+		t.Fatalf("Claude Code tools were dropped: %v", tools)
+	}
+	agentParameters := tools[0].(map[string]interface{})["parameters"].(map[string]interface{})
+	agentProperties := agentParameters["properties"].(map[string]interface{})
+	if _, leaked := agentProperties["model"]; leaked {
+		t.Fatalf("built-in Agent.model reached Codex: %v", agentProperties)
+	}
+	for _, want := range []string{"description", "prompt", "subagent_type", "run_in_background", "isolation"} {
+		if _, ok := agentProperties[want]; !ok {
+			t.Fatalf("Agent property %q was lost: %v", want, agentProperties)
+		}
+	}
+	workflowProperties := tools[1].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})
+	if _, ok := workflowProperties["model"]; !ok {
+		t.Fatalf("non-Agent model property must be preserved: %v", workflowProperties)
+	}
+
+	responses := []byte(`{
+	  "id":"resp_agent","model":"gpt-5.6-sol","status":"completed",
+	  "output":[{
+	    "type":"function_call","call_id":"call_agent","name":"Agent",
+	    "arguments":"{\"description\":\"scan repo\",\"prompt\":\"inspect\",\"subagent_type\":\"general-purpose\",\"model\":\"haiku\"}"
+	  }]
+	}`)
+	messageRaw, err := ResponsesToAnthropicResponse(responses, "gpt-5.6-sol", nil, converted.InheritModelTools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := mustUnmarshal(t, messageRaw)
+	input := message["content"].([]interface{})[0].(map[string]interface{})["input"].(map[string]interface{})
+	if _, leaked := input["model"]; leaked {
+		t.Fatalf("Agent.model reached Claude Code response: %v", input)
+	}
+	if input["subagent_type"] != "general-purpose" || input["prompt"] != "inspect" {
+		t.Fatalf("Agent input was over-sanitized: %v", input)
+	}
+}
+
+func TestAnthropicRequestToResponsesLeavesCustomAgentModelUntouched(t *testing.T) {
+	in := []byte(`{
+	  "model":"gpt-5.6-sol",
+	  "messages":[{"role":"user","content":"run custom tool"}],
+	  "tools":[{
+	    "name":"Agent",
+	    "input_schema":{
+	      "type":"object",
+	      "properties":{"task":{"type":"string"},"model":{"type":"string","enum":["fast"]}},
+	      "required":["task"]
+	    }
+	  }]
+	}`)
+	converted, err := AnthropicRequestToResponses(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted.InheritModelTools["Agent"] {
+		t.Fatalf("custom Agent was mistaken for Claude Code built-in: %v", converted.InheritModelTools)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	properties := root["tools"].([]interface{})[0].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})
+	if _, ok := properties["model"]; !ok {
+		t.Fatalf("custom Agent.model was removed: %v", properties)
+	}
+}
+
 func TestResponsesReasoningEnvelopeReplaysOnNextClaudeTurn(t *testing.T) {
 	responses := []byte(`{
 	  "id":"resp_reasoning","model":"gpt-5.6-sol","status":"completed",
@@ -100,7 +209,7 @@ func TestResponsesReasoningEnvelopeReplaysOnNextClaudeTurn(t *testing.T) {
 	  ],
 	  "usage":{"input_tokens":20,"output_tokens":8,"input_tokens_details":{"cached_tokens":5}}
 	}`)
-	anthropic, err := ResponsesToAnthropicResponse(responses, "gpt-5.6-sol", nil)
+	anthropic, err := ResponsesToAnthropicResponse(responses, "gpt-5.6-sol", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

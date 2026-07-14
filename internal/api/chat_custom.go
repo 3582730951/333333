@@ -243,7 +243,8 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		uscan := usage.NewStreamScanner("openai_chat")
-		_ = streamCopyRewrite(w, io.TeeReader(cc.resp.Body, uscan), cc.scrubber)
+		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "chat_completions", model, cc.resp.StatusCode), provider.ID)
+		_ = streamCopyRewrite(rw, io.TeeReader(cc.resp.Body, uscan), cc.scrubber)
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}
@@ -291,7 +292,8 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		uscan := usage.NewStreamScanner("openai_chat")
-		chatStreamToResponsesSSE(w, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
+		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "custom_openai", model, cc.resp.StatusCode), provider.ID)
+		chatStreamToResponsesSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}
@@ -331,7 +333,8 @@ func (s *Server) handleNativeResponsesViaCustom(w http.ResponseWriter, r *http.R
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
 		uscan := usage.NewStreamScanner("codex")
-		_ = streamCopyRewrite(w, io.TeeReader(cc.resp.Body, uscan), cc.scrubber)
+		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "responses", model, cc.resp.StatusCode), provider.ID)
+		_ = streamCopyRewrite(rw, io.TeeReader(cc.resp.Body, uscan), cc.scrubber)
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
 		}
@@ -372,7 +375,8 @@ func (s *Server) handleChatViaNativeResponsesCustom(w http.ResponseWriter, r *ht
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(cc.resp.StatusCode)
 		uscan := usage.NewStreamScanner("codex")
-		responsesStreamToChatSSE(w, io.TeeReader(cc.resp.Body, uscan), model, chatStreamUsageRequested(raw), cc.scrubber)
+		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "chat_completions", model, cc.resp.StatusCode), provider.ID)
+		responsesStreamToChatSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, chatStreamUsageRequested(raw), cc.scrubber)
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
 		}
@@ -424,7 +428,8 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		uscan := usage.NewStreamScanner("openai_chat")
-		chatStreamToAnthropicSSE(w, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
+		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
+		chatStreamToAnthropicSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}

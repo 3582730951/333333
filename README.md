@@ -180,12 +180,37 @@ Claude Code 的网关模型发现只展示 `claude*`/`anthropic*` ID，因此 GP
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
 export ANTHROPIC_AUTH_TOKEN="<downstream-key>"
-export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-5.6-sol"
+export POOL_CLAUDE_MODEL="gpt-5.6-sol"
+export ANTHROPIC_MODEL="$POOL_CLAUDE_MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$POOL_CLAUDE_MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$POOL_CLAUDE_MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$POOL_CLAUDE_MODEL"
+export ANTHROPIC_DEFAULT_FABLE_MODEL="$POOL_CLAUDE_MODEL"
+export CLAUDE_CODE_SUBAGENT_MODEL="$POOL_CLAUDE_MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$POOL_CLAUDE_MODEL"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 Sol via Pool"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Anthropic Messages → Codex Responses"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES="effort,xhigh_effort,max_effort"
 claude
 ```
+
+不能只设置 `ANTHROPIC_CUSTOM_MODEL_OPTION`：它只把 GPT 模型加入 `/model` 菜单。Claude Code
+内置 `Agent` 工具的可选 `model` 参数仍是 `haiku` / `sonnet` / `opus` / `fable`；模型一旦
+返回其中一个值，子 Agent 请求就会变成 `claude-haiku-*` 等 Claude 模型。只有 Codex 账号的池
+无法承接该请求，会持续返回 503 并触发客户端重试。上面的 default-tier 与
+`CLAUDE_CODE_SUBAGENT_MODEL` 映射让 Agent、Workflow 和自定义 agent frontmatter 都继续使用
+同一个 Codex 模型；桥接层还会仅对 Claude Code 标准内置 `Agent` schema 移除这个可选覆盖，
+让子 Agent 默认继承父模型，不影响自定义同名工具或其他工具的 `model` 字段。
+
+使用本仓库 gateway 时不需要手工维护这些环境变量，初始化时持久化模型即可：
+
+```bash
+gateway init --pool-url http://127.0.0.1:8787 --key <downstream-key> --model gpt-5.6-sol
+```
+
+从旧版 gateway 升级时也要重新执行一次带 `--model` 的 `gateway init`（或重新运行 `/file/<key>`
+生成的一键安装脚本），否则旧 `config.json` 没有 `claude_model`，网关会按兼容原则保留原有环境而
+不会擅自覆盖普通 Claude 路由。
 
 进入 Claude Code 后：
 
@@ -209,8 +234,15 @@ Claude Code 固定发送的 Anthropic `max_tokens` 不会写入内置 Codex Resp
   "model": "gpt-5.6-sol",
   "effortLevel": "xhigh",
   "env": {
+    "ANTHROPIC_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.6-sol",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "gpt-5.6-sol",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-sol",
     "ANTHROPIC_CUSTOM_MODEL_OPTION": "gpt-5.6-sol",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "GPT-5.6 Sol via Pool",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Anthropic Messages → Codex Responses",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES": "effort,xhigh_effort,max_effort"
   }
 }

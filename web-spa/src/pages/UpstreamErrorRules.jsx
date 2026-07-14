@@ -19,6 +19,7 @@ const DOWNSTREAM_ACTIONS = [
   ['custom_error', '返回自定义错误'],
   ['neutralize', '返回中性错误'],
   ['idle_stream', '流式心跳空转'],
+  ['intercept', '拦截命中内容并继续'],
 ];
 const ENTRYPOINTS = [
   ['responses', 'Responses'],
@@ -47,6 +48,8 @@ const emptyRule = () => ({
   idle_seconds: 60,
   idle_ping_seconds: 15,
   skip_log: false,
+  filter_account_action: false,
+  keyword_case_sensitive: true,
   description: '',
 });
 
@@ -167,6 +170,8 @@ export default function UpstreamErrorRules() {
       idle_seconds: form.idle_infinite ? -1 : Number(form.idle_seconds) || 0,
       idle_ping_seconds: Number(form.idle_ping_seconds) || 15,
       skip_log: !!form.skip_log,
+      filter_account_action: !!form.filter_account_action,
+      keyword_case_sensitive: !!form.keyword_case_sensitive,
       description: form.description || '',
     };
   };
@@ -250,7 +255,7 @@ export default function UpstreamErrorRules() {
           <section><h3>B. 匹配条件</h3><div className="upstream-rule-form-grid"><label><span>状态码（status_codes）</span><input className="pool-input" placeholder="429, 500, 529" value={form.status_codes_text || ''} onChange={(e) => setForm((x) => ({ ...x, status_codes_text: e.target.value }))} /></label><label><span>Body 关键词（body_keywords）</span><textarea className="pool-textarea" placeholder={'quota\noverloaded'} value={form.body_keywords_text || ''} onChange={(e) => setForm((x) => ({ ...x, body_keywords_text: e.target.value }))} /></label><label><span>匹配模式</span><Select value={form.match_mode} onChange={(v) => setForm((x) => ({ ...x, match_mode: v }))} optionList={[{ value: 'any', label: '任一条件命中' }, { value: 'all', label: '全部条件命中' }]} /></label></div></section>
           <section><h3>C. 上游账号处理</h3><div className="upstream-rule-form-grid"><label><span>账号动作</span><Select value={form.account_action} onChange={(v) => setForm((x) => ({ ...x, account_action: v }))} optionList={ACCOUNT_ACTIONS.map(([value, label]) => ({ value, label }))} /></label><label><span>冷却时长（秒）</span><input className="pool-input" type="number" value={form.cooldown_seconds || 0} onChange={(e) => setForm((x) => ({ ...x, cooldown_seconds: e.target.value }))} /></label><label><span>优先使用 Retry-After</span><Switch checked={!!form.prefer_retry_after} onChange={(prefer_retry_after) => setForm((x) => ({ ...x, prefer_retry_after }))} /></label></div></section>
           <section><h3>D. 下游响应处理</h3><div className="upstream-rule-form-grid"><label><span>下游动作</span><Select value={form.downstream_action} onChange={(v) => setForm((x) => ({ ...x, downstream_action: v }))} optionList={DOWNSTREAM_ACTIONS.map(([value, label]) => ({ value, label }))} /></label>{form.downstream_action === 'custom_error' ? <><label><span>响应状态码</span><input className="pool-input" type="number" value={form.response_status || 503} onChange={(e) => setForm((x) => ({ ...x, response_status: e.target.value }))} /></label><label><span>自定义错误消息</span><input className="pool-input" value={form.custom_message || ''} onChange={(e) => setForm((x) => ({ ...x, custom_message: e.target.value }))} /></label></> : null}{form.downstream_action === 'idle_stream' ? <><label><span>心跳间隔</span><input className="pool-input" type="number" value={form.idle_ping_seconds || 15} onChange={(e) => setForm((x) => ({ ...x, idle_ping_seconds: e.target.value }))} /></label><label><span>空转时长</span><input className="pool-input" type="number" disabled={!!form.idle_infinite} value={form.idle_seconds || 0} onChange={(e) => setForm((x) => ({ ...x, idle_seconds: e.target.value }))} /></label><label><span>无限空转</span><Switch checked={!!form.idle_infinite} onChange={(idle_infinite) => setForm((x) => ({ ...x, idle_infinite }))} /></label><p className="upstream-rule-note">命中后会释放上游和账号资源，只保持下游 SSE 连接。</p></> : null}</div></section>
-          <details><summary>高级项</summary><label><span>描述</span><textarea className="pool-textarea" value={form.description || ''} onChange={(e) => setForm((x) => ({ ...x, description: e.target.value }))} /></label><label><span>跳过日志</span><Switch checked={!!form.skip_log} onChange={(skip_log) => setForm((x) => ({ ...x, skip_log }))} /></label></details>
+          <details><summary>高级项</summary><label><span>描述</span><textarea className="pool-textarea" value={form.description || ''} onChange={(e) => setForm((x) => ({ ...x, description: e.target.value }))} /></label><label><span>跳过日志</span><Switch checked={!!form.skip_log} onChange={(skip_log) => setForm((x) => ({ ...x, skip_log }))} /></label><label><span>关键词区分大小写</span><Switch checked={!!form.keyword_case_sensitive} onChange={(keyword_case_sensitive) => setForm((x) => ({ ...x, keyword_case_sensitive }))} /></label><label><span>过滤命中时执行账号动作</span><Switch checked={!!form.filter_account_action} onChange={(filter_account_action) => setForm((x) => ({ ...x, filter_account_action }))} /></label></details>
           <section><h3>E. 测试与预览</h3><p className="upstream-rule-note">保存后可在页面底部测试面板点击“测试匹配”。当前摘要：{humanSummary(buildPayload())}</p></section>
         </div>
       </Drawer>

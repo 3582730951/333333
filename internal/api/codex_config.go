@@ -501,8 +501,9 @@ configure_claude() {
 
   say "配置 Claude Code 本地 gateway runtime ($POOL_CLIENT_RUNTIME): $ORIGIN"
   say "Claude Code API: ANTHROPIC_BASE_URL=$ORIGIN"
+  say "Claude Code 主模型/子 Agent: $MODEL"
   install_gateway_binary
-  "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"
+  "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY" --model "$MODEL"
   "$GATEWAY_BIN" stop || true
   if ! "$GATEWAY_BIN" trust-ca; then
     say "CA 自动信任失败；请按上方命令手动信任后继续使用 Claude Code"

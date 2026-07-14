@@ -90,7 +90,8 @@ func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) 
 	claudeBranch := scriptBetween(t, script, "configure_claude() {", "\n}\n\nmain()")
 	for _, want := range []string{
 		"install_gateway_binary",
-		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"`,
+		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY" --model "$MODEL"`,
+		`Claude Code 主模型/子 Agent: $MODEL`,
 		`"$GATEWAY_BIN" stop`,
 		`"$GATEWAY_BIN" start-background`,
 		`"$GATEWAY_BIN" probe-identity`,

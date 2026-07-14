@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
@@ -27,6 +28,7 @@ import (
 	"codex-account-pool/internal/payment"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/reliability"
+	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -93,11 +95,14 @@ type Server struct {
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
 	// 1-writer pool); see asyncwrite.go. FlushWrites drains it on shutdown.
-	asyncWrites chan func()
-	asyncWG     sync.WaitGroup
-	asyncMu     sync.RWMutex
-	asyncClosed bool
-	asyncBytes  int64
+	asyncWrites           chan func()
+	asyncWG               sync.WaitGroup
+	asyncMu               sync.RWMutex
+	asyncClosed           bool
+	asyncBytes            int64
+	upstreamRulesMu       sync.RWMutex
+	upstreamRulesCache    []storage.UpstreamErrorRule
+	upstreamRulesCachedAt time.Time
 
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
@@ -1279,7 +1284,19 @@ codexSuccess:
 		recordingStream := io.TeeReader(streamBody, streamRecorder)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		streamErr := s.streamSSE(r.Context(), w, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
+		streamCtx := r.Context()
+		if rf := s.responseRuleFilter(streamCtx, "codex", func() string {
+			if isChat {
+				return "chat_completions"
+			}
+			return "responses"
+		}(), model, resp.StatusCode); rf != nil {
+			if rf.Rule != nil && rf.Rule.FilterAccountAction {
+				_ = s.applyRuleAccountAction(streamCtx, lease.Account, resp.StatusCode, resp.Header, nil, upstreamErrorRuleDecision{Rule: *rf.Rule, Match: upstreamrules.MatchResult{Rule: *rf.Rule, AccountAction: rf.Rule.AccountAction, DownstreamAction: rf.Rule.DownstreamAction}})
+			}
+			streamCtx = withResponseRuleFilter(streamCtx, rf)
+		}
+		streamErr := s.streamSSE(streamCtx, w, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 		s.persistCodexBindingAliases(r.Context(), affinity, streamRecorder.id, streamRecorder.model, lease, finalEgress, model)
 		if streamErr != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
@@ -1358,6 +1375,14 @@ codexSuccess:
 	// Output guard: deterministically downgrade a non-streaming Responses answer that
 	// claims unverified test/command/file results (no-op when reliability/guard is off).
 	responseBody = s.reliabilityGuardResponsesBody(r.Context(), responseBody, relTurn)
+	if rf := s.responseRuleFilter(r.Context(), "codex", func() string {
+		if isChat {
+			return "chat_completions"
+		}
+		return "responses"
+	}(), model, resp.StatusCode); rf != nil {
+		responseBody, _ = responsefilter.FilterJSON(responseBody, rf.Keywords, rf.CaseSensitive)
+	}
 	_, _ = w.Write(codexScrubber.ReplaceAll(responseBody))
 	return codexAttemptResult{Outcome: outcomeDone}
 }

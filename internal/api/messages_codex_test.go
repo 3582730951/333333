@@ -83,6 +83,85 @@ func TestMessagesRoutesGPTToBuiltInCodexNonStreaming(t *testing.T) {
 	}
 }
 
+func TestMessagesCodexBuiltInAgentInheritsParentModel(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamStream := "event: response.created\n" +
+			`data: {"type":"response.created","response":{"id":"resp_agent_bridge","model":"gpt-5.6-sol"}}` + "\n\n" +
+			"event: response.output_item.done\n" +
+			`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_agent","call_id":"call_agent","name":"Agent","arguments":"{\"description\":\"scan repo\",\"prompt\":\"inspect files\",\"subagent_type\":\"general-purpose\",\"model\":\"haiku\"}"}}` + "\n\n" +
+			"event: response.completed\n" +
+			`data: {"type":"response.completed","response":{"id":"resp_agent_bridge","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":4,"output_tokens":2}}}` + "\n\n"
+		raw := serveCodexResponsesFixture(t, w, r, upstreamStream)
+		var request map[string]interface{}
+		if err := json.Unmarshal(raw, &request); err != nil {
+			t.Fatalf("decode Agent bridge request: %v\n%s", err, raw)
+		}
+		tools := request["tools"].([]interface{})
+		if len(tools) != 2 {
+			t.Fatalf("Claude Code tools were dropped before Codex: %s", raw)
+		}
+		agentProperties := tools[0].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})
+		if _, leaked := agentProperties["model"]; leaked {
+			t.Fatalf("built-in Agent.model reached Codex: %v", agentProperties)
+		}
+		workflowProperties := tools[1].(map[string]interface{})["parameters"].(map[string]interface{})["properties"].(map[string]interface{})
+		if _, ok := workflowProperties["model"]; !ok {
+			t.Fatalf("unrelated Workflow.model was removed: %v", workflowProperties)
+		}
+	})
+	h.importAccount(t, "messages-codex-agent", "upstream-messages-codex-agent", "access-messages-codex-agent")
+
+	body := `{
+	  "model":"gpt-5.6-sol",
+	  "stream":false,
+	  "messages":[{"role":"user","content":"delegate"}],
+	  "tools":[
+	    {
+	      "name":"Agent",
+	      "description":"Launch a new agent",
+	      "input_schema":{
+	        "type":"object",
+	        "properties":{
+	          "description":{"type":"string"},
+	          "prompt":{"type":"string"},
+	          "subagent_type":{"type":"string"},
+	          "model":{"type":"string","enum":["sonnet","opus","haiku","fable"]},
+	          "run_in_background":{"type":"boolean"}
+	        },
+	        "required":["description","prompt"],
+	        "additionalProperties":false
+	      }
+	    },
+	    {
+	      "name":"Workflow",
+	      "input_schema":{"type":"object","properties":{"name":{"type":"string"},"model":{"type":"string"}},"required":["name"]}
+	    }
+	  ]
+	}`
+	resp, err := http.Post(h.pool.URL+"/v1/messages", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Agent bridge status=%d body=%s", resp.StatusCode, raw)
+	}
+	var message map[string]interface{}
+	if err := json.Unmarshal(raw, &message); err != nil {
+		t.Fatalf("decode Agent bridge response: %v\n%s", err, raw)
+	}
+	content := message["content"].([]interface{})
+	toolUse := content[0].(map[string]interface{})
+	input := toolUse["input"].(map[string]interface{})
+	if toolUse["name"] != "Agent" || input["prompt"] != "inspect files" || input["subagent_type"] != "general-purpose" {
+		t.Fatalf("Agent tool call was damaged: %s", raw)
+	}
+	if _, leaked := input["model"]; leaked {
+		t.Fatalf("Agent.model would force Claude Haiku instead of inheriting Codex: %s", raw)
+	}
+}
+
 func TestMessagesRoutesGPTToBuiltInCodexStreamingTools(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/codex/responses" {

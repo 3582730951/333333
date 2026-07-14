@@ -16,6 +16,7 @@ import (
 	"codex-account-pool/internal/identity"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/prompt"
+	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -534,7 +535,14 @@ claudeSuccess:
 			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
 		}
-		if err := s.streamSSE(r.Context(), w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
+		streamCtx := r.Context()
+		if rf := s.responseRuleFilter(streamCtx, "claude", "claude_messages", model, resp.StatusCode); rf != nil {
+			if rf.Rule != nil && rf.Rule.FilterAccountAction {
+				_ = s.applyRuleAccountAction(streamCtx, lease.Account, resp.StatusCode, resp.Header, nil, upstreamErrorRuleDecision{Rule: *rf.Rule, Match: upstreamrules.MatchResult{Rule: *rf.Rule, AccountAction: rf.Rule.AccountAction, DownstreamAction: rf.Rule.DownstreamAction}})
+			}
+			streamCtx = withResponseRuleFilter(streamCtx, rf)
+		}
+		if err := s.streamSSE(streamCtx, w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
@@ -561,6 +569,9 @@ claudeSuccess:
 	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
+	if rf := s.responseRuleFilter(r.Context(), "claude", "claude_messages", model, resp.StatusCode); rf != nil {
+		responseBody, _ = responsefilter.FilterJSON(responseBody, rf.Keywords, rf.CaseSensitive)
+	}
 	_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
 	return outcomeDone
 }

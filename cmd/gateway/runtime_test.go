@@ -64,6 +64,7 @@ func TestStrictRuntimeEnvPointsClaudeCodeAtPoolAPI(t *testing.T) {
 	cfg.ListenAddr = "127.0.0.1:8765"
 	cfg.PoolServerURL = "https://pool.example:1455/"
 	cfg.DownstreamKey = "cap_secret"
+	cfg.ClaudeModel = "gpt-5.6-sol"
 	id := &CachedIdentity{
 		Virtual: &VirtualIdentity{
 			Username: "virtuser",
@@ -82,6 +83,7 @@ func TestStrictRuntimeEnvPointsClaudeCodeAtPoolAPI(t *testing.T) {
 			t.Fatalf("strict runtime env missing %q\n---\n%s", want, joined)
 		}
 	}
+	assertClaudeModelRuntimeEnv(t, joined, "gpt-5.6-sol")
 }
 
 func TestClaudeRuntimeModeDefaultsToCompat(t *testing.T) {
@@ -109,10 +111,13 @@ func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.PoolServerURL = "https://pool.example/"
 	cfg.DownstreamKey = "cap_secret"
+	cfg.ClaudeModel = "gpt-5.6-sol"
 	env := compatRuntimeEnv([]string{
 		"HOME=/home/real",
 		"ANTHROPIC_BASE_URL=https://api.anthropic.com",
 		"ANTHROPIC_AUTH_TOKEN=old",
+		"ANTHROPIC_MODEL=claude-opus-old",
+		"CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-old",
 	}, cfg)
 	joined := "\n" + strings.Join(env, "\n") + "\n"
 	for _, want := range []string{
@@ -129,6 +134,58 @@ func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
 	}
 	if strings.Contains(joined, "https://api.anthropic.com") || strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=old") {
 		t.Fatalf("compat runtime env did not replace old Anthropic settings\n---\n%s", joined)
+	}
+	if strings.Contains(joined, "claude-opus-old") || strings.Contains(joined, "claude-haiku-old") {
+		t.Fatalf("compat runtime env did not replace stale Claude model routing\n---\n%s", joined)
+	}
+	assertClaudeModelRuntimeEnv(t, joined, "gpt-5.6-sol")
+}
+
+func TestRuntimeEnvDoesNotForceClaudeModelWhenUnconfigured(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PoolServerURL = "https://pool.example/"
+	cfg.DownstreamKey = "cap_secret"
+	compat := "\n" + strings.Join(compatRuntimeEnv([]string{"HOME=/home/real"}, cfg), "\n") + "\n"
+	id := &CachedIdentity{Virtual: &VirtualIdentity{Username: "virtuser", HomeDir: "/home/virtuser"}}
+	strict := "\n" + strings.Join(strictRuntimeEnv(cfg, id), "\n") + "\n"
+	for _, key := range claudeModelRuntimeEnvKeys() {
+		needle := "\n" + key + "="
+		if strings.Contains(compat, needle) || strings.Contains(strict, needle) {
+			t.Fatalf("empty claude_model must not inject %s\ncompat:\n%s\nstrict:\n%s", key, compat, strict)
+		}
+	}
+}
+
+func assertClaudeModelRuntimeEnv(t *testing.T, joined, model string) {
+	t.Helper()
+	for _, key := range claudeModelRuntimeEnvKeys() {
+		want := model
+		switch key {
+		case "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":
+			want = model + " via Pool"
+		case "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION":
+			want = "Anthropic Messages to Codex Responses via pool_server"
+		case "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES":
+			want = "effort,xhigh_effort,max_effort"
+		}
+		if !strings.Contains(joined, "\n"+key+"="+want+"\n") {
+			t.Fatalf("Claude model runtime env missing %s=%s\n---\n%s", key, want, joined)
+		}
+	}
+}
+
+func claudeModelRuntimeEnvKeys() []string {
+	return []string{
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL",
+		"CLAUDE_CODE_SUBAGENT_MODEL",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION",
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
 	}
 }
 

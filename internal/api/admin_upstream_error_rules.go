@@ -54,6 +54,7 @@ func (s *Server) adminUpstreamErrorRules(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateUpstreamErrorRules()
 		out, ok, err := s.store.GetUpstreamErrorRule(r.Context(), rule.ID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -108,6 +109,7 @@ func (s *Server) adminUpstreamErrorRuleAction(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateUpstreamErrorRules()
 		out, _, err := s.store.GetUpstreamErrorRule(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -119,6 +121,7 @@ func (s *Server) adminUpstreamErrorRuleAction(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateUpstreamErrorRules()
 		writeJSON(w, http.StatusOK, map[string]interface{}{"id": id, "deleted": true})
 	default:
 		methodNotAllowed(w)
@@ -282,6 +285,14 @@ func overlayUpstreamErrorRule(rule *storage.UpstreamErrorRule, req map[string]js
 			if err := json.Unmarshal(raw, &rule.SkipLog); err != nil {
 				return err
 			}
+		case "filter_account_action":
+			if err := json.Unmarshal(raw, &rule.FilterAccountAction); err != nil {
+				return err
+			}
+		case "keyword_case_sensitive":
+			if err := json.Unmarshal(raw, &rule.KeywordCaseSensitive); err != nil {
+				return err
+			}
 		case "description":
 			if err := json.Unmarshal(raw, &rule.Description); err != nil {
 				return err
@@ -328,7 +339,7 @@ func normalizeRuleAccountAction(action string) string {
 
 func normalizeRuleDownstreamAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case upstreamrules.DownstreamActionFailover, upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream:
+	case upstreamrules.DownstreamActionFailover, upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionIntercept:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return upstreamrules.DownstreamActionBuiltin

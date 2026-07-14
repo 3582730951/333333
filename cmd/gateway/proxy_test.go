@@ -232,6 +232,47 @@ func TestSaveConfigUsesPrivatePermissions(t *testing.T) {
 	assertFileMode(t, path, gatewayConfigFileMode)
 }
 
+func TestGatewayConfigPersistsClaudeModelAndKeepsLegacyConfigsCompatible(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "gateway")
+	path := filepath.Join(dir, "config.json")
+	cfg := DefaultConfig()
+	cfg.DownstreamKey = "cap_secret"
+	cfg.ClaudeModel = "gpt-5.6-sol"
+	if err := SaveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk map[string]interface{}
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		t.Fatal(err)
+	}
+	if disk["claude_model"] != "gpt-5.6-sol" {
+		t.Fatalf("claude_model not persisted: %s", raw)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ClaudeModel != "gpt-5.6-sol" {
+		t.Fatalf("loaded claude_model = %q", loaded.ClaudeModel)
+	}
+
+	legacyPath := filepath.Join(dir, "legacy.json")
+	if err := os.WriteFile(legacyPath, []byte(`{"downstream_key":"cap_legacy"}`), gatewayConfigFileMode); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := LoadConfig(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.ClaudeModel != "" || legacy.DownstreamKey != "cap_legacy" {
+		t.Fatalf("legacy config changed semantics: %#v", legacy)
+	}
+}
+
 func TestLoadConfigHardensLegacyWidePermissions(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "gateway")
 	path := filepath.Join(dir, "config.json")
@@ -643,6 +684,7 @@ func TestInspectGatewayStatusReportsConfiguredServices(t *testing.T) {
 	cfg.ListenAddr = ln.Addr().String()
 	cfg.PoolServerURL = pool.URL
 	cfg.DownstreamKey = "cap_secret"
+	cfg.ClaudeModel = "gpt-5.6-sol"
 	cfg.MITM.CACert = filepath.Join(dir, "ca-cert.pem")
 	cfg.MITM.CAKey = filepath.Join(dir, "ca-key.pem")
 	path := filepath.Join(dir, "config.json")
@@ -663,6 +705,9 @@ func TestInspectGatewayStatusReportsConfiguredServices(t *testing.T) {
 	}
 	if !report.DownstreamKeyConfigured {
 		t.Fatal("downstream key should be reported as configured")
+	}
+	if report.ClaudeModel != "gpt-5.6-sol" {
+		t.Fatalf("Claude model = %q", report.ClaudeModel)
 	}
 	if !report.CACertPresent || !report.CAKeyPresent {
 		t.Fatalf("ca presence = cert:%v key:%v, want both true", report.CACertPresent, report.CAKeyPresent)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"codex-account-pool/internal/storage"
@@ -75,6 +76,9 @@ func TestAdminSkillsCompatDoctorReportsOfficialRawAndProviderTiers(t *testing.T)
 	runtime := checks["claude_runtime_mode"].(map[string]interface{})
 	if runtime["default_runtime"] != "compat" {
 		t.Fatalf("claude runtime default wrong: %#v", runtime)
+	}
+	if required, _ := runtime["required_model_env"].(string); !strings.Contains(required, "CLAUDE_CODE_SUBAGENT_MODEL") {
+		t.Fatalf("claude runtime doctor must explain sub-agent model routing: %#v", runtime)
 	}
 	providers := root["custom_providers"].([]interface{})
 	var sawNative bool

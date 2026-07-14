@@ -1383,6 +1383,8 @@ func upstreamErrorRuleRows(rows []storage.UpstreamErrorRule) [][]string {
 			itoa64(row.IdleSeconds),
 			itoa64(row.IdlePingSeconds),
 			strconv.FormatBool(row.SkipLog),
+			strconv.FormatBool(row.FilterAccountAction),
+			strconv.FormatBool(row.KeywordCaseSensitive),
 			row.Description,
 			itoa64(row.CreatedAt),
 			itoa64(row.UpdatedAt),
