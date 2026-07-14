@@ -46,12 +46,24 @@ func (s *Server) invalidateUpstreamErrorRules() {
 func (s *Server) responseRuleFilter(ctx context.Context, provider, entrypoint, model string, status int) *responseRuleFilter {
 	rules := s.upstreamErrorRules(ctx)
 	for _, rule := range rules {
-		if !rule.Enabled || strings.ToLower(strings.TrimSpace(rule.DownstreamAction)) != upstreamrules.DownstreamActionIntercept || len(rule.BodyKeywords) == 0 {
+		action := strings.ToLower(strings.TrimSpace(rule.DownstreamAction))
+		if !rule.Enabled || (action != upstreamrules.DownstreamActionIntercept && action != upstreamrules.DownstreamActionHideSafetyBuffering) {
 			continue
 		}
-		probe := upstreamrules.MatchInput{Provider: provider, Entrypoint: entrypoint, Model: model, Status: status, Body: []byte(rule.BodyKeywords[0]), Streaming: true}
-		if m, ok := upstreamrules.Match([]storage.UpstreamErrorRule{rule}, probe); ok && m.DownstreamAction == upstreamrules.DownstreamActionIntercept {
-			return &responseRuleFilter{Keywords: append([]string(nil), rule.BodyKeywords...), CaseSensitive: rule.KeywordCaseSensitive, Rule: &rule}
+		if action == upstreamrules.DownstreamActionIntercept && len(rule.BodyKeywords) == 0 {
+			continue
+		}
+		probeRule := rule
+		var probeBody []byte
+		if action == upstreamrules.DownstreamActionHideSafetyBuffering {
+			// This is a protocol-field transform, not a body keyword match.
+			probeRule.BodyKeywords = nil
+		} else if len(rule.BodyKeywords) > 0 {
+			probeBody = []byte(rule.BodyKeywords[0])
+		}
+		probe := upstreamrules.MatchInput{Provider: provider, Entrypoint: entrypoint, Model: model, Status: status, Body: probeBody, Streaming: true}
+		if m, ok := upstreamrules.Match([]storage.UpstreamErrorRule{probeRule}, probe); ok && m.DownstreamAction == action {
+			return &responseRuleFilter{Keywords: append([]string(nil), rule.BodyKeywords...), CaseSensitive: rule.KeywordCaseSensitive, Mode: action, Rule: &rule}
 		}
 	}
 	return nil

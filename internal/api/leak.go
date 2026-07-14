@@ -12,6 +12,7 @@ import (
 	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
 )
 
@@ -19,6 +20,7 @@ type responseRuleFilterKey struct{}
 type responseRuleFilter struct {
 	Keywords      []string
 	CaseSensitive bool
+	Mode          string
 	Rule          *storage.UpstreamErrorRule
 }
 
@@ -38,7 +40,7 @@ func (w *ruleFilteringWriter) Write(p []byte) (int, error) {
 		}
 		frame := append([]byte(nil), w.buf[:idx+2]...)
 		w.buf = w.buf[idx+2:]
-		out := responsefilter.FilterSSEFrame(frame, w.filter.Keywords, w.filter.CaseSensitive)
+		out := filterRuleSSEFrame(frame, w.filter)
 		if len(out) > 0 {
 			if _, err := w.ResponseWriter.Write(out); err != nil {
 				return 0, err
@@ -47,6 +49,30 @@ func (w *ruleFilteringWriter) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func filterRuleSSEFrame(frame []byte, filter *responseRuleFilter) []byte {
+	if filter == nil {
+		return frame
+	}
+	if filter.Mode == upstreamrules.DownstreamActionHideSafetyBuffering {
+		out, _ := responsefilter.StripSafetyBufferingSSE(frame)
+		return out
+	}
+	return responsefilter.FilterSSEFrame(frame, filter.Keywords, filter.CaseSensitive)
+}
+
+func filterRuleJSON(body []byte, filter *responseRuleFilter) []byte {
+	if filter == nil {
+		return body
+	}
+	if filter.Mode == upstreamrules.DownstreamActionHideSafetyBuffering {
+		out, _ := responsefilter.StripSafetyBufferingJSON(body)
+		return out
+	}
+	out, _ := responsefilter.FilterJSON(body, filter.Keywords, filter.CaseSensitive)
+	return out
+}
+
 func (w *ruleFilteringWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
@@ -165,17 +191,11 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 }
 
 func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilter, leak bool, words *streamrewrite.Matcher, provider string) error {
-	// Reuse the existing SSE filter framing by first applying rule decisions to
-	// complete events; ordinary leak scrubbing remains available afterwards.
+	// Apply the selected rule to each complete SSE event. In particular, never
+	// discard a group of pending events together: Codex requires the terminal
+	// response.completed event even when an earlier event is intercepted.
 	buf := make([]byte, 0, 32768)
 	tmp := make([]byte, 32768)
-	pending := make([][]byte, 0, 4)
-	maxKeyword := 1
-	for _, kw := range rf.Keywords {
-		if len(kw) > maxKeyword {
-			maxKeyword = len(kw)
-		}
-	}
 	flusher, _ := w.(http.Flusher)
 	emit := func(p []byte) error {
 		if len(p) == 0 {
@@ -189,34 +209,20 @@ func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilte
 		}
 		return nil
 	}
-	for {
-		n, err := body.Read(tmp)
-		emitFrame := func(frame []byte) error {
-			out := responsefilter.FilterSSEFrame(frame, rf.Keywords, rf.CaseSensitive)
-			if len(out) == 0 {
-				return nil
-			}
-			if leak {
-				out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
-			}
-			return emit(out)
-		}
-		flushPending := func(force bool) error {
-			for len(pending) > 0 {
-				combined := make([]byte, 0)
-				for _, p := range pending {
-					combined = append(combined, p...)
-				}
-				if !force && len(combined) <= maxKeyword {
-					break
-				}
-				if err := emitFrame(pending[0]); err != nil {
-					return err
-				}
-				pending = pending[1:]
-			}
+	emitFrame := func(frame []byte) error {
+		out := filterRuleSSEFrame(frame, rf)
+		if len(out) == 0 {
 			return nil
 		}
+		if leak {
+			out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
+		} else if words != nil && !words.Empty() {
+			out = words.ReplaceAll(out)
+		}
+		return emit(out)
+	}
+	for {
+		n, err := body.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			for {
@@ -226,16 +232,7 @@ func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilte
 				}
 				frame := append([]byte(nil), buf[:idx+2]...)
 				buf = buf[idx+2:]
-				pending = append(pending, frame)
-				combined := make([]byte, 0)
-				for _, p := range pending {
-					combined = append(combined, p...)
-				}
-				if responsefilter.Match(combined, rf.Keywords, rf.CaseSensitive) {
-					pending = pending[:0]
-					continue
-				}
-				if e := flushPending(false); e != nil {
+				if e := emitFrame(frame); e != nil {
 					return e
 				}
 			}
@@ -243,9 +240,9 @@ func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilte
 		if err != nil {
 			if err == io.EOF {
 				if len(buf) > 0 {
-					pending = append(pending, buf)
+					return emitFrame(buf)
 				}
-				return flushPending(true)
+				return nil
 			}
 			return err
 		}

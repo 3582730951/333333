@@ -316,6 +316,14 @@ func validateUpstreamErrorRule(rule *storage.UpstreamErrorRule) error {
 	}
 	rule.AccountAction = normalizeRuleAccountAction(rule.AccountAction)
 	rule.DownstreamAction = normalizeRuleDownstreamAction(rule.DownstreamAction)
+	if rule.DownstreamAction == upstreamrules.DownstreamActionHideSafetyBuffering {
+		// safety_buffering is a Responses protocol field, not text content. Keeping
+		// keywords or account actions here is misleading and can punish a healthy
+		// account for an informational UI signal.
+		rule.BodyKeywords = nil
+		rule.AccountAction = upstreamrules.AccountActionNone
+		rule.FilterAccountAction = false
+	}
 	if rule.ResponseStatus < 0 || rule.ResponseStatus > 599 {
 		return errors.New("response_status must be between 0 and 599")
 	}
@@ -339,7 +347,7 @@ func normalizeRuleAccountAction(action string) string {
 
 func normalizeRuleDownstreamAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case upstreamrules.DownstreamActionFailover, upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionIntercept:
+	case upstreamrules.DownstreamActionFailover, upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionIntercept, upstreamrules.DownstreamActionHideSafetyBuffering:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return upstreamrules.DownstreamActionBuiltin

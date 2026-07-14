@@ -16,7 +16,6 @@ import (
 	"codex-account-pool/internal/identity"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/prompt"
-	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -570,7 +569,7 @@ claudeSuccess:
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if rf := s.responseRuleFilter(r.Context(), "claude", "claude_messages", model, resp.StatusCode); rf != nil {
-		responseBody, _ = responsefilter.FilterJSON(responseBody, rf.Keywords, rf.CaseSensitive)
+		responseBody = filterRuleJSON(responseBody, rf)
 	}
 	_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
 	return outcomeDone

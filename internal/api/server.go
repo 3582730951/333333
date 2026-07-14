@@ -28,7 +28,6 @@ import (
 	"codex-account-pool/internal/payment"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/reliability"
-	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -1381,7 +1380,7 @@ codexSuccess:
 		}
 		return "responses"
 	}(), model, resp.StatusCode); rf != nil {
-		responseBody, _ = responsefilter.FilterJSON(responseBody, rf.Keywords, rf.CaseSensitive)
+		responseBody = filterRuleJSON(responseBody, rf)
 	}
 	_, _ = w.Write(codexScrubber.ReplaceAll(responseBody))
 	return codexAttemptResult{Outcome: outcomeDone}

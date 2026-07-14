@@ -81,6 +81,69 @@ func TestAdminUpstreamErrorRulesCRUDAndTestEndpoint(t *testing.T) {
 	}
 }
 
+func TestValidateHideSafetyBufferingRuleUsesProtocolSafeDefaults(t *testing.T) {
+	rule := storage.UpstreamErrorRule{
+		DownstreamAction:    "hide_safety_buffering",
+		BodyKeywords:        []string{"This request requires additional safety checks"},
+		AccountAction:       "cooldown",
+		FilterAccountAction: true,
+	}
+	if err := validateUpstreamErrorRule(&rule); err != nil {
+		t.Fatal(err)
+	}
+	if len(rule.BodyKeywords) != 0 || rule.AccountAction != "none" || rule.FilterAccountAction {
+		t.Fatalf("unsafe specialized rule normalization: %+v", rule)
+	}
+}
+
+func TestCodexHideSafetyBufferingRulePreservesCompletedStream(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\n" +
+			`data: {"type":"response.created","response":{"id":"resp_safe"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+			"event: response.output_text.delta\n" +
+			`data: {"type":"response.output_text.delta","delta":"ok","safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+			"event: response.completed\n" +
+			`data: {"type":"response.completed","response":{"id":"resp_safe","model":"gpt-5.5","status":"completed"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n"))
+	})
+	acc := h.importAccount(t, "safe", "up-safe", "tok-safe")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "hide-safety-buffering",
+		Name:             "hide safety buffering",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		AccountAction:    "none",
+		DownstreamAction: "hide_safety_buffering",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	got := string(body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, got)
+	}
+	if strings.Contains(got, "safety_buffering") {
+		t.Fatalf("safety field leaked: %s", got)
+	}
+	for _, want := range []string{"response.created", "response.output_text.delta", "ok", "response.completed", "resp_safe"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stream missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestAdminUpstreamErrorRuleModelOptionsMergeSources(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"id":"ok"}`)) })
 	ctx := context.Background()

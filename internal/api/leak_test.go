@@ -1,8 +1,11 @@
 package api
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 )
 
 func TestProbeEarlyCodexSSEFailureDetectsFailedAfterCreated(t *testing.T) {
@@ -68,5 +71,46 @@ func TestClaudeContentBlockStartCommitsContent(t *testing.T) {
 		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
 	if !claudeSSEFrameCommitsContent(frame) {
 		t.Fatal("content_block_start should commit downstream-visible assistant content")
+	}
+}
+
+func TestRuleSSECopyHidesSafetyBufferingWithoutBreakingLifecycle(t *testing.T) {
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_1"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hello","safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n"
+	rec := httptest.NewRecorder()
+	rf := &responseRuleFilter{Mode: upstreamrules.DownstreamActionHideSafetyBuffering}
+	if err := newRuleSSECopy(rec, strings.NewReader(stream), rf, false, nil, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	got := rec.Body.String()
+	if strings.Contains(got, "safety_buffering") {
+		t.Fatalf("safety_buffering leaked downstream: %s", got)
+	}
+	for _, want := range []string{"response.created", "response.output_text.delta", "hello", "response.completed", "resp_1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stream lifecycle lost %q: %s", want, got)
+		}
+	}
+}
+
+func TestRuleSSECopyInterceptKeepsResponseCompleted(t *testing.T) {
+	stream := `data: {"type":"response.created","response":{"id":"resp_1"}}` + "\n\n" +
+		`data: {"type":"response.output_text.delta","delta":"blocked notice"}` + "\n\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}` + "\n\n"
+	rec := httptest.NewRecorder()
+	rf := &responseRuleFilter{Mode: upstreamrules.DownstreamActionIntercept, Keywords: []string{"blocked notice"}, CaseSensitive: true}
+	if err := newRuleSSECopy(rec, strings.NewReader(stream), rf, false, nil, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	got := rec.Body.String()
+	if strings.Contains(got, "blocked notice") {
+		t.Fatalf("matching content leaked downstream: %s", got)
+	}
+	if !strings.Contains(got, "response.created") || !strings.Contains(got, "response.completed") {
+		t.Fatalf("protocol lifecycle was interrupted: %s", got)
 	}
 }

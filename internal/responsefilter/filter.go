@@ -44,6 +44,53 @@ func FilterSSEFrame(frame []byte, keywords []string, caseSensitive bool) []byte 
 	return nil
 }
 
+// StripSafetyBufferingJSON removes only the top-level Responses API
+// safety_buffering control field. All other protocol fields are preserved.
+func StripSafetyBufferingJSON(body []byte) ([]byte, bool) {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(body, &root) != nil {
+		return body, false
+	}
+	if _, ok := root["safety_buffering"]; !ok {
+		return body, false
+	}
+	delete(root, "safety_buffering")
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// StripSafetyBufferingSSE removes only the Responses API safety_buffering
+// control field. The surrounding event remains byte-valid and continues through
+// the normal Codex state machine, including response.created/completed.
+func StripSafetyBufferingSSE(frame []byte) ([]byte, bool) {
+	lines := bytes.Split(frame, []byte("\n"))
+	changed := false
+	for i, line := range lines {
+		trim := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trim, []byte("data:")) {
+			continue
+		}
+		raw := bytes.TrimSpace(bytes.TrimPrefix(trim, []byte("data:")))
+		enc, ok := StripSafetyBufferingJSON(raw)
+		if !ok {
+			continue
+		}
+		prefix := line[:len(line)-len(bytes.TrimLeft(line, " \t"))]
+		lines[i] = append(append(prefix, []byte("data: ")...), enc...)
+		if bytes.HasSuffix(line, []byte("\r")) {
+			lines[i] = append(lines[i], '\r')
+		}
+		changed = true
+	}
+	if !changed {
+		return frame, false
+	}
+	return bytes.Join(lines, []byte("\n")), true
+}
+
 func FilterJSONInSSE(frame []byte, keywords []string, caseSensitive bool) ([]byte, bool) {
 	lines := bytes.Split(frame, []byte("\n"))
 	changed := false

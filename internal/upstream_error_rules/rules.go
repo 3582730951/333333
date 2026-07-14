@@ -19,13 +19,14 @@ const (
 	AccountActionCooldownRecheck = "cooldown_recheck"
 	AccountActionQuarantine      = "quarantine"
 
-	DownstreamActionBuiltin     = "builtin"
-	DownstreamActionFailover    = "failover"
-	DownstreamActionPass        = "pass"
-	DownstreamActionCustomError = "custom_error"
-	DownstreamActionNeutralize  = "neutralize"
-	DownstreamActionIdleStream  = "idle_stream"
-	DownstreamActionIntercept   = "intercept"
+	DownstreamActionBuiltin             = "builtin"
+	DownstreamActionFailover            = "failover"
+	DownstreamActionPass                = "pass"
+	DownstreamActionCustomError         = "custom_error"
+	DownstreamActionNeutralize          = "neutralize"
+	DownstreamActionIdleStream          = "idle_stream"
+	DownstreamActionIntercept           = "intercept"
+	DownstreamActionHideSafetyBuffering = "hide_safety_buffering"
 )
 
 type MatchInput struct {
@@ -120,7 +121,7 @@ func normalizeAccountAction(action string) string {
 
 func normalizeDownstreamAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case DownstreamActionFailover, DownstreamActionPass, DownstreamActionCustomError, DownstreamActionNeutralize, DownstreamActionIdleStream, DownstreamActionIntercept:
+	case DownstreamActionFailover, DownstreamActionPass, DownstreamActionCustomError, DownstreamActionNeutralize, DownstreamActionIdleStream, DownstreamActionIntercept, DownstreamActionHideSafetyBuffering:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return DownstreamActionBuiltin
