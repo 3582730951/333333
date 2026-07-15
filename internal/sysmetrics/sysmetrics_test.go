@@ -1,6 +1,9 @@
 package sysmetrics
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestCollect(t *testing.T) {
 	m := Collect("/")
@@ -32,6 +35,18 @@ func TestCollect(t *testing.T) {
 	}
 	if m.Network.RXBytesPerSec < 0 || m.Network.TXBytesPerSec < 0 || m.Network.TotalBytesPerSec < 0 {
 		t.Errorf("network rates must be non-negative: %+v", m.Network)
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	registration := payload["registration"].(map[string]interface{})
+	if _, ok := registration["procs"].([]interface{}); !ok {
+		t.Fatalf("registration.procs must be a JSON array, got %T (%s)", registration["procs"], raw)
 	}
 	if m.Go.Goroutines <= 0 {
 		t.Errorf("goroutines = %d, want > 0", m.Go.Goroutines)

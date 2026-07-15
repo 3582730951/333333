@@ -55,7 +55,7 @@ export const systemMetricsSchema = z.object({
   }).passthrough().optional(),
   network: z.object({
     interfaces: z.coerce.number().optional(),
-    interface_names: z.array(z.string()).optional(),
+    interface_names: z.array(z.string()).nullish().transform((value) => value ?? []),
     rx_bytes: z.coerce.number().optional(),
     tx_bytes: z.coerce.number().optional(),
     rx_bytes_per_sec: z.coerce.number().optional(),
@@ -67,11 +67,11 @@ export const systemMetricsSchema = z.object({
     node: z.coerce.number().optional(),
     chrome: z.coerce.number().optional(),
     xvfb: z.coerce.number().optional(),
-    procs: z.array(processSchema).optional(),
+    procs: z.array(processSchema).nullish().transform((value) => value ?? []),
   }).passthrough().optional(),
   go: z.object({ goroutines: z.coerce.number().optional(), sys_bytes: z.coerce.number().optional() }).passthrough().optional(),
-  supervisor_events: z.array(eventSchema).optional(),
-  supervisor_modules: z.array(moduleSchema).optional(),
+  supervisor_events: z.array(eventSchema).nullish().transform((value) => value ?? []),
+  supervisor_modules: z.array(moduleSchema).nullish().transform((value) => value ?? []),
 }).passthrough();
 
 export async function fetchSystemMetrics(signal?: AbortSignal): Promise<SystemMetrics> {

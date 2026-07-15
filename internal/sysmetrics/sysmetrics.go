@@ -448,7 +448,7 @@ func readRegistrationProcs(m *Metrics) {
 	if err != nil {
 		return
 	}
-	var procs []ProcInfo
+	procs := make([]ProcInfo, 0)
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
