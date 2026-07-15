@@ -158,7 +158,14 @@ if dry_run:
     print("Dry run: no data changed.")
     raise SystemExit(0)
 if not assume_yes:
-    answer = input("Delete ALL encrypted context journals above and reclaim SQLite space? [y/N] ").strip().lower()
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as terminal:
+            terminal.write("Delete ALL encrypted context journals above and reclaim SQLite space? [y/N] ")
+            terminal.flush()
+            answer = terminal.readline().strip().lower()
+    except OSError:
+        print("No interactive terminal is available; rerun with --yes to confirm deletion.", file=sys.stderr)
+        raise SystemExit(2)
     if answer not in {"y", "yes"}:
         print("Cancelled.")
         raise SystemExit(0)
