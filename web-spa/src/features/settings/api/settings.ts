@@ -248,6 +248,12 @@ export async function fetchRegistrarSettings(signal?: AbortSignal): Promise<Regi
   return {
     cfg,
     smsProviders: providers.filter((provider) => provider.type === 'sms' && ['smsbower', 'herosms'].includes(provider.key)),
+    mailboxProviders: providers.filter((provider) => provider.type === 'mailbox'
+      && ['tempmail', 'cloudflare', 'imap'].includes(provider.key)),
+    captchaProviders: providers.filter((provider) => provider.type === 'captcha'
+      && ['yescaptcha', '2captcha'].includes(provider.key)),
+    emailProviders: providers.filter((provider) => provider.type === 'email'
+      && provider.key === 'hotmail_otp'),
     registrarErrors: {
       config: typeof section.registrar_error === 'string' ? section.registrar_error : '',
       defaults: typeof section.defaults_error === 'string' ? section.defaults_error : '',

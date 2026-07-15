@@ -122,6 +122,11 @@ func buildMailbox(key string, cfg map[string]interface{}, hc *http.Client) Mailb
 		}
 		return adapter
 	case "imap":
+		if strings.TrimSpace(asString(cfg["host"])) == "" ||
+			strings.TrimSpace(asString(cfg["email"])) == "" ||
+			strings.TrimSpace(asString(cfg["password"])) == "" {
+			return nil
+		}
 		return mailbox.NewIMAPProvider(cfg)
 	default:
 		return nil

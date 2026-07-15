@@ -1291,7 +1291,7 @@ func normalizeProviderInput(p providerInput) (providerInput, error) {
 		return p, fmt.Errorf("type and key are required")
 	}
 	switch p.Type {
-	case "sms", "mailbox", "captcha":
+	case "sms", "mailbox", "captcha", "email":
 	default:
 		return p, fmt.Errorf("unsupported provider type %q", p.Type)
 	}

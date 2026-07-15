@@ -306,7 +306,7 @@ func (p *Pipeline) registerViaEmail(ctx context.Context, req RegisterRequest) (*
 	if p.providerMgr == nil {
 		return nil, fmt.Errorf("no providers configured: add a mailbox provider on the Provider page first")
 	}
-	mbox, email, _, mailboxID, err := p.providerMgr.GetMailbox(ctx)
+	mbox, email, _, mailboxID, err := p.providerMgr.GetMailboxFromProvider(ctx, req.MailboxProvider)
 	if err != nil {
 		return nil, fmt.Errorf("getMailbox: %w", err)
 	}

@@ -252,10 +252,9 @@ interface RegistrationTemplateDefinition {
 }
 
 const REG_TEMPLATES: RegistrationTemplateDefinition[] = [
-  { id: 'email-only', name: '仅邮箱注册 (ChatGPT)', desc: '使用邮箱 OTP，无需住宅代理', platform: 'chatgpt', method: 'node', identity_mode: 'email', egress: 'egress_direct', mail_provider: '1secmail', needs: ['mailProvider', 'mailDomains'] },
+  { id: 'email-only', name: '仅邮箱注册 (ChatGPT)', desc: '使用邮箱 OTP，无需住宅代理', platform: 'chatgpt', method: 'node', identity_mode: 'email', egress: 'egress_direct', mail_provider: 'tempmail', needs: ['mailboxProvider'] },
   { id: 'phone-only', name: '仅手机注册 (ChatGPT + 住宅代理)', desc: 'hero-sms 手机号 + 住宅代理', platform: 'chatgpt', method: 'node', identity_mode: 'sms', sms_provider: 'herosms', needs: ['heroSmsApiKey', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword'] },
-  { id: 'full', name: '邮箱+手机完整注册 (ChatGPT)', desc: '邮箱优先，手机备选', platform: 'chatgpt', method: 'node', identity_mode: 'email', mail_provider: '1secmail', sms_provider: 'herosms', needs: ['heroSmsApiKey', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword', 'mailProvider', 'mailDomains'] },
-  { id: 'claude', name: 'Claude 注册', desc: 'Claude 账号注册（邮箱）', platform: 'claude', method: 'node', identity_mode: 'email', mail_provider: 'cloudflare', needs: ['mailProvider', 'mailDomains'] },
+  { id: 'full', name: '邮箱+手机完整注册 (ChatGPT)', desc: '邮箱优先，手机备选', platform: 'chatgpt', method: 'node', identity_mode: 'email', mail_provider: 'tempmail', sms_provider: 'herosms', needs: ['heroSmsApiKey', 'proxyHost', 'proxyPort', 'proxyUsername', 'proxyPassword', 'mailboxProvider'] },
 ];
 
 const EMPTY_AUTOMATION: AutomationSettings = { policies: {}, stats: null, readiness: null, automationErrors: {} };
@@ -283,7 +282,7 @@ const POLICY_TYPES: PolicyDefinition[] = [
     { field: 'interval', label: '检查间隔(秒)', type: 'number', w: 150 },
     { field: 'identity_mode', label: '身份模式', type: 'select', options: [{ label: '手机', value: 'sms' }, { label: '邮箱', value: 'email' }], w: 140 },
     { field: 'register_method', label: '注册引擎', type: 'select', options: [{ label: 'node', value: 'node' }, { label: 'protocol_v2', value: 'protocol_v2' }, { label: 'browser_v3', value: 'browser_v3' }], w: 160 },
-    { field: 'platform', label: '平台', type: 'select', options: [{ label: 'ChatGPT', value: 'chatgpt' }, { label: 'Claude', value: 'claude' }], w: 140 },
+    { field: 'platform', label: '平台', type: 'select', options: [{ label: 'ChatGPT', value: 'chatgpt' }], w: 140 },
     { field: 'group', label: '分组', type: 'group_select', ph: '默认' },
     { field: 'egress', label: '出口', type: 'egress_select', ph: 'egress_direct' },
   ]},
@@ -493,9 +492,22 @@ const KNOWN = ['phoneCountryCode', 'mailProvider', 'mailDomains', 'proxyHost', '
 const SMS_PROVIDER_CARDS = [
   { key: 'smsbower', name: 'SMSBower' },
   { key: 'herosms', name: 'HeroSMS' },
+  { key: 'smsactivate', name: 'SMS-Activate' },
+  { key: 'smspool', name: 'SMSPool' },
+];
+const MAILBOX_PROVIDER_CARDS = [
+  { key: 'tempmail', name: 'TempMail.lol（免配置）', description: '内置公共临时邮箱，无需 API Key；上游可能限制公共邮箱域名。' },
+  { key: 'cloudflare', name: 'Cloudflare / MoeMail', description: '推荐用于稳定批量注册，需要自建 Worker 地址和邮箱域名。' },
+  { key: 'imap', name: 'IMAP 固定邮箱', description: 'Gmail、Outlook 或自有域名邮箱；固定地址通常只适合单账号注册。' },
+];
+const CAPTCHA_PROVIDER_CARDS = [
+  { key: 'yescaptcha', name: 'YesCaptcha' },
+  { key: '2captcha', name: '2Captcha' },
 ];
 const REGISTRAR_META_KEYS = new Set(['defaults', 'registrar_error', 'defaults_error']);
-const EMPTY_REGISTRAR: RegistrarSettings = { cfg: {}, smsProviders: [], registrarErrors: {} };
+const EMPTY_REGISTRAR: RegistrarSettings = {
+  cfg: {}, smsProviders: [], mailboxProviders: [], captchaProviders: [], emailProviders: [], registrarErrors: {},
+};
 
 function registrarConfigOnly(section: SettingsValues | undefined): SettingsValues {
   const out: SettingsValues = {};
@@ -521,6 +533,9 @@ function RegistrarTab() {
 
   const cfg = registrar.cfg || {};
   const smsProviders = registrar.smsProviders || [];
+  const mailboxProviders = registrar.mailboxProviders || [];
+  const captchaProviders = registrar.captchaProviders || [];
+  const emailProviders = registrar.emailProviders || [];
   const registrarErrors = registrar.registrarErrors || {};
 
   const save = async (values: SettingsValues) => {
@@ -550,16 +565,47 @@ function RegistrarTab() {
         type: 'sms',
         key: card.key,
         display_name: card.name,
-        enabled: values[`${card.key}_enabled`] !== false,
+        enabled: values[`${card.key}_enabled`] === true,
         priority: Number(values[`${card.key}_priority`]) || 0,
         config: {
           api_key: values[`${card.key}_api_key`] || '',
           service: values[`${card.key}_service`] || 'dr',
+          max_price: values[`${card.key}_max_price`] || '',
         },
       }));
+      providers.push(...MAILBOX_PROVIDER_CARDS.map((card) => ({
+        type: 'mailbox',
+        key: card.key,
+        display_name: card.name,
+        enabled: values[`${card.key}_enabled`] === true,
+        priority: Number(values[`${card.key}_priority`]) || 0,
+        config: card.key === 'cloudflare' ? {
+          api_url: values.cloudflare_api_url || '',
+          admin_token: values.cloudflare_admin_token || '',
+          domain: values.cloudflare_domain || '',
+        } : card.key === 'imap' ? {
+          host: values.imap_host || '',
+          port: String(Number(values.imap_port) || 993),
+          email: values.imap_email || '',
+          password: values.imap_password || '',
+          use_tls: values.imap_tls !== false,
+        } : {},
+      })));
+      providers.push(...CAPTCHA_PROVIDER_CARDS.map((card) => ({
+        type: 'captcha', key: card.key, display_name: card.name,
+        enabled: values[`${card.key}_enabled`] === true,
+        priority: Number(values[`${card.key}_priority`]) || 0,
+        config: { api_key: values[`${card.key}_api_key`] || '' },
+      })));
+      providers.push({
+        type: 'email', key: 'hotmail_otp', display_name: 'Hotmail OTP',
+        enabled: values.hotmail_otp_enabled === true,
+        priority: Number(values.hotmail_otp_priority) || 0,
+        config: { base_email: values.hotmail_base_email || '', otp_url: values.hotmail_otp_url || '' },
+      });
       const r = await saveMutation.mutateAsync({ providers, values: out });
       setDiffs(r?.saved || [{ section: 'registrar', key: 'sms_providers', old_value: 'saved', new_value: 'saved' }]);
-      setPrevSnapshot({ oldSnap, oldProviders: smsProviders });
+      setPrevSnapshot({ oldSnap, oldProviders: [...smsProviders, ...mailboxProviders, ...captchaProviders, ...emailProviders] });
       Toast.success('注册器凭据已保存');
     } catch (e) { showErrorToast(e); }
   };
@@ -591,10 +637,39 @@ function RegistrarTab() {
   SMS_PROVIDER_CARDS.forEach((card, index) => {
     const row = smsProviders.find((p) => p.key === card.key);
     const providerConfig = row?.config || {};
-    known[`${card.key}_enabled`] = row?.enabled !== false;
+    known[`${card.key}_enabled`] = row ? row.enabled !== false : false;
     known[`${card.key}_priority`] = row?.priority ?? (card.key === 'smsbower' ? 100 : 90 - index);
     known[`${card.key}_api_key`] = providerConfig.api_key || '';
     known[`${card.key}_service`] = providerConfig.service || 'dr';
+    known[`${card.key}_max_price`] = providerConfig.max_price || '';
+  });
+  CAPTCHA_PROVIDER_CARDS.forEach((card, index) => {
+    const row = captchaProviders.find((p) => p.key === card.key);
+    known[`${card.key}_enabled`] = row ? row.enabled !== false : false;
+    known[`${card.key}_priority`] = row?.priority ?? (100 - index * 10);
+    known[`${card.key}_api_key`] = row?.config?.api_key || '';
+  });
+  const hotmailOTP = emailProviders.find((p) => p.key === 'hotmail_otp');
+  known.hotmail_otp_enabled = hotmailOTP ? hotmailOTP.enabled !== false : false;
+  known.hotmail_otp_priority = hotmailOTP?.priority ?? 100;
+  known.hotmail_base_email = hotmailOTP?.config?.base_email || '';
+  known.hotmail_otp_url = hotmailOTP?.config?.otp_url || '';
+  MAILBOX_PROVIDER_CARDS.forEach((card, index) => {
+    const row = mailboxProviders.find((p) => p.key === card.key);
+    const providerConfig = row?.config || {};
+    known[`${card.key}_enabled`] = row ? row.enabled !== false : false;
+    known[`${card.key}_priority`] = row?.priority ?? (100 - index * 10);
+    if (card.key === 'cloudflare') {
+      known.cloudflare_api_url = providerConfig.api_url || '';
+      known.cloudflare_admin_token = providerConfig.admin_token || providerConfig.api_key || '';
+      known.cloudflare_domain = providerConfig.domain || '';
+    } else if (card.key === 'imap') {
+      known.imap_host = providerConfig.host || '';
+      known.imap_port = providerConfig.port || 993;
+      known.imap_email = providerConfig.email || '';
+      known.imap_password = providerConfig.password || '';
+      known.imap_tls = providerConfig.use_tls !== false;
+    }
   });
   if (Array.isArray(known.mailDomains)) known.mailDomains = known.mailDomains.join(', ');
   const extra: SettingsValues = {};
@@ -615,7 +690,7 @@ function RegistrarTab() {
       settingsErrors={registrarErrors}
     >
       <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
-        description="配置自动注册所需的全部凭据。接码平台保存到 provider_settings；住宅代理区域需与手机号国家匹配。" />
+        description="邮箱和接码配置会直接保存到注册流水线实际使用的 provider_settings；住宅代理区域需与手机号国家匹配。" />
       <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" style={{ display: 'flex', flexWrap: 'wrap', gap: '0 24px' }}>
         <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
           {SMS_PROVIDER_CARDS.map((card) => (
@@ -624,12 +699,50 @@ function RegistrarTab() {
               <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
               <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} placeholder="接码平台密钥" />
               <Form.Input field={`${card.key}_service`} label="服务代码" style={{ width: 120 }} placeholder="dr" />
+              {card.key === 'smspool' && <Form.Input field={`${card.key}_max_price`} label="最高单价" style={{ width: 120 }} placeholder="0.20" />}
+            </Card>
+          ))}
+        </div>
+        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>验证码求解器</Typography.Title>
+        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
+          {CAPTCHA_PROVIDER_CARDS.map((card) => (
+            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+              <Form.Switch field={`${card.key}_enabled`} label="启用" />
+              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+              <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} />
+            </Card>
+          ))}
+        </div>
+        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>Hotmail OTP（protocol_v2 / browser_v3）</Typography.Title>
+        <Card title="Hotmail OTP Reader" className="pool-card" style={{ width: '100%' }} bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+          <Form.Switch field="hotmail_otp_enabled" label="启用" />
+          <Form.InputNumber field="hotmail_otp_priority" label="优先级" style={{ width: 120 }} min={0} max={1000} />
+          <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }} placeholder="account@outlook.com" />
+          <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }} placeholder="https://otp.example.com/read" />
+        </Card>
+        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>邮箱提供商</Typography.Title>
+        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
+          {MAILBOX_PROVIDER_CARDS.map((card) => (
+            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+              <Typography.Text type="tertiary" size="small" style={{ width: '100%', marginBottom: 8 }}>{card.description}</Typography.Text>
+              <Form.Switch field={`${card.key}_enabled`} label="启用" />
+              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+              {card.key === 'cloudflare' && <>
+                <Form.Input field="cloudflare_api_url" label="Worker API URL" style={{ width: 280 }} placeholder="https://mail.example.com" />
+                <Form.Input field="cloudflare_domain" label="邮箱域名" style={{ width: 220 }} placeholder="example.com" />
+                <Form.Input field="cloudflare_admin_token" label="Admin Token（可选）" mode="password" style={{ width: 260 }} />
+              </>}
+              {card.key === 'imap' && <>
+                <Form.Input field="imap_host" label="IMAP Host" style={{ width: 220 }} placeholder="imap.gmail.com" />
+                <Form.InputNumber field="imap_port" label="端口" style={{ width: 120 }} min={1} max={65535} />
+                <Form.Input field="imap_email" label="邮箱地址" style={{ width: 260 }} />
+                <Form.Input field="imap_password" label="密码 / App Password" mode="password" style={{ width: 260 }} />
+                <Form.Switch field="imap_tls" label="TLS" />
+              </>}
             </Card>
           ))}
         </div>
         <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
-        <Form.Input field="mailProvider" label="邮箱提供商" style={{ width: 180 }} placeholder="1secmail" />
-        <Form.Input field="mailDomains" label="邮箱域名(逗号分隔)" style={{ width: 360 }} placeholder="guerrillamail.com, sharklasers.com" />
         <Form.Input field="proxyHost" label="住宅代理 Host" style={{ width: 220 }} placeholder="us2.cliproxy.io" />
         <Form.Input field="proxyPort" label="代理端口" style={{ width: 120 }} placeholder="3010" />
         <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }} placeholder="...-region-BR-sid-xxxx-t-5" />

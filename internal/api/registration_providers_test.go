@@ -85,6 +85,25 @@ func TestRegisterProvidersBulkSavesProvidersAndDefaultsAtomically(t *testing.T) 
 	}
 }
 
+func TestRegisterProvidersAcceptsHotmailOTPEmailProvider(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, body := grpReq(t, h, http.MethodPost, "/admin/register/providers", `{
+		"providers": [{"type":"email","key":"hotmail_otp","display_name":"Hotmail OTP","enabled":true,
+			"config":{"base_email":"owner@outlook.com","otp_url":"https://otp.example/read"}}]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("hotmail OTP provider save status = %d: %s", code, body)
+	}
+	var count int
+	if err := h.store.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM provider_settings WHERE provider_type='email' AND provider_key='hotmail_otp' AND enabled=1`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("hotmail OTP provider count = %d, want 1", count)
+	}
+}
+
 func TestRegisterProvidersReportsDefaultsReadErrors(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	if _, err := h.store.DB().ExecContext(context.Background(), `DROP TABLE settings`); err != nil {

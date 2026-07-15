@@ -153,6 +153,10 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 	script := firstEnv("services/codex_register/protocol_register.py", "CODEX_REG_PROTOCOL_SCRIPT")
 	proxyURL := p.proxyURLFromEgress(ctx, req.EgressID)
 	emailProvider := firstEnv("hotmail_otp", "CODEX_REG_EMAIL_PROVIDER")
+	baseEmail, otpURL, emailErr := p.getEmailForRegistration(ctx)
+	if emailErr != nil {
+		return nil, fmt.Errorf("protocol_v2: email: %w", emailErr)
+	}
 
 	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
@@ -164,6 +168,8 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 		"REG_RETRIES=2",
 		"REG_PROXY="+proxyURL,
 		"EMAIL_PROVIDER="+emailProvider,
+		"HOTMAIL_BASE_EMAIL="+baseEmail,
+		"HOTMAIL_OTP_URL="+otpURL,
 	)
 	out, err := cmd.Output()
 	if err != nil && len(out) == 0 {

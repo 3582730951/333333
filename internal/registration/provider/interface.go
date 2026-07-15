@@ -138,6 +138,35 @@ func (m *Manager) GetMailbox(ctx context.Context) (MailboxProvider, string, stri
 	return nil, "", "", "", ErrNoProviderAvailable
 }
 
+// GetMailboxFromProvider honors the provider selected by the registration form or
+// lifecycle defaults. Empty/auto keeps priority-based fallback behavior.
+func (m *Manager) GetMailboxFromProvider(ctx context.Context, providerName string) (MailboxProvider, string, string, string, error) {
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	if providerName == "" || providerName == "auto" {
+		return m.GetMailbox(ctx)
+	}
+	var lastErr error
+	for _, p := range m.Mailbox {
+		name := strings.ToLower(strings.TrimSpace(p.Name()))
+		matches := name == providerName ||
+			(providerName == "tempmail" && name == "tempmail_lol") ||
+			(providerName == "tempmaillol" && name == "tempmail_lol")
+		if !matches {
+			continue
+		}
+		email, password, mailboxID, err := p.CreateEmail(ctx)
+		if err == nil {
+			return p, email, password, mailboxID, nil
+		}
+		lastErr = err
+		break
+	}
+	if lastErr != nil {
+		return nil, "", "", "", lastErr
+	}
+	return nil, "", "", "", ErrNoProviderAvailable
+}
+
 // SolveCaptcha tries all solvers until one succeeds
 func (m *Manager) SolveCaptcha(ctx context.Context, req CaptchaRequest) (string, error) {
 	for _, s := range m.Captcha {

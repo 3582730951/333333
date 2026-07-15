@@ -106,6 +106,9 @@ export interface ProviderSetting {
 export interface RegistrarSettings {
   cfg: SettingsValues;
   smsProviders: ProviderSetting[];
+  mailboxProviders: ProviderSetting[];
+  captchaProviders: ProviderSetting[];
+  emailProviders: ProviderSetting[];
   registrarErrors: Record<string, string>;
 }
 
