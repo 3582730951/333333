@@ -20,7 +20,7 @@ for (const endpoint of [
 ]) {
   assert(page.includes(endpoint), `page must call ${endpoint}`);
 }
-for (const term of ['上游错误规则', '新建规则', '测试匹配', '流式心跳空转', '隐藏安全检查等待提示', 'safety_buffering', 'response.completed', '全部模型', '手动 pattern']) {
+for (const term of ['上游错误规则', '新建规则', '测试匹配', '流式心跳空转', '隐藏安全检查等待提示', 'safety_buffering', 'response.in_progress', 'response.completed', '协议保活间隔', '全部模型', '手动 pattern']) {
   assert(page.includes(term), `page must render ${term}`);
 }
 for (const symbol of ['selectedProvider', 'selectedFamily', 'model_options', 'body_keywords', 'status_codes']) {

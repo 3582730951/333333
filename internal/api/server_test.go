@@ -1725,6 +1725,13 @@ func TestSSEDataPayloadReassemblesMultilineJSON(t *testing.T) {
 	}
 }
 
+func TestSSEDataPayloadConvertsSafetyBufferingHeartbeatForWebSocket(t *testing.T) {
+	payload := sseDataPayload([]byte(safetyBufferingHeartbeatFrame))
+	if payload != `{"type":"response.in_progress"}` {
+		t.Fatalf("heartbeat payload = %q", payload)
+	}
+}
+
 // uaCodexVersion extracts the version from a Codex User-Agent (codex_cli_rs/<ver> (..)).
 // The real client sends the same value in its User-Agent and `version` header; these
 // retry fixtures parse the UA to exercise the older-version branch independently.

@@ -323,6 +323,9 @@ func validateUpstreamErrorRule(rule *storage.UpstreamErrorRule) error {
 		rule.BodyKeywords = nil
 		rule.AccountAction = upstreamrules.AccountActionNone
 		rule.FilterAccountAction = false
+		if rule.IdlePingSeconds > 60 {
+			return errors.New("idle_ping_seconds must be between 1 and 60 for hide_safety_buffering")
+		}
 	}
 	if rule.ResponseStatus < 0 || rule.ResponseStatus > 599 {
 		return errors.New("response_status must be between 0 and 599")

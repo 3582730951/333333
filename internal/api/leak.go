@@ -7,11 +7,13 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
+	"codex-account-pool/internal/supervisor"
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
 )
@@ -174,7 +176,7 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 		rf = v
 	}
 	if rf != nil {
-		err = newRuleSSECopy(sw, body, rf, s.leakScrubEnabled(ctx), words, provider)
+		err = newRuleSSECopy(ctx, sw, body, rf, s.leakScrubEnabled(ctx), words, provider)
 	} else if !s.leakScrubEnabled(ctx) {
 		err = streamCopyRewrite(sw, body, words)
 	} else {
@@ -190,12 +192,33 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 	return err
 }
 
-func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilter, leak bool, words *streamrewrite.Matcher, provider string) error {
+func newRuleSSECopy(ctx context.Context, w http.ResponseWriter, body io.Reader, rf *responseRuleFilter, leak bool, words *streamrewrite.Matcher, provider string) error {
+	return newRuleSSECopyWithHeartbeat(ctx, w, body, rf, leak, words, provider, responseRuleHeartbeatInterval(rf))
+}
+
+const safetyBufferingHeartbeatFrame = "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n"
+
+func responseRuleHeartbeatInterval(rf *responseRuleFilter) time.Duration {
+	if rf == nil || rf.Mode != upstreamrules.DownstreamActionHideSafetyBuffering {
+		return 0
+	}
+	seconds := int64(15)
+	if rf.Rule != nil && rf.Rule.IdlePingSeconds > 0 {
+		seconds = rf.Rule.IdlePingSeconds
+	}
+	// Stay well below Codex's default five-minute stream idle timeout even if an
+	// older rule contains an unexpectedly large heartbeat value.
+	if seconds > 60 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, body io.Reader, rf *responseRuleFilter, leak bool, words *streamrewrite.Matcher, provider string, heartbeatInterval time.Duration) error {
 	// Apply the selected rule to each complete SSE event. In particular, never
 	// discard a group of pending events together: Codex requires the terminal
 	// response.completed event even when an earlier event is intercepted.
 	buf := make([]byte, 0, 32768)
-	tmp := make([]byte, 32768)
 	flusher, _ := w.(http.Flusher)
 	emit := func(p []byte) error {
 		if len(p) == 0 {
@@ -221,10 +244,57 @@ func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilte
 		}
 		return emit(out)
 	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	reads := make(chan readResult, 1)
+	readDone := make(chan struct{})
+	defer close(readDone)
+	go func() {
+		defer supervisor.Recover("upstream-rule-sse-reader")
+		tmp := make([]byte, 32768)
+		defer close(reads)
+		for {
+			n, err := body.Read(tmp)
+			result := readResult{err: err}
+			if n > 0 {
+				result.data = append([]byte(nil), tmp[:n]...)
+			}
+			select {
+			case reads <- result:
+			case <-readDone:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	var heartbeat <-chan time.Time
+	var heartbeatTicker *time.Ticker
+	if heartbeatInterval > 0 {
+		heartbeatTicker = time.NewTicker(heartbeatInterval)
+		heartbeat = heartbeatTicker.C
+		defer heartbeatTicker.Stop()
+	}
+
 	for {
-		n, err := body.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case result, ok := <-reads:
+			if !ok {
+				if len(buf) > 0 {
+					return emitFrame(buf)
+				}
+				return nil
+			}
+			if len(result.data) > 0 {
+				buf = append(buf, result.data...)
+			}
 			for {
 				idx := bytes.Index(buf, []byte("\n\n"))
 				if idx < 0 {
@@ -236,15 +306,19 @@ func newRuleSSECopy(w http.ResponseWriter, body io.Reader, rf *responseRuleFilte
 					return e
 				}
 			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				if len(buf) > 0 {
-					return emitFrame(buf)
+			if result.err != nil {
+				if result.err == io.EOF {
+					if len(buf) > 0 {
+						return emitFrame(buf)
+					}
+					return nil
 				}
-				return nil
+				return result.err
 			}
-			return err
+		case <-heartbeat:
+			if err := emitFrame([]byte(safetyBufferingHeartbeatFrame)); err != nil {
+				return err
+			}
 		}
 	}
 }

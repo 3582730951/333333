@@ -1,9 +1,12 @@
 package api
 
 import (
+	"context"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 )
@@ -83,7 +86,7 @@ func TestRuleSSECopyHidesSafetyBufferingWithoutBreakingLifecycle(t *testing.T) {
 		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n"
 	rec := httptest.NewRecorder()
 	rf := &responseRuleFilter{Mode: upstreamrules.DownstreamActionHideSafetyBuffering}
-	if err := newRuleSSECopy(rec, strings.NewReader(stream), rf, false, nil, "codex"); err != nil {
+	if err := newRuleSSECopy(context.Background(), rec, strings.NewReader(stream), rf, false, nil, "codex"); err != nil {
 		t.Fatal(err)
 	}
 	got := rec.Body.String()
@@ -103,7 +106,7 @@ func TestRuleSSECopyInterceptKeepsResponseCompleted(t *testing.T) {
 		`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}` + "\n\n"
 	rec := httptest.NewRecorder()
 	rf := &responseRuleFilter{Mode: upstreamrules.DownstreamActionIntercept, Keywords: []string{"blocked notice"}, CaseSensitive: true}
-	if err := newRuleSSECopy(rec, strings.NewReader(stream), rf, false, nil, "codex"); err != nil {
+	if err := newRuleSSECopy(context.Background(), rec, strings.NewReader(stream), rf, false, nil, "codex"); err != nil {
 		t.Fatal(err)
 	}
 	got := rec.Body.String()
@@ -112,5 +115,39 @@ func TestRuleSSECopyInterceptKeepsResponseCompleted(t *testing.T) {
 	}
 	if !strings.Contains(got, "response.created") || !strings.Contains(got, "response.completed") {
 		t.Fatalf("protocol lifecycle was interrupted: %s", got)
+	}
+}
+
+func TestRuleSSECopyKeepsSafetyBufferedStreamAlive(t *testing.T) {
+	reader, writer := io.Pipe()
+	rec := httptest.NewRecorder()
+	rf := &responseRuleFilter{Mode: upstreamrules.DownstreamActionHideSafetyBuffering}
+	done := make(chan error, 1)
+	go func() {
+		done <- newRuleSSECopyWithHeartbeat(context.Background(), rec, reader, rf, false, nil, "codex", 10*time.Millisecond)
+	}()
+	go func() {
+		_, _ = writer.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_wait"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n"))
+		time.Sleep(45 * time.Millisecond)
+		_, _ = writer.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_wait","status":"completed"}}` + "\n\n"))
+		_ = writer.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat relay did not finish")
+	}
+	got := rec.Body.String()
+	if strings.Contains(got, "safety_buffering") {
+		t.Fatalf("safety_buffering leaked downstream: %s", got)
+	}
+	if !strings.Contains(got, "response.in_progress") {
+		t.Fatalf("idle heartbeat missing: %s", got)
+	}
+	if !strings.Contains(got, "response.completed") {
+		t.Fatalf("terminal event missing after heartbeat: %s", got)
 	}
 }
