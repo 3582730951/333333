@@ -35,6 +35,7 @@ type Metrics struct {
 	Supported bool  `json:"supported"`
 	Timestamp int64 `json:"timestamp"`
 	CPU       struct {
+		Scope    string  `json:"scope"` // cgroup | host
 		Cores    int     `json:"cores"`
 		Load1    float64 `json:"load1"`
 		Load5    float64 `json:"load5"`
@@ -42,6 +43,7 @@ type Metrics struct {
 		UsagePct float64 `json:"usage_pct"` // sampled busy% across all cores
 	} `json:"cpu"`
 	Mem struct {
+		Scope       string  `json:"scope"` // cgroup | host
 		TotalKB     int64   `json:"total_kb"`
 		AvailableKB int64   `json:"available_kb"`
 		UsedKB      int64   `json:"used_kb"`
@@ -54,6 +56,15 @@ type Metrics struct {
 		UsedBytes  uint64  `json:"used_bytes"`
 		UsedPct    float64 `json:"used_pct"`
 	} `json:"disk"`
+	Network struct {
+		Interfaces       int      `json:"interfaces"`
+		InterfaceNames   []string `json:"interface_names"`
+		RXBytes          uint64   `json:"rx_bytes"`
+		TXBytes          uint64   `json:"tx_bytes"`
+		RXBytesPerSec    float64  `json:"rx_bytes_per_sec"`
+		TXBytesPerSec    float64  `json:"tx_bytes_per_sec"`
+		TotalBytesPerSec float64  `json:"total_bytes_per_sec"`
+	} `json:"network"`
 	UptimeSeconds int64 `json:"uptime_seconds"`
 	Go            struct {
 		AllocBytes uint64 `json:"alloc_bytes"`
@@ -105,11 +116,74 @@ func collectNow(dataDir string) Metrics {
 	readLoadAvg(&m)
 	m.CPU.UsagePct = sampleCPUUsage()
 	readMemInfo(&m)
+	applyCgroupLimits(&m)
 	readDisk(&m, dataDir)
+	readNetwork(&m)
 	m.UptimeSeconds = readUptime()
 	readGoRuntime(&m)
 	readRegistrationProcs(&m)
 	return m
+}
+
+var networkSample struct {
+	sync.Mutex
+	rx, tx uint64
+	at     time.Time
+}
+
+// readNetwork aggregates all non-loopback interfaces. Rates use the same shared
+// one-second sampler as the rest of the system page, so polling the admin endpoint
+// never performs a blocking measurement or creates extra sampling work.
+func readNetwork(m *Metrics) {
+	raw, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return
+	}
+	var rx, tx uint64
+	names := make([]string, 0, 4)
+	for _, line := range strings.Split(string(raw), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		if name == "" || name == "lo" {
+			continue
+		}
+		fields := strings.Fields(parts[1])
+		if len(fields) < 16 {
+			continue
+		}
+		rxValue, rxErr := strconv.ParseUint(fields[0], 10, 64)
+		txValue, txErr := strconv.ParseUint(fields[8], 10, 64)
+		if rxErr != nil || txErr != nil {
+			continue
+		}
+		names = append(names, name)
+		rx += rxValue
+		tx += txValue
+	}
+	sort.Strings(names)
+	m.Network.Interfaces = len(names)
+	m.Network.InterfaceNames = names
+	m.Network.RXBytes = rx
+	m.Network.TXBytes = tx
+
+	now := time.Now()
+	networkSample.Lock()
+	previousRX, previousTX, previousAt := networkSample.rx, networkSample.tx, networkSample.at
+	networkSample.rx, networkSample.tx, networkSample.at = rx, tx, now
+	networkSample.Unlock()
+	if previousAt.IsZero() || rx < previousRX || tx < previousTX {
+		return
+	}
+	seconds := now.Sub(previousAt).Seconds()
+	if seconds <= 0 {
+		return
+	}
+	m.Network.RXBytesPerSec = float64(rx-previousRX) / seconds
+	m.Network.TXBytesPerSec = float64(tx-previousTX) / seconds
+	m.Network.TotalBytesPerSec = m.Network.RXBytesPerSec + m.Network.TXBytesPerSec
 }
 
 func readLoadAvg(m *Metrics) {
@@ -141,7 +215,7 @@ func sampleCPUUsage() float64 {
 	cpuSample.idle, cpuSample.total = idle2, total2
 	cpuSample.Unlock()
 	if total1 == 0 || total2 <= total1 {
-		return -1
+		return 0
 	}
 	dTotal := float64(total2 - total1)
 	dIdle := float64(idle2 - idle1)
@@ -182,6 +256,7 @@ func readCPUStat() (idle, total uint64, ok bool) {
 }
 
 func readMemInfo(m *Metrics) {
+	m.Mem.Scope = "host"
 	f, err := os.Open("/proc/meminfo")
 	if err != nil {
 		return
@@ -204,6 +279,110 @@ func readMemInfo(m *Metrics) {
 		m.Mem.UsedKB = total - avail
 		m.Mem.UsedPct = roundPct(float64(total-avail) / float64(total) * 100)
 	}
+}
+
+var cgroupCPUSample struct {
+	sync.Mutex
+	usage int64
+	at    time.Time
+}
+
+// applyCgroupLimits makes the primary system figures describe the resources that the
+// service can actually consume. /proc reports the host on many container runtimes,
+// which previously made the UI show (for example) 64 GiB and 32 cores for a 2 GiB / 2
+// core service. Unlimited cgroups deliberately retain the host figures.
+func applyCgroupLimits(m *Metrics) {
+	m.CPU.Scope = "host"
+	maxRaw, maxErr := os.ReadFile("/sys/fs/cgroup/memory.max")
+	currentRaw, currentErr := os.ReadFile("/sys/fs/cgroup/memory.current")
+	if maxErr == nil && currentErr == nil && strings.TrimSpace(string(maxRaw)) != "max" {
+		limit, lerr := strconv.ParseInt(strings.TrimSpace(string(maxRaw)), 10, 64)
+		used, uerr := strconv.ParseInt(strings.TrimSpace(string(currentRaw)), 10, 64)
+		if lerr == nil && uerr == nil && limit > 0 {
+			if used < 0 {
+				used = 0
+			}
+			if used > limit {
+				used = limit
+			}
+			m.Mem.Scope = "cgroup"
+			m.Mem.TotalKB = limit / 1024
+			m.Mem.UsedKB = used / 1024
+			m.Mem.AvailableKB = (limit - used) / 1024
+			m.Mem.UsedPct = roundPct(100 * float64(used) / float64(limit))
+		}
+	}
+
+	cpuMax, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return
+	}
+	fields := strings.Fields(string(cpuMax))
+	if len(fields) != 2 || fields[0] == "max" {
+		return
+	}
+	quota, qerr := strconv.ParseFloat(fields[0], 64)
+	period, perr := strconv.ParseFloat(fields[1], 64)
+	if qerr != nil || perr != nil || quota <= 0 || period <= 0 {
+		return
+	}
+	cores := quota / period
+	m.CPU.Scope = "cgroup"
+	m.CPU.Cores = max(1, int(cores+0.999999))
+	if usage, ok := readCgroupCPUUsage(); ok {
+		m.CPU.UsagePct = usage
+	}
+}
+
+func readCgroupCPUUsage() (float64, bool) {
+	raw, err := os.ReadFile("/sys/fs/cgroup/cpu.stat")
+	if err != nil {
+		return 0, false
+	}
+	var usage int64
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "usage_usec" {
+			usage, err = strconv.ParseInt(fields[1], 10, 64)
+			break
+		}
+	}
+	if err != nil || usage <= 0 {
+		return 0, false
+	}
+	now := time.Now()
+	cgroupCPUSample.Lock()
+	previous, previousAt := cgroupCPUSample.usage, cgroupCPUSample.at
+	cgroupCPUSample.usage, cgroupCPUSample.at = usage, now
+	cgroupCPUSample.Unlock()
+	if previous <= 0 || previousAt.IsZero() || usage < previous {
+		return 0, true
+	}
+	elapsed := now.Sub(previousAt).Microseconds()
+	if elapsed <= 0 {
+		return 0, true
+	}
+	// usage delta divided by wall time is effective CPU utilisation. It may exceed
+	// 100% with several cores, so normalise by the cgroup quota read by the caller.
+	cpuMax, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(cpuMax))
+	quota, _ := strconv.ParseFloat(fields[0], 64)
+	period, _ := strconv.ParseFloat(fields[1], 64)
+	capacity := float64(elapsed) * quota / period
+	if capacity <= 0 {
+		return 0, false
+	}
+	value := 100 * float64(usage-previous) / capacity
+	if value < 0 {
+		value = 0
+	}
+	if value > 100 {
+		value = 100
+	}
+	return roundPct(value), true
 }
 
 func parseMemKB(line string) int64 {

@@ -1,1 +1,0 @@
-import{N as e,W as t}from"./index-C6v-zU-m.js";function n(n){return t(e,n)}export{n as t};

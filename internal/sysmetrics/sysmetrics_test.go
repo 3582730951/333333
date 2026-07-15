@@ -12,14 +12,26 @@ func TestCollect(t *testing.T) {
 	if m.CPU.Cores <= 0 {
 		t.Errorf("cores = %d, want > 0", m.CPU.Cores)
 	}
+	if m.CPU.Scope != "host" && m.CPU.Scope != "cgroup" {
+		t.Errorf("cpu scope = %q, want host or cgroup", m.CPU.Scope)
+	}
+	if m.CPU.UsagePct < 0 || m.CPU.UsagePct > 100 {
+		t.Errorf("cpu usage%% = %v, want 0..100", m.CPU.UsagePct)
+	}
 	if m.Mem.TotalKB <= 0 {
 		t.Errorf("mem total = %d kB, want > 0", m.Mem.TotalKB)
 	}
 	if m.Mem.UsedPct < 0 || m.Mem.UsedPct > 100 {
 		t.Errorf("mem used%% = %v, want 0..100", m.Mem.UsedPct)
 	}
+	if m.Mem.Scope != "host" && m.Mem.Scope != "cgroup" {
+		t.Errorf("memory scope = %q, want host or cgroup", m.Mem.Scope)
+	}
 	if m.Disk.TotalBytes == 0 {
 		t.Errorf("disk total = 0, want > 0 for /")
+	}
+	if m.Network.RXBytesPerSec < 0 || m.Network.TXBytesPerSec < 0 || m.Network.TotalBytesPerSec < 0 {
+		t.Errorf("network rates must be non-negative: %+v", m.Network)
 	}
 	if m.Go.Goroutines <= 0 {
 		t.Errorf("goroutines = %d, want > 0", m.Go.Goroutines)

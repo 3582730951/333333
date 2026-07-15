@@ -53,6 +53,15 @@ export const systemMetricsSchema = z.object({
     free_bytes: z.coerce.number().optional(),
     path: z.string().optional(),
   }).passthrough().optional(),
+  network: z.object({
+    interfaces: z.coerce.number().optional(),
+    interface_names: z.array(z.string()).optional(),
+    rx_bytes: z.coerce.number().optional(),
+    tx_bytes: z.coerce.number().optional(),
+    rx_bytes_per_sec: z.coerce.number().optional(),
+    tx_bytes_per_sec: z.coerce.number().optional(),
+    total_bytes_per_sec: z.coerce.number().optional(),
+  }).passthrough().optional(),
   registration: z.object({
     total_rss_kb: z.coerce.number().optional(),
     node: z.coerce.number().optional(),
