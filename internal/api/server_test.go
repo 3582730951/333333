@@ -226,6 +226,7 @@ func TestGatewayResponsesRawStreamingAndHeaders(t *testing.T) {
 	if reqs[0].AccountID != "upstream-a" || reqs[0].Auth != "Bearer access-a" {
 		t.Fatalf("missing auth headers: %+v", reqs[0])
 	}
+	h.app.WaitForAsyncWrites()
 	var holdStatus string
 	if err := h.store.DB().QueryRow(`SELECT status FROM billing_holds LIMIT 1`).Scan(&holdStatus); err != nil {
 		t.Fatalf("billing hold missing: %v", err)
@@ -488,6 +489,12 @@ func equalJSONIgnoringCodexTransportMetadata(t *testing.T, want, got string) boo
 	delete(gm, "prompt_cache_key")
 	delete(wm, "client_metadata")
 	delete(gm, "client_metadata")
+	// Native Responses requests are augmented so a later account can replay the
+	// complete reasoning context. Treat that mandatory transport field like the
+	// other relay metadata while still comparing every input/tool item.
+	if _, expected := wm["include"]; !expected && gm["include"] != nil {
+		wm["include"] = []interface{}{"reasoning.encrypted_content"}
+	}
 	return reflect.DeepEqual(wm, gm)
 }
 
@@ -2223,7 +2230,7 @@ func TestSeamlessFailoverOnLimitSwitchesAccountTransparently(t *testing.T) {
 	}
 }
 
-func TestStatefulTurnDoesNotRebuildOrFailover(t *testing.T) {
+func TestStatefulTurnRebuildsOnAccountFailure(t *testing.T) {
 	var aCalls int
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2276,11 +2283,11 @@ func TestStatefulTurnDoesNotRebuildOrFailover(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("stateful turn should preserve upstream state and surface account A error status, got %d %s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-MiCliProxy-Context-Status") != "rebuilt" {
+		t.Fatalf("stateful turn should rebuild on account B, got %d header=%q %s", resp.StatusCode, resp.Header.Get("X-MiCliProxy-Context-Status"), body)
 	}
-	if bCalled {
-		t.Fatalf("stateful turn with previous_response_id must not be rebuilt or retried on account B")
+	if !bCalled {
+		t.Fatalf("stateful turn was not retried on account B")
 	}
 	reqs := h.requests()
 	var secondA capturedRequest
@@ -2655,7 +2662,7 @@ func TestCodexStreamingContentThenFailedRetriesWithoutLeakingPartial(t *testing.
 	}
 }
 
-func TestCodexStreamingStatefulTurnDoesNotUseRemovedLedger(t *testing.T) {
+func TestCodexStreamingStatefulTurnRebuildsFromJournal(t *testing.T) {
 	var aCalls int
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2711,11 +2718,14 @@ func TestCodexStreamingStatefulTurnDoesNotUseRemovedLedger(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("stream-derived stateful turn should surface account A error status without ledger replay, status=%d body=%s", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream-derived stateful turn should rebuild on account B, status=%d body=%s", resp.StatusCode, body)
 	}
-	if bCalled {
-		t.Fatalf("stream-derived stateful turn must not be rebuilt or retried on account B")
+	if !bCalled || !strings.Contains(string(body), "resp_b_stream_rebuild") {
+		t.Fatalf("stream-derived stateful turn was not rebuilt on account B: called=%v body=%s", bCalled, body)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "rebuilt" {
+		t.Fatalf("context status header=%q, want rebuilt", got)
 	}
 	var secondA capturedRequest
 	for _, req := range h.requests() {
@@ -3990,7 +4000,7 @@ func TestResponsesPreviousResponseBindingPersistsWithoutPromptKey(t *testing.T) 
 	}
 	missingBody, _ := io.ReadAll(missing.Body)
 	missing.Body.Close()
-	if missing.StatusCode != http.StatusConflict || len(auths) != callsBeforeMissing || !bytes.Contains(missingBody, []byte(`"code":"state_binding_missing"`)) {
+	if missing.StatusCode != http.StatusOK || len(auths) != callsBeforeMissing+1 || missing.Header.Get("X-MiCliProxy-Context-Status") != "degraded" {
 		t.Fatalf("missing state binding status=%d calls=%d body=%s", missing.StatusCode, len(auths), missingBody)
 	}
 }

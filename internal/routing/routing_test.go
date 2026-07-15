@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -279,6 +280,27 @@ func TestSmallRequestsKeepConversationAnchorAffinity(t *testing.T) {
 	}
 	if k1.Hash == k2.Hash {
 		t.Fatal("small independent requests should keep conversation-anchor separation")
+	}
+}
+
+func TestClaudeItemAffinitySurvivesTruncatedFirstTurn(t *testing.T) {
+	body := []byte(`{"model":"claude-x","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_123","name":"read"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_123","content":"ok"}]}]}`)
+	keys := ClaudeItemAffinityKeys(body)
+	if len(keys) == 0 || keys[0].Source != "claude_item_id" {
+		t.Fatalf("keys=%+v", keys)
+	}
+	req, _ := http.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	got := ExtractClaudeAffinityKey(req, body)
+	if got.Hash != keys[0].Hash {
+		t.Fatalf("affinity=%+v want=%+v", got, keys[0])
+	}
+}
+
+func TestClaudeItemAffinityParsesStreamingMessageStart(t *testing.T) {
+	stream := []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}\n\n")
+	keys := ClaudeItemAffinityKeys(stream)
+	if len(keys) == 0 || keys[0].Key != "claude_item_id:msg_123" {
+		t.Fatalf("keys=%+v", keys)
 	}
 }
 

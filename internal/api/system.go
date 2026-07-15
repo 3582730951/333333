@@ -1,12 +1,20 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/sysmetrics"
 )
+
+var sidecarMetricsClient = &http.Client{Timeout: 500 * time.Millisecond}
 
 // adminSystem reports host + process resource metrics (CPU/memory/disk/uptime, the Go
 // runtime, and the registration tasks' node/Chrome/Xvfb memory) so an admin can see the
@@ -23,12 +31,41 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 	dataDir := filepath.Dir(s.cfg.DatabasePath)
 	payload := struct {
 		sysmetrics.Metrics
+		Admission         interface{}              `json:"admission"`
+		ContextRebuilt    uint64                   `json:"context_rebuilt"`
+		ContextDegraded   uint64                   `json:"context_degraded"`
+		Sidecar           interface{}              `json:"sidecar,omitempty"`
 		SupervisorEvents  []supervisor.Event       `json:"supervisor_events"`
 		SupervisorModules []supervisor.ModuleState `json:"supervisor_modules"`
 	}{
-		Metrics:           sysmetrics.Collect(dataDir),
+		Metrics:        sysmetrics.Collect(dataDir),
+		Admission:      s.scheduler.AdmissionSnapshot(),
+		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
+		Sidecar:           s.sidecarMetrics(r.Context()),
 		SupervisorEvents:  supervisor.RecentEvents(),
 		SupervisorModules: supervisor.ModuleStates(),
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) sidecarMetrics(parent context.Context) interface{} {
+	if s.upstream == nil || strings.TrimSpace(s.upstream.SidecarEndpoint()) == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(parent, 500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(s.upstream.SidecarEndpoint(), "/")+"/metrics", nil)
+	if err != nil {
+		return map[string]interface{}{"ok": false, "error": err.Error()}
+	}
+	resp, err := sidecarMetricsClient.Do(req)
+	if err != nil {
+		return map[string]interface{}{"ok": false, "error": err.Error()}
+	}
+	defer resp.Body.Close()
+	var out map[string]interface{}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&out); err != nil {
+		return map[string]interface{}{"ok": false, "error": err.Error()}
+	}
+	return out
 }

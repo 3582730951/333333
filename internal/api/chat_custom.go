@@ -125,14 +125,14 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	body = scrub.Body
 	scrubber := scrub.Scrubber
 	osHint := s.osHint(body, lease.Egress)
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	// Backstop for THIS attempt's failure paths (several rule branches below return
 	// without settling). On success the hold is handed to the caller via cc.holdID, which
 	// settles it after streaming — so disarm the backstop before that hand-off.
 	handedOff := false
 	defer func() {
 		if !handedOff {
-			_ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned")
+			_ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned")
 		}
 	}()
 	resp, err := s.upstream.Do(r.Context(), upstream.Request{
@@ -149,7 +149,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		OSHint:         osHint,
 	})
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		lease.Release()
 		writeError(w, http.StatusBadGateway, err)
 		return customCall{}, false
@@ -178,7 +178,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		} else {
 			s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
 		if ruleMatched {
 			switch decision.Match.DownstreamAction {
 			case upstreamrules.DownstreamActionFailover:
@@ -250,12 +250,12 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
-	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(cc.resp.StatusCode)
 	_, _ = w.Write(cc.scrubber.ReplaceAll(body))
@@ -299,12 +299,12 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
-	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
 	out, cerr := prompt.ChatCompletionToResponsesResponse(cc.scrubber.ReplaceAll(body), model)
 	if cerr != nil {
 		writeError(w, http.StatusBadGateway, cerr)
@@ -338,17 +338,17 @@ func (s *Server) handleNativeResponsesViaCustom(w http.ResponseWriter, r *http.R
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled_streaming")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "settled_streaming")
 		return
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
-	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(cc.resp.StatusCode)
 	_, _ = w.Write(cc.scrubber.ReplaceAll(body))
@@ -380,17 +380,17 @@ func (s *Server) handleChatViaNativeResponsesCustom(w http.ResponseWriter, r *ht
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled_streaming")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "settled_streaming")
 		return
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
-	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
 	out, cerr := prompt.ResponsesToChatCompletion(cc.scrubber.ReplaceAll(body), cc.resp.Header.Get("x-request-id"), model)
 	if cerr != nil {
 		writeError(w, http.StatusBadGateway, cerr)
@@ -435,12 +435,12 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 	}
 	body, err := s.readUpstreamResponseBody(cc.resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
-	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
 	out, cerr := prompt.ChatCompletionToAnthropicResponse(cc.scrubber.ReplaceAll(body), model)
 	if cerr != nil {
 		writeError(w, http.StatusBadGateway, cerr)
@@ -457,7 +457,7 @@ func (s *Server) settleStreamUsage(r *http.Request, cc customCall, uscan *usage.
 	if parsed, ok := uscan.Parsed(); ok {
 		s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
 	}
-	_ = s.store.SettleBillingHold(r.Context(), cc.holdID, "settled_streaming")
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled_streaming")
 }
 
 // withStreamUsage sets stream_options.include_usage=true on a streaming Chat

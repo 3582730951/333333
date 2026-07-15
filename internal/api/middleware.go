@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -13,10 +14,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/admission"
 	"codex-account-pool/internal/supervisor"
 )
 
@@ -120,11 +123,62 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w, r)
 
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+	if s.scheduler != nil {
+		reserveBytes := int64(256 << 10)
+		if r.ContentLength > 0 {
+			reserveBytes += 5 * r.ContentLength
+		}
+		release, reserveErr := s.scheduler.Reserve(r.Context(), reserveBytes)
+		if reserveErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(reserveErr, admission.ErrCapacity) {
+				status = http.StatusTooManyRequests
+				rec.Header().Set("Retry-After", "1")
+			}
+			writeError(rec, status, reserveErr)
+			return
+		}
+		defer release()
+	}
 	if r.Body != nil && s.cfg.MaxBodyBytes > 0 {
 		// Enforce one process-wide request budget before route-specific decoders add
 		// their usually smaller limits. This also covers multipart/resource handlers
 		// that do not call readLimited directly.
 		r.Body = http.MaxBytesReader(rec, r.Body, s.cfg.MaxBodyBytes)
+	}
+	if r.Body != nil && r.ContentLength < 0 && s.scheduler != nil {
+		body, cleanup, err := spoolUnknownBody(r.Context(), r.Body, s.scheduler.Reserve)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, admission.ErrCapacity) {
+				status = http.StatusTooManyRequests
+				rec.Header().Set("Retry-After", "1")
+			}
+			writeError(rec, status, err)
+			return
+		}
+		defer cleanup()
+		r.Body = body
+	}
+	if r.Body != nil && r.ContentLength > (1<<20) {
+		tmp, err := os.CreateTemp("", "micliproxy-body-*")
+		if err != nil {
+			writeError(rec, http.StatusServiceUnavailable, err)
+			return
+		}
+		defer os.Remove(tmp.Name())
+		if _, err = io.Copy(tmp, r.Body); err != nil {
+			tmp.Close()
+			writeError(rec, http.StatusBadRequest, err)
+			return
+		}
+		if _, err = tmp.Seek(0, io.SeekStart); err != nil {
+			tmp.Close()
+			writeError(rec, http.StatusInternalServerError, err)
+			return
+		}
+		r.Body = tmp
+		defer tmp.Close()
 	}
 	ctx := contextWithRequestID(r.Context(), requestID)
 	ctx = contextWithRuntimeSettingsCache(ctx)
@@ -152,6 +206,75 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	s.mux.ServeHTTP(rec, r)
+}
+
+// spoolUnknownBody grows the admission reservation as a chunked request is read.
+// The first MiB stays in memory; larger bodies spill to disk before routing begins,
+// allowing a clean 429 if the next chunk would consume the protected headroom.
+func spoolUnknownBody(ctx context.Context, src io.ReadCloser, reserve func(context.Context, int64) (func(), error)) (io.ReadCloser, func(), error) {
+	defer src.Close()
+	const memoryLimit = 1 << 20
+	var memory bytes.Buffer
+	var file *os.File
+	releases := make([]func(), 0, 8)
+	cleanup := func() {
+		for _, release := range releases {
+			release()
+		}
+		if file != nil {
+			name := file.Name()
+			_ = file.Close()
+			_ = os.Remove(name)
+		}
+	}
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			release, reserveErr := reserve(ctx, 5*int64(n))
+			if reserveErr != nil {
+				cleanup()
+				return nil, func() {}, reserveErr
+			}
+			releases = append(releases, release)
+			if file == nil && memory.Len()+n > memoryLimit {
+				file, reserveErr = os.CreateTemp("", "micliproxy-body-*")
+				if reserveErr != nil {
+					cleanup()
+					return nil, func() {}, reserveErr
+				}
+				if _, reserveErr = file.Write(memory.Bytes()); reserveErr != nil {
+					cleanup()
+					return nil, func() {}, reserveErr
+				}
+				memory.Reset()
+			}
+			if file != nil {
+				_, err = file.Write(buf[:n])
+			} else {
+				_, err = memory.Write(buf[:n])
+			}
+			if err != nil {
+				cleanup()
+				return nil, func() {}, err
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+	}
+	if file != nil {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			return nil, func() {}, err
+		}
+		return file, cleanup, nil
+	}
+	return io.NopCloser(bytes.NewReader(memory.Bytes())), cleanup, nil
 }
 
 func setSecurityHeaders(w http.ResponseWriter, r *http.Request) {

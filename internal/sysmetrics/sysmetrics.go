@@ -14,8 +14,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"codex-account-pool/internal/supervisor"
 )
 
 // ProcInfo is one registration-related process and its resident memory.
@@ -69,7 +73,27 @@ type Metrics struct {
 
 // Collect gathers a single snapshot. dataDir is the path whose filesystem usage is
 // reported (the pool's data dir); falls back to "/" when empty.
+var sharedSnapshot atomic.Value
+var samplerOnce sync.Once
+
 func Collect(dataDir string) Metrics {
+	samplerOnce.Do(func() {
+		sharedSnapshot.Store(collectNow(dataDir))
+		supervisor.GoOnce("system-metrics-sampler", func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				sharedSnapshot.Store(collectNow(dataDir))
+			}
+		})
+	})
+	if value := sharedSnapshot.Load(); value != nil {
+		return value.(Metrics)
+	}
+	return collectNow(dataDir)
+}
+
+func collectNow(dataDir string) Metrics {
 	var m Metrics
 	m.Timestamp = time.Now().Unix()
 	if _, err := os.Stat("/proc"); err != nil {
@@ -101,16 +125,22 @@ func readLoadAvg(m *Metrics) {
 	}
 }
 
-// sampleCPUUsage reads the aggregate /proc/stat cpu line twice ~120ms apart and returns
-// the busy percentage (100 - idle%). Returns -1 if it cannot be sampled.
+var cpuSample struct {
+	sync.Mutex
+	idle, total uint64
+}
+
+// sampleCPUUsage uses the previous shared sample and never sleeps in an HTTP handler.
 func sampleCPUUsage() float64 {
-	idle1, total1, ok1 := readCPUStat()
-	if !ok1 {
+	idle2, total2, ok := readCPUStat()
+	if !ok {
 		return -1
 	}
-	time.Sleep(120 * time.Millisecond)
-	idle2, total2, ok2 := readCPUStat()
-	if !ok2 || total2 <= total1 {
+	cpuSample.Lock()
+	idle1, total1 := cpuSample.idle, cpuSample.total
+	cpuSample.idle, cpuSample.total = idle2, total2
+	cpuSample.Unlock()
+	if total1 == 0 || total2 <= total1 {
 		return -1
 	}
 	dTotal := float64(total2 - total1)

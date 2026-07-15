@@ -32,6 +32,7 @@ func TestQuotaCapturedFromUpstreamHeaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	h.app.WaitForAsyncWrites()
 
 	// /admin/quota must now report a snapshot for the account.
 	qr, err := http.Get(h.pool.URL + "/admin/quota")

@@ -2,11 +2,44 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
+	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 )
+
+func (s *Server) createBillingHold(routeKeyHash, accountID string, estimatedTokens int64) string {
+	now := storage.Now()
+	id := fmt.Sprintf("hold_%d_%s", time.Now().UnixNano(), accountID)
+	s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, RouteKeyHash: routeKeyHash, AccountID: accountID, EstimatedTokens: estimatedTokens, CreatedAt: now, Create: true})
+	s.billingEstimates.Store(id, estimatedTokens)
+	return id
+}
+
+func (s *Server) settleBillingHold(_ context.Context, id, status string) error {
+	if id != "" {
+		s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, Status: status, CreatedAt: storage.Now()})
+		s.billingEstimates.Delete(id)
+	}
+	return nil
+}
+
+func (s *Server) billingHoldEstimate(id string) int64 {
+	if value, ok := s.billingEstimates.Load(id); ok {
+		return value.(int64)
+	}
+	return 0
+}
+
+func (s *Server) settleBillingHoldIfHeld(_ context.Context, id, status string) error {
+	if id != "" {
+		s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, Status: status, CreatedAt: storage.Now(), IfHeld: true})
+		s.billingEstimates.Delete(id)
+	}
+	return nil
+}
 
 func (s *Server) startBillingHoldExpiryLoop(ctx context.Context) {
 	expire := func() {

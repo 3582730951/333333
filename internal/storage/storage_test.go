@@ -297,6 +297,29 @@ func TestUsageSummaryByAccountIDs(t *testing.T) {
 	}
 }
 
+func TestUsageEventIdempotencyAndActualReplacement(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	d := UsageDiagnostics{UsageEventID: "evt-1", Estimated: true}
+	if err := s.InsertUsageRecordWithDiagnostics(ctx, "a", "r", "", "", "gpt", 5, 0, 5, 0, 0, 0, json.RawMessage(`{"estimated":true}`), d); err != nil {
+		t.Fatal(err)
+	}
+	d.Estimated = false
+	if err := s.InsertUsageRecordWithDiagnostics(ctx, "a", "r", "", "", "gpt", 7, 3, 10, 0, 0, 0, json.RawMessage(`{"total_tokens":10}`), d); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertUsageRecordWithDiagnostics(ctx, "a", "r", "", "", "gpt", 99, 1, 100, 0, 0, 0, json.RawMessage(`{"total_tokens":100}`), d); err != nil {
+		t.Fatal(err)
+	}
+	var count, total, estimated int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),total_tokens,estimated FROM usage_records WHERE usage_event_id='evt-1'`).Scan(&count, &total, &estimated); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 || total != 10 || estimated != 0 {
+		t.Fatalf("count=%d total=%d estimated=%d", count, total, estimated)
+	}
+}
+
 func TestListAuditLogForAccount(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

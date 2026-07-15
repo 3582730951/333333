@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codex-account-pool/internal/ban"
@@ -95,10 +96,14 @@ type Server struct {
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
 	// 1-writer pool); see asyncwrite.go. FlushWrites drains it on shutdown.
 	asyncWrites           chan func()
+	usageWrites           chan telemetryWrite
+	usagePending          sync.WaitGroup
 	asyncWG               sync.WaitGroup
 	asyncMu               sync.RWMutex
 	asyncClosed           bool
 	asyncBytes            int64
+	billingEstimates      sync.Map
+	missingLimitAudit     sync.Map // account/provider -> last emitted unix hour
 	upstreamRulesMu       sync.RWMutex
 	upstreamRulesCache    []storage.UpstreamErrorRule
 	upstreamRulesCachedAt time.Time
@@ -116,6 +121,8 @@ type Server struct {
 	compatRecent    []compatIncompatibilityRecord
 	qualityMu       sync.Mutex
 	qualityRunning  bool
+	contextRebuilt  uint64
+	contextDegraded uint64
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -505,6 +512,9 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if !isChat {
+		raw = ensureEncryptedReasoningInclude(raw)
+	}
 
 	compiledModelInstructions := ""
 	if group, err := s.store.GetGroup(r.Context(), affinityGroup); err == nil && group.ModelInstructionsEnabled {
@@ -532,17 +542,33 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// non-movable, because a fresh account cannot continue from state it never created.
 	movable := !routing.HasServerSideState(path, r, raw)
 	if !movable {
+		if _, bindErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindErr != nil {
+			if rebuilt, ok := s.journalReplayBody(r.Context(), raw); ok {
+				raw = rebuilt
+				movable = true
+				w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+				atomic.AddUint64(&s.contextRebuilt, 1)
+			}
+		}
+	}
+	if !movable {
 		if affinity.Hash == "" {
 			writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
 			return
 		}
 		if _, bindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindingErr != nil {
 			if storage.NotFound(bindingErr) {
-				writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
+				raw = degradedResponsesReplay(raw)
+				movable = true
+				w.Header().Set("X-MiCliProxy-Context-Status", "degraded")
+				atomic.AddUint64(&s.contextDegraded, 1)
+				log.Printf("[CONTEXT-DEGRADED] request_id=%s previous response journal/binding unavailable", requestIDFromContext(r.Context()))
 			} else {
 				writeError(w, http.StatusInternalServerError, bindingErr)
 			}
-			return
+			if !movable {
+				return
+			}
 		}
 	}
 
@@ -558,7 +584,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// x-codex-turn-state) are non-movable and surface the error instead, because a fresh
 	// account has no such state to continue from.
 	attempts := 1
-	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
+	_, stateReplayAvailable := s.journalReplayBody(r.Context(), raw)
+	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && (movable || stateReplayAvailable) {
 		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
 			attempts = 1
 		}
@@ -785,8 +812,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// virtual context ledger and never trims Responses input. Official Codex
 	// compaction is forwarded unchanged to the upstream.
 	tryRebuildStateful := func(reason string) (codexAttemptResult, bool) {
-		_ = reason
-		return codexAttemptResult{}, false
+		if movable {
+			return codexAttemptResult{}, false
+		}
+		rebuilt, ok := s.journalReplayBody(r.Context(), raw)
+		if !ok {
+			return codexAttemptResult{}, false
+		}
+		exclude[lease.Account.ID] = true
+		w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+		atomic.AddUint64(&s.contextRebuilt, 1)
+		log.Printf("[CONTEXT-REBUILT] request_id=%s account=%s reason=%s", requestIDFromContext(r.Context()), lease.Account.ID, reason)
+		return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: rebuilt, Header: baseHeader.Clone()}}, true
 	}
 
 	// Per-account conversation isolation ("串号隔离", default on, runtime-toggleable):
@@ -841,10 +878,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 	}
 
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
-	defer func() { _ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
+	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	// Session 33: Carry the billing hold id in the request context so deferred
 	// usage recording (recordUsage / recordParsedUsage) can fall back to
 	// estimated_tokens when the response body lacks countable usage data.
@@ -854,7 +891,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	withCodexUsageContext()
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if allowRetry && movable {
 			return retry() // transport error — a fresh account/egress may succeed
 		}
@@ -881,7 +918,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				_ = resp.Body.Close()
 				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
 				if err != nil {
-					_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_refresh")
+					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_refresh")
 					if allowRetry && movable {
 						return retry()
 					}
@@ -939,7 +976,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			_ = resp.Body.Close()
 			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
 			if err != nil {
-				_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_version_retry")
+				_ = s.settleBillingHold(r.Context(), holdID, "failed_after_version_retry")
 				if allowRetry && movable {
 					return retry()
 				}
@@ -998,7 +1035,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		} else {
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
 		if ruleMatched {
 			switch decision.Match.DownstreamAction {
 			case upstreamrules.DownstreamActionFailover:
@@ -1058,7 +1095,7 @@ codexSuccess:
 	if isChat && !isStreamRequest(raw) {
 		responseBody, err := s.readUpstreamResponseBody(resp.Body)
 		if err != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_response_too_large")
+			_ = s.settleBillingHold(r.Context(), holdID, "failed_response_too_large")
 			writeError(w, http.StatusBadGateway, err)
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
@@ -1088,7 +1125,7 @@ codexSuccess:
 				}
 			}
 			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
+			_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 			// Rate limit in 200 body — treat like a 429 for failover purposes.
 			if allowRetry && movable {
 				return retry()
@@ -1131,9 +1168,9 @@ codexSuccess:
 		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
 			responseBody = responseJSON
 		}
-		s.persistCodexStateBindings(r.Context(), affinity, responseBody, lease, finalEgress, model)
+		s.persistCodexStateBindings(r.Context(), affinity, body, responseBody, lease, finalEgress, model)
 		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
+		_ = s.settleBillingHold(r.Context(), holdID, "settled")
 		// A soft 200 "failed" response carrying limit/quota/switch-model state must
 		// not reach the downstream (envelope-only check; never inspects content).
 		if s.leakScrubEnabled(r.Context()) {
@@ -1169,7 +1206,7 @@ codexSuccess:
 		// once either adapter writes HTTP 200, transparent failover is no longer possible.
 		prefix, streamFailure, retryableStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
 		if probeErr != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_probe_failed")
+			_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
 				return retry()
 			}
@@ -1236,7 +1273,7 @@ codexSuccess:
 			} else {
 				s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
 			}
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
+			_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if ruleMatched {
 				switch decision.Match.DownstreamAction {
 				case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream:
@@ -1277,7 +1314,7 @@ codexSuccess:
 			if parsed, ok := uscan.Parsed(); ok {
 				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
 			}
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
+			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		streamRecorder := newCodexStreamLedgerRecorder()
@@ -1296,18 +1333,33 @@ codexSuccess:
 			}
 			streamCtx = withResponseRuleFilter(streamCtx, rf)
 		}
-		streamErr := s.streamSSE(streamCtx, w, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
+		commitWriter := newTerminalCommitWriter(w, func() error {
+			completed := streamRecorder.ResponseJSON()
+			if len(completed) == 0 {
+				log.Printf("[CONTEXT-JOURNAL] recorder empty request_id=%s response_id=%s", requestIDFromContext(r.Context()), streamRecorder.id)
+				return errors.New("completed response missing from context journal recorder")
+			}
+			err := s.persistContextJournal(r.Context(), body, completed, affinity.Hash, lease.Account.ID)
+			if err != nil {
+				log.Printf("[CONTEXT-JOURNAL] terminal commit failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
+			}
+			return err
+		})
+		streamErr := s.streamSSE(streamCtx, commitWriter, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
+		if closeErr := commitWriter.Close(); streamErr == nil {
+			streamErr = closeErr
+		}
 		s.persistCodexBindingAliases(r.Context(), affinity, streamRecorder.id, streamRecorder.model, lease, finalEgress, model)
 		if streamErr != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
+			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
+			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
 		}
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 	responseBody, err := s.readUpstreamResponseBody(resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
@@ -1336,7 +1388,7 @@ codexSuccess:
 			}
 		}
 		s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
+		_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 		// Honor failover here too: a soft rate-limit in a 200 body is the same condition
 		// as a 429, so a movable request should fail over rather than surface it.
 		if allowRetry && movable {
@@ -1367,9 +1419,9 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
-	s.persistCodexStateBindings(r.Context(), affinity, responseBody, lease, finalEgress, model)
+	s.persistCodexStateBindings(r.Context(), affinity, body, responseBody, lease, finalEgress, model)
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
-	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	// Output guard: deterministically downgrade a non-streaming Responses answer that
@@ -1387,13 +1439,14 @@ codexSuccess:
 	return codexAttemptResult{Outcome: outcomeDone}
 }
 
-func (s *Server) persistCodexStateBindings(ctx context.Context, affinity routing.AffinityKey, responseBody []byte, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
+func (s *Server) persistCodexStateBindings(ctx context.Context, affinity routing.AffinityKey, requestBody, responseBody []byte, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
 	var response struct {
 		ID    string `json:"id"`
 		Model string `json:"model"`
 	}
 	_ = json.Unmarshal(responseBody, &response)
 	s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
+	s.persistContextJournal(ctx, requestBody, responseBody, affinity.Hash, lease.Account.ID)
 }
 
 func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routing.AffinityKey, responseID, actualModel string, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
@@ -1570,13 +1623,19 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 		// the billing hold's estimated_tokens so the usage overview is not empty.
 		holdID := holdIDFromCtx(ctx)
 		if holdID != "" {
-			if hold, err := s.store.GetBillingHold(ctx, holdID); err == nil && hold.EstimatedTokens > 0 {
+			estimate := s.billingHoldEstimate(holdID)
+			if estimate == 0 {
+				if hold, err := s.store.GetBillingHold(ctx, holdID); err == nil {
+					estimate = hold.EstimatedTokens
+				}
+			}
+			if estimate > 0 {
 				log.Printf("[USAGE-WARN] account=%s: no usage in body (len=%d), using billing_hold estimate=%d",
-					accountID, len(body), hold.EstimatedTokens)
+					accountID, len(body), estimate)
 				parsed = usage.Parsed{
 					Model:        "unknown",
-					TotalTokens:  hold.EstimatedTokens,
-					PromptTokens: hold.EstimatedTokens / 2,
+					TotalTokens:  estimate,
+					PromptTokens: estimate / 2,
 					RawUsage:     json.RawMessage(`{"estimated":true}`),
 				}
 			} else {
@@ -1591,6 +1650,9 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	if diag.UsageEventID == "" {
+		diag.UsageEventID = requestIDFromContext(ctx)
+	}
 	diag.CacheMissTokens = parsed.CacheMissTokens
 	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
 	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
@@ -1602,15 +1664,9 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	// dashboards (never by request processing), so eventual recording is correct; the
 	// closure captures only the small parsed usage + identity, and uses a detached
 	// context because the request's is cancelled on return.
-	s.enqueueWrite(func() {
-		wctx, cancel := bgWriteContext()
-		defer cancel()
-		err := s.store.InsertUsageRecordWithDiagnostics(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage, diag)
-		if err != nil {
-			log.Printf("[USAGE-ERROR] InsertUsageRecord failed: account=%s, model=%s, prompt=%d, completion=%d, total=%d, error=%v",
-				accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, err)
-		}
-	})
+	s.enqueueUsage(storage.UsageRecordWrite{AccountID: accountID, RouteKeyHash: routeHash, APIKeyHash: keyHash, UserID: userID, Model: parsed.Model,
+		Prompt: parsed.PromptTokens, Completion: parsed.CompletionTokens, Total: parsed.TotalTokens, Cached: parsed.CachedTokens,
+		CacheRead: parsed.CacheReadTokens, CacheCreation: parsed.CacheCreationTokens, Raw: parsed.RawUsage, Diagnostics: diag})
 }
 
 func (s *Server) hasCodexFailoverCandidate(ctx context.Context, groupName, excludeAccountID string) bool {
@@ -1651,13 +1707,19 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 		// completion), fall back to the billing hold's estimated_tokens.
 		holdID := holdIDFromCtx(ctx)
 		if holdID != "" {
-			if hold, err := s.store.GetBillingHold(ctx, holdID); err == nil && hold.EstimatedTokens > 0 {
+			estimate := s.billingHoldEstimate(holdID)
+			if estimate == 0 {
+				if hold, err := s.store.GetBillingHold(ctx, holdID); err == nil {
+					estimate = hold.EstimatedTokens
+				}
+			}
+			if estimate > 0 {
 				log.Printf("[USAGE-WARN] account=%s: stream usage all zero, using billing_hold estimate=%d",
-					accountID, hold.EstimatedTokens)
+					accountID, estimate)
 				parsed = usage.Parsed{
 					Model:        parsed.Model,
-					TotalTokens:  hold.EstimatedTokens,
-					PromptTokens: hold.EstimatedTokens / 2,
+					TotalTokens:  estimate,
+					PromptTokens: estimate / 2,
 					RawUsage:     json.RawMessage(`{"estimated":true}`),
 				}
 			} else {
@@ -1673,6 +1735,9 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	if diag.UsageEventID == "" {
+		diag.UsageEventID = requestIDFromContext(ctx)
+	}
 	diag.CacheMissTokens = parsed.CacheMissTokens
 	diag.CacheTotalInputTokens = parsed.CacheTotalInputTokens
 	diag.CacheCreation5mTokens = parsed.CacheCreation5mTokens
@@ -1680,13 +1745,7 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	if diag.CachePrewarmAttempted && parsed.CacheReadTokens > 0 {
 		diag.CacheHitAfterPrewarm = true
 	}
-	s.enqueueWrite(func() {
-		wctx, cancel := bgWriteContext()
-		defer cancel()
-		err := s.store.InsertUsageRecordWithDiagnostics(wctx, accountID, routeHash, keyHash, userID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens, parsed.CacheReadTokens, parsed.CacheCreationTokens, parsed.RawUsage, diag)
-		if err != nil {
-			log.Printf("[USAGE-ERROR] InsertUsageRecord failed (streaming): account=%s, model=%s, prompt=%d, completion=%d, total=%d, error=%v",
-				accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, err)
-		}
-	})
+	s.enqueueUsage(storage.UsageRecordWrite{AccountID: accountID, RouteKeyHash: routeHash, APIKeyHash: keyHash, UserID: userID, Model: parsed.Model,
+		Prompt: parsed.PromptTokens, Completion: parsed.CompletionTokens, Total: parsed.TotalTokens, Cached: parsed.CachedTokens,
+		CacheRead: parsed.CacheReadTokens, CacheCreation: parsed.CacheCreationTokens, Raw: parsed.RawUsage, Diagnostics: diag})
 }

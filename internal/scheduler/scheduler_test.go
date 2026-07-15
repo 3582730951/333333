@@ -27,6 +27,21 @@ func testStore(t *testing.T) *storage.Store {
 	return store
 }
 
+func TestAdaptiveZeroLimitsDoNotReject(t *testing.T) {
+	if concurrencyLimited(0, 10_000) {
+		t.Fatal("max_concurrency=0 must not impose a static limit")
+	}
+	if tokenBudgetLimited(0, false, 100, 1_000_000, 1_000_000) {
+		t.Fatal("account_token_budget=0 must disable the token budget")
+	}
+	if !concurrencyLimited(2, 2) {
+		t.Fatal("positive concurrency limit must remain a hard cap")
+	}
+	if !tokenBudgetLimited(100, false, 1, 90, 20) {
+		t.Fatal("positive token budget must remain enforced")
+	}
+}
+
 func TestAffinityBindsSameAccount(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

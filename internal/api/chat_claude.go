@@ -181,15 +181,15 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	if waitedForFlight {
 		usageDiag.SingleflightWaitedRequests = 1
 	}
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
+	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
-	defer func() { _ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
+	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
 	releaseFlight()
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 			return
 		}
@@ -206,7 +206,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				resp.Body.Close()
 				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
 				if err != nil {
-					_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_refresh")
+					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_refresh")
 					if writeClaudeWaitError(r.Context(), refreshHeartbeat, err) {
 						return
 					}
@@ -236,7 +236,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		} else {
 			s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errBody)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
 		if writeClaudeWaitError(r.Context(), refreshHeartbeat, errors.New("claude upstream returned an error after authentication refresh")) {
 			return
 		}
@@ -284,24 +284,27 @@ chatClaudeSuccess:
 		// /v1/messages path (the scanner reads the raw Anthropic frames, not the
 		// rewritten chat chunks).
 		uscan := usage.NewStreamScanner("claude")
-		anthropicStreamToChatSSE(w, io.TeeReader(resp.Body, uscan), model, result.Scrubber)
+		aliasCapture := &claudeAliasCapture{}
+		anthropicStreamToChatSSE(w, io.TeeReader(resp.Body, io.MultiWriter(uscan, aliasCapture)), model, result.Scrubber)
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
+		s.persistClaudeItemAliases(r.Context(), anthBody, aliasCapture.Bytes(), lease, model)
+		_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
 		return
 	}
 
 	anthResp, err := s.readUpstreamResponseBody(resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.rememberClaudeCacheDiagnosticsMessageID(affinity, anthResp)
+	s.persistClaudeItemAliases(r.Context(), anthBody, anthResp, lease, model)
 	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), anthResp))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, anthResp)
-	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	chatBody, err := prompt.AnthropicToChatCompletion(result.Scrubber.ReplaceAll(anthResp), model)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)

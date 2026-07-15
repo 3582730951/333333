@@ -55,7 +55,11 @@ func ParseResponse(raw []byte) Parsed {
 	// Anthropic usage carries no total_tokens; derive one so downstream billing
 	// views have a single comparable figure across providers.
 	if parsed.TotalTokens == 0 {
-		parsed.TotalTokens = parsed.PromptTokens + parsed.CompletionTokens
+		if isAnthropicCacheUsage(usageMap) {
+			parsed.TotalTokens = parsed.CacheTotalInputTokens + parsed.CompletionTokens
+		} else {
+			parsed.TotalTokens = parsed.PromptTokens + parsed.CompletionTokens
+		}
 	}
 	return parsed
 }
@@ -370,12 +374,20 @@ func (s *StreamScanner) fillCacheInputBreakdown(um map[string]interface{}) {
 // total is derived (prompt + completion) when the provider omits an explicit total
 // (Anthropic does), mirroring ParseResponse so streamed and buffered usage agree.
 func (s *StreamScanner) Parsed() (Parsed, bool) {
+	if s != nil && len(s.buf) > 0 {
+		s.observeLine(s.buf)
+		s.buf = nil
+	}
 	if s == nil || !s.got {
 		return Parsed{}, false
 	}
 	total := s.totalTokens
 	if total == 0 {
-		total = s.promptTokens + s.completionTokens
+		if s.provider == "claude" && s.cacheTotalInputTokens > 0 {
+			total = s.cacheTotalInputTokens + s.completionTokens
+		} else {
+			total = s.promptTokens + s.completionTokens
+		}
 	}
 	if total == 0 {
 		// A frame was seen but carried no countable tokens — nothing worth recording.

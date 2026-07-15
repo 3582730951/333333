@@ -56,6 +56,9 @@ type Store struct {
 	settingsMu       sync.RWMutex
 	settingsSnapshot map[string]string
 	settingsLoadedAt time.Time
+	tokenCache       sync.Map // account id -> decrypted AccountToken
+	kiroCache        sync.Map // account id -> decrypted KiroCredentials
+	apiKeyUsed       sync.Map // key hash -> last persisted minute
 }
 
 type Group struct {
@@ -605,8 +608,8 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, rdb: rdb}, nil
 }
 
-// readPoolSize is the number of concurrent read connections: max(4, GOMAXPROCS)
-// capped at 32, overridable via CODEX_POOL_DB_MAX_READ_CONNS. Each connection keeps
+// readPoolSize is the number of concurrent read connections: max(2, GOMAXPROCS)
+// capped at 8, overridable via CODEX_POOL_DB_MAX_READ_CONNS. Each connection keeps
 // its own SQLite page cache, so the cap bounds memory under the parallel-read pool.
 func readPoolSize() int {
 	if v := strings.TrimSpace(os.Getenv("CODEX_POOL_DB_MAX_READ_CONNS")); v != "" {
@@ -614,12 +617,12 @@ func readPoolSize() int {
 			return n
 		}
 	}
-	n := runtime.NumCPU()
-	if n < 4 {
-		n = 4
+	n := runtime.GOMAXPROCS(0)
+	if n < 2 {
+		n = 2
 	}
-	if n > 32 {
-		n = 32
+	if n > 8 {
+		n = 8
 	}
 	return n
 }
@@ -644,7 +647,7 @@ func Now() int64 {
 }
 
 func (s *Store) Init(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-32000; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;`); err != nil {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-16384; PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY;`); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
@@ -664,6 +667,9 @@ func (s *Store) Init(ctx context.Context) error {
 		return err
 	}
 	now := Now()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('usage_accuracy_cutover_at',?,?) ON CONFLICT(key) DO NOTHING`, strconv.FormatInt(now, 10), now); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, created_at, updated_at)
 VALUES('cyber', '', 'prepend', 1, 0, ?, ?)
@@ -675,6 +681,14 @@ INSERT INTO egress_profiles(id, name, type, endpoint, region, stream_capable, he
 VALUES(?, 'direct', 'direct', '', '', 1, 'healthy', 0, 0, '', 0, 128, ?, ?)
 ON CONFLICT(id) DO NOTHING`, DefaultDirectEgressID, now, now)
 	if err != nil {
+		return err
+	}
+	// Migrate only the two historical built-in defaults. Other positive limits are
+	// administrator choices and must remain untouched.
+	if _, err := s.db.ExecContext(ctx, `UPDATE egress_profiles SET max_concurrency=0, updated_at=? WHERE id=? AND type='direct' AND max_concurrency=128`, now, DefaultDirectEgressID); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE egress_profiles SET max_concurrency=0, updated_at=? WHERE id='egress_sidecar' AND type='curl_cffi_sidecar' AND max_concurrency=16`, now); err != nil {
 		return err
 	}
 	// Seed default OpenAI-compatible custom providers so the adapter works out of the
@@ -976,6 +990,7 @@ CREATE TABLE IF NOT EXISTS billing_holds(
 CREATE INDEX IF NOT EXISTS idx_billing_holds_status_updated ON billing_holds(status, updated_at);
 CREATE TABLE IF NOT EXISTS usage_records(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  usage_event_id TEXT NOT NULL DEFAULT '',
   account_id TEXT NOT NULL,
   route_key_hash TEXT NOT NULL DEFAULT '',
   model TEXT NOT NULL DEFAULT '',
@@ -1021,6 +1036,12 @@ CREATE TABLE IF NOT EXISTS usage_records(
   raw_usage_json TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS context_journal(
+ response_id TEXT PRIMARY KEY,
+ affinity_hash TEXT NOT NULL DEFAULT '', account_id TEXT NOT NULL DEFAULT '',
+ encrypted_payload TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_context_journal_expires ON context_journal(expires_at);
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model);
 CREATE TABLE IF NOT EXISTS model_quality_status(
   group_name TEXT NOT NULL,
@@ -1295,6 +1316,11 @@ CREATE TABLE IF NOT EXISTS registration_stats_daily(
 // migration is idempotent. New tables are handled by CREATE TABLE IF NOT EXISTS.
 // CREATE INDEX IF NOT EXISTS is also idempotent and adds new indexes to old DBs.
 func (s *Store) migrate(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	stmts := []string{
 		`ALTER TABLE api_keys ADD COLUMN group_name TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE api_keys ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
@@ -1368,6 +1394,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN latest_user_tail_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN latest_user_tool_result_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN route_epoch INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN usage_event_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_event_id ON usage_records(usage_event_id) WHERE usage_event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
 		// Cooldown→health-recheck gate: a benched account stays out of the candidate
 		// pool until a liveness probe confirms it recovered (older DBs created before
@@ -1529,12 +1557,15 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_upstream_error_rules_enabled_priority ON upstream_error_rules(enabled, priority, created_at)`,
 	}
 	for _, stmt := range stmts {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 				continue
 			}
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	return s.backfillUsageCacheDiagnostics(ctx)
 }
@@ -1823,7 +1854,14 @@ func (s *Store) MarkAPIKeyUsed(ctx context.Context, keyHash string, usedAt int64
 	if usedAt <= 0 {
 		usedAt = Now()
 	}
+	minute := usedAt / 60
+	if old, ok := s.apiKeyUsed.Load(keyHash); ok && old.(int64) >= minute {
+		return nil
+	}
 	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE key_hash = ? AND last_used_at < ?`, usedAt, keyHash, usedAt)
+	if err == nil {
+		s.apiKeyUsed.Store(keyHash, minute)
+	}
 	return err
 }
 
@@ -2206,6 +2244,7 @@ ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.tokenCache.Delete(account.ID)
 	return nil
 }
 
@@ -2581,7 +2620,12 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	err = tx.Commit()
+	if err == nil {
+		s.tokenCache.Delete(id)
+		s.kiroCache.Delete(id)
+	}
+	return err
 }
 
 func (s *Store) SetAccountQuarantine(ctx context.Context, id string, until int64, reason string) error {
@@ -2590,6 +2634,9 @@ func (s *Store) SetAccountQuarantine(ctx context.Context, id string, until int64
 }
 
 func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, error) {
+	if cached, ok := s.tokenCache.Load(accountID); ok {
+		return cached.(AccountToken), nil
+	}
 	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
 	var t AccountToken
 	err := row.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
@@ -2597,6 +2644,9 @@ func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, e
 	t.RefreshToken = s.openToken(t.RefreshToken)
 	t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
 	t.IDTokenRaw = s.openToken(t.IDTokenRaw)
+	if err == nil {
+		s.tokenCache.Store(accountID, t)
+	}
 	return t, err
 }
 
@@ -2638,6 +2688,7 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 }
 
 func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
+	s.tokenCache.Delete(t.AccountID)
 	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
 		s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
 	return err
@@ -2652,6 +2703,7 @@ func (s *Store) UpsertKiroCredentials(ctx context.Context, c KiroCredentials) er
 		c.CreatedAt = now
 	}
 	c.UpdatedAt = now
+	s.kiroCache.Delete(c.AccountID)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO account_kiro_credentials(account_id, auth_method, client_id, client_secret, profile_arn, auth_region, api_region, machine_id, kiro_api_key, endpoint, credential_hash, created_at, updated_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET auth_method=excluded.auth_method, client_id=excluded.client_id, client_secret=excluded.client_secret, profile_arn=excluded.profile_arn, auth_region=excluded.auth_region, api_region=excluded.api_region, machine_id=excluded.machine_id, kiro_api_key=excluded.kiro_api_key, endpoint=excluded.endpoint, credential_hash=excluded.credential_hash, updated_at=excluded.updated_at`,
@@ -2660,11 +2712,17 @@ ON CONFLICT(account_id) DO UPDATE SET auth_method=excluded.auth_method, client_i
 }
 
 func (s *Store) GetKiroCredentials(ctx context.Context, accountID string) (KiroCredentials, error) {
+	if cached, ok := s.kiroCache.Load(accountID); ok {
+		return cached.(KiroCredentials), nil
+	}
 	var c KiroCredentials
 	err := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, client_id, client_secret, profile_arn, auth_region, api_region, machine_id, kiro_api_key, endpoint, credential_hash, created_at, updated_at FROM account_kiro_credentials WHERE account_id=?`, accountID).
 		Scan(&c.AccountID, &c.AuthMethod, &c.ClientID, &c.ClientSecret, &c.ProfileARN, &c.AuthRegion, &c.APIRegion, &c.MachineID, &c.KiroAPIKey, &c.Endpoint, &c.CredentialHash, &c.CreatedAt, &c.UpdatedAt)
 	c.ClientSecret = s.openToken(c.ClientSecret)
 	c.KiroAPIKey = s.openToken(c.KiroAPIKey)
+	if err == nil {
+		s.kiroCache.Store(accountID, c)
+	}
 	return c, err
 }
 
@@ -4565,6 +4623,7 @@ func (s *Store) InsertUsageRecordWithCacheDetails(ctx context.Context, accountID
 }
 
 type UsageDiagnostics struct {
+	UsageEventID                      string
 	UsageProvider                     string
 	UsageSource                       string
 	CacheReadPresent                  bool
@@ -4601,10 +4660,108 @@ type UsageDiagnostics struct {
 	RouteEpoch                        int64
 }
 
+type UsageRecordWrite struct {
+	AccountID, RouteKeyHash, APIKeyHash, UserID, Model string
+	Prompt, Completion, Total, Cached                  int64
+	CacheRead, CacheCreation                           int64
+	Raw                                                json.RawMessage
+	Diagnostics                                        UsageDiagnostics
+}
+
+type BillingHoldWrite struct {
+	ID, RouteKeyHash, AccountID, Status string
+	EstimatedTokens, CreatedAt          int64
+	Create, IfHeld                      bool
+}
+
+type sqlExecContext interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
 func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) error {
+	return s.insertUsageRecord(ctx, s.db, UsageRecordWrite{AccountID: accountID, RouteKeyHash: routeKeyHash, APIKeyHash: apiKeyHash, UserID: userID, Model: model, Prompt: prompt, Completion: completion, Total: total, Cached: cached, CacheRead: cacheRead, CacheCreation: cacheCreation, Raw: raw, Diagnostics: diag})
+}
+
+func (s *Store) BatchInsertUsageRecords(ctx context.Context, writes []UsageRecordWrite) error {
+	return s.BatchWriteTelemetry(ctx, writes, nil, nil, nil)
+}
+
+func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWrite, apiKeyUsed map[string]int64, holds []BillingHoldWrite, audits []AuditLogRow) error {
+	if len(writes) == 0 && len(apiKeyUsed) == 0 && len(holds) == 0 && len(audits) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	persistedKeyMinutes := make(map[string]int64, len(apiKeyUsed))
+	for _, write := range writes {
+		if err := s.insertUsageRecord(ctx, tx, write); err != nil {
+			return err
+		}
+	}
+	for keyHash, usedAt := range apiKeyUsed {
+		minute := usedAt / 60
+		if old, ok := s.apiKeyUsed.Load(keyHash); ok && old.(int64) >= minute {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE key_hash = ? AND last_used_at < ?`, usedAt, keyHash, usedAt); err != nil {
+			return err
+		}
+		persistedKeyMinutes[keyHash] = minute
+	}
+	for _, hold := range holds {
+		now := hold.CreatedAt
+		if now == 0 {
+			now = Now()
+		}
+		if hold.Create {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', ?, ?) ON CONFLICT(id) DO NOTHING`, hold.ID, hold.RouteKeyHash, hold.AccountID, hold.EstimatedTokens, now, now); err != nil {
+				return err
+			}
+			continue
+		}
+		status := hold.Status
+		if status == "" {
+			status = "settled"
+		}
+		query := `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ?`
+		if hold.IfHeld {
+			query += ` AND status = 'held'`
+		}
+		if _, err := tx.ExecContext(ctx, query, status, now, hold.ID); err != nil {
+			return err
+		}
+	}
+	for _, row := range audits {
+		if row.CreatedAt == 0 {
+			row.CreatedAt = Now()
+		}
+		if len(row.Detail) > 4000 {
+			row.Detail = row.Detail[:4000]
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id, account_label, action, state, reason, detail, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`,
+			row.AccountID, row.AccountLabel, row.Action, row.State, row.Reason, row.Detail, row.CreatedAt); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for keyHash, minute := range persistedKeyMinutes {
+		s.apiKeyUsed.Store(keyHash, minute)
+	}
+	return nil
+}
+
+func (s *Store) insertUsageRecord(ctx context.Context, exec sqlExecContext, write UsageRecordWrite) error {
+	accountID, routeKeyHash, apiKeyHash, userID, model := write.AccountID, write.RouteKeyHash, write.APIKeyHash, write.UserID, write.Model
+	prompt, completion, total, cached := write.Prompt, write.Completion, write.Total, write.Cached
+	cacheRead, cacheCreation, raw, diag := write.CacheRead, write.CacheCreation, write.Raw, write.Diagnostics
 	diag = finalizeUsageDiagnostics(model, prompt, cached, cacheRead, cacheCreation, raw, diag)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO usage_records(
-account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
+	_, err := exec.ExecContext(ctx, `INSERT INTO usage_records(
+usage_event_id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, usage_source, cache_read_present, cache_creation_present, compatibility_losses_json, cache_capability,
 estimated, cache_miss_tokens, cache_total_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
 affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, stable_prefix_bytes,
@@ -4612,8 +4769,14 @@ retention_effective, retention_source, claude_cache_ttl, cache_control_injected,
 cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
+ account_id=excluded.account_id, route_key_hash=excluded.route_key_hash, api_key_hash=excluded.api_key_hash, user_id=excluded.user_id,
+ model=excluded.model, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens,
+ cached_tokens=excluded.cached_tokens, cache_read_tokens=excluded.cache_read_tokens, cache_creation_tokens=excluded.cache_creation_tokens,
+ usage_provider=excluded.usage_provider, usage_source=excluded.usage_source, estimated=excluded.estimated, raw_usage_json=excluded.raw_usage_json
+WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
+		diag.UsageEventID, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CompatibilityLossesJSON, diag.CacheCapability,
 		boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens, diag.CacheCreation5mTokens, diag.CacheCreation1hTokens,
 		diag.AffinitySource, boolInt(diag.PromptCacheKeyPresent), diag.PromptCacheKeySource, diag.StablePrefixSource, diag.StablePrefixReason, diag.StablePrefixBytes,
@@ -4972,13 +5135,14 @@ const (
 
 // UsageByUser aggregates a single user's usage per model, most-used first.
 func (s *Store) UsageByUser(ctx context.Context, userID string) ([]UserUsageRow, error) {
+	cutover := s.UsageAccuracyCutover(ctx)
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT `+normalizedUsageModelSQL+`, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
        COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
-FROM usage_records WHERE user_id = ? GROUP BY `+normalizedUsageModelSQL+` ORDER BY SUM(total_tokens) DESC`, userID)
+FROM usage_records WHERE user_id = ? AND estimated=0 AND created_at>=? GROUP BY `+normalizedUsageModelSQL+` ORDER BY SUM(total_tokens) DESC`, userID, cutover)
 	if err != nil {
 		return nil, err
 	}
@@ -5003,13 +5167,17 @@ func (s *Store) UsageByModel(ctx context.Context, since int64) ([]UserUsageRow, 
 }
 
 func (s *Store) UsageByModelWindow(ctx context.Context, since, until int64) ([]UserUsageRow, error) {
+	cutover := s.UsageAccuracyCutover(ctx)
+	if since < cutover {
+		since = cutover
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT `+normalizedUsageModelSQL+`, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
        COALESCE(SUM(`+cacheTotalInputTokensSQL+`),0),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0)
-FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY `+normalizedUsageModelSQL+` ORDER BY SUM(total_tokens) DESC, COUNT(*) DESC, `+normalizedUsageModelSQL+` ASC`, since, until)
+FROM usage_records WHERE created_at >= ? AND created_at < ? AND estimated=0 GROUP BY `+normalizedUsageModelSQL+` ORDER BY SUM(total_tokens) DESC, COUNT(*) DESC, `+normalizedUsageModelSQL+` ASC`, since, until)
 	if err != nil {
 		return nil, err
 	}
@@ -5390,6 +5558,10 @@ func (s *Store) UsageTimeseriesByUser(ctx context.Context, userID string, since,
 	if bucketSeconds <= 0 {
 		bucketSeconds = 3600
 	}
+	cutover := s.UsageAccuracyCutover(ctx)
+	if since < cutover {
+		since = cutover
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT (created_at / ?) * ? AS bucket, COUNT(*),
        COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
@@ -5397,7 +5569,7 @@ SELECT (created_at / ?) * ? AS bucket, COUNT(*),
        COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
        COALESCE(SUM(cache_creation_tokens),0),
        COALESCE(SUM(total_tokens),0)
-FROM usage_records WHERE user_id = ? AND created_at >= ?
+FROM usage_records WHERE user_id = ? AND created_at >= ? AND estimated=0
 GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, userID, since)
 	if err != nil {
 		return nil, err
@@ -5424,6 +5596,10 @@ type UsageSummaryRow struct {
 	CachedTokens        int64  `json:"cached_tokens"`
 	CacheReadTokens     int64  `json:"cache_read_tokens"`
 	CacheCreationTokens int64  `json:"cache_creation_tokens"`
+	ActualRequests      int64  `json:"actual_requests"`
+	ActualTokens        int64  `json:"actual_tokens"`
+	EstimatedRequests   int64  `json:"estimated_requests"`
+	EstimatedTokens     int64  `json:"estimated_tokens"`
 }
 
 // UsageSummary aggregates usage_records per account, most-used first.
@@ -5432,11 +5608,17 @@ func (s *Store) UsageSummary(ctx context.Context) ([]UsageSummaryRow, error) {
 }
 
 func (s *Store) UsageSummaryWindow(ctx context.Context, since, until int64) ([]UsageSummaryRow, error) {
+	cutover := s.UsageAccuracyCutover(ctx)
+	if since < cutover {
+		since = cutover
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
-       COALESCE(SUM(cached_tokens),0),
-       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
-       COALESCE(SUM(cache_creation_tokens),0)
+SELECT account_id, SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN estimated=0 THEN prompt_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN estimated=0 THEN completion_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN estimated=0 THEN total_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN cached_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN cache_creation_tokens ELSE 0 END),0),
+       SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN estimated=0 THEN total_tokens ELSE 0 END),0),
+       SUM(CASE WHEN estimated>0 THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0)
 FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY account_id ORDER BY SUM(total_tokens) DESC`, since, until)
 	if err != nil {
 		return nil, err
@@ -5445,12 +5627,21 @@ FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY account_id 
 	var out []UsageSummaryRow
 	for rows.Next() {
 		var row UsageSummaryRow
-		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.ActualRequests, &row.ActualTokens, &row.EstimatedRequests, &row.EstimatedTokens); err != nil {
 			return nil, err
 		}
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) UsageAccuracyCutover(ctx context.Context) int64 {
+	v, ok, err := s.GetSetting(ctx, "usage_accuracy_cutover_at")
+	if err != nil || !ok {
+		return 0
+	}
+	n, _ := strconv.ParseInt(v, 10, 64)
+	return n
 }
 
 // UsageSummaryByAccountIDs aggregates usage only for the requested accounts.
@@ -5459,6 +5650,8 @@ func (s *Store) UsageSummaryByAccountIDs(ctx context.Context, accountIDs []strin
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
+	args := stringArgs(accountIDs)
+	args = append(args, s.UsageAccuracyCutover(ctx))
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
        COALESCE(SUM(cached_tokens),0),
@@ -5466,7 +5659,8 @@ SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(comple
        COALESCE(SUM(cache_creation_tokens),0)
 FROM usage_records
 WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)
-GROUP BY account_id`, stringArgs(accountIDs)...)
+  AND estimated=0 AND created_at>=?
+GROUP BY account_id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -5524,6 +5718,10 @@ func (s *Store) UsageTimeseriesWindow(ctx context.Context, since, until, bucketS
 	if bucketSeconds <= 0 {
 		bucketSeconds = 3600
 	}
+	cutover := s.UsageAccuracyCutover(ctx)
+	if since < cutover {
+		since = cutover
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
 SELECT (created_at / ?) * ? AS bucket,
        COUNT(*),
@@ -5533,7 +5731,7 @@ SELECT (created_at / ?) * ? AS bucket,
        COALESCE(SUM(cache_creation_tokens),0),
        COALESCE(SUM(total_tokens),0)
 FROM usage_records
-WHERE created_at >= ? AND created_at < ?
+WHERE created_at >= ? AND created_at < ? AND estimated=0
 GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, since, until)
 	if err != nil {
 		return nil, err
@@ -5557,12 +5755,16 @@ func (s *Store) UsageModelSeriesWindow(ctx context.Context, since, until, bucket
 	if seriesLimit <= 0 {
 		seriesLimit = 6
 	}
+	cutover := s.UsageAccuracyCutover(ctx)
+	if since < cutover {
+		since = cutover
+	}
 	const keyExpr = "CASE WHEN TRIM(COALESCE(model,'')) = '' THEN '__unknown__' ELSE TRIM(COALESCE(model,'')) END"
 	const labelExpr = "CASE WHEN TRIM(COALESCE(model,'')) = '' THEN '(未知)' ELSE TRIM(COALESCE(model,'')) END"
 	topRows, err := s.rdb.QueryContext(ctx, `
 SELECT `+keyExpr+`, `+labelExpr+`, COALESCE(SUM(total_tokens),0), COUNT(*)
 FROM usage_records
-WHERE created_at >= ? AND created_at < ?
+WHERE created_at >= ? AND created_at < ? AND estimated=0
 GROUP BY `+keyExpr+`
 ORDER BY COALESCE(SUM(total_tokens),0) DESC, COUNT(*) DESC, `+keyExpr+` ASC
 LIMIT ?`, since, until, seriesLimit)
@@ -5607,7 +5809,7 @@ SELECT (created_at / ?) * ? AS bucket,
        COALESCE(SUM(cache_creation_tokens),0),
        COALESCE(SUM(total_tokens),0)
 FROM usage_records
-WHERE created_at >= ? AND created_at < ?
+WHERE created_at >= ? AND created_at < ? AND estimated=0
   AND `+keyExpr+` IN (`+sqlPlaceholders(len(keys))+`)
 GROUP BY bucket, model_key
 ORDER BY bucket, model_key`, args...)

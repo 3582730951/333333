@@ -12,7 +12,7 @@
   "request_timeout_seconds": 600,
   "shutdown_drain_seconds": 30,
   "max_body_bytes": 268435456,
-  "account_token_budget": 2000000,
+  "account_token_budget": 0,
   "admin_token": "",
   "trusted_proxy_cidrs": [
     "127.0.0.0/8",

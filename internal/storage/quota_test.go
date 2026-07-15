@@ -10,6 +10,7 @@ import (
 func TestUsageTimeseriesBuckets(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
+	_, _ = store.db.ExecContext(ctx, `UPDATE settings SET value='0' WHERE key='usage_accuracy_cutover_at'`)
 	// Three records: two in the same hourly bucket, one in the next.
 	base := int64(1_700_000_000)
 	base = (base / 3600) * 3600 // align to a bucket boundary

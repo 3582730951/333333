@@ -1070,7 +1070,8 @@ func (s *Server) adminUsage(w http.ResponseWriter, r *http.Request) {
 	if summary == nil {
 		summary = []storage.UsageSummaryRow{}
 	}
-	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{"rows": summary}, win))
+	cutover := s.store.UsageAccuracyCutover(r.Context())
+	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{"rows": summary, "accuracy_cutover_at": cutover, "legacy_unverified": win.EffectiveStartAt < cutover}, win))
 }
 
 // adminUsageTimeseries returns usage aggregated into fixed-width time buckets for
@@ -1109,6 +1110,9 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 	body := map[string]interface{}{
 		"since": win.EffectiveStartAt, "bucket": bucket, "now": win.EffectiveUntilAt, "buckets": buckets,
 	}
+	cutover := s.store.UsageAccuracyCutover(r.Context())
+	body["accuracy_cutover_at"] = cutover
+	body["legacy_unverified"] = win.EffectiveStartAt < cutover
 	if strings.TrimSpace(r.URL.Query().Get("series_dimension")) == "model" {
 		limit := 6
 		if raw := strings.TrimSpace(r.URL.Query().Get("series_limit")); raw != "" {

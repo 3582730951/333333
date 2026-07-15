@@ -33,7 +33,7 @@ func TestParseAnthropicUsage(t *testing.T) {
 	if parsed.CacheCreation5mTokens != 25 || parsed.CacheCreation1hTokens != 50 {
 		t.Fatalf("anthropic cache creation ttl split wrong: %+v", parsed)
 	}
-	if parsed.TotalTokens != 120 {
+	if parsed.TotalTokens != 235 {
 		t.Fatalf("total not derived from input+output: %+v", parsed)
 	}
 }
@@ -148,8 +148,8 @@ func TestStreamScannerClaudeMessages(t *testing.T) {
 	if p.CompletionTokens != 88 { // last message_delta wins
 		t.Fatalf("claude stream output = %d, want 88 (final delta)", p.CompletionTokens)
 	}
-	if p.TotalTokens != 288 { // derived: input + output
-		t.Fatalf("claude stream total = %d, want 288", p.TotalTokens)
+	if p.TotalTokens != 372 { // ordinary input + cache read + cache creation + output
+		t.Fatalf("claude stream total = %d, want 372", p.TotalTokens)
 	}
 }
 
@@ -176,5 +176,12 @@ func TestStreamScannerNoUsageNoRecord(t *testing.T) {
 	transcript := "event: ping\ndata: {\"type\":\"ping\"}\n\ndata: [DONE]\n\n"
 	if _, ok := feedStream(t, "codex", transcript); ok {
 		t.Fatal("a stream with no usage frame must report no usage")
+	}
+}
+
+func TestStreamScannerFinalUsageWithoutNewline(t *testing.T) {
+	p, ok := feedStream(t, "codex", `data: {"type":"response.completed","response":{"model":"gpt","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`)
+	if !ok || p.TotalTokens != 5 {
+		t.Fatalf("unterminated final usage lost: ok=%v parsed=%+v", ok, p)
 	}
 }

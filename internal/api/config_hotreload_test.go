@@ -444,12 +444,12 @@ func TestAdminConfigRejectsInvalidSchedulerFields(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"resp"}`))
 	})
 
-	status, body := patchConfigStatus(t, h, `{"account_token_budget":0}`)
+	status, body := patchConfigStatus(t, h, `{"account_token_budget":-1}`)
 	if status != http.StatusBadRequest {
-		t.Fatalf("account_token_budget=0 status = %d, want 400: %s", status, body)
+		t.Fatalf("account_token_budget=-1 status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "must be greater than 0") {
-		t.Fatalf("account_token_budget=0 body = %q, want validation message", body)
+	if !strings.Contains(body, "must be zero") {
+		t.Fatalf("account_token_budget=-1 body = %q, want validation message", body)
 	}
 
 	status, body = patchConfigStatus(t, h, `{"cooldown_wait_max_seconds":-1}`)

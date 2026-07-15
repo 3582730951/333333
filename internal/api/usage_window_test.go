@@ -33,6 +33,7 @@ func insertUsageAt(t *testing.T, h *testHarness, accountID, model, apiKeyHash, r
 
 func TestAdminUsageDefaultWindowAndCustomBounds(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	_ = h.store.SetSetting(context.Background(), "usage_accuracy_cutover_at", "0")
 	now := time.Now()
 	dayStart := usageDayStartForTest(now)
 	todayAt := dayStart + 60
@@ -115,6 +116,7 @@ func TestAdminCacheResetRejectsCustomWindowBeforeWriting(t *testing.T) {
 
 func TestAdminCacheResetMovesOnlyCacheDiagnosticsWindow(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	_ = h.store.SetSetting(context.Background(), "usage_accuracy_cutover_at", "0")
 	code, raw := grpReq(t, h, http.MethodPost, "/admin/usage/cache/reset", "")
 	if code != http.StatusOK {
 		t.Fatalf("cache reset = %d: %s", code, raw)
@@ -304,6 +306,7 @@ func TestAdminUsageCacheFieldsAndDynamicModelNormalization(t *testing.T) {
 
 func TestAdminUsageByModelAndSeriesAreDynamicUsageRecordModels(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	_ = h.store.SetSetting(context.Background(), "usage_accuracy_cutover_at", "0")
 	base := time.Now().Unix() - 600
 	insertUsageAt(t, h, "acc-a1", " model-a ", "hash-a1", "route-a1", 100, 0, 100, 0, 0, 0, base+10)
 	insertUsageAt(t, h, "acc-b1", "model-b", "hash-b1", "route-b1", 60, 0, 60, 0, 0, 0, base+10)

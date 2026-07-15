@@ -87,7 +87,7 @@ func run() int {
 			ChainProxy:     cfg.DefaultSidecarChainProxy,
 			StreamCapable:  true,
 			Health:         "healthy",
-			MaxConcurrency: 16,
+			MaxConcurrency: 0,
 		}); err != nil {
 			log.Printf("init sidecar egress: %v", err)
 			return 1
@@ -170,6 +170,12 @@ func run() int {
 					log.Printf("[ledger] purge: %v", err)
 				} else if deleted > 0 {
 					log.Printf("[ledger] purged %d old rows", deleted)
+				}
+				journalDeleted, err := store.CleanupContextJournal(ctx)
+				if err != nil {
+					log.Printf("[context-journal] purge: %v", err)
+				} else if journalDeleted > 0 {
+					log.Printf("[context-journal] purged %d expired rows", journalDeleted)
 				}
 			}
 		}

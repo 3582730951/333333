@@ -84,7 +84,7 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 	}
 	status := strings.ToLower(streamString(root["status"]))
 	if !hasNonEmptyArray(root["output"]) && strings.TrimSpace(streamString(root["output_text"])) == "" &&
-		status != "failed" && status != "incomplete" {
+		status != "failed" && status != "incomplete" && r.id == "" && r.completed == nil {
 		return nil
 	}
 	out, err := json.Marshal(root)

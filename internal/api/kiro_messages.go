@@ -1018,6 +1018,7 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	breakpointsJSON, _ := json.Marshal(data.CachePointBreakpoints)
 	keyHash, userID := downstreamFromCtx(r.Context())
 	diagnostics := storage.UsageDiagnostics{
+		UsageEventID:            requestIDFromContext(r.Context()),
 		UsageProvider:           "kiro",
 		UsageSource:             data.UsageSource,
 		CacheReadPresent:        data.Metering.CacheReadTokens.Present,
@@ -1038,17 +1039,11 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 			return 0
 		}(),
 	}
-	s.enqueueWrite(func() {
-		ctx, cancel := bgWriteContext()
-		defer cancel()
-		totalInput := data.InputTokens
-		if data.Metering.TotalInputTokens.Present {
-			totalInput = data.Metering.TotalInputTokens.Value
-		}
-		if err := s.store.InsertUsageRecordWithDiagnostics(ctx, accountID, affinity.Hash, keyHash, userID, model,
-			data.InputTokens, data.OutputTokens, totalInput+data.OutputTokens, data.CacheReadTokens,
-			data.CacheReadTokens, data.CacheCreationTokens, raw, diagnostics); err != nil {
-			log.Printf("[USAGE-ERROR] Kiro usage insert failed: account=%s model=%s err=%v", accountID, model, err)
-		}
-	})
+	totalInput := data.InputTokens
+	if data.Metering.TotalInputTokens.Present {
+		totalInput = data.Metering.TotalInputTokens.Value
+	}
+	s.enqueueUsage(storage.UsageRecordWrite{AccountID: accountID, RouteKeyHash: affinity.Hash, APIKeyHash: keyHash, UserID: userID, Model: model,
+		Prompt: data.InputTokens, Completion: data.OutputTokens, Total: totalInput + data.OutputTokens, Cached: data.CacheReadTokens,
+		CacheRead: data.CacheReadTokens, CacheCreation: data.CacheCreationTokens, Raw: raw, Diagnostics: diagnostics})
 }

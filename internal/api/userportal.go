@@ -136,6 +136,7 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []storage.UserUsageRow{}
 	}
+	w.Header().Set("X-MiCliProxy-Usage-Accuracy-Cutover", strconv.FormatInt(s.store.UsageAccuracyCutover(r.Context()), 10))
 	writeJSON(w, http.StatusOK, rows)
 }
 

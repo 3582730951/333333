@@ -45,6 +45,7 @@ func TestResolveDownstreamPolicyRejectsExpiredKeyAndMarksValidKeyUsed(t *testing
 	validReq.Header.Set("Authorization", "Bearer cap_valid_lifecycle_test")
 	validW := httptest.NewRecorder()
 	pol, ok := h.app.resolveDownstreamPolicy(validW, validReq)
+	h.app.WaitForAsyncWrites()
 	if !ok || !pol.Authed {
 		t.Fatalf("valid key rejected: status=%d body=%s", validW.Code, validW.Body.String())
 	}

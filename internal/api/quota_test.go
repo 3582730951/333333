@@ -171,9 +171,7 @@ func TestCaptureQuotaThrottlesCodexNoRateLimitHeaderAudit(t *testing.T) {
 		t.Fatalf("audit rows after duplicate capture = %d, want 1: %+v", len(rows), rows)
 	}
 
-	if _, err := store.DB().ExecContext(ctx, `UPDATE audit_log SET created_at = ? WHERE action = ?`, storage.Now()-3601, "codex_no_ratelimit_headers"); err != nil {
-		t.Fatal(err)
-	}
+	app.missingLimitAudit.Store("acc\x00codex", storage.Now()/3600-1)
 	app.captureQuota(ctx, "acc", "codex", "gpt-5.5", header)
 	rows, err = store.ListAuditLogForAccount(ctx, "acc", 10)
 	if err != nil {

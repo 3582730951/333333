@@ -45,7 +45,7 @@ const (
 	// smoothing gate against over-committing a single upstream, not a per-request limit).
 	// Sized for several concurrent 1M-context Claude Code turns per account; exceeding it
 	// now makes a request WAIT for headroom (see AdmissionWait), never fail downstream.
-	DefaultAccountTokenBudget = 8_000_000
+	DefaultAccountTokenBudget = 0
 	// Standard Claude Code OAuth client (Claude Pro/Max). Operators may override
 	// via config if Anthropic rotates these.
 	DefaultClaudeOAuthTokenURL = "https://api.anthropic.com/v1/oauth/token"
@@ -149,12 +149,14 @@ type Config struct {
 	// AdmissionWaitMillis bounds the per-account concurrency/token-budget backpressure
 	// wait (see DefaultAdmissionWaitMillis). Unset (0) adopts the default; a negative
 	// value disables the wait (legacy fail-fast).
-	AdmissionWaitMillis   int    `json:"admission_wait_millis"`
-	RequestTimeoutSeconds int    `json:"request_timeout_seconds"`
-	ShutdownDrainSeconds  int    `json:"shutdown_drain_seconds"`
-	MaxBodyBytes          int64  `json:"max_body_bytes"`
-	AccountTokenBudget    int64  `json:"account_token_budget"`
-	AdminToken            string `json:"admin_token"`
+	AdmissionWaitMillis      int    `json:"admission_wait_millis"`
+	RequestTimeoutSeconds    int    `json:"request_timeout_seconds"`
+	ShutdownDrainSeconds     int    `json:"shutdown_drain_seconds"`
+	MaxBodyBytes             int64  `json:"max_body_bytes"`
+	AccountTokenBudget       int64  `json:"account_token_budget"`
+	ResourceHeadroomPercent  int    `json:"resource_headroom_percent"`
+	ContextJournalTTLSeconds int    `json:"context_journal_ttl_seconds"`
+	AdminToken               string `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
 	// cookie security, or generated public URLs. Direct internet clients cannot
 	// spoof X-Forwarded-* unless their immediate peer is in this list.
@@ -719,6 +721,8 @@ func Default() Config {
 		ShutdownDrainSeconds:           DefaultShutdownDrainSec,
 		MaxBodyBytes:                   DefaultMaxBodyBytes,
 		AccountTokenBudget:             DefaultAccountTokenBudget,
+		ResourceHeadroomPercent:        10,
+		ContextJournalTTLSeconds:       86400,
 		TrustedProxyCIDRs:              []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:          120,
 		KiroVersion:                    "0.11.107",
@@ -1219,8 +1223,14 @@ func (c *Config) normalize() {
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = DefaultMaxBodyBytes
 	}
-	if c.AccountTokenBudget <= 0 {
-		c.AccountTokenBudget = DefaultAccountTokenBudget
+	if c.AccountTokenBudget < 0 {
+		c.AccountTokenBudget = 0
+	}
+	if c.ResourceHeadroomPercent < 10 {
+		c.ResourceHeadroomPercent = 10
+	}
+	if c.ContextJournalTTLSeconds <= 0 {
+		c.ContextJournalTTLSeconds = 86400
 	}
 	if c.SidecarTimeoutSeconds <= 0 {
 		c.SidecarTimeoutSeconds = 120

@@ -52,6 +52,9 @@ func ExtractClaudeAffinityKey(r *http.Request, body []byte) AffinityKey {
 	if key := ExtractClaudeTrueAffinityKey(r, body); key.Hash != "" {
 		return key
 	}
+	if aliases := ClaudeItemAffinityKeys(body); len(aliases) > 0 {
+		return aliases[0]
+	}
 	if key := claudeCachePrefixKey(r, body); key != "" {
 		return newKey(key, "cache_prefix_hash")
 	}
@@ -62,6 +65,52 @@ func ExtractClaudeAffinityKey(r *http.Request, body []byte) AffinityKey {
 		return newKey("stable_messages:"+hash, "stable_messages_hash")
 	}
 	return AffinityKey{}
+}
+
+// ClaudeItemAffinityKeys derives durable aliases from assistant/tool identifiers.
+// They keep a truncated conversation sticky even when its first user anchor has
+// fallen out of the client-provided history.
+func ClaudeItemAffinityKeys(body []byte) []AffinityKey {
+	var root interface{}
+	if json.Unmarshal(body, &root) != nil {
+		items := make([]interface{}, 0, 4)
+		for _, line := range bytes.Split(body, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			var item interface{}
+			if json.Unmarshal(bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:"))), &item) == nil {
+				items = append(items, item)
+			}
+		}
+		root = items
+	}
+	seen := map[string]bool{}
+	out := make([]AffinityKey, 0, 4)
+	var walk func(interface{})
+	walk = func(value interface{}) {
+		switch value := value.(type) {
+		case map[string]interface{}:
+			for _, field := range []string{"tool_use_id", "call_id", "id"} {
+				id, _ := value[field].(string)
+				id = strings.TrimSpace(id)
+				if id != "" && !seen[id] {
+					seen[id] = true
+					out = append(out, newKey("claude_item_id:"+id, "claude_item_id"))
+				}
+			}
+			for _, child := range value {
+				walk(child)
+			}
+		case []interface{}:
+			for _, child := range value {
+				walk(child)
+			}
+		}
+	}
+	walk(root)
+	return out
 }
 
 func ExtractClaudeTrueAffinityKey(r *http.Request, body []byte) AffinityKey {

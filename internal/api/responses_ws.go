@@ -142,6 +142,10 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			continue
 		case "response.create":
 			turnBaseCtx, cancelTurn := context.WithCancel(baseCtx)
+			// One downstream WebSocket can carry many inference turns. Give each
+			// turn its own usage event while every retry/bridge inside that turn
+			// continues to share the same idempotency key.
+			turnBaseCtx = contextWithRequestID(turnBaseCtx, newRequestID())
 			turnCtx := context.WithValue(turnBaseCtx, forceCodexResponsesWebSocketKey{}, true)
 			req := r.Clone(turnCtx)
 			req.Method = http.MethodPost

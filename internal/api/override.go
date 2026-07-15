@@ -169,7 +169,8 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				// Authentication has succeeded. Usage attribution must not depend on this
 				// best-effort observability write, so a transient DB error cannot reject an
 				// otherwise valid inference request.
-				_ = s.store.MarkAPIKeyUsed(ctx, key.KeyHash, storage.Now())
+				keyHash, usedAt := key.KeyHash, storage.Now()
+				s.enqueueAPIKeyUsed(keyHash, usedAt)
 				pol.Authed = true
 				pol.KeyLabel = key.Label
 				pol.KeyHash = key.KeyHash

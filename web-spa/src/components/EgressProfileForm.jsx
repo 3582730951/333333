@@ -79,7 +79,7 @@ export const EGRESS_TEMPLATES = [
       ip_mode: 'local_sidecar',
       provider_key: 'cuff',
       dynamic_config_json: '{}',
-      max_concurrency: 16,
+      max_concurrency: 0,
     },
   },
   {
@@ -96,7 +96,7 @@ export const EGRESS_TEMPLATES = [
       ip_mode: 'datacenter',
       provider_key: 'direct',
       dynamic_config_json: '{}',
-      max_concurrency: 128,
+      max_concurrency: 0,
     },
   },
 ];
@@ -297,7 +297,7 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
       <div className="pool-egress-form-grid">
         <Form.Input field="region" label="地区/国家" placeholder="BR / US / Rand" />
         <Form.Input field="exit_ip" label="出口 IP" placeholder="测试后自动填充" />
-        <Form.InputNumber field="max_concurrency" label="并发上限" min={1} max={128} />
+        <Form.InputNumber field="max_concurrency" label="并发上限（0=自适应）" min={0} />
       </div>
 
       <div className="pool-egress-form-actions">

@@ -211,7 +211,11 @@ func configFields() []configField {
 		{Key: "stateful_sticky_wait_seconds", Label: "Stateful Sticky 等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "仅用于 previous_response_id / X-Codex-Turn-State 等必须同账号请求等待本账号本地容量释放；0=跟随请求超时。", boot: func(c config.Config) interface{} { return c.StatefulStickyWaitSeconds }},
 		{Key: "account_token_budget", Label: "账号并发 Token 预算", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
-			Help: "同账号已有在途请求时允许叠加的估算输入 token 上限。", boot: func(c config.Config) interface{} { return int(c.AccountTokenBudget) }},
+			Help: "同账号已有在途请求时允许叠加的估算输入 token 上限；0=关闭。", boot: func(c config.Config) interface{} { return int(c.AccountTokenBudget) }},
+		{Key: "resource_headroom_percent", Label: "资源安全余量", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
+			Help: "CPU、内存或 FD 达到安全线时暂停新准入；最小 10%。", boot: func(c config.Config) interface{} { return c.ResourceHeadroomPercent }},
+		{Key: "context_journal_ttl_seconds", Label: "上下文日志 TTL", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "加密 Responses 重建日志保留秒数。", boot: func(c config.Config) interface{} { return c.ContextJournalTTLSeconds }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
@@ -394,6 +398,7 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	c.StickyWaitMillis = s.settingInt(ctx, "sticky_wait_millis", c.StickyWaitMillis)
 	c.StatefulStickyWaitSeconds = s.settingInt(ctx, "stateful_sticky_wait_seconds", c.StatefulStickyWaitSeconds)
 	c.AccountTokenBudget = s.settingInt64(ctx, "account_token_budget", c.AccountTokenBudget)
+	c.ResourceHeadroomPercent = s.settingInt(ctx, "resource_headroom_percent", c.ResourceHeadroomPercent)
 	c.StrictStickyMaxCooldownSeconds = s.settingInt(ctx, "strict_sticky_max_cooldown_seconds", c.StrictStickyMaxCooldownSeconds)
 	c.CooldownWaitMaxSeconds = s.settingInt(ctx, "cooldown_wait_max_seconds", c.CooldownWaitMaxSeconds)
 	c.SchedulerHeartbeatSeconds = s.settingInt(ctx, "scheduler_heartbeat_seconds", c.SchedulerHeartbeatSeconds)
@@ -403,8 +408,11 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	if c.StatefulStickyWaitSeconds < 0 {
 		c.StatefulStickyWaitSeconds = 0
 	}
-	if c.AccountTokenBudget <= 0 {
-		c.AccountTokenBudget = config.DefaultAccountTokenBudget
+	if c.AccountTokenBudget < 0 {
+		c.AccountTokenBudget = 0
+	}
+	if c.ResourceHeadroomPercent < 10 {
+		c.ResourceHeadroomPercent = 10
 	}
 	if c.StrictStickyMaxCooldownSeconds < 0 {
 		c.StrictStickyMaxCooldownSeconds = 0
@@ -537,7 +545,37 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		default:
 			return "", fmt.Errorf("expected comma-separated ISO-2 country list")
 		}
-	case "sticky_wait_millis", "account_token_budget", "scheduler_heartbeat_seconds":
+	case "account_token_budget":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.ParseInt(raw, 10, 64)
+		if n < 0 {
+			return "", fmt.Errorf("must be zero (disabled) or greater")
+		}
+		return raw, nil
+	case "resource_headroom_percent":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 10 || n > 50 {
+			return "", fmt.Errorf("must be between 10 and 50")
+		}
+		return raw, nil
+	case "context_journal_ttl_seconds":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 60 {
+			return "", fmt.Errorf("must be at least 60")
+		}
+		return raw, nil
+	case "sticky_wait_millis", "scheduler_heartbeat_seconds":
 		raw, err := validateIntegerSetting(v)
 		if err != nil {
 			return "", err

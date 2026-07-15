@@ -397,17 +397,17 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	if waitedForFlight {
 		usageDiag.SingleflightWaitedRequests = 1
 	}
-	holdID, _ := s.store.CreateBillingHold(r.Context(), affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	// Backstop: guarantee this attempt's hold reaches a terminal status no matter which
 	// branch returns (including a cancelled/streaming disconnect). Only fires while the
 	// hold is still 'held', so an explicit settle below always wins.
-	defer func() { _ = s.store.SettleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
+	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
 	// Session 33: Carry the billing hold id in the request context for usage fallback.
 	r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), usageDiag))
 	resp, err := s.upstream.Do(r.Context(), requestForToken(token))
 	releaseFlight()
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_before_response")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if allowRetry && movable {
 			return retry() // transport error — a fresh account/egress may succeed
 		}
@@ -427,7 +427,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 				resp.Body.Close()
 				resp, err = s.upstream.Do(r.Context(), requestForToken(token))
 				if err != nil {
-					_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_after_refresh")
+					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_refresh")
 					if allowRetry && movable {
 						return retry()
 					}
@@ -467,7 +467,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		} else {
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_upstream")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
 		if ruleMatched {
 			switch decision.Match.DownstreamAction {
 			case upstreamrules.DownstreamActionFailover:
@@ -507,7 +507,7 @@ claudeSuccess:
 	if isEventStream(resp.Header) {
 		prefix, retryableStream, probeErr := probeEarlyClaudeSSEFailure(resp.Body)
 		if probeErr != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_probe_failed")
+			_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
 				return retry()
 			}
@@ -519,7 +519,7 @@ claudeSuccess:
 		}
 		if retryableStream {
 			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, prefix)
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
+			_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if allowRetry && movable {
 				return retry()
 			}
@@ -530,6 +530,8 @@ claudeSuccess:
 			return outcomeDone
 		}
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
+		aliasCapture := &claudeAliasCapture{}
+		streamBody = io.TeeReader(streamBody, aliasCapture)
 		if !refreshHeartbeat.Committed() {
 			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
@@ -542,9 +544,10 @@ claudeSuccess:
 			streamCtx = withResponseRuleFilter(streamCtx, rf)
 		}
 		if err := s.streamSSE(streamCtx, w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
+			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
-			_ = s.store.SettleBillingHold(r.Context(), holdID, "settled_streaming")
+			s.persistClaudeItemAliases(r.Context(), raw, aliasCapture.Bytes(), lease, model)
+			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
 		}
 		return outcomeDone
 	}
@@ -555,7 +558,7 @@ claudeSuccess:
 	// a pre-commit read failure fails over to a fresh account losslessly instead.
 	responseBody, err := s.readUpstreamResponseBody(resp.Body)
 	if err != nil {
-		_ = s.store.SettleBillingHold(r.Context(), holdID, "failed_response_too_large")
+		_ = s.settleBillingHold(r.Context(), holdID, "failed_response_too_large")
 		if allowRetry && movable {
 			return retry()
 		}
@@ -563,9 +566,10 @@ claudeSuccess:
 		return outcomeDone
 	}
 	s.rememberClaudeCacheDiagnosticsMessageID(affinity, responseBody)
+	s.persistClaudeItemAliases(r.Context(), raw, responseBody, lease, model)
 	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), responseBody))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
-	_ = s.store.SettleBillingHold(r.Context(), holdID, "settled")
+	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if rf := s.responseRuleFilter(r.Context(), "claude", "claude_messages", model, resp.StatusCode); rf != nil {
