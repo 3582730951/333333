@@ -49,6 +49,37 @@ func TestCodexCreatedFrameDoesNotCommitContent(t *testing.T) {
 	}
 }
 
+func TestProbeEarlyCodexSSEFailureReleasesSafetyBufferingWithoutWaiting(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	type result struct {
+		prefix []byte
+		retry  bool
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		prefix, _, retry, err := probeEarlyCodexSSEFailure(reader)
+		done <- result{prefix: prefix, retry: retry, err: err}
+	}()
+	frame := `data: {"type":"response.created","response":{"id":"resp_wait"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n"
+	if _, err := writer.Write([]byte(frame)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.retry || !strings.Contains(string(got.prefix), "safety_buffering") {
+			t.Fatalf("unexpected probe result: retry=%v prefix=%q", got.retry, got.prefix)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("safety_buffering remained stuck in the early retry probe")
+	}
+}
+
 func TestProbeEarlyClaudeSSEFailureDetectsErrorBeforeMessageStart(t *testing.T) {
 	stream := "event: error\n" +
 		"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This account has hit its usage limit.\"}}\n\n"

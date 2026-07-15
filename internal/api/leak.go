@@ -196,7 +196,7 @@ func newRuleSSECopy(ctx context.Context, w http.ResponseWriter, body io.Reader, 
 	return newRuleSSECopyWithHeartbeat(ctx, w, body, rf, leak, words, provider, responseRuleHeartbeatInterval(rf))
 }
 
-const safetyBufferingHeartbeatFrame = "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n"
+const safetyBufferingHeartbeatFrame = "event: response.in_progress\ndata: " + responseInProgressPayload + "\n\n"
 
 func responseRuleHeartbeatInterval(rf *responseRuleFilter) time.Duration {
 	if rf == nil || rf.Mode != upstreamrules.DownstreamActionHideSafetyBuffering {
@@ -406,6 +406,12 @@ func codexSSEFrameCommitsContent(frame []byte) bool {
 		"response.output_item.added",
 		"response.function_call_arguments.delta",
 		"response.audio.delta",
+		// Release the early retry probe before a potentially long safety check.
+		// The downstream stream filter can then emit protocol heartbeats while the
+		// upstream is otherwise silent. A real response.failed in the same read is
+		// still detected before the prefix is committed.
+		"safety_buffering",
+		"response.in_progress",
 		`"delta"`,
 	} {
 		if strings.Contains(lower, marker) {

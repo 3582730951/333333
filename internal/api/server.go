@@ -1164,8 +1164,9 @@ codexSuccess:
 		// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
 		// full-response capture destroyed TTFT and manufactured 503s once a successful
 		// stream exceeded its memory/disk capture cap. This probe runs before both the
-		// native Responses and Chat Completions adapters; once either writes HTTP 200,
-		// transparent account failover is no longer possible.
+		// native Responses and Chat Completions adapters. Downstream-visible safety
+		// progress also releases the probe so a long safety check can be kept alive;
+		// once either adapter writes HTTP 200, transparent failover is no longer possible.
 		prefix, streamFailure, retryableStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
 		if probeErr != nil {
 			_ = s.store.SettleBillingHold(r.Context(), holdID, "stream_probe_failed")

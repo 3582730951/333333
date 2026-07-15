@@ -8,7 +8,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/sjson"
@@ -16,6 +19,77 @@ import (
 
 type forceCodexResponsesWebSocketKey struct{}
 type codexResponsesWebSocketSessionKey struct{}
+
+const (
+	responsesWebSocketHeartbeatInterval = 30 * time.Second
+	responseInProgressPayload           = `{"type":"response.in_progress"}`
+)
+
+type webSocketMessageWriter interface {
+	WriteMessage(messageType int, data []byte) error
+}
+
+// responsesWebSocketConn serializes downstream writes and tracks application-level
+// activity. Codex consumes WebSocket Ping/Pong frames in its connection pump, so
+// only a text event resets its stream idle timeout.
+type responsesWebSocketConn struct {
+	dst       webSocketMessageWriter
+	mu        sync.Mutex
+	lastWrite time.Time
+}
+
+func newResponsesWebSocketConn(dst webSocketMessageWriter) *responsesWebSocketConn {
+	return &responsesWebSocketConn{dst: dst, lastWrite: time.Now()}
+}
+
+func (c *responsesWebSocketConn) WriteMessage(messageType int, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.dst.WriteMessage(messageType, data); err != nil {
+		return err
+	}
+	if messageType == websocket.TextMessage {
+		c.lastWrite = time.Now()
+	}
+	return nil
+}
+
+func (c *responsesWebSocketConn) resetIdleClock() {
+	c.mu.Lock()
+	c.lastWrite = time.Now()
+	c.mu.Unlock()
+}
+
+func (c *responsesWebSocketConn) writeHeartbeatIfIdle(interval time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if time.Since(c.lastWrite) < interval {
+		return nil
+	}
+	if err := c.dst.WriteMessage(websocket.TextMessage, []byte(responseInProgressPayload)); err != nil {
+		return err
+	}
+	c.lastWrite = time.Now()
+	return nil
+}
+
+func keepResponsesWebSocketAlive(ctx context.Context, conn *responsesWebSocketConn, interval time.Duration) error {
+	if interval <= 0 {
+		return nil
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := conn.writeHeartbeatIfIdle(interval); err != nil {
+				return err
+			}
+		}
+	}
+}
 
 func forceCodexResponsesWebSocket(ctx context.Context) bool {
 	force, _ := ctx.Value(forceCodexResponsesWebSocketKey{}).(bool)
@@ -40,6 +114,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer conn.Close()
+	downstream := newResponsesWebSocketConn(conn)
 	session := upstream.NewCodexResponsesWebSocketSession()
 	defer session.Close()
 	baseCtx := context.WithValue(r.Context(), codexResponsesWebSocketSessionKey{}, session)
@@ -50,35 +125,55 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if messageType != websocket.TextMessage {
-			_ = writeWebSocketError(conn, http.StatusBadRequest, "unexpected non-text websocket message")
+			_ = writeWebSocketError(downstream, http.StatusBadRequest, "unexpected non-text websocket message")
 			return
 		}
 		kind, body, err := responsesWebSocketRequestToBody(raw)
 		if err != nil {
-			_ = writeWebSocketError(conn, http.StatusBadRequest, err.Error())
+			_ = writeWebSocketError(downstream, http.StatusBadRequest, err.Error())
 			return
 		}
 		switch kind {
 		case "response.processed":
 			if err := session.ForwardProcessed(raw); err != nil {
-				_ = writeWebSocketError(conn, http.StatusBadGateway, err.Error())
+				_ = writeWebSocketError(downstream, http.StatusBadGateway, err.Error())
 				return
 			}
 			continue
 		case "response.create":
-			req := r.Clone(context.WithValue(baseCtx, forceCodexResponsesWebSocketKey{}, true))
+			turnBaseCtx, cancelTurn := context.WithCancel(baseCtx)
+			turnCtx := context.WithValue(turnBaseCtx, forceCodexResponsesWebSocketKey{}, true)
+			req := r.Clone(turnCtx)
 			req.Method = http.MethodPost
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
 			req.Header = r.Header.Clone()
 			req.Header.Set("Content-Type", "application/json")
-			writer := newResponsesWebSocketWriter(conn)
+			writer := newResponsesWebSocketWriter(downstream)
+			downstream.resetIdleClock()
+			heartbeatDone := make(chan error, 1)
+			go func() {
+				heartbeatErr := fmt.Errorf("responses websocket heartbeat stopped unexpectedly")
+				defer func() {
+					if heartbeatErr != nil {
+						cancelTurn()
+					}
+					heartbeatDone <- heartbeatErr
+				}()
+				defer supervisor.Recover("responses-websocket-heartbeat")
+				heartbeatErr = keepResponsesWebSocketAlive(turnBaseCtx, downstream, responsesWebSocketHeartbeatInterval)
+			}()
 			s.handleGatewayPost(writer, req)
+			cancelTurn()
+			heartbeatErr := <-heartbeatDone
+			if heartbeatErr != nil {
+				return
+			}
 			if err := writer.Close(); err != nil {
 				return
 			}
 		default:
-			_ = writeWebSocketError(conn, http.StatusBadRequest, fmt.Sprintf("unsupported websocket request type %q", kind))
+			_ = writeWebSocketError(downstream, http.StatusBadRequest, fmt.Sprintf("unsupported websocket request type %q", kind))
 			return
 		}
 	}
@@ -114,14 +209,14 @@ func responsesWebSocketRequestToBody(raw []byte) (string, []byte, error) {
 }
 
 type responsesWebSocketWriter struct {
-	conn       *websocket.Conn
+	conn       webSocketMessageWriter
 	header     http.Header
 	status     int
 	sseBuffer  []byte
 	bodyBuffer []byte
 }
 
-func newResponsesWebSocketWriter(conn *websocket.Conn) *responsesWebSocketWriter {
+func newResponsesWebSocketWriter(conn webSocketMessageWriter) *responsesWebSocketWriter {
 	return &responsesWebSocketWriter{
 		conn:   conn,
 		header: http.Header{},
@@ -206,7 +301,7 @@ func sseDataPayload(block []byte) string {
 	return strings.Join(data, "\n")
 }
 
-func writeWebSocketError(conn *websocket.Conn, status int, message string) error {
+func writeWebSocketError(conn webSocketMessageWriter, status int, message string) error {
 	if status == 0 {
 		status = http.StatusInternalServerError
 	}
