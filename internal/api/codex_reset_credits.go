@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -66,7 +68,7 @@ func parseCodexResetCredits(body []byte, source string) codexResetCreditsSnapsho
 			target = nested
 		}
 	}
-	if n, ok := jsonIntAnyOK(target, "available_count", "availableCount"); ok && n >= 0 {
+	if n, ok := resetCreditCount(target, "available_count", "availableCount"); ok {
 		out.Known = true
 		out.Status = "ok"
 		out.AvailableCount = n
@@ -80,10 +82,11 @@ func parseCodexResetCredits(body []byte, source string) codexResetCreditsSnapsho
 				if !ok {
 					continue
 				}
-				resetType := firstNonEmpty(jsonStringAny(credit, "reset_type", "resetType"), "")
 				status := strings.TrimSpace(jsonStringAny(credit, "status"))
-				expiresAt := strings.TrimSpace(firstNonEmpty(jsonStringAny(credit, "expires_at", "expiresAt"), ""))
-				if resetType == "codex_rate_limits" && status == "available" && expiresAt != "" {
+				// This endpoint contains only rate-limit reset credits. Requiring
+				// optional metadata such as reset_type or expires_at undercounts
+				// otherwise valid entries when available_count is absent.
+				if strings.EqualFold(status, "available") {
 					count++
 				}
 			}
@@ -94,6 +97,34 @@ func parseCodexResetCredits(body []byte, source string) codexResetCreditsSnapsho
 		}
 	}
 	return out
+}
+
+// resetCreditCount accepts only a complete non-negative integer. The generic
+// quota parser intentionally tolerates loose numeric strings, but a partial
+// value such as "3abc" or a fractional count must not become a usable reset.
+func resetCreditCount(m map[string]interface{}, keys ...string) (int64, bool) {
+	for _, key := range keys {
+		switch v := m[key].(type) {
+		case float64:
+			if v >= 0 && v < 1<<63 && math.Trunc(v) == v {
+				return int64(v), true
+			}
+		case int64:
+			if v >= 0 {
+				return v, true
+			}
+		case int:
+			if v >= 0 {
+				return int64(v), true
+			}
+		case string:
+			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err == nil && n >= 0 {
+				return n, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (s *Server) upsertCodexResetCreditsSnapshot(ctx context.Context, accountID string, snap codexResetCreditsSnapshot) {
@@ -380,13 +411,13 @@ func (s *Server) fetchAndPersistCodexResetCredits(ctx context.Context, account s
 
 func (s *Server) consumeCodexResetCredit(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, redeemID string) (int, []byte, storage.AccountToken, error) {
 	status, body, err := s.codexResetCreditsConsumePOST(ctx, account, token, egress, redeemID)
-	if err == nil && status >= 200 && status < 300 {
+	if err == nil && status >= 200 && status < 300 && codexResetConsumed(body) {
 		return status, body, token, nil
 	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		if rr, rerr := s.refreshCodexToken(ctx, token); rerr == nil && rr.Refreshed {
 			status, body, err = s.codexResetCreditsConsumePOST(ctx, account, rr.Token, egress, redeemID)
-			if err == nil && status >= 200 && status < 300 {
+			if err == nil && status >= 200 && status < 300 && codexResetConsumed(body) {
 				return status, body, rr.Token, nil
 			}
 			token = rr.Token
@@ -395,7 +426,17 @@ func (s *Server) consumeCodexResetCredit(ctx context.Context, account storage.Ac
 	if err != nil {
 		return status, body, token, err
 	}
+	if status >= 200 && status < 300 {
+		return status, body, token, fmt.Errorf("reset credit was not consumed: %s", bodySnippet(body, 300))
+	}
 	return status, body, token, fmt.Errorf("reset credit consume http %d", status)
+}
+
+func codexResetConsumed(body []byte) bool {
+	var response struct {
+		Code string `json:"code"`
+	}
+	return json.Unmarshal(body, &response) == nil && response.Code == "reset"
 }
 
 func (s *Server) codexResetCreditsGET(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile) (int, []byte, storage.AccountToken, error) {
@@ -444,10 +485,15 @@ func applyCodexWhamHeaders(h http.Header, account storage.Account, token storage
 	if id := codexChatGPTAccountID(account); id != "" {
 		h.Set("ChatGPT-Account-Id", id)
 	}
+	if account.IsFedramp {
+		h.Set("X-OpenAI-Fedramp", "true")
+	}
 }
 
 func codexChatGPTAccountID(account storage.Account) string {
-	return strings.TrimSpace(firstNonEmpty(account.ChatGPTUserID, account.UpstreamAccountID, account.ID))
+	// account.ID is the pool's local primary key, not a ChatGPT account ID.
+	// Omitting the header is safer than routing the request with a fabricated ID.
+	return strings.TrimSpace(firstNonEmpty(account.ChatGPTUserID, account.UpstreamAccountID))
 }
 
 func (s *Server) auditCodexResetCredit(ctx context.Context, account storage.Account, action, reason string, detail map[string]interface{}) {

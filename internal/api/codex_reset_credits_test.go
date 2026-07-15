@@ -39,7 +39,7 @@ func TestParseCodexResetCredits(t *testing.T) {
 			wantSource: "rate-limit-reset-credits",
 		},
 		{
-			name: "credits fallback filters codex available credits",
+			name: "credits fallback counts available entries",
 			body: `{"credits":[
 				{"id":"c1","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-07-05T00:00:00Z"},
 				{"id":"c2","resetType":"codex_rate_limits","status":"consumed","expiresAt":"2026-07-05T00:00:00Z"},
@@ -49,7 +49,30 @@ func TestParseCodexResetCredits(t *testing.T) {
 			source:     "rate-limit-reset-credits",
 			wantKnown:  true,
 			wantStatus: "ok",
-			wantCount:  1,
+			wantCount:  3,
+			wantSource: "rate-limit-reset-credits",
+		},
+		{
+			name:       "numeric string count",
+			body:       `{"available_count":"3"}`,
+			source:     "rate-limit-reset-credits",
+			wantKnown:  true,
+			wantStatus: "ok",
+			wantCount:  3,
+			wantSource: "rate-limit-reset-credits",
+		},
+		{
+			name:       "partial numeric string is unknown",
+			body:       `{"available_count":"3abc"}`,
+			source:     "rate-limit-reset-credits",
+			wantStatus: "unknown",
+			wantSource: "rate-limit-reset-credits",
+		},
+		{
+			name:       "fractional count is unknown",
+			body:       `{"available_count":1.5}`,
+			source:     "rate-limit-reset-credits",
+			wantStatus: "unknown",
 			wantSource: "rate-limit-reset-credits",
 		},
 		{
@@ -88,6 +111,35 @@ func TestParseCodexResetCredits(t *testing.T) {
 				t.Fatalf("parse = %+v, want known=%v status=%q count=%d source=%q", got, tt.wantKnown, tt.wantStatus, tt.wantCount, tt.wantSource)
 			}
 		})
+	}
+}
+
+func TestCodexResetConsumedRequiresExplicitResetCode(t *testing.T) {
+	tests := []struct {
+		body string
+		want bool
+	}{
+		{body: `{"code":"reset","windows_reset":2}`, want: true},
+		{body: `{"code":"nothing_to_reset"}`},
+		{body: `{"code":"no_credit"}`},
+		{body: `{"code":"already_redeemed"}`},
+		{body: `{}`},
+		{body: `not-json`},
+	}
+	for _, tt := range tests {
+		if got := codexResetConsumed([]byte(tt.body)); got != tt.want {
+			t.Fatalf("codexResetConsumed(%s) = %v, want %v", tt.body, got, tt.want)
+		}
+	}
+}
+
+func TestCodexChatGPTAccountIDNeverUsesLocalPoolID(t *testing.T) {
+	if got := codexChatGPTAccountID(storage.Account{ID: "local-pool-id"}); got != "" {
+		t.Fatalf("account ID = %q, want empty when no upstream ID is known", got)
+	}
+	account := storage.Account{ID: "local", UpstreamAccountID: "workspace", ChatGPTUserID: "chatgpt"}
+	if got := codexChatGPTAccountID(account); got != "chatgpt" {
+		t.Fatalf("account ID = %q, want chatgpt", got)
 	}
 }
 

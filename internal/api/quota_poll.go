@@ -515,10 +515,6 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	if chatgptUserID == "" {
 		chatgptUserID = acc.UpstreamAccountID
 	}
-	if chatgptUserID == "" {
-		// Try the account_id embedded in the token struct
-		chatgptUserID = acc.ID
-	}
 
 	hc, err := s.upstream.EgressHTTPClient(egress)
 	if err != nil {
@@ -527,7 +523,12 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, whamUsageURL, nil)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("ChatGPT-Account-Id", chatgptUserID)
+	if chatgptUserID != "" {
+		req.Header.Set("ChatGPT-Account-Id", chatgptUserID)
+	}
+	if acc.IsFedramp {
+		req.Header.Set("X-OpenAI-Fedramp", "true")
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Origin", "https://chatgpt.com")
 	req.Header.Set("Referer", "https://chatgpt.com/")
