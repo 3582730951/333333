@@ -123,6 +123,7 @@ type Server struct {
 	qualityRunning  bool
 	contextRebuilt  uint64
 	contextDegraded uint64
+	diskGuard       atomic.Value // DiskGuardSnapshot
 }
 
 func NewServer(dep Dependencies) *Server {

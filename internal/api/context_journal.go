@@ -83,6 +83,9 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 		return e
 	}
 	ttl := s.settingInt(ctx, "context_journal_ttl_seconds", s.cfg.ContextJournalTTLSeconds)
+	if forced := s.diskGuardTTL(); forced > 0 && (ttl <= 0 || forced < ttl) {
+		ttl = forced
+	}
 	if ttl <= 0 {
 		ttl = 3600
 	}

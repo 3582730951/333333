@@ -62,6 +62,15 @@ export const systemMetricsSchema = z.object({
     tx_bytes_per_sec: z.coerce.number().optional(),
     total_bytes_per_sec: z.coerce.number().optional(),
   }).passthrough().optional(),
+  disk_guard: z.object({
+    level: z.string(),
+    free_percent: z.coerce.number(),
+    forced_context_ttl_seconds: z.coerce.number().optional(),
+    contexts_deleted: z.coerce.number().optional(),
+    logs_deleted: z.coerce.number().optional(),
+    last_run_at: z.coerce.number().optional(),
+    last_error: z.string().optional(),
+  }).passthrough().optional(),
   registration: z.object({
     total_rss_kb: z.coerce.number().optional(),
     node: z.coerce.number().optional(),

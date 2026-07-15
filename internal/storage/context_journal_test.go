@@ -81,3 +81,20 @@ func TestContextJournalDefaultTTLMigrationIsOneTime(t *testing.T) {
 		t.Fatalf("one-time migration overwrote admin value: ttl=%q err=%v", value, err)
 	}
 }
+
+func TestContextJournalCompressionRoundTripAndLegacyCompatibility(t *testing.T) {
+	payload := strings.Repeat(`{"role":"assistant","content":"compressible context"}`, 400)
+	compressed := compressContextPayload(payload)
+	if compressed == payload || !strings.HasPrefix(compressed, compressedContextPrefix) {
+		t.Fatal("large context was not compressed")
+	}
+	if len(compressed) >= len(payload)/2 {
+		t.Fatalf("compression ineffective: before=%d after=%d", len(payload), len(compressed))
+	}
+	if got := decompressContextPayload(compressed); got != payload {
+		t.Fatal("compressed round trip changed payload")
+	}
+	if got := decompressContextPayload(payload); got != payload {
+		t.Fatal("legacy compatibility failed")
+	}
+}

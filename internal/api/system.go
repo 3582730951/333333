@@ -35,6 +35,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		ContextRebuilt    uint64                   `json:"context_rebuilt"`
 		ContextDegraded   uint64                   `json:"context_degraded"`
 		Sidecar           interface{}              `json:"sidecar,omitempty"`
+		DiskGuard         DiskGuardSnapshot        `json:"disk_guard"`
 		SupervisorEvents  []supervisor.Event       `json:"supervisor_events"`
 		SupervisorModules []supervisor.ModuleState `json:"supervisor_modules"`
 	}{
@@ -42,6 +43,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		Admission:      s.scheduler.AdmissionSnapshot(),
 		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
 		Sidecar:           s.sidecarMetrics(r.Context()),
+		DiskGuard:         s.diskGuardSnapshot(),
 		SupervisorEvents:  supervisor.RecentEvents(),
 		SupervisorModules: supervisor.ModuleStates(),
 	}

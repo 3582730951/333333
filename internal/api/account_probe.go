@@ -371,6 +371,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 	s.startRecheckLoop(ctx)
 	s.startBillingHoldExpiryLoop(ctx)
 	s.startLogRetentionLoop(ctx)
+	s.startDiskGuard(ctx)
 	interval := time.Duration(s.cfg.ModelProbeIntervalHours) * time.Hour
 	if interval <= 0 {
 		return

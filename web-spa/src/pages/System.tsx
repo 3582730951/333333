@@ -56,6 +56,7 @@ export default function System() {
   const memory = system?.mem || {};
   const disk = system?.disk || {};
   const network = system?.network || {};
+  const diskGuard = system?.disk_guard;
   const registration = system?.registration || {};
   const go = system?.go || {};
   const events = (system?.supervisor_events || []).map((event, index) => ({
@@ -106,6 +107,7 @@ export default function System() {
         <MetricCard label={t('system.memory_usage')} value={`${memory.used_pct ?? '—'}%`} color={meterColor(memory.used_pct || 0)} sub={`${fmtKB(memory.used_kb)} / ${fmtKB(memory.total_kb)}`} />
         <MetricCard label={t('system.disk_usage')} value={`${disk.used_pct ?? '—'}%`} color={meterColor(disk.used_pct || 0)} sub={`${fmtBytes(disk.used_bytes)} / ${fmtBytes(disk.total_bytes)}`} />
         <MetricCard label={t('system.network_traffic')} value={`${fmtBytes(network.total_bytes_per_sec)}/s`} color={C.cyan} sub={`${t('system.network_rx')} ${fmtBytes(network.rx_bytes_per_sec)}/s · ${t('system.network_tx')} ${fmtBytes(network.tx_bytes_per_sec)}/s · ${network.interfaces || 0} ${t('system.interfaces')}`} />
+        <MetricCard label={t('system.disk_guard')} value={diskGuard ? `${diskGuard.free_percent}%` : '—'} color={diskGuard?.level === 'critical' ? C.red : diskGuard?.level === 'pressure' ? C.amber : C.green} sub={diskGuard ? `${t(`system.disk_guard_${diskGuard.level}`, diskGuard.level)} · TTL ${diskGuard.forced_context_ttl_seconds || 3600}s · ${t('system.contexts_deleted')} ${fmtInt(diskGuard.contexts_deleted)}` : '—'} />
         <MetricCard label={t('system.registration_memory')} value={fmtKB(registration.total_rss_kb)} color={C.violet} sub={`node ${registration.node || 0} · chrome ${registration.chrome || 0} · Xvfb ${registration.xvfb || 0}`} />
         <MetricCard label={t('system.uptime')} value={fmtDuration(system?.uptime_seconds)} color={C.cyan} sub={t('system.system_uptime')} />
         <MetricCard label={t('system.go_process')} value={`${go.goroutines || 0}`} color={C.blue} sub={t('system.goroutine_memory').replace('{memory}', fmtBytes(go.sys_bytes))} />
