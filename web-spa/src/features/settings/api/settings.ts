@@ -3,7 +3,7 @@ import { del, get, post } from '../../../api.js';
 import { createApiError, parseApiResponse } from '../../../api/contracts';
 import type {
   AdvancedSettings, AdvancedSettingsKind, AdvancedSettingsSaveInput, AutomationSettings, ConfigField, LifecycleSettings, ProviderOptions, ProviderSetting,
-  LogClearResponse, RegistrarSaveInput, RegistrarSettings, SettingsEgress, SettingsGroup, SettingsPatch,
+  ContextJournalClearResponse, LogClearResponse, RegistrarSaveInput, RegistrarSettings, SettingsEgress, SettingsGroup, SettingsPatch,
   SettingsSaveResponse, SettingsSection, SettingsTemplate, SettingsValues, SharedSettingsOptions,
 } from '../model/settings';
 
@@ -36,6 +36,15 @@ export const logClearResponseSchema = z.object({
   space_reclaimed: z.boolean(),
   reclaim_warning: z.string().optional().default(''),
   retention_days: z.coerce.number().int().positive(),
+}).passthrough();
+
+export const contextJournalClearResponseSchema = z.object({
+  ok: z.boolean(),
+  deleted_contexts: z.coerce.number().int().nonnegative(),
+  space_reclaimed: z.boolean(),
+  reclaim_warning: z.string().optional().default(''),
+  ttl_seconds: z.coerce.number().int().positive(),
+  completed_at: z.coerce.number().int().nonnegative(),
 }).passthrough();
 
 const configFieldSchema = z.object({
@@ -282,6 +291,10 @@ export async function saveSettingsPatches(patches: SettingsPatch[]): Promise<Set
 
 export async function clearLogRecords(): Promise<LogClearResponse> {
   return parseApiResponse(logClearResponseSchema, await del('/admin/logs', undefined, { timeout: 30 * 60 * 1000 })) as LogClearResponse;
+}
+
+export async function clearContextJournal(): Promise<ContextJournalClearResponse> {
+  return parseApiResponse(contextJournalClearResponseSchema, await del('/admin/context-journal', undefined, { timeout: 30 * 60 * 1000 })) as ContextJournalClearResponse;
 }
 
 export async function applySettingsTemplate(templateId: string): Promise<SettingsTemplate> {

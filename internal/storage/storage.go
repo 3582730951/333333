@@ -670,6 +670,9 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('usage_accuracy_cutover_at',?,?) ON CONFLICT(key) DO NOTHING`, strconv.FormatInt(now, 10), now); err != nil {
 		return err
 	}
+	if err := s.migrateContextJournalTTL(ctx, now); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, created_at, updated_at)
 VALUES('cyber', '', 'prepend', 1, 0, ?, ?)
@@ -712,6 +715,31 @@ ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, CustomProviderProtocolChat
 		}
 	}
 	return nil
+}
+
+func (s *Store) migrateContextJournalTTL(ctx context.Context, now int64) error {
+	const marker = "context_journal_ttl_1h_migrated"
+	var migrated int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, marker).Scan(&migrated); err != nil {
+		return err
+	}
+	if migrated > 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// 86400 was the shipped default. Migrate only that known value once; any other
+	// administrator-defined retention remains untouched.
+	if _, err := tx.ExecContext(ctx, `UPDATE settings SET value='3600', updated_at=? WHERE key='context_journal_ttl_seconds' AND value='86400'`, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)`, marker, "1", now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const schemaSQL = `

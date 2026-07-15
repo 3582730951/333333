@@ -215,7 +215,7 @@ func configFields() []configField {
 		{Key: "resource_headroom_percent", Label: "资源安全余量", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "CPU、内存或 FD 达到安全线时暂停新准入；最小 10%。", boot: func(c config.Config) interface{} { return c.ResourceHeadroomPercent }},
 		{Key: "context_journal_ttl_seconds", Label: "上下文日志 TTL", Category: catLimits, Type: fieldInt, Effect: effectHot,
-			Help: "加密 Responses 重建日志保留秒数。", boot: func(c config.Config) interface{} { return c.ContextJournalTTLSeconds }},
+			Help: "加密 Responses 重建日志保留秒数，默认 3600 秒（1 小时）。", boot: func(c config.Config) interface{} { return c.ContextJournalTTLSeconds }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,

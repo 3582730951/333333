@@ -49,6 +49,15 @@ export interface LogClearResponse {
   retention_days: number;
 }
 
+export interface ContextJournalClearResponse {
+  ok: boolean;
+  deleted_contexts: number;
+  space_reclaimed: boolean;
+  reclaim_warning: string;
+  ttl_seconds: number;
+  completed_at: number;
+}
+
 export interface SettingsPatch {
   section: SettingsSection;
   key?: string;

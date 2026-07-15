@@ -8,7 +8,7 @@ import SettingsTabShellBase from '../components/SettingsTabShell.jsx';
 import ConfigFormBase from '../components/ConfigForm';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import {
-  useApplySettingsTemplateMutation, useAutomationSettingsData, useClearLogRecordsMutation, useConfigSettingsData,
+  useApplySettingsTemplateMutation, useAutomationSettingsData, useClearContextJournalMutation, useClearLogRecordsMutation, useConfigSettingsData,
   useLifecycleSettingsData, useLoggingSettingsData, useMemorySettingsData,
   useRegistrarSettingsData, useSaveRegistrarMutation, useSaveSettingsMutation,
   useSharedSettingsOptions,
@@ -717,6 +717,7 @@ function LifecycleTab({ groups, egresses, providerOpts }: { groups: SettingsGrou
 function LoggingTab() {
   const [diffs, setDiffs] = useState<SettingsDiff[] | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
+  const [contextClearOpen, setContextClearOpen] = useState(false);
 
   const {
     data: logging = {},
@@ -727,6 +728,7 @@ function LoggingTab() {
   } = useLoggingSettingsData();
   const saveMutation = useSaveSettingsMutation();
   const clearMutation = useClearLogRecordsMutation();
+  const contextClearMutation = useClearContextJournalMutation();
 
   const save = async (values: SettingsValues) => {
     try {
@@ -743,6 +745,16 @@ function LoggingTab() {
       setClearOpen(false);
       const reclaimed = result.space_reclaimed ? '，数据库空间已回收' : '，记录已删除但数据库压缩未完成';
       Toast.success(`已清空 ${result.deleted_total.toLocaleString()} 条日志${reclaimed}`);
+      if (result.reclaim_warning) Toast.warning(result.reclaim_warning);
+    } catch (e) { showErrorToast(e); }
+  };
+
+  const clearContexts = async () => {
+    try {
+      const result = await contextClearMutation.mutateAsync(undefined);
+      setContextClearOpen(false);
+      const reclaimed = result.space_reclaimed ? '，数据库空间已回收' : '，上下文已删除但数据库压缩未完成';
+      Toast.success(`已清空 ${result.deleted_contexts.toLocaleString()} 条加密上下文${reclaimed}`);
       if (result.reclaim_warning) Toast.warning(result.reclaim_warning);
     } catch (e) { showErrorToast(e); }
   };
@@ -787,6 +799,12 @@ function LoggingTab() {
         </Typography.Text>
         <Button type="danger" loading={clearMutation.isPending} onClick={() => setClearOpen(true)}>清空全部日志</Button>
       </Card>
+      <Card title="上下文磁盘回收" className="pool-card" style={{ maxWidth: 600, marginTop: 20 }}>
+        <Typography.Text type="tertiary" size="small" style={{ display: 'block', marginBottom: 12 }}>
+          加密 Responses 重建上下文默认保留 1 小时。此操作会清空 SQLite context_journal 表并执行 WAL 截断和 VACUUM，账号、凭据、用量和审计日志不受影响。
+        </Typography.Text>
+        <Button type="danger" loading={contextClearMutation.isPending} onClick={() => setContextClearOpen(true)}>清空上下文并回收空间</Button>
+      </Card>
       <ConfirmDialog
         open={clearOpen}
         title="确认清空全部日志？"
@@ -801,6 +819,21 @@ function LoggingTab() {
         destructive
         onCancel={() => setClearOpen(false)}
         onConfirm={clearLogs}
+      />
+      <ConfirmDialog
+        open={contextClearOpen}
+        title="确认清空全部上下文？"
+        description={(
+          <div className="pool-confirm-copy">
+            <p>此操作不可撤销，将删除所有用于跨账号重建的加密 Responses 上下文，并立即压缩 SQLite 数据库。</p>
+            <p>已有会话后续换号时可能进入 degraded 模式；账号、凭据、用量和审计日志不会删除。</p>
+          </div>
+        )}
+        confirmText="清空并回收"
+        cancelText="取消"
+        destructive
+        onCancel={() => setContextClearOpen(false)}
+        onConfirm={clearContexts}
       />
     </SettingsTabShell>
   );

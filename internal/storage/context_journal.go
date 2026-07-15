@@ -33,3 +33,13 @@ func (s *Store) CleanupContextJournal(ctx context.Context) (int64, error) {
 	}
 	return r.RowsAffected()
 }
+
+// ClearContextJournal atomically removes every encrypted replay context. SQLite
+// compaction is intentionally performed by the API after this transaction commits.
+func (s *Store) ClearContextJournal(ctx context.Context) (int64, error) {
+	r, err := s.db.ExecContext(ctx, `DELETE FROM context_journal`)
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
+}

@@ -274,6 +274,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/egress-pools/", s.adminEgressPoolAction)
 	s.mux.HandleFunc("/admin/export/logs", s.adminDiagnosticsExport)
 	s.mux.HandleFunc("/admin/logs", s.adminLogRecords)
+	s.mux.HandleFunc("/admin/context-journal", s.adminContextJournal)
 	s.mux.HandleFunc("/admin/audit", s.adminAudit)
 	s.mux.HandleFunc("/admin/groups", s.adminGroups)
 	s.mux.HandleFunc("/admin/groups/", s.adminGroupAction)

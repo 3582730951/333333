@@ -722,7 +722,7 @@ func Default() Config {
 		MaxBodyBytes:                   DefaultMaxBodyBytes,
 		AccountTokenBudget:             DefaultAccountTokenBudget,
 		ResourceHeadroomPercent:        10,
-		ContextJournalTTLSeconds:       86400,
+		ContextJournalTTLSeconds:       3600,
 		TrustedProxyCIDRs:              []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:          120,
 		KiroVersion:                    "0.11.107",
@@ -1230,7 +1230,7 @@ func (c *Config) normalize() {
 		c.ResourceHeadroomPercent = 10
 	}
 	if c.ContextJournalTTLSeconds <= 0 {
-		c.ContextJournalTTLSeconds = 86400
+		c.ContextJournalTTLSeconds = 3600
 	}
 	if c.SidecarTimeoutSeconds <= 0 {
 		c.SidecarTimeoutSeconds = 120

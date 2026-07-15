@@ -84,7 +84,7 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 	}
 	ttl := s.settingInt(ctx, "context_journal_ttl_seconds", s.cfg.ContextJournalTTLSeconds)
 	if ttl <= 0 {
-		ttl = 86400
+		ttl = 3600
 	}
 	return s.store.PutContextJournal(ctx, storage.ContextJournal{ResponseID: id, AffinityHash: affinityHash, AccountID: accountID, Payload: string(payload), ExpiresAt: time.Now().Add(time.Duration(ttl) * time.Second).Unix()})
 }

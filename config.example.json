@@ -13,6 +13,8 @@
   "shutdown_drain_seconds": 30,
   "max_body_bytes": 268435456,
   "account_token_budget": 0,
+  "resource_headroom_percent": 10,
+  "context_journal_ttl_seconds": 3600,
   "admin_token": "",
   "trusted_proxy_cidrs": [
     "127.0.0.0/8",

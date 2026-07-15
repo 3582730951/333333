@@ -962,6 +962,7 @@ install_binary_and_config() {
     run_root cp -a "${BIN_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}.prev"
   fi
   run_root install -m 0755 "${BUILD_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}"
+  run_root install -m 0755 "${PROJECT_ROOT}/scripts/clear-context-journal.sh" "${BIN_DIR}/codex-pool-clear-context"
   run_root install -m 0755 "${BUILD_DIR}/gateway-bin"/gateway-* "${APP_DIR}/bin/"
 
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -1811,6 +1812,7 @@ print_summary() {
 Install complete.
 
 Binary:        ${BIN_DIR}/${APP_NAME}
+Context clear: ${BIN_DIR}/codex-pool-clear-context
 Config:        ${CONFIG_FILE}
 Data:          ${DATA_DIR}
 Database:      ${DATABASE_PATH}
