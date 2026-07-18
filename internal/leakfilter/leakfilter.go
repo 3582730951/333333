@@ -261,10 +261,11 @@ func NewSSEFilter(provider string, words *streamrewrite.Matcher) *SSEFilter {
 // response.failed, while the official Responses-over-WebSocket transport emits
 // type:error with the real status and quota headers embedded in the JSON body.
 type CodexFailureFrame struct {
-	EventType  string
-	StatusCode int
-	Header     http.Header
-	Body       []byte
+	EventType          string
+	StatusCode         int
+	OrphanedToolOutput bool
+	Header             http.Header
+	Body               []byte
 }
 
 // ParseRetryableCodexFailureFrame recognizes both Codex terminal error envelopes.
@@ -278,6 +279,7 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	}
 	var envelope struct {
 		Type       string                     `json:"type"`
+		Status     json.RawMessage            `json:"status"`
 		StatusCode json.RawMessage            `json:"status_code"`
 		Headers    map[string]json.RawMessage `json:"headers"`
 	}
@@ -295,11 +297,15 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 
 	lower := strings.ToLower(string(data))
 	status := jsonInt(envelope.StatusCode)
+	if status == 0 {
+		status = jsonInt(envelope.Status)
+	}
+	orphanedToolOutput := IsOrphanedToolCallOutputError(status, data)
 	statusRetryable := status == http.StatusUnauthorized || status == http.StatusForbidden ||
 		status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
 		status == http.StatusServiceUnavailable || status >= 500
 	signatureRetryable := containsAnyFold(lower, codexFailedLeakSignatures)
-	if !statusRetryable && !signatureRetryable {
+	if !statusRetryable && !signatureRetryable && !orphanedToolOutput {
 		return CodexFailureFrame{}, false
 	}
 	if status == 0 {
@@ -317,11 +323,43 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		}
 	}
 	return CodexFailureFrame{
-		EventType:  kind,
-		StatusCode: status,
-		Header:     header,
-		Body:       append([]byte(nil), data...),
+		EventType:          kind,
+		StatusCode:         status,
+		OrphanedToolOutput: orphanedToolOutput,
+		Header:             header,
+		Body:               append([]byte(nil), data...),
 	}, true
+}
+
+// IsOrphanedToolCallOutputError recognizes only the Responses 400 emitted when
+// an output references a tool call that is absent from the supplied/server-side
+// context. Matching the structured error message keeps unrelated client 400s out
+// of the transparent context-recovery path.
+func IsOrphanedToolCallOutputError(status int, body []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Response struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	for _, message := range []string{envelope.Error.Message, envelope.Response.Error.Message} {
+		message = strings.TrimSpace(message)
+		lower := strings.ToLower(message)
+		if strings.HasPrefix(lower, "no tool call found ") && strings.Contains(lower, " call_id") {
+			return true
+		}
+	}
+	return false
 }
 
 func IsRetryableCodexFailureFrame(frame []byte) bool {

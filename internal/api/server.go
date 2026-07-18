@@ -535,6 +535,9 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
+	recoveryBudgetNeeded := responsesRecoveryEligible(raw, r.Header)
+	currentHeader := r.Header.Clone()
+	contextRecovered := false
 	// movable: the request carries its full input and so can be re-sent to a fresh
 	// account losslessly. This is the failover gate. It is broader than !strict: a
 	// strict-sticky turn (tool_result/function_call_output, kept on one account for
@@ -547,6 +550,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if _, bindErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindErr != nil {
 			if rebuilt, ok := s.journalReplayBody(r.Context(), raw); ok {
 				raw = rebuilt
+				currentHeader = stripCodexServerStateHeaders(currentHeader)
+				contextRecovered = true
 				movable = true
 				w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
 				atomic.AddUint64(&s.contextRebuilt, 1)
@@ -561,6 +566,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if _, bindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindingErr != nil {
 			if storage.NotFound(bindingErr) {
 				raw = degradedResponsesReplay(raw)
+				currentHeader = stripCodexServerStateHeaders(currentHeader)
+				contextRecovered = true
 				movable = true
 				w.Header().Set("X-MiCliProxy-Context-Status", "degraded")
 				atomic.AddUint64(&s.contextDegraded, 1)
@@ -587,7 +594,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// account has no such state to continue from.
 	attempts := 1
 	_, stateReplayAvailable := s.journalReplayBody(r.Context(), raw)
-	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && (movable || stateReplayAvailable) {
+	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && (movable || stateReplayAvailable || recoveryBudgetNeeded) {
 		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
 			attempts = 1
 		}
@@ -598,7 +605,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// fresh account instead). codexAttempt adds the leased account here before it
 	// returns outcomeRetry.
 	exclude := map[string]bool{}
-	current := codexRetryRequest{Raw: raw, Header: r.Header.Clone()}
+	current := codexRetryRequest{Raw: raw, Header: currentHeader, Recovered: contextRecovered}
 	for attempt := 0; attempt < attempts; attempt++ {
 		headerReq := r.Clone(r.Context())
 		headerReq.Header = current.Header
@@ -612,7 +619,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attempt < attempts-1, exclude)
+		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, current.Recovered, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attempt < attempts-1, exclude)
 		if result.Outcome != outcomeRetry {
 			return
 		}
@@ -631,9 +638,10 @@ const (
 )
 
 type codexRetryRequest struct {
-	Raw      []byte
-	Header   http.Header
-	Prepared bool
+	Raw       []byte
+	Header    http.Header
+	Prepared  bool
+	Recovered bool
 }
 
 type codexAttemptResult struct {
@@ -658,7 +666,7 @@ func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, 
 //
 // exclude carries the accounts this request already failed on; the leased account is
 // added to it before any outcomeRetry so the next attempt selects a different one.
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, exclude map[string]bool) codexAttemptResult {
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared, contextRecovered bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
 	// Decode the "stream" flag once for this attempt: isStreamRequest full-parses
@@ -818,7 +826,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// virtual context ledger and never trims Responses input. Official Codex
 	// compaction is forwarded unchanged to the upstream.
 	tryRebuildStateful := func(reason string) (codexAttemptResult, bool) {
-		if movable {
+		if movable || contextRecovered {
 			return codexAttemptResult{}, false
 		}
 		rebuilt, ok := s.journalReplayBody(r.Context(), raw)
@@ -829,7 +837,30 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
 		atomic.AddUint64(&s.contextRebuilt, 1)
 		log.Printf("[CONTEXT-REBUILT] request_id=%s account=%s reason=%s", requestIDFromContext(r.Context()), lease.Account.ID, reason)
-		return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: rebuilt, Header: baseHeader.Clone()}}, true
+		return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: rebuilt, Header: stripCodexServerStateHeaders(baseHeader), Recovered: true}}, true
+	}
+	tryRecoverOrphanedOutput := func(status int, errorBody []byte, reason string) (codexAttemptResult, bool) {
+		if !isOrphanedToolCallOutputError(status, errorBody) {
+			return codexAttemptResult{}, false
+		}
+		// This error describes stale request context, not account health. Handle it
+		// before the generic classifier so it never cools or quarantines the account.
+		if !allowRetry || contextRecovered {
+			return codexAttemptResult{}, false
+		}
+		recovered, contextStatus, ok := s.recoverOrphanedToolOutput(r.Context(), raw, baseHeader)
+		if !ok {
+			return codexAttemptResult{}, false
+		}
+		exclude[lease.Account.ID] = true
+		w.Header().Set("X-MiCliProxy-Context-Status", contextStatus)
+		if contextStatus == "rebuilt" {
+			atomic.AddUint64(&s.contextRebuilt, 1)
+		} else {
+			atomic.AddUint64(&s.contextDegraded, 1)
+		}
+		log.Printf("[CONTEXT-%s] request_id=%s account=%s reason=%s", strings.ToUpper(contextStatus), requestIDFromContext(r.Context()), lease.Account.ID, reason)
+		return codexAttemptResult{Outcome: outcomeRetry, Retry: recovered}, true
 	}
 
 	// Per-account conversation isolation ("串号隔离", default on, runtime-toggleable):
@@ -916,6 +947,15 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
+		if isOrphanedToolCallOutputError(resp.StatusCode, errorBody) {
+			if recovered, ok := tryRecoverOrphanedOutput(resp.StatusCode, errorBody, "http_orphaned_tool_output"); ok {
+				_ = s.settleBillingHold(r.Context(), holdID, "context_recovery_retry")
+				return recovered
+			}
+			_ = s.settleBillingHold(r.Context(), holdID, "orphaned_tool_output_terminal")
+			s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		detection := cf.Detect(resp.StatusCode, resp.Header, errorBody)
 		v := ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		if v.State == ban.AuthExpired && !cf.EdgeOnly(detection) {
@@ -1079,18 +1119,6 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				return rebuilt
 			}
 		}
-		// Server-side state genuinely lost the tool call (previous_response_id no longer
-		// resolves upstream, and the journal could not rebuild it): rather than surface the
-		// hard 400, degrade to a stateless request with orphaned tool outputs neutralized
-		// and retry on a fresh account. responsesNeedsDegrade gates against a retry loop.
-		if allowRetry && isOrphanedToolCallOutputError(resp.StatusCode, errorBody) && responsesNeedsDegrade(raw) {
-			degraded := degradedResponsesReplay(raw)
-			exclude[lease.Account.ID] = true
-			w.Header().Set("X-MiCliProxy-Context-Status", "degraded")
-			atomic.AddUint64(&s.contextDegraded, 1)
-			log.Printf("[CONTEXT-DEGRADED] request_id=%s account=%s orphaned tool-call output; retrying stateless", requestIDFromContext(r.Context()), lease.Account.ID)
-			return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: degraded, Header: baseHeader.Clone()}}
-		}
 		s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
@@ -1244,6 +1272,16 @@ codexSuccess:
 			}
 			failureStatus := streamFailure.StatusCode
 			failureBody := streamFailure.Body
+			if streamFailure.OrphanedToolOutput {
+				_ = resp.Body.Close()
+				if recovered, ok := tryRecoverOrphanedOutput(failureStatus, failureBody, "stream_orphaned_tool_output"); ok {
+					_ = s.settleBillingHold(r.Context(), holdID, "context_recovery_retry")
+					return recovered
+				}
+				_ = s.settleBillingHold(r.Context(), holdID, "orphaned_tool_output_terminal")
+				s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
+				return codexAttemptResult{Outcome: outcomeDone}
+			}
 			entrypoint := "responses"
 			if isChat {
 				entrypoint = "chat_completions"
@@ -1378,6 +1416,7 @@ codexSuccess:
 				reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
 					creq := requestForToken(token)
 					creq.Body = cbody
+					creq.Headers = stripCodexServerStateHeaders(creq.Headers)
 					cresp, _, cerr := s.doWithCFRetry(cctx, creq, lease, strict)
 					if cerr != nil {
 						return nil, cerr

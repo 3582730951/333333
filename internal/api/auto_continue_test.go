@@ -94,7 +94,7 @@ func TestBuildClaudeContinueBody(t *testing.T) {
 }
 
 func TestBuildCodexContinueBody(t *testing.T) {
-	resolved := `{"model":"gpt-x","previous_response_id":"resp_old","input":[{"role":"user","content":[{"type":"input_text","text":"Q"}]}]}`
+	resolved := `{"model":"gpt-x","previous_response_id":"resp_old","turn_state":{"opaque":"old"},"input":[{"role":"user","content":[{"type":"input_text","text":"Q"}]}]}`
 	partial := []interface{}{map[string]interface{}{"type": "message", "role": "assistant", "content": []interface{}{map[string]interface{}{"type": "output_text", "text": "half"}}}}
 	out, ok := buildCodexContinueBody([]byte(resolved), partial, "resume")
 	if !ok {
@@ -103,6 +103,9 @@ func TestBuildCodexContinueBody(t *testing.T) {
 	m := mustJSON(t, out)
 	if _, has := m["previous_response_id"]; has {
 		t.Fatal("previous_response_id must be stripped for a stateless continuation")
+	}
+	if _, has := m["turn_state"]; has {
+		t.Fatal("turn_state must be stripped for a stateless continuation")
 	}
 	if m["stream"] != true {
 		t.Fatal("stream not forced on")

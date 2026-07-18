@@ -195,6 +195,26 @@ func TestRetryableCodexFailureFrameRejectsWebSocketClientError(t *testing.T) {
 	}
 }
 
+func TestRetryableCodexFailureFrameAcceptsOrphanedToolOutputStatus(t *testing.T) {
+	frame := []byte("event: error\n" +
+		`data: {"type":"error","error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id call_orphan."},"status":400}` + "\n\n")
+	failure, ok := ParseRetryableCodexFailureFrame(frame)
+	if !ok {
+		t.Fatal("orphaned tool output carried in status:400 was not recognized")
+	}
+	if failure.StatusCode != http.StatusBadRequest || !failure.OrphanedToolOutput {
+		t.Fatalf("failure = %+v", failure)
+	}
+}
+
+func TestRetryableCodexFailureFrameRejectsUnrelatedStatus400(t *testing.T) {
+	frame := []byte("event: error\n" +
+		`data: {"type":"error","error":{"type":"invalid_request_error","message":"No tool call supplied"},"status":400}` + "\n\n")
+	if failure, ok := ParseRetryableCodexFailureFrame(frame); ok {
+		t.Fatalf("unrelated status:400 must not be recoverable: %+v", failure)
+	}
+}
+
 func TestSSEFilterNeutralizesClaudeError(t *testing.T) {
 	// A Claude streaming error must be NEUTRALIZED (rewritten to a generic error
 	// event), NOT dropped: dropping it leaves an empty/truncated 200 stream that

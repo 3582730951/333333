@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -59,6 +60,16 @@ func TestOrphanedToolCallOutputErrorDetection(t *testing.T) {
 	}
 	if isOrphanedToolCallOutputError(400, []byte(`{"error":{"message":"invalid api key"}}`)) {
 		t.Fatal("an unrelated 400 must not match")
+	}
+	if isOrphanedToolCallOutputError(400, []byte(`{"error":{"message":"tool call output has an invalid call_id"}}`)) {
+		t.Fatal("a generic call_id validation error must not match")
+	}
+}
+
+func TestResponsesRecoveryEligibleForTurnStateHeaderOnly(t *testing.T) {
+	header := http.Header{"X-Codex-Turn-State": []string{"old-account-state"}}
+	if !responsesRecoveryEligible([]byte(`{"model":"gpt","input":"next"}`), header) {
+		t.Fatal("turn-state-only request must receive a recovery retry budget")
 	}
 }
 

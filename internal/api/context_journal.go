@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/storage"
 )
 
@@ -40,6 +42,7 @@ func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte,
 	}
 	base["input"] = appendItems(base["input"], cur["input"])
 	delete(base, "previous_response_id")
+	delete(base, "turn_state")
 	out, e := json.Marshal(base)
 	return out, e == nil
 }
@@ -238,14 +241,7 @@ func toolOutputText(v interface{}) string {
 // state, held by previous_response_id, is gone) — e.g. "No tool call found for custom
 // tool call output with call_id ...".
 func isOrphanedToolCallOutputError(status int, body []byte) bool {
-	if status != 400 {
-		return false
-	}
-	l := strings.ToLower(string(body))
-	if strings.Contains(l, "no tool call found") {
-		return true
-	}
-	return strings.Contains(l, "tool call output") && strings.Contains(l, "call_id")
+	return leakfilter.IsOrphanedToolCallOutputError(status, body)
 }
 
 // responsesNeedsDegrade reports whether degradedResponsesReplay would actually change the
@@ -269,4 +265,37 @@ func responsesNeedsDegrade(body []byte) bool {
 		}
 	}
 	return false
+}
+
+// responsesRecoveryEligible reports whether a failed request contains account-local
+// Responses state or an orphaned tool result that can be made stateless. It is also
+// used when allocating the retry budget: recovery must have a second attempt even
+// when no context journal exists.
+func responsesRecoveryEligible(body []byte, header http.Header) bool {
+	if strings.TrimSpace(header.Get("X-Codex-Turn-State")) != "" || responsesNeedsDegrade(body) {
+		return true
+	}
+	return false
+}
+
+// recoverOrphanedToolOutput builds the one permitted retry after the upstream says a
+// tool result has no matching call. Journal replay is lossless and therefore wins;
+// otherwise degradation preserves each orphan's output as a user message. Both paths
+// discard every account-local state pointer before selecting a fresh account.
+func (s *Server) recoverOrphanedToolOutput(ctx context.Context, body []byte, header http.Header) (codexRetryRequest, string, bool) {
+	if rebuilt, ok := s.journalReplayBody(ctx, body); ok {
+		return codexRetryRequest{
+			Raw:       rebuilt,
+			Header:    stripCodexServerStateHeaders(header),
+			Recovered: true,
+		}, "rebuilt", true
+	}
+	if !responsesRecoveryEligible(body, header) {
+		return codexRetryRequest{}, "", false
+	}
+	return codexRetryRequest{
+		Raw:       degradedResponsesReplay(body),
+		Header:    stripCodexServerStateHeaders(header),
+		Recovered: true,
+	}, "degraded", true
 }

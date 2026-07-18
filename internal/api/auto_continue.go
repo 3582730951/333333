@@ -385,6 +385,7 @@ func buildCodexContinueBody(resolvedBody []byte, partialItems []interface{}, con
 	root["input"] = appendItems(root["input"], []interface{}{userItem})
 	root["stream"] = true
 	delete(root, "previous_response_id")
+	delete(root, "turn_state")
 	b, err := json.Marshal(root)
 	return b, err == nil
 }
