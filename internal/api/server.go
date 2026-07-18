@@ -1079,6 +1079,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				return rebuilt
 			}
 		}
+		// Server-side state genuinely lost the tool call (previous_response_id no longer
+		// resolves upstream, and the journal could not rebuild it): rather than surface the
+		// hard 400, degrade to a stateless request with orphaned tool outputs neutralized
+		// and retry on a fresh account. responsesNeedsDegrade gates against a retry loop.
+		if allowRetry && isOrphanedToolCallOutputError(resp.StatusCode, errorBody) && responsesNeedsDegrade(raw) {
+			degraded := degradedResponsesReplay(raw)
+			exclude[lease.Account.ID] = true
+			w.Header().Set("X-MiCliProxy-Context-Status", "degraded")
+			atomic.AddUint64(&s.contextDegraded, 1)
+			log.Printf("[CONTEXT-DEGRADED] request_id=%s account=%s orphaned tool-call output; retrying stateless", requestIDFromContext(r.Context()), lease.Account.ID)
+			return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: degraded, Header: baseHeader.Clone()}}
+		}
 		s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
@@ -1386,6 +1398,12 @@ codexSuccess:
 			}
 		}
 		s.persistCodexBindingAliases(r.Context(), affinity, streamRecorder.id, streamRecorder.model, lease, finalEgress, model)
+		// Real-time Codex quota: the codex.rate_limits frame the stream just carried (and
+		// leakfilter dropped downstream) refreshes the 5h/7d quota rows so the quota view
+		// is current between /wham/usage polls.
+		if streamRecorder.rateLimits.any() {
+			s.captureCodexStreamRateLimits(lease.Account.ID, streamRecorder.rateLimits)
+		}
 		if streamErr != nil {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {

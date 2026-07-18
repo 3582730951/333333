@@ -140,9 +140,133 @@ func degradedResponsesReplay(body []byte) []byte {
 	}
 	delete(root, "previous_response_id")
 	delete(root, "turn_state")
+	// Stripping previous_response_id abandons the server-side state that held the tool
+	// CALLS. Any tool-call OUTPUT still in the input then references a call the upstream
+	// can no longer find — a hard 400 "No tool call found for custom tool call output
+	// with call_id ...". Rewrite each orphaned output into a plain user message that
+	// preserves the tool-result text, so the degraded request is valid and the turn still
+	// succeeds (a paired call+output already in the input is left untouched).
+	if input, ok := root["input"].([]interface{}); ok {
+		if fixed, n := neutralizeOrphanedToolOutputs(input); n > 0 {
+			root["input"] = fixed
+		}
+	}
 	out, e := json.Marshal(root)
 	if e != nil {
 		return body
 	}
 	return out
+}
+
+// neutralizeOrphanedToolOutputs converts every tool-call output item whose matching tool
+// call is NOT present in the same input list into a user message carrying the result
+// text. It returns the rewritten list and the number of items converted. Paired
+// call/output items and non-tool items pass through unchanged.
+func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
+	calls := map[string]bool{}
+	for _, it := range input {
+		m, ok := it.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if isToolCallItemType(streamString(m["type"])) {
+			if cid := streamString(m["call_id"]); cid != "" {
+				calls[cid] = true
+			}
+		}
+	}
+	converted := 0
+	out := make([]interface{}, 0, len(input))
+	for _, it := range input {
+		if m, ok := it.(map[string]interface{}); ok {
+			if isToolOutputItemType(streamString(m["type"])) {
+				cid := streamString(m["call_id"])
+				if cid == "" || !calls[cid] {
+					out = append(out, orphanedToolOutputAsUserMessage(m))
+					converted++
+					continue
+				}
+			}
+		}
+		out = append(out, it)
+	}
+	return out, converted
+}
+
+// isToolOutputItemType matches function_call_output / custom_tool_call_output /
+// local_shell_call_output and similar tool-result items.
+func isToolOutputItemType(t string) bool { return strings.HasSuffix(t, "_call_output") }
+
+// isToolCallItemType matches function_call / custom_tool_call / local_shell_call and
+// similar tool-invocation items (never an output).
+func isToolCallItemType(t string) bool {
+	if t == "" || strings.HasSuffix(t, "_call_output") {
+		return false
+	}
+	return strings.HasSuffix(t, "_call")
+}
+
+func orphanedToolOutputAsUserMessage(m map[string]interface{}) map[string]interface{} {
+	text := toolOutputText(m["output"])
+	if strings.TrimSpace(text) == "" {
+		text = "(tool result unavailable)"
+	}
+	return map[string]interface{}{
+		"role": "user",
+		"content": []interface{}{
+			map[string]interface{}{"type": "input_text", "text": "[Earlier tool result] " + text},
+		},
+	}
+}
+
+func toolOutputText(v interface{}) string {
+	switch out := v.(type) {
+	case string:
+		return out
+	case nil:
+		return ""
+	default:
+		if b, err := json.Marshal(out); err == nil {
+			return string(b)
+		}
+		return ""
+	}
+}
+
+// isOrphanedToolCallOutputError recognizes the upstream 400 that fires when a tool-call
+// OUTPUT in the input references a call the upstream can no longer find (its server-side
+// state, held by previous_response_id, is gone) — e.g. "No tool call found for custom
+// tool call output with call_id ...".
+func isOrphanedToolCallOutputError(status int, body []byte) bool {
+	if status != 400 {
+		return false
+	}
+	l := strings.ToLower(string(body))
+	if strings.Contains(l, "no tool call found") {
+		return true
+	}
+	return strings.Contains(l, "tool call output") && strings.Contains(l, "call_id")
+}
+
+// responsesNeedsDegrade reports whether degradedResponsesReplay would actually change the
+// request (it still carries server-side-state pointers or an orphaned tool output). It
+// gates the reactive degrade-and-retry so a body that is already stateless-and-clean is
+// never retried in a loop.
+func responsesNeedsDegrade(body []byte) bool {
+	var root map[string]interface{}
+	if json.Unmarshal(body, &root) != nil {
+		return false
+	}
+	if v, _ := root["previous_response_id"].(string); strings.TrimSpace(v) != "" {
+		return true
+	}
+	if _, ok := root["turn_state"]; ok {
+		return true
+	}
+	if input, ok := root["input"].([]interface{}); ok {
+		if _, n := neutralizeOrphanedToolOutputs(input); n > 0 {
+			return true
+		}
+	}
+	return false
 }

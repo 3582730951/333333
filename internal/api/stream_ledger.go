@@ -16,6 +16,9 @@ type codexStreamLedgerRecorder struct {
 	completed map[string]interface{}
 	added     []interface{}
 	done      []interface{}
+	// rateLimits holds the most recent codex.rate_limits frame's windows (workstream B:
+	// real-time Codex quota captured before leakfilter drops the frame).
+	rateLimits codexStreamRateLimits
 }
 
 func newCodexStreamLedgerRecorder() *codexStreamLedgerRecorder {
@@ -159,6 +162,10 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		} else if typ == "response.failed" {
 			r.completed = cloneJSONMap(ev)
 			r.completed["status"] = "failed"
+		}
+	case "codex.rate_limits":
+		if rl, ok := parseCodexRateLimitsEvent(ev); ok {
+			r.rateLimits = rl
 		}
 	}
 }

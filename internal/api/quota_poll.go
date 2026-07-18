@@ -769,10 +769,30 @@ func parseClaudeOAuthUsage(body []byte, now int64) (claudeOAuthUsageParsed, erro
 }
 
 func claudeUsageWindowFromMap(name string, m map[string]interface{}, now int64) (claudeOAuthUsageWindow, bool) {
-	used, ok := jsonFloatAny(m, "used_percent", "usedPercent", "usage_percent")
+	// The live Claude usage endpoint reports used-percent as "utilization" and reset as an
+	// RFC3339 "resets_at" string; older shapes used "used_percent"/"reset_after_seconds".
+	// Accept both so quota is correct against the current API (matches the reference
+	// implementations' five_hour/seven_day {utilization, resets_at} shape).
+	used, ok := jsonFloatAny(m, "used_percent", "usedPercent", "usage_percent", "utilization")
 	limitWindow := jsonIntAny(m, "limit_window_seconds", "limitWindowSeconds", "window_seconds", "windowSeconds")
 	resetAfter := jsonIntAny(m, "reset_after_seconds", "resetAfterSeconds")
-	resetAt := jsonIntAny(m, "reset_at", "resetAt", "resets_at", "resetsAt")
+	// resets_at is an RFC3339 string in the current API; parse it as such FIRST so a
+	// timestamp is never misread as a bare integer (jsonIntAny would grab the leading
+	// "2030" of "2030-01-01T..."). Fall back to an integer epoch for older shapes.
+	resetAt := int64(0)
+	for _, k := range []string{"resets_at", "resetsAt", "reset_at", "resetAt"} {
+		if ts := strings.TrimSpace(jsonStringAny(m, k)); ts != "" {
+			if off := parseResetTimestamp(ts, now); off > 0 {
+				resetAt = now + off
+				break
+			}
+		}
+	}
+	if resetAt == 0 {
+		if n := jsonIntAny(m, "reset_at", "resetAt", "resets_at", "resetsAt"); n > 946684800 {
+			resetAt = n // a real absolute epoch (> year 2000), not a stringified timestamp's prefix
+		}
+	}
 	if !ok && limitWindow == 0 && resetAfter == 0 && resetAt == 0 {
 		return claudeOAuthUsageWindow{}, false
 	}
@@ -804,11 +824,12 @@ func normalizeClaudeUsageLimiter(name string, windowSeconds int64) (limiter, mod
 	switch {
 	case strings.Contains(l, "oauth") && strings.Contains(l, "app"):
 		return "oauth_app", ""
-	case strings.Contains(l, "claude") || strings.Contains(l, "opus") || strings.Contains(l, "sonnet") || strings.Contains(l, "haiku"):
+	case strings.Contains(l, "opus") || strings.Contains(l, "sonnet") || strings.Contains(l, "haiku") || strings.Contains(l, "cowork"):
+		// Per-model / cowork windows are not the account's primary/secondary gauge.
 		return "", ""
 	case strings.Contains(l, "5h") || strings.Contains(l, "five") || (windowSeconds > 0 && windowSeconds <= 6*3600):
 		return "5h_oauth_usage", ""
-	case strings.Contains(l, "7d") || strings.Contains(l, "week") || windowSeconds >= 6*24*3600:
+	case strings.Contains(l, "7d") || strings.Contains(l, "seven") || strings.Contains(l, "week") || windowSeconds >= 6*24*3600:
 		return "7d_oauth_usage", ""
 	default:
 		return "", ""
