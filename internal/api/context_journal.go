@@ -25,6 +25,9 @@ func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte,
 	if err != nil {
 		return current, false
 	}
+	// Sliding TTL: a resumed tail refreshes its own expiry so an arbitrary-duration
+	// task stays restorable indefinitely without growing disk.
+	s.touchContextJournal(ctx, prev)
 	var base map[string]interface{}
 	if json.Unmarshal([]byte(j.Payload), &base) != nil {
 		return current, false
@@ -72,6 +75,8 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 				base["input"] = appendItems(base["input"], req["input"])
 				req = base
 			}
+			// Keep the chain's live tail warm as the conversation advances.
+			s.touchContextJournal(ctx, prev)
 		}
 	}
 	delete(req, "previous_response_id")
@@ -82,6 +87,13 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 	if e != nil {
 		return e
 	}
+	ttl := s.contextJournalTTLSeconds(ctx)
+	return s.store.PutContextJournal(ctx, storage.ContextJournal{ResponseID: id, AffinityHash: affinityHash, AccountID: accountID, Payload: string(payload), ExpiresAt: time.Now().Add(time.Duration(ttl) * time.Second).Unix()})
+}
+
+// contextJournalTTLSeconds resolves the effective journal TTL: the hot setting (or boot
+// default), shrunk by the disk guard's forced TTL under disk pressure, floored at 1h.
+func (s *Server) contextJournalTTLSeconds(ctx context.Context) int {
 	ttl := s.settingInt(ctx, "context_journal_ttl_seconds", s.cfg.ContextJournalTTLSeconds)
 	if forced := s.diskGuardTTL(); forced > 0 && (ttl <= 0 || forced < ttl) {
 		ttl = forced
@@ -89,7 +101,17 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 	if ttl <= 0 {
 		ttl = 3600
 	}
-	return s.store.PutContextJournal(ctx, storage.ContextJournal{ResponseID: id, AffinityHash: affinityHash, AccountID: accountID, Payload: string(payload), ExpiresAt: time.Now().Add(time.Duration(ttl) * time.Second).Unix()})
+	return ttl
+}
+
+// touchContextJournal slides a journal row's expiry to now+TTL on read. Best-effort: a
+// write-pool hiccup never fails the read that triggered it.
+func (s *Server) touchContextJournal(ctx context.Context, id string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	ttl := s.contextJournalTTLSeconds(ctx)
+	_ = s.store.TouchContextJournal(ctx, id, time.Now().Add(time.Duration(ttl)*time.Second).Unix())
 }
 
 func ensureEncryptedReasoningInclude(body []byte) []byte {

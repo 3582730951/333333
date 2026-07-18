@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -532,6 +533,10 @@ claudeSuccess:
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
 		aliasCapture := &claudeAliasCapture{}
 		streamBody = io.TeeReader(streamBody, aliasCapture)
+		// Tap the stream to detect a truncated response (no message_stop) and capture the
+		// partial answer, so auto-continue can re-issue and stitch when enabled.
+		continueTap := &claudeStreamTap{}
+		streamBody = io.TeeReader(streamBody, continueTap)
 		if !refreshHeartbeat.Committed() {
 			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
@@ -548,6 +553,33 @@ claudeSuccess:
 		} else {
 			s.persistClaudeItemAliases(r.Context(), raw, aliasCapture.Bytes(), lease, model)
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
+			// Auto-continue on a truncated stream (no message_stop). Off by default, so
+			// this block is skipped and the path is unchanged unless the operator opts in.
+			if !continueTap.reachedTerminal() {
+				rfForAC, _ := streamCtx.Value(responseRuleFilterKey{}).(*responseRuleFilter)
+				if s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
+					reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
+						creq := requestForToken(token)
+						creq.Body = cbody
+						cresp, cerr := s.upstream.Do(cctx, creq)
+						if cerr != nil {
+							return nil, cerr
+						}
+						if cresp.StatusCode >= 400 {
+							if cresp.Body != nil {
+								_ = cresp.Body.Close()
+							}
+							return nil, fmt.Errorf("claude continuation upstream status %d", cresp.StatusCode)
+						}
+						return cresp.Body, nil
+					}
+					sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), result.Scrubber, "claude")
+					if acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue); acErr != nil {
+						log.Printf("[AUTO-CONTINUE] claude request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
+					}
+					sw.Flush()
+				}
+			}
 		}
 		return outcomeDone
 	}

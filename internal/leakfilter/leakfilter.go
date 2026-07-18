@@ -511,9 +511,11 @@ func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 	if len(data) == 0 {
 		return false
 	}
-	lowerData := strings.ToLower(string(data))
-	// The model-switch suggestion only ever appears inside a limit error.
-	if strings.Contains(lowerData, "switch to another model") {
+	// This runs on every streamed token, so it must not lower the whole frame.
+	// The model-switch suggestion only ever appears inside a limit error, but it
+	// can ride in any frame type, so it is still checked unconditionally — via an
+	// allocation-free case-insensitive scan rather than strings.ToLower(string(data)).
+	if asciiContainsFold(data, "switch to another model") {
 		return true
 	}
 	switch jsonStringField(data, "type") {
@@ -522,7 +524,7 @@ func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 	case "response.failed", "error":
 		return IsRetryableCodexFailureFrame(frame)
 	case "response.metadata":
-		return strings.Contains(lowerData, "openai_verification_recommendation")
+		return asciiContainsFold(data, "openai_verification_recommendation")
 	}
 	if eventType == "codex.rate_limits" {
 		return true
@@ -532,18 +534,84 @@ func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 
 // parseSSEFrame extracts the event type (from an "event:" line) and the joined
 // data payload (from one or more "data:" lines) of a single SSE frame.
+//
+// The hot path — a frame with a single "data:" line — returns a sub-slice of the
+// input without any bytes.Split/bytes.Join allocation; the allocating join is used
+// only for genuine multi-"data:"-line frames. Lines are scanned with
+// bytes.IndexByte, which is byte-for-byte equivalent to iterating bytes.Split on
+// '\n' for the "event:"/"data:" lines this reads (trailing/blank lines never match
+// a prefix and so never affect the result).
+var (
+	sseEventPrefix = []byte("event:")
+	sseDataPrefix  = []byte("data:")
+	sseLineFeed    = []byte("\n")
+)
+
 func parseSSEFrame(frame []byte) (eventType string, data []byte) {
-	var dataParts [][]byte
-	for _, raw := range bytes.Split(frame, []byte("\n")) {
+	var (
+		firstData []byte
+		haveData  bool
+		dataParts [][]byte // populated only for genuine multi-"data:" frames
+	)
+	for pos := 0; pos < len(frame); {
+		var raw []byte
+		if nl := bytes.IndexByte(frame[pos:], '\n'); nl >= 0 {
+			raw = frame[pos : pos+nl]
+			pos += nl + 1
+		} else {
+			raw = frame[pos:]
+			pos = len(frame)
+		}
 		line := bytes.TrimRight(raw, "\r")
 		switch {
-		case bytes.HasPrefix(line, []byte("event:")):
-			eventType = strings.TrimSpace(string(line[len("event:"):]))
-		case bytes.HasPrefix(line, []byte("data:")):
-			dataParts = append(dataParts, bytes.TrimSpace(line[len("data:"):]))
+		case bytes.HasPrefix(line, sseEventPrefix):
+			eventType = strings.TrimSpace(string(line[len(sseEventPrefix):]))
+		case bytes.HasPrefix(line, sseDataPrefix):
+			part := bytes.TrimSpace(line[len(sseDataPrefix):])
+			switch {
+			case !haveData:
+				firstData = part
+				haveData = true
+			case dataParts == nil:
+				dataParts = [][]byte{firstData, part}
+			default:
+				dataParts = append(dataParts, part)
+			}
 		}
 	}
-	return eventType, bytes.Join(dataParts, []byte("\n"))
+	if dataParts != nil {
+		return eventType, bytes.Join(dataParts, sseLineFeed)
+	}
+	return eventType, firstData
+}
+
+// asciiContainsFold reports whether b contains needle case-insensitively over
+// ASCII letters, without allocating a lowered copy of b. needle must be
+// lower-case. For all-ASCII input (which is all the SSE JSON these guards run
+// against) this is byte-for-byte equivalent to
+// strings.Contains(strings.ToLower(string(b)), needle).
+func asciiContainsFold(b []byte, needle string) bool {
+	n := len(needle)
+	if n == 0 {
+		return true
+	}
+	for i := 0; i+n <= len(b); i++ {
+		match := true
+		for j := 0; j < n; j++ {
+			c := b[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // jsonStringField reads a top-level-ish JSON string field value without a full

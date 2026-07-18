@@ -661,6 +661,10 @@ func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, 
 func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
+	// Decode the "stream" flag once for this attempt: isStreamRequest full-parses
+	// the (potentially multi-MB) body, and it was previously called up to 7× on the
+	// same unchanged `raw` within this function. `raw` is a stable parameter here.
+	streamReq := isStreamRequest(raw)
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:             routeGroup,
 		Provider:          "codex",
@@ -747,7 +751,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				writeError(w, http.StatusBadRequest, err)
 				return codexAttemptResult{Outcome: outcomeDone}
 			}
-			if !isStreamRequest(raw) {
+			if !streamReq {
 				body = forceResponsesStream(body)
 			}
 			path = "/v1/responses"
@@ -1027,7 +1031,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			Status:     resp.StatusCode,
 			Header:     resp.Header,
 			Body:       errorBody,
-			Streaming:  isStreamRequest(raw),
+			Streaming:  streamReq,
 		})
 		if cf.EdgeOnly(detection) {
 			_ = s.store.BenchBindingForRecheck(r.Context(), lease.Account.ID, storage.Now()+60)
@@ -1045,18 +1049,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 					return retry()
 				}
 			case upstreamrules.DownstreamActionIdleStream:
-				if isStreamRequest(raw) {
+				if streamReq {
 					if resp.Body != nil {
 						_ = resp.Body.Close()
 						resp.Body = nil
 					}
 					releaseLease()
 				}
-				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, isStreamRequest(raw)) {
+				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, streamReq) {
 					return codexAttemptResult{Outcome: outcomeDone}
 				}
 			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
-				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, isStreamRequest(raw)) {
+				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, streamReq) {
 					return codexAttemptResult{Outcome: outcomeDone}
 				}
 			}
@@ -1091,10 +1095,10 @@ codexSuccess:
 
 	// Diagnostic logging for usage tracking
 	log.Printf("[CODEX-PATH] account=%s, egress=%s, path=%s, isChat=%v, reqStream=%v, respStream=%v, status=%d, ct=%q",
-		lease.Account.ID, finalEgress.Type, r.URL.Path, isChat, isStreamRequest(raw),
+		lease.Account.ID, finalEgress.Type, r.URL.Path, isChat, streamReq,
 		isEventStream(resp.Header), resp.StatusCode, resp.Header.Get("Content-Type"))
 
-	if isChat && !isStreamRequest(raw) {
+	if isChat && !streamReq {
 		responseBody, err := s.readUpstreamResponseBody(resp.Body)
 		if err != nil {
 			_ = s.settleBillingHold(r.Context(), holdID, "failed_response_too_large")
@@ -1350,6 +1354,36 @@ codexSuccess:
 		streamErr := s.streamSSE(streamCtx, commitWriter, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 		if closeErr := commitWriter.Close(); streamErr == nil {
 			streamErr = closeErr
+		}
+		// Auto-continue: if the upstream stream ended before its terminal
+		// response.completed and the operator has opted in, re-issue once with a
+		// "continue" turn on the SAME account and stitch the continuation into the
+		// already-relayed response. Off by default, so this whole block is skipped and
+		// behavior is byte-identical unless stream_auto_continue_enabled is set.
+		if streamErr == nil && !streamRecorder.reachedTerminal() {
+			rfForAC, _ := streamCtx.Value(responseRuleFilterKey{}).(*responseRuleFilter)
+			if s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
+				reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
+					creq := requestForToken(token)
+					creq.Body = cbody
+					cresp, _, cerr := s.doWithCFRetry(cctx, creq, lease, strict)
+					if cerr != nil {
+						return nil, cerr
+					}
+					if cresp.StatusCode >= 400 {
+						if cresp.Body != nil {
+							_ = cresp.Body.Close()
+						}
+						return nil, fmt.Errorf("codex continuation upstream status %d", cresp.StatusCode)
+					}
+					return cresp.Body, nil
+				}
+				sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), codexScrubber, "codex")
+				if acErr := s.maybeAutoContinueCodex(r.Context(), sw, body, streamRecorder, reissue); acErr != nil {
+					log.Printf("[AUTO-CONTINUE] codex request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
+				}
+				sw.Flush()
+			}
 		}
 		s.persistCodexBindingAliases(r.Context(), affinity, streamRecorder.id, streamRecorder.model, lease, finalEgress, model)
 		if streamErr != nil {
@@ -1618,6 +1652,9 @@ func (s *Server) cfHostForProvider(provider string) string {
 }
 
 func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, body []byte) {
+	if isInternalCall(ctx) {
+		return // relay-internal (moderation) calls must not be metered against pool accounts
+	}
 	parsed := usage.ParseResponse(body)
 	if len(parsed.RawUsage) == 0 {
 		// Session 33: When the upstream response body does not contain countable
@@ -1634,10 +1671,19 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 			if estimate > 0 {
 				log.Printf("[USAGE-WARN] account=%s: no usage in body (len=%d), using billing_hold estimate=%d",
 					accountID, len(body), estimate)
+				// The estimate is an INPUT-side approximation (RuneCount(body)/4). Record
+				// it as prompt tokens with total = prompt (completion unknown → 0) so the
+				// row is internally consistent (total == prompt+completion) instead of the
+				// old prompt=estimate/2, total=estimate, completion=0 shape that never
+				// reconciled. Preserve the model ParseResponse extracted when available.
+				estModel := parsed.Model
+				if estModel == "" {
+					estModel = "unknown"
+				}
 				parsed = usage.Parsed{
-					Model:        "unknown",
+					Model:        estModel,
+					PromptTokens: estimate,
 					TotalTokens:  estimate,
-					PromptTokens: estimate / 2,
 					RawUsage:     json.RawMessage(`{"estimated":true}`),
 				}
 			} else {
@@ -1652,6 +1698,9 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	if diag.UsageEventID == "" {
+		diag.UsageEventID = usageEventIDFromContext(ctx)
+	}
 	if diag.UsageEventID == "" {
 		diag.UsageEventID = requestIDFromContext(ctx)
 	}
@@ -1703,6 +1752,9 @@ func (s *Server) hasCodexFailoverCandidate(ctx context.Context, groupName, exclu
 // recordParsedUsage stores an already-parsed usage figure (the streaming path, where
 // usage is extracted incrementally from the SSE frames rather than a buffered body).
 func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash string, parsed usage.Parsed) {
+	if isInternalCall(ctx) {
+		return // relay-internal (moderation) calls must not be metered against pool accounts
+	}
 	if parsed.TotalTokens == 0 && parsed.PromptTokens == 0 && parsed.CompletionTokens == 0 {
 		// Session 33: When the stream scanner cannot extract countable tokens
 		// (e.g. the upstream terminated with an error instead of a normal
@@ -1720,8 +1772,8 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 					accountID, estimate)
 				parsed = usage.Parsed{
 					Model:        parsed.Model,
+					PromptTokens: estimate,
 					TotalTokens:  estimate,
-					PromptTokens: estimate / 2,
 					RawUsage:     json.RawMessage(`{"estimated":true}`),
 				}
 			} else {
@@ -1737,6 +1789,9 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	if diag.UsageEventID == "" {
+		diag.UsageEventID = usageEventIDFromContext(ctx)
+	}
 	if diag.UsageEventID == "" {
 		diag.UsageEventID = requestIDFromContext(ctx)
 	}

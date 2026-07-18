@@ -149,14 +149,21 @@ type Config struct {
 	// AdmissionWaitMillis bounds the per-account concurrency/token-budget backpressure
 	// wait (see DefaultAdmissionWaitMillis). Unset (0) adopts the default; a negative
 	// value disables the wait (legacy fail-fast).
-	AdmissionWaitMillis      int    `json:"admission_wait_millis"`
-	RequestTimeoutSeconds    int    `json:"request_timeout_seconds"`
-	ShutdownDrainSeconds     int    `json:"shutdown_drain_seconds"`
-	MaxBodyBytes             int64  `json:"max_body_bytes"`
-	AccountTokenBudget       int64  `json:"account_token_budget"`
-	ResourceHeadroomPercent  int    `json:"resource_headroom_percent"`
-	ContextJournalTTLSeconds int    `json:"context_journal_ttl_seconds"`
-	AdminToken               string `json:"admin_token"`
+	AdmissionWaitMillis      int   `json:"admission_wait_millis"`
+	RequestTimeoutSeconds    int   `json:"request_timeout_seconds"`
+	ShutdownDrainSeconds     int   `json:"shutdown_drain_seconds"`
+	MaxBodyBytes             int64 `json:"max_body_bytes"`
+	AccountTokenBudget       int64 `json:"account_token_budget"`
+	ResourceHeadroomPercent  int   `json:"resource_headroom_percent"`
+	ContextJournalTTLSeconds int   `json:"context_journal_ttl_seconds"`
+	// ContextJournalMaxRows / ContextJournalMaxMB bound the encrypted replay journal on
+	// low-config VPS hosts. When either is exceeded the disk guard evicts the rows with
+	// the lowest expires_at first — which, thanks to sliding TTL, are the least-recently
+	// resumed chains — so active long tasks are preserved while disk stays bounded. 0
+	// disables that dimension.
+	ContextJournalMaxRows int    `json:"context_journal_max_rows"`
+	ContextJournalMaxMB   int    `json:"context_journal_max_mb"`
+	AdminToken            string `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
 	// cookie security, or generated public URLs. Direct internet clients cannot
 	// spoof X-Forwarded-* unless their immediate peer is in this list.
@@ -271,6 +278,31 @@ type Config struct {
 	KiroEndpointAllowlist        []string `json:"kiro_endpoint_allowlist"`
 	KiroCacheUnreportedThreshold int      `json:"kiro_cache_unreported_threshold"`
 	SchedulerHeartbeatSeconds    int      `json:"scheduler_heartbeat_seconds"`
+	// StreamKeepAliveSeconds is the general downstream SSE keepalive interval for the
+	// no-rule relay path. When the upstream is silent this long, a provider-appropriate
+	// protocol keepalive frame (Codex response.in_progress / Claude ping) is emitted so
+	// an intermediary or client does not close a long streaming task before
+	// response.completed. 0 disables it (leaving the byte-for-byte fast relay paths
+	// untouched); the value is capped well below common intermediary idle timeouts at
+	// read time. Default 15.
+	StreamKeepAliveSeconds int `json:"stream_keepalive_seconds"`
+	// StreamAutoContinueEnabled is the master switch for the auto-continue subsystem:
+	// when a streaming response ends WITHOUT its terminal event (Codex
+	// response.completed / Anthropic message_stop), the relay re-issues the request
+	// once with an appended "continue" turn (re-injecting the partial output so the
+	// prompt-cache prefix stays intact) and stitches the continuation into a single
+	// coherent downstream response. Default OFF — it re-issues upstream traffic, so an
+	// operator opts in explicitly. Never fabricates content; the only synthetic text is
+	// the operator-configured continue instruction sent upstream, never to the client.
+	StreamAutoContinueEnabled bool `json:"stream_auto_continue_enabled"`
+	// StreamContinueText is the user-turn instruction sent upstream when auto-continue
+	// (or the #3 safety-buffering continue) re-issues a truncated stream. Default English;
+	// an operator may set any language. Sent ONLY upstream, never surfaced downstream.
+	StreamContinueText string `json:"stream_continue_text"`
+	// StreamAutoContinueMaxAttempts bounds how many times a single request may be
+	// auto-continued before the relay gives up and ends the (partial) stream cleanly.
+	// Default 1 ("send one continue"); capped low to bound re-issue amplification.
+	StreamAutoContinueMaxAttempts int `json:"stream_auto_continue_max_attempts"`
 	// ClaudeStainlessVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
 	// version. Empty = the built-in/ per-account default.
@@ -723,6 +755,8 @@ func Default() Config {
 		AccountTokenBudget:             DefaultAccountTokenBudget,
 		ResourceHeadroomPercent:        10,
 		ContextJournalTTLSeconds:       3600,
+		ContextJournalMaxRows:          50000,
+		ContextJournalMaxMB:            200,
 		TrustedProxyCIDRs:              []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:          120,
 		KiroVersion:                    "0.11.107",
@@ -733,6 +767,9 @@ func Default() Config {
 		KiroCacheMode:                  "auto",
 		KiroCacheUnreportedThreshold:   DefaultKiroCacheUnreportedThreshold,
 		SchedulerHeartbeatSeconds:      15,
+		StreamKeepAliveSeconds:         15,
+		StreamContinueText:             "Please continue from exactly where you left off, without repeating anything.",
+		StreamAutoContinueMaxAttempts:  1,
 		ConversationIsolation:          true,
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
 		// that path benefits from prompt caching like native Claude Code does.
@@ -1232,6 +1269,13 @@ func (c *Config) normalize() {
 	if c.ContextJournalTTLSeconds <= 0 {
 		c.ContextJournalTTLSeconds = 3600
 	}
+	// 0 = that budget dimension is disabled (unbounded); a negative value is meaningless.
+	if c.ContextJournalMaxRows < 0 {
+		c.ContextJournalMaxRows = 0
+	}
+	if c.ContextJournalMaxMB < 0 {
+		c.ContextJournalMaxMB = 0
+	}
 	if c.SidecarTimeoutSeconds <= 0 {
 		c.SidecarTimeoutSeconds = 120
 	}
@@ -1258,6 +1302,21 @@ func (c *Config) normalize() {
 	}
 	if c.SchedulerHeartbeatSeconds <= 0 {
 		c.SchedulerHeartbeatSeconds = 15
+	}
+	// A negative keepalive is meaningless; clamp to 0 (disabled). 0 is a valid
+	// operator choice (off), so it is never forced back to the default here.
+	if c.StreamKeepAliveSeconds < 0 {
+		c.StreamKeepAliveSeconds = 0
+	}
+	if strings.TrimSpace(c.StreamContinueText) == "" {
+		c.StreamContinueText = "Please continue from exactly where you left off, without repeating anything."
+	}
+	if c.StreamAutoContinueMaxAttempts <= 0 {
+		c.StreamAutoContinueMaxAttempts = 1
+	}
+	// Bound re-issue amplification: a truncation loop must never fan out upstream.
+	if c.StreamAutoContinueMaxAttempts > 3 {
+		c.StreamAutoContinueMaxAttempts = 3
 	}
 	if c.FailoverMaxAttempts <= 0 {
 		c.FailoverMaxAttempts = 3

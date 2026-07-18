@@ -318,10 +318,15 @@ func validateUpstreamErrorRule(rule *storage.UpstreamErrorRule) error {
 	rule.DownstreamAction = normalizeRuleDownstreamAction(rule.DownstreamAction)
 	if rule.DownstreamAction == upstreamrules.DownstreamActionHideSafetyBuffering {
 		// safety_buffering is a Responses protocol field, not text content. Keeping
-		// keywords or account actions here is misleading and can punish a healthy
-		// account for an informational UI signal.
+		// keywords or (punitive) account actions here is misleading and can punish a
+		// healthy account for an informational UI signal. auto_continue is the one
+		// account action that is kept: it never punishes the account and lets an
+		// operator opt this scoped traffic into a continuation if the safety-checked
+		// stream ends up truncated (workstream A#3).
 		rule.BodyKeywords = nil
-		rule.AccountAction = upstreamrules.AccountActionNone
+		if rule.AccountAction != upstreamrules.AccountActionAutoContinue {
+			rule.AccountAction = upstreamrules.AccountActionNone
+		}
 		rule.FilterAccountAction = false
 		if rule.IdlePingSeconds > 60 {
 			return errors.New("idle_ping_seconds must be between 1 and 60 for hide_safety_buffering")
@@ -341,7 +346,7 @@ func validateUpstreamErrorRule(rule *storage.UpstreamErrorRule) error {
 
 func normalizeRuleAccountAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case upstreamrules.AccountActionNone, upstreamrules.AccountActionCooldown, upstreamrules.AccountActionCooldownRecheck, upstreamrules.AccountActionQuarantine:
+	case upstreamrules.AccountActionNone, upstreamrules.AccountActionCooldown, upstreamrules.AccountActionCooldownRecheck, upstreamrules.AccountActionQuarantine, upstreamrules.AccountActionAutoContinue:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return upstreamrules.AccountActionBuiltin
@@ -350,7 +355,7 @@ func normalizeRuleAccountAction(action string) string {
 
 func normalizeRuleDownstreamAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case upstreamrules.DownstreamActionFailover, upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionIntercept, upstreamrules.DownstreamActionHideSafetyBuffering:
+	case upstreamrules.DownstreamActionFailover, upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionIntercept, upstreamrules.DownstreamActionHideSafetyBuffering, upstreamrules.DownstreamActionHeartbeatFinish:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return upstreamrules.DownstreamActionBuiltin

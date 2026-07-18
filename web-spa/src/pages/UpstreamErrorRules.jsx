@@ -11,6 +11,7 @@ const ACCOUNT_ACTIONS = [
   ['cooldown', '冷却账号'],
   ['cooldown_recheck', '冷却并标记复查'],
   ['quarantine', '隔离账号'],
+  ['auto_continue', '自动续写(截断时继续，不惩罚账号)'],
 ];
 const DOWNSTREAM_ACTIONS = [
   ['builtin', '沿用系统默认逻辑'],
@@ -21,6 +22,7 @@ const DOWNSTREAM_ACTIONS = [
   ['idle_stream', '流式心跳空转'],
   ['intercept', '拦截命中内容并继续'],
   ['hide_safety_buffering', '隐藏安全检查等待提示'],
+  ['heartbeat_finish', '发送一次心跳后干净结束'],
 ];
 const ENTRYPOINTS = [
   ['responses', 'Responses'],
@@ -165,7 +167,7 @@ export default function UpstreamErrorRules() {
       status_codes: splitInts(form.status_codes_text),
       body_keywords: form.downstream_action === 'hide_safety_buffering' ? [] : splitList(form.body_keywords_text),
       match_mode: form.match_mode || 'any',
-      account_action: form.downstream_action === 'hide_safety_buffering' ? 'none' : (form.account_action || 'builtin'),
+      account_action: form.downstream_action === 'hide_safety_buffering' ? (form.account_action === 'auto_continue' ? 'auto_continue' : 'none') : (form.account_action || 'builtin'),
       downstream_action: form.downstream_action || 'builtin',
       response_status: Number(form.response_status) || 0,
       custom_message: form.custom_message || '',

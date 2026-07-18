@@ -121,7 +121,10 @@ func buildCompressedAssets(sub fs.FS) map[string]compressedAsset {
 			return nil
 		}
 		var buf bytes.Buffer
-		zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+		// Assets are compressed exactly ONCE at boot and served from memory forever,
+		// so spend the CPU on BestCompression (smaller wire transfer for the 1.3MB+
+		// JS/CSS bundles) rather than BestSpeed — the cost is paid once at startup.
+		zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
 		if err != nil {
 			return nil
 		}

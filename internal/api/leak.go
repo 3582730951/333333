@@ -177,6 +177,17 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 	}
 	if rf != nil {
 		err = newRuleSSECopy(ctx, sw, body, rf, s.leakScrubEnabled(ctx), words, provider)
+	} else if interval := s.streamKeepAliveInterval(ctx); interval > 0 {
+		// General downstream keepalive: route the no-rule stream through the
+		// frame-aligned heartbeat pump so a long upstream silence is bridged with a
+		// provider protocol keepalive frame, preventing an intermediary or client from
+		// closing a long streaming task before response.completed. With rf=nil,
+		// filterRuleSSEFrame is a passthrough, so emitFrame reproduces BOTH legacy
+		// branches exactly: leak-on runs the same per-frame processFrame as
+		// leakfilter.Copy, and leak-off applies the same per-frame word scrub. Output
+		// parity with streamCopyRewrite / leakfilter.Copy is covered by
+		// TestStreamKeepAliveOutputParity.
+		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, nil, s.leakScrubEnabled(ctx), words, provider, interval)
 	} else if !s.leakScrubEnabled(ctx) {
 		err = streamCopyRewrite(sw, body, words)
 	} else {
@@ -196,7 +207,45 @@ func newRuleSSECopy(ctx context.Context, w http.ResponseWriter, body io.Reader, 
 	return newRuleSSECopyWithHeartbeat(ctx, w, body, rf, leak, words, provider, responseRuleHeartbeatInterval(rf))
 }
 
+// streamKeepAliveMaxSeconds caps the general downstream keepalive interval. Like the
+// safety-buffering heartbeat, it stays well below common intermediary idle timeouts
+// (nginx/cloudflare ~60-100s) and Codex's ~5-minute upstream stream idle timeout so a
+// keepalive frame always lands before anything downstream decides the stream is dead.
+const streamKeepAliveMaxSeconds = 60
+
+// streamKeepAliveInterval resolves the general downstream SSE keepalive interval for
+// the no-rule relay path. A non-positive value (config default 0, or an operator
+// override of 0) disables it, leaving the byte-for-byte streamCopyRewrite /
+// leakfilter.Copy fast paths untouched. A positive value is clamped into (0, 60s].
+func (s *Server) streamKeepAliveInterval(ctx context.Context) time.Duration {
+	seconds := s.settingInt(ctx, "stream_keepalive_seconds", s.cfg.StreamKeepAliveSeconds)
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds > streamKeepAliveMaxSeconds {
+		seconds = streamKeepAliveMaxSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 const safetyBufferingHeartbeatFrame = "event: response.in_progress\ndata: " + responseInProgressPayload + "\n\n"
+
+// claudePingHeartbeatFrame is the Anthropic-protocol keepalive. A real Claude
+// stream emits `ping` events during long thinking, so this is the frame a Claude
+// downstream expects — emitting the Codex `response.in_progress` frame to a Claude
+// client (as the single hardcoded frame previously did) is a protocol mismatch.
+const claudePingHeartbeatFrame = "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+
+// heartbeatFrameFor returns the provider-appropriate keepalive frame so a long
+// upstream silence is bridged with a frame the DOWNSTREAM protocol understands
+// (Codex response.in_progress vs Anthropic ping), keeping the connection alive
+// without injecting content or affecting the eventual response.completed.
+func heartbeatFrameFor(provider string) string {
+	if provider == "claude" {
+		return claudePingHeartbeatFrame
+	}
+	return safetyBufferingHeartbeatFrame
+}
 
 func responseRuleHeartbeatInterval(rf *responseRuleFilter) time.Duration {
 	if rf == nil || rf.Mode != upstreamrules.DownstreamActionHideSafetyBuffering {
@@ -316,7 +365,7 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 				return result.err
 			}
 		case <-heartbeat:
-			if err := emitFrame([]byte(safetyBufferingHeartbeatFrame)); err != nil {
+			if err := emitFrame([]byte(heartbeatFrameFor(provider))); err != nil {
 				return err
 			}
 		}

@@ -327,17 +327,38 @@ func marshalCodexRawArray(items []json.RawMessage) json.RawMessage {
 	return out.Bytes()
 }
 
+// codexRawIsNull reports whether a shared-map field value is absent or the JSON
+// literal null. It reproduces the *json.RawMessage decode semantics used by the
+// original per-field probes, where a null value is treated as "no field to change".
+func codexRawIsNull(raw json.RawMessage) bool {
+	return len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
 // normalizeCodexReasoningEffortForWire mirrors codex-rs'
 // reasoning_effort_for_request conversion. `ultra` remains a valid CLI/catalog
 // setting for models that support automatic delegation, but the Responses API wire
 // value is `max`. Other efforts and malformed/non-object payloads stay byte-identical.
 func normalizeCodexReasoningEffortForWire(raw []byte) []byte {
-	var probe struct {
-		Reasoning *struct {
-			Effort string `json:"effort"`
-		} `json:"reasoning"`
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
 	}
-	if err := json.Unmarshal(raw, &probe); err != nil || probe.Reasoning == nil || probe.Reasoning.Effort != "ultra" {
+	return normalizeCodexReasoningEffortForWireWithFields(raw, fields)
+}
+
+// normalizeCodexReasoningEffortForWireWithFields is the core taking the top-level
+// object already parsed once at the dispatch choke point, so the whole body is not
+// re-unmarshalled just to probe reasoning.effort. A nil map (non-object body) is a
+// no-op, matching the wrapper's malformed-JSON passthrough.
+func normalizeCodexReasoningEffortForWireWithFields(raw []byte, fields map[string]json.RawMessage) []byte {
+	reasoningRaw, ok := fields["reasoning"]
+	if !ok {
+		return raw
+	}
+	var reasoning struct {
+		Effort string `json:"effort"`
+	}
+	if err := json.Unmarshal(reasoningRaw, &reasoning); err != nil || reasoning.Effort != "ultra" {
 		return raw
 	}
 	// Change exactly the official wire field.  Re-marshalling the whole body via
@@ -351,10 +372,15 @@ func normalizeCodexReasoningEffortForWire(raw []byte) []byte {
 }
 
 func stripCodexResponsesPromptCacheRetention(raw []byte) []byte {
-	var probe struct {
-		PromptCacheRetention *json.RawMessage `json:"prompt_cache_retention"`
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
 	}
-	if err := json.Unmarshal(raw, &probe); err != nil || probe.PromptCacheRetention == nil {
+	return stripCodexResponsesPromptCacheRetentionWithFields(raw, fields)
+}
+
+func stripCodexResponsesPromptCacheRetentionWithFields(raw []byte, fields map[string]json.RawMessage) []byte {
+	if codexRawIsNull(fields["prompt_cache_retention"]) {
 		return raw
 	}
 	out, err := sjson.DeleteBytes(raw, "prompt_cache_retention")
@@ -370,10 +396,15 @@ func stripCodexResponsesPromptCacheRetention(raw []byte) []byte {
 // simply omits it. Callers deliberately apply this only to non-API-key accounts.
 // sjson deletes the one leaf without round-tripping large tool/context integers.
 func stripCodexResponsesMaxOutputTokens(raw []byte) []byte {
-	var probe struct {
-		MaxOutputTokens *json.RawMessage `json:"max_output_tokens"`
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
 	}
-	if err := json.Unmarshal(raw, &probe); err != nil || probe.MaxOutputTokens == nil {
+	return stripCodexResponsesMaxOutputTokensWithFields(raw, fields)
+}
+
+func stripCodexResponsesMaxOutputTokensWithFields(raw []byte, fields map[string]json.RawMessage) []byte {
+	if codexRawIsNull(fields["max_output_tokens"]) {
 		return raw
 	}
 	out, err := sjson.DeleteBytes(raw, "max_output_tokens")

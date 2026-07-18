@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"runtime/metrics"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,6 +107,28 @@ func (c *Controller) Wait(ctx context.Context) error {
 	}
 	return nil
 }
+
+// allocMetric reads live heap allocation via runtime/metrics, which — unlike
+// runtime.ReadMemStats — does NOT stop the world. GoAllocBytes is reported for
+// observability only (it never drives the pause/resume decision in sample()),
+// so this swap removes a stop-the-world pause from the 4x/second control loop
+// with no behavioral change. Guarded by a mutex because the sample slice is
+// reused and metrics.Read mutates it.
+var (
+	allocMetricMu     sync.Mutex
+	allocMetricSample = []metrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+)
+
+func heapAllocBytes() uint64 {
+	allocMetricMu.Lock()
+	defer allocMetricMu.Unlock()
+	metrics.Read(allocMetricSample)
+	if allocMetricSample[0].Value.Kind() == metrics.KindUint64 {
+		return allocMetricSample[0].Value.Uint64()
+	}
+	return 0
+}
+
 func (c *Controller) run() {
 	t := time.NewTicker(250 * time.Millisecond)
 	defer t.Stop()
@@ -125,9 +148,7 @@ func (c *Controller) sample() {
 	stop, resume := float64(100-head), float64(95-head)
 	old := c.Snapshot()
 	s := Snapshot{Timestamp: time.Now().Unix(), HeadroomPercent: head, Goroutines: runtime.NumGoroutine(), Paused: old.Paused}
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	s.GoAllocBytes = ms.Alloc
+	s.GoAllocBytes = heapAllocBytes()
 	s.CPUUsedPercent = c.cpuPercent()
 	if cg := c.cgroupCPUPercent(); cg > s.CPUUsedPercent {
 		s.CPUUsedPercent = cg

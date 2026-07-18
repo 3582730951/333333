@@ -34,6 +34,18 @@ func (s *Store) GetContextJournal(ctx context.Context, id string) (ContextJourna
 	j.Payload = decompressContextPayload(s.openToken(p))
 	return j, err
 }
+
+// TouchContextJournal slides a live journal row's expiry forward on successful read, so
+// an actively-resumed conversation tail survives indefinitely (arbitrary-duration /goal
+// tasks) with ZERO extra disk — only the latest full-context row stays warm while older
+// turns still expire on their own schedule. The `expires_at>?` guard refuses to
+// resurrect an already-expired row. Uses the single-writer pool; callers treat failure
+// as best-effort (the read still succeeds).
+func (s *Store) TouchContextJournal(ctx context.Context, id string, expiresAt int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE context_journal SET expires_at=? WHERE response_id=? AND expires_at>?`, expiresAt, id, Now())
+	return err
+}
+
 func (s *Store) CleanupContextJournal(ctx context.Context) (int64, error) {
 	r, e := s.db.ExecContext(ctx, `DELETE FROM context_journal WHERE expires_at<=?`, Now())
 	if e != nil {
@@ -67,6 +79,56 @@ func (s *Store) CleanupContextJournalCreatedBefore(ctx context.Context, cutoff i
 	var total int64
 	for {
 		r, err := s.db.ExecContext(ctx, `DELETE FROM context_journal WHERE rowid IN (SELECT rowid FROM context_journal WHERE created_at<=? LIMIT 64)`, cutoff)
+		if err != nil {
+			return total, err
+		}
+		n, _ := r.RowsAffected()
+		total += n
+		if n == 0 {
+			return total, nil
+		}
+	}
+}
+
+// EvictContextJournalToBudget bounds the journal table on low-config VPS hosts: while the
+// row count exceeds maxRows OR the stored payload bytes exceed maxBytes, it deletes the
+// rows with the LOWEST expires_at first. Because sliding TTL (TouchContextJournal) keeps
+// an actively-resumed chain's expires_at far in the future, the lowest-expires_at rows are
+// the least-recently-used chains — so the chains most likely to resume are preserved. A
+// non-positive value disables that dimension; both non-positive is a no-op. Returns the
+// number of rows evicted.
+func (s *Store) EvictContextJournalToBudget(ctx context.Context, maxRows, maxBytes int64) (int64, error) {
+	if maxRows <= 0 && maxBytes <= 0 {
+		return 0, nil
+	}
+	var total int64
+	for {
+		var rows, bytesUsed int64
+		if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM context_journal`).Scan(&rows, &bytesUsed); err != nil {
+			return total, err
+		}
+		overRows := maxRows > 0 && rows > maxRows
+		overBytes := maxBytes > 0 && bytesUsed > maxBytes
+		if !overRows && !overBytes {
+			return total, nil
+		}
+		// Delete exactly the row excess when the row bound is what is exceeded; when only
+		// the byte bound is over, delete a small batch and re-check (row sizes vary, so the
+		// exact count is unknown). Cap the batch so a huge excess is chipped away safely.
+		var batch int64
+		if overRows {
+			batch = rows - maxRows
+		}
+		if overBytes && batch < 64 {
+			batch = 64
+		}
+		if batch < 1 {
+			batch = 1
+		}
+		if batch > 4096 {
+			batch = 4096
+		}
+		r, err := s.db.ExecContext(ctx, `DELETE FROM context_journal WHERE rowid IN (SELECT rowid FROM context_journal ORDER BY expires_at ASC LIMIT ?)`, batch)
 		if err != nil {
 			return total, err
 		}

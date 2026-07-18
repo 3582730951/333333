@@ -142,6 +142,15 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 	if resp.ProfileARN != "" {
 		cred.ProfileARN = resp.ProfileARN
 	}
+	// Freeze a canonical, stable machine-id the first time we hold the real refresh
+	// token (it is not reachable from the per-request Headers() path). Set-once so a
+	// later token rotation does not churn the device id, and so an operator-supplied
+	// value is never overwritten.
+	if strings.TrimSpace(cred.MachineID) == "" {
+		if mid := canonicalMachineID(cred, token.RefreshToken); mid != "" {
+			cred.MachineID = mid
+		}
+	}
 	if err := m.store.UpdateToken(ctx, token); err != nil {
 		return "", token, cred, err
 	}
@@ -190,11 +199,10 @@ func Headers(cfg config.Config, cred storage.KiroCredentials, bearer string, str
 	h.Set("x-amzn-codewhisperer-optout", "true")
 	h.Set("x-amzn-kiro-agent-mode", "vibe")
 	h.Set("x-amz-user-agent", fmt.Sprintf("aws-sdk-js/1.0.34 KiroIDE-%s-%s", version, mid))
-	h.Set("user-agent", fmt.Sprintf("aws-sdk-js/1.0.34 ua/2.1 os/linux lang/js md/nodejs#%s api/codewhispererstreaming#1.0.34 m/E KiroIDE-%s-%s", node, version, mid))
+	h.Set("user-agent", fmt.Sprintf("aws-sdk-js/1.0.34 ua/2.1 os/%s lang/js md/nodejs#%s api/codewhispererstreaming#1.0.34 m/E KiroIDE-%s-%s", kiroOSToken(first(cred.AccountID, mid)), node, version, mid))
 	h.Set("amz-sdk-invocation-id", uuid.NewString())
 	h.Set("amz-sdk-request", "attempt=1; max=3")
 	h.Set("authorization", "Bearer "+bearer)
-	h.Set("connection", "close")
 	if cred.ProfileARN != "" {
 		h.Set("x-amzn-kiro-profile-arn", cred.ProfileARN)
 	}
@@ -204,12 +212,93 @@ func Headers(cfg config.Config, cred storage.KiroCredentials, bearer string, str
 	return h
 }
 func MachineID(c storage.KiroCredentials, t storage.AccountToken) string {
-	if strings.TrimSpace(c.MachineID) != "" {
-		return c.MachineID
+	if raw := strings.TrimSpace(c.MachineID); raw != "" {
+		// A real Kiro client presents a 64-hex machine-id on the wire. An imported
+		// value may be a dashed UUID; normalize it to the canonical 64-hex shape
+		// (matching the reference client's normalize_machine_id) rather than sending
+		// a malformed dashed form. Unrecognized shapes are preserved as-is.
+		if norm, ok := normalizeMachineID(raw); ok {
+			return norm
+		}
+		return raw
+	}
+	// API-key credentials can derive the canonical machine-id directly from the
+	// always-present key. OAuth's canonical value needs the refresh token, which is
+	// persisted onto cred.MachineID during refresh (returned by the branch above).
+	if c.AuthMethod == "api_key" {
+		if k := strings.TrimSpace(c.KiroAPIKey); k != "" {
+			return sha256String("KiroAPIKey/" + k)
+		}
 	}
 	s := sha256String(first(c.CredentialHash, c.KiroAPIKey, t.RefreshToken, c.ClientID, c.AccountID))
 	return s
 }
+
+// canonicalMachineID derives the machine-id the real Kiro client presents (ground
+// truth: other/kiro.rs machine_id.rs): API-key => sha256("KiroAPIKey/"+key), OAuth
+// => sha256("KotlinNativeAPI/"+refreshToken). Presenting this value makes the pool
+// show the SAME device id AWS already associates with the account, instead of a
+// divergent one that reads as a new/unknown device. Returns "" when the needed
+// material is absent.
+func canonicalMachineID(c storage.KiroCredentials, refreshToken string) string {
+	if c.AuthMethod == "api_key" {
+		if k := strings.TrimSpace(c.KiroAPIKey); k != "" {
+			return sha256String("KiroAPIKey/" + k)
+		}
+		return ""
+	}
+	if r := strings.TrimSpace(refreshToken); r != "" {
+		return sha256String("KotlinNativeAPI/" + r)
+	}
+	return ""
+}
+
+// normalizeMachineID mirrors the reference Kiro client: a 64-char hex string is
+// returned lower-cased; a UUID (32 hex after removing dashes) is duplicated to 64
+// hex. Anything else is rejected so the caller can fall back to derivation.
+func normalizeMachineID(s string) (string, bool) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	if len(t) == 64 && isHexString(t) {
+		return t, true
+	}
+	nodash := strings.ReplaceAll(t, "-", "")
+	if len(nodash) == 32 && isHexString(nodash) {
+		return nodash + nodash, true
+	}
+	return "", false
+}
+
+func isHexString(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// kiroOSProfiles is the platform axis a real Kiro IDE (Electron/Node) reports.
+// The reference client only ever emits darwin#/win32# builds — never linux — so a
+// hardcoded "os/linux" shared across the whole fleet is a correlation tell. Each
+// account draws one STABLE profile from a per-account seed (a rotating OS between
+// requests would be more suspicious, not less).
+var kiroOSProfiles = []string{
+	"darwin#24.6.0", "darwin#24.5.0", "darwin#23.6.0",
+	"win32#10.0.22631", "win32#10.0.22621", "win32#10.0.19045",
+}
+
+func kiroOSToken(seed string) string {
+	if strings.TrimSpace(seed) == "" {
+		return kiroOSProfiles[0]
+	}
+	sum := sha256Sum([]byte("kiro-os\x00" + seed))
+	return kiroOSProfiles[int(sum[0])%len(kiroOSProfiles)]
+}
+
 func sha256String(s string) string { sum := sha256Sum([]byte(s)); return fmt.Sprintf("%x", sum) }
 func sha256Sum(b []byte) [32]byte  { return sha256.Sum256(b) }
 

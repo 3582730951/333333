@@ -18,6 +18,11 @@ const (
 	AccountActionCooldown        = "cooldown"
 	AccountActionCooldownRecheck = "cooldown_recheck"
 	AccountActionQuarantine      = "quarantine"
+	// AccountActionAutoContinue marks matching traffic for the auto-continue subsystem:
+	// on a truncated stream the relay re-issues once with a "continue" turn instead of
+	// surfacing the truncation. It never punishes the account (the account is healthy;
+	// the upstream merely stopped early), so for account fate it behaves like "none".
+	AccountActionAutoContinue = "auto_continue"
 
 	DownstreamActionBuiltin             = "builtin"
 	DownstreamActionFailover            = "failover"
@@ -27,6 +32,12 @@ const (
 	DownstreamActionIdleStream          = "idle_stream"
 	DownstreamActionIntercept           = "intercept"
 	DownstreamActionHideSafetyBuffering = "hide_safety_buffering"
+	// DownstreamActionHeartbeatFinish absorbs a matched upstream error on a streaming
+	// request by emitting a single provider-appropriate keepalive frame (Codex
+	// response.in_progress / Claude ping) and then closing the stream cleanly, instead
+	// of surfacing the error. It positively simulates an upstream heartbeat-then-done so
+	// a lenient client sees a benign empty stream rather than a hard failure.
+	DownstreamActionHeartbeatFinish = "heartbeat_finish"
 )
 
 type MatchInput struct {
@@ -105,6 +116,10 @@ func Preview(rule storage.UpstreamErrorRule, in MatchInput) ResponsePreview {
 			msg = "upstream rule matched; keeping stream alive"
 		}
 		return ResponsePreview{Status: http.StatusOK, Body: ": " + msg + "\n\n", DownstreamAction: action}
+	case DownstreamActionHeartbeatFinish:
+		// One keepalive frame then a clean close. The concrete frame is provider-
+		// specific and rendered at relay time; the preview shows the intent.
+		return ResponsePreview{Status: http.StatusOK, Body: "event: ping\ndata: {\"type\":\"ping\"}\n\n", DownstreamAction: action}
 	default:
 		return ResponsePreview{Status: in.Status, Body: "", DownstreamAction: action}
 	}
@@ -112,7 +127,7 @@ func Preview(rule storage.UpstreamErrorRule, in MatchInput) ResponsePreview {
 
 func normalizeAccountAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case AccountActionNone, AccountActionCooldown, AccountActionCooldownRecheck, AccountActionQuarantine:
+	case AccountActionNone, AccountActionCooldown, AccountActionCooldownRecheck, AccountActionQuarantine, AccountActionAutoContinue:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return AccountActionBuiltin
@@ -121,7 +136,7 @@ func normalizeAccountAction(action string) string {
 
 func normalizeDownstreamAction(action string) string {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case DownstreamActionFailover, DownstreamActionPass, DownstreamActionCustomError, DownstreamActionNeutralize, DownstreamActionIdleStream, DownstreamActionIntercept, DownstreamActionHideSafetyBuffering:
+	case DownstreamActionFailover, DownstreamActionPass, DownstreamActionCustomError, DownstreamActionNeutralize, DownstreamActionIdleStream, DownstreamActionIntercept, DownstreamActionHideSafetyBuffering, DownstreamActionHeartbeatFinish:
 		return strings.ToLower(strings.TrimSpace(action))
 	default:
 		return DownstreamActionBuiltin

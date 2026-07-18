@@ -1071,6 +1071,7 @@ CREATE TABLE IF NOT EXISTS context_journal(
 );
 CREATE INDEX IF NOT EXISTS idx_context_journal_expires ON context_journal(expires_at);
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model);
+CREATE INDEX IF NOT EXISTS idx_usage_records_account_created ON usage_records(account_id, created_at);
 CREATE TABLE IF NOT EXISTS model_quality_status(
   group_name TEXT NOT NULL,
   model_slug TEXT NOT NULL,
@@ -1425,6 +1426,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN usage_event_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_event_id ON usage_records(usage_event_id) WHERE usage_event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
+		// Per-account usage rollups (the admin account list's UsageSummaryByAccountIDs)
+		// filter `account_id IN (...) AND created_at >= ?`. Without an account_id-leading
+		// index SQLite scans the whole usage_records history per page load; this composite
+		// turns it into per-account range seeks. Biggest single win for admin list latency.
+		`CREATE INDEX IF NOT EXISTS idx_usage_records_account_created ON usage_records(account_id, created_at)`,
 		// Cooldown→health-recheck gate: a benched account stays out of the candidate
 		// pool until a liveness probe confirms it recovered (older DBs created before
 		// the recheck loop existed).
@@ -2760,6 +2766,32 @@ func (s *Store) KiroCredentialHashExists(ctx context.Context, hash string) (bool
 	return n > 0, err
 }
 
+// KiroAuthSummariesByAccountIDs batch-loads Kiro auth summaries in a single query,
+// replacing the per-account KiroAuthSummary N+1 in the account list. The summary
+// only needs presence booleans, so the encrypted secret/api-key columns are tested
+// for non-emptiness on the SEALED value (sealed is non-empty iff plaintext is) —
+// no secretbox.Open per row.
+func (s *Store) KiroAuthSummariesByAccountIDs(ctx context.Context, accountIDs []string) (map[string]KiroAuthSummary, error) {
+	out := make(map[string]KiroAuthSummary, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, auth_method, auth_region, api_region, endpoint, client_id, client_secret, profile_arn, machine_id, kiro_api_key FROM account_kiro_credentials WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID, authMethod, authRegion, apiRegion, endpoint, clientID, clientSecret, profileARN, machineID, apiKey string
+		if err := rows.Scan(&accountID, &authMethod, &authRegion, &apiRegion, &endpoint, &clientID, &clientSecret, &profileARN, &machineID, &apiKey); err != nil {
+			return nil, err
+		}
+		out[accountID] = KiroAuthSummary{AuthMethod: authMethod, AuthRegion: authRegion, APIRegion: apiRegion, Endpoint: publicKiroEndpoint(endpoint),
+			HasClientID: clientID != "", HasClientSecret: clientSecret != "", HasProfileARN: profileARN != "", HasMachineID: machineID != "", HasAPIKey: apiKey != ""}
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) KiroAuthSummary(ctx context.Context, accountID string) (KiroAuthSummary, error) {
 	c, err := s.GetKiroCredentials(ctx, accountID)
 	if err != nil {
@@ -3054,6 +3086,31 @@ func (s *Store) ListCapabilitiesByAccountIDs(ctx context.Context, accountIDs []s
 	for rows.Next() {
 		var c ModelCapability
 		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
+			return nil, err
+		}
+		out[c.AccountID] = append(out[c.AccountID], c)
+	}
+	return out, rows.Err()
+}
+
+// ListCapabilitiesSummaryByAccountIDs is ListCapabilitiesByAccountIDs WITHOUT the
+// heavy raw_model_json blob (RawModelJSON left empty). The account LIST view never
+// renders the raw model-catalog JSON, so omitting it at the SQL level avoids
+// reading/scanning/marshaling potentially several MB per page load (50 accounts ×
+// N probed models). Use the full variant only where the raw JSON is actually shown.
+func (s *Store) ListCapabilitiesSummaryByAccountIDs(ctx context.Context, accountIDs []string) (map[string][]ModelCapability, error) {
+	out := make(map[string][]ModelCapability, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c ModelCapability
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
 			return nil, err
 		}
 		out[c.AccountID] = append(out[c.AccountID], c)
@@ -5680,14 +5737,26 @@ func (s *Store) UsageSummaryByAccountIDs(ctx context.Context, accountIDs []strin
 	}
 	args := stringArgs(accountIDs)
 	args = append(args, s.UsageAccuracyCutover(ctx))
+	// Primary columns stay real-only (estimated=0) so the numbers the pool page
+	// already shows are unchanged; the Actual/Estimated split columns additionally
+	// surface estimated traffic (D2) instead of the old `WHERE estimated=0` that
+	// dropped it from the account list entirely (Kiro-unmetered traffic especially).
 	rows, err := s.rdb.QueryContext(ctx, `
-SELECT account_id, COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0),
-       COALESCE(SUM(cached_tokens),0),
-       COALESCE(SUM(CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END),0),
-       COALESCE(SUM(cache_creation_tokens),0)
+SELECT account_id,
+       SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN prompt_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN completion_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN total_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN cached_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN cache_creation_tokens ELSE 0 END),0),
+       SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END),
+       COALESCE(SUM(CASE WHEN estimated=0 THEN total_tokens ELSE 0 END),0),
+       SUM(CASE WHEN estimated>0 THEN 1 ELSE 0 END),
+       COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0)
 FROM usage_records
 WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)
-  AND estimated=0 AND created_at>=?
+  AND created_at>=?
 GROUP BY account_id`, args...)
 	if err != nil {
 		return nil, err
@@ -5695,7 +5764,7 @@ GROUP BY account_id`, args...)
 	defer rows.Close()
 	for rows.Next() {
 		var row UsageSummaryRow
-		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.ActualRequests, &row.ActualTokens, &row.EstimatedRequests, &row.EstimatedTokens); err != nil {
 			return nil, err
 		}
 		out[row.AccountID] = row

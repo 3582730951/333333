@@ -144,7 +144,15 @@ func (s *Server) importAndValidateKiro(ctx context.Context, account storage.Acco
 	if err := s.store.UpsertKiroCredentials(ctx, cred); err != nil {
 		return err
 	}
-	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, egressID); err != nil {
+	// When the operator did not pin an egress, default a Kiro account to a stealth
+	// egress (healthy sidecar/WARP) instead of the shared host IP + Go TLS
+	// fingerprint that trips Kiro anti-abuse. Falls back to direct if none exists;
+	// overridable here and via /admin/groups/<name>/assign-egress afterward.
+	effectiveEgress := egressID
+	if strings.TrimSpace(effectiveEgress) == "" {
+		effectiveEgress = s.resolveKiroDefaultEgress(ctx, account.ID)
+	}
+	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, effectiveEgress); err != nil {
 		return err
 	}
 	if err := s.store.UpsertCapabilities(ctx, capability.StaticKiroModels(account.ID)); err != nil {

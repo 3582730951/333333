@@ -786,7 +786,10 @@ func pureWebSearchRequest(toolsRaw []json.RawMessage, messages []anthropicMessag
 func stableUUID(kind, key string) string {
 	s := sha256.Sum256([]byte(kind + "\x00" + key))
 	b := s[:16]
-	b[6] = (b[6] & 0x0f) | 0x50
+	// Version 4 nibble: a real Kiro client emits v4 conversation/continuation IDs.
+	// Kept deterministic (derived, not random) so the Kiro prompt-cache key stays
+	// stable across a conversation — only the version shape is corrected, v5→v4.
+	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

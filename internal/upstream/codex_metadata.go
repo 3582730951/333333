@@ -163,6 +163,17 @@ func applyCodexClientMetadata(raw []byte, metadata codexRequestMetadata, websock
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return raw
 	}
+	return applyCodexClientMetadataWithFields(raw, fields, metadata, websocket)
+}
+
+// applyCodexClientMetadataWithFields is the core taking the top-level object parsed
+// once at the dispatch choke point. The map only gates a non-object body (nil ->
+// unchanged, matching the wrapper's malformed-JSON passthrough); the client_metadata
+// members themselves are rewritten in place with targeted sjson edits.
+func applyCodexClientMetadataWithFields(raw []byte, fields map[string]json.RawMessage, metadata codexRequestMetadata, websocket bool) []byte {
+	if fields == nil {
+		return raw
+	}
 	out := raw
 	set := func(path string, value interface{}) bool {
 		var err error
@@ -243,6 +254,17 @@ func stampCodexWebSocketRequestStart(raw []byte) []byte {
 func stripCodexTopLevelTransportCorrelators(raw []byte) []byte {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
+	}
+	return stripCodexTopLevelTransportCorrelatorsWithFields(raw, fields)
+}
+
+// stripCodexTopLevelTransportCorrelatorsWithFields is the core taking the top-level
+// object parsed once at the dispatch choke point. Presence is read from the shared
+// map (these keys are not added by any earlier normalization step), and only present
+// keys are deleted from the current bytes, leaving all prompt/context bytes untouched.
+func stripCodexTopLevelTransportCorrelatorsWithFields(raw []byte, fields map[string]json.RawMessage) []byte {
+	if fields == nil {
 		return raw
 	}
 	out := raw

@@ -94,6 +94,32 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 	return out
 }
 
+// reachedTerminal reports whether the stream observed a terminal Responses event
+// (response.completed / response.incomplete / response.failed). When false after the
+// upstream body ends, the stream was truncated — the signal the auto-continue relay
+// uses to decide whether to re-issue.
+func (r *codexStreamLedgerRecorder) reachedTerminal() bool { return r.completed != nil }
+
+// partialText returns the assistant output text accumulated so far.
+func (r *codexStreamLedgerRecorder) partialText() string { return r.text.String() }
+
+// partialItems reconstructs the assistant output items produced so far (the same shape
+// persistContextJournal appends as input for the next turn), used to re-inject the
+// partial answer into the continuation request so the model continues instead of
+// restarting — keeping the prompt-cache prefix intact.
+func (r *codexStreamLedgerRecorder) partialItems() []interface{} {
+	return r.outputItems(r.text.String())
+}
+
+// partialItemCount is the number of output items the stream opened, used to offset the
+// continuation's output_index so its items never collide with the ones already relayed.
+func (r *codexStreamLedgerRecorder) partialItemCount() int {
+	if n := len(r.done); n > len(r.added) {
+		return n
+	}
+	return len(r.added)
+}
+
 func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 	eventType, data := sseFrameEventData(frame)
 	if len(data) == 0 || strings.TrimSpace(string(data)) == "[DONE]" {

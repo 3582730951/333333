@@ -332,34 +332,45 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		} else if !isCompact {
 			req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL, responsesLite)
 		}
+		// Parse the top-level object ONCE here. The remaining normalizations each probe
+		// only one or two top-level fields, so they share this single scan instead of
+		// re-unmarshalling the whole body 4-6 times. None of the fields these steps
+		// inspect (reasoning.effort, prompt_cache_retention, max_output_tokens,
+		// thread_id/session_id/conversation_id) are added or removed by the step above,
+		// so the map stays an accurate probe. It is nil for a non-object body, and every
+		// *WithFields core then returns its input unchanged — the same byte-fidelity
+		// passthrough each function had on malformed JSON. Mutations are still applied
+		// with targeted sjson edits on the live req.Body, never a map re-marshal.
+		var codexFields map[string]json.RawMessage
+		_ = json.Unmarshal(req.Body, &codexFields)
 		// `ultra` is a client-side Codex capability: the official client enables
 		// automatic delegation locally, but serializes `max` on every Responses wire
 		// path (including /responses/compact). Keep the downstream/config value intact
 		// until this final upstream boundary, then mirror that wire contract.
-		req.Body = normalizeCodexReasoningEffortForWire(req.Body)
+		req.Body = normalizeCodexReasoningEffortForWireWithFields(req.Body, codexFields)
 		// Current codex-rs has no prompt_cache_retention request field on either
 		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
 		// cache-affinity control), but strip this obsolete extension consistently.
-		req.Body = stripCodexResponsesPromptCacheRetention(req.Body)
+		req.Body = stripCodexResponsesPromptCacheRetentionWithFields(req.Body, codexFields)
 		if !usesAPIKey {
 			// The ChatGPT Codex/WHAM contract does not accept the public Responses API's
 			// max_output_tokens field. Claude Code always sends Anthropic max_tokens;
 			// the Messages -> Chat -> Responses bridge preserves it until this transport
 			// boundary, where an OAuth account must mirror the official Codex client and
 			// omit the unsupported field. API-key Responses endpoints keep the limit.
-			req.Body = stripCodexResponsesMaxOutputTokens(req.Body)
+			req.Body = stripCodexResponsesMaxOutputTokensWithFields(req.Body, codexFields)
 			metadata := c.newCodexRequestMetadataWithResponsesLite(req, responsesLite)
 			req.codexMetadata = &metadata
 			// ApiCompactionInput projects the same identity through headers; only
 			// normal Responses turns serialize client_metadata in the request body.
 			if !isCompact {
-				req.Body = applyCodexClientMetadata(req.Body, metadata, req.CodexResponsesWebSocket)
+				req.Body = applyCodexClientMetadataWithFields(req.Body, codexFields, metadata, req.CodexResponsesWebSocket)
 			}
 		}
 		// Downstream Codex WebSocket clients may include transport correlators at
 		// the request root. They are useful for routing/identity derivation above,
 		// but are not valid upstream Responses parameters.
-		req.Body = stripCodexTopLevelTransportCorrelators(req.Body)
+		req.Body = stripCodexTopLevelTransportCorrelatorsWithFields(req.Body, codexFields)
 	}
 	if req.CodexResponsesWebSocket {
 		return c.doCodexResponsesWebSocket(ctx, req)

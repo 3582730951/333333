@@ -10,7 +10,6 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,7 +91,7 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 	if err != nil {
 		return nil, err
 	}
-	capabilities, err := s.store.ListCapabilitiesByAccountIDs(ctx, accountIDs)
+	capabilities, err := s.store.ListCapabilitiesSummaryByAccountIDs(ctx, accountIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +112,10 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		return nil, err
 	}
 	reauthConfigs, err := s.store.ListCodexReauthConfigPublicByAccountIDs(ctx, accountIDs)
+	if err != nil {
+		return nil, err
+	}
+	kiroSummaries, err := s.store.KiroAuthSummariesByAccountIDs(ctx, accountIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -141,10 +144,8 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 			view.CodexReauthLastStatus = cfg.LastStatus
 		}
 		if providers[account.ID] == "kiro" {
-			if summary, err := s.store.KiroAuthSummary(ctx, account.ID); err == nil {
+			if summary, ok := kiroSummaries[account.ID]; ok {
 				view.KiroAuth = &summary
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				return nil, err
 			}
 		}
 		out = append(out, view)

@@ -97,6 +97,26 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 			snap.LastError = err.Error()
 		}
 	}
+	// Enforce the journal size/row budget on every tick, independent of free-disk level:
+	// this is the hard bound that keeps a low-config VPS from growing the replay journal
+	// without limit. Lowest-expires_at (least-recently-resumed) rows are evicted first.
+	// The budget is tightened under disk pressure so the journal sheds faster, trading
+	// resume window for disk as the tier escalates.
+	maxRows := int64(s.settingInt(ctx, "context_journal_max_rows", s.cfg.ContextJournalMaxRows))
+	maxBytes := int64(s.settingInt(ctx, "context_journal_max_mb", s.cfg.ContextJournalMaxMB)) * 1024 * 1024
+	switch snap.Level {
+	case "pressure":
+		maxRows, maxBytes = maxRows/2, maxBytes/2
+	case "critical":
+		maxRows, maxBytes = maxRows/10, maxBytes/10
+	}
+	if evicted, err := s.store.EvictContextJournalToBudget(ctx, maxRows, maxBytes); err != nil {
+		if snap.LastError == "" {
+			snap.LastError = err.Error()
+		}
+	} else {
+		snap.ContextsDeleted += evicted
+	}
 	if snap.Level != previous.Level || snap.ContextsDeleted != previous.ContextsDeleted {
 		log.Printf("[DISK-GUARD] level=%s free=%.1f%% ttl=%d contexts_deleted=%d logs_deleted=%d err=%s", snap.Level, snap.FreePercent, snap.ForcedContextTTLSeconds, snap.ContextsDeleted, snap.LogsDeleted, snap.LastError)
 	}

@@ -86,14 +86,28 @@ type Metrics struct {
 // reported (the pool's data dir); falls back to "/" when empty.
 var sharedSnapshot atomic.Value
 var samplerOnce sync.Once
+var lastAccessNanos atomic.Int64
+
+// samplerIdleWindow is how long after the most recent Collect the background
+// sampler keeps refreshing. Beyond it the sampler idles (no /proc scan, no
+// STW MemStats read) until an admin polls again — an admin page open at any
+// reasonable interval keeps it warm, an unwatched server stops paying for it.
+const samplerIdleWindow = 30 * time.Second
 
 func Collect(dataDir string) Metrics {
+	lastAccessNanos.Store(time.Now().UnixNano())
 	samplerOnce.Do(func() {
 		sharedSnapshot.Store(collectNow(dataDir))
 		supervisor.GoOnce("system-metrics-sampler", func() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
+				// Skip the full snapshot when nobody has polled recently, so an
+				// idle gateway does not scan the entire /proc tree and STW-read
+				// MemStats every second in perpetuity. The next Collect re-arms it.
+				if time.Since(time.Unix(0, lastAccessNanos.Load())) > samplerIdleWindow {
+					continue
+				}
 				sharedSnapshot.Store(collectNow(dataDir))
 			}
 		})

@@ -181,6 +181,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		defer tmp.Close()
 	}
 	ctx := contextWithRequestID(r.Context(), requestID)
+	ctx = contextWithUsageEventID(ctx, newRequestID())
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
 	defer func() {
@@ -292,6 +293,23 @@ func contextWithRequestID(ctx context.Context, requestID string) context.Context
 
 func requestIDFromContext(ctx context.Context) string {
 	if value, ok := ctx.Value(requestIDKey).(string); ok {
+		return value
+	}
+	return ""
+}
+
+// usageEventIDKey carries a SERVER-owned per-request id used as the usage_event_id
+// dedup key. It is decoupled from the client-supplied X-Request-ID so a client
+// cannot cause under-counting (by reusing the header across distinct requests) or
+// double-counting (by omitting it) of billable usage.
+const usageEventIDKey = "usage_event_id"
+
+func contextWithUsageEventID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, usageEventIDKey, id)
+}
+
+func usageEventIDFromContext(ctx context.Context) string {
+	if value, ok := ctx.Value(usageEventIDKey).(string); ok {
 		return value
 	}
 	return ""

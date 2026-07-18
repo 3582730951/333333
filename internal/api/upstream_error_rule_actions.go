@@ -85,6 +85,10 @@ func (s *Server) applyRuleAccountAction(ctx context.Context, account storage.Acc
 	switch decision.Match.AccountAction {
 	case upstreamrules.AccountActionNone:
 		return ban.Classify(false, status, header, body)
+	case upstreamrules.AccountActionAutoContinue:
+		// The account is healthy — the upstream merely stopped early. Never cool or
+		// quarantine it; the continuation is handled by the auto-continue relay path.
+		return ban.Classify(false, status, header, body)
 	case upstreamrules.AccountActionCooldown:
 		_ = s.store.SetBindingCooldown(ctx, account.ID, storage.Now()+ruleCooldownSeconds(decision.Rule, status, header, body))
 		s.scheduler.NotifyStateChanged()
@@ -210,7 +214,31 @@ func (s *Server) writeRuleDownstream(ctx context.Context, w http.ResponseWriter,
 		}
 		s.writeRuleNeutralError(w)
 		return true
+	case upstreamrules.DownstreamActionHeartbeatFinish:
+		if streaming {
+			s.writeHeartbeatFinishForRule(w, provider)
+			return true
+		}
+		s.writeRuleNeutralError(w)
+		return true
 	default:
 		return false
+	}
+}
+
+// writeHeartbeatFinishForRule absorbs a matched upstream error on a streaming request
+// by opening a normal SSE response, emitting exactly one provider-appropriate keepalive
+// frame (Codex response.in_progress / Claude ping), and then returning so the stream
+// closes cleanly. The downstream sees a benign, empty successful stream instead of the
+// upstream error. This never fabricates model content — the single frame is a protocol
+// keepalive, not a message delta.
+func (s *Server) writeHeartbeatFinishForRule(w http.ResponseWriter, provider string) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(heartbeatFrameFor(provider)))
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
 	}
 }
