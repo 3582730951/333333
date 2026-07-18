@@ -37,9 +37,9 @@ func seedDownstreamKey(t *testing.T, h *testHarness, plain, hint string) {
 	}
 }
 
-func TestCustomResponsesTypedToolReturnsCapabilityUnavailable(t *testing.T) {
+func TestCustomResponsesHostedToolIsOmittedWithDiagnostic(t *testing.T) {
 	h := newHarness(t, deepseekMock(t))
-	setupDeepSeek(t, h, []string{"deepseek-chat"}, false)
+	accountID := setupDeepSeek(t, h, []string{"deepseek-chat"}, false)
 
 	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{
 	  "model":"deepseek-chat",
@@ -50,23 +50,35 @@ func TestCustomResponsesTypedToolReturnsCapabilityUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	errObj := decodeErrorBody(t, resp.Body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, error=%#v", resp.StatusCode, errObj)
+	var root map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&root); err != nil {
+		t.Fatal(err)
 	}
-	if errObj["type"] != "capability_unavailable" {
-		t.Fatalf("error type = %#v, want capability_unavailable", errObj["type"])
+	if resp.StatusCode != http.StatusOK || root["object"] != "response" {
+		t.Fatalf("status = %d, response=%#v", resp.StatusCode, root)
 	}
-	if errObj["required_tier"] != "official_codex_or_custom_native_responses" {
-		t.Fatalf("required_tier = %#v", errObj["required_tier"])
+	if got := resp.Header.Get(responsesCompatibilityLossesHeader); got != `["responses_hosted_tool_omitted"]` {
+		t.Fatalf("compatibility header = %q", got)
 	}
-	if !strings.Contains(errObj["fix_hint"].(string), "upstream_protocol=\"responses\"") {
-		t.Fatalf("fix_hint missing native responses hint: %#v", errObj["fix_hint"])
-	}
+	forwarded := false
 	for _, req := range h.requests() {
 		if strings.HasSuffix(req.Path, "/chat/completions") {
-			t.Fatalf("typed Responses tool must not be sent to chat bridge: %+v", req)
+			forwarded = true
+			if strings.Contains(req.Body, "web_search") {
+				t.Fatalf("hosted Responses tool leaked to Chat upstream: %+v", req)
+			}
 		}
+	}
+	if !forwarded {
+		t.Fatal("request was not continued through the Chat bridge")
+	}
+	h.app.WaitForAsyncWrites()
+	var recorded string
+	if err := h.store.DB().QueryRow(`SELECT compatibility_losses_json FROM usage_records WHERE account_id = ? ORDER BY id DESC LIMIT 1`, accountID).Scan(&recorded); err != nil {
+		t.Fatalf("read compatibility losses: %v", err)
+	}
+	if recorded != `["responses_hosted_tool_omitted"]` {
+		t.Fatalf("recorded compatibility losses = %q", recorded)
 	}
 }
 

@@ -1651,6 +1651,15 @@ func TestGatewayDownstreamWebSocketKeepsWarmupStateOnOneUpstreamConnection(t *te
 		if json.Unmarshal(warmRaw, &warm) != nil || warm["type"] != "response.create" || warm["generate"] != false {
 			t.Fatalf("bad warmup payload: %s", warmRaw)
 		}
+		warmInput, _ := warm["input"].([]interface{})
+		var warmFirst map[string]interface{}
+		if len(warmInput) > 0 {
+			warmFirst, _ = warmInput[0].(map[string]interface{})
+		}
+		warmMetadata, _ := warm["client_metadata"].(map[string]interface{})
+		if warmFirst["type"] != "additional_tools" || warmMetadata["ws_request_header_x_openai_internal_codex_responses_lite"] != "true" || warm["tools"] != nil || warm["instructions"] != nil {
+			t.Fatalf("warmup lost Responses Lite wire shape: %s", warmRaw)
+		}
 		// Pretty-printed frames exercise the WS->SSE->WS multiline path too.
 		_ = conn.WriteMessage(websocket.TextMessage, []byte("{\n  \"type\": \"response.completed\",\n  \"response\": {\"id\": \"resp_warm\", \"model\": \"gpt-5.6-sol\", \"output\": [], \"usage\": {\"input_tokens\": 5, \"output_tokens\": 0, \"total_tokens\": 5}}\n}"))
 
@@ -1672,6 +1681,16 @@ func TestGatewayDownstreamWebSocketKeepsWarmupStateOnOneUpstreamConnection(t *te
 		if json.Unmarshal(actualRaw, &actual) != nil || actual["type"] != "response.create" || actual["previous_response_id"] != "resp_warm" {
 			t.Fatalf("warmup state was not reused on the same connection: %s", actualRaw)
 		}
+		actualInput, _ := actual["input"].([]interface{})
+		var actualFirst map[string]interface{}
+		if len(actualInput) > 0 {
+			actualFirst, _ = actualInput[0].(map[string]interface{})
+		}
+		actualMetadata, _ := actual["client_metadata"].(map[string]interface{})
+		if actualFirst["type"] != "message" || actualFirst["role"] != "developer" ||
+			actualMetadata["ws_request_header_x_openai_internal_codex_responses_lite"] != "true" || actual["tools"] != nil || actual["instructions"] != nil {
+			t.Fatalf("inference frame fell back from Responses Lite to classic: %s", actualRaw)
+		}
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_actual","model":"gpt-5.6-sol"}}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"PERSISTENT_WS_OK"}`))
 		_ = conn.WriteMessage(websocket.TextMessage, []byte("{\n  \"type\": \"response.completed\",\n  \"response\": {\"id\": \"resp_actual\", \"model\": \"gpt-5.6-sol\", \"usage\": {\"input_tokens\": 7, \"output_tokens\": 3, \"total_tokens\": 10}}\n}"))
@@ -1687,7 +1706,7 @@ func TestGatewayDownstreamWebSocketKeepsWarmupStateOnOneUpstreamConnection(t *te
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","generate":false,"input":[{"role":"developer","content":"stable context"}],"stream":true}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","generate":false,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"apply_patch","format":{"type":"text"}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"stable context"}]}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"},"stream":true}`)); err != nil {
 		t.Fatal(err)
 	}
 	readUntilType := func(want string) []byte {
@@ -1707,7 +1726,7 @@ func TestGatewayDownstreamWebSocketKeepsWarmupStateOnOneUpstreamConnection(t *te
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.processed","response_id":"resp_warm"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","previous_response_id":"resp_warm","input":[{"role":"user","content":"reply"}],"stream":true}`)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","previous_response_id":"resp_warm","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"stable context"}]},{"role":"user","content":"reply"}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"},"stream":true}`)); err != nil {
 		t.Fatal(err)
 	}
 	readUntilType("response.completed")
@@ -2315,7 +2334,9 @@ func TestOrphanedToolOutputHTTP400DegradesAndRetries(t *testing.T) {
 		if r.Header.Get("Authorization") == "Bearer access-a" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id call_1."}}`))
+			inner := `{"error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id call_1."}}`
+			wrapped, _ := json.Marshal(map[string]interface{}{"error": map[string]interface{}{"type": "upstream_error", "message": inner}})
+			_, _ = w.Write(wrapped)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -2323,6 +2344,12 @@ func TestOrphanedToolOutputHTTP400DegradesAndRetries(t *testing.T) {
 	})
 	accA := h.importAccount(t, "a", "upstream-a", "access-a")
 	h.importAccount(t, "b", "upstream-b", "access-b")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
 
 	body := `{"model":"gpt","previous_response_id":"resp_missing","input":[{"type":"custom_tool_call_output","call_id":"call_1","output":"preserve this result"}]}`
 	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -2360,6 +2387,376 @@ func TestOrphanedToolOutputHTTP400DegradesAndRetries(t *testing.T) {
 	if !strings.Contains(retry.Body, "preserve this result") {
 		t.Fatalf("recovery lost tool result text: %s", retry.Body)
 	}
+	account, err := h.store.GetAccount(context.Background(), accA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("context error changed account health: %+v", account)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), accA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.CooldownUntil != 0 || binding.RecheckPending {
+		t.Fatalf("context error cooled/recheck-gated the account: %+v", binding)
+	}
+	if got := atomic.LoadUint64(&h.app.contextDegraded); got != 1 {
+		t.Fatalf("context degraded counter = %d, want 1", got)
+	}
+}
+
+func TestOrphanedToolOutputAccountSwitchRepairsIncompleteDownstreamContext(t *testing.T) {
+	const callID = "call_LhyrFDALDxT1GOWETYWfgfRz"
+	const observedError = `{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
+		if r.Header.Get("Authorization") == "Bearer access-incomplete-a" ||
+			strings.Contains(body, `"previous_response_id"`) ||
+			strings.Contains(body, `"type":"custom_tool_call_output"`) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, observedError)
+			return
+		}
+		// The second account only accepts a stateless replay that retained the tool
+		// result as user data. This makes the test fail if account switching merely
+		// resends the incomplete downstream context unchanged.
+		for _, want := range []string{callID, "preserve structured result", "900719925474099312345", "encrypted-result"} {
+			if !strings.Contains(body, want) {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = fmt.Fprintf(w, `{"error":"degraded replay lost %s"}`, want)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_incomplete_context_recovered","object":"response","status":"completed","model":"gpt","output_text":"ok"}`)
+	})
+	accountA := h.importAccount(t, "incomplete-a", "upstream-incomplete-a", "access-incomplete-a")
+	h.importAccount(t, "incomplete-b", "upstream-incomplete-b", "access-incomplete-b")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"gpt","previous_response_id":"resp_incomplete","input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","status":"completed","output":{"text":"preserve structured result","n":900719925474099312345},"encrypted_content":"encrypted-result","future_field":{"kept":true}}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	keyReq.Header.Set("X-Codex-Turn-State", "incomplete-account-state")
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "incomplete-account-state")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_incomplete_context_recovered") {
+		t.Fatalf("account-switch repair status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "degraded" {
+		t.Fatalf("context status=%q, want degraded", got)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-incomplete-a" || requests[1].Auth != "Bearer access-incomplete-b" {
+		t.Fatalf("repair did not switch accounts exactly once: %+v", requests)
+	}
+	if requests[1].TurnState != "" || strings.Contains(requests[1].Body, "previous_response_id") || strings.Contains(requests[1].Body, `"type":"custom_tool_call_output"`) {
+		t.Fatalf("account B still received incomplete account-local context: %+v", requests[1])
+	}
+	account, err := h.store.GetAccount(context.Background(), accountA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("orphaned-output 400 changed account A health: %+v", account)
+	}
+}
+
+func TestOrphanedToolOutputAccountSwitchReplaysAutomaticallyPersistedCall(t *testing.T) {
+	const callID = "call_LhyrFDALDxT1GOWETYWfgfRz"
+	const observedError = `{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-journal-a":
+			if strings.Contains(body, `"type":"custom_tool_call_output"`) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, observedError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_saved_custom_call","object":"response","status":"completed","model":"gpt","output":[{"type":"custom_tool_call","id":"ctc_saved","call_id":"`+callID+`","name":"apply_patch","input":"{\"patch\":\"saved\"}"}]}`)
+		case "Bearer access-journal-b":
+			callIndex := strings.Index(body, `"type":"custom_tool_call"`)
+			outputIndex := strings.Index(body, `"type":"custom_tool_call_output"`)
+			valid := !strings.Contains(body, "previous_response_id") && r.Header.Get("X-Codex-Turn-State") == "" &&
+				callIndex >= 0 && outputIndex > callIndex && strings.Count(body, callID) >= 2 && strings.Contains(body, "saved tool result")
+			if !valid {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, observedError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_journal_switch_recovered","object":"response","status":"completed","model":"gpt","output_text":"ok"}`)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	})
+	accountA := h.importAccount(t, "journal-a", "upstream-journal-a", "access-journal-a")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	firstBody := `{"model":"gpt","prompt_cache_key":"journal-switch","tools":[{"type":"custom","name":"apply_patch","description":"apply a patch","format":{"type":"text"}}],"input":[{"role":"user","content":"generate call"}]}`
+	firstResp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(firstBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResponseBody, _ := io.ReadAll(firstResp.Body)
+	firstResp.Body.Close()
+	if firstResp.StatusCode != http.StatusOK || !strings.Contains(string(firstResponseBody), "resp_saved_custom_call") {
+		t.Fatalf("first turn status=%d body=%s", firstResp.StatusCode, firstResponseBody)
+	}
+	journal, err := h.store.GetContextJournal(context.Background(), "resp_saved_custom_call")
+	if err != nil {
+		t.Fatalf("first turn did not automatically persist context journal: %v", err)
+	}
+	if !strings.Contains(journal.Payload, `"type":"custom_tool_call"`) || !strings.Contains(journal.Payload, callID) {
+		t.Fatalf("persisted journal lost custom call/call_id: %s", journal.Payload)
+	}
+
+	h.importAccount(t, "journal-b", "upstream-journal-b", "access-journal-b")
+	secondBody := `{"model":"gpt","previous_response_id":"resp_saved_custom_call","input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"saved tool result"}]}`
+	secondReq, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(secondBody))
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondReq.Header.Set("X-Codex-Turn-State", "journal-account-a-state")
+	secondResp, err := http.DefaultClient.Do(secondReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResponseBody, _ := io.ReadAll(secondResp.Body)
+	secondResp.Body.Close()
+	if secondResp.StatusCode != http.StatusOK || !strings.Contains(string(secondResponseBody), "resp_journal_switch_recovered") {
+		t.Fatalf("journal-backed switch status=%d body=%s", secondResp.StatusCode, secondResponseBody)
+	}
+	if got := secondResp.Header.Get("X-MiCliProxy-Context-Status"); got != "rebuilt" {
+		t.Fatalf("context status=%q, want rebuilt", got)
+	}
+	requests := h.requests()
+	if len(requests) != 3 || requests[0].Auth != "Bearer access-journal-a" || requests[1].Auth != "Bearer access-journal-a" || requests[2].Auth != "Bearer access-journal-b" {
+		t.Fatalf("expected first turn A, failed continuation A, rebuilt retry B: %+v", requests)
+	}
+	account, err := h.store.GetAccount(context.Background(), accountA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("journal-repaired 400 changed account A health: %+v", account)
+	}
+}
+
+func TestOrphanedToolOutputContextJournalSurvivesRapidAccountChain(t *testing.T) {
+	const (
+		callA = "call_chain_a"
+		callB = "call_chain_b"
+		callC = "call_chain_c"
+	)
+	writeOrphan := func(w http.ResponseWriter, callID string) {
+		inner, _ := json.MarshalIndent(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type": "invalid_request_error", "message": "No tool call found for custom tool call output with call_id " + callID + ".", "param": "input",
+			},
+			"status": 400,
+		}, "", "  ")
+		outer, _ := json.Marshal(map[string]interface{}{
+			"error": map[string]interface{}{"message": string(inner)}, "status": 400, "type": "error",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(outer)
+	}
+	writeCall := func(w http.ResponseWriter, responseID, callID string) {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"id": responseID, "object": "response", "status": "completed", "model": "gpt",
+			"output": []interface{}{map[string]interface{}{
+				"type": "custom_tool_call", "id": "ctc_" + callID, "call_id": callID, "name": "apply_patch", "input": "{}",
+			}},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	}
+	hasHistory := func(raw []byte, expected map[string]string) bool {
+		root, err := decodeContextJSONMap(raw)
+		if err != nil || streamString(root["previous_response_id"]) != "" {
+			return false
+		}
+		input, _ := root["input"].([]interface{})
+		seenCalls := map[string]bool{}
+		seenOutputs := map[string]string{}
+		for _, rawItem := range input {
+			item, _ := rawItem.(map[string]interface{})
+			switch streamString(item["type"]) {
+			case "custom_tool_call":
+				seenCalls[streamString(item["call_id"])] = true
+			case "custom_tool_call_output":
+				callID := streamString(item["call_id"])
+				if !seenCalls[callID] {
+					return false
+				}
+				seenOutputs[callID] = streamString(item["output"])
+			}
+		}
+		for callID, output := range expected {
+			if !seenCalls[callID] || seenOutputs[callID] != output {
+				return false
+			}
+		}
+		return true
+	}
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-chain-a":
+			if strings.Contains(body, callA) && strings.Contains(body, "custom_tool_call_output") {
+				writeOrphan(w, callA)
+				return
+			}
+			writeCall(w, "resp_chain_a", callA)
+		case "Bearer access-chain-b":
+			if strings.Contains(body, callB) {
+				writeOrphan(w, callB)
+				return
+			}
+			if r.Header.Get("X-Codex-Turn-State") != "" || !hasHistory(raw, map[string]string{callA: "result-a"}) {
+				writeOrphan(w, callA)
+				return
+			}
+			writeCall(w, "resp_chain_b", callB)
+		case "Bearer access-chain-c":
+			if strings.Contains(body, callC) {
+				writeOrphan(w, callC)
+				return
+			}
+			if r.Header.Get("X-Codex-Turn-State") != "" || !hasHistory(raw, map[string]string{callA: "result-a", callB: "result-b"}) {
+				writeOrphan(w, callB)
+				return
+			}
+			writeCall(w, "resp_chain_c", callC)
+		case "Bearer access-chain-d":
+			if r.Header.Get("X-Codex-Turn-State") != "" || !hasHistory(raw, map[string]string{callA: "result-a", callB: "result-b", callC: "result-c"}) {
+				writeOrphan(w, callC)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp_chain_d","object":"response","status":"completed","model":"gpt","output_text":"all hops recovered"}`)
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	})
+	accountA := h.importAccount(t, "chain-a", "upstream-chain-a", "access-chain-a")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	firstBody := `{"model":"gpt","prompt_cache_key":"rapid-account-chain","tools":[{"type":"custom","name":"apply_patch","format":{"type":"text"}}],"input":[{"role":"user","content":"start chain"}]}`
+	firstResp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(firstBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(firstResp.Body)
+	firstResp.Body.Close()
+	if firstResp.StatusCode != http.StatusOK {
+		t.Fatalf("initial A turn status=%d", firstResp.StatusCode)
+	}
+	accountB := h.importAccount(t, "chain-b", "upstream-chain-b", "access-chain-b")
+
+	type turnResult struct {
+		status        int
+		contextStatus string
+		body          []byte
+	}
+	sendOutput := func(previousID, callID, output, state string) turnResult {
+		t.Helper()
+		body := `{"model":"gpt","previous_response_id":"` + previousID + `","input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"` + output + `"}]}`
+		req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Codex-Turn-State", state)
+		resp, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		responseBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return turnResult{status: resp.StatusCode, contextStatus: resp.Header.Get("X-MiCliProxy-Context-Status"), body: responseBody}
+	}
+	assertRebuilt := func(hop string, result turnResult, responseID string) {
+		t.Helper()
+		if result.status != http.StatusOK || result.contextStatus != "rebuilt" || !strings.Contains(string(result.body), responseID) {
+			t.Fatalf("%s status=%d context=%q body=%s", hop, result.status, result.contextStatus, result.body)
+		}
+	}
+
+	assertRebuilt("A->B", sendOutput("resp_chain_a", callA, "result-a", "state-a"), "resp_chain_b")
+	if account, getErr := h.store.GetAccount(context.Background(), accountA); getErr != nil || account.Status != "active" || account.QuarantineUntil != 0 {
+		t.Fatalf("A health changed before explicit retirement: account=%+v err=%v", account, getErr)
+	}
+	if err := h.store.SetAccountStatus(context.Background(), accountA, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Second)
+	accountC := h.importAccount(t, "chain-c", "upstream-chain-c", "access-chain-c")
+	assertRebuilt("B->C after 2s", sendOutput("resp_chain_b", callB, "result-b", "state-b"), "resp_chain_c")
+	if account, getErr := h.store.GetAccount(context.Background(), accountB); getErr != nil || account.Status != "active" || account.QuarantineUntil != 0 {
+		t.Fatalf("B health changed before explicit retirement: account=%+v err=%v", account, getErr)
+	}
+	if err := h.store.SetAccountStatus(context.Background(), accountB, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Second)
+	h.importAccount(t, "chain-d", "upstream-chain-d", "access-chain-d")
+	assertRebuilt("C->D after 1s", sendOutput("resp_chain_c", callC, "result-c", "state-c"), "resp_chain_d")
+	if account, getErr := h.store.GetAccount(context.Background(), accountC); getErr != nil || account.Status != "active" || account.QuarantineUntil != 0 {
+		t.Fatalf("C health changed after orphan repair: account=%+v err=%v", account, getErr)
+	}
+
+	requests := h.requests()
+	wantAuth := []string{
+		"Bearer access-chain-a", "Bearer access-chain-a", "Bearer access-chain-b",
+		"Bearer access-chain-b", "Bearer access-chain-c", "Bearer access-chain-c", "Bearer access-chain-d",
+	}
+	if len(requests) != len(wantAuth) {
+		t.Fatalf("rapid chain attempts=%d, want %d: %+v", len(requests), len(wantAuth), requests)
+	}
+	for index, want := range wantAuth {
+		if requests[index].Auth != want {
+			t.Fatalf("rapid chain auth[%d]=%q, want %q: %+v", index, requests[index].Auth, want, requests)
+		}
+	}
+	if got := atomic.LoadUint64(&h.app.contextRebuilt); got != 3 {
+		t.Fatalf("rebuilt counter=%d, want one per hop", got)
+	}
 }
 
 func TestOrphanedToolOutputStreamStatus400RebuildsFromJournal(t *testing.T) {
@@ -2383,7 +2780,7 @@ func TestOrphanedToolOutputStreamStatus400RebuildsFromJournal(t *testing.T) {
 	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA}); err != nil {
 		t.Fatal(err)
 	}
-	journalPayload := `{"model":"gpt","turn_state":"journal-old-state","input":[{"type":"custom_tool_call","call_id":"call_2","name":"apply_patch","input":"{}"}]}`
+	journalPayload := `{"model":"gpt","turn_state":"journal-old-state","tools":[{"type":"function","name":"big","parameters":{"type":"object","properties":{"n":{"const":900719925474099312345}}}}],"input":[{"type":"custom_tool_call","call_id":"call_2","name":"apply_patch","input":"{}"}]}`
 	if err := h.store.PutContextJournal(context.Background(), storage.ContextJournal{ResponseID: "resp_journal", AccountID: accA, Payload: journalPayload, ExpiresAt: time.Now().Add(time.Hour).Unix()}); err != nil {
 		t.Fatal(err)
 	}
@@ -2412,6 +2809,180 @@ func TestOrphanedToolOutputStreamStatus400RebuildsFromJournal(t *testing.T) {
 	}
 	if !strings.Contains(retry.Body, "custom_tool_call") || !strings.Contains(retry.Body, "custom_tool_call_output") {
 		t.Fatalf("journal replay did not preserve paired call/output: %s", retry.Body)
+	}
+	if !strings.Contains(retry.Body, "900719925474099312345") {
+		t.Fatalf("journal replay rounded a large schema integer: %s", retry.Body)
+	}
+}
+
+func TestOrphanedToolOutputSingleAccountRetriesSameAccountOnce(t *testing.T) {
+	var attempts int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"No tool call found for function call output with call_id call_single."}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_single_recovered","object":"response","status":"completed","model":"gpt","output_text":"ok"}`))
+	})
+	accountID := h.importAccount(t, "single", "upstream-single", "access-single")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt","previous_response_id":"resp_missing","input":[{"type":"function_call_output","call_id":"call_single","output":"keep"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("single-account recovery status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-single" || requests[1].Auth != "Bearer access-single" {
+		t.Fatalf("single account was not safely retried in place: %+v", requests)
+	}
+	if strings.Contains(requests[1].Body, "previous_response_id") || strings.Contains(requests[1].Body, "function_call_output") || !strings.Contains(requests[1].Body, "keep") {
+		t.Fatalf("same-account retry was not stateless/degraded: %s", requests[1].Body)
+	}
+}
+
+func TestOrphanedToolOutputRepairIsAttemptedOnlyOnce(t *testing.T) {
+	var attempts int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"No tool call found for custom tool call output with call_id call_repeat."}}`))
+	})
+	accountID := h.importAccount(t, "repeat", "upstream-repeat", "access-repeat")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt","previous_response_id":"resp_missing","input":[{"type":"custom_tool_call_output","call_id":"call_repeat","output":"keep"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("repeated orphan status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	if got := atomic.LoadUint64(&h.app.contextDegraded); got != 1 {
+		t.Fatalf("context repair count = %d, want exactly one", got)
+	}
+}
+
+func TestOrphanedToolOutputAfterCommittedStreamIsNotRetried(t *testing.T) {
+	var attempts int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\n"+
+			`data: {"type":"response.output_text.delta","delta":"visible"}`+"\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(20 * time.Millisecond)
+		_, _ = io.WriteString(w, "event: error\n"+
+			`data: {"type":"error","status":400,"error":{"message":"No tool call found for function call output with call_id call_late."}}`+"\n\n")
+	})
+	accountID := h.importAccount(t, "late", "upstream-late", "access-late")
+	body := `{"model":"gpt","previous_response_id":"resp_missing","stream":true,"input":[{"type":"function_call_output","call_id":"call_late","output":"keep"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || atomic.LoadInt32(&attempts) != 1 || !strings.Contains(string(responseBody), "visible") {
+		t.Fatalf("committed stream status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "" {
+		t.Fatalf("committed stream unexpectedly repaired context: %q", got)
+	}
+}
+
+func TestOrphanedToolOutputWebSocketStatusCodeRepairsContext(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/backend-api/codex/responses" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade: %v", err)
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Fatalf("read WS request: %v", err)
+		}
+		if r.Header.Get("Authorization") == "Bearer access-ws-a" {
+			inner := `{"error":{"type":"invalid_request_error","message":"No tool call found for tool search output with call_id search_ws."}}`
+			payload, _ := json.Marshal(map[string]interface{}{
+				"type": "error", "status_code": 400,
+				"error": map[string]interface{}{"type": "upstream_error", "message": inner},
+			})
+			_ = conn.WriteMessage(websocket.TextMessage, payload)
+			return
+		}
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_ws_recovered","model":"gpt-5.5"}}`))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_ws_recovered","model":"gpt-5.5","status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`))
+	})
+	accA := h.importAccount(t, "ws-a", "upstream-ws-a", "access-ws-a")
+	h.importAccount(t, "ws-b", "upstream-ws-b", "access-ws-b")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt-5.5","previous_response_id":"resp_missing","stream":true,"input":[{"type":"tool_search_output","call_id":"search_ws","execution":"client","status":"completed","tools":[]}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_ws_recovered") {
+		t.Fatalf("WS recovery status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "degraded" {
+		t.Fatalf("WS context status = %q", got)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-ws-a" || requests[1].Auth != "Bearer access-ws-b" {
+		t.Fatalf("WS recovery did not prefer another account: %+v", requests)
 	}
 }
 

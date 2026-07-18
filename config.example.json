@@ -3,7 +3,7 @@
   "database_path": "/var/lib/codex-pool/pool.sqlite3",
   "upstream_base_url": "https://chatgpt.com/backend-api/codex",
   "oauth_token_url": "",
-  "client_version": "0.144.1",
+  "client_version": "0.144.5",
   "default_group": "cyber",
   "sticky_wait_millis": 100,
   "strict_sticky_max_cooldown_seconds": 60,

@@ -2,7 +2,7 @@
   "listen_addr": "0.0.0.0:8787",
   "database_path": "/var/lib/codex-pool/e2e.sqlite3",
   "upstream_base_url": "http://host.docker.internal:9300/backend-api/codex",
-  "client_version": "0.144.1",
+  "client_version": "0.144.5",
   "default_group": "cyber",
   "admin_token": "pool-e2e-admin-20260710",
   "virtual_2m_enabled": true,

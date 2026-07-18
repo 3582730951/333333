@@ -21,8 +21,8 @@ func InjectResponsesSystemPrompt(raw []byte, systemPrompt string) ([]byte, bool,
 	if systemPrompt == "" {
 		return raw, false, nil
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return nil, false, err
 	}
 	if existing, ok := root["instructions"].(string); ok && strings.TrimSpace(existing) != "" {
@@ -44,8 +44,8 @@ func InjectChatSystemPrompt(raw []byte, systemPrompt string) ([]byte, bool, erro
 	if systemPrompt == "" {
 		return raw, false, nil
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return nil, false, err
 	}
 	messages, _ := root["messages"].([]interface{})
@@ -70,8 +70,8 @@ func InjectChatSystemPrompt(raw []byte, systemPrompt string) ([]byte, bool, erro
 }
 
 func ChatCompletionToResponses(raw []byte) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return nil, err
 	}
 	messages, ok := root["messages"].([]interface{})
@@ -241,13 +241,13 @@ func firstPresent(vs ...interface{}) interface{} {
 	return nil
 }
 
-func ResponsesToChatCompletion(raw []byte, requestID, model string) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+func ResponsesToChatCompletion(raw []byte, requestID, model string, plans ...*ResponsesToolBridgePlan) ([]byte, error) {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return raw, nil
 	}
 	content := extractResponseText(root)
-	toolCalls := extractResponseToolCalls(root)
+	toolCalls := extractResponseToolCalls(root, plans...)
 	if model == "" {
 		if m, ok := root["model"].(string); ok {
 			model = m
@@ -300,23 +300,47 @@ func ResponsesToChatCompletion(raw []byte, requestID, model string) ([]byte, err
 // extractResponseToolCalls pulls function_call items out of a Responses API response's
 // output array and shapes them as OpenAI chat tool_calls, so a third-party client sees
 // the tool calls it expects instead of them vanishing (the old text-only extraction).
-func extractResponseToolCalls(root map[string]interface{}) []interface{} {
+func extractResponseToolCalls(root map[string]interface{}, plans ...*ResponsesToolBridgePlan) []interface{} {
 	output, ok := root["output"].([]interface{})
 	if !ok {
 		return nil
 	}
+	plan := NewResponsesToolBridgePlan()
+	if len(plans) > 0 && plans[0] != nil {
+		plan = plans[0]
+	}
 	var calls []interface{}
 	for _, item := range output {
 		m, ok := item.(map[string]interface{})
-		if !ok || m["type"] != "function_call" {
+		if !ok {
 			continue
 		}
+		var identity ResponsesToolIdentity
+		var arguments string
+		switch stringOr(m["type"], "") {
+		case "function_call":
+			identity = ResponsesToolIdentity{Kind: ResponsesToolFunction, Namespace: stringOr(m["namespace"], ""), Name: stringOr(m["name"], "")}
+			arguments = jsonValueString(m["arguments"])
+		case "custom_tool_call":
+			identity = ResponsesToolIdentity{Kind: ResponsesToolCustom, Namespace: stringOr(m["namespace"], ""), Name: stringOr(m["name"], "")}
+			wrapped, _ := json.Marshal(map[string]interface{}{"input": stringOr(m["input"], "")})
+			arguments = string(wrapped)
+		case "tool_search_call":
+			if !strings.EqualFold(stringOr(m["execution"], "client"), "client") {
+				continue
+			}
+			identity = ResponsesToolIdentity{Kind: ResponsesToolSearch, Name: "tool_search", Execution: "client"}
+			arguments = jsonValueString(m["arguments"])
+		default:
+			continue
+		}
+		name := plan.EnsureChatName(identity)
 		calls = append(calls, map[string]interface{}{
 			"id":   stringOr(firstPresent(m["call_id"], m["id"]), ""),
 			"type": "function",
 			"function": map[string]interface{}{
-				"name":      stringOr(mapGet(m, "name"), ""),
-				"arguments": stringOr(mapGet(m, "arguments"), ""),
+				"name":      name,
+				"arguments": arguments,
 			},
 		})
 	}
@@ -359,8 +383,8 @@ func EnsureResponsesWebSearchTool(raw []byte, toolType string) ([]byte, error) {
 	if strings.TrimSpace(toolType) == "" {
 		toolType = "web_search"
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return nil, err
 	}
 	var tools []interface{}
@@ -423,8 +447,8 @@ func EnsureResponsesPromptCacheRetention(raw []byte, retention string) []byte {
 	if bytesContainsKey(raw, "prompt_cache_retention") {
 		return raw
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return raw
 	}
 	if _, ok := root["prompt_cache_retention"]; ok {

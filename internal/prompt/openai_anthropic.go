@@ -16,8 +16,8 @@ import (
 // tool_result) -> chat messages and tool_calls / tool-role messages; tools
 // (input_schema) -> OpenAI function tools.
 func AnthropicRequestToChatCompletion(raw []byte) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return nil, err
 	}
 	out := map[string]interface{}{}
@@ -280,8 +280,8 @@ func anthropicToolChoiceToChat(v interface{}) interface{} {
 // response into an Anthropic Messages response: assistant text -> a text block, tool
 // calls -> tool_use blocks, finish_reason -> stop_reason, usage -> input/output_tokens.
 func ChatCompletionToAnthropicResponse(raw []byte, model string) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return raw, nil
 	}
 	id, _ := root["id"].(string)

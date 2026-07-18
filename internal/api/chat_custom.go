@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -269,7 +270,7 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 		return
 	}
 	stream := isStreamRequest(raw)
-	chatBody, err := prompt.ResponsesRequestToChatCompletion(raw)
+	bridge, err := prompt.ResponsesRequestToChatCompletionBridge(raw)
 	if err != nil {
 		if s.writePromptCompatibilityError(w, err, "official_codex_or_custom_native_responses", "custom_chat_completions_bridge:"+provider.ID, "Set this provider's upstream_protocol=\"responses\" if it truly supports /v1/responses, or route this request to an official Codex account.") {
 			return
@@ -277,6 +278,14 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	r = withResponsesCompatibilityLosses(r, bridge.CompatibilityLosses)
+	if stream {
+		declareResponsesCompatibilityTrailer(w)
+		defer setResponsesCompatibilityTrailer(w, bridge.CompatibilityLosses)
+	} else {
+		setResponsesCompatibilityHeader(w, bridge.CompatibilityLosses)
+	}
+	chatBody := bridge.Body
 	if stream {
 		chatBody = withStreamUsage(chatBody)
 	}
@@ -293,7 +302,7 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 		w.WriteHeader(http.StatusOK)
 		uscan := usage.NewStreamScanner("openai_chat")
 		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "custom_openai", model, cc.resp.StatusCode), provider.ID)
-		chatStreamToResponsesSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber)
+		chatStreamToResponsesSSE(rw, io.TeeReader(cc.resp.Body, uscan), model, cc.scrubber, bridge.Plan)
 		s.settleStreamUsage(r, cc, uscan)
 		return
 	}
@@ -305,7 +314,7 @@ func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request
 	}
 	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
 	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
-	out, cerr := prompt.ChatCompletionToResponsesResponse(cc.scrubber.ReplaceAll(body), model)
+	out, cerr := prompt.ChatCompletionToResponsesResponse(cc.scrubber.ReplaceAll(body), model, bridge.Plan)
 	if cerr != nil {
 		writeError(w, http.StatusBadGateway, cerr)
 		return
@@ -465,8 +474,10 @@ func (s *Server) settleStreamUsage(r *http.Request, cc customCall, uscan *usage.
 // token usage on a streamed custom-provider response). A no-op for non-streaming
 // bodies or unparseable input. Providers that ignore stream_options are unaffected.
 func withStreamUsage(body []byte) []byte {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
 	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	if dec.Decode(&root) != nil {
 		return body
 	}
 	if stream, _ := root["stream"].(bool); !stream {

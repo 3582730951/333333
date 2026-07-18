@@ -21,6 +21,10 @@ func TestCodexRequestUsesResponsesLiteRequiresNativeEnvelope(t *testing.T) {
 		want bool
 	}{
 		{"native Lite", `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]}]}`, true},
+		{"Lite websocket continuation marker", `{"model":"gpt-5.6-sol","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"base"}]},{"role":"user","content":"hi"}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`, true},
+		{"Lite marker allows empty top-level tools", `{"model":"gpt-5.6-sol","tools":[],"input":[{"role":"user","content":"hi"}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`, true},
+		{"Lite marker rejects hosted top-level tools", `{"model":"gpt-5.6-sol","tools":[{"type":"web_search"}],"input":[{"role":"user","content":"hi"}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`, false},
+		{"false Lite marker", `{"model":"gpt-5.6-sol","input":[{"role":"user","content":"hi"}],"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`, false},
 		{"classic function tools", `{"model":"gpt-5.6-sol","tools":[{"type":"function","name":"run"}],"input":"hi"}`, false},
 		{"classic hosted tool", `{"model":"gpt-5.6-sol","tools":[{"type":"web_search"}],"input":"hi"}`, false},
 		{"wrong additional tools role", `{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"user","tools":[]}]}`, false},

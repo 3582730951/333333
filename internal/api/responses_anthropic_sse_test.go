@@ -86,6 +86,40 @@ func TestResponsesStreamToAnthropicSSERemovesBuiltInAgentModelOverride(t *testin
 	}
 }
 
+func TestResponsesStreamToAnthropicSSERecognizesStableToolKinds(t *testing.T) {
+	stream := "event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_custom","name":"apply_patch","input":""}}` + "\n\n" +
+		"event: response.custom_tool_call_input.delta\n" +
+		`data: {"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":"hello"}` + "\n\n" +
+		"event: response.custom_tool_call_input.done\n" +
+		`data: {"type":"response.custom_tool_call_input.done","output_index":0,"item_id":"ctc_1","input":"hello"}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"tool_search_call","id":"tsc_1","call_id":"call_search","execution":"client","arguments":{}}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"tool_search_call","id":"tsc_1","call_id":"call_search","execution":"client","arguments":{"limit":900719925474099312345}}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_read","namespace":"filesystem","name":"read","arguments":"{\"path\":\"a\"}"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_tools","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	responsesStreamToAnthropicSSE(recorder, strings.NewReader(stream), "gpt", nil, nil, streamrewrite.New(nil))
+	got := recorder.Body.String()
+	for _, want := range []string{
+		`"name":"apply_patch"`,
+		`"partial_json":"{\"input\":\"hello\"}"`,
+		`"name":"tool_search"`,
+		"900719925474099312345",
+		`"name":"filesystem__read_`,
+		`\"path\":\"a\"`,
+		`"stop_reason":"tool_use"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stable Anthropic tool bridge missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestCodexSSEToResponseJSONKeepsIncompleteAndFailedTerminals(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

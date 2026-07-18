@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -129,11 +130,16 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 	return metadata
 }
 
-// CodexRequestUsesResponsesLite opts in only requests already carrying the official
-// Lite envelope. A classic/older client can send hosted tools such as web_search or
-// image_generation; adding the Lite header to that body is precisely what triggers
-// the upstream unsupported_value error. Keeping classic bodies on the classic wire
-// also avoids an incomplete protocol upgrade (Lite has additional image/tool rules).
+// CodexRequestUsesResponsesLite recognizes both stable Lite request shapes. The
+// prewarm/first frame starts with an additional_tools developer item; subsequent
+// frames on the same Responses WebSocket carry the explicit Lite client_metadata
+// marker but may start with an ordinary developer message because the tool envelope
+// is already part of the warm connection state.
+//
+// A classic/older client can send hosted tools such as web_search or image_generation;
+// adding the Lite header to that body is precisely what triggers the upstream
+// unsupported_value error. Therefore the continuation marker is accepted only when
+// top-level tools are absent or empty.
 func CodexRequestUsesResponsesLite(raw []byte) bool {
 	if !capability.CodexUsesResponsesLite(codexBodyString(raw, "model")) {
 		return false
@@ -146,6 +152,9 @@ func CodexRequestUsesResponsesLite(raw []byte) bool {
 	if !ok || len(input) == 0 {
 		return false
 	}
+	if codexResponsesLiteContinuationMarker(fields) {
+		return true
+	}
 	var first struct {
 		Type  string          `json:"type"`
 		Role  string          `json:"role"`
@@ -156,6 +165,23 @@ func CodexRequestUsesResponsesLite(raw []byte) bool {
 	}
 	var tools []json.RawMessage
 	return json.Unmarshal(first.Tools, &tools) == nil
+}
+
+func codexResponsesLiteContinuationMarker(fields map[string]json.RawMessage) bool {
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal(fields["client_metadata"], &metadata); err != nil {
+		return false
+	}
+	var marker string
+	if err := json.Unmarshal(metadata[codexWSResponsesLiteMetadata], &marker); err != nil || !strings.EqualFold(strings.TrimSpace(marker), "true") {
+		return false
+	}
+	toolsRaw, present := fields["tools"]
+	if !present || bytes.Equal(bytes.TrimSpace(toolsRaw), []byte("null")) {
+		return true
+	}
+	var tools []json.RawMessage
+	return json.Unmarshal(toolsRaw, &tools) == nil && len(tools) == 0
 }
 
 func applyCodexClientMetadata(raw []byte, metadata codexRequestMetadata, websocket bool) []byte {

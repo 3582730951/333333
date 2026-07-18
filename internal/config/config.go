@@ -17,9 +17,9 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-07-10 from the installed shipping CLI (codex-cli 0.144.1)
+	// Refreshed 2026-07-10 from the installed shipping CLI (codex-cli 0.144.5)
 	// and other_codex's 0.144.0-gated GPT-5.6 catalog.
-	DefaultClientVersion                  = "0.144.1"
+	DefaultClientVersion                  = "0.144.5"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30

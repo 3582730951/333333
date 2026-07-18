@@ -114,6 +114,17 @@ func TestParseCodexResetCredits(t *testing.T) {
 	}
 }
 
+func TestCodexResetCreditHeadersKeepCapturedDesktopFingerprint(t *testing.T) {
+	headers := http.Header{}
+	applyCodexWhamHeaders(headers, storage.Account{UpstreamAccountID: "acct-reset"}, storage.AccountToken{AccessToken: "access-reset"})
+	if headers.Get("Originator") != "Codex Desktop" || headers.Get("User-Agent") != "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal" {
+		t.Fatalf("reset-credit fingerprint changed: %v", headers)
+	}
+	if headers.Get("OpenAI-Beta") != "codex-1" || headers.Get("ChatGPT-Account-Id") != "acct-reset" {
+		t.Fatalf("reset-credit protocol headers changed: %v", headers)
+	}
+}
+
 func TestCodexResetConsumedRequiresExplicitResetCode(t *testing.T) {
 	tests := []struct {
 		body string

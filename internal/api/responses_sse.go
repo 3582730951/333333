@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
 )
 
@@ -24,7 +26,16 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 	chatID := "chatcmpl-codex"
 	roleSent := false
 	// Map a Responses output_index → the chat tool_call index we present downstream.
-	toolIndexByOutput := map[int]int{}
+	type responseToolStream struct {
+		index           int
+		kind            prompt.ResponsesToolKind
+		customSawDelta  bool
+		customCompleted bool
+		argumentsSent   bool
+	}
+	toolByOutput := map[int]*responseToolStream{}
+	toolByItemID := map[string]*responseToolStream{}
+	bridgePlan := prompt.NewResponsesToolBridgePlan()
 	nextToolIdx := 0
 	sawToolCall := false
 
@@ -90,10 +101,75 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 	}
 
 	outputIndexOf := func(ev map[string]interface{}) int {
-		if v, ok := ev["output_index"].(float64); ok {
+		switch v := ev["output_index"].(type) {
+		case float64:
 			return int(v)
+		case json.Number:
+			if n, err := v.Int64(); err == nil {
+				return int(n)
+			}
 		}
 		return 0
+	}
+	escapeJSONFragment := func(value string) string {
+		quoted := strconv.Quote(value)
+		return quoted[1 : len(quoted)-1]
+	}
+	emitToolArguments := func(state *responseToolStream, arguments string) {
+		if state == nil || arguments == "" {
+			return
+		}
+		emit(map[string]interface{}{"tool_calls": []interface{}{map[string]interface{}{
+			"index": state.index,
+			"function": map[string]interface{}{
+				"arguments": scrubber.ReplaceString(arguments),
+			},
+		}}}, nil)
+		state.argumentsSent = true
+	}
+	ensureTool := func(outputIndex int, item map[string]interface{}) *responseToolStream {
+		if existing := toolByOutput[outputIndex]; existing != nil {
+			if id := asString(item["id"]); id != "" {
+				toolByItemID[id] = existing
+			}
+			return existing
+		}
+		var identity prompt.ResponsesToolIdentity
+		switch asString(item["type"]) {
+		case "function_call":
+			identity = prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolFunction, Namespace: asString(item["namespace"]), Name: asString(item["name"])}
+		case "custom_tool_call":
+			identity = prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolCustom, Namespace: asString(item["namespace"]), Name: asString(item["name"])}
+		case "tool_search_call":
+			if !strings.EqualFold(asString(item["execution"]), "client") {
+				return nil
+			}
+			identity = prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolSearch, Name: "tool_search", Execution: "client"}
+		default:
+			return nil
+		}
+		ensureRole()
+		state := &responseToolStream{index: nextToolIdx, kind: identity.Kind}
+		nextToolIdx++
+		toolByOutput[outputIndex] = state
+		if id := asString(item["id"]); id != "" {
+			toolByItemID[id] = state
+		}
+		sawToolCall = true
+		callID := asString(item["call_id"])
+		if callID == "" {
+			callID = asString(item["id"])
+		}
+		emit(map[string]interface{}{"tool_calls": []interface{}{map[string]interface{}{
+			"index": state.index,
+			"id":    callID,
+			"type":  "function",
+			"function": map[string]interface{}{
+				"name":      bridgePlan.EnsureChatName(identity),
+				"arguments": "",
+			},
+		}}}, nil)
+		return state
 	}
 
 	for scanner.Scan() {
@@ -105,8 +181,10 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 		if data == "" || data == "[DONE]" {
 			continue
 		}
+		dec := json.NewDecoder(strings.NewReader(data))
+		dec.UseNumber()
 		var ev map[string]interface{}
-		if json.Unmarshal([]byte(data), &ev) != nil {
+		if dec.Decode(&ev) != nil {
 			continue
 		}
 		switch ev["type"] {
@@ -124,42 +202,70 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			}
 		case "response.output_item.added":
 			item, _ := ev["item"].(map[string]interface{})
-			if item == nil || item["type"] != "function_call" {
-				continue
+			if item != nil {
+				ensureTool(outputIndexOf(ev), item)
 			}
-			ensureRole()
-			idx := nextToolIdx
-			nextToolIdx++
-			toolIndexByOutput[outputIndexOf(ev)] = idx
-			sawToolCall = true
-			callID := asString(item["call_id"])
-			if callID == "" {
-				callID = asString(item["id"])
-			}
-			emit(map[string]interface{}{"tool_calls": []interface{}{map[string]interface{}{
-				"index": idx,
-				"id":    callID,
-				"type":  "function",
-				"function": map[string]interface{}{
-					"name":      asString(item["name"]),
-					"arguments": "",
-				},
-			}}}, nil)
 		case "response.function_call_arguments.delta":
 			delta, ok := ev["delta"].(string)
 			if !ok || delta == "" {
 				continue
 			}
-			idx, ok := toolIndexByOutput[outputIndexOf(ev)]
-			if !ok {
-				idx = 0
+			emitToolArguments(toolByOutput[outputIndexOf(ev)], delta)
+		case "response.custom_tool_call_input.delta":
+			delta, _ := ev["delta"].(string)
+			state := toolByOutput[outputIndexOf(ev)]
+			if state == nil {
+				state = toolByItemID[asString(ev["item_id"])]
 			}
-			emit(map[string]interface{}{"tool_calls": []interface{}{map[string]interface{}{
-				"index": idx,
-				"function": map[string]interface{}{
-					"arguments": scrubber.ReplaceString(delta),
-				},
-			}}}, nil)
+			if state == nil || state.kind != prompt.ResponsesToolCustom || delta == "" {
+				continue
+			}
+			prefix := ""
+			if !state.customSawDelta {
+				prefix = `{"input":"`
+				state.customSawDelta = true
+			}
+			emitToolArguments(state, prefix+escapeJSONFragment(delta))
+		case "response.custom_tool_call_input.done":
+			state := toolByOutput[outputIndexOf(ev)]
+			if state == nil {
+				state = toolByItemID[asString(ev["item_id"])]
+			}
+			if state == nil || state.kind != prompt.ResponsesToolCustom || state.customCompleted {
+				continue
+			}
+			if state.customSawDelta {
+				emitToolArguments(state, `"}`)
+			} else {
+				emitToolArguments(state, `{"input":"`+escapeJSONFragment(asString(ev["input"]))+`"}`)
+			}
+			state.customCompleted = true
+		case "response.output_item.done":
+			item, _ := ev["item"].(map[string]interface{})
+			if item == nil {
+				continue
+			}
+			state := ensureTool(outputIndexOf(ev), item)
+			if state == nil {
+				continue
+			}
+			switch state.kind {
+			case prompt.ResponsesToolCustom:
+				if !state.customCompleted {
+					input := asString(item["input"])
+					if state.customSawDelta {
+						emitToolArguments(state, `"}`)
+					} else {
+						emitToolArguments(state, `{"input":"`+escapeJSONFragment(input)+`"}`)
+					}
+					state.customCompleted = true
+				}
+			case prompt.ResponsesToolSearch:
+				if !state.argumentsSent {
+					rawArguments, _ := json.Marshal(item["arguments"])
+					emitToolArguments(state, string(rawArguments))
+				}
+			}
 		case "response.completed", "response.incomplete":
 			response, _ := ev["response"].(map[string]interface{})
 			done(response)

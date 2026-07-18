@@ -146,6 +146,14 @@ func record(transport string, r *http.Request, body map[string]interface{}) bool
 	_, bodyMetadataTurnIDPresent := bodyTurnMetadata["turn_id"]
 	_, bodyTurnIDPresent := metadata["turn_id"]
 	_, toolsPresent := body["tools"]
+	input, _ := body["input"].([]interface{})
+	firstInput, _ := func() (map[string]interface{}, bool) {
+		if len(input) == 0 {
+			return nil, false
+		}
+		item, ok := input[0].(map[string]interface{})
+		return item, ok
+	}()
 	reasoning, _ := body["reasoning"].(map[string]interface{})
 	summary := map[string]interface{}{
 		"model":                   modelOf(body),
@@ -153,10 +161,14 @@ func record(transport string, r *http.Request, body map[string]interface{}) bool
 		"parallel_tool_calls":     body["parallel_tool_calls"],
 		"instructions_present":    body["instructions"] != nil,
 		"top_level_tools_present": toolsPresent,
+		"input_first_type":        firstInput["type"],
+		"input_first_role":        firstInput["role"],
+		"input_item_count":        len(input),
 		"client_metadata_present": metadata != nil,
 		"installation_id_present": metadata != nil && metadata["x-codex-installation-id"] != nil,
 		"turn_metadata_present":   metadata != nil && metadata["x-codex-turn-metadata"] != nil,
 		"responses_lite":          metadata != nil && metadata["ws_request_header_x_openai_internal_codex_responses_lite"] == "true",
+		"responses_lite_marker":   metadata["ws_request_header_x_openai_internal_codex_responses_lite"],
 		"ws_timing_present":       metadata != nil && metadata["x-codex-ws-stream-request-start-ms"] != nil,
 		"session_equals_thread":   h["session-id"] != "" && h["session-id"] == h["thread-id"],
 		"thread_id_is_uuidv7":     isUUIDv7(h["thread-id"]),
@@ -176,10 +188,10 @@ func record(transport string, r *http.Request, body map[string]interface{}) bool
 	} else {
 		require(modelOf(body) == "gpt-5.6-sol", "model is not gpt-5.6-sol")
 	}
-	require(h["version"] == "0.144.1", "version header is not 0.144.1")
+	require(h["version"] == "0.144.5", "version header is not 0.144.5")
 	require(h["x-codex-beta-features"] == "remote_compaction_v2", "remote_compaction_v2 missing")
-	require(strings.Contains(h["user-agent"], "codex_exec/0.144.1"), "codex_exec user-agent missing")
-	require(strings.Contains(h["user-agent"], "(codex_exec; 0.144.1)"), "codex_exec user-agent suffix missing")
+	require(strings.Contains(h["user-agent"], "codex_exec/0.144.5"), "codex_exec user-agent missing")
+	require(strings.Contains(h["user-agent"], "(codex_exec; 0.144.5)"), "codex_exec user-agent suffix missing")
 	require(h["x-codex-turn-metadata"] != "", "turn metadata missing")
 	require(isUUIDv7(h["thread-id"]), "thread-id is not UUIDv7")
 	require(h["session-id"] == h["thread-id"], "session-id does not equal thread-id")

@@ -30,20 +30,22 @@ import (
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
 // Refreshed 2026-07-10 from Docker captures of Claude Code 2.1.206 and Codex
-// 0.144.1 plus the matching local open-source Codex tree. Claude's captured tuple
+// 0.144.5 plus the matching local open-source Codex tree. Claude's captured tuple
 // is Node v26.3.0 with Stainless package 0.94.0.
 const (
-	CodexCLIVersion  = "0.144.1"
+	CodexCLIVersion  = "0.144.5"
 	ClaudeCLIVersion = "2.1.206"
 	// CodexOriginator is the interactive Codex CLI entrypoint id; CodexOriginatorExec
 	// is the `codex exec` (non-interactive) entrypoint. The official client sends one
 	// or the other depending on how it was launched, so the relay mirrors whichever
 	// the downstream presents (see codexEntrypoint) instead of forcing a single one.
-	CodexOriginator     = "codex_cli_rs"
-	CodexOriginatorExec = "codex_exec"
+	CodexOriginator       = "codex_cli_rs"
+	CodexOriginatorExec   = "codex_exec"
+	CodexOriginatorTUI    = "codex-tui"
+	CodexOriginatorVSCode = "codex_vscode"
 	// CodexJA3 is the TLS ClientHello fingerprint (ja3 string) captured from the real
 	// Codex (Rust) binary against api.openai.com — ja3 hash 69d274b521896ab1d71737c4d804e22c
-	// (/tmp/pool-capture-20260710/manifest.json; the 0.144.1 source still uses stock
+	// (/tmp/pool-capture-20260710/manifest.json; the 0.144.5 source still uses stock
 	// reqwest/rustls without ClientHello customization).
 	// It is REFERENCE DATA, not a default or an alias target: verified against the Codex
 	// source (other_codex), the real client does NO JA3 spoofing — it builds a stock
@@ -533,15 +535,21 @@ func (i Identity) CodexUserAgentExecVersion(version string) string {
 	return fmt.Sprintf("codex_exec/%s (%s %s; %s) %s (codex_exec; %s)", version, i.OSName, i.OSVersion, i.Arch, i.Terminal, version)
 }
 
-// CodexUserAgentForOriginator returns the entrypoint-correct User-Agent for the
-// given originator ("codex_exec" → exec shape, anything else → interactive CLI
-// shape), so the relay's UA stays consistent with the Originator header it mirrors
-// from the downstream client.
+// CodexUserAgentForOriginator returns the process-originator-correct User-Agent.
+// codex_exec keeps its app-server suffix; every other recognized process uses its
+// own prefix while retaining the account-virtual OS, architecture, and terminal.
 func (i Identity) CodexUserAgentForOriginator(originator, version string) string {
 	if originator == CodexOriginatorExec {
 		return i.CodexUserAgentExecVersion(version)
 	}
-	return i.CodexUserAgentVersion(version)
+	if version == "" {
+		version = CodexCLIVersion
+	}
+	originator = strings.TrimSpace(originator)
+	if originator == "" {
+		originator = CodexOriginator
+	}
+	return fmt.Sprintf("%s/%s (%s %s; %s) %s", originator, version, i.OSName, i.OSVersion, i.Arch, i.Terminal)
 }
 
 // ClaudeUserAgent returns the Claude Code CLI User-Agent, e.g.

@@ -89,7 +89,11 @@ func usageMap(c chatChunk) map[string]interface{} {
 
 // chatStreamToResponsesSSE rewrites a Chat Completions SSE stream into a Responses API
 // SSE stream (response.created → per-item added/delta/done → response.completed).
-func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher) map[string]interface{} {
+func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, plans ...*prompt.ResponsesToolBridgePlan) map[string]interface{} {
+	plan := prompt.NewResponsesToolBridgePlan()
+	if len(plans) > 0 && plans[0] != nil {
+		plan = plans[0]
+	}
 	flusher, _ := w.(http.Flusher)
 	emit := func(ev map[string]interface{}) {
 		b, _ := json.Marshal(ev)
@@ -116,6 +120,8 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 		itemID      string
 		callID      string
 		name        string
+		identity    prompt.ResponsesToolIdentity
+		opened      bool
 		args        strings.Builder
 	}
 	tools := map[int]*toolAcc{}
@@ -156,6 +162,46 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 			"content_index": 0, "part": map[string]interface{}{"type": "output_text", "text": ""},
 		})
 	}
+	openTool := func(acc *toolAcc) {
+		if acc.opened {
+			return
+		}
+		if acc.identity.Name == "" {
+			acc.identity = prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolFunction, Name: acc.name}
+		}
+		prefix := "fc_"
+		item := map[string]interface{}{
+			"type": "function_call", "call_id": acc.callID, "name": acc.identity.Name,
+			"arguments": "", "status": "in_progress",
+		}
+		switch acc.identity.Kind {
+		case prompt.ResponsesToolCustom:
+			prefix = "ctc_"
+			item = map[string]interface{}{
+				"type": "custom_tool_call", "call_id": acc.callID, "name": acc.identity.Name,
+				"input": "", "status": "in_progress",
+			}
+		case prompt.ResponsesToolSearch:
+			prefix = "tsc_"
+			item = map[string]interface{}{
+				"type": "tool_search_call", "call_id": acc.callID, "execution": "client",
+				"arguments": map[string]interface{}{}, "status": "in_progress",
+			}
+		default:
+			if acc.identity.Namespace != "" {
+				item["namespace"] = acc.identity.Namespace
+			}
+		}
+		if acc.identity.Kind == prompt.ResponsesToolCustom && acc.identity.Namespace != "" {
+			item["namespace"] = acc.identity.Namespace
+		}
+		acc.itemID = prefix + respID + "_" + strconv.Itoa(acc.outputIndex)
+		item["id"] = acc.itemID
+		emit(map[string]interface{}{
+			"type": "response.output_item.added", "output_index": acc.outputIndex, "item": item,
+		})
+		acc.opened = true
+	}
 
 	sc := newChatSSEScanner(body)
 	for sc.Scan() {
@@ -194,21 +240,23 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 				}
 				if tc.Function.Name != "" {
 					acc.name = tc.Function.Name
-				}
-				if acc.itemID == "" {
-					acc.itemID = "fc_" + respID + "_" + strconv.Itoa(acc.outputIndex)
-					emit(map[string]interface{}{
-						"type": "response.output_item.added", "output_index": acc.outputIndex,
-						"item": map[string]interface{}{"type": "function_call", "id": acc.itemID, "call_id": acc.callID, "name": acc.name, "arguments": "", "status": "in_progress"},
-					})
+					if identity, ok := plan.ResolveChatName(acc.name); ok {
+						acc.identity = identity
+					} else {
+						acc.identity = prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolFunction, Name: acc.name}
+					}
+					openTool(acc)
 				}
 				if tc.Function.Arguments != "" {
 					arg := scrubber.ReplaceString(tc.Function.Arguments)
 					acc.args.WriteString(arg)
-					emit(map[string]interface{}{
-						"type": "response.function_call_arguments.delta", "item_id": acc.itemID,
-						"output_index": acc.outputIndex, "delta": arg,
-					})
+					if acc.identity.Kind == prompt.ResponsesToolFunction {
+						openTool(acc)
+						emit(map[string]interface{}{
+							"type": "response.function_call_arguments.delta", "item_id": acc.itemID,
+							"output_index": acc.outputIndex, "delta": arg,
+						})
+					}
 				}
 			}
 		}
@@ -237,14 +285,49 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	}
 	for _, idx := range toolOrder {
 		acc := tools[idx]
+		openTool(acc)
 		args := acc.args.String()
-		emit(map[string]interface{}{
-			"type": "response.function_call_arguments.done", "item_id": acc.itemID,
-			"output_index": acc.outputIndex, "arguments": args,
-		})
-		fcItem := map[string]interface{}{"type": "function_call", "id": acc.itemID, "call_id": acc.callID, "name": acc.name, "arguments": args, "status": "completed"}
-		emit(map[string]interface{}{"type": "response.output_item.done", "output_index": acc.outputIndex, "item": fcItem})
-		ordered[acc.outputIndex] = fcItem
+		var completed map[string]interface{}
+		switch acc.identity.Kind {
+		case prompt.ResponsesToolCustom:
+			input := chatCustomToolInput(args)
+			if input != "" {
+				emit(map[string]interface{}{
+					"type": "response.custom_tool_call_input.delta", "item_id": acc.itemID, "call_id": acc.callID,
+					"output_index": acc.outputIndex, "delta": input,
+				})
+			}
+			emit(map[string]interface{}{
+				"type": "response.custom_tool_call_input.done", "item_id": acc.itemID, "call_id": acc.callID,
+				"output_index": acc.outputIndex, "input": input,
+			})
+			completed = map[string]interface{}{
+				"type": "custom_tool_call", "id": acc.itemID, "call_id": acc.callID,
+				"name": acc.identity.Name, "input": input, "status": "completed",
+			}
+			if acc.identity.Namespace != "" {
+				completed["namespace"] = acc.identity.Namespace
+			}
+		case prompt.ResponsesToolSearch:
+			completed = map[string]interface{}{
+				"type": "tool_search_call", "id": acc.itemID, "call_id": acc.callID,
+				"execution": "client", "arguments": decodeJSONAny(args), "status": "completed",
+			}
+		default:
+			emit(map[string]interface{}{
+				"type": "response.function_call_arguments.done", "item_id": acc.itemID,
+				"output_index": acc.outputIndex, "arguments": args,
+			})
+			completed = map[string]interface{}{
+				"type": "function_call", "id": acc.itemID, "call_id": acc.callID,
+				"name": acc.identity.Name, "arguments": args, "status": "completed",
+			}
+			if acc.identity.Namespace != "" {
+				completed["namespace"] = acc.identity.Namespace
+			}
+		}
+		emit(map[string]interface{}{"type": "response.output_item.done", "output_index": acc.outputIndex, "item": completed})
+		ordered[acc.outputIndex] = completed
 	}
 	output := make([]interface{}, 0, nextOutputIndex)
 	for _, it := range ordered {
@@ -258,6 +341,28 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	}
 	emit(map[string]interface{}{"type": "response.completed", "response": resp})
 	return usage
+}
+
+func chatCustomToolInput(arguments string) string {
+	if object, ok := decodeJSONAny(arguments).(map[string]interface{}); ok {
+		if input, ok := object["input"].(string); ok {
+			return input
+		}
+	}
+	return arguments
+}
+
+func decodeJSONAny(raw string) interface{} {
+	if strings.TrimSpace(raw) == "" {
+		return map[string]interface{}{}
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var value interface{}
+	if err := dec.Decode(&value); err != nil {
+		return raw
+	}
+	return value
 }
 
 // chatStreamToAnthropicSSE rewrites a Chat Completions SSE stream into an Anthropic

@@ -728,16 +728,19 @@ func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string
 // on this list (random User-Agent, x-stainless-*, x-forwarded-*, cookies, etc.)
 // is dropped so the upstream sees a clean, official-looking request.
 var codexProtocolHeaders = map[string]bool{
-	"accept":                   true,
-	"openai-beta":              true,
-	"conversation_id":          true,
-	"x-codex-turn-state":       true,
-	"x-codex-turn-metadata":    true,
-	"x-codex-window-id":        true,
-	"x-codex-parent-thread-id": true,
-	"x-codex-beta-features":    true,
-	"x-openai-subagent":        true,
-	"x-client-request-id":      true,
+	"accept":                                true,
+	"openai-beta":                           true,
+	"conversation_id":                       true,
+	"x-codex-turn-state":                    true,
+	"x-codex-turn-metadata":                 true,
+	"x-codex-window-id":                     true,
+	"x-codex-parent-thread-id":              true,
+	"x-codex-beta-features":                 true,
+	"x-openai-subagent":                     true,
+	"x-client-request-id":                   true,
+	"x-openai-memgen-request":               true,
+	"x-openai-internal-codex-residency":     true,
+	"x-responsesapi-include-timing-metrics": true,
 }
 
 // applyCodexHeaders writes the upstream Codex request headers into dst from
@@ -747,10 +750,14 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 	usesAPIKey := AccountUsesAPIKey(spec.Token)
 
 	for k, values := range spec.Headers {
-		if !codexProtocolHeaders[strings.ToLower(strings.TrimSpace(k))] {
+		lowerName := strings.ToLower(strings.TrimSpace(k))
+		if !codexProtocolHeaders[lowerName] || lowerName == "x-codex-beta-features" {
 			continue
 		}
 		for _, v := range values {
+			if !validCodexSemanticHeader(lowerName, v, spec.CodexResponsesWebSocket) {
+				continue
+			}
 			dst.Add(k, v)
 		}
 	}
@@ -788,7 +795,8 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 	// the user is actually running, while the OS/arch/version stay account-bound
 	// (the virtual identity is never the downstream's real one). Default to the
 	// interactive CLI when the downstream sent nothing recognizable.
-	originator := codexEntrypoint(spec.Headers)
+	threadOriginator := codexThreadOriginator(spec.Headers)
+	processOriginator := codexProcessOriginator(spec.Headers, threadOriginator)
 	version := c.cfgSnapshot().CodexCLIVersionOrDefault(id.CodexCLIVersion)
 	// A per-request override (model-discovery probe or version-gated live model) wins,
 	// so the UA/`version` header agree with the client version required upstream.
@@ -796,9 +804,9 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 		version = v
 	}
 	if dst.Get("User-Agent") == "" {
-		dst.Set("User-Agent", id.CodexUserAgentForOriginator(originator, version))
+		dst.Set("User-Agent", id.CodexUserAgentForOriginator(processOriginator, version))
 	}
-	setIfEmptyPreserveCase(dst, "Originator", originator)
+	setIfEmptyPreserveCase(dst, "Originator", threadOriginator)
 	// The built-in OpenAI provider installs `version` as a provider-wide default,
 	// including on /models discovery. RemoteCompactionV2, by contrast, is a
 	// Responses-only session feature.
@@ -806,7 +814,7 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 		setHeaderPreserveCase(dst, "version", version)
 	}
 	if spec.DownstreamPath == "" || strings.Contains(spec.DownstreamPath, "/responses") {
-		setHeaderPreserveCase(dst, "x-codex-beta-features", codexBetaFeaturesHeader)
+		setHeaderPreserveCase(dst, "x-codex-beta-features", mergeCodexBetaFeatures(getHeaderFold(spec.Headers, "x-codex-beta-features")))
 	}
 	// Session identity and compatibility projections come from one canonical
 	// request snapshot, matching CodexResponsesMetadata in codex-rs. /models is not
@@ -856,13 +864,92 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 // Detection reads the raw downstream headers even though Originator/User-Agent are
 // not on the forward allowlist; the relay synthesizes its own coherent values.
 func codexEntrypoint(h http.Header) string {
-	if strings.EqualFold(strings.TrimSpace(getHeaderFold(h, "Originator")), identity.CodexOriginatorExec) {
-		return identity.CodexOriginatorExec
+	return codexThreadOriginator(h)
+}
+
+func codexThreadOriginator(h http.Header) string {
+	if candidate := strings.TrimSpace(getHeaderFold(h, "Originator")); isRecognizedCodexOriginator(candidate) {
+		return candidate
 	}
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(getHeaderFold(h, "User-Agent"))), "codex_exec/") {
-		return identity.CodexOriginatorExec
+	if candidate := codexUserAgentOriginator(getHeaderFold(h, "User-Agent")); isRecognizedCodexOriginator(candidate) {
+		return candidate
 	}
 	return identity.CodexOriginator
+}
+
+func codexProcessOriginator(h http.Header, threadOriginator string) string {
+	if candidate := codexUserAgentOriginator(getHeaderFold(h, "User-Agent")); isRecognizedCodexOriginator(candidate) {
+		return candidate
+	}
+	if isRecognizedCodexOriginator(threadOriginator) {
+		return threadOriginator
+	}
+	return identity.CodexOriginator
+}
+
+func codexUserAgentOriginator(value string) string {
+	value = strings.TrimSpace(value)
+	slash := strings.IndexByte(value, '/')
+	if slash <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(value[:slash])
+}
+
+func isRecognizedCodexOriginator(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 128 || strings.ContainsAny(value, "\r\n") {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "codex_cli_rs", "codex_exec", "codex-tui", "codex_tui", "codex_vscode",
+		"codex_desktop", "codex-app-server", "codex_mcp_server", "codex-cli",
+		"codex_sdk_ts", "codex-app-server-sdk", "codex_atlas", "codex_chatgpt_desktop",
+		"codex_work_desktop", "codex_work_web", "codex_work_mobile", "codex_work_cca", "chatgpt_cca":
+		return true
+	}
+	return strings.HasPrefix(value, "Codex ")
+}
+
+func validCodexSemanticHeader(name, value string, websocket bool) bool {
+	value = strings.TrimSpace(value)
+	switch name {
+	case "x-openai-memgen-request":
+		return value == "true"
+	case "x-openai-internal-codex-residency":
+		return value == "us"
+	case "x-responsesapi-include-timing-metrics":
+		return websocket && value == "true"
+	default:
+		return true
+	}
+}
+
+func mergeCodexBetaFeatures(downstream string) string {
+	allowed := map[string]bool{
+		"memories":             true,
+		"network_proxy":        true,
+		"prevent_idle_sleep":   true,
+		"remote_compaction_v2": true,
+	}
+	seen := map[string]bool{}
+	features := make([]string, 0, 3)
+	for _, raw := range strings.Split(downstream, ",") {
+		feature := strings.ToLower(strings.TrimSpace(raw))
+		if !allowed[feature] || seen[feature] {
+			continue
+		}
+		seen[feature] = true
+		features = append(features, feature)
+	}
+	for _, required := range strings.Split(codexBetaFeaturesHeader, ",") {
+		required = strings.TrimSpace(required)
+		if required != "" && !seen[required] {
+			seen[required] = true
+			features = append(features, required)
+		}
+	}
+	return strings.Join(features, ",")
 }
 
 // codexRunCorrelator returns the first present per-run correlator the downstream

@@ -61,6 +61,31 @@ func TestAutoPromptCacheKeySupportsAssistantOutputTextLosslessly(t *testing.T) {
 	}
 }
 
+func TestAutomaticPromptCacheKeySafeAcceptsStableResponsesHistoryItems(t *testing.T) {
+	for _, itemType := range []string{
+		"agent_message",
+		"tool_search_call",
+		"tool_search_output",
+		"image_generation_call",
+		"compaction",
+		"compaction_summary",
+		"context_compaction",
+		"mcp_tool_call_output",
+	} {
+		t.Run(itemType, func(t *testing.T) {
+			raw, _ := json.Marshal(map[string]interface{}{
+				"input": []interface{}{map[string]interface{}{"type": itemType, "future": map[string]interface{}{"n": 1}}},
+			})
+			if !automaticPromptCacheKeySafe(raw) {
+				t.Fatalf("stable history item %q was rejected", itemType)
+			}
+		})
+	}
+	if automaticPromptCacheKeySafe([]byte(`{"input":[{"type":"future_unknown_history_item"}]}`)) {
+		t.Fatal("unknown future history item must not silently enter automatic cache-key derivation")
+	}
+}
+
 func TestOfficialCodexUUIDPromptCacheKeyNormalizesAcrossIndependentCLIs(t *testing.T) {
 	stableInstructions := strings.Repeat("identical official Codex system and tool prefix ", 140)
 	build := func(key string) []byte {
@@ -71,7 +96,7 @@ func TestOfficialCodexUUIDPromptCacheKeyNormalizesAcrossIndependentCLIs(t *testi
 			`"prompt_cache_key":` + jsonString(key) + `}`)
 	}
 	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
-	req.Header.Set("User-Agent", "codex_exec/0.144.1 (Linux; x86_64) terminal (codex_exec; 0.144.1)")
+	req.Header.Set("User-Agent", "codex_exec/0.144.5 (Linux; x86_64) terminal (codex_exec; 0.144.5)")
 	one, changedOne := normalizeOfficialCodexPromptCacheKey(req, build("019f4b1a-1111-7aaa-8aaa-111111111111"), "gpt-5.6-sol")
 	two, changedTwo := normalizeOfficialCodexPromptCacheKey(req, build("019f4b1a-2222-7bbb-8bbb-222222222222"), "gpt-5.6-sol")
 	if !changedOne || !changedTwo {

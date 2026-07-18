@@ -62,22 +62,26 @@ func TestResponsesRequestToChatCompletion(t *testing.T) {
 	}
 }
 
-func TestResponsesRequestToChatCompletionRejectsUnsupportedResponsesTools(t *testing.T) {
+func TestResponsesRequestToChatCompletionOmitsHostedResponsesTools(t *testing.T) {
 	in := []byte(`{
 	  "model":"deepseek-chat",
 	  "input":[{"role":"user","content":"search"}],
 	  "tools":[{"type":"web_search_preview"}]
 	}`)
-	_, err := ResponsesRequestToChatCompletion(in)
-	if err == nil {
-		t.Fatal("expected explicit compatibility error for typed Responses tool")
+	converted, err := ResponsesRequestToChatCompletionBridge(in)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), `unsupported Responses tool type "web_search_preview"`) {
-		t.Fatalf("unexpected error: %v", err)
+	root := mustUnmarshal(t, converted.Body)
+	if _, exists := root["tools"]; exists {
+		t.Fatalf("hosted tool leaked into Chat request: %v", root["tools"])
+	}
+	if got := strings.Join(converted.CompatibilityLosses, ","); got != LossResponsesHostedToolOmitted {
+		t.Fatalf("compatibility losses = %q", got)
 	}
 }
 
-func TestResponsesRequestToChatCompletionRejectsUnknownInputItems(t *testing.T) {
+func TestResponsesRequestToChatCompletionPreservesUnknownHistoryAsJSON(t *testing.T) {
 	in := []byte(`{
 	  "model":"deepseek-chat",
 	  "input":[
@@ -85,27 +89,32 @@ func TestResponsesRequestToChatCompletionRejectsUnknownInputItems(t *testing.T) 
 	    {"type":"web_search_call","id":"ws_1","status":"completed"}
 	  ]
 	}`)
-	_, err := ResponsesRequestToChatCompletion(in)
-	if err == nil {
-		t.Fatal("expected explicit compatibility error for unknown Responses input item")
+	converted, err := ResponsesRequestToChatCompletionBridge(in)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), `unsupported Responses input item type "web_search_call"`) {
-		t.Fatalf("unexpected error: %v", err)
+	root := mustUnmarshal(t, converted.Body)
+	messages := root["messages"].([]interface{})
+	if len(messages) != 2 || !strings.Contains(messages[1].(map[string]interface{})["content"].(string), `"responses_history_item"`) {
+		t.Fatalf("unknown history was not preserved as JSON: %v", messages)
+	}
+	if got := strings.Join(converted.CompatibilityLosses, ","); got != LossResponsesHistoryItemJSON {
+		t.Fatalf("compatibility losses = %q", got)
 	}
 }
 
-func TestResponsesRequestToChatCompletionRejectsIncludeFields(t *testing.T) {
+func TestResponsesRequestToChatCompletionOmitsIncludeWithDiagnostic(t *testing.T) {
 	in := []byte(`{
 	  "model":"deepseek-chat",
 	  "input":"hi",
 	  "include":["web_search_call.results"]
 	}`)
-	_, err := ResponsesRequestToChatCompletion(in)
-	if err == nil {
-		t.Fatal("expected explicit compatibility error for Responses include fields")
+	converted, err := ResponsesRequestToChatCompletionBridge(in)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), `unsupported Responses include "web_search_call.results"`) {
-		t.Fatalf("unexpected error: %v", err)
+	if got := strings.Join(converted.CompatibilityLosses, ","); got != LossResponsesIncludeOmitted {
+		t.Fatalf("compatibility losses = %q", got)
 	}
 }
 
@@ -157,6 +166,152 @@ func TestChatCompletionToResponsesResponseMapsDeepSeekCacheUsage(t *testing.T) {
 	}
 	if u["prompt_cache_hit_tokens"].(float64) != 64 || u["prompt_cache_miss_tokens"].(float64) != 36 {
 		t.Fatalf("deepseek cache fields not preserved: %v", u)
+	}
+}
+
+func TestResponsesStableToolBridgePlanRoundTrip(t *testing.T) {
+	in := []byte(`{
+	  "model":"chat-model",
+	  "input":"use tools",
+	  "include":["reasoning.encrypted_content"],
+	  "tools":[
+	    {"type":"function","name":"plain","parameters":{"type":"object","properties":{"n":{"const":900719925474099312345}}}},
+	    {"type":"namespace","name":"filesystem","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]},
+	    {"type":"namespace","name":"network","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]},
+	    {"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
+	    {"type":"tool_search","execution":"client","description":"find tools","parameters":{"type":"object"}},
+	    {"type":"tool_search","execution":"server"},
+	    {"type":"web_search_preview"}
+	  ],
+	  "tool_choice":{"type":"custom","name":"apply_patch"}
+	}`)
+	converted, err := ResponsesRequestToChatCompletionBridge(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(converted.Body), "900719925474099312345") {
+		t.Fatalf("large schema integer was rounded: %s", converted.Body)
+	}
+	wantLosses := strings.Join([]string{
+		LossResponsesHostedToolOmitted,
+		LossResponsesIncludeOmitted,
+		LossResponsesServerToolSearchOmitted,
+	}, ",")
+	if got := strings.Join(converted.CompatibilityLosses, ","); got != wantLosses {
+		t.Fatalf("compatibility losses = %q, want %q", got, wantLosses)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	tools := root["tools"].([]interface{})
+	if len(tools) != 5 {
+		t.Fatalf("Chat tools = %d, want 5: %v", len(tools), tools)
+	}
+	seen := map[string]bool{}
+	for _, rawTool := range tools {
+		name := rawTool.(map[string]interface{})["function"].(map[string]interface{})["name"].(string)
+		if len(name) > 64 || seen[name] {
+			t.Fatalf("invalid/colliding Chat tool name %q", name)
+		}
+		seen[name] = true
+	}
+	fsAlias, ok := converted.Plan.ChatName(ResponsesToolFunction, "filesystem", "read")
+	if !ok {
+		t.Fatal("filesystem namespace alias missing")
+	}
+	netAlias, _ := converted.Plan.ChatName(ResponsesToolFunction, "network", "read")
+	if fsAlias == netAlias || len(fsAlias) > 64 || len(netAlias) > 64 {
+		t.Fatalf("namespace aliases collided: %q %q", fsAlias, netAlias)
+	}
+	customAlias, _ := converted.Plan.ChatName(ResponsesToolCustom, "", "apply_patch")
+	searchAlias, _ := converted.Plan.ChatName(ResponsesToolSearch, "", "tool_search")
+	choice := root["tool_choice"].(map[string]interface{})["function"].(map[string]interface{})["name"]
+	if choice != customAlias {
+		t.Fatalf("custom tool choice = %v, want %q", choice, customAlias)
+	}
+
+	chatResponse := []byte(`{"id":"chat-tools","choices":[{"message":{"role":"assistant","tool_calls":[` +
+		`{"id":"c1","type":"function","function":{"name":"plain","arguments":"{}"}},` +
+		`{"id":"c2","type":"function","function":{"name":"` + fsAlias + `","arguments":"{\"path\":\"a\"}"}},` +
+		`{"id":"c3","type":"function","function":{"name":"` + customAlias + `","arguments":"{\"input\":\"*** Begin Patch\"}"}},` +
+		`{"id":"c4","type":"function","function":{"name":"` + searchAlias + `","arguments":"{\"limit\":900719925474099312345}"}}` +
+		`]}}]}`)
+	responses, err := ChatCompletionToResponsesResponse(chatResponse, "chat-model", converted.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(responses), "900719925474099312345") {
+		t.Fatalf("large tool-search argument was rounded: %s", responses)
+	}
+	responseRoot := mustUnmarshal(t, responses)
+	items := responseRoot["output"].([]interface{})
+	if len(items) != 4 {
+		t.Fatalf("Responses output = %v", items)
+	}
+	namespaced := items[1].(map[string]interface{})
+	if namespaced["type"] != "function_call" || namespaced["namespace"] != "filesystem" || namespaced["name"] != "read" {
+		t.Fatalf("namespace identity not restored: %v", namespaced)
+	}
+	custom := items[2].(map[string]interface{})
+	if custom["type"] != "custom_tool_call" || custom["name"] != "apply_patch" || custom["input"] != "*** Begin Patch" {
+		t.Fatalf("custom identity/input not restored: %v", custom)
+	}
+	search := items[3].(map[string]interface{})
+	if search["type"] != "tool_search_call" || search["execution"] != "client" {
+		t.Fatalf("tool-search identity not restored: %v", search)
+	}
+}
+
+func TestResponsesLiteToolSearchAddsDiscoveredTools(t *testing.T) {
+	in := []byte(`{
+	  "model":"chat-model",
+	  "tools":[{"type":"tool_search","execution":"client","parameters":{"type":"object"}}],
+	  "input":[
+	    {"type":"additional_tools","tools":[{"type":"function","name":"lite_tool","parameters":{"type":"object"}}]},
+	    {"type":"tool_search_call","call_id":"search_1","execution":"client","arguments":{"query":"calendar"}},
+	    {"type":"tool_search_output","call_id":"search_1","status":"completed","execution":"client","tools":[
+	      {"type":"custom","name":"freeform"},
+	      {"type":"namespace","name":"calendar","tools":[{"type":"function","name":"create","parameters":{"type":"object"}}]}
+	    ]}
+	  ]
+	}`)
+	converted, err := ResponsesRequestToChatCompletionBridge(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	if tools := root["tools"].([]interface{}); len(tools) != 4 {
+		t.Fatalf("top-level/Lite/discovered tools were not merged: %v", tools)
+	}
+	messages := root["messages"].([]interface{})
+	if len(messages) != 2 || messages[0].(map[string]interface{})["role"] != "assistant" || messages[1].(map[string]interface{})["role"] != "tool" {
+		t.Fatalf("tool-search history was not bridged: %v", messages)
+	}
+	content := messages[1].(map[string]interface{})["content"].(string)
+	for _, want := range []string{`"responses_tool_output"`, `"status":"completed"`, `"execution":"client"`, `"freeform"`} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("structured tool-search output lost %q: %s", want, content)
+		}
+	}
+	if got := strings.Join(converted.CompatibilityLosses, ","); got != LossResponsesStructuredToolOutputJSON {
+		t.Fatalf("compatibility losses = %q", got)
+	}
+}
+
+func TestResponsesForcedHostedToolChoiceDowngradesToAuto(t *testing.T) {
+	converted, err := ResponsesRequestToChatCompletionBridge([]byte(`{
+	  "model":"chat-model","input":"search",
+	  "tools":[{"type":"web_search_preview"}],
+	  "tool_choice":{"type":"web_search_preview"}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	if root["tool_choice"] != "auto" {
+		t.Fatalf("removed hosted tool choice = %v, want auto", root["tool_choice"])
+	}
+	want := LossResponsesHostedToolOmitted + "," + LossResponsesToolChoiceDowngraded
+	if got := strings.Join(converted.CompatibilityLosses, ","); got != want {
+		t.Fatalf("compatibility losses = %q, want %q", got, want)
 	}
 }
 

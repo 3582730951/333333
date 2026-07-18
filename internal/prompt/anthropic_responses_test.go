@@ -200,6 +200,41 @@ func TestAnthropicRequestToResponsesLeavesCustomAgentModelUntouched(t *testing.T
 	}
 }
 
+func TestResponsesToAnthropicResponseSupportsStableToolKinds(t *testing.T) {
+	responses := []byte(`{
+	  "id":"resp_tools","model":"gpt-5.6-sol","status":"completed",
+	  "output":[
+	    {"type":"function_call","call_id":"call_fn","namespace":"apps","name":"lookup","arguments":"{\"id\":900719925474099312345}"},
+	    {"type":"custom_tool_call","call_id":"call_custom","name":"shell_text","input":"echo hello"},
+	    {"type":"tool_search_call","call_id":"call_search","execution":"client","arguments":{"query":"calendar","limit":900719925474099312345}}
+	  ]
+	}`)
+	anthropic, err := ResponsesToAnthropicResponse(responses, "gpt-5.6-sol", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(anthropic), "900719925474099312345") {
+		t.Fatalf("large tool argument was rounded: %s", anthropic)
+	}
+	message := mustUnmarshal(t, anthropic)
+	content := message["content"].([]interface{})
+	if len(content) != 3 {
+		t.Fatalf("stable tool calls were dropped: %s", anthropic)
+	}
+	function := content[0].(map[string]interface{})
+	if function["type"] != "tool_use" || function["name"] == "lookup" || len(function["name"].(string)) > 64 {
+		t.Fatalf("namespace function identity was not safely flattened: %v", function)
+	}
+	custom := content[1].(map[string]interface{})
+	if custom["name"] != "shell_text" || custom["input"].(map[string]interface{})["input"] != "echo hello" {
+		t.Fatalf("custom tool call was not preserved: %v", custom)
+	}
+	search := content[2].(map[string]interface{})
+	if search["name"] != "tool_search" || search["input"].(map[string]interface{})["query"] != "calendar" {
+		t.Fatalf("client tool search was not preserved: %v", search)
+	}
+}
+
 func TestResponsesReasoningEnvelopeReplaysOnNextClaudeTurn(t *testing.T) {
 	responses := []byte(`{
 	  "id":"resp_reasoning","model":"gpt-5.6-sol","status":"completed",

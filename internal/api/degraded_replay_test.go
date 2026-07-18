@@ -50,6 +50,68 @@ func TestDegradedReplayKeepsPairedToolCallOutput(t *testing.T) {
 	}
 }
 
+func TestNeutralizeOrphanedToolOutputsUsesStablePairingRules(t *testing.T) {
+	var root map[string]interface{}
+	raw := []byte(`{"input":[
+	  {"type":"function_call","call_id":"f"},
+	  {"type":"function_call_output","call_id":"f","output":"ok"},
+	  {"type":"local_shell_call","call_id":"shell"},
+	  {"type":"function_call_output","call_id":"shell","output":"ok"},
+	  {"type":"custom_tool_call","call_id":"custom"},
+	  {"type":"custom_tool_call_output","call_id":"custom","output":"ok"},
+	  {"type":"tool_search_call","call_id":"search","execution":"client","arguments":{}},
+	  {"type":"tool_search_output","call_id":"search","execution":"client","status":"completed","tools":[]},
+	  {"type":"function_call","call_id":"mcp"},
+	  {"type":"mcp_tool_call_output","call_id":"mcp","output":"ok"},
+	  {"type":"mcp_tool_call","call_id":"managed-mcp"},
+	  {"type":"mcp_tool_call_output","call_id":"managed-mcp","output":"orphan"},
+	  {"type":"tool_search_output","execution":"server","status":"completed","tools":[]},
+	  {"type":"function_call","call_id":"wrong-kind"},
+	  {"type":"custom_tool_call_output","call_id":"wrong-kind","output":"orphan"},
+	  {"type":"tool_search_output","execution":"client","status":"completed","tools":[]},
+	  {"type":"future_call_output","call_id":"future","output":"untouched"}
+	]}`)
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatal(err)
+	}
+	input := root["input"].([]interface{})
+	fixed, converted := neutralizeOrphanedToolOutputs(input)
+	if converted != 3 {
+		t.Fatalf("converted = %d, want 3: %v", converted, fixed)
+	}
+	for _, index := range []int{1, 3, 5, 7, 9, 10, 12, 16} {
+		item := fixed[index].(map[string]interface{})
+		if item["role"] == "user" {
+			t.Fatalf("valid/stable item at %d was degraded: %v", index, item)
+		}
+	}
+	for _, index := range []int{11, 14, 15} {
+		if fixed[index].(map[string]interface{})["role"] != "user" {
+			t.Fatalf("orphan at %d was not degraded: %v", index, fixed[index])
+		}
+	}
+}
+
+func TestDegradedReplayPreservesStructuredToolOutputAndLargeIntegers(t *testing.T) {
+	body := []byte(`{
+	  "model":"gpt","previous_response_id":"resp_x","turn_state":{"opaque":true},
+	  "input":[{"type":"function_call_output","call_id":"missing","status":"failed","output":[
+	    {"type":"input_image","image_url":"https://example.test/image.png"},
+	    {"type":"input_text","text":"failed","code":900719925474099312345}
+	  ],"encrypted_payload":"opaque","future":{"n":900719925474099312345}}]
+	}`)
+	degraded := degradedResponsesReplay(body)
+	text := string(degraded)
+	for _, want := range []string{"900719925474099312345", "https://example.test/image.png", "encrypted_payload", `\"status\":\"failed\"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("degraded structured output lost %q: %s", want, degraded)
+		}
+	}
+	if strings.Contains(text, "previous_response_id") || strings.Contains(text, "turn_state") || strings.Contains(text, "function_call_output") && !strings.Contains(text, `\"type\":\"function_call_output\"`) {
+		t.Fatalf("state was not stripped or structured envelope malformed: %s", degraded)
+	}
+}
+
 func TestOrphanedToolCallOutputErrorDetection(t *testing.T) {
 	msg := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id call_HkoKDDLSh5YyziVSnZZjYmFK."}}`)
 	if !isOrphanedToolCallOutputError(400, msg) {

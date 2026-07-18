@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -80,13 +81,32 @@ func AnthropicRequestToResponses(raw []byte) (AnthropicResponsesRequest, error) 
 }
 
 func decodeJSONMapUseNumber(raw []byte) (map[string]interface{}, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var root map[string]interface{}
-	if err := dec.Decode(&root); err != nil {
+	value, err := decodeJSONValueUseNumber(raw)
+	if err != nil {
 		return nil, err
 	}
+	root, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("expected JSON object")
+	}
 	return root, nil
+}
+
+func decodeJSONValueUseNumber(raw []byte) (interface{}, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var value interface{}
+	if err := dec.Decode(&value); err != nil {
+		return nil, err
+	}
+	var trailing interface{}
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("unexpected trailing JSON value")
+		}
+		return nil, err
+	}
+	return value, nil
 }
 
 func anthropicResponsesSystem(value interface{}) string {
@@ -663,6 +683,7 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 
 	content := make([]interface{}, 0, 4)
 	hasTools := false
+	bridgePlan := NewResponsesToolBridgePlan()
 	output, _ := root["output"].([]interface{})
 	for _, rawItem := range output {
 		item, _ := rawItem.(map[string]interface{})
@@ -692,6 +713,9 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 			if original := toolNames[name]; original != "" {
 				name = original
 			}
+			if namespace := stringOr(item["namespace"], ""); namespace != "" {
+				name = bridgePlan.EnsureChatName(ResponsesToolIdentity{Kind: ResponsesToolFunction, Namespace: namespace, Name: name})
+			}
 			input, parseErr := responsesFunctionArguments(item["arguments"])
 			if parseErr != nil {
 				if stringOr(root["status"], "") == "completed" {
@@ -703,6 +727,30 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 			callID := stringOr(firstPresent(item["call_id"], item["id"]), "")
 			content = append(content, map[string]interface{}{
 				"type": "tool_use", "id": shortenCodexCallID(callID), "name": name, "input": input,
+			})
+			hasTools = true
+		case "custom_tool_call":
+			name := stringOr(item["name"], "")
+			if original := toolNames[name]; original != "" {
+				name = original
+			}
+			if namespace := stringOr(item["namespace"], ""); namespace != "" {
+				name = bridgePlan.EnsureChatName(ResponsesToolIdentity{Kind: ResponsesToolCustom, Namespace: namespace, Name: name})
+			}
+			callID := stringOr(firstPresent(item["call_id"], item["id"]), "")
+			content = append(content, map[string]interface{}{
+				"type": "tool_use", "id": shortenCodexCallID(callID), "name": name,
+				"input": map[string]interface{}{"input": stringOr(item["input"], "")},
+			})
+			hasTools = true
+		case "tool_search_call":
+			if !strings.EqualFold(stringOr(item["execution"], "client"), "client") {
+				continue
+			}
+			callID := stringOr(firstPresent(item["call_id"], item["id"]), "")
+			content = append(content, map[string]interface{}{
+				"type": "tool_use", "id": shortenCodexCallID(callID), "name": "tool_search",
+				"input": responsesToolSearchArguments(item["arguments"]),
 			})
 			hasTools = true
 		}
@@ -724,6 +772,18 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 		"usage": responsesAnthropicUsage(root["usage"]),
 	}
 	return json.Marshal(response)
+}
+
+func responsesToolSearchArguments(value interface{}) map[string]interface{} {
+	if object, ok := value.(map[string]interface{}); ok {
+		return object
+	}
+	if raw, ok := value.(string); ok {
+		if object, err := decodeJSONMapUseNumber([]byte(raw)); err == nil {
+			return object
+		}
+	}
+	return map[string]interface{}{"arguments": value}
 }
 
 func responsesTerminalError(root map[string]interface{}) error {

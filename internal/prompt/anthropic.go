@@ -18,8 +18,8 @@ import (
 // turn). System/developer messages are hoisted to the top-level `system` field.
 // Anthropic requires max_tokens, so a default is supplied when absent.
 func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return nil, err
 	}
 	messages, _ := root["messages"].([]interface{})
@@ -129,8 +129,8 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 // OpenAI Chat Completions response (non-streaming), mapping tool_use blocks to
 // OpenAI tool_calls.
 func AnthropicToChatCompletion(raw []byte, model string) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(raw, &root); err != nil {
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
 		return raw, nil
 	}
 	text, toolCalls := anthropicContentToOpenAI(root["content"])
@@ -215,8 +215,8 @@ func ensureAnthropicCacheControlWithOptions(body []byte, ttl, policy string, lat
 	if losslessBlockSplit {
 		body = LosslessSplitAnthropicTextBlocks(body)
 	}
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	root, err := decodeJSONMapUseNumber(body)
+	if err != nil {
 		return body
 	}
 	changed := false
@@ -510,8 +510,8 @@ func messageHasCacheControl(msg interface{}) bool {
 // text. It is intentionally narrow: it recognizes Claude Code's auto-context
 // system-reminder delimiter and does not summarize, drop, reorder, or edit bytes.
 func LosslessSplitAnthropicTextBlocks(body []byte) []byte {
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	root, err := decodeJSONMapUseNumber(body)
+	if err != nil {
 		return body
 	}
 	changed := false
@@ -617,8 +617,8 @@ type AnthropicCacheBreakpointDiagnostic struct {
 }
 
 func InspectAnthropicCacheControl(body []byte) AnthropicCacheControlDiagnostics {
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	root, err := decodeJSONMapUseNumber(body)
+	if err != nil {
 		return AnthropicCacheControlDiagnostics{}
 	}
 	latest := latestUserCacheControlDetails(root["messages"])
@@ -1318,8 +1318,7 @@ func parseJSONObject(v interface{}) interface{} {
 		if strings.TrimSpace(t) == "" {
 			return map[string]interface{}{}
 		}
-		var obj interface{}
-		if json.Unmarshal([]byte(t), &obj) == nil {
+		if obj, err := decodeJSONValueUseNumber([]byte(t)); err == nil {
 			return obj
 		}
 		return map[string]interface{}{}

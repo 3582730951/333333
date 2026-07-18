@@ -52,9 +52,13 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
 	client := NewClient(cfg)
 	resp, err := client.Do(context.Background(), Request{
-		DownstreamPath:          "/v1/responses",
-		Headers:                 http.Header{"Originator": []string{"codex_exec"}, "x-client-request-id": []string{"thread-123"}},
-		Body:                    []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep WS context"}]},{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"prompt_cache_retention":"24h"}`),
+		DownstreamPath: "/v1/responses",
+		Headers: http.Header{
+			"Originator": []string{"codex_exec"}, "x-client-request-id": []string{"thread-123"},
+			"x-codex-beta-features":                 []string{"network_proxy,remote_compaction_v2,network_proxy"},
+			"x-responsesapi-include-timing-metrics": []string{"true"},
+		},
+		Body:                    []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}},{"type":"namespace","name":"calendar","tools":[{"type":"function","name":"create"}]},{"type":"custom","name":"freeform","format":{"type":"text"}},{"type":"tool_search","execution":"client"},{"type":"future_tool","future":{"x":1}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep WS context"}]},{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"future_wire_field":{"n":900719925474099312345},"prompt_cache_retention":"24h"}`),
 		Account:                 storage.Account{ID: "acc-ws", UpstreamAccountID: "workspace-should-not-leak"},
 		Token:                   storage.AccountToken{AccessToken: "access-ws"},
 		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -96,8 +100,11 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if gotHeaders.Get("session-id") != wantThread || gotHeaders.Get("thread-id") != wantThread || gotHeaders.Get("x-codex-window-id") != wantThread+":0" {
 		t.Fatalf("ws ids missing/mismatched: %+v", gotHeaders)
 	}
-	if gotHeaders.Get("x-codex-beta-features") != codexBetaFeaturesHeader {
-		t.Fatalf("remote compaction beta feature missing from handshake: %+v", gotHeaders)
+	if gotHeaders.Get("x-codex-beta-features") != "network_proxy,remote_compaction_v2" {
+		t.Fatalf("client/required beta features were not merged on handshake: %+v", gotHeaders)
+	}
+	if gotHeaders.Get("x-responsesapi-include-timing-metrics") != "true" {
+		t.Fatalf("WS timing metrics opt-in missing from handshake: %+v", gotHeaders)
 	}
 	if gotHeaders.Get(codexResponsesLiteHeader) != "" {
 		t.Fatalf("responses-lite is WS client metadata, not a handshake header: %+v", gotHeaders)
@@ -126,6 +133,9 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if _, stale := gotPayload["prompt_cache_retention"]; stale {
 		t.Fatalf("latest Codex WS payload must strip obsolete prompt_cache_retention: %+v", gotPayload)
 	}
+	if _, preserved := gotPayload["future_wire_field"]; !preserved {
+		t.Fatalf("unknown future WS field was dropped: %+v", gotPayload)
+	}
 	metadata, _ := gotPayload["client_metadata"].(map[string]interface{})
 	if metadata["x-codex-installation-id"] != virtualIdentity.MachineID ||
 		metadata["session_id"] != gotHeaders.Get("session-id") ||
@@ -149,6 +159,10 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	items, _ := gotPayload["input"].([]interface{})
 	if len(items) != 3 || items[0].(map[string]interface{})["type"] != "additional_tools" || items[1].(map[string]interface{})["role"] != "developer" || items[2].(map[string]interface{})["role"] != "user" {
 		t.Fatalf("Responses Lite input envelope malformed: %+v", gotPayload)
+	}
+	additional := items[0].(map[string]interface{})["tools"].([]interface{})
+	if len(additional) != 5 {
+		t.Fatalf("stable/future Responses tools were not transparent over WS: %+v", additional)
 	}
 }
 

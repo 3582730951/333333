@@ -339,23 +339,91 @@ func IsOrphanedToolCallOutputError(status int, body []byte) bool {
 	if status != http.StatusBadRequest {
 		return false
 	}
-	var envelope struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-		Response struct {
-			Error struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		} `json:"response"`
-	}
-	if json.Unmarshal(body, &envelope) != nil {
+	const maxStructuredErrorBytes = 64 << 10
+	if len(body) == 0 || len(body) > maxStructuredErrorBytes {
 		return false
 	}
-	for _, message := range []string{envelope.Error.Message, envelope.Response.Error.Message} {
-		message = strings.TrimSpace(message)
-		lower := strings.ToLower(message)
-		if strings.HasPrefix(lower, "no tool call found ") && strings.Contains(lower, " call_id") {
+	remaining := maxStructuredErrorBytes
+	return orphanedToolOutputInStructuredError(body, 0, &remaining)
+}
+
+// orphanedToolOutputInStructuredError follows only the error-message wrapping used by
+// the Responses transports. Some gateways serialize the real OpenAI error object into
+// error.message, and a second relay can do that once more. Limiting both depth and the
+// cumulative decoded bytes prevents a client-controlled 400 from turning recovery
+// detection into an unbounded recursive JSON parser.
+func orphanedToolOutputInStructuredError(raw []byte, depth int, remaining *int) bool {
+	if depth > 2 || remaining == nil || len(raw) == 0 || len(raw) > *remaining {
+		return false
+	}
+	*remaining -= len(raw)
+
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var root map[string]interface{}
+	if err := decoder.Decode(&root); err != nil {
+		return false
+	}
+	var trailing interface{}
+	if decoder.Decode(&trailing) != io.EOF {
+		return false
+	}
+
+	messages := structuredErrorMessages(root)
+	for _, message := range messages {
+		if isMissingPairedToolOutputMessage(message) {
+			return true
+		}
+	}
+	if depth == 2 {
+		return false
+	}
+	for _, message := range messages {
+		nested := strings.TrimSpace(message)
+		if len(nested) < 2 || nested[0] != '{' || nested[len(nested)-1] != '}' {
+			continue
+		}
+		if orphanedToolOutputInStructuredError([]byte(nested), depth+1, remaining) {
+			return true
+		}
+	}
+	return false
+}
+
+func structuredErrorMessages(root map[string]interface{}) []string {
+	if root == nil {
+		return nil
+	}
+	messages := make([]string, 0, 3)
+	appendMessage := func(value interface{}) {
+		if message, ok := value.(string); ok && strings.TrimSpace(message) != "" {
+			messages = append(messages, message)
+		}
+	}
+	appendMessage(root["message"])
+	if detail, ok := root["error"].(map[string]interface{}); ok {
+		appendMessage(detail["message"])
+	}
+	if response, ok := root["response"].(map[string]interface{}); ok {
+		if detail, ok := response["error"].(map[string]interface{}); ok {
+			appendMessage(detail["message"])
+		}
+	}
+	return messages
+}
+
+func isMissingPairedToolOutputMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if !strings.HasPrefix(lower, "no tool call found for ") {
+		return false
+	}
+	for _, outputKind := range []string{
+		"function call output",
+		"custom tool call output",
+		"tool search output",
+		"mcp tool call output",
+	} {
+		if strings.HasPrefix(lower, "no tool call found for "+outputKind+" with call_id") {
 			return true
 		}
 	}

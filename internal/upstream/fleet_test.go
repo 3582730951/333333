@@ -263,9 +263,74 @@ func TestCodexEntrypointAdaptive(t *testing.T) {
 	}
 	// Downstream User-Agent prefix alone (no Originator header) is enough to detect exec.
 	uaOnly := http.Header{}
-	uaOnly.Set("User-Agent", "codex_exec/0.144.1 (Debian 12.0.0; x86_64) unknown")
+	uaOnly.Set("User-Agent", "codex_exec/0.144.5 (Debian 12.0.0; x86_64) unknown")
 	if o, _ := build(uaOnly); o != identity.CodexOriginatorExec {
 		t.Fatalf("UA-only exec detection: originator = %q, want codex_exec", o)
+	}
+
+	// The process User-Agent and the thread Originator are distinct in app-server
+	// clients: a VS Code process can operate a Codex Work thread.
+	vscodeWork := http.Header{}
+	vscodeWork.Set("User-Agent", "codex_vscode/0.144.5 (Darwin 25; arm64) vscode")
+	vscodeWork.Set("Originator", "codex_work_desktop")
+	o, ua = build(vscodeWork)
+	if o != "codex_work_desktop" || !strings.HasPrefix(ua, "codex_vscode/") {
+		t.Fatalf("split process/thread identity: originator=%q ua=%q", o, ua)
+	}
+	if strings.Contains(ua, "Darwin 25") || !strings.Contains(ua, id.OSName) || !strings.Contains(ua, id.Arch) {
+		t.Fatalf("VS Code UA did not use account virtual OS/arch: %q", ua)
+	}
+}
+
+func TestCodexBetaAndSemanticHeadersAreValidatedAndMerged(t *testing.T) {
+	c, _ := fixedSecretClient(t, config.Default())
+	downstream := http.Header{}
+	downstream.Set("x-codex-beta-features", "memories,prevent_idle_sleep,network_proxy,remote_compaction_v2,unknown_future,network_proxy")
+	downstream.Set("x-openai-memgen-request", "true")
+	downstream.Set("x-openai-internal-codex-residency", "us")
+	downstream.Set("x-responsesapi-include-timing-metrics", "true")
+	downstream.Set("x-oai-attestation", "untrusted")
+	build := func(websocket bool) http.Header {
+		headers := http.Header{}
+		c.applyCodexHeaders(headers, Request{
+			Account: storage.Account{ID: "acc-semantics"},
+			Token:   storage.AccountToken{AccessToken: "oauth-access-token"},
+			Headers: downstream, CodexResponsesWebSocket: websocket,
+		})
+		return headers
+	}
+	httpHeaders := build(false)
+	if got := getHeaderFold(httpHeaders, "x-codex-beta-features"); got != "memories,prevent_idle_sleep,network_proxy,remote_compaction_v2" {
+		t.Fatalf("merged beta features = %q", got)
+	}
+	if getHeaderFold(httpHeaders, "x-openai-memgen-request") != "true" || getHeaderFold(httpHeaders, "x-openai-internal-codex-residency") != "us" {
+		t.Fatalf("valid semantic headers missing: %v", httpHeaders)
+	}
+	if getHeaderFold(httpHeaders, "x-responsesapi-include-timing-metrics") != "" {
+		t.Fatalf("WS timing metric header leaked onto HTTP: %v", httpHeaders)
+	}
+	if getHeaderFold(httpHeaders, "x-oai-attestation") != "" {
+		t.Fatalf("untrusted attestation was forwarded: %v", httpHeaders)
+	}
+	wsHeaders := build(true)
+	if getHeaderFold(wsHeaders, "x-responsesapi-include-timing-metrics") != "true" {
+		t.Fatalf("valid WS timing metric header missing: %v", wsHeaders)
+	}
+
+	invalid := downstream.Clone()
+	invalid.Set("x-openai-memgen-request", "false")
+	invalid.Set("x-openai-internal-codex-residency", "eu")
+	invalid.Set("x-responsesapi-include-timing-metrics", "1")
+	headers := http.Header{}
+	c.applyCodexHeaders(headers, Request{
+		Account: storage.Account{ID: "acc-invalid-semantics"},
+		Token:   storage.AccountToken{AccessToken: "oauth-access-token"},
+		Headers: invalid, CodexResponsesWebSocket: true,
+	})
+	for _, name := range []string{"x-openai-memgen-request", "x-openai-internal-codex-residency", "x-responsesapi-include-timing-metrics"} {
+		if getHeaderFold(headers, name) != "" {
+			t.Fatalf("invalid semantic header %s survived: %v", name, headers)
+		}
 	}
 }
 

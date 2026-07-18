@@ -2,6 +2,7 @@ package leakfilter
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -204,6 +205,81 @@ func TestRetryableCodexFailureFrameAcceptsOrphanedToolOutputStatus(t *testing.T)
 	}
 	if failure.StatusCode != http.StatusBadRequest || !failure.OrphanedToolOutput {
 		t.Fatalf("failure = %+v", failure)
+	}
+}
+
+func TestRetryableCodexFailureFrameAcceptsWrappedOrphanStatusAndStatusCode(t *testing.T) {
+	inner := `{"error":{"type":"invalid_request_error","message":"No tool call found for function call output with call_id call_wrapped."}}`
+	for _, tc := range []struct {
+		name, event, typ, field string
+	}{
+		{name: "http_sse_status", event: "response.failed", typ: "response.failed", field: "status"},
+		{name: "websocket_status_code", event: "error", typ: "error", field: "status_code"},
+	} {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":   tc.typ,
+			tc.field: 400,
+			"error": map[string]interface{}{
+				"type": "invalid_request_error", "message": inner,
+			},
+		})
+		frame := append([]byte("event: "+tc.event+"\ndata: "), payload...)
+		frame = append(frame, []byte("\n\n")...)
+		failure, ok := ParseRetryableCodexFailureFrame(frame)
+		if !ok || failure.StatusCode != http.StatusBadRequest || !failure.OrphanedToolOutput {
+			t.Fatalf("%s wrapped orphan failure = %+v, ok=%v, payload=%s", tc.name, failure, ok, payload)
+		}
+	}
+}
+
+func TestOrphanedToolOutputErrorRecognizesBoundedJSONWrappers(t *testing.T) {
+	for _, kind := range []string{
+		"function call output",
+		"custom tool call output",
+		"tool search output",
+		"mcp tool call output",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			inner, _ := json.Marshal(map[string]interface{}{
+				"error": map[string]interface{}{"message": "No tool call found for " + kind + " with call_id call_1."},
+			})
+			outer, _ := json.Marshal(map[string]interface{}{
+				"error": map[string]interface{}{"message": string(inner)},
+			})
+			if !IsOrphanedToolCallOutputError(http.StatusBadRequest, outer) {
+				t.Fatalf("wrapped %s was not recognized: %s", kind, outer)
+			}
+		})
+	}
+
+	inner := `{"error":{"message":"No tool call found for custom tool call output with call_id call_2."}}`
+	for i := 0; i < 3; i++ {
+		wrapped, _ := json.Marshal(map[string]interface{}{"error": map[string]interface{}{"message": inner}})
+		inner = string(wrapped)
+	}
+	if IsOrphanedToolCallOutputError(http.StatusBadRequest, []byte(inner)) {
+		t.Fatal("an error nested beyond two message wrappers must not match")
+	}
+	if IsOrphanedToolCallOutputError(http.StatusBadRequest, []byte(`{"error":{"message":"{malformed"}}`)) {
+		t.Fatal("malformed nested JSON must not match")
+	}
+	if IsOrphanedToolCallOutputError(http.StatusBadRequest, []byte(`{"error":{"message":"No tool call found for another reason; function call output with call_id call_3."}}`)) {
+		t.Fatal("a message that only mentions the target phrase later must not match")
+	}
+	oversized := append([]byte(`{"error":{"message":"No tool call found for function call output with call_id call_3.`), bytes.Repeat([]byte("x"), 64<<10)...)
+	oversized = append(oversized, []byte(`"}}`)...)
+	if IsOrphanedToolCallOutputError(http.StatusBadRequest, oversized) {
+		t.Fatal("an error beyond the 64 KiB budget must not match")
+	}
+}
+
+func TestOrphanedToolOutputErrorRecognizesObservedProxyWrapper(t *testing.T) {
+	// This is the shape emitted by the downstream proxy in production: the actual
+	// Codex error is JSON-encoded inside error.message, while the outer response
+	// independently carries status/type.
+	body := []byte(`{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`)
+	if !IsOrphanedToolCallOutputError(http.StatusBadRequest, body) {
+		t.Fatalf("observed nested proxy error was not recognized: %s", body)
 	}
 }
 

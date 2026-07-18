@@ -568,10 +568,12 @@ func simplePromptMessage(v interface{}) bool {
 		case "message":
 			// Official Responses requests use type:"message" around the same
 			// role/content shape accepted below.
-		case "additional_tools", "reasoning", "function_call", "function_call_output",
+		case "additional_tools", "agent_message", "reasoning", "function_call", "function_call_output",
 			"custom_tool_call", "custom_tool_call_output", "local_shell_call", "local_shell_call_output",
 			"computer_call", "computer_call_output", "web_search_call", "file_search_call",
-			"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response":
+			"tool_search_call", "tool_search_output", "image_generation_call",
+			"compaction", "compaction_summary", "context_compaction",
+			"mcp_call", "mcp_tool_call", "mcp_tool_call_output", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response":
 			// These are self-contained official Responses history items. The
 			// cache key only selects a cache shard; the item bytes remain intact.
 			return true

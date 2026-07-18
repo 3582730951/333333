@@ -533,8 +533,7 @@ func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBod
 	priorItems := first.partialItems()
 	priorText := first.partialText()
 	priorCount := first.partialItemCount()
-	id := first.id
-	model := first.model
+	id, model, _ := first.metadata()
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		body, ok := buildCodexContinueBody(resolvedBody, priorItems, continueText)
 		if !ok {
@@ -555,11 +554,12 @@ func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBod
 		priorText += rec.partialText()
 		priorItems = append(priorItems, rec.partialItems()...)
 		priorCount += rec.partialItemCount()
-		if rec.id != "" {
-			id = rec.id
+		recID, recModel, _ := rec.metadata()
+		if recID != "" {
+			id = recID
 		}
-		if rec.model != "" {
-			model = rec.model
+		if recModel != "" {
+			model = recModel
 		}
 	}
 	return closeCodexStreamGracefully(w, priorItems, priorText, id, model)

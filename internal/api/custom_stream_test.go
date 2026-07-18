@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/streamrewrite"
 )
 
 // custom_stream_test.go is the end-to-end guard for the custom OpenAI-compatible
@@ -198,6 +201,9 @@ func TestCustomProviderResponsesConversion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
+	if got := resp.Header.Get(responsesCompatibilityLossesHeader); got != "none" {
+		t.Fatalf("lossless Responses bridge header = %q", got)
+	}
 	var root map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&root); err != nil {
 		t.Fatal(err)
@@ -263,7 +269,7 @@ func TestCustomProviderNativeResponsesPassthrough(t *testing.T) {
 	}
 
 	resp3, err := http.Post(h.pool.URL+"/v1/responses", "application/json",
-		strings.NewReader(`{"model":"native-resp-model","input":[{"role":"user","content":"search"}],"tools":[{"type":"web_search_preview"}],"include":["web_search_call.results"],"unknown_future_field":{"x":1}}`))
+		strings.NewReader(`{"model":"native-resp-model","input":[{"role":"user","content":"search"}],"tools":[{"type":"function","name":"f","parameters":{"const":900719925474099312345}},{"type":"namespace","name":"calendar","tools":[{"type":"function","name":"create"}]},{"type":"custom","name":"freeform","format":{"type":"text"}},{"type":"tool_search","execution":"client"},{"type":"web_search_preview"},{"type":"future_hosted_tool","future":{"x":1}}],"include":["web_search_call.results"],"unknown_future_field":{"x":1}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,6 +280,9 @@ func TestCustomProviderNativeResponsesPassthrough(t *testing.T) {
 	}
 	if root["object"] != "response" || root["native_passthrough"] != true {
 		t.Fatalf("native Responses body was not transparently returned: %#v", root)
+	}
+	if got := resp3.Header.Get(responsesCompatibilityLossesHeader); got != "" {
+		t.Fatalf("native Responses path must not report Chat bridge losses: %q", got)
 	}
 
 	var responsesCall *capturedRequest
@@ -289,7 +298,7 @@ func TestCustomProviderNativeResponsesPassthrough(t *testing.T) {
 	if responsesCall == nil {
 		t.Fatalf("no native /responses upstream call captured: %+v", h.requests())
 	}
-	for _, want := range []string{`"web_search_preview"`, `"unknown_future_field"`, `"include"`} {
+	for _, want := range []string{`"namespace"`, `"custom"`, `"tool_search"`, `"web_search_preview"`, `"future_hosted_tool"`, `"unknown_future_field"`, `"include"`, "900719925474099312345"} {
 		if !strings.Contains(responsesCall.Body, want) {
 			t.Fatalf("native Responses request lost %s: %s", want, responsesCall.Body)
 		}
@@ -328,7 +337,7 @@ func TestCustomProviderResponsesStreaming(t *testing.T) {
 	acc := setupDeepSeek(t, h, []string{"deepseek-chat"}, false)
 
 	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json",
-		strings.NewReader(`{"model":"deepseek-chat","stream":true,"input":[{"role":"user","content":"hi"}]}`))
+		strings.NewReader(`{"model":"deepseek-chat","stream":true,"include":["reasoning.encrypted_content"],"tools":[{"type":"web_search_preview"}],"input":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,16 +350,59 @@ func TestCustomProviderResponsesStreaming(t *testing.T) {
 			t.Fatalf("responses SSE missing %q:\n%s", want, s)
 		}
 	}
+	wantLosses := `["responses_hosted_tool_omitted","responses_include_omitted"]`
+	if got := resp.Trailer.Get(responsesCompatibilityLossesHeader); got != wantLosses {
+		t.Fatalf("compatibility trailer = %q, want %q; headers=%v trailers=%v", got, wantLosses, resp.Header, resp.Trailer)
+	}
 	// Streamed usage is recorded (the relay set stream_options.include_usage and the
 	// terminal chunk carried usage) so the admin overview reflects custom traffic.
 	h.app.WaitForAsyncWrites() // usage rows are written asynchronously; drain before asserting
 	var prompt, completion, total, cached int64
-	row := h.store.DB().QueryRow(`SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens FROM usage_records WHERE account_id = ? ORDER BY id DESC LIMIT 1`, acc)
-	if err := row.Scan(&prompt, &completion, &total, &cached); err != nil {
+	var compatibility string
+	row := h.store.DB().QueryRow(`SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens, compatibility_losses_json FROM usage_records WHERE account_id = ? ORDER BY id DESC LIMIT 1`, acc)
+	if err := row.Scan(&prompt, &completion, &total, &cached, &compatibility); err != nil {
 		t.Fatalf("no usage recorded for streamed custom response: %v", err)
 	}
 	if prompt != 5 || completion != 2 || total != 7 || cached != 3 {
 		t.Fatalf("streamed custom usage mis-recorded: prompt=%d completion=%d total=%d cached=%d", prompt, completion, total, cached)
+	}
+	if compatibility != wantLosses {
+		t.Fatalf("recorded compatibility losses = %q, want %q", compatibility, wantLosses)
+	}
+}
+
+func TestChatStreamToResponsesSSEUsesBridgePlanForStableTools(t *testing.T) {
+	plan := prompt.NewResponsesToolBridgePlan()
+	customAlias := plan.EnsureChatName(prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolCustom, Name: "apply_patch"})
+	searchAlias := plan.EnsureChatName(prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolSearch, Name: "tool_search", Execution: "client"})
+	namespaceAlias := plan.EnsureChatName(prompt.ResponsesToolIdentity{Kind: prompt.ResponsesToolFunction, Namespace: "filesystem", Name: "read"})
+	stream := "data: " + `{"id":"stable-tools","choices":[{"delta":{"tool_calls":[` +
+		`{"index":0,"id":"call_custom","function":{"name":"` + customAlias + `","arguments":"{\"input\":\"hel"}},` +
+		`{"index":1,"id":"call_search","function":{"name":"` + searchAlias + `","arguments":"{\"limit\":900719925474099312345}"}},` +
+		`{"index":2,"id":"call_read","function":{"name":"` + namespaceAlias + `","arguments":"{\"path\":\"a\"}"}}` +
+		`]}}]}` + "\n\n" +
+		"data: " + `{"id":"stable-tools","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"lo\"}"}}]},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	recorder := httptest.NewRecorder()
+	chatStreamToResponsesSSE(recorder, strings.NewReader(stream), "chat-model", streamrewrite.New(nil), plan)
+	got := recorder.Body.String()
+	for _, want := range []string{
+		"response.custom_tool_call_input.delta",
+		"response.custom_tool_call_input.done",
+		`"type":"custom_tool_call"`,
+		`"name":"apply_patch"`,
+		`"input":"hello"`,
+		`"type":"tool_search_call"`,
+		`"execution":"client"`,
+		"900719925474099312345",
+		`"namespace":"filesystem"`,
+		`"name":"read"`,
+		"response.completed",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stable tool SSE missing %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -460,5 +512,16 @@ func TestCustomProviderCountTokensLocalEstimate(t *testing.T) {
 		if strings.HasSuffix(c.Path, "/chat/completions") {
 			t.Fatalf("count_tokens must not proxy upstream, saw %s", c.Path)
 		}
+	}
+}
+
+func TestWithStreamUsagePreservesLargeSchemaIntegers(t *testing.T) {
+	body := []byte(`{"stream":true,"tools":[{"type":"function","function":{"name":"huge","parameters":{"type":"integer","const":900719925474099312345}}}]}`)
+	converted := withStreamUsage(body)
+	if !strings.Contains(string(converted), "900719925474099312345") {
+		t.Fatalf("large integer was rounded while adding stream usage: %s", converted)
+	}
+	if !strings.Contains(string(converted), `"include_usage":true`) {
+		t.Fatalf("stream usage was not enabled: %s", converted)
 	}
 }

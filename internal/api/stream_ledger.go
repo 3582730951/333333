@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"sync"
 )
 
 const streamLedgerMaxPartialFrame = 256 * 1024
 
 type codexStreamLedgerRecorder struct {
+	mu        sync.Mutex
 	buf       []byte
 	id        string
 	model     string
@@ -35,6 +37,8 @@ func codexSSEToResponseJSON(raw []byte) []byte {
 }
 
 func (r *codexStreamLedgerRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.buf = append(r.buf, p...)
 	for {
 		idx := bytes.Index(r.buf, []byte("\n\n"))
@@ -52,6 +56,8 @@ func (r *codexStreamLedgerRecorder) Write(p []byte) (int, error) {
 }
 
 func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	var root map[string]interface{}
 	if r.completed != nil {
 		root = cloneJSONMap(r.completed)
@@ -101,26 +107,48 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 // (response.completed / response.incomplete / response.failed). When false after the
 // upstream body ends, the stream was truncated — the signal the auto-continue relay
 // uses to decide whether to re-issue.
-func (r *codexStreamLedgerRecorder) reachedTerminal() bool { return r.completed != nil }
+func (r *codexStreamLedgerRecorder) reachedTerminal() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.completed != nil
+}
 
 // partialText returns the assistant output text accumulated so far.
-func (r *codexStreamLedgerRecorder) partialText() string { return r.text.String() }
+func (r *codexStreamLedgerRecorder) partialText() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.text.String()
+}
 
 // partialItems reconstructs the assistant output items produced so far (the same shape
 // persistContextJournal appends as input for the next turn), used to re-inject the
 // partial answer into the continuation request so the model continues instead of
 // restarting — keeping the prompt-cache prefix intact.
 func (r *codexStreamLedgerRecorder) partialItems() []interface{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.outputItems(r.text.String())
 }
 
 // partialItemCount is the number of output items the stream opened, used to offset the
 // continuation's output_index so its items never collide with the ones already relayed.
 func (r *codexStreamLedgerRecorder) partialItemCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if n := len(r.done); n > len(r.added) {
 		return n
 	}
 	return len(r.added)
+}
+
+// metadata returns a consistent copy of the fields consumed after streaming. The
+// heartbeat relay reads upstream data on a helper goroutine; a downstream disconnect
+// can make streamSSE return while that goroutine is completing its final recorder
+// write, so direct field reads would race even though normal EOF is fully drained.
+func (r *codexStreamLedgerRecorder) metadata() (string, string, codexStreamRateLimits) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id, r.model, r.rateLimits
 }
 
 func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {

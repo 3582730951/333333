@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"codex-account-pool/internal/prompt"
@@ -17,6 +19,8 @@ type responsesAnthropicToolStream struct {
 	id         string
 	itemID     string
 	name       string
+	namespace  string
+	kind       prompt.ResponsesToolKind
 	arguments  strings.Builder
 	started    bool
 	closed     bool
@@ -63,6 +67,7 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 	tools := make([]*responsesAnthropicToolStream, 0, 4)
 	reasoningByKey := map[string]*responsesAnthropicReasoningStream{}
 	reasoning := make([]*responsesAnthropicReasoningStream, 0, 2)
+	bridgePlan := prompt.NewResponsesToolBridgePlan()
 
 	ensureStarted := func() {
 		if started {
@@ -111,8 +116,8 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 				return "id:" + text
 			}
 		}
-		if value, ok := event["output_index"].(float64); ok {
-			return "output:" + jsonNumberString(value)
+		if value, ok := jsonNumberString(event["output_index"]); ok {
+			return "output:" + value
 		}
 		return "output:0"
 	}
@@ -120,8 +125,8 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if key := toolKey(event, nil); toolsByKey[key] != nil {
 			return toolsByKey[key]
 		}
-		if value, ok := event["output_index"].(float64); ok {
-			return toolsByKey["output:"+jsonNumberString(value)]
+		if value, ok := jsonNumberString(event["output_index"]); ok {
+			return toolsByKey["output:"+value]
 		}
 		if len(tools) == 1 {
 			return tools[0]
@@ -141,6 +146,9 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if original := toolNames[name]; original != "" {
 			name = original
 		}
+		if state.namespace != "" {
+			name = bridgePlan.EnsureChatName(prompt.ResponsesToolIdentity{Kind: state.kind, Namespace: state.namespace, Name: name})
+		}
 		state.name = name
 		emit("content_block_start", map[string]interface{}{
 			"index":         state.blockIndex,
@@ -156,7 +164,10 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if arguments == "" {
 			arguments = fallback
 		}
-		if arguments == "" {
+		if state.kind == prompt.ResponsesToolCustom {
+			encoded, _ := json.Marshal(map[string]interface{}{"input": arguments})
+			arguments = string(encoded)
+		} else if arguments == "" {
 			arguments = "{}"
 		}
 		arguments = sanitizeAnthropicStreamToolArguments(state.name, arguments, inheritModelTools)
@@ -166,6 +177,29 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		emit("content_block_stop", map[string]interface{}{"index": state.blockIndex})
 		state.closed = true
 	}
+	registerTool := func(event, item map[string]interface{}, kind prompt.ResponsesToolKind) *responsesAnthropicToolStream {
+		state := &responsesAnthropicToolStream{
+			blockIndex: nextBlock, itemID: streamString(mapValue(item, "id")), kind: kind,
+			id:        streamString(firstNonEmptyInterface(mapValue(item, "call_id"), mapValue(item, "id"))),
+			name:      streamString(mapValue(item, "name")),
+			namespace: streamString(mapValue(item, "namespace")),
+		}
+		if kind == prompt.ResponsesToolSearch {
+			state.name = "tool_search"
+		}
+		nextBlock++
+		key := toolKey(event, item)
+		toolsByKey[key] = state
+		if state.itemID != "" {
+			toolsByKey["id:"+state.itemID] = state
+		}
+		if value, ok := jsonNumberString(event["output_index"]); ok {
+			toolsByKey["output:"+value] = state
+		}
+		tools = append(tools, state)
+		startTool(state)
+		return state
+	}
 
 	reasoningKey := func(event, item map[string]interface{}) string {
 		for _, value := range []interface{}{event["item_id"], mapValue(item, "id")} {
@@ -173,8 +207,8 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 				return "id:" + text
 			}
 		}
-		if value, ok := event["output_index"].(float64); ok {
-			return "output:" + jsonNumberString(value)
+		if value, ok := jsonNumberString(event["output_index"]); ok {
+			return "output:" + value
 		}
 		return "output:0"
 	}
@@ -189,8 +223,8 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if itemID := streamString(mapValue(item, "id")); itemID != "" {
 			reasoningByKey["id:"+itemID] = state
 		}
-		if value, ok := event["output_index"].(float64); ok {
-			reasoningByKey["output:"+jsonNumberString(value)] = state
+		if value, ok := jsonNumberString(event["output_index"]); ok {
+			reasoningByKey["output:"+value] = state
 		}
 		reasoning = append(reasoning, state)
 		return state
@@ -305,8 +339,10 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if len(data) == 0 || strings.TrimSpace(string(data)) == "[DONE]" || terminal {
 			return
 		}
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
 		var event map[string]interface{}
-		if json.Unmarshal(data, &event) != nil {
+		if decoder.Decode(&event) != nil {
 			return
 		}
 		typ := streamString(event["type"])
@@ -338,22 +374,13 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			item, _ := event["item"].(map[string]interface{})
 			switch streamString(mapValue(item, "type")) {
 			case "function_call":
-				state := &responsesAnthropicToolStream{
-					blockIndex: nextBlock, itemID: streamString(mapValue(item, "id")),
-					id:   streamString(firstNonEmptyInterface(mapValue(item, "call_id"), mapValue(item, "id"))),
-					name: streamString(mapValue(item, "name")),
+				registerTool(event, item, prompt.ResponsesToolFunction)
+			case "custom_tool_call":
+				registerTool(event, item, prompt.ResponsesToolCustom)
+			case "tool_search_call":
+				if strings.EqualFold(streamString(mapValue(item, "execution")), "client") {
+					registerTool(event, item, prompt.ResponsesToolSearch)
 				}
-				nextBlock++
-				key := toolKey(event, item)
-				toolsByKey[key] = state
-				if state.itemID != "" {
-					toolsByKey["id:"+state.itemID] = state
-				}
-				if value, ok := event["output_index"].(float64); ok {
-					toolsByKey["output:"+jsonNumberString(value)] = state
-				}
-				tools = append(tools, state)
-				startTool(state)
 			case "reasoning":
 				getReasoning(event, item)
 			}
@@ -364,6 +391,14 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		case "response.function_call_arguments.done":
 			state := lookupTool(event)
 			fallback := streamString(firstNonEmptyInterface(event["arguments"], mapValueFromNested(event, "item", "arguments")))
+			flushToolArguments(state, fallback)
+		case "response.custom_tool_call_input.delta":
+			if state := lookupTool(event); state != nil && state.kind == prompt.ResponsesToolCustom {
+				state.arguments.WriteString(streamString(event["delta"]))
+			}
+		case "response.custom_tool_call_input.done":
+			state := lookupTool(event)
+			fallback := streamString(firstNonEmptyInterface(event["input"], mapValueFromNested(event, "item", "input")))
 			flushToolArguments(state, fallback)
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta":
 			state := getReasoning(event, nil)
@@ -383,15 +418,25 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			case "function_call":
 				state := lookupTool(event)
 				if state == nil {
-					state = &responsesAnthropicToolStream{
-						blockIndex: nextBlock, itemID: streamString(mapValue(item, "id")),
-						id:   streamString(firstNonEmptyInterface(mapValue(item, "call_id"), mapValue(item, "id"))),
-						name: streamString(mapValue(item, "name")),
-					}
-					nextBlock++
-					tools = append(tools, state)
+					state = registerTool(event, item, prompt.ResponsesToolFunction)
 				}
 				flushToolArguments(state, streamString(mapValue(item, "arguments")))
+			case "custom_tool_call":
+				state := lookupTool(event)
+				if state == nil {
+					state = registerTool(event, item, prompt.ResponsesToolCustom)
+				}
+				flushToolArguments(state, streamString(mapValue(item, "input")))
+			case "tool_search_call":
+				if !strings.EqualFold(streamString(mapValue(item, "execution")), "client") {
+					break
+				}
+				state := lookupTool(event)
+				if state == nil {
+					state = registerTool(event, item, prompt.ResponsesToolSearch)
+				}
+				arguments, _ := json.Marshal(mapValue(item, "arguments"))
+				flushToolArguments(state, string(arguments))
 			case "message":
 				if !sawText {
 					if text := responsesOutputItemText(item); text != "" {
@@ -465,8 +510,8 @@ func sanitizeAnthropicStreamToolArguments(name, raw string, inheritModelTools ma
 	if (name != "Read" && !inheritModelTools[name]) || strings.TrimSpace(raw) == "" {
 		return raw
 	}
-	var input map[string]interface{}
-	if json.Unmarshal([]byte(raw), &input) != nil {
+	input, err := decodeStreamJSONMapUseNumber([]byte(raw))
+	if err != nil {
 		return raw
 	}
 	if pages, ok := input["pages"].(string); ok && pages == "" {
@@ -527,16 +572,27 @@ func firstNonEmptyInterface(values ...interface{}) interface{} {
 	return nil
 }
 
-func jsonNumberString(value float64) string {
-	encoded, _ := json.Marshal(int(value))
-	return string(encoded)
+func jsonNumberString(value interface{}) (string, bool) {
+	switch current := value.(type) {
+	case json.Number:
+		return current.String(), true
+	case float64:
+		encoded, _ := json.Marshal(int(current))
+		return string(encoded), true
+	case int:
+		return strconv.Itoa(current), true
+	case int64:
+		return strconv.FormatInt(current, 10), true
+	default:
+		return "", false
+	}
 }
 
 // anthropicMessageJSONToSSE adapts a complete Messages object when an upstream
 // Responses endpoint unexpectedly returned JSON to a streaming Claude request.
 func anthropicMessageJSONToSSE(w http.ResponseWriter, raw []byte) error {
-	var message map[string]interface{}
-	if err := json.Unmarshal(raw, &message); err != nil {
+	message, err := decodeStreamJSONMapUseNumber(raw)
+	if err != nil {
 		return err
 	}
 	flusher, _ := w.(http.Flusher)
@@ -598,4 +654,20 @@ func anthropicMessageJSONToSSE(w http.ResponseWriter, raw []byte) error {
 	emit("message_delta", map[string]interface{}{"delta": delta, "usage": endUsage})
 	emit("message_stop", map[string]interface{}{})
 	return nil
+}
+
+func decodeStreamJSONMapUseNumber(raw []byte) (map[string]interface{}, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value map[string]interface{}
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("unexpected trailing JSON value")
+		}
+		return nil, err
+	}
+	return value, nil
 }

@@ -46,11 +46,12 @@ func TestCodexRecorderCapturesRateLimitsFrame(t *testing.T) {
 	rec := newCodexStreamLedgerRecorder()
 	_, _ = rec.Write([]byte("event: codex.rate_limits\n" +
 		`data: {"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":42,"reset_after_seconds":600},"secondary":{"used_percent":7,"reset_after_seconds":86400}}}` + "\n\n"))
-	if !rec.rateLimits.any() {
+	_, _, rateLimits := rec.metadata()
+	if !rateLimits.any() {
 		t.Fatal("recorder did not capture codex.rate_limits frame")
 	}
-	if rec.rateLimits.primaryUsedPct != 42 || rec.rateLimits.secondUsedPct != 7 {
-		t.Fatalf("recorder captured wrong windows: %+v", rec.rateLimits)
+	if rateLimits.primaryUsedPct != 42 || rateLimits.secondUsedPct != 7 {
+		t.Fatalf("recorder captured wrong windows: %+v", rateLimits)
 	}
 	// The frame must not disturb terminal detection (it is not a terminal event).
 	if rec.reachedTerminal() {

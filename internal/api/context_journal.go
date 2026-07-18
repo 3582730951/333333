@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -15,8 +17,8 @@ import (
 // journalReplayBody creates the stateless Responses body used when account-local
 // previous_response_id state is unavailable. Payloads are encrypted by storage.
 func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte, bool) {
-	var cur map[string]interface{}
-	if json.Unmarshal(current, &cur) != nil {
+	cur, err := decodeContextJSONMap(current)
+	if err != nil {
 		return current, false
 	}
 	prev, _ := cur["previous_response_id"].(string)
@@ -30,8 +32,8 @@ func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte,
 	// Sliding TTL: a resumed tail refreshes its own expiry so an arbitrary-duration
 	// task stays restorable indefinitely without growing disk.
 	s.touchContextJournal(ctx, prev)
-	var base map[string]interface{}
-	if json.Unmarshal([]byte(j.Payload), &base) != nil {
+	base, err := decodeContextJSONMap([]byte(j.Payload))
+	if err != nil {
 		return current, false
 	}
 	base["model"] = cur["model"]
@@ -63,8 +65,9 @@ func appendItems(a, b interface{}) []interface{} {
 }
 
 func (s *Server) persistContextJournal(ctx context.Context, requestBody, responseBody []byte, affinityHash, accountID string) error {
-	var req, resp map[string]interface{}
-	if json.Unmarshal(requestBody, &req) != nil || json.Unmarshal(responseBody, &resp) != nil {
+	req, reqErr := decodeContextJSONMap(requestBody)
+	resp, respErr := decodeContextJSONMap(responseBody)
+	if reqErr != nil || respErr != nil {
 		return errors.New("invalid context journal payload")
 	}
 	id, _ := resp["id"].(string)
@@ -73,8 +76,7 @@ func (s *Server) persistContextJournal(ctx context.Context, requestBody, respons
 	}
 	if prev, _ := req["previous_response_id"].(string); prev != "" {
 		if j, e := s.store.GetContextJournal(ctx, prev); e == nil {
-			var base map[string]interface{}
-			if json.Unmarshal([]byte(j.Payload), &base) == nil {
+			if base, decodeErr := decodeContextJSONMap([]byte(j.Payload)); decodeErr == nil {
 				base["input"] = appendItems(base["input"], req["input"])
 				req = base
 			}
@@ -118,8 +120,8 @@ func (s *Server) touchContextJournal(ctx context.Context, id string) {
 }
 
 func ensureEncryptedReasoningInclude(body []byte) []byte {
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
 		return body
 	}
 	items, _ := root["include"].([]interface{})
@@ -137,8 +139,8 @@ func ensureEncryptedReasoningInclude(body []byte) []byte {
 }
 
 func degradedResponsesReplay(body []byte) []byte {
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
 		return body
 	}
 	delete(root, "previous_response_id")
@@ -172,9 +174,9 @@ func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
 		if !ok {
 			continue
 		}
-		if isToolCallItemType(streamString(m["type"])) {
+		if kind := toolCallPairKind(streamString(m["type"])); kind != "" {
 			if cid := streamString(m["call_id"]); cid != "" {
-				calls[cid] = true
+				calls[kind+"\x00"+cid] = true
 			}
 		}
 	}
@@ -182,9 +184,15 @@ func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
 	out := make([]interface{}, 0, len(input))
 	for _, it := range input {
 		if m, ok := it.(map[string]interface{}); ok {
-			if isToolOutputItemType(streamString(m["type"])) {
+			if kind := toolOutputPairKind(m); kind != "" {
+				// A server-executed tool search is already resolved by the Responses
+				// service and is explicitly allowed to omit call_id in stable Codex.
+				if kind == "tool_search_server" {
+					out = append(out, it)
+					continue
+				}
 				cid := streamString(m["call_id"])
-				if cid == "" || !calls[cid] {
+				if cid == "" || !calls[kind+"\x00"+cid] {
 					out = append(out, orphanedToolOutputAsUserMessage(m))
 					converted++
 					continue
@@ -196,21 +204,49 @@ func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
 	return out, converted
 }
 
-// isToolOutputItemType matches function_call_output / custom_tool_call_output /
-// local_shell_call_output and similar tool-result items.
-func isToolOutputItemType(t string) bool { return strings.HasSuffix(t, "_call_output") }
-
-// isToolCallItemType matches function_call / custom_tool_call / local_shell_call and
-// similar tool-invocation items (never an output).
-func isToolCallItemType(t string) bool {
-	if t == "" || strings.HasSuffix(t, "_call_output") {
-		return false
+// toolCallPairKind and toolOutputPairKind intentionally enumerate the stable
+// rust-v0.144.5 pairing rules. Unknown future *_call fields are not guessed at: native
+// Responses forwarding preserves them, while context recovery leaves them untouched.
+func toolCallPairKind(t string) string {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "function_call", "local_shell_call":
+		return "function"
+	case "custom_tool_call":
+		return "custom"
+	case "tool_search_call":
+		return "tool_search"
+	default:
+		return ""
 	}
-	return strings.HasSuffix(t, "_call")
+}
+
+func toolOutputPairKind(item map[string]interface{}) string {
+	t := strings.ToLower(strings.TrimSpace(streamString(item["type"])))
+	switch t {
+	case "function_call_output", "local_shell_call_output", "mcp_tool_call_output":
+		return "function"
+	case "custom_tool_call_output":
+		return "custom"
+	case "tool_search_output":
+		if strings.EqualFold(strings.TrimSpace(streamString(item["execution"])), "server") {
+			return "tool_search_server"
+		}
+		return "tool_search"
+	default:
+		return ""
+	}
+}
+
+func isToolOutputItemType(t string) bool {
+	return toolOutputPairKind(map[string]interface{}{"type": t}) != ""
+}
+
+func isToolCallItemType(t string) bool {
+	return toolCallPairKind(t) != ""
 }
 
 func orphanedToolOutputAsUserMessage(m map[string]interface{}) map[string]interface{} {
-	text := toolOutputText(m["output"])
+	text := degradedToolOutputText(m)
 	if strings.TrimSpace(text) == "" {
 		text = "(tool result unavailable)"
 	}
@@ -220,6 +256,35 @@ func orphanedToolOutputAsUserMessage(m map[string]interface{}) map[string]interf
 			map[string]interface{}{"type": "input_text", "text": "[Earlier tool result] " + text},
 		},
 	}
+}
+
+func degradedToolOutputText(item map[string]interface{}) string {
+	output, hasOutput := item["output"]
+	if text, ok := output.(string); ok && toolOutputHasOnlyTextFields(item) {
+		return text
+	}
+	if !hasOutput && streamString(item["type"]) != "tool_search_output" {
+		return ""
+	}
+	// Marshal the complete item rather than only output so image URLs, error/status
+	// fields, encrypted payloads, tool-search execution metadata, and future fields all
+	// remain model-visible after the stateless downgrade. Maps are encoded with sorted
+	// keys by encoding/json and numbers came from a UseNumber decoder.
+	if raw, err := json.Marshal(item); err == nil {
+		return string(raw)
+	}
+	return toolOutputText(output)
+}
+
+func toolOutputHasOnlyTextFields(item map[string]interface{}) bool {
+	for key := range item {
+		switch key {
+		case "type", "id", "call_id", "name", "output":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func toolOutputText(v interface{}) string {
@@ -249,8 +314,8 @@ func isOrphanedToolCallOutputError(status int, body []byte) bool {
 // gates the reactive degrade-and-retry so a body that is already stateless-and-clean is
 // never retried in a loop.
 func responsesNeedsDegrade(body []byte) bool {
-	var root map[string]interface{}
-	if json.Unmarshal(body, &root) != nil {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
 		return false
 	}
 	if v, _ := root["previous_response_id"].(string); strings.TrimSpace(v) != "" {
@@ -265,6 +330,23 @@ func responsesNeedsDegrade(body []byte) bool {
 		}
 	}
 	return false
+}
+
+func decodeContextJSONMap(raw []byte) (map[string]interface{}, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var root map[string]interface{}
+	if err := decoder.Decode(&root); err != nil {
+		return nil, err
+	}
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	return root, nil
 }
 
 // responsesRecoveryEligible reports whether a failed request contains account-local

@@ -97,7 +97,7 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 		"tiers": []map[string]interface{}{
 			{"tier": 1, "label": "official_codex_account", "compatibility": "full official Codex CLI skills/plugins/local tools path"},
 			{"tier": 2, "label": "custom_native_responses", "compatibility": "native /v1/responses pass-through; ChatGPT cloud plugins not promised"},
-			{"tier": 3, "label": "custom_chat_completions_bridge", "compatibility": "function tools only; typed Responses tools/items return explicit compatibility errors"},
+			{"tier": 3, "label": "custom_chat_completions_bridge", "compatibility": "function/namespace/custom/client tool-search bridge; hosted tools are omitted with explicit loss diagnostics"},
 		},
 		"checks": map[string]interface{}{
 			"official_codex_accounts": map[string]interface{}{
@@ -125,11 +125,11 @@ func (s *Server) adminSkillsCompatDoctor(w http.ResponseWriter, r *http.Request)
 			"chat_bridge_providers": map[string]interface{}{
 				"count":  chatBridgeProviders,
 				"status": checkStatus(chatBridgeProviders > 0, "no_chat_bridge_provider"),
-				"detail": "Tier 3 providers support basic Chat Completions/function tools only; official-only capabilities return capability_unavailable.",
+				"detail": "Tier 3 providers bridge stable function, namespace, custom, and client tool-search tools; unsupported hosted tools continue with X-Pool-Compatibility-Losses diagnostics.",
 			},
-			"chat_bridge_explicit_errors": map[string]interface{}{
+			"chat_bridge_loss_diagnostics": map[string]interface{}{
 				"status": "ok",
-				"detail": "chat_completions bridge rejects typed Responses tools and unknown input items instead of silently dropping them",
+				"detail": "chat_completions bridge reports sorted compatibility losses in response headers/trailers and usage_records.compatibility_losses_json",
 			},
 			"custom_provider_protocols": map[string]interface{}{
 				"status": "ok",
@@ -179,8 +179,8 @@ func customProviderCompatTier(p storage.CustomProvider) (int, string, []string) 
 		return 2, "custom_native_responses", []string{"ChatGPT account-scoped cloud plugins/connectors remain best-effort"}
 	}
 	return 3, "custom_chat_completions_bridge", []string{
-		"Responses typed tools such as web_search are unsupported",
-		"unknown Responses input/output item types are rejected explicitly",
+		"hosted Responses tools such as web_search and server tool-search are omitted with compatibility diagnostics",
+		"unknown Responses history items are preserved in versioned JSON envelopes",
 		"ChatGPT account-scoped cloud plugins/connectors are unavailable",
 	}
 }
