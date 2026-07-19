@@ -2406,6 +2406,235 @@ func TestOrphanedToolOutputHTTP400DegradesAndRetries(t *testing.T) {
 	}
 }
 
+func TestPreviousResponseNotFoundHTTP400DegradesAndRetries(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
+		if r.Header.Get("Authorization") == "Bearer access-previous-a" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"Previous response resp_missing was not found.","type":"previous_response_not_found","param":"previous_response_id"}}`)
+			return
+		}
+		if r.Header.Get("X-Codex-Turn-State") != "" || strings.Contains(body, "previous_response_id") || strings.Contains(body, `"turn_state"`) || strings.Contains(body, `"type":"function_call_output"`) {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = fmt.Fprintf(w, `{"error":"retry retained stale context: %s"}`, body)
+			return
+		}
+		for _, want := range []string{"preserve previous-response tool result", "900719925474099312345", "encrypted-result"} {
+			if !strings.Contains(body, want) {
+				w.WriteHeader(http.StatusUnprocessableEntity)
+				_, _ = fmt.Fprintf(w, `{"error":"degraded replay lost %s"}`, want)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_previous_degraded","object":"response","status":"completed","model":"gpt","output_text":"ok"}`)
+	})
+	accountA := h.importAccount(t, "previous-a", "upstream-previous-a", "access-previous-a")
+	h.importAccount(t, "previous-b", "upstream-previous-b", "access-previous-b")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"gpt","previous_response_id":"resp_missing","turn_state":{"opaque":"old"},"input":[{"type":"function_call_output","call_id":"call_previous","status":"completed","output":{"text":"preserve previous-response tool result","n":900719925474099312345},"encrypted_content":"encrypted-result"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	keyReq.Header.Set("X-Codex-Turn-State", "previous-account-state")
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "previous-account-state")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_previous_degraded") {
+		t.Fatalf("recovery status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "degraded" {
+		t.Fatalf("context status=%q, want degraded", got)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-previous-a" || requests[1].Auth != "Bearer access-previous-b" {
+		t.Fatalf("context recovery did not switch accounts once: %+v", requests)
+	}
+	account, err := h.store.GetAccount(context.Background(), accountA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("previous-response error changed account health: %+v", account)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), accountA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.CooldownUntil != 0 || binding.RecheckPending {
+		t.Fatalf("previous-response error cooled/recheck-gated the account: %+v", binding)
+	}
+	if got := atomic.LoadUint64(&h.app.contextDegraded); got != 1 {
+		t.Fatalf("context degraded counter = %d, want 1", got)
+	}
+}
+
+func TestPreviousResponseNotFoundRebuildsFromJournal(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
+		if r.Header.Get("Authorization") == "Bearer access-rebuild-a" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"type":"previous_response_not_found","message":"Previous response resp_previous_journal was not found."}}`)
+			return
+		}
+		callIndex := strings.Index(body, `"type":"custom_tool_call"`)
+		outputIndex := strings.Index(body, `"type":"custom_tool_call_output"`)
+		if r.Header.Get("X-Codex-Turn-State") != "" || strings.Contains(body, "previous_response_id") || strings.Contains(body, `"turn_state"`) || callIndex < 0 || outputIndex <= callIndex || !strings.Contains(body, "journal result") || !strings.Contains(body, "900719925474099312345") {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = fmt.Fprintf(w, `{"error":"invalid rebuilt replay: %s"}`, body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_previous_rebuilt","object":"response","status":"completed","model":"gpt","output_text":"ok"}`)
+	})
+	accountA := h.importAccount(t, "rebuild-a", "upstream-rebuild-a", "access-rebuild-a")
+	h.importAccount(t, "rebuild-b", "upstream-rebuild-b", "access-rebuild-b")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	journalPayload := `{"model":"gpt","turn_state":{"opaque":"journal"},"tools":[{"type":"function","name":"big","parameters":{"type":"object","properties":{"n":{"const":900719925474099312345}}}}],"input":[{"type":"custom_tool_call","call_id":"call_previous_journal","name":"apply_patch","input":"{}"}]}`
+	if err := h.store.PutContextJournal(context.Background(), storage.ContextJournal{ResponseID: "resp_previous_journal", AccountID: accountA, Payload: journalPayload, ExpiresAt: time.Now().Add(time.Hour).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt","previous_response_id":"resp_previous_journal","input":[{"type":"custom_tool_call_output","call_id":"call_previous_journal","output":"journal result"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	keyReq.Header.Set("X-Codex-Turn-State", "rebuild-account-state")
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "rebuild-account-state")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_previous_rebuilt") {
+		t.Fatalf("rebuild status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "rebuilt" {
+		t.Fatalf("context status=%q, want rebuilt", got)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-rebuild-a" || requests[1].Auth != "Bearer access-rebuild-b" {
+		t.Fatalf("journal recovery did not switch accounts once: %+v", requests)
+	}
+	if got := atomic.LoadUint64(&h.app.contextRebuilt); got != 1 {
+		t.Fatalf("context rebuilt counter = %d, want 1", got)
+	}
+}
+
+func TestPreviousResponseNotFoundSingleAccountRepairsOnlyOnce(t *testing.T) {
+	var attempts int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		inner := `{"type":"error","error":{"type":"previous_response_not_found","message":"Previous response resp_single_missing was not found."},"status":400}`
+		wrapped, _ := json.Marshal(map[string]interface{}{
+			"error":  map[string]interface{}{"type": "upstream_error", "message": inner},
+			"status": 400,
+			"type":   "error",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write(wrapped)
+	})
+	accountID := h.importAccount(t, "previous-single", "upstream-previous-single", "access-previous-single")
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt","previous_response_id":"resp_single_missing","turn_state":{"opaque":"old"},"input":[{"role":"user","content":"continue"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || atomic.LoadInt32(&attempts) != 2 {
+		t.Fatalf("single-account status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "degraded" {
+		t.Fatalf("context status=%q, want degraded", got)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-previous-single" || requests[1].Auth != "Bearer access-previous-single" {
+		t.Fatalf("single account was not retried exactly once: %+v", requests)
+	}
+	if strings.Contains(requests[1].Body, "previous_response_id") || strings.Contains(requests[1].Body, `"turn_state"`) || !strings.Contains(requests[1].Body, "continue") {
+		t.Fatalf("single-account retry was not stateless: %s", requests[1].Body)
+	}
+	account, err := h.store.GetAccount(context.Background(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("repeated context error changed account health: %+v", account)
+	}
+	if got := atomic.LoadUint64(&h.app.contextDegraded); got != 1 {
+		t.Fatalf("context degraded counter = %d, want exactly one", got)
+	}
+}
+
+func TestUnrelatedHTTP400DoesNotRecoverResponsesContext(t *testing.T) {
+	var attempts int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_previous_response","message":"The request is invalid."}}`)
+	})
+	accountID := h.importAccount(t, "ordinary-400", "upstream-ordinary-400", "access-ordinary-400")
+	body := `{"model":"gpt","previous_response_id":"resp_invalid","input":[{"role":"user","content":"continue"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || atomic.LoadInt32(&attempts) != 1 {
+		t.Fatalf("ordinary 400 status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "" {
+		t.Fatalf("ordinary 400 unexpectedly recovered context: %q", got)
+	}
+	if got := atomic.LoadUint64(&h.app.contextRebuilt) + atomic.LoadUint64(&h.app.contextDegraded); got != 0 {
+		t.Fatalf("ordinary 400 changed context recovery counters: %d", got)
+	}
+}
+
 func TestOrphanedToolOutputAccountSwitchRepairsIncompleteDownstreamContext(t *testing.T) {
 	const callID = "call_LhyrFDALDxT1GOWETYWfgfRz"
 	const observedError = `{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`

@@ -256,22 +256,34 @@ func NewSSEFilter(provider string, words *streamrewrite.Matcher) *SSEFilter {
 	return &SSEFilter{provider: provider, words: words}
 }
 
-// CodexFailureFrame is a terminal, account-retryable error carried inside a
-// successful HTTP SSE response. The Responses HTTP transport normally emits
-// response.failed, while the official Responses-over-WebSocket transport emits
-// type:error with the real status and quota headers embedded in the JSON body.
+// CodexFailureFrame is a terminal error carried inside a successful HTTP SSE
+// response that can be handled before downstream content is committed. The
+// Responses HTTP transport normally emits response.failed, while the official
+// Responses-over-WebSocket transport emits type:error with the real status and
+// quota headers embedded in the JSON body.
 type CodexFailureFrame struct {
-	EventType          string
-	StatusCode         int
-	OrphanedToolOutput bool
-	Header             http.Header
-	Body               []byte
+	EventType    string
+	StatusCode   int
+	ContextError ResponsesContextErrorKind
+	Header       http.Header
+	Body         []byte
 }
 
+// ResponsesContextErrorKind identifies the precise upstream 400s that mean a
+// Responses request lost account-local context. These errors are recoverable by
+// rebuilding or degrading the request and must not affect account health.
+type ResponsesContextErrorKind string
+
+const (
+	ResponsesContextErrorNone                     ResponsesContextErrorKind = ""
+	ResponsesContextErrorOrphanedToolOutput       ResponsesContextErrorKind = "orphaned_tool_output"
+	ResponsesContextErrorPreviousResponseNotFound ResponsesContextErrorKind = "previous_response_not_found"
+)
+
 // ParseRetryableCodexFailureFrame recognizes both Codex terminal error envelopes.
-// It deliberately requires either an account-retryable HTTP status or a known
-// limit/overload signature so a genuine client error (for example an invalid
-// request or invalid cache key) is never moved to another account.
+// It deliberately requires an account-retryable HTTP status, a known limit/overload
+// signature, or a precise context-loss error so a genuine client error (for example
+// an invalid request or invalid cache key) is never moved to another account.
 func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	eventType, data := parseSSEFrame(frame)
 	if len(data) == 0 {
@@ -300,12 +312,12 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	if status == 0 {
 		status = jsonInt(envelope.Status)
 	}
-	orphanedToolOutput := IsOrphanedToolCallOutputError(status, data)
+	contextError := DetectResponsesContextError(status, data)
 	statusRetryable := status == http.StatusUnauthorized || status == http.StatusForbidden ||
 		status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
 		status == http.StatusServiceUnavailable || status >= 500
 	signatureRetryable := containsAnyFold(lower, codexFailedLeakSignatures)
-	if !statusRetryable && !signatureRetryable && !orphanedToolOutput {
+	if !statusRetryable && !signatureRetryable && contextError == ResponsesContextErrorNone {
 		return CodexFailureFrame{}, false
 	}
 	if status == 0 {
@@ -323,38 +335,43 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		}
 	}
 	return CodexFailureFrame{
-		EventType:          kind,
-		StatusCode:         status,
-		OrphanedToolOutput: orphanedToolOutput,
-		Header:             header,
-		Body:               append([]byte(nil), data...),
+		EventType:    kind,
+		StatusCode:   status,
+		ContextError: contextError,
+		Header:       header,
+		Body:         append([]byte(nil), data...),
 	}, true
 }
 
-// IsOrphanedToolCallOutputError recognizes only the Responses 400 emitted when
-// an output references a tool call that is absent from the supplied/server-side
-// context. Matching the structured error message keeps unrelated client 400s out
-// of the transparent context-recovery path.
-func IsOrphanedToolCallOutputError(status int, body []byte) bool {
+// DetectResponsesContextError recognizes only the Responses 400s that indicate
+// missing account-local context. Matching structured fields/messages keeps unrelated
+// invalid_request_error responses out of the transparent recovery path.
+func DetectResponsesContextError(status int, body []byte) ResponsesContextErrorKind {
 	if status != http.StatusBadRequest {
-		return false
+		return ResponsesContextErrorNone
 	}
 	const maxStructuredErrorBytes = 64 << 10
 	if len(body) == 0 || len(body) > maxStructuredErrorBytes {
-		return false
+		return ResponsesContextErrorNone
 	}
 	remaining := maxStructuredErrorBytes
-	return orphanedToolOutputInStructuredError(body, 0, &remaining)
+	return responsesContextErrorInStructuredError(body, 0, &remaining)
 }
 
-// orphanedToolOutputInStructuredError follows only the error-message wrapping used by
-// the Responses transports. Some gateways serialize the real OpenAI error object into
-// error.message, and a second relay can do that once more. Limiting both depth and the
-// cumulative decoded bytes prevents a client-controlled 400 from turning recovery
+// IsOrphanedToolCallOutputError is kept for callers that only care about the original
+// missing-tool-call subtype. New recovery code should use DetectResponsesContextError.
+func IsOrphanedToolCallOutputError(status int, body []byte) bool {
+	return DetectResponsesContextError(status, body) == ResponsesContextErrorOrphanedToolOutput
+}
+
+// responsesContextErrorInStructuredError follows only the error-message wrapping used
+// by the Responses transports. Some gateways serialize the real OpenAI error object
+// into error.message, and a second relay can do that once more. Limiting both depth and
+// the cumulative decoded bytes prevents a client-controlled 400 from turning recovery
 // detection into an unbounded recursive JSON parser.
-func orphanedToolOutputInStructuredError(raw []byte, depth int, remaining *int) bool {
+func responsesContextErrorInStructuredError(raw []byte, depth int, remaining *int) ResponsesContextErrorKind {
 	if depth > 2 || remaining == nil || len(raw) == 0 || len(raw) > *remaining {
-		return false
+		return ResponsesContextErrorNone
 	}
 	*remaining -= len(raw)
 
@@ -362,28 +379,62 @@ func orphanedToolOutputInStructuredError(raw []byte, depth int, remaining *int) 
 	decoder.UseNumber()
 	var root map[string]interface{}
 	if err := decoder.Decode(&root); err != nil {
-		return false
+		return ResponsesContextErrorNone
 	}
 	var trailing interface{}
 	if decoder.Decode(&trailing) != io.EOF {
-		return false
+		return ResponsesContextErrorNone
+	}
+
+	if hasPreviousResponseNotFoundType(root) {
+		return ResponsesContextErrorPreviousResponseNotFound
 	}
 
 	messages := structuredErrorMessages(root)
 	for _, message := range messages {
 		if isMissingPairedToolOutputMessage(message) {
-			return true
+			return ResponsesContextErrorOrphanedToolOutput
 		}
 	}
 	if depth == 2 {
-		return false
+		return ResponsesContextErrorNone
 	}
 	for _, message := range messages {
 		nested := strings.TrimSpace(message)
 		if len(nested) < 2 || nested[0] != '{' || nested[len(nested)-1] != '}' {
 			continue
 		}
-		if orphanedToolOutputInStructuredError([]byte(nested), depth+1, remaining) {
+		if kind := responsesContextErrorInStructuredError([]byte(nested), depth+1, remaining); kind != ResponsesContextErrorNone {
+			return kind
+		}
+	}
+	return ResponsesContextErrorNone
+}
+
+func hasPreviousResponseNotFoundType(root map[string]interface{}) bool {
+	if root == nil {
+		return false
+	}
+	matches := func(detail map[string]interface{}) bool {
+		if detail == nil {
+			return false
+		}
+		for _, field := range []string{"type", "code"} {
+			value, _ := detail[field].(string)
+			if strings.TrimSpace(value) == string(ResponsesContextErrorPreviousResponseNotFound) {
+				return true
+			}
+		}
+		return false
+	}
+	if matches(root) {
+		return true
+	}
+	if detail, ok := root["error"].(map[string]interface{}); ok && matches(detail) {
+		return true
+	}
+	if response, ok := root["response"].(map[string]interface{}); ok {
+		if detail, ok := response["error"].(map[string]interface{}); ok && matches(detail) {
 			return true
 		}
 	}

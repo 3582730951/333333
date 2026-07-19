@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"codex-account-pool/internal/leakfilter"
 )
 
 func TestDegradedReplayNeutralizesOrphanedToolOutput(t *testing.T) {
@@ -112,18 +114,22 @@ func TestDegradedReplayPreservesStructuredToolOutputAndLargeIntegers(t *testing.
 	}
 }
 
-func TestOrphanedToolCallOutputErrorDetection(t *testing.T) {
+func TestResponsesContextErrorDetection(t *testing.T) {
 	msg := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id call_HkoKDDLSh5YyziVSnZZjYmFK."}}`)
-	if !isOrphanedToolCallOutputError(400, msg) {
+	if got := responsesContextError(400, msg); got != leakfilter.ResponsesContextErrorOrphanedToolOutput {
 		t.Fatal("should detect the orphaned tool-call-output 400")
 	}
-	if isOrphanedToolCallOutputError(429, msg) {
+	previous := []byte(`{"error":{"type":"previous_response_not_found","message":"Previous response resp_missing was not found."}}`)
+	if got := responsesContextError(400, previous); got != leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+		t.Fatalf("previous-response error kind = %q", got)
+	}
+	if got := responsesContextError(429, msg); got != leakfilter.ResponsesContextErrorNone {
 		t.Fatal("only a 400 should match")
 	}
-	if isOrphanedToolCallOutputError(400, []byte(`{"error":{"message":"invalid api key"}}`)) {
+	if got := responsesContextError(400, []byte(`{"error":{"message":"invalid api key"}}`)); got != leakfilter.ResponsesContextErrorNone {
 		t.Fatal("an unrelated 400 must not match")
 	}
-	if isOrphanedToolCallOutputError(400, []byte(`{"error":{"message":"tool call output has an invalid call_id"}}`)) {
+	if got := responsesContextError(400, []byte(`{"error":{"message":"tool call output has an invalid call_id"}}`)); got != leakfilter.ResponsesContextErrorNone {
 		t.Fatal("a generic call_id validation error must not match")
 	}
 }

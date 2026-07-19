@@ -607,7 +607,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	current := codexRetryRequest{Raw: raw, Header: currentHeader, Recovered: contextRecovered}
 	// Context repair has its own one-shot attempt. It is deliberately independent of
 	// seamless_failover and failover_max_attempts: even a single-account deployment with
-	// failover disabled gets one stateless replay after the precise orphan-output 400.
+	// failover disabled gets one stateless replay after a precise Responses context 400.
 	// Incrementing attemptsRemaining only when that repair is selected makes it an extra
 	// attempt without opening another generic failover round.
 	contextRepairAvailable := !contextRecovered
@@ -851,8 +851,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		log.Printf("[CONTEXT-REBUILT] request_id=%s account=%s reason=%s", requestIDFromContext(r.Context()), lease.Account.ID, reason)
 		return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: rebuilt, Header: stripCodexServerStateHeaders(baseHeader), Recovered: true}}, true
 	}
-	tryRecoverOrphanedOutput := func(status int, errorBody []byte, reason string) (codexAttemptResult, bool) {
-		if !isOrphanedToolCallOutputError(status, errorBody) {
+	tryRecoverResponsesContext := func(contextError leakfilter.ResponsesContextErrorKind, reason string) (codexAttemptResult, bool) {
+		if contextError == leakfilter.ResponsesContextErrorNone {
 			return codexAttemptResult{}, false
 		}
 		// This error describes stale request context, not account health. Handle it
@@ -860,7 +860,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		if !allowContextRepair || contextRecovered {
 			return codexAttemptResult{}, false
 		}
-		recovered, contextStatus, ok := s.recoverOrphanedToolOutput(r.Context(), raw, baseHeader)
+		recovered, contextStatus, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader)
 		if !ok {
 			return codexAttemptResult{}, false
 		}
@@ -883,7 +883,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		} else {
 			atomic.AddUint64(&s.contextDegraded, 1)
 		}
-		log.Printf("[CONTEXT-%s] request_id=%s account=%s reason=%s", strings.ToUpper(contextStatus), requestIDFromContext(r.Context()), lease.Account.ID, reason)
+		log.Printf("[CONTEXT-%s] request_id=%s account=%s reason=%s error_category=%s", strings.ToUpper(contextStatus), requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
 		return codexAttemptResult{Outcome: outcomeRetry, Retry: recovered, ContextRecovery: true}, true
 	}
 
@@ -971,19 +971,20 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
-		handleOrphanedAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
-			if !isOrphanedToolCallOutputError(status, body) {
+		handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
+			contextError := responsesContextError(status, body)
+			if contextError == leakfilter.ResponsesContextErrorNone {
 				return codexAttemptResult{}, false
 			}
-			if recovered, ok := tryRecoverOrphanedOutput(status, body, reason); ok {
+			if recovered, ok := tryRecoverResponsesContext(contextError, reason); ok {
 				_ = s.settleBillingHold(r.Context(), holdID, "context_recovery_retry")
 				return recovered, true
 			}
-			_ = s.settleBillingHold(r.Context(), holdID, "orphaned_tool_output_terminal")
+			_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
 			s.writeFilteredError(r.Context(), w, "codex", status, header, body, codexScrubber)
 			return codexAttemptResult{Outcome: outcomeDone}, true
 		}
-		if handled, ok := handleOrphanedAttemptError(resp.StatusCode, resp.Header, errorBody, "http_orphaned_tool_output"); ok {
+		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
 			return handled
 		}
 		detection := cf.Detect(resp.StatusCode, resp.Header, errorBody)
@@ -1008,7 +1009,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 					goto codexSuccess
 				}
 				errorBody = readUpstreamErrorBody(resp.Body)
-				if handled, ok := handleOrphanedAttemptError(resp.StatusCode, resp.Header, errorBody, "http_orphaned_tool_output_after_auth_refresh"); ok {
+				if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_auth_refresh"); ok {
 					return handled
 				}
 				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
@@ -1042,7 +1043,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				goto codexSuccess
 			} else {
 				errorBody = readUpstreamErrorBody(resp.Body)
-				if handled, ok := handleOrphanedAttemptError(resp.StatusCode, resp.Header, errorBody, "http_orphaned_tool_output_after_ws_fallback"); ok {
+				if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_ws_fallback"); ok {
 					return handled
 				}
 				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
@@ -1072,7 +1073,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				goto codexSuccess
 			}
 			errorBody = readUpstreamErrorBody(resp.Body)
-			if handled, ok := handleOrphanedAttemptError(resp.StatusCode, resp.Header, errorBody, "http_orphaned_tool_output_after_version_retry"); ok {
+			if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_version_retry"); ok {
 				return handled
 			}
 			detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
@@ -1092,7 +1093,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				goto codexSuccess
 			} else {
 				errorBody = readUpstreamErrorBody(resp.Body)
-				if handled, ok := handleOrphanedAttemptError(resp.StatusCode, resp.Header, errorBody, "http_orphaned_tool_output_after_reset_retry"); ok {
+				if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_reset_retry"); ok {
 					return handled
 				}
 				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
@@ -1314,13 +1315,13 @@ codexSuccess:
 			}
 			failureStatus := streamFailure.StatusCode
 			failureBody := streamFailure.Body
-			if streamFailure.OrphanedToolOutput {
+			if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone {
 				_ = resp.Body.Close()
-				if recovered, ok := tryRecoverOrphanedOutput(failureStatus, failureBody, "stream_orphaned_tool_output"); ok {
+				if recovered, ok := tryRecoverResponsesContext(streamFailure.ContextError, "stream_context_error"); ok {
 					_ = s.settleBillingHold(r.Context(), holdID, "context_recovery_retry")
 					return recovered
 				}
-				_ = s.settleBillingHold(r.Context(), holdID, "orphaned_tool_output_terminal")
+				_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
 				s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
 				return codexAttemptResult{Outcome: outcomeDone}
 			}

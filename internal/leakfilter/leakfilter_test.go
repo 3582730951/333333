@@ -203,7 +203,7 @@ func TestRetryableCodexFailureFrameAcceptsOrphanedToolOutputStatus(t *testing.T)
 	if !ok {
 		t.Fatal("orphaned tool output carried in status:400 was not recognized")
 	}
-	if failure.StatusCode != http.StatusBadRequest || !failure.OrphanedToolOutput {
+	if failure.StatusCode != http.StatusBadRequest || failure.ContextError != ResponsesContextErrorOrphanedToolOutput {
 		t.Fatalf("failure = %+v", failure)
 	}
 }
@@ -226,9 +226,41 @@ func TestRetryableCodexFailureFrameAcceptsWrappedOrphanStatusAndStatusCode(t *te
 		frame := append([]byte("event: "+tc.event+"\ndata: "), payload...)
 		frame = append(frame, []byte("\n\n")...)
 		failure, ok := ParseRetryableCodexFailureFrame(frame)
-		if !ok || failure.StatusCode != http.StatusBadRequest || !failure.OrphanedToolOutput {
+		if !ok || failure.StatusCode != http.StatusBadRequest || failure.ContextError != ResponsesContextErrorOrphanedToolOutput {
 			t.Fatalf("%s wrapped orphan failure = %+v, ok=%v, payload=%s", tc.name, failure, ok, payload)
 		}
+	}
+}
+
+func TestRetryableCodexFailureFrameAcceptsPreviousResponseNotFoundStatusFields(t *testing.T) {
+	for _, tc := range []struct {
+		name, event, typ, field string
+	}{
+		{name: "http_sse_status", event: "response.failed", typ: "response.failed", field: "status"},
+		{name: "websocket_status_code", event: "error", typ: "error", field: "status_code"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inner, _ := json.Marshal(map[string]interface{}{
+				"type": "error",
+				"error": map[string]interface{}{
+					"type": "previous_response_not_found", "message": "Previous response resp_missing was not found.",
+				},
+				"status": 400,
+			})
+			payload, _ := json.Marshal(map[string]interface{}{
+				"type":   tc.typ,
+				tc.field: 400,
+				"error": map[string]interface{}{
+					"type": "upstream_error", "message": string(inner),
+				},
+			})
+			frame := append([]byte("event: "+tc.event+"\ndata: "), payload...)
+			frame = append(frame, []byte("\n\n")...)
+			failure, ok := ParseRetryableCodexFailureFrame(frame)
+			if !ok || failure.StatusCode != http.StatusBadRequest || failure.ContextError != ResponsesContextErrorPreviousResponseNotFound {
+				t.Fatalf("failure = %+v, ok=%v, payload=%s", failure, ok, payload)
+			}
+		})
 	}
 }
 
@@ -280,6 +312,63 @@ func TestOrphanedToolOutputErrorRecognizesObservedProxyWrapper(t *testing.T) {
 	body := []byte(`{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`)
 	if !IsOrphanedToolCallOutputError(http.StatusBadRequest, body) {
 		t.Fatalf("observed nested proxy error was not recognized: %s", body)
+	}
+}
+
+func TestResponsesContextErrorRecognizesPreviousResponseNotFound(t *testing.T) {
+	directType := []byte(`{"error":{"message":"Previous response resp_missing was not found.","type":"previous_response_not_found","param":"previous_response_id"}}`)
+	directCode := []byte(`{"error":{"message":"Previous response resp_missing was not found.","type":"invalid_request_error","code":"previous_response_not_found"}}`)
+	inner := `{"type":"error","error":{"type":"previous_response_not_found","message":"Previous response resp_missing was not found."},"status":400}`
+	wrapped, _ := json.Marshal(map[string]interface{}{
+		"error":  map[string]interface{}{"type": "upstream_error", "message": inner},
+		"status": 400,
+		"type":   "error",
+	})
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "direct_type", body: directType},
+		{name: "direct_code", body: directCode},
+		{name: "message_wrapped", body: wrapped},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DetectResponsesContextError(http.StatusBadRequest, tc.body); got != ResponsesContextErrorPreviousResponseNotFound {
+				t.Fatalf("kind = %q, body=%s", got, tc.body)
+			}
+		})
+	}
+	if got := DetectResponsesContextError(http.StatusNotFound, directType); got != ResponsesContextErrorNone {
+		t.Fatalf("non-400 status matched as %q", got)
+	}
+}
+
+func TestResponsesContextErrorRejectsInvalidPreviousResponseErrors(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"type":"invalid_request_error","message":"previous_response_not_found"}}`),
+		[]byte(`{"error":{"type":"previous_response_not_found_later","message":"missing"}}`),
+		[]byte(`{"error":{"type":"invalid_request_error","code":"previous_response_not_found_extra","message":"missing"}}`),
+		[]byte(`{"error":{"type":"invalid_request_error","param":"previous_response_id","message":"Previous response was invalid"}}`),
+		[]byte(`{"error":{"message":"{malformed"}}`),
+	} {
+		if got := DetectResponsesContextError(http.StatusBadRequest, body); got != ResponsesContextErrorNone {
+			t.Fatalf("invalid error matched as %q: %s", got, body)
+		}
+	}
+
+	tooDeep := `{"error":{"type":"previous_response_not_found","message":"missing"}}`
+	for i := 0; i < 3; i++ {
+		wrapped, _ := json.Marshal(map[string]interface{}{"error": map[string]interface{}{"message": tooDeep}})
+		tooDeep = string(wrapped)
+	}
+	if got := DetectResponsesContextError(http.StatusBadRequest, []byte(tooDeep)); got != ResponsesContextErrorNone {
+		t.Fatalf("over-deep wrapper matched as %q", got)
+	}
+
+	oversized := append([]byte(`{"error":{"type":"previous_response_not_found","message":"`), bytes.Repeat([]byte("x"), 64<<10)...)
+	oversized = append(oversized, []byte(`"}}`)...)
+	if got := DetectResponsesContextError(http.StatusBadRequest, oversized); got != ResponsesContextErrorNone {
+		t.Fatalf("oversized error matched as %q", got)
 	}
 }
 

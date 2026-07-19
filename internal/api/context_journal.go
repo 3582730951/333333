@@ -301,12 +301,11 @@ func toolOutputText(v interface{}) string {
 	}
 }
 
-// isOrphanedToolCallOutputError recognizes the upstream 400 that fires when a tool-call
-// OUTPUT in the input references a call the upstream can no longer find (its server-side
-// state, held by previous_response_id, is gone) — e.g. "No tool call found for custom
-// tool call output with call_id ...".
-func isOrphanedToolCallOutputError(status int, body []byte) bool {
-	return leakfilter.IsOrphanedToolCallOutputError(status, body)
+// responsesContextError recognizes the precise upstream 400s that mean account-local
+// Responses context is unavailable: either previous_response_id itself is gone, or a
+// tool output references a call that disappeared with that context.
+func responsesContextError(status int, body []byte) leakfilter.ResponsesContextErrorKind {
+	return leakfilter.DetectResponsesContextError(status, body)
 }
 
 // responsesNeedsDegrade reports whether degradedResponsesReplay would actually change the
@@ -360,11 +359,11 @@ func responsesRecoveryEligible(body []byte, header http.Header) bool {
 	return false
 }
 
-// recoverOrphanedToolOutput builds the one permitted retry after the upstream says a
-// tool result has no matching call. Journal replay is lossless and therefore wins;
-// otherwise degradation preserves each orphan's output as a user message. Both paths
-// discard every account-local state pointer before selecting a fresh account.
-func (s *Server) recoverOrphanedToolOutput(ctx context.Context, body []byte, header http.Header) (codexRetryRequest, string, bool) {
+// recoverResponsesContext builds the one permitted retry after the upstream reports
+// missing Responses context. Journal replay is lossless and therefore wins; otherwise
+// degradation preserves current input and rewrites orphaned tool outputs as user
+// context. Both paths discard every account-local state pointer before retrying.
+func (s *Server) recoverResponsesContext(ctx context.Context, body []byte, header http.Header) (codexRetryRequest, string, bool) {
 	if rebuilt, ok := s.journalReplayBody(ctx, body); ok {
 		return codexRetryRequest{
 			Raw:       rebuilt,
