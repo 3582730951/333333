@@ -205,6 +205,52 @@ func NeutralizeErrorBody(provider string, status int, body []byte) (int, []byte,
 	return outStatus, nb, true
 }
 
+const responsesContextUnavailableMessage = "The service is temporarily unavailable. Please retry shortly."
+
+// NeutralizeResponsesContextErrorBody replaces an internal Responses context-loss
+// error with an account-agnostic server error. Unlike quota leak scrubbing, this is a
+// protocol-safety invariant: call IDs and serialized upstream wrappers must never be
+// exposed even when leak scrubbing is disabled or the one recovery attempt fails.
+func NeutralizeResponsesContextErrorBody(status int, body []byte) (int, []byte, bool) {
+	if DetectResponsesContextError(status, body) == ResponsesContextErrorNone {
+		return status, body, false
+	}
+	payload := map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": responsesContextUnavailableMessage,
+			"type":    "server_error",
+		},
+	}
+	nb, err := json.Marshal(payload)
+	if err != nil {
+		return status, body, false
+	}
+	return http.StatusServiceUnavailable, nb, true
+}
+
+// NeutralizeResponsesContextErrorSSEFrame is the streaming counterpart of
+// NeutralizeResponsesContextErrorBody. It preserves a valid terminal Responses event
+// after downstream content has committed, where transparent retry is no longer safe.
+func NeutralizeResponsesContextErrorSSEFrame(frame []byte) ([]byte, bool) {
+	failure, ok := ParseCodexFailureFrame(frame)
+	if !ok || failure.ContextError == ResponsesContextErrorNone {
+		return frame, false
+	}
+	payload := map[string]interface{}{
+		"type":   "error",
+		"status": http.StatusServiceUnavailable,
+		"error": map[string]interface{}{
+			"message": responsesContextUnavailableMessage,
+			"type":    "server_error",
+		},
+	}
+	nb, err := json.Marshal(payload)
+	if err != nil {
+		return frame, false
+	}
+	return []byte("event: error\ndata: " + string(nb) + "\n\n"), true
+}
+
 // NeutralizeResponsesJSON inspects a NON-streaming Codex /v1/responses body that
 // came back HTTP 200 but whose top-level status reports a soft failure carrying
 // pool-internal limit/quota/model-switch state. It only ever reads the response
@@ -609,15 +655,20 @@ func (f *SSEFilter) Copy(w io.Writer, src io.Reader) error {
 // HTTP-200 stream, which Claude Code reports as "API returned an empty or malformed
 // response (HTTP 200)" / a JSON parse failure; a well-formed error event instead
 // lets the client render the error and run its normal retry/backoff. For the Codex
-// protocol, purely-informational limit/metadata frames are still dropped (those
-// clients tolerate their absence). Kept frames have sensitive words scrubbed.
+// protocol, context-loss errors are rewritten to a generic terminal event while
+// purely-informational limit/metadata frames are still dropped (those clients
+// tolerate their absence). Kept frames have sensitive words scrubbed.
 func (f *SSEFilter) processFrame(frame []byte) []byte {
 	if f.provider == "claude" {
 		if nb, ok := f.neutralizeClaudeError(frame); ok {
 			frame = nb
 		}
-	} else if f.shouldDropCodex(frame) {
-		return nil
+	} else {
+		if nb, ok := NeutralizeResponsesContextErrorSSEFrame(frame); ok {
+			frame = nb
+		} else if f.shouldDropCodex(frame) {
+			return nil
+		}
 	}
 	if f.words != nil && !f.words.Empty() {
 		return f.words.ReplaceAll(frame)

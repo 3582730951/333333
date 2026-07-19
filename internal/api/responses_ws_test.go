@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/routing"
 	"github.com/gorilla/websocket"
 )
 
@@ -66,6 +67,50 @@ func TestResponsesWebSocketRequestConversionPreservesContextBytes(t *testing.T) 
 	}
 	if string(after["stream"]) != "true" {
 		t.Fatalf("stream default missing: %s", body)
+	}
+}
+
+func TestResponsesWebSocketAppendUsesTheSameLosslessRequestEnvelope(t *testing.T) {
+	raw := []byte(`{"type":"response.append","model":"gpt-5.6-sol","previous_response_id":"resp_keep","reasoning":{"effort":"high"},"tools":[{"parameters":{"const":900719925474099312345}}],"input":[{"type":"custom_tool_call_output","call_id":"call_1","output":{"n":900719925474099312345}}]}`)
+	kind, body, err := responsesWebSocketRequestToBody(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != "response.append" {
+		t.Fatalf("kind = %q", kind)
+	}
+	var before, after map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &before); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &after); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"model", "previous_response_id", "reasoning", "tools", "input"} {
+		if !bytes.Equal(before[key], after[key]) {
+			t.Fatalf("append field %q changed\nbefore=%s\n after=%s", key, before[key], after[key])
+		}
+	}
+	if _, present := after["type"]; present || string(after["stream"]) != "true" {
+		t.Fatalf("append envelope was not normalized: %s", body)
+	}
+}
+
+func TestResponsesWebSocketAppendCompletesPreviousResponseID(t *testing.T) {
+	state := &responsesWebSocketState{}
+	state.observe([]byte(`{"type":"response.completed","response":{"id":"resp_ws_previous","output":[]}}`))
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"next"}],"stream":true}`)
+	completed, err := state.completeAppend(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := routing.JSONStringField(completed, "previous_response_id"); got != "resp_ws_previous" {
+		t.Fatalf("previous_response_id=%q body=%s", got, completed)
+	}
+	explicit := []byte(`{"previous_response_id":"resp_client","input":[]}`)
+	unchanged, err := state.completeAppend(explicit)
+	if err != nil || !bytes.Equal(unchanged, explicit) {
+		t.Fatalf("explicit client context changed: err=%v body=%s", err, unchanged)
 	}
 }
 

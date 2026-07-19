@@ -13,12 +13,24 @@ import (
 )
 
 func TestGatewayDirectAllowsTwoHundredConcurrentStreams(t *testing.T) {
+	testGatewayDirectConcurrentStreams(t, 200, 5*time.Second)
+}
+
+func TestGatewayDirectAllowsOneThousandConcurrentStreams(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test")
+	}
+	testGatewayDirectConcurrentStreams(t, 1000, 20*time.Second)
+}
+
+func testGatewayDirectConcurrentStreams(t *testing.T, count int, timeout time.Duration) {
+	t.Helper()
 	var arrived atomic.Int64
 	allArrived := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if arrived.Add(1) == 200 {
+		if arrived.Add(1) == int64(count) {
 			once.Do(func() { close(allArrived) })
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -30,10 +42,10 @@ func TestGatewayDirectAllowsTwoHundredConcurrentStreams(t *testing.T) {
 		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"load\",\"model\":\"gpt\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\ndata: [DONE]\n\n")
 	})
 	h.importAccount(t, "load", "load-upstream", "load-token")
-	client := &http.Client{Transport: &http.Transport{MaxConnsPerHost: 0, MaxIdleConns: 256, MaxIdleConnsPerHost: 256}}
+	client := &http.Client{Transport: &http.Transport{MaxConnsPerHost: 0, MaxIdleConns: count, MaxIdleConnsPerHost: count}}
 	var wg sync.WaitGroup
-	errs := make(chan error, 200)
-	for i := 0; i < 200; i++ {
+	errs := make(chan error, count)
+	for i := 0; i < count; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -58,9 +70,9 @@ func TestGatewayDirectAllowsTwoHundredConcurrentStreams(t *testing.T) {
 	}
 	select {
 	case <-allArrived:
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		close(release)
-		t.Fatalf("only %d/200 streams reached upstream within 5s", arrived.Load())
+		t.Fatalf("only %d/%d streams reached upstream within %s", arrived.Load(), count, timeout)
 	}
 	close(release)
 	wg.Wait()

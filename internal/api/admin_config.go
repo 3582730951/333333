@@ -145,6 +145,8 @@ func (s *Server) effectiveSettings(ctx context.Context) map[string]interface{} {
 		"ban_auto_delete":                       s.flagEnabled(ctx, "ban_auto_delete", s.cfg.BanAutoDelete),
 		"rate_limit_guard_enabled":              s.flagEnabled(ctx, "rate_limit_guard_enabled", s.cfg.RateLimitGuardEnabled),
 		"max_concurrent_upstream":               s.cfg.MaxConcurrentUpstream,
+		"max_concurrent_upstream_effective":     false,
+		"max_concurrent_upstream_note":          "deprecated compatibility field; no process concurrency limit is enforced",
 		"allow_registration":                    s.flagEnabled(ctx, "allow_registration", true),
 	}
 }

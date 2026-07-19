@@ -130,16 +130,28 @@ func heapAllocBytes() uint64 {
 }
 
 func (c *Controller) run() {
-	t := time.NewTicker(250 * time.Millisecond)
+	t := time.NewTimer(0)
 	defer t.Stop()
 	for {
-		c.sample()
 		select {
 		case <-t.C:
+			c.sample()
+			t.Reset(admissionSampleInterval(c.Snapshot()))
 		case <-c.stop:
 			return
 		}
 	}
+}
+
+func admissionSampleInterval(s Snapshot) time.Duration {
+	if s.Paused {
+		return 250 * time.Millisecond
+	}
+	near := float64(100-s.HeadroomPercent) - 10
+	if s.CPUUsedPercent >= near || s.MemUsedPercent >= near || s.FDUsedPercent >= near {
+		return 250 * time.Millisecond
+	}
+	return 2 * time.Second
 }
 
 func (c *Controller) Close() { c.stopOnce.Do(func() { close(c.stop) }) }

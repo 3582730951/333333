@@ -701,6 +701,16 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	})
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
+			// The binding exists but its account can no longer serve the turn. Rebuild
+			// from the encrypted journal before surfacing an availability error; the
+			// replay is self-contained and may be scheduled on another account.
+			if allowContextRepair {
+				if rebuilt, status, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader, leakfilter.ResponsesContextErrorNone); ok && status == "rebuilt" {
+					w.Header().Set("X-MiCliProxy-Context-Status", status)
+					atomic.AddUint64(&s.contextRebuilt, 1)
+					return codexAttemptResult{Outcome: outcomeRetry, Retry: rebuilt, ContextRecovery: true}
+				}
+			}
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
 			return codexAttemptResult{Outcome: outcomeDone}
 		}

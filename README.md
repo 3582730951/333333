@@ -22,6 +22,7 @@
 - 空 prompt raw fast path：普通 responses 在不需要注入和不需要 Virtual 2M 时保持原始 body。
 - affinity/sticky 路由：parent thread、thread/conversation、window、prompt_cache_key、turn metadata、下游 key/project/model、稳定消息 hash。
 - strict sticky：compact、`previous_response_id`、`x-codex-turn-state`、`compaction_trigger`、tool-result continuation 不跨账号。
+- 并发默认无固定数量上限：`account_token_budget=0` 与 egress `max_concurrency=0` 表示不设硬上限；接近 CPU、内存或 FD 安全线时只做无损排队。`max_concurrent_upstream` 仅保留旧配置兼容，不参与调度。
 - 每账号模型窗口探测，`/v1/models` 根据能力返回 `native_2m` 或 `virtual_2m`。
 - Virtual/Pseudo 2M ledger + materialization。
 - Prompt cache 相关字段稳定透传，不降模型、不降 reasoning。

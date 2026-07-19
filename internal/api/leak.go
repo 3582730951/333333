@@ -156,8 +156,10 @@ func (sw *scannerResponseWriter) Flush() {
 
 // streamSSE forwards an upstream SSE stream to the client. When leak-scrub is on
 // it routes through the SSE frame filter (drops pool-internal rate-limit frames,
-// scrubs sensitive words); otherwise it uses the plain boundary-safe scrubbing
-// copy. provider is "claude" for the Anthropic protocol, "codex" otherwise.
+// scrubs sensitive words). With leak-scrub off, Codex still uses a frame-aligned
+// copy so internal Responses context errors can never expose call IDs; other
+// providers use the plain boundary-safe scrubbing copy. provider is "claude" for
+// the Anthropic protocol, "codex" otherwise.
 //
 // It also feeds the stream through a usage.StreamScanner and records the token usage
 // once the stream finishes. Streaming is the common case for real CLI traffic, so
@@ -189,7 +191,14 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 		// TestStreamKeepAliveOutputParity.
 		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, nil, s.leakScrubEnabled(ctx), words, provider, interval)
 	} else if !s.leakScrubEnabled(ctx) {
-		err = streamCopyRewrite(sw, body, words)
+		if provider == "codex" {
+			// Context-loss frames carry account-local call IDs and nested proxy
+			// envelopes. Keep this frame-level safety rewrite enabled independently of
+			// the optional pool leak scrubber, including after content has committed.
+			err = newRuleSSECopyWithHeartbeat(ctx, sw, body, nil, false, words, provider, 0)
+		} else {
+			err = streamCopyRewrite(sw, body, words)
+		}
 	} else {
 		err = leakfilter.NewSSEFilter(provider, words).Copy(sw, body)
 	}
@@ -288,8 +297,13 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		}
 		if leak {
 			out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
-		} else if words != nil && !words.Empty() {
-			out = words.ReplaceAll(out)
+		} else {
+			if provider == "codex" {
+				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
+			}
+			if words != nil && !words.Empty() {
+				out = words.ReplaceAll(out)
+			}
 		}
 		return emit(out)
 	}
@@ -492,8 +506,21 @@ func claudeSSEFrameCommitsContent(frame []byte) bool {
 // provider is "claude" for the Anthropic protocol, "codex" otherwise.
 func (s *Server) writeFilteredError(ctx context.Context, w http.ResponseWriter, provider string, status int, header http.Header, body []byte, words *streamrewrite.Matcher) {
 	out := body
+	filteredHeader := header
+	if !strings.EqualFold(provider, "claude") {
+		if ns, nb, changed := leakfilter.NeutralizeResponsesContextErrorBody(status, body); changed {
+			status = ns
+			out = nb
+			if header == nil {
+				filteredHeader = http.Header{}
+			} else {
+				filteredHeader = header.Clone()
+			}
+			filteredHeader.Set("Content-Type", "application/json")
+		}
+	}
 	if s.leakScrubEnabled(ctx) {
-		if ns, nb, changed := leakfilter.NeutralizeErrorBody(provider, status, body); changed {
+		if ns, nb, changed := leakfilter.NeutralizeErrorBody(provider, status, out); changed {
 			status = ns
 			out = nb
 		}
@@ -501,7 +528,7 @@ func (s *Server) writeFilteredError(ctx context.Context, w http.ResponseWriter, 
 	if words != nil && !words.Empty() {
 		out = words.ReplaceAll(out)
 	}
-	s.writeUpstreamHeaders(ctx, w.Header(), header)
+	s.writeUpstreamHeaders(ctx, w.Header(), filteredHeader)
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
 }

@@ -1628,6 +1628,82 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 	}
 }
 
+func TestDownstreamResponsesWebSocketNeverLeaksRepeatedOrphanedToolOutput(t *testing.T) {
+	const callID = "call_GQqnpD0cS3uxvXlgWBSD974z"
+	var attempts int32
+	upgrader := websocket.Upgrader{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("read upstream WS request: %v", err)
+			return
+		}
+		atomic.AddInt32(&attempts, 1)
+		inner := `{"type":"error","error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id ` + callID + `.","param":"input"},"status":400}`
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":        "error",
+			"status_code": 400,
+			"error": map[string]interface{}{
+				"type": "upstream_error", "message": inner,
+			},
+		})
+		_ = conn.WriteMessage(websocket.TextMessage, payload)
+	})
+	accountID := h.importAccount(t, "downstream-ws-repeat", "acct-downstream-ws-repeat", "access-downstream-ws-repeat")
+	if err := h.store.SetSetting(context.Background(), "leak_scrub", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt-5.5","previous_response_id":"resp_missing","stream":true,"input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"keep"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
+		t.Fatal(err)
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil && resp.Body != nil {
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			t.Fatalf("downstream dial: %v status=%d body=%s", err, resp.StatusCode, raw)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	request := `{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_missing","input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"keep"}],"stream":true}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, terminal, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read safe downstream terminal error: %v", err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("upstream attempts=%d, want exactly 2", got)
+	}
+	for _, leak := range []string{"No tool call found", callID, "invalid_request_error"} {
+		if strings.Contains(string(terminal), leak) {
+			t.Fatalf("downstream WebSocket leaked %q: %s", leak, terminal)
+		}
+	}
+	if !strings.Contains(string(terminal), `"status":503`) || !strings.Contains(string(terminal), "server_error") {
+		t.Fatalf("downstream WebSocket did not receive a stable safe error: %s", terminal)
+	}
+}
+
 func TestGatewayDownstreamWebSocketKeepsWarmupStateOnOneUpstreamConnection(t *testing.T) {
 	var connections atomic.Int32
 	var sawProcessed atomic.Bool
@@ -2578,8 +2654,11 @@ func TestPreviousResponseNotFoundSingleAccountRepairsOnlyOnce(t *testing.T) {
 	}
 	responseBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest || atomic.LoadInt32(&attempts) != 2 {
+	if resp.StatusCode != http.StatusServiceUnavailable || atomic.LoadInt32(&attempts) != 2 {
 		t.Fatalf("single-account status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	if strings.Contains(string(responseBody), "previous_response_not_found") || !strings.Contains(string(responseBody), "server_error") {
+		t.Fatalf("terminal context error was not neutralized: %s", responseBody)
 	}
 	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "degraded" {
 		t.Fatalf("context status=%q, want degraded", got)
@@ -3170,6 +3249,61 @@ func TestOrphanedToolOutputStreamStatus400RebuildsFromJournal(t *testing.T) {
 	}
 }
 
+func TestBoundAccountUnavailableRebuildsFromJournalBeforeReturningConflict(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body := string(raw)
+		if r.Header.Get("Authorization") != "Bearer access-bound-b" ||
+			r.Header.Get("X-Codex-Turn-State") != "" ||
+			strings.Contains(body, "previous_response_id") ||
+			!strings.Contains(body, `"type":"custom_tool_call"`) ||
+			!strings.Contains(body, `"type":"custom_tool_call_output"`) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"invalid rebuilt request"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_bound_rebuilt","object":"response","status":"completed","model":"gpt","output_text":"ok"}`)
+	})
+	accountA := h.importAccount(t, "bound-a", "upstream-bound-a", "access-bound-a")
+	h.importAccount(t, "bound-b", "upstream-bound-b", "access-bound-b")
+	body := `{"model":"gpt","previous_response_id":"resp_bound_old","input":[{"type":"custom_tool_call_output","call_id":"call_bound","output":"kept"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.PutContextJournal(context.Background(), storage.ContextJournal{
+		ResponseID: "resp_bound_old", AccountID: accountA,
+		Payload:   `{"model":"gpt","input":[{"type":"custom_tool_call","call_id":"call_bound","name":"apply_patch","input":"{}"}]}`,
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetAccountStatus(context.Background(), accountA, "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "bound-a-state")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "resp_bound_rebuilt") {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "rebuilt" {
+		t.Fatalf("context status=%q", got)
+	}
+	if requests := h.requests(); len(requests) != 1 || requests[0].Auth != "Bearer access-bound-b" {
+		t.Fatalf("unavailable bound account should not receive an upstream attempt: %+v", requests)
+	}
+}
+
 func TestOrphanedToolOutputSingleAccountRetriesSameAccountOnce(t *testing.T) {
 	var attempts int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -3214,21 +3348,25 @@ func TestOrphanedToolOutputSingleAccountRetriesSameAccountOnce(t *testing.T) {
 }
 
 func TestOrphanedToolOutputRepairIsAttemptedOnlyOnce(t *testing.T) {
+	const callID = "call_GQqnpD0cS3uxvXlgWBSD974z"
 	var attempts int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"message":"No tool call found for custom tool call output with call_id call_repeat."}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id ` + callID + `.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`))
 	})
 	accountID := h.importAccount(t, "repeat", "upstream-repeat", "access-repeat")
+	if err := h.store.SetSetting(context.Background(), "leak_scrub", "false"); err != nil {
+		t.Fatal(err)
+	}
 	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"model":"gpt","previous_response_id":"resp_missing","input":[{"type":"custom_tool_call_output","call_id":"call_repeat","output":"keep"}]}`
+	body := `{"model":"gpt","previous_response_id":"resp_missing","input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"keep"}]}`
 	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	key := routing.ExtractAffinityKey(keyReq, []byte(body))
 	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
@@ -3240,8 +3378,16 @@ func TestOrphanedToolOutputRepairIsAttemptedOnlyOnce(t *testing.T) {
 	}
 	responseBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest || atomic.LoadInt32(&attempts) != 2 {
+	if resp.StatusCode != http.StatusServiceUnavailable || atomic.LoadInt32(&attempts) != 2 {
 		t.Fatalf("repeated orphan status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	for _, leak := range []string{"No tool call found", callID, "invalid_request_error"} {
+		if strings.Contains(string(responseBody), leak) {
+			t.Fatalf("terminal context error leaked %q with leak_scrub disabled: %s", leak, responseBody)
+		}
+	}
+	if !strings.Contains(string(responseBody), "server_error") || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("terminal context error was not replaced with a stable JSON error: headers=%v body=%s", resp.Header, responseBody)
 	}
 	if got := atomic.LoadUint64(&h.app.contextDegraded); got != 1 {
 		t.Fatalf("context repair count = %d, want exactly one", got)
@@ -3263,6 +3409,9 @@ func TestOrphanedToolOutputAfterCommittedStreamIsNotRetried(t *testing.T) {
 			`data: {"type":"error","status":400,"error":{"message":"No tool call found for function call output with call_id call_late."}}`+"\n\n")
 	})
 	accountID := h.importAccount(t, "late", "upstream-late", "access-late")
+	if err := h.store.SetSetting(context.Background(), "leak_scrub", "false"); err != nil {
+		t.Fatal(err)
+	}
 	body := `{"model":"gpt","previous_response_id":"resp_missing","stream":true,"input":[{"type":"function_call_output","call_id":"call_late","output":"keep"}]}`
 	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
 	key := routing.ExtractAffinityKey(keyReq, []byte(body))
@@ -3277,6 +3426,9 @@ func TestOrphanedToolOutputAfterCommittedStreamIsNotRetried(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || atomic.LoadInt32(&attempts) != 1 || !strings.Contains(string(responseBody), "visible") {
 		t.Fatalf("committed stream status=%d attempts=%d body=%s", resp.StatusCode, attempts, responseBody)
+	}
+	if strings.Contains(string(responseBody), "No tool call found") || strings.Contains(string(responseBody), "call_late") || !strings.Contains(string(responseBody), "server_error") {
+		t.Fatalf("committed stream leaked its terminal context error: %s", responseBody)
 	}
 	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "" {
 		t.Fatalf("committed stream unexpectedly repaired context: %q", got)

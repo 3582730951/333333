@@ -82,6 +82,43 @@ func TestUnboundedQueueCancellationRemovesWaiter(t *testing.T) {
 	}
 }
 
+func TestWaitQueueRemovesHeadMiddleAndTailInConstantTimeStructure(t *testing.T) {
+	s := &Scheduler{waitQueues: map[string]*waitQueue{}}
+	route := Route{Group: "g", Provider: "codex", Model: "m"}
+	key, head := s.enqueue(route, "concurrency")
+	_, middle := s.enqueue(route, "concurrency")
+	_, tail := s.enqueue(route, "concurrency")
+	if !s.removeWaiter(key, middle) {
+		if !s.waiterIsHead(key, head) {
+			t.Fatal("removing the middle corrupted the queue head")
+		}
+	} else {
+		t.Fatal("middle waiter was reported as the head")
+	}
+	q := s.waitQueues[key]
+	if q == nil || q.len != 2 || q.head != head || q.tail != tail || head.next != tail || tail.prev != head {
+		t.Fatalf("queue links after middle removal: %+v", q)
+	}
+	if !s.removeWaiter(key, head) || !s.waiterIsHead(key, tail) {
+		t.Fatal("head removal did not promote the tail")
+	}
+	if !s.removeWaiter(key, tail) || s.waitQueues[key] != nil {
+		t.Fatal("final removal did not delete the empty route queue")
+	}
+}
+
+func BenchmarkWaitQueueCancel(b *testing.B) {
+	s := &Scheduler{waitQueues: map[string]*waitQueue{}}
+	route := Route{Group: "g", Provider: "codex", Model: "m"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		key, w := s.enqueue(route, "concurrency")
+		if !s.removeWaiter(key, w) {
+			b.Fatal("single waiter must be the head")
+		}
+	}
+}
+
 func TestUnboundedQueuePreservesFIFOAgainstNewArrivals(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

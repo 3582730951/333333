@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codex-account-pool/internal/secretbox"
@@ -59,6 +59,8 @@ type Store struct {
 	tokenCache       sync.Map // account id -> decrypted AccountToken
 	kiroCache        sync.Map // account id -> decrypted KiroCredentials
 	apiKeyUsed       sync.Map // key hash -> last persisted minute
+	rateLimitGen     atomic.Uint64
+	affinityGen      atomic.Uint64
 }
 
 type Group struct {
@@ -608,23 +610,61 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db, rdb: rdb}, nil
 }
 
-// readPoolSize is the number of concurrent read connections: max(2, GOMAXPROCS)
-// capped at 8, overridable via CODEX_POOL_DB_MAX_READ_CONNS. Each connection keeps
-// its own SQLite page cache, so the cap bounds memory under the parallel-read pool.
+// readPoolSize uses a 2/4/8 memory tier and remains overridable via
+// CODEX_POOL_DB_MAX_READ_CONNS. Each SQLite connection owns a page cache, so CPU
+// count alone is a poor default on a many-core, low-memory VPS.
 func readPoolSize() int {
 	if v := strings.TrimSpace(os.Getenv("CODEX_POOL_DB_MAX_READ_CONNS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}
-	n := runtime.GOMAXPROCS(0)
-	if n < 2 {
-		n = 2
+	return readPoolSizeForMemory(hostOrCgroupMemoryLimit())
+}
+
+func readPoolSizeForMemory(bytes uint64) int {
+	const gib = uint64(1024 * 1024 * 1024)
+	switch {
+	case bytes > 0 && bytes < 2*gib:
+		return 2
+	case bytes > 0 && bytes < 8*gib:
+		return 4
+	default:
+		return 8
 	}
-	if n > 8 {
-		n = 8
+}
+
+func hostOrCgroupMemoryLimit() uint64 {
+	var limit uint64
+	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		value := strings.TrimSpace(string(raw))
+		if value == "" || value == "max" {
+			continue
+		}
+		if n, err := strconv.ParseUint(value, 10, 64); err == nil && n > 0 && n < 1<<60 {
+			limit = n
+			break
+		}
 	}
-	return n
+	if raw, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[0] == "MemTotal:" {
+				if kib, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+					host := kib * 1024
+					if limit == 0 || host < limit {
+						limit = host
+					}
+				}
+				break
+			}
+		}
+	}
+	return limit
 }
 
 func OpenInMemory() (*Store, error) {
@@ -2658,6 +2698,8 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 	if err == nil {
 		s.tokenCache.Delete(id)
 		s.kiroCache.Delete(id)
+		s.rateLimitGen.Add(1)
+		s.affinityGen.Add(1)
 	}
 	return err
 }
@@ -3979,8 +4021,13 @@ ON CONFLICT(route_key_hash) DO UPDATE SET
  epoch = affinity_bindings.epoch + 1,
  updated_at = excluded.updated_at`,
 		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Provider, b.Model, b.EgressID, b.Epoch, b.CreatedAt, b.UpdatedAt)
+	if err == nil {
+		s.affinityGen.Add(1)
+	}
 	return err
 }
+
+func (s *Store) AffinityGeneration() uint64 { return s.affinityGen.Load() }
 
 // ListAffinityBindingsByAccount returns the conversations currently pinned to an
 // account (the per-account session map), most-recently-bound first. The epoch is
@@ -5951,8 +5998,13 @@ ON CONFLICT(account_id, provider, model, limiter_type) DO UPDATE SET
  reset_at = excluded.reset_at, status = excluded.status, raw_json = excluded.raw_json, updated_at = excluded.updated_at`,
 		r.AccountID, r.Provider, r.Model, r.LimiterType, r.Source, r.UsedPercent, r.LimitTokens, r.RemainingTokens,
 		r.LimitRequests, r.RemainingRequests, r.ResetAt, r.Status, r.Raw, r.UpdatedAt)
+	if err == nil {
+		s.rateLimitGen.Add(1)
+	}
 	return err
 }
+
+func (s *Store) RateLimitGeneration() uint64 { return s.rateLimitGen.Load() }
 
 func scanAccountRateLimit(scan func(...interface{}) error) (AccountRateLimit, error) {
 	var r AccountRateLimit

@@ -153,8 +153,13 @@ func (s *scrubbingFrameWriter) Write(p []byte) (int, error) {
 		out := frame
 		if s.leak {
 			out = leakfilter.NewSSEFilter(s.provider, s.words).ProcessFrameForRelay(out)
-		} else if s.words != nil && !s.words.Empty() {
-			out = s.words.ReplaceAll(out)
+		} else {
+			if s.provider == "codex" {
+				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
+			}
+			if s.words != nil && !s.words.Empty() {
+				out = s.words.ReplaceAll(out)
+			}
 		}
 		if len(out) > 0 {
 			if _, err := s.dst.Write(out); err != nil {

@@ -20,6 +20,7 @@ import (
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 )
 
 var ErrNoAccount = errors.New("no active account available")
@@ -36,7 +37,7 @@ type Scheduler struct {
 	loadChanged    chan struct{}
 	rr             int // round-robin cursor for spreading load across equal-load candidates
 	queueMu        sync.Mutex
-	waitQueues     map[string][]*waiter
+	waitQueues     map[string]*waitQueue
 	metrics        SchedulerMetrics
 	admission      *admission.Controller
 
@@ -51,9 +52,14 @@ type Scheduler struct {
 	selectionCache    map[string][]storage.AccountWithEgress
 	selectionCacheAt  map[string]time.Time
 	rateLimitCache    map[string]map[string][]storage.AccountRateLimit
+	rateLimitCacheGen map[string]uint64
 	modelCache        map[string]map[string]bool
 	auxCacheAt        map[string]time.Time
 	affinityCache     map[string]affinityCacheEntry
+	accountRefreshMu  sync.Mutex
+	rateRefreshMu     sync.Mutex
+	modelRefreshMu    sync.Mutex
+	affinityRefreshMu sync.Mutex
 
 	// egressCache is a process-level cache for egress profiles used by selectEgress.
 	// It is separate from the request-scoped egressCache in selectFresh so that concurrent
@@ -86,15 +92,32 @@ type candidate struct {
 	score         float64 // normalized account/token/egress load; lower is better
 }
 
+type rankedCandidate struct {
+	candidate candidate
+	rank      uint64
+}
+
 type affinityCacheEntry struct {
 	binding storage.AffinityBinding
 	found   bool
 	at      time.Time
+	gen     uint64
 }
 
 type waiter struct {
-	id      uint64
 	started time.Time
+	prev    *waiter
+	next    *waiter
+	queue   *waitQueue
+	queued  bool
+}
+
+// waitQueue is an intrusive FIFO. A waiter owns its links, so cancellation and
+// successful dequeue are O(1) even with thousands of queued requests.
+type waitQueue struct {
+	head *waiter
+	tail *waiter
+	len  int
 }
 
 // SchedulerMetrics is a cheap runtime snapshot used by diagnostics and tests. Values
@@ -142,6 +165,7 @@ func (s *Scheduler) InvalidateAccountCache() {
 	s.selectionCache = nil
 	s.selectionCacheAt = nil
 	s.rateLimitCache = nil
+	s.rateLimitCacheGen = nil
 	s.modelCache = nil
 	s.auxCacheAt = nil
 	s.affinityCache = nil
@@ -313,7 +337,7 @@ func New(store *storage.Store, cfg config.Config) *Scheduler {
 		inflightTokens:   map[string]int64{},
 		egressInflight:   map[string]int{},
 		loadChanged:      make(chan struct{}),
-		waitQueues:       map[string][]*waiter{},
+		waitQueues:       map[string]*waitQueue{},
 		selectionCache:   map[string][]storage.AccountWithEgress{},
 		selectionCacheAt: map[string]time.Time{},
 		egressCacheTTL:   30 * time.Second,
@@ -564,10 +588,23 @@ func schedulerQueueKey(route Route) string {
 }
 
 func (s *Scheduler) enqueue(route Route, reason string) (string, *waiter) {
-	w := &waiter{id: uint64(time.Now().UnixNano()), started: time.Now()}
+	w := &waiter{started: time.Now(), queued: true}
 	key := schedulerQueueKey(route)
 	s.queueMu.Lock()
-	s.waitQueues[key] = append(s.waitQueues[key], w)
+	q := s.waitQueues[key]
+	if q == nil {
+		q = &waitQueue{}
+		s.waitQueues[key] = q
+	}
+	w.queue = q
+	w.prev = q.tail
+	if q.tail != nil {
+		q.tail.next = w
+	} else {
+		q.head = w
+	}
+	q.tail = w
+	q.len++
 	s.queueMu.Unlock()
 	atomic.AddInt64(&s.metrics.Queued, 1)
 	atomic.AddInt64(&s.metrics.Waited, 1)
@@ -593,32 +630,75 @@ func (s *Scheduler) recordWaitReason(reason string) {
 func (s *Scheduler) removeWaiter(key string, target *waiter) bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	q := s.waitQueues[key]
-	for i, w := range q {
-		if w == target {
-			s.waitQueues[key] = append(q[:i], q[i+1:]...)
-			if len(s.waitQueues[key]) == 0 {
-				delete(s.waitQueues, key)
-			}
-			atomic.AddInt64(&s.metrics.Queued, -1)
-			return i == 0
-		}
+	q := target.queue
+	if q == nil || !target.queued || s.waitQueues[key] != q {
+		return false
 	}
-	return false
+	wasHead := q.head == target
+	if target.prev != nil {
+		target.prev.next = target.next
+	} else {
+		q.head = target.next
+	}
+	if target.next != nil {
+		target.next.prev = target.prev
+	} else {
+		q.tail = target.prev
+	}
+	q.len--
+	target.prev, target.next, target.queue, target.queued = nil, nil, nil, false
+	if q.len == 0 {
+		delete(s.waitQueues, key)
+	}
+	atomic.AddInt64(&s.metrics.Queued, -1)
+	return wasHead
 }
 
 func (s *Scheduler) waiterIsHead(key string, target *waiter) bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	q := s.waitQueues[key]
-	return len(q) > 0 && q[0] == target
+	return q != nil && q.head == target
 }
 
 func (s *Scheduler) routeHasWaiters(route Route) bool {
 	key := schedulerQueueKey(route)
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
-	return len(s.waitQueues[key]) > 0
+	q := s.waitQueues[key]
+	return q != nil && q.len > 0
+}
+
+// A single process-wide broadcast clock replaces two tickers per queued request.
+// Closing the generation channel wakes every subscriber without making timer and
+// goroutine counts grow with queue length.
+type schedulerClock struct {
+	once sync.Once
+	mu   sync.Mutex
+	ch   chan struct{}
+}
+
+var sharedSchedulerClock schedulerClock
+
+func (c *schedulerClock) subscribe() <-chan struct{} {
+	c.once.Do(func() {
+		c.ch = make(chan struct{})
+		go func() {
+			defer supervisor.Recover("scheduler-shared-wait-clock")
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				c.mu.Lock()
+				close(c.ch)
+				c.ch = make(chan struct{})
+				c.mu.Unlock()
+			}
+		}()
+	})
+	c.mu.Lock()
+	ch := c.ch
+	c.mu.Unlock()
+	return ch
 }
 
 // waitForFreshLease is the central unbounded admission queue. There is deliberately
@@ -635,12 +715,12 @@ func (s *Scheduler) waitForFreshLease(ctx context.Context, route Route, lastErr 
 		atomic.AddInt64(&s.metrics.WaitNanos, time.Since(w.started).Nanoseconds())
 	}()
 	heartbeatEvery := s.Config().SchedulerHeartbeat()
-	heartbeat := time.NewTicker(heartbeatEvery)
-	poll := time.NewTicker(time.Second)
-	defer heartbeat.Stop()
-	defer poll.Stop()
+	lastHeartbeat := time.Now()
+	lastPoll := time.Time{}
 	for {
-		if s.waiterIsHead(key, w) {
+		now := time.Now()
+		if s.waiterIsHead(key, w) && (lastPoll.IsZero() || now.Sub(lastPoll) >= time.Second) {
+			lastPoll = now
 			if err := s.admission.Wait(ctx); err != nil {
 				return Lease{}, err
 			}
@@ -657,17 +737,22 @@ func (s *Scheduler) waitForFreshLease(ctx context.Context, route Route, lastErr 
 			}
 		}
 		changed := s.loadChangedChan()
+		clock := sharedSchedulerClock.subscribe()
 		select {
 		case <-ctx.Done():
 			atomic.AddInt64(&s.metrics.Cancelled, 1)
 			return Lease{}, ctx.Err()
 		case <-changed:
 			atomic.AddInt64(&s.metrics.StateWakeups, 1)
-		case <-poll.C:
-			atomic.AddInt64(&s.metrics.CooldownWakeups, 1)
-		case <-heartbeat.C:
-			if route.OnWait != nil {
-				route.OnWait(waitReason(lastErr), time.Since(w.started))
+			lastPoll = time.Time{}
+		case <-clock:
+			now = time.Now()
+			if now.Sub(lastPoll) >= time.Second {
+				atomic.AddInt64(&s.metrics.CooldownWakeups, 1)
+			}
+			if route.OnWait != nil && now.Sub(lastHeartbeat) >= heartbeatEvery {
+				route.OnWait(waitReason(lastErr), now.Sub(w.started))
+				lastHeartbeat = now
 			}
 		}
 	}
@@ -747,7 +832,21 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		}
 	}
 	reqEgressCache := make(map[string]storage.EgressProfile)
+	// Account selection keeps constant-size state. Affinity routes retain the top
+	// three rendezvous ranks; new routes use power-of-two choices via a two-item
+	// reservoir. Neither path sorts or retains the whole account pool.
 	var candidates []candidate
+	var affinityTop []rankedCandidate
+	useAffinityTop := route.Affinity.Hash != "" && len(accountsWithEgress) > 3
+	usePowerTwo := route.Affinity.Hash == "" && len(accountsWithEgress) > 3
+	seen := uint64(0)
+	rng := uint64(1)
+	if usePowerTwo {
+		s.mu.Lock()
+		rng = uint64(s.rr + 1)
+		s.rr++
+		s.mu.Unlock()
+	}
 	var counters NoAccountCounters
 	for _, awe := range accountsWithEgress {
 		account := awe.Account
@@ -821,84 +920,118 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.TokenBudget++
 			continue
 		}
-		concurrencyLoad := normalizedLoad(egressLoad, egress.MaxConcurrency)
+		// Account load remains relevant even when many accounts share the same
+		// direct egress (whose aggregate load is identical for every candidate).
+		concurrencyLoad := float64(inflight) + normalizedLoad(egressLoad, egress.MaxConcurrency)
 		tokenLoad := normalizedTokenLoad(tokens, cfg.AccountTokenBudget)
 		latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
-		candidates = append(candidates, candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, bootstrap: bootstrap, score: concurrencyLoad + tokenLoad + latencyPenalty})
+		picked := candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, bootstrap: bootstrap, score: concurrencyLoad + tokenLoad + latencyPenalty}
+		if useAffinityTop {
+			affinityTop = insertRendezvousTop3(affinityTop, rankedCandidate{candidate: picked, rank: rendezvous(route.Affinity.Hash, account.ID)})
+			continue
+		}
+		if !usePowerTwo {
+			candidates = append(candidates, picked)
+			continue
+		}
+		seen++
+		candidates = addPowerTwoCandidate(candidates, picked, seen, &rng)
+	}
+	if useAffinityTop {
+		candidates = make([]candidate, len(affinityTop))
+		for i := range affinityTop {
+			candidates[i] = affinityTop[i].candidate
+		}
 	}
 	if len(candidates) == 0 {
 		return Lease{}, s.noAccountError(route, counters)
 	}
-	powerTwo := false
-	if route.Affinity.Hash != "" && len(candidates) > 3 {
-		sort.Slice(candidates, func(i, j int) bool {
-			return rendezvous(route.Affinity.Hash, candidates[i].account.ID) > rendezvous(route.Affinity.Hash, candidates[j].account.ID)
-		})
-		candidates = candidates[:3]
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].bootstrap != candidates[j].bootstrap {
-			return !candidates[i].bootstrap
+	// At most three candidates remain, so insertion sort is constant work. The
+	// second/third entry is retained as a lease-race fallback.
+	for i := 1; i < len(candidates); i++ {
+		for j := i; j > 0 && candidateLess(candidates[j], candidates[j-1]); j-- {
+			candidates[j], candidates[j-1] = candidates[j-1], candidates[j]
 		}
-		return candidates[i].score < candidates[j].score
-	})
-	if route.Affinity.Hash == "" && len(candidates) > 2 {
-		powerTwo = true
-		s.mu.Lock()
-		a := s.rr % len(candidates)
-		b := (s.rr*7 + 1) % len(candidates)
-		s.rr++
-		s.mu.Unlock()
-		if a == b {
-			b = (b + 1) % len(candidates)
+	}
+	if !usePowerTwo && !useAffinityTop {
+		nEq := 1
+		for nEq < len(candidates) && !candidateLess(candidates[0], candidates[nEq]) && !candidateLess(candidates[nEq], candidates[0]) {
+			nEq++
 		}
-		if candidates[b].score < candidates[a].score {
-			a = b
+		if nEq > 1 {
+			s.mu.Lock()
+			start := s.rr % nEq
+			s.rr++
+			s.mu.Unlock()
+			rotated := append([]candidate(nil), candidates[start:nEq]...)
+			rotated = append(rotated, candidates[:start]...)
+			rotated = append(rotated, candidates[nEq:]...)
+			candidates = rotated
 		}
-		picked := candidates[a]
-		copy(candidates[1:a+1], candidates[0:a])
-		candidates[0] = picked
 	}
-	// Round-robin among the LEAST-loaded candidates so new conversations spread evenly
-	// across idle accounts instead of always landing on the oldest one (stable-sort
-	// order). Hammering a single account rate-limits it first and leaves the rest cold;
-	// spreading widens the warm-cache footprint and the effective rate-limit headroom.
-	// Sticky/affinity routing is unaffected (handled before selectFresh). We then try the
-	// rotated order so a lease race just falls through to the next candidate.
-	minScore := candidates[0].score
-	nEq := 0
-	for nEq < len(candidates) && candidates[nEq].bootstrap == candidates[0].bootstrap && candidates[nEq].score == minScore {
-		nEq++
-	}
-	if powerTwo {
-		nEq = 1
-	}
-	start := 0
-	if nEq > 1 {
-		s.mu.Lock()
-		start = s.rr % nEq
-		s.rr++
-		s.mu.Unlock()
-	}
-	order := make([]int, 0, len(candidates))
-	for k := 0; k < nEq; k++ {
-		order = append(order, (start+k)%nEq)
-	}
-	for k := nEq; k < len(candidates); k++ {
-		order = append(order, k)
-	}
-	for _, idx := range order {
-		if lease, ok := s.tryLeaseAccountFromCandidate(ctx, candidates[idx], route); ok {
+	for _, picked := range candidates {
+		if lease, ok := s.tryLeaseAccountFromCandidate(ctx, picked, route); ok {
 			return lease, nil
 		}
 	}
 	return Lease{}, s.noAccountError(route, counters)
 }
 
+func candidateLess(a, b candidate) bool {
+	if a.bootstrap != b.bootstrap {
+		return !a.bootstrap
+	}
+	return a.score < b.score
+}
+
+func insertRendezvousTop3(top []rankedCandidate, item rankedCandidate) []rankedCandidate {
+	if len(top) < 3 {
+		top = append(top, item)
+	} else if item.rank <= top[len(top)-1].rank {
+		return top
+	} else {
+		top[len(top)-1] = item
+	}
+	for i := len(top) - 1; i > 0 && top[i].rank > top[i-1].rank; i-- {
+		top[i], top[i-1] = top[i-1], top[i]
+	}
+	return top
+}
+
+func addPowerTwoCandidate(sample []candidate, item candidate, seen uint64, rng *uint64) []candidate {
+	if len(sample) < 2 {
+		return append(sample, item)
+	}
+	*rng = xorshift64(*rng)
+	if slot := *rng % seen; slot < 2 {
+		sample[slot] = item
+	}
+	return sample
+}
+
+func xorshift64(x uint64) uint64 {
+	if x == 0 {
+		x = 0x9e3779b97f4a7c15
+	}
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	return x
+}
+
 func (s *Scheduler) accountsSnapshot(ctx context.Context, group string) ([]storage.AccountWithEgress, error) {
 	s.accountCacheMutex.RLock()
 	rows, ok := s.selectionCache[group]
 	at := s.selectionCacheAt[group]
+	s.accountCacheMutex.RUnlock()
+	if ok && time.Since(at) < time.Second {
+		return append([]storage.AccountWithEgress(nil), rows...), nil
+	}
+	s.accountRefreshMu.Lock()
+	defer s.accountRefreshMu.Unlock()
+	s.accountCacheMutex.RLock()
+	rows, ok = s.selectionCache[group]
+	at = s.selectionCacheAt[group]
 	s.accountCacheMutex.RUnlock()
 	if ok && time.Since(at) < time.Second {
 		return append([]storage.AccountWithEgress(nil), rows...), nil
@@ -920,11 +1053,30 @@ func (s *Scheduler) accountsSnapshot(ctx context.Context, group string) ([]stora
 
 func (s *Scheduler) rateLimitsSnapshot(ctx context.Context, group string, accountIDs []string) (map[string][]storage.AccountRateLimit, error) {
 	key := "rate:" + group
+	generation := s.store.RateLimitGeneration()
 	s.accountCacheMutex.RLock()
 	rows, ok := s.rateLimitCache[group]
 	at := s.auxCacheAt[key]
+	cachedGeneration := s.rateLimitCacheGen[group]
 	s.accountCacheMutex.RUnlock()
-	complete := ok
+	complete := ok && cachedGeneration == generation
+	for _, id := range accountIDs {
+		if _, present := rows[id]; !present {
+			complete = false
+			break
+		}
+	}
+	if complete && time.Since(at) < time.Second {
+		return rows, nil
+	}
+	s.rateRefreshMu.Lock()
+	defer s.rateRefreshMu.Unlock()
+	s.accountCacheMutex.RLock()
+	rows, ok = s.rateLimitCache[group]
+	at = s.auxCacheAt[key]
+	cachedGeneration = s.rateLimitCacheGen[group]
+	s.accountCacheMutex.RUnlock()
+	complete = ok && cachedGeneration == generation
 	for _, id := range accountIDs {
 		if _, present := rows[id]; !present {
 			complete = false
@@ -942,10 +1094,14 @@ func (s *Scheduler) rateLimitsSnapshot(ctx context.Context, group string, accoun
 	if s.rateLimitCache == nil {
 		s.rateLimitCache = map[string]map[string][]storage.AccountRateLimit{}
 	}
+	if s.rateLimitCacheGen == nil {
+		s.rateLimitCacheGen = map[string]uint64{}
+	}
 	if s.auxCacheAt == nil {
 		s.auxCacheAt = map[string]time.Time{}
 	}
 	s.rateLimitCache[group] = rows
+	s.rateLimitCacheGen[group] = generation
 	s.auxCacheAt[key] = time.Now()
 	s.accountCacheMutex.Unlock()
 	return rows, nil
@@ -956,6 +1112,15 @@ func (s *Scheduler) modelsSnapshot(ctx context.Context, group, model string) (ma
 	s.accountCacheMutex.RLock()
 	rows, ok := s.modelCache[key]
 	at := s.auxCacheAt["model:"+key]
+	s.accountCacheMutex.RUnlock()
+	if ok && time.Since(at) < time.Second {
+		return rows, nil
+	}
+	s.modelRefreshMu.Lock()
+	defer s.modelRefreshMu.Unlock()
+	s.accountCacheMutex.RLock()
+	rows, ok = s.modelCache[key]
+	at = s.auxCacheAt["model:"+key]
 	s.accountCacheMutex.RUnlock()
 	if ok && time.Since(at) < time.Second {
 		return rows, nil
@@ -978,10 +1143,22 @@ func (s *Scheduler) modelsSnapshot(ctx context.Context, group, model string) (ma
 }
 
 func (s *Scheduler) affinitySnapshot(ctx context.Context, hash string) (storage.AffinityBinding, error) {
+	generation := s.store.AffinityGeneration()
 	s.accountCacheMutex.RLock()
 	entry, ok := s.affinityCache[hash]
 	s.accountCacheMutex.RUnlock()
-	if ok && time.Since(entry.at) < time.Second {
+	if ok && entry.gen == generation && time.Since(entry.at) < time.Second {
+		if entry.found {
+			return entry.binding, nil
+		}
+		return storage.AffinityBinding{}, sql.ErrNoRows
+	}
+	s.affinityRefreshMu.Lock()
+	defer s.affinityRefreshMu.Unlock()
+	s.accountCacheMutex.RLock()
+	entry, ok = s.affinityCache[hash]
+	s.accountCacheMutex.RUnlock()
+	if ok && entry.gen == generation && time.Since(entry.at) < time.Second {
 		if entry.found {
 			return entry.binding, nil
 		}
@@ -995,7 +1172,7 @@ func (s *Scheduler) affinitySnapshot(ctx context.Context, hash string) (storage.
 	if s.affinityCache == nil {
 		s.affinityCache = map[string]affinityCacheEntry{}
 	}
-	s.affinityCache[hash] = affinityCacheEntry{binding: binding, found: err == nil, at: time.Now()}
+	s.affinityCache[hash] = affinityCacheEntry{binding: binding, found: err == nil, at: time.Now(), gen: generation}
 	s.accountCacheMutex.Unlock()
 	return binding, err
 }
@@ -1008,7 +1185,7 @@ func (s *Scheduler) upsertAffinity(ctx context.Context, binding storage.Affinity
 	if s.affinityCache == nil {
 		s.affinityCache = map[string]affinityCacheEntry{}
 	}
-	s.affinityCache[binding.RouteKeyHash] = affinityCacheEntry{binding: binding, found: true, at: time.Now()}
+	s.affinityCache[binding.RouteKeyHash] = affinityCacheEntry{binding: binding, found: true, at: time.Now(), gen: s.store.AffinityGeneration()}
 	s.accountCacheMutex.Unlock()
 	return nil
 }
@@ -1279,30 +1456,36 @@ func (s *Scheduler) waitForStatefulStickyLease(ctx context.Context, accountID st
 		atomic.AddInt64(&s.metrics.WaitNanos, time.Since(start).Nanoseconds())
 	}()
 	lastReason := initialReason
-	heartbeat := time.NewTicker(s.Config().SchedulerHeartbeat())
-	poll := time.NewTicker(time.Second)
-	defer heartbeat.Stop()
-	defer poll.Stop()
+	heartbeatEvery := s.Config().SchedulerHeartbeat()
+	lastHeartbeat := time.Now()
+	lastPoll := time.Time{}
 	for {
 		loadChanged := s.loadChangedChan()
-		lease, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil)
-		if ok {
-			return lease, nil
+		now := time.Now()
+		if lastPoll.IsZero() || now.Sub(lastPoll) >= time.Second {
+			lastPoll = now
+			lease, reason, ok := s.tryLeaseAccountDetailed(ctx, accountID, route, nil)
+			if ok {
+				return lease, nil
+			}
+			lastReason = reason
+			if !statefulStickyWaitReason(reason) {
+				return Lease{}, s.diagnoseStickyUnavailability(ctx, accountID, route)
+			}
 		}
-		lastReason = reason
-		if !statefulStickyWaitReason(reason) {
-			return Lease{}, s.diagnoseStickyUnavailability(ctx, accountID, route)
-		}
+		clock := sharedSchedulerClock.subscribe()
 		select {
 		case <-loadChanged:
 			atomic.AddInt64(&s.metrics.StateWakeups, 1)
-			continue
-		case <-poll.C:
-			atomic.AddInt64(&s.metrics.CooldownWakeups, 1)
-			continue
-		case <-heartbeat.C:
-			if route.OnWait != nil {
-				route.OnWait(lastReason.humanString(), time.Since(start))
+			lastPoll = time.Time{}
+		case <-clock:
+			now = time.Now()
+			if now.Sub(lastPoll) >= time.Second {
+				atomic.AddInt64(&s.metrics.CooldownWakeups, 1)
+			}
+			if route.OnWait != nil && now.Sub(lastHeartbeat) >= heartbeatEvery {
+				route.OnWait(lastReason.humanString(), now.Sub(start))
+				lastHeartbeat = now
 			}
 		case <-ctx.Done():
 			atomic.AddInt64(&s.metrics.Cancelled, 1)

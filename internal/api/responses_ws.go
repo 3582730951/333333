@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"github.com/gorilla/websocket"
@@ -36,6 +37,38 @@ type responsesWebSocketConn struct {
 	dst       webSocketMessageWriter
 	mu        sync.Mutex
 	lastWrite time.Time
+}
+
+type responsesWebSocketState struct {
+	mu                 sync.Mutex
+	previousResponseID string
+}
+
+func (s *responsesWebSocketState) observe(payload []byte) {
+	var event struct {
+		Type     string `json:"type"`
+		Response struct {
+			ID string `json:"id"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(payload, &event) == nil && event.Type == "response.completed" && strings.TrimSpace(event.Response.ID) != "" {
+		s.mu.Lock()
+		s.previousResponseID = strings.TrimSpace(event.Response.ID)
+		s.mu.Unlock()
+	}
+}
+
+func (s *responsesWebSocketState) completeAppend(body []byte) ([]byte, error) {
+	if routing.JSONStringField(body, "previous_response_id") != "" {
+		return body, nil
+	}
+	s.mu.Lock()
+	previous := s.previousResponseID
+	s.mu.Unlock()
+	if previous == "" {
+		return body, nil
+	}
+	return sjson.SetBytes(body, "previous_response_id", previous)
 }
 
 func newResponsesWebSocketConn(dst webSocketMessageWriter) *responsesWebSocketConn {
@@ -115,6 +148,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 	}
 	defer conn.Close()
 	downstream := newResponsesWebSocketConn(conn)
+	state := &responsesWebSocketState{}
 	session := upstream.NewCodexResponsesWebSocketSession()
 	defer session.Close()
 	baseCtx := context.WithValue(r.Context(), codexResponsesWebSocketSessionKey{}, session)
@@ -140,7 +174,14 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 			continue
-		case "response.create":
+		case "response.create", "response.append":
+			if kind == "response.append" {
+				body, err = state.completeAppend(body)
+				if err != nil {
+					_ = writeWebSocketError(downstream, http.StatusBadRequest, err.Error())
+					return
+				}
+			}
 			turnBaseCtx, cancelTurn := context.WithCancel(baseCtx)
 			// One downstream WebSocket can carry many inference turns. Give each
 			// turn its own usage event while every retry/bridge inside that turn
@@ -153,7 +194,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			req.ContentLength = int64(len(body))
 			req.Header = r.Header.Clone()
 			req.Header.Set("Content-Type", "application/json")
-			writer := newResponsesWebSocketWriter(downstream)
+			writer := newResponsesWebSocketWriter(downstream, state.observe)
 			downstream.resetIdleClock()
 			heartbeatDone := make(chan error, 1)
 			go func() {
@@ -196,7 +237,7 @@ func responsesWebSocketRequestToBody(raw []byte) (string, []byte, error) {
 	if kind == "" {
 		return "", nil, fmt.Errorf("missing websocket request type")
 	}
-	if kind != "response.create" {
+	if kind != "response.create" && kind != "response.append" {
 		return kind, nil, nil
 	}
 	body, err := sjson.DeleteBytes(raw, "type")
@@ -218,12 +259,14 @@ type responsesWebSocketWriter struct {
 	status     int
 	sseBuffer  []byte
 	bodyBuffer []byte
+	onEvent    func([]byte)
 }
 
-func newResponsesWebSocketWriter(conn webSocketMessageWriter) *responsesWebSocketWriter {
+func newResponsesWebSocketWriter(conn webSocketMessageWriter, onEvent func([]byte)) *responsesWebSocketWriter {
 	return &responsesWebSocketWriter{
-		conn:   conn,
-		header: http.Header{},
+		conn:    conn,
+		header:  http.Header{},
+		onEvent: onEvent,
 	}
 }
 
@@ -290,6 +333,9 @@ func (w *responsesWebSocketWriter) writeSSEBlock(block []byte) error {
 	payload := sseDataPayload(block)
 	if payload == "" || payload == "[DONE]" {
 		return nil
+	}
+	if w.onEvent != nil {
+		w.onEvent([]byte(payload))
 	}
 	return w.conn.WriteMessage(websocket.TextMessage, []byte(payload))
 }

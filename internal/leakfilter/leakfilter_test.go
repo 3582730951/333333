@@ -319,6 +319,42 @@ func TestOrphanedToolOutputErrorRecognizesObservedProxyWrapper(t *testing.T) {
 	}
 }
 
+func TestResponsesContextErrorNeutralizationNeverLeaksObservedWrapper(t *testing.T) {
+	const callID = "call_GQqnpD0cS3uxvXlgWBSD974z"
+	body := []byte(`{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id ` + callID + `.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`)
+	status, neutral, changed := NeutralizeResponsesContextErrorBody(http.StatusBadRequest, body)
+	if !changed || status != http.StatusServiceUnavailable {
+		t.Fatalf("neutralization changed=%v status=%d body=%s", changed, status, neutral)
+	}
+	for _, leak := range []string{"No tool call found", callID, `invalid_request_error`, `\"param\"`} {
+		if bytes.Contains(neutral, []byte(leak)) {
+			t.Fatalf("neutralized HTTP body leaked %q: %s", leak, neutral)
+		}
+	}
+	if !bytes.Contains(neutral, []byte(`"type":"server_error"`)) {
+		t.Fatalf("neutralized HTTP body is not a stable server error: %s", neutral)
+	}
+
+	frame := append([]byte("event: error\ndata: "), body...)
+	frame = append(frame, []byte("\n\n")...)
+	neutralFrame, changed := NeutralizeResponsesContextErrorSSEFrame(frame)
+	if !changed {
+		t.Fatalf("observed SSE wrapper was not neutralized: %s", frame)
+	}
+	for _, leak := range []string{"No tool call found", callID, `invalid_request_error`} {
+		if bytes.Contains(neutralFrame, []byte(leak)) {
+			t.Fatalf("neutralized SSE frame leaked %q: %s", leak, neutralFrame)
+		}
+	}
+	if !bytes.Contains(neutralFrame, []byte(`"status":503`)) || !bytes.Contains(neutralFrame, []byte(`"type":"server_error"`)) {
+		t.Fatalf("neutralized SSE frame is not a stable terminal error: %s", neutralFrame)
+	}
+	filtered := runSSE(t, "codex", string(frame), 7)
+	if strings.Contains(filtered, "No tool call found") || strings.Contains(filtered, callID) || !strings.Contains(filtered, "server_error") {
+		t.Fatalf("Codex SSE filter did not enforce context safety: %s", filtered)
+	}
+}
+
 func TestResponsesContextErrorRecognizesPreviousResponseNotFound(t *testing.T) {
 	directType := []byte(`{"error":{"message":"Previous response resp_missing was not found.","type":"previous_response_not_found","param":"previous_response_id"}}`)
 	directCode := []byte(`{"error":{"message":"Previous response resp_missing was not found.","type":"invalid_request_error","code":"previous_response_not_found"}}`)
