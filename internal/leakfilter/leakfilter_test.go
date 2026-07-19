@@ -191,6 +191,10 @@ func TestRetryableCodexFailureFrameRejectsWebSocketClientError(t *testing.T) {
 	if failure, ok := ParseRetryableCodexFailureFrame(frame); ok {
 		t.Fatalf("genuine client error must not be retried: %+v", failure)
 	}
+	failure, ok := ParseCodexFailureFrame(frame)
+	if !ok || failure.StatusCode != http.StatusBadRequest || failure.BuiltinRetryable {
+		t.Fatalf("client error must remain available to operator rules without becoming built-in retryable: %+v ok=%v", failure, ok)
+	}
 	if got := runSSE(t, "codex", string(frame), 5); !strings.Contains(got, "invalid cache request") {
 		t.Fatalf("genuine client error was dropped: %q", got)
 	}

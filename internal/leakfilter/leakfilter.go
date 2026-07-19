@@ -262,11 +262,12 @@ func NewSSEFilter(provider string, words *streamrewrite.Matcher) *SSEFilter {
 // Responses-over-WebSocket transport emits type:error with the real status and
 // quota headers embedded in the JSON body.
 type CodexFailureFrame struct {
-	EventType    string
-	StatusCode   int
-	ContextError ResponsesContextErrorKind
-	Header       http.Header
-	Body         []byte
+	EventType        string
+	StatusCode       int
+	ContextError     ResponsesContextErrorKind
+	BuiltinRetryable bool
+	Header           http.Header
+	Body             []byte
 }
 
 // ResponsesContextErrorKind identifies the precise upstream 400s that mean a
@@ -280,11 +281,11 @@ const (
 	ResponsesContextErrorPreviousResponseNotFound ResponsesContextErrorKind = "previous_response_not_found"
 )
 
-// ParseRetryableCodexFailureFrame recognizes both Codex terminal error envelopes.
-// It deliberately requires an account-retryable HTTP status, a known limit/overload
-// signature, or a precise context-loss error so a genuine client error (for example
-// an invalid request or invalid cache key) is never moved to another account.
-func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
+// ParseCodexFailureFrame recognizes both Codex terminal error envelopes, including
+// ordinary client 400s. Callers can inspect BuiltinRetryable; operator rule matching
+// needs to see every early terminal frame even when the built-in policy would pass it
+// downstream unchanged.
+func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	eventType, data := parseSSEFrame(frame)
 	if len(data) == 0 {
 		return CodexFailureFrame{}, false
@@ -317,10 +318,8 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
 		status == http.StatusServiceUnavailable || status >= 500
 	signatureRetryable := containsAnyFold(lower, codexFailedLeakSignatures)
-	if !statusRetryable && !signatureRetryable && contextError == ResponsesContextErrorNone {
-		return CodexFailureFrame{}, false
-	}
-	if status == 0 {
+	builtinRetryable := statusRetryable || signatureRetryable || contextError != ResponsesContextErrorNone
+	if status == 0 && builtinRetryable {
 		if containsAnyFold(lower, []string{"server_is_overloaded", "slow_down", "at capacity", "try a different model"}) {
 			status = http.StatusServiceUnavailable
 		} else {
@@ -335,12 +334,21 @@ func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		}
 	}
 	return CodexFailureFrame{
-		EventType:    kind,
-		StatusCode:   status,
-		ContextError: contextError,
-		Header:       header,
-		Body:         append([]byte(nil), data...),
+		EventType:        kind,
+		StatusCode:       status,
+		ContextError:     contextError,
+		BuiltinRetryable: builtinRetryable,
+		Header:           header,
+		Body:             append([]byte(nil), data...),
 	}, true
+}
+
+// ParseRetryableCodexFailureFrame applies the built-in retry policy to a parsed
+// terminal frame. Ordinary client errors remain visible to ParseCodexFailureFrame for
+// operator rules but are not retried or filtered by default.
+func ParseRetryableCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
+	failure, ok := ParseCodexFailureFrame(frame)
+	return failure, ok && failure.BuiltinRetryable
 }
 
 // DetectResponsesContextError recognizes only the Responses 400s that indicate

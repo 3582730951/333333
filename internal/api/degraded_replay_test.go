@@ -52,6 +52,38 @@ func TestDegradedReplayKeepsPairedToolCallOutput(t *testing.T) {
 	}
 }
 
+func TestContextErrorReplayNeutralizesCompletedPairedToolExchange(t *testing.T) {
+	body := []byte(`{"model":"gpt","input":[
+	  {"type":"custom_tool_call","call_id":"call_done","name":"apply_patch","input":"{}"},
+	  {"type":"custom_tool_call_output","call_id":"call_done","status":"completed","output":{"text":"preserve paired result","n":900719925474099312345}},
+	  {"type":"custom_tool_call","call_id":"call_pending","name":"next_tool","input":"{}"}
+	]}`)
+	degraded := degradedResponsesReplayForContextError(body, leakfilter.ResponsesContextErrorOrphanedToolOutput)
+	text := string(degraded)
+	root, err := decodeContextJSONMap(degraded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := false
+	for _, raw := range root["input"].([]interface{}) {
+		item, _ := raw.(map[string]interface{})
+		if streamString(item["call_id"]) == "call_done" && (isToolCallItemType(streamString(item["type"])) || isToolOutputItemType(streamString(item["type"]))) {
+			t.Fatalf("completed rejected tool exchange remained executable: %v", item)
+		}
+		if streamString(item["call_id"]) == "call_pending" && isToolCallItemType(streamString(item["type"])) {
+			pending = true
+		}
+	}
+	if !pending {
+		t.Fatalf("pending tool call was removed: %s", degraded)
+	}
+	for _, want := range []string{"preserve paired result", "900719925474099312345", "call_done", "call_pending", "next_tool"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("context replay lost %q: %s", want, degraded)
+		}
+	}
+}
+
 func TestNeutralizeOrphanedToolOutputsUsesStablePairingRules(t *testing.T) {
 	var root map[string]interface{}
 	raw := []byte(`{"input":[

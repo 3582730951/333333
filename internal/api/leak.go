@@ -379,14 +379,14 @@ const (
 
 func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureFrame, bool, error) {
 	var failure leakfilter.CodexFailureFrame
-	prefix, retryable, err := probeEarlySSEFailure(body, func(frame []byte) bool {
-		parsed, ok := leakfilter.ParseRetryableCodexFailureFrame(frame)
+	prefix, terminal, err := probeEarlySSEFailure(body, func(frame []byte) bool {
+		parsed, ok := leakfilter.ParseCodexFailureFrame(frame)
 		if ok {
 			failure = parsed
 		}
 		return ok
 	}, codexSSEFrameCommitsContent, true)
-	return prefix, failure, retryable, err
+	return prefix, failure, terminal, err
 }
 
 func probeEarlyClaudeSSEFailure(body io.Reader) ([]byte, bool, error) {

@@ -139,6 +139,10 @@ func ensureEncryptedReasoningInclude(body []byte) []byte {
 }
 
 func degradedResponsesReplay(body []byte) []byte {
+	return degradedResponsesReplayForContextError(body, leakfilter.ResponsesContextErrorNone)
+}
+
+func degradedResponsesReplayForContextError(body []byte, contextError leakfilter.ResponsesContextErrorKind) []byte {
 	root, err := decodeContextJSONMap(body)
 	if err != nil {
 		return body
@@ -152,7 +156,15 @@ func degradedResponsesReplay(body []byte) []byte {
 	// preserves the tool-result text, so the degraded request is valid and the turn still
 	// succeeds (a paired call+output already in the input is left untouched).
 	if input, ok := root["input"].([]interface{}); ok {
-		if fixed, n := neutralizeOrphanedToolOutputs(input); n > 0 {
+		fixed, n := neutralizeOrphanedToolOutputs(input)
+		if contextError == leakfilter.ResponsesContextErrorOrphanedToolOutput {
+			// The upstream explicitly rejected a tool output. Even if the current
+			// payload contains a superficially paired call, that pair was not valid in
+			// upstream context. Remove completed calls and preserve their results as
+			// user context so retrying cannot execute the tools a second time.
+			fixed, n = neutralizeCompletedToolExchanges(input)
+		}
+		if n > 0 {
 			root["input"] = fixed
 		}
 	}
@@ -161,6 +173,52 @@ func degradedResponsesReplay(body []byte) []byte {
 		return body
 	}
 	return out
+}
+
+// neutralizeCompletedToolExchanges is the stronger fallback used only after an exact
+// missing-tool-call response. Every client-managed tool output becomes user context,
+// and a matching call in the same input is removed with it. Calls without an output
+// remain untouched because they may still require execution.
+func neutralizeCompletedToolExchanges(input []interface{}) ([]interface{}, int) {
+	completed := map[string]bool{}
+	for _, it := range input {
+		m, ok := it.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		kind := toolOutputPairKind(m)
+		if kind == "" || kind == "tool_search_server" {
+			continue
+		}
+		if cid := streamString(m["call_id"]); cid != "" {
+			completed[kind+"\x00"+cid] = true
+		}
+	}
+
+	converted := 0
+	out := make([]interface{}, 0, len(input))
+	for _, it := range input {
+		m, ok := it.(map[string]interface{})
+		if !ok {
+			out = append(out, it)
+			continue
+		}
+		callKind := toolCallPairKind(streamString(m["type"]))
+		if callKind == "" && strings.EqualFold(strings.TrimSpace(streamString(m["type"])), "mcp_tool_call") {
+			callKind = "function"
+		}
+		if cid := streamString(m["call_id"]); callKind != "" && cid != "" && completed[callKind+"\x00"+cid] {
+			continue
+		}
+		outputKind := toolOutputPairKind(m)
+		if outputKind != "" && outputKind != "tool_search_server" {
+			out = append(out, orphanedToolOutputAsUserMessage(m))
+			converted++
+			continue
+		}
+		out = append(out, it)
+	}
+	return out, converted
 }
 
 // neutralizeOrphanedToolOutputs converts every tool-call output item whose matching tool
@@ -363,7 +421,7 @@ func responsesRecoveryEligible(body []byte, header http.Header) bool {
 // missing Responses context. Journal replay is lossless and therefore wins; otherwise
 // degradation preserves current input and rewrites orphaned tool outputs as user
 // context. Both paths discard every account-local state pointer before retrying.
-func (s *Server) recoverResponsesContext(ctx context.Context, body []byte, header http.Header) (codexRetryRequest, string, bool) {
+func (s *Server) recoverResponsesContext(ctx context.Context, body []byte, header http.Header, contextError leakfilter.ResponsesContextErrorKind) (codexRetryRequest, string, bool) {
 	if rebuilt, ok := s.journalReplayBody(ctx, body); ok {
 		return codexRetryRequest{
 			Raw:       rebuilt,
@@ -371,11 +429,11 @@ func (s *Server) recoverResponsesContext(ctx context.Context, body []byte, heade
 			Recovered: true,
 		}, "rebuilt", true
 	}
-	if !responsesRecoveryEligible(body, header) {
+	if contextError == leakfilter.ResponsesContextErrorNone && !responsesRecoveryEligible(body, header) {
 		return codexRetryRequest{}, "", false
 	}
 	return codexRetryRequest{
-		Raw:       degradedResponsesReplay(body),
+		Raw:       degradedResponsesReplayForContextError(body, contextError),
 		Header:    stripCodexServerStateHeaders(header),
 		Recovered: true,
 	}, "degraded", true

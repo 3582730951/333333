@@ -2603,6 +2603,132 @@ func TestPreviousResponseNotFoundSingleAccountRepairsOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestRuleFailoverThenOrphanedPairedOutputRecoversAgain(t *testing.T) {
+	const callID = "call_diagnostic_chain"
+	recoveredPayload := make(chan []byte, 1)
+	upgrader := websocket.Upgrader{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-chain-a":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: error\n"+
+				`data: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`+"\n\n"+
+				"data: [DONE]\n\n")
+		case "Bearer access-chain-b":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: error\n"+
+				`data: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id `+callID+`."}}`+"\n\n"+
+				"data: [DONE]\n\n")
+		case "Bearer access-chain-c":
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upgrade recovered request: %v", err)
+				return
+			}
+			defer conn.Close()
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("read recovered request: %v", err)
+				return
+			}
+			recoveredPayload <- append([]byte(nil), payload...)
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.output_text.delta","delta":"ok-from-chain-c"}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_chain_c","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
+		default:
+			t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
+		}
+	})
+	accountA := h.importAccount(t, "chain-a", "upstream-chain-a", "access-chain-a")
+	accountB := h.importAccount(t, "chain-b", "upstream-chain-b", "access-chain-b")
+	accountC := h.importAccount(t, "chain-c", "upstream-chain-c", "access-chain-c")
+	for _, accountID := range []string{accountA, accountB, accountC} {
+		setTestCapability(t, h, accountID, "gpt-5.6-sol", 1024)
+	}
+	if err := h.store.SetSetting(context.Background(), "seamless_failover", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID: "chain-hide-safety", Name: "hide safety", Enabled: true, Priority: 1,
+		Providers: []string{"chatgpt"}, Entrypoints: []string{"responses"},
+		AccountAction: "none", DownstreamAction: "hide_safety_buffering",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID: "chain-failover-400", Name: "fail over unsupported model", Enabled: true, Priority: 2,
+		Providers: []string{"chatgpt"}, Entrypoints: []string{"responses"}, StatusCodes: []int{400},
+		BodyKeywords: []string{"using Codex with a ChatGPT account."}, MatchMode: "all",
+		AccountAction: "cooldown_recheck", DownstreamAction: "failover", CooldownSeconds: 1800,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt-5.6-sol","stream":true,"prompt_cache_key":"diagnostic-chain","input":[{"type":"custom_tool_call","call_id":"` + callID + `","name":"apply_patch","input":"{}"},{"type":"custom_tool_call_output","call_id":"` + callID + `","status":"completed","output":{"text":"diagnostic tool result","n":900719925474099312345}}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "ok-from-chain-c") {
+		t.Fatalf("multi-stage recovery status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Context-Status"); got != "degraded" {
+		t.Fatalf("context status=%q, want degraded", got)
+	}
+	requests := h.requests()
+	wantAuth := []string{"Bearer access-chain-a", "Bearer access-chain-b", "Bearer access-chain-c"}
+	if len(requests) != len(wantAuth) {
+		t.Fatalf("multi-stage attempts=%d want=%d: %+v", len(requests), len(wantAuth), requests)
+	}
+	for index, want := range wantAuth {
+		if requests[index].Auth != want {
+			t.Fatalf("auth[%d]=%q want=%q: %+v", index, requests[index].Auth, want, requests)
+		}
+	}
+	var recoveredBody []byte
+	select {
+	case recoveredBody = <-recoveredPayload:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for recovered websocket payload")
+	}
+	recoveredRoot, err := decodeContextJSONMap(recoveredBody)
+	if err != nil {
+		t.Fatalf("decode recovered request method=%s path=%s body=%q: %v", requests[2].Method, requests[2].Path, recoveredBody, err)
+	}
+	preservedResult := false
+	for _, value := range recoveredRoot["input"].([]interface{}) {
+		item, _ := value.(map[string]interface{})
+		if streamString(item["call_id"]) == callID && (isToolCallItemType(streamString(item["type"])) || isToolOutputItemType(streamString(item["type"]))) {
+			t.Fatalf("recovered request could execute completed tool again: %s", recoveredBody)
+		}
+		encoded, _ := json.Marshal(item)
+		if item["role"] == "user" && strings.Contains(string(encoded), "diagnostic tool result") && strings.Contains(string(encoded), "900719925474099312345") {
+			preservedResult = true
+		}
+	}
+	if !preservedResult {
+		t.Fatalf("recovered request lost tool result: %s", recoveredBody)
+	}
+	account, err := h.store.GetAccount(context.Background(), accountB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("context error changed account B health: %+v", account)
+	}
+	if got := atomic.LoadUint64(&h.app.contextDegraded); got != 1 {
+		t.Fatalf("context degraded counter=%d, want 1", got)
+	}
+}
+
 func TestUnrelatedHTTP400DoesNotRecoverResponsesContext(t *testing.T) {
 	var attempts int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

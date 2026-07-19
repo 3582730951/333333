@@ -41,6 +41,19 @@ func TestProbeEarlyCodexSSEFailureDetectsWebSocketError(t *testing.T) {
 	}
 }
 
+func TestProbeEarlyCodexSSEFailureExposesClient400ToRules(t *testing.T) {
+	stream := "event: error\n" +
+		`data: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	prefix, failure, terminal, err := probeEarlyCodexSSEFailure(strings.NewReader(stream))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !terminal || failure.StatusCode != 400 || failure.BuiltinRetryable || !strings.Contains(string(prefix), "ChatGPT account") {
+		t.Fatalf("terminal=%v failure=%+v prefix=%q", terminal, failure, prefix)
+	}
+}
+
 func TestCodexCreatedFrameDoesNotCommitContent(t *testing.T) {
 	frame := []byte("event: response.created\n" +
 		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\n")

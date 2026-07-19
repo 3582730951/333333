@@ -74,7 +74,18 @@ func (s *Server) matchUpstreamErrorRule(ctx context.Context, input upstreamrules
 	if len(rules) == 0 {
 		return upstreamErrorRuleDecision{}, false
 	}
-	match, ok := upstreamrules.Match(rules, input)
+	// Stream transforms are evaluated by responseRuleFilter against ordinary response
+	// frames. They are not terminal-error decisions and must not shadow a later 400/
+	// keyword failover rule merely because they have an earlier creation timestamp.
+	terminalRules := make([]storage.UpstreamErrorRule, 0, len(rules))
+	for _, rule := range rules {
+		action := strings.ToLower(strings.TrimSpace(rule.DownstreamAction))
+		if action == upstreamrules.DownstreamActionIntercept || action == upstreamrules.DownstreamActionHideSafetyBuffering {
+			continue
+		}
+		terminalRules = append(terminalRules, rule)
+	}
+	match, ok := upstreamrules.Match(terminalRules, input)
 	if !ok {
 		return upstreamErrorRuleDecision{}, false
 	}

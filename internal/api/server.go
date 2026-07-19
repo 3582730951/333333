@@ -857,11 +857,17 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		// This error describes stale request context, not account health. Handle it
 		// before the generic classifier so it never cools or quarantines the account.
-		if !allowContextRepair || contextRecovered {
+		if !allowContextRepair {
+			log.Printf("[CONTEXT-TERMINAL] request_id=%s account=%s reason=%s error_category=%s terminal_reason=repair_budget_unavailable", requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
 			return codexAttemptResult{}, false
 		}
-		recovered, contextStatus, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader)
+		if contextRecovered {
+			log.Printf("[CONTEXT-TERMINAL] request_id=%s account=%s reason=%s error_category=%s terminal_reason=already_recovered", requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
+			return codexAttemptResult{}, false
+		}
+		recovered, contextStatus, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader, contextError)
 		if !ok {
+			log.Printf("[CONTEXT-TERMINAL] request_id=%s account=%s reason=%s error_category=%s terminal_reason=recovery_input_unavailable", requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
 			return codexAttemptResult{}, false
 		}
 		exclude[lease.Account.ID] = true
@@ -1293,7 +1299,7 @@ codexSuccess:
 		// native Responses and Chat Completions adapters. Downstream-visible safety
 		// progress also releases the probe so a long safety check can be kept alive;
 		// once either adapter writes HTTP 200, transparent failover is no longer possible.
-		prefix, streamFailure, retryableStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
+		prefix, streamFailure, terminalStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
 		if probeErr != nil {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 			if allowRetry && movable {
@@ -1305,7 +1311,7 @@ codexSuccess:
 			writePublicUnavailable(w, http.StatusServiceUnavailable)
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
-		if retryableStream {
+		if terminalStream {
 			failureHeader := resp.Header.Clone()
 			for name, values := range streamFailure.Header {
 				failureHeader.Del(name)
@@ -1338,66 +1344,77 @@ codexSuccess:
 				Body:       failureBody,
 				Streaming:  true,
 			})
-			shouldRetry := !ruleMatched || decision.Match.DownstreamAction == upstreamrules.DownstreamActionBuiltin || decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
-
-			// A reset credit is an in-place recovery on the same account and therefore
-			// precedes cooldown/failover. Explicit pass/custom/neutralize/idle rules do
-			// not consume credits behind the operator's back.
-			if shouldRetry {
-				// The WebSocket-to-SSE pipe is unbuffered. Closing before another request
-				// prevents its terminal [DONE] write from retaining the WS request mutex.
-				_ = resp.Body.Close()
-			}
-			if shouldRetry && !codexResetRetried && codexResetTriggerAllowed(failureStatus, failureBody) &&
-				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
-				codexResetRetried = true
-				if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
-					token = latest
-				}
-				retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
-				if retryErr == nil && retryResp.StatusCode < 400 {
-					resp = retryResp
-					finalEgress = retryEgress
-					goto codexSuccess
-				}
-				if retryResp != nil && retryResp.Body != nil {
-					_ = retryResp.Body.Close()
-				}
-				if retryErr != nil {
-					log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
-				}
-			}
-			if ruleMatched {
+			explicitRuleAction := ruleMatched && decision.Match.DownstreamAction != upstreamrules.DownstreamActionBuiltin
+			handleStreamFailure := streamFailure.BuiltinRetryable || explicitRuleAction
+			if ruleMatched && !handleStreamFailure {
+				// An account-only rule can still observe an ordinary client error, but
+				// downstream_action=builtin preserves the default pass-through policy.
 				s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
-			} else {
-				s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
 			}
-			_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
-			if ruleMatched {
-				switch decision.Match.DownstreamAction {
-				case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream:
+			if handleStreamFailure {
+				shouldRetry := !ruleMatched ||
+					decision.Match.DownstreamAction == upstreamrules.DownstreamActionBuiltin ||
+					decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
+
+				// A reset credit is an in-place recovery on the same account and therefore
+				// precedes cooldown/failover. Explicit pass/custom/neutralize/idle rules do
+				// not consume credits behind the operator's back.
+				if shouldRetry {
+					// The WebSocket-to-SSE pipe is unbuffered. Closing before another request
+					// prevents its terminal [DONE] write from retaining the WS request mutex.
 					_ = resp.Body.Close()
-					if s.writeRuleDownstream(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber, decision, true) {
+				}
+				if shouldRetry && !codexResetRetried && codexResetTriggerAllowed(failureStatus, failureBody) &&
+					s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
+					codexResetRetried = true
+					if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+						token = latest
+					}
+					retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+					if retryErr == nil && retryResp.StatusCode < 400 {
+						resp = retryResp
+						finalEgress = retryEgress
+						goto codexSuccess
+					}
+					if retryResp != nil && retryResp.Body != nil {
+						_ = retryResp.Body.Close()
+					}
+					if retryErr != nil {
+						log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
+					}
+				}
+				if ruleMatched {
+					s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
+				} else {
+					s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
+				}
+				_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
+				if ruleMatched {
+					switch decision.Match.DownstreamAction {
+					case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionHeartbeatFinish:
+						_ = resp.Body.Close()
+						if s.writeRuleDownstream(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber, decision, true) {
+							return codexAttemptResult{Outcome: outcomeDone}
+						}
+					case upstreamrules.DownstreamActionFailover:
+						_ = resp.Body.Close()
+						if allowRetry && movable {
+							return retry()
+						}
+						s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
 						return codexAttemptResult{Outcome: outcomeDone}
 					}
-				case upstreamrules.DownstreamActionFailover:
-					_ = resp.Body.Close()
-					if allowRetry && movable {
-						return retry()
-					}
-					s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
-					return codexAttemptResult{Outcome: outcomeDone}
 				}
+				_ = resp.Body.Close()
+				if allowRetry && movable {
+					return retry()
+				}
+				if rebuilt, ok := tryRebuildStateful("stream_response_failed"); ok {
+					return rebuilt
+				}
+				writePublicUnavailable(w, http.StatusServiceUnavailable)
+				return codexAttemptResult{Outcome: outcomeDone}
 			}
-			_ = resp.Body.Close()
-			if allowRetry && movable {
-				return retry()
-			}
-			if rebuilt, ok := tryRebuildStateful("stream_response_failed"); ok {
-				return rebuilt
-			}
-			writePublicUnavailable(w, http.StatusServiceUnavailable)
-			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
 		if isChat {

@@ -277,6 +277,104 @@ func TestCodexUpstreamErrorRuleFailoverOnWebSocketSSEUsageLimit(t *testing.T) {
 	}
 }
 
+func TestCodexUpstreamErrorRuleFailoverOnSSEClient400(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-a":
+			_, _ = io.WriteString(w, "event: error\n"+
+				`data: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`+"\n\n"+
+				"data: [DONE]\n\n")
+		case "Bearer access-b":
+			_, _ = io.WriteString(w, "event: response.output_text.delta\n"+
+				`data: {"type":"response.output_text.delta","delta":"ok-from-b"}`+"\n\n"+
+				"event: response.completed\n"+
+				`data: {"type":"response.completed","response":{"id":"resp_b","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n"+
+				"data: [DONE]\n\n")
+		default:
+			t.Fatalf("unexpected auth %q", r.Header.Get("Authorization"))
+		}
+	})
+	accountA := h.importAccount(t, "a", "upstream-a", "access-a")
+	accountB := h.importAccount(t, "b", "upstream-b", "access-b")
+	setTestCapability(t, h, accountA, "gpt-5.6-sol", 1024)
+	setTestCapability(t, h, accountB, "gpt-5.6-sol", 1024)
+	// This transform rule deliberately sorts before the failover rule, matching the
+	// diagnostic bundle. It must not shadow terminal-error decisions.
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID: "hide-safety", Name: "hide safety", Enabled: true, Priority: 1,
+		Providers: []string{"chatgpt"}, Entrypoints: []string{"responses"},
+		AccountAction: "none", DownstreamAction: "hide_safety_buffering",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID: "failover-client-400", Name: "fail over unsupported ChatGPT model", Enabled: true, Priority: 2,
+		Providers: []string{"chatgpt"}, Entrypoints: []string{"responses"}, StatusCodes: []int{400},
+		BodyKeywords: []string{"using Codex with a ChatGPT account."}, MatchMode: "all",
+		AccountAction: "cooldown_recheck", DownstreamAction: "failover", CooldownSeconds: 1800,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt-5.6-sol","stream":true,"prompt_cache_key":"client-400-rule","input":"hi"}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "ok-from-b") || strings.Contains(string(responseBody), "ChatGPT account") {
+		t.Fatalf("client 400 rule failover status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-a" || requests[1].Auth != "Bearer access-b" {
+		t.Fatalf("client 400 did not switch upstream exactly once: %+v", requests)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), accountA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !binding.RecheckPending || binding.CooldownUntil <= storage.Now() {
+		t.Fatalf("configured account action was not applied: %+v", binding)
+	}
+}
+
+func TestCodexSSEClient400WithoutRulePassesThrough(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\n"+
+			`data: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"ordinary client error"}}`+"\n\n"+
+			"data: [DONE]\n\n")
+	})
+	accountA := h.importAccount(t, "a", "upstream-a", "access-a")
+	accountB := h.importAccount(t, "b", "upstream-b", "access-b")
+	setTestCapability(t, h, accountA, "gpt-5.5", 1024)
+	setTestCapability(t, h, accountB, "gpt-5.5", 1024)
+	body := `{"model":"gpt-5.5","stream":true,"prompt_cache_key":"plain-client-400","input":"hi"}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(responseBody), "ordinary client error") {
+		t.Fatalf("ordinary client 400 status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if requests := h.requests(); len(requests) != 1 || requests[0].Auth != "Bearer access-a" {
+		t.Fatalf("ordinary client 400 was unexpectedly retried: %+v", requests)
+	}
+}
+
 func TestCodexChatStreamingWebSocketUsageLimitRetriesBeforeHTTP200(t *testing.T) {
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
