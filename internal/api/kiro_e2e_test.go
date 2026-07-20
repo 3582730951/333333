@@ -928,12 +928,12 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 	h.app.scheduler.InvalidateAccountCache()
 
 	history := strings.Repeat("historic-context-", 65_000) + "tail-marker-before-compaction"
-	request := func(system, finalInstruction, session string) (*http.Response, []byte) {
+	request := func(historyContent, system, finalInstruction, session string) (*http.Response, []byte) {
 		payload, _ := json.Marshal(map[string]any{
 			"model":  "claude-opus-4-8",
 			"system": system,
 			"messages": []any{
-				map[string]any{"role": "user", "content": history},
+				map[string]any{"role": "user", "content": historyContent},
 				map[string]any{"role": "assistant", "content": "previous answer"},
 				map[string]any{"role": "user", "content": finalInstruction},
 			},
@@ -951,8 +951,8 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 		return resp, body
 	}
 
-	ordinary, ordinaryBody := request("You are Claude Code", "continue ordinary work", "ordinary-over-200k")
-	if ordinary.StatusCode != http.StatusBadRequest || ordinary.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" || !bytes.Contains(ordinaryBody, []byte("请运行 /compact")) {
+	ordinary, ordinaryBody := request(history, "You are Claude Code", "continue ordinary work", "ordinary-over-200k")
+	if ordinary.StatusCode != http.StatusBadRequest || ordinary.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" || ordinary.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" || !bytes.Contains(ordinaryBody, []byte("Prompt is too long:")) || !bytes.Contains(ordinaryBody, []byte(`"type":"error"`)) || bytes.Contains(ordinaryBody, []byte("请运行 /compact")) {
 		t.Fatalf("ordinary oversized request was relaxed: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
 	}
 
@@ -962,7 +962,7 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.app.scheduler.InvalidateAccountCache()
-	freeResponse, freeBody := request(compactSystem, compactInstruction, "compact-free")
+	freeResponse, freeBody := request(history, compactSystem, compactInstruction, "compact-free")
 	if freeResponse.StatusCode != http.StatusBadRequest || !bytes.Contains(freeBody, []byte(`"code":"claude_context_1m_unavailable"`)) {
 		t.Fatalf("free Kiro compact bypassed entitlement: status=%d body=%s", freeResponse.StatusCode, freeBody)
 	}
@@ -971,12 +971,28 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.app.scheduler.InvalidateAccountCache()
-	compactResponse, compactBody := request(compactSystem, compactInstruction, "compact-paid")
+	compactResponse, compactBody := request(history, compactSystem, compactInstruction, "compact-paid")
 	if compactResponse.StatusCode != http.StatusOK || !bytes.Contains(compactBody, []byte("compact summary")) {
 		t.Fatalf("paid compact status=%d body=%s", compactResponse.StatusCode, compactBody)
 	}
 	if compactResponse.Header.Get("X-Pool-Kiro-Context-Window") != "1000000" || compactRequests != 1 || !fullHistoryForwarded {
 		t.Fatalf("compact did not use lossless extended window: headers=%v requests=%d full_history=%v", compactResponse.Header, compactRequests, fullHistoryForwarded)
+	}
+	overflowHistory := strings.Repeat("overflow-context-", 280_000)
+	overflowResponse, overflowBody := request(overflowHistory, compactSystem, compactInstruction+"\n\nREMINDER: Do NOT call any tools. Respond with plain text only.", "compact-over-1m")
+	var overflowEnvelope struct {
+		Type  string `json:"type"`
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(overflowBody, &overflowEnvelope); err != nil {
+		t.Fatalf("decode overflow compaction response: %v body=%s", err, overflowBody)
+	}
+	if overflowResponse.StatusCode != http.StatusBadRequest || overflowResponse.Header.Get("X-MiCliProxy-Context-Status") != "compact_failed" || overflowResponse.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" || overflowEnvelope.Type != "error" || overflowEnvelope.Error.Type != "invalid_request_error" || overflowEnvelope.Error.Code != "context_length_exceeded" || !strings.HasPrefix(overflowEnvelope.Error.Message, "Prompt is too long:") || !strings.Contains(overflowEnvelope.Error.Message, "tokens > 1000000") || !strings.Contains(overflowEnvelope.Error.Message, "automatically retry compaction") || strings.Contains(overflowEnvelope.Error.Message, "请运行 /compact") {
+		t.Fatalf("overflow compaction did not request Claude Code partial retry: status=%d headers=%v body=%s", overflowResponse.StatusCode, overflowResponse.Header, overflowBody)
 	}
 	caps, err := h.store.ListCapabilities(context.Background(), account.ID)
 	if err != nil {

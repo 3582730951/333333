@@ -922,7 +922,8 @@ func writeKiroError(w http.ResponseWriter, r *http.Request, status int, err erro
 		w.Header().Set("X-MiCliProxy-Context-Limit", fmt.Sprintf("%d", contextErr.EffectiveLimit))
 		w.Header().Set("X-MiCliProxy-Context-Estimated-Input", fmt.Sprintf("%d", contextErr.EstimatedInput))
 		w.Header().Set("X-MiCliProxy-Kiro-Model", contextErr.KiroModel)
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{
+		w.Header().Set("X-MiCliProxy-Auto-Compact", "client_retry")
+		writeJSON(w, http.StatusBadRequest, map[string]any{"type": "error", "error": map[string]any{
 			"message": err.Error(), "type": "invalid_request_error", "code": "context_length_exceeded",
 		}})
 		return

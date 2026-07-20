@@ -54,6 +54,11 @@ func TestIsClaudeCodeCompactionRequestRequiresDedicatedSignature(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "dedicated system survives changed instruction",
+			raw:  `{"model":"claude-opus-4-8","system":"` + claudeCodeCompactionSystem + `","messages":[{"role":"user","content":"Summarize all earlier turns now."}]}`,
+			want: true,
+		},
+		{
 			name: "billing plus compaction system blocks",
 			raw:  `{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.215;"},{"type":"text","text":"` + claudeCodeCompactionSystem + `"}],"messages":[{"role":"assistant","content":"old"},{"role":"user","content":[{"type":"text","text":"` + instruction + `"}]}]}`,
 			want: true,
@@ -61,6 +66,11 @@ func TestIsClaudeCodeCompactionRequestRequiresDedicatedSignature(t *testing.T) {
 		{
 			name: "ordinary user mentions compact",
 			raw:  `{"model":"claude-opus-4-8","system":"You are Claude Code","messages":[{"role":"user","content":"` + instruction + `"}]}`,
+		},
+		{
+			name: "cache sharing compaction markers",
+			raw:  `{"model":"claude-opus-4-8","system":"You are Claude Code","messages":[{"role":"user","content":"` + instruction + `\n\n` + claudeCodeCompactionReminder + `"}]}`,
+			want: true,
 		},
 		{
 			name: "carried tool definitions do not hide compaction",
@@ -189,12 +199,12 @@ func TestConvertAnthropicRequiresCompactRatherThanDroppingHistory(t *testing.T) 
 	})
 	_, err := ConvertAnthropicRequestWithOptions(raw, "trim-budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 30_000})
 	var contextErr *ContextLengthError
-	if !errors.As(err, &contextErr) || !strings.Contains(err.Error(), "/compact") {
-		t.Fatalf("oversized history error = %v, want compact-required ContextLengthError", err)
+	if !errors.As(err, &contextErr) || !strings.HasPrefix(err.Error(), claudeCodePromptTooLongPrefix) || !strings.Contains(err.Error(), "tokens > 30000") || strings.Contains(err.Error(), "请运行 /compact") {
+		t.Fatalf("oversized history error = %v, want Claude Code auto-compact protocol", err)
 	}
 }
 
-func TestConvertAnthropicOversizedCompactionDoesNotRecommendCompactAgain(t *testing.T) {
+func TestConvertAnthropicOversizedCompactionRequestsAutomaticPartialRetry(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"model":  "claude-opus-4-8",
 		"system": claudeCodeCompactionSystem,
@@ -205,7 +215,7 @@ func TestConvertAnthropicOversizedCompactionDoesNotRecommendCompactAgain(t *test
 	})
 	_, err := ConvertAnthropicRequestWithOptions(raw, "compact-budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 30_000, Compaction: true})
 	var contextErr *ContextLengthError
-	if !errors.As(err, &contextErr) || !contextErr.Compaction || strings.Contains(err.Error(), "请运行 /compact") || !strings.Contains(err.Error(), "/clear") {
+	if !errors.As(err, &contextErr) || !contextErr.Compaction || !strings.HasPrefix(err.Error(), "Prompt is too long:") || !strings.Contains(err.Error(), "tokens > 30000") || !strings.Contains(err.Error(), "automatically retry compaction") || strings.Contains(err.Error(), "请运行 /compact") {
 		t.Fatalf("oversized compaction error = %v", err)
 	}
 }

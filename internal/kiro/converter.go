@@ -42,12 +42,13 @@ const (
 	kiroContextMinOutput     = int64(4096)
 	kiroContextMinHeadroom   = int64(8192)
 
-	// Claude Code 2.1.x uses this dedicated system/instruction pair for manual and
-	// automatic conversation compaction. Requiring both markers keeps an ordinary
-	// user prompt from acquiring compaction-only routing; tools are not a signal,
-	// because some client builds carry definitions while denying all tool calls.
+	// Claude Code 2.1.x uses these dedicated system/instruction markers for manual
+	// and automatic conversation compaction. Tools are not a signal because some
+	// client builds carry definitions while denying all tool calls.
 	claudeCodeCompactionSystem      = "You are a helpful AI assistant tasked with summarizing conversations."
 	claudeCodeCompactionInstruction = "Your task is to create a detailed summary of the conversation so far"
+	claudeCodeCompactionReminder    = "REMINDER: Do NOT call any tools. Respond with plain text only"
+	claudeCodePromptTooLongPrefix   = "Prompt is too long"
 )
 
 var (
@@ -71,10 +72,15 @@ func (e *ContextLengthError) Error() string {
 	if requested == "" {
 		requested = e.KiroModel
 	}
+	// Claude Code recognizes this exact leading phrase and token-count grammar.
+	// Keeping the numbers before model versions is important: its parser extracts
+	// the first "N tokens > M" pair and uses the gap to remove old conversation
+	// groups before retrying compaction automatically.
+	detail := fmt.Sprintf("%s: %d tokens > %d; requested_model=%s kiro_model=%s", claudeCodePromptTooLongPrefix, e.EstimatedInput, e.EffectiveLimit, requested, e.KiroModel)
 	if e.Compaction {
-		return fmt.Sprintf("%v: requested_model=%s kiro_model=%s input_tokens~%d effective_limit=%d; /compact 请求本身仍超出可用上下文，请切换到支持 1M 的账号/模型后重试，或运行 /clear", ErrContextTooLong, requested, e.KiroModel, e.EstimatedInput, e.EffectiveLimit)
+		return detail + "; Claude Code should automatically retry compaction with older conversation groups removed"
 	}
-	return fmt.Sprintf("%v: requested_model=%s kiro_model=%s input_tokens~%d effective_limit=%d; 请运行 /compact 后重试", ErrContextTooLong, requested, e.KiroModel, e.EstimatedInput, e.EffectiveLimit)
+	return detail + "; Claude Code should automatically compact the conversation and retry"
 }
 
 func (e *ContextLengthError) Unwrap() error { return ErrContextTooLong }
@@ -215,11 +221,16 @@ func ConvertAnthropicRequest(raw []byte, affinity string) (Conversion, error) {
 
 // IsClaudeCodeCompactionRequest recognizes Claude Code's dedicated summarization
 // call without trusting a generic word such as "compact". Current Claude Code
-// sends the fixed system role and a fixed final-user instruction prefix.
+// sends either the fixed summarizer system role, or (for its cache-sharing /
+// reactive path) the fixed final-user instruction plus no-tools reminder.
 func IsClaudeCodeCompactionRequest(raw []byte) bool {
-	// Avoid a full JSON decode on ordinary turns. Claude Code emits both markers
-	// as plain ASCII; only the rare matching request pays the structural check.
-	if !bytes.Contains(raw, []byte(claudeCodeCompactionSystem)) || !bytes.Contains(raw, []byte(claudeCodeCompactionInstruction)) {
+	// Avoid a full JSON decode on ordinary turns. The direct compaction path has
+	// the dedicated system marker. Cache-sharing and reactive compaction retain
+	// the normal system prompt but carry both dedicated user markers.
+	hasSystemMarker := bytes.Contains(raw, []byte(claudeCodeCompactionSystem))
+	hasInstructionMarker := bytes.Contains(raw, []byte(claudeCodeCompactionInstruction))
+	hasReminderMarker := bytes.Contains(raw, []byte(claudeCodeCompactionReminder))
+	if !hasSystemMarker && !(hasInstructionMarker && hasReminderMarker) {
 		return false
 	}
 	var req anthropicRequest
@@ -227,14 +238,18 @@ func IsClaudeCodeCompactionRequest(raw []byte) bool {
 		return false
 	}
 	system, present, err := systemContent(req.System, lossSet{})
-	if err != nil || !present || !strings.Contains(system, claudeCodeCompactionSystem) {
+	if err != nil {
 		return false
+	}
+	if present && strings.Contains(system, claudeCodeCompactionSystem) {
+		return true
 	}
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if !strings.EqualFold(strings.TrimSpace(req.Messages[i].Role), "user") {
 			continue
 		}
-		return strings.Contains(contentText(req.Messages[i].Content), claudeCodeCompactionInstruction)
+		text := contentText(req.Messages[i].Content)
+		return strings.Contains(text, claudeCodeCompactionInstruction) && strings.Contains(text, claudeCodeCompactionReminder)
 	}
 	return false
 }
