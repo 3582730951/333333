@@ -7,6 +7,7 @@ import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { fmtTokens, fmtInt, fmtDateTime, fmtRelative } from '../lib/format.js';
+import { healthTestRequestBody, isKiroAccount, isKiroSuspended } from '../features/accounts/model/healthTest.ts';
 
 const Row = ({ k, v }) => (
   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 13 }}>
@@ -193,6 +194,8 @@ export default function AccountDrawer({
   const codexReauth = details.codexReauth || null;
   const codexReauthConfig = codexReauth?.config || {};
   const latestCodexReauthJob = codexReauth?.latest_job || null;
+  const kiroAccount = isKiroAccount(account);
+  const kiroSuspended = isKiroSuspended(account);
 
   return (
     <Drawer title={account.label || account.id} visible={!!account} onCancel={onClose} width={520} className="pool-account-drawer">
@@ -204,7 +207,20 @@ export default function AccountDrawer({
         <Row k="分组" v={account.group_name || '默认'} />
         <Row k="套餐" v={account.plan_type || '—'} />
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
+        <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (kiroSuspended ? '无限期' : fmtRelative(account.quarantine_until)) : '否'} />
+        {account.quarantine_reason ? <Row k="隔离原因" v={account.quarantine_reason} /> : null}
       </Panel>
+
+      {kiroSuspended ? (
+        <Panel title="AWS User ID 已暂停" style={{ marginBottom: 14 }}>
+          <Typography.Text type="danger" as="p">
+            AWS 因安全原因锁定了此身份。账号、API Key、能力和审计已保留，但会无限期停止调度。
+          </Typography.Text>
+          <Typography.Text type="tertiary" as="p">
+            请先联系 AWS Support 完成身份验证；确认恢复后，由管理员执行下方 Kiro 双层测活。只有认证和真实推理都成功才会自动解除隔离。
+          </Typography.Text>
+        </Panel>
+      ) : null}
 
       {account.kiro_auth ? (
         <Panel title="Kiro 认证" style={{ marginBottom: 14 }}>
@@ -213,6 +229,7 @@ export default function AccountDrawer({
           <Row k="API 区域" v={account.kiro_auth.api_region || '—'} />
           <Row k="端点" v={account.kiro_auth.endpoint || 'Kiro IDE'} />
           <Row k="敏感凭证" v={[account.kiro_auth.has_client_secret && 'Client Secret', account.kiro_auth.has_api_key && 'API Key'].filter(Boolean).join(' / ') || 'OAuth Token'} />
+          <Row k="推理状态" v={kiroSuspended ? <Tag color="red" size="small">AWS User ID 已暂停</Tag> : '需双层测活确认'} />
         </Panel>
       ) : null}
 
@@ -336,8 +353,19 @@ export default function AccountDrawer({
       </Panel>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test')}>测活</Button>
-        <Button loading={isActionLoading('clear-quarantine')} disabled={isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解隔离</Button>
+        {kiroAccount ? (
+          <ConfirmDialog
+            title="确认执行 Kiro 双层测活？"
+            description="将先免费检查认证；认证正常后，会绑定此账号和当前出口发送 1 次最小推理请求并消耗少量 credits。"
+            confirmText="确认并测活"
+            onConfirm={() => onAction(account.id, 'health-test', healthTestRequestBody(account, true))}
+          >
+            <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')}>测活</Button>
+          </ConfirmDialog>
+        ) : (
+          <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test')}>测活</Button>
+        )}
+        <Button loading={isActionLoading('clear-quarantine')} disabled={kiroSuspended || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解隔离</Button>
         <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button>
         <ConfirmDialog
           title="删除该账号？"

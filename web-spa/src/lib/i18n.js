@@ -298,6 +298,9 @@ const zh = {
   'audit.state.unreachable': '不可达',
   'audit.state.unknown': '未知',
   'audit.action.permission_denied_no_quarantine': '权限受限未隔离',
+  'audit.action.kiro_user_suspended': 'Kiro AWS 身份暂停',
+  'audit.action.kiro_inference_probe': 'Kiro 推理测活',
+  'audit.action.kiro_suspension_recovered': 'Kiro 暂停已恢复',
   'audit.action.usage_cache_stats_reset': '重置缓存统计',
 
   'lifecycle.title': '生命周期任务',
@@ -944,6 +947,9 @@ const en = {
   'audit.state.unreachable': 'Unreachable',
   'audit.state.unknown': 'Unknown',
   'audit.action.permission_denied_no_quarantine': 'Permission denied without quarantine',
+  'audit.action.kiro_user_suspended': 'Kiro AWS identity suspended',
+  'audit.action.kiro_inference_probe': 'Kiro inference probe',
+  'audit.action.kiro_suspension_recovered': 'Kiro suspension recovered',
   'audit.action.usage_cache_stats_reset': 'Reset cache statistics',
 
   'lifecycle.title': 'Lifecycle Jobs',

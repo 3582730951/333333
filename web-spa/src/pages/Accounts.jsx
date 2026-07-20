@@ -17,11 +17,16 @@ import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtTokens } from '../lib/format.js';
 import { useAccountsPage } from '../features/accounts/queries/accounts.ts';
+import {
+  healthBatchPresentation, healthResultPresentation, healthTestRequestBody,
+  isKiroAccount, isKiroSuspended, selectedHasKiro,
+} from '../features/accounts/model/healthTest.ts';
 
 const now = () => Math.floor(Date.now() / 1000);
 
 function statusInfo(a) {
   const n = now();
+  if (isKiroSuspended(a)) return { label: 'AWS User ID 已暂停', color: 'red', hint: '无限期隔离；需 AWS 支持处理后双层测活' };
   if ((a.quarantine_until || 0) > n) return { label: '隔离中', color: 'red', hint: '暂不参与调度' };
   if (a.egress_binding && a.egress_binding.recheck_pending) return { label: '待复测', color: 'orange', hint: '等待重新测活' };
   if (a.egress_binding && (a.egress_binding.cooldown_until || 0) > n) return { label: '冷却中', color: 'amber', hint: '临时退避' };
@@ -94,6 +99,7 @@ export default function Accounts() {
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [selected, setSelected] = useState([]);
+  const [selectedAccountMeta, setSelectedAccountMeta] = useState({});
   const [selectMode, setSelectMode] = useState(false);
   const [drawerAcct, setDrawerAcct] = useState(null);
   const [moveOpen, setMoveOpen] = useState(false);
@@ -111,6 +117,16 @@ export default function Accounts() {
   const total = data.total || 0;
   const groups = data.groups || [];
   const loadError = error || data.error;
+  const accountByID = new Map(rows.map((account) => [account.id, account]));
+  const selectedAccounts = selected.map((id) => accountByID.get(id) || selectedAccountMeta[id] || { id });
+  const bulkHealthIncludesKiro = selectedHasKiro(selectedAccounts, selected);
+  const handleSelectionChange = useCallback((keys) => {
+    setSelected(keys);
+    setSelectedAccountMeta((previous) => {
+      const visible = new Map(rows.map((account) => [account.id, account]));
+      return Object.fromEntries(keys.map((id) => [id, visible.get(id) || previous[id] || { id }]));
+    });
+  }, [rows]);
 
   const doSearch = () => { setPage(1); setSearch(searchInput.trim()); };
   const onPageChange = (cur) => { setPage(cur); };
@@ -119,10 +135,15 @@ export default function Accounts() {
     run: runAccountAction,
     running: accountActionRunning,
     isRunning: isAccountActionKeyRunning,
-  } = useKeyedAsyncAction(async (_key, id, act) => {
+  } = useKeyedAsyncAction(async (_key, id, act, requestBody = {}) => {
     try {
-      await post(`/admin/accounts/${id}/${act}`, {});
-      Toast.success(`${ACCOUNT_ACTION_LABEL[act] || '操作'}已完成`);
+      const result = await post(`/admin/accounts/${encodeURIComponent(id)}/${act}`, requestBody);
+      if (act === 'health-test') {
+        const presentation = healthResultPresentation(result);
+        Toast[presentation.tone](presentation.message);
+      } else {
+        Toast.success(`${ACCOUNT_ACTION_LABEL[act] || '操作'}已完成`);
+      }
       const nextData = await load();
       if (drawerAcct?.id === id) {
         if (act === 'delete') {
@@ -138,7 +159,7 @@ export default function Accounts() {
       return false;
     }
   });
-  const action = (id, act) => runAccountAction(accountActionKey(id, act), id, act);
+  const action = (id, act, requestBody = {}) => runAccountAction(accountActionKey(id, act), id, act, requestBody);
 
   const handleAccountUpdated = async (id, patch = {}) => {
     const nextData = await load();
@@ -150,11 +171,27 @@ export default function Accounts() {
     }
   };
 
-  const { run: bulkAction, running: bulkActionRunning } = useAsyncAction(async (act, label) => {
+  const { run: bulkAction, running: bulkActionRunning } = useAsyncAction(async (act, label, kiroCostConfirmed = false) => {
     if (!selected.length) return;
-    const result = await batchOp(label, selected, (id) => post(`/admin/accounts/${id}/${act}`, {}));
+    const healthEntries = [];
+    const result = await batchOp(label, selected, async (id) => {
+      const account = accountByID.get(id) || selectedAccountMeta[id] || { id };
+      const response = await post(
+        `/admin/accounts/${encodeURIComponent(id)}/${act}`,
+        act === 'health-test' ? healthTestRequestBody(account, kiroCostConfirmed) : {},
+      );
+      if (act === 'health-test') healthEntries.push({ account, result: response });
+      return response;
+    });
     const failedIDs = result.failed.map((item) => item.id);
-    if (result.failed.length) {
+    if (act === 'health-test') {
+      const presentation = healthBatchPresentation(healthEntries, result.failed.length);
+      Toast[presentation.tone](presentation.message);
+      if (result.failed.length) {
+        const firstErrors = result.failed.slice(0, 3).map((item) => `${item.id}: ${item.error}`).join('；');
+        Toast.warning(firstErrors);
+      }
+    } else if (result.failed.length) {
       const firstErrors = result.failed.slice(0, 3).map((item) => {
         const requestID = item.request_id ? `，请求 ID: ${item.request_id}` : '';
         return `${item.id}: ${item.error}${requestID}`;
@@ -189,11 +226,16 @@ export default function Accounts() {
         {
           label: isAccountActionLoading(r.id, 'health-test') ? '测活中' : '测活',
           disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'health-test'),
-          onSelect: () => action(r.id, 'health-test'),
+          confirm: isKiroAccount(r) ? {
+            title: '确认执行 Kiro 双层测活？',
+            description: '将先免费检查认证；认证正常后，会绑定此账号和出口发送 1 次最小推理请求并消耗少量 credits。',
+            confirmText: '确认并测活',
+          } : undefined,
+          onSelect: () => action(r.id, 'health-test', healthTestRequestBody(r, isKiroAccount(r))),
         },
         {
           label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解隔中' : '解隔',
-          disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine'),
+          disabled: isKiroSuspended(r) || (anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine')),
           onSelect: () => action(r.id, 'clear-quarantine'),
         },
         {
@@ -374,7 +416,18 @@ export default function Accounts() {
       {selected.length > 0 && (
         <div className="pool-bulkbar">
           <span>已选 <b>{selected.length}</b> 项</span>
-          <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', '测活')}>批量测活</Button>
+          {bulkHealthIncludesKiro ? (
+            <ConfirmDialog
+              title="确认批量执行 Kiro 双层测活？"
+              description="所选账号中包含 Kiro。每个认证正常的 Kiro 账号会发送 1 次最小推理请求并消耗少量 credits；其他提供商保持原测活方式。"
+              confirmText="确认并批量测活"
+              onConfirm={() => bulkAction('health-test', '测活', true)}
+            >
+              <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning}>批量测活</Button>
+            </ConfirmDialog>
+          ) : (
+            <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', '测活')}>批量测活</Button>
+          )}
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解隔离')}>批量解隔离</Button>
           <Button size="small" disabled={anyAccountOperationRunning} onClick={() => { setMoveIDs([...selected]); setMoveGroup(''); setMoveOpen(true); }}>移动分组</Button>
           <ConfirmDialog
@@ -400,7 +453,7 @@ export default function Accounts() {
         rowKey="id"
         pagination={{ pageSize, total, currentPage: page, onPageChange: onPageChange }}
         size="middle"
-        rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: (keys) => setSelected(keys) } : undefined}
+        rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: handleSelectionChange } : undefined}
         className="pool-mobile-table pool-accounts-table"
         density="account"
         minScrollX={1092}

@@ -12,6 +12,7 @@ const accountSchema = z.object({
   group_name: z.string().optional(),
   plan_type: z.string().optional(),
   quarantine_until: z.number().optional(),
+  quarantine_reason: z.string().optional(),
   usage: z.record(z.string(), z.unknown()).nullable().optional(),
 }).passthrough();
 

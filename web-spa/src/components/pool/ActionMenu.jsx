@@ -22,7 +22,7 @@ export function ActionMenu({ items = [], label = '更多操作' }) {
                 disabled={item.disabled}
                 onSelect={(event) => {
                   event.preventDefault();
-                  if (item.destructive && item.confirm) {
+                  if (item.confirm) {
                     setConfirmItem(item);
                     return;
                   }

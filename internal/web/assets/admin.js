@@ -23,6 +23,15 @@ function cooldownInfo(a) {
   return until > now ? { active: true, secs: until - now, kind: q > now ? "quarantine" : "cooldown" } : { active: false, secs: 0, kind: "" };
 }
 
+function isKiroAccount(a) { return !!a && String(a.provider || "").toLowerCase() === "kiro"; }
+function isKiroSuspended(a) { return isKiroAccount(a) && String(a.quarantine_reason || "").toLowerCase() === "aws_user_suspended"; }
+function kiroHealthConfirmation(accounts) {
+  if (!(accounts || []).some(isKiroAccount)) return true;
+  return confirm(LANG === "en"
+    ? "Kiro health testing performs a real minimal model request after the free authentication check and may consume credits. Continue?"
+    : "Kiro 测活会先执行免费认证检查，再发送一次最小真实推理请求，可能消耗 credits。是否继续？");
+}
+
 function filterAccTable(el) {
   const container = el.closest(".panel");
   if (!container) return;
@@ -50,6 +59,7 @@ function filterAccTable(el) {
 }
 
 function cooldownChip(a) {
+  if (isKiroSuspended(a)) return `<span class="chip bad" title="${LANG === "en" ? "Contact AWS Support, then run the confirmed health test to recover." : "请先联系 AWS 支持，恢复后由管理员确认并执行双层测活。"}">${LANG === "en" ? "AWS User ID suspended" : "AWS User ID 已暂停"}</span>`;
   const c = cooldownInfo(a);
   if (!c.active) return `<span class="chip ok">${LANG === "en" ? "ready" : "就绪"}</span>`;
   const m = Math.floor(c.secs / 60), s = c.secs % 60;
@@ -160,7 +170,7 @@ function accTableHTML(accs, compact) {
     return `<tr class="clk" onclick="openAcc('${a.id}')">
       <td><div>${esc(a.label || "-")} ${provChip(a.provider)}</div><div class="mono muted">${esc(a.id)}</div></td>
       <td>${esc(a.email || "-")}<div class="muted">${esc(a.plan_type || "")}</div></td>
-      <td>${statusChip(a.status)}${a.is_fedramp ? ' <span class="chip">fedramp</span>' : ""}</td>
+      <td>${isKiroSuspended(a) ? `<span class="chip bad">${LANG === "en" ? "AWS User ID suspended" : "AWS User ID 已暂停"}</span>` : statusChip(a.status)}${a.is_fedramp ? ' <span class="chip">fedramp</span>' : ""}</td>
       <td>${quotaMiniBar(QUOTA[a.id])}</td>
       <td class="mono">${esc(caps || "—")}</td>
       <td class="mono">${esc(eg)}</td>
@@ -192,6 +202,11 @@ async function loadAccounts() {
 async function act(id, action, method) { try { await api(`/admin/accounts/${id}/${action}`, { method }); toast(action + " ✓", "ok"); loadAccounts(); } catch (e) { toast(e.message, "bad"); } }
 async function delAcc(id) { if (!confirm((LANG === "en" ? "Delete account " : "删除账号 ") + id + " ?")) return; try { await api(`/admin/accounts/${id}/delete`, { method: "DELETE" }); toast(t("ok.deleted"), "ok"); closeDrawer(); loadAccounts(); } catch (e) { toast(e.message, "bad"); } }
 async function clearQuarantine(id) {
+  const account = (ACCTS || []).find((a) => a.id === id);
+  if (isKiroSuspended(account)) {
+    toast(LANG === "en" ? "Run a confirmed Kiro health test after AWS restores the account." : "AWS 恢复账号后，请执行带 credits 确认的 Kiro 双层测活。", "bad");
+    return;
+  }
   if (!confirm((LANG === "en" ? "Clear quarantine for account " : "清除账号隔离 ") + id + " ?")) return;
   try {
     await api(`/admin/accounts/${id}/clear-quarantine`, { method: "POST" });
@@ -222,8 +237,9 @@ async function openAcc(id) {
       ${hasSd ? `<div style="text-align:center">${Charts.ring(sd.used_percent, { size: 90, thick: 10, color: quotaColor(sd.used_percent), sub: "7d" })}
         <div class="muted" style="font-size:11px;margin-top:4px">${sd.used_percent >= 0 ? Math.round(sd.used_percent) + "%" : "—"}</div></div>` : `<div style="text-align:center">${Charts.ring(0, { size: 90, thick: 10, color: "var(--muted)", sub: "7d" })}<div class="muted" style="font-size:11px;margin-top:4px">—</div></div>`}
       <div class="kv" style="grid-template-columns:88px 1fr;flex:1;margin:0">${kv("5h " + (LANG === "en" ? "used" : "已用"), q.used_percent >= 0 ? Math.round(q.used_percent) + "%" : "—")}${kv("5h " + (LANG === "en" ? "remain" : "剩余"), q.remaining_tokens >= 0 ? fmt(q.remaining_tokens) : "—")}${hasSd ? kv("7d " + (LANG === "en" ? "used" : "已用"), Math.round(sd.used_percent) + "%") : ""}${hasSd ? kv("7d " + (LANG === "en" ? "remain" : "剩余"), sd.remaining_tokens >= 0 ? fmt(sd.remaining_tokens) : "—") : ""}</div></div>` : "";
+  const suspensionNote = isKiroSuspended(a) ? `<div class="note" style="border-color:var(--bad);color:var(--bad)"><b>${LANG === "en" ? "AWS User ID suspended" : "AWS User ID 已暂停"}</b><br>${LANG === "en" ? "Contact AWS Support for identity verification. After restoration, an administrator must run the confirmed two-stage health test before scheduling resumes." : "请联系 AWS 支持完成身份验证。AWS 恢复后，管理员必须确认 credits 消耗并执行双层测活，成功后才会恢复调度。"}</div>` : "";
   $("#drBody").innerHTML = `
-    <div class="kv">${kv("ID", a.id)}${kv("Provider", a.provider)}${kv("Email", a.email)}${kv("Plan", a.plan_type)}${kv("Status", a.status)}</div>
+    ${suspensionNote}<div class="kv">${kv("ID", a.id)}${kv("Provider", a.provider)}${kv("Email", a.email)}${kv("Plan", a.plan_type)}${kv("Status", isKiroSuspended(a) ? (LANG === "en" ? "AWS User ID suspended / quarantined" : "AWS User ID 已暂停 / 隔离") : a.status)}${kv(LANG === "en" ? "Quarantine reason" : "隔离原因", a.quarantine_reason)}</div>
     <div class="sect">${LANG === "en" ? "Models" : "模型能力"}</div><div class="row">${caps}</div>${quotaSect}
     <div class="sect">${LANG === "en" ? "Egress" : "出口绑定"}</div>
     <div class="row"><select class="t" id="drEg" style="flex:1">${egOpts || "<option>—</option>"}</select><button class="btn" onclick="setEg('${a.id}')">${LANG === "en" ? "Set primary" : "设为主出口"}</button></div>
@@ -235,7 +251,7 @@ async function openAcc(id) {
       <button class="btn sm" onclick="act('${a.id}','refresh','POST')">${LANG === "en" ? "Refresh" : "刷新"}</button>
       <button class="btn sm" onclick="healthTest('${a.id}')">${LANG === "en" ? "Health test" : "测试存活"}</button>
       ${a.status === "active" ? `<button class="btn sm" onclick="act('${a.id}','disable','POST')">${LANG === "en" ? "Disable" : "禁用"}</button>` : `<button class="btn sm" onclick="act('${a.id}','enable','POST')">${LANG === "en" ? "Enable" : "启用"}</button>`}
-      ${a.quarantine_until && a.quarantine_until > Math.floor(Date.now() / 1000) ? `<button class="btn sm warn" onclick="clearQuarantine('${a.id}')">${LANG === "en" ? "Clear quarantine" : "清除隔离"}</button>` : ""}
+      ${!isKiroSuspended(a) && a.quarantine_until && a.quarantine_until > Math.floor(Date.now() / 1000) ? `<button class="btn sm warn" onclick="clearQuarantine('${a.id}')">${LANG === "en" ? "Clear quarantine" : "清除隔离"}</button>` : ""}
       <button class="btn sm danger" onclick="delAcc('${a.id}')">${LANG === "en" ? "Delete" : "删除"}</button>
     </div>`;
   tickUntil();
@@ -523,7 +539,7 @@ async function loadCF() {
 }
 
 /* audit */
-function auditChip(a) { const m = { ban_delete: "bad", ban_quarantine: "bad", auth_quarantine: "warn", health_test: a.state === "alive" ? "ok" : a.state === "banned" ? "bad" : "warn" }; return `<span class="chip ${m[a.action] || ""}">${esc(a.action)}</span>`; }
+function auditChip(a) { const m = { ban_delete: "bad", ban_quarantine: "bad", auth_quarantine: "warn", kiro_user_suspended: "bad", kiro_inference_probe: a.state === "alive" ? "ok" : "bad", kiro_suspension_recovered: "ok", health_test: a.state === "alive" ? "ok" : a.state === "banned" ? "bad" : "warn" }; return `<span class="chip ${m[a.action] || ""}">${esc(a.action)}</span>`; }
 async function loadAudit() {
   $("#auditView").innerHTML = `<div class="panel"><div class="hd"><h2>${LANG === "en" ? "Audit · ban detection" : "审计日志 · 封禁检测"}</h2><span class="sp"></span><button class="btn sm" onclick="healthTestAll()">${LANG === "en" ? "Test abnormal" : "一键测试异常账号"}</button></div><div class="bd" style="padding:0" id="auditTable"><div class="empty">${t("common.loading")}</div></div></div>`;
   const rows = (await api("/admin/audit?limit=200").catch(() => [])) || [];
@@ -531,16 +547,66 @@ async function loadAudit() {
   $("#auditTable").innerHTML = `<table><thead><tr><th>${LANG === "en" ? "Time" : "时间"}</th><th>${LANG === "en" ? "Action" : "动作"}</th><th>${t("common.account")}</th><th>${LANG === "en" ? "Verdict" : "判定"}</th><th>${LANG === "en" ? "Reason" : "原因"}</th></tr></thead><tbody>` +
     rows.map((a) => `<tr><td class="mono">${new Date(a.created_at * 1000).toLocaleString()}</td><td>${auditChip(a)}</td><td>${esc(a.account_label || "-")}</td><td><span class="chip ${a.state === "alive" ? "ok" : a.state === "banned" ? "bad" : "warn"}">${esc(a.state || "-")}</span></td><td class="mono">${esc(a.reason || "")}</td></tr>`).join("") + `</tbody></table>`;
 }
-async function healthTest(id) { toast(LANG === "en" ? "Testing…" : "测试中…"); try { const r = await api(`/admin/accounts/${id}/health-test`, { method: "POST" }); const detail = (r.state !== "alive" || (r.http_status && r.http_status >= 400)) && r.snippet ? " · " + String(r.snippet).slice(0, 160) : ""; toast(`${r.alive ? "✓" : "✕"} ${r.state}${r.reason ? " (" + r.reason + ")" : ""} · HTTP ${r.http_status || "-"}${detail}`, r.alive ? "ok" : "bad"); if (r.deleted) { closeDrawer(); loadAccounts(); } return r; } catch (e) { toast(e.message, "bad"); return null; } }
-async function healthTestQuiet(id) { try { return await api(`/admin/accounts/${id}/health-test`, { method: "POST" }); } catch { return null; } }
+function healthTestMessage(r) {
+  if (r && r.auth_probe) {
+    const auth = r.auth_probe.alive ? (LANG === "en" ? "Authentication OK" : "认证正常") : (LANG === "en" ? "Authentication failed" : "认证失败");
+    let inference = LANG === "en" ? "Inference not checked" : "推理未验证";
+    if (r.inference_probe && r.inference_probe.checked) {
+      inference = r.inference_probe.alive ? (LANG === "en" ? "Inference available" : "推理可用")
+        : r.inference_probe.error_code === "kiro_account_suspended" || r.inference_probe.state === "banned"
+          ? (LANG === "en" ? "Inference suspended (contact AWS Support)" : "推理暂停（需联系 AWS 支持）")
+          : (LANG === "en" ? "Inference failed" : "推理失败");
+    }
+    return `${r.ready ? "✓" : "✕"} ${auth} · ${inference}`;
+  }
+  const detail = (r.state !== "alive" || (r.http_status && r.http_status >= 400)) && r.snippet ? " · " + String(r.snippet).slice(0, 160) : "";
+  return `${r.alive ? "✓" : "✕"} ${r.state}${r.reason ? " (" + r.reason + ")" : ""} · HTTP ${r.http_status || "-"}${detail}`;
+}
+async function healthTest(id) {
+  const account = (ACCTS || []).find((a) => a.id === id);
+  if (!kiroHealthConfirmation(account ? [account] : [])) return null;
+  toast(LANG === "en" ? "Testing…" : "测试中…");
+  try {
+    const opts = { method: "POST" };
+    if (isKiroAccount(account)) opts.body = JSON.stringify({ confirm_cost: true });
+    const r = await api(`/admin/accounts/${id}/health-test`, opts);
+    toast(healthTestMessage(r), r.ready === true || (!r.auth_probe && r.alive) ? "ok" : "bad");
+    if (r.deleted) { closeDrawer(); loadAccounts(); }
+    return r;
+  } catch (e) { toast(e.message, "bad"); return null; }
+}
+async function healthTestQuiet(account, kiroConfirmed) {
+  try {
+    const opts = { method: "POST" };
+    if (isKiroAccount(account)) {
+      if (!kiroConfirmed) return null;
+      opts.body = JSON.stringify({ confirm_cost: true });
+    }
+    return await api(`/admin/accounts/${account.id}/health-test`, opts);
+  } catch { return null; }
+}
 async function healthTestAll() {
   const accs = ACCTS && ACCTS.length ? ACCTS : (await api("/admin/accounts").catch(() => [])) || [];
   let targets = accs.filter((a) => a.status !== "active" || cooldownInfo(a).active); if (!targets.length) targets = accs;
   if (!targets.length) { toast(LANG === "en" ? "No accounts" : "无账号"); return; }
+  if (!kiroHealthConfirmation(targets)) return;
   toast(`${LANG === "en" ? "Testing" : "测试"} ${targets.length}…`);
-  let alive = 0, dead = 0, deleted = 0;
-  for (const a of targets) { const r = await healthTestQuiet(a.id); if (!r) continue; r.alive ? alive++ : dead++; if (r.deleted) deleted++; }
-  toast(`✓${alive} ✕${dead} ${LANG === "en" ? "del" : "删"}${deleted}`, dead ? "bad" : "ok"); loadAudit();
+  let authAlive = 0, authFailed = 0, inferenceAlive = 0, inferenceSuspended = 0, inferenceUnchecked = 0, otherAlive = 0, otherFailed = 0, deleted = 0;
+  for (const a of targets) {
+    const r = await healthTestQuiet(a, true); if (!r) continue;
+    if (r.auth_probe) {
+      r.auth_probe.alive ? authAlive++ : authFailed++;
+      if (!r.inference_probe || !r.inference_probe.checked) inferenceUnchecked++;
+      else if (r.inference_probe.alive) inferenceAlive++;
+      else if (r.inference_probe.error_code === "kiro_account_suspended" || r.inference_probe.state === "banned") inferenceSuspended++;
+      else inferenceUnchecked++;
+    } else r.alive ? otherAlive++ : otherFailed++;
+    if (r.deleted) deleted++;
+  }
+  const summary = LANG === "en"
+    ? `Auth OK ${authAlive} / failed ${authFailed} · inference available ${inferenceAlive} / suspended ${inferenceSuspended} / unverified ${inferenceUnchecked} · other OK ${otherAlive} / failed ${otherFailed} · deleted ${deleted}`
+    : `认证正常 ${authAlive} / 失败 ${authFailed} · 推理可用 ${inferenceAlive} / 暂停 ${inferenceSuspended} / 未验证 ${inferenceUnchecked} · 其他通过 ${otherAlive} / 失败 ${otherFailed} · 删除 ${deleted}`;
+  toast(summary, authFailed || inferenceSuspended || inferenceUnchecked || otherFailed ? "bad" : "ok"); loadAudit();
 }
 
 /* gopay */

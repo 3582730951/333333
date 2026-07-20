@@ -20,7 +20,10 @@ import (
 	"github.com/google/uuid"
 )
 
-var ErrInvalidGrant = errors.New("kiro refresh token permanently invalid")
+var (
+	ErrInvalidGrant     = errors.New("kiro refresh token permanently invalid")
+	ErrAccountSuspended = errors.New("Kiro account AWS User ID is suspended; contact AWS Support for identity verification, then ask an administrator to run the Kiro health test")
+)
 
 type Manager struct {
 	store    *storage.Store
@@ -160,12 +163,24 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 	return bearer, token, cred, nil
 }
 
-func (m *Manager) UsageLimits(ctx context.Context, account storage.Account, cred storage.KiroCredentials, bearer string, egress storage.EgressProfile) (map[string]interface{}, error) {
+type UsageLimitsResult struct {
+	Limits     map[string]interface{}
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+// UsageLimitsProbe preserves the HTTP evidence needed by health checks while
+// keeping UsageLimits as the small compatibility wrapper used by imports and
+// quota polling. A non-2xx response is returned both as structured evidence and
+// as an error, so background callers retain their existing behavior.
+func (m *Manager) UsageLimitsProbe(ctx context.Context, account storage.Account, cred storage.KiroCredentials, bearer string, egress storage.EgressProfile) (UsageLimitsResult, error) {
+	var result UsageLimitsResult
 	cfg := m.Config()
 	region := first(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1")
 	base, err := ValidateEndpoint(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	if strings.HasSuffix(base, "/generateAssistantResponse") {
 		base = strings.TrimSuffix(base, "/generateAssistantResponse")
@@ -175,18 +190,27 @@ func (m *Manager) UsageLimits(ctx context.Context, account storage.Account, cred
 		u += "&profileArn=" + url.QueryEscape(cred.ProfileARN)
 	}
 	head := Headers(cfg, cred, bearer, false)
-	status, _, raw, err := m.do(ctx, egress, http.MethodGet, u, head, nil, account.ID+":"+egress.ID)
+	status, header, raw, err := m.do(ctx, egress, http.MethodGet, u, head, nil, account.ID+":"+egress.ID)
+	result.StatusCode = status
+	result.Header = header
+	result.Body = raw
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("kiro usage status %d: %s", status, trimBody(raw))
+		return result, fmt.Errorf("kiro usage status %d: %s", status, trimBody(raw))
 	}
 	var out map[string]interface{}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
+		return result, err
 	}
-	return out, nil
+	result.Limits = out
+	return result, nil
+}
+
+func (m *Manager) UsageLimits(ctx context.Context, account storage.Account, cred storage.KiroCredentials, bearer string, egress storage.EgressProfile) (map[string]interface{}, error) {
+	result, err := m.UsageLimitsProbe(ctx, account, cred, bearer, egress)
+	return result.Limits, err
 }
 
 func Headers(cfg config.Config, cred storage.KiroCredentials, bearer string, stream bool) http.Header {

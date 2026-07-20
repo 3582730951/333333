@@ -247,8 +247,9 @@ func correlatorValue(routeKey string) string {
 }
 
 // adminHealthTest sends a provider-correct account probe upstream and classifies
-// the response (the operator "一键测试存活"). Kiro's probe is deliberately limited
-// to authentication + UsageLimits and therefore does not claim to test a model.
+// the response (the operator "一键测试存活"). Kiro is handled by its explicit
+// two-layer auth + billable inference probe; background callers continue to use
+// probeAccountLiveness, whose Kiro branch remains the free UsageLimits check.
 func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, accountID string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -264,6 +265,10 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
+	if s.accountProvider(account, token) == "kiro" {
+		s.adminKiroHealthTest(w, r, account, token)
+		return
+	}
 	res := s.probeAccountLiveness(r.Context(), account, token)
 	if res.Err != nil {
 		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
@@ -273,7 +278,8 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		})
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"account_id": accountID, "alive": false, "state": "unreachable", "error": res.Err.Error(),
-			"provider": res.Provider, "model": res.Model, "probe_scope": res.ProbeScope, "model_checked": res.ModelChecked,
+			"ready": false, "provider": res.Provider, "model": res.Model, "probe_scope": res.ProbeScope, "model_checked": res.ModelChecked,
+			"quarantined": account.QuarantineUntil > storage.Now(), "quarantine_reason": account.QuarantineReason,
 		})
 		return
 	}
@@ -284,7 +290,7 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 	deleted := false
 	if v.IsBanned() {
 		s.handleBannedAccount(r.Context(), account, v, res.Status, res.Body, "health_test")
-		deleted = s.flagEnabled(r.Context(), "ban_auto_delete", s.cfg.BanAutoDelete)
+		deleted = s.bannedAccountWillBeDeleted(r.Context(), account, v)
 	} else if v.State == ban.PermissionDenied {
 		s.recordPermissionDeniedNoQuarantine(r.Context(), account, v, res.Status, res.Body, "health_test")
 	} else {
@@ -313,32 +319,28 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		if alive && s.cfg.HealthTestClearsQuarantine {
 			_ = s.store.SetAccountQuarantine(r.Context(), accountID, 0, "")
 		}
-		// A successful Kiro UsageLimits request proves the currently stored API
-		// credential is valid. Recover accounts left in the legacy invalid state by
-		// an earlier transient generation 401/403; otherwise the scheduler keeps
-		// excluding a key that the health test has just verified.
-		if alive && provider == "kiro" && account.Status == "invalid" {
-			_ = s.store.SetAccountStatus(r.Context(), accountID, "active")
-			s.scheduler.InvalidateAccountCache()
-			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
-				AccountID: accountID, AccountLabel: firstNonEmpty(account.Label, account.Email, accountID),
-				Action: "kiro_auth_recovered", State: "active", Reason: "health_test_succeeded",
-				Detail: "Kiro account_auth_usage probe returned HTTP 200; stale invalid status cleared",
-			})
-		}
+	}
+	quarantined := false
+	quarantineReason := ""
+	if current, currentErr := s.store.GetAccount(r.Context(), accountID); currentErr == nil {
+		quarantined = current.QuarantineUntil > storage.Now()
+		quarantineReason = current.QuarantineReason
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"account_id":    accountID,
-		"alive":         alive,
-		"state":         string(v.State),
-		"reason":        v.Reason,
-		"http_status":   res.Status,
-		"provider":      provider,
-		"model":         model,
-		"probe_scope":   res.ProbeScope,
-		"model_checked": res.ModelChecked,
-		"deleted":       deleted,
-		"snippet":       bodySnippet(res.Body, 300),
+		"account_id":        accountID,
+		"alive":             alive,
+		"ready":             res.Ready,
+		"state":             string(v.State),
+		"reason":            v.Reason,
+		"http_status":       res.Status,
+		"provider":          provider,
+		"model":             model,
+		"probe_scope":       res.ProbeScope,
+		"model_checked":     res.ModelChecked,
+		"deleted":           deleted,
+		"quarantined":       quarantined,
+		"quarantine_reason": quarantineReason,
+		"snippet":           bodySnippet(res.Body, 300),
 	})
 }
 
@@ -399,15 +401,26 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			res.Err = kerr
 			return res
 		}
-		usage, kerr := s.kiro.UsageLimits(ctx, account, cred, bearer, egress)
+		usageResult, kerr := s.kiro.UsageLimitsProbe(ctx, account, cred, bearer, egress)
+		res.Status = usageResult.StatusCode
+		res.Body = usageResult.Body
 		if kerr != nil {
-			res.Err = kerr
+			// Transport/setup errors have no HTTP evidence and remain unreachable.
+			// A real non-2xx UsageLimits response is still returned as a classified
+			// auth result so callers can report its state and status accurately.
+			if usageResult.StatusCode == 0 || (usageResult.StatusCode >= 200 && usageResult.StatusCode < 300) {
+				res.Err = kerr
+				return res
+			}
+			res.Verdict = ban.Classify(false, usageResult.StatusCode, usageResult.Header, usageResult.Body)
+			res.Alive = false
+			res.Ready = false
 			return res
 		}
-		body, _ := json.Marshal(usage)
-		res.Status = http.StatusOK
-		res.Body = body
-		res.Verdict = ban.Classify(true, http.StatusOK, http.Header{}, body)
+		if len(res.Body) == 0 {
+			res.Body, _ = json.Marshal(usageResult.Limits)
+		}
+		res.Verdict = ban.Classify(true, usageResult.StatusCode, usageResult.Header, res.Body)
 		res.Alive = true
 		res.Ready = true
 		return res

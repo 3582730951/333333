@@ -621,6 +621,15 @@ func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, ac
 		methodNotAllowed(w)
 		return
 	}
+	account, err := s.store.GetAccount(r.Context(), accountID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if isKiroSuspensionQuarantine(account) {
+		writePoolCodeError(w, http.StatusConflict, "kiro_health_probe_required", "AWS User ID suspension quarantine can only be cleared by a successful administrator Kiro auth and inference health test")
+		return
+	}
 	if err := s.store.SetAccountQuarantine(r.Context(), accountID, 0, ""); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

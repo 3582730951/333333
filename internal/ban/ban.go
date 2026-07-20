@@ -59,6 +59,15 @@ func Classify(ok bool, status int, header http.Header, body []byte) Verdict {
 
 	// 1) Hard ban / deactivation — terminal, highest confidence. (Ported from the
 	// reference manager's deactivation_reason_from_message + is_banned_status_reason.)
+	//
+	// Kiro/AWS can return the Builder/User ID security suspension as HTTP 503 even
+	// though it is an account-level terminal condition.  Do not key off the bare
+	// word "suspended": model/error text can contain it incidentally.  The awkward
+	// exact suspension wording plus the security-lock / identity-support context is
+	// the high-confidence fingerprint AWS sends from generateAssistantResponse.
+	if awsUserSuspended(status, hay) {
+		return Verdict{Banned, "aws_user_suspended"}
+	}
 	for _, sig := range []string{"workspace_deactivated", "deactivated_workspace", "workspace deactivated", "workspace-deactivated", "deactivated workspace"} {
 		if strings.Contains(hay, sig) {
 			return Verdict{Banned, "workspace_deactivated"}
@@ -119,4 +128,31 @@ func Classify(ok bool, status int, header http.Header, body []byte) Verdict {
 		return Verdict{AuthExpired, "http_" + strconv.Itoa(status)}
 	}
 	return Verdict{Unknown, ""}
+}
+
+func awsUserSuspended(status int, hay string) bool {
+	if status < 400 {
+		return false
+	}
+	awsIdentity := containsAny(hay,
+		"aws user id", "aws builder id", "builder id temporarily", "builderid temporarily")
+	temporarilySuspended := strings.Contains(hay, "temporarily is suspended")
+	securityLock := strings.Contains(hay, "locked your account as a security precaution")
+	identityVerification := containsAny(hay,
+		"verify your identity", "identity verification", "verification of your identity")
+	awsSupport := containsAny(hay,
+		"contact aws support", "aws support", "support.aws.amazon.com", "aws.amazon.com/contact-us")
+
+	return (awsIdentity && temporarilySuspended && securityLock) ||
+		(securityLock && identityVerification && awsSupport) ||
+		(awsIdentity && temporarilySuspended && identityVerification && awsSupport)
+}
+
+func containsAny(hay string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(hay, needle) {
+			return true
+		}
+	}
+	return false
 }

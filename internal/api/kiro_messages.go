@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
@@ -890,6 +891,8 @@ func kiroErrorCode(err error) string {
 		return "kiro_endpoint_not_allowed"
 	case errors.Is(err, kirowire.ErrContextTooLong):
 		return "context_length_exceeded"
+	case errors.Is(err, kirowire.ErrAccountSuspended):
+		return "kiro_account_suspended"
 	default:
 		return "kiro_upstream_error"
 	}
@@ -918,8 +921,15 @@ func (s *Server) kiroAttemptError(w http.ResponseWriter, r *http.Request, lease 
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		transient = true
 	}
-	if transient {
-		s.onUpstreamError(r.Context(), lease.Account, status, header, body)
+	verdict := ban.Classify(false, status, header, body)
+	if verdict.IsBanned() {
+		s.handleBannedAccount(r.Context(), lease.Account, verdict, status, body, "upstream_error")
+	} else if transient {
+		verdict = s.onUpstreamError(r.Context(), lease.Account, status, header, body)
+	}
+	if verdict.Reason == kiroSuspensionQuarantineReason {
+		writeKiroError(w, r, http.StatusServiceUnavailable, kirowire.ErrAccountSuspended)
+		return outcomeDone
 	}
 	if cause != nil {
 		if schedulerWaitTerminal(r.Context(), cause.Error()) {
@@ -1019,6 +1029,9 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	}
 	if data.UsageSource == kirowire.UsageSourceEstimated {
 		rawUsage["estimated"] = true
+	}
+	if affinity.Source == "kiro_health_probe" {
+		rawUsage["probe_kind"] = "kiro_health_probe"
 	}
 	raw, _ := json.Marshal(rawUsage)
 	lossesJSON, _ := json.Marshal(data.CompatibilityLosses)

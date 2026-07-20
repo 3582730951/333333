@@ -51,6 +51,27 @@ func TestBannedNeverFromRecoverable(t *testing.T) {
 	}
 }
 
+func TestClassifyAWSUserSuspendedFromKiro503(t *testing.T) {
+	body := `{"message":"Your AWS Builder ID temporarily is suspended. We have locked your account as a security precaution. To restore access, contact AWS Support at https://support.aws.amazon.com/ and complete verification of your identity."}`
+	got := Classify(false, http.StatusServiceUnavailable, nil, []byte(body))
+	if got.State != Banned || got.Reason != "aws_user_suspended" {
+		t.Fatalf("AWS suspension verdict = %+v, want banned/aws_user_suspended", got)
+	}
+}
+
+func TestClassifyDoesNotTreatIncidentalSuspendedAsAWSUserSuspension(t *testing.T) {
+	for _, body := range []string{
+		`{"message":"service temporarily unavailable"}`,
+		`{"message":"the background job is suspended while the model is overloaded"}`,
+		`{"message":"contact support if this suspended animation demo fails"}`,
+	} {
+		got := Classify(false, http.StatusServiceUnavailable, nil, []byte(body))
+		if got.IsBanned() || got.Reason == "aws_user_suspended" {
+			t.Fatalf("incidental body %q classified as %+v", body, got)
+		}
+	}
+}
+
 // TestIsAccountLevel verifies the new IsAccountLevel method distinguishes
 // account-level failures (ban, auth expiry) from function-level restrictions
 // (permission denied, region block).

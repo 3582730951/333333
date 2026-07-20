@@ -222,6 +222,31 @@ func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
 	}
 }
 
+func TestBuildAnthropicModelsResponseUsesClaudeFacingKiroModelIDs(t *testing.T) {
+	body, _, err := BuildAnthropicModelsResponse(StaticKiroModels("kiro-account"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, model := range response.Data {
+		ids[model.ID] = true
+	}
+	if !ids["claude-opus-4-8"] {
+		t.Fatalf("Claude-facing Kiro model alias missing: %s", body)
+	}
+	if ids["claude-opus-4.8"] {
+		t.Fatalf("Kiro-native dotted model leaked into Claude Code catalog: %s", body)
+	}
+}
+
 func TestParseRequestedClaudeModelContextSuffix(t *testing.T) {
 	parsed, err := ParseRequestedClaudeModel("Claude-Opus-4.8[1M]")
 	if err != nil || parsed.RequestedModel != "Claude-Opus-4.8[1M]" || parsed.BaseModel != "claude-opus-4.8" || parsed.ContextMode != "1m" {

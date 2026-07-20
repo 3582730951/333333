@@ -252,10 +252,51 @@ func retryableForFailover(v ban.Verdict, status int) bool {
 // handleBannedAccount records an audit entry (BEFORE any destructive action, so
 // the trail survives) and then removes the account: hard delete when
 // ban_auto_delete is on (the operator-requested behavior), else a long quarantine.
-// It only ever runs on the high-confidence "banned" verdict.
+// AWS User ID suspensions are the deliberate exception: Kiro credentials and
+// evidence are retained under an indefinite operator quarantine.
+const (
+	kiroSuspensionQuarantineReason = "aws_user_suspended"
+	// 9999-12-31T23:59:59Z is an explicit, SQLite/JavaScript-safe representation
+	// of an indefinite operator quarantine. Only a successful paid Kiro health
+	// probe is allowed to clear this sentinel.
+	kiroSuspensionQuarantineUntil int64 = 253402300799
+)
+
+func isKiroUserSuspension(_ storage.Account, v ban.Verdict) bool {
+	// The reason is emitted only by the high-confidence AWS Builder/User ID
+	// fingerprint. Keying protection on it also covers legacy Kiro rows whose
+	// persisted provider is empty and is normally inferred from credentials.
+	return v.Reason == kiroSuspensionQuarantineReason
+}
+
+func isKiroSuspensionQuarantine(account storage.Account) bool {
+	return account.QuarantineReason == kiroSuspensionQuarantineReason
+}
+
+func (s *Server) bannedAccountWillBeDeleted(ctx context.Context, account storage.Account, v ban.Verdict) bool {
+	return !isKiroUserSuspension(account, v) && s.flagEnabled(ctx, "ban_auto_delete", s.cfg.BanAutoDelete)
+}
+
 func (s *Server) handleBannedAccount(ctx context.Context, account storage.Account, v ban.Verdict, status int, body []byte, source string) {
+	if isKiroUserSuspension(account, v) {
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			AccountID:    account.ID,
+			AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+			Action:       "kiro_user_suspended",
+			State:        string(v.State),
+			Reason:       v.Reason,
+			Detail:       fmt.Sprintf("source=%s provider=kiro http=%d body=%s", source, status, bodySnippet(body, 2000)),
+		})
+		_ = s.store.SetAccountQuarantine(ctx, account.ID, kiroSuspensionQuarantineUntil, kiroSuspensionQuarantineReason)
+		_ = s.store.SetBindingRecheckPending(ctx, account.ID, false)
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
+			s.scheduler.NotifyStateChanged()
+		}
+		return
+	}
 	action := "ban_quarantine"
-	if s.flagEnabled(ctx, "ban_auto_delete", s.cfg.BanAutoDelete) {
+	if s.bannedAccountWillBeDeleted(ctx, account, v) {
 		action = "ban_delete"
 	}
 	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
@@ -264,9 +305,9 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 		Action:       action,
 		State:        string(v.State),
 		Reason:       v.Reason,
-		Detail:       fmt.Sprintf("source=%s provider=%s http=%d body=%s", source, account.PlanType, status, bodySnippet(body, 600)),
+		Detail:       fmt.Sprintf("source=%s provider=%s http=%d body=%s", source, account.Provider, status, bodySnippet(body, 600)),
 	})
-	if s.flagEnabled(ctx, "ban_auto_delete", s.cfg.BanAutoDelete) {
+	if s.bannedAccountWillBeDeleted(ctx, account, v) {
 		if err := s.store.DeleteAccount(ctx, account.ID); err != nil {
 			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
 				AccountID:    account.ID,
@@ -274,7 +315,7 @@ func (s *Server) handleBannedAccount(ctx context.Context, account storage.Accoun
 				Action:       "ban_delete_failed",
 				State:        string(v.State),
 				Reason:       v.Reason,
-				Detail:       fmt.Sprintf("source=%s provider=%s http=%d error=%v body=%s", source, account.PlanType, status, err, bodySnippet(body, 600)),
+				Detail:       fmt.Sprintf("source=%s provider=%s http=%d error=%v body=%s", source, account.Provider, status, err, bodySnippet(body, 600)),
 			})
 			return
 		}

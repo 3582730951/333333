@@ -792,7 +792,11 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 		})
 	}
 	for _, c := range merged {
-		appendModel(c.ModelSlug)
+		slug := c.ModelSlug
+		if providerKeyForSource(c.Source) == "kiro" {
+			slug = claudeFacingKiroModelID(slug)
+		}
+		appendModel(slug)
 	}
 	if len(data) == 0 && len(kiroCaps) == 0 {
 		for _, slug := range claudeStaticModels {
@@ -810,6 +814,26 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 	}
 	sum := sha256.Sum256(raw)
 	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
+}
+
+// claudeFacingKiroModelID converts Kiro's native dotted version spelling
+// (claude-opus-4.8) to the public Anthropic/Claude Code spelling
+// (claude-opus-4-8). Request routing accepts both forms and canonicalizes back to
+// Kiro's native ID; this conversion is only for the client-facing model catalog.
+func claudeFacingKiroModelID(slug string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(slug))
+	match := kiroConcreteModelRE.FindStringSubmatch(trimmed)
+	if match == nil {
+		return strings.TrimSpace(slug)
+	}
+	out := "claude-" + match[1] + "-" + match[2]
+	if match[3] != "" {
+		out += "-" + match[3]
+	}
+	if match[4] != "" {
+		out += "-" + match[4]
+	}
+	return out
 }
 
 // claudeDisplayName derives a human label for a Claude model id (Claude Code shows it in

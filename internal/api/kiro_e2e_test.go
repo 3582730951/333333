@@ -160,10 +160,19 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 		case "/generateAssistantResponse":
 			generateCalls++
 			body, _ := io.ReadAll(r.Body)
-			if !bytes.Contains(body, []byte(`"modelId":"claude-opus-4.8"`)) {
-				t.Errorf("bootstrap request did not use canonical Kiro model: %s", body)
+			healthProbe := bytes.Contains(body, []byte("Reply exactly OK"))
+			model := "claude-opus-4.8"
+			maxOutput := `"max_tokens":128000`
+			content := "bootstrap ok"
+			if healthProbe {
+				model = "claude-sonnet-4.6"
+				maxOutput = `"max_tokens":64000`
+				content = "OK"
 			}
-			for _, required := range []string{`"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"max"}`, `"max_tokens":128000`} {
+			if !bytes.Contains(body, []byte(`"modelId":"`+model+`"`)) {
+				t.Errorf("request did not use expected canonical Kiro model %s: %s", model, body)
+			}
+			for _, required := range []string{`"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"max"}`, maxOutput} {
 				if !bytes.Contains(body, []byte(required)) {
 					t.Errorf("mandatory Kiro max-quality field %s missing: %s", required, body)
 				}
@@ -172,7 +181,8 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 				t.Errorf("downstream disabled mandatory Kiro thinking: %s", body)
 			}
 			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"modelId":"claude-opus-4.8","content":"bootstrap ok"}`)))
+			responsePayload, _ := json.Marshal(map[string]any{"modelId": model, "content": content})
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, responsePayload))
 			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "meteringEvent"}, []byte(`{"inputTokens":4,"outputTokens":2}`)))
 		default:
 			http.NotFound(w, r)
@@ -212,7 +222,7 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 		t.Fatalf("runtime state before first request=%+v err=%v", state, err)
 	}
 
-	health, err := http.Post(h.pool.URL+"/admin/accounts/"+account.ID+"/health-test", "application/json", nil)
+	health, err := http.Post(h.pool.URL+"/admin/accounts/"+account.ID+"/health-test", "application/json", strings.NewReader(`{"confirm_cost":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +231,8 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 		t.Fatal(err)
 	}
 	health.Body.Close()
-	if healthBody["probe_scope"] != "account_auth_usage" || healthBody["model_checked"] != false || healthBody["model"] != "" {
-		t.Fatalf("Kiro health probe overstated model coverage: %#v", healthBody)
+	if healthBody["probe_scope"] != kiroHealthProbeScope || healthBody["model_checked"] != true || healthBody["model"] != "claude-sonnet-4.6" || healthBody["ready"] != true {
+		t.Fatalf("Kiro health probe did not report both layers: %#v", healthBody)
 	}
 	recovered, err := h.store.GetAccount(context.Background(), account.ID)
 	if err != nil || recovered.Status != "active" {
@@ -239,8 +249,8 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 			break
 		}
 	}
-	if healthAudit == nil || !strings.Contains(healthAudit.Detail, "probe_scope=account_auth_usage") || !strings.Contains(healthAudit.Detail, "model_checked=false") || strings.Contains(healthAudit.Detail, "claude-sonnet") {
-		t.Fatalf("Kiro health audit overstated model coverage: %+v", auditRows)
+	if healthAudit == nil || !strings.Contains(healthAudit.Detail, "probe_scope="+kiroHealthProbeScope) || !strings.Contains(healthAudit.Detail, "model_checked=false") {
+		t.Fatalf("Kiro health auth audit did not identify the two-layer scope: %+v", auditRows)
 	}
 	state, err = h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8")
 	if err != nil || state.ModelState != "unknown" {
@@ -268,7 +278,7 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 	if !strings.Contains(compatibility, kirowire.LossThinkingForcedAdaptive) || !strings.Contains(compatibility, kirowire.LossThinkingEffortForcedMax) {
 		t.Fatalf("quality overrides not reported: %q", compatibility)
 	}
-	if generateCalls != 1 {
+	if generateCalls != 2 {
 		t.Fatalf("generate calls=%d", generateCalls)
 	}
 	state, err = h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8")

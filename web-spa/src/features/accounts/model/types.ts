@@ -16,6 +16,7 @@ export interface AccountRow {
   group_name?: string;
   plan_type?: string;
   quarantine_until?: number;
+  quarantine_reason?: string;
   usage?: AccountUsage | null;
   [key: string]: unknown;
 }
