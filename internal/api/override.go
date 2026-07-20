@@ -27,9 +27,10 @@ type downstreamPolicy struct {
 	// KeyHash / UserID identify the matched downstream api key and its owning portal
 	// user (both empty for an unauthenticated/legacy request). They are attributed onto
 	// each usage_records row so a user's own console can show their usage.
-	KeyHash string
-	UserID  string
-	Authed  bool
+	KeyHash             string
+	UserID              string
+	Authed              bool
+	ModelOverrideSource string
 }
 
 // downstreamIdent carries the resolved key/user identity through the request context
@@ -47,7 +48,10 @@ const (
 	// back to estimated_tokens when the upstream response body lacks usage data.
 	ctxKeyBillingHold
 	ctxKeyUsageDiagnostics
+	ctxKeyModelDiagnostics
 )
+
+type modelDiagnostics struct{ Requested, Resolved, Source string }
 
 func withInternal(ctx context.Context) context.Context {
 	return context.WithValue(ctx, ctxKeyInternal, true)
@@ -93,6 +97,20 @@ func usageDiagnosticsFromCtx(ctx context.Context) storage.UsageDiagnostics {
 		return v
 	}
 	return storage.UsageDiagnostics{}
+}
+
+func withModelDiagnostics(ctx context.Context, requested, resolved, source string) context.Context {
+	if source == "" {
+		source = "none"
+	}
+	return context.WithValue(ctx, ctxKeyModelDiagnostics, modelDiagnostics{Requested: requested, Resolved: resolved, Source: source})
+}
+
+func modelDiagnosticsFromCtx(ctx context.Context) modelDiagnostics {
+	if value, ok := ctx.Value(ctxKeyModelDiagnostics).(modelDiagnostics); ok {
+		return value
+	}
+	return modelDiagnostics{Source: "none"}
 }
 
 // hashAPIKey is the canonical sha256 hex of a downstream api key; both key
@@ -179,6 +197,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 					pol.Group = key.GroupName
 				}
 				pol.ForceModel = strings.TrimSpace(key.ForceModel)
+				if pol.ForceModel != "" {
+					pol.ModelOverrideSource = "api_key"
+				}
 				pol.ForceEffort = strings.TrimSpace(key.ForceEffort)
 				pol.ProviderHint = normalizeProviderHintLoose(key.ProviderHint)
 			}
@@ -198,6 +219,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 		if g, err := s.store.GetGroup(ctx, pol.Group); err == nil {
 			if pol.ForceModel == "" {
 				pol.ForceModel = strings.TrimSpace(g.ForceModel)
+				if pol.ForceModel != "" {
+					pol.ModelOverrideSource = "group"
+				}
 			}
 			if pol.ForceEffort == "" {
 				pol.ForceEffort = strings.TrimSpace(g.ForceEffort)

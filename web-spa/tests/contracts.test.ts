@@ -258,8 +258,8 @@ describe('API contracts', () => {
 
 describe('routing, responsive actions, and forms', () => {
   it('keeps every management and portal screen in the visual route matrix', () => {
-    expect(adminVisualRoutes).toHaveLength(20);
-    expect(portalRoutes).toHaveLength(3);
+    expect(adminVisualRoutes).toHaveLength(21);
+    expect(portalRoutes).toHaveLength(4);
     expect(new Set(adminRoutes.map((route) => route.path)).size).toBe(adminRoutes.length);
     expect(settingsSections.map((section) => section.key)).toEqual(['config', 'automation', 'registrar', 'lifecycle', 'logging', 'memory', 'thinking', 'moderation']);
     expect(legacyRedirects.find((route) => route.path === '/thinking')?.to).toContain('?tab=thinking');
@@ -331,6 +331,7 @@ describe('query invalidation', () => {
     expect(usageQueryKeys.dashboard(604800)).not.toEqual(usageQueryKeys.dashboard(2592000));
     expect(FULL_CACHE_FIELDS.split(',')).toEqual([
       'summary', 'by_account', 'by_model', 'by_api_key', 'by_account_model',
+      'by_provider', 'by_provider_model',
       'by_route', 'by_route_account_model', 'by_time_bucket',
     ]);
   });

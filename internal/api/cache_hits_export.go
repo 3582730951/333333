@@ -35,6 +35,11 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	completeness, err := s.currentUsageCompleteness(r.Context(), now.Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	report, err := s.store.CacheUsageMetricsWindowFullRoutes(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -61,7 +66,7 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		version = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	}
 	legacyV1 := version == "v1" || version == "codex-pool-cache-hits-v1"
-	files, order, err := buildCacheHitsZipFiles(report, win, codebook, usageRows, kiroCapabilities, now, legacyV1)
+	files, order, err := buildCacheHitsZipFiles(report, win, codebook, usageRows, kiroCapabilities, completeness, now, legacyV1)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -95,7 +100,7 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindow, codebook diagnosticCodebook, usageRows []diagnosticUsageRecord, kiroCapabilities []storage.KiroRuntimeCapability, generatedAt time.Time, legacyV1 bool) (map[string]string, []string, error) {
+func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindow, codebook diagnosticCodebook, usageRows []diagnosticUsageRecord, kiroCapabilities []storage.KiroRuntimeCapability, completeness storage.UsageCompleteness, generatedAt time.Time, legacyV1 bool) (map[string]string, []string, error) {
 	order := []string{
 		"manifest.json",
 		"summary.csv",
@@ -108,7 +113,7 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"account_map.csv",
 	}
 	if !legacyV1 {
-		order = append(order, "kiro_capabilities.csv", "usage_sources.csv")
+		order = append(order, "by_provider.csv", "by_provider_model.csv", "telemetry_completeness.csv", "kiro_capabilities.csv", "usage_sources.csv")
 	}
 	format := "codex-pool-cache-hits-v2"
 	if legacyV1 {
@@ -151,18 +156,26 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"by_account_model.csv":       csvString(cacheMetricHeader("account_code", "model"), cacheMetricRows(report.ByAccountModel, codebook, true, true, !legacyV1)),
 		"by_route.csv":               "",
 		"by_route_account_model.csv": "",
-		"by_time_bucket.csv":         csvString(cacheBucketHeader(), cacheBucketRows(report.ByTimeBucket, !legacyV1)),
+		"by_time_bucket.csv":         csvString(cacheBucketHeader(false), cacheBucketRows(report.ByTimeBucket, false)),
 		"route_map.csv":              "",
 		"account_map.csv":            csvString([]string{"account_code", "account_id"}, accountMapRows(codebook)),
+	}
+	if !legacyV1 {
+		files["summary.csv"] = csvString(cacheMetricHeaderV2("window_start", "window_until"), cacheSummaryRows(report.Summary, win, hasData, true))
+		files["by_api_key.csv"] = csvString(cacheMetricHeaderV2("api_key_hash_prefix"), cacheMetricRows(report.ByAPIKey, codebook, false, false, true))
+		files["by_provider.csv"] = csvString(cacheMetricHeaderV2("provider"), cacheProviderRows(report.ByProvider, false))
+		files["by_provider_model.csv"] = csvString(cacheMetricHeaderV2("provider", "model"), cacheProviderRows(report.ByProviderModel, true))
+		files["by_time_bucket.csv"] = csvString(cacheBucketHeader(true), cacheBucketRows(report.ByTimeBucket, true))
+		files["telemetry_completeness.csv"] = csvString([]string{"data_snapshot_at", "usage_complete_through_at", "usage_lag_seconds", "pending_usage_requests", "partial_data", "telemetry_flush_timed_out", "completeness_gap_count"}, [][]string{{itoa64(completeness.DataSnapshotAt), itoa64(completeness.UsageCompleteThroughAt), itoa64(completeness.UsageLagSeconds), itoa64(completeness.PendingUsageRequests), strconv.FormatBool(completeness.PartialData), strconv.FormatBool(completeness.TelemetryFlushTimedOut), itoa64(completeness.CompletenessGapCount)}})
 	}
 	routes := newRouteExportCodebook()
 	routes.addRows(report.ByRoute)
 	routes.addRows(report.ByRouteAccountModel)
-	files["by_route.csv"] = csvString(cacheRouteHeader(false), cacheRouteRows(report.ByRoute, codebook, routes, false, !legacyV1))
-	files["by_route_account_model.csv"] = csvString(cacheRouteHeader(true), cacheRouteRows(report.ByRouteAccountModel, codebook, routes, true, !legacyV1))
+	files["by_route.csv"] = csvString(cacheRouteHeader(false, !legacyV1), cacheRouteRows(report.ByRoute, codebook, routes, false, !legacyV1))
+	files["by_route_account_model.csv"] = csvString(cacheRouteHeader(true, !legacyV1), cacheRouteRows(report.ByRouteAccountModel, codebook, routes, true, !legacyV1))
 	files["route_map.csv"] = csvString([]string{"route_code", "route_key_hash_prefix", "route_class", "affinity_source"}, routes.rows())
 	if !legacyV1 {
-		files["by_account_model.csv"] = csvString(cacheMetricHeader("account_code", "provider", "model", "cache_capability", "usage_sources"), cacheMetricRowsV2(report.ByAccountModel, codebook, usageRows, kiroCapabilities))
+		files["by_account_model.csv"] = csvString(cacheMetricHeaderV2("account_code", "provider", "model", "cache_capability", "usage_sources"), cacheMetricRowsV2(report.ByAccountModel, codebook, usageRows, kiroCapabilities))
 		files["kiro_capabilities.csv"] = csvString([]string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at", "window_account_model_requests", "window_account_model_metadata_events", "window_account_model_metering_events", "window_account_model_credits_reported_requests", "window_account_model_credits_total", "window_account_model_token_metadata_reported_requests", "window_account_model_cache_point_injected_requests", "window_account_model_cache_point_accepted_requests", "window_account_model_cache_point_unsupported_requests"}, cacheKiroCapabilityRows(kiroCapabilities, codebook, usageRows))
 		files["usage_sources.csv"] = csvString([]string{"provider", "usage_source", "requests", "cache_read_reported", "cache_creation_reported", "metadata_events", "metering_events", "credits_reported_requests", "credits_total", "token_metadata_reported_requests", "cache_point_injected_requests", "cache_point_accepted_requests", "cache_point_unsupported_requests"}, cacheUsageSourceRows(usageRows))
 	}
@@ -183,6 +196,22 @@ func cacheReportHasRows(report storage.CacheUsageReport) bool {
 
 func cacheMetricHeader(prefix ...string) []string {
 	return append(prefix, "requests", "real_requests", "hit_requests", "request_hit_rate", "prompt_tokens", "cached_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_creation_5m_share", "token_hit_rate", "cache_write_share", "eligible_cache_hit_rate", "real_token_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests")
+}
+
+func cacheMetricHeaderV2(prefix ...string) []string {
+	return append(cacheMetricHeader(prefix...), "actual_requests", "actual_prompt_tokens", "actual_completion_tokens", "actual_total_tokens", "estimated_prompt_tokens", "estimated_completion_tokens", "estimated_total_tokens", "combined_requests", "combined_total_tokens", "kiro_credits", "kiro_credits_reported_requests", "cache_reporting_state")
+}
+
+func cacheProviderRows(rows []storage.CacheUsageMetricRow, includeModel bool) [][]string {
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		prefix := []string{row.Provider}
+		if includeModel {
+			prefix = append(prefix, row.Model)
+		}
+		out = append(out, append(prefix, cacheMetricFieldsV2(row)...))
+	}
+	return out
 }
 
 func cacheSummaryRows(row storage.CacheUsageMetricRow, win adminUsageWindow, hasData, v2 bool) [][]string {
@@ -414,10 +443,13 @@ func cacheUsageSourceRows(rows []diagnosticUsageRecord) [][]string {
 	return out
 }
 
-func cacheRouteHeader(withAccountModel bool) []string {
+func cacheRouteHeader(withAccountModel, v2 bool) []string {
 	prefix := []string{"route_code", "route_class", "affinity_source", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "prompt_cache_key_present", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "single_use_route", "risk_flags", "route_epoch"}
 	if withAccountModel {
 		prefix = append([]string{"account_code", "model"}, prefix...)
+	}
+	if v2 {
+		return cacheMetricHeaderV2(prefix...)
 	}
 	return cacheMetricHeader(prefix...)
 }
@@ -521,7 +553,11 @@ func cacheMetricFieldsV2(row storage.CacheUsageMetricRow) []string {
 	if row.CacheCreationTokens == 0 {
 		fields[12] = "" // cache_creation_5m_share
 	}
-	return fields
+	return append(fields,
+		itoa64(row.ActualRequests), itoa64(row.ActualPromptTokens), itoa64(row.ActualCompletionTokens), itoa64(row.ActualTotalTokens),
+		itoa64(row.EstimatedPromptTokens), itoa64(row.EstimatedCompletionTokens), itoa64(row.EstimatedTotalTokens),
+		itoa64(row.CombinedRequests), itoa64(row.CombinedTotalTokens), floatString(row.KiroCredits), itoa64(row.KiroCreditsReportedRequests), row.CacheReportingState,
+	)
 }
 
 type routeExportCodebook struct {
@@ -576,8 +612,12 @@ func (b *routeExportCodebook) rows() [][]string {
 	return out
 }
 
-func cacheBucketHeader() []string {
-	return []string{"bucket", "requests", "real_requests", "hit_requests", "prompt_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_read_share", "cache_write_share", "eligible_cache_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests"}
+func cacheBucketHeader(v2 bool) []string {
+	header := []string{"bucket", "requests", "real_requests", "hit_requests", "prompt_tokens", "hit_tokens", "cache_input_tokens", "cache_miss_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "cache_read_share", "cache_write_share", "eligible_cache_hit_rate", "estimated_requests", "estimated_rate", "cache_creation_reported_requests"}
+	if v2 {
+		header = append(header, "partial")
+	}
+	return header
 }
 
 func cacheBucketRows(rows []storage.CacheUsageBucket, v2 bool) [][]string {
@@ -597,7 +637,7 @@ func cacheBucketRows(rows []storage.CacheUsageBucket, v2 bool) [][]string {
 		if v2 && row.CacheReadTokens+row.CacheCreationTokens == 0 {
 			eligibleHitRate = ""
 		}
-		out = append(out, []string{
+		fields := []string{
 			itoa64(row.Bucket),
 			itoa64(row.Requests),
 			itoa64(row.RealRequests),
@@ -615,7 +655,11 @@ func cacheBucketRows(rows []storage.CacheUsageBucket, v2 bool) [][]string {
 			itoa64(row.EstimatedRequests),
 			floatString(row.EstimatedRate),
 			itoa64(row.CacheCreationReportedRequests),
-		})
+		}
+		if v2 {
+			fields = append(fields, strconv.FormatBool(row.Partial))
+		}
+		out = append(out, fields)
 	}
 	return out
 }

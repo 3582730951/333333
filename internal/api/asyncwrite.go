@@ -26,6 +26,7 @@ type telemetryWrite struct {
 	apiKeyHash string
 	usedAt     int64
 	audit      *storage.AuditLogRow
+	barrier    chan error
 }
 
 // startAsyncWriter launches the single FIFO drainer. Called once from NewServer so the
@@ -75,13 +76,23 @@ func (s *Server) startAsyncWriter() {
 	supervisor.GoOnce("usage-batch-writer", func() {
 		defer s.asyncWG.Done()
 		for first := range s.usageWrites {
+			if first.barrier != nil {
+				first.barrier <- nil
+				s.usagePending.Done()
+				continue
+			}
 			batch := []telemetryWrite{first}
+			var barrier chan error
 			timer := time.NewTimer(5 * time.Millisecond)
 		collect:
 			for len(batch) < 64 {
 				select {
 				case next, ok := <-s.usageWrites:
 					if !ok {
+						break collect
+					}
+					if next.barrier != nil {
+						barrier = next.barrier
 						break collect
 					}
 					batch = append(batch, next)
@@ -122,8 +133,40 @@ func (s *Server) startAsyncWriter() {
 			for range batch {
 				s.usagePending.Done()
 			}
+			if barrier != nil {
+				barrier <- err
+				s.usagePending.Done()
+			}
 		}
 	})
+}
+
+// flushTelemetry inserts a FIFO boundary without waiting for requests that arrive
+// after it. Every usage/hold/audit queued before the boundary is committed before
+// this returns. A bounded caller context prevents dashboard reads from stalling.
+func (s *Server) flushTelemetry(ctx context.Context) (timedOut bool) {
+	done := make(chan error, 1)
+	s.usagePending.Add(1)
+	s.asyncMu.RLock()
+	if s.asyncClosed {
+		s.asyncMu.RUnlock()
+		s.usagePending.Done()
+		return false
+	}
+	select {
+	case s.usageWrites <- telemetryWrite{barrier: done}:
+		s.asyncMu.RUnlock()
+	case <-ctx.Done():
+		s.asyncMu.RUnlock()
+		s.usagePending.Done()
+		return true
+	}
+	select {
+	case <-done:
+		return false
+	case <-ctx.Done():
+		return true
+	}
 }
 
 func (s *Server) enqueueUsage(write storage.UsageRecordWrite) {

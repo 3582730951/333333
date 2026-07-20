@@ -1,0 +1,157 @@
+package api
+
+import (
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"codex-account-pool/internal/capability"
+	"codex-account-pool/internal/storage"
+)
+
+type modelListResponse struct {
+	Models      []string `json:"models"`
+	GeneratedAt int64    `json:"generated_at"`
+}
+
+func (s *Server) handleAdminModels(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	caps, err := s.store.ListCapabilities(r.Context(), "")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	accounts, err := s.store.ListAccounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, modelListResponse{Models: sortedCapabilityModels(filterDisplayCapabilities(caps, accounts), nil), GeneratedAt: storage.Now()})
+}
+
+func (s *Server) handleUserModels(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	keys, err := s.store.ListAPIKeysByUser(r.Context(), u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	now := storage.Now()
+	groups := map[string]bool{}
+	for _, key := range keys {
+		if key.Enabled && (key.ExpiresAt == 0 || key.ExpiresAt > now) && normalizeAPIKeyType(key.KeyType) == "downstream" {
+			group := strings.TrimSpace(key.GroupName)
+			if group == "" {
+				group = s.cfg.DefaultGroup
+			}
+			groups[group] = true
+		}
+	}
+	allowedAccounts := map[string]bool{}
+	var accessibleAccounts []storage.Account
+	for group := range groups {
+		accounts, listErr := s.store.ListActiveAccountsByGroup(r.Context(), group)
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, listErr)
+			return
+		}
+		for _, account := range accounts {
+			allowedAccounts[account.ID] = true
+			accessibleAccounts = append(accessibleAccounts, account)
+		}
+	}
+	caps, err := s.store.ListCapabilities(r.Context(), "")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, modelListResponse{Models: sortedCapabilityModels(filterDisplayCapabilities(caps, accessibleAccounts), allowedAccounts), GeneratedAt: now})
+}
+
+func filterDisplayCapabilities(caps []storage.ModelCapability, accounts []storage.Account) []storage.ModelCapability {
+	byID := map[string]storage.Account{}
+	for _, account := range accounts {
+		byID[account.ID] = account
+	}
+	out := make([]storage.ModelCapability, 0, len(caps))
+	for _, capRow := range caps {
+		visibility := strings.ToLower(strings.TrimSpace(capRow.Visibility))
+		if visibility == "hide" || visibility == "hidden" || visibility == "internal" {
+			continue
+		}
+		if capRow.Source == "kiro_static_unknown" && !capability.KiroPlanAllowsBootstrap(byID[capRow.AccountID].PlanType, capRow.ModelSlug) {
+			continue
+		}
+		out = append(out, capRow)
+	}
+	return out
+}
+
+func sortedCapabilityModels(caps []storage.ModelCapability, allowedAccounts map[string]bool) []string {
+	seen := map[string]string{}
+	for _, cap := range caps {
+		if allowedAccounts != nil && !allowedAccounts[cap.AccountID] {
+			continue
+		}
+		model := strings.TrimSpace(cap.ModelSlug)
+		if model == "" {
+			continue
+		}
+		key := strings.ToLower(model)
+		if _, exists := seen[key]; !exists {
+			seen[key] = model
+		}
+	}
+	models := make([]string, 0, len(seen))
+	for _, model := range seen {
+		models = append(models, model)
+	}
+	sort.Slice(models, func(i, j int) bool { return naturalModelLess(models[i], models[j]) })
+	return models
+}
+
+func naturalModelLess(a, b string) bool {
+	ra, rb := []rune(strings.ToLower(a)), []rune(strings.ToLower(b))
+	for ia, ib := 0, 0; ia < len(ra) && ib < len(rb); {
+		if unicode.IsDigit(ra[ia]) && unicode.IsDigit(rb[ib]) {
+			ja, jb := ia, ib
+			for ja < len(ra) && unicode.IsDigit(ra[ja]) {
+				ja++
+			}
+			for jb < len(rb) && unicode.IsDigit(rb[jb]) {
+				jb++
+			}
+			na, _ := strconv.ParseUint(string(ra[ia:ja]), 10, 64)
+			nb, _ := strconv.ParseUint(string(rb[ib:jb]), 10, 64)
+			if na != nb {
+				return na < nb
+			}
+			if ja-ia != jb-ib {
+				return ja-ia < jb-ib
+			}
+			ia, ib = ja, jb
+			continue
+		}
+		if ra[ia] != rb[ib] {
+			return ra[ia] < rb[ib]
+		}
+		ia++
+		ib++
+	}
+	return len(ra) < len(rb)
+}

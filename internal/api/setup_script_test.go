@@ -90,8 +90,8 @@ func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) 
 	claudeBranch := scriptBetween(t, script, "configure_claude() {", "\n}\n\nmain()")
 	for _, want := range []string{
 		"install_gateway_binary",
-		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY" --model "$MODEL"`,
-		`Claude Code 主模型/子 Agent: $MODEL`,
+		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"`,
+		`Claude Code 模型由客户端自行选择；VPS force_model 可能在服务端覆盖`,
 		`"$GATEWAY_BIN" stop`,
 		`"$GATEWAY_BIN" start-background`,
 		`"$GATEWAY_BIN" probe-identity`,
@@ -115,6 +115,9 @@ func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) 
 	}
 	for _, forbidden := range []string{
 		".claude/settings.json",
+		`--model "$MODEL"`,
+		"ANTHROPIC_MODEL",
+		"CLAUDE_CODE_SUBAGENT_MODEL",
 	} {
 		if strings.Contains(claudeBranch, forbidden) {
 			t.Fatalf("claude branch must not contain %q\n---\n%s", forbidden, claudeBranch)

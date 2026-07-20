@@ -8,6 +8,9 @@ export interface UsageMetricRow {
   model_label?: string;
   series_key?: string;
   series_label?: string;
+  provider?: string;
+  cache_reporting_state?: string;
+  partial?: boolean;
   api_key_hash_prefix?: string;
   route_key_hash_prefix?: string;
   route_class?: string;
@@ -77,10 +80,13 @@ export interface UsageEnvelope {
 
 export interface UsageCacheReport {
   summary?: UsageMetricRow;
+  stable_summary?: UsageMetricRow;
   by_account?: UsageMetricRow[];
   by_model?: UsageMetricRow[];
   by_api_key?: UsageMetricRow[];
   by_account_model?: UsageMetricRow[];
+  by_provider?: UsageMetricRow[];
+  by_provider_model?: UsageMetricRow[];
   by_route?: UsageMetricRow[];
   by_route_account_model?: UsageMetricRow[];
   by_time_bucket?: UsageMetricRow[];

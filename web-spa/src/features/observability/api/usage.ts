@@ -6,7 +6,7 @@ import type {
   UsageRange, UsageSeriesDescriptor,
 } from '../model/usage';
 
-export const FULL_CACHE_FIELDS = 'summary,by_account,by_model,by_api_key,by_account_model,by_route,by_route_account_model,by_time_bucket';
+export const FULL_CACHE_FIELDS = 'summary,by_account,by_model,by_api_key,by_account_model,by_provider,by_provider_model,by_route,by_route_account_model,by_time_bucket';
 
 const numericKeys = [
   'requests', 'real_requests', 'hit_requests', 'request_hit_rate', 'token_hit_rate', 'real_token_hit_rate',
@@ -15,6 +15,11 @@ const numericKeys = [
   'cache_creation_5m_share', 'stable_prefix_bytes', 'cache_breakpoint_count', 'estimated_rate', 'bucket',
   'latest_user_cache_control',
   'latest_user_auto_context_cache_control', 'latest_user_tail_cache_control', 'latest_user_tool_result_cache_control',
+  'actual_requests', 'actual_prompt_tokens', 'actual_completion_tokens', 'actual_total_tokens',
+  'estimated_requests', 'estimated_prompt_tokens', 'estimated_completion_tokens', 'estimated_total_tokens',
+  'combined_requests', 'combined_total_tokens', 'kiro_credits', 'kiro_credits_reported_requests',
+  'cache_reported_requests', 'cache_unreported_requests', 'cache_reporting_rate', 'usage_complete_through_at',
+  'pending_usage_requests', 'usage_lag_seconds',
 ] as const;
 
 const numericShape = Object.fromEntries(numericKeys.map((key) => [key, z.coerce.number().optional()]));
@@ -27,6 +32,9 @@ export const usageMetricRowSchema = z.object({
   model_label: z.string().optional(),
   series_key: z.string().optional(),
   series_label: z.string().optional(),
+  provider: z.string().optional(),
+  cache_reporting_state: z.string().optional(),
+  partial: z.boolean().optional(),
   risk_flags: z.array(z.string()).optional(),
 }).passthrough();
 
@@ -77,10 +85,13 @@ export const usageByModelSchema = z.union([
 
 export const usageCacheSchema = z.object({
   summary: z.preprocess((value) => (value === null ? undefined : value), usageMetricRowSchema.optional()),
+  stable_summary: z.preprocess((value) => (value === null ? undefined : value), usageMetricRowSchema.optional()),
   by_account: optionalUsageRowsSchema,
   by_model: optionalUsageRowsSchema,
   by_api_key: optionalUsageRowsSchema,
   by_account_model: optionalUsageRowsSchema,
+  by_provider: optionalUsageRowsSchema,
+  by_provider_model: optionalUsageRowsSchema,
   by_route: optionalUsageRowsSchema,
   by_route_account_model: optionalUsageRowsSchema,
   by_time_bucket: optionalUsageRowsSchema,

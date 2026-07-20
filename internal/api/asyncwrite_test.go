@@ -1,10 +1,27 @@
 package api
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"codex-account-pool/internal/storage"
 )
+
+func TestTelemetryBarrierCommitsPriorWrites(t *testing.T) {
+	h := newHarness(t, nil)
+	h.app.enqueueAudit(storage.AuditLogRow{Action: "barrier_before", Reason: "test", CreatedAt: storage.Now()})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if timedOut := h.app.flushTelemetry(ctx); timedOut {
+		t.Fatal("telemetry barrier timed out")
+	}
+	rows, err := h.store.ListAuditLog(context.Background(), 10)
+	if err != nil || len(rows) != 1 || rows[0].Action != "barrier_before" {
+		t.Fatalf("barrier did not commit prior audit: rows=%+v err=%v", rows, err)
+	}
+}
 
 func TestAsyncWriterRecoversPanicAndContinues(t *testing.T) {
 	s := &Server{}

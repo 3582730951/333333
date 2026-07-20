@@ -41,7 +41,7 @@
 
 - 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**或 **OpenAI Responses 原生**上游（DeepSeek、硅基流动 SiliconFlow、Kimi/Moonshot、OpenRouter、本地 vLLM、Responses 兼容网关）都能接入。初始化即种入 `deepseek`（`https://api.deepseek.com/v1`）与 `siliconflow`（`https://api.siliconflow.cn/v1`）两个供应商,开箱即用。
 - 每个供应商显式声明 `upstream_protocol`：默认 `chat_completions`（Tier 3，Responses→Chat 桥接，支持稳定版 function/namespace/custom/client tool-search，兼容性损失显式报告）；可选 `responses`（Tier 2，`/v1/responses` 原生透明转发，保留 typed tools、`include`、`previous_response_id` 与未来字段/事件）。
-- 模型可**自动发现**(探测 `{base_url}/models` 并回写)或手动维护;同一供应商可被 **Codex(`/v1/responses`)、Claude Code(`/v1/messages`,`ANTHROPIC_MODEL=<模型>`)、第三方(`/v1/chat/completions`)** 三种入口使用(按 `upstream_protocol` 透明转发或协议转换,含流式)。
+- 模型可**自动发现**(探测 `{base_url}/models` 并回写)或手动维护;同一供应商可被 **Codex(`/v1/responses`)、Claude Code(`/v1/messages`，模型由客户端选择)、第三方(`/v1/chat/completions`)** 三种入口使用(按 `upstream_protocol` 透明转发或协议转换,含流式)。
 - 管理端「供应商」页用**输入框**维护(ID / 名称 / base_url + 逐条模型增删),非 JSON;并提供 DeepSeek / 硅基流动 / Kimi / OpenRouter **一键预设**。
 - REST:`GET/POST /admin/providers`、`DELETE /admin/providers/{id}`、`POST /admin/accounts/import-key`(裸 API Key 入池)。
 
@@ -174,80 +174,30 @@ experimental_bearer_token = "local-downstream-key"
 
 > 兼容提示：上面的 Codex CLI 配置始终使用 `wire_api = "responses"`。完整官方 Codex skills / plugins / Browser Use 体验需要下游模型路由到官方 Codex 账号池；第三方 API 供应商按 `upstream_protocol` 分层 best-effort。
 
-### Claude Code 使用内置 Codex/GPT 模型
+### Claude Code 模型选择
 
-Claude Code 的网关模型发现只展示 `claude*`/`anthropic*` ID，因此 GPT 模型用自定义模型项加入选择器：
-
-```bash
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
-export ANTHROPIC_AUTH_TOKEN="<downstream-key>"
-export POOL_CLAUDE_MODEL="gpt-5.6-sol"
-export ANTHROPIC_MODEL="$POOL_CLAUDE_MODEL"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="$POOL_CLAUDE_MODEL"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="$POOL_CLAUDE_MODEL"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="$POOL_CLAUDE_MODEL"
-export ANTHROPIC_DEFAULT_FABLE_MODEL="$POOL_CLAUDE_MODEL"
-export CLAUDE_CODE_SUBAGENT_MODEL="$POOL_CLAUDE_MODEL"
-export ANTHROPIC_CUSTOM_MODEL_OPTION="$POOL_CLAUDE_MODEL"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 Sol via Pool"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION="Anthropic Messages → Codex Responses"
-export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES="effort,xhigh_effort,max_effort"
-claude
-```
-
-不能只设置 `ANTHROPIC_CUSTOM_MODEL_OPTION`：它只把 GPT 模型加入 `/model` 菜单。Claude Code
-内置 `Agent` 工具的可选 `model` 参数仍是 `haiku` / `sonnet` / `opus` / `fable`；模型一旦
-返回其中一个值，子 Agent 请求就会变成 `claude-haiku-*` 等 Claude 模型。只有 Codex 账号的池
-无法承接该请求，会持续返回 503 并触发客户端重试。上面的 default-tier 与
-`CLAUDE_CODE_SUBAGENT_MODEL` 映射让 Agent、Workflow 和自定义 agent frontmatter 都继续使用
-同一个 Codex 模型；桥接层还会仅对 Claude Code 标准内置 `Agent` schema 移除这个可选覆盖，
-让子 Agent 默认继承父模型，不影响自定义同名工具或其他工具的 `model` 字段。
-
-使用本仓库 gateway 时不需要手工维护这些环境变量，初始化时持久化模型即可：
+本地 gateway 只配置池地址、认证、证书和运行策略，不设置 Claude Code 的默认模型、tier
+映射、子 Agent 模型或自定义模型菜单。初始化方式：
 
 ```bash
-gateway init --pool-url http://127.0.0.1:8787 --key <downstream-key> --model gpt-5.6-sol
+gateway init --pool-url http://127.0.0.1:8787 --key <downstream-key>
 ```
 
-从旧版 gateway 升级时也要重新执行一次带 `--model` 的 `gateway init`（或重新运行 `/file/<key>`
-生成的一键安装脚本），否则旧 `config.json` 没有 `claude_model`，网关会按兼容原则保留原有环境而
-不会擅自覆盖普通 Claude 路由。
-
-进入 Claude Code 后：
-
-```text
-/model gpt-5.6-sol
-/effort xhigh
-```
+模型由 Claude Code 和用户自行选择。下游 Key 或分组的 `force_model` 是 VPS 侧策略：请求到达
+服务器并完成认证后才可能被覆盖，不会写回本地 gateway 或 Claude Code 配置。旧版
+`claude_model` 字段升级后会被忽略并由 gateway 尽力清理；兼容期内 `gateway init --model ...`
+仍可解析，但参数只会输出弃用提示且不会生效。
 
 `/effort` 可选 `low`、`medium`、`high`、`xhigh`、`max`；桥接层把 Claude Code 的
 `output_config.effort` 映射为 Codex Responses 的 `reasoning.effort`，其中 Claude Code
 的 `max` 会钳到 Codex 的最高合法档 `xhigh`。持久化配置可写入
-`~/.claude/settings.json`：
+`~/.claude/settings.json`，但本项目不会替用户写入模型字段。
 
 Claude Code 固定发送的 Anthropic `max_tokens` 不会写入内置 Codex Responses 请求；因此
 `xhigh`/`max` 不再连带产生 WHAM 的 `Unsupported parameter: max_output_tokens`。桥接请求固定
 使用 `stream:true`、`store:false` 与 `include:["reasoning.encrypted_content"]`，非流式 Claude
 请求由网关在返回前聚合为一个 Messages JSON。
 
-```json
-{
-  "model": "gpt-5.6-sol",
-  "effortLevel": "xhigh",
-  "env": {
-    "ANTHROPIC_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL": "gpt-5.6-sol",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-sol",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION": "gpt-5.6-sol",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "GPT-5.6 Sol via Pool",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Anthropic Messages → Codex Responses",
-    "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES": "effort,xhigh_effort,max_effort"
-  }
-}
-```
 
 `max` 是单会话档位，用 `/effort max` 或 `claude --effort max`；持久化 `effortLevel` 使用
 `low`、`medium`、`high`、`xhigh`。

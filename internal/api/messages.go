@@ -74,6 +74,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	clientRequestedModel := routing.Model(raw)
 
 	// Resolve the downstream api key's policy (routing group + forced model /
 	// reasoning effort) and apply the overrides to the body BEFORE model
@@ -93,6 +94,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if pol.ForceEffort != "" {
 		raw = applyForcedThinkingClaude(raw, pol.ForceEffort)
 	}
+	policyResolvedModel := routing.Model(raw)
+	r = r.WithContext(withModelDiagnostics(r.Context(), clientRequestedModel, policyResolvedModel, pol.ModelOverrideSource))
+	w.Header().Set("X-Pool-Requested-Model", clientRequestedModel)
+	w.Header().Set("X-Pool-Resolved-Model", policyResolvedModel)
+	w.Header().Set("X-Pool-Model-Override-Source", firstNonEmpty(pol.ModelOverrideSource, "none"))
 	// Server-side token compression (opt-in, default OFF): conservatively compress large
 	// tool-result blocks before forwarding upstream, cutting billed input tokens (the
 	// rtk-style server-side analogue). Only tool_result content is touched.
@@ -257,6 +263,8 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 	w.Header().Set("X-Pool-Resolved-Provider", "claude")
 	w.Header().Set("X-Pool-Resolved-Model", resolvedModel)
+	modelDiag := modelDiagnosticsFromCtx(r.Context())
+	r = r.WithContext(withModelDiagnostics(r.Context(), modelDiag.Requested, resolvedModel, modelDiag.Source))
 	leaseReleased := false
 	releaseLease := func() {
 		if leaseReleased {

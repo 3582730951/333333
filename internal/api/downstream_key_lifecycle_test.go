@@ -49,7 +49,7 @@ func TestResolveDownstreamPolicyRejectsExpiredKeyAndMarksValidKeyUsed(t *testing
 	if !ok || !pol.Authed {
 		t.Fatalf("valid key rejected: status=%d body=%s", validW.Code, validW.Body.String())
 	}
-	if pol.ForceModel != "gpt-5.6-sol" || pol.ForceEffort != "low" {
+	if pol.ForceModel != "gpt-5.6-sol" || pol.ForceEffort != "low" || pol.ModelOverrideSource != "api_key" {
 		t.Fatalf("valid key policy = model %q effort %q", pol.ForceModel, pol.ForceEffort)
 	}
 	valid, found, err := h.store.LookupAPIKey(ctx, hashAPIKey("cap_valid_lifecycle_test"))
@@ -94,7 +94,7 @@ func TestDownstreamKeyForcesModelAndEffortWithoutChangingUnforcedKey(t *testing.
 		}
 	}
 
-	call := func(key, model, effort string) map[string]interface{} {
+	call := func(key, model, effort string) (map[string]interface{}, http.Header) {
 		t.Helper()
 		before := len(h.requests())
 		body := `{"model":"` + model + `","reasoning":{"effort":"` + effort + `","summary":"auto"},"input":"return ok","stream":false}`
@@ -121,23 +121,29 @@ func TestDownstreamKeyForcesModelAndEffortWithoutChangingUnforcedKey(t *testing.
 		if err := json.Unmarshal([]byte(requests[len(requests)-1].Body), &upstreamBody); err != nil {
 			t.Fatalf("decode upstream body: %v: %s", err, requests[len(requests)-1].Body)
 		}
-		return upstreamBody
+		return upstreamBody, resp.Header.Clone()
 	}
 
-	unforced := call("cap_unforced_override_test", "gpt-5.6-sol", "low")
+	unforced, unforcedHeaders := call("cap_unforced_override_test", "gpt-5.6-sol", "low")
 	if unforced["model"] != "gpt-5.6-sol" {
 		t.Fatalf("unforced model = %#v", unforced["model"])
 	}
 	if reasoning, _ := unforced["reasoning"].(map[string]interface{}); reasoning["effort"] != "low" {
 		t.Fatalf("unforced effort = %#v", reasoning["effort"])
 	}
+	if unforcedHeaders.Get("X-Pool-Requested-Model") != "gpt-5.6-sol" || unforcedHeaders.Get("X-Pool-Resolved-Model") != "gpt-5.6-sol" || unforcedHeaders.Get("X-Pool-Model-Override-Source") != "none" {
+		t.Fatalf("unforced model diagnostics = %v", unforcedHeaders)
+	}
 
-	forced := call("cap_forced_override_test", "gpt-5.6-luna", "low")
+	forced, forcedHeaders := call("cap_forced_override_test", "gpt-5.6-luna", "low")
 	if forced["model"] != "gpt-5.6-terra" {
 		t.Fatalf("forced model = %#v, want terra", forced["model"])
 	}
 	reasoning, _ := forced["reasoning"].(map[string]interface{})
 	if reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
 		t.Fatalf("forced reasoning = %#v, want high with preserved summary", reasoning)
+	}
+	if forcedHeaders.Get("X-Pool-Requested-Model") != "gpt-5.6-luna" || forcedHeaders.Get("X-Pool-Resolved-Model") != "gpt-5.6-terra" || forcedHeaders.Get("X-Pool-Model-Override-Source") != "api_key" {
+		t.Fatalf("forced model diagnostics = %v", forcedHeaders)
 	}
 }

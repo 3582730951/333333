@@ -457,6 +457,8 @@ type BillingHold struct {
 	AccountID       string `json:"account_id"`
 	EstimatedTokens int64  `json:"estimated_tokens"`
 	Status          string `json:"status"`
+	UsageExpected   bool   `json:"usage_expected"`
+	UsageRecordedAt int64  `json:"usage_recorded_at"`
 	CreatedAt       int64  `json:"created_at"`
 	UpdatedAt       int64  `json:"updated_at"`
 }
@@ -1052,6 +1054,8 @@ CREATE TABLE IF NOT EXISTS billing_holds(
   account_id TEXT NOT NULL,
   estimated_tokens INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'held',
+	usage_expected INTEGER NOT NULL DEFAULT 0,
+	usage_recorded_at INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -1101,6 +1105,12 @@ CREATE TABLE IF NOT EXISTS usage_records(
   latest_user_tail_cache_control INTEGER NOT NULL DEFAULT 0,
   latest_user_tool_result_cache_control INTEGER NOT NULL DEFAULT 0,
   route_epoch INTEGER NOT NULL DEFAULT 0,
+	kiro_credits REAL NOT NULL DEFAULT 0,
+	kiro_credits_present INTEGER NOT NULL DEFAULT 0,
+	billing_hold_id TEXT NOT NULL DEFAULT '',
+	requested_model TEXT NOT NULL DEFAULT '',
+	resolved_model TEXT NOT NULL DEFAULT '',
+	model_override_source TEXT NOT NULL DEFAULT 'none',
   raw_usage_json TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
@@ -1464,6 +1474,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE usage_records ADD COLUMN latest_user_tool_result_cache_control INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN route_epoch INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN usage_event_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN kiro_credits REAL NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN kiro_credits_present INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN billing_hold_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN requested_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN resolved_model TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE usage_records ADD COLUMN model_override_source TEXT NOT NULL DEFAULT 'none'`,
+		`ALTER TABLE billing_holds ADD COLUMN usage_expected INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE billing_holds ADD COLUMN usage_recorded_at INTEGER NOT NULL DEFAULT 0`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_event_id ON usage_records(usage_event_id) WHERE usage_event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
 		// Per-account usage rollups (the admin account list's UsageSummaryByAccountIDs)
@@ -4790,6 +4808,12 @@ type UsageDiagnostics struct {
 	LatestUserTailCacheControl        bool
 	LatestUserToolResultCacheControl  bool
 	RouteEpoch                        int64
+	KiroCredits                       float64
+	KiroCreditsPresent                bool
+	BillingHoldID                     string
+	RequestedModel                    string
+	ResolvedModel                     string
+	ModelOverrideSource               string
 }
 
 type UsageRecordWrite struct {
@@ -4849,7 +4873,7 @@ func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWri
 			now = Now()
 		}
 		if hold.Create {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', ?, ?) ON CONFLICT(id) DO NOTHING`, hold.ID, hold.RouteKeyHash, hold.AccountID, hold.EstimatedTokens, now, now); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, usage_expected, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', 1, ?, ?) ON CONFLICT(id) DO NOTHING`, hold.ID, hold.RouteKeyHash, hold.AccountID, hold.EstimatedTokens, now, now); err != nil {
 				return err
 			}
 			continue
@@ -4858,11 +4882,11 @@ func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWri
 		if status == "" {
 			status = "settled"
 		}
-		query := `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ?`
+		query := `UPDATE billing_holds SET status = ?, updated_at = ?, usage_expected = CASE WHEN usage_recorded_at > 0 THEN 1 WHEN ? LIKE 'failed%%' OR ? IN ('abandoned','context_recovery_retry','responses_context_error_terminal') THEN 0 ELSE usage_expected END WHERE id = ?`
 		if hold.IfHeld {
 			query += ` AND status = 'held'`
 		}
-		if _, err := tx.ExecContext(ctx, query, status, now, hold.ID); err != nil {
+		if _, err := tx.ExecContext(ctx, query, status, now, status, status, hold.ID); err != nil {
 			return err
 		}
 	}
@@ -4900,13 +4924,16 @@ affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefi
 retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
 cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
+	kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source,
 raw_usage_json, created_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
  account_id=excluded.account_id, route_key_hash=excluded.route_key_hash, api_key_hash=excluded.api_key_hash, user_id=excluded.user_id,
  model=excluded.model, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens,
  cached_tokens=excluded.cached_tokens, cache_read_tokens=excluded.cache_read_tokens, cache_creation_tokens=excluded.cache_creation_tokens,
- usage_provider=excluded.usage_provider, usage_source=excluded.usage_source, estimated=excluded.estimated, raw_usage_json=excluded.raw_usage_json
+ usage_provider=excluded.usage_provider, usage_source=excluded.usage_source, estimated=excluded.estimated, kiro_credits=excluded.kiro_credits,
+ kiro_credits_present=excluded.kiro_credits_present, billing_hold_id=excluded.billing_hold_id, requested_model=excluded.requested_model,
+ resolved_model=excluded.resolved_model, model_override_source=excluded.model_override_source, raw_usage_json=excluded.raw_usage_json
 WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		diag.UsageEventID, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CompatibilityLossesJSON, diag.CacheCapability,
@@ -4916,8 +4943,21 @@ WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		diag.CacheBreakpointsJSON, diag.UnwrittenTailTokens, diag.MaxPossibleCacheReadTokens, boolInt(diag.CacheHitAfterPrewarm), diag.SingleflightWaitedRequests, diag.DiagnosticsMissReason,
 		boolInt(diag.LatestUserCacheControl),
 		boolInt(diag.LatestUserAutoContextCacheControl), boolInt(diag.LatestUserTailCacheControl), boolInt(diag.LatestUserToolResultCacheControl), diag.RouteEpoch,
+		diag.KiroCredits, boolInt(diag.KiroCreditsPresent), diag.BillingHoldID, diag.RequestedModel, diag.ResolvedModel, firstNonEmptyStorage(diag.ModelOverrideSource, "none"),
 		string(raw), Now())
+	if err == nil && diag.BillingHoldID != "" {
+		_, err = exec.ExecContext(ctx, `UPDATE billing_holds SET usage_recorded_at = ?, usage_expected = 1 WHERE id = ?`, Now(), diag.BillingHoldID)
+	}
 	return err
+}
+
+func firstNonEmptyStorage(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func finalizeUsageDiagnostics(model string, prompt, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) UsageDiagnostics {
@@ -5054,6 +5094,17 @@ func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
 }
 
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
+	for {
+		res, err := s.db.ExecContext(ctx, `UPDATE usage_records SET kiro_credits=CAST(json_extract(raw_usage_json,'$.kiro_credits') AS REAL), kiro_credits_present=1
+WHERE id IN (SELECT id FROM usage_records WHERE usage_provider='kiro' AND kiro_credits_present=0 AND json_valid(raw_usage_json) AND json_type(raw_usage_json,'$.kiro_credits') IN ('integer','real') LIMIT 500)`)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n < 500 {
+			break
+		}
+	}
 	// Older Kiro converters used the wire spelling as the persisted model while
 	// newer responses use the canonical dotted version. Keep one reporting key.
 	if _, err := s.db.ExecContext(ctx, `UPDATE usage_records SET model='claude-opus-4.8' WHERE usage_provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
@@ -5145,6 +5196,8 @@ type CacheUsageReport struct {
 	ByModel             []CacheUsageMetricRow `json:"by_model"`
 	ByAPIKey            []CacheUsageMetricRow `json:"by_api_key"`
 	ByAccountModel      []CacheUsageMetricRow `json:"by_account_model"`
+	ByProvider          []CacheUsageMetricRow `json:"by_provider"`
+	ByProviderModel     []CacheUsageMetricRow `json:"by_provider_model"`
 	ByRoute             []CacheUsageMetricRow `json:"by_route"`
 	ByRouteAccountModel []CacheUsageMetricRow `json:"by_route_account_model"`
 	ByTimeBucket        []CacheUsageBucket    `json:"by_time_bucket"`
@@ -5153,6 +5206,7 @@ type CacheUsageReport struct {
 type CacheUsageMetricRow struct {
 	AccountID                         string   `json:"account_id,omitempty"`
 	Model                             string   `json:"model,omitempty"`
+	Provider                          string   `json:"provider,omitempty"`
 	ModelKey                          string   `json:"model_key,omitempty"`
 	ModelLabel                        string   `json:"model_label,omitempty"`
 	APIKeyHashPrefix                  string   `json:"api_key_hash_prefix,omitempty"`
@@ -5188,6 +5242,21 @@ type CacheUsageMetricRow struct {
 	RiskFlags                         []string `json:"risk_flags,omitempty"`
 	EstimatedRequests                 int64    `json:"estimated_requests"`
 	EstimatedRate                     float64  `json:"estimated_rate"`
+	ActualRequests                    int64    `json:"actual_requests"`
+	ActualPromptTokens                int64    `json:"actual_prompt_tokens"`
+	ActualCompletionTokens            int64    `json:"actual_completion_tokens"`
+	ActualTotalTokens                 int64    `json:"actual_total_tokens"`
+	EstimatedPromptTokens             int64    `json:"estimated_prompt_tokens"`
+	EstimatedCompletionTokens         int64    `json:"estimated_completion_tokens"`
+	EstimatedTotalTokens              int64    `json:"estimated_total_tokens"`
+	CombinedRequests                  int64    `json:"combined_requests"`
+	CombinedTotalTokens               int64    `json:"combined_total_tokens"`
+	CacheReportedRequests             int64    `json:"cache_reported_requests"`
+	CacheUnreportedRequests           int64    `json:"cache_unreported_requests"`
+	CacheReportingRate                float64  `json:"cache_reporting_rate"`
+	CacheReportingState               string   `json:"cache_reporting_state"`
+	KiroCredits                       float64  `json:"kiro_credits"`
+	KiroCreditsReportedRequests       int64    `json:"kiro_credits_reported_requests"`
 	StablePrefixBytes                 int64    `json:"stable_prefix_bytes"`
 	PromptCacheKeyPresent             int64    `json:"prompt_cache_key_present"`
 	CacheControlInjected              int64    `json:"cache_control_injected"`
@@ -5252,6 +5321,59 @@ type CacheUsageBucket struct {
 	EligibleHitRate               float64 `json:"eligible_cache_hit_rate"`
 	EstimatedRequests             int64   `json:"estimated_requests"`
 	EstimatedRate                 float64 `json:"estimated_rate"`
+	Partial                       bool    `json:"partial"`
+}
+
+type UsageCompleteness struct {
+	DataSnapshotAt         int64 `json:"data_snapshot_at"`
+	UsageCompleteThroughAt int64 `json:"usage_complete_through_at"`
+	UsageLagSeconds        int64 `json:"usage_lag_seconds"`
+	PendingUsageRequests   int64 `json:"pending_usage_requests"`
+	PartialData            bool  `json:"partial_data"`
+	TelemetryFlushTimedOut bool  `json:"telemetry_flush_timed_out"`
+	CompletenessGapCount   int64 `json:"completeness_gap_count"`
+}
+
+func (s *Store) UsageCompleteness(ctx context.Context, snapshotAt int64) (UsageCompleteness, error) {
+	if snapshotAt <= 0 {
+		snapshotAt = Now()
+	}
+	cutoff := snapshotAt - 2*60*60
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return UsageCompleteness{}, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_log(account_id, action, state, reason, detail, created_at)
+SELECT account_id, 'usage_missing', 'warning', 'billing hold exceeded two-hour usage deadline', id, ?
+FROM billing_holds WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at < ? AND status <> 'usage_missing'`, snapshotAt, cutoff); err != nil {
+		return UsageCompleteness{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE billing_holds SET status='usage_missing', updated_at=? WHERE usage_expected=1 AND usage_recorded_at=0 AND created_at < ?`, snapshotAt, cutoff); err != nil {
+		return UsageCompleteness{}, err
+	}
+	var pending, earliest, gaps int64
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(created_at),0) FROM billing_holds WHERE usage_expected=1 AND usage_recorded_at=0 AND status <> 'usage_missing'`).Scan(&pending, &earliest); err != nil {
+		return UsageCompleteness{}, err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM billing_holds WHERE status='usage_missing'`).Scan(&gaps); err != nil {
+		return UsageCompleteness{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return UsageCompleteness{}, err
+	}
+	watermark := snapshotAt - 5
+	if earliest > 0 && earliest < watermark {
+		watermark = earliest
+	}
+	if watermark < 0 {
+		watermark = 0
+	}
+	return UsageCompleteness{
+		DataSnapshotAt: snapshotAt, UsageCompleteThroughAt: watermark,
+		UsageLagSeconds: snapshotAt - watermark, PendingUsageRequests: pending,
+		PartialData: pending > 0 || gaps > 0, CompletenessGapCount: gaps,
+	}, nil
 }
 
 const (
@@ -5379,6 +5501,18 @@ func (s *Store) cacheUsageMetricsWindow(ctx context.Context, since, until int64,
 			return CacheUsageReport{}, err
 		}
 	}
+	if want("by_provider") {
+		report.ByProvider, err = s.cacheUsageRows(ctx, since, until, "provider", 200)
+		if err != nil {
+			return CacheUsageReport{}, err
+		}
+	}
+	if want("by_provider_model") {
+		report.ByProviderModel, err = s.cacheUsageRows(ctx, since, until, "provider_model", 200)
+		if err != nil {
+			return CacheUsageReport{}, err
+		}
+	}
 	if want("by_route") {
 		report.ByRoute, err = s.cacheUsageRows(ctx, since, until, "route", routeLimit)
 		if err != nil {
@@ -5417,9 +5551,22 @@ SELECT COUNT(*),
        COALESCE(SUM(`+estimatedUsageRecordSQL+`),0),
        COALESCE(SUM(`+realCacheInputTokensSQL+`),0),
        COALESCE(SUM(`+realCacheReadTokensSQL+`),0),
-       COALESCE(SUM(cache_creation_present),0)
+       COALESCE(SUM(cache_creation_present),0),
+       COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN prompt_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN completion_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN total_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated>0 THEN prompt_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated>0 THEN completion_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN usage_provider='kiro' AND (cache_read_present>0 OR cache_creation_present>0) THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN usage_provider='kiro' AND cache_read_present=0 AND cache_creation_present=0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(kiro_credits),0), COALESCE(SUM(kiro_credits_present),0)
 FROM usage_records
-WHERE created_at >= ? AND created_at < ?`, since, until).Scan(&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests, &row.realCacheInputTokens, &row.realCacheReadTokens, &row.CacheCreationReportedRequests)
+WHERE created_at >= ? AND created_at < ?`, since, until).Scan(&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens, &row.CacheInputTokens, &row.CacheMissTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.CacheCreation5mTokens, &row.CacheCreation1hTokens, &row.EstimatedRequests, &row.realCacheInputTokens, &row.realCacheReadTokens, &row.CacheCreationReportedRequests,
+		&row.ActualRequests, &row.ActualPromptTokens, &row.ActualCompletionTokens, &row.ActualTotalTokens,
+		&row.EstimatedPromptTokens, &row.EstimatedCompletionTokens, &row.EstimatedTotalTokens,
+		&row.CacheReportedRequests, &row.CacheUnreportedRequests, &row.KiroCredits, &row.KiroCreditsReportedRequests)
 	if err != nil {
 		return CacheUsageMetricRow{}, err
 	}
@@ -5428,24 +5575,30 @@ WHERE created_at >= ? AND created_at < ?`, since, until).Scan(&row.Requests, &ro
 }
 
 func (s *Store) cacheUsageRows(ctx context.Context, since, until int64, dimension string, limit int) ([]CacheUsageMetricRow, error) {
-	selectCols := "COALESCE(account_id,''), '', '', '', '', '', '', '', '', '', ''"
+	selectCols := "COALESCE(account_id,''), '', '', '', '', '', '', '', '', '', '', ''"
 	groupBy := "account_id"
 	switch dimension {
 	case "account":
 	case "model":
-		selectCols = "'', " + normalizedUsageModelSQL + ", '', '', '', '', '', '', '', '', ''"
+		selectCols = "'', " + normalizedUsageModelSQL + ", '', '', '', '', '', '', '', '', '', ''"
 		groupBy = normalizedUsageModelSQL
 	case "api_key":
-		selectCols = "'', '', CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END, '', '', '', '', '', '', '', ''"
+		selectCols = "'', '', '', CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END, '', '', '', '', '', '', '', ''"
 		groupBy = "CASE WHEN COALESCE(api_key_hash,'') = '' THEN '' ELSE substr(api_key_hash,1,12) END"
 	case "account_model":
-		selectCols = "COALESCE(account_id,''), " + normalizedUsageModelSQL + ", '', '', '', '', '', '', '', '', ''"
+		selectCols = "COALESCE(account_id,''), " + normalizedUsageModelSQL + ", '', '', '', '', '', '', '', '', '', ''"
 		groupBy = "account_id, " + normalizedUsageModelSQL
+	case "provider":
+		selectCols = "'', '', COALESCE(usage_provider,''), '', '', '', '', '', '', '', '', ''"
+		groupBy = "usage_provider"
+	case "provider_model":
+		selectCols = "'', " + normalizedUsageModelSQL + ", COALESCE(usage_provider,''), '', '', '', '', '', '', '', '', ''"
+		groupBy = "usage_provider, " + normalizedUsageModelSQL
 	case "route":
-		selectCols = "'', '', '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
+		selectCols = "'', '', '', '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
 		groupBy = "CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
 	case "route_account_model":
-		selectCols = "COALESCE(account_id,''), " + normalizedUsageModelSQL + ", '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
+		selectCols = "COALESCE(account_id,''), " + normalizedUsageModelSQL + ", '', '', CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, COALESCE(affinity_source,''), COALESCE(prompt_cache_key_source,''), COALESCE(stable_prefix_source,''), COALESCE(stable_prefix_reason,''), COALESCE(retention_effective,''), COALESCE(retention_source,''), COALESCE(claude_cache_ttl,'')"
 		groupBy = "account_id, " + normalizedUsageModelSQL + ", CASE WHEN COALESCE(route_key_hash,'') = '' THEN '' ELSE substr(route_key_hash,1,12) END, affinity_source, prompt_cache_key_source, stable_prefix_source, stable_prefix_reason, retention_effective, retention_source, claude_cache_ttl"
 	default:
 		return nil, fmt.Errorf("unknown cache usage dimension %q", dimension)
@@ -5487,6 +5640,16 @@ SELECT %s,
        COALESCE(SUM(latest_user_tail_cache_control),0),
        COALESCE(SUM(latest_user_tool_result_cache_control),0),
        COALESCE(MAX(route_epoch),0)
+       ,COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN 1 ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN prompt_tokens ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN completion_tokens ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN estimated=0 AND usage_source='upstream' THEN total_tokens ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN estimated>0 THEN prompt_tokens ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN estimated>0 THEN completion_tokens ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN usage_provider='kiro' AND (cache_read_present>0 OR cache_creation_present>0) THEN 1 ELSE 0 END),0)
+       ,COALESCE(SUM(CASE WHEN usage_provider='kiro' AND cache_read_present=0 AND cache_creation_present=0 THEN 1 ELSE 0 END),0)
+       ,COALESCE(SUM(kiro_credits),0), COALESCE(SUM(kiro_credits_present),0)
 FROM usage_records
 WHERE created_at >= ? AND created_at < ?
 GROUP BY %s
@@ -5500,7 +5663,7 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 	for rows.Next() {
 		var row CacheUsageMetricRow
 		if err := rows.Scan(
-			&row.AccountID, &row.Model, &row.APIKeyHashPrefix, &row.RouteKeyHashPrefix,
+			&row.AccountID, &row.Model, &row.Provider, &row.APIKeyHashPrefix, &row.RouteKeyHashPrefix,
 			&row.AffinitySource, &row.PromptCacheKeySource, &row.StablePrefixSource, &row.StablePrefixReason,
 			&row.RetentionEffective, &row.RetentionSource, &row.ClaudeCacheTTL,
 			&row.Requests, &row.RealRequests, &row.HitRequests, &row.PromptTokens, &row.CachedTokens,
@@ -5512,10 +5675,13 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 			&row.CacheHitAfterPrewarm, &row.SingleflightWaitedRequests, &row.DiagnosticsMissReason,
 			&row.LatestUserCacheControl, &row.LatestUserAutoContextCacheControl,
 			&row.LatestUserTailCacheControl, &row.LatestUserToolResultCacheControl, &row.RouteEpoch,
+			&row.ActualRequests, &row.ActualPromptTokens, &row.ActualCompletionTokens, &row.ActualTotalTokens,
+			&row.EstimatedPromptTokens, &row.EstimatedCompletionTokens, &row.EstimatedTotalTokens,
+			&row.CacheReportedRequests, &row.CacheUnreportedRequests, &row.KiroCredits, &row.KiroCreditsReportedRequests,
 		); err != nil {
 			return nil, err
 		}
-		if dimension == "model" || dimension == "account_model" || dimension == "route_account_model" {
+		if dimension == "model" || dimension == "account_model" || dimension == "route_account_model" || dimension == "provider_model" {
 			row.Model = applyUsageModelFields(row.Model, &row.ModelKey, &row.ModelLabel)
 		}
 		finalizeCacheUsageMetric(&row)
@@ -5525,6 +5691,22 @@ ORDER BY SUM(cache_creation_tokens) DESC, SUM(`+cacheReadTokensSQL+`) DESC, COUN
 }
 
 func finalizeCacheUsageMetric(row *CacheUsageMetricRow) {
+	row.CombinedRequests = row.Requests
+	row.CombinedTotalTokens = row.ActualTotalTokens + row.EstimatedTotalTokens
+	kiroRequests := row.CacheReportedRequests + row.CacheUnreportedRequests
+	if kiroRequests > 0 {
+		row.CacheReportingRate = float64(row.CacheReportedRequests) / float64(kiroRequests)
+		switch {
+		case row.CacheReportedRequests == 0:
+			row.CacheReportingState = "unreported"
+		case row.CacheUnreportedRequests == 0:
+			row.CacheReportingState = "reported"
+		default:
+			row.CacheReportingState = "partial"
+		}
+	} else if row.Provider != "" {
+		row.CacheReportingState = "not_applicable"
+	}
 	if row.RealRequests > 0 {
 		// Estimated usage and Kiro rows whose upstream omitted cache fields are not
 		// misses. Only requests with calculable upstream cache metering belong in
@@ -5720,18 +5902,27 @@ GROUP BY bucket ORDER BY bucket`, bucketSeconds, bucketSeconds, userID, since)
 
 // UsageSummaryRow is a per-account rollup of recorded usage.
 type UsageSummaryRow struct {
-	AccountID           string `json:"account_id"`
-	Requests            int64  `json:"requests"`
-	PromptTokens        int64  `json:"prompt_tokens"`
-	CompletionTokens    int64  `json:"completion_tokens"`
-	TotalTokens         int64  `json:"total_tokens"`
-	CachedTokens        int64  `json:"cached_tokens"`
-	CacheReadTokens     int64  `json:"cache_read_tokens"`
-	CacheCreationTokens int64  `json:"cache_creation_tokens"`
-	ActualRequests      int64  `json:"actual_requests"`
-	ActualTokens        int64  `json:"actual_tokens"`
-	EstimatedRequests   int64  `json:"estimated_requests"`
-	EstimatedTokens     int64  `json:"estimated_tokens"`
+	AccountID                 string  `json:"account_id"`
+	Requests                  int64   `json:"requests"`
+	PromptTokens              int64   `json:"prompt_tokens"`
+	CompletionTokens          int64   `json:"completion_tokens"`
+	TotalTokens               int64   `json:"total_tokens"`
+	CachedTokens              int64   `json:"cached_tokens"`
+	CacheReadTokens           int64   `json:"cache_read_tokens"`
+	CacheCreationTokens       int64   `json:"cache_creation_tokens"`
+	ActualRequests            int64   `json:"actual_requests"`
+	ActualTokens              int64   `json:"actual_tokens"`
+	ActualPromptTokens        int64   `json:"actual_prompt_tokens"`
+	ActualCompletionTokens    int64   `json:"actual_completion_tokens"`
+	ActualTotalTokens         int64   `json:"actual_total_tokens"`
+	EstimatedRequests         int64   `json:"estimated_requests"`
+	EstimatedTokens           int64   `json:"estimated_tokens"`
+	EstimatedPromptTokens     int64   `json:"estimated_prompt_tokens"`
+	EstimatedCompletionTokens int64   `json:"estimated_completion_tokens"`
+	EstimatedTotalTokens      int64   `json:"estimated_total_tokens"`
+	CombinedRequests          int64   `json:"combined_requests"`
+	CombinedTotalTokens       int64   `json:"combined_total_tokens"`
+	EstimatedRate             float64 `json:"estimated_rate"`
 }
 
 // UsageSummary aggregates usage_records per account, most-used first.
@@ -5750,7 +5941,8 @@ SELECT account_id, SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END), COALESCE(SUM(CA
        COALESCE(SUM(CASE WHEN estimated=0 THEN CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END ELSE 0 END),0),
        COALESCE(SUM(CASE WHEN estimated=0 THEN cache_creation_tokens ELSE 0 END),0),
        SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN estimated=0 THEN total_tokens ELSE 0 END),0),
-       SUM(CASE WHEN estimated>0 THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0)
+	   SUM(CASE WHEN estimated>0 THEN 1 ELSE 0 END), COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0),
+	   COALESCE(SUM(CASE WHEN estimated>0 THEN prompt_tokens ELSE 0 END),0), COALESCE(SUM(CASE WHEN estimated>0 THEN completion_tokens ELSE 0 END),0)
 FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY account_id ORDER BY SUM(total_tokens) DESC`, since, until)
 	if err != nil {
 		return nil, err
@@ -5759,9 +5951,10 @@ FROM usage_records WHERE created_at >= ? AND created_at < ? GROUP BY account_id 
 	var out []UsageSummaryRow
 	for rows.Next() {
 		var row UsageSummaryRow
-		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.ActualRequests, &row.ActualTokens, &row.EstimatedRequests, &row.EstimatedTokens); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.ActualRequests, &row.ActualTokens, &row.EstimatedRequests, &row.EstimatedTokens, &row.EstimatedPromptTokens, &row.EstimatedCompletionTokens); err != nil {
 			return nil, err
 		}
+		finalizeUsageSummaryRow(&row)
 		out = append(out, row)
 	}
 	return out, rows.Err()
@@ -5800,7 +5993,9 @@ SELECT account_id,
        SUM(CASE WHEN estimated=0 THEN 1 ELSE 0 END),
        COALESCE(SUM(CASE WHEN estimated=0 THEN total_tokens ELSE 0 END),0),
        SUM(CASE WHEN estimated>0 THEN 1 ELSE 0 END),
-       COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0)
+	   COALESCE(SUM(CASE WHEN estimated>0 THEN total_tokens ELSE 0 END),0),
+	   COALESCE(SUM(CASE WHEN estimated>0 THEN prompt_tokens ELSE 0 END),0),
+	   COALESCE(SUM(CASE WHEN estimated>0 THEN completion_tokens ELSE 0 END),0)
 FROM usage_records
 WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)
   AND created_at>=?
@@ -5811,12 +6006,23 @@ GROUP BY account_id`, args...)
 	defer rows.Close()
 	for rows.Next() {
 		var row UsageSummaryRow
-		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.ActualRequests, &row.ActualTokens, &row.EstimatedRequests, &row.EstimatedTokens); err != nil {
+		if err := rows.Scan(&row.AccountID, &row.Requests, &row.PromptTokens, &row.CompletionTokens, &row.TotalTokens, &row.CachedTokens, &row.CacheReadTokens, &row.CacheCreationTokens, &row.ActualRequests, &row.ActualTokens, &row.EstimatedRequests, &row.EstimatedTokens, &row.EstimatedPromptTokens, &row.EstimatedCompletionTokens); err != nil {
 			return nil, err
 		}
+		finalizeUsageSummaryRow(&row)
 		out[row.AccountID] = row
 	}
 	return out, rows.Err()
+}
+
+func finalizeUsageSummaryRow(row *UsageSummaryRow) {
+	row.ActualPromptTokens, row.ActualCompletionTokens, row.ActualTotalTokens = row.PromptTokens, row.CompletionTokens, row.ActualTokens
+	row.EstimatedTotalTokens = row.EstimatedTokens
+	row.CombinedRequests = row.ActualRequests + row.EstimatedRequests
+	row.CombinedTotalTokens = row.ActualTotalTokens + row.EstimatedTotalTokens
+	if row.CombinedRequests > 0 {
+		row.EstimatedRate = float64(row.EstimatedRequests) / float64(row.CombinedRequests)
+	}
 }
 
 // UsageBucket is a time-bucketed rollup of usage_records, used to render the
@@ -5830,6 +6036,7 @@ type UsageBucket struct {
 	CacheReadTokens     int64 `json:"cache_read_tokens"`
 	CacheCreationTokens int64 `json:"cache_creation_tokens"`
 	TotalTokens         int64 `json:"total_tokens"`
+	Partial             bool  `json:"partial"`
 }
 
 type UsageSeriesDescriptor struct {
@@ -6259,7 +6466,7 @@ func (s *Store) UpdateCodexResetCreditConsumptionStatus(ctx context.Context, acc
 func (s *Store) CreateBillingHold(ctx context.Context, routeKeyHash, accountID string, estimatedTokens int64) (string, error) {
 	now := Now()
 	id := fmt.Sprintf("hold_%d_%s", time.Now().UnixNano(), accountID)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', ?, ?)`,
+	_, err := s.db.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, usage_expected, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', 1, ?, ?)`,
 		id, routeKeyHash, accountID, estimatedTokens, now, now)
 	return id, err
 }
@@ -6313,9 +6520,11 @@ func (s *Store) ExpireStaleBillingHolds(ctx context.Context, olderThan time.Dura
 }
 
 func (s *Store) GetBillingHold(ctx context.Context, id string) (BillingHold, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at FROM billing_holds WHERE id = ?`, id)
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, usage_expected, usage_recorded_at, created_at, updated_at FROM billing_holds WHERE id = ?`, id)
 	var hold BillingHold
-	err := row.Scan(&hold.ID, &hold.RouteKeyHash, &hold.AccountID, &hold.EstimatedTokens, &hold.Status, &hold.CreatedAt, &hold.UpdatedAt)
+	var usageExpected int
+	err := row.Scan(&hold.ID, &hold.RouteKeyHash, &hold.AccountID, &hold.EstimatedTokens, &hold.Status, &usageExpected, &hold.UsageRecordedAt, &hold.CreatedAt, &hold.UpdatedAt)
+	hold.UsageExpected = usageExpected != 0
 	return hold, err
 }
 

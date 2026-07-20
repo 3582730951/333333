@@ -224,8 +224,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/user/api-keys/", s.handleUserKeyAction)
 	s.mux.HandleFunc("/user/usage", s.handleUserUsage)
 	s.mux.HandleFunc("/user/usage/timeseries", s.handleUserUsageTimeseries)
+	s.mux.HandleFunc("/user/models", s.handleUserModels)
 	s.mux.HandleFunc("/user/profile", s.handleUserProfile)
 	s.mux.HandleFunc("/admin/accounts", s.adminAccounts)
+	s.mux.HandleFunc("/admin/models", s.handleAdminModels)
 	s.mux.HandleFunc("/admin/accounts/summary", s.adminAccountsSummary)
 	s.mux.HandleFunc("/admin/accounts/export", s.adminAccountsExport)
 	s.mux.HandleFunc("/admin/accounts/import-auth-json", s.adminImportAuthJSON)
@@ -255,6 +257,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/moderation/translate", s.adminModerationTranslate)
 	s.mux.HandleFunc("/admin/cf-events", s.adminCFEvents)
 	s.mux.HandleFunc("/admin/usage", s.adminUsage)
+	s.mux.HandleFunc("/admin/usage/dashboard", s.adminUsageDashboard)
 	s.mux.HandleFunc("/admin/usage/window", s.adminUsageWindowEndpoint)
 	s.mux.HandleFunc("/admin/model-quality", s.adminModelQuality)
 	s.mux.HandleFunc("/admin/model-quality/run", s.adminModelQualityRun)
@@ -456,6 +459,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "openai"))
+	requestedModel := routing.Model(raw)
 	// Authenticate the downstream api key (if any) and resolve its routing group +
 	// forced model/effort policy. The forced model is applied to the body BEFORE
 	// affinity/capability routing so the request lands on an account that has the
@@ -479,6 +483,11 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if pol.ForceModel != "" {
 		raw = setForcedModel(raw, pol.ForceModel)
 	}
+	resolvedPolicyModel := routing.Model(raw)
+	r = r.WithContext(withModelDiagnostics(r.Context(), requestedModel, resolvedPolicyModel, pol.ModelOverrideSource))
+	w.Header().Set("X-Pool-Requested-Model", requestedModel)
+	w.Header().Set("X-Pool-Resolved-Model", resolvedPolicyModel)
+	w.Header().Set("X-Pool-Model-Override-Source", firstNonEmpty(pol.ModelOverrideSource, "none"))
 	// Compliance: sanitize the conversation history (prior assistant turns) before
 	// forwarding upstream. Zero-cost when moderation is off or no keyword matches; the
 	// live streamed reply is never touched.
@@ -731,6 +740,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		lease.Release()
 	}
 	defer releaseLease()
+	resolvedModel := firstNonEmpty(lease.ResolvedModel, model)
+	if resolvedModel != model {
+		raw = setForcedModel(raw, resolvedModel)
+		model = resolvedModel
+	}
+	w.Header().Set("X-Pool-Resolved-Model", resolvedModel)
+	modelDiag := modelDiagnosticsFromCtx(r.Context())
+	r = r.WithContext(withModelDiagnostics(r.Context(), modelDiag.Requested, resolvedModel, modelDiag.Source))
 	// retry marks the leased account as failed-for-this-request (so the next attempt
 	// excludes it) and signals the caller to fail over to a fresh account.
 	retry := func() codexAttemptResult {
@@ -1828,6 +1845,9 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	modelDiag := modelDiagnosticsFromCtx(ctx)
+	diag.BillingHoldID = holdIDFromCtx(ctx)
+	diag.RequestedModel, diag.ResolvedModel, diag.ModelOverrideSource = modelDiag.Requested, modelDiag.Resolved, modelDiag.Source
 	if diag.UsageEventID == "" {
 		diag.UsageEventID = usageEventIDFromContext(ctx)
 	}
@@ -1925,6 +1945,9 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
+	modelDiag := modelDiagnosticsFromCtx(ctx)
+	diag.BillingHoldID = holdIDFromCtx(ctx)
+	diag.RequestedModel, diag.ResolvedModel, diag.ModelOverrideSource = modelDiag.Requested, modelDiag.Resolved, modelDiag.Source
 	if diag.UsageEventID == "" {
 		diag.UsageEventID = usageEventIDFromContext(ctx)
 	}

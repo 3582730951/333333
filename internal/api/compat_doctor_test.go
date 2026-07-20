@@ -77,8 +77,8 @@ func TestAdminSkillsCompatDoctorReportsOfficialRawAndProviderTiers(t *testing.T)
 	if runtime["default_runtime"] != "compat" {
 		t.Fatalf("claude runtime default wrong: %#v", runtime)
 	}
-	if required, _ := runtime["required_model_env"].(string); !strings.Contains(required, "CLAUDE_CODE_SUBAGENT_MODEL") {
-		t.Fatalf("claude runtime doctor must explain sub-agent model routing: %#v", runtime)
+	if selection, _ := runtime["model_selection"].(string); !strings.Contains(selection, "Claude Code") || !strings.Contains(selection, "force_model") {
+		t.Fatalf("claude runtime doctor must explain client/server model ownership: %#v", runtime)
 	}
 	providers := root["custom_providers"].([]interface{})
 	var sawNative bool

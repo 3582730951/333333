@@ -67,6 +67,12 @@ type diagnosticUsageRecord struct {
 	LatestUserTailCacheControl        int64
 	LatestUserToolResultCacheControl  int64
 	RouteEpoch                        int64
+	KiroCredits                       float64
+	KiroCreditsPresent                int64
+	BillingHoldID                     string
+	RequestedModel                    string
+	ResolvedModel                     string
+	ModelOverrideSource               string
 	RawUsageJSON                      string
 	CreatedAt                         int64
 }
@@ -77,6 +83,8 @@ type diagnosticBillingHold struct {
 	AccountID       string
 	EstimatedTokens int64
 	Status          string
+	UsageExpected   int64
+	UsageRecordedAt int64
 	CreatedAt       int64
 	UpdatedAt       int64
 }
@@ -699,7 +707,7 @@ func streamDiagnosticCFCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, code
 }
 
 func streamDiagnosticUsageCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
-	header := []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json"}
+	header := []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source"}
 	return streamDiagnosticCSV(zw, "usage_records.csv", header, func(cw *csv.Writer) error {
 		rows, err := db.QueryContext(ctx, diagnosticUsageRecordSelectSQL()+` ORDER BY id`)
 		if err != nil {
@@ -720,15 +728,15 @@ func streamDiagnosticUsageCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, c
 }
 
 func streamDiagnosticBillingHoldsCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
-	return streamDiagnosticCSV(zw, "billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status"}, func(cw *csv.Writer) error {
-		rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at FROM billing_holds ORDER BY created_at, id`)
+	return streamDiagnosticCSV(zw, "billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status", "usage_expected", "usage_recorded_at"}, func(cw *csv.Writer) error {
+		rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, usage_expected, usage_recorded_at, created_at, updated_at FROM billing_holds ORDER BY created_at, id`)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var row diagnosticBillingHold
-			if err := rows.Scan(&row.ID, &row.RouteKeyHash, &row.AccountID, &row.EstimatedTokens, &row.Status, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			if err := rows.Scan(&row.ID, &row.RouteKeyHash, &row.AccountID, &row.EstimatedTokens, &row.Status, &row.UsageExpected, &row.UsageRecordedAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
 				return err
 			}
 			if err := cw.Write(billingHoldRows([]diagnosticBillingHold{row}, codebook)[0]); err != nil {
@@ -771,8 +779,8 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_reauth_jobs.csv", []string{"id", "account_code", "status", "reason", "last_error", "created_at", "updated_at", "started_at", "finished_at"}, codexReauthJobRows(reauthJobs, codebook))
 	addCSV("audit_log.csv", []string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, auditLogRows(auditRows, codebook))
 	addCSV("cf_events.csv", []string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, cfEventRows(cfRows, codebook))
-	addCSV("usage_records.csv", []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json"}, usageRecordRows(usageRows, codebook))
-	addCSV("billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status"}, billingHoldRows(holds, codebook))
+	addCSV("usage_records.csv", []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source"}, usageRecordRows(usageRows, codebook))
+	addCSV("billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status", "usage_expected", "usage_recorded_at"}, billingHoldRows(holds, codebook))
 	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
 	addCSV("egress_snapshot.csv", []string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
 	if err := addJSON("diagnostic_summary.json", diagnosticSummary(accounts, tokensByID, auditRows, holds, bindings, rateLimits)); err != nil {
@@ -927,7 +935,7 @@ affinity_source, prompt_cache_key_present, prompt_cache_key_source, stable_prefi
 retention_effective, retention_source, claude_cache_ttl, cache_control_injected, cache_breakpoint_count,
 cache_breakpoints_json, unwritten_tail_tokens, max_possible_cache_read_tokens, cache_hit_after_prewarm, singleflight_waited_requests, diagnostics_miss_reason,
 latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_tail_cache_control, latest_user_tool_result_cache_control, route_epoch,
-raw_usage_json, created_at FROM usage_records`
+raw_usage_json, created_at, kiro_credits, kiro_credits_present, billing_hold_id, requested_model, resolved_model, model_override_source FROM usage_records`
 }
 
 type usageRecordScanner interface {
@@ -942,11 +950,11 @@ func scanDiagnosticUsageRecord(rows usageRecordScanner, r *diagnosticUsageRecord
 		&r.RetentionEffective, &r.RetentionSource, &r.ClaudeCacheTTL, &r.CacheControlInjected, &r.CacheBreakpointCount,
 		&r.CacheBreakpointsJSON, &r.UnwrittenTailTokens, &r.MaxPossibleCacheReadTokens, &r.CacheHitAfterPrewarm, &r.SingleflightWaitedRequests, &r.DiagnosticsMissReason,
 		&r.LatestUserCacheControl, &r.LatestUserAutoContextCacheControl, &r.LatestUserTailCacheControl, &r.LatestUserToolResultCacheControl, &r.RouteEpoch,
-		&r.RawUsageJSON, &r.CreatedAt)
+		&r.RawUsageJSON, &r.CreatedAt, &r.KiroCredits, &r.KiroCreditsPresent, &r.BillingHoldID, &r.RequestedModel, &r.ResolvedModel, &r.ModelOverrideSource)
 }
 
 func listDiagnosticBillingHolds(ctx context.Context, db *sql.DB) ([]diagnosticBillingHold, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, created_at, updated_at FROM billing_holds ORDER BY created_at ASC, id ASC`)
+	rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, usage_expected, usage_recorded_at, created_at, updated_at FROM billing_holds ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -954,7 +962,7 @@ func listDiagnosticBillingHolds(ctx context.Context, db *sql.DB) ([]diagnosticBi
 	var out []diagnosticBillingHold
 	for rows.Next() {
 		var h diagnosticBillingHold
-		if err := rows.Scan(&h.ID, &h.RouteKeyHash, &h.AccountID, &h.EstimatedTokens, &h.Status, &h.CreatedAt, &h.UpdatedAt); err != nil {
+		if err := rows.Scan(&h.ID, &h.RouteKeyHash, &h.AccountID, &h.EstimatedTokens, &h.Status, &h.UsageExpected, &h.UsageRecordedAt, &h.CreatedAt, &h.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
@@ -1523,6 +1531,12 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 			itoa64(row.LatestUserToolResultCacheControl),
 			itoa64(row.RouteEpoch),
 			codebook.sanitize(row.RawUsageJSON),
+			floatString(row.KiroCredits),
+			itoa64(row.KiroCreditsPresent),
+			codebook.sanitize(row.BillingHoldID),
+			row.RequestedModel,
+			row.ResolvedModel,
+			row.ModelOverrideSource,
 		})
 	}
 	return out
@@ -1531,7 +1545,7 @@ func usageRecordRows(rows []diagnosticUsageRecord, codebook diagnosticCodebook) 
 func billingHoldRows(rows []diagnosticBillingHold, codebook diagnosticCodebook) [][]string {
 	out := make([][]string, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, []string{codebook.sanitize(row.ID), itoa64(row.CreatedAt), itoa64(row.UpdatedAt), codebook.code(row.AccountID), row.RouteKeyHash, itoa64(row.EstimatedTokens), row.Status})
+		out = append(out, []string{codebook.sanitize(row.ID), itoa64(row.CreatedAt), itoa64(row.UpdatedAt), codebook.code(row.AccountID), row.RouteKeyHash, itoa64(row.EstimatedTokens), row.Status, itoa64(row.UsageExpected), itoa64(row.UsageRecordedAt)})
 	}
 	return out
 }

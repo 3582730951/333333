@@ -5,6 +5,7 @@ export const adminRoutes = [
   { path: '/accounts', role: 'admin', navGroup: 'accounts', titleKey: 'nav.account_pool', descriptionKey: 'page.accounts.desc', lazyLoader: () => import('../pages/Accounts.jsx'), prefetch: 'eager' },
   { path: '/groups', role: 'admin', navGroup: 'accounts', titleKey: 'nav.groups', descriptionKey: 'page.groups.desc', lazyLoader: () => import('../pages/Groups.jsx') },
   { path: '/providers', role: 'admin', navGroup: 'access', titleKey: 'nav.providers', descriptionKey: 'page.providers.desc', lazyLoader: () => import('../pages/Providers.jsx') },
+  { path: '/models', role: 'admin', navGroup: 'access', titleKey: 'nav.models', descriptionKey: 'page.models.desc', lazyLoader: () => import('../pages/Models.tsx') },
   { path: '/egress', role: 'admin', navGroup: 'access', titleKey: 'nav.egress', descriptionKey: 'page.egress.desc', lazyLoader: () => import('../pages/Egress.jsx'), prefetch: 'idle' },
   { path: '/upstream-error-rules', role: 'admin', navGroup: 'access', titleKey: 'nav.upstream_error_rules', descriptionKey: 'page.upstream.desc', lazyLoader: () => import('../pages/UpstreamErrorRules.jsx') },
   { path: '/registration', role: 'admin', navGroup: 'automation', titleKey: 'nav.auto_register', descriptionKey: 'page.registration.desc', lazyLoader: () => import('../pages/Registration.tsx'), prefetch: 'idle' },
@@ -24,6 +25,7 @@ export const adminRoutes = [
 export const portalRoutes = [
   { path: '/portal', role: 'user', navGroup: 'portal', titleKey: 'nav.my_usage', descriptionKey: 'page.portal_usage.desc', lazyLoader: () => import('../pages/portal/PortalDashboard.tsx'), prefetch: 'eager' },
   { path: '/portal/keys', role: 'user', navGroup: 'portal', titleKey: 'nav.my_keys', descriptionKey: 'page.portal_keys.desc', lazyLoader: () => import('../pages/portal/PortalKeys.tsx'), prefetch: 'idle' },
+  { path: '/portal/models', role: 'user', navGroup: 'portal', titleKey: 'nav.models', descriptionKey: 'page.models.desc', lazyLoader: () => import('../pages/portal/PortalModels.tsx'), prefetch: 'idle' },
   { path: '/portal/profile', role: 'user', navGroup: 'portal', titleKey: 'nav.my_profile', descriptionKey: 'page.portal_profile.desc', lazyLoader: () => import('../pages/portal/PortalProfile.jsx'), prefetch: 'idle' },
 ] as const satisfies ReadonlyArray<RouteDefinition>;
 

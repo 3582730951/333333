@@ -16,8 +16,8 @@ for (const redirect of redirects) {
   const target = redirect.to.split(/[?#]/, 1)[0];
   if (!routePaths.includes(target)) failures.push(`redirect target has no route: ${redirect.path} -> ${redirect.to}`);
 }
-if (routePaths.filter((pathValue) => pathValue.startsWith('/portal')).length !== 3) failures.push('portal route matrix must contain three routes.');
-if (routePaths.filter((pathValue) => !pathValue.startsWith('/portal')).length !== 18) failures.push('admin route metadata must contain eighteen canonical routes.');
+if (routePaths.filter((pathValue) => pathValue.startsWith('/portal')).length !== 4) failures.push('portal route matrix must contain four routes.');
+if (routePaths.filter((pathValue) => !pathValue.startsWith('/portal')).length !== 19) failures.push('admin route metadata must contain nineteen canonical routes.');
 if (!source.includes('adminVisualRoutes') || !source.includes('portalVisualRoutes')) failures.push('visual route matrices must be generated from route metadata.');
 
 if (failures.length) {

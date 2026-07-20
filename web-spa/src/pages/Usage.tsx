@@ -140,16 +140,21 @@ export default function Usage() {
   const byModel = data?.byModel || [];
   const cache = data?.cache || {};
   const cacheSummary = cache.summary || {};
+  const stableCacheSummary = cache.stable_summary || cacheSummary;
   const cacheByKey = cache.by_api_key || [];
   const cacheByAccountModel = cache.by_account_model || [];
+  const cacheByProvider = cache.by_provider || [];
   const cacheByRoute = cache.by_route || [];
   const cacheByRouteAccountModel = cache.by_route_account_model || [];
   const cacheByTimeBucket = cache.by_time_bucket || [];
   const usageWindow = data?.usageWindow || { rows: [] };
   const windowInfo = usageWindow.window || cache.window || {};
 
-  const totalTokens = ts.reduce((s, b) => s + (b.total_tokens || 0), 0);
-  const totalReqs = ts.reduce((s, b) => s + (b.requests || 0), 0);
+  const actualTokens = rows.reduce((s, b) => s + Number(b.actual_total_tokens ?? b.total_tokens ?? 0), 0);
+  const estimatedTokens = rows.reduce((s, b) => s + Number(b.estimated_total_tokens ?? b.estimated_tokens ?? 0), 0);
+  const totalTokens = actualTokens + estimatedTokens;
+  const actualReqs = rows.reduce((s, b) => s + Number(b.actual_requests ?? b.requests ?? 0), 0);
+  const estimatedReqs = rows.reduce((s, b) => s + Number(b.estimated_requests || 0), 0);
   const fallbackCacheRead = ts.reduce((s, b) => s + (b.cache_read_tokens || 0), 0);
   const fallbackCacheCreation = ts.reduce((s, b) => s + (b.cache_creation_tokens || 0), 0);
   const fallbackCacheInput = ts.reduce((s, b) => s + (b.cache_input_tokens ?? b.prompt_tokens ?? 0), 0);
@@ -158,11 +163,12 @@ export default function Usage() {
   const promptForCache = cacheSummary.cache_input_tokens ?? cacheSummary.prompt_tokens ?? fallbackCacheInput;
   const cacheMiss = cacheSummary.cache_miss_tokens ?? Math.max(0, promptForCache - cacheRead);
   const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cacheRead / promptForCache : 0);
-  const realTokenHitRate = cacheSummary.real_token_hit_rate ?? cacheRate;
+  const realTokenHitRate = stableCacheSummary.real_token_hit_rate ?? stableCacheSummary.token_hit_rate ?? cacheRate;
   const cacheCreationReported = Number(cacheSummary.cache_creation_reported_requests || 0) > 0;
   const eligibleHitRate = cacheCreationReported ? (cacheSummary.eligible_cache_hit_rate ?? (cacheRead + cacheCreation > 0 ? cacheRead / (cacheRead + cacheCreation) : 0)) : null;
   const cacheWriteShare = cacheCreationReported ? (cacheSummary.cache_write_share ?? (promptForCache ? cacheCreation / promptForCache : 0)) : null;
-  const requestHitRate = cacheSummary.request_hit_rate ?? 0;
+  const requestHitRate = stableCacheSummary.request_hit_rate ?? 0;
+  const kiroCredits = Number(cacheSummary.kiro_credits || 0);
   const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / promptForCache) * 100))) : 0;
   const cacheWritePct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheCreation / promptForCache) * 100))) : 0;
   const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct - cacheWritePct) : 0;
@@ -216,9 +222,16 @@ export default function Usage() {
 
   const cols: UsageColumn[] = [
     { title: t('usage.account'), dataIndex: 'account_id', render: (v, r) => <span>{r.label || v}</span> },
-    { title: t('usage.requests'), dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
-    { title: t('usage.input'), dataIndex: 'prompt_tokens', sorter: (a, b) => (a.prompt_tokens || 0) - (b.prompt_tokens || 0), render: fmtTokens },
-    { title: t('usage.output'), dataIndex: 'completion_tokens', sorter: (a, b) => (a.completion_tokens || 0) - (b.completion_tokens || 0), render: fmtTokens },
+    { title: '实际请求', dataIndex: 'actual_requests', render: fmtInt },
+    { title: '估算请求', dataIndex: 'estimated_requests', render: fmtInt },
+    { title: '实际输入', dataIndex: 'actual_prompt_tokens', render: fmtTokens },
+    { title: '实际输出', dataIndex: 'actual_completion_tokens', render: fmtTokens },
+    { title: '实际总量', dataIndex: 'actual_total_tokens', render: fmtTokens },
+    { title: '估算输入', dataIndex: 'estimated_prompt_tokens', render: fmtTokens },
+    { title: '估算输出', dataIndex: 'estimated_completion_tokens', render: fmtTokens },
+    { title: '估算总量', dataIndex: 'estimated_total_tokens', render: fmtTokens },
+    { title: '合计', dataIndex: 'combined_total_tokens', render: (v) => <b>{fmtTokens(v)}</b> },
+    { title: '估算占比', dataIndex: 'estimated_rate', render: fmtPct },
     { title: t('usage.cache_read'), dataIndex: 'cache_read_tokens', render: (v) => fmtTokens(v || 0) },
     { title: t('usage.cache_write'), dataIndex: 'cache_creation_tokens', render: fmtTokens },
     { title: t('usage.total'), dataIndex: 'total_tokens', sorter: (a, b) => (a.total_tokens || 0) - (b.total_tokens || 0), defaultSortOrder: 'descend', render: (v) => <b>{fmtTokens(v)}</b> },
@@ -281,7 +294,7 @@ export default function Usage() {
   ];
 
   const cacheTimeCols: UsageColumn[] = [
-    { title: t('usage.time_bucket'), dataIndex: 'bucket', width: 150, render: (v) => (v ? new Date(v * 1000).toLocaleString() : '—') },
+    { title: t('usage.time_bucket'), dataIndex: 'bucket', width: 190, render: (v, row) => <span style={row.partial ? { opacity: .65, borderBottom: '1px dashed currentColor' } : undefined}>{v ? new Date(v * 1000).toLocaleString() : '—'}{row.partial ? ' · 数据仍在写入' : ''}</span> },
     { title: t('usage.request_unit'), dataIndex: 'requests', sorter: (a, b) => (a.requests || 0) - (b.requests || 0), render: fmtInt },
     { title: t('usage.real_requests'), dataIndex: 'real_requests', sorter: (a, b) => (a.real_requests || 0) - (b.real_requests || 0), render: fmtInt },
     { title: t('usage.read_share'), dataIndex: 'cache_read_share', sorter: (a, b) => (a.cache_read_share || 0) - (b.cache_read_share || 0), render: fmtPct },
@@ -309,6 +322,16 @@ export default function Usage() {
   const diagnosticTabs: DiagnosticTab[] = [
     { key: 'apiKey', label: 'API Key', title: t('usage.api_key_diagnostic'), data: cacheByKey, columns: cacheKeyCols, rowKey: (r) => r.api_key_hash_prefix || 'none', minScrollX: 1080, mobileTitle: (r) => r.api_key_hash_prefix || t('usage.unattributed') },
     { key: 'accountModel', label: t('usage.account_model'), title: t('usage.account_model_diagnostic'), data: cacheByAccountModel, columns: cacheAccountModelCols, rowKey: (r) => `${r.account_id || 'none'}:${r.model || 'unknown'}`, minScrollX: 1180, mobileTitle: (r) => `${r.account_id || t('usage.unattributed')} · ${r.model || 'unknown'}` },
+    { key: 'provider', label: 'Provider', title: 'Provider / Kiro 用量诊断', data: cacheByProvider, columns: [
+      { title: 'Provider', dataIndex: 'provider', render: textOrDash }, { title: '实际 Token', dataIndex: 'actual_total_tokens', render: fmtTokens },
+      { title: '估算 Token', dataIndex: 'estimated_total_tokens', render: fmtTokens }, { title: 'Credits', dataIndex: 'kiro_credits' },
+      { title: 'Credits 报告请求', dataIndex: 'kiro_credits_reported_requests', render: fmtInt }, { title: '缓存报告状态', dataIndex: 'cache_reporting_state', render: textOrDash },
+      { title: '缓存读取', dataIndex: 'cache_read_tokens', render: (v, r) => r.cache_reporting_state === 'unreported' ? '—（上游未报告缓存 token）' : fmtTokens(v) },
+      { title: '缓存写入', dataIndex: 'cache_creation_tokens', render: (v, r) => r.cache_reporting_state === 'unreported' ? '—' : fmtTokens(v) },
+      { title: '命中率', dataIndex: 'real_token_hit_rate', render: (v, r) => r.cache_reporting_state === 'unreported' ? '—' : fmtOptionalPct(v) },
+      { title: 'cachePoint 注入/接受', dataIndex: 'cache_control_injected', render: (v) => fmtInt(v || 0) },
+      { title: '已验证 reuse', dataIndex: 'cache_hit_after_prewarm', render: (v) => fmtInt(v || 0) },
+    ], rowKey: (r) => r.provider || 'unknown', minScrollX: 900, mobileTitle: (r) => r.provider || 'unknown' },
     { key: 'route', label: t('usage.route'), title: t('usage.route_diagnostic'), data: cacheByRoute, columns: cacheRouteCols, rowKey: routeDiagKey, minScrollX: 1800, mobileTitle: (r) => r.route_key_hash_prefix || t('usage.unattributed_route') },
     { key: 'time', label: t('usage.time_bucket'), title: t('usage.time_diagnostic'), data: cacheByTimeBucket, columns: cacheTimeCols, rowKey: (r) => r.bucket, minScrollX: 1080, mobileTitle: (r) => (r.bucket ? new Date(r.bucket * 1000).toLocaleString() : t('usage.time_bucket')) },
     { key: 'accountUsage', label: t('usage.account_usage'), title: t('usage.account_usage_title'), data: rows, columns: cols, rowKey: (r) => r.account_id, minScrollX: 860, mobileTitle: (r) => r.label || r.account_id || t('usage.account') },
@@ -332,6 +355,7 @@ export default function Usage() {
           <span>{t('usage.window')} {unixDateTime(usageWindow.effective_start_at)} {t('usage.to')} {unixDateTime(usageWindow.effective_until_at)}</span>
           <span>{t('usage.since_reset')} {unixDateTime(cache.effective_start_at)}</span>
           <span>{t('usage.next_day')} {unixDateTime(windowInfo.next_day_start_at)}</span>
+          <span>完整水位 {unixDateTime(cache.usage_complete_through_at)} · pending {fmtInt(cache.pending_usage_requests || 0)} · 延迟 {fmtInt(cache.usage_lag_seconds || 0)}s</span>
         </div>
         <div className="pool-window-strip__actions">
           <span className="pool-text-tertiary">{t('usage.no_history_delete')}</span>
@@ -343,12 +367,14 @@ export default function Usage() {
       </div>
 
       <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
-        <MetricCard label={t('usage.total_tokens')} value={fmtTokens(totalTokens)} color={C.violet} />
-        <MetricCard label={t('usage.requests')} value={fmtInt(totalReqs)} color={C.blue} />
-        <MetricCard label={t('usage.request_hit_probability')} value={fmtPct(requestHitRate)} color={C.green} sub={`${fmtInt(cacheSummary.hit_requests || 0)} / ${fmtInt(cacheSummary.requests || 0)} ${t('usage.request_unit')}`} />
-        <MetricCard label={t('usage.real_token_hit')} value={fmtPct(realTokenHitRate)} color={C.cyan} sub={`${fmtTokens(cacheRead)} / ${fmtTokens(promptForCache)} ${t('usage.input_short')}`} />
-        <MetricCard label={t('usage.eligible_hit')} value={fmtOptionalPct(eligibleHitRate)} color={C.teal} sub="read / (read + write)" />
-        <MetricCard label={t('usage.write_share')} value={fmtOptionalPct(cacheWriteShare)} color={C.amber} sub={fmtTokens(cacheCreation)} />
+        <MetricCard label="实际 Token" value={fmtTokens(actualTokens)} color={C.blue} />
+        <MetricCard label="估算 Token" value={fmtTokens(estimatedTokens)} color={C.amber} />
+        <MetricCard label="合计 Token" value={fmtTokens(totalTokens)} color={C.violet} />
+        <MetricCard label="实际请求" value={fmtInt(actualReqs)} color={C.blue} />
+        <MetricCard label="估算请求" value={fmtInt(estimatedReqs)} color={C.amber} />
+        <MetricCard label="稳定请求命中率" value={fmtPct(requestHitRate)} color={C.green} />
+        <MetricCard label="稳定 Token 命中率" value={fmtPct(realTokenHitRate)} color={C.cyan} />
+        <MetricCard label="Kiro credits" value={kiroCredits.toFixed(2)} color={C.teal} />
       </div>
 
       <div className="pool-cache-breakdown" style={{ marginBottom: 18 }}>

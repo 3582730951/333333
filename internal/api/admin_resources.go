@@ -1053,6 +1053,11 @@ func (s *Server) adminUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	completeness, err := s.currentUsageCompleteness(r.Context(), now.Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := s.store.EnsureUsageDailyResetAudit(r.Context(), now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1071,7 +1076,8 @@ func (s *Server) adminUsage(w http.ResponseWriter, r *http.Request) {
 		summary = []storage.UsageSummaryRow{}
 	}
 	cutover := s.store.UsageAccuracyCutover(r.Context())
-	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{"rows": summary, "accuracy_cutover_at": cutover, "legacy_unverified": win.EffectiveStartAt < cutover}, win))
+	body := mergeWindowFields(map[string]interface{}{"rows": summary, "accuracy_cutover_at": cutover, "legacy_unverified": win.EffectiveStartAt < cutover}, win)
+	writeJSON(w, http.StatusOK, mergeCompletenessFields(body, completeness))
 }
 
 // adminUsageTimeseries returns usage aggregated into fixed-width time buckets for
@@ -1086,6 +1092,11 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	completeness, err := s.currentUsageCompleteness(r.Context(), now.Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := s.store.EnsureUsageDailyResetAudit(r.Context(), now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -1107,6 +1118,7 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 	if buckets == nil {
 		buckets = []storage.UsageBucket{}
 	}
+	markUsageBucketsPartial(buckets, bucket, completeness.UsageCompleteThroughAt)
 	body := map[string]interface{}{
 		"since": win.EffectiveStartAt, "bucket": bucket, "now": win.EffectiveUntilAt, "buckets": buckets,
 	}
@@ -1132,7 +1144,7 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 		body["series"] = series
 		body["model_series"] = rows
 	}
-	writeJSON(w, http.StatusOK, mergeWindowFields(body, win))
+	writeJSON(w, http.StatusOK, mergeCompletenessFields(mergeWindowFields(body, win), completeness))
 }
 
 // adminQuota returns the latest captured rate-limit / remaining-quota snapshot for

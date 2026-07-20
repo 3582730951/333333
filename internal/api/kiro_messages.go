@@ -1021,6 +1021,8 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 		CompatibilityLossesJSON: string(lossesJSON),
 		CacheCapability:         capabilityState.CacheCapability,
 		Estimated:               data.UsageSource == kirowire.UsageSourceEstimated,
+		KiroCredits:             data.Metering.Credits.Value,
+		KiroCreditsPresent:      data.Metering.Credits.Present,
 		CacheMissTokens:         data.InputTokens,
 		CacheTotalInputTokens:   data.Metering.TotalInputTokens.Value,
 		AffinitySource:          affinity.Source,
@@ -1034,6 +1036,9 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 			return 0
 		}(),
 	}
+	modelDiag := modelDiagnosticsFromCtx(r.Context())
+	diagnostics.BillingHoldID = holdIDFromCtx(r.Context())
+	diagnostics.RequestedModel, diagnostics.ResolvedModel, diagnostics.ModelOverrideSource = modelDiag.Requested, firstNonEmpty(modelDiag.Resolved, model), modelDiag.Source
 	totalInput := data.InputTokens
 	if data.Metering.TotalInputTokens.Present {
 		totalInput = data.Metering.TotalInputTokens.Value

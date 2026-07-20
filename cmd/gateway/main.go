@@ -20,7 +20,6 @@ type Config struct {
 	ListenAddr    string        `json:"listen_addr"`
 	PoolServerURL string        `json:"pool_server_url"`
 	DownstreamKey string        `json:"downstream_key"`
-	ClaudeModel   string        `json:"claude_model"`
 	Providers     []string      `json:"providers"`
 	IdentityTTL   time.Duration `json:"identity_ttl_seconds"`
 	LogLevel      string        `json:"log_level"`
@@ -36,7 +35,6 @@ type gatewayConfigDisk struct {
 	ListenAddr         string     `json:"listen_addr"`
 	PoolServerURL      string     `json:"pool_server_url"`
 	DownstreamKey      string     `json:"downstream_key"`
-	ClaudeModel        string     `json:"claude_model"`
 	Providers          []string   `json:"providers"`
 	IdentityTTLSeconds int64      `json:"identity_ttl_seconds"`
 	LogLevel           string     `json:"log_level"`
@@ -47,7 +45,6 @@ type gatewayConfigPatch struct {
 	ListenAddr         *string     `json:"listen_addr"`
 	PoolServerURL      *string     `json:"pool_server_url"`
 	DownstreamKey      *string     `json:"downstream_key"`
-	ClaudeModel        *string     `json:"claude_model"`
 	Providers          []string    `json:"providers"`
 	IdentityTTLSeconds *int64      `json:"identity_ttl_seconds"`
 	LogLevel           *string     `json:"log_level"`
@@ -95,6 +92,10 @@ func LoadConfig(path string) (Config, error) {
 	if err := applyGatewayConfigJSON(&cfg, data); err != nil {
 		return cfg, err
 	}
+	// claude_model was written by older gateway releases. It is deliberately
+	// ignored at runtime and removed best-effort so upgrades immediately return
+	// model selection to Claude Code without touching native Claude settings.
+	_ = removeLegacyClaudeModel(path, data)
 
 	// 展开 ~ 路径
 	cfg.MITM.CACert = ExpandPath(cfg.MITM.CACert)
@@ -138,9 +139,6 @@ func applyGatewayConfigJSON(cfg *Config, data []byte) error {
 	if patch.DownstreamKey != nil {
 		cfg.DownstreamKey = *patch.DownstreamKey
 	}
-	if patch.ClaudeModel != nil {
-		cfg.ClaudeModel = *patch.ClaudeModel
-	}
 	if patch.Providers != nil {
 		cfg.Providers = patch.Providers
 	}
@@ -165,12 +163,30 @@ func gatewayConfigForDisk(cfg Config) gatewayConfigDisk {
 		ListenAddr:         cfg.ListenAddr,
 		PoolServerURL:      cfg.PoolServerURL,
 		DownstreamKey:      cfg.DownstreamKey,
-		ClaudeModel:        cfg.ClaudeModel,
 		Providers:          cfg.Providers,
 		IdentityTTLSeconds: ttlSeconds,
 		LogLevel:           cfg.LogLevel,
 		MITM:               cfg.MITM,
 	}
+}
+
+func removeLegacyClaudeModel(path string, data []byte) error {
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+	if _, ok := values["claude_model"]; !ok {
+		return nil
+	}
+	delete(values, "claude_model")
+	cleaned, err := json.MarshalIndent(values, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, cleaned, gatewayConfigFileMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, gatewayConfigFileMode)
 }
 
 func gatewayTTLFromDisk(value int64) time.Duration {
@@ -244,7 +260,7 @@ func printUsage() {
 	fmt.Println(`Claude Gateway - Local MITM proxy for pool_server
 
 Usage:
-  gateway init [--pool-url URL] [--key KEY] [--model MODEL]
+  gateway init [--pool-url URL] [--key KEY]
                                                 初始化配置和 CA
   gateway start                                 启动代理服务器
   gateway start-background                      nohup 后台启动代理服务器（写入 PID/log）
@@ -256,14 +272,14 @@ Usage:
   gateway trust-ca [--print-commands]           信任 CA 证书
   gateway install-wrapper                       安装 claude 命令包装器
   gateway uninstall                             完整卸载
-  gateway quick-install [--model MODEL]         一键安装（推荐）
+  gateway quick-install                         一键安装（推荐）
 
 Examples:
   # 一键安装
-  gateway quick-install --pool-url https://your-vps.com:1455 --key cap_xxx --model gpt-5.6-sol
+  gateway quick-install --pool-url https://your-vps.com:1455 --key cap_xxx
 
   # 手动安装
-  gateway init --pool-url https://your-vps.com:1455 --key cap_xxx --model gpt-5.6-sol
+  gateway init --pool-url https://your-vps.com:1455 --key cap_xxx
   gateway trust-ca
   gateway install-wrapper
   gateway start-background
@@ -286,9 +302,7 @@ func handleInit(configPath string) {
 	if *key != "" {
 		cfg.DownstreamKey = *key
 	}
-	if *model != "" {
-		cfg.ClaudeModel = strings.TrimSpace(*model)
-	}
+	warnDeprecatedGatewayModel(*model)
 
 	// 保存配置
 	if err := SaveConfig(configPath, cfg); err != nil {
@@ -334,7 +348,6 @@ type gatewayStatusReport struct {
 	ListenAddr              string
 	PoolServerURL           string
 	DownstreamKeyConfigured bool
-	ClaudeModel             string
 	CACertPresent           bool
 	CAKeyPresent            bool
 	GatewayReachable        bool
@@ -370,7 +383,6 @@ func inspectGatewayStatus(ctx context.Context, configPath string) gatewayStatusR
 	report.ListenAddr = cfg.ListenAddr
 	report.PoolServerURL = cfg.PoolServerURL
 	report.DownstreamKeyConfigured = cfg.DownstreamKey != ""
-	report.ClaudeModel = strings.TrimSpace(cfg.ClaudeModel)
 	report.CACertPresent = fileExists(cfg.MITM.CACert)
 	report.CAKeyPresent = fileExists(cfg.MITM.CAKey)
 	report.IdentityCachePresent = identityCachePresent()
@@ -411,11 +423,6 @@ func printGatewayStatus(report gatewayStatusReport) {
 	fmt.Println("  Listen:", report.ListenAddr)
 	fmt.Println("  Pool:", report.PoolServerURL)
 	fmt.Println("  Downstream key:", yesNo(report.DownstreamKeyConfigured))
-	if report.ClaudeModel == "" {
-		fmt.Println("  Claude model:", "not configured")
-	} else {
-		fmt.Println("  Claude model:", report.ClaudeModel)
-	}
 	fmt.Println("  CA cert:", yesNo(report.CACertPresent))
 	fmt.Println("  CA key:", yesNo(report.CAKeyPresent))
 	fmt.Println("  Identity cache:", yesNo(report.IdentityCachePresent))
@@ -522,8 +529,9 @@ func handleQuickInstall(configPath string) {
 	flag.CommandLine.Parse(os.Args[2:])
 
 	if *poolURL == "" || *key == "" {
-		log.Fatal("Usage: gateway quick-install --pool-url URL --key KEY [--model MODEL]")
+		log.Fatal("Usage: gateway quick-install --pool-url URL --key KEY")
 	}
+	warnDeprecatedGatewayModel(*model)
 
 	fmt.Println("🚀 Claude Gateway 一键安装")
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -533,7 +541,6 @@ func handleQuickInstall(configPath string) {
 	cfg := DefaultConfig()
 	cfg.PoolServerURL = *poolURL
 	cfg.DownstreamKey = *key
-	cfg.ClaudeModel = strings.TrimSpace(*model)
 	if err := SaveConfig(configPath, cfg); err != nil {
 		log.Fatalf("Save config failed: %v", err)
 	}
@@ -551,9 +558,6 @@ func handleQuickInstall(configPath string) {
 		fmt.Printf("  ❌ 自动信任失败，请手动执行:\n")
 		PrintTrustInstructions(cfg.MITM.CACert)
 		fmt.Print("\n执行完成后，运行: gateway quick-install --pool-url ", *poolURL, " --key ", *key)
-		if cfg.ClaudeModel != "" {
-			fmt.Print(" --model ", cfg.ClaudeModel)
-		}
 		fmt.Println()
 		os.Exit(1)
 	}
@@ -579,5 +583,11 @@ func handleQuickInstall(configPath string) {
 	fmt.Println("  1. 直接使用: claude \"your prompt\"")
 	fmt.Println("  2. 查看状态: gateway status")
 	fmt.Println("  3. 查看日志: tail -f ~/.claude-gateway/gateway.log")
-	fmt.Println("\n网关会自动拦截并改写请求，无需手动设置环境变量。")
+	fmt.Println("\nClaude Code 模型由客户端自行选择；VPS force_model 可能在服务端覆盖。")
+}
+
+func warnDeprecatedGatewayModel(model string) {
+	if strings.TrimSpace(model) != "" {
+		fmt.Fprintln(os.Stderr, "warning: --model is deprecated and ignored; Claude Code controls its model selection")
+	}
 }

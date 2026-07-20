@@ -22,6 +22,11 @@ func (s *Server) adminUsageByModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	completeness, err := s.currentUsageCompleteness(r.Context(), now.Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := s.store.EnsureUsageDailyResetAudit(r.Context(), now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -31,7 +36,11 @@ func (s *Server) adminUsageByModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	models, err := s.store.UsageByModelWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt())
+	stableUntil := win.storageUntilAt()
+	if completeness.UsageCompleteThroughAt < stableUntil {
+		stableUntil = completeness.UsageCompleteThroughAt
+	}
+	models, err := s.store.UsageByModelWindow(r.Context(), win.EffectiveStartAt, stableUntil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -39,7 +48,7 @@ func (s *Server) adminUsageByModel(w http.ResponseWriter, r *http.Request) {
 	if models == nil {
 		models = []storage.UserUsageRow{}
 	}
-	writeJSON(w, http.StatusOK, mergeWindowFields(map[string]interface{}{"since": win.EffectiveStartAt, "now": win.EffectiveUntilAt, "models": models}, win))
+	writeJSON(w, http.StatusOK, mergeCompletenessFields(mergeWindowFields(map[string]interface{}{"since": win.EffectiveStartAt, "now": win.EffectiveUntilAt, "models": models}, win), completeness))
 }
 
 // adminUsageCache returns cache-hit diagnostics since `since` (default last 24h).
@@ -54,6 +63,11 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	completeness, err := s.currentUsageCompleteness(r.Context(), now.Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := s.store.EnsureUsageDailyResetAudit(r.Context(), now); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -89,12 +103,23 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	markCacheBucketsPartial(report.ByTimeBucket, bucket, completeness.UsageCompleteThroughAt)
+	stableUntil := win.storageUntilAt()
+	if completeness.UsageCompleteThroughAt < stableUntil {
+		stableUntil = completeness.UsageCompleteThroughAt
+	}
+	stableSummary, err := s.store.CacheUsageMetricsWindowFields(r.Context(), win.EffectiveStartAt, stableUntil, 0, map[string]bool{"summary": true})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	body := map[string]interface{}{
 		"since": win.EffectiveStartAt,
 		"now":   win.EffectiveUntilAt,
 	}
 	if includeField("summary") {
 		body["summary"] = report.Summary
+		body["stable_summary"] = stableSummary.Summary
 	}
 	if includeField("by_account") {
 		body["by_account"] = nonNilCacheUsageRows(report.ByAccount)
@@ -108,6 +133,12 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 	if includeField("by_account_model") {
 		body["by_account_model"] = nonNilCacheUsageRows(report.ByAccountModel)
 	}
+	if includeField("by_provider") {
+		body["by_provider"] = nonNilCacheUsageRows(report.ByProvider)
+	}
+	if includeField("by_provider_model") {
+		body["by_provider_model"] = nonNilCacheUsageRows(report.ByProviderModel)
+	}
 	if includeField("by_route") {
 		body["by_route"] = nonNilCacheUsageRows(report.ByRoute)
 	}
@@ -117,7 +148,7 @@ func (s *Server) adminUsageCache(w http.ResponseWriter, r *http.Request) {
 	if includeField("by_time_bucket") {
 		body["by_time_bucket"] = nonNilCacheUsageBuckets(report.ByTimeBucket)
 	}
-	writeJSON(w, http.StatusOK, mergeWindowFields(body, win))
+	writeJSON(w, http.StatusOK, mergeCompletenessFields(mergeWindowFields(body, win), completeness))
 }
 
 func nonNilCacheUsageRows(rows []storage.CacheUsageMetricRow) []storage.CacheUsageMetricRow {
@@ -145,6 +176,8 @@ func parseCacheUsageFields(raw string) (map[string]bool, error) {
 		"by_model":               true,
 		"by_api_key":             true,
 		"by_account_model":       true,
+		"by_provider":            true,
+		"by_provider_model":      true,
 		"by_route":               true,
 		"by_route_account_model": true,
 		"by_time_bucket":         true,

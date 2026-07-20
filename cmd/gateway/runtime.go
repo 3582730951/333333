@@ -200,10 +200,6 @@ func compatRuntimeEnv(base []string, cfg Config) []string {
 	}
 	set("ANTHROPIC_BASE_URL", strings.TrimRight(strings.TrimSpace(cfg.PoolServerURL), "/"))
 	set("ANTHROPIC_AUTH_TOKEN", strings.TrimSpace(cfg.DownstreamKey))
-	for _, item := range claudeModelRuntimeEnv(cfg.ClaudeModel) {
-		parts := strings.SplitN(item, "=", 2)
-		set(parts[0], parts[1])
-	}
 	set("CLAUDE_CODE_ENABLE_AUTO_MODE", "1")
 	set("POOL_CLIENT_RUNTIME", "compat")
 	set("POOL_STRICT_LINUX", "0")
@@ -486,7 +482,6 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		"ANTHROPIC_AUTH_TOKEN=" + cfg.DownstreamKey,
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 	}
-	out = append(out, claudeModelRuntimeEnv(cfg.ClaudeModel)...)
 	if policy.DisableNonessentialEnv {
 		out = append(out,
 			"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
@@ -499,30 +494,6 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		)
 	}
 	return out
-}
-
-// claudeModelRuntimeEnv pins every Claude Code model role to the selected pool
-// model. Without the tier and sub-agent overrides, an Agent call that chooses
-// "haiku"/"sonnet"/"opus" becomes a claude-* child request and is routed away from
-// a Codex-only account pool. Keeping this process-scoped also preserves ordinary
-// Claude gateway use when claude_model is intentionally left empty.
-func claudeModelRuntimeEnv(rawModel string) []string {
-	model := strings.TrimSpace(rawModel)
-	if model == "" {
-		return nil
-	}
-	return []string{
-		"ANTHROPIC_MODEL=" + model,
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=" + model,
-		"ANTHROPIC_DEFAULT_SONNET_MODEL=" + model,
-		"ANTHROPIC_DEFAULT_OPUS_MODEL=" + model,
-		"ANTHROPIC_DEFAULT_FABLE_MODEL=" + model,
-		"CLAUDE_CODE_SUBAGENT_MODEL=" + model,
-		"ANTHROPIC_CUSTOM_MODEL_OPTION=" + model,
-		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=" + model + " via Pool",
-		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION=Anthropic Messages to Codex Responses via pool_server",
-		"ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=effort,xhigh_effort,max_effort",
-	}
 }
 
 func poolServerBaseURL(cfg Config) string {

@@ -4003,7 +4003,7 @@ func TestClaudeCountTokensUsesFinalUpstreamRequestWithoutUsageRecord(t *testing.
 	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"input_tokens":321`)) {
 		t.Fatalf("count_tokens status=%d body=%s", response.StatusCode, body)
 	}
-	if response.Header.Get("X-Pool-Resolved-Provider") != "claude" || response.Header.Get("X-Pool-Resolved-Model") != "claude-sonnet-4-6" {
+	if response.Header.Get("X-Pool-Resolved-Provider") != "claude" || response.Header.Get("X-Pool-Resolved-Model") != "claude-sonnet-4.6" {
 		t.Fatalf("resolved headers=%v", response.Header)
 	}
 	requests := h.requests()
