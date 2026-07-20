@@ -313,6 +313,19 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		if alive && s.cfg.HealthTestClearsQuarantine {
 			_ = s.store.SetAccountQuarantine(r.Context(), accountID, 0, "")
 		}
+		// A successful Kiro UsageLimits request proves the currently stored API
+		// credential is valid. Recover accounts left in the legacy invalid state by
+		// an earlier transient generation 401/403; otherwise the scheduler keeps
+		// excluding a key that the health test has just verified.
+		if alive && provider == "kiro" && account.Status == "invalid" {
+			_ = s.store.SetAccountStatus(r.Context(), accountID, "active")
+			s.scheduler.InvalidateAccountCache()
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+				AccountID: accountID, AccountLabel: firstNonEmpty(account.Label, account.Email, accountID),
+				Action: "kiro_auth_recovered", State: "active", Reason: "health_test_succeeded",
+				Detail: "Kiro account_auth_usage probe returned HTTP 200; stale invalid status cleared",
+			})
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_id":    accountID,

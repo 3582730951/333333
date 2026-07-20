@@ -510,22 +510,27 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		rawError := readUpstreamErrorBody(response.Body)
 		response.Body.Close()
 		if credentials.AuthMethod == "api_key" {
-			_ = s.store.SetAccountStatus(r.Context(), lease.Account.ID, "invalid")
-			s.scheduler.InvalidateAccountCache()
-			s.kiroAttemptError(w, r, lease, http.StatusServiceUnavailable, response.Header, rawError, false, nil, nil)
-			return nil, endpointHash, outcomeDone
-		}
-		refreshed, _, updated, refreshErr := s.kiro.Prepare(r.Context(), lease.Account, credentials, token, lease.Egress, true)
-		if refreshErr != nil {
-			s.kiroAttemptError(w, r, lease, response.StatusCode, response.Header, rawError, false, nil, refreshErr)
-			return nil, endpointHash, outcomeDone
-		}
-		credentials = updated
-		bearer = refreshed
-		response, err = send(bearer, body)
-		if err != nil {
-			s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
-			return nil, endpointHash, outcomeDone
+			// A single Kiro 401 can be transient and a 403 can describe model or
+			// subscription policy rather than an invalid API key. Retry the exact
+			// request once; only a repeated 401 is allowed to invalidate credentials.
+			response, err = send(bearer, body)
+			if err != nil {
+				s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+				return nil, endpointHash, outcomeDone
+			}
+		} else {
+			refreshed, _, updated, refreshErr := s.kiro.Prepare(r.Context(), lease.Account, credentials, token, lease.Egress, true)
+			if refreshErr != nil {
+				s.kiroAttemptError(w, r, lease, response.StatusCode, response.Header, rawError, false, nil, refreshErr)
+				return nil, endpointHash, outcomeDone
+			}
+			credentials = updated
+			bearer = refreshed
+			response, err = send(bearer, body)
+			if err != nil {
+				s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+				return nil, endpointHash, outcomeDone
+			}
 		}
 	}
 	activeBody := body
@@ -568,9 +573,16 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		}
 
 		downstreamStatus := status
-		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		if status == http.StatusUnauthorized {
 			_ = s.store.SetAccountStatus(r.Context(), lease.Account.ID, "invalid")
 			s.scheduler.InvalidateAccountCache()
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+				AccountID: lease.Account.ID, AccountLabel: firstNonEmpty(lease.Account.Label, lease.Account.Email, lease.Account.ID),
+				Action: "kiro_auth_invalidated", State: "invalid", Reason: "repeated_unauthorized",
+				Detail: "generateAssistantResponse returned HTTP 401 after credential retry",
+			})
+		}
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			downstreamStatus = http.StatusServiceUnavailable
 		}
 		s.kiroAttemptError(w, r, lease, downstreamStatus, header, rawError, false, nil, nil)

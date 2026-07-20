@@ -198,6 +198,11 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 		t.Fatalf("accounts=%+v err=%v", accounts, err)
 	}
 	account := accounts[0]
+	// Reproduce a legacy transient generation auth failure that left a valid API
+	// key excluded from scheduling even though UsageLimits still authenticates.
+	if err := h.store.SetAccountStatus(context.Background(), account.ID, "invalid"); err != nil {
+		t.Fatal(err)
+	}
 	endpointHash, err := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
 	if err != nil {
 		t.Fatal(err)
@@ -219,12 +224,23 @@ func TestKiroAutoFirstConcreteRequestBootstrapsAndVerifiesCapability(t *testing.
 	if healthBody["probe_scope"] != "account_auth_usage" || healthBody["model_checked"] != false || healthBody["model"] != "" {
 		t.Fatalf("Kiro health probe overstated model coverage: %#v", healthBody)
 	}
+	recovered, err := h.store.GetAccount(context.Background(), account.ID)
+	if err != nil || recovered.Status != "active" {
+		t.Fatalf("successful Kiro health test did not recover stale invalid status: account=%+v err=%v", recovered, err)
+	}
 	auditRows, err := h.store.ListAuditLog(context.Background(), 10)
 	if err != nil || len(auditRows) == 0 {
 		t.Fatalf("health audit=%+v err=%v", auditRows, err)
 	}
-	if auditRows[0].Action != "health_test" || !strings.Contains(auditRows[0].Detail, "probe_scope=account_auth_usage") || !strings.Contains(auditRows[0].Detail, "model_checked=false") || strings.Contains(auditRows[0].Detail, "claude-sonnet") {
-		t.Fatalf("Kiro health audit overstated model coverage: %+v", auditRows[0])
+	var healthAudit *storage.AuditLogRow
+	for i := range auditRows {
+		if auditRows[i].Action == "health_test" {
+			healthAudit = &auditRows[i]
+			break
+		}
+	}
+	if healthAudit == nil || !strings.Contains(healthAudit.Detail, "probe_scope=account_auth_usage") || !strings.Contains(healthAudit.Detail, "model_checked=false") || strings.Contains(healthAudit.Detail, "claude-sonnet") {
+		t.Fatalf("Kiro health audit overstated model coverage: %+v", auditRows)
 	}
 	state, err = h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8")
 	if err != nil || state.ModelState != "unknown" {
@@ -350,6 +366,45 @@ func TestKiroRepeatedUnauthorizedInvalidatesAccount(t *testing.T) {
 	accounts, _ := h.store.ListAccounts(context.Background())
 	if len(accounts) != 1 || accounts[0].Status != "invalid" {
 		t.Fatalf("accounts=%+v", accounts)
+	}
+}
+
+func TestKiroTransientForbiddenRetriesWithoutInvalidatingAPIKey(t *testing.T) {
+	var generateCalls int
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			generateCalls++
+			if generateCalls == 1 {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"message":"temporarily unavailable"}`))
+				return
+			}
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"recovered"}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	account := importKiroEndpointForTest(t, h, kiroMock.URL, "transient-forbidden-key")
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "kiro")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || generateCalls != 2 || !bytes.Contains(body, []byte("recovered")) {
+		t.Fatalf("transient forbidden was not recovered: status=%d calls=%d body=%s", response.StatusCode, generateCalls, body)
+	}
+	stored, err := h.store.GetAccount(context.Background(), account.ID)
+	if err != nil || stored.Status != "active" {
+		t.Fatalf("transient forbidden invalidated API key: account=%+v err=%v", stored, err)
 	}
 }
 
