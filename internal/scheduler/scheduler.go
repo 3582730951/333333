@@ -941,11 +941,26 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			}
 			continue
 		}
+		egress, ok = s.applyBoundSidecarWithCache(ctx, binding, egress, now, &reqEgressCache, egressCacheMutex)
+		if !ok {
+			// An explicitly bound transport wrapper is fail-closed. Selecting the base
+			// proxy here would silently expose the Go TLS/HTTP2 fingerprint.
+			counters.EgressUnavailable++
+			continue
+		}
 		inflight, tokens := s.currentLoad(account.ID)
 		egressLoad := s.currentEgressLoad(egress.ID)
 		if concurrencyLimited(egress.MaxConcurrency, egressLoad) {
 			counters.Concurrency++
 			continue
+		}
+		sidecarLoad := 0
+		if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" {
+			sidecarLoad = s.currentEgressLoad(sidecarID)
+			if concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad) {
+				counters.Concurrency++
+				continue
+			}
 		}
 		// Token budget guards CONCURRENT over-commit, not single-request size: only
 		// reject when the account is already serving traffic (inflight > 0). A solo
@@ -961,7 +976,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		}
 		// Account load remains relevant even when many accounts share the same
 		// direct egress (whose aggregate load is identical for every candidate).
-		concurrencyLoad := float64(inflight) + normalizedLoad(egressLoad, egress.MaxConcurrency)
+		concurrencyLoad := float64(inflight) + normalizedLoad(egressLoad, egress.MaxConcurrency) + normalizedLoad(sidecarLoad, egress.TransportSidecarMaxConcurrency)
 		tokenLoad := normalizedTokenLoad(tokens, cfg.AccountTokenBudget)
 		latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
 		picked := candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, bootstrap: bootstrap, score: concurrencyLoad + tokenLoad + latencyPenalty}
@@ -1517,9 +1532,13 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		}
 		return Lease{}, leaseBlockEgressUnavailable, false
 	}
+	egress, ok = s.applyBoundSidecar(ctx, binding, egress, now, egressCache)
+	if !ok {
+		return Lease{}, leaseBlockEgressUnavailable, false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if concurrencyLimited(egress.MaxConcurrency, s.egressInflight[egress.ID]) {
+	if egressConcurrencyLimited(egress, s.egressInflight) {
 		return Lease{}, leaseBlockConcurrency, false
 	}
 	// Budget gate applies only when stacking onto existing in-flight load (see the
@@ -1528,7 +1547,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		return Lease{}, leaseBlockTokenBudget, false
 	}
 	s.inflight[accountID]++
-	s.egressInflight[egress.ID]++
+	incrementEgressInflight(s.egressInflight, egress)
 	s.inflightTokens[accountID] += route.EstimatedTokens
 	released := false
 	release := func() {
@@ -1541,9 +1560,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		if s.inflight[accountID] > 0 {
 			s.inflight[accountID]--
 		}
-		if s.egressInflight[egress.ID] > 0 {
-			s.egressInflight[egress.ID]--
-		}
+		decrementEgressInflight(s.egressInflight, egress)
 		if route.EstimatedTokens > 0 {
 			s.inflightTokens[accountID] -= route.EstimatedTokens
 			if s.inflightTokens[accountID] < 0 {
@@ -1572,10 +1589,37 @@ func (s *Scheduler) currentLoad(accountID string) (int, int64) {
 	defer s.mu.Unlock()
 	return s.inflight[accountID], s.inflightTokens[accountID]
 }
+
 func (s *Scheduler) currentEgressLoad(id string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.egressInflight[id]
+}
+
+func egressConcurrencyLimited(egress storage.EgressProfile, inflight map[string]int) bool {
+	if concurrencyLimited(egress.MaxConcurrency, inflight[egress.ID]) {
+		return true
+	}
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" {
+		return concurrencyLimited(egress.TransportSidecarMaxConcurrency, inflight[sidecarID])
+	}
+	return false
+}
+
+func incrementEgressInflight(inflight map[string]int, egress storage.EgressProfile) {
+	inflight[egress.ID]++
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
+		inflight[sidecarID]++
+	}
+}
+
+func decrementEgressInflight(inflight map[string]int, egress storage.EgressProfile) {
+	if inflight[egress.ID] > 0 {
+		inflight[egress.ID]--
+	}
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID && inflight[sidecarID] > 0 {
+		inflight[sidecarID]--
+	}
 }
 
 func (s *Scheduler) loadChangedChan() <-chan struct{} {
@@ -1789,8 +1833,15 @@ func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID strin
 	if err != nil || !EgressHealthy(egress, now) {
 		return true
 	}
+	egress, ok := s.applyBoundSidecar(ctx, binding, egress, now, nil)
+	if !ok {
+		return true
+	}
 	inflight, tokens := s.currentLoad(accountID)
-	if concurrencyLimited(egress.MaxConcurrency, s.currentEgressLoad(egress.ID)) {
+	s.mu.Lock()
+	egressLimited := egressConcurrencyLimited(egress, s.egressInflight)
+	s.mu.Unlock()
+	if egressLimited {
 		return true
 	}
 	if tokenBudgetLimited(s.Config().AccountTokenBudget, route.Compaction, inflight, tokens, route.EstimatedTokens) {
@@ -1841,11 +1892,24 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 	if !EgressHealthy(egress, now) {
 		return fmt.Errorf("%w: account %s egress %q health=%q (cooldown until %d, now %d)", ErrStrictUnavailable, accountID, binding.PrimaryEgressID, egress.Health, egress.CooldownUntil, now)
 	}
+	egress, err = s.store.ApplySidecarEgressBinding(ctx, binding, egress)
+	if err != nil {
+		return fmt.Errorf("%w: account %s sidecar transport unavailable: %v", ErrStrictUnavailable, accountID, err)
+	}
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" {
+		sidecar, sidecarErr := s.store.GetEgressProfile(ctx, sidecarID)
+		if sidecarErr != nil || !EgressHealthy(sidecar, now) {
+			return fmt.Errorf("%w: account %s sidecar transport %q is unhealthy", ErrStrictUnavailable, accountID, sidecarID)
+		}
+	}
 
 	// 3. Concurrency / token budget
 	inflight, tokens := s.currentLoad(accountID)
 	if concurrencyLimited(egress.MaxConcurrency, s.currentEgressLoad(egress.ID)) {
 		return fmt.Errorf("%w: account %s at max concurrency (%d/%d in-flight)", ErrStrictUnavailable, accountID, inflight, egress.MaxConcurrency)
+	}
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && concurrencyLimited(egress.TransportSidecarMaxConcurrency, s.currentEgressLoad(sidecarID)) {
+		return fmt.Errorf("%w: account %s sidecar %q at max concurrency", ErrStrictUnavailable, accountID, sidecarID)
 	}
 	if tokenBudgetLimited(cfg.AccountTokenBudget, route.Compaction, inflight, tokens, route.EstimatedTokens) {
 		return fmt.Errorf("%w: account %s token budget exceeded (in-flight %d + estimated %d > budget %d)", ErrStrictUnavailable, accountID, tokens, route.EstimatedTokens, cfg.AccountTokenBudget)
@@ -1870,6 +1934,26 @@ func (s *Scheduler) selectEgress(ctx context.Context, binding storage.AccountEgr
 		}
 	}
 	return storage.EgressProfile{}, false
+}
+
+// applyBoundSidecar overlays the account's optional TLS/HTTP2 sidecar on the real
+// selected IP egress. The selected egress ID and operational fields remain intact;
+// only the request transport fields are replaced. Invalid explicit bindings fail
+// closed so callers never fall back to a fingerprint-leaking stdlib path.
+func (s *Scheduler) applyBoundSidecar(ctx context.Context, binding storage.AccountEgressBinding, egress storage.EgressProfile, now int64, egressCache map[string]storage.EgressProfile) (storage.EgressProfile, bool) {
+	sidecarID := strings.TrimSpace(binding.SidecarEgressID)
+	if sidecarID == "" || storage.IsSidecarEgress(egress) {
+		return egress, true
+	}
+	sidecar, err := s.egressProfile(ctx, sidecarID, egressCache)
+	if err != nil || !EgressHealthy(sidecar, now) {
+		return storage.EgressProfile{}, false
+	}
+	wrapped, err := storage.WrapEgressWithSidecar(egress, sidecar)
+	if err != nil {
+		return storage.EgressProfile{}, false
+	}
+	return wrapped, true
 }
 
 // egressProfile fetches an egress profile, serving it from (and populating) the
@@ -2067,6 +2151,22 @@ func (s *Scheduler) selectEgressWithCache(ctx context.Context, binding storage.A
 	return storage.EgressProfile{}, false
 }
 
+func (s *Scheduler) applyBoundSidecarWithCache(ctx context.Context, binding storage.AccountEgressBinding, egress storage.EgressProfile, now int64, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex) (storage.EgressProfile, bool) {
+	sidecarID := strings.TrimSpace(binding.SidecarEgressID)
+	if sidecarID == "" || storage.IsSidecarEgress(egress) {
+		return egress, true
+	}
+	sidecar, ok := s.egressProfileWithCache(ctx, sidecarID, now, reqCache, procCache)
+	if !ok || !EgressHealthy(sidecar, now) {
+		return storage.EgressProfile{}, false
+	}
+	wrapped, err := storage.WrapEgressWithSidecar(egress, sidecar)
+	if err != nil {
+		return storage.EgressProfile{}, false
+	}
+	return wrapped, true
+}
+
 // egressProfileWithCache checks the request-scoped cache first, then the process-level
 // sync.Map, then falls through to the DB. Successful DB reads populate both caches.
 func (s *Scheduler) egressProfileWithCache(ctx context.Context, id string, now int64, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex) (storage.EgressProfile, bool) {
@@ -2190,7 +2290,7 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 	estimatedTokens := route.EstimatedTokens
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if concurrencyLimited(egress.MaxConcurrency, s.egressInflight[egress.ID]) {
+	if egressConcurrencyLimited(egress, s.egressInflight) {
 		return Lease{}, false
 	}
 	// Budget gate applies only when stacking onto existing in-flight load (see the
@@ -2199,7 +2299,7 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 		return Lease{}, false
 	}
 	s.inflight[accountID]++
-	s.egressInflight[egress.ID]++
+	incrementEgressInflight(s.egressInflight, egress)
 	s.inflightTokens[accountID] += estimatedTokens
 	released := false
 	release := func() {
@@ -2212,9 +2312,7 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 		if s.inflight[accountID] > 0 {
 			s.inflight[accountID]--
 		}
-		if s.egressInflight[egress.ID] > 0 {
-			s.egressInflight[egress.ID]--
-		}
+		decrementEgressInflight(s.egressInflight, egress)
 		if estimatedTokens > 0 {
 			s.inflightTokens[accountID] -= estimatedTokens
 			if s.inflightTokens[accountID] < 0 {

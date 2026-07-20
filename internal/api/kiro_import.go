@@ -245,7 +245,7 @@ func (s *Server) importAndValidateKiro(ctx context.Context, account storage.Acco
 	if err != nil {
 		return err
 	}
-	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
+	egress, err := s.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		return err
 	}

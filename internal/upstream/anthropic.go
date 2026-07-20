@@ -136,12 +136,11 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	directCtx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
 	req = req.WithContext(directCtx)
 	// Direct/proxy fallback. A sidecar egress only reaches here when ClaudeForceDirect
-	// is set; httpClientForEgress does not understand the sidecar type, so present it
-	// as a plain direct transport (the sidecar's own proxy chaining does not apply).
+	// is set. For the account-level two-layer binding, restore the selected HTTP/SOCKS
+	// exit and bypass only its sidecar wrapper. A legacy account whose primary egress
+	// is itself a sidecar retains the historical true-direct fallback.
 	directSpec := spec
-	if directSpec.Egress.Type == "curl_cffi_sidecar" {
-		directSpec.Egress.Type = "direct"
-	}
+	directSpec.Egress = storage.WithoutSidecarTransport(directSpec.Egress)
 	client, err := c.httpClientForEgress(directSpec)
 	if err != nil {
 		guard.Fail()

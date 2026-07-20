@@ -207,7 +207,9 @@ type Config struct {
 	ClaudeSensitiveWords  []string `json:"claude_sensitive_words"`
 	// ClaudeForceDirect, when true, makes the Claude/Anthropic upstream always use
 	// the direct/proxy (Go stdlib) transport even when the serving account is bound
-	// to a curl_cffi_sidecar egress. This is an ESCAPE HATCH only: by default a
+	// to a curl_cffi_sidecar egress or has an account-level sidecar transport wrapper.
+	// A wrapper is removed while its underlying HTTP/SOCKS/WARP exit is retained; a
+	// legacy primary sidecar falls back to true direct. This is an ESCAPE HATCH only: by default a
 	// sidecar-bound Claude account IS routed through the sidecar, because the sidecar
 	// is the sole way to present a real client TLS/JA3/HTTP2 fingerprint instead of
 	// the Go standard library's (which is itself a relay-detection signal even though

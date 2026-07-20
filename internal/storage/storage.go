@@ -301,6 +301,15 @@ type EgressProfile struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Endpoint string `json:"endpoint"`
+	// Transport* fields are request-scoped overlays and are never persisted or
+	// returned by the admin egress-profile API. They let an account keep its real
+	// IP egress as the routing/health/CF identity while sending the wire request
+	// through a separately bound curl_cffi sidecar.
+	TransportSidecarID             string `json:"-"`
+	TransportSidecarMaxConcurrency int    `json:"-"`
+	TransportBaseType              string `json:"-"`
+	TransportBaseURL               string `json:"-"`
+	TransportBaseChain             string `json:"-"`
 	// ChainProxy, when set, is an upstream proxy URL (e.g. a WARP exit's local
 	// SOCKS5 "socks5h://127.0.0.1:40000") that a curl_cffi_sidecar egress routes
 	// its impersonated request THROUGH. It is what lets a JA3-bound account also
@@ -374,8 +383,13 @@ type AccountEgressBinding struct {
 	AccountID        string `json:"account_id"`
 	PrimaryEgressID  string `json:"primary_egress_id"`
 	StandbyEgressIDs string `json:"standby_egress_ids"`
-	CookieJarKey     string `json:"cookie_jar_key"`
-	CooldownUntil    int64  `json:"cooldown_until,omitempty"`
+	// SidecarEgressID is an optional transport wrapper. Primary/standby egresses
+	// continue to own the exit IP, cooldown, concurrency and CF attribution; the
+	// sidecar only supplies the TLS/HTTP2 fingerprint and chains through whichever
+	// real egress the scheduler selected.
+	SidecarEgressID string `json:"sidecar_egress_id,omitempty"`
+	CookieJarKey    string `json:"cookie_jar_key"`
+	CooldownUntil   int64  `json:"cooldown_until,omitempty"`
 	// RecheckPending marks an account that was benched after an upstream error and
 	// must pass a liveness re-check ("测活") before it is allowed back into the
 	// candidate pool. While set, the scheduler treats the account as ineligible even
@@ -1024,6 +1038,7 @@ CREATE TABLE IF NOT EXISTS account_egress_bindings(
   account_id TEXT PRIMARY KEY,
   primary_egress_id TEXT NOT NULL,
   standby_egress_ids TEXT NOT NULL DEFAULT '',
+  sidecar_egress_id TEXT NOT NULL DEFAULT '',
   cookie_jar_key TEXT NOT NULL DEFAULT '',
   cooldown_until INTEGER NOT NULL DEFAULT 0,
   recheck_pending INTEGER NOT NULL DEFAULT 0,
@@ -1532,6 +1547,9 @@ ON CONFLICT(account_id) DO NOTHING`,
 		// pool until a liveness probe confirms it recovered (older DBs created before
 		// the recheck loop existed).
 		`ALTER TABLE account_egress_bindings ADD COLUMN recheck_pending INTEGER NOT NULL DEFAULT 0`,
+		// Optional account-level TLS/HTTP2 transport wrapper. The selected primary or
+		// standby remains the real IP egress; this sidecar chains through it.
+		`ALTER TABLE account_egress_bindings ADD COLUMN sidecar_egress_id TEXT NOT NULL DEFAULT ''`,
 		// SMS multi-platform tracking: record which provider + country a registration
 		// used, and what it cost, so the local stats API can aggregate per-platform
 		// per-country success rates (Phase 7 — additive migration).
@@ -2367,8 +2385,8 @@ ON CONFLICT(account_id) DO UPDATE SET
 		return err
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, created_at, updated_at)
-VALUES(?, ?, '', ?, 0, ?, ?)
+INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, created_at, updated_at)
+VALUES(?, ?, '', '', ?, 0, ?, ?)
 ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.ID+":"+DefaultDirectEgressID, now, now)
 	if err != nil {
 		return err
@@ -2626,7 +2644,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
 		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.quarantine_until,
 		       a.quarantine_reason, a.created_at, a.updated_at,
-		       b.primary_egress_id, b.standby_egress_ids, b.cookie_jar_key, b.cooldown_until,
+		       b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cookie_jar_key, b.cooldown_until,
 		       b.recheck_pending, b.created_at, b.updated_at,
 		       COALESCE(e.id,''), COALESCE(e.name,''), COALESCE(e.type,''), COALESCE(e.endpoint,''),
 		       COALESCE(e.chain_proxy,''), COALESCE(e.region,''), COALESCE(e.exit_ip,''),
@@ -2656,7 +2674,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 			&a.Account.ChatGPTUserID, &a.Account.Email, &a.Account.PlanType, &a.Account.Provider,
 			&a.Account.Status, &isFedramp, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
 			&a.Account.CreatedAt, &a.Account.UpdatedAt,
-			&a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.CookieJarKey,
+			&a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.CookieJarKey,
 			&a.Binding.CooldownUntil, &recheck, &a.Binding.CreatedAt, &a.Binding.UpdatedAt,
 			&a.Egress.ID, &a.Egress.Name, &a.Egress.Type, &a.Egress.Endpoint,
 			&a.Egress.ChainProxy, &a.Egress.Region, &a.Egress.ExitIP,
@@ -3285,15 +3303,20 @@ func (s *Store) AccountsWithModelAndContext(ctx context.Context, group, model, c
 	if model == "" {
 		return nil, nil
 	}
+	now := Now()
 	query := `SELECT DISTINCT c.account_id FROM account_model_capabilities c
 JOIN accounts a ON a.id = c.account_id
 JOIN account_egress_bindings b ON b.account_id = a.id
 JOIN egress_profiles e ON e.id = b.primary_egress_id
+LEFT JOIN egress_profiles se ON se.id = b.sidecar_egress_id
 WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ?
   AND c.model_slug = ? AND c.availability_state = 'verified'
   AND b.recheck_pending = 0 AND b.cooldown_until <= ?
-  AND e.health NOT IN ('disabled','tripped') AND e.cooldown_until <= ?`
-	args := []interface{}{group, Now(), model, Now(), Now()}
+  AND e.health NOT IN ('disabled','tripped') AND e.cooldown_until <= ?
+  AND (b.sidecar_egress_id = '' OR
+       (se.id IS NOT NULL AND lower(se.type) = 'curl_cffi_sidecar' AND trim(se.endpoint) <> ''
+        AND se.health NOT IN ('disabled','tripped') AND se.cooldown_until <= ?))`
+	args := []interface{}{group, now, model, now, now, now}
 	if strings.EqualFold(strings.TrimSpace(contextMode), "1m") {
 		query += ` AND c.context_1m_state = 'supported'`
 	}
@@ -3346,7 +3369,7 @@ func (s *Store) ListRoutableCapabilities(ctx context.Context, group string) ([]M
 	rows, err := s.rdb.QueryContext(ctx, `SELECT c.account_id, c.model_slug, c.availability_state, c.context_1m_state, c.context_1m_source,
 c.native_context_window, c.native_max_context_window, c.effective_context_window_percent, c.auto_compact_token_limit,
 c.visibility, c.etag, c.raw_model_json_hash, c.raw_model_json, c.source, c.last_probe_at,
-b.primary_egress_id, b.standby_egress_ids, b.cooldown_until
+b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cooldown_until
 FROM account_model_capabilities c
 JOIN accounts a ON a.id = c.account_id
 JOIN account_egress_bindings b ON b.account_id = a.id
@@ -3369,7 +3392,7 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource,
 			&c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit,
 			&c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt,
-			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.CooldownUntil); err != nil {
+			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.SidecarEgressID, &binding.CooldownUntil); err != nil {
 			return nil, err
 		}
 		binding.AccountID = c.AccountID
@@ -3417,6 +3440,12 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 		if !checked[accountID] {
 			checked[accountID] = true
 			binding := item.binding
+			if sidecarID := strings.TrimSpace(binding.SidecarEgressID); sidecarID != "" {
+				sidecar, ok := loadEgress(sidecarID)
+				if !ok || !IsSidecarEgress(sidecar) || strings.TrimSpace(sidecar.Endpoint) == "" || !egressHealthy(sidecar) {
+					continue
+				}
+			}
 			if binding.CooldownUntil <= now {
 				if egress, ok := loadEgress(binding.PrimaryEgressID); ok && egressHealthy(egress) {
 					routable[accountID] = true
@@ -4164,20 +4193,22 @@ func (s *Store) AssignAccountToEgressPool(ctx context.Context, accountID, poolID
 			memberIDs[m.EgressID] = true
 		}
 	}
-	if binding, err := s.GetEgressBinding(ctx, accountID); err == nil && memberIDs[binding.PrimaryEgressID] {
+	binding, bindingErr := s.GetEgressBinding(ctx, accountID)
+	if bindingErr == nil && memberIDs[binding.PrimaryEgressID] {
 		return binding, nil
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return AccountEgressBinding{}, err
+	} else if bindingErr != nil && !errors.Is(bindingErr, sql.ErrNoRows) {
+		return AccountEgressBinding{}, bindingErr
 	}
 	chosen, err := s.selectEgressPoolMember(ctx, poolID)
 	if err != nil {
 		return AccountEgressBinding{}, err
 	}
-	binding := AccountEgressBinding{
-		AccountID:       accountID,
-		PrimaryEgressID: chosen.EgressID,
-		CookieJarKey:    accountID + ":" + chosen.EgressID,
-	}
+	// Pool reassignment changes the real IP exit only. Preserve the account-level
+	// sidecar wrapper and any other binding state instead of erasing it with a fresh
+	// struct literal.
+	binding.AccountID = accountID
+	binding.PrimaryEgressID = chosen.EgressID
+	binding.CookieJarKey = accountID + ":" + chosen.EgressID
 	if err := s.UpsertEgressBinding(ctx, binding); err != nil {
 		return AccountEgressBinding{}, err
 	}
@@ -4196,10 +4227,10 @@ func (s *Store) SetEgressHealth(ctx context.Context, id, health string) error {
 }
 
 func (s *Store) GetEgressBinding(ctx context.Context, accountID string) (AccountEgressBinding, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id = ?`, accountID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id = ?`, accountID)
 	var b AccountEgressBinding
 	var recheck int
-	err := row.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt)
+	err := row.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt)
 	b.RecheckPending = recheck != 0
 	return b, err
 }
@@ -4209,7 +4240,7 @@ func (s *Store) ListEgressBindingsByAccountIDs(ctx context.Context, accountIDs [
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
 	if err != nil {
 		return nil, err
 	}
@@ -4217,7 +4248,7 @@ func (s *Store) ListEgressBindingsByAccountIDs(ctx context.Context, accountIDs [
 	for rows.Next() {
 		var b AccountEgressBinding
 		var recheck int
-		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		b.RecheckPending = recheck != 0
@@ -4236,16 +4267,17 @@ func (s *Store) UpsertEgressBinding(ctx context.Context, b AccountEgressBinding)
 	}
 	b.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
  primary_egress_id = excluded.primary_egress_id,
  standby_egress_ids = excluded.standby_egress_ids,
+ sidecar_egress_id = excluded.sidecar_egress_id,
  cookie_jar_key = excluded.cookie_jar_key,
  cooldown_until = excluded.cooldown_until,
  recheck_pending = excluded.recheck_pending,
  updated_at = excluded.updated_at`,
-		b.AccountID, b.PrimaryEgressID, b.StandbyEgressIDs, b.CookieJarKey, b.CooldownUntil, boolInt(b.RecheckPending), b.CreatedAt, b.UpdatedAt)
+		b.AccountID, b.PrimaryEgressID, b.StandbyEgressIDs, b.SidecarEgressID, b.CookieJarKey, b.CooldownUntil, boolInt(b.RecheckPending), b.CreatedAt, b.UpdatedAt)
 	return err
 }
 
@@ -4286,7 +4318,7 @@ func (s *Store) ClearBindingRecheck(ctx context.Context, accountID string) error
 // probe. Gating on cooldown_until <= now means the initial cooldown window (often a
 // server-signaled Retry-After) is always honored before the first probe.
 func (s *Store) ListBindingsNeedingRecheck(ctx context.Context, now int64) ([]AccountEgressBinding, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE recheck_pending = 1 AND cooldown_until <= ?`, now)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings WHERE recheck_pending = 1 AND cooldown_until <= ?`, now)
 	if err != nil {
 		return nil, err
 	}
@@ -4295,7 +4327,7 @@ func (s *Store) ListBindingsNeedingRecheck(ctx context.Context, now int64) ([]Ac
 	for rows.Next() {
 		var b AccountEgressBinding
 		var recheck int
-		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		b.RecheckPending = recheck != 0
@@ -4339,7 +4371,7 @@ func (s *Store) AddStandbyEgress(ctx context.Context, accountID, egressID string
 // can pack accounts ≤N per exit. Bounded by the account count and only read on CF
 // events / assignment, never the hot path.
 func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at FROM account_egress_bindings`)
 	if err != nil {
 		return nil, err
 	}
@@ -4348,7 +4380,7 @@ func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding,
 	for rows.Next() {
 		var b AccountEgressBinding
 		var recheck int
-		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.AccountID, &b.PrimaryEgressID, &b.StandbyEgressIDs, &b.SidecarEgressID, &b.CookieJarKey, &b.CooldownUntil, &recheck, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, err
 		}
 		b.RecheckPending = recheck != 0

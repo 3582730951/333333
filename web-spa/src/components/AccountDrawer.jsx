@@ -40,6 +40,7 @@ export default function AccountDrawer({
 }) {
   const binding = account?.egress_binding || null;
   const [selectedEgress, setSelectedEgress] = useState('');
+  const [selectedSidecar, setSelectedSidecar] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
   const [reauthForm, setReauthForm] = useState({ login_email: '', password: '', otp_url: '', target_workspace_id: '', auto_enabled: false });
   const [oauthModal, setOauthModal] = useState({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' });
@@ -78,7 +79,8 @@ export default function AccountDrawer({
 
   useEffect(() => {
     setSelectedEgress(binding?.primary_egress_id || '');
-  }, [account?.id, binding?.primary_egress_id]);
+    setSelectedSidecar(binding?.sidecar_egress_id || '');
+  }, [account?.id, binding?.primary_egress_id, binding?.sidecar_egress_id]);
 
   useEffect(() => {
     setSelectedGroup(account?.group_name || '');
@@ -100,8 +102,9 @@ export default function AccountDrawer({
     try {
       const saved = await post(`/admin/accounts/${encodeURIComponent(account.id)}/egress-binding`, {
         primary_egress_id: selectedEgress,
+        sidecar_egress_id: selectedSidecar,
       });
-      Toast.success('默认出口已保存');
+      Toast.success('出口与 Sidecar 绑定已保存');
       await onUpdated?.(account.id, saved);
     } catch (err) {
       showErrorToast(err);
@@ -190,6 +193,15 @@ export default function AccountDrawer({
     label: `${profile.name || profile.id} (${profile.type || 'direct'})`,
     value: profile.id,
   }));
+  const sidecarOptions = [
+    { label: '不绑定（使用 Go 直连/代理传输）', value: '' },
+    ...profiles
+      .filter((profile) => String(profile.type || '').toLowerCase() === 'curl_cffi_sidecar')
+      .map((profile) => ({ label: `${profile.name || profile.id} (${profile.endpoint || '未配置 Endpoint'})`, value: profile.id })),
+  ];
+  const selectedProfile = profiles.find((profile) => profile.id === selectedEgress) || null;
+  const primaryAlreadySidecar = String(selectedProfile?.type || '').toLowerCase() === 'curl_cffi_sidecar';
+  const recommendClaudeSidecar = (account.provider || '') === 'claude' && !primaryAlreadySidecar && !selectedSidecar;
   const isActionLoading = (act) => Boolean(isActionLoadingProp?.(account.id, act));
   const isActionDisabled = (act) => actionDisabled || (actionRunning && !isActionLoading(act));
   const resetCredits = account.quota_summary?.reset_credits;
@@ -346,7 +358,10 @@ export default function AccountDrawer({
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '8px 0' }}>
               <Select
                 value={selectedEgress}
-                onChange={setSelectedEgress}
+                onChange={(value) => {
+                  setSelectedEgress(value);
+                  if (String(profiles.find((profile) => profile.id === value)?.type || '').toLowerCase() === 'curl_cffi_sidecar') setSelectedSidecar('');
+                }}
                 optionList={egressOptions}
                 placeholder="选择默认出口"
                 disabled={savingDefaultEgress || !egressOptions.length}
@@ -355,10 +370,30 @@ export default function AccountDrawer({
               <Button
                 size="small"
                 loading={savingDefaultEgress}
-                disabled={!selectedEgress || selectedEgress === binding.primary_egress_id}
+                disabled={!selectedEgress || (selectedEgress === binding.primary_egress_id && selectedSidecar === (binding.sidecar_egress_id || ''))}
                 onClick={saveDefaultEgress}
               >保存</Button>
             </div>
+            <Row k="TLS/HTTP2 Sidecar" v={primaryAlreadySidecar ? '默认出口本身已是 Sidecar' : (binding.sidecar_egress_id || '未绑定')} />
+            {!primaryAlreadySidecar ? (
+              <Select
+                value={selectedSidecar}
+                onChange={setSelectedSidecar}
+                optionList={sidecarOptions}
+                disabled={savingDefaultEgress}
+                style={{ width: '100%', marginBottom: 8 }}
+              />
+            ) : null}
+            {recommendClaudeSidecar ? (
+              <div style={{ padding: '8px 10px', marginBottom: 8, borderRadius: 8, background: 'var(--semi-color-warning-light-default)', color: 'var(--semi-color-warning)' }}>
+                Claude 直连或普通代理仍会暴露 Go TLS/HTTP2 指纹。建议绑定 Sidecar；紧急绕过请使用系统配置中的 claude_force_direct，指纹覆盖使用 claude_ja3。
+              </div>
+            ) : null}
+            {selectedSidecar && !primaryAlreadySidecar ? (
+              <Typography.Text size="small" type="tertiary">
+                实际链路：Sidecar → {selectedProfile?.name || selectedEgress} → 上游；出口 IP、冷却与审计仍归属默认出口。
+              </Typography.Text>
+            ) : null}
             <Row k="备用出口" v={binding.standby_egress_ids || '—'} />
             <Row k="冷却至" v={binding.cooldown_until ? fmtRelative(binding.cooldown_until) : '—'} />
             <Row k="待复测" v={binding.recheck_pending ? <Tag color="amber" size="small">是</Tag> : '否'} />

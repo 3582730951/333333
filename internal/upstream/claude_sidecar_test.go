@@ -23,6 +23,7 @@ type sidecarCapture struct {
 	headers http.Header
 	body    string
 	ja3     string
+	proxy   string
 	// defaultHeaders mirrors the meta's "default_headers" field: nil = absent (sidecar
 	// keeps curl's browser defaults), non-nil = the caller pinned it. The Claude path
 	// pins it false to stop curl-impersonate injecting sec-ch-ua/sec-fetch browser headers
@@ -45,6 +46,7 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 			Headers        map[string][]string `json:"headers"`
 			BodyB64        string              `json:"body_b64"`
 			JA3            string              `json:"ja3"`
+			Proxy          string              `json:"proxy"`
 			DefaultHeaders *bool               `json:"default_headers"`
 		}
 		raw, _ := io.ReadAll(r.Body)
@@ -68,6 +70,7 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 		cap.method = payload.Method
 		cap.headers = http.Header(payload.Headers)
 		cap.ja3 = payload.JA3
+		cap.proxy = payload.Proxy
 		cap.defaultHeaders = payload.DefaultHeaders
 		upstreamHdr := http.Header{"Content-Type": []string{"text/event-stream"}}
 		enc, _ := json.Marshal(upstreamHdr)
@@ -177,6 +180,82 @@ func TestClaudeForceDirectBypassesSidecar(t *testing.T) {
 	}
 	if !strings.HasPrefix(directUA, "claude-cli/") {
 		t.Fatalf("direct path lost Claude UA: %q", directUA)
+	}
+}
+
+func TestClaudeForceDirectKeepsWrappedBaseProxy(t *testing.T) {
+	proxyTargets := make(chan string, 1)
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyTargets <- r.URL.String()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer proxyServer.Close()
+
+	var cap sidecarCapture
+	sidecarServer := newFakeSidecar(t, &cap)
+	defer sidecarServer.Close()
+	wrapped, err := storage.WrapEgressWithSidecar(
+		storage.EgressProfile{ID: "residential-exit", Type: "http_proxy", Endpoint: proxyServer.URL, Health: "healthy"},
+		storage.EgressProfile{ID: "local-sidecar", Type: storage.CurlCFFISidecarEgressType, Endpoint: sidecarServer.URL, Health: "healthy"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.ClaudeForceDirect = true
+	cfg.ClaudeUpstreamBaseURL = "http://anthropic.invalid"
+	client := NewClient(cfg)
+	resp, err := client.Do(nilContext(t), Request{
+		Method: http.MethodPost, Provider: "claude", DownstreamPath: "/v1/messages",
+		Body: []byte(`{"model":"claude-sonnet-4-6"}`), Account: storage.Account{ID: "acc-claude-proxy"},
+		Token: storage.AccountToken{AccessToken: "sk-ant-oat-test"}, Egress: wrapped,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if cap.hit {
+		t.Fatal("claude_force_direct did not bypass the account sidecar wrapper")
+	}
+	if target := <-proxyTargets; !strings.HasPrefix(target, "http://anthropic.invalid/v1/messages") {
+		t.Fatalf("force-direct target through base proxy = %q", target)
+	}
+}
+
+func TestClaudeAccountSidecarWrapperChainsThroughSelectedProxy(t *testing.T) {
+	var cap sidecarCapture
+	sidecarServer := newFakeSidecar(t, &cap)
+	defer sidecarServer.Close()
+
+	base := storage.EgressProfile{ID: "residential-exit", Type: "http_proxy", Endpoint: "http://user:pass@proxy.example:8080", Health: "healthy"}
+	wrapped, err := storage.WrapEgressWithSidecar(base, storage.EgressProfile{
+		ID: "local-sidecar", Type: storage.CurlCFFISidecarEgressType, Endpoint: sidecarServer.URL, Health: "healthy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(config.Default())
+	resp, err := client.Do(nilContext(t), Request{
+		Method:         http.MethodPost,
+		Provider:       "claude",
+		DownstreamPath: "/v1/messages",
+		Body:           []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`),
+		Account:        storage.Account{ID: "acc-claude-wrapped"},
+		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-test"},
+		Egress:         wrapped,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if !cap.hit {
+		t.Fatal("account-bound sidecar was not used")
+	}
+	if cap.proxy != base.Endpoint {
+		t.Fatalf("sidecar proxy = %q, want selected exit %q", cap.proxy, base.Endpoint)
+	}
+	if wrapped.ID != base.ID {
+		t.Fatalf("wrapped egress id = %q, want real exit %q", wrapped.ID, base.ID)
 	}
 }
 

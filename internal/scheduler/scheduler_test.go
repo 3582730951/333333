@@ -43,6 +43,104 @@ func TestAdaptiveZeroLimitsDoNotReject(t *testing.T) {
 	}
 }
 
+func TestSelectComposesAccountSidecarOverRealProxyEgress(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "claude-sidecar-proxy", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "sk-ant-oat-test"}); err != nil {
+		t.Fatal(err)
+	}
+	base := storage.EgressProfile{ID: "proxy-exit", Type: "socks5h_proxy", Endpoint: "socks5h://proxy.example:1080", Region: "US", ExitIP: "198.51.100.20", Health: "healthy", MaxConcurrency: 8}
+	sidecar := storage.EgressProfile{ID: "sidecar-transport", Type: storage.CurlCFFISidecarEgressType, Endpoint: "http://127.0.0.1:8790", Health: "healthy", MaxConcurrency: 16}
+	if err := store.UpsertEgressProfile(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressProfile(ctx, sidecar); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressBinding(ctx, storage.AccountEgressBinding{AccountID: account.ID, PrimaryEgressID: base.ID, SidecarEgressID: sidecar.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Egress.ID != base.ID || lease.Egress.Region != base.Region || lease.Egress.ExitIP != base.ExitIP {
+		t.Fatalf("real egress attribution changed: %+v", lease.Egress)
+	}
+	if lease.Egress.Type != storage.CurlCFFISidecarEgressType || lease.Egress.Endpoint != sidecar.Endpoint || lease.Egress.ChainProxy != base.Endpoint {
+		t.Fatalf("sidecar transport was not composed: %+v", lease.Egress)
+	}
+	if lease.Binding.SidecarEgressID != sidecar.ID {
+		t.Fatalf("lease binding sidecar = %q", lease.Binding.SidecarEgressID)
+	}
+}
+
+func TestSelectFailsClosedWhenBoundSidecarIsMissing(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "claude-missing-sidecar", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "sk-ant-oat-test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressBinding(ctx, storage.AccountEgressBinding{AccountID: account.ID, PrimaryEgressID: storage.DefaultDirectEgressID, SidecarEgressID: "deleted-sidecar"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, config.Default())
+	if _, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"}); err == nil {
+		t.Fatal("missing explicit sidecar fell back to Go direct transport")
+	}
+}
+
+func TestSharedSidecarConcurrencyIsEnforcedAcrossBaseEgresses(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	sidecar := storage.EgressProfile{
+		ID: "shared-sidecar", Type: storage.CurlCFFISidecarEgressType,
+		Endpoint: "http://127.0.0.1:8790", Health: "healthy", MaxConcurrency: 1,
+	}
+	if err := store.UpsertEgressProfile(ctx, sidecar); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"claude-a", "claude-b"} {
+		account := storage.Account{ID: id, GroupName: "cyber", Provider: "claude", Status: "active"}
+		if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "sk-ant-oat-test"}); err != nil {
+			t.Fatal(err)
+		}
+		base := storage.EgressProfile{
+			ID: id + "-proxy", Type: "http_proxy", Endpoint: "http://" + id + ".example:8080",
+			Health: "healthy", MaxConcurrency: 4,
+		}
+		if err := store.UpsertEgressProfile(ctx, base); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertEgressBinding(ctx, storage.AccountEgressBinding{
+			AccountID: id, PrimaryEgressID: base.ID, SidecarEgressID: sidecar.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := New(store, config.Default())
+	first, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"}); err == nil {
+		first.Release()
+		t.Fatal("second lease bypassed the shared sidecar max_concurrency=1 limit")
+	}
+	first.Release()
+	second, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"})
+	if err != nil {
+		t.Fatalf("sidecar capacity was not released: %v", err)
+	}
+	second.Release()
+}
+
 func TestAffinityBindsSameAccount(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

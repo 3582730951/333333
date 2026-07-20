@@ -326,7 +326,7 @@ func (s *Server) adminProviderAPIKeyHealthTest(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	egress, err := s.store.GetEgressProfile(r.Context(), binding.PrimaryEgressID)
+	egress, err := s.store.ResolvePrimaryEgressBinding(r.Context(), binding)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return

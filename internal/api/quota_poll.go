@@ -415,12 +415,19 @@ func (s *Server) attachQuotaPollEgresses(ctx context.Context, targets []quotaPol
 	}
 	bindings, err := s.store.ListEgressBindingsByAccountIDs(ctx, accountIDs)
 	if err != nil {
-		log.Printf("[QUOTA-POLL] ListEgressBindingsByAccountIDs error: %v; using direct egress", err)
-		bindings = map[string]storage.AccountEgressBinding{}
+		log.Printf("[QUOTA-POLL] ListEgressBindingsByAccountIDs error: %v; skipping egress-dependent polls", err)
+		for i := range targets {
+			targets[i].Egress = storage.EgressProfile{Type: "unavailable_egress_binding"}
+		}
+		return
 	}
 	profiles, err := s.store.ListEgressProfiles(ctx)
 	if err != nil {
-		log.Printf("[QUOTA-POLL] ListEgressProfiles error: %v; using direct egress", err)
+		log.Printf("[QUOTA-POLL] ListEgressProfiles error: %v; skipping egress-dependent polls", err)
+		for i := range targets {
+			targets[i].Egress = storage.EgressProfile{Type: "unavailable_egress_binding"}
+		}
+		return
 	}
 	profilesByID := quotaPollEgressProfilesByID(profiles)
 	for i := range targets {
@@ -441,11 +448,26 @@ func quotaPollEgressProfilesByID(profiles []storage.EgressProfile) map[string]st
 
 func quotaPollEgressForAccount(accountID string, bindings map[string]storage.AccountEgressBinding, profiles map[string]storage.EgressProfile) storage.EgressProfile {
 	egressID := storage.DefaultDirectEgressID
-	if binding, ok := bindings[accountID]; ok && strings.TrimSpace(binding.PrimaryEgressID) != "" {
+	binding, hasBinding := bindings[accountID]
+	if hasBinding && strings.TrimSpace(binding.PrimaryEgressID) != "" {
 		egressID = binding.PrimaryEgressID
 	}
 	if profile, ok := profiles[egressID]; ok {
+		if hasBinding && strings.TrimSpace(binding.SidecarEgressID) != "" {
+			sidecar, sidecarOK := profiles[binding.SidecarEgressID]
+			if !sidecarOK || !scheduler.EgressHealthy(sidecar, storage.Now()) {
+				return storage.EgressProfile{ID: egressID, Type: "invalid_sidecar_binding"}
+			}
+			wrapped, err := storage.WrapEgressWithSidecar(profile, sidecar)
+			if err != nil {
+				return storage.EgressProfile{ID: egressID, Type: "invalid_sidecar_binding"}
+			}
+			return wrapped
+		}
 		return profile
+	}
+	if hasBinding && strings.TrimSpace(binding.SidecarEgressID) != "" {
+		return storage.EgressProfile{ID: egressID, Type: "invalid_sidecar_binding"}
 	}
 	return storage.EgressProfile{ID: egressID, Type: "direct"}
 }
@@ -517,25 +539,23 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 		chatgptUserID = acc.UpstreamAccountID
 	}
 
-	hc, err := s.upstream.EgressHTTPClient(egress)
-	if err != nil {
-		return newQuotaPollError("egress_error", 0, nil, fmt.Errorf("build http client: %w", err))
-	}
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, whamUsageURL, nil)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+accessToken)
 	if chatgptUserID != "" {
-		req.Header.Set("ChatGPT-Account-Id", chatgptUserID)
+		headers.Set("ChatGPT-Account-Id", chatgptUserID)
 	}
 	if acc.IsFedramp {
-		req.Header.Set("X-OpenAI-Fedramp", "true")
+		headers.Set("X-OpenAI-Fedramp", "true")
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Origin", "https://chatgpt.com")
-	req.Header.Set("Referer", "https://chatgpt.com/")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
+	headers.Set("Accept", "application/json")
+	headers.Set("Origin", "https://chatgpt.com")
+	headers.Set("Referer", "https://chatgpt.com/")
+	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
 
-	resp, err := hc.Do(req)
+	// DoRaw is provider-neutral and, unlike EgressHTTPClient, can execute this GET
+	// through curl_cffi's /proxy protocol. This keeps background quota polling on
+	// the same TLS/HTTP2 fingerprint-safe path as inference.
+	resp, err := s.upstream.DoRaw(ctx, egress, http.MethodGet, whamUsageURL, headers, nil, "quota:"+acc.ID)
 	if err != nil {
 		return newQuotaPollError("network_error", 0, nil, fmt.Errorf("http: %w", err))
 	}

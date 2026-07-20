@@ -72,7 +72,7 @@ func (s *Server) adminKiroCacheProbe(w http.ResponseWriter, r *http.Request, acc
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	egress, err := s.store.GetEgressProfile(r.Context(), binding.PrimaryEgressID)
+	egress, err := s.store.ResolvePrimaryEgressBinding(r.Context(), binding)
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
 		return

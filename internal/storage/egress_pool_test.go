@@ -90,6 +90,16 @@ func TestAssignAccountToEgressPoolStickyLeastUsed(t *testing.T) {
 			t.Fatalf("upsert account %s: %v", id, err)
 		}
 	}
+	if err := store.UpsertEgressProfile(ctx, EgressProfile{
+		ID: "transport-sidecar", Type: CurlCFFISidecarEgressType, Endpoint: "http://127.0.0.1:8791", Health: "healthy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressBinding(ctx, AccountEgressBinding{
+		AccountID: "acc-1", PrimaryEgressID: DefaultDirectEgressID, SidecarEgressID: "transport-sidecar",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	b1, err := store.AssignAccountToEgressPool(ctx, "acc-1", "pool_runtime")
 	if err != nil {
@@ -101,6 +111,9 @@ func TestAssignAccountToEgressPoolStickyLeastUsed(t *testing.T) {
 	}
 	if b1Again.PrimaryEgressID != b1.PrimaryEgressID {
 		t.Fatalf("sticky assignment changed from %q to %q", b1.PrimaryEgressID, b1Again.PrimaryEgressID)
+	}
+	if b1.SidecarEgressID != "transport-sidecar" || b1Again.SidecarEgressID != "transport-sidecar" {
+		t.Fatalf("pool assignment erased account sidecar: first=%+v again=%+v", b1, b1Again)
 	}
 
 	b2, err := store.AssignAccountToEgressPool(ctx, "acc-2", "pool_runtime")

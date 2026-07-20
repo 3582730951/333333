@@ -155,6 +155,22 @@ func TestSaveImportedAccountBindsRequestedEgressAndFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPrimaryEgress(t, h, account.ID, "egress_alt")
+	upsertTestEgressProfile(t, h, "import-sidecar")
+	binding, err := h.store.GetEgressBinding(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.SidecarEgressID = "import-sidecar"
+	if err := h.store.UpsertEgressBinding(context.Background(), binding); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.app.bindImportedAccountPrimaryEgress(context.Background(), account.ID, storage.DefaultDirectEgressID); err != nil {
+		t.Fatal(err)
+	}
+	binding, err = h.store.GetEgressBinding(context.Background(), account.ID)
+	if err != nil || binding.SidecarEgressID != "import-sidecar" {
+		t.Fatalf("credential re-import erased sidecar binding: %+v err=%v", binding, err)
+	}
 
 	account, err = h.app.saveImportedAccount(context.Background(), authparse.ParsedAuth{
 		AccountID:         "acc-save-egress-missing",

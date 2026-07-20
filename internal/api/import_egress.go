@@ -36,11 +36,17 @@ func (s *Server) bindImportedAccountPrimaryEgress(ctx context.Context, accountID
 	if err != nil {
 		return err
 	}
-	return s.store.UpsertEgressBinding(ctx, storage.AccountEgressBinding{
-		AccountID:       accountID,
-		PrimaryEgressID: primary,
-		CookieJarKey:    accountID + ":" + primary,
-	})
+	// Re-importing credentials for an existing account must not silently remove its
+	// independently configured sidecar (or standby list). UpsertAccount creates a
+	// default binding for new accounts, so this also covers the fresh-import path.
+	binding, getErr := s.store.GetEgressBinding(ctx, accountID)
+	if getErr != nil && !errors.Is(getErr, sql.ErrNoRows) {
+		return getErr
+	}
+	binding.AccountID = accountID
+	binding.PrimaryEgressID = primary
+	binding.CookieJarKey = accountID + ":" + primary
+	return s.store.UpsertEgressBinding(ctx, binding)
 }
 
 // resolveKiroDefaultEgress picks a stealth-preferred egress for a newly imported

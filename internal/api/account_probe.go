@@ -43,6 +43,14 @@ func (s *Server) probeAccountModels(ctx context.Context, account storage.Account
 }
 
 func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage.Account, token storage.AccountToken, binding storage.AccountEgressBinding, egress storage.EgressProfile) ([]storage.ModelCapability, error) {
+	// Model discovery is free, but it still reaches the provider and must use the
+	// same account-bound sidecar transport as inference. Never let a background
+	// probe leak the Go stdlib fingerprint through the base proxy.
+	var err error
+	egress, err = s.store.ApplySidecarEgressBinding(ctx, binding, egress)
+	if err != nil {
+		return nil, err
+	}
 	switch provider := s.accountProvider(account, token); provider {
 	case "claude":
 		return s.probeClaudeModels(ctx, account, token, binding, egress)
@@ -608,7 +616,7 @@ func (s *Server) adminRefresh(w http.ResponseWriter, r *http.Request, accountID 
 			writeError(w, http.StatusBadGateway, err)
 			return
 		}
-		egress, err := s.store.GetEgressProfile(r.Context(), binding.PrimaryEgressID)
+		egress, err := s.store.ResolvePrimaryEgressBinding(r.Context(), binding)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err)
 			return

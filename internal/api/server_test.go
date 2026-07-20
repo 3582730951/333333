@@ -2282,6 +2282,144 @@ func TestSidecarCookieJarIsIsolated(t *testing.T) {
 	}
 }
 
+func TestAccountSidecarBindingWrapsSelectedProxyEndToEnd(t *testing.T) {
+	type sidecarCapture struct {
+		payload map[string]interface{}
+		err     error
+	}
+	captures := make(chan sidecarCapture, 1)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metaRaw, err := base64.StdEncoding.DecodeString(r.Header.Get("X-Sidecar-Meta"))
+		if err != nil {
+			captures <- sidecarCapture{err: err}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var sidecarPayload map[string]interface{}
+		if err := json.Unmarshal(metaRaw, &sidecarPayload); err != nil {
+			captures <- sidecarCapture{err: err}
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		captures <- sidecarCapture{payload: sidecarPayload}
+		h := http.Header{"Content-Type": []string{"application/json"}}
+		hraw, _ := json.Marshal(h)
+		w.Header().Set("x-sidecar-upstream-status", "200")
+		w.Header().Set("x-sidecar-upstream-headers-b64", base64.StdEncoding.EncodeToString(hraw))
+		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
+	}))
+	defer sidecar.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("base proxy binding leaked onto the direct upstream path")
+	})
+	acc := h.importAccount(t, "wrapped", "upstream-wrapped", "access-wrapped")
+	baseEndpoint := "http://user:pass@proxy.example:8080"
+	if err := h.store.UpsertEgressProfile(context.Background(), storage.EgressProfile{ID: "proxy-exit", Name: "proxy-exit", Type: "http_proxy", Endpoint: baseEndpoint, StreamCapable: true, Health: "healthy", MaxConcurrency: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertEgressProfile(context.Background(), storage.EgressProfile{ID: "sidecar-transport", Name: "sidecar-transport", Type: storage.CurlCFFISidecarEgressType, Endpoint: sidecar.URL, StreamCapable: true, Health: "healthy", MaxConcurrency: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertEgressBinding(context.Background(), storage.AccountEgressBinding{AccountID: acc, PrimaryEgressID: "proxy-exit", SidecarEgressID: "sidecar-transport"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	captured := <-captures
+	if captured.err != nil {
+		t.Fatal(captured.err)
+	}
+	sidecarPayload := captured.payload
+	if sidecarPayload["proxy"] != baseEndpoint {
+		t.Fatalf("sidecar proxy = %#v, want %q", sidecarPayload["proxy"], baseEndpoint)
+	}
+	key, _ := sidecarPayload["cookie_jar_key"].(string)
+	if !strings.Contains(key, acc+":proxy-exit") {
+		t.Fatalf("cookie jar must be scoped to real exit: %q", key)
+	}
+	if sidecarPayload["url"] == "" {
+		t.Fatal("sidecar target URL missing")
+	}
+}
+
+func TestAccountSidecarBindingSurvivesCFStandbyRetry(t *testing.T) {
+	proxies := make(chan string, 2)
+	var requestCount atomic.Int32
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metaRaw, err := base64.StdEncoding.DecodeString(r.Header.Get("X-Sidecar-Meta"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var meta map[string]interface{}
+		if err := json.Unmarshal(metaRaw, &meta); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		proxies <- fmt.Sprint(meta["proxy"])
+		attempt := requestCount.Add(1)
+		upstreamHeaders := http.Header{"Content-Type": []string{"application/json"}}
+		status := http.StatusOK
+		body := `{"id":"resp","output_text":"ok"}`
+		if attempt == 1 {
+			status = http.StatusForbidden
+			body = "<html>Just a moment</html>"
+			upstreamHeaders.Set("cf-mitigated", "challenge")
+			upstreamHeaders.Set("cf-ray", "wrapped-ray")
+		}
+		hraw, _ := json.Marshal(upstreamHeaders)
+		w.Header().Set("x-sidecar-upstream-status", strconv.Itoa(status))
+		w.Header().Set("x-sidecar-upstream-headers-b64", base64.StdEncoding.EncodeToString(hraw))
+		_, _ = w.Write([]byte(body))
+	}))
+	defer sidecar.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("CF retry leaked onto direct transport")
+	})
+	acc := h.importAccount(t, "wrapped-cf", "upstream-wrapped-cf", "access-wrapped-cf")
+	primaryURL := "http://primary.proxy.example:8080"
+	standbyURL := "socks5h://standby.proxy.example:1080"
+	for _, profile := range []storage.EgressProfile{
+		{ID: "primary-proxy", Type: "http_proxy", Endpoint: primaryURL, StreamCapable: true, Health: "healthy", MaxConcurrency: 10},
+		{ID: "standby-proxy", Type: "socks5h_proxy", Endpoint: standbyURL, StreamCapable: true, Health: "healthy", MaxConcurrency: 10},
+		{ID: "sidecar-cf", Type: storage.CurlCFFISidecarEgressType, Endpoint: sidecar.URL, StreamCapable: true, Health: "healthy", MaxConcurrency: 10},
+	} {
+		if err := h.store.UpsertEgressProfile(context.Background(), profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.store.UpsertEgressBinding(context.Background(), storage.AccountEgressBinding{AccountID: acc, PrimaryEgressID: "primary-proxy", StandbyEgressIDs: "standby-proxy", SidecarEgressID: "sidecar-cf"}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	if requestCount.Load() != 2 {
+		t.Fatalf("sidecar request count = %d, want primary + standby", requestCount.Load())
+	}
+	gotProxies := []string{<-proxies, <-proxies}
+	if gotProxies[0] != primaryURL || gotProxies[1] != standbyURL {
+		t.Fatalf("sidecar retry proxies = %#v, want [%q %q]", gotProxies, primaryURL, standbyURL)
+	}
+}
+
 func TestSeamlessFailoverOnLimitSwitchesAccountTransparently(t *testing.T) {
 	var mu sync.Mutex
 	seenAuth := map[string]bool{}

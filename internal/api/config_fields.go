@@ -92,7 +92,7 @@ func configFields() []configField {
 		{Key: "claude_stainless_version", Label: "Claude Stainless 版本", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "X-Stainless-Package-Version 上报的 SDK 版本。", boot: func(c config.Config) interface{} { return c.ClaudeStainlessVersion }},
 		{Key: "claude_force_direct", Label: "Claude 强制直连", Category: catIdentity, Type: fieldBool, Effect: effectUpstream,
-			Help: "开=即使账号绑定 sidecar 出口也走直连(部署无法运行 sidecar 时用)。", boot: func(c config.Config) interface{} { return c.ClaudeForceDirect }},
+			Help: "开=绕过账号 Sidecar 包装并恢复原 HTTP/SOCKS/WARP 出口；主出口本身是 Sidecar 时退回直连。仅作逃生阀。", boot: func(c config.Config) interface{} { return c.ClaudeForceDirect }},
 		{Key: "identity_os_source", Label: "身份 OS 来源", Category: catIdentity, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"vps", "downstream", "diverse"},
 			Help:    "vps=与主机一致(随出口IP多样而多样)；downstream=按请求体推断；diverse=始终跨OS池。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.IdentityOSSource, "vps") }},

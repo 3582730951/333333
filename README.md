@@ -278,7 +278,17 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
    就是「非官方客户端」的信号；直连/普通代理出口因此在传输层是**不完整**的。
 
 > **生产建议**：对敏感上游（尤其 chatgpt.com / api.anthropic.com），给账号绑定 `curl_cffi_sidecar`
-> 出口（可叠加 `chain_proxy` 走 WARP/代理 IP），以同时获得真实 JA3 + 代理出口 IP。用
+> 传输（可叠加 WARP/HTTP/SOCKS 代理 IP），以同时获得真实 JA3 + 代理出口 IP。账号详情支持把
+> `primary_egress_id`（真实 IP 出口）和 `sidecar_egress_id`（TLS/HTTP2 包装层）分别选择；运行时链路为
+> `sidecar → primary/standby proxy → upstream`，出口健康、冷却、并发与 CF 审计仍归属真实出口。也可调用：
+>
+> ```json
+> POST /admin/accounts/<id>/egress-binding
+> {"primary_egress_id":"proxy_br","sidecar_egress_id":"egress_sidecar"}
+> ```
+>
+> 显式绑定的 sidecar 丢失或无效时会失败关闭，不会静默退回 Go 直连。`claude_force_direct` 可紧急绕过
+> sidecar（保留基础代理出口），`claude_ja3` 可覆盖 Claude 的 sidecar JA3。用
 > `POST /admin/groups/<name>/assign-egress` 可一次把整组账号切到 sidecar/WARP 出口。直连出口适合
 > 无法运行 sidecar 的部署或对传输层指纹不敏感的上游。
 >

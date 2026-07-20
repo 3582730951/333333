@@ -26,6 +26,16 @@ func upsertTestEgressProfile(t *testing.T, h *testHarness, id string) {
 	}
 }
 
+func upsertTestProxyEgressProfile(t *testing.T, h *testHarness, id string) {
+	t.Helper()
+	if err := h.store.UpsertEgressProfile(context.Background(), storage.EgressProfile{
+		ID: id, Name: id, Type: "http_proxy", Endpoint: "http://proxy.example:8080",
+		StreamCapable: true, Health: "healthy", MaxConcurrency: 16,
+	}); err != nil {
+		t.Fatalf("upsert proxy egress profile %s: %v", id, err)
+	}
+}
+
 func TestAdminEgressBindingValidatesReferencedProfiles(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	accountID := h.importAccount(t, "egress-validation", "up-egress-validation", "tok-egress-validation")
@@ -71,6 +81,49 @@ func TestAdminEgressBindingNormalizesStandbyAndCookieJar(t *testing.T) {
 	}
 	if binding.CookieJarKey != accountID+":egress_alt" {
 		t.Fatalf("cookie_jar_key = %q, want account:primary", binding.CookieJarKey)
+	}
+}
+
+func TestAdminEgressBindingConfiguresIndependentSidecarTransport(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	accountID := h.importAccount(t, "sidecar-binding", "up-sidecar-binding", "tok-sidecar-binding")
+	upsertTestProxyEgressProfile(t, h, "proxy_exit")
+	upsertTestEgressProfile(t, h, "sidecar_transport")
+
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{
+		"primary_egress_id":"proxy_exit",
+		"sidecar_egress_id":"sidecar_transport"
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("save sidecar binding = %d: %s", code, raw)
+	}
+	var binding storage.AccountEgressBinding
+	if err := json.Unmarshal(raw, &binding); err != nil {
+		t.Fatal(err)
+	}
+	if binding.PrimaryEgressID != "proxy_exit" || binding.SidecarEgressID != "sidecar_transport" {
+		t.Fatalf("binding = %+v", binding)
+	}
+
+	// Omitting the optional field is backward-compatible and preserves it.
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{"primary_egress_id":"proxy_exit"}`)
+	if code != http.StatusOK || !strings.Contains(string(raw), `"sidecar_egress_id":"sidecar_transport"`) {
+		t.Fatalf("omitted sidecar was not preserved: status=%d body=%s", code, raw)
+	}
+
+	// A normal proxy cannot be smuggled into the transport-only sidecar field.
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{"primary_egress_id":"proxy_exit","sidecar_egress_id":"proxy_exit"}`)
+	if code != http.StatusBadRequest || !strings.Contains(string(raw), "curl_cffi_sidecar") {
+		t.Fatalf("non-sidecar transport accepted: status=%d body=%s", code, raw)
+	}
+
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{"primary_egress_id":"proxy_exit","sidecar_egress_id":""}`)
+	if code != http.StatusOK {
+		t.Fatalf("clear sidecar binding = %d: %s", code, raw)
+	}
+	binding = storage.AccountEgressBinding{}
+	if err := json.Unmarshal(raw, &binding); err != nil || binding.SidecarEgressID != "" {
+		t.Fatalf("sidecar binding not cleared: %+v err=%v", binding, err)
 	}
 }
 

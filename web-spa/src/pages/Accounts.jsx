@@ -79,7 +79,8 @@ function quotaReason(account) {
 
 function routeSummary(account) {
   const binding = account.egress_binding || {};
-  const primary = binding.primary_egress_id || account.egress_id || '默认出口';
+  const exit = binding.primary_egress_id || account.egress_id || '默认出口';
+  const primary = binding.sidecar_egress_id ? `${exit} · via ${binding.sidecar_egress_id}` : exit;
   const model = account.force_model || account.model || '';
   const effort = account.force_effort || account.effort || '';
   return { primary, model, effort };

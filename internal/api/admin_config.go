@@ -384,7 +384,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		res.Err = err
 		return res
 	}
-	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
+	egress, err := s.store.ResolvePrimaryEgressBinding(ctx, binding)
 	if err != nil {
 		res.Err = err
 		return res

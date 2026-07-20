@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -441,13 +440,9 @@ func codexResetConsumed(body []byte) bool {
 }
 
 func (s *Server) codexResetCreditsGET(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile) (int, []byte, storage.AccountToken, error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, whamResetCreditsURL, nil)
-	applyCodexWhamHeaders(req.Header, account, token)
-	client, err := s.upstream.EgressHTTPClient(egress)
-	if err != nil {
-		return 0, nil, token, err
-	}
-	resp, err := client.Do(req)
+	headers := http.Header{}
+	applyCodexWhamHeaders(headers, account, token)
+	resp, err := s.upstream.DoRaw(ctx, egress, http.MethodGet, whamResetCreditsURL, headers, nil, "reset-credit:"+account.ID)
 	if err != nil {
 		return 0, nil, token, err
 	}
@@ -458,13 +453,9 @@ func (s *Server) codexResetCreditsGET(ctx context.Context, account storage.Accou
 
 func (s *Server) codexResetCreditsConsumePOST(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, redeemID string) (int, []byte, error) {
 	payload, _ := json.Marshal(map[string]string{"redeem_request_id": redeemID})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, whamResetCreditsConsumeURL, bytes.NewReader(payload))
-	applyCodexWhamHeaders(req.Header, account, token)
-	client, err := s.upstream.EgressHTTPClient(egress)
-	if err != nil {
-		return 0, nil, err
-	}
-	resp, err := client.Do(req)
+	headers := http.Header{}
+	applyCodexWhamHeaders(headers, account, token)
+	resp, err := s.upstream.DoRaw(ctx, egress, http.MethodPost, whamResetCreditsConsumeURL, headers, payload, "reset-credit:"+account.ID)
 	if err != nil {
 		return 0, nil, err
 	}

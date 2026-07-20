@@ -84,9 +84,35 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 				return
 			}
 		}
+		sidecarID := binding.SidecarEgressID
+		if raw, ok := req["sidecar_egress_id"]; ok {
+			if strings.TrimSpace(string(raw)) == "null" {
+				sidecarID = ""
+			} else if err := json.Unmarshal(raw, &sidecarID); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("sidecar_egress_id must be a string or null"))
+				return
+			}
+		}
+		sidecarID = strings.TrimSpace(sidecarID)
+		if sidecarID != "" {
+			sidecar, err := s.store.GetEgressProfile(r.Context(), sidecarID)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("sidecar egress %q not found", sidecarID))
+				return
+			}
+			if !storage.IsSidecarEgress(sidecar) {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("sidecar egress %q must have type %s", sidecarID, storage.CurlCFFISidecarEgressType))
+				return
+			}
+			if strings.TrimSpace(sidecar.Endpoint) == "" {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("sidecar egress %q endpoint required", sidecarID))
+				return
+			}
+		}
 		binding.AccountID = accountID
 		binding.PrimaryEgressID = primary
 		binding.StandbyEgressIDs = strings.Join(standby, ",")
+		binding.SidecarEgressID = sidecarID
 		binding.CookieJarKey = accountID + ":" + primary
 		if err := s.store.UpsertEgressBinding(r.Context(), binding); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -96,6 +122,9 @@ func (s *Server) adminEgressBinding(w http.ResponseWriter, r *http.Request, acco
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if s.scheduler != nil {
+			s.scheduler.InvalidateAccountCache()
 		}
 		writeJSON(w, http.StatusOK, got)
 	default:

@@ -1711,13 +1711,20 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 	// Re-read the binding so a WARP exit just assigned by handleCFEvent is visible to
 	// the standby retry below — this is what reroutes the request through WARP in the
 	// SAME turn instead of only on the next one.
-	standbys := lease.Binding.StandbyIDs()
+	retryBinding := lease.Binding
+	standbys := retryBinding.StandbyIDs()
 	if updated, err := s.store.GetEgressBinding(ctx, req.Account.ID); err == nil {
+		retryBinding = updated
 		standbys = updated.StandbyIDs()
 	}
 	for _, standbyID := range standbys {
 		standby, err := s.store.GetEgressProfile(ctx, standbyID)
 		if err != nil || !scheduler.EgressHealthy(standby, storage.Now()) {
+			continue
+		}
+		standby, err = s.store.ApplySidecarEgressBinding(ctx, retryBinding, standby)
+		if err != nil {
+			// Explicit sidecar bindings are fail-closed on the retry path too.
 			continue
 		}
 		retryReq := req
@@ -1809,7 +1816,11 @@ func (s *Server) solveAndInject(ctx context.Context, account storage.Account, eg
 		ExitIP:       egress.ExitIP,
 	})
 	_ = s.upstream.ImportCookies(account.ID, egress.ID, upstreamHost, fallbackKey, sol.CookieHeader)
-	if sc := strings.TrimSpace(s.cfg.DefaultSidecarEndpoint); sc != "" {
+	sidecarEndpoint := strings.TrimSpace(s.cfg.DefaultSidecarEndpoint)
+	if storage.IsSidecarEgress(egress) {
+		sidecarEndpoint = strings.TrimSpace(egress.Endpoint)
+	}
+	if sc := sidecarEndpoint; sc != "" {
 		_ = s.upstream.SeedSidecarCookies(ctx, sc, account.ID, egress.ID, upstreamHost, fallbackKey, upstream.CookieMapFromHeader(sol.CookieHeader))
 	}
 	_ = s.store.SetBindingCooldown(ctx, account.ID, 0)

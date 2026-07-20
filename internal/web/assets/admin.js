@@ -227,7 +227,12 @@ async function openAcc(id) {
   $("#drBody").innerHTML = '<div class="empty">' + t("common.loading") + "</div>";
   let idn = {}; try { idn = await api(`/admin/accounts/${id}/identity`); } catch (e) {}
   const curEg = a.egress_binding ? a.egress_binding.primary_egress_id : "";
+  const curSidecar = a.egress_binding ? (a.egress_binding.sidecar_egress_id || "") : "";
   const egOpts = EGRESS.map((e) => `<option value="${esc(e.id)}" ${e.id === curEg ? "selected" : ""}>${esc(e.id)} (${esc(e.type)})</option>`).join("");
+  const sidecarOpts = `<option value="">${LANG === "en" ? "No sidecar (Go transport)" : "不绑定（Go 直连/代理传输）"}</option>` + EGRESS.filter((e) => String(e.type || "").toLowerCase() === "curl_cffi_sidecar").map((e) => `<option value="${esc(e.id)}" ${e.id === curSidecar ? "selected" : ""}>${esc(e.id)} · ${esc(e.endpoint || "")}</option>`).join("");
+  const curEgProfile = EGRESS.find((e) => e.id === curEg);
+  const alreadySidecar = curEgProfile && String(curEgProfile.type || "").toLowerCase() === "curl_cffi_sidecar";
+  const sidecarWarning = a.provider === "claude" && !alreadySidecar && !curSidecar ? `<div class="note" style="border-color:var(--warn);color:var(--warn)">${LANG === "en" ? "Claude direct/proxy transport exposes the Go TLS/HTTP2 fingerprint. Bind a sidecar; claude_force_direct and claude_ja3 remain available as escape hatches." : "Claude 直连或普通代理会暴露 Go TLS/HTTP2 指纹。建议绑定 Sidecar；claude_force_direct 与 claude_ja3 仍可作为逃生阀。"}</div>` : "";
   const caps = (a.capabilities || []).map((c) => `<span class="chip">${esc(c.model_slug)} · ${esc(c.availability_state || "unverified")} · 1M ${esc(c.context_1m_state || "unknown")}</span>`).join(" ") || `<span class="muted">${LANG === "en" ? "not probed" : "未探测"}</span>`;
   const kv = (k, v) => `<div class="key">${k}</div><div class="mono">${esc(v || "—")}</div>`;
   const q = QUOTA[id]; const hasQ = q && (q.used_percent >= 0 || q.remaining_tokens >= 0);
@@ -247,6 +252,8 @@ async function openAcc(id) {
     <div class="sect">${LANG === "en" ? "Models" : "模型能力"}</div><div class="row">${caps}</div>${quotaSect}
     <div class="sect">${LANG === "en" ? "Egress" : "出口绑定"}</div>
     <div class="row"><select class="t" id="drEg" style="flex:1">${egOpts || "<option>—</option>"}</select><button class="btn" onclick="setEg('${a.id}')">${LANG === "en" ? "Set primary" : "设为主出口"}</button></div>
+    ${alreadySidecar ? `<div class="muted">${LANG === "en" ? "The primary egress is already a sidecar." : "默认出口本身已是 Sidecar。"}</div>` : `<label class="f" style="margin-top:8px">TLS/HTTP2 Sidecar</label><select class="t" id="drSidecar" style="width:100%">${sidecarOpts}</select>`}
+    ${sidecarWarning}
     <div class="sect">${LANG === "en" ? "Virtual identity" : "账号绑定的虚拟身份"}</div>
     <div class="kv">${kv("OS", (idn.os_name || "") + " " + (idn.os_version || ""))}${kv("Arch", idn.arch)}${kv("Terminal", idn.terminal)}${kv("Codex UA", idn.codex_user_agent)}${kv("Claude UA", idn.claude_user_agent)}${kv("Session", idn.session_id)}${kv("Machine ID", idn.machine_id)}${kv("Username", idn.username)}${kv("Hostname", idn.hostname)}</div>
     <div class="sect">${t("common.actions")}</div>
@@ -264,7 +271,7 @@ async function openAcc(id) {
   // account never reaches across views.
   setTimeout(() => { enhanceAllTables($("#drBody")); }, 10);
 }
-async function setEg(id) { try { const eg = $("#drEg").value; await api(`/admin/accounts/${id}/egress-binding`, { method: "POST", body: JSON.stringify({ primary_egress_id: eg }) }); toast(t("ok.saved"), "ok"); await loadAccounts(); openAcc(id); } catch (e) { toast(e.message, "bad"); } }
+async function setEg(id) { try { const eg = $("#drEg").value; const selected = EGRESS.find((e) => e.id === eg); const sidecar = selected && String(selected.type || "").toLowerCase() === "curl_cffi_sidecar" ? "" : ($("#drSidecar") ? $("#drSidecar").value : ""); await api(`/admin/accounts/${id}/egress-binding`, { method: "POST", body: JSON.stringify({ primary_egress_id: eg, sidecar_egress_id: sidecar }) }); toast(t("ok.saved"), "ok"); await loadAccounts(); openAcc(id); } catch (e) { toast(e.message, "bad"); } }
 
 /* egress */
 let egMode = "fields";
