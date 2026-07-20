@@ -175,7 +175,7 @@ function ConfigTab() {
 
   const applyOptimalTemplate = async () => {
     try {
-      const r = await templateMutation.mutateAsync('optimal-codex-pool');
+      const r = await templateMutation.mutateAsync('kiro-no-degradation');
       const savedDiffs = r?.saved || [];
       const oldSnap: SettingsValues = {};
       savedDiffs.forEach((d) => {

@@ -50,6 +50,24 @@ var (
 	ErrContextTooLong           = errors.New("Kiro input context is too long")
 )
 
+type ContextLengthError struct {
+	RequestedModel string
+	KiroModel      string
+	EstimatedInput int64
+	EffectiveLimit int64
+	ContextMode    string
+}
+
+func (e *ContextLengthError) Error() string {
+	requested := e.RequestedModel
+	if requested == "" {
+		requested = e.KiroModel
+	}
+	return fmt.Sprintf("%v: requested_model=%s kiro_model=%s input_tokens~%d effective_limit=%d; 请运行 /compact 后重试", ErrContextTooLong, requested, e.KiroModel, e.EstimatedInput, e.EffectiveLimit)
+}
+
+func (e *ContextLengthError) Unwrap() error { return ErrContextTooLong }
+
 type Conversion struct {
 	Body                   []byte
 	BodyWithoutCachePoints []byte
@@ -264,14 +282,12 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		}
 	}
 	systemAcknowledgementHistoryIndex := -1
-	systemHistoryLen := 0
 	if systemPresent {
 		history = append(history,
 			map[string]any{"userInputMessage": map[string]any{"content": systemPrompt, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}},
 			map[string]any{"assistantResponseMessage": map[string]any{"content": systemAcknowledgement}},
 		)
 		systemAcknowledgementHistoryIndex = len(history) - 1
-		systemHistoryLen = len(history)
 	}
 
 	lastIsUser := strings.EqualFold(strings.TrimSpace(req.Messages[len(req.Messages)-1].Role), "user")
@@ -397,44 +413,10 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	estimatedInputTokens := originalInputTokens
 	historyMessagesDropped := 0
 	if maxOutputTokens > 0 && webSearch == nil {
-		headroom := max64(kiroContextMinHeadroom, contextWindow/100)
-		minimumOutput := min64(kiroContextMinOutput, maxOutputTokens)
-		targetInput := contextWindow - headroom - minimumOutput
-		if targetInput <= 0 {
-			return Conversion{}, fmt.Errorf("%w: model=%s context_window=%d output_headroom=%d", ErrContextTooLong, canonical, contextWindow, minimumOutput+headroom)
+		if estimatedInputTokens >= contextWindow {
+			return Conversion{}, &ContextLengthError{KiroModel: canonical, EstimatedInput: estimatedInputTokens, EffectiveLimit: contextWindow}
 		}
-		if estimatedInputTokens > targetInput && len(historySpans) > 0 {
-			protectLastGroup := !lastIsUser
-			if lastIsUser {
-				startsNewTurn, startErr := anthropicMessageStartsTurn(req.Messages[len(req.Messages)-1])
-				if startErr != nil {
-					return Conversion{}, fmt.Errorf("current message: %w", startErr)
-				}
-				protectLastGroup = !startsNewTurn
-			}
-			trimmedHistory, cutoff, dropped, trimmedBody, trimmedEstimate, trimErr := trimKiroHistoryToBudget(
-				out, state, history, historySpans, systemHistoryLen, targetInput, protectLastGroup,
-			)
-			if trimErr != nil {
-				return Conversion{}, trimErr
-			}
-			if cutoff > systemHistoryLen {
-				history = trimmedHistory
-				bodyWithoutCachePoints = trimmedBody
-				estimatedInputTokens = trimmedEstimate
-				historyMessagesDropped = dropped
-				losses.add(LossContextHistoryTruncated)
-				adjustKiroMessageIndexes(messageHistoryIndexes, systemHistoryLen, cutoff)
-				dropKiroCachePlanMessages(&cachePlan, historySpans, cutoff)
-			}
-		}
-		if estimatedInputTokens > targetInput {
-			return Conversion{}, fmt.Errorf("%w: model=%s input_tokens~%d limit=%d current/system/tools cannot be safely truncated", ErrContextTooLong, canonical, estimatedInputTokens, targetInput)
-		}
-		availableOutput := contextWindow - headroom - estimatedInputTokens
-		if availableOutput < minimumOutput {
-			return Conversion{}, fmt.Errorf("%w: model=%s input_tokens~%d leaves %d output tokens", ErrContextTooLong, canonical, estimatedInputTokens, availableOutput)
-		}
+		availableOutput := contextWindow - estimatedInputTokens
 		if maxOutputTokens > availableOutput {
 			maxOutputTokens = availableOutput
 			additionalFields["max_tokens"] = maxOutputTokens

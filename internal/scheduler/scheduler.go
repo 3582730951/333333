@@ -209,8 +209,11 @@ type Route struct {
 	// Kiro accounts without assigning either a fixed priority.
 	AllowedProviders []string
 	Affinity         routing.AffinityKey
-	Strict           bool
-	ServerSideState  bool
+	// AffinityWait overrides the global sticky wait for this route. Kiro uses a
+	// longer cache-preserving wait before switching to another exact-model account.
+	AffinityWait    time.Duration
+	Strict          bool
+	ServerSideState bool
 	// ImmutableAffinity pins provider, account, resolved model and egress after
 	// the first selection. Kiro and Claude/Kiro auto sessions use this mode.
 	ImmutableAffinity bool
@@ -462,7 +465,11 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 					}
 					return Lease{}, s.diagnoseStickyUnavailability(ctx, bound.AccountID, route)
 				}
-				if waitFor(ctx, cfg.StickyWait()) {
+				stickyWait := cfg.StickyWait()
+				if route.AffinityWait > 0 {
+					stickyWait = route.AffinityWait
+				}
+				if waitFor(ctx, stickyWait) {
 					lease, reason, ok = s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
 					if ok {
 						return lease, nil

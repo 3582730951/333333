@@ -222,6 +222,28 @@ func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
 	}
 }
 
+func TestParseRequestedClaudeModelContextSuffix(t *testing.T) {
+	parsed, err := ParseRequestedClaudeModel("Claude-Opus-4.8[1M]")
+	if err != nil || parsed.RequestedModel != "Claude-Opus-4.8[1M]" || parsed.BaseModel != "claude-opus-4.8" || parsed.ContextMode != "1m" {
+		t.Fatalf("parsed=%+v err=%v", parsed, err)
+	}
+	if _, err := ParseRequestedClaudeModel("claude-opus-4.8[fast]"); err == nil {
+		t.Fatal("unknown bracket suffix was silently removed")
+	}
+	if parsed, err := ParseRequestedClaudeModel("claude-opus-4-8"); err != nil || parsed.BaseModel != "claude-opus-4.8" || parsed.ContextMode != "" {
+		t.Fatalf("plain model parsed=%+v err=%v", parsed, err)
+	}
+}
+
+func TestKiroEffectiveContextWindowRequires1MMode(t *testing.T) {
+	if got := KiroEffectiveContextWindow("claude-opus-4.8", "", 900000); got != 200000 {
+		t.Fatalf("standard context = %d, want 200000", got)
+	}
+	if got := KiroEffectiveContextWindow("claude-opus-4.8", "1m", 640000); got != 640000 {
+		t.Fatalf("measured 1m context = %d, want 640000", got)
+	}
+}
+
 func TestKiroAliasesUseOnlyVerifiedModels(t *testing.T) {
 	if _, ok := ResolveKiroModel("auto", nil); ok {
 		t.Fatal("auto resolved without a verified model")

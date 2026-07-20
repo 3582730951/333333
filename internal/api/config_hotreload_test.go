@@ -124,12 +124,12 @@ func getAdminSettings(t *testing.T, h *testHarness) map[string]interface{} {
 	return body
 }
 
-func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
+func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp"}`))
 	})
 
-	status, body := postSettingsTemplate(t, h, `{"template_id":"optimal-codex-pool"}`)
+	status, body := postSettingsTemplate(t, h, `{"template_id":"kiro-no-degradation"}`)
 	if status != http.StatusOK {
 		t.Fatalf("apply optimal template status = %d: %s", status, body)
 	}
@@ -137,7 +137,7 @@ func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatalf("decode template response: %v\n%s", err, body)
 	}
-	if got["id"] != "optimal-codex-pool" {
+	if got["id"] != "kiro-no-degradation" {
 		t.Fatalf("template id = %#v", got["id"])
 	}
 	saved, _ := got["saved"].([]interface{})
@@ -158,32 +158,39 @@ func TestSettingsCenterAppliesOptimalSystemTemplate(t *testing.T) {
 		}
 	}
 	wants := map[string]interface{}{
-		"conversation_isolation":                true,
-		"codex_prefer_sidecar_ja3_over_ws":      true,
-		"codex_prompt_cache_retention":          "",
-		"rate_limit_guard_enabled":              true,
-		"seamless_failover":                     true,
-		"leak_scrub":                            true,
-		"token_save_enabled":                    false,
-		"codex_install_effort":                  "xhigh",
-		"codex_install_model":                   "gpt-5.6-sol",
-		"codex_install_approval_policy":         "never",
-		"codex_install_sandbox_mode":            "danger-full-access",
-		"claude_cache_control_inject":           true,
-		"claude_cache_mode":                     "max_hit",
-		"claude_cache_breakpoint_policy":        "max_hit",
-		"claude_native_cache_breakpoint_inject": true,
-		"claude_cache_latest_tail_write":        true,
-		"claude_cache_prewarm_mode":             "sync_extreme",
-		"claude_cache_diagnostics_enabled":      true,
-		"claude_cache_singleflight_enabled":     true,
-		"claude_cache_lossless_block_split":     true,
-		"claude_cache_ttl":                      "1h",
+		"conversation_isolation":          true,
+		"rate_limit_guard_enabled":        true,
+		"seamless_failover":               true,
+		"leak_scrub":                      true,
+		"token_save_enabled":              false,
+		"kiro_version":                    "0.11.107",
+		"kiro_node_version":               "22.22.0",
+		"kiro_default_auth_region":        "us-east-1",
+		"kiro_default_api_region":         "us-east-1",
+		"kiro_default_thinking":           true,
+		"kiro_cache_mode":                 "auto",
+		"kiro_cache_unreported_threshold": float64(20),
+		"kiro_affinity_wait_millis":       float64(1500),
 	}
 	for key, want := range wants {
 		if values[key] != want {
 			t.Fatalf("template value %s = %#v, want %#v", key, values[key], want)
 		}
+	}
+}
+
+func TestLegacyOptimalTemplateIDMapsToKiroNoDegradation(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	status, body := postSettingsTemplate(t, h, `{"template_id":"optimal-codex-pool"}`)
+	if status != http.StatusOK {
+		t.Fatalf("legacy template status = %d: %s", status, body)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["id"] != "kiro-no-degradation" {
+		t.Fatalf("legacy template resolved to %#v", got["id"])
 	}
 }
 

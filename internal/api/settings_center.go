@@ -1086,46 +1086,35 @@ func registrationTemplates() []map[string]interface{} {
 	}
 }
 
-func optimalSystemTemplateValues() map[string]interface{} {
+func kiroNoDegradationTemplateValues() map[string]interface{} {
 	return map[string]interface{}{
-		"conversation_isolation":                  true,
-		"codex_prefer_sidecar_ja3_over_ws":        true,
-		"codex_prompt_cache_retention":            "",
-		"rate_limit_guard_enabled":                true,
-		"seamless_failover":                       true,
-		"failover_max_attempts":                   float64(3),
-		"leak_scrub":                              true,
-		"token_save_enabled":                      false,
-		"claude_cache_control_inject":             true,
-		"claude_cache_mode":                       "max_hit",
-		"claude_cache_breakpoint_policy":          "max_hit",
-		"claude_native_cache_breakpoint_inject":   true,
-		"claude_cache_latest_tail_write":          true,
-		"claude_cache_prewarm_mode":               "sync_extreme",
-		"claude_cache_diagnostics_enabled":        true,
-		"claude_cache_singleflight_enabled":       true,
-		"claude_cache_lossless_block_split":       true,
-		"claude_cch_signing":                      true,
-		"claude_cache_ttl":                        "1h",
-		"claude_gateway_unknown_target_policy":    "forward",
-		"claude_gateway_forward_hosts":            strings.Join(config.DefaultClaudeGatewayForwardHosts(), ","),
-		"claude_gateway_disable_nonessential_env": true,
-		"claude_gateway_strict_linux_default":     true,
-		"codex_install_model":                     "gpt-5.6-sol",
-		"codex_install_effort":                    "xhigh",
-		"codex_install_approval_policy":           "never",
-		"codex_install_sandbox_mode":              "danger-full-access",
+		"conversation_isolation":   true,
+		"rate_limit_guard_enabled": true,
+		"seamless_failover":        true,
+		"failover_max_attempts":    float64(3),
+		"leak_scrub":               true,
+		// Never rewrite, summarize, or compress Kiro input. Context overflow is
+		// returned as compact_required so the downstream CLI owns /compact.
+		"token_save_enabled":              false,
+		"kiro_version":                    "0.11.107",
+		"kiro_node_version":               "22.22.0",
+		"kiro_default_auth_region":        "us-east-1",
+		"kiro_default_api_region":         "us-east-1",
+		"kiro_default_thinking":           true,
+		"kiro_cache_mode":                 "auto",
+		"kiro_cache_unreported_threshold": float64(config.DefaultKiroCacheUnreportedThreshold),
+		"kiro_affinity_wait_millis":       float64(1500),
 	}
 }
 
 func systemConfigTemplates() []map[string]interface{} {
 	return []map[string]interface{}{
 		{
-			"id":          "optimal-codex-pool",
-			"name":        "推荐默认系统配置",
-			"description": "缓存命中、无缝换号、泄漏擦除和安装默认值的保守最优组合；不启用会改写请求内容的 token 压缩。",
+			"id":          "kiro-no-degradation",
+			"name":        "Kiro 不降智推荐配置",
+			"description": "强制 adaptive thinking + max effort，启用原生 cachePoint 与 1500ms 缓存亲和等待；禁用输入压缩，不跨模型/Provider 降级，超限要求下游 /compact。",
 			"section":     "config",
-			"values":      optimalSystemTemplateValues(),
+			"values":      kiroNoDegradationTemplateValues(),
 		},
 	}
 }
@@ -1145,6 +1134,12 @@ func (s *Server) handleSettingsCenterTemplate(w http.ResponseWriter, r *http.Req
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	// Backward compatibility for bookmarks/scripts created before the recommended
+	// profile became Kiro-only. The old id now applies the same no-degradation
+	// Kiro template; it can no longer re-enable Claude/Codex recommendations.
+	if req.TemplateID == "optimal-codex-pool" {
+		req.TemplateID = "kiro-no-degradation"
 	}
 	for _, t := range systemConfigTemplates() {
 		if t["id"] == req.TemplateID {

@@ -121,6 +121,81 @@ func (s *Server) adminImportKiroJSON(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"recognized": len(items), "imported": counts["imported"], "duplicate": counts["duplicate"], "failed": counts["failed"], "results": results})
 }
 
+func (s *Server) adminImportKiroAPIKey(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		KiroAPIKey string `json:"kiro_api_key"`
+		Label      string `json:"label"`
+		GroupName  string `json:"group_name"`
+		EgressID   string `json:"egress_id"`
+		APIRegion  string `json:"api_region"`
+	}
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	req.KiroAPIKey = strings.TrimSpace(req.KiroAPIKey)
+	if !strings.HasPrefix(req.KiroAPIKey, "ksk_") || len(req.KiroAPIKey) <= len("ksk_") {
+		writeError(w, http.StatusBadRequest, errors.New("kiro_api_key must start with ksk_"))
+		return
+	}
+	kiroCfg := s.effectiveKiroConfig(r.Context())
+	region := strings.ToLower(strings.TrimSpace(req.APIRegion))
+	if region == "" {
+		region = firstNonEmpty(kiroCfg.KiroDefaultAPIRegion, "us-east-1")
+	}
+	if _, err := kirowire.ValidateEndpoint("", region, nil); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid api_region"))
+		return
+	}
+	if req.EgressID != "" {
+		if _, err := s.store.GetEgressProfile(r.Context(), req.EgressID); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("unknown egress_id"))
+			return
+		}
+	}
+	item := kiroImportItem{AuthMethod: "api_key", APIKey: req.KiroAPIKey, APIRegion: region}
+	hash := kiroCredentialHash(item)
+	if exists, err := s.store.KiroCredentialHashExists(r.Context(), hash); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	} else if exists {
+		writeError(w, http.StatusConflict, errors.New("Kiro API Key already imported"))
+		return
+	}
+	group := strings.TrimSpace(req.GroupName)
+	if group == "" {
+		group = s.cfg.DefaultGroup
+	}
+	label := strings.TrimSpace(req.Label)
+	if label == "" {
+		label = "Kiro API Key " + hash[:8]
+	}
+	accountID := "kiro-" + hash[:24]
+	account := storage.Account{ID: accountID, Label: label, GroupName: group, Provider: "kiro", Status: "active"}
+	credential := storage.KiroCredentials{
+		AccountID: accountID, AuthMethod: "api_key", APIRegion: region,
+		AuthRegion: firstNonEmpty(kiroCfg.KiroDefaultAuthRegion, "us-east-1"),
+		KiroAPIKey: req.KiroAPIKey, CredentialHash: hash,
+	}
+	if err := s.importAndValidateKiro(r.Context(), account, storage.AccountToken{}, credential, req.EgressID); err != nil {
+		_ = s.store.DeleteAccount(r.Context(), accountID)
+		writeError(w, http.StatusBadRequest, errors.New(safeKiroImportError(err, item)))
+		return
+	}
+	s.scheduler.InvalidateAccountCache()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": accountID, "label": label, "group_name": group,
+		"provider": "kiro", "auth_method": "api_key", "api_region": region,
+	})
+}
+
 func safeKiroImportError(err error, item kiroImportItem) string {
 	message := err.Error()
 	for _, secret := range []string{item.RefreshToken, item.AccessToken, item.ClientSecret, item.APIKey} {

@@ -51,6 +51,9 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [manualRaw, setManualRaw] = useState('');
   const [kiroRaw, setKiroRaw] = useState('');
   const [kiroClientRaw, setKiroClientRaw] = useState('');
+  const [kiroImportMode, setKiroImportMode] = useState('api_key');
+  const [kiroApiKey, setKiroApiKey] = useState('');
+  const [kiroApiRegion, setKiroApiRegion] = useState('us-east-1');
   const [kiroResult, setKiroResult] = useState(null);
   const [egressId, setEgressId] = useState('egress_direct');
   const [egressProfiles, setEgressProfiles] = useState([]);
@@ -117,6 +120,9 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setManualRaw('');
     setKiroRaw('');
     setKiroClientRaw('');
+    setKiroImportMode('api_key');
+    setKiroApiKey('');
+    setKiroApiRegion('us-east-1');
     setKiroResult(null);
     setLabel('');
     setGroupName('');
@@ -259,6 +265,19 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     } catch (e) { showErrorToast(e, { prefix: 'Kiro 导入失败' }); }
   });
 
+  const { run: handleKiroApiKeyImport, running: kiroApiKeyLoading } = useAsyncAction(async () => {
+    if (!kiroApiKey.trim()) { Toast.warning('请输入 ksk_ API Key'); return; }
+    try {
+      const result = await post('/admin/accounts/import-kiro-api-key', {
+        kiro_api_key: kiroApiKey.trim(), label, group_name: groupName,
+        egress_id: egressId, api_region: kiroApiRegion.trim(),
+      }, { timeout: 120000 });
+      Toast.success(`Kiro API Key 账号 ${result.label || result.id} 已导入并验活`);
+      handleClose();
+      if (onSuccess) onSuccess(result);
+    } catch (e) { showErrorToast(e, { prefix: 'Kiro API Key 导入失败' }); }
+  });
+
   // Provider display info
   const providerInfo = {
     chatgpt: {
@@ -271,7 +290,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       desc: '使用 Anthropic 账号授权登录',
       vendor: 'claude',
     },
-    kiro: { name: 'Kiro', desc: '粘贴 Kiro IDE / KAM 导出的凭证 JSON', vendor: 'kiro' },
+    kiro: { name: 'Kiro', desc: '导入 API Key 或 Kiro IDE / KAM 凭证', vendor: 'kiro' },
   };
 
   const currentInfo = providerInfo[tab] || providerInfo.chatgpt;
@@ -368,8 +387,8 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       <div className="pool-oauth-identity pool-oauth-identity--provider">
         <VendorLogo vendor="kiro" size={40} />
         <div className="pool-oauth-identity__copy">
-          <Text strong className="pool-oauth-identity__name">Kiro 凭证 JSON</Text>
-          <Text type="tertiary" className="pool-oauth-identity__desc">支持 Social、Builder ID / IdC、API Key 与 KAM 批量格式</Text>
+          <Text strong className="pool-oauth-identity__name">Kiro 账号导入</Text>
+          <Text type="tertiary" className="pool-oauth-identity__desc">API Key 直接导入，或使用原有凭证 JSON 批量导入</Text>
         </div>
       </div>
       <Form>
@@ -377,6 +396,23 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         <Form.Slot label="分组 (可选)"><Input value={groupName} onChange={setGroupName} placeholder="留空使用默认分组" /></Form.Slot>
         <Form.Slot label="账号默认出口"><Select value={egressId} onChange={setEgressId} optionList={egressOptions} /></Form.Slot>
       </Form>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+        <Button type={kiroImportMode === 'api_key' ? 'primary' : 'tertiary'} onClick={() => setKiroImportMode('api_key')}>API Key</Button>
+        <Button type={kiroImportMode === 'json' ? 'primary' : 'tertiary'} onClick={() => setKiroImportMode('json')}>凭证 JSON</Button>
+      </div>
+      {kiroImportMode === 'api_key' ? (
+        <div style={{ display: 'grid', gap: 12 }}>
+          <Form>
+            <Form.Slot label="Kiro API Key"><Input type="password" value={kiroApiKey} onChange={setKiroApiKey} placeholder="ksk_..." /></Form.Slot>
+            <Form.Slot label="API 区域"><Input value={kiroApiRegion} onChange={setKiroApiRegion} placeholder="us-east-1" /></Form.Slot>
+          </Form>
+          <Text type="tertiary">Key 仅用于加密账号凭证；导入验活使用非生成型 Usage Limits 接口。</Text>
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button type="primary" theme="solid" loading={kiroApiKeyLoading} disabled={!kiroApiKey.trim()} onClick={handleKiroApiKeyImport}>导入并验活</Button>
+          </div>
+        </div>
+      ) : (
+      <>
       <div style={{ display: 'grid', gap: 12 }}>
         <div>
           <Text strong>Token / 账号 JSON</Text>
@@ -414,6 +450,8 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
           ))}
         </div>
       ) : null}
+      </>
+      )}
     </div>
   );
 

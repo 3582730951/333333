@@ -134,7 +134,17 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allowedProviders, err := claudeAllowedProviders(r, pol)
+	requestedModel, err := capability.ParseRequestedClaudeModel(model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if requestedModel.BaseModel != model {
+		raw = setForcedModel(raw, requestedModel.BaseModel)
+		model = requestedModel.BaseModel
+	}
+	r = r.WithContext(withRequestedClaudeModel(r.Context(), requestedModel))
+	allowedProviders, routeMode, err := s.resolveClaudeProviders(r.Context(), r, pol)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -151,7 +161,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			model = norm
 		}
 	}
-	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, model)
+	affinity := namespaceClaudeAffinity(s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, requestedModel.RequestedModel), routeMode, requestedModel.ContextMode)
 	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
 	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
 	// Native Anthropic Messages requests are always self-contained (the full
@@ -168,7 +178,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	exclude := map[string]bool{}
 	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "anthropic"))
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, affinityEstablished, true, exclude) != outcomeRetry {
+		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, routeMode == "kiro", affinityEstablished, true, exclude) != outcomeRetry {
 			return
 		}
 	}
@@ -182,11 +192,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // account is added to exclude before any retry so it is not re-selected. Mirrors the
 // Codex path's codexAttempt; a benched account is held out of the pool until the
 // recheck loop re-validates it.
-func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, affinityEstablished, allowRetry bool, exclude map[string]bool) attemptOutcome {
+func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, explicitKiro, affinityEstablished, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	streamReq := isStreamRequest(raw)
 	countTokens := strings.HasSuffix(path, "/count_tokens")
-	explicitKiro := len(allowedProviders) == 1 && allowedProviders[0] == "kiro"
-	immutableAffinity := affinityEstablished && (explicitKiro || len(allowedProviders) > 1)
+	immutableAffinity := affinityEstablished && explicitKiro
 	if !movable && !affinityEstablished {
 		writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
 		return outcomeDone
@@ -205,6 +214,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		Group:                 group,
 		AllowedProviders:      allowedProviders,
 		Affinity:              affinity,
+		AffinityWait:          kiroAffinityWait(r.Context(), s, allowedProviders),
 		Strict:                strict,
 		ServerSideState:       !movable,
 		ImmutableAffinity:     immutableAffinity,

@@ -2,6 +2,7 @@ package kiro
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -134,12 +135,12 @@ func TestConvertAnthropicBudgetsForcedOutputAgainstRemainingContext(t *testing.T
 	if got.HistoryMessagesDropped != 0 || !containsString(got.CompatibilityLosses, LossMaxOutputReducedForContext) {
 		t.Fatalf("current input should be preserved while output reserve shrinks: %+v", got)
 	}
-	if got.EstimatedInputTokens+got.MaxOutputTokens+kiroContextMinHeadroom > got.ContextWindow {
-		t.Fatalf("planned request exceeds window: input=%d output=%d headroom=%d window=%d", got.EstimatedInputTokens, got.MaxOutputTokens, kiroContextMinHeadroom, got.ContextWindow)
+	if got.EstimatedInputTokens+got.MaxOutputTokens > got.ContextWindow {
+		t.Fatalf("planned request exceeds window: input=%d output=%d window=%d", got.EstimatedInputTokens, got.MaxOutputTokens, got.ContextWindow)
 	}
 }
 
-func TestConvertAnthropicDropsOldestCompleteTurnsOnlyWhenInputCannotFit(t *testing.T) {
+func TestConvertAnthropicRequiresCompactRatherThanDroppingHistory(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"model": "claude-opus-4-8",
 		"messages": []any{
@@ -150,21 +151,10 @@ func TestConvertAnthropicDropsOldestCompleteTurnsOnlyWhenInputCannotFit(t *testi
 			map[string]any{"role": "user", "content": "current-message"},
 		},
 	})
-	got, err := ConvertAnthropicRequestWithOptions(raw, "trim-budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 30_000})
-	if err != nil {
-		t.Fatal(err)
-	}
-	body := string(got.Body)
-	if got.HistoryMessagesDropped != 2 || !containsString(got.CompatibilityLosses, LossContextHistoryTruncated) {
-		t.Fatalf("oldest turn was not trimmed as a unit: %+v", got)
-	}
-	if strings.Contains(body, "old-history-") || strings.Contains(body, "old-answer") {
-		t.Fatalf("oldest turn remains in budgeted body: %s", body[:min(len(body), 1000)])
-	}
-	for _, required := range []string{"recent-history", "recent-answer", "current-message"} {
-		if !strings.Contains(body, required) {
-			t.Fatalf("recent/current content %q was dropped: %s", required, body)
-		}
+	_, err := ConvertAnthropicRequestWithOptions(raw, "trim-budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 30_000})
+	var contextErr *ContextLengthError
+	if !errors.As(err, &contextErr) || !strings.Contains(err.Error(), "/compact") {
+		t.Fatalf("oversized history error = %v, want compact-required ContextLengthError", err)
 	}
 }
 

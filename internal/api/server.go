@@ -233,6 +233,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/accounts/import-cookie", s.adminImportCookie)
 	s.mux.HandleFunc("/admin/accounts/import-key", s.adminImportKey)
 	s.mux.HandleFunc("/admin/accounts/import-kiro-json", s.adminImportKiroJSON)
+	s.mux.HandleFunc("/admin/accounts/import-kiro-api-key", s.adminImportKiroAPIKey)
 	// Bulk-reassign accounts to a group (exact path; takes precedence over the
 	// /admin/accounts/ subtree handler). Single reassign is /admin/accounts/<id>/group.
 	s.mux.HandleFunc("/admin/accounts/assign-group", s.adminAccountsAssignGroup)

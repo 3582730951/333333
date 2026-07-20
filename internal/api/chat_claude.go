@@ -45,18 +45,28 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 
 	routeGroup := pol.Group
-	allowedProviders, err := claudeAllowedProviders(r, pol)
+	requestedModel, err := capability.ParseRequestedClaudeModel(model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if requestedModel.BaseModel != model {
+		anthBody = setForcedModel(anthBody, requestedModel.BaseModel)
+		model = requestedModel.BaseModel
+	}
+	r = r.WithContext(withRequestedClaudeModel(r.Context(), requestedModel))
+	allowedProviders, routeMode, err := s.resolveClaudeProviders(r.Context(), r, pol)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	r = r.WithContext(withSchedulerWait(r.Context(), w, stream, "openai"))
-	affinity := s.claudeSelectionAffinity(r.Context(), r, raw, anthBody, routeGroup, pol.KeyHash, model)
+	affinity := namespaceClaudeAffinity(s.claudeSelectionAffinity(r.Context(), r, raw, anthBody, routeGroup, pol.KeyHash, requestedModel.RequestedModel), routeMode, requestedModel.ContextMode)
 	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
 	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
 	exclude := map[string]bool{}
-	explicitKiro := len(allowedProviders) == 1 && allowedProviders[0] == "kiro"
-	immutableAffinity := affinityEstablished && (explicitKiro || len(allowedProviders) > 1)
+	explicitKiro := routeMode == "kiro"
+	immutableAffinity := affinityEstablished && explicitKiro
 	kiroCfg := s.effectiveKiroConfig(r.Context())
 	// Kiro is never allowed to run with thinking disabled. The flag is harmless
 	// for official Claude candidates and filters Kiro to thinking-capable models.
@@ -67,6 +77,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			Group:                 routeGroup,
 			AllowedProviders:      allowedProviders,
 			Affinity:              affinity,
+			AffinityWait:          kiroAffinityWait(r.Context(), s, allowedProviders),
 			ImmutableAffinity:     immutableAffinity,
 			ExplicitProvider:      explicitKiro,
 			ThinkingRequired:      thinkingRequired,

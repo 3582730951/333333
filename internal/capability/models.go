@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -14,6 +15,69 @@ import (
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 )
+
+// RequestedClaudeModel separates the downstream model spelling from the model
+// sent upstream. [1m] is a context request and never participates in version or
+// tier selection.
+type RequestedClaudeModel struct {
+	RequestedModel string
+	BaseModel      string
+	ContextMode    string
+}
+
+var claudeContextSuffixRE = regexp.MustCompile(`(?i)^(.*)\[([^\[\]]+)\]$`)
+
+func ParseRequestedClaudeModel(model string) (RequestedClaudeModel, error) {
+	requested := strings.TrimSpace(model)
+	parsed := RequestedClaudeModel{RequestedModel: requested, BaseModel: requested}
+	if !strings.ContainsAny(requested, "[]") {
+		parsed.BaseModel = normalizeRequestedClaudeBase(parsed.BaseModel)
+		return parsed, nil
+	}
+	match := claudeContextSuffixRE.FindStringSubmatch(requested)
+	if match == nil || strings.TrimSpace(match[1]) == "" {
+		return RequestedClaudeModel{}, fmt.Errorf("invalid Claude model context suffix in %q", requested)
+	}
+	if !strings.EqualFold(strings.TrimSpace(match[2]), "1m") {
+		return RequestedClaudeModel{}, fmt.Errorf("unsupported Claude model context suffix [%s] in %q; supported suffix: [1m]", strings.TrimSpace(match[2]), requested)
+	}
+	parsed.BaseModel = normalizeRequestedClaudeBase(match[1])
+	parsed.ContextMode = "1m"
+	return parsed, nil
+}
+
+func normalizeRequestedClaudeBase(model string) string {
+	trimmed := strings.TrimSpace(model)
+	match := kiroConcreteModelRE.FindStringSubmatch(strings.ToLower(trimmed))
+	if match == nil {
+		return trimmed
+	}
+	base := "claude-" + match[1] + "-" + match[2]
+	if match[3] != "" {
+		base += "." + match[3]
+	}
+	if match[4] != "" {
+		base += "-" + match[4]
+	}
+	return base
+}
+
+// KiroEffectiveContextWindow applies the requested context mode to the exact
+// selected model/account. Normal requests never acquire a synthetic 1M window.
+func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64 {
+	limit := KiroContextWindow(model)
+	requestLimit := int64(200000)
+	if strings.EqualFold(strings.TrimSpace(contextMode), "1m") {
+		requestLimit = 1000000
+	}
+	if requestLimit < limit {
+		limit = requestLimit
+	}
+	if measured > 0 && measured < limit {
+		limit = measured
+	}
+	return limit
+}
 
 // claudeModelWindows maps known Claude model ids to their native context window.
 // Anthropic's GET /v1/models does not return context windows, so this table

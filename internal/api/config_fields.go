@@ -63,6 +63,7 @@ type configField struct {
 const (
 	catIdentity      = "虚拟身份 / 指纹"
 	catBehavior      = "行为 / 缓存"
+	catKiro          = "Kiro / API Key / 缓存"
 	catClaudeGateway = "本地 Gateway / Claude Code"
 	catLimits        = "限流 / 封禁"
 	catQuality       = "模型质量 / 降智检测"
@@ -234,22 +235,24 @@ func configFields() []configField {
 			Help: "自动续写/安全等待续写重发时追加的 user 轮指令。默认英文；可设为任意语言。仅发往上游，不下发给客户端。", boot: func(c config.Config) interface{} { return c.StreamContinueText }},
 		{Key: "stream_auto_continue_max_attempts", Label: "自动续写最大次数", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "单个请求最多自动续写的次数，超过则干净结束(保留已产出内容)。默认 1，上限 3，防止重发放大。", boot: func(c config.Config) interface{} { return c.StreamAutoContinueMaxAttempts }},
-		{Key: "kiro_version", Label: "Kiro IDE 版本", Category: catBehavior, Type: fieldString, Effect: effectHot,
+		{Key: "kiro_version", Label: "Kiro IDE 版本", Category: catKiro, Type: fieldString, Effect: effectHot,
 			Help: "Kiro 上游请求指纹中的 IDE 版本。", boot: func(c config.Config) interface{} { return c.KiroVersion }},
-		{Key: "kiro_node_version", Label: "Kiro Node 版本", Category: catBehavior, Type: fieldString, Effect: effectHot,
+		{Key: "kiro_node_version", Label: "Kiro Node 版本", Category: catKiro, Type: fieldString, Effect: effectHot,
 			Help: "Kiro 上游请求指纹中的 Node 版本。", boot: func(c config.Config) interface{} { return c.KiroNodeVersion }},
-		{Key: "kiro_default_auth_region", Label: "Kiro 默认认证区域", Category: catBehavior, Type: fieldString, Effect: effectHot,
+		{Key: "kiro_default_auth_region", Label: "Kiro 默认认证区域", Category: catKiro, Type: fieldString, Effect: effectHot,
 			Help: "凭证未指定时使用的认证区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAuthRegion }},
-		{Key: "kiro_default_api_region", Label: "Kiro 默认 API 区域", Category: catBehavior, Type: fieldString, Effect: effectHot,
+		{Key: "kiro_default_api_region", Label: "Kiro 默认 API 区域", Category: catKiro, Type: fieldString, Effect: effectHot,
 			Help: "凭证未指定时使用的推理区域。", boot: func(c config.Config) interface{} { return c.KiroDefaultAPIRegion }},
-		{Key: "kiro_default_thinking", Label: "Kiro 强制深度思考", Category: catBehavior, Type: fieldBool, Effect: effectHot,
+		{Key: "kiro_default_thinking", Label: "Kiro 强制深度思考", Category: catKiro, Type: fieldBool, Effect: effectHot,
 			Help: "强制开启且不可关闭：所有 Kiro 推理使用原生 adaptive thinking、max effort；不会用提示词伪装思考。", boot: func(config.Config) interface{} { return true }},
-		{Key: "kiro_cache_mode", Label: "Kiro 缓存模式", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
+		{Key: "kiro_cache_mode", Label: "Kiro 缓存模式", Category: catKiro, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"auto", "observe", "off"}, Help: "auto=按 max_hit 规划并发送 cachePoint，同时启用同前缀 singleflight；observe=仅观测；off=关闭请求侧缓存协调。三种模式都会解析真实 token/cache usage。", boot: func(c config.Config) interface{} { return c.KiroCacheMode }},
-		{Key: "kiro_endpoint_allowlist", Label: "Kiro 自定义端点白名单", Category: catBehavior, Type: fieldCSV, Effect: effectHot,
+		{Key: "kiro_endpoint_allowlist", Label: "Kiro 自定义端点白名单", Category: catKiro, Type: fieldCSV, Effect: effectHot,
 			Help: "官方 q.<region>.amazonaws.com 无需配置；测试或私有端点必须精确列出 host:port，防止 bearer token 外发。", boot: func(c config.Config) interface{} { return c.KiroEndpointAllowlist }},
-		{Key: "kiro_cache_unreported_threshold", Label: "Kiro 缓存未报告阈值", Category: catBehavior, Type: fieldInt, Effect: effectHot,
+		{Key: "kiro_cache_unreported_threshold", Label: "Kiro 缓存未报告阈值", Category: catKiro, Type: fieldInt, Effect: effectHot,
 			Help: "连续成功响应未出现缓存计量字段达到该次数后标记 unreported；按响应而非事件数量计数，且不计为缓存 miss。", boot: func(c config.Config) interface{} { return c.KiroCacheUnreportedThreshold }},
+		{Key: "kiro_affinity_wait_millis", Label: "Kiro 亲和短等待毫秒", Category: catKiro, Type: fieldInt, Effect: effectScheduler,
+			Help: "优先等待原 Kiro 账号以复用缓存，超时后才允许切换支持同一精确模型的 Kiro 账号。默认 1500。", boot: func(config.Config) interface{} { return 1500 }},
 		{Key: "codex_prompt_cache_retention", Label: "Codex 提示缓存保留", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"24h", "in_memory", ""},
 			Help:    "兼容旧配置；Codex 0.144.x 已不发送该字段，网关会清除它。缓存复用由 prompt_cache_key 与账号亲和保证。", boot: func(c config.Config) interface{} { return c.CodexPromptCacheRetention }},
