@@ -41,6 +41,42 @@ func TestConvertAnthropicRejectsNonClaude(t *testing.T) {
 	}
 }
 
+func TestIsClaudeCodeCompactionRequestRequiresDedicatedSignature(t *testing.T) {
+	instruction := claudeCodeCompactionInstruction + ", preserving technical details."
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{
+			name: "string system",
+			raw:  `{"model":"claude-opus-4-8","system":"` + claudeCodeCompactionSystem + `","messages":[{"role":"user","content":"` + instruction + `"}]}`,
+			want: true,
+		},
+		{
+			name: "billing plus compaction system blocks",
+			raw:  `{"model":"claude-opus-4-8","system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.215;"},{"type":"text","text":"` + claudeCodeCompactionSystem + `"}],"messages":[{"role":"assistant","content":"old"},{"role":"user","content":[{"type":"text","text":"` + instruction + `"}]}]}`,
+			want: true,
+		},
+		{
+			name: "ordinary user mentions compact",
+			raw:  `{"model":"claude-opus-4-8","system":"You are Claude Code","messages":[{"role":"user","content":"` + instruction + `"}]}`,
+		},
+		{
+			name: "carried tool definitions do not hide compaction",
+			raw:  `{"model":"claude-opus-4-8","system":"` + claudeCodeCompactionSystem + `","tools":[{"name":"Bash","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"` + instruction + `"}]}`,
+			want: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsClaudeCodeCompactionRequest([]byte(test.raw)); got != test.want {
+				t.Fatalf("compaction detection=%v want=%v raw=%s", got, test.want, test.raw)
+			}
+		})
+	}
+}
+
 func TestConvertAnthropicPureWebSearchUsesMCPRequest(t *testing.T) {
 	raw := []byte(`{"model":"claude-sonnet-4-6","max_tokens":256,"messages":[{"role":"user","content":"Perform a web search for the query: Kiro latest release"}],"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":4}]}`)
 	got, err := ConvertAnthropicRequest(raw, "affinity")
@@ -155,6 +191,22 @@ func TestConvertAnthropicRequiresCompactRatherThanDroppingHistory(t *testing.T) 
 	var contextErr *ContextLengthError
 	if !errors.As(err, &contextErr) || !strings.Contains(err.Error(), "/compact") {
 		t.Fatalf("oversized history error = %v, want compact-required ContextLengthError", err)
+	}
+}
+
+func TestConvertAnthropicOversizedCompactionDoesNotRecommendCompactAgain(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"model":  "claude-opus-4-8",
+		"system": claudeCodeCompactionSystem,
+		"messages": []any{
+			map[string]any{"role": "user", "content": strings.Repeat("old-history-", 10_000)},
+			map[string]any{"role": "user", "content": claudeCodeCompactionInstruction},
+		},
+	})
+	_, err := ConvertAnthropicRequestWithOptions(raw, "compact-budget", ConversionOptions{ForceMaxQuality: true, ContextWindow: 30_000, Compaction: true})
+	var contextErr *ContextLengthError
+	if !errors.As(err, &contextErr) || !contextErr.Compaction || strings.Contains(err.Error(), "请运行 /compact") || !strings.Contains(err.Error(), "/clear") {
+		t.Fatalf("oversized compaction error = %v", err)
 	}
 }
 

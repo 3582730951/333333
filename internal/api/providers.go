@@ -145,6 +145,7 @@ func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 		GroupName       string `json:"group_name"`
 		EgressID        string `json:"egress_id"`
 		PrimaryEgressID string `json:"primary_egress_id"`
+		ConfirmCost     bool   `json:"confirm_cost"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -154,6 +155,13 @@ func (s *Server) adminImportKey(w http.ResponseWriter, r *http.Request) {
 	apiKey := strings.TrimSpace(req.APIKey)
 	if providerID == "" || apiKey == "" {
 		writeError(w, http.StatusBadRequest, errors.New("provider_id and api_key are required"))
+		return
+	}
+	if providerID == "codex" || providerID == "claude" {
+		s.adminImportProviderAPIKey(w, r, providerAPIKeyImportRequest{
+			ProviderID: providerID, APIKey: apiKey, Label: req.Label, GroupName: req.GroupName,
+			EgressID: requestedImportEgressID(req.EgressID, req.PrimaryEgressID), ConfirmCost: req.ConfirmCost,
+		})
 		return
 	}
 	if _, ok, err := s.store.GetCustomProvider(r.Context(), providerID); err != nil {

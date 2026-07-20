@@ -76,7 +76,9 @@
     <div class="bd">
       <div class="tabs" id="impTabs">
         <button data-m="oauth_codex" class="on" onclick="setImp('oauth_codex')">Codex · 网页登录</button>
+        <button data-m="codex_key" onclick="setImp('codex_key')">Codex · API Key</button>
         <button data-m="oauth_claude" onclick="setImp('oauth_claude')">Claude · 网页登录</button>
+        <button data-m="claude_key" onclick="setImp('claude_key')">Claude · API Key</button>
         <button data-m="token" onclick="setImp('token')">Codex · AT</button>
         <button data-m="cookie" onclick="setImp('cookie')">Codex · Cookie</button>
         <button data-m="authjson" onclick="setImp('authjson')">Codex · auth.json</button>
@@ -97,11 +99,18 @@
       <div data-m="token"><label class="f">Access Token (AT)</label><textarea class="t" id="tk_at" placeholder="eyJhbGciOi..."></textarea><label class="f">ChatGPT-Account-ID（可选）</label><input class="t" id="tk_acc"></div>
       <div data-m="cookie" class="hide"><label class="f">chatgpt.com 会话 Cookie</label><textarea class="t" id="ck_hdr" placeholder="__Secure-next-auth.session-token=...; ..."></textarea></div>
       <div data-m="authjson" class="hide"><label class="f">auth.json 内容</label><textarea class="t" id="aj_txt" placeholder='{"OPENAI_API_KEY":"...","tokens":{...}}'></textarea></div>
-      <div data-m="claude" class="hide"><label class="f">Claude Token（sk-ant-oat... 或 sk-ant-api...）</label><textarea class="t" id="cl_at" placeholder="sk-ant-oat01-... 或 sk-ant-api03-..."></textarea></div>
+      <div data-m="claude" class="hide"><label class="f">Claude OAuth Access Token（sk-ant-oat...）</label><textarea class="t" id="cl_at" placeholder="sk-ant-oat01-..."></textarea><p class="muted">Anthropic Console API Key 请使用上方“Claude API Key”入口，以执行成本确认和双层测活。</p></div>
+      <div data-m="codex_key" class="hide"><label class="f">OpenAI Platform API Key</label><input class="t mono" type="password" id="codex_api_key" placeholder="sk-...">
+        <div class="note" style="margin-top:8px">按量计费凭据，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后执行一次固定提示的最小推理。</div>
+        <label class="f"><input type="checkbox" id="codex_confirm_cost"> 我确认最小推理探针可能产生少量上游费用。</label></div>
+      <div data-m="claude_key" class="hide"><label class="f">Anthropic Console API Key</label><input class="t mono" type="password" id="claude_api_key" placeholder="sk-ant-api...">
+        <div class="note" style="margin-top:8px">按量计费凭据，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后执行一次固定提示的最小推理。</div>
+        <label class="f"><input type="checkbox" id="claude_confirm_cost"> 我确认最小推理探针可能产生少量上游费用。</label></div>
       <div data-m="customkey" class="hide"><label class="f">供应商 / Provider</label><select class="t" id="ck_provider"></select><label class="f">API Key</label><textarea class="t mono" id="ck_apikey" placeholder="sk-..."></textarea>
         <p class="muted">为 DeepSeek / 硅基流动 等 OpenAI 兼容上游导入账号（Bearer 鉴权）。在「供应商」页管理 base_url 与模型。</p></div>
       <div class="row" style="margin-top:6px"><div style="flex:1"><label class="f">标签 / Label</label><input class="t" id="imp_label" placeholder="main"></div><div style="flex:1"><label class="f">分组 / Group</label><input class="t" id="imp_group" placeholder="cyber"></div></div>
       <div style="height:14px"></div><button class="btn pri" id="impSubmitBtn" onclick="doImport()">导入 / Import</button>
+      <div id="providerKeyResult" class="note hide" style="margin-top:10px"></div>
     </div>
   </div>
 </div>

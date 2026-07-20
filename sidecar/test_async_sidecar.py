@@ -125,5 +125,79 @@ class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
         for session, _ in list(sidecar._sessions.values()): await session.close()
 
 
+    async def test_default_headers_flag_suppresses_browser_fingerprint(self):
+        # End-to-end guard for the relay-fingerprint fix: {"default_headers": false} in the
+        # meta must stop curl-impersonate from injecting the Chrome browser header set
+        # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests) on top of the
+        # caller's authentic client headers. Absent flag = historical behavior (injected).
+        sidecar = load_sidecar()
+        sidecar.IMPERSONATE = "chrome"
+        captured = {}
+
+        async def upstream(reader, writer):
+            head = await reader.readuntil(b"\r\n\r\n")
+            names = set()
+            for line in head.decode("latin1").split("\r\n")[1:]:
+                if ":" in line:
+                    names.add(line.split(":", 1)[0].strip().lower())
+            captured["names"] = names
+            writer.write(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nconnection: close\r\n\r\nok")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        upstream_server = await asyncio.start_server(upstream, "127.0.0.1", 0, backlog=16)
+        upstream_port = upstream_server.sockets[0].getsockname()[1]
+        sidecar_server = await asyncio.start_server(sidecar.client, "127.0.0.1", 0, backlog=16)
+        sidecar_port = sidecar_server.sockets[0].getsockname()[1]
+
+        # An authentic non-browser client header set (mirrors the Go applyClaudeHeaders shape).
+        client_headers = {
+            "User-Agent": "claude-cli/2.1.206 (external, cli)",
+            "X-Stainless-Lang": "js",
+            "Anthropic-Version": "2023-06-01",
+            "Accept": "application/json",
+        }
+        browser_only = {"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                        "sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
+                        "upgrade-insecure-requests", "accept-language"}
+
+        async def call(default_headers):
+            meta_obj = {
+                "method": "POST",
+                "url": f"http://127.0.0.1:{upstream_port}/v1/messages",
+                "headers": {k: [v] for k, v in client_headers.items()},
+                "cookie_jar_key": f"dh-{default_headers}",
+            }
+            if default_headers is not None:
+                meta_obj["default_headers"] = default_headers
+            meta = base64.b64encode(json.dumps(meta_obj).encode()).decode()
+            reader, writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+            writer.write(f"POST /proxy HTTP/1.1\r\nhost: local\r\nx-sidecar-meta: {meta}\r\ncontent-length: 0\r\n\r\n".encode())
+            await writer.drain()
+            await reader.readuntil(b"\r\n\r\n")
+            await reader.read()
+            writer.close()
+            await writer.wait_closed()
+            return captured["names"]
+
+        # Suppressed: the Claude path. No browser-only header may reach the upstream, and the
+        # authentic client headers must survive.
+        suppressed = await call(False)
+        leaked = suppressed & browser_only
+        self.assertEqual(leaked, set(), f"browser headers leaked despite default_headers=false: {leaked}")
+        self.assertIn("user-agent", suppressed)
+        self.assertIn("x-stainless-lang", suppressed)
+
+        # Absent flag: historical browser-shaped behavior (Codex OAuth / registration). This
+        # asserts the flag is what does the suppression — the injection really happens otherwise.
+        injected = await call(None)
+        self.assertIn("sec-ch-ua", injected, "impersonation did not inject browser headers by default")
+
+        sidecar_server.close(); upstream_server.close()
+        await sidecar_server.wait_closed(); await upstream_server.wait_closed()
+        for session, _ in list(sidecar._sessions.values()): await session.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
@@ -241,7 +242,10 @@ func claudeRefreshResumeDelay() time.Duration {
 }
 
 func claudeTokenCanRefresh(token storage.AccountToken) bool {
-	cred := strings.TrimSpace(firstNonEmpty(token.AccessToken, token.OpenAIAPIKey))
+	if accountprovider.UsesAPIKey("claude", token) {
+		return false
+	}
+	cred := accountprovider.Credential("claude", token)
 	return cred != "" && !strings.HasPrefix(cred, "sk-ant-api") && strings.TrimSpace(token.RefreshToken) != ""
 }
 
@@ -435,7 +439,7 @@ func (h *claudeRefreshSSEHeartbeat) writeError(err error) bool {
 
 func (s *Server) refreshClaudeToken(ctx context.Context, account storage.Account, token storage.AccountToken) (claudeRefreshResult, error) {
 	result := claudeRefreshResult{Token: token}
-	cred := strings.TrimSpace(firstNonEmpty(token.AccessToken, token.OpenAIAPIKey))
+	cred := accountprovider.Credential("claude", token)
 	if strings.HasPrefix(cred, "sk-ant-api") || strings.TrimSpace(token.RefreshToken) == "" {
 		token.LastRefresh = storage.Now()
 		_ = s.store.UpdateToken(ctx, token)

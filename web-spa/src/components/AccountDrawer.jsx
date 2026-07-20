@@ -7,7 +7,10 @@ import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { fmtTokens, fmtInt, fmtDateTime, fmtRelative } from '../lib/format.js';
-import { healthTestRequestBody, isKiroAccount, isKiroSuspended } from '../features/accounts/model/healthTest.ts';
+import {
+  healthTestRequestBody, isKiroAccount, isKiroSuspended, isProtectedProbeQuarantine,
+  isProviderAPIKeyAccount, requiresPaidHealthTest,
+} from '../features/accounts/model/healthTest.ts';
 
 const Row = ({ k, v }) => (
   <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, padding: '5px 0', fontSize: 13 }}>
@@ -44,7 +47,7 @@ export default function AccountDrawer({
   const fetchDetails = useCallback(async ({ signal }) => {
     if (!account) return EMPTY_ACCOUNT_DETAIL;
     const encodedID = encodeURIComponent(account.id);
-    const supportsCodexReauth = (account.provider || 'codex') === 'codex';
+    const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key';
     const [data, profiles, groups, codexReauth] = await Promise.all([
       get('/admin/audit', { account_id: account.id, limit: 10 }, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
@@ -190,12 +193,16 @@ export default function AccountDrawer({
   const isActionLoading = (act) => Boolean(isActionLoadingProp?.(account.id, act));
   const isActionDisabled = (act) => actionDisabled || (actionRunning && !isActionLoading(act));
   const resetCredits = account.quota_summary?.reset_credits;
-  const supportsCodexReauth = (account.provider || 'codex') === 'codex';
+  const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key';
   const codexReauth = details.codexReauth || null;
   const codexReauthConfig = codexReauth?.config || {};
   const latestCodexReauthJob = codexReauth?.latest_job || null;
   const kiroAccount = isKiroAccount(account);
   const kiroSuspended = isKiroSuspended(account);
+  const providerAPIKey = isProviderAPIKeyAccount(account);
+  const paidHealthTest = requiresPaidHealthTest(account);
+  const protectedProbeQuarantine = isProtectedProbeQuarantine(account);
+  const capabilities = Array.isArray(account.capabilities) ? account.capabilities : [];
 
   return (
     <Drawer title={account.label || account.id} visible={!!account} onCancel={onClose} width={520} className="pool-account-drawer">
@@ -204,10 +211,13 @@ export default function AccountDrawer({
         <Row k="账号 ID" v={<span className="pool-mono">{account.id}</span>} />
         <Row k="邮箱" v={account.email || '—'} />
         <Row k="提供商" v={<Tag>{account.provider || 'codex'}</Tag>} />
+        <Row k="认证方式" v={<Tag color={providerAPIKey ? 'violet' : 'blue'}>{account.auth_method || 'oauth'}</Tag>} />
+        <Row k="计费方式" v={account.billing_mode === 'pay_as_you_go' ? <Tag color="violet">按量计费</Tag> : '订阅'} />
+        {providerAPIKey ? <Row k="API Key" v={account.api_key_present ? '已加密保存' : '未检测到'} /> : null}
         <Row k="分组" v={account.group_name || '默认'} />
         <Row k="套餐" v={account.plan_type || '—'} />
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
-        <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (kiroSuspended ? '无限期' : fmtRelative(account.quarantine_until)) : '否'} />
+        <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (protectedProbeQuarantine ? '无限期' : fmtRelative(account.quarantine_until)) : '否'} />
         {account.quarantine_reason ? <Row k="隔离原因" v={account.quarantine_reason} /> : null}
       </Panel>
 
@@ -222,6 +232,13 @@ export default function AccountDrawer({
         </Panel>
       ) : null}
 
+      {providerAPIKey ? (
+        <Panel title="上游 API Key" style={{ marginBottom: 14 }}>
+          <Typography.Text as="p">此账号使用 Platform / Console 上游 Key，按量计费，不参与 OAuth 刷新、重登或订阅配额同步。</Typography.Text>
+          <Typography.Text type="tertiary" as="p">手工测活会先免费读取模型列表；认证成功后发送一次最小推理。推理隔离只能由成功的付费双层测活解除。</Typography.Text>
+        </Panel>
+      ) : null}
+
       {account.kiro_auth ? (
         <Panel title="Kiro 认证" style={{ marginBottom: 14 }}>
           <Row k="认证方式" v={account.kiro_auth.auth_method || '—'} />
@@ -233,9 +250,23 @@ export default function AccountDrawer({
         </Panel>
       ) : null}
 
-      <Panel title="账号额度" style={{ marginBottom: 14 }}>
-        <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
-        <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
+      {!providerAPIKey ? (
+        <Panel title="账号额度" style={{ marginBottom: 14 }}>
+          <Row k="主动重置次数" v={formatResetCredits(resetCredits)} />
+          <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
+        </Panel>
+      ) : null}
+
+      <Panel title="模型与上下文能力" style={{ marginBottom: 14 }}>
+        {!capabilities.length ? <Typography.Text type="tertiary">尚无已发现的模型能力</Typography.Text> : capabilities.map((item) => (
+          <div key={`${item.model_slug}:${item.source || ''}`} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, padding: '5px 0', borderBottom: '1px solid var(--pool-border)' }}>
+            <span className="pool-mono" style={{ fontSize: 12 }}>{item.model_slug || '—'}</span>
+            <span style={{ display: 'flex', gap: 5, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              <Tag size="small" color={item.availability_state === 'verified' ? 'green' : item.availability_state === 'unsupported' ? 'red' : 'amber'}>{item.availability_state || 'unverified'}</Tag>
+              <Tag size="small" color={item.context_1m_state === 'supported' ? 'green' : item.context_1m_state === 'unsupported' ? 'grey' : 'amber'}>1M {item.context_1m_state || 'unknown'}</Tag>
+            </span>
+          </div>
+        ))}
       </Panel>
 
       {supportsCodexReauth ? (
@@ -353,10 +384,10 @@ export default function AccountDrawer({
       </Panel>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        {kiroAccount ? (
+        {paidHealthTest ? (
           <ConfirmDialog
-            title="确认执行 Kiro 双层测活？"
-            description="将先免费检查认证；认证正常后，会绑定此账号和当前出口发送 1 次最小推理请求并消耗少量 credits。"
+            title={kiroAccount ? '确认执行 Kiro 双层测活？' : '确认执行 API Key 双层测活？'}
+            description="将先免费检查认证；认证正常后，会绑定此账号和当前出口发送 1 次最小推理请求，并可能产生少量上游费用。"
             confirmText="确认并测活"
             onConfirm={() => onAction(account.id, 'health-test', healthTestRequestBody(account, true))}
           >
@@ -365,8 +396,8 @@ export default function AccountDrawer({
         ) : (
           <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test')}>测活</Button>
         )}
-        <Button loading={isActionLoading('clear-quarantine')} disabled={kiroSuspended || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解隔离</Button>
-        <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button>
+        <Button loading={isActionLoading('clear-quarantine')} disabled={protectedProbeQuarantine || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解隔离</Button>
+        {!providerAPIKey ? <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button> : null}
         <ConfirmDialog
           title="删除该账号？"
           description={`账号 ${account.label || account.email || account.id} 删除后不可恢复。`}

@@ -55,8 +55,8 @@ func TestBuildModelsResponseAdvertisesRealContextNoVirtual2M(t *testing.T) {
 	_ = json.Unmarshal(body, &root)
 	data := root["data"].([]interface{})
 	model := data[0].(map[string]interface{})
-	if model["context_window"].(float64) != 272000 || model["native_context_window"].(float64) != 272000 {
-		t.Fatalf("context windows should be real native values: %v", model)
+	if model["context_window"].(float64) != 128000 || model["native_context_window"].(float64) != 128000 || model["native_max_context_window"].(float64) != 272000 {
+		t.Fatalf("standard and technical context windows were conflated: %v", model)
 	}
 	if model["window_mode"] == "virtual_2m" {
 		t.Fatalf("virtual_2m must not be advertised: %v", model)
@@ -140,10 +140,10 @@ func TestBuildModelsResponseDoesNotForgeOfficialMetadataForCustomModels(t *testi
 // set of the account that supports the MOST models, not the pool-wide union.
 func TestBuildModelsResponseRichestAccount(t *testing.T) {
 	caps := []storage.ModelCapability{
-		{AccountID: "rich", ModelSlug: "gpt-5-codex", NativeMaxContextWindow: 400000},
-		{AccountID: "rich", ModelSlug: "gpt-5.1-codex", NativeMaxContextWindow: 400000},
-		{AccountID: "rich", ModelSlug: "gpt-5.1-codex-max", NativeMaxContextWindow: 400000},
-		{AccountID: "poor", ModelSlug: "gpt-4o-mini", NativeMaxContextWindow: 128000},
+		{AccountID: "rich", ModelSlug: "gpt-5-codex", AvailabilityState: AvailabilityVerified, NativeMaxContextWindow: 400000},
+		{AccountID: "rich", ModelSlug: "gpt-5.1-codex", AvailabilityState: AvailabilityVerified, NativeMaxContextWindow: 400000},
+		{AccountID: "rich", ModelSlug: "gpt-5.1-codex-max", AvailabilityState: AvailabilityVerified, NativeMaxContextWindow: 400000},
+		{AccountID: "poor", ModelSlug: "gpt-4o-mini", AvailabilityState: AvailabilityVerified, NativeMaxContextWindow: 128000},
 	}
 	body, _, err := BuildModelsResponse(caps, config.Default())
 	if err != nil {
@@ -192,13 +192,51 @@ func TestParseClaudeModelsFillsWindows(t *testing.T) {
 	}
 }
 
+func TestClaudeOneMillionRequiresLiveEvidenceOrEligibleOAuthPlan(t *testing.T) {
+	withoutEvidence, err := ParseClaudeModels("api", []byte(`{"data":[{"id":"claude-opus-4-8"}]}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutEvidence = ApplyClaudeAccountPolicy(withoutEvidence, storage.Account{Provider: "claude", PlanType: "api"}, storage.AccountToken{AuthMethod: "api_key", AccessToken: "sk-ant-api"})
+	if got := withoutEvidence[0]; got.NativeContextWindow != 200000 || got.NativeMaxContextWindow != 1000000 || got.Context1MState != Context1MUnknown {
+		t.Fatalf("technical model maximum became API-key entitlement: %+v", got)
+	}
+
+	withEvidence, err := ParseClaudeModels("api", []byte(`{"data":[{"id":"claude-opus-4-8","max_input_tokens":1000000}]}`), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withEvidence = ApplyClaudeAccountPolicy(withEvidence, storage.Account{Provider: "claude", PlanType: "api"}, storage.AccountToken{AuthMethod: "api_key", AccessToken: "sk-ant-api"})
+	if withEvidence[0].Context1MState != Context1MSupported || withEvidence[0].Context1MSource != "live_models" {
+		t.Fatalf("explicit live API-key 1M evidence was lost: %+v", withEvidence[0])
+	}
+
+	pro := ApplyClaudeAccountPolicy(ParseStaticCopy("pro"), storage.Account{Provider: "claude", PlanType: "Pro"}, storage.AccountToken{AuthMethod: "oauth", AccessToken: "oauth"})
+	max := ApplyClaudeAccountPolicy(ParseStaticCopy("max"), storage.Account{Provider: "claude", PlanType: "Max"}, storage.AccountToken{AuthMethod: "oauth", AccessToken: "oauth"})
+	if pro[0].Context1MState != Context1MUnsupported || pro[0].NativeContextWindow != 200000 {
+		t.Fatalf("Pro was not permanently limited to standard context: %+v", pro[0])
+	}
+	if max[0].Context1MState != Context1MSupported {
+		t.Fatalf("eligible Max Opus capability was not enabled: %+v", max[0])
+	}
+}
+
+func ParseStaticCopy(accountID string) []storage.ModelCapability {
+	for _, c := range StaticClaudeModels(accountID) {
+		if c.ModelSlug == "claude-opus-4-8" {
+			return []storage.ModelCapability{c}
+		}
+	}
+	return nil
+}
+
 func TestStaticClaudeModelsNonEmpty(t *testing.T) {
 	caps := StaticClaudeModels("acc2")
 	if len(caps) == 0 {
 		t.Fatal("static Claude model set must not be empty")
 	}
 	for _, c := range caps {
-		if c.AccountID != "acc2" || c.ModelSlug == "" || c.NativeMaxContextWindow == 0 || c.Source != "claude_static" {
+		if c.AccountID != "acc2" || c.ModelSlug == "" || c.NativeContextWindow != 200000 || c.NativeMaxContextWindow == 0 || c.Source != "claude_static_unverified" || c.AvailabilityState != AvailabilityUnverified || c.Context1MState != Context1MUnknown {
 			t.Fatalf("malformed static capability: %+v", c)
 		}
 	}
@@ -223,7 +261,12 @@ func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
 }
 
 func TestBuildAnthropicModelsResponseUsesClaudeFacingKiroModelIDs(t *testing.T) {
-	body, _, err := BuildAnthropicModelsResponse(StaticKiroModels("kiro-account"))
+	caps := StaticKiroModels("kiro-account")
+	for i := range caps {
+		caps[i].AvailabilityState = AvailabilityVerified
+		caps[i].Source = "kiro_runtime"
+	}
+	body, _, err := BuildAnthropicModelsResponse(caps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,12 +303,35 @@ func TestParseRequestedClaudeModelContextSuffix(t *testing.T) {
 	}
 }
 
+func TestClaudeFallbackStaysInFamilyAndOnlyMovesLower(t *testing.T) {
+	caps := []storage.ModelCapability{
+		{ModelSlug: "claude-opus-4-7", AvailabilityState: AvailabilityVerified, Source: "claude_probe"},
+		{ModelSlug: "claude-opus-4-6", AvailabilityState: AvailabilityVerified, Source: "claude_probe"},
+		{ModelSlug: "claude-sonnet-4-9", AvailabilityState: AvailabilityVerified, Source: "claude_probe"},
+		{ModelSlug: "claude-opus-4-9", AvailabilityState: AvailabilityVerified, Source: "claude_probe"},
+	}
+	if got := SuggestedClaudeFallback("claude-opus-4-8", caps); got != "claude-opus-4-7" {
+		t.Fatalf("fallback=%q, want same-family lower Opus 4.7", got)
+	}
+}
+
 func TestKiroEffectiveContextWindowRequires1MMode(t *testing.T) {
 	if got := KiroEffectiveContextWindow("claude-opus-4.8", "", 900000); got != 200000 {
 		t.Fatalf("standard context = %d, want 200000", got)
 	}
 	if got := KiroEffectiveContextWindow("claude-opus-4.8", "1m", 640000); got != 640000 {
 		t.Fatalf("measured 1m context = %d, want 640000", got)
+	}
+}
+
+func TestStaticKiroSeparatesStandardAndTechnicalContextWindows(t *testing.T) {
+	for _, c := range StaticKiroModels("account") {
+		if c.NativeContextWindow != 200000 {
+			t.Fatalf("%s standard window=%d, want 200000", c.ModelSlug, c.NativeContextWindow)
+		}
+		if KiroContextWindow(c.ModelSlug) == 1000000 && c.NativeMaxContextWindow != 1000000 {
+			t.Fatalf("%s technical window=%d, want 1000000", c.ModelSlug, c.NativeMaxContextWindow)
+		}
 	}
 }
 
@@ -302,16 +368,32 @@ func TestKiroFreePlanCannotBootstrapOpus(t *testing.T) {
 	}
 }
 
+func TestKiroPlanAllows1MRequiresKnownPaidPlanAndTechnicalWindow(t *testing.T) {
+	for _, plan := range []string{"", "KIRO FREE"} {
+		if KiroPlanAllows1M(plan, "claude-opus-4-8") {
+			t.Fatalf("plan %q unexpectedly received Kiro 1M entitlement", plan)
+		}
+	}
+	for _, plan := range []string{"KIRO PRO", "KIRO PRO+", "KIRO ENTERPRISE"} {
+		if !KiroPlanAllows1M(plan, "claude-opus-4-8") {
+			t.Fatalf("known paid plan %q was rejected for Kiro 1M", plan)
+		}
+	}
+	if KiroPlanAllows1M("KIRO PRO", "claude-haiku-4.5") {
+		t.Fatal("200K model unexpectedly received Kiro 1M entitlement")
+	}
+}
+
 // TestStaticClaudeModelsIncludesOpus48 locks in the user-reported fix: the current
-// flagship claude-opus-4-8 must be in the static set with its 1M context window, so
-// an OAuth account whose /v1/models probe is rejected still advertises it.
+// flagship claude-opus-4-8 stays discoverable as an unverified hint. Its standard
+// window remains 200K and the 1M technical maximum is not entitlement evidence.
 func TestStaticClaudeModelsIncludesOpus48(t *testing.T) {
 	var found bool
 	for _, c := range StaticClaudeModels("acc") {
 		if c.ModelSlug == "claude-opus-4-8" {
 			found = true
-			if c.NativeMaxContextWindow != 1000000 {
-				t.Fatalf("claude-opus-4-8 window = %d, want 1000000 (1M default)", c.NativeMaxContextWindow)
+			if c.NativeContextWindow != 200000 || c.NativeMaxContextWindow != 1000000 || c.AvailabilityState != AvailabilityUnverified || c.Context1MState != Context1MUnknown {
+				t.Fatalf("claude-opus-4-8 static hint conflated standard/entitled windows: %+v", c)
 			}
 		}
 	}
@@ -320,10 +402,9 @@ func TestStaticClaudeModelsIncludesOpus48(t *testing.T) {
 	}
 }
 
-// TestMergeClaudeStaticFloorsNewestModels confirms a live probe missing the newest
-// model (Anthropic /v1/models lags a fresh release) still surfaces it via the static
-// floor, while the probe's own entries are kept on conflict.
-func TestMergeClaudeStaticFloorsNewestModels(t *testing.T) {
+// A successful live list is authoritative. Models missing from it must not be
+// reintroduced from a static catalog as fake verified capabilities.
+func TestMergeClaudeLiveCatalogIsAuthoritative(t *testing.T) {
 	probe, err := ParseClaudeModels("acc", []byte(`{"data":[{"id":"claude-opus-4-7"}]}`), "")
 	if err != nil {
 		t.Fatal(err)
@@ -337,13 +418,8 @@ func TestMergeClaudeStaticFloorsNewestModels(t *testing.T) {
 	if got := bySlug["claude-opus-4-7"]; got.Source != "claude_probe" {
 		t.Fatalf("probe entry source = %q, want claude_probe (probe must win on conflict)", got.Source)
 	}
-	// Newest model floored in even though the probe omitted it, with the 1M window.
-	op48, ok := bySlug["claude-opus-4-8"]
-	if !ok {
-		t.Fatal("claude-opus-4-8 not floored into merged set")
-	}
-	if op48.NativeMaxContextWindow != 1000000 || op48.Source != "claude_static" {
-		t.Fatalf("floored opus-4-8 = %+v, want 1M window + claude_static source", op48)
+	if _, ok := bySlug["claude-opus-4-8"]; ok {
+		t.Fatalf("missing live model was reintroduced from static data: %+v", merged)
 	}
 }
 
@@ -371,7 +447,7 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 	}
 }
 
-func TestBuildModelsResponseColdStartUsesCurrentCodexCatalog(t *testing.T) {
+func TestBuildModelsResponseColdStartIsEmpty(t *testing.T) {
 	raw, _, err := BuildModelsResponse(nil, config.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -382,21 +458,8 @@ func TestBuildModelsResponseColdStartUsesCurrentCodexCatalog(t *testing.T) {
 	if err := json.Unmarshal(raw, &response); err != nil {
 		t.Fatal(err)
 	}
-	found := false
-	for _, model := range response.Data {
-		if model["id"] != "gpt-5.6-sol" {
-			continue
-		}
-		found = true
-		if model["context_window"] != float64(372000) || model["native_context_window"] != float64(372000) || model["effective_context_window_percent"] != float64(95) {
-			t.Fatalf("cold-start GPT-5.6 catalog entry is stale: %+v", model)
-		}
-	}
-	if !found {
-		t.Fatalf("cold-start catalog omitted gpt-5.6-sol: %s", raw)
-	}
-	if string(raw) == "" || containsModelID(response.Data, "gpt-5.4-codex") {
-		t.Fatalf("obsolete unknown-window placeholder leaked: %s", raw)
+	if len(response.Data) != 0 {
+		t.Fatalf("cold-start catalog injected unverified static models: %s", raw)
 	}
 }
 
@@ -409,11 +472,7 @@ func containsModelID(models []map[string]interface{}, id string) bool {
 	return false
 }
 
-// TestMergeCodexStaticFloorsNewerModels locks in the version-gated Codex /models
-// fix: if a live probe only returns up to gpt-5.4, the current flagship from the
-// static catalog is added; if the live probe already returns gpt-5.5, older static
-// entries are not re-added as stale capabilities.
-func TestMergeCodexStaticFloorsNewerModels(t *testing.T) {
+func TestMergeCodexLiveCatalogIsAuthoritative(t *testing.T) {
 	probe, err := Parse("acc", []byte(`{"models":[{"slug":"gpt-5.4","max_context_window":1000000,"visibility":"list"}]}`), "")
 	if err != nil {
 		t.Fatal(err)
@@ -423,10 +482,8 @@ func TestMergeCodexStaticFloorsNewerModels(t *testing.T) {
 	for _, c := range merged {
 		bySlug[c.ModelSlug] = c
 	}
-	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"} {
-		if _, ok := bySlug[slug]; !ok {
-			t.Fatalf("%s was not floored into a gpt-5.4-only probe: %+v", slug, merged)
-		}
+	if len(merged) != 1 {
+		t.Fatalf("live catalog was padded with static models: %+v", merged)
 	}
 	if bySlug["gpt-5.4"].Source != "probe" {
 		t.Fatalf("probe entry must win on conflict, got %+v", bySlug["gpt-5.4"])

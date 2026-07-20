@@ -5,6 +5,7 @@
 package api
 
 import (
+	"codex-account-pool/internal/accountprovider"
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/storage"
@@ -66,6 +67,9 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 type accountView struct {
 	storage.Account
 	Provider               string                        `json:"provider"`
+	AuthMethod             string                        `json:"auth_method"`
+	BillingMode            string                        `json:"billing_mode"`
+	APIKeyPresent          bool                          `json:"api_key_present"`
 	Capabilities           []storage.ModelCapability     `json:"capabilities"`
 	Egress                 *storage.AccountEgressBinding `json:"egress_binding,omitempty"`
 	Usage                  *storage.UsageSummaryRow      `json:"usage,omitempty"`
@@ -131,6 +135,11 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 			Provider:     providers[account.ID],
 			Capabilities: capabilities[account.ID],
 			QuotaSummary: BuildQuotaSummary(account, token, quotaSnapshots[account.ID], now),
+		}
+		if token != nil {
+			view.AuthMethod = accountprovider.EffectiveAuthMethod(view.Provider, *token)
+			view.BillingMode = accountprovider.BillingMode(view.Provider, *token)
+			view.APIKeyPresent = accountprovider.UsesAPIKey(view.Provider, *token) && accountprovider.Credential(view.Provider, *token) != ""
 		}
 		if binding, ok := bindings[account.ID]; ok {
 			view.Egress = &binding
@@ -230,6 +239,18 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		Scopes:             strings.Join(parsed.Scopes, " "),
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
+	if strings.TrimSpace(account.Provider) == "" {
+		if inferred := accountprovider.InferProviderFromToken(token); inferred != accountprovider.UnknownProvider {
+			account.Provider = inferred
+		}
+	}
+	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
+	credential := accountprovider.Credential(account.Provider, token)
+	if (account.Provider == "codex" || account.Provider == "claude") &&
+		(accountprovider.UsesAPIKey(account.Provider, token) || accountprovider.LooksLikeAPIKey(account.Provider, credential)) {
+		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "built-in provider API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
+		return
+	}
 	if existing, err := s.store.GetAccount(r.Context(), account.ID); err == nil {
 		writeJSON(w, http.StatusOK, accountImportResponse{Account: existing, Duplicate: true, ImportStatus: "duplicate"})
 		return
@@ -262,6 +283,16 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	if provider == "" {
 		provider = parsed.Provider
 	}
+	if strings.TrimSpace(provider) == "" {
+		shape := storage.AccountToken{
+			AccessToken: parsed.AccessToken, RefreshToken: refreshToken,
+			OpenAIAPIKey: parsed.OpenAIAPIKey, IDTokenRaw: parsed.IDTokenRaw,
+			Scopes: strings.Join(parsed.Scopes, " "),
+		}
+		if inferred := accountprovider.InferProviderFromToken(shape); inferred != accountprovider.UnknownProvider {
+			provider = inferred
+		}
+	}
 	account := storage.Account{
 		ID:                parsed.AccountID,
 		Label:             label,
@@ -288,6 +319,7 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 		Scopes:             strings.Join(parsed.Scopes, " "),
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
+	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
 	if existing, err := s.store.GetAccount(ctx, account.ID); err == nil {
 		return existing, nil
 	}
@@ -305,8 +337,8 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 }
 
 // seedImportedAccountCapabilities closes the import-to-first-request race. Static
-// provider capabilities are available synchronously; the detached live probe below
-// replaces/floors them with the account's actual model catalog.
+// provider capabilities are unverified discovery hints; the detached live probe
+// replaces them with the account's authoritative model catalog when available.
 func (s *Server) seedImportedAccountCapabilities(ctx context.Context, account storage.Account) error {
 	var caps []storage.ModelCapability
 	switch strings.ToLower(strings.TrimSpace(account.Provider)) {
@@ -360,6 +392,11 @@ func (s *Server) adminImportToken(w http.ResponseWriter, r *http.Request) {
 	parsed, err := authparse.ParseAccessToken(req.AccessToken, req.AccountID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	provider := accountprovider.InferProviderFromToken(storage.AccountToken{AccessToken: parsed.AccessToken})
+	if (provider == "codex" || provider == "claude") && accountprovider.LooksLikeAPIKey(provider, parsed.AccessToken) {
+		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "upstream API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
 		return
 	}
 	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, req.RefreshToken, "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
@@ -461,6 +498,12 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	accountID, action := parts[0], parts[1]
+	if strings.HasPrefix(action, "codex-reauth") {
+		if token, err := s.store.GetToken(r.Context(), accountID); err == nil && accountprovider.UsesAPIKey("codex", token) {
+			writePoolCodeError(w, http.StatusBadRequest, "reauth_not_applicable", "API-key accounts do not use Codex OAuth reauthentication")
+			return
+		}
+	}
 	switch action {
 	case "kiro":
 		if len(parts) == 3 && parts[2] == "cache-probe" {
@@ -504,6 +547,10 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminCodexReauthAction(w http.ResponseWriter, r *http.Request, accountID string, parts []string) {
+	if token, err := s.store.GetToken(r.Context(), accountID); err == nil && accountprovider.UsesAPIKey("codex", token) {
+		writePoolCodeError(w, http.StatusBadRequest, "reauth_not_applicable", "API-key accounts do not use Codex OAuth reauthentication")
+		return
+	}
 	if len(parts) == 0 {
 		http.NotFound(w, r)
 		return
@@ -630,6 +677,10 @@ func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, ac
 		writePoolCodeError(w, http.StatusConflict, "kiro_health_probe_required", "AWS User ID suspension quarantine can only be cleared by a successful administrator Kiro auth and inference health test")
 		return
 	}
+	if isProviderAPIKeyInferenceQuarantine(account.QuarantineReason) {
+		writePoolCodeError(w, http.StatusConflict, "provider_api_key_health_probe_required", "API-key inference quarantine can only be cleared by a successful administrator health test with confirm_cost:true")
+		return
+	}
 	if err := s.store.SetAccountQuarantine(r.Context(), accountID, 0, ""); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -661,6 +712,7 @@ func (s *Server) adminDeleteAccount(w http.ResponseWriter, r *http.Request, acco
 // three stay consistent. Codex accounts are probed via the ChatGPT /models
 // endpoint (reporting a current client_version so the version-gated catalog returns
 // today's models), with a curated static fallback when the probe is unavailable;
-// Claude accounts are probed via Anthropic's /v1/models, unioned with a static
-// current-gen floor (see probeClaudeModels). Accounts of other providers are
-// skipped (returns nil, nil). A probe failure NEVER bans the account.
+// Claude accounts are probed via Anthropic's /v1/models; a successful live catalog
+// is authoritative, while an unavailable catalog leaves only unverified static
+// discovery hints (see probeClaudeModels). Accounts of other providers are skipped
+// (returns nil, nil). A probe failure NEVER bans the account.

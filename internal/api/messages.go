@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cf"
@@ -26,6 +27,8 @@ import (
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/virtual"
 )
+
+const kiroCompactionExtendedRouteThreshold int64 = 190000
 
 // appendVirtualHomeToWords ensures the streamrewrite scrubber replaces the real
 // home directory prefix with the virtual home directory (the value of `virtualHome`).
@@ -145,6 +148,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if anthropicContext1MRequested(r.Header) {
+		requestedModel.ContextMode = "1m"
+	}
 	if requestedModel.BaseModel != model {
 		raw = setForcedModel(raw, requestedModel.BaseModel)
 		model = requestedModel.BaseModel
@@ -155,21 +161,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	// Normalize a Claude model alias (auto/default/sonnet/opus/haiku, or an undated family
-	// name) that Anthropic would reject into a concrete same-tier model id, and forward
-	// that id upstream. Same-tier only — never a downgrade — so Claude Code's default/auto
-	// selection works end-to-end. No-op for concrete claude-* ids (the common case) and
-	// when a downstream key already forced a concrete model above.
-	if len(allowedProviders) == 1 && allowedProviders[0] == "claude" {
-		norm := capability.NormalizeClaudeModelAlias(model)
-		if norm != model {
-			raw = setForcedModel(raw, norm)
-			model = norm
-		}
-	}
 	affinity := namespaceClaudeAffinity(s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, requestedModel.RequestedModel), routeMode, requestedModel.ContextMode)
 	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
 	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
+	// Once an auto-routed Claude session is bound to Kiro, preserve Kiro's
+	// immutable-session guarantee. A later request must fail visibly if that exact
+	// account is unavailable instead of switching identities behind Claude Code.
+	boundKiro := affinityEstablished && strings.EqualFold(existingAffinity.Provider, "kiro")
 	// Native Anthropic Messages requests are always self-contained (the full
 	// conversation is in `messages`; there is no server-side previous_response_id), so
 	// they are movable and fail over to a fresh account on a recoverable error instead
@@ -181,12 +179,23 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			attempts = 1
 		}
 	}
+	if movable && attempts < 2 {
+		attempts = 2
+	}
 	exclude := map[string]bool{}
+	modelCapabilityRejected := false
 	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "anthropic"))
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, routeMode == "kiro", affinityEstablished, true, exclude) != outcomeRetry {
+		outcome := s.claudeMessagesAttempt(w, r, raw, path, affinity, strict, movable, model, pol.Group, pol.KeyHash, allowedProviders, routeMode == "kiro" || boundKiro, affinityEstablished, true, exclude)
+		if outcome == outcomeModelRetry {
+			modelCapabilityRejected = true
+		}
+		if outcome != outcomeRetry && outcome != outcomeModelRetry {
 			return
 		}
+	}
+	if modelCapabilityRejected && s.handleCapabilitySelectionError(r.Context(), w, &scheduler.NoAccountError{Model: model, Counters: scheduler.NoAccountCounters{ModelUnsupported: 1}}, true, pol.Group, strings.Join(allowedProviders, ","), requestedModel.RequestedModel, requestedModel.ContextMode) {
+		return
 	}
 	writePoolCodeError(w, http.StatusBadGateway, "retry_exhausted", "upstream retry limit exhausted")
 }
@@ -201,6 +210,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, raw []byte, path string, affinity routing.AffinityKey, strict, movable bool, model, group, apiKeyHash string, allowedProviders []string, explicitKiro, affinityEstablished, allowRetry bool, exclude map[string]bool) attemptOutcome {
 	streamReq := isStreamRequest(raw)
 	countTokens := strings.HasSuffix(path, "/count_tokens")
+	compaction := kirowire.IsClaudeCodeCompactionRequest(raw)
+	routeContextMode := requestedClaudeModelFromContext(r.Context()).ContextMode
+	// A large genuine Claude Code /compact request needs the selected Kiro account
+	// to be 1M-eligible before conversion. Keep smaller compactions on the standard
+	// route so Free/200K accounts can still summarize conversations that fit.
+	if explicitKiro && compaction && virtual.EstimateTokensJSON(raw) >= kiroCompactionExtendedRouteThreshold {
+		routeContextMode = "1m"
+	}
 	immutableAffinity := affinityEstablished && explicitKiro
 	if !movable && !affinityEstablished {
 		writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
@@ -230,6 +247,8 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
 		Movable:               movable,
 		Model:                 model,
+		ContextMode:           routeContextMode,
+		Compaction:            compaction,
 		EstimatedTokens:       virtual.EstimateTokensJSON(raw),
 		Exclude:               exclude,
 		OnWait:                schedulerWaitCallback(r.Context()),
@@ -239,8 +258,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
 			return outcomeDone
 		}
-		if explicitKiro && capability.KiroModelAlias(model) {
-			writeKiroError(w, r, http.StatusServiceUnavailable, fmt.Errorf("%w: %s", kirowire.ErrVerifiedModelUnavailable, model))
+		if s.handleCapabilitySelectionError(r.Context(), w, err, true, group, strings.Join(allowedProviders, ","), requestedClaudeModelFromContext(r.Context()).RequestedModel, routeContextMode) {
 			return outcomeDone
 		}
 		if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
@@ -388,6 +406,15 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 				}
 			}
 			if resp.StatusCode >= 400 {
+				if isModelNotFoundError(resp.StatusCode, errorBody) {
+					s.rejectAccountModel(r.Context(), lease.Account, model, resp.StatusCode)
+					if allowRetry && movable {
+						retry()
+						return outcomeModelRetry
+					}
+					_ = s.handleCapabilitySelectionError(r.Context(), w, &scheduler.NoAccountError{Model: model, Counters: scheduler.NoAccountCounters{ModelUnsupported: 1}}, true, group, "claude", model, requestedClaudeModelFromContext(r.Context()).ContextMode)
+					return outcomeDone
+				}
 				verdict := s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 				if allowRetry && movable && retryableForFailover(verdict, resp.StatusCode) {
 					return retry()
@@ -471,6 +498,16 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		if d := cf.Detect(resp.StatusCode, resp.Header, errorBody); cf.Recordable(d) {
 			s.handleCFEvent(r.Context(), lease.Account, lease.Egress, resp.StatusCode, d)
 		}
+		if isModelNotFoundError(resp.StatusCode, errorBody) {
+			s.rejectAccountModel(r.Context(), lease.Account, model, resp.StatusCode)
+			_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
+			if allowRetry && movable {
+				retry()
+				return outcomeModelRetry
+			}
+			_ = s.handleCapabilitySelectionError(r.Context(), w, &scheduler.NoAccountError{Model: model, Counters: scheduler.NoAccountCounters{ModelUnsupported: 1}}, true, group, "claude", model, requestedClaudeModelFromContext(r.Context()).ContextMode)
+			return outcomeDone
+		}
 		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
 			Provider:   "claude",
 			Entrypoint: "claude_messages",
@@ -520,6 +557,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		return outcomeDone
 	}
 claudeSuccess:
+	s.verifyAccountModel(r.Context(), lease.Account, model, requestedClaudeModelFromContext(r.Context()).ContextMode)
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
@@ -633,11 +671,7 @@ claudeSuccess:
 // (Claude Pro/Max) rather than an Anthropic API key. OAuth traffic must carry
 // the full Claude Code fingerprint (identity system block, tool renames).
 func claudeIsOAuth(token storage.AccountToken) bool {
-	cred := strings.TrimSpace(token.AccessToken)
-	if cred == "" {
-		cred = strings.TrimSpace(token.OpenAIAPIKey)
-	}
-	return !strings.HasPrefix(cred, "sk-ant-api")
+	return accountprovider.EffectiveAuthMethod("claude", token) == accountprovider.AuthMethodOAuth
 }
 
 // streamCopyRewrite copies an upstream SSE stream to the client while replacing

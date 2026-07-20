@@ -23,7 +23,12 @@ type sidecarCapture struct {
 	headers http.Header
 	body    string
 	ja3     string
-	hit     bool
+	// defaultHeaders mirrors the meta's "default_headers" field: nil = absent (sidecar
+	// keeps curl's browser defaults), non-nil = the caller pinned it. The Claude path
+	// pins it false to stop curl-impersonate injecting sec-ch-ua/sec-fetch browser headers
+	// on top of the claude-cli/Node identity.
+	defaultHeaders *bool
+	hit            bool
 }
 
 func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
@@ -35,11 +40,12 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 		}
 		cap.hit = true
 		var payload struct {
-			Method  string              `json:"method"`
-			URL     string              `json:"url"`
-			Headers map[string][]string `json:"headers"`
-			BodyB64 string              `json:"body_b64"`
-			JA3     string              `json:"ja3"`
+			Method         string              `json:"method"`
+			URL            string              `json:"url"`
+			Headers        map[string][]string `json:"headers"`
+			BodyB64        string              `json:"body_b64"`
+			JA3            string              `json:"ja3"`
+			DefaultHeaders *bool               `json:"default_headers"`
 		}
 		raw, _ := io.ReadAll(r.Body)
 		if meta := r.Header.Get("X-Sidecar-Meta"); meta != "" {
@@ -62,6 +68,7 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 		cap.method = payload.Method
 		cap.headers = http.Header(payload.Headers)
 		cap.ja3 = payload.JA3
+		cap.defaultHeaders = payload.DefaultHeaders
 		upstreamHdr := http.Header{"Content-Type": []string{"text/event-stream"}}
 		enc, _ := json.Marshal(upstreamHdr)
 		w.Header().Set("x-sidecar-upstream-status", "200")
@@ -305,5 +312,78 @@ func TestClaudeJA3DisableKeepsChrome(t *testing.T) {
 
 	if cap.ja3 != "" {
 		t.Fatalf("claude_ja3=off must forward no ja3 (Chrome), got %q", cap.ja3)
+	}
+}
+
+// TestClaudeSidecarSuppressesBrowserDefaultHeaders is the relay-fingerprint fix: on the
+// DEFAULT (Chrome-impersonation, no explicit JA3) sidecar path, the Claude request must
+// pin the meta "default_headers": false so the sidecar tells curl-impersonate NOT to
+// inject the browser's own header set (sec-ch-ua*, sec-fetch-*, accept-language,
+// upgrade-insecure-requests). Those browser-only headers riding next to a claude-cli
+// User-Agent + x-stainless-* headers are a combination no genuine Claude Code (Node)
+// client emits — i.e. a clear "impersonation relay" tell to the upstream. The Chrome
+// TLS/HTTP2 impersonation is unaffected (still no ja3 forwarded).
+func TestClaudeSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
+	for _, tok := range []storage.AccountToken{
+		{AccessToken: "sk-ant-oat-xyz"},    // OAuth (Pro/Max)
+		{OpenAIAPIKey: "sk-ant-api03-abc"}, // API key (SDK)
+	} {
+		var cap sidecarCapture
+		sidecar := newFakeSidecar(t, &cap)
+
+		client := NewClient(config.Default())
+		resp, err := client.Do(nilContext(t), Request{
+			Provider:       "claude",
+			DownstreamPath: "/v1/messages",
+			Body:           []byte(`{"stream":true}`),
+			Account:        storage.Account{ID: "acc-claude"},
+			Token:          tok,
+			Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
+		})
+		if err != nil {
+			sidecar.Close()
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		sidecar.Close()
+
+		if cap.defaultHeaders == nil {
+			t.Fatalf("Claude sidecar meta omitted default_headers: browser headers (sec-ch-ua/sec-fetch/*) would be injected onto the claude-cli identity")
+		}
+		if *cap.defaultHeaders {
+			t.Fatalf("Claude sidecar must pin default_headers=false, got true")
+		}
+		// The Chrome TLS/HTTP2 impersonation stays: suppression is headers-only.
+		if cap.ja3 != "" {
+			t.Fatalf("suppression must not change the TLS default; want no ja3, got %q", cap.ja3)
+		}
+	}
+}
+
+// TestCodexOAuthSidecarKeepsBrowserDefaultHeaders guards the deliberate asymmetry: a
+// ChatGPT-OAuth Codex account behind Cloudflare KEEPS curl's browser defaults (no
+// default_headers pin in the meta), because chatgpt.com's CF edge is validated against
+// the Chrome-shaped request. Only Claude (no CF wall) and API-key SDK traffic suppress.
+func TestCodexOAuthSidecarKeepsBrowserDefaultHeaders(t *testing.T) {
+	var cap sidecarCapture
+	sidecar := newFakeSidecar(t, &cap)
+	defer sidecar.Close()
+
+	client := NewClient(config.Default())
+	resp, err := client.Do(nilContext(t), Request{
+		Provider:       "codex",
+		DownstreamPath: "/responses",
+		Body:           []byte(`{"stream":true}`),
+		Account:        storage.Account{ID: "acc-codex"},
+		Token:          storage.AccountToken{AccessToken: "eyJhb.codex.oauth"},
+		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if cap.defaultHeaders != nil {
+		t.Fatalf("Codex OAuth (CF-walled) must keep curl browser defaults; meta pinned default_headers=%v", *cap.defaultHeaders)
 	}
 }

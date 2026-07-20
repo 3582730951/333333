@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/storage"
 	"github.com/google/uuid"
 )
@@ -274,7 +275,7 @@ func (s *Server) codexResetAccountLock(accountID string) func() {
 }
 
 func (s *Server) tryAutoConsumeCodexResetCredit(ctx context.Context, account storage.Account, token storage.AccountToken, egress storage.EgressProfile, triggerAllowed bool, status int, header http.Header, body []byte, source string) bool {
-	if strings.TrimSpace(account.ID) == "" || !triggerAllowed || !s.codexResetCreditsEnabled(ctx, account) {
+	if strings.TrimSpace(account.ID) == "" || accountprovider.UsesAPIKey("codex", token) || !triggerAllowed || !s.codexResetCreditsEnabled(ctx, account) {
 		return false
 	}
 	unlock := s.codexResetAccountLock(account.ID)
@@ -473,7 +474,7 @@ func (s *Server) codexResetCreditsConsumePOST(ctx context.Context, account stora
 }
 
 func applyCodexWhamHeaders(h http.Header, account storage.Account, token storage.AccountToken) {
-	accessToken := strings.TrimSpace(firstNonEmpty(token.AccessToken, token.OpenAIAPIKey))
+	accessToken := accountprovider.Credential("codex", token)
 	if accessToken != "" {
 		h.Set("Authorization", "Bearer "+accessToken)
 	}

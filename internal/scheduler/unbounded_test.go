@@ -205,6 +205,9 @@ func TestMixedClaudeKiroChoosesLeastLoaded(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{{AccountID: "c", ModelSlug: "claude-sonnet-4-6", AvailabilityState: capability.AvailabilityUnverified, Source: "claude_static_unverified"}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.UpsertCapabilities(ctx, capability.StaticKiroModels("k")); err != nil {
 		t.Fatal(err)
 	}

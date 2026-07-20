@@ -1,6 +1,7 @@
 package api
 
 import (
+	"codex-account-pool/internal/accountprovider"
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/storage"
 	"database/sql"
@@ -81,6 +82,7 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		Scopes:             strings.Join(parsed.Scopes, " "),
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
+	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

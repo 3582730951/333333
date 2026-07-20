@@ -203,7 +203,7 @@ func TestCodexHTTPAPIKeyPreservesMaxOutputTokens(t *testing.T) {
 	defer server.Close()
 
 	cfg := config.Default()
-	cfg.UpstreamBaseURL = server.URL + "/v1"
+	cfg.OpenAIAPIUpstreamBaseURL = server.URL + "/v1"
 	client := NewClient(cfg)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",

@@ -282,8 +282,8 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		return nil
 	}
 	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
-	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "token_provider_hint", "access_token_present", "access_token_len", "access_token_type", "refresh_token_present", "refresh_token_len", "openai_api_key_present", "openai_api_key_len", "openai_api_key_type", "id_token_present", "id_token_len", "scopes", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
-	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "native_context_window", "native_max_context_window", "effective_context_window_percent", "auto_compact_token_limit", "visibility", "etag", "raw_model_json_hash", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
+	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
+	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
 	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
@@ -765,8 +765,8 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	}
 
 	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
-	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "token_provider_hint", "access_token_present", "access_token_len", "access_token_type", "refresh_token_present", "refresh_token_len", "openai_api_key_present", "openai_api_key_len", "openai_api_key_type", "id_token_present", "id_token_len", "scopes", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
-	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "native_context_window", "native_max_context_window", "effective_context_window_percent", "auto_compact_token_limit", "visibility", "etag", "raw_model_json_hash", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
+	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
+	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
 	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
@@ -1202,22 +1202,14 @@ func accountAuthMetadataRows(accounts []storage.Account, tokensByID map[string]s
 	out := make([][]string, 0, len(accounts))
 	for _, account := range accounts {
 		token, found := tokensByID[account.ID]
+		provider := accountprovider.EffectiveProvider(account.Provider, token, found)
 		out = append(out, []string{
 			codebook.code(account.ID),
 			account.Provider,
-			accountprovider.EffectiveProvider(account.Provider, token, found),
-			accountprovider.InferProviderFromToken(token),
-			strconv.FormatBool(strings.TrimSpace(token.AccessToken) != ""),
-			strconv.Itoa(len(token.AccessToken)),
-			tokenSecretType(token.AccessToken),
-			strconv.FormatBool(strings.TrimSpace(token.RefreshToken) != ""),
-			strconv.Itoa(len(token.RefreshToken)),
-			strconv.FormatBool(strings.TrimSpace(token.OpenAIAPIKey) != ""),
-			strconv.Itoa(len(token.OpenAIAPIKey)),
-			tokenSecretType(token.OpenAIAPIKey),
-			strconv.FormatBool(strings.TrimSpace(token.IDTokenRaw) != ""),
-			strconv.Itoa(len(token.IDTokenRaw)),
-			token.Scopes,
+			provider,
+			accountprovider.EffectiveAuthMethod(provider, token),
+			accountprovider.BillingMode(provider, token),
+			strconv.FormatBool(strings.TrimSpace(accountprovider.Credential(provider, token)) != ""),
 			itoa64(token.ExpiresAt),
 			itoa64(token.LastRefresh),
 			token.OAuthRateLimitTier,
@@ -1226,22 +1218,6 @@ func accountAuthMetadataRows(accounts []storage.Account, tokensByID map[string]s
 		})
 	}
 	return out
-}
-
-func tokenSecretType(value string) string {
-	value = strings.TrimSpace(value)
-	switch {
-	case value == "":
-		return "missing"
-	case strings.HasPrefix(value, "sk-ant"):
-		return "anthropic"
-	case strings.HasPrefix(value, "sk-"):
-		return "api_key"
-	case strings.Count(value, ".") >= 2:
-		return "jwt"
-	default:
-		return "opaque"
-	}
 }
 
 func modelCapabilityRows(rows []storage.ModelCapability, codebook diagnosticCodebook) [][]string {
@@ -1256,13 +1232,11 @@ func modelCapabilityRows(rows []storage.ModelCapability, codebook diagnosticCode
 		out = append(out, []string{
 			codebook.code(row.AccountID),
 			row.ModelSlug,
+			row.AvailabilityState,
+			row.Context1MState,
+			row.Context1MSource,
 			itoa64(row.NativeContextWindow),
 			itoa64(row.NativeMaxContextWindow),
-			itoa64(row.EffectiveContextWindowPercent),
-			itoa64(row.AutoCompactTokenLimit),
-			row.Visibility,
-			row.ETag,
-			row.RawModelJSONHash,
 			row.Source,
 			itoa64(row.LastProbeAt),
 		})

@@ -76,6 +76,8 @@ const (
 // elsewhere — neither is duplicated here.
 func configFields() []configField {
 	return []configField{
+		{Key: "openai_api_upstream_base_url", Label: "OpenAI Platform Base URL", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
+			Help: "仅供 Codex/OpenAI API Key 账号使用；ChatGPT OAuth 继续使用 WHAM upstream_base_url。", boot: func(c config.Config) interface{} { return c.OpenAIAPIUpstreamBaseURL }},
 		// ── 虚拟身份 / 指纹 ─────────────────────────────────────────────────────
 		{Key: "codex_ja3", Label: "Codex JA3 覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=Chrome(默认，更安全)。设置则 sidecar 尝试重放该 JA3。", boot: func(c config.Config) interface{} { return c.CodexJA3Override }},
@@ -393,6 +395,7 @@ func configFieldCanonicalValue(f configField, stored string) interface{} {
 // every settings PATCH that touches an effectUpstream field.
 func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 	c := s.cfg
+	c.OpenAIAPIUpstreamBaseURL = s.settingString(ctx, "openai_api_upstream_base_url", c.OpenAIAPIUpstreamBaseURL)
 	c.CodexJA3Override = s.settingString(ctx, "codex_ja3", c.CodexJA3Override)
 	c.ClaudeJA3Override = s.settingString(ctx, "claude_ja3", c.ClaudeJA3Override)
 	c.ClaudeForceDirect = s.flagEnabled(ctx, "claude_force_direct", c.ClaudeForceDirect)

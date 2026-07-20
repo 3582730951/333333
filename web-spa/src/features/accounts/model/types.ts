@@ -7,6 +7,17 @@ export interface AccountUsage {
   [key: string]: unknown;
 }
 
+export interface AccountModelCapability {
+  model_slug?: string;
+  availability_state?: 'verified' | 'unverified' | 'unsupported' | string;
+  context_1m_state?: 'supported' | 'unsupported' | 'unknown' | string;
+  context_1m_source?: string;
+  native_context_window?: number;
+  native_max_context_window?: number;
+  source?: string;
+  [key: string]: unknown;
+}
+
 export interface AccountRow {
   id: string;
   label?: string;
@@ -15,8 +26,12 @@ export interface AccountRow {
   status?: string;
   group_name?: string;
   plan_type?: string;
+  auth_method?: 'oauth' | 'access_token' | 'api_key' | string;
+  billing_mode?: 'subscription' | 'pay_as_you_go' | string;
+  api_key_present?: boolean;
   quarantine_until?: number;
   quarantine_reason?: string;
+  capabilities?: AccountModelCapability[];
   usage?: AccountUsage | null;
   [key: string]: unknown;
 }

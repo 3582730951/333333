@@ -11,8 +11,20 @@ const accountSchema = z.object({
   status: z.string().optional(),
   group_name: z.string().optional(),
   plan_type: z.string().optional(),
+  auth_method: z.string().optional(),
+  billing_mode: z.string().optional(),
+  api_key_present: z.boolean().optional(),
   quarantine_until: z.number().optional(),
   quarantine_reason: z.string().optional(),
+  capabilities: z.array(z.object({
+    model_slug: z.string().optional(),
+    availability_state: z.string().optional(),
+    context_1m_state: z.string().optional(),
+    context_1m_source: z.string().optional(),
+    native_context_window: z.coerce.number().optional(),
+    native_max_context_window: z.coerce.number().optional(),
+    source: z.string().optional(),
+  }).passthrough()).optional(),
   usage: z.record(z.string(), z.unknown()).nullable().optional(),
 }).passthrough();
 

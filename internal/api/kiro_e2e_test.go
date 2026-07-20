@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/capability"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -887,6 +888,108 @@ func TestKiroContentLengthRetryTrimsOldestTurnOnlyAfterReducedOutputFails(t *tes
 	}
 	if response.Header.Get("X-Pool-Kiro-History-Messages-Dropped") == "" {
 		t.Fatalf("trim diagnostics missing: %v", response.Header)
+	}
+}
+
+func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
+	var compactRequests int
+	var fullHistoryForwarded bool
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			body, _ := io.ReadAll(r.Body)
+			if bytes.Contains(body, []byte("Your task is to create a detailed summary of the conversation so far")) {
+				compactRequests++
+				fullHistoryForwarded = bytes.Contains(body, []byte("historic-context-")) && bytes.Contains(body, []byte("tail-marker-before-compaction"))
+			}
+			w.Header().Set("Content-Type", "application/vnd.amazon.eventstream")
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"compact summary"}`)))
+			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":278032,"outputTokens":120,"totalTokens":278152}}`)))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	account := importKiroEndpointForTest(t, h, kiroMock.URL, "compact-window-key")
+	if !strings.Contains(strings.ToUpper(account.PlanType), "PRO") {
+		t.Fatalf("imported Kiro plan=%q, want paid plan evidence", account.PlanType)
+	}
+	endpointHash, err := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.ObserveKiroCapability(context.Background(), account.ID, endpointHash, "claude-opus-4.8", storage.KiroCapabilityObservation{ModelSucceeded: true, ThinkingRequested: true}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	history := strings.Repeat("historic-context-", 65_000) + "tail-marker-before-compaction"
+	request := func(system, finalInstruction, session string) (*http.Response, []byte) {
+		payload, _ := json.Marshal(map[string]any{
+			"model":  "claude-opus-4-8",
+			"system": system,
+			"messages": []any{
+				map[string]any{"role": "user", "content": history},
+				map[string]any{"role": "assistant", "content": "previous answer"},
+				map[string]any{"role": "user", "content": finalInstruction},
+			},
+		})
+		req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Pool-Provider", "kiro")
+		req.Header.Set("X-Claude-Code-Session-Id", session)
+		resp, requestErr := http.DefaultClient.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, body
+	}
+
+	ordinary, ordinaryBody := request("You are Claude Code", "continue ordinary work", "ordinary-over-200k")
+	if ordinary.StatusCode != http.StatusBadRequest || ordinary.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" || !bytes.Contains(ordinaryBody, []byte("请运行 /compact")) {
+		t.Fatalf("ordinary oversized request was relaxed: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
+	}
+
+	compactSystem := "You are a helpful AI assistant tasked with summarizing conversations."
+	compactInstruction := "Your task is to create a detailed summary of the conversation so far, preserving every technical decision."
+	if err := h.store.SetAccountPlanType(context.Background(), account.ID, "KIRO FREE"); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+	freeResponse, freeBody := request(compactSystem, compactInstruction, "compact-free")
+	if freeResponse.StatusCode != http.StatusBadRequest || !bytes.Contains(freeBody, []byte(`"code":"claude_context_1m_unavailable"`)) {
+		t.Fatalf("free Kiro compact bypassed entitlement: status=%d body=%s", freeResponse.StatusCode, freeBody)
+	}
+
+	if err := h.store.SetAccountPlanType(context.Background(), account.ID, "KIRO PRO"); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+	compactResponse, compactBody := request(compactSystem, compactInstruction, "compact-paid")
+	if compactResponse.StatusCode != http.StatusOK || !bytes.Contains(compactBody, []byte("compact summary")) {
+		t.Fatalf("paid compact status=%d body=%s", compactResponse.StatusCode, compactBody)
+	}
+	if compactResponse.Header.Get("X-Pool-Kiro-Context-Window") != "1000000" || compactRequests != 1 || !fullHistoryForwarded {
+		t.Fatalf("compact did not use lossless extended window: headers=%v requests=%d full_history=%v", compactResponse.Header, compactRequests, fullHistoryForwarded)
+	}
+	caps, err := h.store.ListCapabilities(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextVerified := false
+	for _, capRow := range caps {
+		if canonical, ok := capability.KiroCanonicalModel(capRow.ModelSlug); ok && canonical == "claude-opus-4.8" && capRow.Context1MState == capability.Context1MSupported {
+			contextVerified = true
+		}
+	}
+	if !contextVerified {
+		t.Fatalf("successful compact did not persist 1M runtime evidence: %+v", caps)
 	}
 }
 

@@ -229,8 +229,11 @@ type Route struct {
 	KiroDefaultRegion     string
 	// Movable is kept for existing call sites/tests that already computed
 	// !ServerSideState. New callers should set ServerSideState directly.
-	Movable         bool
-	Model           string
+	Movable bool
+	Model   string
+	// ContextMode is part of routing identity and capability selection. "1m"
+	// requires account-scoped evidence and may never fall through to a 200K account.
+	ContextMode     string
 	EstimatedTokens int64
 	Compaction      bool
 	// Exclude lists account IDs that must not be selected for this call — the
@@ -591,7 +594,7 @@ func routeProvidersKey(route Route) string {
 }
 
 func schedulerQueueKey(route Route) string {
-	return route.Group + "\x00" + route.Model + "\x00" + routeProvidersKey(route)
+	return route.Group + "\x00" + route.Model + "\x00" + strings.ToLower(strings.TrimSpace(route.ContextMode)) + "\x00" + routeProvidersKey(route)
 }
 
 func (s *Scheduler) enqueue(route Route, reason string) (string, *waiter) {
@@ -808,6 +811,23 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	for _, awe := range accountsWithEgress {
 		accountIDs = append(accountIDs, awe.Account.ID)
 	}
+	capabilitiesByAccount := map[string][]storage.ModelCapability{}
+	if capabilityRouteModel(route.Model) {
+		if loaded, loadErr := s.store.ListCapabilitiesSummaryByAccountIDs(ctx, accountIDs); loadErr == nil {
+			capabilitiesByAccount = loaded
+		} else {
+			return Lease{}, loadErr
+		}
+		authority, loadErr := s.store.ListModelCatalogAuthorityByAccountIDs(ctx, accountIDs)
+		if loadErr != nil {
+			return Lease{}, loadErr
+		}
+		for accountID, authoritative := range authority {
+			if authoritative {
+				capabilitiesByAccount[accountID] = append(capabilitiesByAccount[accountID], modelCatalogAuthorityMarker())
+			}
+		}
+	}
 	// Load every candidate's quota snapshots in one query (chunked by storage for
 	// large pools). The old per-candidate AccountRateLimitCooldownUntil call made
 	// account selection O(N) SQLite round-trips under load.
@@ -834,7 +854,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 
 	var capable map[string]bool
 	if route.Model != "" {
-		if m, err := s.modelsSnapshot(ctx, route.Group, route.Model); err == nil && len(m) > 0 {
+		if m, err := s.modelsSnapshot(ctx, route.Group, route.Model, route.ContextMode); err == nil && len(m) > 0 {
 			capable = m
 		}
 	}
@@ -877,9 +897,23 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		}
 		resolvedModel := route.Model
 		bootstrap := false
-		if accountProvider == "kiro" && route.Model != "" {
+		if accountProvider == "kiro" && capabilityRouteModel(route.Model) {
 			var modelOK bool
 			resolvedModel, bootstrap, modelOK = s.resolveKiroRouteModel(ctx, account, route)
+			if !modelOK {
+				counters.ModelUnsupported++
+				continue
+			}
+		} else if accountProvider == "claude" && capabilityRouteModel(route.Model) {
+			var modelOK bool
+			resolvedModel, bootstrap, modelOK = resolveClaudeRouteModel(route, capabilitiesByAccount[account.ID])
+			if !modelOK {
+				counters.ModelUnsupported++
+				continue
+			}
+		} else if accountProvider == "codex" && capabilityRouteModel(route.Model) {
+			var modelOK bool
+			resolvedModel, bootstrap, modelOK = resolveCodexRouteModel(route, capabilitiesByAccount[account.ID])
 			if !modelOK {
 				counters.ModelUnsupported++
 				continue
@@ -887,8 +921,6 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		} else if capable != nil && !capable[account.ID] {
 			counters.ModelUnsupported++
 			continue
-		} else if accountProvider == "claude" {
-			resolvedModel = capability.NormalizeClaudeModelAlias(route.Model)
 		}
 		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited {
 			counters.RateLimitCooldown++
@@ -1114,8 +1146,8 @@ func (s *Scheduler) rateLimitsSnapshot(ctx context.Context, group string, accoun
 	return rows, nil
 }
 
-func (s *Scheduler) modelsSnapshot(ctx context.Context, group, model string) (map[string]bool, error) {
-	key := group + "\x00" + model
+func (s *Scheduler) modelsSnapshot(ctx context.Context, group, model, contextMode string) (map[string]bool, error) {
+	key := group + "\x00" + model + "\x00" + strings.ToLower(strings.TrimSpace(contextMode))
 	s.accountCacheMutex.RLock()
 	rows, ok := s.modelCache[key]
 	at := s.auxCacheAt["model:"+key]
@@ -1132,7 +1164,7 @@ func (s *Scheduler) modelsSnapshot(ctx context.Context, group, model string) (ma
 	if ok && time.Since(at) < time.Second {
 		return rows, nil
 	}
-	rows, err := s.store.AccountsWithModel(ctx, group, model)
+	rows, err := s.store.AccountsWithModelAndContext(ctx, group, model, contextMode)
 	if err != nil {
 		return nil, err
 	}
@@ -1210,6 +1242,97 @@ func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding st
 	return false
 }
 
+func capabilityRouteModel(model string) bool {
+	model = strings.TrimSpace(model)
+	return model != "" && !strings.HasPrefix(strings.ToLower(model), "resource:")
+}
+
+func resolveClaudeRouteModel(route Route, caps []storage.ModelCapability) (string, bool, bool) {
+	parsed, err := capability.ParseRequestedClaudeModel(route.Model)
+	if err != nil {
+		return "", false, false
+	}
+	requested := parsed.BaseModel
+	context1M := strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") || parsed.ContextMode == "1m"
+	if capability.ClaudeModelAlias(requested) {
+		resolved, ok := capability.ResolveClaudeModel(requested, caps, context1M)
+		return resolved, false, ok
+	}
+	canonical := canonicalClaudeRouteModel(requested)
+	for _, c := range caps {
+		if canonicalClaudeRouteModel(c.ModelSlug) != canonical {
+			continue
+		}
+		if c.AvailabilityState == capability.AvailabilityUnsupported {
+			// model_not_found is scoped to this exact account/model. It must
+			// survive catalog bootstrap while leaving other models eligible.
+			return "", false, false
+		}
+		if context1M && c.Context1MState != capability.Context1MSupported {
+			return "", false, false
+		}
+		// A persisted exact discovery hint is sufficient to try this account and is
+		// stronger than a Kiro static bootstrap. Runtime success still promotes the
+		// row to verified; this flag only controls candidate ordering.
+		return c.ModelSlug, false, true
+	}
+	// No authoritative catalog exists yet: a concrete standard-window request may
+	// bootstrap and turn the inference response into runtime evidence. Static hints
+	// must not turn absence into an unsupported verdict. Aliases and 1M still require
+	// an explicit candidate capability.
+	if !capabilityCatalogAuthoritative(caps) && !context1M && canonical != "" {
+		return requested, true, true
+	}
+	return "", false, false
+}
+
+func resolveCodexRouteModel(route Route, caps []storage.ModelCapability) (string, bool, bool) {
+	requested := strings.TrimSpace(route.Model)
+	for _, c := range caps {
+		if !strings.EqualFold(strings.TrimSpace(c.ModelSlug), requested) {
+			continue
+		}
+		if c.AvailabilityState == capability.AvailabilityUnsupported {
+			return "", false, false
+		}
+		return c.ModelSlug, false, true
+	}
+	if !capabilityCatalogAuthoritative(caps) && requested != "" {
+		return requested, true, true
+	}
+	return "", false, false
+}
+
+func capabilityCatalogAuthoritative(caps []storage.ModelCapability) bool {
+	for _, c := range caps {
+		if c.AvailabilityState != capability.AvailabilityVerified {
+			continue
+		}
+		source := strings.ToLower(strings.TrimSpace(c.Source))
+		// A successful /models catalog is authoritative for absence. Runtime
+		// inference/rejection is evidence for one exact model only and must not
+		// prevent a different concrete model from being tried on the account.
+		if strings.Contains(source, "probe") && !strings.Contains(source, "static") && !strings.Contains(source, "unknown") {
+			return true
+		}
+		if !strings.Contains(source, "runtime") && !strings.Contains(source, "static") && !strings.Contains(source, "unknown") {
+			return true
+		}
+	}
+	return false
+}
+
+func modelCatalogAuthorityMarker() storage.ModelCapability {
+	return storage.ModelCapability{
+		AvailabilityState: capability.AvailabilityVerified,
+		Source:            "catalog_probe_marker",
+	}
+}
+
+func canonicalClaudeRouteModel(model string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(model)), ".", "-")
+}
+
 // resolveKiroRouteModel returns a canonical Kiro model plus whether selecting it
 // would be a bootstrap attempt. Aliases are resolved exclusively from runtime-
 // verified capabilities. A concrete model may bootstrap only when the account's
@@ -1241,13 +1364,22 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 		return "", false, false
 	}
 	if capability.KiroModelAlias(route.Model) {
+		if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") && !capability.KiroPlanAllows1M(account.PlanType, resolved) {
+			return "", false, false
+		}
 		return resolved, false, true
 	}
 	for _, model := range verified {
 		canonical, modelOK := capability.KiroCanonicalModel(model)
 		if modelOK && canonical == resolved {
+			if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") && !capability.KiroPlanAllows1M(account.PlanType, resolved) {
+				return "", false, false
+			}
 			return resolved, false, true
 		}
+	}
+	if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") {
+		return "", false, false
 	}
 	if !capability.KiroSupportsAdaptiveThinking(resolved) {
 		return "", false, false
@@ -1321,14 +1453,31 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		return Lease{}, leaseBlockProviderMismatch, false
 	}
 	resolvedModel := route.Model
-	if accountProvider == "kiro" && route.Model != "" {
+	if accountProvider == "kiro" && capabilityRouteModel(route.Model) {
 		var ok bool
 		resolvedModel, _, ok = s.resolveKiroRouteModel(ctx, account, route)
 		if !ok {
 			return Lease{}, leaseBlockModelUnsupported, false
 		}
-	} else if accountProvider == "claude" && route.Model != "" {
-		resolvedModel = capability.NormalizeClaudeModelAlias(route.Model)
+	} else if (accountProvider == "claude" || accountProvider == "codex") && capabilityRouteModel(route.Model) {
+		caps, err := s.store.ListCapabilities(ctx, account.ID)
+		if err != nil {
+			return Lease{}, leaseBlockModelUnsupported, false
+		}
+		if authoritative, authorityErr := s.store.ModelCatalogAuthoritative(ctx, account.ID); authorityErr != nil {
+			return Lease{}, leaseBlockModelUnsupported, false
+		} else if authoritative {
+			caps = append(caps, modelCatalogAuthorityMarker())
+		}
+		var ok bool
+		if accountProvider == "claude" {
+			resolvedModel, _, ok = resolveClaudeRouteModel(route, caps)
+		} else {
+			resolvedModel, _, ok = resolveCodexRouteModel(route, caps)
+		}
+		if !ok {
+			return Lease{}, leaseBlockModelUnsupported, false
+		}
 	}
 	rateRows, rateErr := s.rateLimitsSnapshot(ctx, route.Group, []string{accountID})
 	provider := providerForRoute(s, ctx, account, route)
@@ -1785,7 +1934,7 @@ func (s *Scheduler) shortestCooldown(ctx context.Context, group, provider, model
 	now := storage.Now()
 	var capable map[string]bool
 	if model != "" {
-		if m, err := s.modelsSnapshot(ctx, group, model); err == nil && len(m) > 0 {
+		if m, err := s.modelsSnapshot(ctx, group, model, ""); err == nil && len(m) > 0 {
 			capable = m
 		}
 	}
@@ -1978,7 +2127,7 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 	now := storage.Now()
 	var capable map[string]bool
 	if model != "" {
-		if m, err := s.modelsSnapshot(ctx, group, model); err == nil && len(m) > 0 {
+		if m, err := s.modelsSnapshot(ctx, group, model, ""); err == nil && len(m) > 0 {
 			capable = m
 		}
 	}

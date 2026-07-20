@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/storage"
 )
@@ -472,6 +473,7 @@ func (s *Server) applyCodexReauthParsed(ctx context.Context, accountID string, p
 		Scopes:       strings.Join(parsed.Scopes, " "),
 		CreatedAt:    storage.Now(),
 	}
+	token.AuthMethod = accountprovider.AuthMethodOAuth
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return storage.Account{}, err
 	}

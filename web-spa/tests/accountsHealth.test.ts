@@ -4,12 +4,16 @@ import {
   healthResultPresentation,
   healthTestRequestBody,
   isKiroSuspended,
+  isProtectedProbeQuarantine,
+  isProviderAPIKeyAccount,
+  selectedHasPaidProbe,
   selectedHasKiro,
 } from '../src/features/accounts/model/healthTest';
 
 describe('Kiro health-test UI contracts', () => {
   const kiro = { id: 'kiro-1', provider: 'kiro' };
   const codex = { id: 'codex-1', provider: 'codex' };
+  const platform = { id: 'platform-1', provider: 'codex', auth_method: 'api_key' };
 
   it('requires cost confirmation only for selected Kiro accounts', () => {
     expect(selectedHasKiro([kiro, codex], ['codex-1'])).toBe(false);
@@ -17,6 +21,20 @@ describe('Kiro health-test UI contracts', () => {
     expect(healthTestRequestBody(codex, true)).toEqual({});
     expect(healthTestRequestBody(kiro, false)).toEqual({});
     expect(healthTestRequestBody(kiro, true)).toEqual({ confirm_cost: true });
+  });
+
+  it('requires the same explicit cost confirmation for provider API-key probes', () => {
+    expect(isProviderAPIKeyAccount(platform)).toBe(true);
+    expect(selectedHasPaidProbe([codex, platform], ['platform-1'])).toBe(true);
+    expect(healthTestRequestBody(platform, false)).toEqual({});
+    expect(healthTestRequestBody(platform, true)).toEqual({ confirm_cost: true });
+    expect(isProtectedProbeQuarantine({ ...platform, quarantine_reason: 'provider_api_key_inference_probe_failed:billing_error' })).toBe(true);
+    expect(isProtectedProbeQuarantine({ ...platform, quarantine_reason: 'provider_api_key_inference_probe_pending' })).toBe(true);
+    expect(healthResultPresentation({
+      provider: 'codex', auth_method: 'api_key', ready: false,
+      auth_probe: { alive: true, state: 'alive' },
+      inference_probe: { checked: true, alive: false, state: 'inference_failed', error_code: 'billing_error' },
+    })).toEqual({ tone: 'error', message: '认证正常；推理失败（inference_failed）' });
   });
 
   it('distinguishes auth health from suspended and unchecked inference', () => {

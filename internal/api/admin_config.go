@@ -6,6 +6,7 @@ package api
 
 import (
 	"bytes"
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
@@ -269,6 +270,10 @@ func (s *Server) adminHealthTest(w http.ResponseWriter, r *http.Request, account
 		s.adminKiroHealthTest(w, r, account, token)
 		return
 	}
+	if accountprovider.UsesAPIKey(s.accountProvider(account, token), token) && (s.accountProvider(account, token) == "codex" || s.accountProvider(account, token) == "claude") {
+		s.adminProviderAPIKeyHealthTest(w, r, account, token)
+		return
+	}
 	res := s.probeAccountLiveness(r.Context(), account, token)
 	if res.Err != nil {
 		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
@@ -382,6 +387,25 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
 	if err != nil {
 		res.Err = err
+		return res
+	}
+	if accountprovider.UsesAPIKey(provider, token) && (provider == "codex" || provider == "claude") {
+		res.ProbeScope = "account_auth_models"
+		res.ModelChecked = false
+		stage, caps := s.runProviderAPIKeyAuthProbe(ctx, account, token, egress)
+		res.Status = stage.HTTPStatus
+		res.Alive = stage.Alive
+		res.Ready = stage.Alive
+		if stage.ErrorCode != "" {
+			res.Body, _ = json.Marshal(map[string]interface{}{"error": map[string]interface{}{"code": stage.ErrorCode}})
+		}
+		res.Verdict = ban.Classify(stage.Alive, stage.HTTPStatus, http.Header{}, res.Body)
+		if stage.State == "unreachable" {
+			res.Err = errors.New(firstNonEmpty(stage.ErrorCode, "provider API key authentication probe failed"))
+		}
+		if stage.Alive {
+			_ = s.store.ReplaceCapabilities(ctx, account.ID, caps)
+		}
 		return res
 	}
 	model := ""

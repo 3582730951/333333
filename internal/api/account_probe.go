@@ -48,9 +48,6 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		return s.probeClaudeModels(ctx, account, token, binding, egress)
 	case "kiro":
 		caps := capability.StaticKiroModels(account.ID)
-		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
-			return nil, err
-		}
 		cred, err := s.store.GetKiroCredentials(ctx, account.ID)
 		if err != nil {
 			return nil, err
@@ -67,6 +64,62 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		if err := s.store.EnsureKiroRuntimeModels(ctx, account.ID, endpointHash, models); err != nil {
 			return nil, err
 		}
+		verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, true)
+		if err != nil {
+			return nil, err
+		}
+		verifiedByCanonical := map[string]string{}
+		for _, model := range verified {
+			if canonical, ok := capability.KiroCanonicalModel(model); ok {
+				verifiedByCanonical[canonical] = model
+			}
+		}
+		existingByCanonical := map[string]storage.ModelCapability{}
+		if existing, listErr := s.store.ListCapabilities(ctx, account.ID); listErr == nil {
+			for _, current := range existing {
+				if canonical, ok := capability.KiroCanonicalModel(current.ModelSlug); ok {
+					existingByCanonical[canonical] = current
+				}
+			}
+		}
+		seen := map[string]bool{}
+		for i := range caps {
+			canonical, ok := capability.KiroCanonicalModel(caps[i].ModelSlug)
+			if !ok {
+				continue
+			}
+			seen[canonical] = true
+			if _, ok := verifiedByCanonical[canonical]; !ok {
+				continue
+			}
+			caps[i].AvailabilityState = capability.AvailabilityVerified
+			caps[i].Source = "kiro_runtime_inference"
+			if prior, ok := existingByCanonical[canonical]; ok {
+				caps[i].Context1MState = prior.Context1MState
+				caps[i].Context1MSource = prior.Context1MSource
+			}
+		}
+		for canonical, runtimeModel := range verifiedByCanonical {
+			if seen[canonical] {
+				continue
+			}
+			model := firstNonEmpty(runtimeModel, canonical)
+			window := capability.KiroContextWindow(model)
+			cap := storage.ModelCapability{
+				AccountID: account.ID, ModelSlug: model, AvailabilityState: capability.AvailabilityVerified,
+				Context1MState: capability.Context1MUnknown, NativeContextWindow: 200000,
+				NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100,
+				Source: "kiro_runtime_inference", LastProbeAt: storage.Now(),
+			}
+			if prior, ok := existingByCanonical[canonical]; ok {
+				cap.Context1MState = prior.Context1MState
+				cap.Context1MSource = prior.Context1MSource
+			}
+			caps = append(caps, cap)
+		}
+		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+			return nil, err
+		}
 		return caps, nil
 	case "codex":
 		// fall through to the Codex /models probe below
@@ -75,9 +128,15 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		return s.probeCustomModels(ctx, account, token, binding, egress, provider)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
+		probePath := capability.ProbePath(s.cfg.ClientVersion)
+		clientVersion := s.cfg.ClientVersion
+		if accountprovider.UsesAPIKey("codex", token) {
+			probePath = "/v1/models"
+			clientVersion = ""
+		}
 		resp, err := s.upstream.Do(ctx, upstream.Request{
 			Method:         http.MethodGet,
-			DownstreamPath: capability.ProbePath(s.cfg.ClientVersion),
+			DownstreamPath: probePath,
 			Headers:        http.Header{},
 			Account:        account,
 			Token:          token,
@@ -87,20 +146,20 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 			// ?client_version= query, so the probe request is internally coherent. The
 			// ChatGPT /models backend gates the catalog by client_version; a stale value
 			// here is exactly why the newest models never came back.
-			CodexClientVersion: s.cfg.ClientVersion,
+			CodexClientVersion: clientVersion,
 		})
 		if err != nil {
 			log.Printf("codex model probe %s: %v; using static model set", account.ID, err)
-			return s.upsertStaticCodexModels(ctx, account.ID)
+			return s.existingOrStaticCodexModels(ctx, account.ID)
 		}
 		raw, err := upstream.DrainAndClose(resp.Body)
 		if err != nil {
 			log.Printf("codex model probe %s: read body: %v; using static model set", account.ID, err)
-			return s.upsertStaticCodexModels(ctx, account.ID)
+			return s.existingOrStaticCodexModels(ctx, account.ID)
 		}
 		if resp.StatusCode >= 400 {
 			v := ban.Classify(false, resp.StatusCode, resp.Header, raw)
-			if attempt == 0 && v.State == ban.AuthExpired {
+			if attempt == 0 && v.State == ban.AuthExpired && !accountprovider.UsesAPIKey("codex", token) {
 				if refreshed, rerr := s.refreshCodexToken(ctx, token); rerr == nil && refreshed.Refreshed {
 					token = refreshed.Token
 					continue
@@ -114,30 +173,23 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 				snippet = snippet[:200]
 			}
 			log.Printf("codex model probe %s: upstream %d (%s); using static model set", account.ID, resp.StatusCode, snippet)
-			return s.upsertStaticCodexModels(ctx, account.ID)
+			return s.existingOrStaticCodexModels(ctx, account.ID)
 		}
 		caps, err := capability.Parse(account.ID, raw, capability.ETagFromHeader(resp.Header))
 		if err != nil {
 			log.Printf("codex model probe %s: parse: %v; using static model set", account.ID, err)
-			return s.upsertStaticCodexModels(ctx, account.ID)
+			return s.existingOrStaticCodexModels(ctx, account.ID)
 		}
-		if len(caps) == 0 {
-			log.Printf("codex model probe %s: empty model set; using static model set", account.ID)
-			return s.upsertStaticCodexModels(ctx, account.ID)
-		}
-		caps = capability.MergeCodexStatic(account.ID, caps)
-		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+		if err := s.store.ReplaceCapabilities(ctx, account.ID, caps); err != nil {
 			return nil, err
 		}
 		return caps, nil
 	}
-	return s.upsertStaticCodexModels(ctx, account.ID)
+	return s.existingOrStaticCodexModels(ctx, account.ID)
 }
 
-// upsertStaticCodexModels stores (and returns) the curated current-generation Codex
-// catalog for an account. It is the fallback when the live ChatGPT /models probe is
-// unavailable, so a transient probe failure never leaves a Codex account with an
-// empty or stale model set. A probe failure NEVER bans the account.
+// upsertStaticCodexModels stores unverified discovery hints when the live ChatGPT
+// model list is unavailable. A probe failure never bans the account.
 func (s *Server) upsertStaticCodexModels(ctx context.Context, accountID string) ([]storage.ModelCapability, error) {
 	caps := capability.StaticCodexModels(accountID)
 	if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
@@ -146,21 +198,33 @@ func (s *Server) upsertStaticCodexModels(ctx context.Context, accountID string) 
 	return caps, nil
 }
 
+func (s *Server) existingOrStaticCodexModels(ctx context.Context, accountID string) ([]storage.ModelCapability, error) {
+	if caps, err := s.store.ListCapabilities(ctx, accountID); err == nil {
+		// Preserve both runtime verification and exact model_not_found evidence.
+		// Replacing a non-empty catalog with bundled hints would erase an
+		// account/model-scoped rejection and make the next request retry it.
+		if len(caps) > 0 {
+			return caps, nil
+		}
+		if authoritative, authorityErr := s.store.ModelCatalogAuthoritative(ctx, accountID); authorityErr == nil && authoritative {
+			return caps, nil
+		}
+	}
+	return s.upsertStaticCodexModels(ctx, accountID)
+}
+
 // probeClaudeModels populates a Claude account's model capabilities. It first
 // asks Anthropic's GET /v1/models through the account (so the advertised set
-// reflects what the account can actually use), and falls back to a curated
-// static current-generation model set when that endpoint is unavailable — an
-// OAuth (sk-ant-oat) token is scoped to inference and may be rejected by the
-// models-listing endpoint. The reference relay (CLIProxyAPI) ships Claude models
-// as a static registry for exactly this reason, so the fallback is faithful, not
-// a guess. Either way the UI and /v1/models stop showing an empty/failed set.
-// A probe failure here NEVER bans the account: capability discovery is advisory.
+// reflects what the account can actually use), and falls back to unverified static
+// discovery hints when that endpoint is unavailable. Successful live results,
+// including an empty catalog, are authoritative. A probe failure never bans the
+// account: capability discovery is advisory.
 func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account, token storage.AccountToken, binding storage.AccountEgressBinding, egress storage.EgressProfile) ([]storage.ModelCapability, error) {
 	var err error
 	token, err = s.prepareClaudeToken(ctx, account, token, "model_probe_preflight")
 	if err != nil {
 		log.Printf("claude model probe %s: refresh wait: %v; using static model set", account.ID, err)
-		return s.upsertStaticClaudeModels(ctx, account.ID)
+		return s.existingOrStaticClaudeModels(ctx, account, token)
 	}
 	requestForToken := func(t storage.AccountToken) upstream.Request {
 		return upstream.Request{
@@ -188,9 +252,9 @@ func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account,
 						raw, derr = upstream.DrainAndClose(retryResp.Body)
 						resp = retryResp
 						if derr == nil && resp.StatusCode < 400 {
-							if caps, perr := capability.ParseClaudeModels(account.ID, raw, capability.ETagFromHeader(resp.Header)); perr == nil && len(caps) > 0 {
-								caps = capability.MergeClaudeStatic(account.ID, caps)
-								if uerr := s.store.UpsertCapabilities(ctx, caps); uerr != nil {
+							if caps, perr := capability.ParseClaudeModels(account.ID, raw, capability.ETagFromHeader(resp.Header)); perr == nil {
+								caps = capability.ApplyClaudeAccountPolicy(caps, account, token)
+								if uerr := s.store.ReplaceCapabilities(ctx, account.ID, caps); uerr != nil {
 									return nil, uerr
 								}
 								return caps, nil
@@ -205,14 +269,9 @@ func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account,
 			}
 			log.Printf("claude model probe %s: upstream %d (%s); using static model set", account.ID, resp.StatusCode, snippet)
 		default:
-			if caps, perr := capability.ParseClaudeModels(account.ID, raw, capability.ETagFromHeader(resp.Header)); perr == nil && len(caps) > 0 {
-				// Union the curated current-gen set as a floor: a live probe is
-				// authoritative for what the account exposes, but Anthropic's
-				// /v1/models can lag a freshly shipped model (e.g. claude-opus-4-8),
-				// so without this floor the newest model would stay hidden even on a
-				// "successful" probe. MergeClaudeStatic keeps probe entries on conflict.
-				caps = capability.MergeClaudeStatic(account.ID, caps)
-				if uerr := s.store.UpsertCapabilities(ctx, caps); uerr != nil {
+			if caps, perr := capability.ParseClaudeModels(account.ID, raw, capability.ETagFromHeader(resp.Header)); perr == nil {
+				caps = capability.ApplyClaudeAccountPolicy(caps, account, token)
+				if uerr := s.store.ReplaceCapabilities(ctx, account.ID, caps); uerr != nil {
 					return nil, uerr
 				}
 				return caps, nil
@@ -223,15 +282,31 @@ func (s *Server) probeClaudeModels(ctx context.Context, account storage.Account,
 	} else {
 		log.Printf("claude model probe %s: %v; using static model set", account.ID, err)
 	}
-	return s.upsertStaticClaudeModels(ctx, account.ID)
+	return s.existingOrStaticClaudeModels(ctx, account, token)
 }
 
-func (s *Server) upsertStaticClaudeModels(ctx context.Context, accountID string) ([]storage.ModelCapability, error) {
-	caps := capability.StaticClaudeModels(accountID)
+func (s *Server) upsertStaticClaudeModels(ctx context.Context, account storage.Account, token storage.AccountToken) ([]storage.ModelCapability, error) {
+	caps := capability.ApplyClaudeAccountPolicy(capability.StaticClaudeModels(account.ID), account, token)
 	if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
 		return nil, err
 	}
 	return caps, nil
+}
+
+func (s *Server) existingOrStaticClaudeModels(ctx context.Context, account storage.Account, token storage.AccountToken) ([]storage.ModelCapability, error) {
+	if caps, err := s.store.ListCapabilities(ctx, account.ID); err == nil {
+		if len(caps) > 0 {
+			caps = capability.ApplyClaudeAccountPolicy(caps, account, token)
+			if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+				return nil, err
+			}
+			return caps, nil
+		}
+		if authoritative, authorityErr := s.store.ModelCatalogAuthoritative(ctx, account.ID); authorityErr == nil && authoritative {
+			return caps, nil
+		}
+	}
+	return s.upsertStaticClaudeModels(ctx, account, token)
 }
 
 // accountProvider resolves an account's upstream provider, preferring the explicit
@@ -513,7 +588,12 @@ func (s *Server) adminRefresh(w http.ResponseWriter, r *http.Request, accountID 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	switch provider := s.accountProvider(account, token); {
+	provider := s.accountProvider(account, token)
+	if accountprovider.UsesAPIKey(provider, token) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "refreshed": false, "reason": "api_key credentials are static"})
+		return
+	}
+	switch {
 	case provider == "claude":
 		s.refreshClaude(w, r, token)
 		return

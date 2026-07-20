@@ -64,7 +64,16 @@ async def proxy(writer,payload:dict[str,Any],body:bytes):
  method=str(payload.get("method") or "POST").upper();url=str(payload["url"]);jar=str(payload.get("cookie_jar_key") or "default");proxy_url=str(payload.get("proxy") or "").strip();ja3=str(payload.get("ja3") or "").strip();akamai=str(payload.get("akamai") or "").strip()
  key=(proxy_url,ja3,akamai,jar);session=await session_for(key);_session_active[key]=_session_active.get(key,0)+1;kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":body or None,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
  if proxy_url:kwargs["proxy"]=proxy_url
+ # default_headers gates curl-impersonate's INJECTION of the browser's own header set
+ # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests, …) ON TOP of the
+ # caller-supplied headers. An explicit ja3 already disables it (exact-header replay). When
+ # no ja3 is set the caller may still opt out via {"default_headers": false}: the Go layer
+ # builds a complete, authentic client header set from scratch (e.g. the claude-cli/Node
+ # fingerprint), so the browser extras are pure noise that would out the request as an
+ # impersonation relay — while the TLS/HTTP2 impersonation (session impersonate=) is kept.
+ # Absent field => True (curl default), so existing Codex/registration callers are unchanged.
  if ja3:kwargs.update(ja3=ja3,default_headers=False)
+ elif payload.get("default_headers") is False:kwargs["default_headers"]=False
  if akamai:kwargs["akamai"]=akamai
  if payload.get("allow_redirects") is False:kwargs["allow_redirects"]=False
  _handles+=1

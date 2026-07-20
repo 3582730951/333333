@@ -31,7 +31,7 @@ async function api(path, opts = {}) {
   const r = await fetch(path, { ...opts, headers: headers(opts.headers || {}), credentials: "same-origin" });
   const txt = await r.text();
   let data; try { data = txt ? JSON.parse(txt) : null; } catch { data = txt; }
-  if (!r.ok) { const m = (data && data.error && data.error.message) || (typeof data === "string" && data ? data : r.status); const e = new Error(m); e.status = r.status; throw e; }
+  if (!r.ok) { const m = (data && data.error && data.error.message) || (typeof data === "string" && data ? data : r.status); const e = new Error(m); e.status = r.status; e.data = data; throw e; }
   return data;
 }
 

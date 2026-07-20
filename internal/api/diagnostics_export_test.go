@@ -179,9 +179,14 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}
 
 	authCSV := files["account_auth_metadata.csv"]
-	for _, want := range []string{"access_token_present", "access_token_len", "effective_provider", "codex"} {
+	for _, want := range []string{"auth_method", "billing_mode", "credential_present", "effective_provider", "codex"} {
 		if !strings.Contains(authCSV, want) {
 			t.Fatalf("account_auth_metadata.csv missing %q:\n%s", want, authCSV)
+		}
+	}
+	for _, forbidden := range []string{"access_token_len", "refresh_token_len", "openai_api_key_len"} {
+		if strings.Contains(authCSV, forbidden) {
+			t.Fatalf("account_auth_metadata.csv leaked credential-shape metadata %q:\n%s", forbidden, authCSV)
 		}
 	}
 

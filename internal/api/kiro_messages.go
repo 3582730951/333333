@@ -302,9 +302,22 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 		return kirowire.Conversion{}, err
 	}
 	capabilityModel, _ := capability.ResolveKiroModel(firstNonEmpty(lease.ResolvedModel, routing.Model(raw)), verified)
+	requestedModel := requestedClaudeModelFromContext(ctx)
+	compaction := kirowire.IsClaudeCodeCompactionRequest(raw)
+	effectiveContextMode := requestedModel.ContextMode
+	if compaction && capability.KiroPlanAllows1M(lease.Account.PlanType, capabilityModel) {
+		// Kiro has no Anthropic beta header on the wire. For the dedicated Claude
+		// Code summarization call only, a paid + runtime-verified 1M-capable model
+		// may use its technical window so /compact cannot be blocked by the 200K
+		// preflight it is meant to recover from.
+		effectiveContextMode = "1m"
+	}
 	measuredWindow := int64(0)
 	if capabilityModel != "" {
 		storedWindow, windowErr := s.store.BestNativeWindow(ctx, lease.Account.ID, capabilityModel)
+		if strings.EqualFold(strings.TrimSpace(effectiveContextMode), "1m") {
+			storedWindow, windowErr = s.store.BestNativeMaxWindow(ctx, lease.Account.ID, capabilityModel)
+		}
 		if windowErr != nil {
 			return kirowire.Conversion{}, windowErr
 		}
@@ -312,8 +325,7 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 			measuredWindow = storedWindow
 		}
 	}
-	requestedModel := requestedClaudeModelFromContext(ctx)
-	contextWindow := capability.KiroEffectiveContextWindow(capabilityModel, requestedModel.ContextMode, measuredWindow)
+	contextWindow := capability.KiroEffectiveContextWindow(capabilityModel, effectiveContextMode, measuredWindow)
 	cachePointsEnabled := strings.EqualFold(strings.TrimSpace(kiroCfg.KiroCacheMode), "auto")
 	if cachePointsEnabled {
 		capabilityState, capabilityErr := s.store.GetKiroRuntimeCapability(ctx, lease.Account.ID, endpointHash, capabilityModel)
@@ -336,12 +348,15 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 		EnableCachePoints: cachePointsEnabled,
 		ContextWindow:     contextWindow,
 		VerifiedModels:    verified,
+		Compaction:        compaction,
+		ContextMode:       effectiveContextMode,
 	})
 	if err != nil {
 		var contextErr *kirowire.ContextLengthError
 		if errors.As(err, &contextErr) {
 			contextErr.RequestedModel = firstNonEmpty(requestedModel.RequestedModel, routing.Model(raw))
-			contextErr.ContextMode = requestedModel.ContextMode
+			contextErr.ContextMode = effectiveContextMode
+			contextErr.Compaction = compaction
 		}
 	}
 	return converted, err
@@ -422,7 +437,7 @@ func normalizeKiroContextError(ctx context.Context, err error, converted kirowir
 	return &kirowire.ContextLengthError{
 		RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
 		KiroModel:      converted.Model, EstimatedInput: converted.EstimatedInputTokens,
-		EffectiveLimit: converted.ContextWindow, ContextMode: requested.ContextMode,
+		EffectiveLimit: converted.ContextWindow, ContextMode: converted.ContextMode, Compaction: converted.Compaction,
 	}
 }
 
@@ -537,6 +552,8 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	activeBody := body
 	activeFallbackBody := fallbackBody
 	cacheFallbackUsed := false
+	contextOutputReduced := false
+	contextHistoryRetries := 0
 	for response.StatusCode < 200 || response.StatusCode >= 300 {
 		status := response.StatusCode
 		header := response.Header
@@ -544,11 +561,49 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		response.Body.Close()
 
 		if kirowire.ContentLengthExceeded(rawError) {
+			if !contextOutputReduced {
+				if reduced, changed, reduceErr := kirowire.ReduceKiroMaxOutput(activeBody, 4096); reduceErr == nil && changed {
+					activeBody = reduced
+					converted.Body = reduced
+					converted.MaxOutputTokens = 4096
+					converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossMaxOutputReducedForContext})
+					setKiroQualityHeaders(w, *converted)
+					if len(activeFallbackBody) > 0 {
+						if fallback, fallbackChanged, fallbackErr := kirowire.ReduceKiroMaxOutput(activeFallbackBody, 4096); fallbackErr == nil && fallbackChanged {
+							activeFallbackBody = fallback
+						}
+					}
+					contextOutputReduced = true
+					response, err = send(bearer, activeBody)
+					if err != nil {
+						s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+						return nil, endpointHash, outcomeDone
+					}
+					continue
+				}
+				contextOutputReduced = true
+			}
+			if contextHistoryRetries < 3 {
+				if trimmed, dropped, changed, trimErr := kirowire.TrimOldestKiroHistory(activeBody, 3, 4); trimErr == nil && changed {
+					activeBody = trimmed
+					converted.Body = trimmed
+					converted.HistoryMessagesDropped += dropped
+					converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossContextHistoryTruncated})
+					setKiroQualityHeaders(w, *converted)
+					contextHistoryRetries++
+					response, err = send(bearer, activeBody)
+					if err != nil {
+						s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
+						return nil, endpointHash, outcomeDone
+					}
+					continue
+				}
+			}
 			requested := requestedClaudeModelFromContext(r.Context())
 			writeKiroError(w, r, http.StatusBadRequest, &kirowire.ContextLengthError{
 				RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
 				KiroModel:      converted.Model, EstimatedInput: converted.EstimatedInputTokens,
-				EffectiveLimit: converted.ContextWindow, ContextMode: requested.ContextMode,
+				EffectiveLimit: converted.ContextWindow, ContextMode: converted.ContextMode, Compaction: converted.Compaction,
 			})
 			return nil, endpointHash, outcomeDone
 		}
@@ -859,7 +914,11 @@ func writeKiroError(w http.ResponseWriter, r *http.Request, status int, err erro
 	code := kiroErrorCode(err)
 	var contextErr *kirowire.ContextLengthError
 	if errors.As(err, &contextErr) {
-		w.Header().Set("X-MiCliProxy-Context-Status", "compact_required")
+		contextStatus := "compact_required"
+		if contextErr.Compaction {
+			contextStatus = "compact_failed"
+		}
+		w.Header().Set("X-MiCliProxy-Context-Status", contextStatus)
 		w.Header().Set("X-MiCliProxy-Context-Limit", fmt.Sprintf("%d", contextErr.EffectiveLimit))
 		w.Header().Set("X-MiCliProxy-Context-Estimated-Input", fmt.Sprintf("%d", contextErr.EstimatedInput))
 		w.Header().Set("X-MiCliProxy-Kiro-Model", contextErr.KiroModel)
@@ -971,6 +1030,14 @@ func (s *Server) observeKiroResponse(ctx context.Context, accountID, endpointHas
 	})
 	if err != nil {
 		log.Printf("[KIRO-CAPABILITY] account=%s model=%s observation failed: %v", accountID, observedModel, err)
+		return state
+	}
+	contextState, contextSource := capability.Context1MUnknown, ""
+	if strings.EqualFold(strings.TrimSpace(conversion.ContextMode), "1m") {
+		contextState, contextSource = capability.Context1MSupported, "runtime_inference"
+	}
+	if capErr := s.store.SetModelCapabilityState(ctx, accountID, observedModel, capability.AvailabilityVerified, contextState, contextSource, "kiro_runtime_inference"); capErr != nil {
+		log.Printf("[KIRO-CAPABILITY] account=%s model=%s model catalog promotion failed: %v", accountID, observedModel, capErr)
 	}
 	return state
 }

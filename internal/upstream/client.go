@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
@@ -199,6 +200,10 @@ type Request struct {
 	// turns and must not be rewritten. Account auth + the Claude Code identity headers
 	// are still attached, and the call still routes through the account's egress/sidecar.
 	PassThrough bool
+	// MinimalProbe sends the caller-provided provider-native body unchanged. It is
+	// used only by the administrator-confirmed API-key inference probe, which must
+	// not add thinking, tools, or cache points.
+	MinimalProbe bool
 }
 
 type Response struct {
@@ -300,6 +305,7 @@ func (b *idleCancelBody) Close() error {
 
 func NewClient(cfg config.Config) *Client {
 	cfg.UpstreamBaseURL = NormalizeBaseURL(cfg.UpstreamBaseURL)
+	cfg.OpenAIAPIUpstreamBaseURL = NormalizeBaseURL(cfg.OpenAIAPIUpstreamBaseURL)
 	secret := identity.ResolveSecret([]byte(cfg.IdentitySecret))
 	return &Client{cfg: cfg, identitySecret: secret, jars: newJarLRU(0), transports: map[string]*http.Transport{}}
 }
@@ -323,14 +329,15 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	// 400 {"detail":"Store must be set to false"}; a downstream client wrongly sending
 	// store:true is corrected. This is the production-relay complement to the health-test
 	// probe at server.go:2243, and continues the Session-21 masked-bug chain.
-	if strings.Contains(req.DownstreamPath, "/responses") {
+	if strings.Contains(req.DownstreamPath, "/responses") && !req.MinimalProbe {
 		isCompact := strings.Contains(strings.ToLower(req.DownstreamPath), "/responses/compact")
 		usesAPIKey := AccountUsesAPIKey(req.Token)
+		codexBaseURL := c.codexBaseURL(req)
 		responsesLite := !usesAPIKey && CodexRequestUsesResponsesLite(req.Body)
 		if isCompact && responsesLite {
 			req.Body = normalizeCodexResponsesLiteCompactBody(req.Body)
 		} else if !isCompact {
-			req.Body = normalizeCodexResponsesBody(req.Body, c.cfg.UpstreamBaseURL, responsesLite)
+			req.Body = normalizeCodexResponsesBody(req.Body, codexBaseURL, responsesLite)
 		}
 		// Parse the top-level object ONCE here. The remaining normalizations each probe
 		// only one or two top-level fields, so they share this single scan instead of
@@ -388,7 +395,7 @@ func (c *Client) doHTTP(ctx context.Context, spec Request) (*Response, error) {
 	if method == "" {
 		method = http.MethodPost
 	}
-	target := ComputeURL(c.cfg.UpstreamBaseURL, spec.DownstreamPath)
+	target := ComputeURL(c.codexBaseURL(spec), spec.DownstreamPath)
 	// An IDLE-timeout guard (reset on every read) bounds the call without cutting a
 	// long-but-progressing stream, and releases the context on the body's Close — never
 	// on this function's return (see requestGuard).
@@ -529,7 +536,7 @@ func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error)
 	if spec.Egress.Endpoint == "" {
 		return nil, errors.New("curl_cffi_sidecar endpoint required")
 	}
-	target := ComputeURL(c.cfg.UpstreamBaseURL, spec.DownstreamPath)
+	target := ComputeURL(c.codexBaseURL(spec), spec.DownstreamPath)
 	built := http.Header{}
 	c.applyCodexHeaders(built, spec)
 	// TLS/JA3 the sidecar replays for Codex. DEFAULT IS CHROME (""), i.e. the
@@ -547,7 +554,11 @@ func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error)
 	if !AccountUsesAPIKey(spec.Token) {
 		ja3 = resolveCodexJA3(c.cfgSnapshot().CodexJA3Override)
 	}
-	return c.postViaSidecar(ctx, spec, target, built, c.cfg.SidecarTimeout(), ja3)
+	// Preserve the historical browser-shaped defaults for ChatGPT OAuth. Platform
+	// API keys are ordinary SDK traffic, so their complete header set must not be
+	// mixed with injected sec-ch-ua/sec-fetch browser headers.
+	defaultHeaders := !AccountUsesAPIKey(spec.Token)
+	return c.postViaSidecar(ctx, spec, target, built, c.cfg.SidecarTimeout(), ja3, defaultHeaders)
 }
 
 // resolveCodexJA3 resolves the TLS/JA3 fingerprint the curl_cffi sidecar replays for
@@ -647,7 +658,17 @@ func canonicalizeHeaders(raw map[string][]string) http.Header {
 	return canon
 }
 
-func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration, ja3 string) (*Response, error) {
+// defaultHeaders controls whether the sidecar lets curl-impersonate INJECT the
+// impersonated browser's own header set (sec-ch-ua*, sec-fetch-*, accept-language,
+// upgrade-insecure-requests, …) on top of `built`. Pass false whenever `built` is a
+// complete, authentic non-browser client fingerprint (e.g. the claude-cli/Node header
+// set): the browser extras would otherwise ride alongside a claude-cli User-Agent +
+// x-stainless-* headers, an incoherent combination no real client emits and thus a
+// clear impersonation-relay tell. The TLS/HTTP2 impersonation is unaffected either way.
+// Pass true to keep curl's browser defaults (a browser-shaped call, e.g. the CF-walled
+// OpenAI signup flow, or a path validated to need them). An explicit ja3 already forces
+// them off in the sidecar regardless.
+func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration, ja3 string, defaultHeaders bool) (*Response, error) {
 	if spec.Egress.Endpoint == "" {
 		return nil, errors.New("curl_cffi_sidecar endpoint required")
 	}
@@ -666,6 +687,13 @@ func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string
 		"headers":        headers,
 		"cookie_jar_key": sidecarCookieKey(spec.Account.ID, spec.Egress.ID, target, spec.CookieJarKey),
 		"stream":         true,
+	}
+	if !defaultHeaders {
+		// Tell the sidecar NOT to let curl-impersonate inject the browser's own header set
+		// on top of `built` (see the doc comment). Emitted only when suppressing, so the
+		// wire meta for every existing (browser-shaped) caller is byte-identical — an older
+		// sidecar simply ignores the unknown key during a rolling deploy.
+		meta["default_headers"] = false
 	}
 	if ja3 != "" {
 		// Strip unlistable SCSV signalling values (e.g. rustls' 0xFF) so an explicit
@@ -772,11 +800,15 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 	// which made every Codex SIDECAR request reach chatgpt.com with no content type and
 	// get rejected with 400 {"detail":"Unsupported content type"}. Setting it in this
 	// shared builder fixes all transports (the WS path overwrites it afterward).
-	if dst.Get("Content-Type") == "" {
+	if len(spec.Body) > 0 && dst.Get("Content-Type") == "" {
 		dst.Set("Content-Type", "application/json")
 	}
 	if dst.Get("Accept") == "" {
-		dst.Set("Accept", "text/event-stream")
+		if strings.EqualFold(firstNonEmpty(spec.Method, http.MethodPost), http.MethodGet) || (usesAPIKey && !bodyStreamTrue(spec.Body)) {
+			dst.Set("Accept", "application/json")
+		} else {
+			dst.Set("Accept", "text/event-stream")
+		}
 	}
 	// NOTE: do not set a "Connection" header — Go's HTTP/2 transport rejects
 	// requests carrying hop-by-hop headers (checkConnHeaders), which would break
@@ -1007,22 +1039,11 @@ func setIfEmptyPreserveCase(h http.Header, key, value string) {
 // and auth.json imports, whose parser mirrors that key into AccessToken. A distinct
 // access token still means OAuth even if an auxiliary API-key field is present.
 func AccountUsesAPIKey(token storage.AccountToken) bool {
-	access := strings.TrimSpace(token.AccessToken)
-	key := strings.TrimSpace(token.OpenAIAPIKey)
-	if key == "" || (access != "" && access != key) {
-		return false
-	}
-	if strings.TrimSpace(token.RefreshToken) != "" || strings.TrimSpace(token.IDTokenRaw) != "" || strings.TrimSpace(token.Scopes) != "" {
-		return false
-	}
-	return true
+	return accountprovider.UsesAPIKey(accountprovider.InferProviderFromToken(token), token)
 }
 
 func addAuthHeaders(h http.Header, token storage.AccountToken) {
-	bearer := token.AccessToken
-	if bearer == "" {
-		bearer = token.OpenAIAPIKey
-	}
+	bearer := accountprovider.Credential("codex", token)
 	if bearer != "" {
 		h.Set("Authorization", "Bearer "+bearer)
 	}
@@ -1151,9 +1172,19 @@ func sidecarCookieKey(accountID, egressID, target, fallback string) string {
 }
 
 func (c *Client) cookieJarFor(spec Request) *cookiejar.Jar {
-	target := ComputeURL(c.cfg.UpstreamBaseURL, spec.DownstreamPath)
+	target := ComputeURL(c.codexBaseURL(spec), spec.DownstreamPath)
 	key := sidecarCookieKey(spec.Account.ID, spec.Egress.ID, target, spec.CookieJarKey)
 	return c.cookieJarForKey(key)
+}
+
+// codexBaseURL keeps ChatGPT OAuth/access-token traffic on the WHAM backend while
+// routing OpenAI Platform API keys through the public /v1 API on every transport.
+func (c *Client) codexBaseURL(spec Request) string {
+	cfg := c.cfgSnapshot()
+	if accountprovider.UsesAPIKey("codex", spec.Token) {
+		return NormalizeBaseURL(firstNonEmpty(cfg.OpenAIAPIUpstreamBaseURL, config.DefaultOpenAIAPIUpstreamBaseURL))
+	}
+	return NormalizeBaseURL(cfg.UpstreamBaseURL)
 }
 
 func (c *Client) cookieJarForKey(key string) *cookiejar.Jar {

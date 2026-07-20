@@ -78,6 +78,7 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 	}
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = up.URL + "/backend-api/codex"
+	cfg.OpenAIAPIUpstreamBaseURL = up.URL + "/v1"
 	cfg.ClaudeUpstreamBaseURL = up.URL
 	cfg.DatabasePath = filepath.Join(t.TempDir(), "unused.sqlite3")
 	cfg.StickyWaitMillis = 1
@@ -4775,9 +4776,8 @@ func TestHealthTestClaudeUsesCloakedCountTokens(t *testing.T) {
 	}
 }
 
-// TestProbeClaudeModelsViaV1Models confirms a Claude account's capabilities are
-// populated from a live GET /v1/models probe, with the context window filled from
-// the known-model table (Anthropic's /v1/models omits it).
+// A successful live Claude model list is authoritative. Technical window metadata
+// may still come from the model table, but omitted models are not forged into it.
 func TestProbeClaudeModelsViaV1Models(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -4809,10 +4809,8 @@ func TestProbeClaudeModelsViaV1Models(t *testing.T) {
 	if windows["claude-sonnet-4-6"] != 200000 {
 		t.Fatalf("expected sonnet-4-6 window 200000, got %d (caps=%+v)", windows["claude-sonnet-4-6"], res.Capabilities)
 	}
-	// The static floor unions the current flagship in even though this probe (like a
-	// lagging Anthropic /v1/models) did not return it — with its 1M context window.
-	if windows["claude-opus-4-8"] != 1000000 {
-		t.Fatalf("expected opus-4-8 floored in at window 1000000, got %d (caps=%+v)", windows["claude-opus-4-8"], res.Capabilities)
+	if _, forged := windows["claude-opus-4-8"]; forged {
+		t.Fatalf("live model list missing opus-4-8 was padded from static data: %+v", res.Capabilities)
 	}
 }
 
@@ -4913,7 +4911,7 @@ func TestProbeCodexModelsSendsCurrentClientVersion(t *testing.T) {
 	}
 }
 
-func TestProbeCodexModelsFloorsNewerStaticFlagship(t *testing.T) {
+func TestProbeCodexModelsDoesNotPadSuccessfulLiveCatalog(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			w.Header().Set("Content-Type", "application/json")
@@ -4939,8 +4937,8 @@ func TestProbeCodexModelsFloorsNewerStaticFlagship(t *testing.T) {
 	for _, c := range res.Capabilities {
 		got[c.ModelSlug] = true
 	}
-	if !got["gpt-5.4"] || !got["gpt-5.5"] {
-		t.Fatalf("expected live gpt-5.4 plus static newer gpt-5.5, got %+v", res.Capabilities)
+	if !got["gpt-5.4"] || got["gpt-5.5"] || len(got) != 1 {
+		t.Fatalf("successful live catalog was padded from static data: %+v", res.Capabilities)
 	}
 }
 

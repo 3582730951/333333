@@ -111,5 +111,5 @@ func (c *Client) DoViaSidecar(ctx context.Context, egress storage.EgressProfile,
 		Egress:       egress,
 		CookieJarKey: cookieJarKey,
 	}
-	return c.postViaSidecar(ctx, spec, rawURL, built, c.cfg.SidecarTimeout(), "")
+	return c.postViaSidecar(ctx, spec, rawURL, built, c.cfg.SidecarTimeout(), "", true)
 }

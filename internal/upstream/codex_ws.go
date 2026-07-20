@@ -118,7 +118,7 @@ func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*
 }
 
 func (c *Client) prepareCodexResponsesWebSocket(spec Request) (string, http.Header, []byte, error) {
-	target := ComputeCodexResponsesWebSocketURL(c.cfg.UpstreamBaseURL, spec.DownstreamPath)
+	target := ComputeCodexResponsesWebSocketURL(c.codexBaseURL(spec), spec.DownstreamPath)
 	headers := http.Header{}
 	c.applyCodexHeaders(headers, spec)
 	metadata := spec.codexMetadata

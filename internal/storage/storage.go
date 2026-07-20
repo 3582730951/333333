@@ -200,6 +200,7 @@ type AccountPoolSummary struct {
 
 type AccountToken struct {
 	AccountID          string `json:"account_id"`
+	AuthMethod         string `json:"auth_method,omitempty"`
 	AccessToken        string `json:"access_token,omitempty"`
 	RefreshToken       string `json:"refresh_token,omitempty"`
 	OpenAIAPIKey       string `json:"openai_api_key,omitempty"`
@@ -246,6 +247,9 @@ type KiroAuthSummary struct {
 type ModelCapability struct {
 	AccountID                     string `json:"account_id"`
 	ModelSlug                     string `json:"model_slug"`
+	AvailabilityState             string `json:"availability_state"`
+	Context1MState                string `json:"context_1m_state"`
+	Context1MSource               string `json:"context_1m_source,omitempty"`
 	NativeContextWindow           int64  `json:"native_context_window"`
 	NativeMaxContextWindow        int64  `json:"native_max_context_window"`
 	EffectiveContextWindowPercent int64  `json:"effective_context_window_percent"`
@@ -869,6 +873,7 @@ CREATE TABLE IF NOT EXISTS accounts(
 CREATE INDEX IF NOT EXISTS idx_accounts_group_status ON accounts(group_name, status);
 CREATE TABLE IF NOT EXISTS account_auth_tokens(
   account_id TEXT PRIMARY KEY,
+  auth_method TEXT NOT NULL DEFAULT '',
   access_token TEXT,
   refresh_token TEXT,
   openai_api_key TEXT,
@@ -901,6 +906,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_kiro_credential_hash ON account_kiro_crede
 CREATE TABLE IF NOT EXISTS account_model_capabilities(
   account_id TEXT NOT NULL,
   model_slug TEXT NOT NULL,
+  availability_state TEXT NOT NULL DEFAULT 'unverified',
+  context_1m_state TEXT NOT NULL DEFAULT 'unknown',
+  context_1m_source TEXT NOT NULL DEFAULT '',
   native_context_window INTEGER NOT NULL DEFAULT 0,
   native_max_context_window INTEGER NOT NULL DEFAULT 0,
   effective_context_window_percent INTEGER NOT NULL DEFAULT 100,
@@ -918,6 +926,12 @@ CREATE TABLE IF NOT EXISTS account_model_capabilities(
 -- SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id
 -- WHERE a.group_name = ? AND a.status = 'active' AND c.model_slug = ?
 CREATE INDEX IF NOT EXISTS idx_capabilities_model ON account_model_capabilities(model_slug, account_id);
+CREATE TABLE IF NOT EXISTS account_model_catalog_status(
+  account_id TEXT PRIMARY KEY,
+  authoritative INTEGER NOT NULL DEFAULT 0,
+  last_probe_at INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS kiro_runtime_capabilities(
   account_id TEXT NOT NULL,
   endpoint_hash TEXT NOT NULL,
@@ -1416,10 +1430,35 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN auth_method TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN oauth_rate_limit_tier TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_model_capabilities ADD COLUMN raw_model_json TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_model_capabilities ADD COLUMN availability_state TEXT NOT NULL DEFAULT 'unverified'`,
+		`ALTER TABLE account_model_capabilities ADD COLUMN context_1m_state TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE account_model_capabilities ADD COLUMN context_1m_source TEXT NOT NULL DEFAULT ''`,
+		`UPDATE account_model_capabilities
+SET availability_state = 'verified'
+WHERE availability_state = 'unverified'
+  AND source <> ''
+  AND lower(source) NOT LIKE '%static%'
+  AND lower(source) NOT LIKE '%unknown%'`,
+		`CREATE TABLE IF NOT EXISTS account_model_catalog_status(
+  account_id TEXT PRIMARY KEY,
+  authoritative INTEGER NOT NULL DEFAULT 0,
+  last_probe_at INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`INSERT INTO account_model_catalog_status(account_id, authoritative, last_probe_at)
+SELECT account_id, 1, MAX(last_probe_at)
+FROM account_model_capabilities
+WHERE availability_state = 'verified'
+  AND lower(source) NOT LIKE '%runtime%'
+  AND lower(source) NOT LIKE '%static%'
+  AND lower(source) NOT LIKE '%unknown%'
+GROUP BY account_id
+ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE affinity_bindings ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE affinity_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE affinity_bindings ADD COLUMN egress_id TEXT NOT NULL DEFAULT ''`,
@@ -2310,9 +2349,10 @@ ON CONFLICT(id) DO UPDATE SET
 	}
 	token.UpdatedAt = now
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO account_auth_tokens(account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_auth_tokens(account_id, auth_method, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
+ auth_method = excluded.auth_method,
  access_token = excluded.access_token,
  refresh_token = excluded.refresh_token,
  openai_api_key = excluded.openai_api_key,
@@ -2322,7 +2362,7 @@ ON CONFLICT(account_id) DO UPDATE SET
  scopes = excluded.scopes,
  oauth_rate_limit_tier = excluded.oauth_rate_limit_tier,
  updated_at = excluded.updated_at`,
-		token.AccountID, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), token.LastRefresh, token.ExpiresAt, token.Scopes, token.OAuthRateLimitTier, token.CreatedAt, token.UpdatedAt)
+		token.AccountID, token.AuthMethod, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), token.LastRefresh, token.ExpiresAt, token.Scopes, token.OAuthRateLimitTier, token.CreatedAt, token.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -2731,9 +2771,9 @@ func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, e
 	if cached, ok := s.tokenCache.Load(accountID); ok {
 		return cached.(AccountToken), nil
 	}
-	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
 	var t AccountToken
-	err := row.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
+	err := row.Scan(&t.AccountID, &t.AuthMethod, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
 	t.AccessToken = s.openToken(t.AccessToken)
 	t.RefreshToken = s.openToken(t.RefreshToken)
 	t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
@@ -2762,14 +2802,14 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, auth_method, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var t AccountToken
-		if err := rows.Scan(&t.AccountID, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.AccountID, &t.AuthMethod, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		t.AccessToken = s.openToken(t.AccessToken)
@@ -2783,8 +2823,8 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 
 func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
 	s.tokenCache.Delete(t.AccountID)
-	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
-		s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
+	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET auth_method = ?, access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
+		t.AuthMethod, s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
 	return err
 }
 
@@ -3058,6 +3098,39 @@ func (s *Store) ListInjectedCookies(ctx context.Context) ([]InjectedCookie, erro
 	return out, rows.Err()
 }
 
+func normalizeCapabilityAvailability(state, source string) string {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "verified", "unverified", "unsupported":
+		return strings.ToLower(strings.TrimSpace(state))
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(source)), "static") || strings.Contains(strings.ToLower(strings.TrimSpace(source)), "unknown") {
+		return "unverified"
+	}
+	return "verified"
+}
+
+func normalizeContext1MState(state string) string {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "supported", "unsupported", "unknown":
+		return strings.ToLower(strings.TrimSpace(state))
+	default:
+		return "unknown"
+	}
+}
+
+func capabilityProvesAuthoritativeCatalog(c ModelCapability) bool {
+	if c.AvailabilityState != "verified" {
+		return false
+	}
+	source := strings.ToLower(strings.TrimSpace(c.Source))
+	if strings.Contains(source, "probe") && !strings.Contains(source, "static") && !strings.Contains(source, "unknown") {
+		return true
+	}
+	return !strings.Contains(source, "runtime") &&
+		!strings.Contains(source, "static") &&
+		!strings.Contains(source, "unknown")
+}
+
 func (s *Store) UpsertCapabilities(ctx context.Context, capabilities []ModelCapability) error {
 	if len(capabilities) == 0 {
 		return nil
@@ -3074,11 +3147,13 @@ func (s *Store) UpsertCapabilities(ctx context.Context, capabilities []ModelCapa
 	// keep being advertised forever. Scoped to the account IDs actually present in the
 	// input (an empty input early-returns above, so this never wipes on a transient).
 	deleted := map[string]bool{}
+	authoritative := map[string]bool{}
 	for _, c := range capabilities {
 		if deleted[c.AccountID] {
 			continue
 		}
 		deleted[c.AccountID] = true
+		authoritative[c.AccountID] = false
 		if _, err := tx.ExecContext(ctx, `DELETE FROM account_model_capabilities WHERE account_id = ?`, c.AccountID); err != nil {
 			return err
 		}
@@ -3087,10 +3162,18 @@ func (s *Store) UpsertCapabilities(ctx context.Context, capabilities []ModelCapa
 		if c.LastProbeAt == 0 {
 			c.LastProbeAt = Now()
 		}
+		c.AvailabilityState = normalizeCapabilityAvailability(c.AvailabilityState, c.Source)
+		c.Context1MState = normalizeContext1MState(c.Context1MState)
+		if capabilityProvesAuthoritativeCatalog(c) {
+			authoritative[c.AccountID] = true
+		}
 		_, err := tx.ExecContext(ctx, `
-INSERT INTO account_model_capabilities(account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_model_capabilities(account_id, model_slug, availability_state, context_1m_state, context_1m_source, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id, model_slug) DO UPDATE SET
+ availability_state = excluded.availability_state,
+ context_1m_state = excluded.context_1m_state,
+ context_1m_source = excluded.context_1m_source,
  native_context_window = excluded.native_context_window,
  native_max_context_window = excluded.native_max_context_window,
  effective_context_window_percent = excluded.effective_context_window_percent,
@@ -3101,16 +3184,137 @@ ON CONFLICT(account_id, model_slug) DO UPDATE SET
  raw_model_json = excluded.raw_model_json,
  source = excluded.source,
  last_probe_at = excluded.last_probe_at`,
-			c.AccountID, c.ModelSlug, c.NativeContextWindow, c.NativeMaxContextWindow, c.EffectiveContextWindowPercent, c.AutoCompactTokenLimit, c.Visibility, c.ETag, c.RawModelJSONHash, c.RawModelJSON, c.Source, c.LastProbeAt)
+			c.AccountID, c.ModelSlug, c.AvailabilityState, c.Context1MState, c.Context1MSource, c.NativeContextWindow, c.NativeMaxContextWindow, c.EffectiveContextWindowPercent, c.AutoCompactTokenLimit, c.Visibility, c.ETag, c.RawModelJSONHash, c.RawModelJSON, c.Source, c.LastProbeAt)
 		if err != nil {
+			return err
+		}
+	}
+	for accountID, isAuthoritative := range authoritative {
+		value := 0
+		if isAuthoritative {
+			value = 1
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO account_model_catalog_status(account_id, authoritative, last_probe_at)
+VALUES(?, ?, ?)
+ON CONFLICT(account_id) DO UPDATE SET authoritative=excluded.authoritative, last_probe_at=excluded.last_probe_at`, accountID, value, Now()); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
+// ReplaceCapabilities persists the complete authoritative catalog for one account.
+// Unlike UpsertCapabilities it can represent a successful empty /models response,
+// which must remove stale rows rather than silently retaining a static fallback.
+func (s *Store) ReplaceCapabilities(ctx context.Context, accountID string, capabilities []ModelCapability) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return errors.New("capability account id is required")
+	}
+	if len(capabilities) == 0 {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_model_capabilities WHERE account_id = ?`, accountID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO account_model_catalog_status(account_id, authoritative, last_probe_at)
+VALUES(?, 1, ?)
+ON CONFLICT(account_id) DO UPDATE SET authoritative=1, last_probe_at=excluded.last_probe_at`, accountID, Now()); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	for i := range capabilities {
+		if capabilities[i].AccountID == "" {
+			capabilities[i].AccountID = accountID
+		}
+		if capabilities[i].AccountID != accountID {
+			return errors.New("capability replacement spans multiple accounts")
+		}
+	}
+	if err := s.UpsertCapabilities(ctx, capabilities); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_model_catalog_status(account_id, authoritative, last_probe_at)
+VALUES(?, 1, ?)
+ON CONFLICT(account_id) DO UPDATE SET authoritative=1, last_probe_at=excluded.last_probe_at`, accountID, Now())
+	return err
+}
+
+// SetModelCapabilityState records account/model-scoped runtime evidence without
+// touching account quarantine. In particular, a model_not_found response marks
+// only that model unsupported, while a successful inference promotes a static
+// discovery hint to verified.
+func (s *Store) SetModelCapabilityState(ctx context.Context, accountID, model, availability, context1MState, context1MSource, evidenceSource string) error {
+	availability = normalizeCapabilityAvailability(availability, "runtime")
+	context1MState = normalizeContext1MState(context1MState)
+	evidenceSource = strings.TrimSpace(evidenceSource)
+	if evidenceSource == "" {
+		if availability == "verified" {
+			evidenceSource = "runtime_inference"
+		} else {
+			evidenceSource = "runtime_rejected"
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO account_model_capabilities(
+account_id, model_slug, availability_state, context_1m_state, context_1m_source,
+native_context_window, native_max_context_window, effective_context_window_percent,
+auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at)
+VALUES(?, ?, ?, ?, ?, 0, 0, 100, 0, '', '', '', '', ?, ?)
+ON CONFLICT(account_id, model_slug) DO UPDATE SET
+ availability_state = excluded.availability_state,
+ context_1m_state = CASE WHEN excluded.context_1m_state = 'unknown' THEN account_model_capabilities.context_1m_state ELSE excluded.context_1m_state END,
+ context_1m_source = CASE WHEN excluded.context_1m_source = '' THEN account_model_capabilities.context_1m_source ELSE excluded.context_1m_source END,
+ source = CASE
+   WHEN instr(account_model_capabilities.source, excluded.source) > 0 THEN account_model_capabilities.source
+   WHEN lower(account_model_capabilities.source) LIKE '%probe%'
+     AND lower(account_model_capabilities.source) NOT LIKE '%static%'
+     AND lower(account_model_capabilities.source) NOT LIKE '%unknown%'
+     THEN account_model_capabilities.source || '+' || excluded.source
+   ELSE excluded.source END,
+ last_probe_at = excluded.last_probe_at`,
+		accountID, model, availability, context1MState, context1MSource,
+		evidenceSource, Now())
+	return err
+}
+
+func (s *Store) AccountsWithModelAndContext(ctx context.Context, group, model, contextMode string) (map[string]bool, error) {
+	if model == "" {
+		return nil, nil
+	}
+	query := `SELECT DISTINCT c.account_id FROM account_model_capabilities c
+JOIN accounts a ON a.id = c.account_id
+JOIN account_egress_bindings b ON b.account_id = a.id
+JOIN egress_profiles e ON e.id = b.primary_egress_id
+WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ?
+  AND c.model_slug = ? AND c.availability_state = 'verified'
+  AND b.recheck_pending = 0 AND b.cooldown_until <= ?
+  AND e.health NOT IN ('disabled','tripped') AND e.cooldown_until <= ?`
+	args := []interface{}{group, Now(), model, Now(), Now()}
+	if strings.EqualFold(strings.TrimSpace(contextMode), "1m") {
+		query += ` AND c.context_1m_state = 'supported'`
+	}
+	rows, err := s.rdb.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]ModelCapability, error) {
-	query := `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at FROM account_model_capabilities`
+	query := `SELECT account_id, model_slug, availability_state, context_1m_state, context_1m_source, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at FROM account_model_capabilities`
 	args := []interface{}{}
 	if accountID != "" {
 		query += ` WHERE account_id = ?`
@@ -3125,7 +3329,7 @@ func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]Model
 	var out []ModelCapability
 	for rows.Next() {
 		var c ModelCapability
-		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -3133,19 +3337,120 @@ func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]Model
 	return out, rows.Err()
 }
 
+// ListRoutableCapabilities returns only verified capabilities backed by an active,
+// non-quarantined account and at least one egress the scheduler can select now.
+// Public model catalogs use this so inactive or isolated accounts cannot advertise
+// models that the scheduler cannot actually reach.
+func (s *Store) ListRoutableCapabilities(ctx context.Context, group string) ([]ModelCapability, error) {
+	now := Now()
+	rows, err := s.rdb.QueryContext(ctx, `SELECT c.account_id, c.model_slug, c.availability_state, c.context_1m_state, c.context_1m_source,
+c.native_context_window, c.native_max_context_window, c.effective_context_window_percent, c.auto_compact_token_limit,
+c.visibility, c.etag, c.raw_model_json_hash, c.raw_model_json, c.source, c.last_probe_at,
+b.primary_egress_id, b.standby_egress_ids, b.cooldown_until
+FROM account_model_capabilities c
+JOIN accounts a ON a.id = c.account_id
+JOIN account_egress_bindings b ON b.account_id = a.id
+WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ?
+  AND b.recheck_pending = 0
+  AND c.availability_state = 'verified'
+ORDER BY c.account_id, c.model_slug`, group, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type candidate struct {
+		capability ModelCapability
+		binding    AccountEgressBinding
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c ModelCapability
+		var binding AccountEgressBinding
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource,
+			&c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit,
+			&c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt,
+			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.CooldownUntil); err != nil {
+			return nil, err
+		}
+		binding.AccountID = c.AccountID
+		candidates = append(candidates, candidate{capability: c, binding: binding})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	routable := map[string]bool{}
+	checked := map[string]bool{}
+	egresses := map[string]EgressProfile{}
+	loadEgress := func(id string) (EgressProfile, bool) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return EgressProfile{}, false
+		}
+		if egress, ok := egresses[id]; ok {
+			return egress, true
+		}
+		egress, err := s.GetEgressProfile(ctx, id)
+		if err != nil {
+			return EgressProfile{}, false
+		}
+		egresses[id] = egress
+		return egress, true
+	}
+	egressHealthy := func(egress EgressProfile) bool {
+		if egress.CooldownUntil > now {
+			return false
+		}
+		switch egress.Health {
+		case "", "healthy", "cooldown", "tripped":
+			return true
+		default:
+			return false
+		}
+	}
+	var out []ModelCapability
+	for _, item := range candidates {
+		accountID := item.capability.AccountID
+		if !checked[accountID] {
+			checked[accountID] = true
+			binding := item.binding
+			if binding.CooldownUntil <= now {
+				if egress, ok := loadEgress(binding.PrimaryEgressID); ok && egressHealthy(egress) {
+					routable[accountID] = true
+				}
+			}
+			if !routable[accountID] {
+				for _, standbyID := range binding.StandbyIDs() {
+					if egress, ok := loadEgress(standbyID); ok && egressHealthy(egress) {
+						routable[accountID] = true
+						break
+					}
+				}
+			}
+		}
+		if routable[accountID] {
+			out = append(out, item.capability)
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) ListCapabilitiesByAccountIDs(ctx context.Context, accountIDs []string) (map[string][]ModelCapability, error) {
 	out := make(map[string][]ModelCapability, len(accountIDs))
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, availability_state, context_1m_state, context_1m_source, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, raw_model_json, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var c ModelCapability
-		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt); err != nil {
 			return nil, err
 		}
 		out[c.AccountID] = append(out[c.AccountID], c)
@@ -3163,14 +3468,14 @@ func (s *Store) ListCapabilitiesSummaryByAccountIDs(ctx context.Context, account
 	if len(accountIDs) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, model_slug, availability_state, context_1m_state, context_1m_source, native_context_window, native_max_context_window, effective_context_window_percent, auto_compact_token_limit, visibility, etag, raw_model_json_hash, source, last_probe_at FROM account_model_capabilities WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`) ORDER BY account_id, model_slug`, stringArgs(accountIDs)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var c ModelCapability
-		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
+		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource, &c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit, &c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.Source, &c.LastProbeAt); err != nil {
 			return nil, err
 		}
 		out[c.AccountID] = append(out[c.AccountID], c)
@@ -3178,9 +3483,48 @@ func (s *Store) ListCapabilitiesSummaryByAccountIDs(ctx context.Context, account
 	return out, rows.Err()
 }
 
+func (s *Store) ListModelCatalogAuthorityByAccountIDs(ctx context.Context, accountIDs []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, authoritative FROM account_model_catalog_status WHERE account_id IN (`+sqlPlaceholders(len(accountIDs))+`)`, stringArgs(accountIDs)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID string
+		var authoritative int
+		if err := rows.Scan(&accountID, &authoritative); err != nil {
+			return nil, err
+		}
+		out[accountID] = authoritative != 0
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ModelCatalogAuthoritative(ctx context.Context, accountID string) (bool, error) {
+	var authoritative int
+	err := s.rdb.QueryRowContext(ctx, `SELECT authoritative FROM account_model_catalog_status WHERE account_id = ?`, accountID).Scan(&authoritative)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return authoritative != 0, err
+}
+
 func (s *Store) BestNativeWindow(ctx context.Context, accountID, model string) (int64, error) {
 	var value int64
-	err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(MAX(native_max_context_window), 0) FROM account_model_capabilities WHERE account_id = ? AND (? = '' OR model_slug = ?)`, accountID, model, model).Scan(&value)
+	err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(MAX(native_context_window), 0) FROM account_model_capabilities WHERE account_id = ? AND (? = '' OR model_slug = ?) AND availability_state <> 'unsupported'`, accountID, model, model).Scan(&value)
+	return value, err
+}
+
+// BestNativeMaxWindow returns the model's technical/account-verified ceiling. It
+// is used only after routing has independently required the extended context mode;
+// standard requests continue to use BestNativeWindow.
+func (s *Store) BestNativeMaxWindow(ctx context.Context, accountID, model string) (int64, error) {
+	var value int64
+	err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(MAX(native_max_context_window), 0) FROM account_model_capabilities WHERE account_id = ? AND (? = '' OR model_slug = ?) AND availability_state <> 'unsupported'`, accountID, model, model).Scan(&value)
 	return value, err
 }
 
@@ -3193,7 +3537,7 @@ func (s *Store) AccountsWithModel(ctx context.Context, group, model string) (map
 	if model == "" {
 		return nil, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id WHERE a.group_name = ? AND a.status = 'active' AND c.model_slug = ?`, group, model)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ? AND c.model_slug = ? AND c.availability_state = 'verified'`, group, Now(), model)
 	if err != nil {
 		return nil, err
 	}

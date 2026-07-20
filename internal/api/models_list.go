@@ -62,25 +62,16 @@ func (s *Server) handleUserModels(w http.ResponseWriter, r *http.Request) {
 			groups[group] = true
 		}
 	}
-	allowedAccounts := map[string]bool{}
-	var accessibleAccounts []storage.Account
+	var caps []storage.ModelCapability
 	for group := range groups {
-		accounts, listErr := s.store.ListActiveAccountsByGroup(r.Context(), group)
+		rows, listErr := s.store.ListRoutableCapabilities(r.Context(), group)
 		if listErr != nil {
 			writeError(w, http.StatusInternalServerError, listErr)
 			return
 		}
-		for _, account := range accounts {
-			allowedAccounts[account.ID] = true
-			accessibleAccounts = append(accessibleAccounts, account)
-		}
+		caps = append(caps, rows...)
 	}
-	caps, err := s.store.ListCapabilities(r.Context(), "")
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, modelListResponse{Models: sortedCapabilityModels(filterDisplayCapabilities(caps, accessibleAccounts), allowedAccounts), GeneratedAt: now})
+	writeJSON(w, http.StatusOK, modelListResponse{Models: sortedCapabilityModels(caps, nil), GeneratedAt: now})
 }
 
 func filterDisplayCapabilities(caps []storage.ModelCapability, accounts []storage.Account) []storage.ModelCapability {

@@ -363,7 +363,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errors.New("pool import key cannot query models"))
 		return
 	}
-	caps, err := s.store.ListCapabilities(r.Context(), "")
+	group := s.cfg.DefaultGroup
+	if plain := downstreamBearer(r); plain != "" {
+		if key, found, _ := s.store.LookupAPIKey(r.Context(), hashAPIKey(plain)); found && strings.TrimSpace(key.GroupName) != "" {
+			group = strings.TrimSpace(key.GroupName)
+		}
+	}
+	caps, err := s.store.ListRoutableCapabilities(r.Context(), group)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -608,6 +614,9 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			attempts = 1
 		}
 	}
+	if movable && attempts < 2 {
+		attempts = 2
+	}
 	// Accounts this request has already tried and failed on. Passed to the scheduler
 	// each attempt so a just-failed account is never re-selected within the same
 	// request — not even via its sticky binding (the conversation rebinds to the
@@ -621,6 +630,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// Incrementing attemptsRemaining only when that repair is selected makes it an extra
 	// attempt without opening another generic failover round.
 	contextRepairAvailable := !contextRecovered
+	modelCapabilityRejected := false
 	attemptsRemaining := attempts
 	for attemptsRemaining > 0 {
 		attemptsRemaining--
@@ -637,7 +647,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			currentAffinity = affinity
 		}
 		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, current.Recovered, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attemptsRemaining > 0, contextRepairAvailable, exclude)
-		if result.Outcome != outcomeRetry {
+		if result.Outcome == outcomeModelRetry {
+			modelCapabilityRejected = true
+		}
+		if result.Outcome != outcomeRetry && result.Outcome != outcomeModelRetry {
 			return
 		}
 		if result.ContextRecovery {
@@ -648,14 +661,18 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			current = result.Retry
 		}
 	}
+	if modelCapabilityRejected && s.handleCapabilitySelectionError(r.Context(), w, &scheduler.NoAccountError{Model: model, Counters: scheduler.NoAccountCounters{ModelUnsupported: 1}}, false, pol.Group, "codex", model, "") {
+		return
+	}
 	writePoolCodeError(w, http.StatusBadGateway, "retry_exhausted", "upstream retry limit exhausted")
 }
 
 type attemptOutcome int
 
 const (
-	outcomeDone  attemptOutcome = iota // request finished (success, or terminal error already written)
-	outcomeRetry                       // recoverable error on a self-contained request — retry on a fresh account
+	outcomeDone       attemptOutcome = iota // request finished (success, or terminal error already written)
+	outcomeRetry                            // recoverable error on a self-contained request — retry on a fresh account
+	outcomeModelRetry                       // account-scoped model_not_found — retry, then require manual fallback
 )
 
 type codexRetryRequest struct {
@@ -722,6 +739,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				}
 			}
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
+		if s.handleCapabilitySelectionError(r.Context(), w, err, false, routeGroup, "codex", model, "") {
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
@@ -1023,7 +1043,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		detection := cf.Detect(resp.StatusCode, resp.Header, errorBody)
 		v := ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
-		if v.State == ban.AuthExpired && !cf.EdgeOnly(detection) {
+		if v.State == ban.AuthExpired && !cf.EdgeOnly(detection) && !upstream.AccountUsesAPIKey(token) {
 			if refreshed, rerr := s.refreshCodexToken(r.Context(), token); rerr == nil && refreshed.Refreshed {
 				token = refreshed.Token
 				_ = resp.Body.Close()
@@ -1114,6 +1134,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		}
 		if !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
+			!upstream.AccountUsesAPIKey(token) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, errorBody, "http_error") {
 			codexResetRetried = true
 			if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
@@ -1133,6 +1154,16 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
 				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 			}
+		}
+		if isModelNotFoundError(resp.StatusCode, errorBody) {
+			s.rejectAccountModel(r.Context(), lease.Account, model, resp.StatusCode)
+			_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
+			if allowRetry && movable {
+				retry()
+				return codexAttemptResult{Outcome: outcomeModelRetry}
+			}
+			_ = s.handleCapabilitySelectionError(r.Context(), w, &scheduler.NoAccountError{Model: model, Counters: scheduler.NoAccountCounters{ModelUnsupported: 1}}, false, routeGroup, "codex", model, "")
+			return codexAttemptResult{Outcome: outcomeDone}
 		}
 		if cf.Recordable(detection) {
 			s.handleCFEvent(r.Context(), lease.Account, finalEgress, resp.StatusCode, detection)
@@ -1200,9 +1231,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 codexSuccess:
+	s.verifyAccountModel(r.Context(), lease.Account, model, "")
 	normalizeCodexStreamContentType(resp.Header, isStreamRequest(body))
 	resetHeaderExhaustion := false
-	if !codexResetRetried && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
+	if !codexResetRetried && !upstream.AccountUsesAPIKey(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
 	}
 	if !resetHeaderExhaustion {

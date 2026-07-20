@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/anthropicwire"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/storage"
 )
 
 // Official Claude Code anti-fingerprint constants (see cliproxyapi-reference).
@@ -34,8 +36,8 @@ func claudeBaseURL(cfg config.Config) string {
 
 // claudeUsesAPIKey reports whether the credential is an Anthropic API key
 // (sk-ant-api...) rather than an OAuth access token (sk-ant-oat...).
-func claudeUsesAPIKey(token string) bool {
-	return strings.HasPrefix(strings.TrimSpace(token), "sk-ant-api")
+func claudeUsesAPIKey(token storage.AccountToken) bool {
+	return accountprovider.UsesAPIKey("claude", token)
 }
 
 func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) {
@@ -70,10 +72,10 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// 1. Not in passthrough mode (passthrough = opaque body, no thinking injection)
 	// 2. Thinking is enabled in config
 	// 3. Path is a messages endpoint (not files/skills/agents)
-	if !spec.PassThrough && c.cfg.ThinkingEnabled && strings.Contains(path, "/v1/messages") {
+	if !spec.PassThrough && !spec.MinimalProbe && c.cfg.ThinkingEnabled && strings.Contains(path, "/v1/messages") {
 		spec.Body = c.applyThinkingConfig(spec.Body, "claude", spec.Model, spec.Account)
 	}
-	if !spec.PassThrough && strings.Contains(path, "/v1/messages") {
+	if !spec.PassThrough && !spec.MinimalProbe && strings.Contains(path, "/v1/messages") {
 		spec = c.normalizeClaudeMessagesSpec(spec)
 	}
 
@@ -113,7 +115,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		// JA3 is set, the sidecar disables its impersonation default headers and uses
 		// exactly the header set built above.
 		ja3 := resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override)
-		return c.postViaSidecar(ctx, claudeSpec, target, built, timeout, ja3)
+		return c.postViaSidecar(ctx, claudeSpec, target, built, timeout, ja3, false)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, bytes.NewReader(spec.Body))
@@ -194,8 +196,8 @@ func resolveClaudeJA3(override string) string {
 // scratch using the account-bound virtual identity, so the upstream sees a
 // consistent, first-party-looking client instead of the relay/host machine.
 func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.Identity, stream bool) {
-	token := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey)
-	apiKey := claudeUsesAPIKey(token)
+	token := accountprovider.Credential("claude", spec.Token)
+	apiKey := claudeUsesAPIKey(spec.Token)
 
 	dst.Set("Content-Type", "application/json")
 	if apiKey {
@@ -259,8 +261,8 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 // auth and the Claude Code identity fingerprint (X-App, X-Stainless-*, UA) so the call
 // looks like it came from the same first-party client as the account's message turns.
 func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id identity.Identity, stream bool) {
-	token := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey)
-	apiKey := claudeUsesAPIKey(token)
+	token := accountprovider.Credential("claude", spec.Token)
+	apiKey := claudeUsesAPIKey(spec.Token)
 
 	// Auth, per credential type (mirrors applyClaudeHeaders).
 	if apiKey {
@@ -522,8 +524,8 @@ func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
 // opaque user id, while OAuth and native Claude Code requests use the JSON shape.
 func (c *Client) normalizeClaudeMessagesMetadata(root map[string]interface{}, spec Request) bool {
 	metadata, hasMetadata := root["metadata"].(map[string]interface{})
-	token := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey)
-	claudeCode := (token != "" && !claudeUsesAPIKey(token)) || claudeRootHasCodeIdentity(root)
+	token := accountprovider.Credential("claude", spec.Token)
+	claudeCode := (token != "" && !claudeUsesAPIKey(spec.Token)) || claudeRootHasCodeIdentity(root)
 	if !hasMetadata && !claudeCode {
 		return false
 	}

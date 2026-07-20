@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/accountprovider"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
@@ -374,6 +375,9 @@ func codexQuotaPollTargets(accounts []storage.Account, tokens map[string]storage
 		if strings.TrimSpace(account.Provider) == "" && scheduler.ProviderFromToken(token) != "codex" {
 			continue
 		}
+		if accountprovider.UsesAPIKey("codex", token) {
+			continue
+		}
 		targets = append(targets, quotaPollTarget{Account: account, Token: token})
 	}
 	return targets, missingTokens
@@ -504,10 +508,7 @@ func (s *Server) recordQuotaPollError(ctx context.Context, acc storage.Account, 
 // two AccountRateLimit rows: one for the 5h (primary) window and one for the 7d
 // (secondary) window.
 func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, token storage.AccountToken, egress storage.EgressProfile) error {
-	accessToken := strings.TrimSpace(token.AccessToken)
-	if accessToken == "" {
-		accessToken = strings.TrimSpace(token.OpenAIAPIKey)
-	}
+	accessToken := accountprovider.Credential("codex", token)
 	if accessToken == "" {
 		return newQuotaPollError("token_missing", 0, nil, fmt.Errorf("no access token"))
 	}

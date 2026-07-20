@@ -232,6 +232,130 @@ func TestAccountBatchExpansionHelpers(t *testing.T) {
 	}
 }
 
+func TestReplaceCapabilitiesPersistsAuthoritativeEmptyCatalog(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.UpsertAccount(ctx, Account{ID: "account", GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertCapabilities(ctx, []ModelCapability{{AccountID: "account", ModelSlug: "stale", AvailabilityState: "unverified", Source: "static"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceCapabilities(ctx, "account", nil); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListCapabilities(ctx, "account")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("successful empty catalog retained stale rows=%+v err=%v", rows, err)
+	}
+	authoritative, err := store.ModelCatalogAuthoritative(ctx, "account")
+	if err != nil || !authoritative {
+		t.Fatalf("successful empty catalog authority=%v err=%v", authoritative, err)
+	}
+}
+
+func TestModelCapabilityRuntimeEvidencePreservesProviderAndWindowAxes(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.UpsertAccount(ctx, Account{ID: "claude", GroupName: "cyber", Provider: "claude", Status: "active"}, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertCapabilities(ctx, []ModelCapability{{
+		AccountID: "claude", ModelSlug: "claude-opus-4-8", AvailabilityState: "unverified",
+		NativeContextWindow: 200000, NativeMaxContextWindow: 1000000, Source: "claude_static_unverified",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetModelCapabilityState(ctx, "claude", "claude-opus-4-8", "verified", "supported", "runtime_inference", "claude_runtime_inference"); err != nil {
+		t.Fatal(err)
+	}
+	standard, err := store.BestNativeWindow(ctx, "claude", "claude-opus-4-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	maximum, err := store.BestNativeMaxWindow(ctx, "claude", "claude-opus-4-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListCapabilities(ctx, "claude")
+	if err != nil || len(rows) != 1 || rows[0].Source != "claude_runtime_inference" || standard != 200000 || maximum != 1000000 {
+		t.Fatalf("rows=%+v standard=%d maximum=%d err=%v", rows, standard, maximum, err)
+	}
+}
+
+func TestRuntimeEvidenceDoesNotEraseLiveCatalogAuthority(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.UpsertAccount(ctx, Account{ID: "claude-live", GroupName: "cyber", Provider: "claude", Status: "active"}, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceCapabilities(ctx, "claude-live", []ModelCapability{{
+		AccountID: "claude-live", ModelSlug: "claude-opus-4-8", AvailabilityState: "verified", Source: "claude_probe",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetModelCapabilityState(ctx, "claude-live", "claude-opus-4-8", "verified", "unknown", "", "claude_runtime_inference"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListCapabilities(ctx, "claude-live")
+	if err != nil || len(rows) != 1 || rows[0].Source != "claude_probe+claude_runtime_inference" {
+		t.Fatalf("combined capability source=%+v err=%v", rows, err)
+	}
+	// Rewriting the retained rows after a failed background probe must preserve
+	// the successful live catalog's authority, including absence of other models.
+	if err := store.UpsertCapabilities(ctx, rows); err != nil {
+		t.Fatal(err)
+	}
+	authoritative, err := store.ModelCatalogAuthoritative(ctx, "claude-live")
+	if err != nil || !authoritative {
+		t.Fatalf("live catalog authority=%v err=%v", authoritative, err)
+	}
+}
+
+func TestListRoutableCapabilitiesUsesHealthyStandbyEgress(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := Now()
+	account := Account{ID: "standby-capability", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressProfile(ctx, EgressProfile{ID: "blocked-primary", Name: "blocked", Type: "direct", Health: "disabled"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressProfile(ctx, EgressProfile{ID: "healthy-standby", Name: "standby", Type: "direct", Health: "healthy"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertEgressBinding(ctx, AccountEgressBinding{
+		AccountID: account.ID, PrimaryEgressID: "blocked-primary", StandbyEgressIDs: "healthy-standby", CooldownUntil: now + 3600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertCapabilities(ctx, []ModelCapability{{
+		AccountID: account.ID, ModelSlug: "gpt-standby", AvailabilityState: "verified", Source: "probe",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	caps, err := store.ListRoutableCapabilities(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caps) != 1 || caps[0].ModelSlug != "gpt-standby" {
+		t.Fatalf("healthy standby capability missing: %+v", caps)
+	}
+	if err := store.SetEgressHealth(ctx, "healthy-standby", "disabled"); err != nil {
+		t.Fatal(err)
+	}
+	caps, err = store.ListRoutableCapabilities(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caps) != 0 {
+		t.Fatalf("account without a usable egress remained visible: %+v", caps)
+	}
+}
+
 func TestListAccountsByIDs(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

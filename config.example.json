@@ -2,6 +2,7 @@
   "listen_addr": "127.0.0.1:8787",
   "database_path": "/var/lib/codex-pool/pool.sqlite3",
   "upstream_base_url": "https://chatgpt.com/backend-api/codex",
+  "openai_api_upstream_base_url": "https://api.openai.com/v1",
   "oauth_token_url": "",
   "client_version": "0.144.5",
   "default_group": "cyber",

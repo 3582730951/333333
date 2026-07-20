@@ -19,7 +19,7 @@ import { fmtInt, fmtTokens } from '../lib/format.js';
 import { useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import {
   healthBatchPresentation, healthResultPresentation, healthTestRequestBody,
-  isKiroAccount, isKiroSuspended, selectedHasKiro,
+  isKiroSuspended, isProtectedProbeQuarantine, requiresPaidHealthTest, selectedHasPaidProbe,
 } from '../features/accounts/model/healthTest.ts';
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -119,7 +119,7 @@ export default function Accounts() {
   const loadError = error || data.error;
   const accountByID = new Map(rows.map((account) => [account.id, account]));
   const selectedAccounts = selected.map((id) => accountByID.get(id) || selectedAccountMeta[id] || { id });
-  const bulkHealthIncludesKiro = selectedHasKiro(selectedAccounts, selected);
+  const bulkHealthIncludesPaidProbe = selectedHasPaidProbe(selectedAccounts, selected);
   const handleSelectionChange = useCallback((keys) => {
     setSelected(keys);
     setSelectedAccountMeta((previous) => {
@@ -171,14 +171,14 @@ export default function Accounts() {
     }
   };
 
-  const { run: bulkAction, running: bulkActionRunning } = useAsyncAction(async (act, label, kiroCostConfirmed = false) => {
+  const { run: bulkAction, running: bulkActionRunning } = useAsyncAction(async (act, label, costConfirmed = false) => {
     if (!selected.length) return;
     const healthEntries = [];
     const result = await batchOp(label, selected, async (id) => {
       const account = accountByID.get(id) || selectedAccountMeta[id] || { id };
       const response = await post(
         `/admin/accounts/${encodeURIComponent(id)}/${act}`,
-        act === 'health-test' ? healthTestRequestBody(account, kiroCostConfirmed) : {},
+        act === 'health-test' ? healthTestRequestBody(account, costConfirmed) : {},
       );
       if (act === 'health-test') healthEntries.push({ account, result: response });
       return response;
@@ -226,16 +226,16 @@ export default function Accounts() {
         {
           label: isAccountActionLoading(r.id, 'health-test') ? '测活中' : '测活',
           disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'health-test'),
-          confirm: isKiroAccount(r) ? {
-            title: '确认执行 Kiro 双层测活？',
-            description: '将先免费检查认证；认证正常后，会绑定此账号和出口发送 1 次最小推理请求并消耗少量 credits。',
+          confirm: requiresPaidHealthTest(r) ? {
+            title: '确认执行双层测活？',
+            description: '将先免费检查认证；认证正常后，会绑定此账号和出口发送 1 次最小推理请求，并可能产生少量上游费用。',
             confirmText: '确认并测活',
           } : undefined,
-          onSelect: () => action(r.id, 'health-test', healthTestRequestBody(r, isKiroAccount(r))),
+          onSelect: () => action(r.id, 'health-test', healthTestRequestBody(r, requiresPaidHealthTest(r))),
         },
         {
           label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解隔中' : '解隔',
-          disabled: isKiroSuspended(r) || (anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine')),
+          disabled: isProtectedProbeQuarantine(r) || (anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine')),
           onSelect: () => action(r.id, 'clear-quarantine'),
         },
         {
@@ -269,7 +269,8 @@ export default function Accounts() {
     const cols = [
       { title: 'id', get: (r) => r.id }, { title: 'label', get: (r) => r.label }, { title: 'email', get: (r) => r.email },
       { title: 'provider', get: (r) => r.provider }, { title: 'group', get: (r) => r.group_name },
-      { title: 'plan', get: (r) => r.plan_type }, { title: 'status', get: (r) => r.status },
+      { title: 'plan', get: (r) => r.plan_type }, { title: 'auth_method', get: (r) => r.auth_method },
+      { title: 'billing_mode', get: (r) => r.billing_mode }, { title: 'status', get: (r) => r.status },
     ];
     const ok = downloadCSV('accounts.csv', toCSV(filtered, cols));
     if (!ok) Toast.error('导出失败，请检查浏览器下载权限');
@@ -286,6 +287,7 @@ export default function Accounts() {
           <div className="pool-account-titleline">
             <TextClamp strong onClick={() => setDrawerAcct(r)}>{r.label || r.id}</TextClamp>
             <Tag size="small">{r.provider || 'codex'}</Tag>
+            <Tag size="small" color={r.auth_method === 'api_key' ? 'violet' : 'blue'}>{r.auth_method || 'oauth'}</Tag>
           </div>
           <div className="pool-account-metaline">
             <TextClamp muted className="pool-account-email" title={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
@@ -315,7 +317,7 @@ export default function Accounts() {
         return (
           <div className="pool-resource-summary">
             <TextClamp>{r.group_name || '默认'}</TextClamp>
-            <div className="pool-resource-summary__meta">{r.plan_type || '未设置套餐'}</div>
+            <div className="pool-resource-summary__meta">{r.billing_mode === 'pay_as_you_go' ? '按量计费' : (r.plan_type || '未设置套餐')}</div>
           </div>
         );
       },
@@ -376,6 +378,7 @@ export default function Accounts() {
           <Tag size="small">{r.provider || 'codex'}</Tag>
           <Tag size="small">{r.group_name || '默认'}</Tag>
           {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
+          {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
           <Tag size="small" color="blue">{route.primary}</Tag>
         </>}
         details={[
@@ -416,10 +419,10 @@ export default function Accounts() {
       {selected.length > 0 && (
         <div className="pool-bulkbar">
           <span>已选 <b>{selected.length}</b> 项</span>
-          {bulkHealthIncludesKiro ? (
+          {bulkHealthIncludesPaidProbe ? (
             <ConfirmDialog
-              title="确认批量执行 Kiro 双层测活？"
-              description="所选账号中包含 Kiro。每个认证正常的 Kiro 账号会发送 1 次最小推理请求并消耗少量 credits；其他提供商保持原测活方式。"
+              title="确认批量执行付费双层测活？"
+              description="所选账号中包含 Kiro 或上游 API Key。每个认证正常的此类账号会发送 1 次最小推理请求，并可能产生少量上游费用；其他账号保持免费测活。"
               confirmText="确认并批量测活"
               onConfirm={() => bulkAction('health-test', '测活', true)}
             >

@@ -12,8 +12,19 @@ import (
 	"strconv"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
+)
+
+const (
+	AvailabilityVerified    = "verified"
+	AvailabilityUnverified  = "unverified"
+	AvailabilityUnsupported = "unsupported"
+
+	Context1MSupported   = "supported"
+	Context1MUnsupported = "unsupported"
+	Context1MUnknown     = "unknown"
 )
 
 // RequestedClaudeModel separates the downstream model spelling from the model
@@ -79,11 +90,9 @@ func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64
 	return limit
 }
 
-// claudeModelWindows maps known Claude model ids to their native context window.
-// Anthropic's GET /v1/models does not return context windows, so this table
-// (mirrored from the reference relay's static model registry) both enriches a
-// successful live probe and seeds the static fallback. Unknown ids default to
-// the standard 200k Claude window in claudeWindow.
+// claudeModelWindows records the model's technical maximum. It is deliberately
+// separate from NativeContextWindow: the latter is the window this account may
+// use without the context-1m beta and is 200K for current Claude accounts.
 var claudeModelWindows = map[string]int64{
 	"claude-haiku-4-5-20251001":  200000,
 	"claude-sonnet-4-5-20250929": 200000,
@@ -97,12 +106,9 @@ var claudeModelWindows = map[string]int64{
 	"claude-sonnet-4-20250514":   200000,
 }
 
-// claudeStaticModels is the current-generation Claude model set advertised when
-// the per-account /v1/models probe is unavailable (e.g. an OAuth token that the
-// models-listing endpoint rejects). It also acts as a FLOOR unioned onto a live
-// probe (see MergeClaudeStatic) so the newest models surface even when Anthropic's
-// /v1/models lags behind a freshly shipped release. Curated and ordered
-// most-capable first; claude-opus-4-8 leads (1M context window by default).
+// claudeStaticModels is a discovery hint for credentials that cannot enumerate
+// models (notably some OAuth tokens). Static rows are never advertised as verified
+// and are never unioned into a successful live model response.
 var claudeStaticModels = []string{
 	"claude-opus-4-8",
 	"claude-opus-4-7",
@@ -247,6 +253,18 @@ func KiroPlanAllowsBootstrap(plan, model string) bool {
 	return true
 }
 
+// KiroPlanAllows1M reports whether the observed subscription may attempt a
+// runtime-verified model in one-million-token mode. A model's technical maximum
+// is not entitlement evidence: an empty/unknown plan and KIRO FREE stay on the
+// standard window until a paid subscription is observed.
+func KiroPlanAllows1M(plan, model string) bool {
+	if KiroContextWindow(model) < 1000000 {
+		return false
+	}
+	normalizedPlan := strings.ToUpper(strings.TrimSpace(plan))
+	return normalizedPlan != "" && !strings.Contains(normalizedPlan, "FREE")
+}
+
 func StaticKiroModels(accountID string) []storage.ModelCapability {
 	now := storage.Now()
 	out := make([]storage.ModelCapability, 0, len(kiroStaticModels))
@@ -255,8 +273,9 @@ func StaticKiroModels(accountID string) []storage.ModelCapability {
 		if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
 			window = 200000
 		}
-		out = append(out, storage.ModelCapability{AccountID: accountID, ModelSlug: slug, NativeContextWindow: window,
-			NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100, Source: "kiro_static_unknown", LastProbeAt: now})
+		out = append(out, storage.ModelCapability{AccountID: accountID, ModelSlug: slug, NativeContextWindow: 200000,
+			NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100, AvailabilityState: AvailabilityUnverified,
+			Context1MState: Context1MUnknown, Source: "kiro_static_unknown", LastProbeAt: now})
 	}
 	return out
 }
@@ -295,6 +314,110 @@ func NormalizeClaudeModelAlias(model string) string {
 	return model
 }
 
+// ClaudeModelAlias reports aliases whose concrete model must be selected from
+// the candidate account's capabilities rather than from the bundled catalog.
+func ClaudeModelAlias(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "auto", "default", "opus", "claude-opus", "sonnet", "claude-sonnet", "haiku", "claude-haiku":
+		return true
+	default:
+		return false
+	}
+}
+
+// ResolveClaudeModel resolves an alias only against usable capability rows for
+// one candidate account. Static discovery hints cannot make an alias routable.
+func ResolveClaudeModel(model string, caps []storage.ModelCapability, context1M bool) (string, bool) {
+	if !ClaudeModelAlias(model) {
+		return normalizeRequestedClaudeBase(model), strings.TrimSpace(model) != ""
+	}
+	wanted := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model)), "claude-")
+	if wanted == "auto" || wanted == "default" {
+		wanted = ""
+	}
+	best := ""
+	bestScore := int64(-1)
+	for _, c := range caps {
+		// Aliases cannot safely bootstrap from a bundled discovery hint: there is
+		// no exact downstream model to retry or reject. Resolve them only from
+		// account-scoped live/runtime evidence.
+		if !capabilityIsVerified(c) {
+			continue
+		}
+		if context1M && c.Context1MState != Context1MSupported {
+			continue
+		}
+		family, score := claudeModelRank(c.ModelSlug)
+		if family == "" || (wanted != "" && family != wanted) {
+			continue
+		}
+		if score > bestScore || (score == bestScore && c.ModelSlug > best) {
+			best, bestScore = c.ModelSlug, score
+		}
+	}
+	return best, best != ""
+}
+
+func capabilityIsVerified(c storage.ModelCapability) bool {
+	switch c.AvailabilityState {
+	case AvailabilityVerified:
+		return true
+	case AvailabilityUnverified, AvailabilityUnsupported:
+		return false
+	}
+	source := strings.ToLower(strings.TrimSpace(c.Source))
+	return source != "" && !strings.Contains(source, "static") && !strings.Contains(source, "unknown")
+}
+
+func claudeModelRank(model string) (string, int64) {
+	canonical := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(model)), ".", "-")
+	match := kiroConcreteModelRE.FindStringSubmatch(canonical)
+	if match == nil {
+		return "", -1
+	}
+	familyRank := map[string]int64{"haiku": 1, "sonnet": 2, "opus": 3}[match[1]]
+	major, _ := strconv.ParseInt(match[2], 10, 64)
+	minor, _ := strconv.ParseInt(match[3], 10, 64)
+	date, _ := strconv.ParseInt(match[4], 10, 64)
+	return match[1], familyRank*1_000_000_000_000_000 + major*1_000_000_000_000 + minor*1_000_000_000 + date
+}
+
+// ClaudeModelFamily returns opus, sonnet or haiku for a concrete Claude id or
+// family alias. It is used to keep fallback advice inside the requested tier.
+func ClaudeModelFamily(model string) string {
+	trimmed := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model)), "claude-")
+	for _, family := range []string{"opus", "sonnet", "haiku"} {
+		if trimmed == family || strings.HasPrefix(trimmed, family+"-") || strings.HasPrefix(trimmed, family+".") {
+			return family
+		}
+	}
+	return ""
+}
+
+// SuggestedClaudeFallback selects the highest verified lower-version model in
+// the same family. It never crosses Opus/Sonnet/Haiku boundaries.
+func SuggestedClaudeFallback(requested string, caps []storage.ModelCapability) string {
+	family, requestedScore := claudeModelRank(requested)
+	if family == "" {
+		family = ClaudeModelFamily(requested)
+		requestedScore = int64(^uint64(0) >> 1)
+	}
+	best, bestScore := "", int64(-1)
+	for _, c := range caps {
+		if !capabilityIsVerified(c) {
+			continue
+		}
+		candidateFamily, score := claudeModelRank(c.ModelSlug)
+		if candidateFamily != family || score >= requestedScore {
+			continue
+		}
+		if score > bestScore {
+			best, bestScore = c.ModelSlug, score
+		}
+	}
+	return best
+}
+
 // newestStaticClaudeByTier returns the most-capable current-generation Claude model id
 // of a tier ("opus"/"sonnet"/"haiku"), or "" if none is known. claudeStaticModels is
 // ordered most-capable first, so the first tier match is the newest/strongest.
@@ -308,9 +431,10 @@ func newestStaticClaudeByTier(tier string) string {
 }
 
 // ParseClaudeModels parses Anthropic's GET /v1/models response (data[].id) into
-// capabilities, filling the context window from claudeModelWindows since the
-// endpoint omits it. Source is tagged "claude_probe" to distinguish a live probe
-// from the static fallback.
+// capabilities. The standard window remains 200K. A larger technical maximum is
+// only entitlement evidence when the live payload reports it explicitly; the
+// curated model table is discovery metadata, not proof that this credential may
+// use the 1M beta.
 func ParseClaudeModels(accountID string, raw []byte, etag string) ([]storage.ModelCapability, error) {
 	var root interface{}
 	if err := json.Unmarshal(raw, &root); err != nil {
@@ -326,16 +450,24 @@ func ParseClaudeModels(accountID string, raw []byte, etag string) ([]storage.Mod
 		if slug == "" {
 			continue
 		}
-		window := firstInt(model, "context_window", "context_length", "max_context_tokens", "native_context_window")
-		if window == 0 {
-			window = claudeWindow(slug)
+		reportedMax := firstInt(model, "max_input_tokens", "max_context_window", "native_max_context_window", "max_context_tokens", "context_window", "context_length")
+		technicalMax := reportedMax
+		if technicalMax == 0 {
+			technicalMax = claudeWindow(slug)
+		}
+		contextState, contextSource := Context1MUnknown, ""
+		if reportedMax >= 1000000 || modelDeclaresContext1M(model) {
+			contextState, contextSource = Context1MSupported, "live_models"
 		}
 		out = append(out, storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     slug,
-			NativeContextWindow:           window,
-			NativeMaxContextWindow:        window,
+			NativeContextWindow:           200000,
+			NativeMaxContextWindow:        technicalMax,
 			EffectiveContextWindowPercent: 100,
+			AvailabilityState:             AvailabilityVerified,
+			Context1MState:                contextState,
+			Context1MSource:               contextSource,
 			Visibility:                    firstString(model, "visibility"),
 			ETag:                          etag,
 			RawModelJSONHash:              hash,
@@ -353,43 +485,94 @@ func StaticClaudeModels(accountID string) []storage.ModelCapability {
 	now := storage.Now()
 	out := make([]storage.ModelCapability, 0, len(claudeStaticModels))
 	for _, slug := range claudeStaticModels {
-		window := claudeWindow(slug)
+		technicalMax := claudeWindow(slug)
 		out = append(out, storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     slug,
-			NativeContextWindow:           window,
-			NativeMaxContextWindow:        window,
+			NativeContextWindow:           200000,
+			NativeMaxContextWindow:        technicalMax,
 			EffectiveContextWindowPercent: 100,
-			Source:                        "claude_static",
+			AvailabilityState:             AvailabilityUnverified,
+			Context1MState:                Context1MUnknown,
+			Source:                        "claude_static_unverified",
 			LastProbeAt:                   now,
 		})
 	}
 	return out
 }
 
-// MergeClaudeStatic unions the curated current-generation static set onto a live
-// /v1/models probe result, treating the static list as a FLOOR. A live probe is
-// authoritative for what an account exposes, but Anthropic's /v1/models both omits
-// context windows and can lag a freshly shipped model by days (claude-opus-4-8 is
-// the immediate example), while an OAuth token may be rejected by the endpoint
-// entirely. Without a floor, a probe that "succeeds" but is missing the latest
-// model would hide it. probeCaps win on conflict (their slug already present is
-// kept as-is); any static slug the probe did not return is appended so the newest
-// known models always appear. Order is preserved (probe first, then new static).
+// MergeClaudeStatic remains for callers compiled against the previous API. A
+// successful live list is authoritative, so the result is now an exact copy.
 func MergeClaudeStatic(accountID string, probeCaps []storage.ModelCapability) []storage.ModelCapability {
-	have := make(map[string]struct{}, len(probeCaps))
-	out := make([]storage.ModelCapability, 0, len(probeCaps)+len(claudeStaticModels))
-	for _, c := range probeCaps {
-		have[c.ModelSlug] = struct{}{}
-		out = append(out, c)
-	}
-	for _, c := range StaticClaudeModels(accountID) {
-		if _, ok := have[c.ModelSlug]; ok {
+	_ = accountID
+	return append([]storage.ModelCapability(nil), probeCaps...)
+}
+
+// ApplyClaudeAccountPolicy converts technical/live metadata into the context
+// entitlement of this credential. Pro is permanently 200K. API keys may use 1M
+// only when live model metadata proves it; eligible OAuth plans may use 1M only
+// on qualifying Opus models.
+func ApplyClaudeAccountPolicy(caps []storage.ModelCapability, account storage.Account, token storage.AccountToken) []storage.ModelCapability {
+	method := accountprovider.EffectiveAuthMethod("claude", token)
+	plan := strings.ToLower(strings.TrimSpace(account.PlanType))
+	for i := range caps {
+		c := &caps[i]
+		c.NativeContextWindow = 200000
+		if c.NativeMaxContextWindow == 0 {
+			c.NativeMaxContextWindow = claudeWindow(c.ModelSlug)
+		}
+		if method == accountprovider.AuthMethodAPIKey {
+			if c.AvailabilityState != AvailabilityVerified && c.Context1MState == Context1MSupported {
+				c.Context1MState, c.Context1MSource = Context1MUnknown, ""
+			}
 			continue
 		}
-		out = append(out, c)
+		switch {
+		case strings.Contains(plan, "pro") && !strings.Contains(plan, "enterprise"):
+			c.Context1MState, c.Context1MSource = Context1MUnsupported, "plan:pro"
+		case claudeOAuthPlanAllows1M(plan) && claudeOpusSupports1M(c.ModelSlug, c.NativeMaxContextWindow):
+			c.Context1MState, c.Context1MSource = Context1MSupported, "plan:"+plan
+		case plan != "" && claudeOAuthPlanAllows1M(plan):
+			c.Context1MState, c.Context1MSource = Context1MUnsupported, "model_not_eligible"
+		default:
+			c.Context1MState, c.Context1MSource = Context1MUnknown, "plan:unknown"
+		}
 	}
-	return out
+	return caps
+}
+
+func claudeOAuthPlanAllows1M(plan string) bool {
+	return strings.Contains(plan, "max") || strings.Contains(plan, "team") || strings.Contains(plan, "enterprise")
+}
+
+func claudeOpusSupports1M(model string, technicalMax int64) bool {
+	family, score := claudeModelRank(model)
+	_, baseline := claudeModelRank("claude-opus-4-6")
+	return family == "opus" && score >= baseline && technicalMax >= 1000000
+}
+
+func modelDeclaresContext1M(model map[string]interface{}) bool {
+	for key, value := range model {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "1m") || (strings.Contains(lower, "context") && strings.Contains(lower, "million")) {
+			if b, ok := value.(bool); ok && b {
+				return true
+			}
+		}
+		switch nested := value.(type) {
+		case map[string]interface{}:
+			if modelDeclaresContext1M(nested) {
+				return true
+			}
+		case []interface{}:
+			for _, item := range nested {
+				if child, ok := item.(map[string]interface{}); ok && modelDeclaresContext1M(child) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // codexStaticModel describes one current-generation Codex (ChatGPT) model for the
@@ -493,6 +676,8 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 			NativeContextWindow:           m.window,
 			NativeMaxContextWindow:        m.maxWindow,
 			EffectiveContextWindowPercent: 95,
+			AvailabilityState:             AvailabilityUnverified,
+			Context1MState:                Context1MUnknown,
 			Visibility:                    "list",
 			Source:                        "codex_static",
 			LastProbeAt:                   now,
@@ -501,43 +686,10 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 	return out
 }
 
-// MergeCodexStatic adds only the static Codex models that are NEWER than the
-// newest known static model returned by a live probe. ChatGPT /models is version-
-// gated and can legitimately return "up to gpt-5.4" when the probe version/scope
-// is stale; adding the static prefix surfaces the current flagship without turning
-// every successful probe into the full fallback catalog. Probe entries still win on
-// conflicts, and older static entries are not re-added so a re-probe can evict stale
-// models the account no longer exposes.
+// MergeCodexStatic remains for compatibility. Live /models data is authoritative.
 func MergeCodexStatic(accountID string, probeCaps []storage.ModelCapability) []storage.ModelCapability {
-	if len(probeCaps) == 0 {
-		return StaticCodexModels(accountID)
-	}
-	staticIndex := make(map[string]int, len(codexStaticModels))
-	for i, m := range codexStaticModels {
-		staticIndex[m.slug] = i
-	}
-	have := make(map[string]struct{}, len(probeCaps))
-	firstKnown := len(codexStaticModels)
-	for _, c := range probeCaps {
-		have[c.ModelSlug] = struct{}{}
-		if idx, ok := staticIndex[c.ModelSlug]; ok && idx < firstKnown {
-			firstKnown = idx
-		}
-	}
-	out := make([]storage.ModelCapability, 0, len(probeCaps)+firstKnown)
-	for _, c := range probeCaps {
-		out = append(out, c)
-	}
-	if firstKnown == len(codexStaticModels) {
-		return out
-	}
-	for _, c := range StaticCodexModels(accountID)[:firstKnown] {
-		if _, ok := have[c.ModelSlug]; ok {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
+	_ = accountID
+	return append([]storage.ModelCapability(nil), probeCaps...)
 }
 
 func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability, error) {
@@ -585,6 +737,8 @@ func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability
 			NativeContextWindow:           native,
 			NativeMaxContextWindow:        maxNative,
 			EffectiveContextWindowPercent: percent,
+			AvailabilityState:             AvailabilityVerified,
+			Context1MState:                Context1MUnknown,
 			AutoCompactTokenLimit:         autoCompact,
 			Visibility:                    visibility,
 			ETag:                          etag,
@@ -668,14 +822,6 @@ func providerKeyForSource(source string) string {
 
 func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Config) ([]byte, string, error) {
 	_ = cfg // kept for API compatibility; model responses now advertise only real native windows.
-	// A freshly imported Codex account has a short interval before its first live
-	// capability probe. Serve the same curated Codex floor used when that probe is
-	// unavailable instead of leaking the obsolete gpt-5.4-codex/unknown placeholder.
-	// Once stored probe data exists it remains authoritative and replaces this
-	// cold-start catalog, including any larger context window advertised upstream.
-	if len(capabilities) == 0 {
-		capabilities = StaticCodexModels("codex-static-cold-start")
-	}
 	// Group by provider so a mixed pool advertises EVERY provider's models. The old
 	// single pool-wide "richest account" pick hid all but one provider's models when
 	// codex/claude/custom accounts coexisted. Within each provider we still advertise
@@ -684,6 +830,9 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	buckets := map[string][]storage.ModelCapability{}
 	order := make([]string, 0)
 	for _, c := range capabilities {
+		if !capabilityIsVerified(c) {
+			continue
+		}
 		key := providerKeyForSource(c.Source)
 		if _, ok := buckets[key]; !ok {
 			order = append(order, key)
@@ -711,13 +860,13 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	data := make([]interface{}, 0, len(best)+1)
 	for _, key := range keys {
 		cap := best[key]
-		window := cap.NativeMaxContextWindow
+		window := cap.NativeContextWindow
 		if window == 0 {
-			window = cap.NativeContextWindow
+			window = cap.NativeMaxContextWindow
 		}
-		native := cap.NativeMaxContextWindow
+		native := cap.NativeContextWindow
 		if native == 0 {
-			native = cap.NativeContextWindow
+			native = cap.NativeMaxContextWindow
 		}
 		item := rawOfficialModelItem(cap)
 		item["id"] = cap.ModelSlug
@@ -757,9 +906,8 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 // native GET /v1/models schema — {data:[{type:"model",id,display_name,created_at}],
 // has_more:false,first_id,last_id}. Anthropic clients (Claude Code) enumerate models
 // from THIS shape and disable their model picker / "auto" selection when handed the
-// OpenAI-shaped list BuildModelsResponse returns. Only claude-* models are listed; the
-// curated current-generation set is unioned as a floor so a freshly shipped model (or an
-// OAuth token whose /models endpoint is rejected) still surfaces.
+// OpenAI-shaped list BuildModelsResponse returns. Only verified claude-* models are
+// listed; unverified static discovery hints never leak into the public catalog.
 func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byte, string, error) {
 	claudeCaps := make([]storage.ModelCapability, 0, len(capabilities))
 	kiroCaps := make([]storage.ModelCapability, 0, len(capabilities))
@@ -771,11 +919,9 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 			kiroCaps = append(kiroCaps, c)
 		}
 	}
-	// Richest single Claude account's set, floored by the static current-gen list so the
-	// full sonnet/haiku/opus family Claude Code's auto mode expects is always present.
 	merged := append([]storage.ModelCapability(nil), richestAccountCaps(kiroCaps)...)
 	if len(claudeCaps) > 0 {
-		merged = append(merged, MergeClaudeStatic("", richestAccountCaps(claudeCaps))...)
+		merged = append(merged, richestAccountCaps(claudeCaps)...)
 	}
 	seen := make(map[string]bool, len(merged))
 	data := make([]interface{}, 0, len(merged))
@@ -792,16 +938,14 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 		})
 	}
 	for _, c := range merged {
+		if !capabilityIsVerified(c) {
+			continue
+		}
 		slug := c.ModelSlug
 		if providerKeyForSource(c.Source) == "kiro" {
-			slug = claudeFacingKiroModelID(slug)
+			slug = ClaudeFacingKiroModelID(slug)
 		}
 		appendModel(slug)
-	}
-	if len(data) == 0 && len(kiroCaps) == 0 {
-		for _, slug := range claudeStaticModels {
-			appendModel(slug)
-		}
 	}
 	resp := map[string]interface{}{"data": data, "has_more": false}
 	if len(data) > 0 {
@@ -816,11 +960,12 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
 }
 
-// claudeFacingKiroModelID converts Kiro's native dotted version spelling
+// ClaudeFacingKiroModelID converts Kiro's native dotted version spelling
 // (claude-opus-4.8) to the public Anthropic/Claude Code spelling
 // (claude-opus-4-8). Request routing accepts both forms and canonicalizes back to
-// Kiro's native ID; this conversion is only for the client-facing model catalog.
-func claudeFacingKiroModelID(slug string) string {
+// Kiro's native ID; this conversion is used for all client-facing model metadata
+// and fallback instructions.
+func ClaudeFacingKiroModelID(slug string) string {
 	trimmed := strings.ToLower(strings.TrimSpace(slug))
 	match := kiroConcreteModelRE.FindStringSubmatch(trimmed)
 	if match == nil {

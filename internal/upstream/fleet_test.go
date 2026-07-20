@@ -505,12 +505,14 @@ func TestCodexSidecarAPIKeyOmitsJA3(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	cfg := config.Default()
+	cfg.OpenAIAPIUpstreamBaseURL = "https://api.openai.example/v1"
+	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{
 		DownstreamPath: "/v1/responses",
 		Body:           []byte(`{"stream":true}`),
 		Account:        storage.Account{ID: "acc-cdx-api"},
-		Token:          storage.AccountToken{OpenAIAPIKey: "sk-openai-xyz"},
+		Token:          storage.AccountToken{AuthMethod: "api_key", OpenAIAPIKey: "sk-openai-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
 	})
 	if err != nil {
@@ -521,6 +523,15 @@ func TestCodexSidecarAPIKeyOmitsJA3(t *testing.T) {
 	// masquerade with Codex's TLS fingerprint.
 	if cap.ja3 != "" {
 		t.Fatalf("api-key path replayed Codex JA3 %q, want none", cap.ja3)
+	}
+	if cap.url != "https://api.openai.example/v1/responses" {
+		t.Fatalf("api-key sidecar target = %q, want OpenAI Platform URL", cap.url)
+	}
+	if cap.headers.Get("Authorization") != "Bearer sk-openai-xyz" {
+		t.Fatalf("api-key Authorization = %q", cap.headers.Get("Authorization"))
+	}
+	if cap.defaultHeaders == nil || *cap.defaultHeaders {
+		t.Fatalf("api-key sidecar must suppress browser default headers, got %v", cap.defaultHeaders)
 	}
 	// ...but it still POSTs JSON, so it needs the content type too (the 400 fix applies
 	// to API-key and OAuth accounts alike).

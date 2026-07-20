@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+
+	"codex-account-pool/internal/accountprovider"
 )
 
 // openAICompatUserAgent is sent on custom-provider traffic. It mimics the official
@@ -66,7 +68,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 		sidecarSpec := spec
 		sidecarSpec.Method = method
-		return c.postViaSidecar(ctx, sidecarSpec, target, built, timeout, "")
+		return c.postViaSidecar(ctx, sidecarSpec, target, built, timeout, "", true)
 	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
@@ -102,7 +104,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 // body, the streaming-appropriate Accept, and a generic OpenAI-SDK User-Agent. It
 // deliberately forwards NONE of the downstream client's headers.
 func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
-	if bearer := firstNonEmpty(spec.Token.AccessToken, spec.Token.OpenAIAPIKey); bearer != "" {
+	if bearer := accountprovider.Credential(spec.Account.Provider, spec.Token); bearer != "" {
 		dst.Set("Authorization", "Bearer "+bearer)
 	}
 	if len(spec.Body) > 0 {

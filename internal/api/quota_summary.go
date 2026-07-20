@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
@@ -86,6 +87,11 @@ func BuildQuotaSummary(account storage.Account, token *storage.AccountToken, sna
 	}
 	switch provider {
 	case "codex", "chatgpt", "openai":
+		if accountprovider.UsesAPIKey("codex", *token) {
+			out.SyncReason = "unsupported_api_key_billing"
+			out.Supported = false
+			return out
+		}
 	case "claude":
 		if !claudeTokenCanRefresh(*token) {
 			out.SyncReason = "unsupported_claude_non_oauth"

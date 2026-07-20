@@ -85,6 +85,52 @@ func TestAutoKiroOnlyConcreteModelBootstrapsThenBecomesVerified(t *testing.T) {
 	verifiedLease.Release()
 }
 
+func TestKiroOneMillionRequiresRuntimeVerifiedOpus(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	endpointHash := seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-1m", Label: "kiro", GroupName: "cyber", PlanType: "KIRO PRO"})
+	s := New(store, config.Default())
+	route := Route{Group: "cyber", AllowedProviders: []string{"kiro"}, ExplicitProvider: true, Model: "claude-opus-4-8", ContextMode: "1m", ThinkingRequired: true}
+	if _, err := s.Select(ctx, route); !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("unverified Kiro 1M capability routed: %v", err)
+	}
+	if _, err := store.ObserveKiroCapability(ctx, "kiro-1m", endpointHash, "claude-opus-4.8", storage.KiroCapabilityObservation{ModelSucceeded: true, ThinkingRequested: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.InvalidateAccountCache()
+	lease, err := s.Select(ctx, route)
+	if err != nil {
+		t.Fatalf("runtime-verified Kiro Opus 1M did not route: %v", err)
+	}
+	if lease.ResolvedModel != "claude-opus-4.8" {
+		t.Fatalf("resolved model=%q", lease.ResolvedModel)
+	}
+	lease.Release()
+}
+
+func TestKiroOneMillionRejectsFreeAndUnknownPlansAfterRuntimeVerification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		plan string
+	}{
+		{name: "free", plan: "KIRO FREE"},
+		{name: "unknown", plan: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testStore(t)
+			ctx := context.Background()
+			accountID := "kiro-1m-" + tc.name
+			endpointHash := seedUnverifiedKiroAccount(t, store, storage.Account{ID: accountID, Label: tc.name, GroupName: "cyber", PlanType: tc.plan})
+			if _, err := store.ObserveKiroCapability(ctx, accountID, endpointHash, "claude-sonnet-4.6", storage.KiroCapabilityObservation{ModelSucceeded: true, ThinkingRequested: true}); err != nil {
+				t.Fatal(err)
+			}
+			s := New(store, config.Default())
+			_, err := s.Select(ctx, Route{Group: "cyber", AllowedProviders: []string{"kiro"}, ExplicitProvider: true, Model: "claude-sonnet-4-6", ContextMode: "1m", ThinkingRequired: true})
+			requireModelUnsupported(t, err, 1)
+		})
+	}
+}
+
 func TestKiroBootstrapCandidatePriority(t *testing.T) {
 	t.Run("official claude before bootstrap", func(t *testing.T) {
 		store := testStore(t)

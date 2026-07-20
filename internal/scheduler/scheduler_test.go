@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
@@ -346,6 +347,85 @@ func TestSelectFreshRoundRobinSpread(t *testing.T) {
 		if counts[id] != 3 {
 			t.Fatalf("account %s got %d/9 selections, want 3 (even round-robin); counts=%v", id, counts[id], counts)
 		}
+	}
+}
+
+func TestProviderAPIKeyAndOAuthAccountsBalanceEqually(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	accounts := []struct {
+		id, method string
+	}{{"claude-oauth", "oauth"}, {"claude-api-key", "api_key"}}
+	for _, item := range accounts {
+		account := storage.Account{ID: item.id, Label: item.id, GroupName: "cyber", Provider: "claude", Status: "active"}
+		if err := store.UpsertAccount(ctx, account, storage.AccountToken{AuthMethod: item.method, AccessToken: "credential-" + item.id}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{{
+			AccountID: item.id, ModelSlug: "claude-sonnet-4-6", AvailabilityState: capability.AvailabilityVerified, Source: "claude_probe",
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := New(store, config.Default())
+	counts := map[string]int{}
+	for i := 0; i < 8; i++ {
+		lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude", Model: "claude-sonnet-4-6"})
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		counts[lease.Account.ID]++
+		lease.Release()
+	}
+	if counts["claude-oauth"] != 4 || counts["claude-api-key"] != 4 {
+		t.Fatalf("auth method influenced balancing: %v", counts)
+	}
+}
+
+func TestClaudeAliasRequiresVerifiedCapabilityAndRejectionsStayModelScoped(t *testing.T) {
+	aliasRoute := Route{Model: "opus"}
+	if resolved, _, ok := resolveClaudeRouteModel(aliasRoute, []storage.ModelCapability{{
+		ModelSlug: "claude-opus-4-8", AvailabilityState: capability.AvailabilityUnverified, Source: "claude_static_unverified",
+	}}); ok || resolved != "" {
+		t.Fatalf("unverified static alias resolved to %q", resolved)
+	}
+	if resolved, _, ok := resolveClaudeRouteModel(aliasRoute, []storage.ModelCapability{{
+		ModelSlug: "claude-opus-4-8", AvailabilityState: capability.AvailabilityVerified, Source: "claude_runtime_inference",
+	}}); !ok || resolved != "claude-opus-4-8" {
+		t.Fatalf("verified alias=(%q,%v)", resolved, ok)
+	}
+
+	caps := []storage.ModelCapability{{
+		ModelSlug: "claude-opus-4-8", AvailabilityState: capability.AvailabilityUnsupported, Source: "claude_runtime_rejected",
+	}}
+	if resolved, _, ok := resolveClaudeRouteModel(Route{Model: "claude-opus-4-8"}, caps); ok || resolved != "" {
+		t.Fatalf("rejected exact model was retried as %q", resolved)
+	}
+	if resolved, bootstrap, ok := resolveClaudeRouteModel(Route{Model: "claude-sonnet-4-6"}, caps); !ok || !bootstrap || resolved == "" {
+		t.Fatalf("one rejection blocked a different model: resolved=%q bootstrap=%v ok=%v", resolved, bootstrap, ok)
+	}
+	if resolved, _, ok := resolveCodexRouteModel(Route{Model: "gpt-5.6-sol"}, []storage.ModelCapability{{
+		ModelSlug: "gpt-5.6-sol", AvailabilityState: capability.AvailabilityUnsupported, Source: "codex_runtime_rejected",
+	}}); ok || resolved != "" {
+		t.Fatalf("rejected Codex model was retried as %q", resolved)
+	}
+}
+
+func TestSuccessfulEmptyModelCatalogPreventsConcreteBootstrap(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "claude-empty", Label: "claude-empty", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AuthMethod: "oauth", AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceCapabilities(ctx, account.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, config.Default())
+	_, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude", Model: "claude-opus-4-8"})
+	var noAccount *NoAccountError
+	if !errors.As(err, &noAccount) || noAccount.Counters.ModelUnsupported != 1 {
+		t.Fatalf("empty authoritative catalog bootstrapped model: err=%v", err)
 	}
 }
 
@@ -958,6 +1038,7 @@ func TestNoAccountErrorIncludesSkipCounters(t *testing.T) {
 		}
 	}
 	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{
+		{AccountID: "acc-model", ModelSlug: "gpt-other", AvailabilityState: capability.AvailabilityVerified, NativeMaxContextWindow: 200000},
 		{AccountID: "acc-rate", ModelSlug: "gpt-5", NativeMaxContextWindow: 200000},
 		{AccountID: "acc-budget", ModelSlug: "gpt-5", NativeMaxContextWindow: 200000},
 	}); err != nil {

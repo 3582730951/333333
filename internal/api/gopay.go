@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/gopay"
 	"codex-account-pool/internal/storage"
 )
@@ -88,7 +89,11 @@ func (s *Server) adminGopaySubscribe(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err)
 			return
 		}
-		token = firstNonEmpty(t.AccessToken, t.OpenAIAPIKey)
+		if accountprovider.UsesAPIKey("codex", t) {
+			writePoolCodeError(w, http.StatusBadRequest, "subscription_operation_unavailable", "API-key accounts do not support subscription operations")
+			return
+		}
+		token = accountprovider.Credential("codex", t)
 		if acc, e := s.store.GetAccount(r.Context(), req.AccountID); e == nil {
 			label = firstNonEmpty(acc.Label, acc.Email, acc.ID)
 		}

@@ -2,9 +2,9 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -12,7 +12,6 @@ import (
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
-	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/scheduler"
@@ -23,6 +22,13 @@ import (
 	"codex-account-pool/internal/usage"
 	"codex-account-pool/internal/virtual"
 )
+
+type chatClaudeModelRetryKey struct{}
+
+func chatClaudeModelRetryCount(ctx context.Context) int {
+	count, _ := ctx.Value(chatClaudeModelRetryKey{}).(int)
+	return count
+}
 
 // isClaudeModel reports whether a model id targets Anthropic Claude, so an
 // OpenAI-compatible /v1/chat/completions request can be transparently relayed to
@@ -49,6 +55,9 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	if anthropicContext1MRequested(r.Header) {
+		requestedModel.ContextMode = "1m"
 	}
 	if requestedModel.BaseModel != model {
 		anthBody = setForcedModel(anthBody, requestedModel.BaseModel)
@@ -84,6 +93,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			KiroEndpointAllowlist: kiroCfg.KiroEndpointAllowlist,
 			KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
 			Model:                 model,
+			ContextMode:           requestedModel.ContextMode,
 			EstimatedTokens:       virtual.EstimateTokensJSON(raw),
 			Exclude:               exclude,
 			OnWait:                schedulerWaitCallback(r.Context()),
@@ -93,8 +103,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
 				return
 			}
-			if explicitKiro && capability.KiroModelAlias(model) {
-				writeKiroError(w, r, http.StatusServiceUnavailable, fmt.Errorf("%w: %s", kirowire.ErrVerifiedModelUnavailable, model))
+			if s.handleCapabilitySelectionError(r.Context(), w, err, false, routeGroup, strings.Join(allowedProviders, ","), requestedModel.RequestedModel, requestedModel.ContextMode) {
 				return
 			}
 			if schedulerWaitTerminal(r.Context(), "The model is temporarily unavailable. Please retry shortly.") {
@@ -233,6 +242,23 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 				return
 			}
 		}
+		if isModelNotFoundError(resp.StatusCode, errBody) {
+			s.rejectAccountModel(r.Context(), lease.Account, model, resp.StatusCode)
+			_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
+			maxAttempts := s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts)
+			if maxAttempts < 2 {
+				maxAttempts = 2
+			}
+			retryCount := chatClaudeModelRetryCount(r.Context())
+			if retryCount+1 < maxAttempts && !refreshHeartbeat.Committed() {
+				releaseLease()
+				retryContext := context.WithValue(r.Context(), chatClaudeModelRetryKey{}, retryCount+1)
+				s.handleChatViaClaude(w, r.WithContext(retryContext), raw, requestedModel.RequestedModel, pol)
+				return
+			}
+			_ = s.handleCapabilitySelectionError(r.Context(), w, &scheduler.NoAccountError{Model: model, Counters: scheduler.NoAccountCounters{ModelUnsupported: 1}}, false, routeGroup, "claude", requestedModel.RequestedModel, requestedModel.ContextMode)
+			return
+		}
 		decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
 			Provider:   "claude",
 			Entrypoint: "chat_completions",
@@ -281,6 +307,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 		return
 	}
 chatClaudeSuccess:
+	s.verifyAccountModel(r.Context(), lease.Account, model, requestedModel.ContextMode)
 	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 

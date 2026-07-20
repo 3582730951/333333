@@ -41,6 +41,13 @@ const (
 	assistantFirstPadding    = "Continue the conversation."
 	kiroContextMinOutput     = int64(4096)
 	kiroContextMinHeadroom   = int64(8192)
+
+	// Claude Code 2.1.x uses this dedicated system/instruction pair for manual and
+	// automatic conversation compaction. Requiring both markers keeps an ordinary
+	// user prompt from acquiring compaction-only routing; tools are not a signal,
+	// because some client builds carry definitions while denying all tool calls.
+	claudeCodeCompactionSystem      = "You are a helpful AI assistant tasked with summarizing conversations."
+	claudeCodeCompactionInstruction = "Your task is to create a detailed summary of the conversation so far"
 )
 
 var (
@@ -56,12 +63,16 @@ type ContextLengthError struct {
 	EstimatedInput int64
 	EffectiveLimit int64
 	ContextMode    string
+	Compaction     bool
 }
 
 func (e *ContextLengthError) Error() string {
 	requested := e.RequestedModel
 	if requested == "" {
 		requested = e.KiroModel
+	}
+	if e.Compaction {
+		return fmt.Sprintf("%v: requested_model=%s kiro_model=%s input_tokens~%d effective_limit=%d; /compact 请求本身仍超出可用上下文，请切换到支持 1M 的账号/模型后重试，或运行 /clear", ErrContextTooLong, requested, e.KiroModel, e.EstimatedInput, e.EffectiveLimit)
 	}
 	return fmt.Sprintf("%v: requested_model=%s kiro_model=%s input_tokens~%d effective_limit=%d; 请运行 /compact 后重试", ErrContextTooLong, requested, e.KiroModel, e.EstimatedInput, e.EffectiveLimit)
 }
@@ -85,6 +96,8 @@ type Conversion struct {
 	ThinkingEffort         string
 	MaxOutputTokens        int64
 	ContextWindow          int64
+	ContextMode            string
+	Compaction             bool
 	OriginalInputTokens    int64
 	HistoryMessagesDropped int
 	CachePointCount        int
@@ -115,6 +128,11 @@ type ConversionOptions struct {
 	// It is required to resolve family/auto aliases; concrete versions never use a
 	// different verified version as a substitute.
 	VerifiedModels []string
+	// Compaction marks a genuine Claude Code summarization request. It does not
+	// change the window by itself; the API layer must still prove account/model
+	// eligibility before passing a larger ContextWindow.
+	Compaction  bool
+	ContextMode string
 }
 
 type WebSearchRequest struct{ Query, ToolUseID string }
@@ -193,6 +211,32 @@ func (l lossSet) sorted() []string {
 
 func ConvertAnthropicRequest(raw []byte, affinity string) (Conversion, error) {
 	return ConvertAnthropicRequestWithOptions(raw, affinity, ConversionOptions{})
+}
+
+// IsClaudeCodeCompactionRequest recognizes Claude Code's dedicated summarization
+// call without trusting a generic word such as "compact". Current Claude Code
+// sends the fixed system role and a fixed final-user instruction prefix.
+func IsClaudeCodeCompactionRequest(raw []byte) bool {
+	// Avoid a full JSON decode on ordinary turns. Claude Code emits both markers
+	// as plain ASCII; only the rare matching request pays the structural check.
+	if !bytes.Contains(raw, []byte(claudeCodeCompactionSystem)) || !bytes.Contains(raw, []byte(claudeCodeCompactionInstruction)) {
+		return false
+	}
+	var req anthropicRequest
+	if decodeUseNumber(raw, &req) != nil {
+		return false
+	}
+	system, present, err := systemContent(req.System, lossSet{})
+	if err != nil || !present || !strings.Contains(system, claudeCodeCompactionSystem) {
+		return false
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if !strings.EqualFold(strings.TrimSpace(req.Messages[i].Role), "user") {
+			continue
+		}
+		return strings.Contains(contentText(req.Messages[i].Content), claudeCodeCompactionInstruction)
+	}
+	return false
 }
 
 func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options ConversionOptions) (Conversion, error) {
@@ -414,7 +458,7 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	historyMessagesDropped := 0
 	if maxOutputTokens > 0 && webSearch == nil {
 		if estimatedInputTokens >= contextWindow {
-			return Conversion{}, &ContextLengthError{KiroModel: canonical, EstimatedInput: estimatedInputTokens, EffectiveLimit: contextWindow}
+			return Conversion{}, &ContextLengthError{KiroModel: canonical, EstimatedInput: estimatedInputTokens, EffectiveLimit: contextWindow, ContextMode: options.ContextMode, Compaction: options.Compaction}
 		}
 		availableOutput := contextWindow - estimatedInputTokens
 		if maxOutputTokens > availableOutput {
@@ -468,6 +512,8 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		ThinkingEffort:         thinkingEffort,
 		MaxOutputTokens:        maxOutputTokens,
 		ContextWindow:          contextWindow,
+		ContextMode:            options.ContextMode,
+		Compaction:             options.Compaction,
 		OriginalInputTokens:    originalInputTokens,
 		HistoryMessagesDropped: historyMessagesDropped,
 		CachePointCount:        cachePlan.count,

@@ -69,8 +69,11 @@ function setImp(m) {
   impMode = m; $$("#impTabs button").forEach((x) => x.classList.toggle("on", x.dataset.m === m));
   $$("#importMask [data-m]").forEach((x) => { if (x.tagName === "DIV") x.classList.toggle("hide", x.dataset.m !== m); });
   const isOauth = m === "oauth_codex" || m === "oauth_claude";
+  const isProviderKey = m === "codex_key" || m === "claude_key";
   $("#oauthPanel").classList.toggle("hide", !isOauth);
   $("#impSubmitBtn").classList.toggle("hide", isOauth);
+  $("#impSubmitBtn").textContent = isProviderKey ? (LANG === "en" ? "Import and run two-stage probe" : "导入并执行双层测活") : (LANG === "en" ? "Import" : "导入 / Import");
+  $("#providerKeyResult").classList.add("hide"); $("#providerKeyResult").innerHTML = "";
   if (isOauth) resetOauth();
   if (m === "customkey") fillProviderSelect();
 }
@@ -88,17 +91,43 @@ async function oauthComplete() {
   try { const acc = await api("/admin/oauth/complete", { method: "POST", body: JSON.stringify({ session_id: oauthSession, redirected, label: $("#imp_label").value.trim(), group_name: $("#imp_group").value.trim() }) }); toast("✓ " + (acc.label || acc.email || acc.id), "ok"); closeImport(); loadAccounts(); } catch (e) { toast(e.message, "bad"); }
 }
 async function fillProviderSelect() { try { PROVIDERS = (await api("/admin/providers")) || []; } catch { PROVIDERS = []; } const sel = $("#ck_provider"); if (!sel) return; const en = PROVIDERS.filter((p) => p.enabled !== false); sel.innerHTML = en.length ? en.map((p) => `<option value="${esc(p.id)}">${esc(p.name || p.id)}</option>`).join("") : `<option value="">${LANG === "en" ? "(add a provider first)" : "（请先新增供应商）"}</option>`; }
+function renderProviderKeyResult(acc) {
+  const auth = acc.auth_probe || {}, inference = acc.inference_probe || {};
+  const result = $("#providerKeyResult"); if (!result) return;
+  const state = acc.ready ? (LANG === "en" ? "Ready" : "已就绪")
+    : acc.quarantined ? (LANG === "en" ? "Saved and quarantined" : "已保存并隔离")
+      : (LANG === "en" ? "Authentication failed; not saved" : "认证失败，未保存");
+  result.classList.remove("hide");
+  result.innerHTML = `<b>${state}</b><br>`
+    + `${LANG === "en" ? "Free auth probe" : "免费认证探针"}: ${auth.alive ? "✓" : "✕"} ${esc(auth.state || "unknown")} · HTTP ${esc(auth.http_status || "—")}<br>`
+    + `${LANG === "en" ? "Minimal inference probe" : "最小推理探针"}: ${inference.alive ? "✓" : inference.checked ? "✕" : "—"} ${esc(inference.state || "unknown")}${inference.model ? " · " + esc(inference.model) : ""}`
+    + (acc.quarantine_reason ? `<br>${LANG === "en" ? "Quarantine reason" : "隔离原因"}: ${esc(acc.quarantine_reason)}` : "");
+}
 async function doImport() {
   const label = $("#imp_label").value.trim(), group = $("#imp_group").value.trim();
   try {
     let ep, body;
     if (impMode === "token") { ep = "/admin/accounts/import-token"; body = { access_token: $("#tk_at").value.trim(), account_id: $("#tk_acc").value.trim(), label, group_name: group }; }
     else if (impMode === "claude") { ep = "/admin/accounts/import-token"; body = { access_token: $("#cl_at").value.trim(), label, group_name: group }; }
+    else if (impMode === "codex_key" || impMode === "claude_key") {
+      const codex = impMode === "codex_key";
+      const key = $(codex ? "#codex_api_key" : "#claude_api_key").value.trim();
+      const confirmed = $(codex ? "#codex_confirm_cost" : "#claude_confirm_cost").checked;
+      if (!key) { toast(LANG === "en" ? "Enter the upstream API key" : "请填写上游 API Key", "bad"); return; }
+      if (!confirmed) { toast(LANG === "en" ? "Confirm the possible inference cost" : "请确认最小推理可能产生费用", "bad"); return; }
+      ep = "/admin/accounts/import-key"; body = { provider_id: codex ? "codex" : "claude", api_key: key, label, group_name: group, confirm_cost: true };
+    }
     else if (impMode === "customkey") { ep = "/admin/accounts/import-key"; body = { provider_id: $("#ck_provider").value, api_key: $("#ck_apikey").value.trim(), label, group_name: group }; if (!body.provider_id) { toast(LANG === "en" ? "Pick a provider" : "请选择供应商", "bad"); return; } if (!body.api_key) { toast(LANG === "en" ? "Enter API key" : "请填写 API Key", "bad"); return; } }
     else if (impMode === "cookie") { ep = "/admin/accounts/import-cookie"; body = { cookie_header: $("#ck_hdr").value.trim(), label, group_name: group }; }
     else { ep = "/admin/accounts/import-auth-json"; body = { auth_json_text: $("#aj_txt").value, label, group_name: group }; }
-    const acc = await api(ep, { method: "POST", body: JSON.stringify(body) }); toast("✓ " + (acc.label || acc.id), "ok"); closeImport(); loadAccounts();
-  } catch (e) { toast(e.message, "bad"); }
+    const acc = await api(ep, { method: "POST", body: JSON.stringify(body) });
+    if (impMode === "codex_key" || impMode === "claude_key") {
+      renderProviderKeyResult(acc);
+      toast(acc.ready ? "✓ " + (acc.label || acc.id) : (LANG === "en" ? "Authentication passed; inference failed and the account is quarantined" : "认证通过，但推理失败；账号已隔离"), acc.ready ? "ok" : "bad");
+      loadAccounts(); return;
+    }
+    toast("✓ " + (acc.label || acc.id), "ok"); closeImport(); loadAccounts();
+  } catch (e) { const result = $("#providerKeyResult"); if (result && (impMode === "codex_key" || impMode === "claude_key")) { if (e.data && e.data.auth_probe) renderProviderKeyResult(e.data); else { result.classList.remove("hide"); result.textContent = e.message; } } toast(e.message, "bad"); }
 }
 
 /* ===== Moderation ===== */
@@ -180,4 +209,3 @@ async function saveModeration() {
     toast(e.message, "bad");
   }
 }
-

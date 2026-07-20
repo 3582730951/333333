@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import {
-  Modal, Tabs, TabPane, Form, Input, Select, Button, Typography, Toast, Divider, Tooltip,
+  Modal, Tabs, TabPane, Form, Input, Select, Button, Typography, Toast, Divider, Tooltip, Tag,
 } from './pool/index.jsx';
 import {
   IconCopy, IconTick, IconRefresh, IconLink,
@@ -55,6 +55,10 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [kiroApiKey, setKiroApiKey] = useState('');
   const [kiroApiRegion, setKiroApiRegion] = useState('us-east-1');
   const [kiroResult, setKiroResult] = useState(null);
+  const [authMode, setAuthMode] = useState('oauth');
+  const [providerApiKey, setProviderApiKey] = useState('');
+  const [confirmProviderCost, setConfirmProviderCost] = useState(false);
+  const [providerKeyResult, setProviderKeyResult] = useState(null);
   const [egressId, setEgressId] = useState('egress_direct');
   const [egressProfiles, setEgressProfiles] = useState([]);
   const countdownRef = useRef(null);
@@ -124,6 +128,10 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setKiroApiKey('');
     setKiroApiRegion('us-east-1');
     setKiroResult(null);
+    setAuthMode('oauth');
+    setProviderApiKey('');
+    setConfirmProviderCost(false);
+    setProviderKeyResult(null);
     setLabel('');
     setGroupName('');
     setNote('');
@@ -276,6 +284,29 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       handleClose();
       if (onSuccess) onSuccess(result);
     } catch (e) { showErrorToast(e, { prefix: 'Kiro API Key 导入失败' }); }
+  });
+
+  const { run: handleProviderApiKeyImport, running: providerApiKeyLoading } = useAsyncAction(async () => {
+    if (!providerApiKey.trim()) { Toast.warning('请输入上游 API Key'); return; }
+    if (!confirmProviderCost) { Toast.warning('请确认将执行一次可能计费的最小推理探针'); return; }
+    const providerId = tab === 'claude' ? 'claude' : 'codex';
+    try {
+      const result = await post('/admin/accounts/import-key', {
+        provider_id: providerId,
+        api_key: providerApiKey.trim(),
+        label,
+        group_name: groupName,
+        egress_id: egressId,
+        confirm_cost: true,
+      }, { timeout: 120000 });
+      setProviderKeyResult(result);
+      if (result.ready) Toast.success('认证与最小推理均通过，API Key 账号已就绪');
+      else Toast.warning('认证已通过，但推理探针失败；账号已保存并无限期隔离');
+      if (onSuccess) onSuccess(result);
+    } catch (e) {
+      setProviderKeyResult(e?.response?.data || e?.data || null);
+      showErrorToast(e, { prefix: 'API Key 导入失败' });
+    }
   });
 
   // Provider display info
@@ -472,6 +503,17 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             </div>
           </div>
 
+          <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+            <Button
+              type={authMode === 'oauth' ? 'primary' : 'tertiary'}
+              onClick={() => { setAuthMode('oauth'); setProviderKeyResult(null); }}
+            >OAuth</Button>
+            <Button
+              type={authMode === 'api_key' ? 'primary' : 'tertiary'}
+              onClick={() => { setAuthMode('api_key'); setProviderKeyResult(null); }}
+            >API Key</Button>
+          </div>
+
           <Form>
             <Form.Slot label="备注 (可选)">
               <Input
@@ -499,19 +541,71 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             </Form.Slot>
           </Form>
 
-          <div style={{ marginTop: 20, textAlign: 'center' }}>
-            <Button
-              type="primary"
-              theme="solid"
-              size="large"
-              icon={<IconLink />}
-              loading={generating}
-              onClick={handleGenerate}
-              style={{ minWidth: 200 }}
-            >
-              {generating ? '正在生成...' : '生成授权链接'}
-            </Button>
-          </div>
+          {authMode === 'api_key' ? (
+            <div style={{ display: 'grid', gap: 12, marginTop: 14 }}>
+              <Form>
+                <Form.Slot label={`${currentInfo.name} 上游 API Key`}>
+                  <Input
+                    type="password"
+                    value={providerApiKey}
+                    onChange={(value) => { setProviderApiKey(value); setProviderKeyResult(null); }}
+                    placeholder={tab === 'claude' ? 'sk-ant-...' : 'sk-...'}
+                  />
+                </Form.Slot>
+              </Form>
+              <div style={{ padding: 12, borderRadius: 6, background: 'var(--pool-bg-surface-2)' }}>
+                <Text strong>按量计费凭据</Text>
+                <Text type="tertiary" as="p" style={{ margin: '6px 0 0', lineHeight: 1.6 }}>
+                  该 Key 属于上游 Platform / Console，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后仅发送一次固定提示“Reply exactly OK”的最小推理。若推理失败，账号会保留但无限期隔离。
+                </Text>
+              </div>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={confirmProviderCost}
+                  onChange={(event) => setConfirmProviderCost(event.target.checked)}
+                  style={{ marginTop: 3 }}
+                />
+                <span>我确认认证成功后执行 1 次可能产生少量费用的最小推理探针。</span>
+              </label>
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <Button
+                  type="primary"
+                  theme="solid"
+                  loading={providerApiKeyLoading}
+                  disabled={!providerApiKey.trim() || !confirmProviderCost}
+                  onClick={handleProviderApiKeyImport}
+                >导入并执行双层测活</Button>
+              </div>
+              {providerKeyResult ? (
+                <div style={{ display: 'grid', gap: 8, padding: 12, border: '1px solid var(--pool-border)', borderRadius: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                    <Text strong>探针结果</Text>
+                    <Tag color={providerKeyResult.ready ? 'green' : providerKeyResult.quarantined ? 'red' : 'orange'}>
+                      {providerKeyResult.ready ? '已就绪' : providerKeyResult.quarantined ? '已保存并隔离' : '认证失败，未保存'}
+                    </Tag>
+                  </div>
+                  <Text>免费认证探针：{providerKeyResult.auth_probe?.alive ? '通过' : '失败'} · {providerKeyResult.auth_probe?.state || 'unknown'} · HTTP {providerKeyResult.auth_probe?.http_status || '—'}</Text>
+                  <Text>最小推理探针：{providerKeyResult.inference_probe?.alive ? '通过' : providerKeyResult.inference_probe?.checked ? '失败' : '未执行'} · {providerKeyResult.inference_probe?.state || 'unknown'}{providerKeyResult.inference_probe?.model ? ` · ${providerKeyResult.inference_probe.model}` : ''}</Text>
+                  {providerKeyResult.quarantine_reason ? <Text type="danger">隔离原因：{providerKeyResult.quarantine_reason}</Text> : null}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div style={{ marginTop: 20, textAlign: 'center' }}>
+              <Button
+                type="primary"
+                theme="solid"
+                size="large"
+                icon={<IconLink />}
+                loading={generating}
+                onClick={handleGenerate}
+                style={{ minWidth: 200 }}
+              >
+                {generating ? '正在生成...' : '生成授权链接'}
+              </Button>
+            </div>
+          )}
         </div>
       ) : (
         <div>

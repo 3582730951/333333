@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	DefaultListenAddr      = "127.0.0.1:8787"
-	DefaultDatabasePath    = "codex-pool.sqlite3"
-	DefaultUpstreamBaseURL = "https://chatgpt.com/backend-api/codex"
-	DefaultGroupName       = "cyber"
+	DefaultListenAddr               = "127.0.0.1:8787"
+	DefaultDatabasePath             = "codex-pool.sqlite3"
+	DefaultUpstreamBaseURL          = "https://chatgpt.com/backend-api/codex"
+	DefaultOpenAIAPIUpstreamBaseURL = "https://api.openai.com/v1"
+	DefaultGroupName                = "cyber"
 	// DefaultClientVersion is the current Codex client version sent on model
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
@@ -139,6 +140,7 @@ type Config struct {
 	ListenAddr                     string `json:"listen_addr"`
 	DatabasePath                   string `json:"database_path"`
 	UpstreamBaseURL                string `json:"upstream_base_url"`
+	OpenAIAPIUpstreamBaseURL       string `json:"openai_api_upstream_base_url"`
 	OAuthTokenURL                  string `json:"oauth_token_url"`
 	ClientVersion                  string `json:"client_version"`
 	DefaultGroup                   string `json:"default_group"`
@@ -742,6 +744,7 @@ func Default() Config {
 		ListenAddr:                     DefaultListenAddr,
 		DatabasePath:                   DefaultDatabasePath,
 		UpstreamBaseURL:                DefaultUpstreamBaseURL,
+		OpenAIAPIUpstreamBaseURL:       DefaultOpenAIAPIUpstreamBaseURL,
 		ClientVersion:                  DefaultClientVersion,
 		DefaultGroup:                   DefaultGroupName,
 		Virtual2MEnabled:               false,
@@ -1045,6 +1048,9 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL"); v != "" {
 		c.UpstreamBaseURL = v
 	}
+	if v := os.Getenv("CODEX_POOL_OPENAI_API_UPSTREAM_BASE_URL"); v != "" {
+		c.OpenAIAPIUpstreamBaseURL = v
+	}
 	if v := os.Getenv("CODEX_POOL_OAUTH_TOKEN_URL"); v != "" {
 		c.OAuthTokenURL = v
 	}
@@ -1226,6 +1232,9 @@ func (c *Config) normalize() {
 	}
 	if c.UpstreamBaseURL == "" {
 		c.UpstreamBaseURL = DefaultUpstreamBaseURL
+	}
+	if c.OpenAIAPIUpstreamBaseURL == "" {
+		c.OpenAIAPIUpstreamBaseURL = DefaultOpenAIAPIUpstreamBaseURL
 	}
 	if c.ClientVersion == "" || dottedVersionLess(c.ClientVersion, DefaultClientVersion) {
 		c.ClientVersion = DefaultClientVersion
