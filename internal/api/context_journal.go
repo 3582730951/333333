@@ -17,6 +17,12 @@ import (
 // journalReplayBody creates the stateless Responses body used when account-local
 // previous_response_id state is unavailable. Payloads are encrypted by storage.
 func (s *Server) journalReplayBody(ctx context.Context, current []byte) ([]byte, bool) {
+	// v2 is the durable first choice.  The v1 journal below remains a read fallback
+	// during the dual-write migration, so an existing task is never stranded merely
+	// because its latest successful turn predates the new tables.
+	if replay := s.goalReplayBody(ctx, nil, "codex", current); replay.Kind == goalResumeFound {
+		return replay.Body, true
+	}
 	cur, err := decodeContextJSONMap(current)
 	if err != nil {
 		return current, false
@@ -65,6 +71,11 @@ func appendItems(a, b interface{}) []interface{} {
 }
 
 func (s *Server) persistContextJournal(ctx context.Context, requestBody, responseBody []byte, affinityHash, accountID string) error {
+	if s.goalContinuityEnabled(ctx) && !s.flagEnabled(ctx, "goal_legacy_journal_dual_write", s.cfg.GoalLegacyJournalDualWrite) {
+		// Migration phase 4: keep v1 rows readable until their natural TTL expires,
+		// but do not keep copying complete histories once v2 recovery is validated.
+		return nil
+	}
 	req, reqErr := decodeContextJSONMap(requestBody)
 	resp, respErr := decodeContextJSONMap(responseBody)
 	if reqErr != nil || respErr != nil {

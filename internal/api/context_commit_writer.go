@@ -6,8 +6,10 @@ import (
 	"sync"
 )
 
-// terminalCommitWriter withholds the terminal Responses SSE frame until commit has
-// durably stored the replay journal. Earlier deltas remain fully streaming.
+// terminalCommitWriter attempts a durable continuity commit before releasing the
+// terminal Responses SSE frame.  A persistence fault must never turn an upstream
+// success into an endless client-side "Working" state: the completed frame is still
+// delivered and commitErr is retained for audit/background retry by the caller.
 type terminalCommitWriter struct {
 	dst       http.ResponseWriter
 	commit    func() error
@@ -33,9 +35,6 @@ func (w *terminalCommitWriter) Write(p []byte) (int, error) {
 		w.buf = w.buf[idx+2:]
 		if bytes.Contains(frame, []byte(`"type":"response.completed"`)) || bytes.Contains(frame, []byte("event: response.completed")) {
 			w.once.Do(func() { w.commitErr = w.commit() })
-			if w.commitErr != nil {
-				return len(p), w.commitErr
-			}
 		}
 		if _, err := w.dst.Write(frame); err != nil {
 			return len(p), err
@@ -54,5 +53,10 @@ func (w *terminalCommitWriter) Close() error {
 		w.buf = nil
 		return err
 	}
-	return w.commitErr
+	// Commit failure is intentionally not returned here.  Returning it after the
+	// response.completed frame causes callers to classify a successful upstream turn
+	// as an interrupted stream and can leave clients retrying indefinitely.
+	return nil
 }
+
+func (w *terminalCommitWriter) PersistenceError() error { return w.commitErr }

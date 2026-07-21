@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -34,6 +35,10 @@ import (
 // original attempt (so context affinity and prompt cache are preserved); tests supply a
 // synthetic stream. The caller closes the returned reader.
 type reissueFunc func(ctx context.Context, continuationBody []byte) (io.ReadCloser, error)
+
+// errAutoContinueUnavailable means no lossless continuation request could be built.
+// Callers must synthesize a protocol failure terminal rather than silently EOF.
+var errAutoContinueUnavailable = errors.New("lossless auto-continue context unavailable")
 
 func (s *Server) autoContinueEnabled(ctx context.Context, decision *upstreamErrorRuleDecision) bool {
 	if s.flagEnabled(ctx, "stream_auto_continue_enabled", s.cfg.StreamAutoContinueEnabled) {
@@ -200,17 +205,18 @@ func autoContinueDecisionFromFilter(rf *responseRuleFilter) *upstreamErrorRuleDe
 // context for the continuation (expanding previous_response_id via the journal, and
 // declining to continue rather than break context on a journal miss) and drives the
 // Responses continuation loop. A terminal-reached first stream is a no-op.
-func (s *Server) maybeAutoContinueCodex(ctx context.Context, w io.Writer, originalBody []byte, rec *codexStreamLedgerRecorder, reissue reissueFunc) error {
+func (s *Server) maybeAutoContinueCodex(ctx context.Context, w io.Writer, originalBody []byte, rec *codexStreamLedgerRecorder, reissue reissueFunc) (*codexStreamLedgerRecorder, error) {
 	if rec == nil || rec.reachedTerminal() {
-		return nil
+		return rec, nil
 	}
 	resolved := originalBody
 	if bodyHasPreviousResponseID(originalBody) {
 		expanded, ok := s.journalReplayBody(ctx, originalBody)
 		if !ok {
 			// Journal miss: continuing with only the latest turn would drop the prior
-			// conversation. Never break context — leave the truncated answer as-is.
-			return nil
+			// conversation. Do not send it upstream; the caller will make the failure
+			// visible instead of leaving the client at a silent EOF.
+			return nil, errAutoContinueUnavailable
 		}
 		resolved = expanded
 	}
@@ -470,12 +476,15 @@ func responsesRootOutputText(resp map[string]interface{}) string {
 
 // ─────────────────────────── Orchestrators ───────────────────────────
 
-// autoContinueClaude drives the Anthropic continuation loop: build a continue body from
-// the accumulated partial answer, re-issue, stitch, and repeat up to the configured
-// attempt cap until the stream terminates. If the attempts are exhausted while the stream
-// is still open, it closes the message gracefully so the client renders the partial answer
-// instead of hanging — a graceful degradation, never a hard error.
-func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBody []byte, first *claudeStreamTap, reissue reissueFunc) error {
+// autoContinueClaude drives the Anthropic continuation loop.  The returned tap is
+// non-nil only when a real upstream message_stop arrived; callers use that signal to
+// commit the merged stream to the durable goal chain.  A nil tap with nil error means
+// this function has already emitted the native error terminal after the bounded retry.
+// capture, when non-nil, receives the raw continuation events for encrypted replay.
+func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBody []byte, first *claudeStreamTap, reissue reissueFunc, capture io.Writer) (*claudeStreamTap, error) {
+	if capture == nil {
+		capture = io.Discard
+	}
 	maxAttempts := s.autoContinueMaxAttempts(ctx)
 	continueText := s.autoContinueText(ctx)
 	priorBlocks := first.blocksOpened
@@ -491,13 +500,13 @@ func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBo
 		if err != nil || stream == nil {
 			break
 		}
-		tap, stitchErr := stitchClaudeContinuation(w, stream, priorBlocks, priorOpenIndex, priorOpen)
+		tap, stitchErr := stitchClaudeContinuation(w, io.TeeReader(stream, capture), priorBlocks, priorOpenIndex, priorOpen)
 		_ = stream.Close()
 		if stitchErr != nil {
-			return stitchErr
+			return nil, stitchErr
 		}
 		if tap.reachedTerminal() {
-			return nil
+			return tap, nil
 		}
 		newOpenIndex := priorBlocks + tap.openBlockIndex
 		priorBlocks += tap.blocksOpened
@@ -505,19 +514,28 @@ func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBo
 		priorOpenIndex = newOpenIndex
 		accumulated += tap.partialText()
 	}
-	return closeClaudeStreamGracefully(w, priorOpen, priorOpenIndex)
+	if err := closeClaudeStreamGracefully(w, priorOpen, priorOpenIndex); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
-// closeClaudeStreamGracefully terminates a still-open Anthropic stream so the client
-// finishes with whatever partial content it already received.
+// closeClaudeStreamGracefully terminates a truncated Anthropic stream with its native
+// error event.  The previous synthetic end_turn made a missing upstream terminal look
+// successful and left long-running clients unable to know they must resume.
 func closeClaudeStreamGracefully(w io.Writer, open bool, openIndex int) error {
 	if open {
 		if err := writeSSEEvent(w, "content_block_stop", map[string]interface{}{"index": openIndex}); err != nil {
 			return err
 		}
 	}
-	if err := writeSSEEvent(w, "message_delta", map[string]interface{}{
-		"delta": map[string]interface{}{"stop_reason": "end_turn", "stop_sequence": nil},
+	if err := writeSSEEvent(w, "error", map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    "api_error",
+			"code":    "goal_stream_interrupted",
+			"message": "Upstream ended without message_stop; resume from the last checkpoint.",
+		},
 	}); err != nil {
 		return err
 	}
@@ -529,10 +547,11 @@ func closeClaudeStreamGracefully(w io.Writer, open bool, openIndex int) error {
 }
 
 // autoContinueCodex drives the Responses continuation loop. resolvedBody is the stateless
-// full-context body (previous_response_id already expanded and stripped). On exhaustion of
-// a still-open stream it synthesizes a terminal response.completed carrying the merged
-// output so the client does not hang.
-func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBody []byte, first *codexStreamLedgerRecorder, reissue reissueFunc) error {
+// full-context body (previous_response_id already expanded and stripped).  A non-nil
+// recorder means the continuation reached a real upstream terminal and can be committed
+// as the new durable response.  A nil recorder with a nil error means an explicit
+// response.failed was already emitted after the bounded retry was exhausted.
+func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBody []byte, first *codexStreamLedgerRecorder, reissue reissueFunc) (*codexStreamLedgerRecorder, error) {
 	maxAttempts := s.autoContinueMaxAttempts(ctx)
 	continueText := s.autoContinueText(ctx)
 	priorItems := first.partialItems()
@@ -551,10 +570,10 @@ func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBod
 		rec, stitchErr := stitchCodexContinuation(w, stream, priorItems, priorText, priorCount)
 		_ = stream.Close()
 		if stitchErr != nil {
-			return stitchErr
+			return nil, stitchErr
 		}
 		if rec.reachedTerminal() {
-			return nil
+			return rec, nil
 		}
 		priorText += rec.partialText()
 		priorItems = append(priorItems, rec.partialItems()...)
@@ -567,25 +586,31 @@ func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBod
 			model = recModel
 		}
 	}
-	return closeCodexStreamGracefully(w, priorItems, priorText, id, model)
+	if err := closeCodexStreamGracefully(w, priorItems, priorText, id, model); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
-// closeCodexStreamGracefully emits a synthesized terminal response.completed carrying the
-// merged output so a still-open Responses stream ends cleanly with the partial answer.
+// closeCodexStreamGracefully emits an explicit failure terminal for a stream whose
+// upstream ended without a terminal event.  Partial text may already be visible, but
+// declaring it completed would make clients commit an unknowingly truncated result.
 func closeCodexStreamGracefully(w io.Writer, items []interface{}, text, id, model string) error {
+	_ = items
+	_ = text
 	resp := map[string]interface{}{
 		"id":     firstNonEmpty(id, "resp_pool_autocontinue"),
 		"object": "response",
-		"status": "completed",
-		"output": items,
+		"status": "failed",
+		"error": map[string]interface{}{
+			"code":    "goal_stream_interrupted",
+			"message": "Upstream ended without a terminal response event; resume from the last checkpoint.",
+		},
 	}
 	if model != "" {
 		resp["model"] = model
 	}
-	if strings.TrimSpace(text) != "" {
-		resp["output_text"] = text
-	}
-	if err := writeSSEEvent(w, "response.completed", map[string]interface{}{"response": resp}); err != nil {
+	if err := writeSSEEvent(w, "response.failed", map[string]interface{}{"type": "response.failed", "response": resp}); err != nil {
 		return err
 	}
 	flushWriter(w)

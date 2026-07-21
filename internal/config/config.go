@@ -163,9 +163,22 @@ type Config struct {
 	// the lowest expires_at first — which, thanks to sliding TTL, are the least-recently
 	// resumed chains — so active long tasks are preserved while disk stays bounded. 0
 	// disables that dimension.
-	ContextJournalMaxRows int    `json:"context_journal_max_rows"`
-	ContextJournalMaxMB   int    `json:"context_journal_max_mb"`
-	AdminToken            string `json:"admin_token"`
+	ContextJournalMaxRows int `json:"context_journal_max_rows"`
+	ContextJournalMaxMB   int `json:"context_journal_max_mb"`
+	// GoalContinuity persists the durable, cross-account context chain used to
+	// recover long-running Codex / Claude Code goals after a restart.  It is kept
+	// separate from context_journal: the latter remains a short-lived v1 replay
+	// fallback during the migration, while this chain is bounded and incremental.
+	GoalContinuityEnabled      bool    `json:"goal_continuity_enabled"`
+	GoalLegacyJournalDualWrite bool    `json:"goal_legacy_journal_dual_write"`
+	GoalRetentionDays          int     `json:"goal_retention_days"`
+	GoalStorageMaxMB           int     `json:"goal_storage_max_mb"`
+	GoalCompressionChunkRatio  float64 `json:"goal_compression_chunk_ratio"`
+	GoalCompressionMaxStages   int     `json:"goal_compression_max_stages"`
+	GoalLeaseSeconds           int     `json:"goal_lease_seconds"`
+	GoalHeartbeatSeconds       int     `json:"goal_heartbeat_seconds"`
+	GoalCompressionConcurrency int     `json:"goal_compression_concurrency"`
+	AdminToken                 string  `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
 	// cookie security, or generated public URLs. Direct internet clients cannot
 	// spoof X-Forwarded-* unless their immediate peer is in this list.
@@ -762,6 +775,15 @@ func Default() Config {
 		ContextJournalTTLSeconds:       3600,
 		ContextJournalMaxRows:          50000,
 		ContextJournalMaxMB:            200,
+		GoalContinuityEnabled:          true,
+		GoalLegacyJournalDualWrite:     true,
+		GoalRetentionDays:              7,
+		GoalStorageMaxMB:               256,
+		GoalCompressionChunkRatio:      0.70,
+		GoalCompressionMaxStages:       16,
+		GoalLeaseSeconds:               90,
+		GoalHeartbeatSeconds:           15,
+		GoalCompressionConcurrency:     1,
 		TrustedProxyCIDRs:              []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:          120,
 		KiroVersion:                    "0.11.107",
@@ -1286,6 +1308,27 @@ func (c *Config) normalize() {
 	}
 	if c.ContextJournalMaxMB < 0 {
 		c.ContextJournalMaxMB = 0
+	}
+	if c.GoalRetentionDays <= 0 {
+		c.GoalRetentionDays = 7
+	}
+	if c.GoalStorageMaxMB <= 0 {
+		c.GoalStorageMaxMB = 256
+	}
+	if c.GoalCompressionChunkRatio <= 0 || c.GoalCompressionChunkRatio >= 1 {
+		c.GoalCompressionChunkRatio = 0.70
+	}
+	if c.GoalCompressionMaxStages <= 0 {
+		c.GoalCompressionMaxStages = 16
+	}
+	if c.GoalLeaseSeconds <= 0 {
+		c.GoalLeaseSeconds = 90
+	}
+	if c.GoalHeartbeatSeconds <= 0 || c.GoalHeartbeatSeconds >= c.GoalLeaseSeconds {
+		c.GoalHeartbeatSeconds = 15
+	}
+	if c.GoalCompressionConcurrency <= 0 {
+		c.GoalCompressionConcurrency = 1
 	}
 	if c.SidecarTimeoutSeconds <= 0 {
 		c.SidecarTimeoutSeconds = 120

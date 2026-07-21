@@ -223,6 +223,24 @@ func configFields() []configField {
 			Help: "上下文重建日志表行数上限；超出按 expires_at 最早(最久未续期)优先清理，保护最可能恢复的活跃链。0=不限制。默认 50000。", boot: func(c config.Config) interface{} { return c.ContextJournalMaxRows }},
 		{Key: "context_journal_max_mb", Label: "上下文日志最大MB", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "上下文重建日志表存储上限(MB，按加密负载字节)，超出按最早过期优先清理。低配 VPS 磁盘保护。0=不限制。默认 200。", boot: func(c config.Config) interface{} { return c.ContextJournalMaxMB }},
+		{Key: "goal_continuity_enabled", Label: "长任务连续性", Category: catLimits, Type: fieldBool, Effect: effectHot,
+			Help: "开(默认)=将目标链、检查点和运行租约持久化；旧 context_journal 仍双写作为迁移回退。", boot: func(c config.Config) interface{} { return c.GoalContinuityEnabled }},
+		{Key: "goal_legacy_journal_dual_write", Label: "旧日志双写", Category: catLimits, Type: fieldBool, Effect: effectHot,
+			Help: "迁移验证完成后可关：停止旧 context_journal 的整段快照写入，但保留其读取回退直至 TTL 到期。", boot: func(c config.Config) interface{} { return c.GoalLegacyJournalDualWrite }},
+		{Key: "goal_retention_days", Label: "目标保留天数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "目标、检查点和持久 working_state 的滑动保留期。默认 7 天；运行中的目标不会被驱逐。", boot: func(c config.Config) interface{} { return c.GoalRetentionDays }},
+		{Key: "goal_storage_max_mb", Label: "目标存储上限MB", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "所有 v2 目标链的加密存储预算。默认 256 MiB；空间不足时保留活跃上下文并返回可见错误。", boot: func(c config.Config) interface{} { return c.GoalStorageMaxMB }},
+		{Key: "goal_compression_chunk_ratio", Label: "目标压缩块比例", Category: catLimits, Type: fieldString, Effect: effectHot,
+			Help: "分段检查点的目标块比例(0 到 1)，默认 0.70。", boot: func(c config.Config) interface{} { return c.GoalCompressionChunkRatio }},
+		{Key: "goal_compression_max_stages", Label: "目标最大分段数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "超过该完整 turn 数后归并为新的加密 checkpoint，默认 16。", boot: func(c config.Config) interface{} { return c.GoalCompressionMaxStages }},
+		{Key: "goal_lease_seconds", Label: "目标租约秒数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "同一目标恢复的数据库租约，默认 90 秒。", boot: func(c config.Config) interface{} { return c.GoalLeaseSeconds }},
+		{Key: "goal_heartbeat_seconds", Label: "目标心跳秒数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "压缩、账号等待及恢复期间的目标运行心跳，默认 15 秒。", boot: func(c config.Config) interface{} { return c.GoalHeartbeatSeconds }},
+		{Key: "goal_compression_concurrency", Label: "目标压缩并发", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "全局可同时执行的目标压缩作业数，默认 1。", boot: func(c config.Config) interface{} { return c.GoalCompressionConcurrency }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
@@ -591,6 +609,34 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		n, _ := strconv.Atoi(raw)
 		if n < 60 {
 			return "", fmt.Errorf("must be at least 60")
+		}
+		return raw, nil
+	case "goal_retention_days", "goal_storage_max_mb", "goal_compression_max_stages", "goal_lease_seconds", "goal_heartbeat_seconds", "goal_compression_concurrency":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n <= 0 {
+			return "", fmt.Errorf("must be greater than 0")
+		}
+		if f.Key == "goal_heartbeat_seconds" && n > 60 {
+			return "", fmt.Errorf("must be at most 60")
+		}
+		return raw, nil
+	case "goal_compression_chunk_ratio":
+		var raw string
+		switch value := v.(type) {
+		case string:
+			raw = strings.TrimSpace(value)
+		case float64:
+			raw = strconv.FormatFloat(value, 'f', -1, 64)
+		default:
+			return "", fmt.Errorf("expected decimal between 0 and 1")
+		}
+		n, err := strconv.ParseFloat(raw, 64)
+		if err != nil || n <= 0 || n >= 1 {
+			return "", fmt.Errorf("must be greater than 0 and less than 1")
 		}
 		return raw, nil
 	case "sticky_wait_millis", "scheduler_heartbeat_seconds":

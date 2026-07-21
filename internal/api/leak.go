@@ -465,6 +465,13 @@ func probeEarlySSEFailure(body io.Reader, retryableFrame func([]byte) bool, cont
 func codexSSEFrameCommitsContent(frame []byte) bool {
 	lower := strings.ToLower(string(frame))
 	for _, marker := range []string{
+		// response.created proves the upstream accepted the turn.  Releasing the
+		// early-error probe here is essential for long-poll/task responses: waiting
+		// for the first text delta would leave the relay unable to emit its protocol
+		// keepalive while the upstream is legitimately silent.  A later failure is
+		// still relayed as its explicit terminal event; it is no longer safe to hide
+		// it behind transparent account failover after a real response has begun.
+		"response.created",
 		"response.output_text.delta",
 		"response.output_item.added",
 		"response.function_call_arguments.delta",

@@ -16,6 +16,7 @@ type codexStreamLedgerRecorder struct {
 	model     string
 	text      strings.Builder
 	completed map[string]interface{}
+	terminal  string
 	added     []interface{}
 	done      []interface{}
 	// rateLimits holds the most recent codex.rate_limits frame's windows (workstream B:
@@ -113,6 +114,15 @@ func (r *codexStreamLedgerRecorder) reachedTerminal() bool {
 	return r.completed != nil
 }
 
+// completedSuccessfully distinguishes a real response.completed from an upstream
+// response.failed/response.incomplete.  All three are terminals for the transport,
+// but only the first may advance a goal checkpoint as a successful turn.
+func (r *codexStreamLedgerRecorder) completedSuccessfully() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.terminal == "response.completed"
+}
+
 // partialText returns the assistant output text accumulated so far.
 func (r *codexStreamLedgerRecorder) partialText() string {
 	r.mu.Lock()
@@ -183,6 +193,7 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 			r.done = append(r.done, item)
 		}
 	case "response.completed", "response.incomplete", "response.failed":
+		r.terminal = typ
 		if resp, ok := ev["response"].(map[string]interface{}); ok {
 			r.completed = cloneJSONMap(resp)
 			r.id = firstNonEmpty(r.id, streamString(resp["id"]))

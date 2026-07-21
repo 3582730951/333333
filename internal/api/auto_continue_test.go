@@ -263,7 +263,7 @@ func TestAutoContinueClaudeStitchesToTerminal(t *testing.T) {
 		return io.NopCloser(strings.NewReader(tap2Feed())), nil
 	}
 	var buf strings.Builder
-	if err := h.app.autoContinueClaude(context.Background(), &buf, []byte(`{"model":"c","messages":[{"role":"user","content":"hi"}]}`), first, reissue); err != nil {
+	if _, err := h.app.autoContinueClaude(context.Background(), &buf, []byte(`{"model":"c","messages":[{"role":"user","content":"hi"}]}`), first, reissue, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The re-issue must carry the partial answer + a continue turn.
@@ -281,24 +281,25 @@ func TestAutoContinueClaudeStitchesToTerminal(t *testing.T) {
 	}
 }
 
-func TestAutoContinueClaudeGracefulCloseWhenStillTruncated(t *testing.T) {
+func TestAutoContinueClaudeFailsTerminalWhenStillTruncated(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	first := &claudeStreamTap{}
 	_, _ = first.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"X\"}}\n\n"))
 	// Continuation is ALSO truncated (no message_stop); with max attempts 1 the loop then
-	// closes gracefully so the client does not hang.
+	// emits a protocol error terminal so the client does not mistake a truncated
+	// result for a completed long-running task.
 	reissue := func(ctx context.Context, body []byte) (io.ReadCloser, error) {
 		return io.NopCloser(strings.NewReader("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
 			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Y\"}}\n\n")), nil
 	}
 	var buf strings.Builder
-	if err := h.app.autoContinueClaude(context.Background(), &buf, []byte(`{"model":"c","messages":[{"role":"user","content":"hi"}]}`), first, reissue); err != nil {
+	if _, err := h.app.autoContinueClaude(context.Background(), &buf, []byte(`{"model":"c","messages":[{"role":"user","content":"hi"}]}`), first, reissue, nil); err != nil {
 		t.Fatal(err)
 	}
 	frames := parseSSE(t, buf.String())
-	if idxOf(frames, "message_stop") == -1 || idxOf(frames, "message_delta") == -1 {
-		t.Fatalf("graceful close must emit message_delta+message_stop: %s", buf.String())
+	if idxOf(frames, "message_stop") == -1 || idxOf(frames, "error") == -1 || idxOf(frames, "message_delta") != -1 {
+		t.Fatalf("truncated stream must emit error+message_stop: %s", buf.String())
 	}
 }
 
@@ -318,7 +319,7 @@ func TestAutoContinueCodexStitchesToTerminal(t *testing.T) {
 			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"more\"}]}],\"output_text\":\"more\"}}\n\n")), nil
 	}
 	var buf strings.Builder
-	if err := h.app.autoContinueCodex(context.Background(), &buf, []byte(`{"model":"gpt","input":[{"role":"user","content":[{"type":"input_text","text":"Q"}]}]}`), first, reissue); err != nil {
+	if _, err := h.app.autoContinueCodex(context.Background(), &buf, []byte(`{"model":"gpt","input":[{"role":"user","content":[{"type":"input_text","text":"Q"}]}]}`), first, reissue); err != nil {
 		t.Fatal(err)
 	}
 	frames := parseSSE(t, buf.String())

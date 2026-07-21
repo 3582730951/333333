@@ -58,6 +58,8 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
 		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, storage.KiroRuntimeCapability{})
 		displayModel := downstreamKiroModel(r.Context(), data.Model)
+		goalResponse := kirowire.AnthropicJSON(*data, displayModel, id)
+		s.persistKiroGoalContinuity(r.Context(), r, raw, goalResponse)
 		if isStreamRequest(raw) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -68,7 +70,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 			return outcomeDone
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(kirowire.AnthropicJSON(*data, displayModel, id))
+		_, _ = w.Write(goalResponse)
 		return outcomeDone
 	}
 	if isStreamRequest(raw) {
@@ -105,6 +107,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 				setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
 				s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
 				emitter.fail(kiroErrorCode(streamErr), streamErr)
+				s.markGoalStreamRetryable(r.Context(), r, "kiro", raw, "upstream_stream_error")
 			} else {
 				writeKiroError(w, r, http.StatusBadGateway, normalizeKiroContextError(r.Context(), streamErr, converted))
 			}
@@ -114,6 +117,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		emitter.finish(data)
 		setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
 		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+		s.persistKiroGoalContinuity(r.Context(), r, raw, kirowire.AnthropicJSON(data, downstreamKiroModel(r.Context(), data.Model), id))
 		return outcomeDone
 	}
 
@@ -129,9 +133,18 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, *data)
 	setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
 	s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, capabilityState)
+	goalResponse := kirowire.AnthropicJSON(*data, downstreamKiroModel(r.Context(), data.Model), id)
+	s.persistKiroGoalContinuity(r.Context(), r, raw, goalResponse)
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(kirowire.AnthropicJSON(*data, downstreamKiroModel(r.Context(), data.Model), id))
+	_, _ = w.Write(goalResponse)
 	return outcomeDone
+}
+
+func (s *Server) persistKiroGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
+	if _, err := s.persistGoalContinuity(ctx, r, "kiro", requestBody, responseBody); err != nil {
+		log.Printf("[GOAL-CONTINUITY] kiro persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "kiro_terminal", Detail: "payload persistence failed"})
+	}
 }
 
 func (s *Server) kiroCountTokensWithLease(w http.ResponseWriter, r *http.Request, raw []byte, affinity routing.AffinityKey, lease scheduler.Lease) attemptOutcome {

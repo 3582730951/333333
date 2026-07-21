@@ -24,11 +24,11 @@ func TestTerminalCommitWriterCommitsBeforeCompletedFrame(t *testing.T) {
 	}
 }
 
-func TestTerminalCommitWriterSuppressesCompletedFrameOnCommitFailure(t *testing.T) {
+func TestTerminalCommitWriterDeliversCompletedFrameOnCommitFailure(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	w := newTerminalCommitWriter(recorder, func() error { return errors.New("disk full") })
 	_, err := w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"))
-	if err == nil || strings.Contains(recorder.Body.String(), "response.completed") {
-		t.Fatalf("completion must be withheld on failed commit: err=%v body=%q", err, recorder.Body.String())
+	if err != nil || !strings.Contains(recorder.Body.String(), "response.completed") || w.PersistenceError() == nil {
+		t.Fatalf("successful terminal must survive failed persistence: err=%v commit_err=%v body=%q", err, w.PersistenceError(), recorder.Body.String())
 	}
 }

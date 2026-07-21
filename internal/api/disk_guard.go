@@ -16,6 +16,7 @@ type DiskGuardSnapshot struct {
 	FreePercent             float64 `json:"free_percent"`
 	ForcedContextTTLSeconds int     `json:"forced_context_ttl_seconds"`
 	ContextsDeleted         int64   `json:"contexts_deleted"`
+	GoalsDeleted            int64   `json:"goals_deleted"`
 	LogsDeleted             int64   `json:"logs_deleted"`
 	LastRunAt               int64   `json:"last_run_at"`
 	LastLogCleanupAt        int64   `json:"last_log_cleanup_at,omitempty"`
@@ -65,7 +66,7 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	}
 	free := 100 * float64(fs.Bavail) / float64(fs.Blocks)
 	previous := s.diskGuardSnapshot()
-	snap := DiskGuardSnapshot{Level: "normal", FreePercent: float64(int(free*10)) / 10, LastRunAt: storage.Now(), ContextsDeleted: previous.ContextsDeleted, LogsDeleted: previous.LogsDeleted, LastLogCleanupAt: previous.LastLogCleanupAt}
+	snap := DiskGuardSnapshot{Level: "normal", FreePercent: float64(int(free*10)) / 10, LastRunAt: storage.Now(), ContextsDeleted: previous.ContextsDeleted, GoalsDeleted: previous.GoalsDeleted, LogsDeleted: previous.LogsDeleted, LastLogCleanupAt: previous.LastLogCleanupAt}
 	// 10% recovery hysteresis prevents TTL oscillation near the 8% boundary.
 	if diskGuardLevel(free, previous.Level) == "critical" {
 		snap.Level = "critical"
@@ -117,8 +118,19 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	} else {
 		snap.ContextsDeleted += evicted
 	}
-	if snap.Level != previous.Level || snap.ContextsDeleted != previous.ContextsDeleted {
-		log.Printf("[DISK-GUARD] level=%s free=%.1f%% ttl=%d contexts_deleted=%d logs_deleted=%d err=%s", snap.Level, snap.FreePercent, snap.ForcedContextTTLSeconds, snap.ContextsDeleted, snap.LogsDeleted, snap.LastError)
+	// v2 goals have their own seven-day sliding retention and never inherit the
+	// legacy journal's aggressive disk-pressure TTL.  Reclaim only expired sessions
+	// whose leases are no longer live; active checkpoints and pending tool results are
+	// explicitly protected by CleanupGoalContinuity.
+	if goals, err := s.store.CleanupGoalContinuity(ctx); err != nil {
+		if snap.LastError == "" {
+			snap.LastError = err.Error()
+		}
+	} else {
+		snap.GoalsDeleted += goals
+	}
+	if snap.Level != previous.Level || snap.ContextsDeleted != previous.ContextsDeleted || snap.GoalsDeleted != previous.GoalsDeleted {
+		log.Printf("[DISK-GUARD] level=%s free=%.1f%% ttl=%d contexts_deleted=%d goals_deleted=%d logs_deleted=%d err=%s", snap.Level, snap.FreePercent, snap.ForcedContextTTLSeconds, snap.ContextsDeleted, snap.GoalsDeleted, snap.LogsDeleted, snap.LastError)
 	}
 	s.diskGuard.Store(snap)
 }

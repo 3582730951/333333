@@ -90,7 +90,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.goalContinuityEnabled(r.Context()) {
+		w.Header().Set("X-MiCliProxy-Context-Engine", "v2; build=goal-continuity-v2")
+	}
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
+	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "claude")))
+	r = r.WithContext(withGoalOriginalBody(r.Context(), raw))
 	if pol.ForceModel != "" {
 		raw = setForcedModel(raw, pol.ForceModel)
 	}
@@ -114,6 +119,33 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Compliance: sanitize prior-turn history before forwarding (no effect on the
 	// streamed reply). count_tokens runs through here too — harmless.
 	raw = s.moderateHistory(r.Context(), raw, "anthropic")
+	// Claude Code does not expose a literal `/goal resume` to the gateway.  Its
+	// durable session correlator arrives on the next normal /v1/messages request.
+	// A matching v2 checkpoint is rebuilt before account selection so the request can
+	// move across accounts after restart; a first-use session simply has no match and
+	// proceeds as a new goal.
+	if s.goalContinuityEnabled(r.Context()) && !strings.HasSuffix(path, "/count_tokens") {
+		replay := s.goalReplayBody(r.Context(), r, "claude", raw)
+		switch replay.Kind {
+		case goalResumeFound:
+			finish, leaseErr := s.beginGoalRun(r.Context(), replay.Session.ID, "running")
+			if leaseErr != nil {
+				kind := goalResumeUnidentified
+				if errors.Is(leaseErr, storage.ErrGoalInProgress) {
+					kind = goalResumeInProgress
+				}
+				writeGoalResumeError(w, isStreamRequest(raw), "claude", kind, leaseErr.Error())
+				return
+			}
+			defer finish()
+			raw = replay.Body
+			w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+			w.Header().Set("X-MiCliProxy-Goal-Status", replay.Session.State)
+		case goalResumeAmbiguous, goalResumeRequiresToolResult, goalResumeStorageExhausted:
+			writeGoalResumeError(w, isStreamRequest(raw), "claude", replay.Kind, replay.Reason)
+			return
+		}
+	}
 
 	strict := routing.IsStrictSticky(path, r, raw)
 	model := routing.Model(raw)
@@ -606,14 +638,30 @@ claudeSuccess:
 		}
 		if err := s.streamSSE(streamCtx, w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
+			if synthErr := closeClaudeStreamGracefully(w, continueTap.openBlock, continueTap.openBlockIndex); synthErr != nil {
+				log.Printf("[GOAL-STREAM] claude interrupted terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
+			}
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_stream_terminal_synthesized", State: "retryable", Reason: "upstream_stream_error", Detail: "claude error terminal emitted"})
+			s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "upstream_stream_error")
 		} else {
 			s.persistClaudeItemAliases(r.Context(), raw, aliasCapture.Bytes(), lease, model)
+			if continueTap.reachedTerminal() {
+				if response := goalResponseFromSSE(aliasCapture.Bytes()); len(response) > 0 {
+					if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
+						log.Printf("[GOAL-CONTINUITY] claude stream persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+						_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "claude_stream_terminal", Detail: "payload persistence failed"})
+					}
+				}
+			}
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
 			// Auto-continue on a truncated stream (no message_stop). Off by default, so
 			// this block is skipped and the path is unchanged unless the operator opts in.
 			if !continueTap.reachedTerminal() {
 				rfForAC, _ := streamCtx.Value(responseRuleFilterKey{}).(*responseRuleFilter)
-				if s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
+				// `ping` keepalives cover genuine long-poll silence.  An EOF without
+				// message_stop is a closed upstream stream; v2 retries it once with the
+				// same account and full self-contained history before emitting an error.
+				if s.goalContinuityEnabled(r.Context()) || s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
 					reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
 						creq := requestForToken(token)
 						creq.Body = cbody
@@ -629,11 +677,32 @@ claudeSuccess:
 						}
 						return cresp.Body, nil
 					}
+					var continuationCapture bytes.Buffer
 					sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), result.Scrubber, "claude")
-					if acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue); acErr != nil {
+					continuation, acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue, &continuationCapture)
+					if acErr != nil {
 						log.Printf("[AUTO-CONTINUE] claude request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
+						_ = closeClaudeStreamGracefully(sw, continueTap.openBlock, continueTap.openBlockIndex)
+						s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "continuation_unavailable")
+					} else if continuation != nil && continuation.reachedTerminal() {
+						mergedFrames := append(append([]byte(nil), aliasCapture.Bytes()...), continuationCapture.Bytes()...)
+						s.persistClaudeItemAliases(r.Context(), raw, mergedFrames, lease, model)
+						if response := goalResponseFromSSE(mergedFrames); len(response) > 0 {
+							if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
+								log.Printf("[GOAL-CONTINUITY] claude continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+								_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "claude_continuation_terminal", Detail: "payload persistence failed"})
+							}
+						}
+					} else {
+						s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "upstream_eof_without_terminal")
 					}
 					sw.Flush()
+				} else {
+					if synthErr := closeClaudeStreamGracefully(w, continueTap.openBlock, continueTap.openBlockIndex); synthErr != nil {
+						log.Printf("[GOAL-STREAM] claude terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
+					}
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_stream_terminal_synthesized", State: "retryable", Reason: "upstream_eof_without_terminal", Detail: "claude error terminal emitted"})
+					s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "upstream_eof_without_terminal")
 				}
 			}
 		}
@@ -655,6 +724,10 @@ claudeSuccess:
 	}
 	s.rememberClaudeCacheDiagnosticsMessageID(affinity, responseBody)
 	s.persistClaudeItemAliases(r.Context(), raw, responseBody, lease, model)
+	if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, responseBody); persistErr != nil {
+		log.Printf("[GOAL-CONTINUITY] claude persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "claude_response_terminal", Detail: "payload persistence failed"})
+	}
 	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), responseBody))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.settleBillingHold(r.Context(), holdID, "settled")

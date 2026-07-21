@@ -115,15 +115,17 @@ type Server struct {
 	kiroCacheFlightsMu   sync.Mutex
 	kiroCacheFlights     map[string]chan struct{}
 
-	codexResetMu    sync.Mutex
-	codexResetLocks map[string]*sync.Mutex
-	compatMu        sync.Mutex
-	compatRecent    []compatIncompatibilityRecord
-	qualityMu       sync.Mutex
-	qualityRunning  bool
-	contextRebuilt  uint64
-	contextDegraded uint64
-	diskGuard       atomic.Value // DiskGuardSnapshot
+	codexResetMu         sync.Mutex
+	codexResetLocks      map[string]*sync.Mutex
+	compatMu             sync.Mutex
+	compatRecent         []compatIncompatibilityRecord
+	qualityMu            sync.Mutex
+	qualityRunning       bool
+	goalCompactionMu     sync.Mutex
+	goalCompactionActive int
+	contextRebuilt       uint64
+	contextDegraded      uint64
+	diskGuard            atomic.Value // DiskGuardSnapshot
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -280,6 +282,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/export/logs", s.adminDiagnosticsExport)
 	s.mux.HandleFunc("/admin/logs", s.adminLogRecords)
 	s.mux.HandleFunc("/admin/context-journal", s.adminContextJournal)
+	s.mux.HandleFunc("/admin/goals", s.adminGoals)
+	s.mux.HandleFunc("/admin/goals/", s.adminGoalAction)
 	s.mux.HandleFunc("/admin/audit", s.adminAudit)
 	s.mux.HandleFunc("/admin/groups", s.adminGroups)
 	s.mux.HandleFunc("/admin/groups/", s.adminGroupAction)
@@ -474,9 +478,17 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.goalContinuityEnabled(r.Context()) {
+		w.Header().Set("X-MiCliProxy-Context-Engine", "v2; build=goal-continuity-v2")
+	}
 	// Carry the matched key/user identity in the context so usage is attributed to the
 	// owning portal user (their console reads /user/usage).
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
+	// Preserve only this request's exact correlators while later recovery replaces a
+	// stateful body with a self-contained checkpoint replay.  They are hashed at the
+	// storage boundary and are never logged or exposed by admin APIs.
+	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "codex")))
+	r = r.WithContext(withGoalOriginalBody(r.Context(), raw))
 	// Gateway reliability model routing (opt-in): when the layer is on and neither the
 	// key nor the group forced a model, apply the configured reliability model BEFORE
 	// routing so account selection lands on an account that actually has it. Empty
@@ -550,9 +562,81 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A /goal resume is represented downstream by real session correlators, not a
+	// literal command.  Resolve it before selecting an account: a recovered payload is
+	// self-contained and may safely move to a compatible account after a restart.
+	goalContextRecovered := false
+	if hadServerState := routing.HasServerSideState(path, r, raw); hadServerState && s.goalContinuityEnabled(r.Context()) {
+		replay := s.goalReplayBody(r.Context(), r, "codex", raw)
+		switch replay.Kind {
+		case goalResumeFound:
+			leaseOwner := "gateway:" + requestIDFromContext(r.Context())
+			if leaseOwner == "gateway:" {
+				leaseOwner = fmt.Sprintf("gateway:%d", time.Now().UnixNano())
+			}
+			goalRun, leaseErr := s.store.AcquireGoalRun(r.Context(), replay.Session.ID, leaseOwner, "running", s.goalLeaseDuration(r.Context()))
+			if leaseErr != nil {
+				if errors.Is(leaseErr, storage.ErrGoalInProgress) {
+					writeGoalResumeError(w, isStreamRequest(raw), "codex", goalResumeInProgress, leaseErr.Error())
+				} else {
+					writeGoalResumeError(w, isStreamRequest(raw), "codex", goalResumeUnidentified, leaseErr.Error())
+				}
+				return
+			}
+			// The lease covers the full foreground relay, including a bounded EOF
+			// continuation.  Any unfinished work remains in its checkpoint chain;
+			// completing this relay lease never repeats a pending client tool call.
+			heartbeatStop := make(chan struct{})
+			heartbeatDone := make(chan struct{})
+			heartbeatInterval := s.goalHeartbeatDuration(r.Context())
+			go func(runID, owner string, lease, interval time.Duration) {
+				defer close(heartbeatDone)
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-heartbeatStop:
+						return
+					case <-ticker.C:
+						if err := s.store.HeartbeatGoalRun(context.Background(), runID, owner, lease); err != nil {
+							log.Printf("[GOAL-HEARTBEAT] run=%s: %v", runID, err)
+							return
+						}
+					}
+				}
+			}(goalRun.ID, leaseOwner, s.goalLeaseDuration(r.Context()), heartbeatInterval)
+			defer func(runID, owner string) {
+				close(heartbeatStop)
+				<-heartbeatDone
+				_ = s.store.FinishGoalRun(context.Background(), runID, owner, "completed", "")
+			}(goalRun.ID, leaseOwner)
+			raw = replay.Body
+			goalContextRecovered = true
+			w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+			w.Header().Set("X-MiCliProxy-Goal-Status", replay.Session.State)
+			atomic.AddUint64(&s.contextRebuilt, 1)
+		case goalResumeAmbiguous, goalResumeRequiresToolResult, goalResumeStorageExhausted:
+			writeGoalResumeError(w, isStreamRequest(raw), "codex", replay.Kind, replay.Reason)
+			return
+		case goalResumeUnidentified:
+			// v1 stays a read fallback throughout the dual-write migration.  Its
+			// successful replay is still explicit and does not downgrade context.
+			if rebuilt, ok := s.journalReplayBody(r.Context(), raw); ok {
+				raw = rebuilt
+				goalContextRecovered = true
+				w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt-v1-fallback")
+			} else {
+				writeGoalResumeError(w, isStreamRequest(raw), "codex", replay.Kind, replay.Reason)
+				return
+			}
+		}
+	}
 	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
 	currentHeader := r.Header.Clone()
-	contextRecovered := false
+	contextRecovered := goalContextRecovered
+	if contextRecovered {
+		currentHeader = stripCodexServerStateHeaders(currentHeader)
+	}
 	// movable: the request carries its full input and so can be re-sent to a fresh
 	// account losslessly. This is the failover gate. It is broader than !strict: a
 	// strict-sticky turn (tool_result/function_call_output, kept on one account for
@@ -629,7 +713,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// failover disabled gets one stateless replay after a precise Responses context 400.
 	// Incrementing attemptsRemaining only when that repair is selected makes it an extra
 	// attempt without opening another generic failover round.
-	contextRepairAvailable := !contextRecovered
+	// A preflight v2 rebuild can still hit an account-local stale-context error on
+	// the affinity-preferred account. Keep one repair/failover budget: the rebuilt
+	// payload is self-contained and can move safely to a compatible account.
+	contextRepairAvailable := true
 	modelCapabilityRejected := false
 	attemptsRemaining := attempts
 	for attemptsRemaining > 0 {
@@ -919,8 +1006,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			return codexAttemptResult{}, false
 		}
 		if contextRecovered {
-			log.Printf("[CONTEXT-TERMINAL] request_id=%s account=%s reason=%s error_category=%s terminal_reason=already_recovered", requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
-			return codexAttemptResult{}, false
+			exclude[lease.Account.ID] = true
+			w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
+			log.Printf("[GOAL-RECOVERED-FAILOVER] request_id=%s account=%s reason=%s", requestIDFromContext(r.Context()), lease.Account.ID, reason)
+			return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: body, Header: stripCodexServerStateHeaders(baseHeader), Recovered: true}, ContextRecovery: true}, true
 		}
 		recovered, contextStatus, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader, contextError)
 		if !ok {
@@ -1359,7 +1448,7 @@ codexSuccess:
 		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
 			responseBody = responseJSON
 		}
-		s.persistCodexStateBindings(r.Context(), affinity, body, responseBody, lease, finalEgress, model)
+		s.persistCodexStateBindings(r.Context(), r, affinity, body, responseBody, lease, finalEgress, model)
 		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 		_ = s.settleBillingHold(r.Context(), holdID, "settled")
 		// A soft 200 "failed" response carrying limit/quota/switch-model state must
@@ -1552,11 +1641,17 @@ codexSuccess:
 				log.Printf("[CONTEXT-JOURNAL] recorder empty request_id=%s response_id=%s", requestIDFromContext(r.Context()), responseID)
 				return errors.New("completed response missing from context journal recorder")
 			}
-			err := s.persistContextJournal(r.Context(), body, completed, affinity.Hash, lease.Account.ID)
-			if err != nil {
-				log.Printf("[CONTEXT-JOURNAL] terminal commit failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
+			if _, err := s.persistGoalContinuity(r.Context(), r, "codex", body, completed); err != nil {
+				log.Printf("[GOAL-CONTINUITY] terminal commit degraded request_id=%s: %v", requestIDFromContext(r.Context()), err)
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "stream_terminal", Detail: "payload persistence failed"})
+				return err
 			}
-			return err
+			if err := s.persistContextJournal(r.Context(), body, completed, affinity.Hash, lease.Account.ID); err != nil {
+				log.Printf("[CONTEXT-JOURNAL] terminal fallback write failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "journal_fallback", Detail: "v1 fallback persistence failed"})
+				return err
+			}
+			return nil
 		})
 		streamErr := s.streamSSE(streamCtx, commitWriter, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 		if closeErr := commitWriter.Close(); streamErr == nil {
@@ -1567,9 +1662,16 @@ codexSuccess:
 		// "continue" turn on the SAME account and stitch the continuation into the
 		// already-relayed response. Off by default, so this whole block is skipped and
 		// behavior is byte-identical unless stream_auto_continue_enabled is set.
+		continuationResponseID := ""
+		continuationResponseModel := ""
 		if streamErr == nil && !streamRecorder.reachedTerminal() {
 			rfForAC, _ := streamCtx.Value(responseRuleFilterKey{}).(*responseRuleFilter)
-			if s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
+			// A silence is handled by the heartbeat pump above.  Reaching EOF without
+			// response.completed is different: it is an upstream close, so v2 goal
+			// continuity performs one bounded same-account `continue` request even
+			// when the legacy global auto-continue knob is off.  This gives a long
+			// polling/task turn a chance to finish before we synthesize response.failed.
+			if s.goalContinuityEnabled(r.Context()) || s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
 				reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
 					creq := requestForToken(token)
 					creq.Body = cbody
@@ -1587,13 +1689,65 @@ codexSuccess:
 					return cresp.Body, nil
 				}
 				sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), codexScrubber, "codex")
-				if acErr := s.maybeAutoContinueCodex(r.Context(), sw, body, streamRecorder, reissue); acErr != nil {
+				continuation, acErr := s.maybeAutoContinueCodex(r.Context(), sw, body, streamRecorder, reissue)
+				if acErr != nil {
 					log.Printf("[AUTO-CONTINUE] codex request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
+					_ = closeCodexStreamGracefully(sw, streamRecorder.partialItems(), streamRecorder.partialText(), func() string { id, _, _ := streamRecorder.metadata(); return id }(), func() string { _, model, _ := streamRecorder.metadata(); return model }())
+					s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "continuation_unavailable")
+				} else if continuation != nil && continuation.completedSuccessfully() {
+					completed := mergedCodexContinuationResponse(streamRecorder, continuation)
+					if len(completed) == 0 {
+						log.Printf("[GOAL-CONTINUITY] continuation terminal could not be reconstructed request_id=%s", requestIDFromContext(r.Context()))
+						_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "continuation_terminal", Detail: "merged continuation response unavailable"})
+					} else {
+						if _, persistErr := s.persistGoalContinuity(r.Context(), r, "codex", body, completed); persistErr != nil {
+							log.Printf("[GOAL-CONTINUITY] continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+							_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "continuation_terminal", Detail: "payload persistence failed"})
+						} else if err := s.persistContextJournal(r.Context(), body, completed, affinity.Hash, lease.Account.ID); err != nil {
+							log.Printf("[CONTEXT-JOURNAL] continuation fallback write failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
+							_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "continuation_journal_fallback", Detail: "v1 fallback persistence failed"})
+						}
+					}
+					continuationResponseID, continuationResponseModel, _ = continuation.metadata()
+				} else {
+					// The bounded request itself ended in response.failed/incomplete, or it
+					// exhausted its retry and emitted our response.failed.  Either way the
+					// client has a visible terminal and the last committed checkpoint is
+					// the only safe recovery point.
+					s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_eof_without_terminal")
 				}
 				sw.Flush()
+			} else {
+				id, streamModel, _ := streamRecorder.metadata()
+				if synthErr := closeCodexStreamGracefully(w, streamRecorder.partialItems(), streamRecorder.partialText(), id, streamModel); synthErr != nil {
+					log.Printf("[GOAL-STREAM] codex terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
+				}
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_stream_terminal_synthesized", State: "retryable", Reason: "upstream_eof_without_terminal", Detail: "codex response.failed emitted"})
+				s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_eof_without_terminal")
 			}
+		} else if streamErr == nil && !streamRecorder.completedSuccessfully() {
+			// response.failed and response.incomplete are already visible, protocol
+			// correct terminals. Do not append another terminal or issue continue, but
+			// retain the last *successful* checkpoint for an explicit later resume.
+			s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_terminal_not_completed")
+		} else if streamErr != nil {
+			// A transport read failure is not an EOF success.  The downstream writer may
+			// already be gone, but make a best-effort native terminal and retain the
+			// prior checkpoint for the next /goal resume.
+			id, streamModel, _ := streamRecorder.metadata()
+			if synthErr := closeCodexStreamGracefully(w, streamRecorder.partialItems(), streamRecorder.partialText(), id, streamModel); synthErr != nil {
+				log.Printf("[GOAL-STREAM] codex interrupted terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
+			}
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_stream_terminal_synthesized", State: "retryable", Reason: "upstream_stream_error", Detail: "codex response.failed emitted"})
+			s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_stream_error")
 		}
 		responseID, responseModel, streamRateLimits := streamRecorder.metadata()
+		if continuationResponseID != "" {
+			responseID = continuationResponseID
+		}
+		if continuationResponseModel != "" {
+			responseModel = continuationResponseModel
+		}
 		s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, finalEgress, model)
 		// Real-time Codex quota: the codex.rate_limits frame the stream just carried (and
 		// leakfilter dropped downstream) refreshes the 5h/7d quota rows so the quota view
@@ -1670,7 +1824,7 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
-	s.persistCodexStateBindings(r.Context(), affinity, body, responseBody, lease, finalEgress, model)
+	s.persistCodexStateBindings(r.Context(), r, affinity, body, responseBody, lease, finalEgress, model)
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
@@ -1690,13 +1844,17 @@ codexSuccess:
 	return codexAttemptResult{Outcome: outcomeDone}
 }
 
-func (s *Server) persistCodexStateBindings(ctx context.Context, affinity routing.AffinityKey, requestBody, responseBody []byte, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
+func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, affinity routing.AffinityKey, requestBody, responseBody []byte, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
 	var response struct {
 		ID    string `json:"id"`
 		Model string `json:"model"`
 	}
 	_ = json.Unmarshal(responseBody, &response)
 	s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
+	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {
+		log.Printf("[GOAL-CONTINUITY] non-stream persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "response_terminal", Detail: "payload persistence failed"})
+	}
 	s.persistContextJournal(ctx, requestBody, responseBody, affinity.Hash, lease.Account.ID)
 }
 

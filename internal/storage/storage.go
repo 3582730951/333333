@@ -718,6 +718,12 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return err
 	}
+	// goalContinuitySchemaSQL is deliberately additive and runs independently of the
+	// legacy context_journal migration.  Existing installations start dual-writing v2
+	// rows without a risky rewrite of historical snapshots.
+	if _, err := s.db.ExecContext(ctx, goalContinuitySchemaSQL); err != nil {
+		return err
+	}
 	// Create lifecycle management tables
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
 		return err
