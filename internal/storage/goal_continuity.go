@@ -168,13 +168,20 @@ type GoalTurn struct {
 	InitialGoalHash   string
 	ResponseID        string
 	Aliases           []GoalAlias
-	CheckpointPayload string
-	SegmentPayload    string
-	WorkingState      string
-	AwaitingTool      bool
-	ExpiresAt         int64
-	StorageMaxBytes   int64
-	CompressionStages int
+	// ResolutionAliasSets are ordered strongest-to-weakest identity candidates.
+	// CommitGoalTurn resolves the first set that actually has a durable match;
+	// critically, it never unions weak client/session aliases with a concrete
+	// thread identity.  This prevents two independent CLI conversations that
+	// happen to share a process/session marker from being merged into one goal.
+	// Existing callers that leave this empty retain the legacy single-set behavior.
+	ResolutionAliasSets [][]GoalAlias
+	CheckpointPayload   string
+	SegmentPayload      string
+	WorkingState        string
+	AwaitingTool        bool
+	ExpiresAt           int64
+	StorageMaxBytes     int64
+	CompressionStages   int
 }
 
 type GoalResolution struct {
@@ -302,6 +309,30 @@ func (s *Store) ResolveGoalAliases(ctx context.Context, aliases []GoalAlias) (Go
 	return s.resolveGoalAliases(ctx, s.rdb, aliases)
 }
 
+// ResolveGoalAliasSets applies the caller's documented identity precedence.  A
+// complete set is deliberately resolved together: conflicting concrete aliases in
+// the same precedence level remain an ambiguity, while a missing stronger alias
+// may fall through to a persisted response/turn alias.  It is used by the relay
+// before recovery and by CommitGoalTurn inside its write transaction.
+func (s *Store) ResolveGoalAliasSets(ctx context.Context, aliasSets [][]GoalAlias) (GoalResolution, error) {
+	return s.resolveGoalAliasSets(ctx, s.rdb, aliasSets)
+}
+
+func (s *Store) resolveGoalAliasSets(ctx context.Context, q sqlQueryer, aliasSets [][]GoalAlias) (GoalResolution, error) {
+	for _, aliases := range aliasSets {
+		aliases = normalizedGoalAliases(aliases)
+		if len(aliases) == 0 {
+			continue
+		}
+		resolution, err := s.resolveGoalAliases(ctx, q, aliases)
+		if errors.Is(err, ErrGoalNotFound) {
+			continue
+		}
+		return resolution, err
+	}
+	return GoalResolution{}, ErrGoalNotFound
+}
+
 // ResolveFallbackGoal is deliberately narrow: only the exact key/workspace/initial
 // fingerprint triple is allowed and callers must reject more than one result.  It is
 // never a model-name, cache-prefix, or account-affinity guess.
@@ -379,19 +410,24 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	// A Codex child branch always resolves by its own concrete thread first.  The
 	// parent/root alias remains owned by the root session and is relationship data,
 	// never an instruction to merge a child's raw segment stream into its parent.
-	resolutionAliases := aliases
-	if strings.TrimSpace(turn.BranchHash) != "" {
-		branchAliases := make([]GoalAlias, 0, 1)
-		for _, alias := range aliases {
-			if alias.Type == "codex_branch_thread" {
-				branchAliases = append(branchAliases, alias)
+	resolutionSets := turn.ResolutionAliasSets
+	if len(resolutionSets) == 0 {
+		// Backward-compatible storage callers did not supply priority sets. A
+		// concrete branch remains the only special case in that legacy shape.
+		resolutionSets = [][]GoalAlias{aliases}
+		if strings.TrimSpace(turn.BranchHash) != "" {
+			branchAliases := make([]GoalAlias, 0, 1)
+			for _, alias := range aliases {
+				if alias.Type == "codex_branch_thread" {
+					branchAliases = append(branchAliases, alias)
+				}
+			}
+			if len(branchAliases) > 0 {
+				resolutionSets = [][]GoalAlias{branchAliases}
 			}
 		}
-		if len(branchAliases) > 0 {
-			resolutionAliases = branchAliases
-		}
 	}
-	resolution, resolveErr := s.resolveGoalAliases(ctx, tx, resolutionAliases)
+	resolution, resolveErr := s.resolveGoalAliasSets(ctx, tx, resolutionSets)
 	if resolveErr != nil && !errors.Is(resolveErr, ErrGoalNotFound) {
 		return GoalSession{}, resolveErr
 	}

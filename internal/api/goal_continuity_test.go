@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,6 +199,99 @@ func TestGoalContinuityMarksVisibleUpstreamFailureRetryableWithoutSecondTerminal
 	}
 }
 
+func TestGoalContinuitySeparatesConcurrentCLIThreadsWithSharedWeakSession(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		kind := "unknown"
+		for _, candidate := range []string{"alpha-start", "beta-start", "alpha-next", "beta-next"} {
+			if strings.Contains(string(body), candidate) {
+				kind = candidate
+				break
+			}
+		}
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp_%s","object":"response","status":"completed","model":"gpt","output":[{"type":"message","content":[{"type":"output_text","text":"answer-%s"}]}]}`,
+			strings.ReplaceAll(kind, "-", "_"), kind)
+	})
+	h.importAccount(t, "goal-cli-isolation", "upstream-goal-cli-isolation", "access-goal-cli-isolation")
+
+	post := func(thread, body string) (int, string, error) {
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			return 0, "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("thread-id", thread)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, "", err
+		}
+		result, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(result), nil
+	}
+
+	// These represent independent Codex CLI windows. Some clients expose a common
+	// process-level session_id while their thread-id is the actual conversation key.
+	// The weak shared marker must never cause their goal chains or leases to merge.
+	if status, body, err := post("cli-thread-alpha", `{"model":"gpt","session_id":"shared-cli-process","input":"alpha-start"}`); err != nil || status != http.StatusOK || !strings.Contains(body, "resp_alpha_start") {
+		t.Fatalf("alpha initial status=%d body=%s", status, body)
+	}
+	if status, body, err := post("cli-thread-beta", `{"model":"gpt","session_id":"shared-cli-process","input":"beta-start"}`); err != nil || status != http.StatusOK || !strings.Contains(body, "resp_beta_start") {
+		t.Fatalf("beta initial status=%d body=%s", status, body)
+	}
+	goals, err := h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 2 {
+		t.Fatalf("shared weak session merged independent CLI threads: goals=%+v err=%v", goals, err)
+	}
+
+	type result struct {
+		name   string
+		status int
+		body   string
+		err    error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, tc := range []struct {
+		name, thread, body string
+	}{
+		{"alpha", "cli-thread-alpha", `{"model":"gpt","session_id":"shared-cli-process","previous_response_id":"resp_alpha_start","input":"alpha-next"}`},
+		{"beta", "cli-thread-beta", `{"model":"gpt","session_id":"shared-cli-process","previous_response_id":"resp_beta_start","input":"beta-next"}`},
+	} {
+		wg.Add(1)
+		go func(tc struct{ name, thread, body string }) {
+			defer wg.Done()
+			status, body, err := post(tc.thread, tc.body)
+			results <- result{name: tc.name, status: status, body: body, err: err}
+		}(tc)
+	}
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if got.err != nil || got.status != http.StatusOK || strings.Contains(got.body, "goal_in_progress") || strings.Contains(got.body, "goal_resume_ambiguous") {
+			t.Fatalf("%s concurrent resume stalled status=%d body=%s", got.name, got.status, got.body)
+		}
+	}
+	if calls.Load() != 4 {
+		t.Fatalf("upstream calls=%d, want four isolated turns", calls.Load())
+	}
+	for _, request := range h.requests() {
+		switch {
+		case strings.Contains(request.Body, "alpha-next"):
+			if !strings.Contains(request.Body, "alpha-start") || strings.Contains(request.Body, "beta-start") {
+				t.Fatalf("alpha replay crossed into beta: %s", request.Body)
+			}
+		case strings.Contains(request.Body, "beta-next"):
+			if !strings.Contains(request.Body, "beta-start") || strings.Contains(request.Body, "alpha-start") {
+				t.Fatalf("beta replay crossed into alpha: %s", request.Body)
+			}
+		}
+	}
+}
+
 func TestGoalContinuityRebuildsClaudeSessionIntoNativeMessages(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -374,7 +468,7 @@ func TestGoalResumeUnidentifiedAlwaysProducesStreamTerminal(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), "response.failed") || !strings.Contains(string(body), "goal_resume_context_unidentified") {
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-MiCliProxy-Goal-Error") != "goal_resume_context_unidentified" || !strings.Contains(string(body), "response.failed") || !strings.Contains(string(body), "goal_resume_context_unidentified") {
 		t.Fatalf("unidentified stream must terminate status=%d body=%s", resp.StatusCode, body)
 	}
 }

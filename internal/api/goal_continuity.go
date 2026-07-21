@@ -341,6 +341,107 @@ func goalAliases(r *http.Request, body []byte, protocol string) []storage.GoalAl
 	return aliases
 }
 
+// goalAliasPrioritySets returns identity candidates in the exact recovery order.
+// Do not combine different kinds into one storage lookup: a process-wide session_id
+// occasionally appears in several independent CLI windows, and a union lookup would
+// turn that weak collision into an incorrect shared goal or goal_in_progress lease.
+func goalAliasPrioritySets(aliases []storage.GoalAlias) [][]storage.GoalAlias {
+	order := []string{
+		"codex_branch_thread",
+		"codex_root_thread",
+		"claude_code_session",
+		"claude_session",
+		"response_id",
+		"codex_turn_state",
+		"conversation_id",
+		"thread_id",
+		"session_id",
+	}
+	sets := make([][]storage.GoalAlias, 0, len(order))
+	for _, kind := range order {
+		set := make([]storage.GoalAlias, 0, 1)
+		for _, alias := range aliases {
+			if alias.Type == kind && strings.TrimSpace(alias.Value) != "" {
+				set = append(set, alias)
+			}
+		}
+		if len(set) > 0 {
+			sets = append(sets, set)
+		}
+	}
+	return sets
+}
+
+func goalHasResumeAlias(aliases []storage.GoalAlias) bool {
+	for _, alias := range aliases {
+		switch alias.Type {
+		case "response_id", "codex_turn_state":
+			if strings.TrimSpace(alias.Value) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// goalResolutionAliasSets protects a new concrete CLI thread from accidentally
+// falling through to a weaker, shared process/session marker. Stateful resumes may
+// fall through to their persisted response/turn aliases when the client changed its
+// thread header. A child branch is always authoritative over its parent root.
+func goalResolutionAliasSets(aliases []storage.GoalAlias, allowResumeFallback bool) [][]storage.GoalAlias {
+	sets := goalAliasPrioritySets(aliases)
+	if len(sets) == 0 {
+		return nil
+	}
+	if sets[0][0].Type == "codex_branch_thread" {
+		if !allowResumeFallback {
+			return sets[:1]
+		}
+		out := append([][]storage.GoalAlias(nil), sets[:1]...)
+		for _, set := range sets[1:] {
+			if set[0].Type == "response_id" || set[0].Type == "codex_turn_state" {
+				out = append(out, set)
+			}
+		}
+		return out
+	}
+	if !allowResumeFallback {
+		return sets[:1]
+	}
+	return sets
+}
+
+func (s *Server) resolveGoalAliasesByPriority(ctx context.Context, aliases []storage.GoalAlias, allowResumeFallback bool) (storage.GoalResolution, error) {
+	return s.store.ResolveGoalAliasSets(ctx, goalResolutionAliasSets(aliases, allowResumeFallback))
+}
+
+// goalPersistentAliases retains the concrete identity plus stateful aliases but not
+// weaker process-wide markers once a thread/session already identifies the goal.
+// That makes alias persistence monotonic and prevents an old shared session_id from
+// steering another CLI conversation into this goal on a later resume.
+func goalPersistentAliases(aliases []storage.GoalAlias) []storage.GoalAlias {
+	sets := goalAliasPrioritySets(aliases)
+	if len(sets) == 0 {
+		return nil
+	}
+	out := append([]storage.GoalAlias(nil), sets[0]...)
+	seen := make(map[string]bool, len(out))
+	for _, alias := range out {
+		seen[alias.Type+"\x00"+alias.Value] = true
+	}
+	for _, alias := range aliases {
+		if alias.Type != "response_id" && alias.Type != "codex_turn_state" {
+			continue
+		}
+		key := alias.Type + "\x00" + alias.Value
+		if strings.TrimSpace(alias.Value) != "" && !seen[key] {
+			seen[key] = true
+			out = append(out, alias)
+		}
+	}
+	return out
+}
+
 func jsonStringField(raw []byte, key string) string {
 	var root map[string]interface{}
 	if json.Unmarshal(raw, &root) != nil {
@@ -661,14 +762,7 @@ func (s *Server) markGoalStreamRetryable(ctx context.Context, r *http.Request, p
 	}
 	aliases := goalAliases(r, requestBody, protocol)
 	aliases = append(aliases, goalIdentityAliases(ctx)...)
-	lookup := aliases
-	for _, alias := range aliases {
-		if alias.Type == "codex_branch_thread" {
-			lookup = []storage.GoalAlias{alias}
-			break
-		}
-	}
-	resolved, err := s.store.ResolveGoalAliases(ctx, lookup)
+	resolved, err := s.resolveGoalAliasesByPriority(ctx, aliases, goalHasResumeAlias(aliases))
 	if errors.Is(err, storage.ErrGoalNotFound) {
 		keyHash, _ := downstreamFromCtx(ctx)
 		resolved, err = s.store.ResolveFallbackGoal(ctx, keyHash, goalWorkspaceFingerprint(r, requestBody), goalInitialFingerprint(requestBody))
@@ -689,8 +783,10 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	if err != nil {
 		return storage.GoalSession{}, err
 	}
-	aliases := goalAliases(r, requestBody, protocol)
-	aliases = append(aliases, goalIdentityAliases(ctx)...)
+	requestAliases := goalAliases(r, requestBody, protocol)
+	requestAliases = append(requestAliases, goalIdentityAliases(ctx)...)
+	resolutionSets := goalResolutionAliasSets(requestAliases, goalHasResumeAlias(requestAliases))
+	aliases := goalPersistentAliases(requestAliases)
 	if responseID != "" {
 		aliases = append(aliases, storage.GoalAlias{Type: "response_id", Value: responseID})
 	}
@@ -709,7 +805,8 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		Protocol: protocol, ParentGoalID: "", BranchHash: branchHash, DownstreamKeyHash: keyHash,
 		WorkspaceHash: goalWorkspaceFingerprint(r, requestBody), InitialGoalHash: goalInitialFingerprint(requestBody),
 		ResponseID: responseID, Aliases: aliases, CheckpointPayload: checkpoint, SegmentPayload: segment,
-		WorkingState: goalWorkingState(requestBody), AwaitingTool: awaitingTool,
+		ResolutionAliasSets: resolutionSets,
+		WorkingState:        goalWorkingState(requestBody), AwaitingTool: awaitingTool,
 		ExpiresAt: time.Now().Add(s.goalRetention(ctx)).Unix(), StorageMaxBytes: s.goalStorageMaxBytes(ctx),
 		CompressionStages: s.goalCompressionStages(ctx),
 	}
@@ -737,18 +834,7 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 		return goalResumeResult{Kind: goalResumeUnidentified}
 	}
 	aliases := goalAliases(r, current, protocol)
-	// A child request deliberately carries both the root and its own thread.  Resolve
-	// the concrete branch first; looking up both together would correctly find two
-	// sessions but incorrectly report the intentional parent/child relationship as
-	// an ambiguous resume.
-	lookupAliases := aliases
-	for _, alias := range aliases {
-		if alias.Type == "codex_branch_thread" {
-			lookupAliases = []storage.GoalAlias{alias}
-			break
-		}
-	}
-	resolution, err := s.store.ResolveGoalAliases(ctx, lookupAliases)
+	resolution, err := s.resolveGoalAliasesByPriority(ctx, aliases, goalHasResumeAlias(aliases))
 	if errors.Is(err, storage.ErrGoalNotFound) {
 		keyHash, _ := downstreamFromCtx(ctx)
 		resolution, err = s.store.ResolveFallbackGoal(ctx, keyHash, goalWorkspaceFingerprint(r, current), goalInitialFingerprint(current))
@@ -831,7 +917,12 @@ func writeGoalResumeError(w http.ResponseWriter, stream bool, protocol string, k
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusConflict)
+	// CLI SSE implementations commonly discard a non-2xx response before parsing
+	// its body. A stream-level failure therefore has to use a successful transport
+	// status and carry the failure in the provider-native terminal event; otherwise
+	// a concurrent goal/lease conflict looks like a silent unanswered prompt.
+	w.Header().Set("X-MiCliProxy-Goal-Error", code)
+	w.WriteHeader(http.StatusOK)
 	if protocol == "claude" {
 		_, _ = fmt.Fprintf(w, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"code\":%q,\"message\":%q}}\n\n", code, message)
 		_, _ = fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
