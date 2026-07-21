@@ -153,3 +153,89 @@ func TestAdminImportSub2APIDataImportsAgentIdentityProxyAndIsolatesErrors(t *tes
 		t.Fatalf("unsafe/incomplete account response: %d %s", code, accountsRaw)
 	}
 }
+
+func TestAdminImportSub2APIDataSeparatesAgentUsersInSharedWorkspace(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	buildAccount := func(userID, privateKey string) map[string]interface{} {
+		return map[string]interface{}{
+			"name": userID + "@example.com", "platform": "openai", "type": "oauth",
+			"credentials": map[string]interface{}{
+				"auth_mode": "agentIdentity", "agent_runtime_id": "runtime-" + userID, "agent_private_key": privateKey,
+				"task_id": "task-" + userID, "account_id": "shared-workspace", "chatgpt_user_id": userID,
+			},
+		}
+	}
+	payload := map[string]interface{}{
+		"type": "sub2api-data", "version": 1, "proxies": []interface{}{},
+		"accounts": []interface{}{
+			buildAccount("user-one", sub2APIAgentPrivateKey(t)),
+			buildAccount("user-two", sub2APIAgentPrivateKey(t)),
+		},
+	}
+	requestBody, _ := json.Marshal(map[string]interface{}{"auth_json": payload, "group_name": "cyber"})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/import-auth-json", string(requestBody))
+	if code != http.StatusOK {
+		t.Fatalf("import = %d: %s", code, raw)
+	}
+	var result authDocumentImportResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Imported != 2 || result.Duplicates != 0 || result.Failed != 0 || len(result.Items) != 2 {
+		t.Fatalf("unexpected result: %+v body=%s", result, raw)
+	}
+	if result.Items[0].AccountID == "" || result.Items[0].AccountID == result.Items[1].AccountID {
+		t.Fatalf("distinct Agent Identity users received duplicate account ids: %+v", result.Items)
+	}
+}
+
+func TestAdminImportSub2APIDataKeepsLegacyAgentIdentityDuplicateScopedToUser(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	legacyKey := sub2APIAgentPrivateKey(t)
+	legacy := storage.Account{
+		ID: "legacy-agent-identity", Label: "legacy", GroupName: "cyber", Provider: "codex", Status: "active",
+		UpstreamAccountID: "shared-workspace", ChatGPTUserID: "user-one",
+	}
+	if err := h.store.UpsertAccount(context.Background(), legacy, storage.AccountToken{
+		AuthMethod: "oauth", CredentialMode: "agent_identity", AgentRuntimeID: "legacy-runtime", AgentPrivateKey: legacyKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	buildAccount := func(userID, privateKey string) map[string]interface{} {
+		return map[string]interface{}{
+			"name": userID + "@example.com", "platform": "openai", "type": "oauth",
+			"credentials": map[string]interface{}{
+				"auth_mode": "agentIdentity", "agent_runtime_id": "runtime-" + userID, "agent_private_key": privateKey,
+				"task_id": "task-" + userID, "account_id": "shared-workspace", "chatgpt_user_id": userID,
+			},
+		}
+	}
+	payload := map[string]interface{}{
+		"type": "sub2api-data", "version": 1, "proxies": []interface{}{},
+		"accounts": []interface{}{
+			buildAccount("user-one", legacyKey),
+			buildAccount("user-two", sub2APIAgentPrivateKey(t)),
+		},
+	}
+	requestBody, _ := json.Marshal(map[string]interface{}{"auth_json": payload, "group_name": "cyber"})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/import-auth-json", string(requestBody))
+	if code != http.StatusOK {
+		t.Fatalf("import = %d: %s", code, raw)
+	}
+	var result authDocumentImportResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Imported != 1 || result.Duplicates != 1 || result.Failed != 0 {
+		t.Fatalf("unexpected result: %+v body=%s", result, raw)
+	}
+	if result.Items[0].Action != "duplicate" || result.Items[0].AccountID != legacy.ID || result.Items[1].Action != "imported" {
+		t.Fatalf("legacy/new split was not preserved: %+v", result.Items)
+	}
+}

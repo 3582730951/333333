@@ -58,7 +58,7 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		Status:            "active",
 		IsFedramp:         parsed.IsFedramp,
 	}
-	if existing, err := s.store.GetAccount(r.Context(), account.ID); err == nil {
+	if existing, err := s.findExistingImportedAccount(r.Context(), parsed); err == nil {
 		key.LastUsedAt = storage.Now()
 		_ = s.store.UpsertAPIKey(r.Context(), key)
 		writeJSON(w, http.StatusOK, accountImportResponse{Account: existing, Duplicate: true, ImportStatus: "duplicate"})

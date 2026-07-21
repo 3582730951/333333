@@ -61,6 +61,35 @@ func TestParseSub2APIDataAgentIdentityAndIsolateBadAccounts(t *testing.T) {
 	}
 }
 
+func TestParseSub2APIAgentIdentitySeparatesUsersInSharedWorkspace(t *testing.T) {
+	firstKey := agentPrivateKeyForTest(t)
+	secondKey := agentPrivateKeyForTest(t)
+	buildEntry := func(userID, privateKey string) map[string]interface{} {
+		return map[string]interface{}{
+			"name": userID + "@example.com", "platform": "openai", "type": "oauth",
+			"credentials": map[string]interface{}{
+				"auth_mode": "agentIdentity", "agent_runtime_id": "runtime-" + userID, "agent_private_key": privateKey,
+				"task_id": "task-" + userID, "account_id": "shared-workspace", "chatgpt_user_id": userID,
+			},
+		}
+	}
+	payload := map[string]interface{}{
+		"type": "sub2api-data", "version": 1, "proxies": []interface{}{},
+		"accounts": []interface{}{buildEntry("user-one", firstKey), buildEntry("user-two", secondKey)},
+	}
+	raw, _ := json.Marshal(payload)
+	doc, err := ParseImportDocument(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Entries) != 2 || doc.Entries[0].Err != nil || doc.Entries[1].Err != nil {
+		t.Fatalf("unexpected document: %+v", doc)
+	}
+	if doc.Entries[0].Parsed.AccountID == doc.Entries[1].Parsed.AccountID {
+		t.Fatalf("users in a shared workspace were assigned the same account id: %q", doc.Entries[0].Parsed.AccountID)
+	}
+}
+
 func TestParseSub2APIDataValidatesHeaderAndPrivateKey(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"sub2api-data","version":2,"proxies":[],"accounts":[]}`,

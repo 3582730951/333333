@@ -91,7 +91,7 @@ func (s *Server) adminImportAuthDocument(w http.ResponseWriter, r *http.Request,
 			s.failAuthDocumentItem(&result, &item, errors.New("built-in provider API keys require /admin/accounts/import-key with confirm_cost:true"))
 			continue
 		}
-		if existing, err := s.store.GetAccount(r.Context(), parsed.AccountID); err == nil {
+		if existing, err := s.findExistingImportedAccount(r.Context(), parsed); err == nil {
 			item.AccountID = existing.ID
 			item.Name = firstNonEmpty(existing.Label, item.Name)
 			item.Action = "duplicate"

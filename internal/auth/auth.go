@@ -138,9 +138,11 @@ func parseAgentIdentity(m map[string]interface{}) (ParsedAuth, error) {
 	}, false); err != nil {
 		return ParsedAuth{}, err
 	}
-	// sub2api deliberately keys Agent Identity by the ChatGPT account, because the
-	// runtime and task IDs can rotate. Preserve that stable deduplication behavior.
-	out.AccountID = stableAccountID("agent_identity:" + out.UpstreamAccountID)
+	// A sub2api account_id can be a shared ChatGPT workspace/account identifier,
+	// so it cannot safely identify an Agent Identity credential by itself. The
+	// runtime and task IDs rotate, but account + user stays stable and keeps two
+	// users in the same workspace from being collapsed into one pool account.
+	out.AccountID = stableAccountID("agent_identity:" + codexAccountIdentity(out.ChatGPTUserID, out.UpstreamAccountID))
 	return out, nil
 }
 

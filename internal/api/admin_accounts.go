@@ -11,6 +11,7 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -266,8 +267,11 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "built-in provider API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
 		return
 	}
-	if existing, err := s.store.GetAccount(r.Context(), account.ID); err == nil {
+	if existing, err := s.findExistingImportedAccount(r.Context(), parsed); err == nil {
 		writeJSON(w, http.StatusOK, accountImportResponse{Account: existing, Duplicate: true, ImportStatus: "duplicate"})
+		return
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
@@ -339,8 +343,10 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
 	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
-	if existing, err := s.store.GetAccount(ctx, account.ID); err == nil {
+	if existing, err := s.findExistingImportedAccount(ctx, parsed); err == nil {
 		return existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return storage.Account{}, err
 	}
 	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
 		return storage.Account{}, err
@@ -353,6 +359,42 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	}
 	s.probeImportedAccountAsync(account)
 	return account, nil
+}
+
+// findExistingImportedAccount keeps Agent Identity imports compatible with rows
+// created before its stable key included chatgpt_user_id. A workspace/account ID
+// may be shared by multiple users, so the fallback always requires both fields
+// and confirms the stored credential mode before reporting a duplicate.
+func (s *Server) findExistingImportedAccount(ctx context.Context, parsed authparse.ParsedAuth) (storage.Account, error) {
+	if existing, err := s.store.GetAccount(ctx, parsed.AccountID); err == nil || !errors.Is(err, sql.ErrNoRows) {
+		return existing, err
+	}
+	shape := storage.AccountToken{
+		CredentialMode: parsed.CredentialMode, AgentRuntimeID: parsed.AgentRuntimeID, AgentPrivateKey: parsed.AgentPrivateKey,
+	}
+	if !accountprovider.IsAgentIdentity(shape) || strings.TrimSpace(parsed.UpstreamAccountID) == "" || strings.TrimSpace(parsed.ChatGPTUserID) == "" {
+		return storage.Account{}, sql.ErrNoRows
+	}
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return storage.Account{}, err
+	}
+	for _, candidate := range accounts {
+		if candidate.UpstreamAccountID != parsed.UpstreamAccountID || candidate.ChatGPTUserID != parsed.ChatGPTUserID {
+			continue
+		}
+		token, tokenErr := s.store.GetToken(ctx, candidate.ID)
+		if tokenErr != nil {
+			if errors.Is(tokenErr, sql.ErrNoRows) {
+				continue
+			}
+			return storage.Account{}, tokenErr
+		}
+		if accountprovider.IsAgentIdentity(token) {
+			return candidate, nil
+		}
+	}
+	return storage.Account{}, sql.ErrNoRows
 }
 
 // seedImportedAccountCapabilities closes the import-to-first-request race. Static
