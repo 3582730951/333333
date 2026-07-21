@@ -26,6 +26,7 @@ function cooldownInfo(a) {
 function isKiroAccount(a) { return !!a && String(a.provider || "").toLowerCase() === "kiro"; }
 function isKiroSuspended(a) { return isKiroAccount(a) && String(a.quarantine_reason || "").toLowerCase() === "aws_user_suspended"; }
 function isProviderAPIKeyAccount(a) { const p = String(a && a.provider || "").toLowerCase(); return !!a && a.auth_method === "api_key" && (p === "codex" || p === "claude"); }
+function isAgentIdentityAccount(a) { return !!a && a.credential_mode === "agent_identity"; }
 function requiresPaidHealthTest(a) { return isKiroAccount(a) || isProviderAPIKeyAccount(a); }
 function isProtectedProbeQuarantine(a) { const reason = String(a.quarantine_reason || ""); return isKiroSuspended(a) || (isProviderAPIKeyAccount(a) && (reason === "provider_api_key_inference_probe_pending" || reason.startsWith("provider_api_key_inference_probe_failed:"))); }
 function kiroHealthConfirmation(accounts) {
@@ -167,11 +168,11 @@ function accTableHTML(accs, compact) {
     const eg = a.egress_binding ? a.egress_binding.primary_egress_id : "-";
     const actions = compact ? "" : `
       <button class="btn sm" onclick="event.stopPropagation();act('${a.id}','probe-models','POST')">${LANG === "en" ? "Probe" : "探测"}</button>
-      ${isProviderAPIKeyAccount(a) ? "" : `<button class="btn sm" onclick="event.stopPropagation();act('${a.id}','refresh','POST')">${LANG === "en" ? "Refresh" : "刷新"}</button>`}
+      ${isProviderAPIKeyAccount(a) || isAgentIdentityAccount(a) ? "" : `<button class="btn sm" onclick="event.stopPropagation();act('${a.id}','refresh','POST')">${LANG === "en" ? "Refresh" : "刷新"}</button>`}
       ${a.status === "active" ? `<button class="btn sm" onclick="event.stopPropagation();act('${a.id}','disable','POST')">${LANG === "en" ? "Disable" : "禁用"}</button>` : `<button class="btn sm" onclick="event.stopPropagation();act('${a.id}','enable','POST')">${LANG === "en" ? "Enable" : "启用"}</button>`}
       <button class="btn sm danger" onclick="event.stopPropagation();delAcc('${a.id}')">${LANG === "en" ? "Delete" : "删除"}</button>`;
     return `<tr class="clk" onclick="openAcc('${a.id}')">
-      <td><div>${esc(a.label || "-")} ${provChip(a.provider)} <span class="chip">${esc(a.auth_method || "oauth")}</span></div><div class="mono muted">${esc(a.id)}</div></td>
+      <td><div>${esc(a.label || "-")} ${provChip(a.provider)} <span class="chip">${esc(isAgentIdentityAccount(a) ? "agent identity" : (a.auth_method || "oauth"))}</span></div><div class="mono muted">${esc(a.id)}</div></td>
       <td>${esc(a.email || "-")}<div class="muted">${a.billing_mode === "pay_as_you_go" ? (LANG === "en" ? "Pay as you go" : "按量计费") : esc(a.plan_type || "")}</div></td>
       <td>${isKiroSuspended(a) ? `<span class="chip bad">${LANG === "en" ? "AWS User ID suspended" : "AWS User ID 已暂停"}</span>` : statusChip(a.status)}${a.is_fedramp ? ' <span class="chip">fedramp</span>' : ""}</td>
       <td>${quotaMiniBar(QUOTA[a.id])}</td>
@@ -247,8 +248,9 @@ async function openAcc(id) {
       <div class="kv" style="grid-template-columns:88px 1fr;flex:1;margin:0">${kv("5h " + (LANG === "en" ? "used" : "已用"), q.used_percent >= 0 ? Math.round(q.used_percent) + "%" : "—")}${kv("5h " + (LANG === "en" ? "remain" : "剩余"), q.remaining_tokens >= 0 ? fmt(q.remaining_tokens) : "—")}${hasSd ? kv("7d " + (LANG === "en" ? "used" : "已用"), Math.round(sd.used_percent) + "%") : ""}${hasSd ? kv("7d " + (LANG === "en" ? "remain" : "剩余"), sd.remaining_tokens >= 0 ? fmt(sd.remaining_tokens) : "—") : ""}</div></div>` : "";
   const suspensionNote = isKiroSuspended(a) ? `<div class="note" style="border-color:var(--bad);color:var(--bad)"><b>${LANG === "en" ? "AWS User ID suspended" : "AWS User ID 已暂停"}</b><br>${LANG === "en" ? "Contact AWS Support for identity verification. After restoration, an administrator must run the confirmed two-stage health test before scheduling resumes." : "请联系 AWS 支持完成身份验证。AWS 恢复后，管理员必须确认 credits 消耗并执行双层测活，成功后才会恢复调度。"}</div>` : "";
   const apiKeyNote = isProviderAPIKeyAccount(a) ? `<div class="note"><b>${LANG === "en" ? "Upstream API key · pay as you go" : "上游 API Key · 按量计费"}</b><br>${LANG === "en" ? "This credential does not use OAuth refresh, reauthentication, or subscription quota operations. A confirmed health test performs one minimal inference." : "该凭据不进入 OAuth 刷新、重登或订阅配额流程。确认测活会执行一次最小推理。"}</div>` : "";
+  const agentIdentityNote = isAgentIdentityAccount(a) ? `<div class="note"><b>Agent Identity</b><br>${LANG === "en" ? "The private key is encrypted at rest. Requests are signed dynamically and an invalid task is registered again once through the bound egress." : "私钥已加密保存；请求动态签名，task 失效时会经账号绑定出口自动注册并重试一次。"}</div>` : "";
   $("#drBody").innerHTML = `
-    ${suspensionNote}${apiKeyNote}<div class="kv">${kv("ID", a.id)}${kv("Provider", a.provider)}${kv(LANG === "en" ? "Authentication" : "认证方式", a.auth_method || "oauth")}${kv(LANG === "en" ? "Billing" : "计费方式", a.billing_mode === "pay_as_you_go" ? (LANG === "en" ? "Pay as you go" : "按量计费") : (LANG === "en" ? "Subscription" : "订阅"))}${kv("Email", a.email)}${kv("Plan", a.plan_type)}${kv("Status", isKiroSuspended(a) ? (LANG === "en" ? "AWS User ID suspended / quarantined" : "AWS User ID 已暂停 / 隔离") : a.status)}${kv(LANG === "en" ? "Quarantine reason" : "隔离原因", a.quarantine_reason)}</div>
+    ${suspensionNote}${apiKeyNote}${agentIdentityNote}<div class="kv">${kv("ID", a.id)}${kv("Provider", a.provider)}${kv(LANG === "en" ? "Authentication" : "认证方式", isAgentIdentityAccount(a) ? "agent identity" : (a.auth_method || "oauth"))}${kv(LANG === "en" ? "Billing" : "计费方式", a.billing_mode === "pay_as_you_go" ? (LANG === "en" ? "Pay as you go" : "按量计费") : (LANG === "en" ? "Subscription" : "订阅"))}${kv("Email", a.email)}${kv("Plan", a.plan_type)}${kv("Status", isKiroSuspended(a) ? (LANG === "en" ? "AWS User ID suspended / quarantined" : "AWS User ID 已暂停 / 隔离") : a.status)}${kv(LANG === "en" ? "Quarantine reason" : "隔离原因", a.quarantine_reason)}</div>
     <div class="sect">${LANG === "en" ? "Models" : "模型能力"}</div><div class="row">${caps}</div>${quotaSect}
     <div class="sect">${LANG === "en" ? "Egress" : "出口绑定"}</div>
     <div class="row"><select class="t" id="drEg" style="flex:1">${egOpts || "<option>—</option>"}</select><button class="btn" onclick="setEg('${a.id}')">${LANG === "en" ? "Set primary" : "设为主出口"}</button></div>
@@ -259,7 +261,7 @@ async function openAcc(id) {
     <div class="sect">${t("common.actions")}</div>
     <div class="row">
       <button class="btn sm" onclick="act('${a.id}','probe-models','POST')">${LANG === "en" ? "Probe models" : "探测模型"}</button>
-      ${isProviderAPIKeyAccount(a) ? "" : `<button class="btn sm" onclick="act('${a.id}','refresh','POST')">${LANG === "en" ? "Refresh" : "刷新"}</button>`}
+      ${isProviderAPIKeyAccount(a) || isAgentIdentityAccount(a) ? "" : `<button class="btn sm" onclick="act('${a.id}','refresh','POST')">${LANG === "en" ? "Refresh" : "刷新"}</button>`}
       <button class="btn sm" onclick="healthTest('${a.id}')">${LANG === "en" ? "Health test" : "测试存活"}</button>
       ${a.status === "active" ? `<button class="btn sm" onclick="act('${a.id}','disable','POST')">${LANG === "en" ? "Disable" : "禁用"}</button>` : `<button class="btn sm" onclick="act('${a.id}','enable','POST')">${LANG === "en" ? "Enable" : "启用"}</button>`}
       ${!isProtectedProbeQuarantine(a) && a.quarantine_until && a.quarantine_until > Math.floor(Date.now() / 1000) ? `<button class="btn sm warn" onclick="clearQuarantine('${a.id}')">${LANG === "en" ? "Clear quarantine" : "清除隔离"}</button>` : ""}

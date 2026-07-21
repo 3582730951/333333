@@ -530,9 +530,23 @@ func (s *Server) recordQuotaPollError(ctx context.Context, acc storage.Account, 
 // two AccountRateLimit rows: one for the 5h (primary) window and one for the 7d
 // (secondary) window.
 func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, token storage.AccountToken, egress storage.EgressProfile) error {
-	accessToken := accountprovider.Credential("codex", token)
-	if accessToken == "" {
-		return newQuotaPollError("token_missing", 0, nil, fmt.Errorf("no access token"))
+	authorization := ""
+	if isAgentIdentityToken(token) {
+		var err error
+		token, err = s.ensureAgentIdentityTask(ctx, acc, token, egress, "quota:"+acc.ID, "")
+		if err != nil {
+			return newQuotaPollError("agent_task_error", 0, nil, err)
+		}
+		authorization, err = agentIdentityAuthorization(token)
+		if err != nil {
+			return newQuotaPollError("agent_assertion_error", 0, nil, err)
+		}
+	} else {
+		accessToken := accountprovider.Credential("codex", token)
+		if accessToken == "" {
+			return newQuotaPollError("token_missing", 0, nil, fmt.Errorf("no access token"))
+		}
+		authorization = "Bearer " + accessToken
 	}
 	chatgptUserID := acc.ChatGPTUserID
 	if chatgptUserID == "" {
@@ -540,7 +554,7 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	}
 
 	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+accessToken)
+	headers.Set("Authorization", authorization)
 	if chatgptUserID != "" {
 		headers.Set("ChatGPT-Account-Id", chatgptUserID)
 	}
@@ -562,6 +576,27 @@ func (s *Server) pollOneCodexQuota(ctx context.Context, acc storage.Account, tok
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body = redactAgentIdentityError(token, body)
+	if isInvalidAgentIdentityTask(resp.StatusCode, body, token) {
+		recovered, recoverErr := s.ensureAgentIdentityTask(ctx, acc, token, egress, "quota:"+acc.ID, token.AgentTaskID)
+		if recoverErr != nil {
+			return newQuotaPollError("agent_task_error", resp.StatusCode, body, recoverErr)
+		}
+		token = recovered
+		authorization, recoverErr = agentIdentityAuthorization(token)
+		if recoverErr != nil {
+			return newQuotaPollError("agent_assertion_error", 0, nil, recoverErr)
+		}
+		headers.Set("Authorization", authorization)
+		resp.Body.Close()
+		resp, err = s.upstream.DoRaw(ctx, egress, http.MethodGet, whamUsageURL, headers, nil, "quota:"+acc.ID)
+		if err != nil {
+			return newQuotaPollError("network_error", 0, nil, fmt.Errorf("http after task recovery: %w", err))
+		}
+		defer resp.Body.Close()
+		body, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		body = redactAgentIdentityError(token, body)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return newQuotaPollError("http_error", resp.StatusCode, body, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}

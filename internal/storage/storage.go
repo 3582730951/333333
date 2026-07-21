@@ -39,7 +39,8 @@ type Store struct {
 	// it is the same handle as db (see Open).
 	rdb *sql.DB
 	// tokenKey, when set (32 bytes), enables transparent AES-256-GCM encryption of the
-	// secret columns in account_auth_tokens (access/refresh/id token, upstream api key),
+	// secret columns in account_auth_tokens (access/refresh/id token, upstream api key,
+	// and Agent Identity runtime/private/task credentials),
 	// api_keys.secret (copyable downstream key), and session cookies. nil = encryption
 	// disabled (plaintext, legacy behavior) — kept nil by tests/in-memory stores so
 	// they are unaffected. Set via SetTokenEncryptionKey from main using the resolved
@@ -201,10 +202,14 @@ type AccountPoolSummary struct {
 type AccountToken struct {
 	AccountID          string `json:"account_id"`
 	AuthMethod         string `json:"auth_method,omitempty"`
+	CredentialMode     string `json:"credential_mode,omitempty"`
 	AccessToken        string `json:"access_token,omitempty"`
 	RefreshToken       string `json:"refresh_token,omitempty"`
 	OpenAIAPIKey       string `json:"openai_api_key,omitempty"`
 	IDTokenRaw         string `json:"id_token_raw,omitempty"`
+	AgentRuntimeID     string `json:"-"`
+	AgentPrivateKey    string `json:"-"`
+	AgentTaskID        string `json:"-"`
 	LastRefresh        int64  `json:"last_refresh,omitempty"`
 	ExpiresAt          int64  `json:"expires_at,omitempty"`
 	Scopes             string `json:"scopes,omitempty"`
@@ -888,10 +893,14 @@ CREATE INDEX IF NOT EXISTS idx_accounts_group_status ON accounts(group_name, sta
 CREATE TABLE IF NOT EXISTS account_auth_tokens(
   account_id TEXT PRIMARY KEY,
   auth_method TEXT NOT NULL DEFAULT '',
+  credential_mode TEXT NOT NULL DEFAULT '',
   access_token TEXT,
   refresh_token TEXT,
   openai_api_key TEXT,
   id_token_raw TEXT,
+  agent_runtime_id TEXT NOT NULL DEFAULT '',
+  agent_private_key TEXT NOT NULL DEFAULT '',
+  agent_task_id TEXT NOT NULL DEFAULT '',
   last_refresh INTEGER NOT NULL DEFAULT 0,
   expires_at INTEGER NOT NULL DEFAULT 0,
   scopes TEXT NOT NULL DEFAULT '',
@@ -1446,6 +1455,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN auth_method TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN credential_mode TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN agent_runtime_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN agent_private_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE account_auth_tokens ADD COLUMN agent_task_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN scopes TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN oauth_rate_limit_tier TEXT NOT NULL DEFAULT ''`,
@@ -2367,20 +2380,24 @@ ON CONFLICT(id) DO UPDATE SET
 	}
 	token.UpdatedAt = now
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO account_auth_tokens(account_id, auth_method, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO account_auth_tokens(account_id, auth_method, credential_mode, access_token, refresh_token, openai_api_key, id_token_raw, agent_runtime_id, agent_private_key, agent_task_id, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(account_id) DO UPDATE SET
  auth_method = excluded.auth_method,
+ credential_mode = excluded.credential_mode,
  access_token = excluded.access_token,
  refresh_token = excluded.refresh_token,
  openai_api_key = excluded.openai_api_key,
  id_token_raw = excluded.id_token_raw,
+ agent_runtime_id = excluded.agent_runtime_id,
+ agent_private_key = excluded.agent_private_key,
+ agent_task_id = excluded.agent_task_id,
  last_refresh = excluded.last_refresh,
  expires_at = excluded.expires_at,
  scopes = excluded.scopes,
  oauth_rate_limit_tier = excluded.oauth_rate_limit_tier,
  updated_at = excluded.updated_at`,
-		token.AccountID, token.AuthMethod, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), token.LastRefresh, token.ExpiresAt, token.Scopes, token.OAuthRateLimitTier, token.CreatedAt, token.UpdatedAt)
+		token.AccountID, token.AuthMethod, token.CredentialMode, s.sealToken(token.AccessToken), s.sealToken(token.RefreshToken), s.sealToken(token.OpenAIAPIKey), s.sealToken(token.IDTokenRaw), s.sealToken(token.AgentRuntimeID), s.sealToken(token.AgentPrivateKey), s.sealToken(token.AgentTaskID), token.LastRefresh, token.ExpiresAt, token.Scopes, token.OAuthRateLimitTier, token.CreatedAt, token.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -2789,13 +2806,16 @@ func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, e
 	if cached, ok := s.tokenCache.Load(accountID); ok {
 		return cached.(AccountToken), nil
 	}
-	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
+	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, credential_mode, access_token, refresh_token, openai_api_key, id_token_raw, agent_runtime_id, agent_private_key, agent_task_id, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
 	var t AccountToken
-	err := row.Scan(&t.AccountID, &t.AuthMethod, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
+	err := row.Scan(&t.AccountID, &t.AuthMethod, &t.CredentialMode, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.AgentRuntimeID, &t.AgentPrivateKey, &t.AgentTaskID, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
 	t.AccessToken = s.openToken(t.AccessToken)
 	t.RefreshToken = s.openToken(t.RefreshToken)
 	t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
 	t.IDTokenRaw = s.openToken(t.IDTokenRaw)
+	t.AgentRuntimeID = s.openToken(t.AgentRuntimeID)
+	t.AgentPrivateKey = s.openToken(t.AgentPrivateKey)
+	t.AgentTaskID = s.openToken(t.AgentTaskID)
 	if err == nil {
 		s.tokenCache.Store(accountID, t)
 	}
@@ -2820,20 +2840,23 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, auth_method, access_token, refresh_token, openai_api_key, id_token_raw, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, auth_method, credential_mode, access_token, refresh_token, openai_api_key, id_token_raw, agent_runtime_id, agent_private_key, agent_task_id, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var t AccountToken
-		if err := rows.Scan(&t.AccountID, &t.AuthMethod, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.AccountID, &t.AuthMethod, &t.CredentialMode, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.AgentRuntimeID, &t.AgentPrivateKey, &t.AgentTaskID, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		t.AccessToken = s.openToken(t.AccessToken)
 		t.RefreshToken = s.openToken(t.RefreshToken)
 		t.OpenAIAPIKey = s.openToken(t.OpenAIAPIKey)
 		t.IDTokenRaw = s.openToken(t.IDTokenRaw)
+		t.AgentRuntimeID = s.openToken(t.AgentRuntimeID)
+		t.AgentPrivateKey = s.openToken(t.AgentPrivateKey)
+		t.AgentTaskID = s.openToken(t.AgentTaskID)
 		out[t.AccountID] = t
 	}
 	return out, rows.Err()
@@ -2841,8 +2864,8 @@ func (s *Store) ListTokensByAccountIDs(ctx context.Context, accountIDs []string)
 
 func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
 	s.tokenCache.Delete(t.AccountID)
-	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET auth_method = ?, access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
-		t.AuthMethod, s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
+	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET auth_method = ?, credential_mode = ?, access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, agent_runtime_id = ?, agent_private_key = ?, agent_task_id = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
+		t.AuthMethod, t.CredentialMode, s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), s.sealToken(t.AgentRuntimeID), s.sealToken(t.AgentPrivateKey), s.sealToken(t.AgentTaskID), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
 	return err
 }
 
@@ -2970,20 +2993,20 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	n := 0
-	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw FROM account_auth_tokens`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token, openai_api_key, id_token_raw, agent_runtime_id, agent_private_key, agent_task_id FROM account_auth_tokens`)
 	if err != nil {
 		return 0, err
 	}
-	type rec struct{ id, at, rt, ak, it string }
+	type rec struct{ id, at, rt, ak, it, ar, ap, task string }
 	var pending []rec
 	for rows.Next() {
 		var r rec
-		if err := rows.Scan(&r.id, &r.at, &r.rt, &r.ak, &r.it); err != nil {
+		if err := rows.Scan(&r.id, &r.at, &r.rt, &r.ak, &r.it, &r.ar, &r.ap, &r.task); err != nil {
 			rows.Close()
 			return 0, err
 		}
 		// Only rows with at least one non-empty, not-yet-sealed secret need an upgrade.
-		if anyPlaintextSecret(r.at, r.rt, r.ak, r.it) {
+		if anyPlaintextSecret(r.at, r.rt, r.ak, r.it, r.ar, r.ap, r.task) {
 			pending = append(pending, r)
 		}
 	}
@@ -2992,8 +3015,8 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	for _, r := range pending {
-		if _, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ? WHERE account_id = ?`,
-			s.sealToken(r.at), s.sealToken(r.rt), s.sealToken(r.ak), s.sealToken(r.it), r.id); err != nil {
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, agent_runtime_id = ?, agent_private_key = ?, agent_task_id = ? WHERE account_id = ?`,
+			s.sealToken(r.at), s.sealToken(r.rt), s.sealToken(r.ak), s.sealToken(r.it), s.sealToken(r.ar), s.sealToken(r.ap), s.sealToken(r.task), r.id); err != nil {
 			return n, err
 		}
 		n++

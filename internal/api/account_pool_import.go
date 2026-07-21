@@ -5,7 +5,6 @@ import (
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/storage"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -20,14 +19,7 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req struct {
-		Label           string          `json:"label"`
-		GroupName       string          `json:"group_name"`
-		EgressID        string          `json:"egress_id"`
-		PrimaryEgressID string          `json:"primary_egress_id"`
-		AuthJSON        json.RawMessage `json:"auth_json"`
-		AuthJSONText    string          `json:"auth_json_text"`
-	}
+	var req authJSONImportRequest
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -36,11 +28,18 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 	if len(raw) == 0 && strings.TrimSpace(req.AuthJSONText) != "" {
 		raw = []byte(req.AuthJSONText)
 	}
-	parsed, err := authparse.ParseAuthJSON(raw)
+	doc, err := authparse.ParseImportDocument(raw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if doc.Format != authparse.ImportFormatSingle {
+		key.LastUsedAt = storage.Now()
+		_ = s.store.UpsertAPIKey(r.Context(), key)
+		s.adminImportAuthDocument(w, r, req, doc)
+		return
+	}
+	parsed := doc.Entries[0].Parsed
 	if req.Label == "" {
 		req.Label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
@@ -73,10 +72,14 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		lastRefresh = storage.Now()
 	}
 	token := storage.AccountToken{
+		CredentialMode:     parsed.CredentialMode,
 		AccessToken:        parsed.AccessToken,
 		RefreshToken:       parsed.RefreshToken,
 		OpenAIAPIKey:       parsed.OpenAIAPIKey,
 		IDTokenRaw:         parsed.IDTokenRaw,
+		AgentRuntimeID:     parsed.AgentRuntimeID,
+		AgentPrivateKey:    parsed.AgentPrivateKey,
+		AgentTaskID:        parsed.AgentTaskID,
 		LastRefresh:        lastRefresh,
 		ExpiresAt:          parsed.ExpiresAt,
 		Scopes:             strings.Join(parsed.Scopes, " "),

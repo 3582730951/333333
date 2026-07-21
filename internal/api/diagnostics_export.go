@@ -282,7 +282,7 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		return nil
 	}
 	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
-	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
+	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "credential_mode", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
@@ -765,7 +765,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	}
 
 	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
-	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
+	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "credential_mode", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
@@ -1208,8 +1208,9 @@ func accountAuthMetadataRows(accounts []storage.Account, tokensByID map[string]s
 			account.Provider,
 			provider,
 			accountprovider.EffectiveAuthMethod(provider, token),
+			token.CredentialMode,
 			accountprovider.BillingMode(provider, token),
-			strconv.FormatBool(strings.TrimSpace(accountprovider.Credential(provider, token)) != ""),
+			strconv.FormatBool(strings.TrimSpace(accountprovider.Credential(provider, token)) != "" || accountprovider.IsAgentIdentity(token)),
 			itoa64(token.ExpiresAt),
 			itoa64(token.LastRefresh),
 			token.OAuthRateLimitTier,

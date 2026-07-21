@@ -781,6 +781,15 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		writeError(w, http.StatusInternalServerError, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
+	token, err = s.ensureAgentIdentityTask(r.Context(), lease.Account, token, lease.Egress, lease.Binding.CookieJarKey, "")
+	if err != nil {
+		log.Printf("agent identity task prepare %s: %v", lease.Account.ID, err)
+		if allowRetry && movable {
+			return retry()
+		}
+		writeError(w, http.StatusBadGateway, err)
+		return codexAttemptResult{Outcome: outcomeDone}
+	}
 	// Start with the raw body. Every downstream transform (system-prompt inject,
 	// chat→responses conversion, Virtualize) returns its own freshly-allocated
 	// slice via json.Marshal, so the initial clone is unnecessary — it would
@@ -1025,6 +1034,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
+		errorBody = redactAgentIdentityError(token, errorBody)
 		handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
 			contextError := responsesContextError(status, body)
 			if contextError == leakfilter.ResponsesContextErrorNone {
@@ -1043,7 +1053,31 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		detection := cf.Detect(resp.StatusCode, resp.Header, errorBody)
 		v := ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
-		if v.State == ban.AuthExpired && !cf.EdgeOnly(detection) && !upstream.AccountUsesAPIKey(token) {
+		if isInvalidAgentIdentityTask(resp.StatusCode, errorBody, token) {
+			oldTaskID := token.AgentTaskID
+			if recovered, recoverErr := s.ensureAgentIdentityTask(r.Context(), lease.Account, token, finalEgress, lease.Binding.CookieJarKey, oldTaskID); recoverErr == nil {
+				token = recovered
+				_ = resp.Body.Close()
+				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+				if err != nil {
+					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_agent_task_recovery")
+					if allowRetry && movable {
+						return retry()
+					}
+					writeError(w, http.StatusBadGateway, err)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				if resp.StatusCode < 400 {
+					goto codexSuccess
+				}
+				errorBody = redactAgentIdentityError(token, readUpstreamErrorBody(resp.Body))
+				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
+				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
+			} else {
+				log.Printf("agent identity task recovery %s: %v", lease.Account.ID, recoverErr)
+			}
+		}
+		if v.State == ban.AuthExpired && !cf.EdgeOnly(detection) && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) {
 			if refreshed, rerr := s.refreshCodexToken(r.Context(), token); rerr == nil && refreshed.Refreshed {
 				token = refreshed.Token
 				_ = resp.Body.Close()
@@ -1062,7 +1096,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				if resp.StatusCode < 400 {
 					goto codexSuccess
 				}
-				errorBody = readUpstreamErrorBody(resp.Body)
+				errorBody = redactAgentIdentityError(token, readUpstreamErrorBody(resp.Body))
 				if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_auth_refresh"); ok {
 					return handled
 				}
@@ -1096,7 +1130,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				withCodexUsageContext()
 				goto codexSuccess
 			} else {
-				errorBody = readUpstreamErrorBody(resp.Body)
+				errorBody = redactAgentIdentityError(token, readUpstreamErrorBody(resp.Body))
 				if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_ws_fallback"); ok {
 					return handled
 				}
@@ -1126,7 +1160,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if resp.StatusCode < 400 {
 				goto codexSuccess
 			}
-			errorBody = readUpstreamErrorBody(resp.Body)
+			errorBody = redactAgentIdentityError(token, readUpstreamErrorBody(resp.Body))
 			if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_version_retry"); ok {
 				return handled
 			}
@@ -1135,6 +1169,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		if !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
 			!upstream.AccountUsesAPIKey(token) &&
+			!isAgentIdentityToken(token) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, errorBody, "http_error") {
 			codexResetRetried = true
 			if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
@@ -1234,7 +1269,7 @@ codexSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, "")
 	normalizeCodexStreamContentType(resp.Header, isStreamRequest(body))
 	resetHeaderExhaustion := false
-	if !codexResetRetried && !upstream.AccountUsesAPIKey(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
+	if !codexResetRetried && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
 	}
 	if !resetHeaderExhaustion {
@@ -1260,6 +1295,7 @@ codexSuccess:
 		// one so the downstream never sees the error.
 		if cd := usageLimitCooldown(200, responseBody); cd > 0 {
 			if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
+				!isAgentIdentityToken(token) &&
 				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
 				codexResetRetried = true
 				if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
@@ -1424,7 +1460,7 @@ codexSuccess:
 					// prevents its terminal [DONE] write from retaining the WS request mutex.
 					_ = resp.Body.Close()
 				}
-				if shouldRetry && !codexResetRetried && codexResetTriggerAllowed(failureStatus, failureBody) &&
+				if shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
 					s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
 					codexResetRetried = true
 					if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {

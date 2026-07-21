@@ -16,6 +16,9 @@ func TestEffectiveProviderPrefersDeclaredThenTokenShapeThenUnknown(t *testing.T)
 	if got := EffectiveProvider("", storage.AccountToken{AccessToken: "access-token"}, true); got != "codex" {
 		t.Fatalf("codex token provider = %q, want codex", got)
 	}
+	if got := EffectiveProvider("", storage.AccountToken{CredentialMode: "agent_identity", AgentRuntimeID: "runtime", AgentPrivateKey: "private"}, true); got != "codex" {
+		t.Fatalf("agent identity provider = %q, want codex", got)
+	}
 	if got := EffectiveProvider("", storage.AccountToken{}, false); got != "unknown" {
 		t.Fatalf("missing token provider = %q, want unknown", got)
 	}
@@ -31,6 +34,7 @@ func TestEffectiveAuthMethodAndCredentialPreserveLegacyShapes(t *testing.T) {
 		{name: "legacy anthropic api key", provider: "claude", token: storage.AccountToken{AccessToken: "sk-ant-api03-key"}, method: AuthMethodAPIKey, billing: BillingModePayAsYouGo, credential: "sk-ant-api03-key"},
 		{name: "legacy oauth", provider: "codex", token: storage.AccountToken{AccessToken: "oauth-access", RefreshToken: "refresh"}, method: AuthMethodOAuth, billing: BillingModeSubscription, credential: "oauth-access"},
 		{name: "explicit access token", provider: "claude", token: storage.AccountToken{AuthMethod: AuthMethodAccessToken, AccessToken: "opaque"}, method: AuthMethodAccessToken, billing: BillingModeSubscription, credential: "opaque"},
+		{name: "agent identity", provider: "codex", token: storage.AccountToken{CredentialMode: "agent_identity", AgentRuntimeID: "runtime", AgentPrivateKey: "private"}, method: AuthMethodOAuth, billing: BillingModeSubscription, credential: ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

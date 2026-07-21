@@ -126,6 +126,12 @@ async function doImport() {
       toast(acc.ready ? "✓ " + (acc.label || acc.id) : (LANG === "en" ? "Authentication passed; inference failed and the account is quarantined" : "认证通过，但推理失败；账号已隔离"), acc.ready ? "ok" : "bad");
       loadAccounts(); return;
     }
+    if (Array.isArray(acc.items)) {
+      const summary = `${LANG === "en" ? "Imported" : "导入"} ${acc.imported || 0} · ${LANG === "en" ? "duplicates" : "重复"} ${acc.duplicates || 0} · ${LANG === "en" ? "failed" : "失败"} ${acc.failed || 0}`;
+      toast(summary, (acc.failed || 0) > 0 ? "bad" : "ok");
+      if ((acc.failed || 0) === 0) closeImport();
+      loadAccounts(); return;
+    }
     toast("✓ " + (acc.label || acc.id), "ok"); closeImport(); loadAccounts();
   } catch (e) { const result = $("#providerKeyResult"); if (result && (impMode === "codex_key" || impMode === "claude_key")) { if (e.data && e.data.auth_probe) renderProviderKeyResult(e.data); else { result.classList.remove("hide"); result.textContent = e.message; } } toast(e.message, "bad"); }
 }

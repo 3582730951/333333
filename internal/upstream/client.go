@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/agentidentity"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
@@ -408,7 +409,10 @@ func (c *Client) doHTTP(ctx context.Context, spec Request) (*Response, error) {
 	// Build exactly the header set the official client would send (allowlist +
 	// account-bound identity). We deliberately do NOT forward arbitrary
 	// downstream headers, which would leak the relay's presence to the upstream.
-	c.applyCodexHeaders(req.Header, spec)
+	if err := c.applyCodexHeaders(req.Header, spec); err != nil {
+		guard.Fail()
+		return nil, err
+	}
 	if req.Header.Get("Content-Type") == "" && len(spec.Body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -538,7 +542,9 @@ func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error)
 	}
 	target := ComputeURL(c.codexBaseURL(spec), spec.DownstreamPath)
 	built := http.Header{}
-	c.applyCodexHeaders(built, spec)
+	if err := c.applyCodexHeaders(built, spec); err != nil {
+		return nil, err
+	}
 	// TLS/JA3 the sidecar replays for Codex. DEFAULT IS CHROME (""), i.e. the
 	// sidecar's native impersonation — and so is the "real Codex" opt-in. The real
 	// Codex client does NO JA3 spoofing (vanilla reqwest 0.12 + rustls 0.23, verified
@@ -774,7 +780,7 @@ var codexProtocolHeaders = map[string]bool{
 // applyCodexHeaders writes the upstream Codex request headers into dst from
 // scratch: it forwards only allowlisted downstream protocol headers, then sets
 // the auth + account-bound identity headers that the official client carries.
-func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
+func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	usesAPIKey := AccountUsesAPIKey(spec.Token)
 
 	for k, values := range spec.Headers {
@@ -790,7 +796,9 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 		}
 	}
 
-	addAuthHeaders(dst, spec.Token)
+	if err := addAuthHeaders(dst, spec.Token); err != nil {
+		return err
+	}
 	// The official Codex client always POSTs a JSON body to /responses with an explicit
 	// Content-Type: application/json (verified in other_codex: codex-client/src/request.rs
 	// inserts CONTENT_TYPE = "application/json"; the body is RequestBody::Json). The relay
@@ -818,7 +826,7 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 	// the Codex CLI session fingerprint (UA/Originator/Account-ID/Session_id).
 	// Only OAuth (AT / Sign-in-with-ChatGPT) accounts present it.
 	if usesAPIKey {
-		return
+		return nil
 	}
 
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
@@ -887,6 +895,7 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) {
 	if spec.Account.IsFedramp {
 		setIfEmptyPreserveCase(dst, "X-OpenAI-Fedramp", "true")
 	}
+	return nil
 }
 
 // codexEntrypoint returns the Codex launch entrypoint the downstream client
@@ -1042,11 +1051,22 @@ func AccountUsesAPIKey(token storage.AccountToken) bool {
 	return accountprovider.UsesAPIKey(accountprovider.InferProviderFromToken(token), token)
 }
 
-func addAuthHeaders(h http.Header, token storage.AccountToken) {
+func addAuthHeaders(h http.Header, token storage.AccountToken) error {
+	if accountprovider.IsAgentIdentity(token) {
+		assertion, err := agentidentity.BuildAssertion(agentidentity.Credentials{
+			RuntimeID: token.AgentRuntimeID, PrivateKey: token.AgentPrivateKey, TaskID: token.AgentTaskID,
+		}, time.Now())
+		if err != nil {
+			return err
+		}
+		h.Set("Authorization", assertion)
+		return nil
+	}
 	bearer := accountprovider.Credential("codex", token)
 	if bearer != "" {
 		h.Set("Authorization", "Bearer "+bearer)
 	}
+	return nil
 }
 
 func DrainAndClose(body io.ReadCloser) ([]byte, error) {

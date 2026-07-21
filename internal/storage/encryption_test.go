@@ -25,7 +25,7 @@ func TestTokenEncryptionAtRest(t *testing.T) {
 	w.SetTokenEncryptionKey([]byte("deployment-secret"))
 	if err := w.UpsertAccount(ctx,
 		Account{ID: "acc-1", GroupName: "cyber", Status: "active"},
-		AccountToken{AccessToken: "plain-AT", RefreshToken: "plain-RT"}); err != nil {
+		AccountToken{AccessToken: "plain-AT", RefreshToken: "plain-RT", CredentialMode: "agent_identity", AgentRuntimeID: "plain-runtime", AgentPrivateKey: "plain-private", AgentTaskID: "plain-task"}); err != nil {
 		t.Fatal(err)
 	}
 	// Keyed read → plaintext.
@@ -33,8 +33,8 @@ func TestTokenEncryptionAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.AccessToken != "plain-AT" || got.RefreshToken != "plain-RT" {
-		t.Fatalf("keyed read = %q/%q, want plain-AT/plain-RT", got.AccessToken, got.RefreshToken)
+	if got.AccessToken != "plain-AT" || got.RefreshToken != "plain-RT" || got.AgentRuntimeID != "plain-runtime" || got.AgentPrivateKey != "plain-private" || got.AgentTaskID != "plain-task" {
+		t.Fatalf("keyed read did not recover all credentials: %+v", got)
 	}
 	w.Close()
 
@@ -51,11 +51,13 @@ func TestTokenEncryptionAtRest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if raw.AccessToken == "plain-AT" {
-		t.Fatal("access token is plaintext at rest — encryption did not apply")
+	if raw.AccessToken == "plain-AT" || raw.AgentRuntimeID == "plain-runtime" || raw.AgentPrivateKey == "plain-private" || raw.AgentTaskID == "plain-task" {
+		t.Fatal("account credential is plaintext at rest — encryption did not apply")
 	}
-	if !secretbox.IsSealed(raw.AccessToken) {
-		t.Fatalf("at-rest value not sealed: %q", raw.AccessToken)
+	for name, value := range map[string]string{"access": raw.AccessToken, "agent_runtime": raw.AgentRuntimeID, "agent_private": raw.AgentPrivateKey, "agent_task": raw.AgentTaskID} {
+		if !secretbox.IsSealed(value) {
+			t.Fatalf("at-rest %s value not sealed: %q", name, value)
+		}
 	}
 }
 

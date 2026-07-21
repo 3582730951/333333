@@ -48,7 +48,7 @@ export default function AccountDrawer({
   const fetchDetails = useCallback(async ({ signal }) => {
     if (!account) return EMPTY_ACCOUNT_DETAIL;
     const encodedID = encodeURIComponent(account.id);
-    const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key';
+    const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key' && account.credential_mode !== 'agent_identity';
     const [data, profiles, groups, codexReauth] = await Promise.all([
       get('/admin/audit', { account_id: account.id, limit: 10 }, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
@@ -205,7 +205,7 @@ export default function AccountDrawer({
   const isActionLoading = (act) => Boolean(isActionLoadingProp?.(account.id, act));
   const isActionDisabled = (act) => actionDisabled || (actionRunning && !isActionLoading(act));
   const resetCredits = account.quota_summary?.reset_credits;
-  const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key';
+  const supportsCodexReauth = (account.provider || 'codex') === 'codex' && account.auth_method !== 'api_key' && account.credential_mode !== 'agent_identity';
   const codexReauth = details.codexReauth || null;
   const codexReauthConfig = codexReauth?.config || {};
   const latestCodexReauthJob = codexReauth?.latest_job || null;
@@ -224,6 +224,7 @@ export default function AccountDrawer({
         <Row k="邮箱" v={account.email || '—'} />
         <Row k="提供商" v={<Tag>{account.provider || 'codex'}</Tag>} />
         <Row k="认证方式" v={<Tag color={providerAPIKey ? 'violet' : 'blue'}>{account.auth_method || 'oauth'}</Tag>} />
+        {account.credential_mode === 'agent_identity' ? <Row k="凭据模式" v={<Tag color="cyan">Agent Identity</Tag>} /> : null}
         <Row k="计费方式" v={account.billing_mode === 'pay_as_you_go' ? <Tag color="violet">按量计费</Tag> : '订阅'} />
         {providerAPIKey ? <Row k="API Key" v={account.api_key_present ? '已加密保存' : '未检测到'} /> : null}
         <Row k="分组" v={account.group_name || '默认'} />
@@ -248,6 +249,13 @@ export default function AccountDrawer({
         <Panel title="上游 API Key" style={{ marginBottom: 14 }}>
           <Typography.Text as="p">此账号使用 Platform / Console 上游 Key，按量计费，不参与 OAuth 刷新、重登或订阅配额同步。</Typography.Text>
           <Typography.Text type="tertiary" as="p">手工测活会先免费读取模型列表；认证成功后发送一次最小推理。推理隔离只能由成功的付费双层测活解除。</Typography.Text>
+        </Panel>
+      ) : null}
+
+      {account.credential_mode === 'agent_identity' ? (
+        <Panel title="Agent Identity" style={{ marginBottom: 14 }}>
+          <Typography.Text as="p">私钥已加密保存；每次请求动态签名，task 失效时会经账号绑定出口自动注册并重试一次。</Typography.Text>
+          <Typography.Text type="tertiary" as="p">此模式不使用 OAuth access/refresh token，也不会显示 OAuth 重登操作。</Typography.Text>
         </Panel>
       ) : null}
 
@@ -432,7 +440,7 @@ export default function AccountDrawer({
           <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test')}>测活</Button>
         )}
         <Button loading={isActionLoading('clear-quarantine')} disabled={protectedProbeQuarantine || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解隔离</Button>
-        {!providerAPIKey ? <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button> : null}
+        {!providerAPIKey && account.credential_mode !== 'agent_identity' ? <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button> : null}
         <ConfirmDialog
           title="删除该账号？"
           description={`账号 ${account.label || account.email || account.id} 删除后不可恢复。`}

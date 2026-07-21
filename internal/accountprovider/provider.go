@@ -3,6 +3,7 @@ package accountprovider
 import (
 	"strings"
 
+	"codex-account-pool/internal/agentidentity"
 	"codex-account-pool/internal/storage"
 )
 
@@ -31,6 +32,9 @@ func EffectiveProvider(declared string, token storage.AccountToken, tokenFound b
 }
 
 func InferProviderFromToken(token storage.AccountToken) string {
+	if IsAgentIdentity(token) {
+		return "codex"
+	}
 	if strings.HasPrefix(token.AccessToken, "sk-ant") || strings.HasPrefix(token.OpenAIAPIKey, "sk-ant") {
 		return "claude"
 	}
@@ -41,6 +45,11 @@ func InferProviderFromToken(token storage.AccountToken) string {
 		return UnknownProvider
 	}
 	return "codex"
+}
+
+func IsAgentIdentity(token storage.AccountToken) bool {
+	return strings.EqualFold(strings.TrimSpace(token.CredentialMode), agentidentity.CredentialMode) ||
+		(strings.TrimSpace(token.AgentRuntimeID) != "" && strings.TrimSpace(token.AgentPrivateKey) != "")
 }
 
 // NormalizeAuthMethod accepts only the three persisted credential classes. An
@@ -64,6 +73,9 @@ func NormalizeAuthMethod(method string) string {
 // Explicit metadata always wins so business code never has to infer an API key
 // from the historical OpenAIAPIKey column name.
 func EffectiveAuthMethod(provider string, token storage.AccountToken) string {
+	if IsAgentIdentity(token) {
+		return AuthMethodOAuth
+	}
 	if method := NormalizeAuthMethod(token.AuthMethod); method != "" {
 		return method
 	}

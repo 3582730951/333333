@@ -270,7 +270,7 @@ export default function Accounts() {
     const cols = [
       { title: 'id', get: (r) => r.id }, { title: 'label', get: (r) => r.label }, { title: 'email', get: (r) => r.email },
       { title: 'provider', get: (r) => r.provider }, { title: 'group', get: (r) => r.group_name },
-      { title: 'plan', get: (r) => r.plan_type }, { title: 'auth_method', get: (r) => r.auth_method },
+      { title: 'plan', get: (r) => r.plan_type }, { title: 'auth_method', get: (r) => `${r.auth_method || ''} ${r.credential_mode || ''}` },
       { title: 'billing_mode', get: (r) => r.billing_mode }, { title: 'status', get: (r) => r.status },
     ];
     const ok = downloadCSV('accounts.csv', toCSV(filtered, cols));
@@ -288,7 +288,9 @@ export default function Accounts() {
           <div className="pool-account-titleline">
             <TextClamp strong onClick={() => setDrawerAcct(r)}>{r.label || r.id}</TextClamp>
             <Tag size="small">{r.provider || 'codex'}</Tag>
-            <Tag size="small" color={r.auth_method === 'api_key' ? 'violet' : 'blue'}>{r.auth_method || 'oauth'}</Tag>
+            <Tag size="small" color={r.auth_method === 'api_key' ? 'violet' : r.credential_mode === 'agent_identity' ? 'cyan' : 'blue'}>
+              {r.credential_mode === 'agent_identity' ? 'agent identity' : (r.auth_method || 'oauth')}
+            </Tag>
           </div>
           <div className="pool-account-metaline">
             <TextClamp muted className="pool-account-email" title={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>

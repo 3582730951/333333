@@ -135,6 +135,11 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		// Custom OpenAI-compatible provider (DeepSeek, …).
 		return s.probeCustomModels(ctx, account, token, binding, egress, provider)
 	}
+	token, err = s.ensureAgentIdentityTask(ctx, account, token, egress, binding.CookieJarKey, "")
+	if err != nil {
+		return s.existingOrStaticCodexModels(ctx, account.ID)
+	}
+	agentTaskRecovered := false
 	for attempt := 0; attempt < 2; attempt++ {
 		probePath := capability.ProbePath(s.cfg.ClientVersion)
 		clientVersion := s.cfg.ClientVersion
@@ -166,8 +171,18 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 			return s.existingOrStaticCodexModels(ctx, account.ID)
 		}
 		if resp.StatusCode >= 400 {
+			raw = redactAgentIdentityError(token, raw)
+			if !agentTaskRecovered && isInvalidAgentIdentityTask(resp.StatusCode, raw, token) {
+				if recovered, recoverErr := s.ensureAgentIdentityTask(ctx, account, token, egress, binding.CookieJarKey, token.AgentTaskID); recoverErr == nil {
+					token = recovered
+					agentTaskRecovered = true
+					continue
+				} else {
+					log.Printf("codex model probe %s: agent task recovery failed: %v", account.ID, recoverErr)
+				}
+			}
 			v := ban.Classify(false, resp.StatusCode, resp.Header, raw)
-			if attempt == 0 && v.State == ban.AuthExpired && !accountprovider.UsesAPIKey("codex", token) {
+			if attempt == 0 && v.State == ban.AuthExpired && !accountprovider.UsesAPIKey("codex", token) && !isAgentIdentityToken(token) {
 				if refreshed, rerr := s.refreshCodexToken(ctx, token); rerr == nil && refreshed.Refreshed {
 					token = refreshed.Token
 					continue
@@ -664,6 +679,10 @@ type codexRefreshResult struct {
 
 func (s *Server) refreshCodexToken(ctx context.Context, token storage.AccountToken) (codexRefreshResult, error) {
 	result := codexRefreshResult{Token: token}
+	if accountprovider.IsAgentIdentity(token) {
+		result.Reason = "agent identity uses signed task assertions, not OAuth token refresh"
+		return result, nil
+	}
 	tokenURL := firstNonEmpty(s.cfg.OAuthTokenURL, s.cfg.CodexOAuthTokenURL)
 	if tokenURL == "" || token.RefreshToken == "" {
 		// Cookie-imported "AT" accounts (no refresh_token) refresh by re-minting

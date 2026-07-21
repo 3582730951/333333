@@ -81,7 +81,7 @@
         <button data-m="claude_key" onclick="setImp('claude_key')">Claude · API Key</button>
         <button data-m="token" onclick="setImp('token')">Codex · AT</button>
         <button data-m="cookie" onclick="setImp('cookie')">Codex · Cookie</button>
-        <button data-m="authjson" onclick="setImp('authjson')">Codex · auth.json</button>
+        <button data-m="authjson" onclick="setImp('authjson')">Codex · auth.json / sub2api</button>
         <button data-m="claude" onclick="setImp('claude')">Claude · Token</button>
         <button data-m="customkey" onclick="setImp('customkey')">自定义 · API Key</button>
       </div>
@@ -98,7 +98,7 @@
       </div>
       <div data-m="token"><label class="f">Access Token (AT)</label><textarea class="t" id="tk_at" placeholder="eyJhbGciOi..."></textarea><label class="f">ChatGPT-Account-ID（可选）</label><input class="t" id="tk_acc"></div>
       <div data-m="cookie" class="hide"><label class="f">chatgpt.com 会话 Cookie</label><textarea class="t" id="ck_hdr" placeholder="__Secure-next-auth.session-token=...; ..."></textarea></div>
-      <div data-m="authjson" class="hide"><label class="f">auth.json 内容</label><textarea class="t" id="aj_txt" placeholder='{"OPENAI_API_KEY":"...","tokens":{...}}'></textarea></div>
+      <div data-m="authjson" class="hide"><label class="f">auth.json / sub2api-data 内容</label><textarea class="t" id="aj_txt" placeholder='{"type":"sub2api-data","version":1,"proxies":[],"accounts":[...]}'></textarea></div>
       <div data-m="claude" class="hide"><label class="f">Claude OAuth Access Token（sk-ant-oat...）</label><textarea class="t" id="cl_at" placeholder="sk-ant-oat01-..."></textarea><p class="muted">Anthropic Console API Key 请使用上方“Claude API Key”入口，以执行成本确认和双层测活。</p></div>
       <div data-m="codex_key" class="hide"><label class="f">OpenAI Platform API Key</label><input class="t mono" type="password" id="codex_api_key" placeholder="sk-...">
         <div class="note" style="margin-top:8px">按量计费凭据，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后执行一次固定提示的最小推理。</div>

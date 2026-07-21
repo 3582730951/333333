@@ -541,6 +541,14 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			return res
 		}
 		req.Token = token
+	} else if provider == "codex" {
+		var perr error
+		token, perr = s.ensureAgentIdentityTask(ctx, account, token, egress, binding.CookieJarKey, "")
+		if perr != nil {
+			res.Err = perr
+			return res
+		}
+		req.Token = token
 	}
 	resp, err := s.upstream.Do(ctx, req)
 	if err != nil {
@@ -549,6 +557,25 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if provider == "codex" {
+		body = redactAgentIdentityError(token, body)
+		if isInvalidAgentIdentityTask(resp.StatusCode, body, token) {
+			if recovered, rerr := s.ensureAgentIdentityTask(ctx, account, token, egress, binding.CookieJarKey, token.AgentTaskID); rerr == nil {
+				token = recovered
+				req.Token = token
+				resp.Body.Close()
+				retryResp, retryErr := s.upstream.Do(ctx, req)
+				if retryErr != nil {
+					res.Err = retryErr
+					return res
+				}
+				defer retryResp.Body.Close()
+				body, _ = io.ReadAll(io.LimitReader(retryResp.Body, 1<<20))
+				body = redactAgentIdentityError(token, body)
+				resp = retryResp
+			}
+		}
+	}
 	if provider == "claude" && claudeAuthError(resp.StatusCode, resp.Header, body) && claudeTokenCanRefresh(token) {
 		if refreshed, rerr := s.forceRefreshClaudeToken(ctx, account, "auth_error"); rerr == nil {
 			req.Token = refreshed

@@ -68,6 +68,8 @@ type accountView struct {
 	storage.Account
 	Provider               string                        `json:"provider"`
 	AuthMethod             string                        `json:"auth_method"`
+	CredentialMode         string                        `json:"credential_mode,omitempty"`
+	AgentIdentityPresent   bool                          `json:"agent_identity_present,omitempty"`
 	BillingMode            string                        `json:"billing_mode"`
 	APIKeyPresent          bool                          `json:"api_key_present"`
 	Capabilities           []storage.ModelCapability     `json:"capabilities"`
@@ -84,6 +86,15 @@ type accountImportResponse struct {
 	storage.Account
 	Duplicate    bool   `json:"duplicate,omitempty"`
 	ImportStatus string `json:"import_status,omitempty"`
+}
+
+type authJSONImportRequest struct {
+	Label           string          `json:"label"`
+	GroupName       string          `json:"group_name"`
+	EgressID        string          `json:"egress_id"`
+	PrimaryEgressID string          `json:"primary_egress_id"`
+	AuthJSON        json.RawMessage `json:"auth_json"`
+	AuthJSONText    string          `json:"auth_json_text"`
 }
 
 func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) ([]accountView, error) {
@@ -138,6 +149,8 @@ func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) (
 		}
 		if token != nil {
 			view.AuthMethod = accountprovider.EffectiveAuthMethod(view.Provider, *token)
+			view.CredentialMode = token.CredentialMode
+			view.AgentIdentityPresent = accountprovider.IsAgentIdentity(*token)
 			view.BillingMode = accountprovider.BillingMode(view.Provider, *token)
 			view.APIKeyPresent = accountprovider.UsesAPIKey(view.Provider, *token) && accountprovider.Credential(view.Provider, *token) != ""
 		}
@@ -186,14 +199,7 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	var req struct {
-		Label           string          `json:"label"`
-		GroupName       string          `json:"group_name"`
-		EgressID        string          `json:"egress_id"`
-		PrimaryEgressID string          `json:"primary_egress_id"`
-		AuthJSON        json.RawMessage `json:"auth_json"`
-		AuthJSONText    string          `json:"auth_json_text"`
-	}
+	var req authJSONImportRequest
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -202,11 +208,16 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 	if len(raw) == 0 && req.AuthJSONText != "" {
 		raw = []byte(req.AuthJSONText)
 	}
-	parsed, err := authparse.ParseAuthJSON(raw)
+	doc, err := authparse.ParseImportDocument(raw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if doc.Format != authparse.ImportFormatSingle {
+		s.adminImportAuthDocument(w, r, req, doc)
+		return
+	}
+	parsed := doc.Entries[0].Parsed
 	if req.Label == "" {
 		req.Label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
@@ -230,10 +241,14 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		lastRefresh = storage.Now()
 	}
 	token := storage.AccountToken{
+		CredentialMode:     parsed.CredentialMode,
 		AccessToken:        parsed.AccessToken,
 		RefreshToken:       parsed.RefreshToken,
 		OpenAIAPIKey:       parsed.OpenAIAPIKey,
 		IDTokenRaw:         parsed.IDTokenRaw,
+		AgentRuntimeID:     parsed.AgentRuntimeID,
+		AgentPrivateKey:    parsed.AgentPrivateKey,
+		AgentTaskID:        parsed.AgentTaskID,
 		LastRefresh:        lastRefresh,
 		ExpiresAt:          parsed.ExpiresAt,
 		Scopes:             strings.Join(parsed.Scopes, " "),
@@ -310,10 +325,14 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 		lastRefresh = storage.Now()
 	}
 	token := storage.AccountToken{
+		CredentialMode:     parsed.CredentialMode,
 		AccessToken:        parsed.AccessToken,
 		RefreshToken:       refreshToken,
 		OpenAIAPIKey:       parsed.OpenAIAPIKey,
 		IDTokenRaw:         parsed.IDTokenRaw,
+		AgentRuntimeID:     parsed.AgentRuntimeID,
+		AgentPrivateKey:    parsed.AgentPrivateKey,
+		AgentTaskID:        parsed.AgentTaskID,
 		LastRefresh:        lastRefresh,
 		ExpiresAt:          parsed.ExpiresAt,
 		Scopes:             strings.Join(parsed.Scopes, " "),
@@ -499,8 +518,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 	}
 	accountID, action := parts[0], parts[1]
 	if strings.HasPrefix(action, "codex-reauth") {
-		if token, err := s.store.GetToken(r.Context(), accountID); err == nil && accountprovider.UsesAPIKey("codex", token) {
-			writePoolCodeError(w, http.StatusBadRequest, "reauth_not_applicable", "API-key accounts do not use Codex OAuth reauthentication")
+		if token, err := s.store.GetToken(r.Context(), accountID); err == nil && (accountprovider.UsesAPIKey("codex", token) || accountprovider.IsAgentIdentity(token)) {
+			writePoolCodeError(w, http.StatusBadRequest, "reauth_not_applicable", "this account does not use Codex OAuth reauthentication")
 			return
 		}
 	}
@@ -547,8 +566,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminCodexReauthAction(w http.ResponseWriter, r *http.Request, accountID string, parts []string) {
-	if token, err := s.store.GetToken(r.Context(), accountID); err == nil && accountprovider.UsesAPIKey("codex", token) {
-		writePoolCodeError(w, http.StatusBadRequest, "reauth_not_applicable", "API-key accounts do not use Codex OAuth reauthentication")
+	if token, err := s.store.GetToken(r.Context(), accountID); err == nil && (accountprovider.UsesAPIKey("codex", token) || accountprovider.IsAgentIdentity(token)) {
+		writePoolCodeError(w, http.StatusBadRequest, "reauth_not_applicable", "this account does not use Codex OAuth reauthentication")
 		return
 	}
 	if len(parts) == 0 {

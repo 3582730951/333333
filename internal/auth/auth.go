@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"codex-account-pool/internal/agentidentity"
 )
 
 type ParsedAuth struct {
@@ -28,6 +30,10 @@ type ParsedAuth struct {
 	Scopes             []string
 	OAuthRateLimitTier string
 	IsFedramp          bool
+	CredentialMode     string
+	AgentRuntimeID     string
+	AgentPrivateKey    string
+	AgentTaskID        string
 }
 
 func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
@@ -38,6 +44,9 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 
 	if claude, ok := objectField(root, "claudeAiOauth", "claude_ai_oauth"); ok {
 		return parseClaudeCredentialsJSON(claude)
+	}
+	if agent, ok := agentIdentityObject(root); ok {
+		return parseAgentIdentity(agent)
 	}
 
 	var out ParsedAuth
@@ -95,6 +104,43 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token, access_token nor OPENAI_API_KEY")
 	}
 	out.AccountID = stableAccountID(codexAccountIdentity(out.ChatGPTUserID, out.UpstreamAccountID), out.AccessToken, out.OpenAIAPIKey)
+	return out, nil
+}
+
+func agentIdentityObject(root map[string]interface{}) (map[string]interface{}, bool) {
+	if nested, ok := objectField(root, "agent_identity", "agentIdentity"); ok {
+		return nested, true
+	}
+	mode := stringFieldAny(root, "auth_mode", "authMode")
+	return root, strings.EqualFold(strings.TrimSpace(mode), agentidentity.ExportAuthMode) ||
+		strings.EqualFold(strings.TrimSpace(mode), agentidentity.CredentialMode)
+}
+
+func parseAgentIdentity(m map[string]interface{}) (ParsedAuth, error) {
+	out := ParsedAuth{
+		Provider:          "codex",
+		CredentialMode:    agentidentity.CredentialMode,
+		AgentRuntimeID:    stringFieldAny(m, "agent_runtime_id", "agentRuntimeId"),
+		AgentPrivateKey:   stringFieldAny(m, "agent_private_key", "agentPrivateKey"),
+		AgentTaskID:       stringFieldAny(m, "task_id", "taskId"),
+		UpstreamAccountID: stringFieldAny(m, "chatgpt_account_id", "chatgptAccountId", "account_id", "accountId"),
+		ChatGPTUserID:     stringFieldAny(m, "chatgpt_user_id", "chatgptUserId", "user_id", "userId"),
+		Email:             stringFieldAny(m, "email", "email_address", "emailAddress"),
+		Name:              stringFieldAny(m, "name", "display_name", "displayName"),
+		PlanType:          stringFieldAny(m, "plan_type", "planType", "chatgpt_plan_type"),
+		IsFedramp:         boolFieldAny(m, "chatgpt_account_is_fedramp", "chatgptAccountIsFedramp", "is_fedramp"),
+	}
+	if out.UpstreamAccountID == "" || out.ChatGPTUserID == "" {
+		return ParsedAuth{}, errors.New("agent identity is missing account_id or chatgpt_user_id")
+	}
+	if err := agentidentity.Validate(agentidentity.Credentials{
+		RuntimeID: out.AgentRuntimeID, PrivateKey: out.AgentPrivateKey, TaskID: out.AgentTaskID,
+	}, false); err != nil {
+		return ParsedAuth{}, err
+	}
+	// sub2api deliberately keys Agent Identity by the ChatGPT account, because the
+	// runtime and task IDs can rotate. Preserve that stable deduplication behavior.
+	out.AccountID = stableAccountID("agent_identity:" + out.UpstreamAccountID)
 	return out, nil
 }
 
@@ -259,6 +305,18 @@ func stringFieldAny(m map[string]interface{}, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func boolFieldAny(m map[string]interface{}, keys ...string) bool {
+	for _, key := range keys {
+		switch value := m[key].(type) {
+		case bool:
+			return value
+		case string:
+			return strings.EqualFold(strings.TrimSpace(value), "true")
+		}
+	}
+	return false
 }
 
 func firstPresent(vs ...interface{}) interface{} {

@@ -49,6 +49,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [redirected, setRedirected] = useState('');
   const [copied, setCopied] = useState(false);
   const [manualRaw, setManualRaw] = useState('');
+  const [manualResult, setManualResult] = useState(null);
   const [kiroRaw, setKiroRaw] = useState('');
   const [kiroClientRaw, setKiroClientRaw] = useState('');
   const [kiroImportMode, setKiroImportMode] = useState('api_key');
@@ -122,6 +123,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setRedirected('');
     setCopied(false);
     setManualRaw('');
+    setManualResult(null);
     setKiroRaw('');
     setKiroClientRaw('');
     setKiroImportMode('api_key');
@@ -230,6 +232,15 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         auth_json_text: val,
       });
       if (actionEpoch !== actionEpochRef.current) return;
+      if (Array.isArray(result.items)) {
+        setManualResult(result);
+        const summary = `导入 ${result.imported || 0}，重复 ${result.duplicates || 0}，失败 ${result.failed || 0}`;
+        if ((result.failed || 0) > 0) Toast.warning(summary);
+        else Toast.success(summary);
+        if ((result.imported || 0) > 0 && onSuccess) onSuccess(result);
+        if ((result.failed || 0) === 0) handleClose();
+        return;
+      }
       Toast.success({
         content: (
           <span>
@@ -333,7 +344,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         <span className="pool-oauth-manual-icon"><IconFile /></span>
         <div className="pool-oauth-identity__copy">
           <Text strong className="pool-oauth-identity__name">手动导入</Text>
-          <Text type="tertiary" className="pool-oauth-identity__desc">粘贴本地 auth.json 内容导入账号</Text>
+          <Text type="tertiary" className="pool-oauth-identity__desc">支持 auth.json、数组及 sub2api-data 备份</Text>
         </div>
       </div>
 
@@ -375,14 +386,14 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
 
         <div style={{ marginBottom: 12 }}>
           <Text type="tertiary" style={{ fontSize: 13 }}>
-            请粘贴完整的 auth.json 内容：
+            支持单个 auth.json、auth.json 数组或 other_sub2api 导出的 sub2api-data：
           </Text>
         </div>
         <textarea
           className="pool-textarea"
           placeholder={'{\n  "tokens": {\n    "access_token": "...",\n    "refresh_token": "..."\n  }\n}'}
           value={manualRaw}
-          onChange={(e) => setManualRaw(e.target.value)}
+          onChange={(e) => { setManualRaw(e.target.value); setManualResult(null); }}
           style={{
             width: '100%',
             minHeight: 200,
@@ -396,6 +407,21 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             color: 'var(--pool-text)',
           }}
         />
+        {manualResult ? (
+          <div style={{ marginTop: 12, padding: 12, border: '1px solid var(--pool-border)', borderRadius: 6 }}>
+            <Text strong>批量导入结果</Text>
+            <Text as="p" type="tertiary" style={{ margin: '6px 0' }}>
+              账号：导入 {manualResult.imported || 0} / 重复 {manualResult.duplicates || 0} / 失败 {manualResult.failed || 0}
+              {manualResult.proxy_created || manualResult.proxy_reused || manualResult.proxy_failed
+                ? `；出口：新建 ${manualResult.proxy_created || 0} / 复用 ${manualResult.proxy_reused || 0} / 失败 ${manualResult.proxy_failed || 0}` : ''}
+            </Text>
+            {(manualResult.items || []).filter((item) => item.action === 'failed').map((item) => (
+              <Text key={`${item.index}:${item.name || ''}`} type="danger" as="p" style={{ margin: '4px 0' }}>
+                第 {item.index} 条{item.name ? `（${item.name}）` : ''}：{item.message || '导入失败'}
+              </Text>
+            ))}
+          </div>
+        ) : null}
       </Form>
 
       <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end' }}>
