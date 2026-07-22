@@ -188,11 +188,21 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 	if v, ok := ctx.Value(responseRuleFilterKey{}).(*responseRuleFilter); ok {
 		rf = v
 	}
-	// Strict CPA leaves native Codex context/tool frames untouched. It still uses
-	// the heartbeat reader so a long upstream silence produces a protocol-valid
-	// keepalive rather than being mistaken for EOF and locally continued.
+	// Strict CPA leaves native upstream session state and client tool payloads
+	// untouched.  It does not silently bypass an administrator's explicitly
+	// configured downstream response rule: those rules operate only after the
+	// upstream has produced its frame.  The heartbeat reader still ensures a long
+	// upstream silence produces a protocol-valid keepalive rather than being
+	// mistaken for EOF and locally continued.
 	if provider == "codex" && codexStrictCPAFromContext(ctx) {
-		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, nil, false, nil, provider, s.streamKeepAliveInterval(ctx))
+		interval := s.streamKeepAliveInterval(ctx)
+		if ruleInterval := responseRuleHeartbeatInterval(rf); ruleInterval > 0 {
+			// hide_safety_buffering carries its own per-rule heartbeat contract.
+			// Prefer it over the generic relay interval just as the non-CPA path
+			// does, so an administrator sees the same behavior on either path.
+			interval = ruleInterval
+		}
+		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, rf, false, nil, provider, interval)
 	} else if rf != nil {
 		err = newRuleSSECopy(ctx, sw, body, rf, s.leakScrubEnabled(ctx), words, provider)
 	} else if interval := s.streamKeepAliveInterval(ctx); interval > 0 {

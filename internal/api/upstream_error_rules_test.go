@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -141,6 +142,530 @@ func TestCodexHideSafetyBufferingRulePreservesCompletedStream(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stream missing %q: %s", want, got)
 		}
+	}
+}
+
+func TestCodexStrictCPAHideSafetyBufferingRuleViaSidecar(t *testing.T) {
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_strict_safe","status":"in_progress"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_strict_safe","name":"apply_patch","arguments":"{}"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"safe-through-sidecar","safety_buffering":{"reasons":["user_risk"]}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_strict_safe","model":"gpt-5.5","status":"completed","output":[]},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n"
+	sidecar := mockSidecar(t, "text/event-stream", stream)
+	defer sidecar.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("direct upstream must not be called when strict CPA uses sidecar")
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-safe", "upstream-strict-safe", "access-strict-safe")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	bindSidecarEgress(t, h, acc, sidecar.URL)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-sidecar-hide-safety",
+		Name:             "strict sidecar hide safety",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		AccountAction:    "none",
+		DownstreamAction: "hide_safety_buffering",
+		IdlePingSeconds:  7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-sidecar-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	got := string(body)
+	if resp.StatusCode != http.StatusOK || strings.Contains(got, "safety_buffering") {
+		t.Fatalf("strict sidecar safety filter status=%d body=%s", resp.StatusCode, got)
+	}
+	for _, want := range []string{"resp_strict_safe", "call_strict_safe", "safe-through-sidecar", "response.completed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("strict sidecar stream missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestCodexStrictCPAHideSafetyBufferingRuleNonStreaming(t *testing.T) {
+	sidecar := mockSidecar(t, "application/json", `{"id":"resp_strict_safe_json","object":"response","model":"gpt-5.5","status":"completed","output":[],"safety_buffering":{"reasons":["user_risk"]}}`)
+	defer sidecar.Close()
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("direct upstream must not be called when strict CPA uses sidecar")
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-safe-json", "upstream-strict-safe-json", "access-strict-safe-json")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	bindSidecarEgress(t, h, acc, sidecar.URL)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-sidecar-hide-safety-json",
+		Name:             "strict sidecar hide safety json",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		AccountAction:    "none",
+		DownstreamAction: "hide_safety_buffering",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-sidecar-json-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := string(body)
+	if resp.StatusCode != http.StatusOK || strings.Contains(got, "safety_buffering") || !strings.Contains(got, "resp_strict_safe_json") {
+		t.Fatalf("strict non-stream safety filter status=%d body=%s", resp.StatusCode, got)
+	}
+}
+
+func TestCodexStrictCPAInterceptRulePreservesLifecycle(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_strict_intercept\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"operator-hidden-content\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_strict_intercept\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[]}}\n\n")
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-intercept", "upstream-strict-intercept", "access-strict-intercept")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-intercept",
+		Name:             "strict intercept",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		BodyKeywords:     []string{"operator-hidden-content"},
+		AccountAction:    "none",
+		DownstreamAction: "intercept",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-intercept-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := string(body)
+	if resp.StatusCode != http.StatusOK || strings.Contains(got, "operator-hidden-content") {
+		t.Fatalf("strict intercept status=%d body=%s", resp.StatusCode, got)
+	}
+	if !strings.Contains(got, "response.created") || !strings.Contains(got, "response.completed") || !strings.Contains(got, "resp_strict_intercept") {
+		t.Fatalf("strict intercept broke lifecycle: %s", got)
+	}
+}
+
+func TestCodexStrictCPAUsesTerminalCustomErrorRule(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"operator terminal sentinel"}}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-terminal", "upstream-strict-terminal", "access-strict-terminal")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-terminal-custom",
+		Name:             "strict terminal custom",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		StatusCodes:      []int{http.StatusTooManyRequests},
+		BodyKeywords:     []string{"operator terminal sentinel"},
+		AccountAction:    "none",
+		DownstreamAction: "custom_error",
+		ResponseStatus:   http.StatusServiceUnavailable,
+		CustomMessage:    "administrator selected response",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-terminal-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := string(body)
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(got, "administrator selected response") || strings.Contains(got, "operator terminal sentinel") {
+		t.Fatalf("strict terminal rule status=%d body=%s", resp.StatusCode, got)
+	}
+}
+
+func TestCodexStrictCPARespectsTerminalRuleActions(t *testing.T) {
+	cases := []struct {
+		name       string
+		action     string
+		stream     bool
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "pass", action: "pass", wantStatus: http.StatusTooManyRequests, wantBody: "strict terminal action sentinel"},
+		{name: "neutralize", action: "neutralize", wantStatus: http.StatusServiceUnavailable, wantBody: "upstream temporarily unavailable"},
+		{name: "idle", action: "idle_stream", stream: true, wantStatus: http.StatusOK, wantBody: "strict idle action"},
+		{name: "heartbeat finish", action: "heartbeat_finish", stream: true, wantStatus: http.StatusOK, wantBody: "response.in_progress"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"error":{"message":"strict terminal action sentinel"}}`))
+			})
+			enableCodexSessionMappingForTest(h)
+			acc := h.importAccount(t, "strict-action-"+tc.action, "upstream-strict-action-"+tc.action, "access-strict-action-"+tc.action)
+			setTestCapability(t, h, acc, "gpt-5.5", 1024)
+			if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+				ID:               "strict-action-" + tc.action,
+				Name:             "strict action " + tc.action,
+				Enabled:          true,
+				Priority:         1,
+				Providers:        []string{"chatgpt"},
+				Entrypoints:      []string{"responses"},
+				StatusCodes:      []int{http.StatusTooManyRequests},
+				BodyKeywords:     []string{"strict terminal action sentinel"},
+				AccountAction:    "none",
+				DownstreamAction: tc.action,
+				IdleSeconds:      0,
+				IdlePingSeconds:  1,
+				CustomMessage:    "strict idle action",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			body := `{"model":"gpt-5.5","input":"hi"}`
+			if tc.stream {
+				body = `{"model":"gpt-5.5","stream":true,"input":"hi"}`
+			}
+			req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Thread-Id", "strict-action-root-"+tc.action)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus || !strings.Contains(string(payload), tc.wantBody) {
+				t.Fatalf("action=%s status=%d body=%s", tc.action, resp.StatusCode, payload)
+			}
+		})
+	}
+}
+
+func TestCodexStrictCPAUsesHTTP200BodyCustomErrorRuleViaSidecar(t *testing.T) {
+	sidecar := mockSidecar(t, "application/json", `{"error":{"message":"strict HTTP 200 rule sentinel"}}`)
+	defer sidecar.Close()
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("direct upstream must not be called for strict HTTP 200 sidecar rule")
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-200-rule", "upstream-strict-200-rule", "access-strict-200-rule")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	bindSidecarEgress(t, h, acc, sidecar.URL)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-200-custom",
+		Name:             "strict 200 custom",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		StatusCodes:      []int{http.StatusOK},
+		BodyKeywords:     []string{"strict HTTP 200 rule sentinel"},
+		AccountAction:    "none",
+		DownstreamAction: "custom_error",
+		ResponseStatus:   http.StatusServiceUnavailable,
+		CustomMessage:    "administrator handled HTTP 200 error envelope",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.5","input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-200-rule-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := string(body)
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(got, "administrator handled HTTP 200 error envelope") || strings.Contains(got, "strict HTTP 200 rule sentinel") {
+		t.Fatalf("strict HTTP 200 rule status=%d body=%s", resp.StatusCode, got)
+	}
+}
+
+func TestCodexStrictCPAUsesEarlySSETerminalRuleViaSidecar(t *testing.T) {
+	stream := "event: response.failed\n" +
+		`data: {"type":"response.failed","status":429,"error":{"message":"strict sse rule sentinel"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	sidecar := mockSidecar(t, "text/event-stream", stream)
+	defer sidecar.Close()
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("direct upstream must not be called for strict sidecar SSE rule")
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-sse-rule", "upstream-strict-sse-rule", "access-strict-sse-rule")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	bindSidecarEgress(t, h, acc, sidecar.URL)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-sse-custom",
+		Name:             "strict sse custom",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		StatusCodes:      []int{http.StatusTooManyRequests},
+		BodyKeywords:     []string{"strict sse rule sentinel"},
+		AccountAction:    "none",
+		DownstreamAction: "custom_error",
+		ResponseStatus:   http.StatusServiceUnavailable,
+		CustomMessage:    "administrator handled SSE failure",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-sse-rule-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	got := string(body)
+	if resp.StatusCode != http.StatusServiceUnavailable || !strings.Contains(got, "administrator handled SSE failure") || strings.Contains(got, "strict sse rule sentinel") {
+		t.Fatalf("strict SSE rule status=%d body=%s", resp.StatusCode, got)
+	}
+}
+
+func TestCodexStrictCPAStatefulFailoverRuleRetiresEpoch(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_rule_failover_origin","object":"response","model":"gpt-5.5","status":"completed","output":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"operator stateful failover sentinel"}}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	accA := h.importAccount(t, "strict-failover-a", "upstream-strict-failover-a", "access-strict-failover-a")
+	setTestCapability(t, h, accA, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-stateful-failover",
+		Name:             "strict stateful failover",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		StatusCodes:      []int{http.StatusBadGateway},
+		BodyKeywords:     []string{"operator stateful failover sentinel"},
+		AccountAction:    "none",
+		DownstreamAction: "failover",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "strict-failover-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		payload, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(payload)
+	}
+	if status, body := post(`{"model":"gpt-5.5","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp_rule_failover_origin") {
+		t.Fatalf("initial strict stateful status=%d body=%s", status, body)
+	}
+	// A second eligible account makes the assertion meaningful: strict CPA must
+	// not migrate a previous_response_id to it. The configured failover retires
+	// the epoch instead, so the next root can be scheduled normally.
+	accB := h.importAccount(t, "strict-failover-b", "upstream-strict-failover-b", "access-strict-failover-b")
+	setTestCapability(t, h, accB, "gpt-5.5", 1024)
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_failover_origin","input":"resume"}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") {
+		t.Fatalf("stateful failover status=%d body=%s", status, body)
+	}
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_failover_origin","input":"retry"}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") || calls.Load() != 2 {
+		t.Fatalf("retired stateful failover status=%d calls=%d body=%s", status, calls.Load(), body)
+	}
+}
+
+func TestCodexStrictCPAStatelessFailoverRuleSwitchesAccount(t *testing.T) {
+	var calls []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Header.Get("Authorization"))
+		switch r.Header.Get("Authorization") {
+		case "Bearer access-strict-stateless-a":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"strict stateless failover sentinel"}}`))
+		case "Bearer access-strict-stateless-b":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_strict_stateless_b","object":"response","model":"gpt-5.5","status":"completed","output_text":"ok-from-strict-b","output":[]}`))
+		default:
+			t.Fatalf("unexpected authorization %q", r.Header.Get("Authorization"))
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	accA := h.importAccount(t, "strict-stateless-a", "upstream-strict-stateless-a", "access-strict-stateless-a")
+	accB := h.importAccount(t, "strict-stateless-b", "upstream-strict-stateless-b", "access-strict-stateless-b")
+	setTestCapability(t, h, accA, "gpt-5.5", 1024)
+	setTestCapability(t, h, accB, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-stateless-failover",
+		Name:             "strict stateless failover",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		StatusCodes:      []int{http.StatusBadGateway},
+		BodyKeywords:     []string{"strict stateless failover sentinel"},
+		AccountAction:    "none",
+		DownstreamAction: "failover",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"gpt-5.5","prompt_cache_key":"strict-stateless-failover","input":"hi"}`
+	keyReq, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
+		RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-stateless-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(payload), "ok-from-strict-b") {
+		t.Fatalf("strict stateless failover status=%d body=%s", resp.StatusCode, payload)
+	}
+	if len(calls) != 2 || calls[0] != "Bearer access-strict-stateless-a" || calls[1] != "Bearer access-strict-stateless-b" {
+		t.Fatalf("strict stateless failover calls=%v", calls)
+	}
+}
+
+func TestCodexStrictCPAContextRuleChangesPresentationAndRetiresEpoch(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_rule_context_origin","object":"response","model":"gpt-5.5","status":"completed","output":[]}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"previous_response_not_found","message":"Previous response resp_rule_context_origin was not found."}}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	acc := h.importAccount(t, "strict-context-rule", "upstream-strict-context-rule", "access-strict-context-rule")
+	setTestCapability(t, h, acc, "gpt-5.5", 1024)
+	if err := h.store.UpsertUpstreamErrorRule(context.Background(), storage.UpstreamErrorRule{
+		ID:               "strict-context-custom",
+		Name:             "strict context custom",
+		Enabled:          true,
+		Priority:         1,
+		Providers:        []string{"chatgpt"},
+		Entrypoints:      []string{"responses"},
+		StatusCodes:      []int{http.StatusBadRequest},
+		BodyKeywords:     []string{"Previous response"},
+		AccountAction:    "none",
+		DownstreamAction: "custom_error",
+		ResponseStatus:   http.StatusServiceUnavailable,
+		CustomMessage:    "administrator handled context loss",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "strict-context-rule-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		payload, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(payload)
+	}
+	if status, body := post(`{"model":"gpt-5.5","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp_rule_context_origin") {
+		t.Fatalf("initial strict context status=%d body=%s", status, body)
+	}
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":"resume"}`); status != http.StatusServiceUnavailable || !strings.Contains(body, "administrator handled context loss") {
+		t.Fatalf("strict context rule status=%d body=%s", status, body)
+	}
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":"retry"}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") || calls.Load() != 2 {
+		t.Fatalf("strict context epoch status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }
 

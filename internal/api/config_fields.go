@@ -246,7 +246,7 @@ func configFields() []configField {
 		{Key: "codex_session_mapping_retention_days", Label: "Codex 映射保留天数", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "Codex 会话映射的滑动保留期，默认 7 天；仅保留 HMAC 别名和加密身份元数据。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingRetentionDays }},
 		{Key: "codex_cpa_strict", Label: "Codex 严格 CPA", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=previous_response_id 与工具输出只原样交给同一上游会话；找不到映射时显式失败，不降级重放。", boot: func(c config.Config) interface{} { return c.CodexCPAStrict }},
+			Help: "开(默认)=previous_response_id 与工具输出只原样交给同一上游会话；找不到映射时显式失败，不降级重放。管理员配置的上游错误规则仍会执行。", boot: func(c config.Config) interface{} { return c.CodexCPAStrict }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,

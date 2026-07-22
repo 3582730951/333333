@@ -969,6 +969,46 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	requestForToken := func(t storage.AccountToken) upstream.Request {
 		return requestForTokenWithIdentity(t, body, hdr, codexIdentity)
 	}
+	// Explicit administrator rules are a downstream policy overlay, including on
+	// strict CPA turns.  Strict CPA still guarantees that the request sent upstream
+	// is the native session/tool payload; it must not silently suppress the
+	// administrator's configured response policy after an upstream result arrives.
+	//
+	// A stateful previous_response_id cannot be migrated to a different upstream
+	// account without reconstructing context, which strict CPA intentionally never
+	// does.  For an explicit failover rule we therefore retire that exact epoch and
+	// return the normal visible CPA retirement signal.  A self-contained turn can
+	// still transparently retry on a fresh account as usual.
+	applyCodexRule := func(decision upstreamErrorRuleDecision, status int, header http.Header, errorBody []byte, streaming bool) (codexAttemptResult, bool) {
+		switch decision.Match.DownstreamAction {
+		case upstreamrules.DownstreamActionFailover:
+			if allowRetry && movable {
+				return retry(), true
+			}
+			if strictNativeCPA && !movable {
+				if err := s.retireCodexSessionMapping(r.Context(), mapping, "admin_rule_failover"); err != nil &&
+					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+					log.Printf("[CODEX-SESSION-MAPPING] admin failover retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+				}
+				s.writeCodexSessionMappingError(w, streaming, "codex_context_epoch_retired")
+				return codexAttemptResult{Outcome: outcomeDone}, true
+			}
+		case upstreamrules.DownstreamActionPass,
+			upstreamrules.DownstreamActionCustomError,
+			upstreamrules.DownstreamActionNeutralize,
+			upstreamrules.DownstreamActionIdleStream,
+			upstreamrules.DownstreamActionHeartbeatFinish:
+			if decision.Match.DownstreamAction == upstreamrules.DownstreamActionIdleStream && streaming {
+				// The rule owns the downstream keepalive from here on; do not keep
+				// the upstream account lease occupied for its configured idle window.
+				releaseLease()
+			}
+			if s.writeRuleDownstream(r.Context(), w, "codex", status, header, errorBody, codexScrubber, decision, streaming) {
+				return codexAttemptResult{Outcome: outcomeDone}, true
+			}
+		}
+		return codexAttemptResult{}, false
+	}
 
 	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
@@ -1005,20 +1045,40 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if contextError == leakfilter.ResponsesContextErrorNone {
 				return codexAttemptResult{}, false
 			}
-			_ = reason
-			// A missing previous response is an upstream-confirmed loss of this
-			// account-local context. Retire the whole mapped tree with CAS; orphaned
-			// tool output is a normal client 400 and must never rotate an epoch.
+			// This is an upstream fact, not a downstream presentation choice: once
+			// the original upstream no longer knows a previous response, no later
+			// request may reuse that mapping. An administrator rule may choose what
+			// the current caller sees, but it cannot keep an invalid epoch alive.
 			if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
 				if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
 					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
 					log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
 				}
 			}
+			entrypoint := "responses"
+			if isChat {
+				entrypoint = "chat_completions"
+			}
+			// An administrator may deliberately choose a different outcome even for
+			// a native context error (for example a custom error or an explicit
+			// failover/epoch rotation). Evaluate that policy before the built-in CPA
+			// context-loss behavior. No request body is reconstructed in either case.
+			if decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+				Provider: "codex", Entrypoint: entrypoint, Model: model, Status: status,
+				Header: header, Body: body, Streaming: streamReq,
+			}); ruleMatched {
+				s.applyRuleAccountAction(r.Context(), lease.Account, status, header, body, decision)
+				_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_rule")
+				if result, handled := applyCodexRule(decision, status, header, body, streamReq); handled {
+					return result, true
+				}
+			}
+			_ = reason
 			_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
-			// Do not neutralize or reinterpret native tool/context failures. In
-			// particular, "No tool output found …" is a client-visible 400 and must
-			// neither trigger account rotation nor be converted into a user message.
+			// Absent an explicit administrator rule, do not neutralize or reinterpret
+			// native tool/context failures. In particular, "No tool output found …"
+			// remains a client-visible 400 and must neither trigger account rotation
+			// nor be converted into a user message.
 			writeRaw(w, status, header, body)
 			return codexAttemptResult{Outcome: outcomeDone}, true
 		}
@@ -1193,27 +1253,15 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
-		if ruleMatched && !strictNativeCPA {
-			switch decision.Match.DownstreamAction {
-			case upstreamrules.DownstreamActionFailover:
-				if allowRetry && movable {
-					return retry()
+		if ruleMatched {
+			if decision.Match.DownstreamAction == upstreamrules.DownstreamActionIdleStream && streamReq {
+				if resp.Body != nil {
+					_ = resp.Body.Close()
+					resp.Body = nil
 				}
-			case upstreamrules.DownstreamActionIdleStream:
-				if streamReq {
-					if resp.Body != nil {
-						_ = resp.Body.Close()
-						resp.Body = nil
-					}
-					releaseLease()
-				}
-				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, streamReq) {
-					return codexAttemptResult{Outcome: outcomeDone}
-				}
-			case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize:
-				if s.writeRuleDownstream(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber, decision, streamReq) {
-					return codexAttemptResult{Outcome: outcomeDone}
-				}
+			}
+			if result, handled := applyCodexRule(decision, resp.StatusCode, resp.Header, errorBody, streamReq); handled {
+				return result
 			}
 		}
 		canFailover := allowRetry && movable
@@ -1347,12 +1395,17 @@ codexSuccess:
 	}
 
 	if isEventStream(resp.Header) {
-		// Strict CPA must begin relaying immediately: holding response.created in
-		// the legacy retry probe would block the heartbeat pump during a legitimate
-		// long-running upstream task. Its terminal/error frames are native protocol
-		// results and therefore pass through without local retry/rewrite anyway.
 		var prefix []byte
-		if !strictNativeCPA {
+		entrypoint := "responses"
+		if isChat {
+			entrypoint = "chat_completions"
+		}
+		// A configured terminal rule must be able to handle an HTTP-200 SSE
+		// response.failed before its raw frame commits downstream. Compatibility
+		// traffic always uses the existing bounded probe. Strict CPA uses it only
+		// when an administrator has a scope-compatible terminal rule; otherwise it
+		// retains the immediate native relay for long-running sessions.
+		if !strictNativeCPA || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
 			// Hold back only a bounded early prefix so a retryable failure frame can still
 			// fail over before any downstream bytes are committed. As soon as real content
 			// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
@@ -1383,18 +1436,15 @@ codexSuccess:
 				}
 				failureStatus := streamFailure.StatusCode
 				failureBody := streamFailure.Body
-				if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone {
-					_ = resp.Body.Close()
-					if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
-						_ = s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid")
+				// A confirmed missing previous response permanently invalidates the
+				// mapped epoch even when an administrator replaces the current
+				// downstream error. The rule controls presentation/account handling,
+				// never whether stale upstream context remains reusable.
+				if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+					if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+						!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+						log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
 					}
-					_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
-					writeRaw(w, failureStatus, failureHeader, failureBody)
-					return codexAttemptResult{Outcome: outcomeDone}
-				}
-				entrypoint := "responses"
-				if isChat {
-					entrypoint = "chat_completions"
 				}
 				decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
 					Provider:   "codex",
@@ -1406,6 +1456,18 @@ codexSuccess:
 					Streaming:  true,
 				})
 				explicitRuleAction := ruleMatched && decision.Match.DownstreamAction != upstreamrules.DownstreamActionBuiltin
+				if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone && !explicitRuleAction {
+					// Preserve native context-loss handling by default, but do not let it
+					// silently bypass an administrator's explicitly selected account
+					// action. A builtin action remains the historical no-op here.
+					if ruleMatched && decision.Match.AccountAction != upstreamrules.AccountActionBuiltin {
+						s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
+					}
+					_ = resp.Body.Close()
+					_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
+					writeRaw(w, failureStatus, failureHeader, failureBody)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
 				handleStreamFailure := streamFailure.BuiltinRetryable || explicitRuleAction
 				if ruleMatched && !handleStreamFailure {
 					// An account-only rule can still observe an ordinary client error, but
@@ -1451,19 +1513,9 @@ codexSuccess:
 					}
 					_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 					if ruleMatched {
-						switch decision.Match.DownstreamAction {
-						case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionHeartbeatFinish:
-							_ = resp.Body.Close()
-							if s.writeRuleDownstream(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber, decision, true) {
-								return codexAttemptResult{Outcome: outcomeDone}
-							}
-						case upstreamrules.DownstreamActionFailover:
-							_ = resp.Body.Close()
-							if allowRetry && movable {
-								return retry()
-							}
-							s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
-							return codexAttemptResult{Outcome: outcomeDone}
+						_ = resp.Body.Close()
+						if result, handled := applyCodexRule(decision, failureStatus, failureHeader, failureBody, true); handled {
+							return result
 						}
 					}
 					_ = resp.Body.Close()
@@ -1646,6 +1698,29 @@ codexSuccess:
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
+	// Some backend-api failures arrive as a JSON error envelope with HTTP 200 but
+	// do not carry one of the built-in quota signatures.  An administrator's
+	// status/body rule is still authoritative on strict CPA traffic, so evaluate
+	// explicit terminal actions before treating this as an ordinary completed body.
+	if decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+		Provider: "codex", Entrypoint: "responses", Model: model, Status: resp.StatusCode,
+		Header: resp.Header, Body: responseBody, Streaming: false,
+	}); ruleMatched {
+		if decision.Match.AccountAction != upstreamrules.AccountActionBuiltin {
+			s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, responseBody, decision)
+		}
+		if decision.Match.DownstreamAction != upstreamrules.DownstreamActionBuiltin {
+			// Preserve the historic default classifier for builtin rules; explicit
+			// administrator actions take precedence over it.
+			if decision.Match.AccountAction == upstreamrules.AccountActionBuiltin {
+				s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, responseBody, decision)
+			}
+			_ = s.settleBillingHold(r.Context(), holdID, "success_body_rule")
+			if result, handled := applyCodexRule(decision, resp.StatusCode, resp.Header, responseBody, false); handled {
+				return result
+			}
+		}
+	}
 	// Session 33: Success-path body scan for rate-limit signals in 200 response.
 	// Same logic as the isChat non-streaming path above: when the upstream returns
 	// a soft limit error in a 200 body, cool the account and fail over.
@@ -1714,14 +1789,18 @@ codexSuccess:
 	// claims unverified test/command/file results (no-op when reliability/guard is off).
 	if !strictNativeCPA {
 		responseBody = s.reliabilityGuardResponsesBody(r.Context(), responseBody, relTurn)
-		if rf := s.responseRuleFilter(r.Context(), "codex", func() string {
-			if isChat {
-				return "chat_completions"
-			}
-			return "responses"
-		}(), model, resp.StatusCode); rf != nil {
-			responseBody = filterRuleJSON(responseBody, rf)
+	}
+	// Administrator-configured response filters are deliberately independent of
+	// the strict CPA request boundary: they shape only the completed downstream
+	// response and never alter the upstream session, previous_response_id, or a
+	// client tool result.
+	if rf := s.responseRuleFilter(r.Context(), "codex", func() string {
+		if isChat {
+			return "chat_completions"
 		}
+		return "responses"
+	}(), model, resp.StatusCode); rf != nil {
+		responseBody = filterRuleJSON(responseBody, rf)
 	}
 	_, _ = w.Write(codexScrubber.ReplaceAll(responseBody))
 	return codexAttemptResult{Outcome: outcomeDone}

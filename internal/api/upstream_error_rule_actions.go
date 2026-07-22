@@ -69,6 +69,43 @@ func (s *Server) responseRuleFilter(ctx context.Context, provider, entrypoint, m
 	return nil
 }
 
+// hasPotentialTerminalResponseRule reports whether an enabled administrator rule
+// could apply to an early terminal Responses frame.  A successful HTTP SSE response
+// can carry response.failed / error as its first meaningful frame, before a status
+// code or body is available to the normal matcher.  In that case the relay must hold
+// only the bounded early prefix so an explicit downstream action (custom_error,
+// failover, heartbeat_finish, ...) can be applied before any bytes are committed.
+//
+// Strict CPA keeps upstream session state native; it does not exempt an
+// administrator's explicit response policy.  This scope-only probe deliberately
+// clears status/body predicates and lets upstreamrules.Match perform the normal
+// provider (including chatgpt<->codex), entrypoint, and model matching.
+func (s *Server) hasPotentialTerminalResponseRule(ctx context.Context, provider, entrypoint, model string) bool {
+	for _, rule := range s.upstreamErrorRules(ctx) {
+		action := strings.ToLower(strings.TrimSpace(rule.DownstreamAction))
+		if !rule.Enabled || action == upstreamrules.DownstreamActionIntercept || action == upstreamrules.DownstreamActionHideSafetyBuffering {
+			continue
+		}
+		accountAction := strings.ToLower(strings.TrimSpace(rule.AccountAction))
+		// A completely builtin rule has no administrator override to apply before
+		// committing the native stream. Avoid adding a first-frame wait merely for
+		// the ordinary default classifier; an explicit account action still probes.
+		if (action == "" || action == upstreamrules.DownstreamActionBuiltin) &&
+			(accountAction == "" || accountAction == upstreamrules.AccountActionBuiltin) {
+			continue
+		}
+		probeRule := rule
+		probeRule.StatusCodes = nil
+		probeRule.BodyKeywords = nil
+		if _, ok := upstreamrules.Match([]storage.UpstreamErrorRule{probeRule}, upstreamrules.MatchInput{
+			Provider: provider, Entrypoint: entrypoint, Model: model, Streaming: true,
+		}); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) matchUpstreamErrorRule(ctx context.Context, input upstreamrules.MatchInput) (upstreamErrorRuleDecision, bool) {
 	rules := s.upstreamErrorRules(ctx)
 	if len(rules) == 0 {
