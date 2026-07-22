@@ -173,6 +173,50 @@ func TestGoalContinuityRejectsUnpairedCustomToolCallBeforeUpstream(t *testing.T)
 	}
 }
 
+func TestGoalContinuityStreamCustomToolCallRequiresResultBeforeResume(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if upstreamCalls.Add(1) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"No tool output found for custom tool call call_goal_stream_pending."},"status":400}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_goal_stream_pending\",\"model\":\"gpt\"}}\n\n"+
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call_goal_stream_pending\",\"name\":\"patch\",\"input\":\"{}\"}}\n\n"+
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_goal_stream_pending\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt\"}}\n\n")
+	})
+	h.importAccount(t, "goal-stream-pending", "upstream-goal-stream-pending", "access-goal-stream-pending")
+	first, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","stream":true,"input":[{"role":"user","content":"make a streamed patch"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBody, _ := io.ReadAll(first.Body)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK || !strings.Contains(string(firstBody), "response.completed") {
+		t.Fatalf("streamed first turn status=%d body=%s", first.StatusCode, firstBody)
+	}
+	goals, err := h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 1 || goals[0].State != "awaiting_tool_result" {
+		t.Fatalf("streamed custom call must persist awaiting state, goals=%+v err=%v", goals, err)
+	}
+	resume := `{"model":"gpt","stream":true,"previous_response_id":"resp_goal_stream_pending","input":[{"role":"user","content":"continue without tool output"}]}`
+	second, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(resume))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody, _ := io.ReadAll(second.Body)
+	second.Body.Close()
+	if second.StatusCode != http.StatusOK || second.Header.Get("X-MiCliProxy-Goal-Error") != "goal_resume_requires_tool_result" ||
+		!strings.Contains(string(secondBody), "response.failed") || !strings.Contains(string(secondBody), "goal_resume_requires_tool_result") {
+		t.Fatalf("streamed missing result terminal status=%d headers=%v body=%s", second.StatusCode, second.Header, secondBody)
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("streamed unpaired custom call was forwarded upstream %d times", upstreamCalls.Load())
+	}
+}
+
 func TestGoalContinuitySendsBoundedContinueBeforeSynthesizingEOFError(t *testing.T) {
 	var calls atomic.Int32
 	var continuationInstruction atomic.Bool
