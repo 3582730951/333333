@@ -391,18 +391,6 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 		return mapping, nil
 	}
 
-	// Fork is a new root by definition. Its source mapping is consulted only to
-	// preserve an encrypted internal fork relationship; it never inherits the old
-	// root/session identity or window generation.
-	if id.ForkedFromID != "" {
-		if parent, err := lookupBranchOrRoot(id.ForkedFromID); err == nil {
-			mapping.anchor = parent
-		} else if !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
-			return mapping, err
-		}
-		return mapping, nil
-	}
-
 	// A child normally sends parent_thread_id on every turn, including a
 	// self-contained turn that has no previous_response_id.  Prefer an existing
 	// branch before treating that same hierarchy as a newly-created child; otherwise
@@ -460,6 +448,50 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 		} else if !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
 			return mapping, err
 		}
+	}
+
+	// A Codex client can retain forked_from_thread_id on every later turn of the
+	// fork, even when that turn is self-contained and has no previous_response_id.
+	// Resolve the fork's own durable root first. Treating each such turn as a new
+	// fork creates a second upstream thread with the same downstream root alias;
+	// its terminal commit then conflicts and leaves the returned response id
+	// impossible to resume.
+	if id.ForkedFromID != "" {
+		if id.RootID != "" {
+			if root, err := s.lookupCodexSessionAlias(ctx, mapping.namespace, storage.CodexSessionAlias{Type: "root", Value: id.RootID}); err == nil {
+				if root.State == "active" {
+					// A known root that was not created as this fork is an incompatible
+					// downstream hierarchy claim. Do not silently turn it into a new
+					// upstream session under the same root alias.
+					if root.ForkedFromThreadID == "" {
+						return mapping, storage.ErrCodexSessionMappingAmbiguous
+					}
+					if parent, parentErr := lookupBranchOrRoot(id.ForkedFromID); parentErr == nil && root.ForkedFromThreadID != parent.ThreadID {
+						return mapping, storage.ErrCodexSessionMappingAmbiguous
+					} else if parentErr != nil && !errors.Is(parentErr, storage.ErrCodexSessionMappingNotFound) {
+						return mapping, parentErr
+					}
+					mapping.binding = root
+					mapping.requiredAccount, mapping.requiredEgress = root.AccountID, root.EgressID
+					return mapping, nil
+				}
+				// A retired fork root must not become the source of its replacement:
+				// that would set ForkedFromThreadID to the retired fork itself rather
+				// than to the original source thread. Fall through and resolve the
+				// explicit fork source below.
+			} else if !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
+				return mapping, err
+			}
+		}
+		// This is the first turn of a new fork. Its source mapping is consulted
+		// only to preserve an encrypted relationship; it never inherits the old
+		// root/session identity or window generation.
+		if parent, err := lookupBranchOrRoot(id.ForkedFromID); err == nil {
+			mapping.anchor = parent
+		} else if !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
+			return mapping, err
+		}
+		return mapping, nil
 	}
 
 	if id.RootID != "" {

@@ -550,6 +550,50 @@ func TestCodexSessionMappingRetiresOnlyAfterUpstreamContextLoss(t *testing.T) {
 	}
 }
 
+func TestCodexSessionMappingRetiresOnSoft200PreviousResponseNotFound(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-soft-retired-origin","object":"response","model":"gpt","status":"completed","output":[]}`))
+			return
+		}
+		// The backend sometimes returns this error envelope with HTTP 200. The
+		// semantic status is nested in error.message and must still retire CPA.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error":{"message":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp-soft-retired-origin' not found.\",\"param\":\"previous_response_id\"},\"status\":400}"},"status":400,"type":"error"}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "soft-retire", "upstream-soft-retire", "access-soft-retire")
+
+	post := func(body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "soft-retire-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		result, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(result)
+	}
+	if status, body := post(`{"model":"gpt","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp-soft-retired-origin") {
+		t.Fatalf("initial status=%d body=%s", status, body)
+	}
+	if status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":"resume"}`); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
+		t.Fatalf("soft context loss must surface as native 400 status=%d body=%s", status, body)
+	}
+	status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":"resume again"}`)
+	if status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
+		t.Fatalf("soft-retired epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+	}
+}
+
 func TestCodexSessionMappingRetiresAfterNativeStreamContextLoss(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -794,6 +838,26 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 	}
 	if fork.SessionID == root.RootSessionID || fork.SessionID != fork.ThreadID || fork.ParentThreadID != "" || fork.ForkedFromThreadID != child.ThreadID || !strings.HasSuffix(fork.WindowID(), ":0") {
 		t.Fatalf("fork snapshot=%+v child=%+v root=%+v", fork, child, root)
+	}
+	if err := h.app.commitCodexSessionMapping(ctx, forkMapping, lease, lease.Egress, "resp-fork", "", false); err != nil {
+		t.Fatal(err)
+	}
+	// Codex retains the original fork marker on later self-contained turns. That
+	// marker identifies ancestry, not a request to create a fresh fork every time;
+	// the second turn must reuse the durable fork root and commit another response
+	// alias without colliding with its own root alias.
+	repeatForkBody := []byte(`{"model":"gpt","thread_id":"fork-client-root","forked_from_thread_id":"client-child","input":"fork follow-up"}`)
+	repeatForkRequest, _ := http.NewRequest(http.MethodPost, "http://example.invalid/v1/responses", bytes.NewReader(repeatForkBody))
+	repeatForkMapping, err := h.app.resolveCodexSessionMapping(ctx, repeatForkRequest, repeatForkBody, downstreamPolicy{})
+	if err != nil || repeatForkMapping.binding == nil || repeatForkMapping.binding.ID != forkMapping.binding.ID {
+		t.Fatalf("persistent fork marker did not reuse its root binding=%+v err=%v", repeatForkMapping.binding, err)
+	}
+	repeatFork, err := repeatForkMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
+	if err != nil || repeatFork.SessionID != fork.SessionID || repeatFork.ThreadID != fork.ThreadID || repeatFork.ForkedFromThreadID != fork.ForkedFromThreadID {
+		t.Fatalf("persistent fork marker changed upstream identity=%+v err=%v", repeatFork, err)
+	}
+	if err := h.app.commitCodexSessionMapping(ctx, repeatForkMapping, lease, lease.Egress, "resp-fork-follow-up", "", false); err != nil {
+		t.Fatalf("persistent fork marker collided during terminal commit: %v", err)
 	}
 	if _, err := h.store.RetireCodexSessionTree(ctx, root.ID, root.Epoch); err != nil {
 		t.Fatal(err)

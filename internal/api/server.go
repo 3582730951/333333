@@ -1069,53 +1069,53 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}()
 	codexResetRetried := false
 	statefulRuleRecoveryAttempted := false
+	handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
+		contextError := responsesContextError(status, body)
+		if contextError == leakfilter.ResponsesContextErrorNone {
+			return codexAttemptResult{}, false
+		}
+		// This is an upstream fact, not a downstream presentation choice: once
+		// the original upstream no longer knows a previous response, no later
+		// request may reuse that mapping. An administrator rule may choose what
+		// the current caller sees, but it cannot keep an invalid epoch alive.
+		if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+				!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+				log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+			}
+		}
+		entrypoint := "responses"
+		if isChat {
+			entrypoint = "chat_completions"
+		}
+		// An administrator may deliberately choose a different outcome even for
+		// a native context error (for example a custom error or an explicit
+		// failover/epoch rotation). Evaluate that policy before the built-in CPA
+		// context-loss behavior. No request body is reconstructed in either case.
+		if decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+			Provider: "codex", Entrypoint: entrypoint, Model: model, Status: status,
+			Header: header, Body: body, Streaming: streamReq,
+		}); ruleMatched {
+			s.applyRuleAccountAction(r.Context(), lease.Account, status, header, body, decision)
+			_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_rule")
+			if result, handled := applyCodexRule(decision, status, header, body, streamReq); handled {
+				return result, true
+			}
+		}
+		_ = reason
+		_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
+		// Absent an explicit administrator rule, do not neutralize or reinterpret
+		// native tool/context failures. In particular, "No tool output found …"
+		// remains a client-visible 400 and must neither trigger account rotation
+		// nor be converted into a user message.
+		writeRaw(w, status, header, body)
+		return codexAttemptResult{Outcome: outcomeDone}, true
+	}
 
 codexResponse:
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
 		errorBody = redactAgentIdentityError(token, errorBody)
-		handleResponsesContextAttemptError := func(status int, header http.Header, body []byte, reason string) (codexAttemptResult, bool) {
-			contextError := responsesContextError(status, body)
-			if contextError == leakfilter.ResponsesContextErrorNone {
-				return codexAttemptResult{}, false
-			}
-			// This is an upstream fact, not a downstream presentation choice: once
-			// the original upstream no longer knows a previous response, no later
-			// request may reuse that mapping. An administrator rule may choose what
-			// the current caller sees, but it cannot keep an invalid epoch alive.
-			if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
-				if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
-					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
-					log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
-				}
-			}
-			entrypoint := "responses"
-			if isChat {
-				entrypoint = "chat_completions"
-			}
-			// An administrator may deliberately choose a different outcome even for
-			// a native context error (for example a custom error or an explicit
-			// failover/epoch rotation). Evaluate that policy before the built-in CPA
-			// context-loss behavior. No request body is reconstructed in either case.
-			if decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
-				Provider: "codex", Entrypoint: entrypoint, Model: model, Status: status,
-				Header: header, Body: body, Streaming: streamReq,
-			}); ruleMatched {
-				s.applyRuleAccountAction(r.Context(), lease.Account, status, header, body, decision)
-				_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_rule")
-				if result, handled := applyCodexRule(decision, status, header, body, streamReq); handled {
-					return result, true
-				}
-			}
-			_ = reason
-			_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
-			// Absent an explicit administrator rule, do not neutralize or reinterpret
-			// native tool/context failures. In particular, "No tool output found …"
-			// remains a client-visible 400 and must neither trigger account rotation
-			// nor be converted into a user message.
-			writeRaw(w, status, header, body)
-			return codexAttemptResult{Outcome: outcomeDone}, true
-		}
 		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
 			return handled
 		}
@@ -1821,6 +1821,16 @@ codexSuccess:
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_response_too_large")
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
+	}
+	// backend-api can encode a semantic Responses 400 inside a HTTP 200 JSON error
+	// envelope. Treat the typed body error as the actual upstream result before the
+	// generic soft-200 rule path; otherwise a previous_response_not_found escapes
+	// CPA retirement and its unusable alias remains active.
+	if responsesContextError(http.StatusBadRequest, responseBody) != leakfilter.ResponsesContextErrorNone {
+		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "soft_context_error", http.StatusBadRequest)
+		if handled, ok := handleResponsesContextAttemptError(http.StatusBadRequest, resp.Header, responseBody, "http_200_context_error"); ok {
+			return handled
+		}
 	}
 	// Some backend-api failures arrive as a JSON error envelope with HTTP 200 but
 	// do not carry one of the built-in quota signatures.  An administrator's
