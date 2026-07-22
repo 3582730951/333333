@@ -211,6 +211,48 @@ func TestCodexSessionIDSeededFromCorrelator(t *testing.T) {
 	}
 }
 
+func TestCodexMappedDeviceUsesSnapshotOSProfile(t *testing.T) {
+	c, secret := fixedSecretClient(t, config.Default())
+	account := storage.Account{ID: "acc-mapped-device"}
+	egress := storage.EgressProfile{ID: "egress-mapped-device", Type: "direct"}
+	mappedDevice := identity.CodexDevice(secret, account.ID, egress.ID, "Mac OS")
+	snapshot := &CodexIdentitySnapshot{
+		InstallationID: mappedDevice.MachineID,
+		DeviceOSHint:   "Mac OS",
+		SessionID:      "019f0000-0000-7000-8000-000000000051",
+		ThreadID:       "019f0000-0000-7000-8000-000000000051",
+		TurnID:         "019f0000-0000-7000-8000-000000000052",
+	}
+	spec := Request{
+		DownstreamPath: "/v1/responses",
+		Body:           []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"tool output says Platform: linux"}`),
+		Account:        account,
+		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
+		Egress:         egress,
+		// A later tool-result body can infer Linux, but the strict CPA snapshot
+		// must keep the root-elected macOS profile coherent with its device.
+		OSHint:        "Linux",
+		CodexIdentity: snapshot,
+	}
+	wantUA := mappedDevice.CodexUserAgentVersion(config.DefaultClientVersion)
+	httpHeaders := http.Header{}
+	if err := c.applyCodexHeaders(httpHeaders, spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := httpHeaders.Get("User-Agent"); got != wantUA {
+		t.Fatalf("HTTP mapped device UA = %q, want root snapshot profile %q", got, wantUA)
+	}
+
+	spec.CodexResponsesWebSocket = true
+	_, wsHeaders, _, err := c.prepareCodexResponsesWebSocket(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wsHeaders.Get("User-Agent"); got != wantUA {
+		t.Fatalf("WebSocket mapped device UA = %q, want root snapshot profile %q", got, wantUA)
+	}
+}
+
 // --- Codex: the API-key path carries no CLI session fingerprint ---
 
 func TestCodexAPIKeyPathOmitsFingerprint(t *testing.T) {

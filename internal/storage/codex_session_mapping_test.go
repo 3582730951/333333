@@ -16,14 +16,17 @@ func TestCodexSessionMappingEncryptsIdentityAndRetiresWholeTree(t *testing.T) {
 	commit := CodexSessionCommit{
 		Namespace: "key:test-namespace",
 		Binding: CodexSessionBinding{
-			ID:            "binding-root",
-			TreeID:        "tree-root",
-			AccountID:     "account-a",
-			EgressID:      "direct",
-			Epoch:         0,
-			State:         "active",
-			RootSessionID: "019f0000-0000-7000-8000-000000000001",
-			ThreadID:      "019f0000-0000-7000-8000-000000000001",
+			ID:              "binding-root",
+			TreeID:          "tree-root",
+			AccountID:       "account-a",
+			EgressID:        "direct",
+			Epoch:           0,
+			State:           "active",
+			InstallationID:  "install-real-identity",
+			DeviceOSHint:    "Mac OS",
+			DeviceOSHintSet: true,
+			RootSessionID:   "019f0000-0000-7000-8000-000000000001",
+			ThreadID:        "019f0000-0000-7000-8000-000000000001",
 		},
 		Aliases: []CodexSessionAlias{
 			{Type: "root", Value: "real-root-thread"},
@@ -36,7 +39,7 @@ func TestCodexSessionMappingEncryptsIdentityAndRetiresWholeTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if committed.RootSessionID != commit.Binding.RootSessionID || committed.ThreadID != commit.Binding.ThreadID {
+	if committed.InstallationID != commit.Binding.InstallationID || committed.DeviceOSHint != commit.Binding.DeviceOSHint || !committed.DeviceOSHintSet || committed.RootSessionID != commit.Binding.RootSessionID || committed.ThreadID != commit.Binding.ThreadID {
 		t.Fatalf("identity round-trip = %+v", committed)
 	}
 
@@ -44,7 +47,7 @@ func TestCodexSessionMappingEncryptsIdentityAndRetiresWholeTree(t *testing.T) {
 		{Type: "response", Value: "resp-real-1"},
 		{Type: "turn_state", Value: "opaque-real-state"},
 	})
-	if err != nil || resolved.ID != committed.ID || resolved.AccountID != "account-a" {
+	if err != nil || resolved.ID != committed.ID || resolved.AccountID != "account-a" || resolved.InstallationID != commit.Binding.InstallationID || resolved.DeviceOSHint != commit.Binding.DeviceOSHint || !resolved.DeviceOSHintSet {
 		t.Fatalf("resolve = %+v, %v", resolved, err)
 	}
 
@@ -55,7 +58,7 @@ func TestCodexSessionMappingEncryptsIdentityAndRetiresWholeTree(t *testing.T) {
 	if err := store.DB().QueryRowContext(ctx, `SELECT alias_hash FROM codex_session_alias WHERE binding_id=? LIMIT 1`, committed.ID).Scan(&aliasHash); err != nil {
 		t.Fatal(err)
 	}
-	for _, raw := range []string{"test-namespace", "real-root-thread", "resp-real-1", "opaque-real-state", commit.Binding.RootSessionID} {
+	for _, raw := range []string{"test-namespace", "real-root-thread", "resp-real-1", "opaque-real-state", commit.Binding.InstallationID, commit.Binding.DeviceOSHint, commit.Binding.RootSessionID} {
 		if strings.Contains(namespaceHash, raw) || strings.Contains(aliasHash, raw) || strings.Contains(encryptedIdentity, raw) {
 			t.Fatalf("raw identifier leaked into mapping storage: %q", raw)
 		}
@@ -146,7 +149,10 @@ func TestCodexSessionMappingResolvesAfterStoreRestart(t *testing.T) {
 		Namespace: "key:restart",
 		Binding: CodexSessionBinding{
 			ID: "binding-restart", TreeID: "tree-restart", AccountID: "account-a", EgressID: "direct", State: "active",
-			RootSessionID: "019f0000-0000-7000-8000-000000000041", ThreadID: "019f0000-0000-7000-8000-000000000041",
+			InstallationID:  "install-restart",
+			DeviceOSHint:    "Linux",
+			DeviceOSHintSet: true,
+			RootSessionID:   "019f0000-0000-7000-8000-000000000041", ThreadID: "019f0000-0000-7000-8000-000000000041",
 		},
 		Aliases:   []CodexSessionAlias{{Type: "response", Value: "resp-restart"}, {Type: "turn_state", Value: "state-restart"}},
 		ExpiresAt: time.Now().Add(time.Hour).Unix(),
@@ -169,7 +175,7 @@ func TestCodexSessionMappingResolvesAfterStoreRestart(t *testing.T) {
 	}
 	reopened.SetTokenEncryptionKey(secret)
 	resolved, err := reopened.ResolveCodexSessionAliases(ctx, "key:restart", []CodexSessionAlias{{Type: "response", Value: "resp-restart"}, {Type: "turn_state", Value: "state-restart"}})
-	if err != nil || resolved.ID != committed.ID || resolved.RootSessionID != committed.RootSessionID || resolved.AccountID != "account-a" || resolved.EgressID != "direct" {
+	if err != nil || resolved.ID != committed.ID || resolved.InstallationID != committed.InstallationID || resolved.DeviceOSHint != committed.DeviceOSHint || !resolved.DeviceOSHintSet || resolved.RootSessionID != committed.RootSessionID || resolved.AccountID != "account-a" || resolved.EgressID != "direct" {
 		t.Fatalf("restart mapping resolve=%+v err=%v", resolved, err)
 	}
 }

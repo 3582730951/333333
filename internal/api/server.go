@@ -973,6 +973,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		codexUseWebSocket = false
 	}
 	requestForTokenWithIdentity := func(t storage.AccountToken, requestBody []byte, requestHeaders http.Header, requestIdentity *upstream.CodexIdentitySnapshot) upstream.Request {
+		requestOSHint := osHint
+		if requestIdentity != nil {
+			// A strict mapped tree keeps the root-elected device profile even when
+			// a later tool result happens to contain a different OS marker.
+			requestOSHint = requestIdentity.DeviceOSHint
+		}
 		return upstream.Request{
 			Method:                  http.MethodPost,
 			DownstreamPath:          pathWithQuery(path, r.URL.RawQuery),
@@ -982,7 +988,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			Token:                   t,
 			Egress:                  lease.Egress,
 			CookieJarKey:            lease.Binding.CookieJarKey,
-			OSHint:                  osHint,
+			OSHint:                  requestOSHint,
 			CodexClientVersion:      codexClientVersion,
 			CodexResponsesWebSocket: codexUseWebSocket,
 			CodexWebSocketSession:   codexResponsesWebSocketSession(r.Context()),

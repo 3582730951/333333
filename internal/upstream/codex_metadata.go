@@ -30,7 +30,11 @@ const (
 // Downstream turn state is opaque upstream context, not a correlator to rewrite;
 // the gateway validates it through its exact mapping before it reaches this type.
 type CodexIdentitySnapshot struct {
-	InstallationID     string
+	InstallationID string
+	// DeviceOSHint is the root-elected OS profile used for every part of the
+	// virtual Codex device, including the User-Agent. It may intentionally be
+	// empty to select the host-default profile.
+	DeviceOSHint       string
 	SessionID          string
 	ThreadID           string
 	TurnID             string

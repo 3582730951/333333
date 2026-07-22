@@ -127,6 +127,85 @@ func TestCodexSessionMappingKeepsNativeIdentityAndToolOutput(t *testing.T) {
 	}
 }
 
+func TestCodexSessionMappingPersistsInstallationIDAcrossOSHints(t *testing.T) {
+	var mu sync.Mutex
+	installationIDs := []string{}
+	userAgents := []string{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var payload struct {
+			ClientMetadata map[string]json.RawMessage `json:"client_metadata"`
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("upstream payload: %v", err)
+		}
+		var installationID string
+		if err := json.Unmarshal(payload.ClientMetadata["x-codex-installation-id"], &installationID); err != nil || installationID == "" {
+			t.Fatalf("mapped installation id=%q err=%v payload=%s", installationID, err, raw)
+		}
+		mu.Lock()
+		installationIDs = append(installationIDs, installationID)
+		userAgents = append(userAgents, r.Header.Get("User-Agent"))
+		call := len(installationIDs)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call == 1 {
+			_, _ = w.Write([]byte(`{"id":"resp-installation-root","object":"response","model":"gpt","status":"completed","output":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp-installation-next","object":"response","model":"gpt","status":"completed","output":[]}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	h.app.cfg.IdentityOSSource = "downstream"
+	h.importAccount(t, "installation", "upstream-installation", "access-installation")
+
+	post := func(body string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "installation-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// The root presents macOS; the tool-result turn explicitly presents Linux.
+	// Without a persisted virtual installation identity those two OS hints derive
+	// different devices and the upstream rejects the otherwise valid response id.
+	first := post(`{"model":"gpt","input":[{"role":"user","content":"work in /Users/alice/project"}]}`)
+	_, _ = io.Copy(io.Discard, first.Body)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("root status=%d", first.StatusCode)
+	}
+	second := post(`{"model":"gpt","previous_response_id":"resp-installation-root","input":[{"type":"function_call_output","call_id":"call-installation","output":"Platform: linux"}]}`)
+	_, _ = io.Copy(io.Discard, second.Body)
+	second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("continuation status=%d", second.StatusCode)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), installationIDs...)
+	gotUserAgents := append([]string(nil), userAgents...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] == "" || got[1] != got[0] {
+		t.Fatalf("installation identity changed across strict continuation: %q", got)
+	}
+	if len(gotUserAgents) != 2 || gotUserAgents[0] == "" || gotUserAgents[1] != gotUserAgents[0] {
+		t.Fatalf("device OS profile changed across strict continuation: %q", gotUserAgents)
+	}
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-installation-root"})
+	if err != nil || len(rows) != 1 || rows[0].InstallationID != got[0] || rows[0].DeviceOSHint != "Mac OS" || !rows[0].DeviceOSHintSet {
+		t.Fatalf("durable installation mapping rows=%+v err=%v", rows, err)
+	}
+}
+
 func TestNativeCodexContinuePreservesInstructionSnapshotLitePrefix(t *testing.T) {
 	original := setResponsesInstructions([]byte(`{"model":"gpt-5.6-sol","instructions":"must disappear","previous_response_id":"resp-old","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","format":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"old user turn"}],"exact":900719925474099312345}]}`), "snapshotted administrator base")
 	continued, err := nativeCodexContinueBody(original, "resp-latest")
@@ -639,7 +718,11 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 		Namespace: "unauthenticated",
 		Binding: storage.CodexSessionBinding{
 			ID: "root-binding", TreeID: "root-tree", AccountID: "account-root", EgressID: storage.DefaultDirectEgressID, State: "active",
-			RootSessionID: "019f0000-0000-7000-8000-000000000101", ThreadID: "019f0000-0000-7000-8000-000000000101",
+			InstallationID:  "install-root-device",
+			DeviceOSHint:    "Mac OS",
+			DeviceOSHintSet: true,
+			RootSessionID:   "019f0000-0000-7000-8000-000000000101",
+			ThreadID:        "019f0000-0000-7000-8000-000000000101",
 		},
 		Aliases: []storage.CodexSessionAlias{{Type: "root", Value: "client-root"}, {Type: "session", Value: "client-root"}},
 	})
@@ -660,7 +743,7 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child.SessionID != root.RootSessionID || child.ThreadID == child.SessionID || child.ParentThreadID != root.ThreadID || !strings.HasSuffix(child.WindowID(), ":0") {
+	if child.InstallationID != root.InstallationID || child.DeviceOSHint != root.DeviceOSHint || child.SessionID != root.RootSessionID || child.ThreadID == child.SessionID || child.ParentThreadID != root.ThreadID || !strings.HasSuffix(child.WindowID(), ":0") {
 		t.Fatalf("child snapshot=%+v root=%+v", child, root)
 	}
 	if err := h.app.commitCodexSessionMapping(ctx, childMapping, lease, lease.Egress, "resp-child", "", false); err != nil {
@@ -686,7 +769,7 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 		t.Fatal(err)
 	}
 	noSessionChild, err := noSessionMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
-	if err != nil || noSessionChild.SessionID != root.RootSessionID || noSessionChild.ThreadID == noSessionChild.SessionID || noSessionChild.ParentThreadID != root.ThreadID {
+	if err != nil || noSessionChild.InstallationID != root.InstallationID || noSessionChild.DeviceOSHint != root.DeviceOSHint || noSessionChild.SessionID != root.RootSessionID || noSessionChild.ThreadID == noSessionChild.SessionID || noSessionChild.ParentThreadID != root.ThreadID {
 		t.Fatalf("child without session snapshot=%+v err=%v", noSessionChild, err)
 	}
 	if err := h.app.commitCodexSessionMapping(ctx, noSessionMapping, lease, lease.Egress, "resp-child-no-session", "", false); err != nil {

@@ -584,6 +584,12 @@ func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Le
 			created.RootSessionID = m.anchor.RootSessionID
 			created.ThreadID = identity.NewUUIDv7()
 			created.ParentThreadID = m.anchor.ThreadID
+			// A child is a new thread, not a new physical Codex device. The
+			// parent tree's encrypted device identity must survive a child request
+			// whose input happens to imply a different downstream OS family.
+			created.InstallationID = m.anchor.InstallationID
+			created.DeviceOSHint = m.anchor.DeviceOSHint
+			created.DeviceOSHintSet = m.anchor.DeviceOSHintSet
 		} else {
 			// Fork and a fresh root both start a new tree. A fork keeps only the
 			// mapped source thread as encrypted relationship metadata.
@@ -599,12 +605,29 @@ func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Le
 		m.prospective = &created
 		binding = &created
 	}
-	device := identity.CodexDevice(secret, lease.Account.ID, lease.Egress.ID, osHint)
+	// `identity_os_source=downstream` can legitimately infer different OS
+	// families from a user turn and a later tool-result turn. The upstream
+	// associates a previous_response_id with the full device identity, including
+	// the OS-specific User-Agent, so a strict CPA continuation must reuse both
+	// the encrypted installation id and the OS profile elected by the root.
+	if !binding.DeviceOSHintSet {
+		// Older rows did not retain an OS profile, and an installation id alone
+		// cannot reveal one: its deterministic value is deliberately independent
+		// of the chosen OS profile. Preserve the historical behavior for such a
+		// row by electing the current hint once, then persist it after a successful
+		// terminal; never fabricate a claimed recovery of the original profile.
+		binding.DeviceOSHint = strings.TrimSpace(osHint)
+		binding.DeviceOSHintSet = true
+	}
+	if strings.TrimSpace(binding.InstallationID) == "" {
+		binding.InstallationID = identity.CodexDevice(secret, lease.Account.ID, lease.Egress.ID, binding.DeviceOSHint).MachineID
+	}
 	if m.logicalTurnID == "" {
 		m.logicalTurnID = identity.NewUUIDv7()
 	}
 	snapshot := &upstream.CodexIdentitySnapshot{
-		InstallationID:     device.MachineID,
+		InstallationID:     binding.InstallationID,
+		DeviceOSHint:       binding.DeviceOSHint,
 		SessionID:          binding.RootSessionID,
 		ThreadID:           binding.ThreadID,
 		TurnID:             m.logicalTurnID,
@@ -811,6 +834,9 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	binding.EgressID = firstNonEmpty(egress.ID, lease.Egress.ID)
 	// The mapping's internal identity is the source of truth. Do not derive it
 	// from a retry body or a downstream correlator.
+	binding.InstallationID = mapping.snapshot.InstallationID
+	binding.DeviceOSHint = mapping.snapshot.DeviceOSHint
+	binding.DeviceOSHintSet = true
 	binding.RootSessionID = mapping.snapshot.SessionID
 	binding.ThreadID = mapping.snapshot.ThreadID
 	binding.ParentThreadID = mapping.snapshot.ParentThreadID

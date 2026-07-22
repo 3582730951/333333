@@ -101,6 +101,14 @@ type CodexSessionBinding struct {
 	Epoch     int64
 	State     string
 
+	// InstallationID and DeviceOSHint describe the virtual Codex device selected
+	// for this upstream tree. They are stored only inside encrypted_identity: a
+	// continuation must not recompute either from a later request's OS-shaped
+	// input. DeviceOSHintSet distinguishes an elected host-default hint ("") from
+	// a legacy mapping that predates this field.
+	InstallationID     string
+	DeviceOSHint       string
+	DeviceOSHintSet    bool
 	RootSessionID      string
 	ThreadID           string
 	ParentThreadID     string
@@ -152,6 +160,9 @@ type CodexUpstreamAttempt struct {
 }
 
 type codexSessionIdentityPayload struct {
+	InstallationID     string `json:"installation_id,omitempty"`
+	DeviceOSHint       string `json:"device_os_hint,omitempty"`
+	DeviceOSHintSet    bool   `json:"device_os_hint_set,omitempty"`
 	RootSessionID      string `json:"root_session_id"`
 	ThreadID           string `json:"thread_id"`
 	ParentThreadID     string `json:"parent_thread_id,omitempty"`
@@ -263,6 +274,9 @@ const codexInstructionSnapshotColumns = `tree_id,encrypted_instructions,revision
 
 func (s *Store) sealCodexSessionIdentity(binding CodexSessionBinding) (string, error) {
 	payload, err := json.Marshal(codexSessionIdentityPayload{
+		InstallationID:     binding.InstallationID,
+		DeviceOSHint:       binding.DeviceOSHint,
+		DeviceOSHintSet:    binding.DeviceOSHintSet,
 		RootSessionID:      binding.RootSessionID,
 		ThreadID:           binding.ThreadID,
 		ParentThreadID:     binding.ParentThreadID,
@@ -284,6 +298,9 @@ func (s *Store) openCodexSessionIdentity(value string, binding *CodexSessionBind
 	if err := json.Unmarshal([]byte(plain), &payload); err != nil {
 		return err
 	}
+	binding.InstallationID = strings.TrimSpace(payload.InstallationID)
+	binding.DeviceOSHint = strings.TrimSpace(payload.DeviceOSHint)
+	binding.DeviceOSHintSet = payload.DeviceOSHintSet
 	binding.RootSessionID = strings.TrimSpace(payload.RootSessionID)
 	binding.ThreadID = strings.TrimSpace(payload.ThreadID)
 	binding.ParentThreadID = strings.TrimSpace(payload.ParentThreadID)

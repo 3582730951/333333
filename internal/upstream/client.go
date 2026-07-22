@@ -1046,9 +1046,10 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
 	if spec.CodexIdentity != nil {
 		// A native Codex mapping binds virtual device state to the exact account
-		// and exit. The standalone fallback keeps the historical account-only
-		// profile for callers that have no durable mapping.
-		id = identity.CodexDevice(c.identitySecret, spec.Account.ID, spec.Egress.ID, spec.OSHint)
+		// and exit, including the OS-shaped profile that produces its User-Agent.
+		// The standalone fallback keeps the historical account-only profile for
+		// callers that have no durable mapping.
+		id = identity.CodexDevice(c.identitySecret, spec.Account.ID, spec.Egress.ID, spec.CodexIdentity.DeviceOSHint)
 	}
 	// Mirror the downstream client's launch entrypoint (interactive `codex` vs
 	// `codex exec`) so Originator + User-Agent agree with each other and with what
