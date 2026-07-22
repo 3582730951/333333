@@ -178,7 +178,13 @@ type Config struct {
 	GoalLeaseSeconds           int     `json:"goal_lease_seconds"`
 	GoalHeartbeatSeconds       int     `json:"goal_heartbeat_seconds"`
 	GoalCompressionConcurrency int     `json:"goal_compression_concurrency"`
-	AdminToken                 string  `json:"admin_token"`
+	// CodexSessionMappingEnabled enables the strict native Responses context
+	// engine. It stores only encrypted identity metadata plus HMAC aliases; unlike
+	// goal/context replay it never persists or reconstructs prompt history.
+	CodexSessionMappingEnabled       bool   `json:"codex_session_mapping_enabled"`
+	CodexSessionMappingRetentionDays int    `json:"codex_session_mapping_retention_days"`
+	CodexCPAStrict                   bool   `json:"codex_cpa_strict"`
+	AdminToken                       string `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
 	// cookie security, or generated public URLs. Direct internet clients cannot
 	// spoof X-Forwarded-* unless their immediate peer is in this list.
@@ -756,48 +762,51 @@ type ThinkingOverride struct {
 
 func Default() Config {
 	return Config{
-		ListenAddr:                     DefaultListenAddr,
-		DatabasePath:                   DefaultDatabasePath,
-		UpstreamBaseURL:                DefaultUpstreamBaseURL,
-		OpenAIAPIUpstreamBaseURL:       DefaultOpenAIAPIUpstreamBaseURL,
-		ClientVersion:                  DefaultClientVersion,
-		DefaultGroup:                   DefaultGroupName,
-		Virtual2MEnabled:               false,
-		VirtualContextWindow:           DefaultVirtualWindow,
-		VirtualContextLedgerTTLSeconds: DefaultVirtualContextLedgerTTLSeconds,
-		StickyWaitMillis:               DefaultStickyWaitMillis,
-		AdmissionWaitMillis:            DefaultAdmissionWaitMillis,
-		RequestTimeoutSeconds:          DefaultRequestTimeoutSec,
-		ShutdownDrainSeconds:           DefaultShutdownDrainSec,
-		MaxBodyBytes:                   DefaultMaxBodyBytes,
-		AccountTokenBudget:             DefaultAccountTokenBudget,
-		ResourceHeadroomPercent:        10,
-		ContextJournalTTLSeconds:       3600,
-		ContextJournalMaxRows:          50000,
-		ContextJournalMaxMB:            200,
-		GoalContinuityEnabled:          true,
-		GoalLegacyJournalDualWrite:     true,
-		GoalRetentionDays:              7,
-		GoalStorageMaxMB:               256,
-		GoalCompressionChunkRatio:      0.70,
-		GoalCompressionMaxStages:       16,
-		GoalLeaseSeconds:               90,
-		GoalHeartbeatSeconds:           15,
-		GoalCompressionConcurrency:     1,
-		TrustedProxyCIDRs:              []string{"127.0.0.0/8", "::1/128"},
-		SidecarTimeoutSeconds:          120,
-		KiroVersion:                    "0.11.107",
-		KiroNodeVersion:                "22.22.0",
-		KiroDefaultAuthRegion:          "us-east-1",
-		KiroDefaultAPIRegion:           "us-east-1",
-		KiroDefaultThinking:            true,
-		KiroCacheMode:                  "auto",
-		KiroCacheUnreportedThreshold:   DefaultKiroCacheUnreportedThreshold,
-		SchedulerHeartbeatSeconds:      15,
-		StreamKeepAliveSeconds:         15,
-		StreamContinueText:             "Please continue from exactly where you left off, without repeating anything.",
-		StreamAutoContinueMaxAttempts:  1,
-		ConversationIsolation:          true,
+		ListenAddr:                       DefaultListenAddr,
+		DatabasePath:                     DefaultDatabasePath,
+		UpstreamBaseURL:                  DefaultUpstreamBaseURL,
+		OpenAIAPIUpstreamBaseURL:         DefaultOpenAIAPIUpstreamBaseURL,
+		ClientVersion:                    DefaultClientVersion,
+		DefaultGroup:                     DefaultGroupName,
+		Virtual2MEnabled:                 false,
+		VirtualContextWindow:             DefaultVirtualWindow,
+		VirtualContextLedgerTTLSeconds:   DefaultVirtualContextLedgerTTLSeconds,
+		StickyWaitMillis:                 DefaultStickyWaitMillis,
+		AdmissionWaitMillis:              DefaultAdmissionWaitMillis,
+		RequestTimeoutSeconds:            DefaultRequestTimeoutSec,
+		ShutdownDrainSeconds:             DefaultShutdownDrainSec,
+		MaxBodyBytes:                     DefaultMaxBodyBytes,
+		AccountTokenBudget:               DefaultAccountTokenBudget,
+		ResourceHeadroomPercent:          10,
+		ContextJournalTTLSeconds:         3600,
+		ContextJournalMaxRows:            50000,
+		ContextJournalMaxMB:              200,
+		GoalContinuityEnabled:            true,
+		GoalLegacyJournalDualWrite:       true,
+		GoalRetentionDays:                7,
+		GoalStorageMaxMB:                 256,
+		GoalCompressionChunkRatio:        0.70,
+		GoalCompressionMaxStages:         16,
+		GoalLeaseSeconds:                 90,
+		GoalHeartbeatSeconds:             15,
+		GoalCompressionConcurrency:       1,
+		CodexSessionMappingEnabled:       true,
+		CodexSessionMappingRetentionDays: 7,
+		CodexCPAStrict:                   true,
+		TrustedProxyCIDRs:                []string{"127.0.0.0/8", "::1/128"},
+		SidecarTimeoutSeconds:            120,
+		KiroVersion:                      "0.11.107",
+		KiroNodeVersion:                  "22.22.0",
+		KiroDefaultAuthRegion:            "us-east-1",
+		KiroDefaultAPIRegion:             "us-east-1",
+		KiroDefaultThinking:              true,
+		KiroCacheMode:                    "auto",
+		KiroCacheUnreportedThreshold:     DefaultKiroCacheUnreportedThreshold,
+		SchedulerHeartbeatSeconds:        15,
+		StreamKeepAliveSeconds:           15,
+		StreamContinueText:               "Please continue from exactly where you left off, without repeating anything.",
+		StreamAutoContinueMaxAttempts:    1,
+		ConversationIsolation:            true,
 		// Auto-inject Claude cache_control on the OpenAI-compat path by default so
 		// that path benefits from prompt caching like native Claude Code does.
 		ClaudeCacheControlInject:          true,
@@ -1329,6 +1338,9 @@ func (c *Config) normalize() {
 	}
 	if c.GoalCompressionConcurrency <= 0 {
 		c.GoalCompressionConcurrency = 1
+	}
+	if c.CodexSessionMappingRetentionDays <= 0 {
+		c.CodexSessionMappingRetentionDays = 7
 	}
 	if c.SidecarTimeoutSeconds <= 0 {
 		c.SidecarTimeoutSeconds = 120

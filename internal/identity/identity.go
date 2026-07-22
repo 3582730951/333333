@@ -25,6 +25,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 // Current official client versions. Kept here so a single edit updates the
@@ -365,6 +368,31 @@ func ForOS(secret []byte, accountID, osName string) Identity {
 		return forPool(secret, accountID, pool)
 	}
 	return For(secret, accountID)
+}
+
+// CodexDevice returns the stable virtual device profile for one account/egress
+// boundary.  Codex's installation id is a device property, so a session that must
+// stay on a particular exit gets a profile stable across restarts while another exit
+// cannot accidentally present the same virtual installation.
+func CodexDevice(secret []byte, accountID, egressID, osName string) Identity {
+	return ForOS(secret, strings.TrimSpace(accountID)+"\x00codex-egress\x00"+strings.TrimSpace(egressID), osName)
+}
+
+// NewUUIDv7 creates a time-ordered UUIDv7 for a logical Codex session/thread/turn.
+// Unlike DerivedUUIDv7 it intentionally has fresh randomness: persistent mapping
+// rows retain the chosen values, while each new root/branch/turn mirrors the native
+// client's newly allocated UUID lifecycle.
+func NewUUIDv7() string {
+	if value, err := uuid.NewV7(); err == nil {
+		return value.String()
+	}
+	// uuid.NewRandom is still RFC4122-valid if a system clock/rand failure prevents
+	// the library's v7 constructor. The caller persists it immediately, so this is
+	// preferable to deterministic reuse. This path is exceptionally rare.
+	if value, err := uuid.NewRandom(); err == nil {
+		return value.String()
+	}
+	return DerivedUUIDv7At("codex-uuidv7-fallback", fmt.Sprintf("%d", time.Now().UnixNano()), time.Now().UnixMilli())
 }
 
 func forFamily(secret []byte, accountID, osName string) Identity {

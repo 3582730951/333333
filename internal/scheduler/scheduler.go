@@ -223,7 +223,12 @@ type Route struct {
 	ExplicitProvider bool
 	// ThinkingRequired is retained for route diagnostics/call-site compatibility.
 	// Kiro scheduling always enforces adaptive-thinking support, even when false.
-	ThinkingRequired      bool
+	ThinkingRequired bool
+	// RequiredAccountID is an exact, externally persisted session binding owned by
+	// the Codex CPA mapper. Unlike ordinary affinity it may never fall through to a
+	// fresh account: previous_response_id / turn-state belongs to one upstream
+	// session. RequiredEgressID completes that same identity boundary.
+	RequiredAccountID     string
 	RequiredEgressID      string
 	KiroEndpointAllowlist []string
 	KiroDefaultRegion     string
@@ -404,6 +409,21 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	hadBinding := false
 	if route.Group == "" {
 		route.Group = cfg.DefaultGroup
+	}
+	if strings.TrimSpace(route.RequiredAccountID) != "" {
+		if route.Exclude[route.RequiredAccountID] {
+			return Lease{}, fmt.Errorf("%w: account=%s", ErrBoundAccountUnavailable, route.RequiredAccountID)
+		}
+		lease, reason, ok := s.tryLeaseAccountDetailed(ctx, route.RequiredAccountID, route, nil)
+		if ok {
+			return lease, nil
+		}
+		if route.ServerSideState && statefulStickyWaitReason(reason) {
+			if lease, err := s.waitForStatefulStickyLease(ctx, route.RequiredAccountID, route, reason); err == nil {
+				return lease, nil
+			}
+		}
+		return Lease{}, fmt.Errorf("%w: account=%s egress=%s reason=%s", ErrBoundAccountUnavailable, route.RequiredAccountID, route.RequiredEgressID, reason.humanString())
 	}
 	if route.Affinity.Hash != "" {
 		if bound, err := s.affinitySnapshot(ctx, route.Affinity.Hash); err == nil {

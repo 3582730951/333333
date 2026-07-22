@@ -34,6 +34,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		Admission         interface{}              `json:"admission"`
 		ContextRebuilt    uint64                   `json:"context_rebuilt"`
 		ContextDegraded   uint64                   `json:"context_degraded"`
+		CodexSessionMap   map[string]interface{}   `json:"codex_session_mapping"`
 		Sidecar           interface{}              `json:"sidecar,omitempty"`
 		DiskGuard         DiskGuardSnapshot        `json:"disk_guard"`
 		SupervisorEvents  []supervisor.Event       `json:"supervisor_events"`
@@ -42,6 +43,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		Metrics:        sysmetrics.Collect(dataDir),
 		Admission:      s.scheduler.AdmissionSnapshot(),
 		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
+		CodexSessionMap:   s.codexSessionMappingStats(r.Context()),
 		Sidecar:           s.sidecarMetrics(r.Context()),
 		DiskGuard:         s.diskGuardSnapshot(),
 		SupervisorEvents:  supervisor.RecentEvents(),

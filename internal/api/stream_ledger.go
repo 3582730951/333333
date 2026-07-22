@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+
+	"codex-account-pool/internal/leakfilter"
 )
 
 const streamLedgerMaxPartialFrame = 256 * 1024
@@ -17,8 +19,14 @@ type codexStreamLedgerRecorder struct {
 	text      strings.Builder
 	completed map[string]interface{}
 	terminal  string
-	added     []interface{}
-	done      []interface{}
+	turnState string
+	// contextError is captured from the raw terminal SSE frame before any
+	// downstream filtering. Strict CPA uses it only to retire a confirmed lost
+	// previous_response epoch; ordinary missing tool output remains visible but
+	// does not rotate the mapping.
+	contextError leakfilter.ResponsesContextErrorKind
+	added        []interface{}
+	done         []interface{}
 	// rateLimits holds the most recent codex.rate_limits frame's windows (workstream B:
 	// real-time Codex quota captured before leakfilter drops the frame).
 	rateLimits codexStreamRateLimits
@@ -123,6 +131,22 @@ func (r *codexStreamLedgerRecorder) completedSuccessfully() bool {
 	return r.terminal == "response.completed"
 }
 
+func (r *codexStreamLedgerRecorder) terminalContextError() leakfilter.ResponsesContextErrorKind {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.contextError
+}
+
+// responseTurnState returns the opaque upstream continuation token observed in a
+// response.metadata SSE event. WebSocket Responses transports carry this value in
+// the event headers rather than the HTTP response headers, so it must be retained
+// separately from the synthesized terminal response JSON.
+func (r *codexStreamLedgerRecorder) responseTurnState() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.turnState
+}
+
 // partialText returns the assistant output text accumulated so far.
 func (r *codexStreamLedgerRecorder) partialText() string {
 	r.mu.Lock()
@@ -162,6 +186,9 @@ func (r *codexStreamLedgerRecorder) metadata() (string, string, codexStreamRateL
 }
 
 func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
+	if failure, ok := leakfilter.ParseCodexFailureFrame(frame); ok && failure.ContextError != leakfilter.ResponsesContextErrorNone {
+		r.contextError = failure.ContextError
+	}
 	eventType, data := sseFrameEventData(frame)
 	if len(data) == 0 || strings.TrimSpace(string(data)) == "[DONE]" {
 		return
@@ -175,10 +202,16 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		typ = eventType
 	}
 	switch typ {
+	case "response.metadata":
+		r.turnState = firstNonEmpty(r.turnState, codexSSEHeaderValue(ev, "x-codex-turn-state"))
 	case "response.created":
 		if resp, ok := ev["response"].(map[string]interface{}); ok {
-			r.id = firstNonEmpty(r.id, streamString(resp["id"]))
-			r.model = firstNonEmpty(r.model, streamString(resp["model"]))
+			if id := strings.TrimSpace(streamString(resp["id"])); id != "" {
+				r.id = id
+			}
+			if model := strings.TrimSpace(streamString(resp["model"])); model != "" {
+				r.model = model
+			}
 		}
 	case "response.output_text.delta":
 		if delta := streamString(ev["delta"]); delta != "" {
@@ -196,8 +229,12 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		r.terminal = typ
 		if resp, ok := ev["response"].(map[string]interface{}); ok {
 			r.completed = cloneJSONMap(resp)
-			r.id = firstNonEmpty(r.id, streamString(resp["id"]))
-			r.model = firstNonEmpty(r.model, streamString(resp["model"]))
+			if id := strings.TrimSpace(streamString(resp["id"])); id != "" {
+				r.id = id
+			}
+			if model := strings.TrimSpace(streamString(resp["model"])); model != "" {
+				r.model = model
+			}
 		} else if typ == "response.failed" {
 			r.completed = cloneJSONMap(ev)
 			r.completed["status"] = "failed"
@@ -207,6 +244,18 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 			r.rateLimits = rl
 		}
 	}
+}
+
+func codexSSEHeaderValue(event map[string]interface{}, name string) string {
+	headers, _ := event["headers"].(map[string]interface{})
+	for key, value := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), name) {
+			continue
+		}
+		text, _ := value.(string)
+		return strings.TrimSpace(text)
+	}
+	return ""
 }
 
 func (r *codexStreamLedgerRecorder) outputItems(text string) []interface{} {

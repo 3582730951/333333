@@ -724,6 +724,13 @@ func (s *Store) Init(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, goalContinuitySchemaSQL); err != nil {
 		return err
 	}
+	// Codex session mappings are independent from the legacy goal/context replay
+	// store. They contain encrypted identity metadata plus HMAC aliases only, so an
+	// upgrade can begin exact native previous_response_id routing without rewriting
+	// any historical prompt bodies.
+	if _, err := s.db.ExecContext(ctx, codexSessionMappingSchemaSQL); err != nil {
+		return err
+	}
 	// Create lifecycle management tables
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
 		return err

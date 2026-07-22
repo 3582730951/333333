@@ -14,7 +14,16 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
+// skipLegacyCodexGoalReplay marks tests for the v1 Codex goal/checkpoint engine.
+// CPA-v2 deliberately keeps Codex context only in the original upstream session;
+// equivalent mapping/EOF/tool-result coverage lives in codex_session_mapping_test.go.
+func skipLegacyCodexGoalReplay(t *testing.T) {
+	t.Helper()
+	t.Skip("Codex goal/journal replay was retired in favor of strict CPA-v2 mapping")
+}
+
 func TestGoalContinuityRebuildsResponseAliasAfterRestartStyleRequest(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var upstreamCalls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -73,6 +82,7 @@ func TestGoalContinuityRebuildsResponseAliasAfterRestartStyleRequest(t *testing.
 }
 
 func TestGoalContinuityAcceptsCustomToolCallOutputOnResume(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var upstreamCalls atomic.Int32
 	var pairedReplay atomic.Bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -120,6 +130,7 @@ func TestGoalContinuityAcceptsCustomToolCallOutputOnResume(t *testing.T) {
 }
 
 func TestGoalContinuityRejectsUnpairedCustomToolCallBeforeUpstream(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var upstreamCalls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if upstreamCalls.Add(1) != 1 {
@@ -174,6 +185,7 @@ func TestGoalContinuityRejectsUnpairedCustomToolCallBeforeUpstream(t *testing.T)
 }
 
 func TestGoalContinuityStreamCustomToolCallRequiresResultBeforeResume(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var upstreamCalls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if upstreamCalls.Add(1) != 1 {
@@ -218,6 +230,7 @@ func TestGoalContinuityStreamCustomToolCallRequiresResultBeforeResume(t *testing
 }
 
 func TestGoalContinuitySendsBoundedContinueBeforeSynthesizingEOFError(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var calls atomic.Int32
 	var continuationInstruction atomic.Bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -287,6 +300,7 @@ func TestGoalContinuityDoesNotContinueAQuietLongPollThatLaterTerminates(t *testi
 }
 
 func TestGoalContinuityMarksVisibleUpstreamFailureRetryableWithoutSecondTerminal(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
@@ -325,6 +339,7 @@ func TestGoalContinuityMarksVisibleUpstreamFailureRetryableWithoutSecondTerminal
 }
 
 func TestGoalContinuitySeparatesConcurrentCLIThreadsWithSharedWeakSession(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -507,6 +522,7 @@ func TestGoalContinuityPersistsClaudeBoundedContinuation(t *testing.T) {
 }
 
 func TestGoalContinuitySchedulesBoundedCheckpointCompaction(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		id := calls.Add(1)
@@ -555,6 +571,7 @@ func TestGoalContinuitySchedulesBoundedCheckpointCompaction(t *testing.T) {
 }
 
 func TestGoalContinuityCanStopLegacySnapshotDualWrite(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"resp_goal_no_v1","object":"response","status":"completed","model":"gpt","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}`)
@@ -583,6 +600,7 @@ func TestGoalContinuityCanStopLegacySnapshotDualWrite(t *testing.T) {
 }
 
 func TestGoalResumeUnidentifiedAlwaysProducesStreamTerminal(t *testing.T) {
+	skipLegacyCodexGoalReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("unidentified resume must not contact upstream")
 	})

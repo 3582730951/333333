@@ -99,6 +99,7 @@ func withResponseRuleFilter(ctx context.Context, f *responseRuleFilter) context.
 // path filters headers.
 func (s *Server) writeUpstreamHeaders(ctx context.Context, dst, src http.Header) {
 	stripLeak := s.leakScrubEnabled(ctx)
+	strictCodex := codexStrictCPAFromContext(ctx)
 	for k, values := range src {
 		lower := strings.ToLower(k)
 		if lower == "authorization" ||
@@ -116,7 +117,17 @@ func (s *Server) writeUpstreamHeaders(ctx context.Context, dst, src http.Header)
 			lower == "connection" {
 			continue
 		}
-		if stripLeak && leakfilter.IsLeakHeader(lower) {
+		// CPA-v2 identity values are proxy-internal and must not be reflected to a
+		// downstream client.  The opaque upstream turn state is the one exception:
+		// the client needs it verbatim to resume, and the mapper stores only its
+		// HMAC alias rather than exposing any internal session identity.
+		if strictCodex {
+			switch lower {
+			case "session-id", "thread-id", "x-client-request-id", "x-codex-window-id", "x-codex-parent-thread-id", "x-codex-forked-from-thread-id", "x-codex-turn-metadata", "x-codex-installation-id":
+				continue
+			}
+		}
+		if stripLeak && leakfilter.IsLeakHeader(lower) && !(strictCodex && lower == "x-codex-turn-state") {
 			continue
 		}
 		for _, value := range values {
@@ -177,7 +188,12 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 	if v, ok := ctx.Value(responseRuleFilterKey{}).(*responseRuleFilter); ok {
 		rf = v
 	}
-	if rf != nil {
+	// Strict CPA leaves native Codex context/tool frames untouched. It still uses
+	// the heartbeat reader so a long upstream silence produces a protocol-valid
+	// keepalive rather than being mistaken for EOF and locally continued.
+	if provider == "codex" && codexStrictCPAFromContext(ctx) {
+		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, nil, false, nil, provider, s.streamKeepAliveInterval(ctx))
+	} else if rf != nil {
 		err = newRuleSSECopy(ctx, sw, body, rf, s.leakScrubEnabled(ctx), words, provider)
 	} else if interval := s.streamKeepAliveInterval(ctx); interval > 0 {
 		// General downstream keepalive: route the no-rule stream through the
@@ -298,7 +314,7 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		if leak {
 			out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
 		} else {
-			if provider == "codex" {
+			if provider == "codex" && !codexStrictCPAFromContext(ctx) {
 				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
 			}
 			if words != nil && !words.Empty() {
@@ -465,13 +481,9 @@ func probeEarlySSEFailure(body io.Reader, retryableFrame func([]byte) bool, cont
 func codexSSEFrameCommitsContent(frame []byte) bool {
 	lower := strings.ToLower(string(frame))
 	for _, marker := range []string{
-		// response.created proves the upstream accepted the turn.  Releasing the
-		// early-error probe here is essential for long-poll/task responses: waiting
-		// for the first text delta would leave the relay unable to emit its protocol
-		// keepalive while the upstream is legitimately silent.  A later failure is
-		// still relayed as its explicit terminal event; it is no longer safe to hide
-		// it behind transparent account failover after a real response has begun.
-		"response.created",
+		// A response.created frame is only lifecycle metadata, not committed output.
+		// Keep it in the bounded early-error probe so an immediately-following
+		// response.failed can still be handled before anything is sent downstream.
 		"response.output_text.delta",
 		"response.output_item.added",
 		"response.function_call_arguments.delta",
@@ -512,6 +524,10 @@ func claudeSSEFrameCommitsContent(frame []byte) bool {
 // account-agnostic error when leak-scrub is on, and always filtering headers.
 // provider is "claude" for the Anthropic protocol, "codex" otherwise.
 func (s *Server) writeFilteredError(ctx context.Context, w http.ResponseWriter, provider string, status int, header http.Header, body []byte, words *streamrewrite.Matcher) {
+	if strings.EqualFold(provider, "codex") && codexStrictCPAFromContext(ctx) {
+		writeRaw(w, status, header, body)
+		return
+	}
 	out := body
 	filteredHeader := header
 	if !strings.EqualFold(provider, "claude") {

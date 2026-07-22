@@ -35,7 +35,13 @@ type CodexResponsesWebSocketSession struct {
 	conn      *websocket.Conn
 	target    string
 	accountID string
-	closed    bool
+	egressID  string
+	// identityKey covers handshake-scoped CPA metadata. A persistent Responses
+	// WebSocket may be reused for sequential turns of one mapped thread, but never
+	// for a different root/branch or a post-compaction window whose handshake
+	// headers would otherwise describe the prior identity.
+	identityKey string
+	closed      bool
 }
 
 func NewCodexResponsesWebSocketSession() *CodexResponsesWebSocketSession {
@@ -51,6 +57,8 @@ func (s *CodexResponsesWebSocketSession) Close() error {
 	}
 	err := s.conn.Close()
 	s.conn = nil
+	s.egressID = ""
+	s.identityKey = ""
 	return err
 }
 
@@ -201,7 +209,8 @@ func (s *CodexResponsesWebSocketSession) connection(ctx context.Context, c *Clie
 	if s.closed {
 		return nil, nil, errors.New("codex websocket session is closed")
 	}
-	if s.conn != nil && s.target == target && s.accountID == spec.Account.ID {
+	identityKey := codexWebSocketSessionIdentityKey(spec)
+	if s.conn != nil && s.target == target && s.accountID == spec.Account.ID && s.egressID == spec.Egress.ID && s.identityKey == identityKey {
 		return s.conn, nil, nil
 	}
 	if s.conn != nil {
@@ -222,7 +231,23 @@ func (s *CodexResponsesWebSocketSession) connection(ctx context.Context, c *Clie
 	s.conn = conn
 	s.target = target
 	s.accountID = spec.Account.ID
+	s.egressID = spec.Egress.ID
+	s.identityKey = identityKey
 	return conn, nil, nil
+}
+
+func codexWebSocketSessionIdentityKey(spec Request) string {
+	if spec.CodexIdentity == nil {
+		// Preserve legacy reuse behavior for callers that do not participate in
+		// the durable CPA mapper.
+		return ""
+	}
+	identity := spec.CodexIdentity
+	return strings.Join([]string{
+		strings.TrimSpace(identity.SessionID),
+		strings.TrimSpace(identity.ThreadID),
+		identity.WindowID(),
+	}, "\x00")
 }
 
 func (s *CodexResponsesWebSocketSession) invalidate(conn *websocket.Conn) {
@@ -233,6 +258,8 @@ func (s *CodexResponsesWebSocketSession) invalidate(conn *websocket.Conn) {
 	}
 	_ = s.conn.Close()
 	s.conn = nil
+	s.egressID = ""
+	s.identityKey = ""
 }
 
 func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*websocket.Dialer, error) {
@@ -287,6 +314,12 @@ func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
 	dst.Del("Accept")
 	deleteHeaderFold(dst, "Content-Type")
 	deleteHeaderFold(dst, "Session_id")
+	if ids.mappedIdentity {
+		// The strict CPA mapping serializes fork ancestry into the canonical turn
+		// metadata. Keeping a raw downstream header would make the two transports
+		// disagree about the branch relation.
+		deleteHeaderFold(dst, "x-codex-forked-from-thread-id")
+	}
 
 	setHeaderPreserveCase(dst, "OpenAI-Beta", codexResponsesWebSocketBeta)
 	setHeaderPreserveCase(dst, "session-id", ids.sessionID)

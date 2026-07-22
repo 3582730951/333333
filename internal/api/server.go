@@ -125,7 +125,15 @@ type Server struct {
 	goalCompactionActive int
 	contextRebuilt       uint64
 	contextDegraded      uint64
-	diskGuard            atomic.Value // DiskGuardSnapshot
+	// Codex CPA-v2 aggregate-only observability. Values intentionally carry no
+	// downstream/upstream ids or prompt bodies.
+	codexMappingBindingsCreated uint64
+	codexMappingEpochRotations  uint64
+	codexMappingUnidentified    uint64
+	codexMappingAmbiguous       uint64
+	codexNativeContinues        uint64
+	codexEOFCompensations       uint64
+	diskGuard                   atomic.Value // DiskGuardSnapshot
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -355,6 +363,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler != nil {
 		body["scheduler"] = s.scheduler.Metrics()
 	}
+	body["codex_session_mapping"] = s.codexSessionMappingStats(r.Context())
 	writeJSON(w, http.StatusOK, body)
 }
 
@@ -478,17 +487,13 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.goalContinuityEnabled(r.Context()) {
-		w.Header().Set("X-MiCliProxy-Context-Engine", "v2; build=goal-continuity-v2")
-	}
 	// Carry the matched key/user identity in the context so usage is attributed to the
 	// owning portal user (their console reads /user/usage).
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
-	// Preserve only this request's exact correlators while later recovery replaces a
-	// stateful body with a self-contained checkpoint replay.  They are hashed at the
-	// storage boundary and are never logged or exposed by admin APIs.
-	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "codex")))
-	r = r.WithContext(withGoalOriginalBody(r.Context(), raw))
+	// This is populated only after provider routing below confirms the request is
+	// headed to native Codex. Claude and custom providers keep their own continuity
+	// semantics and must not create Codex aliases merely by sharing this gateway.
+	var codexMapping *codexSessionMapping
 	// Gateway reliability model routing (opt-in): when the layer is on and neither the
 	// key nor the group forced a model, apply the configured reliability model BEFORE
 	// routing so account selection lands on an account that actually has it. Empty
@@ -506,17 +511,13 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Pool-Requested-Model", requestedModel)
 	w.Header().Set("X-Pool-Resolved-Model", resolvedPolicyModel)
 	w.Header().Set("X-Pool-Model-Override-Source", firstNonEmpty(pol.ModelOverrideSource, "none"))
-	// Compliance: sanitize the conversation history (prior assistant turns) before
-	// forwarding upstream. Zero-cost when moderation is off or no keyword matches; the
-	// live streamed reply is never touched.
-	if r.URL.Path == "/v1/chat/completions" {
-		raw = s.moderateHistory(r.Context(), raw, "chat")
-	} else {
-		raw = s.moderateHistory(r.Context(), raw, "responses")
-	}
 	path := r.URL.Path
 	isChat := path == "/v1/chat/completions"
-	isCompact := strings.Contains(path, "/responses/compact")
+	// Compaction is signaled either by the dedicated endpoint or by the native
+	// trigger carried in a Responses body. The same classification drives routing,
+	// request shaping, and the CPA window-generation increment after terminal
+	// success, so the three cannot disagree.
+	isCompact := routing.IsCompaction(path, raw)
 	affinityGroup := pol.Group
 	if affinityGroup == "" {
 		affinityGroup = s.cfg.DefaultGroup
@@ -527,6 +528,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// relayed to the Anthropic upstream (format-converted both ways) instead of
 	// Codex; everything else continues down the Codex/Responses path.
 	if isChat && isClaudeModel(model) {
+		raw = s.moderateHistory(r.Context(), raw, "chat")
 		s.handleChatViaClaude(w, r, raw, model, pol)
 		return
 	}
@@ -536,18 +538,61 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// (near-passthrough) and the Codex /v1/responses entrypoint (Responses ↔ chat).
 	if prov, ok := s.customProviderForModel(r.Context(), model); ok {
 		if isChat {
+			raw = s.moderateHistory(r.Context(), raw, "chat")
+		} else {
+			raw = s.moderateHistory(r.Context(), raw, "responses")
+		}
+		if isChat {
 			s.handleChatViaCustom(w, r, raw, model, pol.Group, prov)
 		} else {
 			s.handleResponsesViaCustom(w, r, raw, model, pol.Group, prov)
 		}
 		return
 	}
-	if !isChat {
+	// Native Codex context is owned exclusively by the upstream Responses session.
+	// Resolve only exact downstream aliases here; unlike the retired goal/journal
+	// engine this never rebuilds prompt history or rewrites tool output.
+	if s.codexSessionMappingEnabled(r.Context()) {
+		s.codexMappingContextHeader(w)
+		var mappingErr error
+		codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
+		if mappingErr != nil {
+			code := codexMappingErrorCode(mappingErr)
+			// An unidentified first request without a real session identity is valid:
+			// it receives a one-shot identity and is bound only after success. Every
+			// stateful request, ambiguity, and retired epoch is explicit downstream.
+			if codexDownstreamSessionIdentity(r.Header, raw).stateful() || code != "codex_session_mapping_unidentified" {
+				s.auditCodexMappingFailure(r.Context(), code)
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+				return
+			}
+		}
+		r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
+		if s.codexCPAStrict(r.Context()) {
+			r = r.WithContext(withCodexStrictCPA(r.Context()))
+		}
+	}
+	// Strict CPA sends Responses context and client tool results directly to the
+	// original upstream session. In that mode even a moderation rewrite would make
+	// the submitted tool payload differ from what the client paired with its call.
+	if !codexStrictCPAFromContext(r.Context()) {
+		if isChat {
+			raw = s.moderateHistory(r.Context(), raw, "chat")
+		} else {
+			raw = s.moderateHistory(r.Context(), raw, "responses")
+		}
+	}
+	// Native CPA turns must preserve the submitted Responses payload.  The
+	// compatibility fields below are useful for ordinary stateless traffic, but
+	// adding them beside a previous_response_id or a client tool result creates a
+	// different upstream turn rather than an exact native resume.
+	strictNativeCPA := codexStrictCPAFromContext(r.Context()) && !isChat
+	if !isChat && !strictNativeCPA {
 		raw = ensureEncryptedReasoningInclude(raw)
 	}
 
 	compiledModelInstructions := ""
-	if group, err := s.store.GetGroup(r.Context(), affinityGroup); err == nil && group.ModelInstructionsEnabled {
+	if group, err := s.store.GetGroup(r.Context(), affinityGroup); err == nil && group.ModelInstructionsEnabled && !strictNativeCPA {
 		compiled, _, err := s.compileGroupModelInstructions(r.Context(), group)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -562,81 +607,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A /goal resume is represented downstream by real session correlators, not a
-	// literal command.  Resolve it before selecting an account: a recovered payload is
-	// self-contained and may safely move to a compatible account after a restart.
-	goalContextRecovered := false
-	if hadServerState := routing.HasServerSideState(path, r, raw); hadServerState && s.goalContinuityEnabled(r.Context()) {
-		replay := s.goalReplayBody(r.Context(), r, "codex", raw)
-		switch replay.Kind {
-		case goalResumeFound:
-			leaseOwner := "gateway:" + requestIDFromContext(r.Context())
-			if leaseOwner == "gateway:" {
-				leaseOwner = fmt.Sprintf("gateway:%d", time.Now().UnixNano())
-			}
-			goalRun, leaseErr := s.store.AcquireGoalRun(r.Context(), replay.Session.ID, leaseOwner, "running", s.goalLeaseDuration(r.Context()))
-			if leaseErr != nil {
-				if errors.Is(leaseErr, storage.ErrGoalInProgress) {
-					writeGoalResumeError(w, isStreamRequest(raw), "codex", goalResumeInProgress, leaseErr.Error())
-				} else {
-					writeGoalResumeError(w, isStreamRequest(raw), "codex", goalResumeUnidentified, leaseErr.Error())
-				}
-				return
-			}
-			// The lease covers the full foreground relay, including a bounded EOF
-			// continuation.  Any unfinished work remains in its checkpoint chain;
-			// completing this relay lease never repeats a pending client tool call.
-			heartbeatStop := make(chan struct{})
-			heartbeatDone := make(chan struct{})
-			heartbeatInterval := s.goalHeartbeatDuration(r.Context())
-			go func(runID, owner string, lease, interval time.Duration) {
-				defer close(heartbeatDone)
-				ticker := time.NewTicker(interval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-heartbeatStop:
-						return
-					case <-ticker.C:
-						if err := s.store.HeartbeatGoalRun(context.Background(), runID, owner, lease); err != nil {
-							log.Printf("[GOAL-HEARTBEAT] run=%s: %v", runID, err)
-							return
-						}
-					}
-				}
-			}(goalRun.ID, leaseOwner, s.goalLeaseDuration(r.Context()), heartbeatInterval)
-			defer func(runID, owner string) {
-				close(heartbeatStop)
-				<-heartbeatDone
-				_ = s.store.FinishGoalRun(context.Background(), runID, owner, "completed", "")
-			}(goalRun.ID, leaseOwner)
-			raw = replay.Body
-			goalContextRecovered = true
-			w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
-			w.Header().Set("X-MiCliProxy-Goal-Status", replay.Session.State)
-			atomic.AddUint64(&s.contextRebuilt, 1)
-		case goalResumeAmbiguous, goalResumeRequiresToolResult, goalResumeStorageExhausted:
-			writeGoalResumeError(w, isStreamRequest(raw), "codex", replay.Kind, replay.Reason)
-			return
-		case goalResumeUnidentified:
-			// v1 stays a read fallback throughout the dual-write migration.  Its
-			// successful replay is still explicit and does not downgrade context.
-			if rebuilt, ok := s.journalReplayBody(r.Context(), raw); ok {
-				raw = rebuilt
-				goalContextRecovered = true
-				w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt-v1-fallback")
-			} else {
-				writeGoalResumeError(w, isStreamRequest(raw), "codex", replay.Kind, replay.Reason)
-				return
-			}
-		}
-	}
 	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
 	currentHeader := r.Header.Clone()
-	contextRecovered := goalContextRecovered
-	if contextRecovered {
-		currentHeader = stripCodexServerStateHeaders(currentHeader)
-	}
 	// movable: the request carries its full input and so can be re-sent to a fresh
 	// account losslessly. This is the failover gate. It is broader than !strict: a
 	// strict-sticky turn (tool_result/function_call_output, kept on one account for
@@ -645,39 +617,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// genuine server-side-state turns (previous_response_id / x-codex-turn-state) are
 	// non-movable, because a fresh account cannot continue from state it never created.
 	movable := !routing.HasServerSideState(path, r, raw)
-	if !movable {
-		if _, bindErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindErr != nil {
-			if rebuilt, ok := s.journalReplayBody(r.Context(), raw); ok {
-				raw = rebuilt
-				currentHeader = stripCodexServerStateHeaders(currentHeader)
-				contextRecovered = true
-				movable = true
-				w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
-				atomic.AddUint64(&s.contextRebuilt, 1)
-			}
-		}
-	}
-	if !movable {
-		if affinity.Hash == "" {
-			writePoolCodeError(w, http.StatusConflict, "state_binding_missing", "request depends on server-side state but no persisted session binding exists")
-			return
-		}
-		if _, bindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindingErr != nil {
-			if storage.NotFound(bindingErr) {
-				raw = degradedResponsesReplay(raw)
-				currentHeader = stripCodexServerStateHeaders(currentHeader)
-				contextRecovered = true
-				movable = true
-				w.Header().Set("X-MiCliProxy-Context-Status", "degraded")
-				atomic.AddUint64(&s.contextDegraded, 1)
-				log.Printf("[CONTEXT-DEGRADED] request_id=%s previous response journal/binding unavailable", requestIDFromContext(r.Context()))
-			} else {
-				writeError(w, http.StatusInternalServerError, bindingErr)
-			}
-			if !movable {
-				return
-			}
-		}
+	if s.codexSessionMappingEnabled(r.Context()) && !movable && (codexMapping == nil || codexMapping.binding == nil) {
+		// resolveCodexSessionMapping should have caught this already; keep a strict
+		// defensive boundary in case a middleware supplied an unusual body shape.
+		s.auditCodexMappingFailure(r.Context(), "codex_session_mapping_unidentified")
+		s.writeCodexSessionMappingError(w, isStreamRequest(raw), "codex_session_mapping_unidentified")
+		return
 	}
 
 	// Transparent seamless failover. A movable request (no per-account server-side
@@ -692,8 +637,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// x-codex-turn-state) are non-movable and surface the error instead, because a fresh
 	// account has no such state to continue from.
 	attempts := 1
-	_, stateReplayAvailable := s.journalReplayBody(r.Context(), raw)
-	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && (movable || stateReplayAvailable) {
+	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
 		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
 			attempts = 1
 		}
@@ -707,16 +651,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// fresh account instead). codexAttempt adds the leased account here before it
 	// returns outcomeRetry.
 	exclude := map[string]bool{}
-	current := codexRetryRequest{Raw: raw, Header: currentHeader, Recovered: contextRecovered}
-	// Context repair has its own one-shot attempt. It is deliberately independent of
-	// seamless_failover and failover_max_attempts: even a single-account deployment with
-	// failover disabled gets one stateless replay after a precise Responses context 400.
-	// Incrementing attemptsRemaining only when that repair is selected makes it an extra
-	// attempt without opening another generic failover round.
-	// A preflight v2 rebuild can still hit an account-local stale-context error on
-	// the affinity-preferred account. Keep one repair/failover budget: the rebuilt
-	// payload is self-contained and can move safely to a compatible account.
-	contextRepairAvailable := true
+	current := codexRetryRequest{Raw: raw, Header: currentHeader}
 	modelCapabilityRejected := false
 	attemptsRemaining := attempts
 	for attemptsRemaining > 0 {
@@ -733,16 +668,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, current.Recovered, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attemptsRemaining > 0, contextRepairAvailable, exclude)
+		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attemptsRemaining > 0, exclude)
 		if result.Outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
 		}
 		if result.Outcome != outcomeRetry && result.Outcome != outcomeModelRetry {
 			return
-		}
-		if result.ContextRecovery {
-			contextRepairAvailable = false
-			attemptsRemaining++
 		}
 		if len(result.Retry.Raw) > 0 {
 			current = result.Retry
@@ -763,16 +694,14 @@ const (
 )
 
 type codexRetryRequest struct {
-	Raw       []byte
-	Header    http.Header
-	Prepared  bool
-	Recovered bool
+	Raw      []byte
+	Header   http.Header
+	Prepared bool
 }
 
 type codexAttemptResult struct {
-	Outcome         attemptOutcome
-	Retry           codexRetryRequest
-	ContextRecovery bool
+	Outcome attemptOutcome
+	Retry   codexRetryRequest
 }
 
 // shouldInjectCodexHostedWebSearch keeps hosted search for classic Responses and
@@ -792,14 +721,14 @@ func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, 
 //
 // exclude carries the accounts this request already failed on; the leased account is
 // added to it before any outcomeRetry so the next attempt selects a different one.
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared, contextRecovered bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry, allowContextRepair bool, exclude map[string]bool) codexAttemptResult {
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
 	// Decode the "stream" flag once for this attempt: isStreamRequest full-parses
 	// the (potentially multi-MB) body, and it was previously called up to 7× on the
 	// same unchanged `raw` within this function. `raw` is a stable parameter here.
 	streamReq := isStreamRequest(raw)
-	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
+	route := scheduler.Route{
 		Group:             routeGroup,
 		Provider:          "codex",
 		Affinity:          affinity,
@@ -812,19 +741,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		Compaction:        routing.IsCompaction(path, raw),
 		Exclude:           exclude,
 		OnWait:            schedulerWaitCallback(r.Context()),
-	})
+	}
+	route = codexMappingRequiredRoute(codexSessionMappingFromContext(r.Context()), route)
+	lease, err := s.scheduler.Select(r.Context(), route)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
-			// The binding exists but its account can no longer serve the turn. Rebuild
-			// from the encrypted journal before surfacing an availability error; the
-			// replay is self-contained and may be scheduled on another account.
-			if allowContextRepair {
-				if rebuilt, status, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader, leakfilter.ResponsesContextErrorNone); ok && status == "rebuilt" {
-					w.Header().Set("X-MiCliProxy-Context-Status", status)
-					atomic.AddUint64(&s.contextRebuilt, 1)
-					return codexAttemptResult{Outcome: outcomeRetry, Retry: rebuilt, ContextRecovery: true}
-				}
-			}
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
@@ -883,6 +804,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// only be overwritten. The rare unmarshal-failure fallback path returns the
 	// original slice, which is read-only from this point on.
 	body := raw
+	strictNativeCPA := codexStrictCPAFromContext(r.Context()) && !isChat
 	promptCacheKeySource := "none"
 	if routing.PromptCacheKey(body) != "" {
 		promptCacheKeySource = "downstream"
@@ -898,7 +820,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 	if !prepared {
-		if compiledModelInstructions == "" && prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
+		if !strictNativeCPA && compiledModelInstructions == "" && prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
 			if isChat {
 				body, _, err = prompt.InjectChatSystemPrompt(body, group.SystemPrompt)
 			} else {
@@ -920,7 +842,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 			path = "/v1/responses"
 		}
-		if compiledModelInstructions != "" {
+		if !strictNativeCPA && compiledModelInstructions != "" {
 			body = setResponsesInstructions(body, compiledModelInstructions)
 		}
 	}
@@ -932,7 +854,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// stays inactive when the flag is off, so the response guard below is a no-op too.
 	var relTurn reliabilityTurn
 	effectiveEffort := forceEffort
-	if !prepared && !isCompact && s.reliabilityEnabled(r.Context()) {
+	if !prepared && !strictNativeCPA && !isCompact && s.reliabilityEnabled(r.Context()) {
 		body, relTurn = s.applyReliabilityRequest(r.Context(), body, affinity)
 		if s.reliabilityEffortFloorEnabled(r.Context()) {
 			// Floor RAISES effort to the risk minimum but never lowers a stronger
@@ -944,13 +866,13 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// Per-key/group forced reasoning effort, combined with the reliability risk floor
 	// above: applied to the responses-shaped body (after any chat→responses
 	// conversion) so it covers both entry paths.
-	if !prepared && effectiveEffort != "" {
+	if !prepared && !strictNativeCPA && effectiveEffort != "" {
 		body = applyForcedReasoningResponses(body, effectiveEffort)
 	}
 
 	// 联网搜索 (AT path): ensure a web_search tool is present so the account
 	// session serves it without API-key/org verification. Skipped for compact.
-	if !prepared && !isCompact && shouldInjectCodexHostedWebSearch(model, token, body) &&
+	if !prepared && !strictNativeCPA && !isCompact && shouldInjectCodexHostedWebSearch(model, token, body) &&
 		s.flagEnabled(r.Context(), "web_search_enabled", s.cfg.WebSearchEnabled) {
 		if injected, werr := prompt.EnsureResponsesWebSearchTool(body, s.cfg.WebSearchToolType); werr == nil {
 			body = injected
@@ -961,13 +883,13 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// Responses-over-WebSocket. The upstream choke point strips any legacy value;
 	// do not inject one here or report an unsupported 24h policy as effective. Cache
 	// reuse is driven by the supported prompt_cache_key + stable account affinity.
-	if !prepared {
+	if !prepared && !strictNativeCPA {
 		if updated, normalized := normalizeOfficialCodexPromptCacheKey(r, body, model); normalized {
 			body = updated
 			promptCacheKeySource = "official_codex_stable_prefix"
 		}
 	}
-	if !prepared && routing.PromptCacheKey(body) == "" {
+	if !prepared && !strictNativeCPA && routing.PromptCacheKey(body) == "" {
 		if prefixHash := automaticPromptCachePrefixHash(body); prefixHash != "" {
 			updated := ensureResponsesPromptCacheKey(body, automaticPromptCacheKey(model, prefixHash))
 			if routing.PromptCacheKey(updated) != "" {
@@ -978,66 +900,19 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 	logicalUsageDiag := codexRequestUsageDiagnostics(body, affinity, promptCacheKeySource, retentionEffective, retentionSource)
 
-	// Virtual2M is intentionally disabled: the gateway no longer records/replays a
-	// virtual context ledger and never trims Responses input. Official Codex
-	// compaction is forwarded unchanged to the upstream.
-	tryRebuildStateful := func(reason string) (codexAttemptResult, bool) {
-		if movable || contextRecovered {
-			return codexAttemptResult{}, false
-		}
-		rebuilt, ok := s.journalReplayBody(r.Context(), raw)
-		if !ok {
-			return codexAttemptResult{}, false
-		}
-		exclude[lease.Account.ID] = true
-		w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
-		atomic.AddUint64(&s.contextRebuilt, 1)
-		log.Printf("[CONTEXT-REBUILT] request_id=%s account=%s reason=%s", requestIDFromContext(r.Context()), lease.Account.ID, reason)
-		return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: rebuilt, Header: stripCodexServerStateHeaders(baseHeader), Recovered: true}}, true
+	// Resolve the persistent identity only after the exact account and egress are
+	// selected. A transport/auth retry below reuses this snapshot and therefore the
+	// same turn_id; a separately issued native EOF continue allocates its own turn.
+	mapping := codexSessionMappingFromContext(r.Context())
+	codexIdentity, identityErr := mapping.identitySnapshot(s.identitySecret(), lease, s.osHint(raw, lease.Egress))
+	if identityErr != nil {
+		writePoolCodeError(w, http.StatusConflict, codexMappingErrorCode(identityErr), "Codex session identity is no longer available")
+		return codexAttemptResult{Outcome: outcomeDone}
 	}
-	tryRecoverResponsesContext := func(contextError leakfilter.ResponsesContextErrorKind, reason string) (codexAttemptResult, bool) {
-		if contextError == leakfilter.ResponsesContextErrorNone {
-			return codexAttemptResult{}, false
-		}
-		// This error describes stale request context, not account health. Handle it
-		// before the generic classifier so it never cools or quarantines the account.
-		if !allowContextRepair {
-			log.Printf("[CONTEXT-TERMINAL] request_id=%s account=%s reason=%s error_category=%s terminal_reason=repair_budget_unavailable", requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
-			return codexAttemptResult{}, false
-		}
-		if contextRecovered {
-			exclude[lease.Account.ID] = true
-			w.Header().Set("X-MiCliProxy-Context-Status", "rebuilt")
-			log.Printf("[GOAL-RECOVERED-FAILOVER] request_id=%s account=%s reason=%s", requestIDFromContext(r.Context()), lease.Account.ID, reason)
-			return codexAttemptResult{Outcome: outcomeRetry, Retry: codexRetryRequest{Raw: body, Header: stripCodexServerStateHeaders(baseHeader), Recovered: true}, ContextRecovery: true}, true
-		}
-		recovered, contextStatus, ok := s.recoverResponsesContext(r.Context(), raw, baseHeader, contextError)
-		if !ok {
-			log.Printf("[CONTEXT-TERMINAL] request_id=%s account=%s reason=%s error_category=%s terminal_reason=recovery_input_unavailable", requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
-			return codexAttemptResult{}, false
-		}
-		exclude[lease.Account.ID] = true
-		// Prefer moving repaired stateless context to a different account. If the pool
-		// has no other usable Codex account, let the scheduler select this same account
-		// again: the request no longer carries its stale server-side pointer, so an
-		// in-place replay is safe and is the only recovery available to single-account
-		// deployments.
-		excludedAccountIDs := make([]string, 0, len(exclude))
-		for accountID := range exclude {
-			excludedAccountIDs = append(excludedAccountIDs, accountID)
-		}
-		if !s.hasCodexFailoverCandidate(r.Context(), routeGroup, excludedAccountIDs...) {
-			delete(exclude, lease.Account.ID)
-		}
-		w.Header().Set("X-MiCliProxy-Context-Status", contextStatus)
-		if contextStatus == "rebuilt" {
-			atomic.AddUint64(&s.contextRebuilt, 1)
-		} else {
-			atomic.AddUint64(&s.contextDegraded, 1)
-		}
-		log.Printf("[CONTEXT-%s] request_id=%s account=%s reason=%s error_category=%s", strings.ToUpper(contextStatus), requestIDFromContext(r.Context()), lease.Account.ID, reason, contextError)
-		return codexAttemptResult{Outcome: outcomeRetry, Retry: recovered, ContextRecovery: true}, true
-	}
+	// The mapping snapshot includes an account+egress-bound virtual device. Once it
+	// exists, a Cloudflare standby retry must not silently move only the egress and
+	// leave the durable identity describing a different device boundary.
+	mappingTransportStrict := strict || (mapping != nil && mapping.enabled)
 
 	// Per-account conversation isolation ("串号隔离", default on, runtime-toggleable):
 	// namespace the forwarded conversation-correlation identifiers so a rate-limited
@@ -1045,9 +920,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// that later serves the same conversation. Also resolves the (optionally
 	// OS-hinted) identity used to build the upstream headers.
 	osHint := s.osHint(raw, lease.Egress)
-	id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 	hdr := baseHeader.Clone()
-	if s.isolationEnabled(r.Context()) {
+	if s.isolationEnabled(r.Context()) && !codexStrictCPAFromContext(r.Context()) {
+		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
 		body = isolateCodexConversation(hdr, body, id)
 	}
 
@@ -1057,7 +932,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// and — via the same matcher — the response stream. An empty matcher (scrub
 	// off / no words) is a zero-cost pass-through.
 	codexScrubber := streamrewrite.New(nil)
-	if s.flagEnabled(r.Context(), "codex_identity_scrub", s.cfg.CodexIdentityScrub) {
+	if s.flagEnabled(r.Context(), "codex_identity_scrub", s.cfg.CodexIdentityScrub) && !codexStrictCPAFromContext(r.Context()) {
 		scrub := cloak.ScrubSensitive(body, s.cfg.SensitiveWordsFor("codex"))
 		body = scrub.Body
 		codexScrubber = scrub.Scrubber
@@ -1074,12 +949,12 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		strings.EqualFold(strings.TrimSpace(lease.Egress.Type), "curl_cffi_sidecar") {
 		codexUseWebSocket = false
 	}
-	requestForToken := func(t storage.AccountToken) upstream.Request {
+	requestForTokenWithIdentity := func(t storage.AccountToken, requestBody []byte, requestHeaders http.Header, requestIdentity *upstream.CodexIdentitySnapshot) upstream.Request {
 		return upstream.Request{
 			Method:                  http.MethodPost,
 			DownstreamPath:          pathWithQuery(path, r.URL.RawQuery),
-			Headers:                 hdr,
-			Body:                    body,
+			Headers:                 requestHeaders,
+			Body:                    requestBody,
 			Account:                 lease.Account,
 			Token:                   t,
 			Egress:                  lease.Egress,
@@ -1088,7 +963,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			CodexClientVersion:      codexClientVersion,
 			CodexResponsesWebSocket: codexUseWebSocket,
 			CodexWebSocketSession:   codexResponsesWebSocketSession(r.Context()),
+			CodexIdentity:           requestIdentity,
 		}
+	}
+	requestForToken := func(t storage.AccountToken) upstream.Request {
+		return requestForTokenWithIdentity(t, body, hdr, codexIdentity)
 	}
 
 	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
@@ -1102,14 +981,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), codexRetentionDiagnosticsForTransport(logicalUsageDiag, codexUseWebSocket)))
 	}
 	withCodexUsageContext()
-	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 	if err != nil {
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if allowRetry && movable {
 			return retry() // transport error — a fresh account/egress may succeed
-		}
-		if rebuilt, ok := tryRebuildStateful("transport_error"); ok {
-			return rebuilt
 		}
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
@@ -1129,12 +1005,21 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if contextError == leakfilter.ResponsesContextErrorNone {
 				return codexAttemptResult{}, false
 			}
-			if recovered, ok := tryRecoverResponsesContext(contextError, reason); ok {
-				_ = s.settleBillingHold(r.Context(), holdID, "context_recovery_retry")
-				return recovered, true
+			_ = reason
+			// A missing previous response is an upstream-confirmed loss of this
+			// account-local context. Retire the whole mapped tree with CAS; orphaned
+			// tool output is a normal client 400 and must never rotate an epoch.
+			if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+				if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+					log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+				}
 			}
 			_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
-			s.writeFilteredError(r.Context(), w, "codex", status, header, body, codexScrubber)
+			// Do not neutralize or reinterpret native tool/context failures. In
+			// particular, "No tool output found …" is a client-visible 400 and must
+			// neither trigger account rotation nor be converted into a user message.
+			writeRaw(w, status, header, body)
 			return codexAttemptResult{Outcome: outcomeDone}, true
 		}
 		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
@@ -1147,7 +1032,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if recovered, recoverErr := s.ensureAgentIdentityTask(r.Context(), lease.Account, token, finalEgress, lease.Binding.CookieJarKey, oldTaskID); recoverErr == nil {
 				token = recovered
 				_ = resp.Body.Close()
-				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 				if err != nil {
 					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_agent_task_recovery")
 					if allowRetry && movable {
@@ -1170,14 +1055,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			if refreshed, rerr := s.refreshCodexToken(r.Context(), token); rerr == nil && refreshed.Refreshed {
 				token = refreshed.Token
 				_ = resp.Body.Close()
-				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+				resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 				if err != nil {
 					_ = s.settleBillingHold(r.Context(), holdID, "failed_after_refresh")
 					if allowRetry && movable {
 						return retry()
-					}
-					if rebuilt, ok := tryRebuildStateful("transport_after_refresh"); ok {
-						return rebuilt
 					}
 					writeError(w, http.StatusBadGateway, err)
 					return codexAttemptResult{Outcome: outcomeDone}
@@ -1203,7 +1085,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			_ = resp.Body.Close()
 			fallbackReq := requestForToken(token)
 			fallbackReq.CodexResponsesWebSocket = false
-			resp, finalEgress, err = s.doWithCFRetry(r.Context(), fallbackReq, lease, strict)
+			resp, finalEgress, err = s.doWithCFRetry(r.Context(), fallbackReq, lease, mappingTransportStrict)
 			if err != nil {
 				log.Printf("codex websocket permission fallback %s: %v", lease.Account.ID, err)
 				resp = &upstream.Response{
@@ -1234,14 +1116,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 			withCodexUsageContext()
 			_ = resp.Body.Close()
-			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 			if err != nil {
 				_ = s.settleBillingHold(r.Context(), holdID, "failed_after_version_retry")
 				if allowRetry && movable {
 					return retry()
-				}
-				if rebuilt, ok := tryRebuildStateful("transport_after_version_retry"); ok {
-					return rebuilt
 				}
 				writeError(w, http.StatusBadGateway, err)
 				return codexAttemptResult{Outcome: outcomeDone}
@@ -1265,7 +1144,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				token = latest
 			}
 			_ = resp.Body.Close()
-			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+			resp, finalEgress, err = s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 			if err != nil {
 				log.Printf("codex reset-credit retry %s: %v", lease.Account.ID, err)
 			} else if resp.StatusCode < 400 {
@@ -1314,7 +1193,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
-		if ruleMatched {
+		if ruleMatched && !strictNativeCPA {
 			switch decision.Match.DownstreamAction {
 			case upstreamrules.DownstreamActionFailover:
 				if allowRetry && movable {
@@ -1345,11 +1224,6 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 			// Recoverable error → move to a fresh account. The downstream never sees this.
 			return retry()
-		}
-		if allowRetry && !movable && retryableForFailover(v, resp.StatusCode) {
-			if rebuilt, ok := tryRebuildStateful(fmt.Sprintf("http_%d", resp.StatusCode)); ok {
-				return rebuilt
-			}
 		}
 		s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
 		return codexAttemptResult{Outcome: outcomeDone}
@@ -1391,7 +1265,7 @@ codexSuccess:
 					token = latest
 				}
 				_ = resp.Body.Close()
-				retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+				retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 				if retryErr == nil && retryResp.StatusCode < 400 {
 					resp = retryResp
 					finalEgress = retryEgress
@@ -1410,10 +1284,7 @@ codexSuccess:
 			if allowRetry && movable {
 				return retry()
 			}
-			if rebuilt, ok := tryRebuildStateful("soft_200_rate_limit"); ok {
-				return rebuilt
-			}
-			if s.leakScrubEnabled(r.Context()) {
+			if !strictNativeCPA && s.leakScrubEnabled(r.Context()) {
 				if nb, changed := leakfilter.NeutralizeResponsesJSON(responseBody); changed {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusServiceUnavailable)
@@ -1433,7 +1304,7 @@ codexSuccess:
 			if findings := s.reliabilityFindings(r.Context(), responseBody, relTurn); len(findings) > 0 {
 				repairReq := requestForToken(token)
 				repairReq.Body = appendDeveloperTurn(body, s.reliabilityEnvelopeRole(r.Context()), reliability.RepairInstruction(findings))
-				if r2, _, e2 := s.doWithCFRetry(r.Context(), repairReq, lease, strict); e2 == nil && r2 != nil {
+				if r2, _, e2 := s.doWithCFRetry(r.Context(), repairReq, lease, mappingTransportStrict); e2 == nil && r2 != nil {
 					if r2.StatusCode < 400 {
 						if b2, e := s.readUpstreamResponseBody(r2.Body); e == nil && len(b2) > 0 {
 							responseBody = b2
@@ -1448,12 +1319,12 @@ codexSuccess:
 		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
 			responseBody = responseJSON
 		}
-		s.persistCodexStateBindings(r.Context(), r, affinity, body, responseBody, lease, finalEgress, model)
+		s.persistCodexStateBindings(r.Context(), r, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
 		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 		_ = s.settleBillingHold(r.Context(), holdID, "settled")
 		// A soft 200 "failed" response carrying limit/quota/switch-model state must
 		// not reach the downstream (envelope-only check; never inspects content).
-		if s.leakScrubEnabled(r.Context()) {
+		if !strictNativeCPA && s.leakScrubEnabled(r.Context()) {
 			if nb, changed := leakfilter.NeutralizeResponsesJSON(responseBody); changed {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusServiceUnavailable)
@@ -1476,129 +1347,132 @@ codexSuccess:
 	}
 
 	if isEventStream(resp.Header) {
-		// Hold back only a bounded early prefix so a retryable failure frame can still
-		// fail over before any downstream bytes are committed. As soon as real content
-		// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
-		// full-response capture destroyed TTFT and manufactured 503s once a successful
-		// stream exceeded its memory/disk capture cap. This probe runs before both the
-		// native Responses and Chat Completions adapters. Downstream-visible safety
-		// progress also releases the probe so a long safety check can be kept alive;
-		// once either adapter writes HTTP 200, transparent failover is no longer possible.
-		prefix, streamFailure, terminalStream, probeErr := probeEarlyCodexSSEFailure(resp.Body)
-		if probeErr != nil {
-			_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
-			if allowRetry && movable {
-				return retry()
-			}
-			if rebuilt, ok := tryRebuildStateful("stream_capture_error"); ok {
-				return rebuilt
-			}
-			writePublicUnavailable(w, http.StatusServiceUnavailable)
-			return codexAttemptResult{Outcome: outcomeDone}
-		}
-		if terminalStream {
-			failureHeader := resp.Header.Clone()
-			for name, values := range streamFailure.Header {
-				failureHeader.Del(name)
-				for _, value := range values {
-					failureHeader.Add(name, value)
-				}
-			}
-			failureStatus := streamFailure.StatusCode
-			failureBody := streamFailure.Body
-			if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone {
-				_ = resp.Body.Close()
-				if recovered, ok := tryRecoverResponsesContext(streamFailure.ContextError, "stream_context_error"); ok {
-					_ = s.settleBillingHold(r.Context(), holdID, "context_recovery_retry")
-					return recovered
-				}
-				_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
-				s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
-				return codexAttemptResult{Outcome: outcomeDone}
-			}
-			entrypoint := "responses"
-			if isChat {
-				entrypoint = "chat_completions"
-			}
-			decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
-				Provider:   "codex",
-				Entrypoint: entrypoint,
-				Model:      model,
-				Status:     failureStatus,
-				Header:     failureHeader,
-				Body:       failureBody,
-				Streaming:  true,
-			})
-			explicitRuleAction := ruleMatched && decision.Match.DownstreamAction != upstreamrules.DownstreamActionBuiltin
-			handleStreamFailure := streamFailure.BuiltinRetryable || explicitRuleAction
-			if ruleMatched && !handleStreamFailure {
-				// An account-only rule can still observe an ordinary client error, but
-				// downstream_action=builtin preserves the default pass-through policy.
-				s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
-			}
-			if handleStreamFailure {
-				shouldRetry := !ruleMatched ||
-					decision.Match.DownstreamAction == upstreamrules.DownstreamActionBuiltin ||
-					decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
-
-				// A reset credit is an in-place recovery on the same account and therefore
-				// precedes cooldown/failover. Explicit pass/custom/neutralize/idle rules do
-				// not consume credits behind the operator's back.
-				if shouldRetry {
-					// The WebSocket-to-SSE pipe is unbuffered. Closing before another request
-					// prevents its terminal [DONE] write from retaining the WS request mutex.
-					_ = resp.Body.Close()
-				}
-				if shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
-					s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
-					codexResetRetried = true
-					if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
-						token = latest
-					}
-					retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
-					if retryErr == nil && retryResp.StatusCode < 400 {
-						resp = retryResp
-						finalEgress = retryEgress
-						goto codexSuccess
-					}
-					if retryResp != nil && retryResp.Body != nil {
-						_ = retryResp.Body.Close()
-					}
-					if retryErr != nil {
-						log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
-					}
-				}
-				if ruleMatched {
-					s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
-				} else {
-					s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
-				}
-				_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
-				if ruleMatched {
-					switch decision.Match.DownstreamAction {
-					case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionHeartbeatFinish:
-						_ = resp.Body.Close()
-						if s.writeRuleDownstream(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber, decision, true) {
-							return codexAttemptResult{Outcome: outcomeDone}
-						}
-					case upstreamrules.DownstreamActionFailover:
-						_ = resp.Body.Close()
-						if allowRetry && movable {
-							return retry()
-						}
-						s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
-						return codexAttemptResult{Outcome: outcomeDone}
-					}
-				}
-				_ = resp.Body.Close()
+		// Strict CPA must begin relaying immediately: holding response.created in
+		// the legacy retry probe would block the heartbeat pump during a legitimate
+		// long-running upstream task. Its terminal/error frames are native protocol
+		// results and therefore pass through without local retry/rewrite anyway.
+		var prefix []byte
+		if !strictNativeCPA {
+			// Hold back only a bounded early prefix so a retryable failure frame can still
+			// fail over before any downstream bytes are committed. As soon as real content
+			// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
+			// full-response capture destroyed TTFT and manufactured 503s once a successful
+			// stream exceeded its memory/disk capture cap. This probe runs before both the
+			// native Responses and Chat Completions adapters. Downstream-visible safety
+			// progress also releases the probe so a long safety check can be kept alive;
+			// once either adapter writes HTTP 200, transparent failover is no longer possible.
+			var streamFailure leakfilter.CodexFailureFrame
+			var terminalStream bool
+			var probeErr error
+			prefix, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailure(resp.Body)
+			if probeErr != nil {
+				_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 				if allowRetry && movable {
 					return retry()
 				}
-				if rebuilt, ok := tryRebuildStateful("stream_response_failed"); ok {
-					return rebuilt
-				}
 				writePublicUnavailable(w, http.StatusServiceUnavailable)
 				return codexAttemptResult{Outcome: outcomeDone}
+			}
+			if terminalStream {
+				failureHeader := resp.Header.Clone()
+				for name, values := range streamFailure.Header {
+					failureHeader.Del(name)
+					for _, value := range values {
+						failureHeader.Add(name, value)
+					}
+				}
+				failureStatus := streamFailure.StatusCode
+				failureBody := streamFailure.Body
+				if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone {
+					_ = resp.Body.Close()
+					if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+						_ = s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid")
+					}
+					_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
+					writeRaw(w, failureStatus, failureHeader, failureBody)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				entrypoint := "responses"
+				if isChat {
+					entrypoint = "chat_completions"
+				}
+				decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
+					Provider:   "codex",
+					Entrypoint: entrypoint,
+					Model:      model,
+					Status:     failureStatus,
+					Header:     failureHeader,
+					Body:       failureBody,
+					Streaming:  true,
+				})
+				explicitRuleAction := ruleMatched && decision.Match.DownstreamAction != upstreamrules.DownstreamActionBuiltin
+				handleStreamFailure := streamFailure.BuiltinRetryable || explicitRuleAction
+				if ruleMatched && !handleStreamFailure {
+					// An account-only rule can still observe an ordinary client error, but
+					// downstream_action=builtin preserves the default pass-through policy.
+					s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
+				}
+				if handleStreamFailure {
+					shouldRetry := !ruleMatched ||
+						decision.Match.DownstreamAction == upstreamrules.DownstreamActionBuiltin ||
+						decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
+
+					// A reset credit is an in-place recovery on the same account and therefore
+					// precedes cooldown/failover. Explicit pass/custom/neutralize/idle rules do
+					// not consume credits behind the operator's back.
+					if shouldRetry {
+						// The WebSocket-to-SSE pipe is unbuffered. Closing before another request
+						// prevents its terminal [DONE] write from retaining the WS request mutex.
+						_ = resp.Body.Close()
+					}
+					if shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
+						s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
+						codexResetRetried = true
+						if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+							token = latest
+						}
+						retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
+						if retryErr == nil && retryResp.StatusCode < 400 {
+							resp = retryResp
+							finalEgress = retryEgress
+							goto codexSuccess
+						}
+						if retryResp != nil && retryResp.Body != nil {
+							_ = retryResp.Body.Close()
+						}
+						if retryErr != nil {
+							log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
+						}
+					}
+					if ruleMatched {
+						s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
+					} else {
+						s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
+					}
+					_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
+					if ruleMatched {
+						switch decision.Match.DownstreamAction {
+						case upstreamrules.DownstreamActionPass, upstreamrules.DownstreamActionCustomError, upstreamrules.DownstreamActionNeutralize, upstreamrules.DownstreamActionIdleStream, upstreamrules.DownstreamActionHeartbeatFinish:
+							_ = resp.Body.Close()
+							if s.writeRuleDownstream(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber, decision, true) {
+								return codexAttemptResult{Outcome: outcomeDone}
+							}
+						case upstreamrules.DownstreamActionFailover:
+							_ = resp.Body.Close()
+							if allowRetry && movable {
+								return retry()
+							}
+							s.writeFilteredError(r.Context(), w, "codex", failureStatus, failureHeader, failureBody, codexScrubber)
+							return codexAttemptResult{Outcome: outcomeDone}
+						}
+					}
+					_ = resp.Body.Close()
+					if allowRetry && movable {
+						return retry()
+					}
+					writePublicUnavailable(w, http.StatusServiceUnavailable)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
 			}
 		}
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
@@ -1611,7 +1485,18 @@ codexSuccess:
 			w.Header().Set("Cache-Control", "no-cache")
 			w.WriteHeader(resp.StatusCode)
 			uscan := usage.NewStreamScanner("codex")
-			responsesStreamToChatSSE(w, io.TeeReader(streamBody, uscan), model, includeChatStreamUsage, codexScrubber)
+			nativeRecorder := newCodexStreamLedgerRecorder()
+			responsesStreamToChatSSE(w, io.TeeReader(streamBody, io.MultiWriter(uscan, nativeRecorder)), model, includeChatStreamUsage, codexScrubber)
+			if nativeRecorder.completedSuccessfully() {
+				responseID, responseModel, _ := nativeRecorder.metadata()
+				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+					if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, finalEgress, responseID, firstNonEmpty(nativeRecorder.responseTurnState(), responseTurnState(resp.Header, nativeRecorder.ResponseJSON())), isCompact); err != nil {
+						log.Printf("[CODEX-SESSION-MAPPING] chat stream terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
+					}
+				} else {
+					s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, finalEgress, model)
+				}
+			}
 			if parsed, ok := uscan.Parsed(); ok {
 				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
 			}
@@ -1634,121 +1519,114 @@ codexSuccess:
 			}
 			streamCtx = withResponseRuleFilter(streamCtx, rf)
 		}
-		commitWriter := newTerminalCommitWriter(w, func() error {
-			completed := streamRecorder.ResponseJSON()
-			if len(completed) == 0 {
-				responseID, _, _ := streamRecorder.metadata()
-				log.Printf("[CONTEXT-JOURNAL] recorder empty request_id=%s response_id=%s", requestIDFromContext(r.Context()), responseID)
-				return errors.New("completed response missing from context journal recorder")
+		commitStreamMapping := func(recorder *codexStreamLedgerRecorder, upstreamHeader http.Header, committedEgress storage.EgressProfile) error {
+			if recorder == nil || !recorder.completedSuccessfully() {
+				return nil
 			}
-			if _, err := s.persistGoalContinuity(r.Context(), r, "codex", body, completed); err != nil {
-				log.Printf("[GOAL-CONTINUITY] terminal commit degraded request_id=%s: %v", requestIDFromContext(r.Context()), err)
-				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "stream_terminal", Detail: "payload persistence failed"})
-				return err
+			responseID, responseModel, _ := recorder.metadata()
+			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+				if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, committedEgress, responseID, firstNonEmpty(recorder.responseTurnState(), responseTurnState(upstreamHeader, recorder.ResponseJSON())), isCompact); err != nil {
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "stream_terminal_metadata_only"})
+					return err
+				}
+				return nil
 			}
-			if err := s.persistContextJournal(r.Context(), body, completed, affinity.Hash, lease.Account.ID); err != nil {
-				log.Printf("[CONTEXT-JOURNAL] terminal fallback write failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
-				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "journal_fallback", Detail: "v1 fallback persistence failed"})
-				return err
-			}
+			// Compatibility mode retains only the old affinity metadata; no Codex
+			// goal/checkpoint/journal write is permitted.
+			s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, committedEgress, model)
 			return nil
+		}
+		commitWriter := newTerminalCommitWriter(w, func() error {
+			return commitStreamMapping(streamRecorder, resp.Header, finalEgress)
 		})
 		streamErr := s.streamSSE(streamCtx, commitWriter, recordingStream, codexScrubber, "codex", lease.Account.ID, affinity.Hash)
 		if closeErr := commitWriter.Close(); streamErr == nil {
 			streamErr = closeErr
 		}
-		// Auto-continue: if the upstream stream ended before its terminal
-		// response.completed and the operator has opted in, re-issue once with a
-		// "continue" turn on the SAME account and stitch the continuation into the
-		// already-relayed response. Off by default, so this whole block is skipped and
-		// behavior is byte-identical unless stream_auto_continue_enabled is set.
-		continuationResponseID := ""
-		continuationResponseModel := ""
+		if persistErr := commitWriter.PersistenceError(); persistErr != nil {
+			log.Printf("[CODEX-SESSION-MAPPING] stream terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+		}
+		// Strict CPA relays terminal SSE failures immediately rather than holding
+		// them in the legacy early-retry probe. Preserve the same epoch rule here:
+		// only an upstream-confirmed missing previous response retires the whole
+		// tree; a missing tool output remains an ordinary visible client error.
+		if streamRecorder.terminalContextError() == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+				!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+				log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+			}
+		}
+		_, _, streamRateLimits := streamRecorder.metadata()
+		continuationFailed := false
+		nativeContinueAttempted := false
 		if streamErr == nil && !streamRecorder.reachedTerminal() {
-			rfForAC, _ := streamCtx.Value(responseRuleFilterKey{}).(*responseRuleFilter)
-			// A silence is handled by the heartbeat pump above.  Reaching EOF without
-			// response.completed is different: it is an upstream close, so v2 goal
-			// continuity performs one bounded same-account `continue` request even
-			// when the legacy global auto-continue knob is off.  This gives a long
-			// polling/task turn a chance to finish before we synthesize response.failed.
-			if s.goalContinuityEnabled(r.Context()) || s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
-				reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
-					creq := requestForToken(token)
-					creq.Body = cbody
-					creq.Headers = stripCodexServerStateHeaders(creq.Headers)
-					cresp, _, cerr := s.doWithCFRetry(cctx, creq, lease, strict)
-					if cerr != nil {
-						return nil, cerr
-					}
-					if cresp.StatusCode >= 400 {
-						if cresp.Body != nil {
-							_ = cresp.Body.Close()
-						}
-						return nil, fmt.Errorf("codex continuation upstream status %d", cresp.StatusCode)
-					}
-					return cresp.Body, nil
-				}
-				sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), codexScrubber, "codex")
-				continuation, acErr := s.maybeAutoContinueCodex(r.Context(), sw, body, streamRecorder, reissue)
-				if acErr != nil {
-					log.Printf("[AUTO-CONTINUE] codex request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
-					_ = closeCodexStreamGracefully(sw, streamRecorder.partialItems(), streamRecorder.partialText(), func() string { id, _, _ := streamRecorder.metadata(); return id }(), func() string { _, model, _ := streamRecorder.metadata(); return model }())
-					s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "continuation_unavailable")
-				} else if continuation != nil && continuation.completedSuccessfully() {
-					completed := mergedCodexContinuationResponse(streamRecorder, continuation)
-					if len(completed) == 0 {
-						log.Printf("[GOAL-CONTINUITY] continuation terminal could not be reconstructed request_id=%s", requestIDFromContext(r.Context()))
-						_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "continuation_terminal", Detail: "merged continuation response unavailable"})
-					} else {
-						if _, persistErr := s.persistGoalContinuity(r.Context(), r, "codex", body, completed); persistErr != nil {
-							log.Printf("[GOAL-CONTINUITY] continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
-							_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "continuation_terminal", Detail: "payload persistence failed"})
-						} else if err := s.persistContextJournal(r.Context(), body, completed, affinity.Hash, lease.Account.ID); err != nil {
-							log.Printf("[CONTEXT-JOURNAL] continuation fallback write failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
-							_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "continuation_journal_fallback", Detail: "v1 fallback persistence failed"})
-						}
-					}
-					continuationResponseID, continuationResponseModel, _ = continuation.metadata()
+			responseID, responseModel, _ := streamRecorder.metadata()
+			mapping := codexSessionMappingFromContext(r.Context())
+			// Native EOF compensation belongs only to the strict persistent CPA
+			// protocol. Compatibility-mode streams historically end at an ordinary
+			// upstream EOF and must remain a byte-for-byte relay.
+			if mapping != nil && mapping.enabled {
+				if responseID == "" || hasPendingClientToolCall(streamRecorder.partialItems()) {
+					continuationFailed = true
+					_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "truncated_eof_uncontinuable")
+				} else if continuationBody, buildErr := nativeCodexContinueBody(body, responseID); buildErr != nil {
+					continuationFailed = true
+					_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_build_failed")
 				} else {
-					// The bounded request itself ended in response.failed/incomplete, or it
-					// exhausted its retry and emitted our response.failed.  Either way the
-					// client has a visible terminal and the last committed checkpoint is
-					// the only safe recovery point.
-					s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_eof_without_terminal")
+					turnState := firstNonEmpty(streamRecorder.responseTurnState(), responseTurnState(resp.Header, streamRecorder.ResponseJSON()))
+					continuationHeaders := hdr.Clone()
+					if turnState != "" {
+						continuationHeaders.Set("X-Codex-Turn-State", turnState)
+					}
+					continuationSnapshot := mapping.nextContinueSnapshot(turnState)
+					continuationReq := requestForTokenWithIdentity(token, continuationBody, continuationHeaders, continuationSnapshot)
+					nativeContinueAttempted = true
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "codex_native_continue", State: "attempted", Reason: "truncated_eof", Detail: "same_account_egress_epoch"})
+					continuationResp, continuationEgress, continuationErr := s.doWithCFRetry(r.Context(), continuationReq, lease, true)
+					atomic.AddUint64(&s.codexNativeContinues, 1)
+					if continuationErr != nil || continuationResp == nil || continuationResp.StatusCode >= http.StatusBadRequest || !isEventStream(continuationResp.Header) {
+						continuationFailed = true
+						if continuationResp != nil && continuationResp.Body != nil {
+							_ = continuationResp.Body.Close()
+						}
+						_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_request_failed")
+					} else {
+						continuationRecorder := newCodexStreamLedgerRecorder()
+						continuationWriter := newTerminalCommitWriter(w, func() error {
+							return commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress)
+						})
+						continuationStreamErr := s.streamSSE(streamCtx, continuationWriter, io.TeeReader(continuationResp.Body, continuationRecorder), codexScrubber, "codex", lease.Account.ID, affinity.Hash)
+						if closeErr := continuationWriter.Close(); continuationStreamErr == nil {
+							continuationStreamErr = closeErr
+						}
+						_ = continuationResp.Body.Close()
+						if persistErr := continuationWriter.PersistenceError(); persistErr != nil {
+							log.Printf("[CODEX-SESSION-MAPPING] native continue terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+						}
+						_, _, continuationRateLimits := continuationRecorder.metadata()
+						if continuationRateLimits.any() {
+							streamRateLimits = continuationRateLimits
+						}
+						if continuationStreamErr != nil || !continuationRecorder.completedSuccessfully() {
+							continuationFailed = true
+							if !continuationRecorder.reachedTerminal() {
+								_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_stream_failed")
+							}
+						}
+					}
 				}
-				sw.Flush()
-			} else {
-				id, streamModel, _ := streamRecorder.metadata()
-				if synthErr := closeCodexStreamGracefully(w, streamRecorder.partialItems(), streamRecorder.partialText(), id, streamModel); synthErr != nil {
-					log.Printf("[GOAL-STREAM] codex terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
-				}
-				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_stream_terminal_synthesized", State: "retryable", Reason: "upstream_eof_without_terminal", Detail: "codex response.failed emitted"})
-				s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_eof_without_terminal")
 			}
-		} else if streamErr == nil && !streamRecorder.completedSuccessfully() {
-			// response.failed and response.incomplete are already visible, protocol
-			// correct terminals. Do not append another terminal or issue continue, but
-			// retain the last *successful* checkpoint for an explicit later resume.
-			s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_terminal_not_completed")
 		} else if streamErr != nil {
-			// A transport read failure is not an EOF success.  The downstream writer may
-			// already be gone, but make a best-effort native terminal and retain the
-			// prior checkpoint for the next /goal resume.
-			id, streamModel, _ := streamRecorder.metadata()
-			if synthErr := closeCodexStreamGracefully(w, streamRecorder.partialItems(), streamRecorder.partialText(), id, streamModel); synthErr != nil {
-				log.Printf("[GOAL-STREAM] codex interrupted terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
+			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+				id, streamModel, _ := streamRecorder.metadata()
+				_ = s.emitCodexNativeContinuationFailure(r.Context(), w, id, streamModel, "stream_interrupted")
 			}
-			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_stream_terminal_synthesized", State: "retryable", Reason: "upstream_stream_error", Detail: "codex response.failed emitted"})
-			s.markGoalStreamRetryable(r.Context(), r, "codex", raw, "upstream_stream_error")
 		}
-		responseID, responseModel, streamRateLimits := streamRecorder.metadata()
-		if continuationResponseID != "" {
-			responseID = continuationResponseID
+		if nativeContinueAttempted && continuationFailed {
+			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "native_eof_continue_failed"); err != nil && !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
+				log.Printf("[CODEX-SESSION-MAPPING] native continue rotation request_id=%s: %v", requestIDFromContext(r.Context()), err)
+			}
 		}
-		if continuationResponseModel != "" {
-			responseModel = continuationResponseModel
-		}
-		s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, finalEgress, model)
 		// Real-time Codex quota: the codex.rate_limits frame the stream just carried (and
 		// leakfilter dropped downstream) refreshes the 5h/7d quota rows so the quota view
 		// is current between /wham/usage polls.
@@ -1779,7 +1657,7 @@ codexSuccess:
 				token = latest
 			}
 			_ = resp.Body.Close()
-			retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, strict)
+			retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 			if retryErr == nil && retryResp.StatusCode < 400 {
 				resp = retryResp
 				finalEgress = retryEgress
@@ -1794,13 +1672,16 @@ codexSuccess:
 		}
 		s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
 		_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
+		if strictNativeCPA {
+			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(responseBody)
+			return codexAttemptResult{Outcome: outcomeDone}
+		}
 		// Honor failover here too: a soft rate-limit in a 200 body is the same condition
 		// as a 429, so a movable request should fail over rather than surface it.
 		if allowRetry && movable {
 			return retry()
-		}
-		if rebuilt, ok := tryRebuildStateful("soft_200_rate_limit"); ok {
-			return rebuilt
 		}
 		if s.leakScrubEnabled(r.Context()) {
 			if nb, changed := leakfilter.NeutralizeResponsesJSON(responseBody); changed {
@@ -1815,7 +1696,7 @@ codexSuccess:
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 	// Non-stream raw responses: scrub a soft 200 limit/quota failure before forwarding.
-	if s.leakScrubEnabled(r.Context()) {
+	if !strictNativeCPA && s.leakScrubEnabled(r.Context()) {
 		if nb, changed := leakfilter.NeutralizeResponsesJSON(responseBody); changed {
 			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 			w.Header().Set("Content-Type", "application/json")
@@ -1824,41 +1705,57 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
-	s.persistCodexStateBindings(r.Context(), r, affinity, body, responseBody, lease, finalEgress, model)
+	s.persistCodexStateBindings(r.Context(), r, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	// Output guard: deterministically downgrade a non-streaming Responses answer that
 	// claims unverified test/command/file results (no-op when reliability/guard is off).
-	responseBody = s.reliabilityGuardResponsesBody(r.Context(), responseBody, relTurn)
-	if rf := s.responseRuleFilter(r.Context(), "codex", func() string {
-		if isChat {
-			return "chat_completions"
+	if !strictNativeCPA {
+		responseBody = s.reliabilityGuardResponsesBody(r.Context(), responseBody, relTurn)
+		if rf := s.responseRuleFilter(r.Context(), "codex", func() string {
+			if isChat {
+				return "chat_completions"
+			}
+			return "responses"
+		}(), model, resp.StatusCode); rf != nil {
+			responseBody = filterRuleJSON(responseBody, rf)
 		}
-		return "responses"
-	}(), model, resp.StatusCode); rf != nil {
-		responseBody = filterRuleJSON(responseBody, rf)
 	}
 	_, _ = w.Write(codexScrubber.ReplaceAll(responseBody))
 	return codexAttemptResult{Outcome: outcomeDone}
 }
 
-func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, affinity routing.AffinityKey, requestBody, responseBody []byte, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
+func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, affinity routing.AffinityKey, responseBody []byte, responseHeader http.Header, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string, compact bool) {
 	var response struct {
-		ID    string `json:"id"`
-		Model string `json:"model"`
+		ID     string `json:"id"`
+		Model  string `json:"model"`
+		Status string `json:"status"`
 	}
 	_ = json.Unmarshal(responseBody, &response)
-	s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
-	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {
-		log.Printf("[GOAL-CONTINUITY] non-stream persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
-		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "response_terminal", Detail: "payload persistence failed"})
+	if response.Status != "" && !strings.EqualFold(response.Status, "completed") {
+		return
 	}
-	s.persistContextJournal(ctx, requestBody, responseBody, affinity.Hash, lease.Account.ID)
+	if mapping := codexSessionMappingFromContext(ctx); mapping != nil && mapping.enabled {
+		if err := s.commitCodexSessionMapping(ctx, mapping, lease, egress, response.ID, responseTurnState(responseHeader, responseBody), compact); err != nil {
+			log.Printf("[CODEX-SESSION-MAPPING] terminal commit request_id=%s: %v", requestIDFromContext(ctx), err)
+			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "terminal_metadata_only"})
+		}
+		return
+	}
+	// Compatibility mode retains ordinary affinity metadata only. Codex never
+	// writes goal/checkpoint/journal bodies, even when the CPA mapper is disabled.
+	s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
 }
 
 func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routing.AffinityKey, responseID, actualModel string, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {
+	if s.codexSessionMappingEnabled(ctx) {
+		// CPA-v2 stores downstream response/thread aliases only as HMACs in its
+		// dedicated mapping tables. Never let a compatibility call write a raw
+		// Responses id back into affinity_bindings while it is enabled.
+		return
+	}
 	model := firstNonEmpty(actualModel, lease.ResolvedModel, requestedModel)
 	egressID := firstNonEmpty(egress.ID, lease.Egress.ID)
 	upsert := func(key routing.AffinityKey) {

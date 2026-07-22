@@ -274,6 +274,7 @@ func (s *Server) beginGoalRunWithResult(ctx context.Context, goalID, phase strin
 	done := make(chan struct{})
 	interval := s.goalHeartbeatDuration(ctx)
 	go func() {
+		defer supervisor.Recover("goal-heartbeat")
 		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

@@ -189,6 +189,12 @@ type Request struct {
 	// a generate=false warmup, then references that response id on the same
 	// connection; opening a fresh upstream connection per frame loses that state.
 	CodexWebSocketSession *CodexResponsesWebSocketSession
+	// CodexIdentity is the gateway's immutable, persistence-backed identity
+	// snapshot for this logical Responses submission.  It is deliberately public
+	// because the API layer owns the durable mapping; HTTP, SSE and WebSocket all
+	// consume the same snapshot below. Nil keeps the legacy standalone-client
+	// fallback used by focused upstream tests and non-gateway callers.
+	CodexIdentity *CodexIdentitySnapshot
 	// codexMetadata is an immutable, request-scoped snapshot generated at the Do
 	// choke point. HTTP headers, HTTP client_metadata and the WS handshake/body all
 	// consume the same snapshot so account-virtualized identifiers cannot drift.
@@ -830,6 +836,12 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	}
 
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	if spec.CodexIdentity != nil {
+		// A native Codex mapping binds virtual device state to the exact account
+		// and exit. The standalone fallback keeps the historical account-only
+		// profile for callers that have no durable mapping.
+		id = identity.CodexDevice(c.identitySecret, spec.Account.ID, spec.Egress.ID, spec.OSHint)
+	}
 	// Mirror the downstream client's launch entrypoint (interactive `codex` vs
 	// `codex exec`) so Originator + User-Agent agree with each other and with what
 	// the user is actually running, while the OS/arch/version stay account-bound
@@ -865,6 +877,11 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 		metadata = &generated
 	}
 	if metadata != nil {
+		if metadata.mappedIdentity {
+			// Fork ancestry is represented only by the mapped turn metadata. Do not
+			// forward an untrusted downstream header alongside that internal relation.
+			deleteHeaderFold(dst, "x-codex-forked-from-thread-id")
+		}
 		setHeaderPreserveCase(dst, "session-id", metadata.sessionID)
 		setHeaderPreserveCase(dst, "thread-id", metadata.threadID)
 		setHeaderPreserveCase(dst, "x-client-request-id", metadata.threadID)
@@ -881,6 +898,13 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 			setHeaderPreserveCase(dst, codexSubagentHeader, metadata.subagent)
 		} else {
 			deleteHeaderFold(dst, codexSubagentHeader)
+		}
+		// turn state is opaque server-owned context. It is validated by the CPA
+		// mapper, then forwarded byte-for-byte rather than derived from any local
+		// identity. HTTP carries it as a header while the WebSocket path also
+		// projects it into client_metadata.
+		if metadata.turnState != "" {
+			setHeaderPreserveCase(dst, "x-codex-turn-state", metadata.turnState)
 		}
 		if strings.Contains(strings.ToLower(spec.DownstreamPath), "compact") {
 			setHeaderPreserveCase(dst, codexInstallationIDMetadataKey, metadata.installationID)

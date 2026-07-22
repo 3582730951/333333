@@ -156,6 +156,36 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	}
 }
 
+func TestCodexMappedSnapshotDoesNotDeriveUnresolvedForkRelationship(t *testing.T) {
+	client := NewClient(config.Default())
+	metadata := client.newCodexRequestMetadata(Request{
+		DownstreamPath: "/v1/responses",
+		Body:           []byte(`{"model":"gpt-5.6-sol","input":"fork","client_metadata":{"x-codex-turn-metadata":"{\"forked_from_thread_id\":\"downstream-unmapped-fork\",\"thread_id\":\"downstream-thread\"}"}}`),
+		Account:        storage.Account{ID: "acc-mapped"},
+		Egress:         storage.EgressProfile{ID: "direct", Type: "direct", Health: "healthy"},
+		CodexIdentity: &CodexIdentitySnapshot{
+			InstallationID:   "mapped-installation",
+			SessionID:        "019f0000-0000-7000-8000-000000000031",
+			ThreadID:         "019f0000-0000-7000-8000-000000000031",
+			TurnID:           "019f0000-0000-7000-8000-000000000032",
+			WindowGeneration: 0,
+		},
+	})
+	if !metadata.mappedIdentity {
+		t.Fatal("CPA snapshot was not marked as mapping-managed")
+	}
+	if strings.Contains(metadata.turnMetadata, "downstream-unmapped-fork") {
+		t.Fatalf("raw downstream fork leaked into mapped turn metadata: %s", metadata.turnMetadata)
+	}
+	var turn map[string]interface{}
+	if err := json.Unmarshal([]byte(metadata.turnMetadata), &turn); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := turn["forked_from_thread_id"]; present {
+		t.Fatalf("unresolved fork relationship was derived in strict CPA: %+v", turn)
+	}
+}
+
 func TestCodexHTTPClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T) {
 	var gotHeader http.Header
 	var gotBody []byte

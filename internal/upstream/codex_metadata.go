@@ -21,21 +21,49 @@ const (
 	codexBetaFeaturesHeader        = "remote_compaction_v2"
 )
 
+// CodexIdentitySnapshot is the canonical internal identity selected by the
+// gateway after account and egress selection.  Root SessionID and ThreadID are
+// intentionally separate for child agents: a root has the same value for both,
+// while every branch receives its own ThreadID under the root SessionID. TurnID is
+// one logical submission and is reused by in-attempt transport/auth retries.
+//
+// Downstream turn state is opaque upstream context, not a correlator to rewrite;
+// the gateway validates it through its exact mapping before it reaches this type.
+type CodexIdentitySnapshot struct {
+	InstallationID     string
+	SessionID          string
+	ThreadID           string
+	TurnID             string
+	WindowGeneration   int64
+	ParentThreadID     string
+	ForkedFromThreadID string
+	TurnState          string
+}
+
+func (s CodexIdentitySnapshot) WindowID() string {
+	return strings.TrimSpace(s.ThreadID) + ":" + fmt.Sprintf("%d", s.WindowGeneration)
+}
+
 // codexRequestMetadata is the canonical per-request identity snapshot mirrored
 // from codex-rs/core/src/responses_metadata.rs. The same value drives HTTP/WS
 // compatibility headers and client_metadata so no transport exposes a different
 // session, thread, turn, or window identity.
 type codexRequestMetadata struct {
-	installationID string
-	sessionID      string
-	threadID       string
-	turnID         string
-	windowID       string
-	parentThreadID string
-	subagent       string
-	turnState      string
-	turnMetadata   string
-	responsesLite  bool
+	installationID     string
+	sessionID          string
+	threadID           string
+	turnID             string
+	windowID           string
+	parentThreadID     string
+	forkedFromThreadID string
+	subagent           string
+	turnState          string
+	turnMetadata       string
+	responsesLite      bool
+	// mappedIdentity marks a CPA-v2 snapshot. In that path hierarchy correlators
+	// must come solely from the persisted mapping; falling back to a derived value
+	// from a raw downstream fork id would create an untracked relationship.
+	mappedIdentity bool
 }
 
 // Keep the old internal name as an alias for focused WS tests and helpers while
@@ -48,6 +76,39 @@ func (c *Client) newCodexRequestMetadata(spec Request) codexRequestMetadata {
 }
 
 func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, responsesLite bool) codexRequestMetadata {
+	if snapshot := spec.CodexIdentity; snapshot != nil && strings.TrimSpace(snapshot.SessionID) != "" && strings.TrimSpace(snapshot.ThreadID) != "" {
+		bodyMetadata := codexBodyClientMetadata(spec.Body)
+		incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
+		requestKind := codexRequestKind(spec, incomingTurn)
+		startedAt := int64(0)
+		if requestKind != "prewarm" {
+			startedAt = codexMapInt64(incomingTurn, "turn_started_at_unix_ms")
+			if startedAt <= 0 {
+				startedAt = time.Now().UnixMilli()
+			}
+		}
+		metadata := codexRequestMetadata{
+			installationID:     strings.TrimSpace(snapshot.InstallationID),
+			sessionID:          strings.TrimSpace(snapshot.SessionID),
+			threadID:           strings.TrimSpace(snapshot.ThreadID),
+			turnID:             strings.TrimSpace(snapshot.TurnID),
+			windowID:           snapshot.WindowID(),
+			parentThreadID:     strings.TrimSpace(snapshot.ParentThreadID),
+			forkedFromThreadID: strings.TrimSpace(snapshot.ForkedFromThreadID),
+			turnState:          strings.TrimSpace(snapshot.TurnState),
+			responsesLite:      responsesLite,
+			mappedIdentity:     true,
+			subagent: firstNonEmpty(
+				getHeaderFold(spec.Headers, codexSubagentHeader),
+				codexMetadataString(bodyMetadata, codexSubagentHeader),
+			),
+		}
+		if requestKind == "prewarm" {
+			metadata.turnID = ""
+		}
+		metadata.turnMetadata = buildCodexTurnMetadata(metadata, incomingTurn, requestKind, startedAt)
+		return metadata
+	}
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
 	bodyMetadata := codexBodyClientMetadata(spec.Body)
 	incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
@@ -212,13 +273,17 @@ func applyCodexClientMetadataWithFields(raw []byte, fields map[string]json.RawMe
 		return err == nil
 	}
 	for _, key := range []string{
+		"installation_id",
 		codexInstallationIDMetadataKey,
 		"session_id",
 		"thread_id",
 		"turn_id",
+		"window_id",
 		"x-codex-window-id",
 		codexSubagentHeader,
+		"parent_thread_id",
 		"x-codex-parent-thread-id",
+		"forked_from_thread_id",
 		"x-codex-turn-metadata",
 		"x-codex-turn-state",
 		codexWSResponsesLiteMetadata,
@@ -294,7 +359,16 @@ func stripCodexTopLevelTransportCorrelatorsWithFields(raw []byte, fields map[str
 		return raw
 	}
 	out := raw
-	for _, key := range []string{"thread_id", "session_id", "conversation_id"} {
+	for _, key := range []string{
+		"thread_id",
+		"session_id",
+		"conversation_id",
+		"window_id",
+		"parent_thread_id",
+		"forked_from_thread_id",
+		"turn_metadata",
+		"turn_state",
+	} {
 		if _, present := fields[key]; !present {
 			continue
 		}
@@ -347,8 +421,12 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 	if metadata.parentThreadID != "" {
 		turn["parent_thread_id"] = metadata.parentThreadID
 	}
-	if forked := codexMapString(incoming, "forked_from_thread_id"); forked != "" {
-		turn["forked_from_thread_id"] = identity.DerivedUUIDv7(metadata.installationID+"\x00forked", forked)
+	if metadata.forkedFromThreadID != "" {
+		turn["forked_from_thread_id"] = metadata.forkedFromThreadID
+	} else if !metadata.mappedIdentity {
+		if forked := codexMapString(incoming, "forked_from_thread_id"); forked != "" {
+			turn["forked_from_thread_id"] = identity.DerivedUUIDv7(metadata.installationID+"\x00forked", forked)
+		}
 	}
 	raw, err := json.Marshal(turn)
 	if err != nil {

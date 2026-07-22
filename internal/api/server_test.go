@@ -48,6 +48,15 @@ type testHarness struct {
 	app      *Server
 }
 
+// skipLegacyCodexContextReplay marks v1 tests that asserted journal reconstruction,
+// tool-output neutralization, or account migration for a previous_response_id.
+// CPA-v2 intentionally makes those stateful failures visible and pins them to one
+// exact mapped account/egress; focused coverage is in codex_session_mapping_test.go.
+func skipLegacyCodexContextReplay(t *testing.T) {
+	t.Helper()
+	t.Skip("Codex journal/degraded replay was retired in favor of strict CPA-v2 mapping")
+}
+
 func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 	t.Helper()
 	var mu sync.Mutex
@@ -82,6 +91,11 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 	cfg.ClaudeUpstreamBaseURL = up.URL
 	cfg.DatabasePath = filepath.Join(t.TempDir(), "unused.sqlite3")
 	cfg.StickyWaitMillis = 1
+	// Most long-standing gateway tests exercise the retired compatibility engine
+	// explicitly. Keep that harness opt-out scoped to those tests; CPA-v2 tests
+	// enable the production default through enableCodexSessionMappingForTest.
+	cfg.CodexSessionMappingEnabled = false
+	cfg.CodexCPAStrict = false
 	app := NewServer(Dependencies{
 		Config:    cfg,
 		Store:     store,
@@ -1630,6 +1644,7 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 }
 
 func TestDownstreamResponsesWebSocketNeverLeaksRepeatedOrphanedToolOutput(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	const callID = "call_GQqnpD0cS3uxvXlgWBSD974z"
 	var attempts int32
 	upgrader := websocket.Upgrader{}
@@ -2465,6 +2480,7 @@ func TestSeamlessFailoverOnLimitSwitchesAccountTransparently(t *testing.T) {
 }
 
 func TestStatefulTurnRebuildsOnAccountFailure(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	var aCalls int
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -2545,6 +2561,7 @@ func TestStatefulTurnRebuildsOnAccountFailure(t *testing.T) {
 }
 
 func TestOrphanedToolOutputHTTP400DegradesAndRetries(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer access-a" {
 			w.Header().Set("Content-Type", "application/json")
@@ -2622,6 +2639,7 @@ func TestOrphanedToolOutputHTTP400DegradesAndRetries(t *testing.T) {
 }
 
 func TestPreviousResponseNotFoundHTTP400DegradesAndRetries(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		body := string(raw)
@@ -2701,6 +2719,7 @@ func TestPreviousResponseNotFoundHTTP400DegradesAndRetries(t *testing.T) {
 }
 
 func TestPreviousResponseNotFoundRebuildsFromJournal(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		body := string(raw)
@@ -2761,6 +2780,7 @@ func TestPreviousResponseNotFoundRebuildsFromJournal(t *testing.T) {
 }
 
 func TestPreviousResponseNotFoundSingleAccountRepairsOnlyOnce(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	var attempts int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
@@ -2822,6 +2842,7 @@ func TestPreviousResponseNotFoundSingleAccountRepairsOnlyOnce(t *testing.T) {
 }
 
 func TestRuleFailoverThenOrphanedPairedOutputRecoversAgain(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	const callID = "call_diagnostic_chain"
 	recoveredPayload := make(chan []byte, 1)
 	upgrader := websocket.Upgrader{}
@@ -2980,6 +3001,7 @@ func TestUnrelatedHTTP400DoesNotRecoverResponsesContext(t *testing.T) {
 }
 
 func TestOrphanedToolOutputAccountSwitchRepairsIncompleteDownstreamContext(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	const callID = "call_LhyrFDALDxT1GOWETYWfgfRz"
 	const observedError = `{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`
 
@@ -3055,6 +3077,7 @@ func TestOrphanedToolOutputAccountSwitchRepairsIncompleteDownstreamContext(t *te
 }
 
 func TestOrphanedToolOutputAccountSwitchReplaysAutomaticallyPersistedCall(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	const callID = "call_LhyrFDALDxT1GOWETYWfgfRz"
 	const observedError = `{"error":{"message":"{\n\"type\": \"error\",\n\"error\": {\n\"type\": \"invalid_request_error\",\n\"message\": \"No tool call found for custom tool call output with call_id call_LhyrFDALDxT1GOWETYWfgfRz.\",\n\"param\": \"input\"\n},\n\"status\": 400\n}"},"status":400,"type":"error"}`
 
@@ -3145,6 +3168,7 @@ func TestOrphanedToolOutputAccountSwitchReplaysAutomaticallyPersistedCall(t *tes
 }
 
 func TestOrphanedToolOutputContextJournalSurvivesRapidAccountChain(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	const (
 		callA = "call_chain_a"
 		callB = "call_chain_b"
@@ -3333,6 +3357,7 @@ func TestOrphanedToolOutputContextJournalSurvivesRapidAccountChain(t *testing.T)
 }
 
 func TestOrphanedToolOutputStreamStatus400RebuildsFromJournal(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "Bearer access-a" {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -3389,6 +3414,7 @@ func TestOrphanedToolOutputStreamStatus400RebuildsFromJournal(t *testing.T) {
 }
 
 func TestBoundAccountUnavailableRebuildsFromJournalBeforeReturningConflict(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		body := string(raw)
@@ -3444,6 +3470,7 @@ func TestBoundAccountUnavailableRebuildsFromJournalBeforeReturningConflict(t *te
 }
 
 func TestOrphanedToolOutputSingleAccountRetriesSameAccountOnce(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	var attempts int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if atomic.AddInt32(&attempts, 1) == 1 {
@@ -3487,6 +3514,7 @@ func TestOrphanedToolOutputSingleAccountRetriesSameAccountOnce(t *testing.T) {
 }
 
 func TestOrphanedToolOutputRepairIsAttemptedOnlyOnce(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	const callID = "call_GQqnpD0cS3uxvXlgWBSD974z"
 	var attempts int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -3575,6 +3603,7 @@ func TestOrphanedToolOutputAfterCommittedStreamIsNotRetried(t *testing.T) {
 }
 
 func TestOrphanedToolOutputWebSocketStatusCodeRepairsContext(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	upgrader := websocket.Upgrader{}
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/backend-api/codex/responses" {
@@ -3985,6 +4014,7 @@ func TestCodexStreamingContentThenFailedRetriesWithoutLeakingPartial(t *testing.
 }
 
 func TestCodexStreamingStatefulTurnRebuildsFromJournal(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	var aCalls int
 	var bCalled bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
@@ -5273,6 +5303,7 @@ func TestProbeReplacesStaleCapabilities(t *testing.T) {
 }
 
 func TestResponsesPreviousResponseBindingPersistsWithoutPromptKey(t *testing.T) {
+	skipLegacyCodexContextReplay(t)
 	var auths []string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		auths = append(auths, r.Header.Get("Authorization"))

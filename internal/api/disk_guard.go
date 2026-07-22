@@ -17,6 +17,7 @@ type DiskGuardSnapshot struct {
 	ForcedContextTTLSeconds int     `json:"forced_context_ttl_seconds"`
 	ContextsDeleted         int64   `json:"contexts_deleted"`
 	GoalsDeleted            int64   `json:"goals_deleted"`
+	CodexMappingsDeleted    int64   `json:"codex_mappings_deleted"`
 	LogsDeleted             int64   `json:"logs_deleted"`
 	LastRunAt               int64   `json:"last_run_at"`
 	LastLogCleanupAt        int64   `json:"last_log_cleanup_at,omitempty"`
@@ -66,7 +67,7 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	}
 	free := 100 * float64(fs.Bavail) / float64(fs.Blocks)
 	previous := s.diskGuardSnapshot()
-	snap := DiskGuardSnapshot{Level: "normal", FreePercent: float64(int(free*10)) / 10, LastRunAt: storage.Now(), ContextsDeleted: previous.ContextsDeleted, GoalsDeleted: previous.GoalsDeleted, LogsDeleted: previous.LogsDeleted, LastLogCleanupAt: previous.LastLogCleanupAt}
+	snap := DiskGuardSnapshot{Level: "normal", FreePercent: float64(int(free*10)) / 10, LastRunAt: storage.Now(), ContextsDeleted: previous.ContextsDeleted, GoalsDeleted: previous.GoalsDeleted, CodexMappingsDeleted: previous.CodexMappingsDeleted, LogsDeleted: previous.LogsDeleted, LastLogCleanupAt: previous.LastLogCleanupAt}
 	// 10% recovery hysteresis prevents TTL oscillation near the 8% boundary.
 	if diskGuardLevel(free, previous.Level) == "critical" {
 		snap.Level = "critical"
@@ -129,8 +130,15 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 	} else {
 		snap.GoalsDeleted += goals
 	}
-	if snap.Level != previous.Level || snap.ContextsDeleted != previous.ContextsDeleted || snap.GoalsDeleted != previous.GoalsDeleted {
-		log.Printf("[DISK-GUARD] level=%s free=%.1f%% ttl=%d contexts_deleted=%d goals_deleted=%d logs_deleted=%d err=%s", snap.Level, snap.FreePercent, snap.ForcedContextTTLSeconds, snap.ContextsDeleted, snap.GoalsDeleted, snap.LogsDeleted, snap.LastError)
+	if mappings, err := s.store.CleanupCodexSessionMappings(ctx); err != nil {
+		if snap.LastError == "" {
+			snap.LastError = err.Error()
+		}
+	} else {
+		snap.CodexMappingsDeleted += mappings
+	}
+	if snap.Level != previous.Level || snap.ContextsDeleted != previous.ContextsDeleted || snap.GoalsDeleted != previous.GoalsDeleted || snap.CodexMappingsDeleted != previous.CodexMappingsDeleted {
+		log.Printf("[DISK-GUARD] level=%s free=%.1f%% ttl=%d contexts_deleted=%d goals_deleted=%d codex_mappings_deleted=%d logs_deleted=%d err=%s", snap.Level, snap.FreePercent, snap.ForcedContextTTLSeconds, snap.ContextsDeleted, snap.GoalsDeleted, snap.CodexMappingsDeleted, snap.LogsDeleted, snap.LastError)
 	}
 	s.diskGuard.Store(snap)
 }

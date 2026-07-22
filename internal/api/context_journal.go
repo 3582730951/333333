@@ -477,17 +477,15 @@ func responsesRecoveryEligible(body []byte, header http.Header) bool {
 func (s *Server) recoverResponsesContext(ctx context.Context, body []byte, header http.Header, contextError leakfilter.ResponsesContextErrorKind) (codexRetryRequest, string, bool) {
 	if rebuilt, ok := s.journalReplayBody(ctx, body); ok {
 		return codexRetryRequest{
-			Raw:       rebuilt,
-			Header:    stripCodexServerStateHeaders(header),
-			Recovered: true,
+			Raw:    rebuilt,
+			Header: stripCodexServerStateHeaders(header),
 		}, "rebuilt", true
 	}
 	if contextError == leakfilter.ResponsesContextErrorNone && !responsesRecoveryEligible(body, header) {
 		return codexRetryRequest{}, "", false
 	}
 	return codexRetryRequest{
-		Raw:       degradedResponsesReplayForContextError(body, contextError),
-		Header:    stripCodexServerStateHeaders(header),
-		Recovered: true,
+		Raw:    degradedResponsesReplayForContextError(body, contextError),
+		Header: stripCodexServerStateHeaders(header),
 	}, "degraded", true
 }

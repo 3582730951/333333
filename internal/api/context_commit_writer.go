@@ -14,6 +14,8 @@ type terminalCommitWriter struct {
 	dst       http.ResponseWriter
 	commit    func() error
 	buf       []byte
+	deferred  [][]byte
+	terminal  bool
 	once      sync.Once
 	commitErr error
 }
@@ -33,11 +35,33 @@ func (w *terminalCommitWriter) Write(p []byte) (int, error) {
 		}
 		frame := append([]byte(nil), w.buf[:idx+2]...)
 		w.buf = w.buf[idx+2:]
-		if bytes.Contains(frame, []byte(`"type":"response.completed"`)) || bytes.Contains(frame, []byte("event: response.completed")) {
+		isCompleted := bytes.Contains(frame, []byte(`"type":"response.completed"`)) || bytes.Contains(frame, []byte("event: response.completed"))
+		isTerminal := isCompleted || bytes.Contains(frame, []byte(`"type":"response.incomplete"`)) || bytes.Contains(frame, []byte("event: response.incomplete")) ||
+			bytes.Contains(frame, []byte(`"type":"response.failed"`)) || bytes.Contains(frame, []byte("event: response.failed"))
+		isDone := bytes.Contains(frame, []byte("data: [DONE]"))
+		if isDone && !w.terminal {
+			// A malformed/truncated upstream can emit [DONE] without a Responses
+			// terminal. Keep it off the wire until we know whether a native EOF
+			// continuation is needed; otherwise a client would close before it.
+			w.deferred = append(w.deferred, frame)
+			continue
+		}
+		if isCompleted {
 			w.once.Do(func() { w.commitErr = w.commit() })
+		}
+		if isTerminal {
+			w.terminal = true
 		}
 		if _, err := w.dst.Write(frame); err != nil {
 			return len(p), err
+		}
+		if isTerminal && len(w.deferred) > 0 {
+			for _, deferred := range w.deferred {
+				if _, err := w.dst.Write(deferred); err != nil {
+					return len(p), err
+				}
+			}
+			w.deferred = nil
 		}
 	}
 	return len(p), nil
@@ -53,6 +77,9 @@ func (w *terminalCommitWriter) Close() error {
 		w.buf = nil
 		return err
 	}
+	// A deferred [DONE] without a preceding terminal is intentionally discarded:
+	// the caller either starts one native continuation or writes response.failed.
+	w.deferred = nil
 	// Commit failure is intentionally not returned here.  Returning it after the
 	// response.completed frame causes callers to classify a successful upstream turn
 	// as an interrupted stream and can leave clients retrying indefinitely.
