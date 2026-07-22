@@ -26,10 +26,15 @@ const now = () => Math.floor(Date.now() / 1000);
 
 function statusInfo(a) {
   const n = now();
-  if (isKiroSuspended(a)) return { label: 'AWS User ID 已暂停', color: 'red', hint: '无限期隔离；需 AWS 支持处理后双层测活' };
-  if ((a.quarantine_until || 0) > n) return { label: '隔离中', color: 'red', hint: '暂不参与调度' };
-  if (a.egress_binding && a.egress_binding.recheck_pending) return { label: '待复测', color: 'orange', hint: '等待重新测活' };
-  if (a.egress_binding && (a.egress_binding.cooldown_until || 0) > n) return { label: '冷却中', color: 'amber', hint: '临时退避' };
+  const ignoresRateLimitControls = Boolean(a.ignore_rate_limit_controls);
+  const hasIgnoredControlState = (a.quarantine_until || 0) > n
+    || Boolean(a.egress_binding?.recheck_pending)
+    || (a.egress_binding?.cooldown_until || 0) > n;
+  if (ignoresRateLimitControls && hasIgnoredControlState) return { label: '例外调度', color: 'orange', hint: '已忽略此账号的 429、冷却与隔离状态' };
+  if (!ignoresRateLimitControls && isKiroSuspended(a)) return { label: 'AWS User ID 已暂停', color: 'red', hint: '无限期隔离；需 AWS 支持处理后双层测活' };
+  if (!ignoresRateLimitControls && (a.quarantine_until || 0) > n) return { label: '隔离中', color: 'red', hint: '暂不参与调度' };
+  if (!ignoresRateLimitControls && a.egress_binding && a.egress_binding.recheck_pending) return { label: '待复测', color: 'orange', hint: '等待重新测活' };
+  if (!ignoresRateLimitControls && a.egress_binding && (a.egress_binding.cooldown_until || 0) > n) return { label: '冷却中', color: 'amber', hint: '临时退避' };
   const map = {
     active: { label: '可用', color: 'green', hint: '可立即调度' },
     permission_denied: { label: '权限受限', color: 'red', hint: '凭据或权限需要处理' },

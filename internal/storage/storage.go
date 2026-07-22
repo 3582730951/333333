@@ -178,13 +178,18 @@ type Account struct {
 	// provider id (e.g. "deepseek"). It is the authoritative routing key; the
 	// token-shape heuristic (scheduler.ProviderFromToken) is only the fallback for
 	// pre-migration rows whose provider is still empty.
-	Provider         string `json:"provider,omitempty"`
-	Status           string `json:"status"`
-	IsFedramp        bool   `json:"is_fedramp"`
-	QuarantineUntil  int64  `json:"quarantine_until,omitempty"`
-	QuarantineReason string `json:"quarantine_reason,omitempty"`
-	CreatedAt        int64  `json:"created_at"`
-	UpdatedAt        int64  `json:"updated_at"`
+	Provider  string `json:"provider,omitempty"`
+	Status    string `json:"status"`
+	IsFedramp bool   `json:"is_fedramp"`
+	// IgnoreRateLimitControls is an account-scoped operator override. It keeps
+	// this account eligible despite its own rate-limit cooldown, recheck flag,
+	// or quarantine. It never re-enables a disabled account or an unhealthy
+	// shared egress profile.
+	IgnoreRateLimitControls bool   `json:"ignore_rate_limit_controls"`
+	QuarantineUntil         int64  `json:"quarantine_until,omitempty"`
+	QuarantineReason        string `json:"quarantine_reason,omitempty"`
+	CreatedAt               int64  `json:"created_at"`
+	UpdatedAt               int64  `json:"updated_at"`
 }
 
 type AccountPoolSummary struct {
@@ -897,6 +902,7 @@ CREATE TABLE IF NOT EXISTS accounts(
   provider TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'active',
   is_fedramp INTEGER NOT NULL DEFAULT 0,
+  ignore_rate_limit_controls INTEGER NOT NULL DEFAULT 0,
   quarantine_until INTEGER NOT NULL DEFAULT 0,
   quarantine_reason TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
@@ -1467,6 +1473,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN ignore_rate_limit_controls INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN auth_method TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN credential_mode TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE account_auth_tokens ADD COLUMN agent_runtime_id TEXT NOT NULL DEFAULT ''`,
@@ -2370,8 +2377,8 @@ func (s *Store) UpsertAccount(ctx context.Context, account Account, token Accoun
 	}
 	defer tx.Rollback()
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO accounts(id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO accounts(id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  label = excluded.label,
  group_name = excluded.group_name,
@@ -2383,7 +2390,7 @@ ON CONFLICT(id) DO UPDATE SET
  status = excluded.status,
  is_fedramp = excluded.is_fedramp,
  updated_at = excluded.updated_at`,
-		account.ID, account.Label, account.GroupName, account.UpstreamAccountID, account.ChatGPTUserID, account.Email, account.PlanType, account.Provider, account.Status, boolInt(account.IsFedramp), account.QuarantineUntil, account.QuarantineReason, account.CreatedAt, account.UpdatedAt)
+		account.ID, account.Label, account.GroupName, account.UpstreamAccountID, account.ChatGPTUserID, account.Email, account.PlanType, account.Provider, account.Status, boolInt(account.IsFedramp), boolInt(account.IgnoreRateLimitControls), account.QuarantineUntil, account.QuarantineReason, account.CreatedAt, account.UpdatedAt)
 	if err != nil {
 		return err
 	}
@@ -2429,7 +2436,7 @@ ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts ORDER BY created_at, id`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -2554,7 +2561,7 @@ func (s *Store) listAccountsPage(ctx context.Context, limit, offset int, search,
 	if err := s.rdb.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	query := "SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts" + where + " ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
+	query := "SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts" + where + " ORDER BY " + orderBy + " LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)
 	rows, err := s.rdb.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -2641,7 +2648,7 @@ func (s *Store) ResolveAccountProviders(ctx context.Context, accounts []Account)
 }
 
 func (s *Store) ListActiveAccountsByGroup(ctx context.Context, group string) ([]Account, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE group_name = ? AND status = 'active' ORDER BY created_at, id`, group)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE group_name = ? AND status = 'active' ORDER BY created_at, id`, group)
 	if err != nil {
 		return nil, err
 	}
@@ -2672,7 +2679,7 @@ type AccountWithEgress struct {
 func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) ([]AccountWithEgress, error) {
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
-		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.quarantine_until,
+		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.ignore_rate_limit_controls, a.quarantine_until,
 		       a.quarantine_reason, a.created_at, a.updated_at,
 		       b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cookie_jar_key, b.cooldown_until,
 		       b.recheck_pending, b.created_at, b.updated_at,
@@ -2697,12 +2704,13 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 	for rows.Next() {
 		var a AccountWithEgress
 		var isFedramp int
+		var ignoreRateLimitControls int
 		var recheck int
 		var streamCapable int
 		err := rows.Scan(
 			&a.Account.ID, &a.Account.Label, &a.Account.GroupName, &a.Account.UpstreamAccountID,
 			&a.Account.ChatGPTUserID, &a.Account.Email, &a.Account.PlanType, &a.Account.Provider,
-			&a.Account.Status, &isFedramp, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
+			&a.Account.Status, &isFedramp, &ignoreRateLimitControls, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
 			&a.Account.CreatedAt, &a.Account.UpdatedAt,
 			&a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.CookieJarKey,
 			&a.Binding.CooldownUntil, &recheck, &a.Binding.CreatedAt, &a.Binding.UpdatedAt,
@@ -2718,6 +2726,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 			return nil, err
 		}
 		a.Account.IsFedramp = isFedramp != 0
+		a.Account.IgnoreRateLimitControls = ignoreRateLimitControls != 0
 		a.Binding.RecheckPending = recheck != 0
 		a.Egress.StreamCapable = streamCapable != 0
 		out = append(out, a)
@@ -2726,7 +2735,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 }
 
 func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id = ?`, id)
+	row := s.rdb.QueryRowContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id = ?`, id)
 	return scanAccount(row)
 }
 
@@ -2748,7 +2757,7 @@ func (s *Store) ListAccountsByIDs(ctx context.Context, accountIDs []string) (map
 	if len(ids) == 0 {
 		return out, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at FROM accounts WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, stringArgs(ids)...)
 	if err != nil {
 		return nil, err
 	}
@@ -2770,6 +2779,14 @@ func (s *Store) SetAccountStatus(ctx context.Context, id, status string) error {
 
 func (s *Store) SetAccountPlanType(ctx context.Context, id, planType string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET plan_type = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(planType), Now(), id)
+	return err
+}
+
+// SetAccountIgnoreRateLimitControls changes the account-scoped scheduling
+// override. Existing cooldown/quarantine records are intentionally retained for
+// diagnostics and become effective again as soon as the override is disabled.
+func (s *Store) SetAccountIgnoreRateLimitControls(ctx context.Context, id string, enabled bool) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET ignore_rate_limit_controls = ?, updated_at = ? WHERE id = ?`, boolInt(enabled), Now(), id)
 	return err
 }
 
@@ -3345,9 +3362,11 @@ JOIN accounts a ON a.id = c.account_id
 JOIN account_egress_bindings b ON b.account_id = a.id
 JOIN egress_profiles e ON e.id = b.primary_egress_id
 LEFT JOIN egress_profiles se ON se.id = b.sidecar_egress_id
-WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ?
+WHERE a.group_name = ? AND a.status = 'active'
+  AND (a.quarantine_until <= ? OR a.ignore_rate_limit_controls = 1)
   AND c.model_slug = ? AND c.availability_state = 'verified'
-  AND b.recheck_pending = 0 AND b.cooldown_until <= ?
+  AND (b.recheck_pending = 0 OR a.ignore_rate_limit_controls = 1)
+  AND (b.cooldown_until <= ? OR a.ignore_rate_limit_controls = 1)
   AND e.health NOT IN ('disabled','tripped') AND e.cooldown_until <= ?
   AND (b.sidecar_egress_id = '' OR
        (se.id IS NOT NULL AND lower(se.type) = 'curl_cffi_sidecar' AND trim(se.endpoint) <> ''
@@ -3396,21 +3415,24 @@ func (s *Store) ListCapabilities(ctx context.Context, accountID string) ([]Model
 	return out, rows.Err()
 }
 
-// ListRoutableCapabilities returns only verified capabilities backed by an active,
-// non-quarantined account and at least one egress the scheduler can select now.
-// Public model catalogs use this so inactive or isolated accounts cannot advertise
-// models that the scheduler cannot actually reach.
+// ListRoutableCapabilities returns only verified capabilities backed by an active
+// account and at least one egress the scheduler can select now. Accounts with the
+// account-local rate-limit override remain visible despite their own quarantine,
+// cooldown, or recheck state; disabled accounts and unhealthy shared egresses stay
+// excluded.
 func (s *Store) ListRoutableCapabilities(ctx context.Context, group string) ([]ModelCapability, error) {
 	now := Now()
 	rows, err := s.rdb.QueryContext(ctx, `SELECT c.account_id, c.model_slug, c.availability_state, c.context_1m_state, c.context_1m_source,
 c.native_context_window, c.native_max_context_window, c.effective_context_window_percent, c.auto_compact_token_limit,
 c.visibility, c.etag, c.raw_model_json_hash, c.raw_model_json, c.source, c.last_probe_at,
-b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cooldown_until
+b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cooldown_until,
+a.ignore_rate_limit_controls
 FROM account_model_capabilities c
 JOIN accounts a ON a.id = c.account_id
 JOIN account_egress_bindings b ON b.account_id = a.id
-WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ?
-  AND b.recheck_pending = 0
+WHERE a.group_name = ? AND a.status = 'active'
+  AND (a.quarantine_until <= ? OR a.ignore_rate_limit_controls = 1)
+  AND (b.recheck_pending = 0 OR a.ignore_rate_limit_controls = 1)
   AND c.availability_state = 'verified'
 ORDER BY c.account_id, c.model_slug`, group, now)
 	if err != nil {
@@ -3418,21 +3440,24 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 	}
 	defer rows.Close()
 	type candidate struct {
-		capability ModelCapability
-		binding    AccountEgressBinding
+		capability              ModelCapability
+		binding                 AccountEgressBinding
+		ignoreRateLimitControls bool
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var c ModelCapability
 		var binding AccountEgressBinding
+		var ignoreRateLimitControls int
 		if err := rows.Scan(&c.AccountID, &c.ModelSlug, &c.AvailabilityState, &c.Context1MState, &c.Context1MSource,
 			&c.NativeContextWindow, &c.NativeMaxContextWindow, &c.EffectiveContextWindowPercent, &c.AutoCompactTokenLimit,
 			&c.Visibility, &c.ETag, &c.RawModelJSONHash, &c.RawModelJSON, &c.Source, &c.LastProbeAt,
-			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.SidecarEgressID, &binding.CooldownUntil); err != nil {
+			&binding.PrimaryEgressID, &binding.StandbyEgressIDs, &binding.SidecarEgressID, &binding.CooldownUntil,
+			&ignoreRateLimitControls); err != nil {
 			return nil, err
 		}
 		binding.AccountID = c.AccountID
-		candidates = append(candidates, candidate{capability: c, binding: binding})
+		candidates = append(candidates, candidate{capability: c, binding: binding, ignoreRateLimitControls: ignoreRateLimitControls != 0})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -3482,7 +3507,7 @@ ORDER BY c.account_id, c.model_slug`, group, now)
 					continue
 				}
 			}
-			if binding.CooldownUntil <= now {
+			if item.ignoreRateLimitControls || binding.CooldownUntil <= now {
 				if egress, ok := loadEgress(binding.PrimaryEgressID); ok && egressHealthy(egress) {
 					routable[accountID] = true
 				}
@@ -3602,7 +3627,7 @@ func (s *Store) AccountsWithModel(ctx context.Context, group, model string) (map
 	if model == "" {
 		return nil, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id WHERE a.group_name = ? AND a.status = 'active' AND a.quarantine_until <= ? AND c.model_slug = ? AND c.availability_state = 'verified'`, group, Now(), model)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT DISTINCT c.account_id FROM account_model_capabilities c JOIN accounts a ON a.id = c.account_id WHERE a.group_name = ? AND a.status = 'active' AND (a.quarantine_until <= ? OR a.ignore_rate_limit_controls = 1) AND c.model_slug = ? AND c.availability_state = 'verified'`, group, Now(), model)
 	if err != nil {
 		return nil, err
 	}
@@ -6969,8 +6994,10 @@ type scanner interface {
 func scanAccount(row scanner) (Account, error) {
 	var acc Account
 	var fed int
-	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &acc.UpstreamAccountID, &acc.ChatGPTUserID, &acc.Email, &acc.PlanType, &acc.Provider, &acc.Status, &fed, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
+	var ignoreRateLimitControls int
+	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &acc.UpstreamAccountID, &acc.ChatGPTUserID, &acc.Email, &acc.PlanType, &acc.Provider, &acc.Status, &fed, &ignoreRateLimitControls, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
 	acc.IsFedramp = fed != 0
+	acc.IgnoreRateLimitControls = ignoreRateLimitControls != 0
 	return acc, err
 }
 

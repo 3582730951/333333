@@ -65,6 +65,34 @@ func TestAccountImportCreatesEgressBinding(t *testing.T) {
 	}
 }
 
+func TestAccountIgnoreRateLimitControlsPersistsIndividually(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for _, account := range []Account{
+		{ID: "ignore-controls-on", Label: "on", GroupName: "cyber", Status: "active", IgnoreRateLimitControls: true},
+		{ID: "ignore-controls-off", Label: "off", GroupName: "cyber", Status: "active"},
+	} {
+		if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "access-" + account.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	on, err := store.GetAccount(ctx, "ignore-controls-on")
+	if err != nil || !on.IgnoreRateLimitControls {
+		t.Fatalf("enabled account = %+v err=%v", on, err)
+	}
+	off, err := store.GetAccount(ctx, "ignore-controls-off")
+	if err != nil || off.IgnoreRateLimitControls {
+		t.Fatalf("disabled account = %+v err=%v", off, err)
+	}
+	if err := store.SetAccountIgnoreRateLimitControls(ctx, off.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	off, err = store.GetAccount(ctx, off.ID)
+	if err != nil || !off.IgnoreRateLimitControls {
+		t.Fatalf("updated account = %+v err=%v", off, err)
+	}
+}
+
 func TestAccountTokenOAuthMetadataPersists(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

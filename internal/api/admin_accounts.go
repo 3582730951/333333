@@ -598,6 +598,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminSetAccountStatus(w, r, accountID, "active")
 	case "clear-quarantine":
 		s.adminClearQuarantine(w, r, accountID)
+	case "rate-limit-controls":
+		s.adminSetAccountRateLimitControls(w, r, accountID)
 	case "group":
 		s.adminSetAccountGroup(w, r, accountID)
 	case "delete":
@@ -722,6 +724,45 @@ func (s *Server) adminSetAccountStatus(w http.ResponseWriter, r *http.Request, a
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "status": status})
+}
+
+// adminSetAccountRateLimitControls updates the account-local override exposed by
+// the account drawer. It deliberately does not clear stored cooldown/quarantine
+// state: switching it back off restores the normal protections immediately.
+func (s *Server) adminSetAccountRateLimitControls(w http.ResponseWriter, r *http.Request, accountID string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPatch {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		IgnoreRateLimitControls bool `json:"ignore_rate_limit_controls"`
+	}
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := s.store.GetAccount(r.Context(), accountID); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err := s.store.SetAccountIgnoreRateLimitControls(r.Context(), accountID, req.IgnoreRateLimitControls); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
+		s.scheduler.NotifyStateChanged()
+	}
+	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+		AccountID: accountID,
+		Action:    "set_ignore_rate_limit_controls",
+		State:     "manual",
+		Reason:    strconv.FormatBool(req.IgnoreRateLimitControls),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id":                 accountID,
+		"ignore_rate_limit_controls": req.IgnoreRateLimitControls,
+	})
 }
 
 func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, accountID string) {

@@ -463,7 +463,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			writeError(w, http.StatusBadGateway, readErr)
 			return outcomeDone
 		}
-		s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(result.Scrubber.ReplaceAll(responseBody))
@@ -590,7 +590,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 claudeSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, requestedClaudeModelFromContext(r.Context()).ContextMode)
-	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if isEventStream(resp.Header) {
@@ -607,7 +607,7 @@ claudeSuccess:
 			return outcomeDone
 		}
 		if retryableStream {
-			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, prefix)
+			s.benchOnLimitForAccount(r.Context(), lease.Account, 200, resp.Header, prefix)
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 			if allowRetry && movable {
 				return retry()

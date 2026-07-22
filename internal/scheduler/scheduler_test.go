@@ -665,6 +665,41 @@ func TestRecheckPendingAccountIsNotSelected(t *testing.T) {
 	lease.Release()
 }
 
+func TestIgnoreRateLimitControlsKeepsOnlyThatAccountEligible(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{
+		ID: "ignore-controls", Label: "ignore-controls", GroupName: "cyber", Provider: "codex", Status: "active",
+		IgnoreRateLimitControls: true,
+	}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "access-ignore-controls"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAccountQuarantine(ctx, account.ID, storage.Now()+3600, "test quarantine"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BenchBindingForRecheck(ctx, account.ID, storage.Now()+3600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: account.ID, Provider: "codex", LimiterType: "tokens", Source: "test",
+		RemainingTokens: 0, RemainingRequests: -1, LimitTokens: 100, LimitRequests: -1,
+		ResetAt: storage.Now() + 3600, Status: "rejected",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatalf("overridden account should remain selectable: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != account.ID || !lease.Account.IgnoreRateLimitControls {
+		t.Fatalf("lease = %+v, want overridden account", lease.Account)
+	}
+}
+
 // A strict self-contained request bound to a recheck-pending account must fail over
 // and rebind rather than return ErrStrictUnavailable, because the request can be
 // resent to a healthy account without server-side state.

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
@@ -214,6 +215,13 @@ func stripCodexServerStateHeaders(header http.Header) http.Header {
 // It returns the verdict so the caller can decide whether to fail over.
 func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, status int, header http.Header, body []byte) ban.Verdict {
 	v := ban.Classify(false, status, header, body)
+	// This is an explicit per-account operator override, not a global switch.
+	// Keep the upstream result visible to the caller that is not using Codex's
+	// same-account retry path, but never mutate this account into cooldown,
+	// recheck, quarantine, or deletion because of a rate-limit/CF signal.
+	if account.IgnoreRateLimitControls && ignoresRateLimitControls(status, header, body) {
+		return v
+	}
 	if v.IsBanned() {
 		s.handleBannedAccount(ctx, account, v, status, body, "upstream_error")
 		return v
@@ -233,7 +241,7 @@ func (s *Server) onUpstreamError(ctx context.Context, account storage.Account, s
 		s.recordPermissionDeniedNoQuarantine(ctx, account, v, status, body, "upstream_error")
 		return v
 	}
-	s.benchOnLimit(ctx, account.ID, status, header, body)
+	s.benchOnLimitForAccount(ctx, account, status, header, body)
 	return v
 }
 
@@ -393,6 +401,15 @@ func (s *Server) guardRateLimit(ctx context.Context, accountID string, header ht
 	}
 }
 
+// guardRateLimitForAccount avoids a hot-path account lookup while preserving the
+// legacy ID-only helper for callers that do not already hold the selected account.
+func (s *Server) guardRateLimitForAccount(ctx context.Context, account storage.Account, header http.Header) {
+	if account.IgnoreRateLimitControls {
+		return
+	}
+	s.guardRateLimit(ctx, account.ID, header)
+}
+
 func bodySnippet(body []byte, n int) string {
 	s := strings.TrimSpace(string(body))
 	if len(s) > n {
@@ -404,6 +421,18 @@ func bodySnippet(body []byte, n int) string {
 // usageLimitCooldown returns how many seconds to bench an account whose upstream
 // response indicates a usage/rate limit. Returns 0 when not a limit.
 func usageLimitCooldown(status int, body []byte) int64 {
+	if usageLimitSignal(body) {
+		log.Printf("[RATE-LIMIT-DETECT] matched rate/quota signal status=%d body_len=%d", status, len(body))
+		return 1800
+	}
+	if status == http.StatusTooManyRequests {
+		log.Printf("[RATE-LIMIT-DETECT] status=429 body_len=%d", len(body))
+		return 60
+	}
+	return 0
+}
+
+func usageLimitSignal(body []byte) bool {
 	lb := strings.ToLower(string(body))
 	for _, sig := range []string{
 		"usage_limit_exceeded", "usage limit", "usage_limit",
@@ -411,15 +440,20 @@ func usageLimitCooldown(status int, body []byte) int64 {
 		"rate_limit_exceeded", "too many requests",
 	} {
 		if strings.Contains(lb, sig) {
-			log.Printf("[RATE-LIMIT-DETECT] matched keyword=%q status=%d body_len=%d", sig, status, len(body))
-			return 1800
+			return true
 		}
 	}
-	if status == 429 {
-		log.Printf("[RATE-LIMIT-DETECT] status=429 body_len=%d", len(body))
-		return 60
+	return false
+}
+
+// ignoresRateLimitControls limits the per-account override to rate/quota and
+// Cloudflare-derived controls. Authentication failures and ordinary request
+// errors remain visible and retain their existing remediation behavior.
+func ignoresRateLimitControls(status int, header http.Header, body []byte) bool {
+	if status == http.StatusTooManyRequests || usageLimitSignal(body) {
+		return true
 	}
-	return 0
+	return cf.Detect(status, header, body).Matched
 }
 
 // benchOnLimit cools the account's egress binding when the upstream signals a
@@ -442,4 +476,11 @@ func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int,
 	if s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
 	}
+}
+
+func (s *Server) benchOnLimitForAccount(ctx context.Context, account storage.Account, status int, header http.Header, body []byte) {
+	if account.IgnoreRateLimitControls {
+		return
+	}
+	s.benchOnLimit(ctx, account.ID, status, header, body)
 }

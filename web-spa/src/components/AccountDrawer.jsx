@@ -42,6 +42,7 @@ export default function AccountDrawer({
   const [selectedEgress, setSelectedEgress] = useState('');
   const [selectedSidecar, setSelectedSidecar] = useState('');
   const [selectedGroup, setSelectedGroup] = useState('');
+  const [ignoreRateLimitControls, setIgnoreRateLimitControls] = useState(false);
   const [reauthForm, setReauthForm] = useState({ login_email: '', password: '', otp_url: '', target_workspace_id: '', auto_enabled: false });
   const [oauthModal, setOauthModal] = useState({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' });
 
@@ -87,6 +88,10 @@ export default function AccountDrawer({
   }, [account?.id, account?.group_name]);
 
   useEffect(() => {
+    setIgnoreRateLimitControls(Boolean(account?.ignore_rate_limit_controls));
+  }, [account?.id, account?.ignore_rate_limit_controls]);
+
+  useEffect(() => {
     const cfg = details.codexReauth?.config || {};
     setReauthForm({
       login_email: cfg.login_email || account?.email || '',
@@ -118,6 +123,22 @@ export default function AccountDrawer({
       Toast.success('分组已保存');
       await onUpdated?.(account.id, { group_name: selectedGroup });
     } catch (err) {
+      showErrorToast(err);
+    }
+  });
+
+  const { run: saveIgnoreRateLimitControls, running: savingIgnoreRateLimitControls } = useAsyncAction(async (enabled) => {
+    if (!account) return;
+    const previous = ignoreRateLimitControls;
+    setIgnoreRateLimitControls(enabled);
+    try {
+      const saved = await post(`/admin/accounts/${encodeURIComponent(account.id)}/rate-limit-controls`, {
+        ignore_rate_limit_controls: enabled,
+      });
+      Toast.success(enabled ? '此账号已忽略 429、冷却和隔离' : '此账号已恢复正常限流保护');
+      await onUpdated?.(account.id, saved);
+    } catch (err) {
+      setIgnoreRateLimitControls(previous);
       showErrorToast(err);
     }
   });
@@ -230,6 +251,7 @@ export default function AccountDrawer({
         <Row k="分组" v={account.group_name || '默认'} />
         <Row k="套餐" v={account.plan_type || '—'} />
         <Row k="状态" v={statusTag ? statusTag(account) : account.status} />
+        <Row k="调度例外" v={ignoreRateLimitControls ? <Tag color="orange" size="small">忽略 429 / 冷却 / 隔离</Tag> : '无'} />
         <Row k="隔离" v={(account.quarantine_until || 0) > Math.floor(Date.now() / 1000) ? (protectedProbeQuarantine ? '无限期' : fmtRelative(account.quarantine_until)) : '否'} />
         {account.quarantine_reason ? <Row k="隔离原因" v={account.quarantine_reason} /> : null}
       </Panel>
@@ -276,6 +298,25 @@ export default function AccountDrawer({
           <Row k="更新时间" v={resetCredits?.updated_at ? fmtRelative(resetCredits.updated_at) : '—'} />
         </Panel>
       ) : null}
+
+      <Panel title="调度例外" style={{ marginBottom: 14 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>忽略 429、冷却与隔离</div>
+            <Typography.Text size="small" type="tertiary">
+              仅影响此账号。Codex 遇到 429 会保持同账号同链路重试，不向下游透传 429；Cloudflare 命中也不会自动冷却或隔离。
+            </Typography.Text>
+          </div>
+          <Switch
+            checked={ignoreRateLimitControls}
+            disabled={savingIgnoreRateLimitControls}
+            onChange={saveIgnoreRateLimitControls}
+          />
+        </div>
+        <Typography.Text size="small" type="tertiary" as="p" style={{ marginTop: 8, display: 'block' }}>
+          手动停用、出口不可用及并发上限仍然有效；关闭后，已有冷却和隔离记录会立即重新生效。
+        </Typography.Text>
+      </Panel>
 
       <Panel title="模型与上下文能力" style={{ marginBottom: 14 }}>
         {!capabilities.length ? <Typography.Text type="tertiary">尚无已发现的模型能力</Typography.Text> : capabilities.map((item) => (

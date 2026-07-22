@@ -1158,6 +1158,24 @@ codexResponse:
 		if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error"); ok {
 			return handled
 		}
+		if lease.Account.IgnoreRateLimitControls && codexIgnoredRateLimitResponse(resp.StatusCode, errorBody) {
+			_ = resp.Body.Close()
+			resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
+				return requestForToken(token)
+			}, resp.StatusCode, resp.Header, errorBody)
+			if err != nil {
+				_ = s.settleBillingHold(r.Context(), holdID, "ignored_rate_limit_retry_interrupted")
+				if r.Context().Err() != nil {
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				writeError(w, http.StatusBadGateway, err)
+				return codexAttemptResult{Outcome: outcomeDone}
+			}
+			if resp.StatusCode < http.StatusBadRequest {
+				goto codexSuccess
+			}
+			goto codexResponse
+		}
 		detection := cf.Detect(resp.StatusCode, resp.Header, errorBody)
 		v := ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		if isInvalidAgentIdentityTask(resp.StatusCode, errorBody, token) {
@@ -1318,7 +1336,9 @@ codexResponse:
 			Streaming:  streamReq,
 		})
 		if cf.EdgeOnly(detection) {
-			_ = s.store.BenchBindingForRecheck(r.Context(), lease.Account.ID, storage.Now()+60)
+			if !lease.Account.IgnoreRateLimitControls {
+				_ = s.store.BenchBindingForRecheck(r.Context(), lease.Account.ID, storage.Now()+60)
+			}
 			v = ban.Verdict{State: ban.RegionBlocked, Reason: "cloudflare_edge"}
 		} else if ruleMatched {
 			v = s.applyRuleAccountAction(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody, decision)
@@ -1373,7 +1393,7 @@ codexSuccess:
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
 	}
 	if !resetHeaderExhaustion {
-		s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 	}
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
 
@@ -1394,6 +1414,24 @@ codexSuccess:
 		// instead of 429). When detected, cool the account and fail over to a fresh
 		// one so the downstream never sees the error.
 		if cd := usageLimitCooldown(200, responseBody); cd > 0 {
+			if lease.Account.IgnoreRateLimitControls {
+				_ = resp.Body.Close()
+				resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
+					return requestForToken(token)
+				}, resp.StatusCode, resp.Header, responseBody)
+				if err != nil {
+					_ = s.settleBillingHold(r.Context(), holdID, "ignored_rate_limit_retry_interrupted")
+					if r.Context().Err() != nil {
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
+					writeError(w, http.StatusBadGateway, err)
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				if resp.StatusCode < http.StatusBadRequest {
+					goto codexSuccess
+				}
+				goto codexResponse
+			}
 			if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
 				!isAgentIdentityToken(token) &&
 				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
@@ -1415,7 +1453,7 @@ codexSuccess:
 					log.Printf("codex soft-200 reset-credit retry %s: %v", lease.Account.ID, retryErr)
 				}
 			}
-			s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
+			s.benchOnLimitForAccount(r.Context(), lease.Account, 200, resp.Header, responseBody)
 			_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 			// Rate limit in 200 body — treat like a 429 for failover purposes.
 			if allowRetry && movable {
@@ -1495,7 +1533,7 @@ codexSuccess:
 		// traffic always uses the existing bounded probe. Strict CPA uses it only
 		// when an administrator has a scope-compatible terminal rule; otherwise it
 		// retains the immediate native relay for long-running sessions.
-		if !strictNativeCPA || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
+		if !strictNativeCPA || lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
 			// Hold back only a bounded early prefix so a retryable failure frame can still
 			// fail over before any downstream bytes are committed. As soon as real content
 			// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
@@ -1565,6 +1603,24 @@ codexSuccess:
 					_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_terminal")
 					writeRaw(w, failureStatus, failureHeader, failureBody)
 					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				if lease.Account.IgnoreRateLimitControls && codexIgnoredRateLimitResponse(failureStatus, failureBody) {
+					_ = resp.Body.Close()
+					resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
+						return requestForToken(token)
+					}, failureStatus, failureHeader, failureBody)
+					if err != nil {
+						_ = s.settleBillingHold(r.Context(), holdID, "ignored_rate_limit_retry_interrupted")
+						if r.Context().Err() != nil {
+							return codexAttemptResult{Outcome: outcomeDone}
+						}
+						writeError(w, http.StatusBadGateway, err)
+						return codexAttemptResult{Outcome: outcomeDone}
+					}
+					if resp.StatusCode < http.StatusBadRequest {
+						goto codexSuccess
+					}
+					goto codexResponse
 				}
 				handleStreamFailure := streamFailure.BuiltinRetryable || explicitRuleAction
 				if ruleMatched && !handleStreamFailure {
@@ -1898,6 +1954,24 @@ codexSuccess:
 	// Same logic as the isChat non-streaming path above: when the upstream returns
 	// a soft limit error in a 200 body, cool the account and fail over.
 	if cd := usageLimitCooldown(200, responseBody); cd > 0 {
+		if lease.Account.IgnoreRateLimitControls {
+			_ = resp.Body.Close()
+			resp, finalEgress, err = s.retryCodexSameAccountAfterRateLimit(r.Context(), lease, func() upstream.Request {
+				return requestForToken(token)
+			}, resp.StatusCode, resp.Header, responseBody)
+			if err != nil {
+				_ = s.settleBillingHold(r.Context(), holdID, "ignored_rate_limit_retry_interrupted")
+				if r.Context().Err() != nil {
+					return codexAttemptResult{Outcome: outcomeDone}
+				}
+				writeError(w, http.StatusBadGateway, err)
+				return codexAttemptResult{Outcome: outcomeDone}
+			}
+			if resp.StatusCode < http.StatusBadRequest {
+				goto codexSuccess
+			}
+			goto codexResponse
+		}
 		if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
 			codexResetRetried = true
@@ -1918,7 +1992,7 @@ codexSuccess:
 				log.Printf("codex raw soft-200 reset-credit retry %s: %v", lease.Account.ID, retryErr)
 			}
 		}
-		s.benchOnLimit(r.Context(), lease.Account.ID, 200, resp.Header, responseBody)
+		s.benchOnLimitForAccount(r.Context(), lease.Account, 200, resp.Header, responseBody)
 		_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 		if strictNativeCPA {
 			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
@@ -2082,6 +2156,77 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 	return resp, req.Egress, nil
 }
 
+// ignoredRateLimitRetryFloor is deliberately a variable so focused gateway tests
+// can exercise same-account retry without sleeping for the production floor.
+// It is not a user-facing global setting: the behavior is opted into per account.
+var ignoredRateLimitRetryFloor = time.Second
+
+func codexIgnoredRateLimitResponse(status int, body []byte) bool {
+	return status == http.StatusTooManyRequests || usageLimitSignal(body)
+}
+
+func ignoredRateLimitRetryDelay(header http.Header) time.Duration {
+	now := storage.Now()
+	seconds := retryAfterSeconds(header, now)
+	if seconds <= 0 {
+		seconds = resetSeconds(header, now)
+	}
+	if seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if ignoredRateLimitRetryFloor > 0 {
+		return ignoredRateLimitRetryFloor
+	}
+	return time.Second
+}
+
+func waitForIgnoredRateLimitRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// retryCodexSameAccountAfterRateLimit suppresses only a rate/quota response from a
+// checked account. Every retry retains the already-leased account and egress, so a
+// strict CPA turn remains in the same native upstream chain. It intentionally keeps
+// retrying until the caller cancels; no 429 is written to the downstream client.
+// A non-rate-limit response is returned untouched for the ordinary response path.
+func (s *Server) retryCodexSameAccountAfterRateLimit(ctx context.Context, lease scheduler.Lease, request func() upstream.Request, status int, header http.Header, body []byte) (*upstream.Response, storage.EgressProfile, error) {
+	for attempts := 1; codexIgnoredRateLimitResponse(status, body); attempts++ {
+		delay := ignoredRateLimitRetryDelay(header)
+		log.Printf("[CODEX-RATE-LIMIT-OVERRIDE] account=%s attempt=%d retry_in=%s same_account_egress=true", lease.Account.ID, attempts, delay.Round(time.Millisecond))
+		if err := waitForIgnoredRateLimitRetry(ctx, delay); err != nil {
+			return nil, lease.Egress, err
+		}
+		// Strict=true intentionally disables the ordinary standby-egress CF retry.
+		// This opt-in loop must remain on the exact account/egress lease, including
+		// for non-CPA Codex requests.
+		resp, egress, err := s.doWithCFRetry(ctx, request(), lease, true)
+		if err != nil {
+			return nil, egress, err
+		}
+		if resp.StatusCode < http.StatusBadRequest {
+			return resp, egress, nil
+		}
+		nextBody := readUpstreamErrorBody(resp.Body)
+		if !codexIgnoredRateLimitResponse(resp.StatusCode, nextBody) {
+			resp.Body = io.NopCloser(bytes.NewReader(nextBody))
+			return resp, egress, nil
+		}
+		_ = resp.Body.Close()
+		status, header, body = resp.StatusCode, resp.Header, nextBody
+	}
+	return nil, lease.Egress, context.Canceled
+}
+
 // handleCFEvent is the single reaction point for a confirmed Cloudflare event. It
 // records the event (the existing StormBreaker cooldown/quarantine ladder) and then
 // applies the WARP ladder:
@@ -2094,6 +2239,13 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 //     (solver first, then re-register for a fresh IP) so the live request fails fast
 //     to a fresh account while the exit is restored for subsequent traffic.
 func (s *Server) handleCFEvent(ctx context.Context, account storage.Account, egress storage.EgressProfile, status int, detection cf.Detection) {
+	if account.IgnoreRateLimitControls {
+		// Do not feed this account into StormBreaker's cooldown/quarantine ladder.
+		// In particular, no account or shared-egress state may be mutated merely
+		// because this explicitly opted-in account met a CF interstitial.
+		log.Printf("[CF] account=%s ignored automatic CF controls category=%s status=%d", account.ID, detection.Category, status)
+		return
+	}
 	_ = (cf.StormBreaker{Store: s.store}).Record(ctx, account.ID, egress.ID, status, detection)
 	if s.warp == nil || !s.warp.Enabled() {
 		return

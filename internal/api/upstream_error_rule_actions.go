@@ -130,6 +130,12 @@ func (s *Server) matchUpstreamErrorRule(ctx context.Context, input upstreamrules
 }
 
 func (s *Server) applyRuleAccountAction(ctx context.Context, account storage.Account, status int, header http.Header, body []byte, decision upstreamErrorRuleDecision) ban.Verdict {
+	// A per-account override wins over automatic rate-limit/Cloudflare actions,
+	// including an administrator rule that would otherwise bench or quarantine the
+	// account. Other rule classes keep their normal account actions.
+	if account.IgnoreRateLimitControls && ignoresRateLimitControls(status, header, body) {
+		return ban.Classify(false, status, header, body)
+	}
 	switch decision.Match.AccountAction {
 	case upstreamrules.AccountActionNone:
 		return ban.Classify(false, status, header, body)

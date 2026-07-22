@@ -308,7 +308,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 chatClaudeSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, requestedModel.ContextMode)
-	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", model, resp.Header)
 
 	if stream && isEventStream(resp.Header) {

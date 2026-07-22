@@ -14,6 +14,7 @@ const accountSchema = z.object({
   auth_method: z.string().optional(),
   billing_mode: z.string().optional(),
   api_key_present: z.boolean().optional(),
+  ignore_rate_limit_controls: z.boolean().optional(),
   quarantine_until: z.number().optional(),
   quarantine_reason: z.string().optional(),
   capabilities: z.array(z.object({

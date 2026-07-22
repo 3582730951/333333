@@ -902,7 +902,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.Inactive++
 			continue
 		}
-		if account.QuarantineUntil > now {
+		if account.QuarantineUntil > now && !account.IgnoreRateLimitControls {
 			counters.Quarantined++
 			continue
 		}
@@ -942,19 +942,19 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.ModelUnsupported++
 			continue
 		}
-		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited && !account.IgnoreRateLimitControls {
 			counters.RateLimitCooldown++
 			continue
 		}
 		// An account benched after an error stays out of the pool until the recheck
 		// loop confirms it is healthy again — even once its cooldown has elapsed.
-		if binding.RecheckPending {
+		if binding.RecheckPending && !account.IgnoreRateLimitControls {
 			counters.RecheckPending++
 			continue
 		}
-		egress, ok := s.selectEgressWithCache(ctx, binding, now, &reqEgressCache, egressCacheMutex, &egressCacheTime)
+		egress, ok := s.selectEgressWithCache(ctx, binding, now, account.IgnoreRateLimitControls, &reqEgressCache, egressCacheMutex, &egressCacheTime)
 		if !ok {
-			if s.egressTemporarilyUnavailable(ctx, binding, now) {
+			if s.egressTemporarilyUnavailable(ctx, binding, now, account.IgnoreRateLimitControls) {
 				counters.EgressCooldown++
 			} else {
 				counters.EgressUnavailable++
@@ -1264,8 +1264,8 @@ func (s *Scheduler) upsertAffinity(ctx context.Context, binding storage.Affinity
 	return nil
 }
 
-func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding storage.AccountEgressBinding, now int64) bool {
-	if binding.CooldownUntil > now {
+func (s *Scheduler) egressTemporarilyUnavailable(ctx context.Context, binding storage.AccountEgressBinding, now int64, ignoreBindingCooldown bool) bool {
+	if binding.CooldownUntil > now && !ignoreBindingCooldown {
 		return true
 	}
 	ids := append([]string{binding.PrimaryEgressID}, binding.StandbyIDs()...)
@@ -1477,7 +1477,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if account.Status != "active" {
 		return Lease{}, leaseBlockInactive, false
 	}
-	if account.QuarantineUntil > now {
+	if account.QuarantineUntil > now && !account.IgnoreRateLimitControls {
 		return Lease{}, leaseBlockQuarantined, false
 	}
 	if route.Group != "" && account.GroupName != route.Group {
@@ -1517,7 +1517,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	rateRows, rateErr := s.rateLimitsSnapshot(ctx, route.Group, []string{accountID})
 	provider := providerForRoute(s, ctx, account, route)
 	if rateErr == nil {
-		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateRows[accountID], provider, route.Model, now); limited {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateRows[accountID], provider, route.Model, now); limited && !account.IgnoreRateLimitControls {
 			return Lease{}, leaseBlockRateLimitCooldown, false
 		}
 	}
@@ -1528,7 +1528,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	}
 	// Benched-after-error accounts are ineligible until the recheck loop clears them,
 	// even via the sticky path (which calls this directly).
-	if binding.RecheckPending {
+	if binding.RecheckPending && !account.IgnoreRateLimitControls {
 		return Lease{}, leaseBlockRecheckPending, false
 	}
 	var egress storage.EgressProfile
@@ -1538,16 +1538,16 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 			return Lease{}, leaseBlockEgressUnavailable, false
 		}
 		egress, err = s.egressProfile(ctx, route.RequiredEgressID, egressCache)
-		ok = err == nil && EgressHealthy(egress, now) && binding.CooldownUntil <= now
+		ok = err == nil && EgressHealthy(egress, now) && (account.IgnoreRateLimitControls || binding.CooldownUntil <= now)
 	} else {
-		if snapshot.Egress.ID == binding.PrimaryEgressID && binding.CooldownUntil <= now && EgressHealthy(snapshot.Egress, now) {
+		if snapshot.Egress.ID == binding.PrimaryEgressID && (account.IgnoreRateLimitControls || binding.CooldownUntil <= now) && EgressHealthy(snapshot.Egress, now) {
 			egress, ok = snapshot.Egress, true
 		} else {
-			egress, ok = s.selectEgress(ctx, binding, now, egressCache)
+			egress, ok = s.selectEgress(ctx, binding, now, egressCache, account.IgnoreRateLimitControls)
 		}
 	}
 	if !ok {
-		if s.egressTemporarilyUnavailable(ctx, binding, now) {
+		if s.egressTemporarilyUnavailable(ctx, binding, now, account.IgnoreRateLimitControls) {
 			return Lease{}, leaseBlockEgressCooldown, false
 		}
 		return Lease{}, leaseBlockEgressUnavailable, false
@@ -1836,17 +1836,17 @@ func (s *Scheduler) strictStickyCanFailover(ctx context.Context, accountID strin
 		return true
 	}
 	now := storage.Now()
-	if account.Status != "active" || account.QuarantineUntil > now {
+	if account.Status != "active" || (account.QuarantineUntil > now && !account.IgnoreRateLimitControls) {
 		return false
 	}
-	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); ok && until > now {
+	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); !account.IgnoreRateLimitControls && ok && until > now {
 		return true
 	}
 	binding, err := s.store.GetEgressBinding(ctx, accountID)
 	if err != nil {
 		return true
 	}
-	if binding.RecheckPending || binding.CooldownUntil > now {
+	if !account.IgnoreRateLimitControls && (binding.RecheckPending || binding.CooldownUntil > now) {
 		return true
 	}
 	egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
@@ -1885,11 +1885,11 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 	if account.Status != "active" {
 		return fmt.Errorf("%w: account %s status=%q", ErrStrictUnavailable, accountID, account.Status)
 	}
-	if account.QuarantineUntil > now {
+	if account.QuarantineUntil > now && !account.IgnoreRateLimitControls {
 		remaining := account.QuarantineUntil - now
 		return fmt.Errorf("%w: account %s quarantined for %ds (reason: %s)", ErrStrictUnavailable, accountID, remaining, account.QuarantineReason)
 	}
-	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); ok {
+	if until, ok := s.accountRateLimitCooldownUntil(ctx, account, route, now); !account.IgnoreRateLimitControls && ok {
 		return fmt.Errorf("%w: account %s provider=%q model=%q rate-limit cooldown for %ds", ErrStrictUnavailable, accountID, providerForRoute(s, ctx, account, route), route.Model, until-now)
 	}
 
@@ -1898,10 +1898,10 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 	if err != nil {
 		return fmt.Errorf("%w: account %s has no egress binding: %v", ErrStrictUnavailable, accountID, err)
 	}
-	if binding.RecheckPending {
+	if binding.RecheckPending && !account.IgnoreRateLimitControls {
 		return fmt.Errorf("%w: account %s pending health re-check after error", ErrStrictUnavailable, accountID)
 	}
-	if binding.CooldownUntil > now {
+	if binding.CooldownUntil > now && !account.IgnoreRateLimitControls {
 		remaining := binding.CooldownUntil - now
 		return fmt.Errorf("%w: account %s on cooldown for %ds (rate-limited by upstream)", ErrStrictUnavailable, accountID, remaining)
 	}
@@ -1942,8 +1942,8 @@ func (s *Scheduler) diagnoseStickyUnavailability(ctx context.Context, accountID 
 // cooldown and healthy, else the first healthy standby. egressCache (when non-nil)
 // memoizes GetEgressProfile lookups by id within a single selection so accounts that
 // share an egress do not each re-read the same row; pass nil to read through.
-func (s *Scheduler) selectEgress(ctx context.Context, binding storage.AccountEgressBinding, now int64, egressCache map[string]storage.EgressProfile) (storage.EgressProfile, bool) {
-	if binding.CooldownUntil <= now {
+func (s *Scheduler) selectEgress(ctx context.Context, binding storage.AccountEgressBinding, now int64, egressCache map[string]storage.EgressProfile, ignoreBindingCooldown bool) (storage.EgressProfile, bool) {
+	if ignoreBindingCooldown || binding.CooldownUntil <= now {
 		if egress, err := s.egressProfile(ctx, binding.PrimaryEgressID, egressCache); err == nil && EgressHealthy(egress, now) {
 			return egress, true
 		}
@@ -2045,7 +2045,7 @@ func (s *Scheduler) shortestCooldown(ctx context.Context, group, provider, model
 	var minCooldown int64
 	found := false
 	for _, account := range accounts {
-		if account.Status != "active" || account.QuarantineUntil > now {
+		if account.Status != "active" || (account.QuarantineUntil > now && !account.IgnoreRateLimitControls) {
 			continue
 		}
 		if capable != nil && !capable[account.ID] {
@@ -2054,7 +2054,7 @@ func (s *Scheduler) shortestCooldown(ctx context.Context, group, provider, model
 		if provider != "" && s.providerOfAccount(ctx, account) != provider {
 			continue
 		}
-		if until, limited := s.accountRateLimitCooldownUntil(ctx, account, Route{Provider: provider, Model: model}, now); limited {
+		if until, limited := s.accountRateLimitCooldownUntil(ctx, account, Route{Provider: provider, Model: model}, now); limited && !account.IgnoreRateLimitControls {
 			remaining := until - now
 			if remaining > 0 && (!found || remaining < minCooldown) {
 				minCooldown = remaining
@@ -2068,10 +2068,10 @@ func (s *Scheduler) shortestCooldown(ctx context.Context, group, provider, model
 		}
 		// Recheck-pending accounts won't become available the moment their cooldown
 		// elapses (they must pass a probe first), so they are not something to wait on.
-		if binding.RecheckPending {
+		if binding.RecheckPending && !account.IgnoreRateLimitControls {
 			continue
 		}
-		if binding.CooldownUntil <= now {
+		if account.IgnoreRateLimitControls || binding.CooldownUntil <= now {
 			// Account is not cooling — but check egress health
 			egress, err := s.store.GetEgressProfile(ctx, binding.PrimaryEgressID)
 			if err == nil && EgressHealthy(egress, now) {
@@ -2080,10 +2080,12 @@ func (s *Scheduler) shortestCooldown(ctx context.Context, group, provider, model
 			}
 		}
 		// Account is cooling — track the shortest cooldown
-		remaining := binding.CooldownUntil - now
-		if remaining > 0 && (!found || remaining < minCooldown) {
-			minCooldown = remaining
-			found = true
+		if !account.IgnoreRateLimitControls {
+			remaining := binding.CooldownUntil - now
+			if remaining > 0 && (!found || remaining < minCooldown) {
+				minCooldown = remaining
+				found = true
+			}
 		}
 	}
 	if !found {
@@ -2157,8 +2159,8 @@ func ProviderFromToken(t storage.AccountToken) string {
 // cache (for cross-request sharing) and the request-scoped map. It populates the
 // process-level cache on miss and returns the cached time so the caller can update
 // egressCacheTime atomically.
-func (s *Scheduler) selectEgressWithCache(ctx context.Context, binding storage.AccountEgressBinding, now int64, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex, cacheTime *time.Time) (storage.EgressProfile, bool) {
-	if binding.CooldownUntil <= now {
+func (s *Scheduler) selectEgressWithCache(ctx context.Context, binding storage.AccountEgressBinding, now int64, ignoreBindingCooldown bool, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex, cacheTime *time.Time) (storage.EgressProfile, bool) {
+	if ignoreBindingCooldown || binding.CooldownUntil <= now {
 		if egress, ok := s.egressProfileWithCache(ctx, binding.PrimaryEgressID, now, reqCache, procCache); ok && EgressHealthy(egress, now) {
 			return egress, true
 		}
@@ -2256,7 +2258,7 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 	for _, awe := range accountsWithEgress {
 		account := awe.Account
 		binding := awe.Binding
-		if account.Status != "active" || account.QuarantineUntil > now {
+		if account.Status != "active" || (account.QuarantineUntil > now && !account.IgnoreRateLimitControls) {
 			continue
 		}
 		if capable != nil && !capable[account.ID] {
@@ -2268,7 +2270,7 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 		} else if accountProvider == "" {
 			accountProvider = actualProvider
 		}
-		if until, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, model, now); limited {
+		if until, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, model, now); limited && !account.IgnoreRateLimitControls {
 			remaining := until - now
 			if remaining > 0 && (!found || remaining < minCooldown) {
 				minCooldown = remaining
@@ -2276,10 +2278,10 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 			}
 			continue
 		}
-		if binding.RecheckPending {
+		if binding.RecheckPending && !account.IgnoreRateLimitControls {
 			continue
 		}
-		if binding.CooldownUntil <= now {
+		if account.IgnoreRateLimitControls || binding.CooldownUntil <= now {
 			// Account is not cooling — check egress health
 			if awe.Egress.ID != "" && EgressHealthy(awe.Egress, now) {
 				// Found an available account — no need to wait
@@ -2287,10 +2289,12 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 			}
 		}
 		// Account is cooling — track the shortest cooldown
-		remaining := binding.CooldownUntil - now
-		if remaining > 0 && (!found || remaining < minCooldown) {
-			minCooldown = remaining
-			found = true
+		if !account.IgnoreRateLimitControls {
+			remaining := binding.CooldownUntil - now
+			if remaining > 0 && (!found || remaining < minCooldown) {
+				minCooldown = remaining
+				found = true
+			}
 		}
 	}
 	if !found {

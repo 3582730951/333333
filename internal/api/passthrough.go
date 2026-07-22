@@ -202,7 +202,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 	}
 passthroughSuccess:
 
-	s.guardRateLimit(r.Context(), lease.Account.ID, resp.Header)
+	s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 	s.captureQuota(r.Context(), lease.Account.ID, "claude", "", resp.Header)
 	if resourceAffinity.Hash != "" {
 		s.persistClaudeResourceBinding(r.Context(), resourceAffinity, resourceKind, lease)

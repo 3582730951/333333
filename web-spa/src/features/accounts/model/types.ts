@@ -29,6 +29,7 @@ export interface AccountRow {
   auth_method?: 'oauth' | 'access_token' | 'api_key' | string;
   billing_mode?: 'subscription' | 'pay_as_you_go' | string;
   api_key_present?: boolean;
+  ignore_rate_limit_controls?: boolean;
   quarantine_until?: number;
   quarantine_reason?: string;
   capabilities?: AccountModelCapability[];
