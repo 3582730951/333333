@@ -521,17 +521,24 @@ func goalInitialFingerprint(body []byte) string {
 
 func bodyHasClientToolResult(body []byte) bool {
 	lower := strings.ToLower(string(body))
-	return strings.Contains(lower, `"function_call_output"`) || strings.Contains(lower, `"custom_tool_call_output"`) || strings.Contains(lower, `"tool_result"`) || strings.Contains(lower, `"tool_use_result"`)
+	return strings.Contains(lower, `"function_call_output"`) || strings.Contains(lower, `"local_shell_call_output"`) ||
+		strings.Contains(lower, `"mcp_tool_call_output"`) || strings.Contains(lower, `"custom_tool_call_output"`) ||
+		strings.Contains(lower, `"tool_search_output"`) || strings.Contains(lower, `"tool_result"`) || strings.Contains(lower, `"tool_use_result"`)
 }
 
 func outputAwaitingTool(response map[string]interface{}) bool {
+	// Inspect ordinary Responses history with exact call/result pairing first. The
+	// generic walk below remains for protocol-specific nested tool-use blocks.
+	if hasPendingClientToolCall(response["output"]) || hasPendingClientToolCall(response["content"]) {
+		return true
+	}
 	var walk func(interface{}) bool
 	walk = func(value interface{}) bool {
 		switch item := value.(type) {
 		case map[string]interface{}:
 			typ, _ := item["type"].(string)
 			switch strings.ToLower(typ) {
-			case "function_call", "tool_use", "mcp_tool_call":
+			case "tool_use", "mcp_tool_call":
 				return true
 			}
 			for _, child := range item {
@@ -888,6 +895,13 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 	}
 	delete(replayed, "previous_response_id")
 	delete(replayed, "turn_state")
+	// Sessions written before custom_tool_call was added to the awaiting-state
+	// detector may still say ready.  Validate the reconstructed, chronological
+	// history as the last line of defence so those older checkpoint chains cannot be
+	// sent upstream without the tool result that completes the call.
+	if protocol == "codex" && hasPendingClientToolCall(replayed[historyKey]) {
+		return goalResumeResult{Kind: goalResumeRequiresToolResult, Session: session, Reason: "the reconstructed history contains a client tool call without its result"}
+	}
 	body, err := json.Marshal(replayed)
 	if err != nil {
 		return goalResumeResult{Kind: goalResumeUnidentified, Reason: err.Error()}

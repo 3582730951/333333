@@ -73,9 +73,19 @@ func TestGoalContinuityRebuildsResponseAliasAfterRestartStyleRequest(t *testing.
 }
 
 func TestGoalContinuityAcceptsCustomToolCallOutputOnResume(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	var pairedReplay atomic.Bool
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"resp_goal_custom","object":"response","status":"completed","model":"gpt","output":[{"type":"custom_tool_call","call_id":"call_goal_custom","name":"patch","input":"{}"}]}`)
+		if upstreamCalls.Add(1) == 1 {
+			_, _ = io.WriteString(w, `{"id":"resp_goal_custom","object":"response","status":"completed","model":"gpt","output":[{"type":"custom_tool_call","call_id":"call_goal_custom","name":"patch","input":"{}"}]}`)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		callIndex := strings.Index(string(body), `"type":"custom_tool_call"`)
+		outputIndex := strings.Index(string(body), `"type":"custom_tool_call_output"`)
+		pairedReplay.Store(callIndex >= 0 && outputIndex > callIndex)
+		_, _ = io.WriteString(w, `{"id":"resp_goal_custom_done","object":"response","status":"completed","model":"gpt","output":[{"type":"message","content":[{"type":"output_text","text":"patched"}]}]}`)
 	})
 	h.importAccount(t, "goal-custom", "upstream-goal-custom", "access-goal-custom")
 	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","input":[{"role":"user","content":"tool task"}]}`))
@@ -84,11 +94,82 @@ func TestGoalContinuityAcceptsCustomToolCallOutputOnResume(t *testing.T) {
 	}
 	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
+	goals, err := h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 1 || goals[0].State != "awaiting_tool_result" {
+		t.Fatalf("custom tool call must persist awaiting state, goals=%+v err=%v", goals, err)
+	}
 	current := []byte(`{"model":"gpt","previous_response_id":"resp_goal_custom","input":[{"type":"custom_tool_call_output","call_id":"call_goal_custom","output":"ok"}]}`)
 	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(string(current)))
 	replay := h.app.goalReplayBody(context.Background(), request, "codex", current)
 	if replay.Kind != goalResumeFound || !strings.Contains(string(replay.Body), "custom_tool_call_output") || !strings.Contains(string(replay.Body), "custom_tool_call") {
 		t.Fatalf("custom tool goal replay=%+v body=%s", replay, replay.Body)
+	}
+	second, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(string(current)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(second.Body)
+	second.Body.Close()
+	if second.StatusCode != http.StatusOK || upstreamCalls.Load() != 2 || !pairedReplay.Load() {
+		t.Fatalf("paired custom tool replay status=%d upstreamCalls=%d paired=%v", second.StatusCode, upstreamCalls.Load(), pairedReplay.Load())
+	}
+	goals, err = h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 1 || goals[0].State != "ready" {
+		t.Fatalf("completed tool result must advance goal state, goals=%+v err=%v", goals, err)
+	}
+}
+
+func TestGoalContinuityRejectsUnpairedCustomToolCallBeforeUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if upstreamCalls.Add(1) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"No tool output found for custom tool call call_goal_pending."},"status":400}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_goal_pending","object":"response","status":"completed","model":"gpt","output":[{"type":"custom_tool_call","call_id":"call_goal_pending","name":"patch","input":"{}"}]}`)
+	})
+	h.importAccount(t, "goal-pending", "upstream-goal-pending", "access-goal-pending")
+	first, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","input":[{"role":"user","content":"make a patch"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(first.Body)
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first status=%d", first.StatusCode)
+	}
+	goals, err := h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 1 || goals[0].State != "awaiting_tool_result" {
+		t.Fatalf("pending custom call state goals=%+v err=%v", goals, err)
+	}
+
+	// Emulate a checkpoint written by the version that did not recognize
+	// custom_tool_call.  Its session says ready, but the segment still contains the
+	// call and must be protected by the reconstruction-time pairing check.
+	if _, err := h.store.DB().ExecContext(context.Background(), `UPDATE goal_session SET state='ready' WHERE id=?`, goals[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	resume := `{"model":"gpt","stream":true,"previous_response_id":"resp_goal_pending","input":[{"role":"user","content":"continue without tool output"}]}`
+	request, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(resume))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-MiCliProxy-Goal-Error") != "goal_resume_requires_tool_result" ||
+		!strings.Contains(string(body), "response.failed") || !strings.Contains(string(body), "goal_resume_requires_tool_result") {
+		t.Fatalf("missing tool result must be a visible SSE terminal status=%d headers=%v body=%s", response.StatusCode, response.Header, body)
+	}
+	if upstreamCalls.Load() != 1 {
+		t.Fatalf("unpaired custom call was forwarded upstream %d times", upstreamCalls.Load())
 	}
 }
 

@@ -289,6 +289,48 @@ func toolCallPairKind(t string) string {
 	}
 }
 
+// hasPendingClientToolCall reports whether a stateless Responses history carries a
+// client-managed tool call without its matching result.  A replay must never forward
+// such a history: the upstream correctly rejects it with e.g. "No tool output found
+// for custom tool call ...", while executing the call again would be unsafe.
+//
+// Server-executed tool search calls are excluded because their result is owned by the
+// Responses service rather than the downstream client.  Pairing is intentionally
+// ordered: an output that appears before its call is invalid and does not make a later
+// call look complete.
+func hasPendingClientToolCall(input interface{}) bool {
+	pending := map[string]struct{}{}
+	for _, raw := range appendItems(nil, input) {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if kind := clientToolCallPairKind(item); kind != "" {
+			if callID := streamString(item["call_id"]); callID != "" {
+				pending[kind+"\x00"+callID] = struct{}{}
+			}
+			continue
+		}
+		if kind := toolOutputPairKind(item); kind != "" && kind != "tool_search_server" {
+			if callID := streamString(item["call_id"]); callID != "" {
+				delete(pending, kind+"\x00"+callID)
+			}
+		}
+	}
+	return len(pending) > 0
+}
+
+func clientToolCallPairKind(item map[string]interface{}) string {
+	kind := toolCallPairKind(streamString(item["type"]))
+	if kind != "tool_search" {
+		return kind
+	}
+	if strings.EqualFold(strings.TrimSpace(streamString(item["execution"])), "client") {
+		return kind
+	}
+	return ""
+}
+
 func toolOutputPairKind(item map[string]interface{}) string {
 	t := strings.ToLower(strings.TrimSpace(streamString(item["type"])))
 	switch t {
