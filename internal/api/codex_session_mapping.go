@@ -22,6 +22,7 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -117,6 +118,11 @@ type codexSessionMapping struct {
 	snapshotEgr   string
 	logicalTurnID string
 	instructions  *CodexInstructionPlan
+	// recoveryAliases retain only durable hierarchy correlators from a known-dead
+	// tree while the new root is committed. They intentionally never contain a
+	// response id or turn-state token, so an old upstream state pointer can never
+	// become valid again through the new tree.
+	recoveryAliases []storage.CodexSessionAlias
 }
 
 func withCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping) context.Context {
@@ -277,6 +283,131 @@ func codexDownstreamSessionIdentity(headers http.Header, body []byte) codexDowns
 		ResponseID:   strings.TrimSpace(responseID),
 		TurnState:    strings.TrimSpace(turnState),
 	}
+}
+
+// codexRetiredEpochFreshRootRequest removes only the account-local state pointers
+// from a request whose mapped epoch has already been retired after an upstream
+// context-loss confirmation.  Codex CLI's /goal resume control is consumed by the
+// client: the gateway sees its next ordinary Responses request, not the literal
+// command.  Starting that request as a fresh root prevents an already-proven-dead
+// previous_response_id from being submitted forever.
+//
+// This is deliberately narrower than legacy context recovery.  It never rebuilds
+// history, never rewrites a tool result, and never turns a client tool output into a
+// user message.  A request containing such an output remains a visible retired-epoch
+// error because its call can only be understood in the lost upstream context.
+func codexRetiredEpochFreshRootRequest(body []byte, header http.Header) ([]byte, http.Header, bool) {
+	if !codexDownstreamSessionIdentity(header, body).stateful() || bodyHasClientToolResult(body) {
+		return body, header, false
+	}
+
+	// Preserve every untouched request fragment, including input/tool definitions and
+	// large JSON numbers.  sjson is used only on the fixed set of CPA state fields.
+	out := append([]byte(nil), body...)
+	for _, path := range []string{
+		"previous_response_id",
+		"turn_state",
+		"session_id",
+		"parent_thread_id",
+		"x-codex-parent-thread-id",
+		"forked_from_thread_id",
+		"x-codex-forked-from-thread-id",
+		"client_metadata.x-codex-turn-state",
+		"client_metadata.turn_state",
+		"client_metadata.session_id",
+		"client_metadata.parent_thread_id",
+		"client_metadata.x-codex-parent-thread-id",
+		"client_metadata.forked_from_thread_id",
+		"client_metadata.x-codex-forked-from-thread-id",
+		"turn_metadata.x-codex-turn-state",
+		"turn_metadata.turn_state",
+		"turn_metadata.session_id",
+		"turn_metadata.parent_thread_id",
+		"turn_metadata.x-codex-parent-thread-id",
+		"turn_metadata.forked_from_thread_id",
+		"turn_metadata.x-codex-forked-from-thread-id",
+	} {
+		var err error
+		out, err = sjson.DeleteBytes(out, path)
+		if err != nil {
+			return body, header, false
+		}
+	}
+	// The transport commonly embeds turn metadata as a JSON string.  Preserve useful
+	// non-state fields such as request_kind and turn_started_at, but remove the same
+	// stale state/hierarchy pointers before the mapped upstream metadata builder sees
+	// them.
+	if updated, metadataChanged := stripCodexRetiredEpochEmbeddedTurnMetadata(out, "client_metadata.x-codex-turn-metadata"); metadataChanged {
+		out = updated
+	}
+
+	nextHeader := header.Clone()
+	for _, name := range []string{
+		"X-Codex-Turn-State",
+		"Session-Id",
+		"X-Codex-Parent-Thread-Id",
+		"X-Codex-Forked-From-Thread-Id",
+	} {
+		nextHeader.Del(name)
+	}
+	if value := codexHeaderValue(nextHeader, "X-Codex-Turn-Metadata"); value != "" {
+		if cleaned, metadataChanged := stripCodexRetiredEpochTurnMetadata(value); metadataChanged {
+			nextHeader.Set("X-Codex-Turn-Metadata", cleaned)
+		}
+	}
+	// Do not make a best-effort reset if a future client moves a state alias to a
+	// currently unrecognised location.  Sending that alias to a new root would break
+	// the strict CPA boundary.
+	if codexDownstreamSessionIdentity(nextHeader, out).stateful() {
+		return body, header, false
+	}
+	return out, nextHeader, true
+}
+
+func stripCodexRetiredEpochEmbeddedTurnMetadata(body []byte, path string) ([]byte, bool) {
+	value := gjson.GetBytes(body, path)
+	if !value.Exists() || value.Type != gjson.String {
+		return body, false
+	}
+	cleaned, changed := stripCodexRetiredEpochTurnMetadata(value.String())
+	if !changed {
+		return body, false
+	}
+	out, err := sjson.SetBytes(body, path, cleaned)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+func stripCodexRetiredEpochTurnMetadata(raw string) (string, bool) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &fields) != nil || fields == nil {
+		return raw, false
+	}
+	changed := false
+	for _, key := range []string{
+		"x-codex-turn-state",
+		"turn_state",
+		"session_id",
+		"parent_thread_id",
+		"x-codex-parent-thread-id",
+		"forked_from_thread_id",
+		"x-codex-forked-from-thread-id",
+	} {
+		if _, ok := fields[key]; ok {
+			delete(fields, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	cleaned, err := json.Marshal(fields)
+	if err != nil {
+		return raw, false
+	}
+	return string(cleaned), true
 }
 
 func codexSessionNamespace(pol downstreamPolicy, r *http.Request) string {
@@ -571,6 +702,24 @@ func (m *codexSessionMapping) setInstructionPlan(plan *CodexInstructionPlan) {
 	m.mu.Unlock()
 }
 
+// retainRetiredEpochHierarchy lets the first successful fresh-root turn reclaim
+// its client's stable root/session/branch aliases from a retired tree. Without
+// this, a CLI that continues to send Session-Id after /goal resume would resolve
+// that harmless hierarchy alias to the old retired binding on the very next turn.
+// State aliases are deliberately excluded.
+func (m *codexSessionMapping) retainRetiredEpochHierarchy(identity codexDownstreamIdentity) {
+	if m == nil {
+		return
+	}
+	aliases := identity.directAliases()
+	if parent := strings.TrimSpace(identity.ParentID); parent != "" {
+		aliases = append(aliases, storage.CodexSessionAlias{Type: "branch", Value: parent})
+	}
+	m.mu.Lock()
+	m.recoveryAliases = append(m.recoveryAliases, aliases...)
+	m.mu.Unlock()
+}
+
 // upstreamAttemptBinding returns only the durable routing metadata needed for a
 // redacted CPA diagnostic. It never exposes aliases, downstream ids, request text,
 // or the encrypted identity payload. Fresh roots/forks have no tree yet and are
@@ -813,15 +962,16 @@ func (s *Server) emitCodexNativeContinuationFailure(ctx context.Context, w io.Wr
 // HMAC aliases, internal UUIDs, response ids, or request content is exposed.
 func (s *Server) codexSessionMappingStats(ctx context.Context) map[string]interface{} {
 	stats := map[string]interface{}{
-		"enabled":           s.codexSessionMappingEnabled(ctx),
-		"strict_cpa":        s.codexCPAStrict(ctx),
-		"retention_days":    int(s.codexSessionMappingRetention(ctx).Hours() / 24),
-		"bindings_created":  atomic.LoadUint64(&s.codexMappingBindingsCreated),
-		"epoch_rotations":   atomic.LoadUint64(&s.codexMappingEpochRotations),
-		"unidentified":      atomic.LoadUint64(&s.codexMappingUnidentified),
-		"ambiguous":         atomic.LoadUint64(&s.codexMappingAmbiguous),
-		"native_continues":  atomic.LoadUint64(&s.codexNativeContinues),
-		"eof_compensations": atomic.LoadUint64(&s.codexEOFCompensations),
+		"enabled":                        s.codexSessionMappingEnabled(ctx),
+		"strict_cpa":                     s.codexCPAStrict(ctx),
+		"retention_days":                 int(s.codexSessionMappingRetention(ctx).Hours() / 24),
+		"bindings_created":               atomic.LoadUint64(&s.codexMappingBindingsCreated),
+		"epoch_rotations":                atomic.LoadUint64(&s.codexMappingEpochRotations),
+		"fresh_roots_after_context_loss": atomic.LoadUint64(&s.codexMappingFreshRoots),
+		"unidentified":                   atomic.LoadUint64(&s.codexMappingUnidentified),
+		"ambiguous":                      atomic.LoadUint64(&s.codexMappingAmbiguous),
+		"native_continues":               atomic.LoadUint64(&s.codexNativeContinues),
+		"eof_compensations":              atomic.LoadUint64(&s.codexEOFCompensations),
 	}
 	if s.store == nil {
 		return stats
@@ -877,10 +1027,12 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	created := binding.ID == ""
 	expiresAt := time.Now().Add(s.codexSessionMappingRetention(ctx)).Unix()
 	instructionSnapshot := mapping.instructions.snapshotCommit(binding.TreeID, expiresAt)
+	aliases := mapping.identity.aliasesForBinding(*binding, responseID, turnState)
+	aliases = append(aliases, mapping.recoveryAliases...)
 	committed, err := s.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
 		Namespace:           mapping.namespace,
 		Binding:             *binding,
-		Aliases:             mapping.identity.aliasesForBinding(*binding, responseID, turnState),
+		Aliases:             aliases,
 		ExpiresAt:           expiresAt,
 		InstructionSnapshot: instructionSnapshot,
 	})

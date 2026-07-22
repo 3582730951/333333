@@ -130,6 +130,7 @@ type Server struct {
 	// downstream/upstream ids or prompt bodies.
 	codexMappingBindingsCreated uint64
 	codexMappingEpochRotations  uint64
+	codexMappingFreshRoots      uint64
 	codexMappingUnidentified    uint64
 	codexMappingAmbiguous       uint64
 	codexNativeContinues        uint64
@@ -563,7 +564,32 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if s.codexSessionMappingEnabled(r.Context()) {
 		s.codexMappingContextHeader(w)
 		var mappingErr error
+		freshRootAfterContextLoss := false
 		codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
+		// A confirmed previous_response_not_found retires the full mapped tree. On
+		// the next ordinary Codex /goal resume request, the CLI still carries the
+		// durable previous_response_id even though it has already consumed the
+		// literal command locally. Start a fresh root with that new input rather than
+		// repeatedly forwarding the known-dead state pointer. Strict CPA never
+		// reconstructs history here; client tool outputs remain rejected above.
+		if mappingErr != nil && s.codexCPAStrict(r.Context()) && errors.Is(mappingErr, storage.ErrCodexSessionEpochRetired) {
+			retiredIdentity := codexDownstreamSessionIdentity(r.Header, raw)
+			if resetBody, resetHeader, reset := codexRetiredEpochFreshRootRequest(raw, r.Header); reset {
+				raw = resetBody
+				r = r.Clone(r.Context())
+				r.Header = resetHeader
+				codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
+				if mappingErr == nil {
+					codexMapping.retainRetiredEpochHierarchy(retiredIdentity)
+					freshRootAfterContextLoss = true
+					atomic.AddUint64(&s.codexMappingFreshRoots, 1)
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+						Action: "codex_context_new_root", State: "recovered",
+						Reason: "retired_upstream_context", Detail: "no_history_replay",
+					})
+				}
+			}
+		}
 		if mappingErr != nil {
 			code := codexMappingErrorCode(mappingErr)
 			// An unidentified first request without a real session identity is valid:
@@ -574,6 +600,9 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
 				return
 			}
+		}
+		if freshRootAfterContextLoss {
+			w.Header().Set("X-MiCliProxy-Context-Status", "new_root_after_context_loss")
 		}
 		r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
 		if s.codexCPAStrict(r.Context()) {
@@ -963,6 +992,16 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 
 	codexClientVersion := s.codexClientVersionForModel(model)
 	codexUseWebSocket := forceCodexResponsesWebSocket(r.Context()) || s.codexResponsesWebSocketForModel(model, isChat, isCompact, body)
+	// A preferred Responses WebSocket opened for an ordinary HTTP request is a
+	// one-shot upstream connection. Some Codex backend response ids are scoped to
+	// that connection, so a later HTTP continuation would necessarily open a new
+	// socket and lose its previous_response_id despite retaining the account,
+	// egress and virtual device. Strict CPA therefore uses HTTP/SSE for the whole
+	// HTTP-originated tree. A real downstream WebSocket carries the session object
+	// below and still reuses its matching upstream connection across turns.
+	if strictNativeCPA && codexResponsesWebSocketSession(r.Context()) == nil {
+		codexUseWebSocket = false
+	}
 	// A sidecar-bound account presents the real Codex JA3 only on the HTTP/SSE path
 	// (postViaSidecar replays it); the WS dialer cannot, so it would dial with Go-stdlib
 	// TLS and throw away the fingerprint the sidecar binding exists for. Prefer the SSE

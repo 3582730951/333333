@@ -672,7 +672,7 @@ func TestCodexStrictCPAContextRuleChangesPresentationAndRetiresEpoch(t *testing.
 	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":"resume"}`); status != http.StatusServiceUnavailable || !strings.Contains(body, "administrator handled context loss") {
 		t.Fatalf("strict context rule status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":"retry"}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") || calls.Load() != 2 {
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":[{"type":"custom_tool_call_output","call_id":"call-rule-context","output":"must remain native"}]}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") || calls.Load() != 2 {
 		t.Fatalf("strict context epoch status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }

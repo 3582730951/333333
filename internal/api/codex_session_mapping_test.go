@@ -127,6 +127,72 @@ func TestCodexSessionMappingKeepsNativeIdentityAndToolOutput(t *testing.T) {
 	}
 }
 
+func TestCodexSessionMappingUsesHTTPForPersistentHTTPChain(t *testing.T) {
+	type capturedUpstreamCall struct {
+		method  string
+		upgrade string
+		body    string
+	}
+	var mu sync.Mutex
+	var calls []capturedUpstreamCall
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, capturedUpstreamCall{method: r.Method, upgrade: r.Header.Get("Upgrade"), body: string(raw)})
+		call := len(calls)
+		mu.Unlock()
+
+		responseID := "resp-http-chain-root"
+		if call > 1 {
+			responseID = "resp-http-chain-next"
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\""+responseID+"\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\""+responseID+"\",\"object\":\"response\",\"model\":\"gpt-5.6-sol\",\"status\":\"completed\",\"output\":[]}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	enableCodexSessionMappingForTest(h)
+	accountID := h.importAccount(t, "http-chain", "upstream-http-chain", "access-http-chain")
+	setTestCapability(t, h, accountID, "gpt-5.6-sol", 1024)
+
+	post := func(body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "http-chain-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		payload, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(payload)
+	}
+	if status, body := post(`{"model":"gpt-5.6-sol","stream":true,"input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp-http-chain-root") {
+		t.Fatalf("root status=%d body=%s", status, body)
+	}
+	if status, body := post(`{"model":"gpt-5.6-sol","stream":true,"previous_response_id":"resp-http-chain-root","input":"continue"}`); status != http.StatusOK || !strings.Contains(body, "resp-http-chain-next") {
+		t.Fatalf("continuation status=%d body=%s", status, body)
+	}
+	mu.Lock()
+	got := append([]capturedUpstreamCall(nil), calls...)
+	mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("upstream calls=%d %#v", len(got), got)
+	}
+	for i, call := range got {
+		if call.method != http.MethodPost || call.upgrade != "" {
+			t.Fatalf("HTTP CPA turn %d unexpectedly used websocket: %#v", i, call)
+		}
+	}
+	if !strings.Contains(got[1].body, `"previous_response_id":"resp-http-chain-root"`) {
+		t.Fatalf("continuation lost native response id: %s", got[1].body)
+	}
+}
+
 func TestCodexSessionMappingPersistsInstallationIDAcrossOSHints(t *testing.T) {
 	var mu sync.Mutex
 	installationIDs := []string{}
@@ -544,9 +610,114 @@ func TestCodexSessionMappingRetiresOnlyAfterUpstreamContextLoss(t *testing.T) {
 	if status, body := post(`{"model":"gpt","previous_response_id":"resp-retired-origin","input":"resume"}`); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
 		t.Fatalf("context loss must stay native status=%d body=%s", status, body)
 	}
-	status, body := post(`{"model":"gpt","previous_response_id":"resp-retired-origin","input":"resume again"}`)
+	status, body := post(`{"model":"gpt","previous_response_id":"resp-retired-origin","input":[{"type":"custom_tool_call_output","call_id":"call-retired","output":"must remain native"}]}`)
 	if status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
-		t.Fatalf("retired epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+		t.Fatalf("retired tool epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+	}
+}
+
+func TestCodexSessionMappingGoalResumeStartsFreshRootAfterContextLoss(t *testing.T) {
+	type capturedCall struct {
+		body         string
+		session      string
+		thread       string
+		turnState    string
+		turnMetadata string
+	}
+	var mu sync.Mutex
+	var calls []capturedCall
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		calls = append(calls, capturedCall{
+			body:         string(raw),
+			session:      r.Header.Get("Session-Id"),
+			thread:       r.Header.Get("Thread-Id"),
+			turnState:    r.Header.Get("X-Codex-Turn-State"),
+			turnMetadata: r.Header.Get("X-Codex-Turn-Metadata"),
+		})
+		call := len(calls)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			w.Header().Set("X-Codex-Turn-State", "stale-goal-turn-state")
+			_, _ = w.Write([]byte(`{"id":"resp-goal-resume-origin","object":"response","model":"gpt","status":"completed","output":[]}`))
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"previous_response_not_found","message":"Previous response resp-goal-resume-origin was not found."}}`))
+		case 3:
+			w.Header().Set("X-Codex-Turn-State", "fresh-goal-turn-state")
+			_, _ = w.Write([]byte(`{"id":"resp-goal-resume-fresh","object":"response","model":"gpt","status":"completed","output":[]}`))
+		case 4:
+			_, _ = w.Write([]byte(`{"id":"resp-goal-resume-followup","object":"response","model":"gpt","status":"completed","output":[]}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "goal-resume", "upstream-goal-resume", "access-goal-resume")
+
+	post := func(body, thread, session, state, metadata string) (int, http.Header, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", thread)
+		if session != "" {
+			req.Header.Set("Session-Id", session)
+		}
+		if state != "" {
+			req.Header.Set("X-Codex-Turn-State", state)
+		}
+		if metadata != "" {
+			req.Header.Set("X-Codex-Turn-Metadata", metadata)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		result, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Clone(), string(result)
+	}
+
+	if status, _, body := post(`{"model":"gpt","input":"start"}`, "goal-resume-root", "goal-resume-root", "", ""); status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-origin") {
+		t.Fatalf("initial status=%d body=%s", status, body)
+	}
+	if status, _, body := post(`{"model":"gpt","previous_response_id":"resp-goal-resume-origin","input":"resume"}`, "goal-resume-root", "goal-resume-root", "stale-goal-turn-state", ""); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
+		t.Fatalf("context loss must remain visible once status=%d body=%s", status, body)
+	}
+	resumeMetadata := `{"thread_id":"goal-resume-root","session_id":"goal-resume-root","turn_state":"stale-goal-turn-state","request_kind":"turn"}`
+	resumeBody := `{"model":"gpt","previous_response_id":"resp-goal-resume-origin","turn_state":"stale-goal-turn-state","session_id":"goal-resume-root","client_metadata":{"x-codex-turn-state":"stale-goal-turn-state","session_id":"goal-resume-root","x-codex-turn-metadata":"{\"thread_id\":\"goal-resume-root\",\"session_id\":\"goal-resume-root\",\"turn_state\":\"stale-goal-turn-state\",\"request_kind\":\"turn\"}"},"input":[{"role":"user","content":[{"type":"input_text","text":"resume"}],"exact":900719925474099312345}]}`
+	status, headers, body := post(resumeBody, "goal-resume-root", "goal-resume-root", "stale-goal-turn-state", resumeMetadata)
+	if status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-fresh") || headers.Get("X-MiCliProxy-Context-Status") != "new_root_after_context_loss" {
+		t.Fatalf("goal resume fresh root status=%d headers=%v body=%s", status, headers, body)
+	}
+	if status, _, body := post(`{"model":"gpt","previous_response_id":"resp-goal-resume-fresh","input":"follow up"}`, "goal-resume-root", "goal-resume-root", "fresh-goal-turn-state", ""); status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-followup") {
+		t.Fatalf("fresh root continuation status=%d body=%s", status, body)
+	}
+
+	mu.Lock()
+	got := append([]capturedCall(nil), calls...)
+	mu.Unlock()
+	if len(got) != 4 {
+		t.Fatalf("upstream calls=%d", len(got))
+	}
+	if strings.Contains(got[2].body, `"previous_response_id":"resp-goal-resume-origin"`) || got[2].turnState != "" || strings.Contains(got[2].turnMetadata, "stale-goal-turn-state") {
+		t.Fatalf("fresh root retained stale upstream state: %+v", got[2])
+	}
+	if !strings.Contains(got[2].body, "900719925474099312345") {
+		t.Fatalf("fresh root changed untouched input number: %s", got[2].body)
+	}
+	if got[0].session == "" || got[2].session == "" || got[0].session == got[2].session || got[0].thread == got[2].thread {
+		t.Fatalf("fresh root did not allocate a new native identity old=%+v new=%+v", got[0], got[2])
+	}
+	if !strings.Contains(got[3].body, `"previous_response_id":"resp-goal-resume-fresh"`) {
+		t.Fatalf("follow-up did not bind to fresh root: %s", got[3].body)
 	}
 }
 
@@ -588,9 +759,9 @@ func TestCodexSessionMappingRetiresOnSoft200PreviousResponseNotFound(t *testing.
 	if status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":"resume"}`); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
 		t.Fatalf("soft context loss must surface as native 400 status=%d body=%s", status, body)
 	}
-	status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":"resume again"}`)
+	status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":[{"type":"custom_tool_call_output","call_id":"call-soft-retired","output":"must remain native"}]}`)
 	if status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
-		t.Fatalf("soft-retired epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+		t.Fatalf("soft-retired tool epoch status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }
 
@@ -631,8 +802,8 @@ func TestCodexSessionMappingRetiresAfterNativeStreamContextLoss(t *testing.T) {
 	if status, body := post(`{"model":"gpt","stream":true,"previous_response_id":"resp-stream-retired-origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "previous_response_not_found") || strings.Contains(body, "codex_native_continue_failed") {
 		t.Fatalf("native stream context loss status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt","previous_response_id":"resp-stream-retired-origin","input":"retry"}`); status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
-		t.Fatalf("retired stream epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+	if status, body := post(`{"model":"gpt","previous_response_id":"resp-stream-retired-origin","input":[{"type":"custom_tool_call_output","call_id":"call-stream-retired","output":"must remain native"}]}`); status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
+		t.Fatalf("retired stream tool epoch status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }
 
