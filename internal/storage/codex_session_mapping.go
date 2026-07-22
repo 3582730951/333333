@@ -50,13 +50,36 @@ CREATE TABLE IF NOT EXISTS codex_session_alias(
 );
 CREATE INDEX IF NOT EXISTS idx_codex_session_alias_lookup ON codex_session_alias(alias_hash, expires_at, binding_id);
 CREATE INDEX IF NOT EXISTS idx_codex_session_alias_binding ON codex_session_alias(binding_id);
+CREATE TABLE IF NOT EXISTS codex_instruction_snapshot(
+  tree_id TEXT PRIMARY KEY,
+  encrypted_instructions TEXT NOT NULL,
+  revision_hmac TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codex_instruction_snapshot_expiry ON codex_instruction_snapshot(expires_at);
+CREATE TABLE IF NOT EXISTS codex_upstream_attempt(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tree_id TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  state TEXT NOT NULL,
+  status_code INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_expiry ON codex_upstream_attempt(expires_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_tree ON codex_upstream_attempt(tree_id, created_at);
 `
 
 var (
-	ErrCodexSessionMappingNotFound  = errors.New("codex session mapping not found")
-	ErrCodexSessionMappingAmbiguous = errors.New("codex session mapping is ambiguous")
-	ErrCodexSessionEpochRetired     = errors.New("codex session context epoch retired")
-	ErrCodexSessionEpochConflict    = errors.New("codex session context epoch changed")
+	ErrCodexSessionMappingNotFound      = errors.New("codex session mapping not found")
+	ErrCodexSessionMappingAmbiguous     = errors.New("codex session mapping is ambiguous")
+	ErrCodexSessionEpochRetired         = errors.New("codex session context epoch retired")
+	ErrCodexSessionEpochConflict        = errors.New("codex session context epoch changed")
+	ErrCodexInstructionSnapshotNotFound = errors.New("codex instruction snapshot not found")
 )
 
 // CodexSessionAlias is plaintext only at the API/storage boundary.  Store methods
@@ -94,10 +117,38 @@ type CodexSessionBinding struct {
 // new child branch).  ResponseID and TurnState are intentionally aliases rather
 // than columns, which makes every stateful resume use the same exact lookup path.
 type CodexSessionCommit struct {
-	Namespace string
-	Binding   CodexSessionBinding
-	Aliases   []CodexSessionAlias
-	ExpiresAt int64
+	Namespace           string
+	Binding             CodexSessionBinding
+	Aliases             []CodexSessionAlias
+	ExpiresAt           int64
+	InstructionSnapshot *CodexInstructionSnapshot
+}
+
+// CodexInstructionSnapshot is the tree-scoped, encrypted base-instructions
+// snapshot used by native Codex CPA sessions. Instructions deliberately never
+// appear in a mapping, alias, audit row, or diagnostic export in plaintext.
+// Revision is a domain-separated HMAC, not a content hash exposed to clients.
+type CodexInstructionSnapshot struct {
+	TreeID       string
+	Instructions string
+	Revision     string
+	CreatedAt    int64
+	UpdatedAt    int64
+	ExpiresAt    int64
+}
+
+// CodexUpstreamAttempt is intentionally metadata-only. It is enough to correlate
+// a strict CPA upstream attempt with the durable tree/account/real-exit epoch in
+// a support bundle without retaining input, output, aliases, or upstream ids.
+type CodexUpstreamAttempt struct {
+	TreeID     string
+	AccountID  string
+	EgressID   string
+	Epoch      int64
+	State      string
+	StatusCode int
+	CreatedAt  int64
+	ExpiresAt  int64
 }
 
 type codexSessionIdentityPayload struct {
@@ -160,6 +211,55 @@ func (s *Store) codexSessionAliasHash(namespace, typ, value string) string {
 func (s *Store) codexSessionNamespaceHash(namespace string) string {
 	return s.codexSessionAliasHash(namespace, "namespace", "")
 }
+
+func (s *Store) codexInstructionRevision(instructions string) string {
+	mac := hmac.New(sha256.New, s.codexSessionMappingKey())
+	_, _ = mac.Write([]byte("codex-instruction-snapshot-revision/v1\x00"))
+	_, _ = mac.Write([]byte(instructions))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// CodexInstructionRevision exposes the opaque revision used by safe operational
+// diagnostics. It is intentionally HMAC-derived so equal instruction text cannot
+// be tested offline from an exported revision value.
+func (s *Store) CodexInstructionRevision(instructions string) string {
+	return s.codexInstructionRevision(instructions)
+}
+
+// CodexGroupPolicyRevision returns an opaque, domain-separated revision for
+// safe diagnostics. Its caller supplies configuration metadata only (never the
+// instruction file contents), so support bundles can correlate policy changes
+// without creating an offline oracle for either configuration or prompt text.
+func (s *Store) CodexGroupPolicyRevision(policy string) string {
+	mac := hmac.New(sha256.New, s.codexSessionMappingKey())
+	_, _ = mac.Write([]byte("codex-group-policy-revision/v1\x00"))
+	_, _ = mac.Write([]byte(policy))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Store) sealCodexInstructionSnapshot(instructions string) (string, error) {
+	return secretbox.Seal(s.codexSessionMappingKey(), instructions)
+}
+
+func (s *Store) openCodexInstructionSnapshot(value string) (string, error) {
+	return secretbox.Open(s.codexSessionMappingKey(), value)
+}
+
+func scanCodexInstructionSnapshot(s *Store, scanner interface{ Scan(...interface{}) error }) (CodexInstructionSnapshot, error) {
+	var snapshot CodexInstructionSnapshot
+	var encrypted string
+	if err := scanner.Scan(&snapshot.TreeID, &encrypted, &snapshot.Revision, &snapshot.CreatedAt, &snapshot.UpdatedAt, &snapshot.ExpiresAt); err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	instructions, err := s.openCodexInstructionSnapshot(encrypted)
+	if err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	snapshot.Instructions = instructions
+	return snapshot, nil
+}
+
+const codexInstructionSnapshotColumns = `tree_id,encrypted_instructions,revision_hmac,created_at,updated_at,expires_at`
 
 func (s *Store) sealCodexSessionIdentity(binding CodexSessionBinding) (string, error) {
 	payload, err := json.Marshal(codexSessionIdentityPayload{
@@ -291,6 +391,102 @@ func (s *Store) ResolveCodexSessionAliases(ctx context.Context, namespace string
 	return *chosen, nil
 }
 
+// GetCodexInstructionSnapshot resolves one tree's immutable administrator
+// instruction snapshot. An expired row is treated as absent; callers can then
+// safely create a fresh root rather than resurrecting stale session policy.
+func (s *Store) GetCodexInstructionSnapshot(ctx context.Context, treeID string) (CodexInstructionSnapshot, error) {
+	treeID = strings.TrimSpace(treeID)
+	if treeID == "" {
+		return CodexInstructionSnapshot{}, ErrCodexInstructionSnapshotNotFound
+	}
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+codexInstructionSnapshotColumns+`
+FROM codex_instruction_snapshot WHERE tree_id=? AND expires_at>?`, treeID, Now())
+	snapshot, err := scanCodexInstructionSnapshot(s, row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CodexInstructionSnapshot{}, ErrCodexInstructionSnapshotNotFound
+	}
+	return snapshot, err
+}
+
+// ensureCodexInstructionSnapshotTx is the tree-level compare-and-set used both
+// by lazy migration and terminal mapping commits. The first writer determines a
+// tree's instruction text forever (until expiry); concurrent branches receive
+// that exact stored value instead of racing current group files into the tree.
+func (s *Store) ensureCodexInstructionSnapshotTx(ctx context.Context, tx *sql.Tx, candidate CodexInstructionSnapshot) (CodexInstructionSnapshot, error) {
+	candidate.TreeID = strings.TrimSpace(candidate.TreeID)
+	if candidate.TreeID == "" {
+		return CodexInstructionSnapshot{}, ErrCodexInstructionSnapshotNotFound
+	}
+	now := Now()
+	if candidate.ExpiresAt <= now {
+		candidate.ExpiresAt = now + int64((7*24*time.Hour)/time.Second)
+	}
+	candidate.Instructions = strings.TrimSpace(candidate.Instructions)
+	if candidate.Revision == "" {
+		candidate.Revision = s.codexInstructionRevision(candidate.Instructions)
+	}
+	encrypted, err := s.sealCodexInstructionSnapshot(candidate.Instructions)
+	if err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	if candidate.CreatedAt == 0 {
+		candidate.CreatedAt = now
+	}
+	candidate.UpdatedAt = now
+	// The conflict update intentionally fires only for an expired snapshot. This
+	// is a CAS, not a configuration refresh: active trees must never observe file
+	// edits made after their root turn began.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO codex_instruction_snapshot(`+codexInstructionSnapshotColumns+`)
+VALUES(?,?,?,?,?,?)
+ON CONFLICT(tree_id) DO UPDATE SET
+ encrypted_instructions=excluded.encrypted_instructions,
+ revision_hmac=excluded.revision_hmac,
+ created_at=excluded.created_at,
+ updated_at=excluded.updated_at,
+ expires_at=excluded.expires_at
+WHERE codex_instruction_snapshot.expires_at<=?`, candidate.TreeID, encrypted, candidate.Revision,
+		candidate.CreatedAt, candidate.UpdatedAt, candidate.ExpiresAt, now); err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	row := tx.QueryRowContext(ctx, `SELECT `+codexInstructionSnapshotColumns+` FROM codex_instruction_snapshot WHERE tree_id=?`, candidate.TreeID)
+	stored, err := scanCodexInstructionSnapshot(s, row)
+	if err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	if stored.ExpiresAt > now {
+		// A successful use slides the TTL but never changes the stored content or
+		// revision. This also refreshes a concurrently-created snapshot safely.
+		expiresAt := candidate.ExpiresAt
+		if expiresAt > stored.ExpiresAt {
+			stored.ExpiresAt = expiresAt
+		}
+		stored.UpdatedAt = now
+		if _, err := tx.ExecContext(ctx, `UPDATE codex_instruction_snapshot SET updated_at=?,expires_at=? WHERE tree_id=?`, stored.UpdatedAt, stored.ExpiresAt, stored.TreeID); err != nil {
+			return CodexInstructionSnapshot{}, err
+		}
+	}
+	return stored, nil
+}
+
+// EnsureCodexInstructionSnapshot lazily migrates legacy CPA trees. It is safe to
+// call before a stateful continuation: a single SQLite transaction elects one
+// snapshot for all concurrent child branches and returns the elected value.
+func (s *Store) EnsureCodexInstructionSnapshot(ctx context.Context, candidate CodexInstructionSnapshot) (CodexInstructionSnapshot, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	defer tx.Rollback()
+	stored, err := s.ensureCodexInstructionSnapshotTx(ctx, tx, candidate)
+	if err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CodexInstructionSnapshot{}, err
+	}
+	return stored, nil
+}
+
 // CommitCodexSessionBinding is deliberately terminal-only.  Alias ownership is
 // checked inside the same SQLite transaction as the binding write, so concurrent
 // requests cannot silently make a response id point at two active identities.
@@ -361,6 +557,14 @@ WHERE id=? AND epoch=? AND state='active'`, binding.AccountID, binding.EgressID,
 		changed, _ := result.RowsAffected()
 		if changed != 1 {
 			return CodexSessionBinding{}, ErrCodexSessionEpochConflict
+		}
+	}
+	if commit.InstructionSnapshot != nil {
+		snapshot := *commit.InstructionSnapshot
+		snapshot.TreeID = binding.TreeID
+		snapshot.ExpiresAt = binding.ExpiresAt
+		if _, err := s.ensureCodexInstructionSnapshotTx(ctx, tx, snapshot); err != nil {
+			return CodexSessionBinding{}, err
 		}
 	}
 
@@ -506,6 +710,12 @@ func (s *Store) CleanupCodexSessionMappings(ctx context.Context) (int64, error) 
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM codex_session_alias WHERE expires_at<=? OR binding_id NOT IN (SELECT id FROM codex_session_binding)`, Now()); err != nil {
 		return 0, err
 	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM codex_instruction_snapshot WHERE expires_at<=? OR tree_id NOT IN (SELECT DISTINCT tree_id FROM codex_session_binding)`, Now()); err != nil {
+		return 0, err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM codex_upstream_attempt WHERE expires_at<=? OR tree_id NOT IN (SELECT DISTINCT tree_id FROM codex_session_binding)`, Now()); err != nil {
+		return 0, err
+	}
 	n, _ := result.RowsAffected()
 	return n, nil
 }
@@ -531,4 +741,137 @@ func (s *Store) CodexSessionMappingMetrics(ctx context.Context) (active, retired
 		}
 	}
 	return active, retired, rows.Err()
+}
+
+// CodexSessionMappingDiagnostic is intentionally safe for support bundles: raw
+// response ids, downstream aliases, internal UUIDs and instruction text are absent.
+// Tree and namespace values are domain-separated HMAC prefixes only.
+type CodexSessionMappingDiagnostic struct {
+	TreeHMACPrefix      string
+	NamespaceHMACPrefix string
+	AccountID           string
+	EgressID            string
+	Epoch               int64
+	State               string
+	SnapshotPresent     bool
+	CreatedAt           int64
+	UpdatedAt           int64
+	ExpiresAt           int64
+}
+
+type CodexInstructionSnapshotDiagnostic struct {
+	TreeHMACPrefix string
+	RevisionPrefix string
+	CreatedAt      int64
+	UpdatedAt      int64
+	ExpiresAt      int64
+}
+
+type CodexUpstreamAttemptDiagnostic struct {
+	TreeHMACPrefix string
+	AccountID      string
+	EgressID       string
+	Epoch          int64
+	State          string
+	StatusCode     int
+	CreatedAt      int64
+}
+
+func (s *Store) codexDiagnosticPrefix(domain, value string) string {
+	mac := hmac.New(sha256.New, s.codexSessionMappingKey())
+	_, _ = mac.Write([]byte("codex-safe-diagnostic/v1\x00"))
+	_, _ = mac.Write([]byte(strings.TrimSpace(domain)))
+	_, _ = mac.Write([]byte("\x00"))
+	_, _ = mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))[:16]
+}
+
+func (s *Store) ListCodexSessionMappingDiagnostics(ctx context.Context) ([]CodexSessionMappingDiagnostic, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT b.tree_id,b.namespace_hash,b.account_id,b.egress_id,b.epoch,b.state,
+CASE WHEN i.tree_id IS NULL THEN 0 ELSE 1 END,b.created_at,b.updated_at,b.expires_at
+FROM codex_session_binding b LEFT JOIN codex_instruction_snapshot i ON i.tree_id=b.tree_id
+ORDER BY b.created_at,b.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CodexSessionMappingDiagnostic{}
+	for rows.Next() {
+		var treeID, namespaceHash string
+		var row CodexSessionMappingDiagnostic
+		var present int
+		if err := rows.Scan(&treeID, &namespaceHash, &row.AccountID, &row.EgressID, &row.Epoch, &row.State, &present, &row.CreatedAt, &row.UpdatedAt, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		row.TreeHMACPrefix = s.codexDiagnosticPrefix("tree", treeID)
+		row.NamespaceHMACPrefix = s.codexDiagnosticPrefix("namespace", namespaceHash)
+		row.SnapshotPresent = present != 0
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListCodexInstructionSnapshotDiagnostics(ctx context.Context) ([]CodexInstructionSnapshotDiagnostic, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT tree_id,revision_hmac,created_at,updated_at,expires_at FROM codex_instruction_snapshot ORDER BY created_at,tree_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CodexInstructionSnapshotDiagnostic{}
+	for rows.Next() {
+		var treeID, revision string
+		var row CodexInstructionSnapshotDiagnostic
+		if err := rows.Scan(&treeID, &revision, &row.CreatedAt, &row.UpdatedAt, &row.ExpiresAt); err != nil {
+			return nil, err
+		}
+		row.TreeHMACPrefix = s.codexDiagnosticPrefix("tree", treeID)
+		if len(revision) > 16 {
+			revision = revision[:16]
+		}
+		row.RevisionPrefix = revision
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// InsertCodexUpstreamAttempt persists one safe strict-CPA transport observation.
+// An empty tree means a root/fork has not committed yet and therefore has no durable
+// session configuration to diagnose; callers intentionally skip that case.
+func (s *Store) InsertCodexUpstreamAttempt(ctx context.Context, attempt CodexUpstreamAttempt) error {
+	attempt.TreeID = strings.TrimSpace(attempt.TreeID)
+	attempt.AccountID = strings.TrimSpace(attempt.AccountID)
+	attempt.EgressID = strings.TrimSpace(attempt.EgressID)
+	attempt.State = strings.TrimSpace(attempt.State)
+	if attempt.TreeID == "" || attempt.AccountID == "" || attempt.EgressID == "" || attempt.State == "" {
+		return errors.New("codex upstream attempt metadata incomplete")
+	}
+	if attempt.CreatedAt <= 0 {
+		attempt.CreatedAt = Now()
+	}
+	if attempt.ExpiresAt <= attempt.CreatedAt {
+		attempt.ExpiresAt = attempt.CreatedAt + int64((7 * 24 * time.Hour).Seconds())
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at)
+VALUES(?,?,?,?,?,?,?,?)`, attempt.TreeID, attempt.AccountID, attempt.EgressID, attempt.Epoch, attempt.State, attempt.StatusCode, attempt.CreatedAt, attempt.ExpiresAt)
+	return err
+}
+
+func (s *Store) ListCodexUpstreamAttemptDiagnostics(ctx context.Context) ([]CodexUpstreamAttemptDiagnostic, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT tree_id,account_id,egress_id,epoch,state,status_code,created_at
+FROM codex_upstream_attempt WHERE expires_at>? ORDER BY created_at,id`, Now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CodexUpstreamAttemptDiagnostic{}
+	for rows.Next() {
+		var treeID string
+		var row CodexUpstreamAttemptDiagnostic
+		if err := rows.Scan(&treeID, &row.AccountID, &row.EgressID, &row.Epoch, &row.State, &row.StatusCode, &row.CreatedAt); err != nil {
+			return nil, err
+		}
+		row.TreeHMACPrefix = s.codexDiagnosticPrefix("tree", treeID)
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }

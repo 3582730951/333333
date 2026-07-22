@@ -487,16 +487,22 @@ func TestCodexStrictCPAUsesEarlySSETerminalRuleViaSidecar(t *testing.T) {
 	}
 }
 
-func TestCodexStrictCPAStatefulFailoverRuleRetiresEpoch(t *testing.T) {
+func TestCodexStrictCPAStatefulFailoverRuleRecoversSameBinding(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
+		switch calls.Add(1) {
+		case 1:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"resp_rule_failover_origin","object":"response","model":"gpt-5.5","status":"completed","output":[]}`))
 			return
+		case 2:
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"operator stateful failover sentinel"}}`))
+			return
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp_rule_failover_recovered","object":"response","model":"gpt-5.5","status":"completed","output":[]}`))
 		}
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte(`{"error":{"message":"operator stateful failover sentinel"}}`))
 	})
 	enableCodexSessionMappingForTest(h)
 	accA := h.importAccount(t, "strict-failover-a", "upstream-strict-failover-a", "access-strict-failover-a")
@@ -535,15 +541,16 @@ func TestCodexStrictCPAStatefulFailoverRuleRetiresEpoch(t *testing.T) {
 		t.Fatalf("initial strict stateful status=%d body=%s", status, body)
 	}
 	// A second eligible account makes the assertion meaningful: strict CPA must
-	// not migrate a previous_response_id to it. The configured failover retires
-	// the epoch instead, so the next root can be scheduled normally.
+	// not migrate a previous_response_id to it. The configured failover retries
+	// once on the original account+real egress before it can surface a terminal.
 	accB := h.importAccount(t, "strict-failover-b", "upstream-strict-failover-b", "access-strict-failover-b")
 	setTestCapability(t, h, accB, "gpt-5.5", 1024)
-	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_failover_origin","input":"resume"}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") {
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_failover_origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "resp_rule_failover_recovered") {
 		t.Fatalf("stateful failover status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_failover_origin","input":"retry"}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") || calls.Load() != 2 {
-		t.Fatalf("retired stateful failover status=%d calls=%d body=%s", status, calls.Load(), body)
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp_rule_failover_origin"})
+	if err != nil || len(rows) != 1 || rows[0].State != "active" || rows[0].AccountID != accA || calls.Load() != 3 {
+		t.Fatalf("stateful failover migrated/retired rows=%+v calls=%d err=%v", rows, calls.Load(), err)
 	}
 }
 
@@ -586,7 +593,8 @@ func TestCodexStrictCPAStatelessFailoverRuleSwitchesAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := routing.ExtractAffinityKey(keyReq, []byte(body))
+	keyReq.Header.Set("Thread-Id", "strict-stateless-root")
+	key := codexSelectionAffinity(keyReq, []byte(body), routing.ExtractAffinityKey(keyReq, []byte(body)), h.app.cfg.DefaultGroup)
 	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
 		RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accA,
 	}); err != nil {

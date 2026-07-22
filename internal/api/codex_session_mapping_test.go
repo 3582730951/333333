@@ -127,6 +127,34 @@ func TestCodexSessionMappingKeepsNativeIdentityAndToolOutput(t *testing.T) {
 	}
 }
 
+func TestNativeCodexContinuePreservesInstructionSnapshotLitePrefix(t *testing.T) {
+	original := setResponsesInstructions([]byte(`{"model":"gpt-5.6-sol","instructions":"must disappear","previous_response_id":"resp-old","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","format":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"old user turn"}],"exact":900719925474099312345}]}`), "snapshotted administrator base")
+	continued, err := nativeCodexContinueBody(original, "resp-latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(continued, &root); err != nil {
+		t.Fatal(err)
+	}
+	if string(root["previous_response_id"]) != `"resp-latest"` {
+		t.Fatalf("previous response was not updated: %s", continued)
+	}
+	if _, exists := root["instructions"]; exists {
+		t.Fatalf("Lite continuation regained top-level instructions: %s", continued)
+	}
+	var input []json.RawMessage
+	if err := json.Unmarshal(root["input"], &input); err != nil {
+		t.Fatal(err)
+	}
+	if len(input) != 3 || !strings.Contains(string(input[0]), `900719925474099312345`) || !strings.Contains(string(input[1]), "snapshotted administrator base") || strings.Contains(string(continued), "old user turn") {
+		t.Fatalf("Lite continuation did not retain only its stable prefix: %s", continued)
+	}
+	if !strings.Contains(string(input[2]), `"text":"continue"`) || !strings.Contains(string(root["stream"]), "true") {
+		t.Fatalf("native continuation input missing: %s", continued)
+	}
+}
+
 func TestCodexSessionMappingPersistsTurnStateFromStreamMetadata(t *testing.T) {
 	var calls atomic.Int32
 	var resumedState string
@@ -625,6 +653,9 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := childMapping.instructionTreeID(); got != root.TreeID {
+		t.Fatalf("child instruction tree=%q, want parent tree %q", got, root.TreeID)
+	}
 	child, err := childMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
 	if err != nil {
 		t.Fatal(err)
@@ -671,12 +702,26 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got := forkMapping.instructionTreeID(); got != "" {
+		t.Fatalf("fork must create a fresh instruction tree, got inherited %q", got)
+	}
 	fork, err := forkMapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fork.SessionID == root.RootSessionID || fork.SessionID != fork.ThreadID || fork.ParentThreadID != "" || fork.ForkedFromThreadID != child.ThreadID || !strings.HasSuffix(fork.WindowID(), ":0") {
 		t.Fatalf("fork snapshot=%+v child=%+v root=%+v", fork, child, root)
+	}
+	if _, err := h.store.RetireCodexSessionTree(ctx, root.ID, root.Epoch); err != nil {
+		t.Fatal(err)
+	}
+	newRootRequest, _ := http.NewRequest(http.MethodPost, "http://example.invalid/v1/responses", strings.NewReader(`{"model":"gpt","thread_id":"client-root","session_id":"client-root","input":"fresh root"}`))
+	newRootMapping, err := h.app.resolveCodexSessionMapping(ctx, newRootRequest, []byte(`{"model":"gpt","thread_id":"client-root","session_id":"client-root","input":"fresh root"}`), downstreamPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := newRootMapping.instructionTreeID(); got != "" {
+		t.Fatalf("new root after retirement inherited old instruction tree %q", got)
 	}
 }
 

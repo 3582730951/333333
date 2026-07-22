@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
+	"github.com/tidwall/sjson"
 )
 
 type codexSessionMappingContextKey struct{}
@@ -114,6 +116,7 @@ type codexSessionMapping struct {
 	snapshotAcc   string
 	snapshotEgr   string
 	logicalTurnID string
+	instructions  *CodexInstructionPlan
 }
 
 func withCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping) context.Context {
@@ -504,6 +507,58 @@ func (m *codexSessionMapping) requiredRoute() (string, string) {
 	return m.requiredAccount, m.requiredEgress
 }
 
+// instructionTreeID returns the tree whose administrator configuration a strict
+// request belongs to. A child inherits its parent tree; a fork deliberately does
+// not, because it is a new root/session under current operator configuration.
+func (m *codexSessionMapping) instructionTreeID() string {
+	if m == nil || !m.enabled {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.binding != nil {
+		return strings.TrimSpace(m.binding.TreeID)
+	}
+	// An active parent anchor means this is a newly-created child branch and it
+	// inherits the parent tree's session policy. A retired anchor, by contrast,
+	// only supplies the next epoch number for a fresh root: that root must compile
+	// the administrator configuration visible now, rather than reviving its old
+	// tree snapshot.
+	if m.anchor != nil && m.anchor.State == "active" && m.identity.ForkedFromID == "" {
+		return strings.TrimSpace(m.anchor.TreeID)
+	}
+	return ""
+}
+
+func (m *codexSessionMapping) setInstructionPlan(plan *CodexInstructionPlan) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.instructions = plan
+	m.mu.Unlock()
+}
+
+// upstreamAttemptBinding returns only the durable routing metadata needed for a
+// redacted CPA diagnostic. It never exposes aliases, downstream ids, request text,
+// or the encrypted identity payload. Fresh roots/forks have no tree yet and are
+// intentionally omitted until their terminal commit assigns one.
+func (m *codexSessionMapping) upstreamAttemptBinding() (storage.CodexSessionBinding, bool) {
+	if m == nil || !m.enabled {
+		return storage.CodexSessionBinding{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding := m.binding
+	if binding == nil {
+		binding = m.prospective
+	}
+	if binding == nil || strings.TrimSpace(binding.TreeID) == "" {
+		return storage.CodexSessionBinding{}, false
+	}
+	return *binding, true
+}
+
 func (m *codexSessionMapping) identitySnapshot(secret []byte, lease scheduler.Lease, osHint string) (*upstream.CodexIdentitySnapshot, error) {
 	if m == nil || !m.enabled {
 		return nil, nil
@@ -589,23 +644,46 @@ func nativeCodexContinueBody(original []byte, previousResponseID string) ([]byte
 	if previousResponseID == "" {
 		return nil, storage.ErrCodexSessionMappingNotFound
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal(original, &root); err != nil || root == nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(original, &fields); err != nil || fields == nil {
 		if err == nil {
 			err = errors.New("Codex continuation request is not an object")
 		}
 		return nil, err
 	}
-	root["previous_response_id"] = previousResponseID
-	root["input"] = []interface{}{map[string]interface{}{
+	continueItem, err := json.Marshal(map[string]interface{}{
 		"role": "user",
 		"content": []interface{}{map[string]interface{}{
 			"type": "input_text",
 			"text": "continue",
 		}},
-	}}
-	root["stream"] = true
-	return json.Marshal(root)
+	})
+	if err != nil {
+		return nil, err
+	}
+	// Preserve the native Lite prefix (additional_tools + the plan's developer
+	// base instructions) while dropping all prior turn content. Classic requests
+	// retain their existing top-level instructions untouched. Targeted sjson edits
+	// keep tool values and all unrelated large integer fragments byte-exact.
+	input := []json.RawMessage{continueItem}
+	if items, ok := codexRawInputItems(fields["input"]); ok && len(items) > 0 && codexLiteAdditionalTools(items[0]) {
+		input = append(input[:0], items[0])
+		if len(items) > 1 && codexDeveloperMessage(items[1]) {
+			input = append(input, items[1])
+		}
+		input = append(input, continueItem)
+	}
+	out, err := sjson.SetRawBytes(original, "input", codexMarshalRawArray(input))
+	if err != nil {
+		return nil, err
+	}
+	if out, err = sjson.SetBytes(out, "previous_response_id", previousResponseID); err != nil {
+		return nil, err
+	}
+	if out, err = sjson.SetBytes(out, "stream", true); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // writeCodexNativeContinuationFailure gives an EOF continuation a visible
@@ -622,6 +700,36 @@ func writeCodexNativeContinuationFailure(w io.Writer, id, model string) error {
 	}
 	if strings.TrimSpace(model) != "" {
 		response["model"] = strings.TrimSpace(model)
+	}
+	if err := writeSSEEvent(w, "response.failed", map[string]interface{}{"response": response}); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	flushWriter(w)
+	return nil
+}
+
+// writeCodexSidecarStreamFailure terminates an already-started SSE response with
+// a protocol-valid failure when sidecar v2 reports a post-header transport break.
+// It intentionally does not claim the upstream reached a native EOF, so callers
+// must not invoke a continuation or rotate the CPA epoch from this condition.
+func writeCodexSidecarStreamFailure(w io.Writer, id, model, phase string) error {
+	response := map[string]interface{}{
+		"id":     firstNonEmpty(strings.TrimSpace(id), "resp_pool_sidecar_stream"),
+		"object": "response",
+		"status": "failed",
+		"error": map[string]string{
+			"code":    "sidecar_stream_interrupted",
+			"message": "The sidecar interrupted the upstream stream after response headers were sent.",
+		},
+	}
+	if strings.TrimSpace(model) != "" {
+		response["model"] = strings.TrimSpace(model)
+	}
+	if strings.TrimSpace(phase) != "" {
+		response["error"].(map[string]string)["phase"] = strings.TrimSpace(phase)
 	}
 	if err := writeSSEEvent(w, "response.failed", map[string]interface{}{"response": response}); err != nil {
 		return err
@@ -710,11 +818,13 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	binding.WindowGeneration = mapping.snapshot.WindowGeneration
 	created := binding.ID == ""
 	expiresAt := time.Now().Add(s.codexSessionMappingRetention(ctx)).Unix()
+	instructionSnapshot := mapping.instructions.snapshotCommit(binding.TreeID, expiresAt)
 	committed, err := s.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
-		Namespace: mapping.namespace,
-		Binding:   *binding,
-		Aliases:   mapping.identity.aliasesForBinding(*binding, responseID, turnState),
-		ExpiresAt: expiresAt,
+		Namespace:           mapping.namespace,
+		Binding:             *binding,
+		Aliases:             mapping.identity.aliasesForBinding(*binding, responseID, turnState),
+		ExpiresAt:           expiresAt,
+		InstructionSnapshot: instructionSnapshot,
 	})
 	if err != nil {
 		return err
@@ -738,7 +848,46 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 			Detail: "metadata_only_no_raw_identifiers",
 		})
 	}
+	s.recordCodexUpstreamAttemptBinding(ctx, committed, lease, egress, "terminal_success", http.StatusOK)
 	return nil
+}
+
+func (s *Server) recordCodexUpstreamAttempt(ctx context.Context, mapping *codexSessionMapping, lease scheduler.Lease, egress storage.EgressProfile, state string, statusCode int) {
+	if s == nil || s.store == nil {
+		return
+	}
+	binding, ok := mapping.upstreamAttemptBinding()
+	if !ok {
+		return
+	}
+	s.recordCodexUpstreamAttemptBinding(ctx, binding, lease, egress, state, statusCode)
+}
+
+func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding storage.CodexSessionBinding, lease scheduler.Lease, egress storage.EgressProfile, state string, statusCode int) {
+	if s == nil || s.store == nil {
+		return
+	}
+	if accountID := strings.TrimSpace(lease.Account.ID); accountID != "" {
+		binding.AccountID = accountID
+	}
+	if egressID := strings.TrimSpace(egress.ID); egressID != "" {
+		binding.EgressID = egressID
+	}
+	expiresAt := binding.ExpiresAt
+	if expiresAt <= time.Now().Unix() {
+		expiresAt = time.Now().Add(s.codexSessionMappingRetention(ctx)).Unix()
+	}
+	if err := s.store.InsertCodexUpstreamAttempt(ctx, storage.CodexUpstreamAttempt{
+		TreeID:     binding.TreeID,
+		AccountID:  binding.AccountID,
+		EgressID:   binding.EgressID,
+		Epoch:      binding.Epoch,
+		State:      state,
+		StatusCode: statusCode,
+		ExpiresAt:  expiresAt,
+	}); err != nil {
+		log.Printf("[CODEX-UPSTREAM-ATTEMPT] record request_id=%s: %v", requestIDFromContext(ctx), err)
+	}
 }
 
 func (s *Server) retireCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping, reason string) error {

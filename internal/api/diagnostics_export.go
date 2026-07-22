@@ -19,6 +19,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
 )
 
 type diagnosticUsageRecord struct {
@@ -167,6 +168,11 @@ func diagnosticFileOrder() []string {
 		"kiro_runtime_capabilities.csv",
 		"account_rate_limits.csv",
 		"affinity_bindings.csv",
+		"codex_session_mappings.csv",
+		"codex_instruction_snapshots.csv",
+		"codex_upstream_attempts.csv",
+		"codex_group_policy_revisions.csv",
+		"sidecar_status.csv",
 		"settings.csv",
 		"custom_providers.csv",
 		"upstream_error_rules.csv",
@@ -202,6 +208,10 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 	if err != nil {
 		return err
 	}
+	groups, err := s.store.ListGroups(ctx)
+	if err != nil {
+		return err
+	}
 	tokensByID, err := s.store.ListTokensByAccountIDs(ctx, accountIDsForDiagnostics(accounts))
 	if err != nil {
 		return err
@@ -219,6 +229,18 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		return err
 	}
 	affinityBindings, err := listDiagnosticAffinityBindings(ctx, s.store.DB())
+	if err != nil {
+		return err
+	}
+	codexMappings, err := s.store.ListCodexSessionMappingDiagnostics(ctx)
+	if err != nil {
+		return err
+	}
+	codexInstructionSnapshots, err := s.store.ListCodexInstructionSnapshotDiagnostics(ctx)
+	if err != nil {
+		return err
+	}
+	codexUpstreamAttempts, err := s.store.ListCodexUpstreamAttemptDiagnostics(ctx)
 	if err != nil {
 		return err
 	}
@@ -255,6 +277,9 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		return err
 	}
 	summary := diagnosticSummary(accounts, tokensByID, nil, nil, bindings, rateLimits)
+	codexCPA := s.codexSessionMappingStats(ctx)
+	codexCPA["instruction_policy_groups"] = len(groups)
+	summary["codex_cpa"] = codexCPA
 	if err := applyDiagnosticAuditSummary(ctx, s.store.DB(), summary); err != nil {
 		return err
 	}
@@ -287,6 +312,15 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
 	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
+	addCSV("codex_session_mappings.csv", []string{"tree_hmac_prefix", "namespace_hmac_prefix", "account_code", "egress_id", "epoch", "state", "instruction_snapshot_present", "created_at", "updated_at", "expires_at"}, codexSessionMappingDiagnosticRows(codexMappings, codebook))
+	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, codexInstructionSnapshotDiagnosticRows(codexInstructionSnapshots))
+	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, codexUpstreamAttemptDiagnosticRows(codexUpstreamAttempts, codebook))
+	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, codexGroupPolicyRevisionRows(groups, s))
+	sidecarAdaptive := []upstream.SidecarAdaptiveStatus(nil)
+	if s.upstream != nil {
+		sidecarAdaptive = s.upstream.SidecarAdaptiveStatuses()
+	}
+	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, sidecarStatusRows(egressProfiles, bindings, sidecarAdaptive))
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
 	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "enabled", "auto_discover_models", "models", "created_at", "updated_at"}, customProviderRows(customProviders))
 	addCSV("upstream_error_rules.csv", []string{"id", "name", "enabled", "priority", "providers", "entrypoints", "model_patterns", "status_codes", "body_keywords", "match_mode", "account_action", "downstream_action", "response_status", "custom_message", "cooldown_seconds", "prefer_retry_after", "idle_seconds", "idle_ping_seconds", "skip_log", "description", "created_at", "updated_at"}, upstreamErrorRuleRows(upstreamRules))
@@ -353,6 +387,33 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		affinityTimes = append(affinityTimes, row.CreatedAt)
 	}
 	addRange("affinity_bindings.csv", affinityTimes)
+	codexMappingTimes := make([]int64, 0, len(codexMappings))
+	for _, row := range codexMappings {
+		codexMappingTimes = append(codexMappingTimes, row.CreatedAt)
+	}
+	addRange("codex_session_mappings.csv", codexMappingTimes)
+	codexSnapshotTimes := make([]int64, 0, len(codexInstructionSnapshots))
+	for _, row := range codexInstructionSnapshots {
+		codexSnapshotTimes = append(codexSnapshotTimes, row.CreatedAt)
+	}
+	addRange("codex_instruction_snapshots.csv", codexSnapshotTimes)
+	codexAttemptTimes := make([]int64, 0, len(codexUpstreamAttempts))
+	for _, row := range codexUpstreamAttempts {
+		codexAttemptTimes = append(codexAttemptTimes, row.CreatedAt)
+	}
+	addRange("codex_upstream_attempts.csv", codexAttemptTimes)
+	groupPolicyTimes := make([]int64, 0, len(groups))
+	for _, row := range groups {
+		groupPolicyTimes = append(groupPolicyTimes, row.UpdatedAt)
+	}
+	addRange("codex_group_policy_revisions.csv", groupPolicyTimes)
+	sidecarTimes := make([]int64, 0, len(egressProfiles))
+	for _, row := range egressProfiles {
+		if storage.IsSidecarEgress(row) {
+			sidecarTimes = append(sidecarTimes, row.UpdatedAt)
+		}
+	}
+	addRange("sidecar_status.csv", sidecarTimes)
 	settingTimes := make([]int64, 0, len(settings))
 	for _, row := range settings {
 		settingTimes = append(settingTimes, row.UpdatedAt)
@@ -770,6 +831,14 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
 	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
+	// This legacy in-memory helper has no Store handle. Keep the safe CPA files
+	// present with headers so callers see the same bundle schema; the streaming
+	// admin export above fills them from encrypted mapping tables.
+	addCSV("codex_session_mappings.csv", []string{"tree_hmac_prefix", "namespace_hmac_prefix", "account_code", "egress_id", "epoch", "state", "instruction_snapshot_present", "created_at", "updated_at", "expires_at"}, nil)
+	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, nil)
+	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, nil)
+	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, nil)
+	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, nil)
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
 	addCSV("custom_providers.csv", []string{"id", "name", "base_url", "upstream_protocol", "enabled", "auto_discover_models", "models", "created_at", "updated_at"}, customProviderRows(customProviders))
 	addCSV("upstream_error_rules.csv", []string{"id", "name", "enabled", "priority", "providers", "entrypoints", "model_patterns", "status_codes", "body_keywords", "match_mode", "account_action", "downstream_action", "response_status", "custom_message", "cooldown_seconds", "prefer_retry_after", "idle_seconds", "idle_ping_seconds", "skip_log", "description", "created_at", "updated_at"}, upstreamErrorRuleRows(upstreamRules))
@@ -1290,6 +1359,132 @@ func affinityBindingRows(rows []storage.AffinityBinding, codebook diagnosticCode
 	out := make([][]string, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, []string{row.RouteKeyHash, codebook.sanitize(row.RouteKey), row.Source, codebook.code(row.AccountID), row.Provider, row.Model, row.EgressID, itoa64(row.Epoch), itoa64(row.CreatedAt), itoa64(row.UpdatedAt)})
+	}
+	return out
+}
+
+func codexSessionMappingDiagnosticRows(rows []storage.CodexSessionMappingDiagnostic, codebook diagnosticCodebook) [][]string {
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, []string{
+			row.TreeHMACPrefix,
+			row.NamespaceHMACPrefix,
+			codebook.code(row.AccountID),
+			row.EgressID,
+			itoa64(row.Epoch),
+			row.State,
+			strconv.FormatBool(row.SnapshotPresent),
+			itoa64(row.CreatedAt),
+			itoa64(row.UpdatedAt),
+			itoa64(row.ExpiresAt),
+		})
+	}
+	return out
+}
+
+func codexInstructionSnapshotDiagnosticRows(rows []storage.CodexInstructionSnapshotDiagnostic) [][]string {
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, []string{row.TreeHMACPrefix, row.RevisionPrefix, itoa64(row.CreatedAt), itoa64(row.UpdatedAt), itoa64(row.ExpiresAt)})
+	}
+	return out
+}
+
+func codexUpstreamAttemptDiagnosticRows(rows []storage.CodexUpstreamAttemptDiagnostic, codebook diagnosticCodebook) [][]string {
+	out := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, []string{
+			row.TreeHMACPrefix,
+			codebook.code(row.AccountID),
+			row.EgressID,
+			itoa64(row.Epoch),
+			row.State,
+			strconv.Itoa(row.StatusCode),
+			itoa64(row.CreatedAt),
+		})
+	}
+	return out
+}
+
+func codexGroupPolicyRevisionRows(groups []storage.Group, s *Server) [][]string {
+	rows := append([]storage.Group(nil), groups...)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	out := make([][]string, 0, len(rows))
+	for _, group := range rows {
+		revision := s.codexGroupInstructionPolicyRevision(group)
+		if len(revision) > 16 {
+			revision = revision[:16]
+		}
+		out = append(out, []string{
+			group.Name,
+			strconv.FormatBool(group.ModelInstructionsEnabled),
+			strconv.Itoa(len(group.ModelInstructionsFiles)),
+			revision,
+			itoa64(group.UpdatedAt),
+		})
+	}
+	return out
+}
+
+// sidecarStatusRows deliberately reports only durable profile state. It contains
+// no endpoint, proxy URL, cookie key, raw error body, or client identifier; the
+// egress id is already the safe operator-facing reference used throughout the
+// diagnostic bundle.
+func sidecarStatusRows(profiles []storage.EgressProfile, bindings []storage.AccountEgressBinding, adaptive []upstream.SidecarAdaptiveStatus) [][]string {
+	bound := map[string]int{}
+	for _, binding := range bindings {
+		if id := strings.TrimSpace(binding.SidecarEgressID); id != "" {
+			bound[id]++
+		}
+	}
+	profilesByID := map[string]storage.EgressProfile{}
+	for _, profile := range profiles {
+		profilesByID[profile.ID] = profile
+	}
+	ids := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		if storage.IsSidecarEgress(profile) {
+			ids = append(ids, profile.ID)
+		}
+	}
+	sort.Strings(ids)
+	out := make([][]string, 0, len(ids)+len(adaptive))
+	for _, id := range ids {
+		profile := profilesByID[id]
+		if !storage.IsSidecarEgress(profile) {
+			continue
+		}
+		out = append(out, []string{
+			profile.ID,
+			"",
+			profile.Health,
+			strconv.Itoa(profile.MaxConcurrency),
+			"", "", "", "", "", "", "",
+			itoa64(profile.CooldownUntil),
+			strconv.Itoa(bound[profile.ID]),
+			itoa64(profile.CreatedAt),
+			itoa64(profile.UpdatedAt),
+		})
+	}
+	for _, status := range adaptive {
+		profile := profilesByID[status.SidecarEgressID]
+		out = append(out, []string{
+			status.SidecarEgressID,
+			status.RealEgressID,
+			profile.Health,
+			strconv.Itoa(profile.MaxConcurrency),
+			strconv.Itoa(status.Limit),
+			strconv.Itoa(status.Inflight),
+			strconv.Itoa(status.QueueDepth),
+			strconv.Itoa(status.RecentFailures),
+			status.CircuitState,
+			itoa64(status.CircuitUntil),
+			itoa64(status.BypassUntil),
+			itoa64(profile.CooldownUntil),
+			strconv.Itoa(bound[status.SidecarEgressID]),
+			itoa64(profile.CreatedAt),
+			itoa64(status.UpdatedAt),
+		})
 	}
 	return out
 }

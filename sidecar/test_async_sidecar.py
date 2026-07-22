@@ -17,6 +17,24 @@ def load_sidecar():
     return module
 
 
+async def read_chunked_body(reader):
+    """Decode the sidecar v2 HTTP/1.1 chunked relay body and trailers."""
+    body = bytearray()
+    trailers = {}
+    while True:
+        line = await reader.readuntil(b"\r\n")
+        size = int(line.split(b";", 1)[0].strip(), 16)
+        if size == 0:
+            while True:
+                line = await reader.readuntil(b"\r\n")
+                if line == b"\r\n":
+                    return bytes(body), trailers
+                key, value = line.decode("latin1").split(":", 1)
+                trailers[key.lower()] = value.strip()
+        body.extend(await reader.readexactly(size))
+        await reader.readexactly(2)
+
+
 class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_two_hundred_streams_reach_upstream(self):
         sidecar = load_sidecar()
@@ -58,13 +76,19 @@ class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
             await writer.drain()
             head = await reader.readuntil(b"\r\n\r\n")
             self.assertIn(b"x-sidecar-upstream-status: 200", head.lower())
-            body = await reader.read()
+            body, trailers = await read_chunked_body(reader)
+            self.assertEqual(trailers, {})
             writer.close()
             await writer.wait_closed()
             return body
 
         tasks = [asyncio.create_task(request()) for _ in range(200)]
-        await asyncio.wait_for(all_arrived.wait(), timeout=5)
+        # curl_cffi creates 200 browser-profile connections in one event loop;
+        # constrained CI runners can spend several seconds in that native setup
+        # before every upstream socket is visible. This guards capacity, not a
+        # five-second latency SLO, so keep the deadline generous enough to avoid
+        # conflating scheduler contention with a lost stream.
+        await asyncio.wait_for(all_arrived.wait(), timeout=10)
         self.assertEqual(sidecar._inflight, 200)
         release.set()
         bodies = await asyncio.gather(*tasks)
@@ -105,10 +129,9 @@ class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
             writer.write(f"POST /proxy HTTP/1.1\r\nx-sidecar-meta: {meta}\r\ncontent-length: 0\r\n\r\n".encode())
             await writer.drain()
             await reader.readuntil(b"\r\n\r\n")
-            total = 0
-            while chunk := await reader.read(4096):
-                total += len(chunk)
-                await asyncio.sleep(0.0005)
+            body, trailers = await read_chunked_body(reader)
+            self.assertEqual(trailers, {})
+            total = len(body)
             writer.close()
             await writer.wait_closed()
             return total

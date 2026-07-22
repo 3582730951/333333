@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -549,6 +550,13 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// `ultra` is a Codex CLI semantic, not a generic Responses wire value. Sol and
+	// Terra may use it (the upstream boundary serializes max); Luna and unknown
+	// models must be rejected before CPA mapping, scheduling, or tool/session work.
+	if effort := requestedResponsesReasoningEffort(raw); unsupportedCodexReasoningEffort(model, effort) {
+		writeCodexReasoningEffortUnsupported(w, model, effort)
+		return
+	}
 	// Native Codex context is owned exclusively by the upstream Responses session.
 	// Resolve only exact downstream aliases here; unlike the retired goal/journal
 	// engine this never rebuilds prompt history or rewrites tool output.
@@ -587,24 +595,39 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// adding them beside a previous_response_id or a client tool result creates a
 	// different upstream turn rather than an exact native resume.
 	strictNativeCPA := codexStrictCPAFromContext(r.Context()) && !isChat
+	if !strictNativeCPA && unsupportedCodexReasoningEffort(model, pol.ForceEffort) {
+		writeCodexReasoningEffortUnsupported(w, model, normalizeEffort(pol.ForceEffort))
+		return
+	}
 	if !isChat && !strictNativeCPA {
 		raw = ensureEncryptedReasoningInclude(raw)
 	}
 
-	compiledModelInstructions := ""
-	if group, err := s.store.GetGroup(r.Context(), affinityGroup); err == nil && group.ModelInstructionsEnabled && !strictNativeCPA {
-		compiled, _, err := s.compileGroupModelInstructions(r.Context(), group)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		compiledModelInstructions = compiled
-		if !isChat {
-			raw = setResponsesInstructions(raw, compiledModelInstructions)
-		}
-	} else if err != nil {
+	group, err := s.store.GetGroup(r.Context(), affinityGroup)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	instructionPlan, err := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA)
+	if err != nil {
+		// A configured instruction file is part of the administrator's session
+		// policy. Report missing/empty files before any account lease or upstream
+		// attempt; existing strict trees instead load their durable snapshot and do
+		// not touch changed/deleted files at all.
+		writeCodexInstructionConfigurationError(w, err)
+		return
+	}
+	if codexMapping != nil {
+		codexMapping.setInstructionPlan(instructionPlan)
+	}
+	if strictNativeCPA {
+		w.Header().Set("X-MiCliProxy-CPA-Instructions", instructionPlan.Source)
+	}
+	// Responses requests are shaped once at the entrance. Chat requests are
+	// converted to Responses later in codexAttempt, where the same immutable plan
+	// is applied exactly once after conversion.
+	if !isChat && instructionPlan.applies() {
+		raw = setResponsesInstructions(raw, instructionPlan.Instructions)
 	}
 
 	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
@@ -668,7 +691,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, compiledModelInstructions, attemptsRemaining > 0, exclude)
+		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, instructionPlan, attemptsRemaining > 0, exclude)
 		if result.Outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
 		}
@@ -721,7 +744,7 @@ func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, 
 //
 // exclude carries the accounts this request already failed on; the leased account is
 // added to it before any outcomeRetry so the next attempt selects a different one.
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort, compiledModelInstructions string, allowRetry bool, exclude map[string]bool) codexAttemptResult {
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort string, instructionPlan *CodexInstructionPlan, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
 	// Decode the "stream" flag once for this attempt: isStreamRequest full-parses
@@ -820,7 +843,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
 	if !prepared {
-		if !strictNativeCPA && compiledModelInstructions == "" && prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
+		if !strictNativeCPA && !instructionPlan.applies() && prompt.ShouldRewrite(group.SystemPrompt, isCompact, group.SystemPromptApplyToCompaction) {
 			if isChat {
 				body, _, err = prompt.InjectChatSystemPrompt(body, group.SystemPrompt)
 			} else {
@@ -842,8 +865,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 			path = "/v1/responses"
 		}
-		if !strictNativeCPA && compiledModelInstructions != "" {
-			body = setResponsesInstructions(body, compiledModelInstructions)
+		if !strictNativeCPA && isChat && instructionPlan.applies() {
+			body = setResponsesInstructions(body, instructionPlan.Instructions)
 		}
 	}
 
@@ -976,9 +999,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	//
 	// A stateful previous_response_id cannot be migrated to a different upstream
 	// account without reconstructing context, which strict CPA intentionally never
-	// does.  For an explicit failover rule we therefore retire that exact epoch and
-	// return the normal visible CPA retirement signal.  A self-contained turn can
-	// still transparently retry on a fresh account as usual.
+	// does. Stateful administrator failover is handled by one same-account,
+	// same-egress recovery below; if it still fails, the original rule/error is
+	// surfaced without retiring a context that was not proven invalid. A
+	// self-contained turn can still transparently retry on a fresh account as usual.
 	applyCodexRule := func(decision upstreamErrorRuleDecision, status int, header http.Header, errorBody []byte, streaming bool) (codexAttemptResult, bool) {
 		switch decision.Match.DownstreamAction {
 		case upstreamrules.DownstreamActionFailover:
@@ -986,12 +1010,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				return retry(), true
 			}
 			if strictNativeCPA && !movable {
-				if err := s.retireCodexSessionMapping(r.Context(), mapping, "admin_rule_failover"); err != nil &&
-					!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
-					log.Printf("[CODEX-SESSION-MAPPING] admin failover retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
-				}
-				s.writeCodexSessionMappingError(w, streaming, "codex_context_epoch_retired")
-				return codexAttemptResult{Outcome: outcomeDone}, true
+				// Never translate an administrator failover preference into a false
+				// claim that the upstream context epoch is invalid. The caller below
+				// has already attempted the only safe recovery (same binding); fall
+				// through to the rule's normal visible/builtin terminal behavior.
+				return codexAttemptResult{}, false
 			}
 		case upstreamrules.DownstreamActionPass,
 			upstreamrules.DownstreamActionCustomError,
@@ -1021,8 +1044,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), codexRetentionDiagnosticsForTransport(logicalUsageDiag, codexUseWebSocket)))
 	}
 	withCodexUsageContext()
+	s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "attempted", 0)
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 	if err != nil {
+		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "transport_error", 0)
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
 		if allowRetry && movable {
 			return retry() // transport error — a fresh account/egress may succeed
@@ -1030,13 +1055,16 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
 	}
+	s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "response_headers", resp.StatusCode)
 	defer func() {
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
 		}
 	}()
 	codexResetRetried := false
+	statefulRuleRecoveryAttempted := false
 
+codexResponse:
 	if resp.StatusCode >= 400 {
 		errorBody := readUpstreamErrorBody(resp.Body)
 		errorBody = redactAgentIdentityError(token, errorBody)
@@ -1252,6 +1280,22 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		} else {
 			v = s.onUpstreamError(r.Context(), lease.Account, resp.StatusCode, resp.Header, errorBody)
 		}
+		// An administrator may ask to fail over after a stateful failure, but CPA
+		// cannot send that previous_response_id to another account or real exit.
+		// Reissue the exact same logical turn once through its leased binding before
+		// deciding on the rule's visible terminal. The stable Codex identity/turn id
+		// makes this a same-chain recovery, not local context reconstruction.
+		if ruleMatched && decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover &&
+			strictNativeCPA && !movable && !statefulRuleRecoveryAttempted {
+			statefulRuleRecoveryAttempted = true
+			_ = resp.Body.Close()
+			if retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, true); retryErr == nil && retryResp != nil {
+				resp, finalEgress = retryResp, retryEgress
+				goto codexResponse
+			} else if retryResp != nil && retryResp.Body != nil {
+				_ = retryResp.Body.Close()
+			}
+		}
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_upstream")
 		if ruleMatched {
 			if decision.Match.DownstreamAction == upstreamrules.DownstreamActionIdleStream && streamReq {
@@ -1396,6 +1440,7 @@ codexSuccess:
 
 	if isEventStream(resp.Header) {
 		var prefix []byte
+		relayBody := io.Reader(resp.Body)
 		entrypoint := "responses"
 		if isChat {
 			entrypoint = "chat_completions"
@@ -1417,7 +1462,15 @@ codexSuccess:
 			var streamFailure leakfilter.CodexFailureFrame
 			var terminalStream bool
 			var probeErr error
-			prefix, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailure(resp.Body)
+			if keepalive := s.streamKeepAliveInterval(r.Context()); keepalive > 0 {
+				idleRelease := earlySSECreatedIdleRelease
+				if keepalive < idleRelease {
+					idleRelease = keepalive
+				}
+				prefix, relayBody, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailureWithIdleRelease(resp.Body, idleRelease)
+			} else {
+				prefix, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailure(resp.Body)
+			}
 			if probeErr != nil {
 				_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 				if allowRetry && movable {
@@ -1506,6 +1559,23 @@ codexSuccess:
 							log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
 						}
 					}
+					// The early-frame probe has not committed any downstream bytes, so a
+					// stateful failover rule may make one safe retry through the exact
+					// same account+egress. Do not convert an ordinary repeated upstream
+					// failure into an epoch retirement: only a confirmed context-loss
+					// response is allowed to retire the CPA tree.
+					if ruleMatched && decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover &&
+						strictNativeCPA && !movable && !statefulRuleRecoveryAttempted {
+						statefulRuleRecoveryAttempted = true
+						retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, true)
+						if retryErr == nil && retryResp != nil && retryResp.StatusCode < http.StatusBadRequest {
+							resp, finalEgress = retryResp, retryEgress
+							goto codexSuccess
+						}
+						if retryResp != nil && retryResp.Body != nil {
+							_ = retryResp.Body.Close()
+						}
+					}
 					if ruleMatched {
 						s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
 					} else {
@@ -1527,7 +1597,7 @@ codexSuccess:
 				}
 			}
 		}
-		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
+		streamBody := io.MultiReader(bytes.NewReader(prefix), relayBody)
 		if isChat {
 			// Third-party OpenAI client streaming against a GPT model: convert the
 			// upstream Responses SSE into chat.completion.chunk frames it can parse
@@ -1598,6 +1668,29 @@ codexSuccess:
 		if persistErr := commitWriter.PersistenceError(); persistErr != nil {
 			log.Printf("[CODEX-SESSION-MAPPING] stream terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
 		}
+		// Sidecar v2 reports an error discovered after its response headers through
+		// HTTP trailers. A body read error on a sidecar transport is treated the
+		// same way: the sidecar may have lost its own client connection before it
+		// could deliver a trailer. Neither condition is a real upstream EOF, so
+		// never native-continue it, never rotate the CPA epoch, and never append a
+		// bare HTTP error after SSE bytes have reached the client.
+		sidecarStreamFailure := resp.SidecarStreamFailure()
+		sidecarStreamInterrupted := sidecarStreamFailure != nil || (storage.IsSidecarEgress(finalEgress) && streamErr != nil)
+		sidecarFailureCode := "sidecar_stream_interrupted"
+		sidecarFailurePhase := "stream"
+		sidecarFailureRetryable := false
+		if sidecarStreamFailure != nil {
+			sidecarFailureCode = sidecarStreamFailure.Code
+			sidecarFailurePhase = firstNonEmpty(sidecarStreamFailure.Phase, sidecarFailurePhase)
+			sidecarFailureRetryable = sidecarStreamFailure.Retryable
+		}
+		if sidecarStreamInterrupted {
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+				AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+				Action: "sidecar_stream_failure", State: "terminal", Reason: sidecarFailureCode,
+				Detail: "phase=" + sidecarFailurePhase + " retryable=" + strconv.FormatBool(sidecarFailureRetryable),
+			})
+		}
 		// Strict CPA relays terminal SSE failures immediately rather than holding
 		// them in the legacy early-retry probe. Preserve the same epoch rule here:
 		// only an upstream-confirmed missing previous response retires the whole
@@ -1611,7 +1704,8 @@ codexSuccess:
 		_, _, streamRateLimits := streamRecorder.metadata()
 		continuationFailed := false
 		nativeContinueAttempted := false
-		if streamErr == nil && !streamRecorder.reachedTerminal() {
+		continuationSidecarInterrupted := false
+		if streamErr == nil && !sidecarStreamInterrupted && !streamRecorder.reachedTerminal() {
 			responseID, responseModel, _ := streamRecorder.metadata()
 			mapping := codexSessionMappingFromContext(r.Context())
 			// Native EOF compensation belongs only to the strict persistent CPA
@@ -1634,15 +1728,24 @@ codexSuccess:
 					continuationReq := requestForTokenWithIdentity(token, continuationBody, continuationHeaders, continuationSnapshot)
 					nativeContinueAttempted = true
 					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "codex_native_continue", State: "attempted", Reason: "truncated_eof", Detail: "same_account_egress_epoch"})
+					s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "native_continue_attempted", 0)
 					continuationResp, continuationEgress, continuationErr := s.doWithCFRetry(r.Context(), continuationReq, lease, true)
 					atomic.AddUint64(&s.codexNativeContinues, 1)
 					if continuationErr != nil || continuationResp == nil || continuationResp.StatusCode >= http.StatusBadRequest || !isEventStream(continuationResp.Header) {
-						continuationFailed = true
+						continuationSidecarInterrupted = continuationErr != nil && storage.IsSidecarEgress(continuationEgress)
+						if !continuationSidecarInterrupted {
+							continuationFailed = true
+						}
 						if continuationResp != nil && continuationResp.Body != nil {
 							_ = continuationResp.Body.Close()
 						}
-						_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_request_failed")
+						if continuationSidecarInterrupted {
+							_ = writeCodexSidecarStreamFailure(w, responseID, responseModel, "request")
+						} else {
+							_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_request_failed")
+						}
 					} else {
+						s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, continuationEgress, "native_continue_headers", continuationResp.StatusCode)
 						continuationRecorder := newCodexStreamLedgerRecorder()
 						continuationWriter := newTerminalCommitWriter(w, func() error {
 							return commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress)
@@ -1659,7 +1762,17 @@ codexSuccess:
 						if continuationRateLimits.any() {
 							streamRateLimits = continuationRateLimits
 						}
-						if continuationStreamErr != nil || !continuationRecorder.completedSuccessfully() {
+						continuationSidecarFailure := continuationResp.SidecarStreamFailure()
+						continuationSidecarInterrupted = continuationSidecarFailure != nil || (storage.IsSidecarEgress(continuationEgress) && continuationStreamErr != nil)
+						if continuationSidecarInterrupted {
+							if !continuationRecorder.reachedTerminal() {
+								phase := "stream"
+								if continuationSidecarFailure != nil {
+									phase = firstNonEmpty(continuationSidecarFailure.Phase, phase)
+								}
+								_ = writeCodexSidecarStreamFailure(w, responseID, responseModel, phase)
+							}
+						} else if continuationStreamErr != nil || !continuationRecorder.completedSuccessfully() {
 							continuationFailed = true
 							if !continuationRecorder.reachedTerminal() {
 								_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_stream_failed")
@@ -1668,13 +1781,18 @@ codexSuccess:
 					}
 				}
 			}
+		} else if sidecarStreamInterrupted {
+			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+				id, streamModel, _ := streamRecorder.metadata()
+				_ = writeCodexSidecarStreamFailure(w, id, streamModel, sidecarFailurePhase)
+			}
 		} else if streamErr != nil {
 			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
 				id, streamModel, _ := streamRecorder.metadata()
 				_ = s.emitCodexNativeContinuationFailure(r.Context(), w, id, streamModel, "stream_interrupted")
 			}
 		}
-		if nativeContinueAttempted && continuationFailed {
+		if nativeContinueAttempted && continuationFailed && !continuationSidecarInterrupted {
 			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "native_eof_continue_failed"); err != nil && !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
 				log.Printf("[CODEX-SESSION-MAPPING] native continue rotation request_id=%s: %v", requestIDFromContext(r.Context()), err)
 			}
@@ -1685,7 +1803,7 @@ codexSuccess:
 		if streamRateLimits.any() {
 			s.captureCodexStreamRateLimits(lease.Account.ID, streamRateLimits)
 		}
-		if streamErr != nil {
+		if streamErr != nil || sidecarStreamInterrupted {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")

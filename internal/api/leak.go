@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -427,6 +428,181 @@ func probeEarlyCodexSSEFailure(body io.Reader) ([]byte, leakfilter.CodexFailureF
 		return ok
 	}, codexSSEFrameCommitsContent, true)
 	return prefix, failure, terminal, err
+}
+
+// earlySSECreatedIdleRelease is the small grace window after a standalone
+// response.created frame. It preserves the useful early-error probe for a
+// coalesced created+failed response while letting a genuine long-poll stream
+// reach the heartbeat relay before its first keepalive is due.
+const earlySSECreatedIdleRelease = 25 * time.Millisecond
+
+var errEarlySSEProbeIdle = errors.New("early SSE probe idle after response.created")
+
+type earlySSEReadResult struct {
+	data []byte
+	err  error
+}
+
+// earlySSEReadAhead owns the one outstanding upstream read while the initial
+// SSE probe waits briefly for an error immediately following response.created.
+// If that wait expires, the same reader is handed to the normal relay; it then
+// consumes the pending read rather than issuing a concurrent read on resp.Body.
+type earlySSEReadAhead struct {
+	source io.Reader
+	result chan earlySSEReadResult
+
+	reading    bool
+	pending    []byte
+	pendingErr error
+}
+
+func newEarlySSEReadAhead(source io.Reader) *earlySSEReadAhead {
+	return &earlySSEReadAhead{
+		source: source,
+		result: make(chan earlySSEReadResult, 1),
+	}
+}
+
+func (r *earlySSEReadAhead) startRead() {
+	if r.reading {
+		return
+	}
+	r.reading = true
+	go func() {
+		defer func() {
+			if panicValue := recover(); panicValue != nil {
+				supervisor.LogPanic("early-sse-probe-reader", panicValue)
+				r.result <- earlySSEReadResult{err: io.ErrUnexpectedEOF}
+			}
+		}()
+		tmp := make([]byte, 4096)
+		n, err := r.source.Read(tmp)
+		result := earlySSEReadResult{err: err}
+		if n > 0 {
+			result.data = append([]byte(nil), tmp[:n]...)
+		}
+		r.result <- result
+	}()
+}
+
+func (r *earlySSEReadAhead) accept(result earlySSEReadResult) {
+	r.reading = false
+	r.pending = result.data
+	r.pendingErr = result.err
+}
+
+func (r *earlySSEReadAhead) consume(p []byte) (int, error, bool) {
+	if len(r.pending) > 0 {
+		n := copy(p, r.pending)
+		r.pending = r.pending[n:]
+		return n, nil, true
+	}
+	if r.pendingErr != nil {
+		err := r.pendingErr
+		r.pendingErr = nil
+		return 0, err, true
+	}
+	return 0, nil, false
+}
+
+func (r *earlySSEReadAhead) read(p []byte, idle time.Duration) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for {
+		if n, err, ok := r.consume(p); ok {
+			return n, err
+		}
+		r.startRead()
+		if idle <= 0 {
+			r.accept(<-r.result)
+			continue
+		}
+		timer := time.NewTimer(idle)
+		select {
+		case result := <-r.result:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			r.accept(result)
+		case <-timer.C:
+			return 0, errEarlySSEProbeIdle
+		}
+	}
+}
+
+func (r *earlySSEReadAhead) Read(p []byte) (int, error) {
+	return r.read(p, 0)
+}
+
+func (r *earlySSEReadAhead) readWithIdle(p []byte, idle time.Duration) (int, error) {
+	return r.read(p, idle)
+}
+
+// probeEarlyCodexSSEFailureWithIdleRelease mirrors probeEarlyCodexSSEFailure,
+// but releases a live stream after a tiny post-created grace window. The returned
+// reader must be used for the remaining relay because it owns an in-flight read.
+func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration) ([]byte, io.Reader, leakfilter.CodexFailureFrame, bool, error) {
+	reader := newEarlySSEReadAhead(body)
+	var failure leakfilter.CodexFailureFrame
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+	processed := 0
+	frames := 0
+	sawCreated := false
+	for len(buf) < earlySSEMaxBytes && frames < earlySSEMaxFrames {
+		committedInBatch := false
+		for {
+			idx := bytes.Index(buf[processed:], []byte("\n\n"))
+			if idx < 0 {
+				break
+			}
+			end := processed + idx + 2
+			frame := buf[processed:end]
+			frames++
+			if parsed, ok := leakfilter.ParseCodexFailureFrame(frame); ok {
+				failure = parsed
+				return buf, reader, failure, true, nil
+			}
+			if codexSSEFrameCommitsContent(frame) {
+				committedInBatch = true
+			}
+			if bytes.Contains(bytes.ToLower(frame), []byte("response.created")) {
+				sawCreated = true
+			}
+			processed = end
+			if frames >= earlySSEMaxFrames {
+				return buf, reader, failure, false, nil
+			}
+		}
+		if committedInBatch {
+			return buf, reader, failure, false, nil
+		}
+		readIdle := time.Duration(0)
+		if sawCreated {
+			readIdle = idle
+		}
+		n, err := reader.readWithIdle(tmp, readIdle)
+		if errors.Is(err, errEarlySSEProbeIdle) {
+			return buf, reader, failure, false, nil
+		}
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF {
+				if n > 0 {
+					continue
+				}
+				return buf, reader, failure, false, nil
+			}
+			return buf, reader, failure, false, err
+		}
+	}
+	return buf, reader, failure, false, nil
 }
 
 func probeEarlyClaudeSSEFailure(body io.Reader) ([]byte, bool, error) {

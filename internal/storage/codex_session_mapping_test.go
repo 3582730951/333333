@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -170,5 +171,131 @@ func TestCodexSessionMappingResolvesAfterStoreRestart(t *testing.T) {
 	resolved, err := reopened.ResolveCodexSessionAliases(ctx, "key:restart", []CodexSessionAlias{{Type: "response", Value: "resp-restart"}, {Type: "turn_state", Value: "state-restart"}})
 	if err != nil || resolved.ID != committed.ID || resolved.RootSessionID != committed.RootSessionID || resolved.AccountID != "account-a" || resolved.EgressID != "direct" {
 		t.Fatalf("restart mapping resolve=%+v err=%v", resolved, err)
+	}
+}
+
+func TestCodexInstructionSnapshotIsEncryptedStableAndTreeCAS(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	store.SetTokenEncryptionKey([]byte("instruction-snapshot-test-secret"))
+	const treeID = "tree-instruction-snapshot"
+	const first = "first administrator instructions\n\nnever persist plaintext"
+	stored, err := store.EnsureCodexInstructionSnapshot(ctx, CodexInstructionSnapshot{
+		TreeID: treeID, Instructions: first, ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Instructions != first || stored.Revision == "" {
+		t.Fatalf("stored snapshot=%+v", stored)
+	}
+	var encrypted, revision string
+	if err := store.DB().QueryRowContext(ctx, `SELECT encrypted_instructions,revision_hmac FROM codex_instruction_snapshot WHERE tree_id=?`, treeID).Scan(&encrypted, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(encrypted, "administrator instructions") || strings.Contains(revision, "administrator instructions") || revision != stored.Revision {
+		t.Fatalf("snapshot plaintext/revision leaked: encrypted=%q revision=%q", encrypted, revision)
+	}
+
+	// A second caller may have observed newer files, but an active tree must keep
+	// the first elected instructions and revision.
+	again, err := store.EnsureCodexInstructionSnapshot(ctx, CodexInstructionSnapshot{
+		TreeID: treeID, Instructions: "new file content must not replace active tree", ExpiresAt: time.Now().Add(2 * time.Hour).Unix(),
+	})
+	if err != nil || again.Instructions != first || again.Revision != stored.Revision || again.ExpiresAt < stored.ExpiresAt {
+		t.Fatalf("stable snapshot=%+v err=%v", again, err)
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan CodexInstructionSnapshot, 8)
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			snapshot, callErr := store.EnsureCodexInstructionSnapshot(ctx, CodexInstructionSnapshot{
+				TreeID: treeID, Instructions: "racing candidate " + string(rune('a'+i)), ExpiresAt: time.Now().Add(3 * time.Hour).Unix(),
+			})
+			if callErr != nil {
+				errs <- callErr
+				return
+			}
+			results <- snapshot
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	for snapshot := range results {
+		if snapshot.Instructions != first || snapshot.Revision != stored.Revision {
+			t.Fatalf("CAS allowed concurrent replacement: %+v", snapshot)
+		}
+	}
+}
+
+func TestCodexInstructionSnapshotSurvivesStoreRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "instruction-snapshot.sqlite3")
+	key := []byte("persistent-instruction-snapshot-secret")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Init(ctx); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	store.SetTokenEncryptionKey(key)
+	want := CodexInstructionSnapshot{
+		TreeID: "tree-persistent-instruction-snapshot", Instructions: "durable administrator instructions", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}
+	stored, err := store.EnsureCodexInstructionSnapshot(ctx, want)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reopened.SetTokenEncryptionKey(key)
+	got, err := reopened.GetCodexInstructionSnapshot(ctx, want.TreeID)
+	if err != nil || got.Instructions != want.Instructions || got.Revision != stored.Revision {
+		t.Fatalf("restarted instruction snapshot=%+v err=%v", got, err)
+	}
+}
+
+func TestCodexUpstreamAttemptDiagnosticsRedactTreeID(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.InsertCodexUpstreamAttempt(ctx, CodexUpstreamAttempt{
+		TreeID:     "tree-real-upstream-attempt",
+		AccountID:  "account-a",
+		EgressID:   "egress-real",
+		Epoch:      3,
+		State:      "response_headers",
+		StatusCode: 200,
+		ExpiresAt:  time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListCodexUpstreamAttemptDiagnostics(ctx)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("attempt diagnostics=%+v err=%v", rows, err)
+	}
+	row := rows[0]
+	if row.TreeHMACPrefix == "" || strings.Contains(row.TreeHMACPrefix, "tree-real") || row.AccountID != "account-a" || row.EgressID != "egress-real" || row.Epoch != 3 || row.StatusCode != 200 {
+		t.Fatalf("redacted attempt diagnostic=%+v", row)
 	}
 }

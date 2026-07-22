@@ -28,6 +28,10 @@ import (
 
 const drainAndCloseBodyLimit = 8 << 20
 
+// Kept as a variable for deterministic focused transport tests. Production uses
+// the required ten-second maximum recovery window.
+var sidecarPreHeaderRecoveryWindow = 10 * time.Second
+
 type Client struct {
 	cfg config.Config
 	// liveCfg is an atomically-swappable config overlay. When set (via UpdateConfig),
@@ -41,6 +45,7 @@ type Client struct {
 	jars           *jarLRU
 	tmu            sync.Mutex
 	transports     map[string]*http.Transport
+	sidecars       *sidecarAdaptiveController
 }
 
 // cfgSnapshot returns the live config overlay when an admin has pushed one via
@@ -216,7 +221,36 @@ type Request struct {
 type Response struct {
 	StatusCode int
 	Header     http.Header
-	Body       io.ReadCloser
+	// Trailer is populated by net/http after Body reaches EOF. Sidecar v2 uses
+	// chunked trailers for failures discovered after response headers have already
+	// been committed, so callers must inspect it only after consuming Body.
+	Trailer http.Header
+	Body    io.ReadCloser
+}
+
+// SidecarStreamFailure is a structured post-header failure. It contains no
+// upstream body or identifier and lets the gateway emit a legal SSE terminal frame
+// instead of attempting a second HTTP status line or a native EOF continuation.
+type SidecarStreamFailure struct {
+	Code      string
+	Phase     string
+	Retryable bool
+}
+
+func (r *Response) SidecarStreamFailure() *SidecarStreamFailure {
+	if r == nil || r.Trailer == nil {
+		return nil
+	}
+	code := strings.TrimSpace(r.Trailer.Get("X-Sidecar-Stream-Error-Code"))
+	if code == "" {
+		return nil
+	}
+	retryable := strings.EqualFold(strings.TrimSpace(r.Trailer.Get("X-Sidecar-Stream-Error-Retryable")), "true") || r.Trailer.Get("X-Sidecar-Stream-Error-Retryable") == "1"
+	return &SidecarStreamFailure{
+		Code:      code,
+		Phase:     strings.TrimSpace(r.Trailer.Get("X-Sidecar-Stream-Error-Phase")),
+		Retryable: retryable,
+	}
 }
 
 // requestGuard bounds an upstream call by an IDLE timeout and releases the request
@@ -314,7 +348,23 @@ func NewClient(cfg config.Config) *Client {
 	cfg.UpstreamBaseURL = NormalizeBaseURL(cfg.UpstreamBaseURL)
 	cfg.OpenAIAPIUpstreamBaseURL = NormalizeBaseURL(cfg.OpenAIAPIUpstreamBaseURL)
 	secret := identity.ResolveSecret([]byte(cfg.IdentitySecret))
-	return &Client{cfg: cfg, identitySecret: secret, jars: newJarLRU(0), transports: map[string]*http.Transport{}}
+	return &Client{
+		cfg:            cfg,
+		identitySecret: secret,
+		jars:           newJarLRU(0),
+		transports:     map[string]*http.Transport{},
+		sidecars:       newSidecarAdaptiveController(),
+	}
+}
+
+// SidecarAdaptiveStatuses exposes only safe aggregate transport health for the
+// diagnostics exporter. It intentionally has no request, cookie, endpoint, or
+// upstream-response data.
+func (c *Client) SidecarAdaptiveStatuses() []SidecarAdaptiveStatus {
+	if c == nil {
+		return nil
+	}
+	return c.sidecars.statuses()
 }
 
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
@@ -723,26 +773,112 @@ func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string
 	if err != nil {
 		return nil, err
 	}
-	// Idle-timeout guard, released on the body's Close (see requestGuard): bounds the
-	// sidecar call (connect + each streamed chunk) without truncating a long-but-
-	// progressing upstream response that the sidecar relays back chunk by chunk.
+	encodedMeta := base64.StdEncoding.EncodeToString(metaRaw)
+	// A v2 pre-header failure is the only sidecar failure that is safe to retry:
+	// the sidecar explicitly reports it before it has handed an upstream response
+	// to us. A socket error has ambiguous delivery and therefore never causes a
+	// transparent replay of a potentially stateful upstream turn.
+	recoveryUntil := time.Now().Add(sidecarPreHeaderRecoveryWindow)
+	if deadline, ok := ctx.Deadline(); ok && deadline.Before(recoveryUntil) {
+		recoveryUntil = deadline
+	}
+	var lastErr error
+	for {
+		lease, acquireErr := c.sidecars.acquire(ctx, spec.Egress)
+		if acquireErr != nil {
+			lastErr = acquireErr
+			if circuit, ok := acquireErr.(*sidecarCircuitOpenError); ok {
+				if circuit.BypassReady && sidecarDirectBypassAllowed(spec.Egress, ja3) {
+					return c.postDirectThroughSidecarChain(ctx, spec, target, built, timeout)
+				}
+				if time.Now().Before(recoveryUntil) {
+					waitUntil := circuit.RetryAt
+					if waitUntil.IsZero() || waitUntil.After(recoveryUntil) {
+						waitUntil = recoveryUntil
+					}
+					if waitForSidecarRetry(ctx, waitUntil) {
+						continue
+					}
+				}
+				if sidecarDirectBypassAllowed(spec.Egress, ja3) {
+					c.sidecars.enableBypass(spec.Egress)
+					return c.postDirectThroughSidecarChain(ctx, spec, target, built, timeout)
+				}
+			}
+			return nil, lastErr
+		}
+		response, preHeaderFailure, attemptErr := c.postViaSidecarOnce(ctx, spec, encodedMeta, timeout, lease)
+		if !preHeaderFailure {
+			if attemptErr != nil {
+				lease.release(sidecarOutcomeFailure)
+				return nil, attemptErr
+			}
+			return response, nil
+		}
+		lease.release(sidecarOutcomeFailure)
+		lastErr = attemptErr
+		if time.Now().Before(recoveryUntil) {
+			if waitForSidecarRetry(ctx, minTime(time.Now().Add(100*time.Millisecond), recoveryUntil)) {
+				continue
+			}
+		}
+		if sidecarDirectBypassAllowed(spec.Egress, ja3) {
+			c.sidecars.enableBypass(spec.Egress)
+			return c.postDirectThroughSidecarChain(ctx, spec, target, built, timeout)
+		}
+		return nil, lastErr
+	}
+}
+
+func minTime(left, right time.Time) time.Time {
+	if left.After(right) {
+		return right
+	}
+	return left
+}
+
+func waitForSidecarRetry(ctx context.Context, until time.Time) bool {
+	if !until.After(time.Now()) {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(time.Until(until))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// postViaSidecarOnce returns preHeaderFailure only when the sidecar itself
+// explicitly certifies that an error happened before it could hand a request to
+// the upstream. A socket error (including one before response headers) remains
+// delivery-ambiguous: the upstream may already have accepted a stateful turn.
+func (c *Client) postViaSidecarOnce(ctx context.Context, spec Request, encodedMeta string, timeout time.Duration, lease *sidecarAdaptiveLease) (*Response, bool, error) {
 	ctx, guard := newRequestGuard(ctx, timeout)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(spec.Egress.Endpoint, "/")+"/proxy", bytes.NewReader(spec.Body))
 	if err != nil {
 		guard.Fail()
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Sidecar-Meta", base64.StdEncoding.EncodeToString(metaRaw))
+	req.Header.Set("X-Sidecar-Meta", encodedMeta)
 	client, err := c.sidecarHTTPClient()
 	if err != nil {
 		guard.Fail()
-		return nil, err
+		return nil, false, err
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		guard.Fail()
-		return nil, err
+		return nil, false, err
+	}
+	if code, failed := sidecarPreHeaderFailure(resp); failed {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		guard.Fail()
+		return nil, true, fmt.Errorf("sidecar pre-header failure: %s", code)
 	}
 	header := resp.Header.Clone()
 	if statusHeader := header.Get("x-sidecar-upstream-status"); statusHeader != "" {
@@ -760,7 +896,79 @@ func (c *Client) postViaSidecar(ctx context.Context, spec Request, target string
 			}
 		}
 	}
-	return &Response{StatusCode: resp.StatusCode, Header: header, Body: guard.Wrap(resp.Body)}, nil
+	body := &adaptiveSidecarBody{ReadCloser: resp.Body, trailer: resp.Trailer, lease: lease}
+	return &Response{StatusCode: resp.StatusCode, Header: header, Trailer: resp.Trailer, Body: guard.Wrap(body)}, false, nil
+}
+
+func sidecarPreHeaderFailure(resp *http.Response) (string, bool) {
+	if resp == nil {
+		return "", false
+	}
+	if code := strings.TrimSpace(resp.Header.Get("X-Sidecar-Error-Code")); code != "" {
+		// Sidecar v2 sets this only for failures it can prove occurred before
+		// upstream delivery. Treat the header as an explicit protocol assertion,
+		// rather than guessing from a 5xx status or an exception string.
+		retryable := strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-Sidecar-Error-Retryable")), "true") ||
+			strings.TrimSpace(resp.Header.Get("X-Sidecar-Error-Retryable")) == "1"
+		if retryable {
+			return code, true
+		}
+	}
+	return "", false
+}
+
+// sidecarDirectBypassAllowed is intentionally narrow. A bypass must keep using
+// the selected account's real chained proxy and must not discard a custom TLS
+// fingerprint request (JA3/Akamai), otherwise it would silently leak traffic
+// through the host network or materially change the upstream fingerprint.
+func sidecarDirectBypassAllowed(egress storage.EgressProfile, ja3 string) bool {
+	if strings.TrimSpace(ja3) != "" || strings.Contains(strings.ToLower(egress.DynamicConfigJSON), "akamai") {
+		return false
+	}
+	_, ok := sidecarBypassEgress(egress)
+	return ok
+}
+
+func sidecarBypassEgress(egress storage.EgressProfile) (storage.EgressProfile, bool) {
+	base := storage.WithoutSidecarTransport(egress)
+	switch strings.ToLower(strings.TrimSpace(base.Type)) {
+	case "http_proxy", "https_proxy", "warp_proxy", "socks5h_proxy", "socks5_proxy":
+		return base, strings.TrimSpace(base.Endpoint) != ""
+	}
+	// Legacy sidecar profiles can be configured with their own explicit chain
+	// proxy but have no TransportBase* fields. Preserve that exact proxy rather
+	// than degrading to a host-direct connection.
+	if strings.TrimSpace(egress.TransportSidecarID) == "" && storage.IsSidecarEgress(egress) {
+		if chain := strings.TrimSpace(egress.ChainProxy); chain != "" {
+			return storage.EgressProfile{ID: egress.ID, Type: proxyTypeForURL(chain), Endpoint: chain}, true
+		}
+	}
+	return storage.EgressProfile{}, false
+}
+
+func (c *Client) postDirectThroughSidecarChain(ctx context.Context, spec Request, target string, built http.Header, timeout time.Duration) (*Response, error) {
+	egress, ok := sidecarBypassEgress(spec.Egress)
+	if !ok {
+		return nil, errors.New("sidecar direct bypass requires the selected chain proxy")
+	}
+	ctx, guard := newRequestGuard(ctx, timeout)
+	req, err := http.NewRequestWithContext(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, bytes.NewReader(spec.Body))
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	req.Header = built.Clone()
+	client, err := c.httpClientForEgress(Request{Egress: egress, Account: spec.Account, CookieJarKey: spec.CookieJarKey})
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		guard.Fail()
+		return nil, err
+	}
+	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
 }
 
 // codexProtocolHeaders is the allowlist of request headers the official Codex

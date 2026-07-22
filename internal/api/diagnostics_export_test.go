@@ -98,6 +98,11 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		"kiro_runtime_capabilities.csv",
 		"account_rate_limits.csv",
 		"affinity_bindings.csv",
+		"codex_session_mappings.csv",
+		"codex_instruction_snapshots.csv",
+		"codex_upstream_attempts.csv",
+		"codex_group_policy_revisions.csv",
+		"sidecar_status.csv",
 		"settings.csv",
 		"custom_providers.csv",
 		"upstream_error_rules.csv",
@@ -194,7 +199,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := json.Unmarshal([]byte(files["diagnostic_summary.json"]), &summary); err != nil {
 		t.Fatalf("diagnostic_summary.json: %v\n%s", err, files["diagnostic_summary.json"])
 	}
-	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups"} {
+	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa"} {
 		if _, ok := summary[key]; !ok {
 			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
 		}

@@ -290,7 +290,7 @@ export default function Groups() {
             field="model_instructions_files_csv"
             label="指令文件顺序"
             placeholder={instructionFiles.map((file) => file.name).join(',') || 'coding-style.md,testing.txt'}
-            help="逗号分隔，按填写顺序拼接；仅对 ChatGPT/Codex 路由生效。"
+            help="逗号分隔，按填写顺序拼接；仅对 ChatGPT/Codex 路由生效。Codex 会话会固定创建时的快照，修改仅影响新会话。"
           />
           <Button htmlType="submit" theme="solid" loading={creating} style={{ marginTop: 12 }}>创建</Button>
         </Form>
@@ -336,7 +336,7 @@ export default function Groups() {
                 disabled={savingGroupInstructions}
                 onChange={(checked) => setEditingGroup((current) => ({ ...(current || {}), model_instructions_enabled: checked }))}
               />
-              <div className="pool-field__help">启用后仅注入 ChatGPT/Codex 路由，并作为 Responses 顶层 instructions。</div>
+              <div className="pool-field__help">启用后覆盖 ChatGPT/Codex 的基础指令。Codex 会话在创建时固定快照，修改、删除文件或开关仅影响新会话。</div>
             </span>
           </label>
           <div className="pool-field pool-field--left">

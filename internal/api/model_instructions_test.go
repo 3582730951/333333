@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+
+	"codex-account-pool/internal/storage"
 )
 
 func TestGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
@@ -110,26 +113,69 @@ func TestGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
 }
 
 func TestSetResponsesInstructionsReplacesLiteDeveloperBase(t *testing.T) {
-	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	raw := []byte(`{"model":"gpt-5.6-sol","opaque":{"exact":900719925474099312345},"instructions":"top-level old","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec","format":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}],"exact":900719925474099312345}]}`)
 	got := setResponsesInstructions(raw, "new compiled instructions")
-	var root map[string]interface{}
+	var root map[string]json.RawMessage
 	if err := json.Unmarshal(got, &root); err != nil {
 		t.Fatal(err)
 	}
 	if _, present := root["instructions"]; present {
 		t.Fatalf("Lite override leaked a top-level instructions field: %s", got)
 	}
-	input, _ := root["input"].([]interface{})
+	var input []json.RawMessage
+	if err := json.Unmarshal(root["input"], &input); err != nil {
+		t.Fatal(err)
+	}
 	if len(input) != 3 {
 		t.Fatalf("Lite override changed input item count: %s", got)
 	}
-	developer, _ := input[1].(map[string]interface{})
-	content, _ := developer["content"].([]interface{})
-	if len(content) != 1 || content[0].(map[string]interface{})["text"] != "new compiled instructions" {
+	if !strings.Contains(string(input[0]), `"const":900719925474099312345`) || !strings.Contains(string(root["opaque"]), `900719925474099312345`) {
+		t.Fatalf("Lite prefix or unrelated large integer changed: %s", got)
+	}
+	var developer struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(input[1], &developer); err != nil {
+		t.Fatal(err)
+	}
+	if len(developer.Content) != 1 || developer.Content[0].Text != "new compiled instructions" {
 		t.Fatalf("Lite developer base was not replaced: %s", got)
 	}
-	if strings.Contains(string(got), "old base") {
+	if strings.Contains(string(got), "old base") || !strings.Contains(string(input[2]), `"exact":900719925474099312345`) {
 		t.Fatalf("old Lite base instructions survived override: %s", got)
+	}
+}
+
+func TestSetResponsesInstructionsKeepsExactlyOneLiteBaseMessage(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"first stale base"}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"second stale base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"keep user turn"}]}]}`)
+	got := setResponsesInstructions(raw, "the only administrator base")
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	var input []json.RawMessage
+	if err := json.Unmarshal(root["input"], &input); err != nil {
+		t.Fatal(err)
+	}
+	if len(input) != 3 || !strings.Contains(string(input[1]), "the only administrator base") || strings.Contains(string(got), "stale base") || !strings.Contains(string(input[2]), "keep user turn") {
+		t.Fatalf("Lite prefix must contain exactly one replacement base message: %s", got)
+	}
+}
+
+func TestSetResponsesInstructionsDoesNotInventLitePrefix(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"user","tools":[]},{"role":"user","content":"hi"}]}`)
+	got := setResponsesInstructions(raw, "operator base")
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	if string(root["instructions"]) != `"operator base"` {
+		t.Fatalf("unrecognized envelope should remain classic: %s", got)
+	}
+	if strings.Contains(string(got), `"role":"developer","content":[{"type":"input_text","text":"operator base"}]`) {
+		t.Fatalf("unrecognized envelope gained Lite developer prefix: %s", got)
 	}
 }
 
@@ -163,8 +209,132 @@ func TestGroupModelInstructionsMissingFileIsConfigurationError(t *testing.T) {
 	if upstreamCalls != 0 {
 		t.Fatalf("configuration error should not call upstream, calls=%d", upstreamCalls)
 	}
-	if !strings.Contains(string(raw), "missing.md") {
+	if !strings.Contains(string(raw), "missing.md") || !strings.Contains(string(raw), "codex_instruction_configuration_error") {
 		t.Fatalf("error should mention missing file: %s", raw)
+	}
+}
+
+func TestStrictCPAModelInstructionsAreTreeSnapshots(t *testing.T) {
+	var captured []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		captured = append(captured, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		switch len(captured) {
+		case 1:
+			_, _ = w.Write([]byte(`{"id":"resp-instruction-snapshot-1","object":"response","model":"gpt","status":"completed","output":[]}`))
+		case 2:
+			_, _ = w.Write([]byte(`{"id":"resp-instruction-snapshot-2","object":"response","model":"gpt","status":"completed","output":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{"id":"resp-instruction-snapshot-new-root","object":"response","model":"gpt","status":"completed","output":[]}`))
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	save := func(content string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"name": "strict.md", "content": content})
+		if code, raw := grpReq(t, h, http.MethodPost, "/admin/model-instructions", string(body)); code != http.StatusOK {
+			t.Fatalf("save instructions = %d: %s", code, raw)
+		}
+	}
+	save("first immutable administrator instructions")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"strict-snapshot","model_instructions_enabled":true,"model_instructions_files":["strict.md"]}`); code != http.StatusOK {
+		t.Fatalf("create group = %d: %s", code, raw)
+	}
+	key := createTestAPIKeyForGroup(t, h, "strict-snapshot")
+	accountID := h.importAccount(t, "strict-snapshot", "up-strict-snapshot", "access-strict-snapshot")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/group", `{"group":"strict-snapshot"}`); code != http.StatusOK {
+		t.Fatalf("assign group = %d: %s", code, raw)
+	}
+	setTestCapability(t, h, accountID, "gpt", 272000)
+	post := func(body string) ([]byte, *http.Response) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "strict-instruction-root")
+		req.Header.Set("Session-Id", "strict-instruction-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return bodyBytes, resp
+	}
+	if body, resp := post(`{"model":"gpt","instructions":"downstream must be replaced","input":"root"}`); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp-instruction-snapshot-1") || resp.Header.Get("X-MiCliProxy-CPA-Instructions") != "pending_root" {
+		t.Fatalf("root status=%d instruction-state=%q body=%s", resp.StatusCode, resp.Header.Get("X-MiCliProxy-CPA-Instructions"), body)
+	}
+	// A file update is deliberately visible only to a later root. The continuation
+	// must use the snapshot committed with the completed first response.
+	save("second mutable administrator instructions")
+	if body, resp := post(`{"model":"gpt","previous_response_id":"resp-instruction-snapshot-1","input":"continue"}`); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp-instruction-snapshot-2") || resp.Header.Get("X-MiCliProxy-CPA-Instructions") != "snapshot" {
+		t.Fatalf("continuation status=%d instruction-state=%q body=%s", resp.StatusCode, resp.Header.Get("X-MiCliProxy-CPA-Instructions"), body)
+	}
+	if len(captured) != 2 {
+		t.Fatalf("upstream calls before rotation=%d", len(captured))
+	}
+	for i, body := range captured {
+		if !strings.Contains(body, "first immutable administrator instructions") || strings.Contains(body, "second mutable administrator instructions") || strings.Contains(body, "downstream must be replaced") {
+			t.Fatalf("request %d did not use immutable tree instructions: %s", i+1, body)
+		}
+	}
+	// Retiring an epoch turns a later self-contained request into a fresh root.
+	// It must read the current operator configuration rather than inherit the old
+	// tree snapshot through the retired anchor used only to allocate the next epoch.
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), "key:"+hashAPIKey(key), storage.CodexSessionAlias{Type: "root", Value: "strict-instruction-root"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("root mapping before rotation rows=%+v err=%v", rows, err)
+	}
+	if _, err := h.store.RetireCodexSessionTree(context.Background(), rows[0].ID, rows[0].Epoch); err != nil {
+		t.Fatalf("retire root tree: %v", err)
+	}
+	if body, resp := post(`{"model":"gpt","input":"fresh root after epoch rotation"}`); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "resp-instruction-snapshot-new-root") || resp.Header.Get("X-MiCliProxy-CPA-Instructions") != "pending_root" {
+		t.Fatalf("new root status=%d instruction-state=%q body=%s", resp.StatusCode, resp.Header.Get("X-MiCliProxy-CPA-Instructions"), body)
+	}
+	if len(captured) != 3 || !strings.Contains(captured[2], "second mutable administrator instructions") || strings.Contains(captured[2], "first immutable administrator instructions") {
+		t.Fatalf("fresh root did not compile current configuration: %v", captured)
+	}
+	var snapshotCount int
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM codex_instruction_snapshot`).Scan(&snapshotCount); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotCount != 2 {
+		t.Fatalf("snapshot rows=%d, want 2", snapshotCount)
+	}
+}
+
+func TestStrictCPAModelInstructionsRejectBrokenNewRootBeforeUpstream(t *testing.T) {
+	var calls int
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"strict-broken","model_instructions_enabled":true,"model_instructions_files":["missing.md"]}`); code != http.StatusOK {
+		t.Fatalf("create group = %d: %s", code, raw)
+	}
+	key := createTestAPIKeyForGroup(t, h, "strict-broken")
+	accountID := h.importAccount(t, "strict-broken", "up-strict-broken", "access-strict-broken")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/group", `{"group":"strict-broken"}`); code != http.StatusOK {
+		t.Fatalf("assign group = %d: %s", code, raw)
+	}
+	setTestCapability(t, h, accountID, "gpt", 272000)
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","input":"new root"}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "strict-broken-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || calls != 0 || !strings.Contains(string(body), "missing.md") {
+		t.Fatalf("status=%d calls=%d body=%s", resp.StatusCode, calls, body)
 	}
 }
 

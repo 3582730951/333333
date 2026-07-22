@@ -71,6 +71,36 @@ func TestCanonicalizeHeaders(t *testing.T) {
 	}
 }
 
+func TestSidecarV2StreamTrailersExposeStructuredFailure(t *testing.T) {
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enc, _ := json.Marshal(map[string][]string{"content-type": {"text/event-stream"}})
+		w.Header().Set("x-sidecar-upstream-status", "200")
+		w.Header().Set("x-sidecar-upstream-headers-b64", base64.StdEncoding.EncodeToString(enc))
+		w.Header().Set("Trailer", "X-Sidecar-Stream-Error-Code, X-Sidecar-Stream-Error-Phase, X-Sidecar-Stream-Error-Retryable")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: partial\n\n"))
+		w.Header().Set("X-Sidecar-Stream-Error-Code", "sidecar_stream_error")
+		w.Header().Set("X-Sidecar-Stream-Error-Phase", "stream")
+		w.Header().Set("X-Sidecar-Stream-Error-Retryable", "true")
+	}))
+	defer sidecar.Close()
+
+	client := NewClient(config.Default())
+	resp, err := client.DoViaSidecar(context.Background(), storage.EgressProfile{ID: "eg-v2", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"}, http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", http.Header{}, []byte("{}"), "jar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	failure := resp.SidecarStreamFailure()
+	if failure == nil || failure.Code != "sidecar_stream_error" || failure.Phase != "stream" || !failure.Retryable {
+		t.Fatalf("sidecar v2 trailer failure=%+v trailers=%v", failure, resp.Trailer)
+	}
+}
+
 func TestCodexSidecarResponsesStripsPromptCacheRetention(t *testing.T) {
 	var gotBody string
 	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

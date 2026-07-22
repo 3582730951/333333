@@ -55,37 +55,68 @@ async def read_request(reader:asyncio.StreamReader):
 async def send(writer,status:int,headers:dict[str,str],body:bytes=b""):
  reason={200:"OK",400:"Bad Request",404:"Not Found",502:"Bad Gateway",503:"Service Unavailable"}.get(status,"OK");headers=dict(headers);headers.setdefault("content-length",str(len(body)));headers["connection"]="close"
  writer.write((f"HTTP/1.1 {status} {reason}\r\n"+"".join(f"{k}: {v}\r\n" for k,v in headers.items())+"\r\n").encode("latin1")+body);await writer.drain()
+async def send_chunk(writer,body:bytes):
+ writer.write(f"{len(body):X}\r\n".encode("ascii")+body+b"\r\n");await writer.drain()
+async def finish_chunked(writer,code:str="",phase:str="",retryable:bool=False):
+ trailers=""
+ if code:
+  trailers+=f"X-Sidecar-Stream-Error-Code: {code}\r\nX-Sidecar-Stream-Error-Phase: {phase or 'stream'}\r\nX-Sidecar-Stream-Error-Retryable: {'true' if retryable else 'false'}\r\n"
+ writer.write(("0\r\n"+trailers+"\r\n").encode("latin1"));await writer.drain()
+def structured_error(code:str,phase:str,retryable:bool,message:str)->bytes:
+ return json.dumps({"error":{"code":code,"phase":phase,"retryable":retryable,"message":message}},separators=(",",":"),ensure_ascii=False).encode()
 def metrics():
  rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
  return {"ok":True,"inflight":_inflight,"curl_handles":_handles,"session_buckets":len(_sessions),"rss_bytes":rss*(1024 if sys.platform!="darwin" else 1),"impersonate":IMPERSONATE,"draining":_stopping}
 
+# A transport error after curl has begun a request is delivery-ambiguous: the
+# upstream may already have accepted a stateful Responses turn. Only the narrow
+# preflight class below is safe for the Go relay to retry or bypass.
+class SidecarPreflightError(Exception): pass
+class SidecarDeliveryUnknownError(Exception): pass
+
 async def proxy(writer,payload:dict[str,Any],body:bytes):
  global _handles
- method=str(payload.get("method") or "POST").upper();url=str(payload["url"]);jar=str(payload.get("cookie_jar_key") or "default");proxy_url=str(payload.get("proxy") or "").strip();ja3=str(payload.get("ja3") or "").strip();akamai=str(payload.get("akamai") or "").strip()
- key=(proxy_url,ja3,akamai,jar);session=await session_for(key);_session_active[key]=_session_active.get(key,0)+1;kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":body or None,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
- if proxy_url:kwargs["proxy"]=proxy_url
- # default_headers gates curl-impersonate's INJECTION of the browser's own header set
- # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests, …) ON TOP of the
- # caller-supplied headers. An explicit ja3 already disables it (exact-header replay). When
- # no ja3 is set the caller may still opt out via {"default_headers": false}: the Go layer
- # builds a complete, authentic client header set from scratch (e.g. the claude-cli/Node
- # fingerprint), so the browser extras are pure noise that would out the request as an
- # impersonation relay — while the TLS/HTTP2 impersonation (session impersonate=) is kept.
- # Absent field => True (curl default), so existing Codex/registration callers are unchanged.
- if ja3:kwargs.update(ja3=ja3,default_headers=False)
- elif payload.get("default_headers") is False:kwargs["default_headers"]=False
- if akamai:kwargs["akamai"]=akamai
- if payload.get("allow_redirects") is False:kwargs["allow_redirects"]=False
- _handles+=1
+ try:
+  method=str(payload.get("method") or "POST").upper();url=str(payload["url"]);jar=str(payload.get("cookie_jar_key") or "default");proxy_url=str(payload.get("proxy") or "").strip();ja3=str(payload.get("ja3") or "").strip();akamai=str(payload.get("akamai") or "").strip()
+  key=(proxy_url,ja3,akamai,jar);session=await session_for(key);kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":body or None,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
+  if proxy_url:kwargs["proxy"]=proxy_url
+  # default_headers gates curl-impersonate's INJECTION of the browser's own header set
+  # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests, …) ON TOP of the
+  # caller-supplied headers. An explicit ja3 already disables it (exact-header replay). When
+  # no ja3 is set the caller may still opt out via {"default_headers": false}: the Go layer
+  # builds a complete, authentic client header set from scratch (e.g. the claude-cli/Node
+  # fingerprint), so the browser extras are pure noise that would out the request as an
+  # impersonation relay — while the TLS/HTTP2 impersonation (session impersonate=) is kept.
+  # Absent field => True (curl default), so existing Codex/registration callers are unchanged.
+  if ja3:kwargs.update(ja3=ja3,default_headers=False)
+  elif payload.get("default_headers") is False:kwargs["default_headers"]=False
+  if akamai:kwargs["akamai"]=akamai
+  if payload.get("allow_redirects") is False:kwargs["allow_redirects"]=False
+ except Exception as e:
+  raise SidecarPreflightError(str(e)) from e
+ _session_active[key]=_session_active.get(key,0)+1
+ _handles+=1;started=False
  try:
   async with session.stream(method,url,**kwargs) as resp:
    merged=load_cookies(jar)
    try:merged.update(resp.cookies.get_dict());save_cookies(jar,merged)
    except Exception:pass
    reported={k:[v] for k,v in resp.headers.items() if k.lower() not in {"content-encoding","content-length","transfer-encoding"}}
-   enc=base64.b64encode(json.dumps(reported).encode()).decode();writer.write(("HTTP/1.1 200 OK\r\n"+f"x-sidecar-upstream-status: {resp.status_code}\r\nx-sidecar-upstream-headers-b64: {enc}\r\ncontent-type: {resp.headers.get('content-type','application/octet-stream')}\r\nconnection: close\r\n\r\n").encode("latin1"));await writer.drain()
+   # v2 never emits another HTTP status once this header block is written. Any
+   # later curl/read failure is represented through chunked trailers, which Go can
+   # observe after consuming the stream and turn into a legal downstream terminal.
+   enc=base64.b64encode(json.dumps(reported).encode()).decode();writer.write(("HTTP/1.1 200 OK\r\n"+f"x-sidecar-upstream-status: {resp.status_code}\r\nx-sidecar-upstream-headers-b64: {enc}\r\ncontent-type: {resp.headers.get('content-type','application/octet-stream')}\r\ntransfer-encoding: chunked\r\ntrailer: X-Sidecar-Stream-Error-Code, X-Sidecar-Stream-Error-Phase, X-Sidecar-Stream-Error-Retryable\r\nconnection: close\r\n\r\n").encode("latin1"));await writer.drain();started=True
    async for chunk in resp.aiter_content():
-    if chunk:writer.write(chunk);await writer.drain()
+    if chunk:await send_chunk(writer,chunk)
+   await finish_chunked(writer)
+ except Exception as e:
+  if started:
+   # Writing the trailer may itself fail after the client disconnects. Either way
+   # do not re-raise into client(), which would otherwise append a second 502 line.
+   try:await finish_chunked(writer,"sidecar_stream_error","stream",True)
+   except Exception:pass
+   return
+  raise SidecarDeliveryUnknownError(str(e)) from e
  finally:_handles-=1;_session_active[key]=max(0,_session_active.get(key,1)-1)
 
 async def client(reader,writer):
@@ -101,8 +132,16 @@ async def client(reader,writer):
   if h.get("x-sidecar-meta"):p=json.loads(base64.b64decode(h["x-sidecar-meta"]));body=raw
   else:p=json.loads(raw);body=base64.b64decode(str(p.get("body_b64") or ""))
   await proxy(writer,p,body)
+ except SidecarPreflightError as e:
+  # This is the only pre-header error certified not to have reached the upstream.
+  # The v2 retryability header is an explicit contract with the Go relay.
+  if not writer.is_closing():await send(writer,502,{"content-type":"application/json","x-sidecar-error-code":"sidecar_preflight_error","x-sidecar-error-phase":"preflight","x-sidecar-error-retryable":"true"},structured_error("sidecar_preflight_error","preflight",True,str(e)))
+ except SidecarDeliveryUnknownError as e:
+  # Do not invite a replay: curl may have sent request bytes before its failure.
+  if not writer.is_closing():await send(writer,502,{"content-type":"application/json","x-sidecar-error-code":"sidecar_delivery_unknown","x-sidecar-error-phase":"request","x-sidecar-error-retryable":"false"},structured_error("sidecar_delivery_unknown","request",False,str(e)))
  except Exception as e:
-  if not writer.is_closing():await send(writer,502,{"content-type":"application/json"},json.dumps({"error":str(e)}).encode())
+  # Malformed local requests are structured for diagnosis but are never retried.
+  if not writer.is_closing():await send(writer,502,{"content-type":"application/json","x-sidecar-error-code":"sidecar_request_error","x-sidecar-error-phase":"request","x-sidecar-error-retryable":"false"},structured_error("sidecar_request_error","request",False,str(e)))
  finally:
   if 'path' in locals() and path=="/proxy":_inflight=max(0,_inflight-1)
   writer.close();await writer.wait_closed()

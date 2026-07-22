@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"codex-account-pool/internal/storage"
@@ -166,5 +167,83 @@ func TestSidecarEgressRecordsUsageStreaming(t *testing.T) {
 	}
 	if cached := sumUsage(rows, "cached_tokens"); cached != 5 {
 		t.Fatalf("streaming cached_tokens via sidecar = %v, want 5 (rows=%v)", cached, rows)
+	}
+}
+
+func TestStrictCPASidecarTrailerDoesNotNativeContinueOrRetireTree(t *testing.T) {
+	var directCalls atomic.Int32
+	var sidecarCalls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		directCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-sidecar-root","object":"response","model":"gpt","status":"completed","output":[]}`))
+	})
+	enableCodexSessionMappingForTest(h)
+	accountID := h.importAccount(t, "sidecar-cpa", "upstream-sidecar-cpa", "access-sidecar-cpa")
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sidecarCalls.Add(1)
+		headers, _ := json.Marshal(http.Header{"Content-Type": {"text/event-stream"}})
+		w.Header().Set("x-sidecar-upstream-status", "200")
+		w.Header().Set("x-sidecar-upstream-headers-b64", base64.StdEncoding.EncodeToString(headers))
+		w.Header().Set("Trailer", "X-Sidecar-Stream-Error-Code, X-Sidecar-Stream-Error-Phase, X-Sidecar-Stream-Error-Retryable")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-sidecar-partial\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"in_progress\"}}\n\n"))
+		w.Header().Set("X-Sidecar-Stream-Error-Code", "sidecar_stream_error")
+		w.Header().Set("X-Sidecar-Stream-Error-Phase", "stream")
+		w.Header().Set("X-Sidecar-Stream-Error-Retryable", "true")
+	}))
+	defer sidecar.Close()
+
+	post := func(body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "sidecar-cpa-root")
+		req.Header.Set("Session-Id", "sidecar-cpa-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, string(raw)
+	}
+
+	if status, body := post(`{"model":"gpt","input":"root"}`); status != http.StatusOK || !strings.Contains(body, "resp-sidecar-root") {
+		t.Fatalf("root status=%d body=%s", status, body)
+	}
+	// Keep the real exit id bound to the strict CPA tree and attach the sidecar as
+	// its transport wrapper. A stateful mapping is intentionally not allowed to
+	// migrate to a different real egress just to exercise a transport failure.
+	if err := h.store.UpsertEgressProfile(context.Background(), storage.EgressProfile{
+		ID: "sidecar", Name: "sidecar", Type: storage.CurlCFFISidecarEgressType, Endpoint: sidecar.URL,
+		StreamCapable: true, Health: "healthy", MaxConcurrency: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertEgressBinding(context.Background(), storage.AccountEgressBinding{
+		AccountID: accountID, PrimaryEgressID: storage.DefaultDirectEgressID, SidecarEgressID: "sidecar",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	status, body := post(`{"model":"gpt","stream":true,"previous_response_id":"resp-sidecar-root","input":"resume"}`)
+	if status != http.StatusOK || !strings.Contains(body, "sidecar_stream_interrupted") || strings.Contains(body, "codex_native_continue_failed") {
+		t.Fatalf("sidecar terminal status=%d body=%s", status, body)
+	}
+	if got := sidecarCalls.Load(); got != 1 {
+		t.Fatalf("sidecar calls=%d, want exactly one initial stream", got)
+	}
+	if got := directCalls.Load(); got != 1 {
+		t.Fatalf("sidecar interruption triggered an upstream continue/direct call: %d", got)
+	}
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-sidecar-root"})
+	if err != nil || len(rows) != 1 || rows[0].State != "active" {
+		t.Fatalf("sidecar interruption retired tree rows=%+v err=%v", rows, err)
 	}
 }
