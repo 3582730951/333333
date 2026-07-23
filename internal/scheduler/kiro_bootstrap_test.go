@@ -85,6 +85,96 @@ func TestAutoKiroOnlyConcreteModelBootstrapsThenBecomesVerified(t *testing.T) {
 	verifiedLease.Release()
 }
 
+func TestKiroGPTConcreteModelBootstrapsWithoutThinkingAndUsesModelEvidence(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	endpointHash := seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-gpt-bootstrap", Label: "kiro gpt", GroupName: "cyber", PlanType: "KIRO PRO"})
+	s := New(store, config.Default())
+	route := Route{
+		Group: "cyber", AllowedProviders: []string{"kiro"}, ExplicitProvider: true,
+		Model: "gpt-5.6-sol",
+	}
+
+	// GPT models use Kiro's non-Claude generation envelope. A static exact match
+	// must therefore bootstrap even though adaptive-thinking evidence does not
+	// exist for it.
+	lease, err := s.Select(ctx, route)
+	if err != nil {
+		t.Fatalf("GPT bootstrap select: %v", err)
+	}
+	if lease.Account.ID != "kiro-gpt-bootstrap" || lease.ResolvedModel != "gpt-5.6-sol" {
+		t.Fatalf("GPT bootstrap lease=%+v", lease)
+	}
+	lease.Release()
+
+	// GPT conversion records model success without a Claude thinking request. It
+	// must nevertheless become runtime-verified for subsequent scheduling.
+	if _, err := store.ObserveKiroCapability(ctx, "kiro-gpt-bootstrap", endpointHash, "gpt-5.6-sol", storage.KiroCapabilityObservation{ModelSucceeded: true}); err != nil {
+		t.Fatal(err)
+	}
+	resolved, bootstrap, ok := s.resolveKiroRouteModel(ctx, storage.Account{
+		ID: "kiro-gpt-bootstrap", PlanType: "KIRO PRO",
+	}, route)
+	if !ok || bootstrap || resolved != "gpt-5.6-sol" {
+		t.Fatalf("GPT runtime evidence resolved=%q bootstrap=%t ok=%t", resolved, bootstrap, ok)
+	}
+}
+
+func TestKiroGPTAccountsUseNormalFairSchedulerRotation(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-gpt-a", Label: "kiro gpt a", GroupName: "cyber", PlanType: "KIRO PRO"})
+	seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-gpt-b", Label: "kiro gpt b", GroupName: "cyber", PlanType: "KIRO PRO"})
+	s := New(store, config.Default())
+
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "kiro", Model: "gpt-5.6-sol"})
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		seen[lease.Account.ID] = true
+		lease.Release()
+	}
+	if !seen["kiro-gpt-a"] || !seen["kiro-gpt-b"] {
+		t.Fatalf("equal-load Kiro GPT accounts were not fairly rotated: %v", seen)
+	}
+}
+
+func TestFairSchedulingBypassesStickyAffinityForAutoKiroGPT(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-fair-a", Label: "kiro fair a", GroupName: "cyber", PlanType: "KIRO PRO"})
+	seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-fair-b", Label: "kiro fair b", GroupName: "cyber", PlanType: "KIRO PRO"})
+	affinity := routing.AffinityFromKey("auto-gpt-fair-session", "test")
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		RouteKeyHash: affinity.Hash, RouteKey: affinity.Key, Source: affinity.Source,
+		AccountID: "kiro-fair-a", Provider: "kiro", Model: "gpt-5.6-sol", EgressID: storage.DefaultDirectEgressID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	seen := map[string]bool{}
+	for i := 0; i < 4; i++ {
+		lease, err := s.Select(ctx, Route{
+			Group: "cyber", Provider: "kiro", Model: "gpt-5.6-sol", Affinity: affinity, FairScheduling: true,
+		})
+		if err != nil {
+			t.Fatalf("select %d: %v", i, err)
+		}
+		seen[lease.Account.ID] = true
+		lease.Release()
+	}
+	if !seen["kiro-fair-a"] || !seen["kiro-fair-b"] {
+		t.Fatalf("fair route reused the sticky account instead of rotating: %v", seen)
+	}
+	bound, err := store.GetAffinityBinding(ctx, affinity.Hash)
+	if err != nil || bound.AccountID != "kiro-fair-a" {
+		t.Fatalf("fair route unexpectedly rewrote its existing affinity binding: %+v err=%v", bound, err)
+	}
+}
+
 func TestKiroOneMillionRequiresRuntimeVerifiedOpus(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

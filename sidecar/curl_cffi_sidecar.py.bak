@@ -99,7 +99,7 @@ async def proxy(writer,payload:dict[str,Any],body:bytes):
  try:
   async with session.stream(method,url,**kwargs) as resp:
    merged=load_cookies(jar)
-   try:merged.update(session.cookies.get_dict());save_cookies(jar,merged)
+   try:merged.update(resp.cookies.get_dict());save_cookies(jar,merged)
    except Exception:pass
    reported={k:[v] for k,v in resp.headers.items() if k.lower() not in {"content-encoding","content-length","transfer-encoding"}}
    # v2 never emits another HTTP status once this header block is written. Any

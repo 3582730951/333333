@@ -41,6 +41,40 @@ func TestConvertAnthropicRejectsNonClaude(t *testing.T) {
 	}
 }
 
+func TestConvertAnthropicKiroGPTUsesPlainGenerationEnvelope(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"max_tokens":321,
+		"thinking":{"type":"enabled","budget_tokens":2048},
+		"output_config":{"effort":"max"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+	got, err := ConvertAnthropicRequestWithOptions(raw, "gpt-affinity", ConversionOptions{
+		DefaultThinking: true,
+		ForceMaxQuality: true,
+		ContextWindow:   272000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "gpt-5.6-sol" || got.ThinkingEnabled || got.ThinkingEffort != "" || got.MaxOutputTokens != 0 || got.ContextWindow != 272000 {
+		t.Fatalf("GPT conversion envelope=%+v", got)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(got.Body, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["additionalModelRequestFields"]; exists {
+		t.Fatalf("GPT request carried Claude-only additional model fields: %s", got.Body)
+	}
+	if strings.Contains(string(got.Body), `"thinking"`) || strings.Contains(string(got.Body), `"output_config"`) || strings.Contains(string(got.Body), `"max_tokens"`) {
+		t.Fatalf("GPT request carried Claude-only generation envelope: %s", got.Body)
+	}
+	if !strings.Contains(string(got.Body), `"modelId":"gpt-5.6-sol"`) {
+		t.Fatalf("GPT model id was not retained: %s", got.Body)
+	}
+}
+
 func TestIsClaudeCodeCompactionRequestRequiresDedicatedSignature(t *testing.T) {
 	instruction := claudeCodeCompactionInstruction + ", preserving technical details."
 	tests := []struct {

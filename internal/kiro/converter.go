@@ -423,11 +423,19 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 			thinkingEnabled = true
 		}
 	}
-	if options.ForceMaxQuality {
+	// Kiro's GPT-5.6 models use the same conversation wire format but reject the
+	// Claude-only adaptive-thinking/output_config envelope. They retain the
+	// downstream model id verbatim and use the upstream default generation policy.
+	// Do not turn the global Claude max-quality invariant into a GPT 400.
+	isKiroGPT := capability.KiroSupportsGPTModel(canonical)
+	if options.ForceMaxQuality && !isKiroGPT {
 		if explicitlyDisabled {
 			losses.add(LossThinkingForcedAdaptive)
 		}
 		thinkingEnabled = true
+	}
+	if isKiroGPT {
+		thinkingEnabled = false
 	}
 	if thinkingEnabled && !capability.KiroSupportsAdaptiveThinking(canonical) {
 		return Conversion{}, fmt.Errorf("%w: model %s does not support adaptive thinking", ErrReasoningUnavailable, canonical)
@@ -436,11 +444,14 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	if req.OutputConfig != nil {
 		thinkingEffort = normalizeKiroThinkingEffort(req.OutputConfig.Effort)
 	}
-	if options.ForceMaxQuality {
+	if options.ForceMaxQuality && !isKiroGPT {
 		if thinkingEffort != "" && thinkingEffort != "max" {
 			losses.add(LossThinkingEffortForcedMax)
 		}
 		thinkingEffort = "max"
+	}
+	if isKiroGPT {
+		thinkingEffort = ""
 	}
 	additionalFields := map[string]any{}
 	if thinkingEnabled {
@@ -453,7 +464,7 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		}
 	}
 	maxOutputTokens := int64(0)
-	if options.ForceMaxQuality {
+	if options.ForceMaxQuality && !isKiroGPT {
 		maxOutputTokens = kiroMaxOutputTokens(canonical)
 		additionalFields["max_tokens"] = maxOutputTokens
 	}

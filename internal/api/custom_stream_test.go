@@ -406,6 +406,20 @@ func TestChatStreamToResponsesSSEUsesBridgePlanForStableTools(t *testing.T) {
 	}
 }
 
+func TestChatStreamToResponsesSSEPreservesTerminalChatError(t *testing.T) {
+	stream := "data: " + `{"id":"chat-err","choices":[{"delta":{"role":"assistant","content":"partial"}}]}` + "\n\n" +
+		"data: " + `{"error":{"type":"api_error","message":"Kiro stream failed"}}` + "\n\n"
+	recorder := httptest.NewRecorder()
+	chatStreamToResponsesSSE(recorder, strings.NewReader(stream), "gpt-5.6-sol", streamrewrite.New(nil))
+	got := recorder.Body.String()
+	if !strings.Contains(got, "response.failed") || !strings.Contains(got, "Kiro stream failed") {
+		t.Fatalf("Responses stream lost chat error:\n%s", got)
+	}
+	if strings.Contains(got, "response.completed") {
+		t.Fatalf("Responses stream completed after a terminal chat error:\n%s", got)
+	}
+}
+
 func TestCustomProviderMessagesStreaming(t *testing.T) {
 	h := newHarness(t, deepseekMock(t))
 	acc := setupDeepSeek(t, h, []string{"deepseek-chat"}, false)

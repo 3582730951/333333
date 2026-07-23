@@ -156,6 +156,10 @@ func (w *codexMessagesResponseWriter) finish() {
 		if w.pipeDone != nil {
 			<-w.pipeDone
 		}
+		// copyBridgeHeaders intentionally skips TrailerPrefix values so they are
+		// never exposed as ordinary headers before the stream begins. Forward the
+		// final values now that the Responses → Messages stream has completed.
+		copyBridgeTrailers(w.downstream, w.header)
 		return
 	}
 
@@ -193,7 +197,10 @@ func (w *codexMessagesResponseWriter) finish() {
 
 func copyBridgeHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if strings.EqualFold(key, "Content-Length") {
+		// TrailerPrefix values are internal ResponseWriter trailer storage, not
+		// ordinary HTTP headers. They are forwarded after a streaming bridge closes
+		// by copyBridgeTrailers so the final values are not sent as bogus headers.
+		if strings.EqualFold(key, "Content-Length") || strings.HasPrefix(key, http.TrailerPrefix) {
 			continue
 		}
 		dst.Del(key)

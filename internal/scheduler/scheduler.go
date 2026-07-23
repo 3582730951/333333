@@ -209,6 +209,12 @@ type Route struct {
 	// Kiro accounts without assigning either a fixed priority.
 	AllowedProviders []string
 	Affinity         routing.AffinityKey
+	// FairScheduling bypasses persisted affinity reuse and rendezvous ranking for
+	// this selection. The supplied Affinity remains available to the wire adapter
+	// as a stable conversation salt, but account/provider choice is made fresh from
+	// the current load-aware fair pool and is not persisted as a sticky binding.
+	// Auto GPT spillover uses this when Kiro joins Codex as an equal candidate.
+	FairScheduling bool
 	// AffinityWait overrides the global sticky wait for this route. Kiro uses a
 	// longer cache-preserving wait before switching to another exact-model account.
 	AffinityWait    time.Duration
@@ -232,6 +238,11 @@ type Route struct {
 	RequiredEgressID      string
 	KiroEndpointAllowlist []string
 	KiroDefaultRegion     string
+	// KiroFallbackModel lets a mixed Codex/Kiro fair route retain the downstream
+	// Codex model for Codex candidates while selecting this concrete model for Kiro
+	// candidates. It is used when Kiro does not expose the requested Codex model and
+	// must serve the turn with gpt-5.6-sol instead.
+	KiroFallbackModel string
 	// Movable is kept for existing call sites/tests that already computed
 	// !ServerSideState. New callers should set ServerSideState directly.
 	Movable bool
@@ -425,7 +436,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 		}
 		return Lease{}, fmt.Errorf("%w: account=%s egress=%s reason=%s", ErrBoundAccountUnavailable, route.RequiredAccountID, route.RequiredEgressID, reason.humanString())
 	}
-	if route.Affinity.Hash != "" {
+	if route.Affinity.Hash != "" && !route.FairScheduling {
 		if bound, err := s.affinitySnapshot(ctx, route.Affinity.Hash); err == nil {
 			hadBinding = true
 			if route.ImmutableAffinity {
@@ -552,7 +563,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	if hadExclusions {
 		atomic.AddInt64(&s.metrics.AccountSwitches, 1)
 	}
-	if route.Affinity.Hash != "" {
+	if route.Affinity.Hash != "" && !route.FairScheduling {
 		binding := storage.AffinityBinding{
 			RouteKeyHash: route.Affinity.Hash,
 			RouteKey:     route.Affinity.Key,
@@ -601,6 +612,17 @@ func routeAllowsProvider(route Route, provider string) bool {
 	return false
 }
 
+// routeForProviderModel applies a provider-specific fallback without changing the
+// route's downstream model. Keeping the original Route.Model intact is important:
+// a Codex candidate must still be capability-checked and sent the exact model the
+// downstream requested, while a Kiro candidate can use its documented fallback.
+func routeForProviderModel(route Route, provider string) Route {
+	if strings.EqualFold(strings.TrimSpace(provider), "kiro") && strings.TrimSpace(route.KiroFallbackModel) != "" {
+		route.Model = strings.TrimSpace(route.KiroFallbackModel)
+	}
+	return route
+}
+
 func routeProvidersKey(route Route) string {
 	providers := append([]string(nil), route.AllowedProviders...)
 	if len(providers) == 0 && strings.TrimSpace(route.Provider) != "" {
@@ -614,7 +636,7 @@ func routeProvidersKey(route Route) string {
 }
 
 func schedulerQueueKey(route Route) string {
-	return route.Group + "\x00" + route.Model + "\x00" + strings.ToLower(strings.TrimSpace(route.ContextMode)) + "\x00" + routeProvidersKey(route)
+	return route.Group + "\x00" + route.Model + "\x00" + strings.TrimSpace(route.KiroFallbackModel) + "\x00" + strings.ToLower(strings.TrimSpace(route.ContextMode)) + "\x00" + routeProvidersKey(route)
 }
 
 func (s *Scheduler) enqueue(route Route, reason string) (string, *waiter) {
@@ -884,8 +906,8 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	// reservoir. Neither path sorts or retains the whole account pool.
 	var candidates []candidate
 	var affinityTop []rankedCandidate
-	useAffinityTop := route.Affinity.Hash != "" && len(accountsWithEgress) > 3
-	usePowerTwo := route.Affinity.Hash == "" && len(accountsWithEgress) > 3
+	useAffinityTop := !route.FairScheduling && route.Affinity.Hash != "" && len(accountsWithEgress) > 3
+	usePowerTwo := (route.FairScheduling || route.Affinity.Hash == "") && len(accountsWithEgress) > 3
 	seen := uint64(0)
 	rng := uint64(1)
 	if usePowerTwo {
@@ -915,25 +937,26 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.ProviderMismatch++
 			continue
 		}
-		resolvedModel := route.Model
+		candidateRoute := routeForProviderModel(route, accountProvider)
+		resolvedModel := candidateRoute.Model
 		bootstrap := false
-		if accountProvider == "kiro" && capabilityRouteModel(route.Model) {
+		if accountProvider == "kiro" && capabilityRouteModel(candidateRoute.Model) {
 			var modelOK bool
-			resolvedModel, bootstrap, modelOK = s.resolveKiroRouteModel(ctx, account, route)
+			resolvedModel, bootstrap, modelOK = s.resolveKiroRouteModel(ctx, account, candidateRoute)
 			if !modelOK {
 				counters.ModelUnsupported++
 				continue
 			}
-		} else if accountProvider == "claude" && capabilityRouteModel(route.Model) {
+		} else if accountProvider == "claude" && capabilityRouteModel(candidateRoute.Model) {
 			var modelOK bool
-			resolvedModel, bootstrap, modelOK = resolveClaudeRouteModel(route, capabilitiesByAccount[account.ID])
+			resolvedModel, bootstrap, modelOK = resolveClaudeRouteModel(candidateRoute, capabilitiesByAccount[account.ID])
 			if !modelOK {
 				counters.ModelUnsupported++
 				continue
 			}
-		} else if accountProvider == "codex" && capabilityRouteModel(route.Model) {
+		} else if accountProvider == "codex" && capabilityRouteModel(candidateRoute.Model) {
 			var modelOK bool
-			resolvedModel, bootstrap, modelOK = resolveCodexRouteModel(route, capabilitiesByAccount[account.ID])
+			resolvedModel, bootstrap, modelOK = resolveCodexRouteModel(candidateRoute, capabilitiesByAccount[account.ID])
 			if !modelOK {
 				counters.ModelUnsupported++
 				continue
@@ -942,7 +965,7 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.ModelUnsupported++
 			continue
 		}
-		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, route.Model, now); limited && !account.IgnoreRateLimitControls {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateLimitsByAccount[account.ID], accountProvider, candidateRoute.Model, now); limited && !account.IgnoreRateLimitControls {
 			counters.RateLimitCooldown++
 			continue
 		}
@@ -999,6 +1022,14 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 		concurrencyLoad := float64(inflight) + normalizedLoad(egressLoad, egress.MaxConcurrency) + normalizedLoad(sidecarLoad, egress.TransportSidecarMaxConcurrency)
 		tokenLoad := normalizedTokenLoad(tokens, cfg.AccountTokenBudget)
 		latencyPenalty := float64(maxInt64(0, egress.LatencyMillis)) / 100000.0
+		// A fair auto GPT pool must be able to warm an exact Kiro GPT capability
+		// beside already-verified Codex accounts. The normal bootstrap penalty is
+		// still correct for Claude-family auto routes, but retaining it here would
+		// permanently starve every fresh Kiro GPT account before it receives its
+		// first successful model observation.
+		if route.FairScheduling && accountProvider == "kiro" && capability.KiroSupportsGPTModel(candidateRoute.Model) {
+			bootstrap = false
+		}
 		picked := candidate{account: account, egress: egress, binding: binding, resolvedModel: resolvedModel, bootstrap: bootstrap, score: concurrencyLoad + tokenLoad + latencyPenalty}
 		if useAffinityTop {
 			affinityTop = insertRendezvousTop3(affinityTop, rankedCandidate{candidate: picked, rank: rendezvous(route.Affinity.Hash, account.ID)})
@@ -1371,8 +1402,9 @@ func canonicalClaudeRouteModel(model string) string {
 // resolveKiroRouteModel returns a canonical Kiro model plus whether selecting it
 // would be a bootstrap attempt. Aliases are resolved exclusively from runtime-
 // verified capabilities. A concrete model may bootstrap only when the account's
-// persisted static capability table contains the same canonical model, its current
-// plan permits it, and any requested thinking mode is statically known to work.
+// persisted static capability table contains the same canonical model and its
+// current plan permits it. Claude-family bootstrap additionally requires static
+// adaptive-thinking support; Kiro's exact GPT models do not use that envelope.
 func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.Account, route Route) (string, bool, bool) {
 	credentials, err := s.store.GetKiroCredentials(ctx, account.ID)
 	if err != nil {
@@ -1387,10 +1419,13 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 	if err != nil {
 		return "", false, false
 	}
-	// Kiro inference is a mandatory-thinking path. Only capabilities that have
-	// successfully completed a thinking request qualify as verified; concrete
-	// bootstrap below is likewise limited to statically confirmed thinking models.
-	verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, true)
+	// Claude-family Kiro inference is a mandatory-thinking path, so its runtime
+	// evidence must include a successful thinking request. Kiro's GPT-5.6 models
+	// use a distinct non-thinking envelope: use ordinary model verification for
+	// those exact models so a successful GPT request is reusable on the next
+	// selection instead of being treated as a bootstrap forever.
+	isGPTRequest := capability.KiroSupportsGPTModel(route.Model)
+	verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, !isGPTRequest)
 	if err != nil {
 		return "", false, false
 	}
@@ -1416,7 +1451,10 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 	if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") {
 		return "", false, false
 	}
-	if !capability.KiroSupportsAdaptiveThinking(resolved) {
+	// GPT models are deliberately exact and have already passed
+	// KiroSupportsGPTModel above. They do not support the Claude adaptive-thinking
+	// envelope, but may still bootstrap from their persisted static capability.
+	if !capability.KiroSupportsGPTModel(resolved) && !capability.KiroSupportsAdaptiveThinking(resolved) {
 		return "", false, false
 	}
 	if !capability.KiroPlanAllowsBootstrap(account.PlanType, resolved) {
@@ -1487,14 +1525,15 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if !routeAllowsProvider(route, accountProvider) {
 		return Lease{}, leaseBlockProviderMismatch, false
 	}
-	resolvedModel := route.Model
-	if accountProvider == "kiro" && capabilityRouteModel(route.Model) {
+	candidateRoute := routeForProviderModel(route, accountProvider)
+	resolvedModel := candidateRoute.Model
+	if accountProvider == "kiro" && capabilityRouteModel(candidateRoute.Model) {
 		var ok bool
-		resolvedModel, _, ok = s.resolveKiroRouteModel(ctx, account, route)
+		resolvedModel, _, ok = s.resolveKiroRouteModel(ctx, account, candidateRoute)
 		if !ok {
 			return Lease{}, leaseBlockModelUnsupported, false
 		}
-	} else if (accountProvider == "claude" || accountProvider == "codex") && capabilityRouteModel(route.Model) {
+	} else if (accountProvider == "claude" || accountProvider == "codex") && capabilityRouteModel(candidateRoute.Model) {
 		caps, err := s.store.ListCapabilities(ctx, account.ID)
 		if err != nil {
 			return Lease{}, leaseBlockModelUnsupported, false
@@ -1506,9 +1545,9 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		}
 		var ok bool
 		if accountProvider == "claude" {
-			resolvedModel, _, ok = resolveClaudeRouteModel(route, caps)
+			resolvedModel, _, ok = resolveClaudeRouteModel(candidateRoute, caps)
 		} else {
-			resolvedModel, _, ok = resolveCodexRouteModel(route, caps)
+			resolvedModel, _, ok = resolveCodexRouteModel(candidateRoute, caps)
 		}
 		if !ok {
 			return Lease{}, leaseBlockModelUnsupported, false
@@ -1517,7 +1556,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	rateRows, rateErr := s.rateLimitsSnapshot(ctx, route.Group, []string{accountID})
 	provider := providerForRoute(s, ctx, account, route)
 	if rateErr == nil {
-		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateRows[accountID], provider, route.Model, now); limited && !account.IgnoreRateLimitControls {
+		if _, limited := storage.AccountRateLimitCooldownUntilFromSnapshots(rateRows[accountID], provider, candidateRoute.Model, now); limited && !account.IgnoreRateLimitControls {
 			return Lease{}, leaseBlockRateLimitCooldown, false
 		}
 	}
@@ -1745,9 +1784,10 @@ func (s *Scheduler) accountRateLimitedForRoute(ctx context.Context, account stor
 
 func (s *Scheduler) accountRateLimitCooldownUntil(ctx context.Context, account storage.Account, route Route, now int64) (int64, bool) {
 	provider := providerForRoute(s, ctx, account, route)
-	until, ok, err := s.store.AccountRateLimitCooldownUntil(ctx, account.ID, provider, route.Model, now)
+	candidateRoute := routeForProviderModel(route, provider)
+	until, ok, err := s.store.AccountRateLimitCooldownUntil(ctx, account.ID, provider, candidateRoute.Model, now)
 	if err != nil {
-		log.Printf("[SCHEDULER] rate-limit snapshot lookup failed: account=%s provider=%s model=%s err=%v", account.ID, provider, route.Model, err)
+		log.Printf("[SCHEDULER] rate-limit snapshot lookup failed: account=%s provider=%s model=%s err=%v", account.ID, provider, candidateRoute.Model, err)
 		return 0, false
 	}
 	return until, ok

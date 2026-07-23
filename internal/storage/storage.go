@@ -254,6 +254,23 @@ type KiroAuthSummary struct {
 	HasAPIKey       bool   `json:"has_api_key"`
 }
 
+// EmailAccount represents a Microsoft/Outlook email account used for ChatGPT
+// protocol registration. The Password and RefreshToken fields are stored as-is
+// and are never exposed in API list responses.
+type EmailAccount struct {
+	ID           string `json:"id"`
+	Email        string `json:"email"`
+	Password     string `json:"-"`
+	ClientID     string `json:"client_id,omitempty"`
+	RefreshToken string `json:"-"`
+	Status       string `json:"status"`
+	GroupName    string `json:"group_name,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	LastUsedAt   int64  `json:"last_used_at,omitempty"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+}
+
 type ModelCapability struct {
 	AccountID                     string `json:"account_id"`
 	ModelSlug                     string `json:"model_slug"`
@@ -1444,6 +1461,21 @@ CREATE TABLE IF NOT EXISTS registration_stats_daily(
   cost_usd REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (date, platform, method, provider_key)
 );
+
+CREATE TABLE IF NOT EXISTS email_pool(
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL,
+  password TEXT NOT NULL DEFAULT '',
+  client_id TEXT NOT NULL DEFAULT '',
+  refresh_token TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'idle',
+  group_name TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  last_used_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name);
 `
 
 // migrate applies additive schema changes to databases created by an older

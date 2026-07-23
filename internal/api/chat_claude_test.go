@@ -65,3 +65,26 @@ func TestAnthropicStreamToChatSSEToolUse(t *testing.T) {
 		t.Fatalf("missing tool_calls finish_reason:\n%s", body)
 	}
 }
+
+func TestAnthropicStreamToChatSSEErrorIsNotReportedAsSuccessfulDone(t *testing.T) {
+	anthSSE := strings.Join([]string{
+		`data: {"type":"message_start","message":{"id":"msg_err"}}`,
+		``,
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`,
+		``,
+		`event: error`,
+		`data: {"type":"error","error":{"type":"api_error","message":"Kiro stream failed"}}`,
+		``,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	rec := httptest.NewRecorder()
+	anthropicStreamToChatSSE(rec, strings.NewReader(anthSSE), "gpt-5.6-sol", streamrewrite.New(nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `"Kiro stream failed"`) {
+		t.Fatalf("stream error was lost:\n%s", body)
+	}
+	if strings.Contains(body, "data: [DONE]") || strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Fatalf("failed stream was incorrectly completed:\n%s", body)
+	}
+}

@@ -179,8 +179,9 @@ type Config struct {
 	GoalHeartbeatSeconds       int     `json:"goal_heartbeat_seconds"`
 	GoalCompressionConcurrency int     `json:"goal_compression_concurrency"`
 	// CodexSessionMappingEnabled enables the strict native Responses context
-	// engine. It stores only encrypted identity metadata plus HMAC aliases; unlike
-	// goal/context replay it never persists or reconstructs prompt history.
+	// engine. Normal turns use encrypted identity metadata plus HMAC aliases; when
+	// the bound account or previous_response_id is lost, the encrypted goal chain
+	// can rebuild one fresh root so active work survives a pool refill.
 	CodexSessionMappingEnabled       bool   `json:"codex_session_mapping_enabled"`
 	CodexSessionMappingRetentionDays int    `json:"codex_session_mapping_retention_days"`
 	CodexCPAStrict                   bool   `json:"codex_cpa_strict"`
@@ -666,6 +667,18 @@ type Config struct {
 	// on a bad day.
 	SMSStatsTopN int `json:"sms_stats_top_n"`
 
+	// ── Email Registration (ChatGPT email OTP flow via Outlook/IMAP) ──
+	// EmailRegistrationEnabled enables the email-based ChatGPT registration service.
+	EmailRegistrationEnabled bool `json:"email_registration_enabled"`
+	// EmailRegistrationConcurrency caps parallel email registrations.
+	EmailRegistrationConcurrency int `json:"email_registration_concurrency"`
+	// EmailRegistrationTimeoutSeconds is the max time for one email registration.
+	EmailRegistrationTimeoutSeconds int `json:"email_registration_timeout_seconds"`
+	// EmailRegistrationGroup is the default group assigned to registered accounts.
+	EmailRegistrationGroup string `json:"email_registration_group"`
+	// EmailRegistrationEgressPoolID is the default egress pool for email registration.
+	EmailRegistrationEgressPoolID string `json:"email_registration_egress_pool_id"`
+
 	// ── CLIPProxy API whitelist mode + exit-region validation ──
 	// CliproxyAPIBase is the cliproxy white-api base URL (default https://api.cliproxy.io),
 	// used when an egress profile has proxy_auth_mode="api_whitelist" to extract ip:port.
@@ -874,6 +887,11 @@ func Default() Config {
 		WarpAccountsPerExit:                    3,
 		RegistrationConcurrency:                1,
 		RegistrationTimeout:                    300,
+		EmailRegistrationEnabled:               false,
+		EmailRegistrationConcurrency:           2,
+		EmailRegistrationTimeoutSeconds:        300,
+		EmailRegistrationGroup:                 "cyber",
+		EmailRegistrationEgressPoolID:          "",
 		GopayAutoStart:                         true,
 		CodexPreferSidecarJA3OverWS:            true,
 		SMSPlatformStrategy:                    "auto",
@@ -1496,6 +1514,17 @@ func (c *Config) normalize() {
 		c.RegistrationTimeout = 300
 	}
 	c.RegistrationEgressPoolID = strings.TrimSpace(c.RegistrationEgressPoolID)
+	// Email registration normalization
+	if c.EmailRegistrationConcurrency <= 0 {
+		c.EmailRegistrationConcurrency = 2
+	}
+	if c.EmailRegistrationTimeoutSeconds <= 0 {
+		c.EmailRegistrationTimeoutSeconds = 300
+	}
+	if strings.TrimSpace(c.EmailRegistrationGroup) == "" {
+		c.EmailRegistrationGroup = "cyber"
+	}
+	c.EmailRegistrationEgressPoolID = strings.TrimSpace(c.EmailRegistrationEgressPoolID)
 	if c.DefaultSMSProvider == "" {
 		c.DefaultSMSProvider = "smsbower"
 	}

@@ -310,11 +310,16 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 	if err != nil {
 		return kirowire.Conversion{}, err
 	}
-	verified, err := s.store.VerifiedKiroModels(ctx, lease.Account.ID, endpointHash, true)
+	// Claude-family Kiro calls require an adaptive-thinking observation before
+	// they are reusable. Kiro's exact GPT models deliberately use the ordinary
+	// (non-thinking) generation envelope, so their successful model observation
+	// is the relevant evidence instead.
+	requestedKiroModel := firstNonEmpty(lease.ResolvedModel, routing.Model(raw))
+	verified, err := s.store.VerifiedKiroModels(ctx, lease.Account.ID, endpointHash, !capability.KiroSupportsGPTModel(requestedKiroModel))
 	if err != nil {
 		return kirowire.Conversion{}, err
 	}
-	capabilityModel, _ := capability.ResolveKiroModel(firstNonEmpty(lease.ResolvedModel, routing.Model(raw)), verified)
+	capabilityModel, _ := capability.ResolveKiroModel(requestedKiroModel, verified)
 	requestedModel := requestedClaudeModelFromContext(ctx)
 	compaction := kirowire.IsClaudeCodeCompactionRequest(raw)
 	effectiveContextMode := requestedModel.ContextMode
@@ -462,10 +467,10 @@ func minKiroInt64(a, b int64) int64 {
 }
 
 func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, converted *kirowire.Conversion, lease scheduler.Lease) (*upstream.Response, string, attemptOutcome) {
-	// Defense in depth: no present or future call site may reach Kiro generation
-	// without the mandatory native max-quality controls. MCP web search is not a
-	// model-generation request and is therefore intentionally exempt.
-	if converted.WebSearch == nil && (!converted.ThinkingEnabled || converted.ThinkingEffort != "max" || converted.MaxOutputTokens <= 0) {
+	// Claude-family Kiro calls require the native max-quality envelope. Kiro's
+	// GPT-5.6 models intentionally omit that Claude-only envelope and use their
+	// upstream defaults, so they are exempt from this invariant.
+	if converted.WebSearch == nil && !capability.KiroSupportsGPTModel(converted.Model) && (!converted.ThinkingEnabled || converted.ThinkingEffort != "max" || converted.MaxOutputTokens <= 0) {
 		writeKiroError(w, r, http.StatusInternalServerError, errors.New("mandatory Kiro adaptive thinking/max-effort invariant was not applied"))
 		return nil, "", outcomeDone
 	}

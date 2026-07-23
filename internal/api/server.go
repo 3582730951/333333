@@ -29,6 +29,7 @@ import (
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/payment"
 	"codex-account-pool/internal/prompt"
+	"codex-account-pool/internal/registration"
 	"codex-account-pool/internal/reliability"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -88,7 +89,9 @@ type Server struct {
 	// when the gateway_reliability flag is on. See reliability.go.
 	relState *reliability.Store
 	// regHandler handles registration API requests
-	regHandler       *Handler
+	regHandler *Handler
+	// emailReg orchestrates email-based ChatGPT registration
+	emailReg         *registration.EmailRegOrchestrator
 	lifecycleHandler *LifecycleHandlers
 	claudeRefresh    *claudeRefreshGates
 	kiro             *kiro.Manager
@@ -159,6 +162,7 @@ func NewServer(dep Dependencies) *Server {
 		),
 		relState:            reliability.NewStore(relStateTTL, relStateMax),
 		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
+		emailReg:            newEmailRegOrchestrator(dep.Store, &dep.Config),
 		lifecycleHandler:    newServerLifecycleHandlers(dep.Store),
 		claudeRefresh:       newClaudeRefreshGates(),
 		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
@@ -340,6 +344,18 @@ func (s *Server) routes() {
 	// Readiness self-check: reports whether "deploy → auto-fill the pool" is actually
 	// configured to run (refill policy, providers, pool deficit, blockers).
 	s.mux.HandleFunc("/admin/register/readiness", s.handleRegisterReadiness)
+	// Email-based registration (ChatGPT protocol registration via Outlook/IMAP OTP).
+	s.mux.HandleFunc("/admin/register/email/start", s.handleEmailRegStart)
+	s.mux.HandleFunc("/admin/register/email/jobs", s.handleEmailRegJobs)
+	s.mux.HandleFunc("/admin/register/email/job/status", s.handleEmailRegJobStatus)
+	s.mux.HandleFunc("/admin/register/email/job/events", s.handleEmailRegJobEvents)
+	s.mux.HandleFunc("/admin/register/email/job/events/sse", s.handleEmailRegJobEventsSSE)
+	s.mux.HandleFunc("/admin/register/email/job/", s.handleEmailRegJobAction)
+	s.mux.HandleFunc("/admin/register/email/config", s.handleEmailRegConfig)
+	// Email account pool management (Outlook/Hotmail accounts for registration).
+	s.mux.HandleFunc("/admin/email-pool/import", s.adminEmailPoolImport)
+	s.mux.HandleFunc("/admin/email-pool", s.adminEmailPool)
+	s.mux.HandleFunc("/admin/email-pool/", s.adminEmailPoolAction)
 	// Unified settings center (SettingsV2 page): aggregates config registry, registrar
 	// credentials, automation policies, lifecycle defaults, logging & memory knobs.
 	s.mux.HandleFunc("/admin/settings-center", s.handleSettingsCenter)
@@ -492,6 +508,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// Carry the matched key/user identity in the context so usage is attributed to the
 	// owning portal user (their console reads /user/usage).
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
+	// Keep the exact downstream aliases and turn body available to the durable Codex
+	// recovery journal.  Native CPA remains the steady-state fast path; these values
+	// are consulted only if its bound account disappears or the upstream confirms
+	// that a previous_response_id has been lost.
+	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "codex")))
+	r = r.WithContext(withGoalOriginalBody(r.Context(), raw))
 	// This is populated only after provider routing below confirms the request is
 	// headed to native Codex. Claude and custom providers keep their own continuity
 	// semantics and must not create Codex aliases merely by sharing this gateway.
@@ -558,35 +580,63 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		writeCodexReasoningEffortUnsupported(w, model, effort)
 		return
 	}
-	// Native Codex context is owned exclusively by the upstream Responses session.
-	// Resolve only exact downstream aliases here; unlike the retired goal/journal
-	// engine this never rebuilds prompt history or rewrites tool output.
+	// In auto mode, exact Kiro GPT-5.6 models may join the current group's Codex
+	// fair pool when pressure exceeds 50%, or when fewer than two Codex GPT
+	// accounts are available while pressure remains below 50%. This happens before
+	// native Codex CPA mapping because Kiro has no compatible
+	// previous_response_id/session state.
+	if s.tryServeAutoKiroGPT(w, r, raw, model, affinityGroup, isChat, isCompact, pol) {
+		return
+	}
+	// Native Codex context is owned by the upstream Responses session during normal
+	// operation. Resolve exact downstream aliases first; only a missing bound account
+	// or confirmed upstream context loss activates the encrypted durable replay path.
 	if s.codexSessionMappingEnabled(r.Context()) {
 		s.codexMappingContextHeader(w)
 		var mappingErr error
 		freshRootAfterContextLoss := false
+		contextRecoveryStatus := ""
 		codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
-		// A confirmed previous_response_not_found retires the full mapped tree. On
-		// the next ordinary Codex /goal resume request, the CLI still carries the
-		// durable previous_response_id even though it has already consumed the
-		// literal command locally. Start a fresh root with that new input rather than
-		// repeatedly forwarding the known-dead state pointer. Strict CPA never
-		// reconstructs history here; client tool outputs remain rejected above.
+		// A prior process/version may already have retired this epoch after an
+		// upstream context loss. Prefer the durable checkpoint replay on the first
+		// following request so the client does not need to manually restart its
+		// task. The legacy fresh-root reset remains only when no checkpoint exists.
 		if mappingErr != nil && s.codexCPAStrict(r.Context()) && errors.Is(mappingErr, storage.ErrCodexSessionEpochRetired) {
-			retiredIdentity := codexDownstreamSessionIdentity(r.Header, raw)
-			if resetBody, resetHeader, reset := codexRetiredEpochFreshRootRequest(raw, r.Header); reset {
-				raw = resetBody
+			if migration, recovered, recoveryErr := s.recoverCodexSessionMapping(r.Context(), r, raw, r.Header, pol, codexMapping, leakfilter.ResponsesContextErrorPreviousResponseNotFound, "retired_upstream_context"); recovered {
+				raw = migration.Retry.Raw
 				r = r.Clone(r.Context())
-				r.Header = resetHeader
-				codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
-				if mappingErr == nil {
-					codexMapping.retainRetiredEpochHierarchy(retiredIdentity)
-					freshRootAfterContextLoss = true
-					atomic.AddUint64(&s.codexMappingFreshRoots, 1)
-					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
-						Action: "codex_context_new_root", State: "recovered",
-						Reason: "retired_upstream_context", Detail: "no_history_replay",
-					})
+				r.Header = migration.Retry.Header
+				codexMapping, mappingErr = migration.Mapping, nil
+				freshRootAfterContextLoss = true
+				contextRecoveryStatus = migration.Mode
+				if migration.Mode == "rebuilt" {
+					atomic.AddUint64(&s.contextRebuilt, 1)
+				} else {
+					atomic.AddUint64(&s.contextDegraded, 1)
+				}
+				atomic.AddUint64(&s.codexMappingFreshRoots, 1)
+				_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+					Action: "codex_context_migrated", State: "recovered", Reason: "retired_upstream_context", Detail: "durable_replay_new_epoch",
+				})
+			} else if recoveryErr != nil {
+				log.Printf("[CODEX-SESSION-MAPPING] retired context migration request_id=%s: %v", requestIDFromContext(r.Context()), recoveryErr)
+			}
+			if mappingErr != nil {
+				retiredIdentity := codexDownstreamSessionIdentity(r.Header, raw)
+				if resetBody, resetHeader, reset := codexRetiredEpochFreshRootRequest(raw, r.Header); reset {
+					raw = resetBody
+					r = r.Clone(r.Context())
+					r.Header = resetHeader
+					codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
+					if mappingErr == nil {
+						codexMapping.retainRetiredEpochHierarchy(retiredIdentity)
+						freshRootAfterContextLoss = true
+						atomic.AddUint64(&s.codexMappingFreshRoots, 1)
+						_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+							Action: "codex_context_new_root", State: "recovered",
+							Reason: "retired_upstream_context", Detail: "no_history_replay",
+						})
+					}
 				}
 			}
 		}
@@ -602,7 +652,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if freshRootAfterContextLoss {
-			w.Header().Set("X-MiCliProxy-Context-Status", "new_root_after_context_loss")
+			w.Header().Set("X-MiCliProxy-Context-Status", firstNonEmpty(contextRecoveryStatus, "new_root_after_context_loss"))
 		}
 		r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
 		if s.codexCPAStrict(r.Context()) {
@@ -667,7 +717,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// prompt-cache warmth) is still movable, and MUST be allowed to fail over on an
 	// error — pinning it was the cause of "429 leaks downstream, no auto-switch". Only
 	// genuine server-side-state turns (previous_response_id / x-codex-turn-state) are
-	// non-movable, because a fresh account cannot continue from state it never created.
+	// non-movable in the normal failover loop. A separate, one-shot durable replay
+	// handles a disappeared binding or a confirmed upstream context loss.
 	movable := !routing.HasServerSideState(path, r, raw)
 	if s.codexSessionMappingEnabled(r.Context()) && !movable && (codexMapping == nil || codexMapping.binding == nil) {
 		// resolveCodexSessionMapping should have caught this already; keep a strict
@@ -686,8 +737,8 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// "串号" leak). This INCLUDES strict-sticky turns (tool_result/function_call_output):
 	// they stay pinned for cache warmth in steady state, but on an error they fail over
 	// rather than leak it. Genuine stateful turns (previous_response_id /
-	// x-codex-turn-state) are non-movable and surface the error instead, because a fresh
-	// account has no such state to continue from.
+	// x-codex-turn-state) stay on their native session here; only the dedicated
+	// durable-replay recovery below may replace a lost state epoch.
 	attempts := 1
 	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
 		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
@@ -706,6 +757,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	current := codexRetryRequest{Raw: raw, Header: currentHeader}
 	modelCapabilityRejected := false
 	attemptsRemaining := attempts
+	contextRecoveryAttempted := false
 	for attemptsRemaining > 0 {
 		attemptsRemaining--
 		headerReq := r.Clone(r.Context())
@@ -724,6 +776,60 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		if result.Outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
 		}
+		if result.Outcome == outcomeContextRecovery {
+			// A strict CPA turn normally stays on its original account.  When that
+			// account is gone, or its upstream context has been confirmed missing,
+			// rebuild the encrypted durable history into one fresh root instead of
+			// returning a permanent 409/previous_response_not_found to the client.
+			if !contextRecoveryAttempted {
+				contextRecoveryAttempted = true
+				migration, recovered, recoveryErr := s.recoverCodexSessionMapping(r.Context(), r, current.Raw, current.Header, pol, codexSessionMappingFromContext(r.Context()), result.RecoveryContextError, result.RecoveryReason)
+				if recoveryErr != nil {
+					log.Printf("[CODEX-SESSION-MAPPING] context migration request_id=%s: %v", requestIDFromContext(r.Context()), recoveryErr)
+				}
+				if recovered {
+					codexMapping = migration.Mapping
+					freshPlan, planErr := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA)
+					if planErr != nil {
+						writeCodexInstructionConfigurationError(w, planErr)
+						return
+					}
+					instructionPlan = freshPlan
+					codexMapping.setInstructionPlan(instructionPlan)
+					current = migration.Retry
+					current.Prepared = false
+					if !isChat && instructionPlan.applies() {
+						current.Raw = setResponsesInstructions(current.Raw, instructionPlan.Instructions)
+					}
+					r = r.WithContext(withCodexSessionMapping(r.Context(), codexMapping))
+					if s.codexCPAStrict(r.Context()) {
+						r = r.WithContext(withCodexStrictCPA(r.Context()))
+					}
+					w.Header().Set("X-MiCliProxy-Context-Status", migration.Mode)
+					if migration.Mode == "rebuilt" {
+						atomic.AddUint64(&s.contextRebuilt, 1)
+					} else {
+						atomic.AddUint64(&s.contextDegraded, 1)
+					}
+					atomic.AddUint64(&s.codexMappingFreshRoots, 1)
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+						Action: "codex_context_migrated", State: "recovered", Reason: firstNonEmpty(result.RecoveryReason, "upstream_context_unavailable"),
+						Detail: "durable_replay_new_epoch",
+					})
+					// The recovered turn is now self-contained. Give its fresh root a
+					// full attempt even when the original stateful route had a one-shot
+					// retry budget.
+					attemptsRemaining = 1
+					continue
+				}
+			}
+			if result.RecoveryBoundUnavailable {
+				writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
+				return
+			}
+			writeRaw(w, result.RecoveryStatus, result.RecoveryHeader, result.RecoveryBody)
+			return
+		}
 		if result.Outcome != outcomeRetry && result.Outcome != outcomeModelRetry {
 			return
 		}
@@ -740,9 +846,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 type attemptOutcome int
 
 const (
-	outcomeDone       attemptOutcome = iota // request finished (success, or terminal error already written)
-	outcomeRetry                            // recoverable error on a self-contained request — retry on a fresh account
-	outcomeModelRetry                       // account-scoped model_not_found — retry, then require manual fallback
+	outcomeDone            attemptOutcome = iota // request finished (success, or terminal error already written)
+	outcomeRetry                                 // recoverable error on a self-contained request — retry on a fresh account
+	outcomeModelRetry                            // account-scoped model_not_found — retry, then require manual fallback
+	outcomeContextRecovery                       // strict CPA needs a fresh, durable replay epoch
 )
 
 type codexRetryRequest struct {
@@ -754,6 +861,15 @@ type codexRetryRequest struct {
 type codexAttemptResult struct {
 	Outcome attemptOutcome
 	Retry   codexRetryRequest
+	// Recovery* is populated only with outcomeContextRecovery. The outer gateway
+	// owns the mapping epoch transition so it can recompile instruction policy and
+	// install the fresh mapping before issuing the replay.
+	RecoveryContextError     leakfilter.ResponsesContextErrorKind
+	RecoveryReason           string
+	RecoveryStatus           int
+	RecoveryHeader           http.Header
+	RecoveryBody             []byte
+	RecoveryBoundUnavailable bool
 }
 
 // shouldInjectCodexHostedWebSearch keeps hosted search for classic Responses and
@@ -798,6 +914,14 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	lease, err := s.scheduler.Select(r.Context(), route)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {
+			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled && mapping.binding != nil {
+				return codexAttemptResult{
+					Outcome:                  outcomeContextRecovery,
+					RecoveryReason:           "bound_account_unavailable",
+					RecoveryStatus:           http.StatusConflict,
+					RecoveryBoundUnavailable: true,
+				}
+			}
 			writePoolCodeError(w, http.StatusConflict, "bound_account_unavailable", "the account bound to this session is unavailable")
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
@@ -1042,12 +1166,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// is the native session/tool payload; it must not silently suppress the
 	// administrator's configured response policy after an upstream result arrives.
 	//
-	// A stateful previous_response_id cannot be migrated to a different upstream
-	// account without reconstructing context, which strict CPA intentionally never
-	// does. Stateful administrator failover is handled by one same-account,
-	// same-egress recovery below; if it still fails, the original rule/error is
-	// surfaced without retiring a context that was not proven invalid. A
-	// self-contained turn can still transparently retry on a fresh account as usual.
+	// A stateful previous_response_id stays on its native account during ordinary
+	// rule-driven failover. A different account is used only by the dedicated
+	// durable-replay recovery after the binding vanished or the upstream proved that
+	// its state is missing. A self-contained turn can transparently retry as usual.
 	applyCodexRule := func(decision upstreamErrorRuleDecision, status int, header http.Header, errorBody []byte, streaming bool) (codexAttemptResult, bool) {
 		switch decision.Match.DownstreamAction {
 		case upstreamrules.DownstreamActionFailover:
@@ -1115,9 +1237,23 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		// This is an upstream fact, not a downstream presentation choice: once
 		// the original upstream no longer knows a previous response, no later
-		// request may reuse that mapping. An administrator rule may choose what
-		// the current caller sees, but it cannot keep an invalid epoch alive.
+		// request may reuse that mapping. Strict CPA now promotes a durable
+		// checkpoint into a fresh epoch in the same client request, before any
+		// bytes are committed. That preserves long-running work across an
+		// upstream context loss (notably the ultra path) rather than surfacing a
+		// permanent previous_response_not_found.
 		if contextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+			if mapping := codexSessionMappingFromContext(r.Context()); strictNativeCPA && mapping != nil && mapping.enabled && mapping.binding != nil {
+				_ = s.settleBillingHold(r.Context(), holdID, "responses_context_error_recovering")
+				return codexAttemptResult{
+					Outcome:              outcomeContextRecovery,
+					RecoveryContextError: contextError,
+					RecoveryReason:       "previous_response_not_found",
+					RecoveryStatus:       status,
+					RecoveryHeader:       header.Clone(),
+					RecoveryBody:         append([]byte(nil), body...),
+				}, true
+			}
 			if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
 				!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
 				log.Printf("[CODEX-SESSION-MAPPING] upstream context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
@@ -1494,7 +1630,7 @@ codexSuccess:
 		if responseJSON := codexSSEToResponseJSON(responseBody); len(responseJSON) > 0 {
 			responseBody = responseJSON
 		}
-		s.persistCodexStateBindings(r.Context(), r, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
+		s.persistCodexStateBindings(r.Context(), r, body, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
 		s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 		_ = s.settleBillingHold(r.Context(), holdID, "settled")
 		// A soft 200 "failed" response carrying limit/quota/switch-model state must
@@ -1533,7 +1669,7 @@ codexSuccess:
 		// traffic always uses the existing bounded probe. Strict CPA uses it only
 		// when an administrator has a scope-compatible terminal rule; otherwise it
 		// retains the immediate native relay for long-running sessions.
-		if !strictNativeCPA || lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
+		if !strictNativeCPA || (strictNativeCPA && !movable) || lease.Account.IgnoreRateLimitControls || s.hasPotentialTerminalResponseRule(r.Context(), "codex", entrypoint, model) {
 			// Hold back only a bounded early prefix so a retryable failure frame can still
 			// fail over before any downstream bytes are committed. As soon as real content
 			// appears (or the 64KiB/8-frame probe budget is reached), stream live. The old
@@ -1572,16 +1708,6 @@ codexSuccess:
 				}
 				failureStatus := streamFailure.StatusCode
 				failureBody := streamFailure.Body
-				// A confirmed missing previous response permanently invalidates the
-				// mapped epoch even when an administrator replaces the current
-				// downstream error. The rule controls presentation/account handling,
-				// never whether stale upstream context remains reusable.
-				if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
-					if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
-						!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
-						log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
-					}
-				}
 				decision, ruleMatched := s.matchUpstreamErrorRule(r.Context(), upstreamrules.MatchInput{
 					Provider:   "codex",
 					Entrypoint: entrypoint,
@@ -1592,7 +1718,34 @@ codexSuccess:
 					Streaming:  true,
 				})
 				explicitRuleAction := ruleMatched && decision.Match.DownstreamAction != upstreamrules.DownstreamActionBuiltin
+				// A rule may override the current response presentation, but it must
+				// not leave a proven-dead upstream response alias active. The automatic
+				// recovery branch below retires as part of its new-epoch transition.
+				if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound && explicitRuleAction {
+					if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+						!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+						log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+					}
+				}
 				if streamFailure.ContextError != leakfilter.ResponsesContextErrorNone && !explicitRuleAction {
+					if streamFailure.ContextError == leakfilter.ResponsesContextErrorPreviousResponseNotFound {
+						if mapping := codexSessionMappingFromContext(r.Context()); strictNativeCPA && mapping != nil && mapping.enabled && mapping.binding != nil {
+							_ = resp.Body.Close()
+							_ = s.settleBillingHold(r.Context(), holdID, "stream_context_error_recovering")
+							return codexAttemptResult{
+								Outcome:              outcomeContextRecovery,
+								RecoveryContextError: streamFailure.ContextError,
+								RecoveryReason:       "previous_response_not_found",
+								RecoveryStatus:       failureStatus,
+								RecoveryHeader:       failureHeader.Clone(),
+								RecoveryBody:         append([]byte(nil), failureBody...),
+							}
+						}
+						if err := s.retireCodexSessionMapping(r.Context(), codexSessionMappingFromContext(r.Context()), "upstream_context_invalid"); err != nil &&
+							!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+							log.Printf("[CODEX-SESSION-MAPPING] streamed context retirement request_id=%s: %v", requestIDFromContext(r.Context()), err)
+						}
+					}
 					// Preserve native context-loss handling by default, but do not let it
 					// silently bypass an administrator's explicitly selected account
 					// action. A builtin action remains the historical no-op here.
@@ -1712,6 +1865,7 @@ codexSuccess:
 			responsesStreamToChatSSE(w, io.TeeReader(streamBody, io.MultiWriter(uscan, nativeRecorder)), model, includeChatStreamUsage, codexScrubber)
 			if nativeRecorder.completedSuccessfully() {
 				responseID, responseModel, _ := nativeRecorder.metadata()
+				responseJSON := nativeRecorder.ResponseJSON()
 				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
 					if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, finalEgress, responseID, firstNonEmpty(nativeRecorder.responseTurnState(), responseTurnState(resp.Header, nativeRecorder.ResponseJSON())), isCompact); err != nil {
 						log.Printf("[CODEX-SESSION-MAPPING] chat stream terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
@@ -1719,6 +1873,7 @@ codexSuccess:
 				} else {
 					s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, finalEgress, model)
 				}
+				s.persistCodexGoalContinuity(r.Context(), r, body, responseJSON)
 			}
 			if parsed, ok := uscan.Parsed(); ok {
 				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
@@ -1747,16 +1902,18 @@ codexSuccess:
 				return nil
 			}
 			responseID, responseModel, _ := recorder.metadata()
+			responseJSON := recorder.ResponseJSON()
 			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
 				if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, committedEgress, responseID, firstNonEmpty(recorder.responseTurnState(), responseTurnState(upstreamHeader, recorder.ResponseJSON())), isCompact); err != nil {
 					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "stream_terminal_metadata_only"})
 					return err
 				}
-				return nil
+			} else {
+				// Compatibility mode retains only the old affinity metadata; no Codex
+				// goal/checkpoint/journal write is permitted.
+				s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, committedEgress, model)
 			}
-			// Compatibility mode retains only the old affinity metadata; no Codex
-			// goal/checkpoint/journal write is permitted.
-			s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, committedEgress, model)
+			s.persistCodexGoalContinuity(r.Context(), r, body, responseJSON)
 			return nil
 		}
 		commitWriter := newTerminalCommitWriter(w, func() error {
@@ -2027,7 +2184,7 @@ codexSuccess:
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
 	}
-	s.persistCodexStateBindings(r.Context(), r, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
+	s.persistCodexStateBindings(r.Context(), r, body, affinity, responseBody, resp.Header, lease, finalEgress, model, isCompact)
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)
 	_ = s.settleBillingHold(r.Context(), holdID, "settled")
 	s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
@@ -2053,7 +2210,7 @@ codexSuccess:
 	return codexAttemptResult{Outcome: outcomeDone}
 }
 
-func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, affinity routing.AffinityKey, responseBody []byte, responseHeader http.Header, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string, compact bool) {
+func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request, requestBody []byte, affinity routing.AffinityKey, responseBody []byte, responseHeader http.Header, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string, compact bool) {
 	var response struct {
 		ID     string `json:"id"`
 		Model  string `json:"model"`
@@ -2068,11 +2225,28 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 			log.Printf("[CODEX-SESSION-MAPPING] terminal commit request_id=%s: %v", requestIDFromContext(ctx), err)
 			_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "terminal_metadata_only"})
 		}
+	} else {
+		// Compatibility mode retains ordinary affinity metadata only. Codex never
+		// writes goal/checkpoint/journal bodies unless CPA-v2 is active.
+		s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
+	}
+	s.persistCodexGoalContinuity(ctx, r, requestBody, responseBody)
+}
+
+// persistCodexGoalContinuity writes an encrypted, incremental replay checkpoint
+// only for CPA-v2 sessions. The native upstream session remains the normal path;
+// this state is used exclusively to migrate a tree whose bound account or upstream
+// previous_response_id became unavailable.
+func (s *Server) persistCodexGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
+	if !s.codexSessionMappingEnabled(ctx) || !s.goalContinuityEnabled(ctx) {
 		return
 	}
-	// Compatibility mode retains ordinary affinity metadata only. Codex never
-	// writes goal/checkpoint/journal bodies, even when the CPA mapper is disabled.
-	s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
+	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {
+		log.Printf("[GOAL-CONTINUITY] codex persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			Action: "goal_persistence_degraded", State: "retryable", Reason: "codex_terminal", Detail: "payload persistence failed",
+		})
+	}
 }
 
 func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routing.AffinityKey, responseID, actualModel string, lease scheduler.Lease, egress storage.EgressProfile, requestedModel string) {

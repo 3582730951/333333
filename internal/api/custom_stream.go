@@ -209,6 +209,23 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 		if !ok {
 			continue
 		}
+		// A Chat-Completions stream may fail after its HTTP status and headers
+		// have already committed. Preserve that terminal error instead of treating
+		// its lack of `choices` as an empty successful assistant response.
+		var raw map[string]interface{}
+		if json.Unmarshal([]byte(data), &raw) == nil {
+			if streamError, failed := raw["error"].(map[string]interface{}); failed && streamError != nil {
+				ensureCreated("")
+				emit(map[string]interface{}{
+					"type": "response.failed",
+					"response": map[string]interface{}{
+						"id": respID, "object": "response", "status": "failed", "model": model,
+						"error": streamError,
+					},
+				})
+				return usage
+			}
+		}
 		var c chatChunk
 		if json.Unmarshal([]byte(data), &c) != nil {
 			continue

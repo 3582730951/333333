@@ -1,10 +1,10 @@
 package api
 
-// Strict CPA session mapping for native Codex Responses.  This layer is deliberately
-// small: it identifies an exact downstream session/response alias, pins a stateful
-// request to the corresponding account+egress, and supplies the encrypted internal
-// UUID lifecycle to upstream.  It never reads goal_session, context_journal or any
-// persisted prompt body.
+// Strict CPA session mapping for native Codex Responses. This layer identifies an
+// exact downstream session/response alias, pins a normal stateful request to the
+// corresponding account+egress, and supplies the encrypted internal UUID lifecycle
+// to upstream. A goal checkpoint is consulted only after that binding disappears or
+// the upstream confirms previous_response_id loss; steady-state turns remain native.
 
 import (
 	"context"
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
@@ -123,6 +124,17 @@ type codexSessionMapping struct {
 	// response id or turn-state token, so an old upstream state pointer can never
 	// become valid again through the new tree.
 	recoveryAliases []storage.CodexSessionAlias
+}
+
+// codexContextMigration is a fresh, self-contained replay of a native Codex
+// turn whose account-local Responses state is no longer usable.  The replay is
+// assembled from the encrypted goal checkpoint when available, then committed as
+// a new CPA epoch after its terminal response.  It deliberately carries no old
+// previous_response_id or turn-state pointer to the replacement account.
+type codexContextMigration struct {
+	Retry   codexRetryRequest
+	Mapping *codexSessionMapping
+	Mode    string
 }
 
 func withCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping) context.Context {
@@ -296,6 +308,37 @@ func codexDownstreamSessionIdentity(headers http.Header, body []byte) codexDowns
 // history, never rewrites a tool result, and never turns a client tool output into a
 // user message.  A request containing such an output remains a visible retired-epoch
 // error because its call can only be understood in the lost upstream context.
+var codexFreshRootStatePaths = []string{
+	"previous_response_id",
+	"turn_state",
+	"session_id",
+	"parent_thread_id",
+	"x-codex-parent-thread-id",
+	"forked_from_thread_id",
+	"x-codex-forked-from-thread-id",
+	"client_metadata.x-codex-turn-state",
+	"client_metadata.turn_state",
+	"client_metadata.session_id",
+	"client_metadata.parent_thread_id",
+	"client_metadata.x-codex-parent-thread-id",
+	"client_metadata.forked_from_thread_id",
+	"client_metadata.x-codex-forked-from-thread-id",
+	"turn_metadata.x-codex-turn-state",
+	"turn_metadata.turn_state",
+	"turn_metadata.session_id",
+	"turn_metadata.parent_thread_id",
+	"turn_metadata.x-codex-parent-thread-id",
+	"turn_metadata.forked_from_thread_id",
+	"turn_metadata.x-codex-forked-from-thread-id",
+}
+
+var codexFreshRootStateHeaders = []string{
+	"X-Codex-Turn-State",
+	"Session-Id",
+	"X-Codex-Parent-Thread-Id",
+	"X-Codex-Forked-From-Thread-Id",
+}
+
 func codexRetiredEpochFreshRootRequest(body []byte, header http.Header) ([]byte, http.Header, bool) {
 	if !codexDownstreamSessionIdentity(header, body).stateful() || bodyHasClientToolResult(body) {
 		return body, header, false
@@ -304,29 +347,7 @@ func codexRetiredEpochFreshRootRequest(body []byte, header http.Header) ([]byte,
 	// Preserve every untouched request fragment, including input/tool definitions and
 	// large JSON numbers.  sjson is used only on the fixed set of CPA state fields.
 	out := append([]byte(nil), body...)
-	for _, path := range []string{
-		"previous_response_id",
-		"turn_state",
-		"session_id",
-		"parent_thread_id",
-		"x-codex-parent-thread-id",
-		"forked_from_thread_id",
-		"x-codex-forked-from-thread-id",
-		"client_metadata.x-codex-turn-state",
-		"client_metadata.turn_state",
-		"client_metadata.session_id",
-		"client_metadata.parent_thread_id",
-		"client_metadata.x-codex-parent-thread-id",
-		"client_metadata.forked_from_thread_id",
-		"client_metadata.x-codex-forked-from-thread-id",
-		"turn_metadata.x-codex-turn-state",
-		"turn_metadata.turn_state",
-		"turn_metadata.session_id",
-		"turn_metadata.parent_thread_id",
-		"turn_metadata.x-codex-parent-thread-id",
-		"turn_metadata.forked_from_thread_id",
-		"turn_metadata.x-codex-forked-from-thread-id",
-	} {
+	for _, path := range codexFreshRootStatePaths {
 		var err error
 		out, err = sjson.DeleteBytes(out, path)
 		if err != nil {
@@ -342,12 +363,7 @@ func codexRetiredEpochFreshRootRequest(body []byte, header http.Header) ([]byte,
 	}
 
 	nextHeader := header.Clone()
-	for _, name := range []string{
-		"X-Codex-Turn-State",
-		"Session-Id",
-		"X-Codex-Parent-Thread-Id",
-		"X-Codex-Forked-From-Thread-Id",
-	} {
+	for _, name := range codexFreshRootStateHeaders {
 		nextHeader.Del(name)
 	}
 	if value := codexHeaderValue(nextHeader, "X-Codex-Turn-Metadata"); value != "" {
@@ -362,6 +378,84 @@ func codexRetiredEpochFreshRootRequest(body []byte, header http.Header) ([]byte,
 		return body, header, false
 	}
 	return out, nextHeader, true
+}
+
+// stripCodexStateForRecoveredRoot is the recovery counterpart to
+// codexRetiredEpochFreshRootRequest.  Unlike the manual /goal-resume fallback it
+// is allowed to retain a client tool result: a durable replay contains the paired
+// historical call, so dropping the output would lose the user's completed work.
+// It removes every account-local pointer from the body and headers before the
+// replay is allowed onto a new account/CPA epoch.
+func stripCodexStateForRecoveredRoot(body []byte, header http.Header) ([]byte, http.Header, bool) {
+	out := append([]byte(nil), body...)
+	for _, path := range codexFreshRootStatePaths {
+		var err error
+		out, err = sjson.DeleteBytes(out, path)
+		if err != nil {
+			return body, header, false
+		}
+	}
+	if updated, changed := stripCodexRetiredEpochEmbeddedTurnMetadata(out, "client_metadata.x-codex-turn-metadata"); changed {
+		out = updated
+	}
+
+	nextHeader := header.Clone()
+	for _, name := range codexFreshRootStateHeaders {
+		nextHeader.Del(name)
+	}
+	if value := codexHeaderValue(nextHeader, "X-Codex-Turn-Metadata"); value != "" {
+		if cleaned, changed := stripCodexRetiredEpochTurnMetadata(value); changed {
+			nextHeader.Set("X-Codex-Turn-Metadata", cleaned)
+		}
+	}
+	if codexDownstreamSessionIdentity(nextHeader, out).stateful() {
+		return body, header, false
+	}
+	return out, nextHeader, true
+}
+
+// recoverCodexSessionMapping transitions a strict, account-bound CPA tree into a
+// fresh epoch after the bound account disappeared or the upstream rejected its
+// previous_response_id.  A goal checkpoint is lossless and preferred; the legacy
+// encrypted journal/degraded body remains a compatibility fallback.  The caller
+// retries exactly once with the returned self-contained request.
+func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request, body []byte, header http.Header, pol downstreamPolicy, mapping *codexSessionMapping, contextError leakfilter.ResponsesContextErrorKind, reason string) (codexContextMigration, bool, error) {
+	if s == nil || mapping == nil || !mapping.enabled || mapping.binding == nil {
+		return codexContextMigration{}, false, nil
+	}
+
+	var retry codexRetryRequest
+	mode := ""
+	if replay := s.goalReplayBody(ctx, r, "codex", body); replay.Kind == goalResumeFound {
+		retry = codexRetryRequest{Raw: replay.Body, Header: stripCodexServerStateHeaders(header)}
+		mode = "rebuilt"
+	} else {
+		var ok bool
+		retry, mode, ok = s.recoverResponsesContext(ctx, body, header, contextError)
+		if !ok {
+			return codexContextMigration{}, false, nil
+		}
+	}
+	cleanBody, cleanHeader, cleaned := stripCodexStateForRecoveredRoot(retry.Raw, retry.Header)
+	if !cleaned {
+		return codexContextMigration{}, false, nil
+	}
+	retry.Raw, retry.Header = cleanBody, cleanHeader
+
+	retiredIdentity := codexDownstreamSessionIdentity(header, body)
+	if err := s.retireCodexSessionMapping(ctx, mapping, reason); err != nil &&
+		!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+		return codexContextMigration{}, false, err
+	}
+
+	recoveryRequest := r.Clone(ctx)
+	recoveryRequest.Header = retry.Header
+	freshMapping, err := s.resolveCodexSessionMapping(ctx, recoveryRequest, retry.Raw, pol)
+	if err != nil {
+		return codexContextMigration{}, false, err
+	}
+	freshMapping.retainRetiredEpochHierarchy(retiredIdentity)
+	return codexContextMigration{Retry: retry, Mapping: freshMapping, Mode: mode}, true, nil
 }
 
 func stripCodexRetiredEpochEmbeddedTurnMetadata(body []byte, path string) ([]byte, bool) {
@@ -480,6 +574,14 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 	if id.stateful() {
 		binding, err := s.store.ResolveCodexSessionAliases(ctx, mapping.namespace, id.stateAliases())
 		if err != nil {
+			// Preserve the retired binding long enough for the gateway to build a
+			// durable fresh-root replay. It is never selected as an upstream route:
+			// recoverCodexSessionMapping retires idempotently and resolves a new
+			// mapping before its retry is issued.
+			if errors.Is(err, storage.ErrCodexSessionEpochRetired) && binding.ID != "" {
+				mapping.binding = &binding
+				mapping.requiredAccount, mapping.requiredEgress = binding.AccountID, binding.EgressID
+			}
 			return mapping, err
 		}
 		// If a real hierarchy accompanies state aliases it must agree with the
@@ -1116,7 +1218,7 @@ func (s *Server) writeCodexSessionMappingError(w http.ResponseWriter, stream boo
 	message := map[string]string{
 		"codex_session_mapping_unidentified": "Codex stateful request has no exact session mapping; start a new session or retry with its original response id.",
 		"codex_session_mapping_ambiguous":    "Codex session aliases resolve to more than one internal session.",
-		"codex_context_epoch_retired":        "Codex context epoch was retired; this previous_response_id cannot be migrated to a new account.",
+		"codex_context_epoch_retired":        "Codex context epoch was retired and no recoverable checkpoint is available for this previous_response_id.",
 	}[code]
 	if message == "" {
 		message = "Codex session mapping failed."

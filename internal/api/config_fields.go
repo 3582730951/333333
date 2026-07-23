@@ -242,7 +242,7 @@ func configFields() []configField {
 		{Key: "goal_compression_concurrency", Label: "目标压缩并发", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "全局可同时执行的目标压缩作业数，默认 1。", boot: func(c config.Config) interface{} { return c.GoalCompressionConcurrency }},
 		{Key: "codex_session_mapping_enabled", Label: "Codex 会话映射", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=Codex 仅以加密映射恢复原生上游会话；不保存或重建上下文正文。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
+			Help: "开(默认)=Codex 正常以加密映射维持原生会话；绑定账号补号或上游丢失 previous_response_id 时，用加密目标检查点重建一个新根继续任务。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
 		{Key: "codex_session_mapping_retention_days", Label: "Codex 映射保留天数", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "Codex 会话映射的滑动保留期，默认 7 天；仅保留 HMAC 别名和加密身份元数据。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingRetentionDays }},
 		{Key: "codex_cpa_strict", Label: "Codex 严格 CPA", Category: catLimits, Type: fieldBool, Effect: effectHot,

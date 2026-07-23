@@ -78,6 +78,13 @@ func normalizeRequestedClaudeBase(model string) string {
 func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64 {
 	limit := KiroContextWindow(model)
 	requestLimit := int64(200000)
+	// GPT-5.6 is a native Kiro model family with a 272K standard context
+	// window. This is not the paid Claude-only 1M extension, so a normal GPT
+	// request must retain the model's documented window rather than being
+	// artificially reduced to the generic 200K default.
+	if KiroSupportsGPTModel(model) {
+		requestLimit = limit
+	}
 	if strings.EqualFold(strings.TrimSpace(contextMode), "1m") {
 		requestLimit = 1000000
 	}
@@ -123,9 +130,14 @@ var kiroStaticModels = []string{
 	"claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5",
 	"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5",
 	"claude-haiku-4.5", "claude-fable-5",
+	// Kiro also exposes this GPT-5.6 family through generateAssistantResponse.
+	// Keep this list intentionally exact: an unknown GPT slug must not be routed
+	// to Kiro merely because it shares a prefix with a Codex model.
+	"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
 }
 
 var kiroConcreteModelRE = regexp.MustCompile(`^claude-(opus|sonnet|haiku|fable)-([0-9]+)(?:[.-]([0-9]+))?(?:-([0-9]{8}))?$`)
+var kiroGPTModelRE = regexp.MustCompile(`^gpt-5\.6-(sol|terra|luna)$`)
 
 // KiroModelAlias reports whether model needs account-specific capability
 // resolution. Aliases are deliberately not resolved from the static catalog: those
@@ -140,12 +152,15 @@ func KiroModelAlias(model string) bool {
 	}
 }
 
-// KiroCanonicalModel canonicalizes only a concrete Claude model identifier. Dot
+// KiroCanonicalModel canonicalizes concrete Kiro model identifiers. Claude dot
 // and hyphen spellings, and an optional dated suffix, map to the same numeric
-// version. A different or previously unknown version is never attracted to a
-// nearby static model (for example 4.9 can never become 4.8).
+// version. The GPT family is deliberately exact: only the GPT-5.6 ids exposed by
+// Kiro are accepted, so an unrelated Codex GPT model is never silently rerouted.
 func KiroCanonicalModel(model string) (string, bool) {
 	m := strings.ToLower(strings.TrimSpace(model))
+	if match := kiroGPTModelRE.FindStringSubmatch(m); match != nil {
+		return "gpt-5.6-" + match[1], true
+	}
 	match := kiroConcreteModelRE.FindStringSubmatch(m)
 	if match == nil {
 		return "", false
@@ -155,6 +170,14 @@ func KiroCanonicalModel(model string) (string, bool) {
 		version += "." + match[3]
 	}
 	return "claude-" + match[1] + "-" + version, true
+}
+
+// KiroSupportsGPTModel reports whether a concrete GPT request can be served by
+// Kiro's generateAssistantResponse backend. It is used only for auto spillover;
+// explicit Codex traffic remains on Codex.
+func KiroSupportsGPTModel(model string) bool {
+	canonical, ok := KiroCanonicalModel(model)
+	return ok && strings.HasPrefix(canonical, "gpt-")
 }
 
 // ResolveKiroModel resolves aliases against models that were verified for the
@@ -227,6 +250,9 @@ func KiroContextWindow(model string) int64 {
 	if !ok {
 		return 200000
 	}
+	if strings.HasPrefix(canonical, "gpt-") {
+		return 272000
+	}
 	switch canonical {
 	case "claude-sonnet-5", "claude-sonnet-4.6",
 		"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6",
@@ -265,15 +291,24 @@ func KiroPlanAllows1M(plan, model string) bool {
 	return normalizedPlan != "" && !strings.Contains(normalizedPlan, "FREE")
 }
 
+func minKiroNativeWindow(slug string, maximum int64) int64 {
+	if strings.HasPrefix(slug, "gpt-") {
+		return maximum
+	}
+	return 200000
+}
+
 func StaticKiroModels(accountID string) []storage.ModelCapability {
 	now := storage.Now()
 	out := make([]storage.ModelCapability, 0, len(kiroStaticModels))
 	for _, slug := range kiroStaticModels {
 		window := int64(1000000)
-		if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
+		if strings.HasPrefix(slug, "gpt-") {
+			window = 272000
+		} else if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
 			window = 200000
 		}
-		out = append(out, storage.ModelCapability{AccountID: accountID, ModelSlug: slug, NativeContextWindow: 200000,
+		out = append(out, storage.ModelCapability{AccountID: accountID, ModelSlug: slug, NativeContextWindow: minKiroNativeWindow(slug, window),
 			NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100, AvailabilityState: AvailabilityUnverified,
 			Context1MState: Context1MUnknown, Source: "kiro_static_unknown", LastProbeAt: now})
 	}

@@ -391,6 +391,22 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			flusher.Flush()
 		}
 	}
+	emitError := func(value map[string]interface{}) {
+		// OpenAI Chat Completions SSE represents a terminal failure as an error
+		// payload, not a successful finish chunk followed by [DONE].  This is
+		// particularly important for the Kiro bridge: its EventStream decoder emits
+		// an Anthropic `error` frame after a stream has started.
+		if value == nil {
+			value = map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": "Anthropic upstream stream failed"}}
+		}
+		b, _ := json.Marshal(value)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -406,6 +422,9 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			continue
 		}
 		switch ev["type"] {
+		case "error":
+			emitError(ev)
+			return
 		case "message_start":
 			if m, ok := ev["message"].(map[string]interface{}); ok {
 				if idv, ok := m["id"].(string); ok && idv != "" {
