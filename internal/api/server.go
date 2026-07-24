@@ -588,6 +588,26 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if s.tryServeAutoKiroGPT(w, r, raw, model, affinityGroup, isChat, isCompact, pol) {
 		return
 	}
+	// CPA-style stateless passthrough (default). Make every native Codex turn
+	// self-contained so ANY account can serve it and seamless failover is lossless:
+	// strip the two server-side-state signals the client carries — previous_response_id
+	// (body) and x-codex-turn-state (header). degradedResponsesReplay removes both from
+	// the body AND rewrites any now-orphaned tool-call outputs into plain context, so the
+	// stripped turn stays a valid Responses request rather than 400-ing on a missing
+	// tool call. `store` is deliberately left untouched: upstream normalization already
+	// forces the exact per-upstream real-client value, which is better fingerprint
+	// fidelity than a blanket store:false. With no state signals the request is `movable`
+	// below, the session-mapping engine reports disabled, and the 409/400 the client used
+	// to see cannot arise. Chat completions carry their history in `messages` and never
+	// hold server-side state, so they are unaffected.
+	if !isChat && s.codexStatelessPassthrough(r.Context()) && routing.HasServerSideState(path, r, raw) {
+		raw = degradedResponsesReplay(raw)
+		if r.Header.Get("X-Codex-Turn-State") != "" {
+			r = r.Clone(r.Context())
+			r.Header.Del("X-Codex-Turn-State")
+		}
+		w.Header().Set("X-MiCliProxy-Codex-Passthrough", "stateless")
+	}
 	// Native Codex context is owned by the upstream Responses session during normal
 	// operation. Resolve exact downstream aliases first; only a missing bound account
 	// or confirmed upstream context loss activates the encrypted durable replay path.

@@ -621,6 +621,7 @@ func TestCodexStrictCPAStatelessFailoverRuleSwitchesAccount(t *testing.T) {
 }
 
 func TestCodexStrictCPAContextRuleChangesPresentationAndRetiresEpoch(t *testing.T) {
+	skipLegacyStrictCPARecovery(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {

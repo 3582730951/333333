@@ -162,7 +162,31 @@ func codexStrictCPAFromContext(ctx context.Context) bool {
 }
 
 func (s *Server) codexSessionMappingEnabled(ctx context.Context) bool {
+	// CPA-style stateless passthrough takes precedence. When it is on, the entire
+	// durable session-mapping / goal-continuity / context-journal engine is bypassed so
+	// every native Codex turn is self-contained and portable across accounts. Reporting
+	// "not enabled" here is the single choke point that keeps that engine dormant at
+	// every call site (routing gate, movable guard, terminal goal persistence) without
+	// deleting it, so setting the flag back to false instantly restores strict mapping.
+	if s.codexStatelessPassthrough(ctx) {
+		return false
+	}
 	return s.flagEnabled(ctx, "codex_session_mapping_enabled", s.cfg.CodexSessionMappingEnabled)
+}
+
+func (s *Server) codexStatelessPassthrough(ctx context.Context) bool {
+	// The downstream Responses-over-WebSocket path is a single persistent upstream
+	// connection: its previous_response_id always references a response created moments
+	// earlier on that same connection/account (warmup-state reuse via completeAppend),
+	// never a cross-account continuation. Stripping it there would defeat the warmup
+	// optimization for zero stability gain and cannot produce the cross-account 409/400
+	// this mode exists to prevent, so stateless passthrough never applies to a WS turn.
+	// This also keeps codexSessionMappingEnabled at its configured value for the WS path,
+	// matching its pre-passthrough behavior exactly.
+	if forceCodexResponsesWebSocket(ctx) {
+		return false
+	}
+	return s.flagEnabled(ctx, "codex_stateless_passthrough", s.cfg.CodexStatelessPassthrough)
 }
 
 func (s *Server) codexCPAStrict(ctx context.Context) bool {
@@ -1065,6 +1089,7 @@ func (s *Server) emitCodexNativeContinuationFailure(ctx context.Context, w io.Wr
 func (s *Server) codexSessionMappingStats(ctx context.Context) map[string]interface{} {
 	stats := map[string]interface{}{
 		"enabled":                        s.codexSessionMappingEnabled(ctx),
+		"stateless_passthrough":          s.codexStatelessPassthrough(ctx),
 		"strict_cpa":                     s.codexCPAStrict(ctx),
 		"retention_days":                 int(s.codexSessionMappingRetention(ctx).Hours() / 24),
 		"bindings_created":               atomic.LoadUint64(&s.codexMappingBindingsCreated),

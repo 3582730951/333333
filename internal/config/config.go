@@ -185,6 +185,15 @@ type Config struct {
 	CodexSessionMappingEnabled       bool   `json:"codex_session_mapping_enabled"`
 	CodexSessionMappingRetentionDays int    `json:"codex_session_mapping_retention_days"`
 	CodexCPAStrict                   bool   `json:"codex_cpa_strict"`
+	// CodexStatelessPassthrough makes native Codex /v1/responses fully self-contained
+	// (CPA-style). When on (default) the durable session-mapping / goal-continuity /
+	// context-journal engine is bypassed and every turn strips previous_response_id +
+	// x-codex-turn-state, so ANY account can serve ANY turn and seamless failover is
+	// always lossless. This trades the previous_response_id server-side cache discount
+	// (more input tokens per turn) for stability: the "bound_account_unavailable" 409 and
+	// upstream "previous_response_not_found" 400 become structurally impossible. Set to
+	// false to restore the strict native session-mapping engine.
+	CodexStatelessPassthrough        bool   `json:"codex_stateless_passthrough"`
 	AdminToken                       string `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
 	// cookie security, or generated public URLs. Direct internet clients cannot
@@ -806,6 +815,7 @@ func Default() Config {
 		CodexSessionMappingEnabled:       true,
 		CodexSessionMappingRetentionDays: 7,
 		CodexCPAStrict:                   true,
+		CodexStatelessPassthrough:        true,
 		TrustedProxyCIDRs:                []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:            120,
 		KiroVersion:                      "0.11.107",

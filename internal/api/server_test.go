@@ -2118,6 +2118,9 @@ func TestStrictStickyDoesNotCrossAccount(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
+	// previous_response_id here exercises the stateful pinning engine, which is dormant
+	// under the default CPA-style stateless passthrough. Opt back into it for this test.
+	h.app.cfg.CodexStatelessPassthrough = false
 	acc1 := h.importAccount(t, "a", "upstream-a", "access-a")
 	h.importAccount(t, "b", "upstream-b", "access-b")
 	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: "hash-strict", RouteKey: "key", Source: "test", AccountID: acc1}); err != nil {
@@ -2143,10 +2146,82 @@ func TestStrictStickyDoesNotCrossAccount(t *testing.T) {
 	}
 }
 
+// TestCodexStatelessPassthroughSurvivesDeadBoundAccount is the regression guard for the
+// two failures this mode was built to remove. It is the exact scenario as
+// TestStrictStickyDoesNotCrossAccount — a continuation carrying previous_response_id (and
+// an x-codex-turn-state header) whose bound account has become unavailable — but under
+// the DEFAULT stateless passthrough it must NOT surface bound_account_unavailable (409),
+// and must strip previous_response_id so the upstream can never answer
+// previous_response_not_found (400). The self-contained turn simply fails over to a
+// healthy account and succeeds.
+func TestCodexStatelessPassthroughSurvivesDeadBoundAccount(t *testing.T) {
+	var mu sync.Mutex
+	var upstreamBodies []string
+	var upstreamTurnStates []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		upstreamBodies = append(upstreamBodies, string(raw))
+		upstreamTurnStates = append(upstreamTurnStates, r.Header.Get("X-Codex-Turn-State"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_fresh","object":"response","status":"completed","output":[]}`)
+	})
+	// Do NOT disable stateless passthrough: this asserts the shipped default.
+	dead := h.importAccount(t, "dead", "upstream-dead", "access-dead")
+	h.importAccount(t, "healthy", "upstream-healthy", "access-healthy")
+
+	reqBody := `{"model":"gpt","previous_response_id":"resp_from_dead","prompt_cache_key":"pass","input":[{"role":"user","content":"continue"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: dead}); err != nil {
+		t.Fatal(err)
+	}
+	// The bound account is out of service — quota exhausted / banned in production terms.
+	if err := h.store.SetAccountQuarantine(context.Background(), dead, storage.Now()+3600, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "turnstate_from_dead")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stateless passthrough must survive a dead bound account with 200, got %d body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("X-MiCliProxy-Codex-Passthrough"); got != "stateless" {
+		t.Fatalf("expected X-MiCliProxy-Codex-Passthrough=stateless, got %q", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(upstreamBodies) == 0 {
+		t.Fatal("no upstream request captured")
+	}
+	for i, b := range upstreamBodies {
+		if strings.Contains(b, "previous_response_id") {
+			t.Fatalf("upstream attempt %d still carried previous_response_id: %s", i, b)
+		}
+		if strings.Contains(b, "resp_from_dead") {
+			t.Fatalf("upstream attempt %d leaked the dead response id: %s", i, b)
+		}
+		if upstreamTurnStates[i] != "" {
+			t.Fatalf("upstream attempt %d leaked X-Codex-Turn-State=%q", i, upstreamTurnStates[i])
+		}
+	}
+}
+
 func TestStatefulStrictStickyWaitsForPinnedAccountCapacity(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
+	// previous_response_id keeps this turn on its pinned account only while the stateful
+	// engine is active; it is dormant under the default stateless passthrough.
+	h.app.cfg.CodexStatelessPassthrough = false
 	acc1 := h.importAccount(t, "a", "upstream-a", "access-a")
 	h.importAccount(t, "b", "upstream-b", "access-b")
 	cfg := h.app.scheduler.Config()
@@ -2976,6 +3051,9 @@ func TestUnrelatedHTTP400DoesNotRecoverResponsesContext(t *testing.T) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_previous_response","message":"The request is invalid."}}`)
 	})
+	// This test asserts recovery semantics of the stateful context engine, which the
+	// default stateless passthrough bypasses; keep the engine on so the 400 reaches it.
+	h.app.cfg.CodexStatelessPassthrough = false
 	accountID := h.importAccount(t, "ordinary-400", "upstream-ordinary-400", "access-ordinary-400")
 	body := `{"model":"gpt","previous_response_id":"resp_invalid","input":[{"role":"user","content":"continue"}]}`
 	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))

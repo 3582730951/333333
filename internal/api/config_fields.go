@@ -247,6 +247,8 @@ func configFields() []configField {
 			Help: "Codex 会话映射的滑动保留期，默认 7 天；仅保留 HMAC 别名和加密身份元数据。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingRetentionDays }},
 		{Key: "codex_cpa_strict", Label: "Codex 严格 CPA", Category: catLimits, Type: fieldBool, Effect: effectHot,
 			Help: "开(默认)=previous_response_id 与工具输出只原样交给同一上游会话；找不到映射时显式失败，不降级重放。管理员配置的上游错误规则仍会执行。", boot: func(c config.Config) interface{} { return c.CodexCPAStrict }},
+		{Key: "codex_stateless_passthrough", Label: "Codex 无状态直通", Category: catLimits, Type: fieldBool, Effect: effectHot,
+			Help: "开(默认)=原生 Codex 学 CPA 走无状态直通：剥掉 previous_response_id / x-codex-turn-state，每轮自包含，任意账号可接、换号无损，从根本上消除 bound_account_unavailable(409) 与 previous_response_not_found(400)；代价是每轮重发全量上下文、额度消耗更多。优先级高于上面的“Codex 会话映射 / 严格 CPA”，开启时后两者对 Codex 自动失效。关=恢复严格原生会话映射引擎(旧行为)。", boot: func(c config.Config) interface{} { return c.CodexStatelessPassthrough }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
