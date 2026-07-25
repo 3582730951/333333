@@ -62,6 +62,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [providerKeyResult, setProviderKeyResult] = useState(null);
   const [egressId, setEgressId] = useState('egress_direct');
   const [egressProfiles, setEgressProfiles] = useState([]);
+  const [groups, setGroups] = useState([]);
   const countdownRef = useRef(null);
   const copyResetRef = useRef(null);
   const actionEpochRef = useRef(0);
@@ -72,16 +73,29 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [groupName, setGroupName] = useState('');
   const [note, setNote] = useState('');
   const egressOptions = useMemo(() => egressOptionList(egressProfiles), [egressProfiles]);
+  const groupOptions = useMemo(() => {
+    const opts = [{ label: '留空使用默认分组', value: '' }];
+    for (const g of groups) {
+      opts.push({ label: g.name || g, value: g.name || g });
+    }
+    return opts;
+  }, [groups]);
 
   useEffect(() => {
     if (!isVisible) return undefined;
     let cancelled = false;
-    get('/admin/egress-profiles')
-      .then((data) => {
-        if (!cancelled) setEgressProfiles(normalizeEgressResponse(data));
+    Promise.all([
+      get('/admin/egress-profiles'),
+      get('/admin/groups'),
+    ])
+      .then(([egressData, groupsData]) => {
+        if (!cancelled) {
+          setEgressProfiles(normalizeEgressResponse(egressData));
+          setGroups(Array.isArray(groupsData) ? groupsData : groupsData?.groups || []);
+        }
       })
       .catch((e) => {
-        if (!cancelled) showErrorToast(e, { prefix: '出口列表读取失败' });
+        if (!cancelled) showErrorToast(e, { prefix: '数据加载失败' });
       });
     return () => { cancelled = true; };
   }, [isVisible]);
@@ -197,7 +211,9 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       return;
     }
     try {
-      const result = await oauthComplete(sessionId, val, label, groupName, egressId);
+      // Kiro 和 Antigravity 自动使用对应的分组
+      const finalGroupName = tab === 'antigravity' ? 'antigravity' : groupName;
+      const result = await oauthComplete(sessionId, val, label, finalGroupName, egressId);
       if (actionEpoch !== actionEpochRef.current) return;
       Toast.success({
         content: (
@@ -267,13 +283,13 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   }, [kiroRaw]);
 
   const { run: handleKiroImport, running: kiroLoading } = useAsyncAction(async () => {
-    if (!kiroRaw.trim()) { Toast.warning('请粘贴 Kiro 凭证 JSON'); return; }
+    if (!kiroRaw.trim()) { Toast.warning('请粘贴 claude-opus-4-8 凭证 JSON'); return; }
     try {
       const result = await post('/admin/accounts/import-kiro-json', {
         kiro_json_text: kiroRaw,
         kiro_client_json_text: kiroClientRaw,
         label,
-        group_name: groupName,
+        group_name: 'kiro', // claude-opus-4-8 自动使用 kiro 分组
         egress_id: egressId,
       }, { timeout: 120000 });
       setKiroResult(result);
@@ -288,7 +304,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     if (!kiroApiKey.trim()) { Toast.warning('请输入 ksk_ API Key'); return; }
     try {
       const result = await post('/admin/accounts/import-kiro-api-key', {
-        kiro_api_key: kiroApiKey.trim(), label, group_name: groupName,
+        kiro_api_key: kiroApiKey.trim(), label, group_name: 'kiro', // Kiro 自动使用 kiro 分组
         egress_id: egressId, api_region: kiroApiRegion.trim(),
       }, { timeout: 120000 });
       Toast.success(`Kiro API Key 账号 ${result.label || result.id} 已导入并验活`);
@@ -371,10 +387,11 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         </Form.Slot>
 
         <Form.Slot label="分组 (可选)">
-          <Input
+          <Select
             placeholder="留空使用默认分组"
             value={groupName}
             onChange={setGroupName}
+            optionList={groupOptions}
           />
         </Form.Slot>
 
@@ -455,7 +472,6 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       </div>
       <Form>
         <Form.Slot label="标签 (可选)"><Input value={label} onChange={setLabel} placeholder="批量导入时会自动追加序号" /></Form.Slot>
-        <Form.Slot label="分组 (可选)"><Input value={groupName} onChange={setGroupName} placeholder="留空使用默认分组" /></Form.Slot>
         <Form.Slot label="账号默认出口"><Select value={egressId} onChange={setEgressId} optionList={egressOptions} /></Form.Slot>
       </Form>
       <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
@@ -554,13 +570,16 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               />
             </Form.Slot>
 
-            <Form.Slot label="分组 (可选)">
-              <Input
-                placeholder="留空使用默认分组"
-                value={groupName}
-                onChange={setGroupName}
-              />
-            </Form.Slot>
+            {tab !== 'antigravity' && (
+              <Form.Slot label="分组 (可选)">
+                <Select
+                  placeholder="留空使用默认分组"
+                  value={groupName}
+                  onChange={setGroupName}
+                  optionList={groupOptions}
+                />
+              </Form.Slot>
+            )}
 
             <Form.Slot label="账号默认出口">
               <Select
