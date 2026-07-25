@@ -78,7 +78,7 @@ func normalizeRequestedClaudeBase(model string) string {
 func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64 {
 	limit := KiroContextWindow(model)
 	requestLimit := int64(200000)
-	// GPT-5.6 is a native Kiro model family with a 272K standard context
+	// GPT-5.6 is a native Kiro model family with a 372K standard context
 	// window. This is not the paid Claude-only 1M extension, so a normal GPT
 	// request must retain the model's documented window rather than being
 	// artificially reduced to the generic 200K default.
@@ -245,13 +245,17 @@ func KiroSupportsAdaptiveThinking(model string) bool {
 // exposes one-million-token windows for the newer families, while 4.5/Haiku
 // models retain the 200k window. Unknown future versions use 200k until a live
 // capability proves otherwise.
+//
+// GPT-5.6 cap raised to 372K (2026-07-25): the official Codex static model
+// table records 372K for gpt-5.6-sol/terra/luna; 272K was a conservative
+// placeholder that under-served the actual upstream limit.
 func KiroContextWindow(model string) int64 {
 	canonical, ok := KiroCanonicalModel(model)
 	if !ok {
 		return 200000
 	}
 	if strings.HasPrefix(canonical, "gpt-") {
-		return 272000
+		return 372000
 	}
 	switch canonical {
 	case "claude-sonnet-5", "claude-sonnet-4.6",
@@ -304,7 +308,7 @@ func StaticKiroModels(accountID string) []storage.ModelCapability {
 	for _, slug := range kiroStaticModels {
 		window := int64(1000000)
 		if strings.HasPrefix(slug, "gpt-") {
-			window = 272000
+			window = 372000 // gpt-5.6-sol/terra/luna actual limit (was 272K, raised 2026-07-25)
 		} else if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
 			window = 200000
 		}

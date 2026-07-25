@@ -113,7 +113,7 @@ func TestCodexSidecarResponsesStripsPromptCacheRetention(t *testing.T) {
 	}))
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	cfg.UpstreamBaseURL = "https://chatgpt.com/backend-api/codex"
 	client := NewClient(cfg)
 	resp, err := client.Do(context.Background(), Request{

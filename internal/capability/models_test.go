@@ -266,8 +266,8 @@ func TestKiroGPTModelsAreExactAndKeepTheirNativeWindow(t *testing.T) {
 		if !ok || !KiroSupportsGPTModel(model) {
 			t.Fatalf("Kiro GPT model %q was not recognized", model)
 		}
-		if got := KiroEffectiveContextWindow(canonical, "", 0); got != 272000 {
-			t.Fatalf("%s standard window=%d, want 272000", canonical, got)
+		if got := KiroEffectiveContextWindow(canonical, "", 0); got != 372000 {
+			t.Fatalf("%s standard window=%d, want 372000", canonical, got)
 		}
 	}
 	for _, model := range []string{"gpt-5.6", "gpt-5.6-sol-preview", "gpt-5.5-sol", "gpt-4.1"} {
@@ -345,13 +345,13 @@ func TestStaticKiroSeparatesStandardAndTechnicalContextWindows(t *testing.T) {
 	for _, c := range StaticKiroModels("account") {
 		wantNative := int64(200000)
 		if KiroSupportsGPTModel(c.ModelSlug) {
-			wantNative = 272000
+			wantNative = 372000
 		}
 		if c.NativeContextWindow != wantNative {
 			t.Fatalf("%s standard window=%d, want %d", c.ModelSlug, c.NativeContextWindow, wantNative)
 		}
-		if KiroSupportsGPTModel(c.ModelSlug) && c.NativeMaxContextWindow != 272000 {
-			t.Fatalf("%s GPT maximum window=%d, want 272000", c.ModelSlug, c.NativeMaxContextWindow)
+		if KiroSupportsGPTModel(c.ModelSlug) && c.NativeMaxContextWindow != 372000 {
+			t.Fatalf("%s GPT maximum window=%d, want 372000", c.ModelSlug, c.NativeMaxContextWindow)
 		}
 		if KiroContextWindow(c.ModelSlug) == 1000000 && c.NativeMaxContextWindow != 1000000 {
 			t.Fatalf("%s technical window=%d, want 1000000", c.ModelSlug, c.NativeMaxContextWindow)

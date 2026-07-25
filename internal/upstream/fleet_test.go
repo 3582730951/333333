@@ -454,7 +454,7 @@ func TestCodexSidecarDefaultsToChromeJA3(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	client := NewClient(sidecarEngineConfig())
 	resp, err := client.Do(nilContext(t), Request{
 		DownstreamPath: "/v1/responses",
 		Body:           []byte(`{"stream":true}`),
@@ -491,7 +491,7 @@ func TestCodexSidecarAliasResolvesToChrome(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	cfg.CodexJA3Override = "codex-cli" // "real Codex" alias — now resolves to Chrome
 	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{
@@ -517,7 +517,7 @@ func TestCodexSidecarRawJA3IsSanitized(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	// An operator who pastes the real Codex JA3 verbatim gets a best-effort replay with
 	// the unlistable 0xFF SCSV signalling cipher stripped, so curl_cffi doesn't 502 on it.
 	cfg.CodexJA3Override = identity.CodexJA3
@@ -547,7 +547,7 @@ func TestCodexSidecarAPIKeyOmitsJA3(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	cfg.OpenAIAPIUpstreamBaseURL = "https://api.openai.example/v1"
 	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{

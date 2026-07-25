@@ -72,11 +72,25 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 
 	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), group)
 	kiroCfg := s.effectiveKiroConfig(r.Context())
+
+	// Fair scheduling is only for the first unbound request. Once an affinity
+	// binding exists for this conversation and it targets a Kiro account, honor
+	// the sticky binding so context is preserved across turns. Without this,
+	// every turn re-runs the coin-flip and may land on a different Kiro account,
+	// which changes the conversationId and loses any per-account upstream state.
+	fairScheduling := true
+	if affinity.Hash != "" {
+		if bound, bindErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash); bindErr == nil &&
+			strings.EqualFold(strings.TrimSpace(bound.Provider), "kiro") {
+			fairScheduling = false
+		}
+	}
+
 	route := scheduler.Route{
 		Group:                 group,
 		AllowedProviders:      []string{"codex", "kiro"},
 		Affinity:              affinity,
-		FairScheduling:        true,
+		FairScheduling:        fairScheduling,
 		KiroEndpointAllowlist: kiroCfg.KiroEndpointAllowlist,
 		KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
 		Model:                 model,

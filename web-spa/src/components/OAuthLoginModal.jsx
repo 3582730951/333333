@@ -332,6 +332,11 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       desc: '使用 Anthropic 账号授权登录',
       vendor: 'claude',
     },
+    antigravity: {
+      name: 'Antigravity (Google Cloud Code)',
+      desc: '使用 Google 账号授权登录',
+      vendor: 'google',
+    },
     kiro: { name: 'Kiro', desc: '导入 API Key 或 Kiro IDE / KAM 凭证', vendor: 'kiro' },
   };
 
@@ -803,6 +808,17 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             </span>
           )}
           itemKey="claude"
+        >
+          {oauthTabContent}
+        </TabPane>
+        <TabPane
+          tab={(
+            <span className="pool-vendor-tab">
+              <VendorLogo vendor="google" size={18} />
+              <span>Antigravity</span>
+            </span>
+          )}
+          itemKey="antigravity"
         >
           {oauthTabContent}
         </TabPane>

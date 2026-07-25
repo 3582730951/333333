@@ -951,9 +951,11 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 		return resp, body
 	}
 
+	// PRO accounts now get automatic 1M window for all non-compaction Claude requests,
+	// so a 276k-token ordinary request should succeed instead of being rejected.
 	ordinary, ordinaryBody := request(history, "You are Claude Code", "continue ordinary work", "ordinary-over-200k")
-	if ordinary.StatusCode != http.StatusBadRequest || ordinary.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" || ordinary.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" || !bytes.Contains(ordinaryBody, []byte("Prompt is too long:")) || !bytes.Contains(ordinaryBody, []byte(`"type":"error"`)) || bytes.Contains(ordinaryBody, []byte("请运行 /compact")) {
-		t.Fatalf("ordinary oversized request was relaxed: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
+	if ordinary.StatusCode != http.StatusOK || ordinary.Header.Get("X-Pool-Kiro-Context-Window") != "1000000" || !bytes.Contains(ordinaryBody, []byte(`"type":"message"`)) {
+		t.Fatalf("PRO ordinary request over 200k should succeed with 1M auto-upgrade: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
 	}
 
 	compactSystem := "You are a helpful AI assistant tasked with summarizing conversations."

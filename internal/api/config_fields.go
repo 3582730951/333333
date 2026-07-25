@@ -83,6 +83,9 @@ func configFields() []configField {
 			Help: "留空=Chrome(默认，更安全)。设置则 sidecar 尝试重放该 JA3。", boot: func(c config.Config) interface{} { return c.CodexJA3Override }},
 		{Key: "claude_ja3", Label: "Claude JA3 覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=Chrome(默认)。真实 claude-cli/Node JA3 为显式 opt-in。", boot: func(c config.Config) interface{} { return c.ClaudeJA3Override }},
+		{Key: "egress_fingerprint_engine", Label: "出口指纹引擎", Category: catIdentity, Type: fieldSelect, Effect: effectUpstream,
+			Options: []string{"inprocess", "sidecar"},
+			Help:    "inprocess(默认)=进程内 Go tls-client(uTLS+fhttp)复现 JA3 与 HTTP/2 Akamai 指纹(Chrome_120，与边车 chrome120 一致)，无独立进程/本地回环跳/双倍套接字；sidecar=经外部 Python curl_cffi 边车，作为随时可切回的兜底。两引擎默认指纹按构造一致；部署后用 /admin/egress-fingerprint-check 校验。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.EgressFingerprintEngine, "inprocess") }},
 		{Key: "codex_cli_version", Label: "Codex CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
 			Help: "留空=内置默认。覆盖上游 Codex 客户端版本指纹。", boot: func(c config.Config) interface{} { return c.CodexCLIVersionOverride }},
 		{Key: "claude_cli_version", Label: "Claude CLI 版本覆盖", Category: catIdentity, Type: fieldString, Effect: effectUpstream,
@@ -424,6 +427,7 @@ func (s *Server) effectiveUpstreamConfig(ctx context.Context) config.Config {
 	c.OpenAIAPIUpstreamBaseURL = s.settingString(ctx, "openai_api_upstream_base_url", c.OpenAIAPIUpstreamBaseURL)
 	c.CodexJA3Override = s.settingString(ctx, "codex_ja3", c.CodexJA3Override)
 	c.ClaudeJA3Override = s.settingString(ctx, "claude_ja3", c.ClaudeJA3Override)
+	c.EgressFingerprintEngine = s.settingString(ctx, "egress_fingerprint_engine", c.EgressFingerprintEngine)
 	c.ClaudeForceDirect = s.flagEnabled(ctx, "claude_force_direct", c.ClaudeForceDirect)
 	c.CodexCLIVersionOverride = s.settingString(ctx, "codex_cli_version", c.CodexCLIVersionOverride)
 	c.ClaudeCLIVersionOverride = s.settingString(ctx, "claude_cli_version", c.ClaudeCLIVersionOverride)

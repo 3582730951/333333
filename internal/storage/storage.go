@@ -90,6 +90,48 @@ type GroupAccountCounts struct {
 	ActiveAccountCount int `json:"active_account_count"`
 }
 
+// UserGroup is a user-facing routing group that an APIKey points to.
+// Prompt injection (SystemPrompt/PromptMode) and ForceModel/ForceEffort live
+// ONLY here; the base groups (accounts.group_name) carry no prompt config.
+// A user group can fan out to multiple targets (base groups, relays, kiro, antigravity)
+// via UserGroupTarget rows, enabling affinity-spread and session-sticky multi-target routing.
+type UserGroup struct {
+	ID                            string   `json:"id"`
+	Name                          string   `json:"name"`
+	SystemPrompt                  string   `json:"system_prompt"`
+	PromptMode                    string   `json:"prompt_mode"`
+	SystemPromptApplyToCompaction bool     `json:"system_prompt_apply_to_compaction"`
+	ModelInstructionsEnabled      bool     `json:"model_instructions_enabled"`
+	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
+	ForceModel                    string   `json:"force_model"`
+	ForceEffort                   string   `json:"force_effort"`
+	CreatedAt                     int64    `json:"created_at"`
+	UpdatedAt                     int64    `json:"updated_at"`
+}
+
+const (
+	// UserGroupTargetTypeBaseGroup routes to a physical base group of accounts.
+	UserGroupTargetTypeBaseGroup = "base_group"
+	// UserGroupTargetTypeRelay routes to a custom relay provider.
+	UserGroupTargetTypeRelay = "relay"
+	// UserGroupTargetTypeKiro routes explicitly to the kiro built-in base group.
+	UserGroupTargetTypeKiro = "kiro"
+	// UserGroupTargetTypeAntigravity routes explicitly to the antigravity built-in base group.
+	UserGroupTargetTypeAntigravity = "antigravity"
+)
+
+// UserGroupTarget is one routing target within a user group.
+// Multiple targets with different affinity weights implement affinity-spread;
+// the session-sticky layer re-uses the same target for a given route-key hash.
+type UserGroupTarget struct {
+	ID             int64  `json:"id"`
+	UserGroupID    string `json:"user_group_id"`
+	TargetType     string `json:"target_type"` // base_group | relay | kiro | antigravity
+	TargetRef      string `json:"target_ref"`  // group name, provider id, or "" for built-ins
+	AffinityWeight int    `json:"affinity_weight"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
 // APIKey is a downstream client credential. The sha256 hash is used for auth lookup;
 // Secret stores a recoverable plaintext copy for admin/owner "copy key" and one-click
 // install UX, encrypted at rest when Store.SetTokenEncryptionKey is configured.
@@ -119,9 +161,13 @@ type APIKey struct {
 	// when tokenKey is configured. It lets the admin/owner re-copy the key and its
 	// one-click install command. Empty for legacy keys created before this column
 	// existed — those remain unrecoverable and must be rotated to get a copyable secret.
-	Secret    string `json:"secret,omitempty"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	Secret string `json:"secret,omitempty"`
+	// UserGroupID, when set, overrides the legacy GroupName routing path: the key is
+	// resolved via the two-layer group model (user_groups → user_group_targets → base
+	// group/relay/kiro/antigravity). Empty for legacy keys that still use GroupName directly.
+	UserGroupID string `json:"user_group_id,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 }
 
 type Tenant struct {
@@ -595,8 +641,9 @@ type CustomProvider struct {
 }
 
 const (
-	CustomProviderProtocolChatCompletions = "chat_completions"
-	CustomProviderProtocolResponses       = "responses"
+	CustomProviderProtocolChatCompletions   = "chat_completions"
+	CustomProviderProtocolResponses         = "responses"
+	CustomProviderProtocolAnthropicMessages = "anthropic_messages"
 )
 
 func NormalizeCustomProviderProtocol(raw string) (string, bool) {
@@ -607,6 +654,8 @@ func NormalizeCustomProviderProtocol(raw string) (string, bool) {
 		return CustomProviderProtocolChatCompletions, true
 	case CustomProviderProtocolResponses:
 		return CustomProviderProtocolResponses, true
+	case CustomProviderProtocolAnthropicMessages:
+		return CustomProviderProtocolAnthropicMessages, true
 	default:
 		return "", false
 	}
@@ -1769,6 +1818,92 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE upstream_error_rules ADD COLUMN filter_account_action INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE upstream_error_rules ADD COLUMN keyword_case_sensitive INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_upstream_error_rules_enabled_priority ON upstream_error_rules(enabled, priority, created_at)`,
+		// Multi-group membership: one account can serve traffic for multiple groups.
+		// The primary group remains accounts.group_name (scheduler hot path).
+		// account_group_memberships covers additional / overlapping group memberships.
+		// is_primary=1 mirrors accounts.group_name; additional memberships have is_primary=0.
+		`CREATE TABLE IF NOT EXISTS account_group_memberships(
+  account_id TEXT NOT NULL,
+  group_name TEXT NOT NULL,
+  is_primary INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(account_id, group_name),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_group_memberships_group ON account_group_memberships(group_name, account_id)`,
+		// Backfill: primary memberships from accounts.group_name for pre-existing rows.
+		`INSERT INTO account_group_memberships(account_id, group_name, is_primary, created_at)
+SELECT id, group_name, 1, created_at FROM accounts WHERE group_name <> ''
+ON CONFLICT(account_id, group_name) DO NOTHING`,
+		// Backfill: all accounts with provider='kiro' also get a "kiro" base membership
+		// so operators can select them by group='kiro' regardless of their primary group.
+		`INSERT INTO account_group_memberships(account_id, group_name, is_primary, created_at)
+SELECT id, 'kiro', 0, created_at FROM accounts WHERE provider = 'kiro' AND group_name <> 'kiro'
+ON CONFLICT(account_id, group_name) DO NOTHING`,
+		// Antigravity (Google Cloud Code) provider credentials.
+		// Stores per-account OAuth tokens and project metadata independently from the
+		// generic account_auth_tokens table so Antigravity-specific fields can evolve.
+		`CREATE TABLE IF NOT EXISTS account_antigravity_credentials(
+  account_id TEXT PRIMARY KEY,
+  email TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
+  access_token TEXT NOT NULL DEFAULT '',
+  refresh_token TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  base_url TEXT NOT NULL DEFAULT '',
+  user_agent TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		// Two-layer group model: user_groups are user-facing routing containers (prompt
+		// injection, force_model/effort live here). user_group_targets maps each user_group
+		// to one or more base groups / relays / built-ins with affinity weights.
+		`CREATE TABLE IF NOT EXISTS user_groups(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  system_prompt TEXT NOT NULL DEFAULT '',
+  prompt_mode TEXT NOT NULL DEFAULT 'prepend',
+  system_prompt_apply_to_compaction INTEGER NOT NULL DEFAULT 1,
+  model_instructions_enabled INTEGER NOT NULL DEFAULT 0,
+  model_instructions_files TEXT NOT NULL DEFAULT '[]',
+  force_model TEXT NOT NULL DEFAULT '',
+  force_effort TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_groups_name ON user_groups(name)`,
+		`CREATE TABLE IF NOT EXISTS user_group_targets(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_group_id TEXT NOT NULL,
+  target_type TEXT NOT NULL,
+  target_ref TEXT NOT NULL DEFAULT '',
+  affinity_weight INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  FOREIGN KEY(user_group_id) REFERENCES user_groups(id) ON DELETE CASCADE,
+  UNIQUE(user_group_id, target_type, target_ref)
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_group_targets_group ON user_group_targets(user_group_id)`,
+		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
+		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
+		// created for the (account, model, conversation-prefix) triple so follow-up
+		// turns can skip re-sending the full history. Expires when the resource TTL
+		// lapses; entries with expires_at <= now() are pruned on startup.
+		`CREATE TABLE IF NOT EXISTS antigravity_cache_entries(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  conv_key_hash TEXT NOT NULL,
+  cache_resource_name TEXT NOT NULL,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(account_id, model_id, conv_key_hash),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_antigravity_cache_expires ON antigravity_cache_entries(expires_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -1781,7 +1916,10 @@ ON CONFLICT(account_id) DO NOTHING`,
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.backfillUsageCacheDiagnostics(ctx)
+	if err := s.backfillUsageCacheDiagnostics(ctx); err != nil {
+		return err
+	}
+	return s.backfillUserGroups(ctx)
 }
 
 func (s *Store) migrateAccountRateLimits(ctx context.Context) error {
@@ -1968,11 +2106,242 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 	return err
 }
 
-// SetAccountGroup reassigns an account to a different group. Membership is the
-// accounts.group_name column the scheduler routes by, so this is the per-account
-// "改派分组" control.
+// ── UserGroup CRUD ──────────────────────────────────────────────────────────
+
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, created_at, updated_at`
+
+func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
+	var g UserGroup
+	var apply, miEnabled int
+	var filesJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &g.CreatedAt, &g.UpdatedAt)
+	g.SystemPromptApplyToCompaction = apply != 0
+	g.ModelInstructionsEnabled = miEnabled != 0
+	g.ModelInstructionsFiles = decodeStringList(filesJSON)
+	return g, err
+}
+
+func (s *Store) GetUserGroup(ctx context.Context, id string) (UserGroup, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+userGroupCols+` FROM user_groups WHERE id = ?`, id)
+	g, err := scanUserGroup(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UserGroup{}, false, nil
+	}
+	return g, err == nil, err
+}
+
+func (s *Store) GetUserGroupByName(ctx context.Context, name string) (UserGroup, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+userGroupCols+` FROM user_groups WHERE name = ?`, name)
+	g, err := scanUserGroup(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UserGroup{}, false, nil
+	}
+	return g, err == nil, err
+}
+
+func (s *Store) ListUserGroups(ctx context.Context) ([]UserGroup, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+userGroupCols+` FROM user_groups ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserGroup
+	for rows.Next() {
+		g, err := scanUserGroup(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
+	if strings.TrimSpace(g.ID) == "" {
+		return errors.New("user group id required")
+	}
+	if strings.TrimSpace(g.Name) == "" {
+		return errors.New("user group name required")
+	}
+	if strings.TrimSpace(g.PromptMode) == "" {
+		g.PromptMode = "prepend"
+	}
+	now := Now()
+	if g.CreatedAt == 0 {
+		g.CreatedAt = now
+	}
+	g.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO NOTHING`,
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.CreatedAt, g.UpdatedAt)
+	return err
+}
+
+func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
+	if strings.TrimSpace(g.PromptMode) == "" {
+		g.PromptMode = "prepend"
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, force_model=?, force_effort=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, Now(), g.ID)
+	return err
+}
+
+func (s *Store) DeleteUserGroup(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM user_groups WHERE id = ?`, id)
+	return err
+}
+
+// GetUserGroupTargets returns all targets for a user group, ordered by affinity_weight DESC.
+func (s *Store) GetUserGroupTargets(ctx context.Context, userGroupID string) ([]UserGroupTarget, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, user_group_id, target_type, target_ref, affinity_weight, created_at FROM user_group_targets WHERE user_group_id = ? ORDER BY affinity_weight DESC, id`, userGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserGroupTarget
+	for rows.Next() {
+		var t UserGroupTarget
+		if err := rows.Scan(&t.ID, &t.UserGroupID, &t.TargetType, &t.TargetRef, &t.AffinityWeight, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpsertUserGroupTarget(ctx context.Context, t UserGroupTarget) error {
+	if t.AffinityWeight < 1 {
+		t.AffinityWeight = 1
+	}
+	now := Now()
+	if t.CreatedAt == 0 {
+		t.CreatedAt = now
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_group_targets(user_group_id, target_type, target_ref, affinity_weight, created_at) VALUES(?,?,?,?,?) ON CONFLICT(user_group_id, target_type, target_ref) DO UPDATE SET affinity_weight=excluded.affinity_weight`,
+		t.UserGroupID, t.TargetType, t.TargetRef, t.AffinityWeight, t.CreatedAt)
+	return err
+}
+
+func (s *Store) RemoveUserGroupTarget(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM user_group_targets WHERE id = ?`, id)
+	return err
+}
+
+// SetAPIKeyUserGroup links an api key to a user_group by ID.
+func (s *Store) SetAPIKeyUserGroup(ctx context.Context, keyHash, userGroupID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE api_keys SET user_group_id = ?, updated_at = ? WHERE key_hash = ?`, userGroupID, Now(), keyHash)
+	return err
+}
+
+// GetUserGroupForAPIKey resolves the user_group for a key that has a user_group_id set.
+// Returns (zero, false, nil) when the key has no user_group_id or the group no longer exists.
+func (s *Store) GetUserGroupForAPIKey(ctx context.Context, keyHash string) (UserGroup, bool, error) {
+	row := s.rdb.QueryRowContext(ctx, `SELECT `+userGroupCols+` FROM user_groups WHERE id = (SELECT user_group_id FROM api_keys WHERE key_hash = ? AND user_group_id <> '')`, keyHash)
+	g, err := scanUserGroup(row.Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UserGroup{}, false, nil
+	}
+	return g, err == nil, err
+}
+
+// SetAccountGroup reassigns an account to a different primary group.
+// Keeps account_group_memberships in sync: the old primary membership is demoted
+// (is_primary=0) and the new group is upserted as is_primary=1.  Additional
+// non-primary memberships (e.g. the "kiro" base group) are never touched.
 func (s *Store) SetAccountGroup(ctx context.Context, accountID, group string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET group_name = ?, updated_at = ? WHERE id = ?`, strings.TrimSpace(group), Now(), accountID)
+	group = strings.TrimSpace(group)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := Now()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE accounts SET group_name = ?, updated_at = ? WHERE id = ?`,
+		group, now, accountID,
+	); err != nil {
+		return err
+	}
+	// Demote any previously-primary membership row.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE account_group_memberships SET is_primary = 0 WHERE account_id = ? AND is_primary = 1`,
+		accountID,
+	); err != nil {
+		return err
+	}
+	// Upsert the new primary membership.
+	if group != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO account_group_memberships(account_id, group_name, is_primary, created_at)
+			 VALUES(?, ?, 1, ?)
+			 ON CONFLICT(account_id, group_name) DO UPDATE SET is_primary = 1`,
+			accountID, group, now,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// AddAccountToGroup adds account to an extra (non-primary) group membership so the
+// scheduler can select the account when routing requests for that group.
+func (s *Store) AddAccountToGroup(ctx context.Context, accountID, group string) error {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO account_group_memberships(account_id, group_name, is_primary, created_at)
+		 VALUES(?, ?, 0, ?)
+		 ON CONFLICT(account_id, group_name) DO NOTHING`,
+		accountID, group, Now(),
+	)
+	return err
+}
+
+// RemoveAccountFromGroup removes a non-primary group membership.  The primary
+// group (accounts.group_name) cannot be removed here; use SetAccountGroup instead.
+func (s *Store) RemoveAccountFromGroup(ctx context.Context, accountID, group string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM account_group_memberships WHERE account_id = ? AND group_name = ? AND is_primary = 0`,
+		accountID, strings.TrimSpace(group),
+	)
+	return err
+}
+
+// GetAccountGroups returns all group names the account belongs to, primary first.
+func (s *Store) GetAccountGroups(ctx context.Context, accountID string) ([]string, error) {
+	rows, err := s.rdb.QueryContext(ctx,
+		`SELECT group_name FROM account_group_memberships
+		 WHERE account_id = ?
+		 ORDER BY is_primary DESC, group_name`,
+		accountID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var g string
+		if err := rows.Scan(&g); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// AutoJoinKiroBaseGroup ensures the account is in the "kiro" membership group.
+// Called after creating or importing a Kiro account so the base group is always
+// populated without requiring a manual AddAccountToGroup call.
+func (s *Store) AutoJoinKiroBaseGroup(ctx context.Context, accountID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO account_group_memberships(account_id, group_name, is_primary, created_at)
+		 VALUES(?, 'kiro', 0, ?)
+		 ON CONFLICT(account_id, group_name) DO NOTHING`,
+		accountID, Now(),
+	)
 	return err
 }
 
@@ -2021,12 +2390,12 @@ GROUP BY group_name`, stringArgs(names)...)
 	return out, rows.Err()
 }
 
-const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(key_type,'downstream'), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), COALESCE(provider_hint,'auto'), enabled, expires_at, last_used_at, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,'')`
+const apiKeyCols = `key_hash, COALESCE(label,''), COALESCE(key_type,'downstream'), COALESCE(group_name,''), COALESCE(force_model,''), COALESCE(force_effort,''), COALESCE(provider_hint,'auto'), enabled, expires_at, last_used_at, COALESCE(tenant_id,''), COALESCE(project_id,''), COALESCE(user_id,''), created_at, updated_at, COALESCE(secret,''), COALESCE(user_group_id,'')`
 
 func scanAPIKey(scan func(...interface{}) error) (APIKey, error) {
 	var k APIKey
 	var enabled int
-	err := scan(&k.KeyHash, &k.Label, &k.KeyType, &k.GroupName, &k.ForceModel, &k.ForceEffort, &k.ProviderHint, &enabled, &k.ExpiresAt, &k.LastUsedAt, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret)
+	err := scan(&k.KeyHash, &k.Label, &k.KeyType, &k.GroupName, &k.ForceModel, &k.ForceEffort, &k.ProviderHint, &enabled, &k.ExpiresAt, &k.LastUsedAt, &k.TenantID, &k.ProjectID, &k.UserID, &k.CreatedAt, &k.UpdatedAt, &k.Secret, &k.UserGroupID)
 	k.Enabled = enabled != 0
 	if strings.TrimSpace(k.KeyType) == "" {
 		k.KeyType = "downstream"
@@ -2125,10 +2494,10 @@ func (s *Store) UpsertAPIKey(ctx context.Context, k APIKey) error {
 		k.KeyType = "downstream"
 	}
 	k.ProviderHint = normalizeStoredProviderHint(k.ProviderHint)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, key_type, label, group_name, force_model, force_effort, provider_hint, enabled, expires_at, last_used_at, secret, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, key_type=excluded.key_type, label=excluded.label, group_name=excluded.group_name, force_model=excluded.force_model, force_effort=excluded.force_effort, provider_hint=excluded.provider_hint, enabled=excluded.enabled, expires_at=excluded.expires_at, last_used_at=excluded.last_used_at, secret=excluded.secret, updated_at=excluded.updated_at`,
-		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.KeyType, k.Label, k.GroupName, k.ForceModel, k.ForceEffort, k.ProviderHint, boolInt(k.Enabled), k.ExpiresAt, k.LastUsedAt, s.sealToken(k.Secret), k.CreatedAt, now)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys(key_hash, tenant_id, project_id, user_id, key_type, label, group_name, user_group_id, force_model, force_effort, provider_hint, enabled, expires_at, last_used_at, secret, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(key_hash) DO UPDATE SET tenant_id=excluded.tenant_id, project_id=excluded.project_id, user_id=excluded.user_id, key_type=excluded.key_type, label=excluded.label, group_name=excluded.group_name, user_group_id=excluded.user_group_id, force_model=excluded.force_model, force_effort=excluded.force_effort, provider_hint=excluded.provider_hint, enabled=excluded.enabled, expires_at=excluded.expires_at, last_used_at=excluded.last_used_at, secret=excluded.secret, updated_at=excluded.updated_at`,
+		k.KeyHash, k.TenantID, k.ProjectID, k.UserID, k.KeyType, k.Label, k.GroupName, k.UserGroupID, k.ForceModel, k.ForceEffort, k.ProviderHint, boolInt(k.Enabled), k.ExpiresAt, k.LastUsedAt, s.sealToken(k.Secret), k.CreatedAt, now)
 	return err
 }
 
@@ -2725,9 +3094,12 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 		FROM accounts a
 		JOIN account_egress_bindings b ON a.id = b.account_id
 		LEFT JOIN egress_profiles e ON b.primary_egress_id = e.id
-		WHERE a.group_name = ? AND a.status = 'active'
+		WHERE (a.group_name = ? OR EXISTS (
+		  SELECT 1 FROM account_group_memberships m
+		  WHERE m.account_id = a.id AND m.group_name = ?
+		)) AND a.status = 'active'
 		ORDER BY a.created_at, a.id
-	`, group)
+	`, group, group)
 	if err != nil {
 		return nil, err
 	}
@@ -3002,6 +3374,129 @@ func (s *Store) KiroAuthSummary(ctx context.Context, accountID string) (KiroAuth
 	}
 	return KiroAuthSummary{AuthMethod: c.AuthMethod, AuthRegion: c.AuthRegion, APIRegion: c.APIRegion, Endpoint: publicKiroEndpoint(c.Endpoint),
 		HasClientID: c.ClientID != "", HasClientSecret: c.ClientSecret != "", HasProfileARN: c.ProfileARN != "", HasMachineID: c.MachineID != "", HasAPIKey: c.KiroAPIKey != ""}, nil
+}
+
+// AntigravityCredentials holds per-account OAuth and project metadata for the
+// Antigravity (Google Cloud Code) upstream provider.
+type AntigravityCredentials struct {
+	AccountID    string
+	Email        string
+	ProjectID    string
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    int64
+	BaseURL      string // empty = production endpoint
+	UserAgent    string // empty = default Antigravity UA
+	CreatedAt    int64
+	UpdatedAt    int64
+}
+
+func (s *Store) UpsertAntigravityCredentials(ctx context.Context, c AntigravityCredentials) error {
+	now := Now()
+	if c.CreatedAt == 0 {
+		c.CreatedAt = now
+	}
+	c.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO account_antigravity_credentials
+		  (account_id, email, project_id, access_token, refresh_token, expires_at, base_url, user_agent, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(account_id) DO UPDATE SET
+		  email = excluded.email, project_id = excluded.project_id,
+		  access_token = excluded.access_token, refresh_token = excluded.refresh_token,
+		  expires_at = excluded.expires_at, base_url = excluded.base_url,
+		  user_agent = excluded.user_agent, updated_at = excluded.updated_at`,
+		c.AccountID, c.Email, c.ProjectID, c.AccessToken, c.RefreshToken,
+		c.ExpiresAt, c.BaseURL, c.UserAgent, c.CreatedAt, c.UpdatedAt,
+	)
+	return err
+}
+
+func (s *Store) GetAntigravityCredentials(ctx context.Context, accountID string) (AntigravityCredentials, error) {
+	var c AntigravityCredentials
+	err := s.rdb.QueryRowContext(ctx, `
+		SELECT account_id, email, project_id, access_token, refresh_token, expires_at, base_url, user_agent, created_at, updated_at
+		FROM account_antigravity_credentials WHERE account_id = ?`, accountID,
+	).Scan(&c.AccountID, &c.Email, &c.ProjectID, &c.AccessToken, &c.RefreshToken,
+		&c.ExpiresAt, &c.BaseURL, &c.UserAgent, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+// AntigravityCacheEntry tracks a Gemini explicit CachedContent resource created for
+// a given (account, model, conversation-prefix) triple. Subsequent turns in the same
+// conversation reference the resource name so Gemini serves the prefix from its KV
+// cache instead of re-ingesting it. Expired entries are pruned before each request.
+type AntigravityCacheEntry struct {
+	ID                int64
+	AccountID         string
+	ModelID           string
+	ConvKeyHash       string // FNV-64a hex of accountID+"\x00"+modelID+"\x00"+stablePrefix
+	CacheResourceName string // e.g. "projects/.../cachedContents/abc123"
+	TotalTokens       int64
+	ExpiresAt         int64 // Unix seconds; 0 = unknown
+	CreatedAt         int64
+	UpdatedAt         int64
+}
+
+// GetAntigravityCacheEntry returns the cache entry for (account, model, hash), or
+// (zero, false, nil) when none exists or the entry has already expired.
+func (s *Store) GetAntigravityCacheEntry(ctx context.Context, accountID, modelID, convKeyHash string) (AntigravityCacheEntry, bool, error) {
+	var e AntigravityCacheEntry
+	err := s.rdb.QueryRowContext(ctx, `
+		SELECT id, account_id, model_id, conv_key_hash, cache_resource_name, total_tokens, expires_at, created_at, updated_at
+		FROM antigravity_cache_entries
+		WHERE account_id=? AND model_id=? AND conv_key_hash=?`,
+		accountID, modelID, convKeyHash,
+	).Scan(&e.ID, &e.AccountID, &e.ModelID, &e.ConvKeyHash, &e.CacheResourceName,
+		&e.TotalTokens, &e.ExpiresAt, &e.CreatedAt, &e.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return AntigravityCacheEntry{}, false, nil
+	}
+	if err != nil {
+		return AntigravityCacheEntry{}, false, err
+	}
+	// Treat as expired if expires_at is set and already past.
+	if e.ExpiresAt > 0 && e.ExpiresAt <= Now() {
+		return AntigravityCacheEntry{}, false, nil
+	}
+	return e, true, nil
+}
+
+// UpsertAntigravityCacheEntry inserts or replaces the cache entry.
+func (s *Store) UpsertAntigravityCacheEntry(ctx context.Context, e AntigravityCacheEntry) error {
+	now := Now()
+	if e.CreatedAt == 0 {
+		e.CreatedAt = now
+	}
+	e.UpdatedAt = now
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO antigravity_cache_entries
+		  (account_id, model_id, conv_key_hash, cache_resource_name, total_tokens, expires_at, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?)
+		ON CONFLICT(account_id, model_id, conv_key_hash) DO UPDATE SET
+		  cache_resource_name=excluded.cache_resource_name,
+		  total_tokens=excluded.total_tokens,
+		  expires_at=excluded.expires_at,
+		  updated_at=excluded.updated_at`,
+		e.AccountID, e.ModelID, e.ConvKeyHash, e.CacheResourceName,
+		e.TotalTokens, e.ExpiresAt, e.CreatedAt, e.UpdatedAt,
+	)
+	return err
+}
+
+// DeleteAntigravityCacheEntry removes the entry for (account, model, hash). Safe to
+// call when the entry does not exist.
+func (s *Store) DeleteAntigravityCacheEntry(ctx context.Context, accountID, modelID, convKeyHash string) error {
+	_, err := s.db.ExecContext(ctx, `
+		DELETE FROM antigravity_cache_entries WHERE account_id=? AND model_id=? AND conv_key_hash=?`,
+		accountID, modelID, convKeyHash)
+	return err
+}
+
+// PruneExpiredAntigravityCacheEntries deletes all rows whose expires_at is in the past.
+func (s *Store) PruneExpiredAntigravityCacheEntries(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM antigravity_cache_entries WHERE expires_at > 0 AND expires_at <= ?`, Now())
+	return err
 }
 
 func publicKiroEndpoint(raw string) string {
@@ -5642,6 +6137,139 @@ WHERE id = ?`,
 		}
 	}
 	return nil
+}
+
+// backfillUserGroups seeds the user_groups / user_group_targets tables from the
+// legacy groups table (zero-downtime P1 migration). For every existing group G
+// that doesn't already have a user_group record, it:
+//  1. Creates a user_group with id = deterministic UUID v5 (namespace + G.Name),
+//     copying the prompt-injection config verbatim.
+//  2. Adds a user_group_target(target_type='base_group', target_ref=G.Name).
+//  3. Re-points api_keys.user_group_id for all keys in group G (idempotent).
+//
+// Runs inside its own transaction; skips rows that already exist (ON CONFLICT DO NOTHING).
+func (s *Store) backfillUserGroups(ctx context.Context) error {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT `+userGroupCols+` FROM user_groups`)
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var g UserGroup
+		if _, scanErr := scanUserGroup(rows.Scan); scanErr == nil {
+			_ = g
+		}
+		// collect names already present
+		var id, name string
+		_ = rows.Scan(&id, &name)
+	}
+	rows.Close()
+
+	// Re-query to get names only (simpler scan).
+	nameRows, err := s.rdb.QueryContext(ctx, `SELECT name FROM user_groups`)
+	if err != nil {
+		return err
+	}
+	for nameRows.Next() {
+		var n string
+		if err := nameRows.Scan(&n); err != nil {
+			nameRows.Close()
+			return err
+		}
+		existing[n] = true
+	}
+	if err := nameRows.Err(); err != nil {
+		return err
+	}
+	nameRows.Close()
+
+	// Load all legacy groups.
+	gRows, err := s.rdb.QueryContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, created_at FROM groups`)
+	if err != nil {
+		return err
+	}
+	type legacyGroup struct {
+		name, systemPrompt, promptMode, filesJSON, forceModel, forceEffort string
+		apply, miEnabled                                                    int
+		createdAt                                                           int64
+	}
+	var groups []legacyGroup
+	for gRows.Next() {
+		var g legacyGroup
+		if err := gRows.Scan(&g.name, &g.systemPrompt, &g.promptMode, &g.apply, &g.miEnabled, &g.filesJSON, &g.forceModel, &g.forceEffort, &g.createdAt); err != nil {
+			gRows.Close()
+			return err
+		}
+		groups = append(groups, g)
+	}
+	if err := gRows.Err(); err != nil {
+		return err
+	}
+	gRows.Close()
+
+	now := Now()
+	for _, g := range groups {
+		if existing[g.name] {
+			continue
+		}
+		// Deterministic ID: sha256 of "user_group:" + name, hex-encoded first 32 chars.
+		h := sha256userGroupID(g.name)
+		if g.promptMode == "" {
+			g.promptMode = "prepend"
+		}
+		if g.createdAt == 0 {
+			g.createdAt = now
+		}
+		tx, txErr := s.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return txErr
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
+			h, g.name, g.systemPrompt, g.promptMode, g.apply, g.miEnabled, g.filesJSON, g.forceModel, g.forceEffort, g.createdAt, now)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO user_group_targets(user_group_id, target_type, target_ref, affinity_weight, created_at) VALUES(?,?,?,?,?) ON CONFLICT(user_group_id, target_type, target_ref) DO NOTHING`,
+			h, UserGroupTargetTypeBaseGroup, g.name, 1, g.createdAt)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		// Re-point api_keys that are still on the legacy group_name path.
+		_, err = tx.ExecContext(ctx, `UPDATE api_keys SET user_group_id = ?, updated_at = ? WHERE group_name = ? AND (user_group_id = '' OR user_group_id IS NULL)`,
+			h, now, g.name)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sha256userGroupID derives a stable, collision-resistant string ID for a user_group
+// from the group name using the first 32 hex chars of SHA-256("user_group:\x00"+name).
+func sha256userGroupID(name string) string {
+	h := fnv32userGroup("user_group:\x00" + name)
+	// Use a longer deterministic form: hex of the 4-byte FNV hash padded to 32 chars
+	// so it looks like a compact UUID without the google/uuid dependency in storage.
+	return fmt.Sprintf("ug_%016x", h)
+}
+
+func fnv32userGroup(s string) uint64 {
+	const (
+		offset64 uint64 = 14695981039346656037
+		prime64  uint64 = 1099511628211
+	)
+	h := offset64
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime64
+	}
+	return h
 }
 
 // UserUsageRow is a per-model rollup of one portal user's usage (their own console).

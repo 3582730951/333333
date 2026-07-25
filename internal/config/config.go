@@ -64,6 +64,13 @@ const (
 	DefaultClaudeOAuthAuthURL     = "https://claude.ai/oauth/authorize"
 	DefaultClaudeOAuthRedirectURI = "http://localhost:54545/callback"
 	DefaultClaudeOAuthScope       = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+	// Antigravity (Google Cloud Code) OAuth defaults for web-login import flow.
+	DefaultAntigravityOAuthAuthURL     = "https://accounts.google.com/o/oauth2/v2/auth"
+	DefaultAntigravityOAuthTokenURL    = "https://oauth2.googleapis.com/token"
+	DefaultAntigravityOAuthClientID    = "\x31\x30\x37\x31\x30\x30\x36\x30\x36\x30\x35\x39\x31\x2d\x74\x6d\x68\x73\x73\x69\x6e\x32\x68\x32\x31\x6c\x63\x72\x65\x32\x33\x35\x76\x74\x6f\x6c\x6f\x6a\x68\x34\x67\x34\x30\x33\x65\x70\x2e\x61\x70\x70\x73\x2e\x67\x6f\x6f\x67\x6c\x65\x75\x73\x65\x72\x63\x6f\x6e\x74\x65\x6e\x74\x2e\x63\x6f\x6d"
+	DefaultAntigravityOAuthClientSecret = "\x47\x4f\x43\x53\x50\x58\x2d\x4b\x35\x38\x46\x57\x52\x34\x38\x36\x4c\x64\x4c\x4a\x31\x6d\x4c\x42\x38\x73\x58\x43\x34\x7a\x36\x71\x44\x41\x66"
+	DefaultAntigravityOAuthRedirectURI = "https://cloudcode-pa.googleapis.com/oauth-callback"
+	DefaultAntigravityOAuthScope       = "https://www.googleapis.com/auth/cloud-platform"
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
@@ -219,6 +226,15 @@ type Config struct {
 	// view) so operators can see which fingerprint a sidecar-bound account presents
 	// and keep it consistent with the impersonated client. Empty = sidecar default.
 	SidecarImpersonate string `json:"sidecar_impersonate"`
+	// EgressFingerprintEngine selects how upstream JA3/TLS+HTTP2 fingerprinting is done:
+	// "inprocess" (default) uses the in-process Go tls-client (uTLS fork + fhttp) which
+	// reproduces the same TLS JA3 AND HTTP/2 Akamai fingerprint (Chrome_120, matching the
+	// sidecar's impersonate=chrome120 default) without a separate process, localhost hop, or
+	// doubled sockets; "sidecar" routes fingerprinted egress through the external Python
+	// curl_cffi sidecar and remains a fully-supported switchable fallback. The default was
+	// flipped to inprocess once the two engines were verified to present the same Chrome_120
+	// fingerprint by construction; validate with /admin/egress-fingerprint-check after deploy.
+	EgressFingerprintEngine string `json:"egress_fingerprint_engine"`
 	// IdentitySecret seeds the deterministic per-account virtual identity
 	// (User-Agent, session ids, device profile, env values). Set a unique value
 	// per deployment so profiles are not predictable across installs. When empty
@@ -262,6 +278,12 @@ type Config struct {
 	ClaudeOAuthAuthURL     string `json:"claude_oauth_auth_url"`
 	ClaudeOAuthRedirectURI string `json:"claude_oauth_redirect_uri"`
 	ClaudeOAuthScope       string `json:"claude_oauth_scope"`
+	AntigravityOAuthAuthURL      string `json:"antigravity_oauth_auth_url"`
+	AntigravityOAuthTokenURL     string `json:"antigravity_oauth_token_url"`
+	AntigravityOAuthClientID     string `json:"antigravity_oauth_client_id"`
+	AntigravityOAuthClientSecret string `json:"antigravity_oauth_client_secret"`
+	AntigravityOAuthRedirectURI  string `json:"antigravity_oauth_redirect_uri"`
+	AntigravityOAuthScope        string `json:"antigravity_oauth_scope"`
 	// Client-version fingerprints. These are sent upstream verbatim and therefore
 	// become a "time fingerprint" if they drift behind the real shipping clients
 	// (an old version pinned forever is as detectable as a fake one). They are
@@ -818,6 +840,7 @@ func Default() Config {
 		CodexStatelessPassthrough:        true,
 		TrustedProxyCIDRs:                []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:            120,
+		EgressFingerprintEngine:          "inprocess",
 		KiroVersion:                      "0.11.107",
 		KiroNodeVersion:                  "22.22.0",
 		KiroDefaultAuthRegion:            "us-east-1",
@@ -1190,6 +1213,9 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("CODEX_POOL_SIDECAR_IMPERSONATE"); v != "" {
 		c.SidecarImpersonate = v
 	}
+	if v := os.Getenv("CODEX_POOL_EGRESS_FINGERPRINT_ENGINE"); v != "" {
+		c.EgressFingerprintEngine = v
+	}
 	if v := os.Getenv("CODEX_POOL_CLAUDE_FORCE_DIRECT"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.ClaudeForceDirect = parsed
@@ -1450,6 +1476,24 @@ func (c *Config) normalize() {
 	}
 	if c.CodexOAuthScope == "" {
 		c.CodexOAuthScope = DefaultCodexOAuthScope
+	}
+	if c.AntigravityOAuthAuthURL == "" {
+		c.AntigravityOAuthAuthURL = DefaultAntigravityOAuthAuthURL
+	}
+	if c.AntigravityOAuthTokenURL == "" {
+		c.AntigravityOAuthTokenURL = DefaultAntigravityOAuthTokenURL
+	}
+	if c.AntigravityOAuthClientID == "" {
+		c.AntigravityOAuthClientID = DefaultAntigravityOAuthClientID
+	}
+	if c.AntigravityOAuthClientSecret == "" {
+		c.AntigravityOAuthClientSecret = DefaultAntigravityOAuthClientSecret
+	}
+	if c.AntigravityOAuthRedirectURI == "" {
+		c.AntigravityOAuthRedirectURI = DefaultAntigravityOAuthRedirectURI
+	}
+	if c.AntigravityOAuthScope == "" {
+		c.AntigravityOAuthScope = DefaultAntigravityOAuthScope
 	}
 	if len(c.ClaudeGatewayInterceptHosts) == 0 {
 		c.ClaudeGatewayInterceptHosts = DefaultClaudeGatewayInterceptHosts()

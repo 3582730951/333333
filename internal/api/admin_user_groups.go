@@ -1,0 +1,240 @@
+package api
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"codex-account-pool/internal/storage"
+	"github.com/google/uuid"
+)
+
+// adminUserGroups handles collection-level operations on user_groups.
+//
+//	GET  /admin/user-groups  — list all user groups
+//	POST /admin/user-groups  — create a user group; generates a "ug_" prefixed UUID
+func (s *Server) adminUserGroups(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		groups, err := s.store.ListUserGroups(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if groups == nil {
+			groups = []storage.UserGroup{}
+		}
+		writeJSON(w, http.StatusOK, groups)
+	case http.MethodPost:
+		var req storage.UserGroup
+		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("name required"))
+			return
+		}
+		req.ID = "ug_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		if err := s.store.CreateUserGroup(r.Context(), req); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		created, ok, err := s.store.GetUserGroup(r.Context(), req.ID)
+		if err != nil || !ok {
+			writeJSON(w, http.StatusCreated, req)
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+// adminUserGroupsAction dispatches sub-paths under /admin/user-groups/:
+//
+//	GET/PUT/DELETE /admin/user-groups/{id}
+//	GET/POST       /admin/user-groups/{id}/targets
+//	DELETE         /admin/user-groups/{id}/targets/{tid}
+func (s *Server) adminUserGroupsAction(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/user-groups/"), "/")
+	parts := strings.Split(rest, "/")
+	switch len(parts) {
+	case 1:
+		s.adminUserGroupsItem(w, r, parts[0])
+	case 2:
+		if parts[1] == "targets" {
+			s.adminUserGroupTargets(w, r, parts[0])
+		} else {
+			http.NotFound(w, r)
+		}
+	case 3:
+		if parts[1] == "targets" {
+			s.adminUserGroupTargetItem(w, r, parts[0], parts[2])
+		} else {
+			http.NotFound(w, r)
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// adminUserGroupsItem handles GET/PUT/DELETE /admin/user-groups/{id}.
+func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		g, ok, err := s.store.GetUserGroup(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, g)
+	case http.MethodPut:
+		var req storage.UserGroup
+		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("name required"))
+			return
+		}
+		req.ID = id
+		if err := s.store.UpdateUserGroup(r.Context(), req); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		updated, ok, err := s.store.GetUserGroup(r.Context(), id)
+		if err != nil || !ok {
+			writeJSON(w, http.StatusOK, req)
+			return
+		}
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.store.DeleteUserGroup(r.Context(), id); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": id})
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+// adminUserGroupTargets handles GET/POST /admin/user-groups/{id}/targets.
+func (s *Server) adminUserGroupTargets(w http.ResponseWriter, r *http.Request, groupID string) {
+	if groupID == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		targets, err := s.store.GetUserGroupTargets(r.Context(), groupID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if targets == nil {
+			targets = []storage.UserGroupTarget{}
+		}
+		writeJSON(w, http.StatusOK, targets)
+	case http.MethodPost:
+		var req storage.UserGroupTarget
+		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		req.UserGroupID = groupID
+		if strings.TrimSpace(req.TargetType) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("target_type required"))
+			return
+		}
+		if err := s.store.UpsertUserGroupTarget(r.Context(), req); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		targets, err := s.store.GetUserGroupTargets(r.Context(), groupID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if targets == nil {
+			targets = []storage.UserGroupTarget{}
+		}
+		writeJSON(w, http.StatusCreated, targets)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+// adminUserGroupTargetItem handles DELETE /admin/user-groups/{id}/targets/{tid}.
+func (s *Server) adminUserGroupTargetItem(w http.ResponseWriter, r *http.Request, groupID, tidStr string) {
+	if groupID == "" || tidStr == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodDelete {
+		methodNotAllowed(w)
+		return
+	}
+	tid, err := strconv.ParseInt(tidStr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid target id: %w", err))
+		return
+	}
+	if err := s.store.RemoveUserGroupTarget(r.Context(), tid); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": tid})
+}
+
+// adminAPIKeySetUserGroup handles POST /admin/api-keys/{hash}/user-group.
+// It links (or clears) the user_group_id on the given api key.
+func (s *Server) adminAPIKeySetUserGroup(w http.ResponseWriter, r *http.Request, keyHash string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	var req struct {
+		UserGroupID string `json:"user_group_id"`
+	}
+	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	userGroupID := strings.TrimSpace(req.UserGroupID)
+	if userGroupID != "" {
+		if _, ok, err := s.store.GetUserGroup(r.Context(), userGroupID); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("user_group %q not found", userGroupID))
+			return
+		}
+	}
+	if err := s.store.SetAPIKeyUserGroup(r.Context(), keyHash, userGroupID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"key_hash":      keyHash,
+		"user_group_id": userGroupID,
+	})
+}

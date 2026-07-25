@@ -1,9 +1,10 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import * as PoolUI from './pool/index.jsx';
 import { IconPlus } from './pool/icons.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import { t } from '../lib/i18n.js';
+import { get } from '../api.js';
 import type { ApiKeyCreateInput } from '../features/access/model/keys';
 
 const { Button, Form, Modal } = PoolUI as any;
@@ -15,6 +16,7 @@ interface RawKeyForm {
   force_effort?: unknown;
   expires_at?: unknown;
   group_name?: unknown;
+  user_group_id?: unknown;
 }
 interface LegacyFormApi {
   reset?: () => void;
@@ -45,6 +47,7 @@ export function cleanApiKeyValues(values: RawKeyForm, mode: KeyMode): ApiKeyCrea
   }
   if (mode === 'admin') {
     cleaned.group_name = String(values.group_name || '').trim();
+    cleaned.user_group_id = String(values.user_group_id || '').trim();
   }
   return cleaned;
 }
@@ -57,6 +60,18 @@ export default function ApiKeyCreateModal({
 }: ApiKeyCreateModalProps) {
   const formApi = useRef<LegacyFormApi | null>(null);
   const admin = mode === 'admin';
+  const [userGroups, setUserGroups] = useState<Array<{ id: string; name: string }>>([]);
+
+  useEffect(() => {
+    if (visible && admin) {
+      get('/admin/user-groups')
+        .then((res) => {
+          const groups = Array.isArray(res) ? res : res?.user_groups || [];
+          setUserGroups(groups);
+        })
+        .catch(() => setUserGroups([]));
+    }
+  }, [visible, admin]);
 
   const { run: submit, running: submitting } = useAsyncAction(async (values: RawKeyForm) => {
     try {
@@ -94,6 +109,18 @@ export default function ApiKeyCreateModal({
           />
         ) : null}
         {admin ? <Form.Input field="group_name" label={t('keys.group')} placeholder={t('users.optional')} /> : null}
+        {admin && userGroups.length > 0 ? (
+          <Form.Select
+            field="user_group_id"
+            label="用户分组"
+            placeholder="可选（多目标路由）"
+            optionList={[
+              { label: '不使用用户分组', value: '' },
+              ...userGroups.map((g) => ({ label: g.name, value: g.id })),
+            ]}
+            initValue=""
+          />
+        ) : null}
         <Form.Input field="force_model" label={t('keys.force_model')} placeholder={t('keys.force_model_hint')} />
         <Form.Select field="force_effort" label={t('keys.effort')} optionList={effortOptions()} initValue="" />
         {admin ? <Form.Input field="expires_at" label={t('keys.expires_at')} placeholder={t('keys.expires_hint')} /> : null}

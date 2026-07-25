@@ -81,6 +81,22 @@ func newFakeSidecar(t *testing.T, cap *sidecarCapture) *httptest.Server {
 	}))
 }
 
+// sidecarEngineConfig returns a Default() config pinned to the curl_cffi sidecar
+// egress engine. The production default is now the in-process TLS fingerprinter
+// (EgressFingerprintEngine="inprocess"); on that default a client.Do call bound to
+// a curl_cffi_sidecar egress bypasses the fake sidecar and reaches the real
+// upstream instead. Every test that asserts on the forwarded sidecar envelope
+// (target URL / headers / body / ja3 / default_headers captured via newFakeSidecar)
+// must opt back into the sidecar engine so the fake sidecar is actually contacted
+// and the assertions are genuine rather than vacuous. The in-process path has its
+// own fidelity validation via the reflector (/admin/egress-fingerprint-check), not
+// these sidecar wire-protocol tests.
+func sidecarEngineConfig() config.Config {
+	cfg := config.Default()
+	cfg.EgressFingerprintEngine = "sidecar"
+	return cfg
+}
+
 // TestClaudeRoutesThroughSidecarWithClaudeHeaders is the core anti-fingerprint
 // fix: a Claude account bound to a curl_cffi_sidecar egress must EGRESS THROUGH
 // the sidecar (for a real client TLS/JA3 fingerprint), and the forwarded request
@@ -90,7 +106,7 @@ func TestClaudeRoutesThroughSidecarWithClaudeHeaders(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	cfg.ClaudeUpstreamBaseURL = "https://api.anthropic.com"
 	client := NewClient(cfg)
 
@@ -234,7 +250,7 @@ func TestClaudeAccountSidecarWrapperChainsThroughSelectedProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := NewClient(config.Default())
+	client := NewClient(sidecarEngineConfig())
 	resp, err := client.Do(nilContext(t), Request{
 		Method:         http.MethodPost,
 		Provider:       "claude",
@@ -266,7 +282,7 @@ func TestClaudeCLIVersionOverrideAppliesToHeaders(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	cfg.ClaudeCLIVersionOverride = "9.9.9"
 	cfg.ClaudeNodeVersion = "v30.0.0"
 	cfg.ClaudeStainlessVersion = "0.99.0"
@@ -311,7 +327,7 @@ func TestClaudeSidecarDefaultsToChromeJA3(t *testing.T) {
 		var cap sidecarCapture
 		sidecar := newFakeSidecar(t, &cap)
 
-		cfg := config.Default()
+		cfg := sidecarEngineConfig()
 		client := NewClient(cfg)
 		resp, err := client.Do(nilContext(t), Request{
 			Provider:       "claude",
@@ -342,7 +358,7 @@ func TestClaudeJA3OptInReplaysRealClaudeJA3(t *testing.T) {
 		var cap sidecarCapture
 		sidecar := newFakeSidecar(t, &cap)
 
-		cfg := config.Default()
+		cfg := sidecarEngineConfig()
 		cfg.ClaudeJA3Override = override
 		client := NewClient(cfg)
 		resp, err := client.Do(nilContext(t), Request{
@@ -372,7 +388,7 @@ func TestClaudeJA3DisableKeepsChrome(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	cfg.ClaudeJA3Override = "off"
 	client := NewClient(cfg)
 
@@ -410,7 +426,7 @@ func TestClaudeSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
 		var cap sidecarCapture
 		sidecar := newFakeSidecar(t, &cap)
 
-		client := NewClient(config.Default())
+		client := NewClient(sidecarEngineConfig())
 		resp, err := client.Do(nilContext(t), Request{
 			Provider:       "claude",
 			DownstreamPath: "/v1/messages",
@@ -448,7 +464,7 @@ func TestCodexOAuthSidecarKeepsBrowserDefaultHeaders(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	client := NewClient(sidecarEngineConfig())
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "codex",
 		DownstreamPath: "/responses",

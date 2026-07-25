@@ -23,6 +23,7 @@ import (
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream/tlsclient"
 	"golang.org/x/net/proxy"
 )
 
@@ -46,6 +47,17 @@ type Client struct {
 	tmu            sync.Mutex
 	transports     map[string]*http.Transport
 	sidecars       *sidecarAdaptiveController
+	// tlsFactory is the in-process TLS/HTTP2 fingerprinting engine (bogdanfinn/tls-client).
+	// It is the switchable replacement for the external curl_cffi sidecar; a sidecar egress
+	// routes through it instead of the Python process when EgressFingerprintEngine=="inprocess".
+	tlsFactory *tlsclient.Factory
+}
+
+// inProcessFingerprint reports whether sidecar-bound egress should route through the
+// in-process tls-client engine instead of the external curl_cffi sidecar. It reads the
+// hot config overlay so an admin can flip the engine without a restart.
+func (c *Client) inProcessFingerprint() bool {
+	return strings.EqualFold(strings.TrimSpace(c.cfgSnapshot().EgressFingerprintEngine), "inprocess")
 }
 
 // cfgSnapshot returns the live config overlay when an admin has pushed one via
@@ -354,6 +366,7 @@ func NewClient(cfg config.Config) *Client {
 		jars:           newJarLRU(0),
 		transports:     map[string]*http.Transport{},
 		sidecars:       newSidecarAdaptiveController(),
+		tlsFactory:     tlsclient.New(),
 	}
 }
 
@@ -620,6 +633,12 @@ func (c *Client) doSidecar(ctx context.Context, spec Request) (*Response, error)
 	// API keys are ordinary SDK traffic, so their complete header set must not be
 	// mixed with injected sec-ch-ua/sec-fetch browser headers.
 	defaultHeaders := !AccountUsesAPIKey(spec.Token)
+	// In-process fingerprint engine: route through tls-client (Chrome_120, matching the
+	// sidecar's chrome120 default) instead of the external Python process. The sidecar
+	// remains the fallback whenever the engine is left on "sidecar".
+	if c.inProcessFingerprint() {
+		return c.postInProcess(ctx, spec, target, built, c.cfg.SidecarTimeout(), ja3, tlsclient.ProfileChrome)
+	}
 	return c.postViaSidecar(ctx, spec, target, built, c.cfg.SidecarTimeout(), ja3, defaultHeaders)
 }
 

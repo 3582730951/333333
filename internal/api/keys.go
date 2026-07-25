@@ -146,8 +146,19 @@ func (s *Server) adminAPIKeyAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/api-keys/"), "/")
-	if hash == "" || strings.Contains(hash, "/") {
+	if hash == "" {
 		http.NotFound(w, r)
+		return
+	}
+	// Dispatch sub-paths: /admin/api-keys/{hash}/user-group
+	if idx := strings.Index(hash, "/"); idx >= 0 {
+		keyHash := hash[:idx]
+		sub := hash[idx+1:]
+		if sub == "user-group" {
+			s.adminAPIKeySetUserGroup(w, r, keyHash)
+		} else {
+			http.NotFound(w, r)
+		}
 		return
 	}
 	switch r.Method {

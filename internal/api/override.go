@@ -30,6 +30,8 @@ type downstreamPolicy struct {
 	KeyHash             string
 	UserID              string
 	Authed              bool
+	// UserGroupID, when set, means the key uses the two-layer group model.
+	UserGroupID         string
 	ModelOverrideSource string
 }
 
@@ -202,6 +204,9 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				}
 				pol.ForceEffort = strings.TrimSpace(key.ForceEffort)
 				pol.ProviderHint = normalizeProviderHintLoose(key.ProviderHint)
+				if strings.TrimSpace(key.UserGroupID) != "" {
+					pol.UserGroupID = key.UserGroupID
+				}
 			}
 		} else if isPoolImportKeyPlain(plain) {
 			writeError(w, http.StatusForbidden, errors.New("pool import key cannot be used for inference"))
@@ -216,15 +221,30 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 	}
 	// Group-level fallback for any force value the key did not set.
 	if pol.ForceModel == "" || pol.ForceEffort == "" {
-		if g, err := s.store.GetGroup(ctx, pol.Group); err == nil {
-			if pol.ForceModel == "" {
-				pol.ForceModel = strings.TrimSpace(g.ForceModel)
-				if pol.ForceModel != "" {
-					pol.ModelOverrideSource = "group"
+		if pol.UserGroupID != "" {
+			if ug, ok, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && ok {
+				if pol.ForceModel == "" {
+					pol.ForceModel = strings.TrimSpace(ug.ForceModel)
+					if pol.ForceModel != "" {
+						pol.ModelOverrideSource = "user_group"
+					}
+				}
+				if pol.ForceEffort == "" {
+					pol.ForceEffort = strings.TrimSpace(ug.ForceEffort)
 				}
 			}
-			if pol.ForceEffort == "" {
-				pol.ForceEffort = strings.TrimSpace(g.ForceEffort)
+		}
+		if pol.ForceModel == "" || pol.ForceEffort == "" {
+			if g, err := s.store.GetGroup(ctx, pol.Group); err == nil {
+				if pol.ForceModel == "" {
+					pol.ForceModel = strings.TrimSpace(g.ForceModel)
+					if pol.ForceModel != "" {
+						pol.ModelOverrideSource = "group"
+					}
+				}
+				if pol.ForceEffort == "" {
+					pol.ForceEffort = strings.TrimSpace(g.ForceEffort)
+				}
 			}
 		}
 	}
@@ -242,7 +262,7 @@ func normalizeProviderHintLoose(v string) string {
 func normalizeProviderHint(v string) (string, bool) {
 	v = normalizeProviderHintLoose(v)
 	switch v {
-	case "auto", "codex", "claude", "kiro":
+	case "auto", "codex", "claude", "kiro", "antigravity":
 		return v, true
 	}
 	if strings.HasPrefix(v, "custom:") && strings.TrimPrefix(v, "custom:") != "" {
@@ -263,6 +283,8 @@ func claudeAllowedProviders(r *http.Request, pol downstreamPolicy) ([]string, er
 		return []string{"claude"}, nil
 	case "kiro":
 		return []string{"kiro"}, nil
+	case "antigravity":
+		return []string{"antigravity"}, nil
 	default:
 		return nil, errors.New("Claude-family inference provider must be auto, claude, or kiro")
 	}

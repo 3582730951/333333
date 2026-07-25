@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream/tlsclient"
 )
 
 // DoRaw performs a provider-neutral request while retaining the pool's egress and
@@ -17,6 +18,15 @@ import (
 // and wire protocol are neither Codex nor Anthropic HTTP.
 func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
 	if strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
+		// In-process fingerprint engine: route native-adapter egress (Kiro's aws-sdk-js
+		// calls, Codex/WHAM reset-credit/quota/registration calls) through tls-client with
+		// the per-client profile instead of the external curl_cffi sidecar. The profile is
+		// derived from the User-Agent so aws-sdk-js (Kiro/Node) and Codex (Chrome) each get
+		// the right fingerprint without changing this provider-neutral signature. The
+		// sidecar stays the fallback whenever the engine is left on "sidecar".
+		if c.inProcessFingerprint() {
+			return c.doRawInProcess(ctx, egress, method, rawURL, headers, body, cookieJarKey, rawProfileForHeaders(headers), nil)
+		}
 		return c.DoViaSidecar(ctx, egress, method, rawURL, headers, body, cookieJarKey)
 	}
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
@@ -70,6 +80,20 @@ func (c *Client) EgressHTTPClient(egress storage.EgressProfile) (*http.Client, e
 		Jar:       jar,
 		Timeout:   90 * time.Second,
 	}, nil
+}
+
+// rawProfileForHeaders picks the in-process tls-client profile for a provider-neutral
+// DoRaw call from its User-Agent. Kiro's traffic (KiroIDE Node and ksk_ Amazon Q alike)
+// is emitted by aws-sdk-js over Node.js, so it maps to ProfileNode; everything else
+// (Codex/WHAM reset-credit, quota, agent registration) keeps the Chrome default. Node
+// currently resolves to Chrome_120 in tlsclient.ResolveProfile — a safe placeholder until
+// a validated aws-sdk-js capture replaces it (the non-negotiable fingerprint gate).
+func rawProfileForHeaders(headers http.Header) string {
+	ua := strings.ToLower(headers.Get("User-Agent") + " " + headers.Get("x-amz-user-agent"))
+	if strings.Contains(ua, "aws-sdk-js") || strings.Contains(ua, "kiroide") {
+		return tlsclient.ProfileNode
+	}
+	return tlsclient.ProfileChrome
 }
 
 // proxyTypeForURL maps a proxy URL scheme onto the egress Type that

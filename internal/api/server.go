@@ -261,6 +261,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/accounts/", s.adminAccountAction)
 	s.mux.HandleFunc("/admin/egress-profiles", s.adminEgressProfiles)
 	s.mux.HandleFunc("/admin/egress-profiles/", s.adminEgressProfileAction)
+	// A2 fidelity-diff: verify in-process vs sidecar JA3/JA4/Akamai against a reflector.
+	s.mux.HandleFunc("/admin/egress-fingerprint-check", s.adminEgressFingerprintCheck)
 	s.mux.HandleFunc("/admin/providers", s.adminProviders)
 
 	// Lifecycle management API routes
@@ -308,6 +310,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/projects", s.adminProjects)
 	s.mux.HandleFunc("/admin/api-keys", s.adminAPIKeys)
 	s.mux.HandleFunc("/admin/api-keys/", s.adminAPIKeyAction)
+	s.mux.HandleFunc("/admin/user-groups", s.adminUserGroups)
+	s.mux.HandleFunc("/admin/user-groups/", s.adminUserGroupsAction)
 	// Thinking (deep reasoning) configuration APIs
 	s.mux.HandleFunc("/admin/thinking", s.handleThinkingConfig)
 	s.mux.HandleFunc("/admin/thinking/preview", s.handlePreviewThinking)

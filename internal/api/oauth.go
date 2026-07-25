@@ -18,6 +18,7 @@ import (
 
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/storage"
 )
 
 // oauth.go implements the web-login (paste-back) account import flow for both
@@ -132,8 +133,17 @@ func (s *Server) oauthProvider(name string) (oauthProviderDesc, error) {
 			redirectURI: s.cfg.ClaudeOAuthRedirectURI,
 			scope:       s.cfg.ClaudeOAuthScope,
 		}, nil
+	case "antigravity", "google":
+		return oauthProviderDesc{
+			provider:    "antigravity",
+			authURL:     s.cfg.AntigravityOAuthAuthURL,
+			tokenURL:    s.cfg.AntigravityOAuthTokenURL,
+			clientID:    s.cfg.AntigravityOAuthClientID,
+			redirectURI: s.cfg.AntigravityOAuthRedirectURI,
+			scope:       s.cfg.AntigravityOAuthScope,
+		}, nil
 	default:
-		return oauthProviderDesc{}, fmt.Errorf("unknown provider %q (use codex or claude)", name)
+		return oauthProviderDesc{}, fmt.Errorf("unknown provider %q (use codex, claude, or antigravity)", name)
 	}
 }
 
@@ -183,6 +193,9 @@ func (d oauthProviderDesc) authorizeURLWithOptions(challenge, state string, opts
 		if allowed := strings.TrimSpace(opts.AllowedWorkspaceID); allowed != "" {
 			params.Set("allowed_workspace_id", allowed)
 		}
+	} else if d.provider == "antigravity" {
+		params.Set("access_type", "offline")
+		params.Set("prompt", "consent")
 	} else {
 		params.Set("code", "true")
 	}
@@ -382,6 +395,8 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		parsed, err = s.exchangeCodexCode(r.Context(), desc, code, pend.verifier)
 	case "claude":
 		parsed, err = s.exchangeClaudeCode(r.Context(), desc, code, firstNonEmpty(state, pend.state), pend.verifier)
+	case "antigravity":
+		parsed, err = s.exchangeAntigravityCode(r.Context(), code, desc.redirectURI, pend.verifier)
 	default:
 		err = fmt.Errorf("unknown provider %q", pend.provider)
 	}
@@ -522,4 +537,71 @@ func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, co
 	subscriptionType := firstNonEmpty(tr.SubscriptionType, tr.ClaudeAiOauth.SubscriptionType)
 	rateLimitTier := firstNonEmpty(tr.RateLimitTier, tr.ClaudeAiOauth.RateLimitTier)
 	return authparse.ParseOAuthClaudeMetadata(tr.AccessToken, tr.RefreshToken, tr.Account.EmailAddress, subscriptionType, rateLimitTier, expiresAt, scopes)
+}
+
+// exchangeAntigravityCode runs the Google OAuth2 authorization-code → tokens exchange
+// for Antigravity credentials. Returns a ParsedAuth with provider="antigravity".
+func (s *Server) exchangeAntigravityCode(ctx context.Context, code, redirectURI, verifier string) (authparse.ParsedAuth, error) {
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {s.cfg.AntigravityOAuthClientID},
+		"client_secret": {s.cfg.AntigravityOAuthClientSecret},
+		"code":          {code},
+		"redirect_uri":  {redirectURI},
+		"code_verifier": {verifier},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.AntigravityOAuthTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", oauthUserAgent)
+	resp, err := oauthHTTPClient().Do(req)
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return authparse.ParsedAuth{}, fmt.Errorf("google token exchange failed (%d): %s", resp.StatusCode, bodySnippet(body, 300))
+	}
+	var tr struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		TokenType    string `json:"token_type"`
+		Scope        string `json:"scope"`
+	}
+	if err := json.Unmarshal(body, &tr); err != nil {
+		return authparse.ParsedAuth{}, fmt.Errorf("parse token response: %w", err)
+	}
+
+	expiresAt := time.Now().Unix() + tr.ExpiresIn
+
+	// Extract email from ID token or userinfo endpoint (Google doesn't return email in token response)
+	email := ""
+
+	// Persist via storage
+	creds := storage.AntigravityCredentials{
+		Email:        email,
+		ProjectID:    "", // Will be set later via admin UI
+		AccessToken:  tr.AccessToken,
+		RefreshToken: tr.RefreshToken,
+		ExpiresAt:    expiresAt,
+		BaseURL:      "https://cloudcode-pa.googleapis.com",
+		UserAgent:    "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)",
+	}
+
+	if err := s.store.UpsertAntigravityCredentials(ctx, creds); err != nil {
+		return authparse.ParsedAuth{}, fmt.Errorf("persist antigravity credentials: %w", err)
+	}
+
+	return authparse.ParsedAuth{
+		Provider:     "antigravity",
+		Email:        email,
+		AccessToken:  tr.AccessToken,
+		RefreshToken: tr.RefreshToken,
+		ExpiresAt:    expiresAt,
+	}, nil
 }

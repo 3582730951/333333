@@ -15,6 +15,7 @@ import (
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream/tlsclient"
 )
 
 // Official Claude Code anti-fingerprint constants (see cliproxyapi-reference).
@@ -115,6 +116,11 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		// JA3 is set, the sidecar disables its impersonation default headers and uses
 		// exactly the header set built above.
 		ja3 := resolveClaudeJA3(c.cfgSnapshot().ClaudeJA3Override)
+		// In-process fingerprint engine: route through tls-client (Chrome_120) instead of
+		// the external curl_cffi sidecar. The sidecar stays the fallback on engine "sidecar".
+		if c.inProcessFingerprint() {
+			return c.postInProcess(ctx, claudeSpec, target, built, timeout, ja3, tlsclient.ProfileChrome)
+		}
 		return c.postViaSidecar(ctx, claudeSpec, target, built, timeout, ja3, false)
 	}
 

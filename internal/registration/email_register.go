@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 )
 
 // EmailRegOrchestrator manages email-based registration workflows.
@@ -120,6 +121,7 @@ func (o *EmailRegOrchestrator) CancelJob(jobID string) error {
 
 // runJob is the main worker loop for a registration job.
 func (o *EmailRegOrchestrator) runJob(ctx context.Context, job *EmailRegJob) {
+	defer supervisor.Recover("registration.email_run_job")
 	defer func() {
 		o.mu.Lock()
 		delete(o.jobs, job.ID)
@@ -141,6 +143,7 @@ func (o *EmailRegOrchestrator) runJob(ctx context.Context, job *EmailRegJob) {
 
 		wg.Add(1)
 		go func(idx int) {
+			defer supervisor.Recover("registration.email_register_one")
 			defer wg.Done()
 			defer func() { <-sem }()
 			o.registerOne(ctx, job)

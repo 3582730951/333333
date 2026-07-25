@@ -99,7 +99,9 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 	headers := http.Header{"Content-Type": {"application/json"}, "Accept": {"application/json, text/plain, */*"}, "Connection": {"close"}}
 	if cred.AuthMethod == "idc" {
 		headers.Set("x-amz-user-agent", "aws-sdk-js/3.980.0 KiroIDE")
-		headers.Set("user-agent", fmt.Sprintf("aws-sdk-js/3.980.0 ua/2.1 os/linux lang/js md/nodejs#%s api/sso-oidc#3.980.0 m/E KiroIDE", first(cfg.KiroNodeVersion, "22.22.0")))
+		// Use per-account stable OS token (darwin/win32 only, matching real Kiro IDE).
+		// The idc refresh path previously sent os/linux, a fleet-wide correlation tell.
+		headers.Set("user-agent", fmt.Sprintf("aws-sdk-js/3.980.0 ua/2.1 os/%s lang/js md/nodejs#%s api/sso-oidc#3.980.0 m/E KiroIDE", kiroOSToken(first(account.ID, cred.AccountID)), first(cfg.KiroNodeVersion, "22.22.0")))
 		headers.Set("amz-sdk-invocation-id", uuid.NewString())
 		headers.Set("amz-sdk-request", "attempt=1; max=4")
 	} else {

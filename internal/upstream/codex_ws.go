@@ -17,6 +17,7 @@ import (
 
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
+	"codex-account-pool/internal/upstream/tlsclient"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/sjson"
 	"golang.org/x/net/proxy"
@@ -271,6 +272,22 @@ func (c *Client) codexWebSocketDialerForEgress(egress storage.EgressProfile) (*w
 
 	switch egress.Type {
 	case "", "direct", "curl_cffi_sidecar":
+		// In-process fingerprint engine: give the WebSocket handshake the SAME Chrome_120
+		// TLS fingerprint the HTTP path presents, instead of the Go stdlib TLS stack. Without
+		// this the /responses WS transport would leak a plain-Go ClientHello while the HTTP
+		// transport shows Chrome — an incoherent split fingerprint across one account. The
+		// tls-client dialer also honors the sidecar egress's chain proxy (embedded via the
+		// factory's WithProxyUrl), so traffic still leaves from the intended exit IP.
+		if egress.Type == "curl_cffi_sidecar" && c.inProcessFingerprint() {
+			tlsDialer, err := c.tlsFactory.TLSDialerFor(tlsclient.Request{
+				Profile:  tlsclient.ProfileChrome,
+				ProxyURL: strings.TrimSpace(egress.ChainProxy),
+			})
+			if err != nil {
+				return nil, err
+			}
+			dialer.NetDialTLSContext = tlsDialer
+		}
 		return &dialer, nil
 	case "http_proxy", "https_proxy", "warp_proxy":
 		if egress.Endpoint == "" {

@@ -39,6 +39,20 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	}
 	setKiroQualityHeaders(w, converted)
 	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+	// A streaming Kiro attempt has a silent pre-first-token window (cache-singleflight
+	// wait + token refresh inside openKiroAttempt + upstream time-to-first-byte). With
+	// no downstream bytes during that window a busy pool can exceed the client's
+	// idle-SSE timeout ("idle timeout waiting for SSE"). Declare trailers now — before a
+	// keepalive comment could commit response headers and drop the Trailer declarations —
+	// then bridge the window with SSE keepalive comments. stopKeepalive is synchronous, so
+	// no comment can trail the first real emitted frame. WebSearch buffers internally and
+	// takes its own branch, so it is left untouched.
+	stopKeepalive := func() {}
+	if converted.WebSearch == nil && isStreamRequest(raw) {
+		declareKiroTrailers(w)
+		stopKeepalive = startSchedulerWaitKeepalive(r.Context(), s.streamKeepAliveInterval(r.Context()))
+	}
+	defer stopKeepalive()
 	releaseFlight, waitedForFlight := func() (func(), bool) {
 		if converted.WebSearch != nil {
 			return func() {}, false
@@ -75,12 +89,15 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	}
 	if isStreamRequest(raw) {
 		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
+		// Stop the keepalive synchronously before any emitter write. The emitter writes
+		// straight to w, bypassing schedulerWaitState's mutex, so a trailing keepalive
+		// tick must be guaranteed gone before the first real frame (success or error).
+		stopKeepalive()
 		if response == nil {
 			return outcome
 		}
 		defer response.Body.Close()
 		emitter := newKiroAnthropicEmitter(w, func(metering kirowire.KiroMetering, actualModel string) {
-			declareKiroTrailers(w)
 			usageSource := metering.UsageSource()
 			if usageSource == kirowire.UsageSourceUnreported {
 				usageSource = kirowire.UsageSourceEstimated
@@ -175,6 +192,16 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 	}
 	setKiroQualityHeaders(w, converted)
 	resolvedModel := firstNonEmpty(converted.Model, lease.ResolvedModel, model)
+	// Bridge the silent pre-first-token window with SSE keepalive comments; see
+	// kiroMessagesWithLease for the full rationale. Trailers are declared before the
+	// keepalive can commit headers, and stopKeepalive is synchronous so no comment can
+	// trail the first real frame written by the anthropicStreamToChatSSE goroutine.
+	stopKeepalive := func() {}
+	if converted.WebSearch == nil && isStreamRequest(anthBody) {
+		declareKiroTrailers(w)
+		stopKeepalive = startSchedulerWaitKeepalive(r.Context(), s.streamKeepAliveInterval(r.Context()))
+	}
+	defer stopKeepalive()
 	releaseFlight, waitedForFlight := func() (func(), bool) {
 		if converted.WebSearch != nil {
 			return func() {}, false
@@ -210,6 +237,9 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 	}
 	if isStreamRequest(anthBody) {
 		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
+		// Stop the keepalive synchronously before startChat can spawn the SSE-writing
+		// goroutine, so no keepalive comment can interleave with a real frame on w.
+		stopKeepalive()
 		if response == nil {
 			return outcome
 		}
@@ -222,7 +252,6 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 				return
 			}
 			started = true
-			declareKiroTrailers(w)
 			usageSource := metering.UsageSource()
 			if usageSource == kirowire.UsageSourceUnreported {
 				usageSource = kirowire.UsageSourceEstimated
@@ -328,6 +357,17 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 		// Code summarization call only, a paid + runtime-verified 1M-capable model
 		// may use its technical window so /compact cannot be blocked by the 200K
 		// preflight it is meant to recover from.
+		effectiveContextMode = "1m"
+	}
+	// For non-compaction Claude requests on PRO plans with a 1M-capable model,
+	// automatically upgrade to the 1M window so Claude Code users get the full
+	// context (claude-opus-4.8, claude-sonnet-4.6, etc.) without needing the
+	// [1m] model suffix. GPT models are excluded: they use their own documented
+	// window via KiroContextWindow and are not entitled to the Claude 1M beta.
+	// This never fires when the client already specified a contextMode — their
+	// explicit preference wins.
+	if effectiveContextMode == "" && !compaction && !capability.KiroSupportsGPTModel(capabilityModel) &&
+		capability.KiroPlanAllows1M(lease.Account.PlanType, capabilityModel) {
 		effectiveContextMode = "1m"
 	}
 	measuredWindow := int64(0)

@@ -193,6 +193,22 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// Two-layer group model: override pol.Group / allowedProviders from user_group targets.
+	if pol.UserGroupID != "" {
+		if rg, rp, ugErr := resolveUserGroupRoute(r.Context(), s.store, pol, r, raw); ugErr == nil {
+			if rg != "" {
+				pol.Group = rg
+			}
+			if rp != "" && rp != "auto" {
+				pol.ProviderHint = rp
+				allowedProviders, routeMode, err = s.resolveClaudeProviders(r.Context(), r, pol)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, err)
+					return
+				}
+			}
+		}
+	}
 	affinity := namespaceClaudeAffinity(s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, requestedModel.RequestedModel), routeMode, requestedModel.ContextMode)
 	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
 	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
@@ -305,6 +321,13 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			return s.kiroCountTokensWithLease(w, r, raw, affinity, lease)
 		}
 		return s.kiroMessagesWithLease(w, r, raw, model, affinity, lease, false, nil)
+	}
+	if lease.Account.Provider == "antigravity" {
+		if countTokens {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
+			return outcomeDone
+		}
+		return s.antigravityMessagesWithLease(w, r, raw, model, lease)
 	}
 	resolvedModel := firstNonEmpty(lease.ResolvedModel, model)
 	if resolvedModel != model {

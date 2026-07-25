@@ -195,7 +195,7 @@ func TestClaudeMessagesFinalSanitizerBeforeSidecar(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	cfg := config.Default()
+	cfg := sidecarEngineConfig()
 	client := NewClient(cfg)
 	body := []byte(`{"model":"claude-x","stream":true,"metadata":{"user_id":"real-user"},"betas":["body-beta-2099"],"thinking":{"type":"enabled","budget_tokens":1000},"output_config":{"effort":"high"},"tool_choice":{"type":"any"},"tools":[{"type":"web_search_20250305","name":"web_search","allowed_domains":[],"blocked_domains":[]},{"type":"web_search_20250305","name":"web_search_strict","allowed_domains":["example.com"],"blocked_domains":["bad.com"]}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -255,7 +255,7 @@ func TestClaudeMessagesFinalSanitizerNormalizesThinkingSampling(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	client := NewClient(sidecarEngineConfig())
 	body := []byte(`{"model":"claude-x","stream":true,"temperature":0.2,"top_p":0.7,"top_k":20,"thinking":{"type":"enabled","budget_tokens":1000},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
@@ -293,7 +293,7 @@ func TestClaudeMessagesFinalSanitizerStripsHistoryProvenance(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	client := NewClient(sidecarEngineConfig())
 	body := []byte(`{"model":"claude-x","stream":true,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"cmd":"pwd"},"signature":"sig","thoughtSignature":"ts","thought_signature":"ts2","model":"foreign","extra_content":{"google":{"thought_signature":"gts"}}},{"type":"thinking","text":"","signature":""},{"type":"text","text":"kept"}]}]}`)
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
@@ -339,7 +339,7 @@ func TestClaudeMessagesFinalSanitizerNormalizesCacheControlTTL(t *testing.T) {
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
 
-	client := NewClient(config.Default())
+	client := NewClient(sidecarEngineConfig())
 	body := []byte(`{"model":"claude-x","stream":true,"tools":[{"name":"Bash","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",

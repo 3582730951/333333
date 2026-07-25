@@ -413,6 +413,10 @@ func (s *Server) handleChatViaNativeResponsesCustom(w http.ResponseWriter, r *ht
 // handleMessagesViaCustom serves a Claude Code /v1/messages request from a custom
 // provider: Anthropic request → chat, then chat response/SSE → Anthropic response/SSE.
 func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	if provider.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages {
+		s.handleNativeAnthropicMessagesViaCustom(w, r, raw, model, routeGroup, provider)
+		return
+	}
 	stream := isStreamRequest(raw)
 	chatBody, err := prompt.AnthropicRequestToChatCompletion(raw)
 	if err != nil {
@@ -458,6 +462,44 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(out)
+}
+
+// handleNativeAnthropicMessagesViaCustom relays /v1/messages to a custom provider that
+// natively speaks the Anthropic Messages API. The raw request body is forwarded unchanged
+// to the provider's base_url + /messages endpoint; the response passes through as-is.
+func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	stream := isStreamRequest(raw)
+	cc, ok := s.callCustom(w, r, provider, raw, model, routeGroup, "claude", "/messages")
+	if !ok {
+		return
+	}
+	defer cc.lease.Release()
+	defer cc.resp.Body.Close()
+
+	if stream && isEventStream(cc.resp.Header) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(cc.resp.StatusCode)
+		uscan := usage.NewStreamScanner("anthropic")
+		rw := newRuleFilteringWriter(w, s.responseRuleFilter(r.Context(), provider.ID, "claude_messages", model, cc.resp.StatusCode), provider.ID)
+		_ = streamCopyRewrite(rw, io.TeeReader(cc.resp.Body, uscan), cc.scrubber)
+		if parsed, ok := uscan.Parsed(); ok {
+			s.recordParsedUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, parsed)
+		}
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "settled_streaming")
+		return
+	}
+	body, err := s.readUpstreamResponseBody(cc.resp.Body)
+	if err != nil {
+		_ = s.settleBillingHold(r.Context(), cc.holdID, "failed_response_too_large")
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	s.recordUsage(r.Context(), cc.lease.Account.ID, cc.affinity.Hash, body)
+	_ = s.settleBillingHold(r.Context(), cc.holdID, "settled")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(cc.resp.StatusCode)
+	_, _ = w.Write(cc.scrubber.ReplaceAll(body))
 }
 
 // settleStreamUsage records the streamed usage (if any) and settles the billing hold —

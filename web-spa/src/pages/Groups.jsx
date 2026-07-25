@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { ActionMenu, Button, Toast, Modal, Form, Tag, Switch } from '../components/pool/index.jsx';
+import { ActionMenu, Button, Toast, Modal, Form, Tag, Switch, Tabs } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import { get, post, patch, del } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
@@ -70,6 +70,7 @@ function normalizedFileList(values = []) {
 }
 
 export default function Groups() {
+  const [activeTab, setActiveTab] = useState('base');
   const [open, setOpen] = useState(false);
   const [instructionLibraryOpen, setInstructionLibraryOpen] = useState(false);
   const [instructionName, setInstructionName] = useState('');
@@ -79,19 +80,22 @@ export default function Groups() {
   const [editFiles, setEditFiles] = useState([]);
 
   const fetchRows = useCallback(async ({ signal }) => {
-    const [g, files, egresses] = await Promise.all([
+    const [g, files, egresses, userGroups] = await Promise.all([
       get('/admin/groups', undefined, { signal }),
       get('/admin/model-instructions', undefined, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
+      get('/admin/user-groups', undefined, { signal }).catch(() => ({ user_groups: [] })),
     ]);
     return {
       groups: Array.isArray(g) ? g : g?.groups || [],
       files: Array.isArray(files) ? files : files?.files || [],
       egresses: Array.isArray(egresses) ? egresses : egresses?.profiles || egresses?.egress_profiles || [],
+      userGroups: Array.isArray(userGroups) ? userGroups : userGroups?.user_groups || [],
     };
   }, []);
-  const { data = { groups: [], files: [], egresses: [] }, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: { groups: [], files: [], egresses: [] } });
+  const { data = { groups: [], files: [], egresses: [], userGroups: [] }, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: { groups: [], files: [], egresses: [], userGroups: [] } });
   const rows = data.groups || [];
+  const userGroupRows = data.userGroups || [];
   const instructionFiles = data.files || [];
   const egressOptions = egressOptionList(data.egresses || []);
   const groupMetrics = [
@@ -100,6 +104,11 @@ export default function Groups() {
     { label: '推理强度', value: rows.filter((row) => row.force_effort).length },
     { label: '默认出口', value: rows.filter((row) => row.default_egress_id).length },
     { label: '模型指令', value: rows.filter((row) => row.model_instructions_enabled).length, tone: 'success' },
+  ];
+
+  const userGroupMetrics = [
+    { label: '用户分组数', value: userGroupRows.length },
+    { label: '多目标', value: userGroupRows.filter((row) => (row.targets?.length || 0) > 1).length },
   ];
 
   const { run: create, running: creating } = useAsyncAction(async (values) => {
@@ -238,35 +247,114 @@ export default function Groups() {
     ) },
   ];
 
+  const userGroupColumns = [
+    {
+      title: '用户分组',
+      dataIndex: 'name',
+      width: 200,
+      render: (v) => <TextClamp strong>{v || '-'}</TextClamp>,
+    },
+    {
+      title: '目标',
+      dataIndex: 'targets',
+      render: (targets) => (
+        <TagList
+          items={(targets || []).map((t) => ({ label: `${t.base_group_name} (${t.weight})`, color: 'blue' }))}
+          max={3}
+          renderItem={(item) => <Tag key={item.label} size="small" color={item.color}>{item.label}</Tag>}
+        />
+      ),
+    },
+    {
+      title: '操作',
+      key: 'ops',
+      width: 80,
+      render: (_, r) => (
+        <ActionMenu
+          label="操作"
+          items={[
+            {
+              label: '删除',
+              destructive: true,
+              confirm: {
+                title: `删除用户分组 ${r.name}?`,
+                description: '删除后关联的 API Key 将无法使用此分组。',
+                confirmText: '删除',
+              },
+              onSelect: async () => {
+                try {
+                  await del(`/admin/user-groups/${encodeURIComponent(r.id)}`);
+                  Toast.success('已删除');
+                  await load();
+                } catch (e) {
+                  showErrorToast(e);
+                }
+              },
+            },
+          ]}
+        />
+      ),
+    },
+  ];
+
   return (
     <div>
-      <PageHeader title="分组" subtitle="按分组下发强制模型 / 推理强度 / Codex 模型指令文件"
+      <PageHeader title="分组" subtitle="Base Groups = 账号池物理分组；User Groups = 多目标权重路由"
         actions={<>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
           <Button onClick={() => setInstructionLibraryOpen(true)}>模型指令文件</Button>
           <Button icon={<IconPlus />} theme="solid" disabled={removing} onClick={() => setOpen(true)}>新建分组</Button>
         </>} />
-      <div className="pool-resource-split">
-        <ResourceTable
-          error={error}
-          onRetry={load}
-          loading={loading}
-          lastRefresh={lastRefresh}
-          dataSource={rows}
-          columns={columns}
-          rowKey="name"
-          pagination={false}
-          density="compact"
-          layout="fit"
-          className="pool-groups-table"
-          scroll={false}
-          rowHeight={68}
-          emptyTitle="暂无分组"
-          emptyType="groups"
-          skeletonRows={5}
-        />
-        {!error || lastRefresh ? <MetricRail items={groupMetrics} /> : null}
-      </div>
+
+      <Tabs activeKey={activeTab} onChange={setActiveTab} type="line">
+        <Tabs.TabPane tab="Base Groups（账号池分组）" itemKey="base">
+          <div className="pool-resource-split">
+            <ResourceTable
+              error={error}
+              onRetry={load}
+              loading={loading}
+              lastRefresh={lastRefresh}
+              dataSource={rows}
+              columns={columns}
+              rowKey="name"
+              pagination={false}
+              density="compact"
+              layout="fit"
+              className="pool-groups-table"
+              scroll={false}
+              rowHeight={68}
+              emptyTitle="暂无分组"
+              emptyType="groups"
+              skeletonRows={5}
+            />
+            {!error || lastRefresh ? <MetricRail items={groupMetrics} /> : null}
+          </div>
+        </Tabs.TabPane>
+
+        <Tabs.TabPane tab="User Groups（用户分组）" itemKey="user">
+          <div className="pool-resource-split">
+            <ResourceTable
+              error={error}
+              onRetry={load}
+              loading={loading}
+              lastRefresh={lastRefresh}
+              dataSource={userGroupRows}
+              columns={userGroupColumns}
+              rowKey="id"
+              pagination={false}
+              density="compact"
+              layout="fit"
+              scroll={false}
+              rowHeight={56}
+              emptyTitle="暂无用户分组"
+              emptyDescription="用户分组支持多目标 + 权重路由，可在 API Key 创建时选择"
+              skeletonRows={5}
+            />
+            {!error || lastRefresh ? <MetricRail items={userGroupMetrics} /> : null}
+          </div>
+        </Tabs.TabPane>
+      </Tabs>
+
       <Modal title="模型指令文件" visible={instructionLibraryOpen} onCancel={() => { if (!savingInstruction) setInstructionLibraryOpen(false); }} footer={null} maskClosable={!savingInstruction}>
         <Form onSubmit={saveInstruction} labelPosition="top">
           <Form.Input field="instruction_name" label="保存名称" value={instructionName} onChange={setInstructionName} placeholder="coding-style.md" />
@@ -354,7 +442,7 @@ export default function Groups() {
                     <span>{file.name}</span>
                     {file.error ? <Tag size="small" color="red">{file.error}</Tag> : null}
                   </label>
-                )) : <span className="pool-muted">暂无已保存文件，请先在右侧“模型指令文件”卡片保存 .md/.txt。</span>}
+                )) : <span className="pool-muted">暂无已保存文件，请先在右侧"模型指令文件"卡片保存 .md/.txt。</span>}
               </div>
               <div className="pool-field__help">勾选即挂载；下方列表顺序就是拼接顺序。</div>
             </span>
@@ -363,25 +451,21 @@ export default function Groups() {
             <span className="pool-field__label">排序</span>
             <span>
               <div style={{ display: 'grid', gap: 6 }}>
-                {editFiles.length ? editFiles.map((name, index) => (
-                  <div key={name} style={{ display: 'flex', gap: 8, alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Tag size="small" color="blue">{index + 1}. {name}</Tag>
-                    <span style={{ display: 'flex', gap: 6 }}>
-                      <Button size="small" disabled={index === 0 || savingGroupInstructions} onClick={() => moveEditFile(index, -1)}>↑</Button>
-                      <Button size="small" disabled={index === editFiles.length - 1 || savingGroupInstructions} onClick={() => moveEditFile(index, 1)}>↓</Button>
-                    </span>
+                {editFiles.map((name, i) => (
+                  <div key={name} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <Tag size="small" color="blue">{i + 1}</Tag>
+                    <span>{name}</span>
+                    <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                      <Button size="small" disabled={i === 0 || savingGroupInstructions} onClick={() => moveEditFile(i, -1)}>↑</Button>
+                      <Button size="small" disabled={i === editFiles.length - 1 || savingGroupInstructions} onClick={() => moveEditFile(i, 1)}>↓</Button>
+                    </div>
                   </div>
-                )) : <span className="pool-muted">未选择文件</span>}
+                ))}
               </div>
+              {!editFiles.length ? <span className="pool-muted">勾选文件后显示顺序</span> : null}
             </span>
           </div>
-          {editingGroup?.model_instructions_error ? (
-            <Tag color="red">当前错误：{editingGroup.model_instructions_error}</Tag>
-          ) : null}
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
-            <Button disabled={savingGroupInstructions} onClick={() => setEditingGroup(null)}>取消</Button>
-            <Button theme="solid" loading={savingGroupInstructions} onClick={saveGroupInstructions}>保存</Button>
-          </div>
+          <Button theme="solid" loading={savingGroupInstructions} onClick={saveGroupInstructions} style={{ marginTop: 12 }}>保存</Button>
         </div>
       </Modal>
     </div>

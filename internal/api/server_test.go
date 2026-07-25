@@ -91,6 +91,13 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 	cfg.ClaudeUpstreamBaseURL = up.URL
 	cfg.DatabasePath = filepath.Join(t.TempDir(), "unused.sqlite3")
 	cfg.StickyWaitMillis = 1
+	// The production default is now the in-process TLS fingerprinter
+	// (EgressFingerprintEngine="inprocess"), which dials a REAL TLS connection and
+	// cannot be exercised against these httptest mock upstreams / mock sidecars.
+	// This harness validates the sidecar /proxy wire protocol, so route
+	// curl_cffi_sidecar egresses through the (mockable) sidecar engine. Inert for
+	// direct-egress tests — the engine selector only branches on sidecar egress.
+	cfg.EgressFingerprintEngine = "sidecar"
 	// Most long-standing gateway tests exercise the retired compatibility engine
 	// explicitly. Keep that harness opt-out scoped to those tests; CPA-v2 tests
 	// enable the production default through enableCodexSessionMappingForTest.
