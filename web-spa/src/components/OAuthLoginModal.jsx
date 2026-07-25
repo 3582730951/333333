@@ -300,7 +300,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const { run: handleProviderApiKeyImport, running: providerApiKeyLoading } = useAsyncAction(async () => {
     if (!providerApiKey.trim()) { Toast.warning('请输入上游 API Key'); return; }
     if (!confirmProviderCost) { Toast.warning('请确认将执行一次可能计费的最小推理探针'); return; }
-    const providerId = tab === 'claude' ? 'claude' : 'codex';
+    const providerId = tab === 'claude' ? 'claude' : tab === 'antigravity' ? 'antigravity' : 'codex';
     try {
       const result = await post('/admin/accounts/import-key', {
         provider_id: providerId,
