@@ -348,8 +348,18 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return storage.Account{}, err
 	}
-	if err := s.store.UpsertAccount(ctx, account, token); err != nil {
-		return storage.Account{}, err
+	var persistErr error
+	if strings.EqualFold(provider, "antigravity") {
+		persistErr = s.store.UpsertAccountWithAntigravityCredentials(ctx, account, token, storage.AntigravityCredentials{
+			AccountID: account.ID, Email: account.Email, ProjectID: parsed.AntigravityProjectID,
+			AccessToken: parsed.AccessToken, RefreshToken: refreshToken, ExpiresAt: parsed.ExpiresAt,
+			BaseURL: parsed.AntigravityBaseURL, UserAgent: parsed.AntigravityUserAgent,
+		})
+	} else {
+		persistErr = s.store.UpsertAccount(ctx, account, token)
+	}
+	if persistErr != nil {
+		return storage.Account{}, persistErr
 	}
 	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, egressID); err != nil {
 		return storage.Account{}, err

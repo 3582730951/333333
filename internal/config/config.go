@@ -69,8 +69,8 @@ const (
 	DefaultAntigravityOAuthTokenURL     = "https://oauth2.googleapis.com/token"
 	DefaultAntigravityOAuthClientID     = "\x31\x30\x37\x31\x30\x30\x36\x30\x36\x30\x35\x39\x31\x2d\x74\x6d\x68\x73\x73\x69\x6e\x32\x68\x32\x31\x6c\x63\x72\x65\x32\x33\x35\x76\x74\x6f\x6c\x6f\x6a\x68\x34\x67\x34\x30\x33\x65\x70\x2e\x61\x70\x70\x73\x2e\x67\x6f\x6f\x67\x6c\x65\x75\x73\x65\x72\x63\x6f\x6e\x74\x65\x6e\x74\x2e\x63\x6f\x6d"
 	DefaultAntigravityOAuthClientSecret = "\x47\x4f\x43\x53\x50\x58\x2d\x4b\x35\x38\x46\x57\x52\x34\x38\x36\x4c\x64\x4c\x4a\x31\x6d\x4c\x42\x38\x73\x58\x43\x34\x7a\x36\x71\x44\x41\x66"
-	DefaultAntigravityOAuthRedirectURI  = "https://cloudcode-pa.googleapis.com/oauth-callback"
-	DefaultAntigravityOAuthScope        = "https://www.googleapis.com/auth/cloud-platform"
+	DefaultAntigravityOAuthRedirectURI  = "http://localhost:51121/oauth-callback"
+	DefaultAntigravityOAuthScope        = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs"
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.

@@ -109,8 +109,8 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	requestPolicy := requestUserGroupPolicy(r.Context())
 	policyPrompt := strings.TrimSpace(requestPolicy.SystemPrompt)
-	if requestPolicy.ModelInstructionsEnabled {
-		compiled, _, compileErr := s.compileGroupModelInstructions(r.Context(), requestPolicy)
+	if enabled, _, _ := modelInstructionPolicyForModel(requestPolicy, routing.Model(raw)); enabled {
+		compiled, _, compileErr := s.compileGroupModelInstructionsForModel(r.Context(), requestPolicy, routing.Model(raw))
 		if compileErr != nil {
 			writeCodexInstructionConfigurationError(w, compileErr)
 			return
@@ -359,7 +359,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 			return outcomeDone
 		}
-		return s.antigravityMessagesWithLease(w, r, raw, model, lease)
+		return s.antigravityMessagesWithLease(w, r, raw, model, lease, exclude)
 	}
 	resolvedModel := firstNonEmpty(lease.ResolvedModel, model)
 	if resolvedModel != model {
@@ -714,7 +714,7 @@ claudeSuccess:
 				if response := goalResponseFromSSE(aliasCapture.Bytes()); len(response) > 0 {
 					if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
 						log.Printf("[GOAL-CONTINUITY] claude stream persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
-						_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "claude_stream_terminal", Detail: "payload persistence failed"})
+						s.auditGoalPersistenceDegraded(r.Context(), "claude_stream_terminal", persistErr)
 					}
 				}
 			}
@@ -742,17 +742,11 @@ claudeSuccess:
 							}
 							return nil, fmt.Errorf("claude continuation upstream status %d", cresp.StatusCode)
 						}
-						return newUpstreamActivityReadCloser(
-							cctx,
-							cresp.Body,
-							s.streamStallRecoveryInterval(cctx),
-							s.streamKeepAliveInterval(cctx),
-							func() error {
-								_, err := io.WriteString(sw, heartbeatFrameFor("claude"))
-								sw.Flush()
-								return err
-							},
-						), nil
+						heartbeatEvery := s.streamKeepAliveInterval(cctx)
+						if ruleInterval := responseRuleHeartbeatInterval(rfForAC); ruleInterval > 0 {
+							heartbeatEvery = ruleInterval
+						}
+						return newSemanticSSERelayReadCloser(cctx, cresp.Body, rfForAC, "claude", s.streamStallRecoveryInterval(cctx), heartbeatEvery), nil
 					}
 					continuation, acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue, &continuationCapture)
 					if acErr != nil {
@@ -765,7 +759,7 @@ claudeSuccess:
 						if response := goalResponseFromSSE(mergedFrames); len(response) > 0 {
 							if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
 								log.Printf("[GOAL-CONTINUITY] claude continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
-								_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "claude_continuation_terminal", Detail: "payload persistence failed"})
+								s.auditGoalPersistenceDegraded(r.Context(), "claude_continuation_terminal", persistErr)
 							}
 						}
 					} else {
@@ -801,7 +795,7 @@ claudeSuccess:
 	s.persistClaudeItemAliases(r.Context(), raw, responseBody, lease, model)
 	if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, responseBody); persistErr != nil {
 		log.Printf("[GOAL-CONTINUITY] claude persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
-		_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "claude_response_terminal", Detail: "payload persistence failed"})
+		s.auditGoalPersistenceDegraded(r.Context(), "claude_response_terminal", persistErr)
 	}
 	r = r.WithContext(withClaudeDiagnosticsMissReason(r.Context(), responseBody))
 	s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, responseBody)

@@ -146,9 +146,17 @@ func TestUserGroupHTTPHandlerFallsBackAcrossModelProviders(t *testing.T) {
 		Model: model,
 		Tiers: [][]storage.TargetRef{{targets[0]}, {targets[1]}},
 	}})
-	key := createTestAPIKeyForGroup(t, h, "cyber")
-	if code, raw := grpReq(t, h, http.MethodPost, "/admin/api-keys/"+hashAPIKey(key)+"/user-group", `{"user_group_id":"`+groupID+`"}`); code != http.StatusOK {
-		t.Fatalf("bind API key to user group = %d: %s", code, raw)
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"provider fallback","user_group_id":"`+groupID+`"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create API key for user group = %d: %s", code, raw)
+	}
+	var keyPayload map[string]interface{}
+	if err := json.Unmarshal(raw, &keyPayload); err != nil {
+		t.Fatalf("decode API key response: %v (%s)", err, raw)
+	}
+	key, _ := keyPayload["key"].(string)
+	if key == "" {
+		t.Fatalf("API key response missing key: %s", raw)
 	}
 
 	body := `{"model":"` + model + `","input":"fallback please"}`
@@ -163,7 +171,7 @@ func TestUserGroupHTTPHandlerFallsBackAcrossModelProviders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "served by secondary") {
 		t.Fatalf("fallback response status=%d body=%s", resp.StatusCode, raw)

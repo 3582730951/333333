@@ -71,6 +71,59 @@ func TestServeHTTPServerReturnsListenError(t *testing.T) {
 	}
 }
 
+func TestListenerFromSystemdFileClosesOriginalAndKeepsListenerUsable(t *testing.T) {
+	source, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen source socket: %v", err)
+	}
+	tcpSource, ok := source.(*net.TCPListener)
+	if !ok {
+		source.Close()
+		t.Fatalf("source listener type = %T, want *net.TCPListener", source)
+	}
+	activationFile, err := tcpSource.File()
+	if err != nil {
+		source.Close()
+		t.Fatalf("duplicate activation socket: %v", err)
+	}
+	addr := source.Addr().String()
+	if err := source.Close(); err != nil {
+		activationFile.Close()
+		t.Fatalf("close source listener: %v", err)
+	}
+
+	activated, ok := listenerFromSystemdFile(activationFile)
+	if !ok {
+		t.Fatal("listenerFromSystemdFile rejected a valid TCP socket")
+	}
+	defer activated.Close()
+	if _, err := activationFile.Stat(); err == nil {
+		t.Fatal("inherited activation descriptor remains open")
+	}
+
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := activated.Accept()
+		if err == nil {
+			err = conn.Close()
+		}
+		accepted <- err
+	}()
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("dial duplicated activation listener: %v", err)
+	}
+	_ = conn.Close()
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("accept on duplicated activation listener: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("duplicated activation listener did not accept a connection")
+	}
+}
+
 func TestCleanServeErrorTreatsServerClosedAsClean(t *testing.T) {
 	if err := cleanServeError(http.ErrServerClosed); err != nil {
 		t.Fatalf("cleanServeError(http.ErrServerClosed) = %v, want nil", err)

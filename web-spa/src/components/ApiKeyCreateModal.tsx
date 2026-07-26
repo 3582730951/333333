@@ -1,10 +1,9 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as PoolUI from './pool/index.jsx';
 import { IconPlus } from './pool/icons.jsx';
 import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import { t } from '../lib/i18n.js';
-import { get } from '../api.js';
 import type { ApiKeyCreateInput } from '../features/access/model/keys';
 
 const { Button, Form, Modal } = PoolUI as any;
@@ -24,6 +23,8 @@ interface LegacyFormApi {
 interface ApiKeyCreateModalProps {
   visible: boolean;
   mode?: KeyMode;
+  accountGroups?: Array<{ name: string }>;
+  userGroups?: Array<{ id: string; name: string }>;
   onCancel: () => void;
   onCreate: (values: ApiKeyCreateInput) => Promise<unknown>;
 }
@@ -46,8 +47,15 @@ export function cleanApiKeyValues(values: RawKeyForm, mode: KeyMode): ApiKeyCrea
     cleaned.expires_at = Math.floor(ts / 1000);
   }
   if (mode === 'admin') {
-    cleaned.group_name = String(values.group_name || '').trim();
-    cleaned.user_group_id = String(values.user_group_id || '').trim();
+    if (cleaned.key_type === 'pool_import') {
+      cleaned.group_name = String(values.group_name || '').trim();
+      cleaned.user_group_id = '';
+      cleaned.force_model = '';
+      cleaned.force_effort = '';
+    } else {
+      cleaned.group_name = '';
+      cleaned.user_group_id = String(values.user_group_id || '').trim();
+    }
   }
   return cleaned;
 }
@@ -55,23 +63,18 @@ export function cleanApiKeyValues(values: RawKeyForm, mode: KeyMode): ApiKeyCrea
 export default function ApiKeyCreateModal({
   visible,
   mode = 'admin',
+  accountGroups = [],
+  userGroups = [],
   onCancel,
   onCreate,
 }: ApiKeyCreateModalProps) {
   const formApi = useRef<LegacyFormApi | null>(null);
   const admin = mode === 'admin';
-  const [userGroups, setUserGroups] = useState<Array<{ id: string; name: string }>>([]);
+  const [keyType, setKeyType] = useState('downstream');
 
   useEffect(() => {
-    if (visible && admin) {
-      get('/admin/user-groups')
-        .then((res) => {
-          const groups = Array.isArray(res) ? res : res?.user_groups || [];
-          setUserGroups(groups);
-        })
-        .catch(() => setUserGroups([]));
-    }
-  }, [visible, admin]);
+    if (visible) setKeyType('downstream');
+  }, [visible]);
 
   const { run: submit, running: submitting } = useAsyncAction(async (values: RawKeyForm) => {
     try {
@@ -101,6 +104,8 @@ export default function ApiKeyCreateModal({
           <Form.Select
             field="key_type"
             label={t('keys.type')}
+            value={keyType}
+            onChange={setKeyType}
             initValue="downstream"
             optionList={[
               { label: t('keys.type_downstream'), value: 'downstream' },
@@ -108,12 +113,19 @@ export default function ApiKeyCreateModal({
             ]}
           />
         ) : null}
-        {admin ? <Form.Input field="group_name" label={t('keys.group')} placeholder={t('users.optional')} /> : null}
-        {admin && userGroups.length > 0 ? (
+        {admin && keyType === 'pool_import' ? (
+          <Form.Select
+            field="group_name"
+            label="账号池底层分组"
+            placeholder="不指定"
+            optionList={accountGroups.map((group) => ({ label: group.name, value: group.name }))}
+            initValue=""
+          />
+        ) : null}
+        {admin && keyType !== 'pool_import' ? (
           <Form.Select
             field="user_group_id"
             label="用户分组"
-            placeholder="可选（多目标路由）"
             optionList={[
               { label: '不使用用户分组', value: '' },
               ...userGroups.map((g) => ({ label: g.name, value: g.id })),
@@ -121,8 +133,12 @@ export default function ApiKeyCreateModal({
             initValue=""
           />
         ) : null}
-        <Form.Input field="force_model" label={t('keys.force_model')} placeholder={t('keys.force_model_hint')} />
-        <Form.Select field="force_effort" label={t('keys.effort')} optionList={effortOptions()} initValue="" />
+        {!admin || keyType !== 'pool_import' ? (
+          <>
+            <Form.Input field="force_model" label={t('keys.force_model')} placeholder={t('keys.force_model_hint')} />
+            <Form.Select field="force_effort" label={t('keys.effort')} optionList={effortOptions()} initValue="" />
+          </>
+        ) : null}
         {admin ? <Form.Input field="expires_at" label={t('keys.expires_at')} placeholder={t('keys.expires_hint')} /> : null}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
           <Button onClick={onCancel} disabled={submitting}>{t('common.cancel')}</Button>

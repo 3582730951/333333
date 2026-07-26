@@ -54,8 +54,11 @@ const usageSurface = `${usage}\n${usageApi}`;
 if (!/series_dimension:\s*'provider_model'/.test(usageSurface) || !/series_limit:\s*8/.test(usageSurface) || !/dimension:\s*'provider_model'/.test(usageSurface)) {
   problems.push('Usage Token trend and summary must request Provider + Model dimensions by default.');
 }
-if (!/FULL_CACHE_FIELDS\s*=\s*'summary,by_account,by_model,by_api_key,by_account_model,by_provider,by_provider_model,by_route,by_route_account_model,by_time_bucket'/.test(usageSurface) || !/fields:\s*FULL_CACHE_FIELDS/.test(usageSurface)) {
-  problems.push('Usage cache diagnostics must request the full reset-aware cache field set explicitly.');
+if (!/PRIMARY_CACHE_FIELDS\s*=\s*'summary,by_model,by_provider,by_provider_model'/.test(usageSurface)
+  || !/fields:\s*PRIMARY_CACHE_FIELDS/.test(usageSurface)
+  || !/fetchUsageCacheDiagnostic/.test(usageSurface)
+  || !/fields:\s*field/.test(usageSurface)) {
+  problems.push('Usage must load primary cache chart fields up front and defer heavy diagnostic dimensions until selected.');
 }
 if (!/UsageModelAreaChart/.test(usage) || !/cacheCompositionSegments/.test(usage) || !/selectedCacheModels/.test(usage)) {
   problems.push('Usage must include model hover metrics, cache composition model hover segments, and model cache trend selection.');

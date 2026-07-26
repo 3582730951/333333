@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { del, get, patch, post } from '../../../api.js';
 import { parseApiResponse } from '../../../api/contracts';
-import type { ApiKeyCreateInput, ApiKeyRow } from '../model/keys';
+import type { ApiKeyCreateInput, ApiKeyRoutingOptions, ApiKeyRow, ApiKeyUpdateInput } from '../model/keys';
 
 const keySchema = z.object({
   key_hash: z.string().optional(),
@@ -26,8 +26,41 @@ export async function createAdminKey(input: ApiKeyCreateInput) {
   return post('/admin/api-keys', input);
 }
 
+export async function updateAdminKey(input: ApiKeyUpdateInput): Promise<ApiKeyRow> {
+  const { hash, ...values } = input;
+  return patch(`/admin/api-keys/${encodeURIComponent(hash)}`, values) as Promise<ApiKeyRow>;
+}
+
 export async function deleteAdminKey(hash: string) {
   return del(`/admin/api-keys/${encodeURIComponent(hash)}`);
+}
+
+const accountGroupsSchema = z.union([
+  z.array(z.object({ name: z.string() }).passthrough()),
+  z.object({ groups: z.array(z.object({ name: z.string() }).passthrough()).optional() })
+    .passthrough()
+    .transform((value) => value.groups ?? []),
+]);
+
+const userGroupsSchema = z.union([
+  z.array(z.object({ id: z.string(), name: z.string() }).passthrough()),
+  z.object({ user_groups: z.array(z.object({ id: z.string(), name: z.string() }).passthrough()).optional() })
+    .passthrough()
+    .transform((value) => value.user_groups ?? []),
+]);
+
+export async function fetchAdminKeyRoutingOptions(signal?: AbortSignal): Promise<ApiKeyRoutingOptions> {
+  const [accountGroups, userGroups] = await Promise.allSettled([
+    Promise.resolve(get('/admin/groups', undefined, { signal }))
+      .then((value) => parseApiResponse(accountGroupsSchema, value)),
+    Promise.resolve(get('/admin/user-groups', undefined, { signal }))
+      .then((value) => parseApiResponse(userGroupsSchema, value)),
+  ]);
+  if (accountGroups.status === 'rejected' && userGroups.status === 'rejected') throw accountGroups.reason;
+  return {
+    accountGroups: accountGroups.status === 'fulfilled' ? accountGroups.value : [],
+    userGroups: userGroups.status === 'fulfilled' ? userGroups.value : [],
+  } as ApiKeyRoutingOptions;
 }
 
 export async function fetchPortalKeys(signal?: AbortSignal): Promise<ApiKeyRow[]> {

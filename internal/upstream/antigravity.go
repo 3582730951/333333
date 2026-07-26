@@ -23,16 +23,20 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"time"
 
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/storage"
 
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -40,23 +44,13 @@ import (
 )
 
 const (
-	antigravityProdBaseURL  = "https://cloudcode-pa.googleapis.com"
+	antigravityProdBaseURL  = "https://daily-cloudcode-pa.googleapis.com"
 	antigravityStreamPath   = "/v1internal:streamGenerateContent?alt=sse"
 	antigravityGeneratePath = "/v1internal:generateContent"
-	antigravityDefaultUA    = "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)"
+	antigravityDefaultUA    = "antigravity/hub/2.2.1 darwin/arm64"
+	antigravityOAuthUA      = "Go-http-client/2.0"
 	// refreshSkew: token is considered expired 3000s early — mirrors CLIProxyAPI source.
 	antigravityRefreshSkew = 3000
-
-	// Vertex AI Anthropic publisher endpoint — used when the requested model is a
-	// Claude model routed through the Antigravity OAuth credentials.
-	// Claude models are not served by the cloudcode-pa v1internal endpoint; they
-	// require Vertex AI's native Anthropic-format path instead.
-	antigravityVertexBaseURL    = "https://us-east5-aiplatform.googleapis.com"
-	antigravityVertexRegion     = "us-east5"
-	antigravityVertexStreamSuffix = ":streamRawPredict" // returns native Anthropic SSE
-	antigravityVertexRawSuffix    = ":rawPredict"       // returns native Anthropic JSON
-	// anthropicVersion is the value Vertex AI requires in the request body.
-	antigravityVertexAnthropicVersion = "vertex-2023-10-16"
 )
 
 // antigravityTransport is a cached HTTP/1.1-only transport (one per process).
@@ -74,21 +68,165 @@ type AntigravityTokenResponse struct {
 	TokenType    string `json:"token_type"`
 }
 
+type AntigravityModel struct {
+	ID                  string
+	DisplayName         string
+	MaxTokens           int64
+	MaxCompletionTokens int64
+	RawJSON             []byte
+}
+
+type antigravityRawRequest func(context.Context, string, http.Header, []byte) (*Response, error)
+
+func directAntigravityRawRequest(timeout time.Duration) antigravityRawRequest {
+	client := &http.Client{Transport: antigravityTransport, Timeout: timeout}
+	return func(ctx context.Context, target string, headers http.Header, body []byte) (*Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = headers.Clone()
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body}, nil
+	}
+}
+
+// FetchAntigravityModels returns the account-scoped model catalog exposed by
+// Cloud Code Assist. Standalone callers use the direct HTTP/1.1 transport.
+func FetchAntigravityModels(ctx context.Context, accessToken, projectID, baseURL, userAgent string) ([]AntigravityModel, error) {
+	return fetchAntigravityModels(ctx, accessToken, projectID, baseURL, userAgent, directAntigravityRawRequest(30*time.Second))
+}
+
+// FetchAntigravityModels performs account discovery through the same outlet used
+// for inference, preventing model probes from leaking the host's direct IP.
+func (c *Client) FetchAntigravityModels(ctx context.Context, egress storage.EgressProfile, cookieJarKey, accessToken, projectID, baseURL, userAgent string) ([]AntigravityModel, error) {
+	return fetchAntigravityModels(ctx, accessToken, projectID, baseURL, userAgent, func(ctx context.Context, target string, headers http.Header, body []byte) (*Response, error) {
+		return c.DoRawHTTP1(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey)
+	})
+}
+
+func fetchAntigravityModels(ctx context.Context, accessToken, projectID, baseURL, userAgent string, do antigravityRawRequest) ([]AntigravityModel, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return nil, errors.New("antigravity model probe requires an access token")
+	}
+	bases := []string{}
+	if custom := strings.TrimRight(strings.TrimSpace(baseURL), "/"); custom != "" {
+		bases = append(bases, custom)
+	} else {
+		bases = append(bases, antigravityProdBaseURL, "https://cloudcode-pa.googleapis.com")
+	}
+	payload := map[string]string{}
+	if projectID = strings.TrimSpace(projectID); projectID != "" {
+		payload["project"] = projectID
+	}
+	body, _ := json.Marshal(payload)
+	ua := strings.TrimSpace(userAgent)
+	if ua == "" {
+		ua = antigravityDefaultUA
+	}
+	var lastErr error
+	for _, base := range bases {
+		headers := make(http.Header)
+		headers.Set("Authorization", "Bearer "+accessToken)
+		headers.Set("Content-Type", "application/json")
+		headers.Set("User-Agent", ua)
+		resp, err := do(ctx, base+"/v1internal:fetchAvailableModels", headers, body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("antigravity model probe returned HTTP %d", resp.StatusCode)
+			continue
+		}
+		modelsNode := gjson.GetBytes(respBody, "models")
+		if !modelsNode.IsObject() {
+			if gjson.GetBytes(respBody, "webSearchModelIds").IsArray() {
+				lastErr = errors.New("antigravity model probe returned capability hints without a model catalog")
+			} else {
+				lastErr = errors.New("antigravity model probe response is missing models")
+			}
+			continue
+		}
+		modelMap := modelsNode.Map()
+		if len(modelMap) == 0 {
+			lastErr = errors.New("antigravity model probe returned an empty non-authoritative catalog")
+			continue
+		}
+		ids := make([]string, 0, len(modelMap))
+		for id := range modelMap {
+			id = strings.TrimSpace(id)
+			if id != "" && !isAntigravityInternalModel(id) {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		models := make([]AntigravityModel, 0, len(ids))
+		for _, id := range ids {
+			entry := modelMap[id]
+			models = append(models, AntigravityModel{
+				ID:                  id,
+				DisplayName:         firstNonEmptyString(entry.Get("displayName").String(), id),
+				MaxTokens:           entry.Get("maxTokens").Int(),
+				MaxCompletionTokens: entry.Get("maxOutputTokens").Int(),
+				RawJSON:             []byte(entry.Raw),
+			})
+		}
+		return models, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("antigravity model probe failed")
+	}
+	return nil, lastErr
+}
+
+func isAntigravityInternalModel(model string) bool {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "chat_20706", "chat_23310", "tab_flash_lite_preview", "tab_jump_flash_lite_preview", "gemini-2.5-flash-thinking", "gemini-2.5-pro":
+		return true
+	default:
+		return false
+	}
+}
+
 // RefreshAntigravityToken exchanges a refresh token for a new access token.
 // Returns the new access token, updated refresh token, and expiry (Unix seconds).
 func RefreshAntigravityToken(ctx context.Context, refreshToken string, cfg *config.Config) (AntigravityTokenResponse, error) {
-	form := "client_id=" + cfg.AntigravityOAuthClientID +
-		"&client_secret=" + cfg.AntigravityOAuthClientSecret +
-		"&grant_type=refresh_token" +
-		"&refresh_token=" + refreshToken
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AntigravityOAuthTokenURL,
-		strings.NewReader(form))
-	if err != nil {
-		return AntigravityTokenResponse{}, err
+	return refreshAntigravityToken(ctx, refreshToken, cfg, directAntigravityRawRequest(30*time.Second))
+}
+
+// RefreshAntigravityToken refreshes account credentials through the selected
+// account outlet. OAuth and inference therefore share the same source IP.
+func (c *Client) RefreshAntigravityToken(ctx context.Context, egress storage.EgressProfile, cookieJarKey, refreshToken string, cfg *config.Config) (AntigravityTokenResponse, error) {
+	return refreshAntigravityToken(ctx, refreshToken, cfg, func(ctx context.Context, target string, headers http.Header, body []byte) (*Response, error) {
+		return c.DoRawHTTP1(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey)
+	})
+}
+
+func refreshAntigravityToken(ctx context.Context, refreshToken string, cfg *config.Config, do antigravityRawRequest) (AntigravityTokenResponse, error) {
+	if cfg == nil {
+		return AntigravityTokenResponse{}, errors.New("antigravity OAuth config is required")
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// Use Go's default UA for OAuth token refresh — mirrors real Antigravity behaviour.
-	resp, err := antigravityTransport.RoundTrip(req)
+	form := url.Values{
+		"client_id":     []string{cfg.AntigravityOAuthClientID},
+		"client_secret": []string{cfg.AntigravityOAuthClientSecret},
+		"grant_type":    []string{"refresh_token"},
+		"refresh_token": []string{refreshToken},
+	}.Encode()
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/x-www-form-urlencoded")
+	headers.Set("User-Agent", antigravityOAuthUA)
+	resp, err := do(ctx, cfg.AntigravityOAuthTokenURL, headers, []byte(form))
 	if err != nil {
 		return AntigravityTokenResponse{}, err
 	}
@@ -109,44 +247,52 @@ func RefreshAntigravityToken(ctx context.Context, refreshToken string, cfg *conf
 
 // AntigravityRequest is the pool-side representation of a single Antigravity inference call.
 type AntigravityRequest struct {
-	AccessToken       string
-	ProjectID         string
-	Model             string // Gemini or Claude model slug
-	BaseURL           string // empty → production
-	UserAgent         string // empty → default UA
-	Body              []byte // Anthropic-format request JSON
-	Stream            bool
-	CachedContentName string // optional: Vertex AI resource name for explicit caching
+	AccessToken string
+	ProjectID   string
+	Model       string // Gemini or Claude model slug
+	BaseURL     string // empty → production
+	UserAgent   string // empty → default UA
+	Body        []byte // Anthropic-format request JSON
+	Stream      bool
 }
 
-// AntigravityIsClaudeModel reports whether the given model slug is an Anthropic
-// Claude model routed through the Antigravity provider. Claude models require a
-// different upstream endpoint (Vertex AI Anthropic publisher) and a different wire
-// format (native Anthropic JSON) than Gemini models (cloudcode-pa v1internal).
+// AntigravityConversionError identifies a downstream request that cannot be
+// represented by the Antigravity wire protocol without losing semantics. API
+// handlers must return this as a local 422 and must not retry another account.
+type AntigravityConversionError struct {
+	Reason string
+}
+
+func (e *AntigravityConversionError) Error() string {
+	return e.Reason
+}
+
+func antigravityConversionError(format string, args ...interface{}) error {
+	return &AntigravityConversionError{Reason: fmt.Sprintf(format, args...)}
+}
+
+func IsAntigravityConversionError(err error) bool {
+	var target *AntigravityConversionError
+	return errors.As(err, &target)
+}
+
+// AntigravityIsClaudeModel reports whether the model uses Claude semantics. Both
+// Claude and Gemini are sent through Antigravity's v1internal endpoint; the flag is
+// used only for model-family policy and cache behavior.
 func AntigravityIsClaudeModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude")
 }
 
-// DoAntigravity sends one Antigravity request and returns the raw HTTP response.
-// The caller is responsible for closing the response body.
-//
-// Routing:
-//   - Claude models → Vertex AI Anthropic publisher endpoint (native Anthropic format).
-//   - Gemini models → cloudcode-pa.googleapis.com/v1internal (Gemini format, existing path).
-func DoAntigravity(ctx context.Context, req AntigravityRequest) (*http.Response, error) {
-	if AntigravityIsClaudeModel(req.Model) {
-		return doAntigravityClaudeViaVertex(ctx, req)
-	}
-
+func buildAntigravityRequest(req AntigravityRequest) (string, http.Header, []byte, error) {
 	base := strings.TrimRight(antigravityProdBaseURL, "/")
 	if u := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"); u != "" {
 		base = u
 	}
 
 	// Convert Anthropic request body → Antigravity wire format.
-	agBody, err := anthropicToAntigravity(req.Body, req.Model, req.ProjectID, req.CachedContentName)
+	agBody, err := anthropicToAntigravity(req.Body, req.Model, req.ProjectID)
 	if err != nil {
-		return nil, fmt.Errorf("antigravity body conversion: %w", err)
+		return "", nil, nil, err
 	}
 
 	var target string
@@ -156,98 +302,57 @@ func DoAntigravity(ctx context.Context, req AntigravityRequest) (*http.Response,
 		target = base + antigravityGeneratePath
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target,
-		bytes.NewReader(agBody))
-	if err != nil {
-		return nil, err
-	}
 	ua := antigravityDefaultUA
 	if u := strings.TrimSpace(req.UserAgent); u != "" {
 		ua = u
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
-	httpReq.Header.Set("User-Agent", ua)
-	httpReq.Header.Set("Host", httpReq.URL.Host)
-	httpReq.Close = true // Connection: close — matches Node.js https default
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Authorization", "Bearer "+req.AccessToken)
+	headers.Set("User-Agent", ua)
+	return target, headers, agBody, nil
+}
+
+// DoAntigravity sends a request through the scheduler-selected egress while
+// retaining Antigravity's HTTP/1.1-only wire profile.
+func (c *Client) DoAntigravity(ctx context.Context, egress storage.EgressProfile, cookieJarKey string, req AntigravityRequest) (*Response, error) {
+	target, headers, body, err := buildAntigravityRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	return c.DoRawHTTP1(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey)
+}
+
+// DoAntigravity remains available to standalone adapter callers and focused
+// conversion tests. Production API traffic uses Client.DoAntigravity above.
+func DoAntigravity(ctx context.Context, req AntigravityRequest) (*http.Response, error) {
+	target, headers, body, err := buildAntigravityRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header = headers
 
 	client := &http.Client{Transport: antigravityTransport, Timeout: 5 * time.Minute}
 	return client.Do(httpReq)
 }
 
-// doAntigravityClaudeViaVertex routes a Claude model request through the Vertex AI
-// Anthropic publisher endpoint. The request body is passed in native Anthropic format
-// (no Gemini conversion); only anthropic_version is injected and the top-level model
-// field is removed (it lives in the URL instead).
-//
-// Vertex AI supports HTTP/2, so we use a plain http.Client (not the HTTP/1.1-only
-// antigravityTransport which is required only for the cloudcode-pa Gemini endpoint).
-func doAntigravityClaudeViaVertex(ctx context.Context, req AntigravityRequest) (*http.Response, error) {
-	if req.ProjectID == "" {
-		return nil, fmt.Errorf("antigravity: project_id required for Claude-via-Vertex routing")
-	}
-
-	body, err := prepareAntigravityClaudeVertexBody(req.Body)
-	if err != nil {
-		return nil, fmt.Errorf("antigravity: claude vertex body prep: %w", err)
-	}
-
-	suffix := antigravityVertexRawSuffix
-	if req.Stream {
-		suffix = antigravityVertexStreamSuffix
-	}
-	target := fmt.Sprintf(
-		"%s/v1/projects/%s/locations/%s/publishers/anthropic/models/%s%s",
-		antigravityVertexBaseURL, req.ProjectID, antigravityVertexRegion, req.Model, suffix,
-	)
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
-
-	client := &http.Client{Timeout: 5 * time.Minute}
-	return client.Do(httpReq)
-}
-
-// prepareAntigravityClaudeVertexBody adjusts an Anthropic-format request body for
-// the Vertex AI Anthropic publisher:
-//   - Sets anthropic_version to the Vertex-required value (overrides any client value).
-//   - Removes the top-level "model" field (the model is encoded in the request URL).
-func prepareAntigravityClaudeVertexBody(body []byte) ([]byte, error) {
-	out, err := sjson.SetBytes(body, "anthropic_version", antigravityVertexAnthropicVersion)
-	if err != nil {
-		return nil, err
-	}
-	out, err = sjson.DeleteBytes(out, "model")
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // anthropicToAntigravity converts an Anthropic /v1/messages JSON body to the
 // Antigravity wire format: outer Antigravity envelope wrapping a Gemini inner request.
-// When cacheRef is non-empty the cache is referenced via request.cachedContent and
-// only the final (new) user turn is sent in request.contents; the prefix is served
-// from the cache so we must NOT repeat it here.
-func anthropicToAntigravity(body []byte, model, projectID, cacheRef string) ([]byte, error) {
-	var (
-		contents    []geminiContent
-		contentsErr error
-	)
-	if cacheRef != "" {
-		// Cache mode: only the last user turn goes in request.contents.
-		_, lastTurns, _, _ := ExtractAntigravityPrefixForCache(body)
-		contents = lastTurns
-	} else {
-		// Normal mode: all turns.
-		contents, contentsErr = anthropicMessagesToGeminiContents(body)
-		if contentsErr != nil {
-			return nil, contentsErr
-		}
+func anthropicToAntigravity(body []byte, model, projectID string) ([]byte, error) {
+	if !json.Valid(body) {
+		return nil, antigravityConversionError("request body is not valid JSON")
+	}
+	if strings.TrimSpace(model) == "" {
+		return nil, antigravityConversionError("request model is required")
+	}
+	isClaudeModel := AntigravityIsClaudeModel(model)
+	contents, err := anthropicMessagesToGeminiContents(body, model)
+	if err != nil {
+		return nil, err
 	}
 	contentsJSON, err := json.Marshal(contents)
 	if err != nil {
@@ -265,13 +370,9 @@ func anthropicToAntigravity(body []byte, model, projectID, cacheRef string) ([]b
 	out, _ = sjson.SetBytes(out, "requestId", "agent-"+strings.ReplaceAll(uuid.NewString(), "-", ""))
 	out, _ = sjson.SetRawBytes(out, "request.contents", contentsJSON)
 	out, _ = sjson.SetBytes(out, "request.sessionId", antigravityStableSessionID(body))
-	if cacheRef != "" {
-		// Inject explicit cache reference; systemInstruction is already in the cache.
-		out, _ = sjson.SetBytes(out, "request.cachedContent", cacheRef)
-	}
 
 	// 3. Forward generationConfig fields.
-	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() {
+	if mt := gjson.GetBytes(body, "max_tokens"); isClaudeModel && mt.Exists() {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", mt.Int())
 	}
 	if temp := gjson.GetBytes(body, "temperature"); temp.Exists() {
@@ -283,75 +384,190 @@ func anthropicToAntigravity(body []byte, model, projectID, cacheRef string) ([]b
 	if topK := gjson.GetBytes(body, "top_k"); topK.Exists() {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.topK", topK.Int())
 	}
-
-	// 4. System prompt → systemInstruction (omitted in cache mode; it lives in the cache).
-	if cacheRef == "" {
-		if sys := gjson.GetBytes(body, "system"); sys.Exists() {
-			sysText := ""
-			switch sys.Type {
-			case gjson.String:
-				sysText = sys.String()
-			case gjson.JSON:
-				// Array of content blocks — concatenate text parts.
-				for _, b := range sys.Array() {
-					if b.Get("type").String() == "text" {
-						sysText += b.Get("text").String()
-					}
-				}
+	if stops := gjson.GetBytes(body, "stop_sequences"); stops.Exists() {
+		if !stops.IsArray() {
+			return nil, antigravityConversionError("stop_sequences must be an array")
+		}
+		values := make([]string, 0, len(stops.Array()))
+		for _, stop := range stops.Array() {
+			if stop.Type != gjson.String {
+				return nil, antigravityConversionError("stop_sequences entries must be strings")
 			}
-			if sysText != "" {
-				out, _ = sjson.SetBytes(out, "request.systemInstruction.parts.0.text", sysText)
+			values = append(values, stop.String())
+		}
+		out, _ = sjson.SetBytes(out, "request.generationConfig.stopSequences", values)
+	}
+	if thinking := gjson.GetBytes(body, "thinking"); thinking.Exists() {
+		if !thinking.IsObject() {
+			return nil, antigravityConversionError("thinking must be an object")
+		}
+		switch thinking.Get("type").String() {
+		case "enabled":
+			budget := thinking.Get("budget_tokens")
+			if !budget.Exists() || budget.Type != gjson.Number || budget.Int() <= 0 {
+				return nil, antigravityConversionError("enabled thinking requires a positive budget_tokens")
 			}
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget.Int())
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+		case "adaptive", "auto":
+			effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "output_config.effort").String()))
+			if effort == "" {
+				effort = "high"
+			}
+			switch effort {
+			case "low", "medium", "high":
+			default:
+				return nil, antigravityConversionError("unsupported adaptive thinking effort %q", effort)
+			}
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel", effort)
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+		case "disabled":
+		default:
+			return nil, antigravityConversionError("unsupported thinking type %q", thinking.Get("type").String())
 		}
 	}
 
+	// 4. System prompt → systemInstruction.
+	parts, err := anthropicSystemToGeminiParts(body)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) > 0 {
+		partsJSON, _ := json.Marshal(parts)
+		out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
+		out, _ = sjson.SetRawBytes(out, "request.systemInstruction.parts", partsJSON)
+	}
+
 	// 5. Tools → functionDeclarations.
+	hasFunctionTools := false
 	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() && len(tools.Array()) > 0 {
 		funcDecls := make([]json.RawMessage, 0, len(tools.Array()))
-		for _, t := range tools.Array() {
-			fdBytes := []byte(t.Raw)
-			// Remap: Anthropic uses "input_schema", Gemini uses "parameters".
-			if is := gjson.GetBytes(fdBytes, "input_schema"); is.Exists() {
-				if updated, e := sjson.SetRawBytes(fdBytes, "parameters", []byte(is.Raw)); e == nil {
-					fdBytes = updated
-				}
-				if updated, e := sjson.DeleteBytes(fdBytes, "input_schema"); e == nil {
-					fdBytes = updated
-				}
+		for index, t := range tools.Array() {
+			if typ := strings.TrimSpace(t.Get("type").String()); typ != "" && typ != "custom" {
+				return nil, antigravityConversionError("tools[%d] type %q is not supported by Antigravity", index, typ)
+			}
+			name := strings.TrimSpace(t.Get("name").String())
+			if name == "" {
+				return nil, antigravityConversionError("tools[%d] is missing name", index)
+			}
+			inputSchema := t.Get("input_schema")
+			if !inputSchema.IsObject() {
+				return nil, antigravityConversionError("tools[%d].input_schema must be an object", index)
+			}
+			cleanSchema, schemaErr := sanitizeAntigravityToolSchema(inputSchema.Raw, isClaudeModel)
+			if schemaErr != nil {
+				return nil, antigravityConversionError("tools[%d].input_schema cannot be converted: %v", index, schemaErr)
+			}
+			declaration := map[string]interface{}{"name": name, "parameters": cleanSchema}
+			if description := t.Get("description"); description.Type == gjson.String && description.String() != "" {
+				declaration["description"] = description.String()
+			}
+			fdBytes, marshalErr := json.Marshal(declaration)
+			if marshalErr != nil {
+				return nil, antigravityConversionError("tools[%d] could not be serialized: %v", index, marshalErr)
 			}
 			funcDecls = append(funcDecls, json.RawMessage(fdBytes))
 		}
 		fdJSON, err := json.Marshal(funcDecls)
-		if err == nil {
-			out, _ = sjson.SetRawBytes(out, "request.tools.0.functionDeclarations", fdJSON)
+		if err != nil {
+			return nil, antigravityConversionError("tools could not be serialized: %v", err)
 		}
+		out, _ = sjson.SetRawBytes(out, "request.tools.0.functionDeclarations", fdJSON)
+		hasFunctionTools = len(funcDecls) > 0
+	}
+	if toolChoice := gjson.GetBytes(body, "tool_choice"); toolChoice.Exists() {
+		if !toolChoice.IsObject() {
+			return nil, antigravityConversionError("tool_choice must be an object")
+		}
+		switch typ := toolChoice.Get("type").String(); typ {
+		case "auto":
+			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "AUTO")
+		case "none":
+			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "NONE")
+		case "any":
+			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+		case "tool":
+			name := strings.TrimSpace(toolChoice.Get("name").String())
+			if name == "" {
+				return nil, antigravityConversionError("tool_choice type tool requires name")
+			}
+			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "ANY")
+			out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{name})
+		default:
+			return nil, antigravityConversionError("unsupported tool_choice type %q", typ)
+		}
+	}
+	if isClaudeModel && hasFunctionTools {
+		// Antigravity Claude validates tool arguments against the cleaned schema.
+		// The real client overrides AUTO/ANY/NONE at the final transport boundary.
+		out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
+	}
+	out, _ = sjson.SetBytes(out, "request.safetySettings", antigravityDefaultSafetySettings())
+	if gjson.GetBytes(body, "context_management").Exists() {
+		return nil, antigravityConversionError("context_management is not supported by the Antigravity protocol")
+	}
+	if gjson.GetBytes(body, "mcp_servers").Exists() {
+		return nil, antigravityConversionError("mcp_servers are not supported by the Antigravity protocol")
 	}
 
 	return out, nil
 }
 
+func anthropicSystemToGeminiParts(body []byte) ([]geminiPart, error) {
+	system := gjson.GetBytes(body, "system")
+	if !system.Exists() {
+		return nil, nil
+	}
+	if system.Type == gjson.String {
+		if system.String() == "" {
+			return nil, nil
+		}
+		return []geminiPart{{Text: system.String()}}, nil
+	}
+	if !system.IsArray() {
+		return nil, antigravityConversionError("system must be a string or an array of text blocks")
+	}
+	parts := make([]geminiPart, 0, len(system.Array()))
+	for index, block := range system.Array() {
+		if block.Get("type").String() != "text" {
+			return nil, antigravityConversionError("system[%d] type %q cannot be converted", index, block.Get("type").String())
+		}
+		if text := block.Get("text").String(); text != "" {
+			parts = append(parts, geminiPart{Text: text})
+		}
+	}
+	return parts, nil
+}
+
 // geminiContent is a single Gemini content object.
 type geminiContent struct {
-	Role  string          `json:"role"`
-	Parts []geminiPart    `json:"parts"`
+	Role  string       `json:"role"`
+	Parts []geminiPart `json:"parts"`
 }
 
 type geminiPart struct {
 	Text             string          `json:"text,omitempty"`
+	InlineData       json.RawMessage `json:"inlineData,omitempty"`
 	FunctionCall     json.RawMessage `json:"functionCall,omitempty"`
 	FunctionResponse json.RawMessage `json:"functionResponse,omitempty"`
+	Thought          bool            `json:"thought,omitempty"`
+	ThoughtSignature string          `json:"thoughtSignature,omitempty"`
 }
 
 // anthropicMessagesToGeminiContents converts an Anthropic messages array to
 // the Gemini contents format.
-func anthropicMessagesToGeminiContents(body []byte) ([]geminiContent, error) {
+func anthropicMessagesToGeminiContents(body []byte, model string) ([]geminiContent, error) {
 	msgs := gjson.GetBytes(body, "messages")
 	if !msgs.IsArray() {
-		return nil, fmt.Errorf("anthropic body missing messages array")
+		return nil, antigravityConversionError("anthropic body is missing messages array")
 	}
 	out := make([]geminiContent, 0, len(msgs.Array()))
-	for _, m := range msgs.Array() {
-		role := m.Get("role").String()
+	toolNameByID := make(map[string]string)
+	for messageIndex, m := range msgs.Array() {
+		role := strings.TrimSpace(m.Get("role").String())
+		if role != "user" && role != "assistant" {
+			return nil, antigravityConversionError("messages[%d] has unsupported role %q", messageIndex, role)
+		}
 		// Anthropic "assistant" → Gemini "model"
 		if role == "assistant" {
 			role = "model"
@@ -360,39 +576,273 @@ func anthropicMessagesToGeminiContents(body []byte) ([]geminiContent, error) {
 		content := m.Get("content")
 		switch content.Type {
 		case gjson.String:
-			gc.Parts = []geminiPart{{Text: content.String()}}
+			if content.String() != "" {
+				gc.Parts = []geminiPart{{Text: content.String()}}
+			}
 		case gjson.JSON:
-			for _, block := range content.Array() {
+			if !content.IsArray() {
+				return nil, antigravityConversionError("messages[%d].content must be a string or array", messageIndex)
+			}
+			for blockIndex, block := range content.Array() {
 				typ := block.Get("type").String()
 				switch typ {
 				case "text":
-					gc.Parts = append(gc.Parts, geminiPart{Text: block.Get("text").String()})
+					if text := block.Get("text").String(); text != "" {
+						gc.Parts = append(gc.Parts, geminiPart{Text: text})
+					}
+				case "image":
+					source := block.Get("source")
+					if source.Get("type").String() != "base64" {
+						return nil, antigravityConversionError("messages[%d].content[%d] image source type %q is not supported", messageIndex, blockIndex, source.Get("type").String())
+					}
+					mediaType := strings.TrimSpace(source.Get("media_type").String())
+					data := strings.TrimSpace(source.Get("data").String())
+					if mediaType == "" || data == "" {
+						return nil, antigravityConversionError("messages[%d].content[%d] base64 image requires media_type and data", messageIndex, blockIndex)
+					}
+					inlineData, _ := json.Marshal(map[string]string{"mimeType": mediaType, "data": data})
+					gc.Parts = append(gc.Parts, geminiPart{InlineData: inlineData})
+				case "thinking":
+					if role != "model" {
+						return nil, antigravityConversionError("messages[%d].content[%d] thinking is only valid for assistant messages", messageIndex, blockIndex)
+					}
+					thinkingText := block.Get("thinking").String()
+					signature, compatible := antigravityReplayThinkingSignature(model, block.Get("signature").String())
+					if thinkingText == "" || !compatible {
+						// Signed reasoning is provider-specific. Dropping an incompatible
+						// historical block is safer than replaying it and failing the turn.
+						continue
+					}
+					gc.Parts = append(gc.Parts, geminiPart{Text: thinkingText, Thought: true, ThoughtSignature: signature})
+				case "redacted_thinking":
+					return nil, antigravityConversionError("messages[%d].content[%d] redacted_thinking cannot be safely converted", messageIndex, blockIndex)
 				case "tool_use":
 					// Anthropic tool_use → Gemini functionCall
-					fc := map[string]interface{}{
-						"name": block.Get("name").String(),
-						"args": json.RawMessage(block.Get("input").Raw),
+					if role != "model" {
+						return nil, antigravityConversionError("messages[%d].content[%d] tool_use is only valid for assistant messages", messageIndex, blockIndex)
 					}
-					fcJSON, _ := json.Marshal(fc)
-					gc.Parts = append(gc.Parts, geminiPart{FunctionCall: fcJSON})
+					toolID := strings.TrimSpace(block.Get("id").String())
+					toolName := strings.TrimSpace(block.Get("name").String())
+					input := block.Get("input")
+					inputRaw := input.Raw
+					if input.Type == gjson.String {
+						parsed := gjson.Parse(input.String())
+						if parsed.IsObject() {
+							inputRaw = parsed.Raw
+						}
+					}
+					if toolID == "" || toolName == "" || !gjson.Parse(inputRaw).IsObject() {
+						return nil, antigravityConversionError("messages[%d].content[%d] tool_use requires id, name, and object input", messageIndex, blockIndex)
+					}
+					if prior := toolNameByID[toolID]; prior != "" && prior != toolName {
+						return nil, antigravityConversionError("tool_use id %q is associated with conflicting names", toolID)
+					}
+					toolNameByID[toolID] = toolName
+					fc := map[string]interface{}{
+						"name": toolName,
+						"args": json.RawMessage(inputRaw),
+						"id":   toolID,
+					}
+					for _, signaturePath := range []string{"signature", "thought_signature", "extra_content.google.thought_signature"} {
+						if signature, ok := antigravityReplayToolSignature(model, block.Get(signaturePath).String()); ok {
+							fcJSON, _ := json.Marshal(fc)
+							gc.Parts = append(gc.Parts, geminiPart{FunctionCall: fcJSON, ThoughtSignature: signature})
+							fc = nil
+							break
+						}
+					}
+					if fc != nil {
+						fcJSON, _ := json.Marshal(fc)
+						part := geminiPart{FunctionCall: fcJSON}
+						if !AntigravityIsClaudeModel(model) {
+							part.ThoughtSignature = "skip_thought_signature_validator"
+						}
+						gc.Parts = append(gc.Parts, part)
+					}
 				case "tool_result":
 					// Anthropic tool_result → Gemini functionResponse
+					if role != "user" {
+						return nil, antigravityConversionError("messages[%d].content[%d] tool_result is only valid for user messages", messageIndex, blockIndex)
+					}
+					toolID := strings.TrimSpace(block.Get("tool_use_id").String())
+					if toolID == "" {
+						return nil, antigravityConversionError("messages[%d].content[%d] tool_result requires tool_use_id", messageIndex, blockIndex)
+					}
+					toolName := toolNameByID[toolID]
+					if toolName == "" {
+						toolName = antigravityToolNameFromID(toolID)
+					}
+					response, parts, responseErr := antigravityToolResult(block.Get("content"), messageIndex, blockIndex)
+					if responseErr != nil {
+						return nil, responseErr
+					}
 					fr := map[string]interface{}{
-						"name": block.Get("tool_use_id").String(),
-						"response": map[string]interface{}{
-							"content": block.Get("content").Value(),
-						},
+						"id":       toolID,
+						"name":     toolName,
+						"response": response,
+					}
+					if len(parts) > 0 {
+						fr["parts"] = parts
+					}
+					if block.Get("is_error").Bool() {
+						fr["isError"] = true
 					}
 					frJSON, _ := json.Marshal(fr)
 					gc.Parts = append(gc.Parts, geminiPart{FunctionResponse: frJSON})
+				default:
+					return nil, antigravityConversionError("messages[%d].content[%d] type %q cannot be safely converted", messageIndex, blockIndex, typ)
 				}
 			}
+		default:
+			return nil, antigravityConversionError("messages[%d].content must be a string or array", messageIndex)
 		}
-		if len(gc.Parts) > 0 {
-			out = append(out, gc)
+		if len(gc.Parts) == 0 && role == "model" {
+			continue
 		}
+		if len(gc.Parts) == 0 {
+			return nil, antigravityConversionError("messages[%d] has no convertible content", messageIndex)
+		}
+		out = append(out, gc)
+	}
+	if len(out) == 0 {
+		return nil, antigravityConversionError("request has no messages")
 	}
 	return out, nil
+}
+
+func antigravityToolResult(content gjson.Result, messageIndex, blockIndex int) (map[string]interface{}, []map[string]interface{}, error) {
+	response := map[string]interface{}{}
+	if content.Type == gjson.String {
+		response["result"] = content.String()
+		return response, nil, nil
+	}
+	if !content.IsArray() {
+		if !content.Exists() {
+			response["result"] = ""
+			return response, nil, nil
+		}
+		if content.IsObject() {
+			var object interface{}
+			if err := json.Unmarshal([]byte(content.Raw), &object); err != nil {
+				return nil, nil, antigravityConversionError("messages[%d].content[%d] tool_result object is invalid: %v", messageIndex, blockIndex, err)
+			}
+			response["result"] = object
+			return response, nil, nil
+		}
+		return nil, nil, antigravityConversionError("messages[%d].content[%d] tool_result content must be a string or array", messageIndex, blockIndex)
+	}
+	results := make([]interface{}, 0, len(content.Array()))
+	inlineParts := make([]map[string]interface{}, 0)
+	for resultIndex, item := range content.Array() {
+		switch item.Get("type").String() {
+		case "text":
+			results = append(results, map[string]interface{}{"type": "text", "text": item.Get("text").String()})
+		case "image":
+			source := item.Get("source")
+			if source.Get("type").String() != "base64" || strings.TrimSpace(source.Get("media_type").String()) == "" || strings.TrimSpace(source.Get("data").String()) == "" {
+				return nil, nil, antigravityConversionError("messages[%d].content[%d] tool_result item %d has an unsupported image source", messageIndex, blockIndex, resultIndex)
+			}
+			inlineParts = append(inlineParts, map[string]interface{}{"inlineData": map[string]string{
+				"mimeType": source.Get("media_type").String(), "data": source.Get("data").String(),
+			}})
+		default:
+			return nil, nil, antigravityConversionError("messages[%d].content[%d] tool_result item %d type %q cannot be safely converted", messageIndex, blockIndex, resultIndex, item.Get("type").String())
+		}
+	}
+	switch len(results) {
+	case 0:
+		response["result"] = ""
+	case 1:
+		response["result"] = results[0]
+	default:
+		response["result"] = results
+	}
+	return response, inlineParts, nil
+}
+
+func antigravityToolNameFromID(toolID string) string {
+	toolID = strings.TrimSpace(toolID)
+	parts := strings.Split(toolID, "-")
+	if len(parts) > 2 {
+		if derived := strings.TrimSpace(strings.Join(parts[:len(parts)-2], "-")); derived != "" {
+			return derived
+		}
+	}
+	if toolID != "" {
+		return toolID
+	}
+	return "tool"
+}
+
+func antigravityReplayThinkingSignature(model, raw string) (string, bool) {
+	if !AntigravityIsClaudeModel(model) {
+		return "", false
+	}
+	return normalizeAntigravityClaudeSignature(raw)
+}
+
+func antigravityReplayToolSignature(model, raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	if AntigravityIsClaudeModel(model) {
+		return normalizeAntigravityClaudeSignature(raw)
+	}
+	if _, incompatibleClaude := normalizeAntigravityClaudeSignature(raw); incompatibleClaude || strings.HasPrefix(strings.ToLower(raw), "claude#") || strings.HasPrefix(strings.ToLower(raw), "anthropic#") {
+		return "skip_thought_signature_validator", true
+	}
+	if prefix, payload, ok := strings.Cut(raw, "#"); ok && (strings.EqualFold(prefix, "gemini") || strings.EqualFold(prefix, "google")) {
+		raw = strings.TrimSpace(payload)
+	}
+	return raw, raw != ""
+}
+
+// Antigravity Claude expects its provider-native E-form signature wrapped in a
+// second base64 layer (R-form). Shallow validation is deliberate here: malformed
+// or cross-provider history is dropped before the request, while valid signatures
+// are normalized without interpreting their opaque payload.
+func normalizeAntigravityClaudeSignature(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if prefix, payload, ok := strings.Cut(raw, "#"); ok {
+		if !strings.EqualFold(strings.TrimSpace(prefix), "claude") && !strings.EqualFold(strings.TrimSpace(prefix), "anthropic") {
+			return "", false
+		}
+		raw = strings.TrimSpace(payload)
+	}
+	if raw == "" || len(raw) > 32*1024*1024 {
+		return "", false
+	}
+	switch raw[0] {
+	case 'E':
+		decoded, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(decoded) == 0 || decoded[0] != 0x12 {
+			return "", false
+		}
+		return base64.StdEncoding.EncodeToString([]byte(raw)), true
+	case 'R':
+		inner, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil || len(inner) == 0 || inner[0] != 'E' {
+			return "", false
+		}
+		decoded, err := base64.StdEncoding.DecodeString(string(inner))
+		if err != nil || len(decoded) == 0 || decoded[0] != 0x12 {
+			return "", false
+		}
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
+func antigravityDefaultSafetySettings() []map[string]string {
+	return []map[string]string{
+		{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+		{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+		{"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+		{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+		{"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+	}
 }
 
 // antigravityStableSessionID derives a stable session ID from the first user message
@@ -431,17 +881,27 @@ func antigravityStableSessionID(body []byte) string {
 type AntigravityChunk struct {
 	Text         string
 	FunctionCall *AntigravityFunctionCall
-	StopReason   string   // "end_turn", "tool_use", "max_tokens", ""
+	Parts        []AntigravityResponsePart
+	StopReason   string // "end_turn", "tool_use", "max_tokens", ""
 	InputTokens  int64
 	OutputTokens int64
 	CachedTokens int64 // usageMetadata.cachedContentTokenCount; >0 means cache hit
 	IsLast       bool
+	Blocked      bool
 }
 
 type AntigravityFunctionCall struct {
+	ID    string
 	Name  string
 	Args  json.RawMessage
 	Index int
+}
+
+type AntigravityResponsePart struct {
+	Text             string
+	Thought          bool
+	ThoughtSignature string
+	FunctionCall     *AntigravityFunctionCall
 }
 
 // ParseAntigravitySSELine parses one "data:" SSE line from an Antigravity stream
@@ -459,15 +919,40 @@ func ParseAntigravitySSELine(line string) (*AntigravityChunk, error) {
 }
 
 func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
+	if !json.Valid(payload) {
+		return nil, fmt.Errorf("antigravity response chunk is not valid JSON")
+	}
 	r := gjson.ParseBytes(payload)
+	if r.Get("error").Exists() {
+		return nil, fmt.Errorf("antigravity response contains an upstream error")
+	}
+	if wrapped := r.Get("response"); wrapped.Exists() {
+		r = wrapped
+	}
+	if r.Get("error").Exists() {
+		return nil, fmt.Errorf("antigravity response contains an upstream error")
+	}
 	chunk := &AntigravityChunk{}
 
 	// usageMetadata at top level
 	if usage := r.Get("usageMetadata"); usage.Exists() {
 		chunk.InputTokens = usage.Get("promptTokenCount").Int()
-		chunk.OutputTokens = usage.Get("candidatesTokenCount").Int()
+		chunk.OutputTokens = usage.Get("candidatesTokenCount").Int() + usage.Get("thoughtsTokenCount").Int()
 		chunk.CachedTokens = usage.Get("cachedContentTokenCount").Int()
 		chunk.IsLast = true // usage chunk is terminal
+	}
+	if usage := r.Get("cpaUsageMetadata"); usage.Exists() {
+		if chunk.InputTokens == 0 {
+			chunk.InputTokens = usage.Get("promptTokenCount").Int()
+		}
+		if chunk.OutputTokens == 0 {
+			chunk.OutputTokens = usage.Get("candidatesTokenCount").Int() + usage.Get("thoughtsTokenCount").Int()
+		}
+	}
+	if r.Get("promptFeedback.blockReason").String() != "" {
+		chunk.Blocked = true
+		chunk.IsLast = true
+		chunk.StopReason = "end_turn"
 	}
 
 	candidates := r.Get("candidates")
@@ -478,7 +963,10 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 
 	// finishReason
 	switch strings.ToUpper(cand.Get("finishReason").String()) {
-	case "STOP", "":
+	case "STOP":
+		chunk.StopReason = "end_turn"
+		chunk.IsLast = true
+	case "":
 		if chunk.IsLast {
 			chunk.StopReason = "end_turn"
 		}
@@ -488,6 +976,7 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 	case "SAFETY", "OTHER", "FINISH_REASON_UNSPECIFIED":
 		chunk.StopReason = "end_turn"
 		chunk.IsLast = true
+		chunk.Blocked = strings.EqualFold(cand.Get("finishReason").String(), "SAFETY")
 	default:
 		if cand.Get("finishReason").String() != "" {
 			chunk.StopReason = "end_turn"
@@ -501,21 +990,90 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 		return chunk, nil
 	}
 	for i, part := range parts.Array() {
-		if text := part.Get("text").String(); text != "" {
-			chunk.Text += text
+		responsePart := AntigravityResponsePart{
+			Text:             part.Get("text").String(),
+			Thought:          part.Get("thought").Bool(),
+			ThoughtSignature: firstNonEmptyString(part.Get("thoughtSignature").String(), part.Get("thought_signature").String()),
+		}
+		if responsePart.Text != "" && !responsePart.Thought {
+			chunk.Text += responsePart.Text
 		}
 		if fc := part.Get("functionCall"); fc.Exists() {
-			chunk.FunctionCall = &AntigravityFunctionCall{
+			responsePart.FunctionCall = &AntigravityFunctionCall{
+				ID:    fc.Get("id").String(),
 				Name:  fc.Get("name").String(),
 				Args:  []byte(fc.Get("args").Raw),
 				Index: i,
+			}
+			if chunk.FunctionCall == nil {
+				chunk.FunctionCall = responsePart.FunctionCall
 			}
 			if chunk.StopReason == "" {
 				chunk.StopReason = "tool_use"
 			}
 		}
+		if responsePart.Text != "" || responsePart.ThoughtSignature != "" || responsePart.FunctionCall != nil {
+			chunk.Parts = append(chunk.Parts, responsePart)
+		}
 	}
 	return chunk, nil
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func antigravitySignatureForClaude(model, signature string) string {
+	if signature == "" || !AntigravityIsClaudeModel(model) || !strings.HasPrefix(signature, "R") {
+		return signature
+	}
+	decoded, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil || len(decoded) == 0 {
+		return signature
+	}
+	return string(decoded)
+}
+
+// ProbeAntigravitySSE reads through the first valid Antigravity data event. The
+// returned prefix must be replayed into AntigravityStreamToAnthropic. This lets
+// the API fail over while no downstream bytes have been committed when a 200
+// response actually contains an error or closes before producing a response.
+func ProbeAntigravitySSE(reader *bufio.Reader) ([]byte, error) {
+	if reader == nil {
+		return nil, io.ErrUnexpectedEOF
+	}
+	var prefix bytes.Buffer
+	for prefix.Len() <= 512*1024 {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			prefix.WriteString(line)
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "data:") {
+				chunk, parseErr := ParseAntigravitySSELine(trimmed)
+				if parseErr != nil {
+					return nil, parseErr
+				}
+				if chunk != nil {
+					if len(chunk.Parts) == 0 && chunk.IsLast && !chunk.Blocked && chunk.InputTokens == 0 && chunk.OutputTokens == 0 {
+						return nil, io.ErrUnexpectedEOF
+					}
+					return append([]byte(nil), prefix.Bytes()...), nil
+				}
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("antigravity stream did not produce a valid event within the probe limit")
 }
 
 // AntigravityStreamToAnthropic reads an Antigravity SSE stream and writes Anthropic-
@@ -523,35 +1081,75 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 // The msgID is used as the Anthropic message id (msg_*) for the downstream response.
 func AntigravityStreamToAnthropic(ctx context.Context, body io.Reader, w io.Writer,
 	model, msgID string) (inputTok, outputTok, cachedTok int64, stopReason string, err error) {
-
 	stopReason = "end_turn"
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	scanner.Buffer(make([]byte, 256*1024), 2*1024*1024)
+	writeEvent := func(event string, payload []byte) error {
+		_, writeErr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, payload)
+		return writeErr
+	}
+	msgStart, _ := json.Marshal(map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id": msgID, "type": "message", "role": "assistant", "content": []interface{}{},
+			"model": model, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]int64{"input_tokens": 0, "output_tokens": 0},
+		},
+	})
+	if err = writeEvent("message_start", msgStart); err != nil {
+		return 0, 0, 0, "", err
+	}
+	if err = writeEvent("ping", []byte(`{"type":"ping"}`)); err != nil {
+		return 0, 0, 0, "", err
+	}
 
-	// message_start
-	msgStart := fmt.Sprintf(`{"type":"message_start","message":{"id":%q,"type":"message","role":"assistant","content":[],"model":%q,"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`,
-		msgID, model)
-	if _, werr := fmt.Fprintf(w, "event: message_start\ndata: %s\n\n", msgStart); werr != nil {
-		return 0, 0, 0, "", werr
+	blockIndex := 0
+	blockType := ""
+	hasContent := false
+	sawChunk := false
+	sawTerminal := false
+	closeBlock := func() error {
+		if blockType == "" {
+			return nil
+		}
+		payload, _ := json.Marshal(map[string]interface{}{"type": "content_block_stop", "index": blockIndex})
+		if closeErr := writeEvent("content_block_stop", payload); closeErr != nil {
+			return closeErr
+		}
+		blockIndex++
+		blockType = ""
+		return nil
 	}
-	// content_block_start for index 0 (text block)
-	if _, werr := fmt.Fprintf(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"); werr != nil {
-		return 0, 0, 0, "", werr
+	startBlock := func(kind string, content map[string]interface{}) error {
+		if blockType == kind && kind != "tool_use" {
+			return nil
+		}
+		if closeErr := closeBlock(); closeErr != nil {
+			return closeErr
+		}
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type": "content_block_start", "index": blockIndex, "content_block": content,
+		})
+		if startErr := writeEvent("content_block_start", payload); startErr != nil {
+			return startErr
+		}
+		blockType = kind
+		hasContent = true
+		return nil
 	}
-	if _, werr := fmt.Fprintf(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n"); werr != nil {
-		return 0, 0, 0, "", werr
-	}
-
-	toolIndex := -1 // tracks if we've opened a tool-use block
 	for scanner.Scan() {
 		if ctx.Err() != nil {
 			return inputTok, outputTok, cachedTok, stopReason, ctx.Err()
 		}
 		line := scanner.Text()
 		chunk, parseErr := ParseAntigravitySSELine(line)
-		if parseErr != nil || chunk == nil {
+		if parseErr != nil {
+			return inputTok, outputTok, cachedTok, stopReason, parseErr
+		}
+		if chunk == nil {
 			continue
 		}
+		sawChunk = true
 		if chunk.InputTokens > 0 {
 			inputTok = chunk.InputTokens
 		}
@@ -565,61 +1163,114 @@ func AntigravityStreamToAnthropic(ctx context.Context, body io.Reader, w io.Writ
 			stopReason = chunk.StopReason
 		}
 
-		// Text delta
-		if chunk.Text != "" {
-			textJSON, _ := json.Marshal(chunk.Text)
-			if _, werr := fmt.Fprintf(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":%s}}\n\n", textJSON); werr != nil {
-				return inputTok, outputTok, cachedTok, stopReason, werr
+		for _, part := range chunk.Parts {
+			if part.FunctionCall != nil {
+				fc := part.FunctionCall
+				toolID := strings.TrimSpace(fc.ID)
+				if toolID == "" {
+					toolID = "toolu_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+				}
+				if err = startBlock("tool_use", map[string]interface{}{"type": "tool_use", "id": toolID, "name": fc.Name, "input": map[string]interface{}{}}); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+				args := string(fc.Args)
+				if args == "" {
+					args = "{}"
+				}
+				delta, _ := json.Marshal(map[string]interface{}{
+					"type": "content_block_delta", "index": blockIndex,
+					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": args},
+				})
+				if err = writeEvent("content_block_delta", delta); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+				if err = closeBlock(); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+				continue
 			}
-		}
-
-		// Function call
-		if fc := chunk.FunctionCall; fc != nil && toolIndex < 0 {
-			toolIndex = 1 // tool block at index 1
-			fcNameJSON, _ := json.Marshal(fc.Name)
-			if _, werr := fmt.Fprintf(w,
-				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":%q,\"name\":%s,\"input\":{}}}\n\n",
-				"toolu_"+strings.ReplaceAll(uuid.NewString(), "-", "")[:16], fcNameJSON,
-			); werr != nil {
-				return inputTok, outputTok, cachedTok, stopReason, werr
+			if part.Thought {
+				if err = startBlock("thinking", map[string]interface{}{"type": "thinking", "thinking": ""}); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+				if part.Text != "" {
+					delta, _ := json.Marshal(map[string]interface{}{
+						"type": "content_block_delta", "index": blockIndex,
+						"delta": map[string]interface{}{"type": "thinking_delta", "thinking": part.Text},
+					})
+					if err = writeEvent("content_block_delta", delta); err != nil {
+						return inputTok, outputTok, cachedTok, stopReason, err
+					}
+				}
+				if signature := antigravitySignatureForClaude(model, part.ThoughtSignature); signature != "" {
+					delta, _ := json.Marshal(map[string]interface{}{
+						"type": "content_block_delta", "index": blockIndex,
+						"delta": map[string]interface{}{"type": "signature_delta", "signature": signature},
+					})
+					if err = writeEvent("content_block_delta", delta); err != nil {
+						return inputTok, outputTok, cachedTok, stopReason, err
+					}
+				}
+				continue
 			}
-			argsJSON, _ := json.Marshal(string(fc.Args))
-			if _, werr := fmt.Fprintf(w,
-				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":%s}}\n\n",
-				argsJSON,
-			); werr != nil {
-				return inputTok, outputTok, cachedTok, stopReason, werr
+			if part.ThoughtSignature != "" {
+				if err = startBlock("thinking", map[string]interface{}{"type": "thinking", "thinking": ""}); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+				delta, _ := json.Marshal(map[string]interface{}{
+					"type": "content_block_delta", "index": blockIndex,
+					"delta": map[string]interface{}{"type": "signature_delta", "signature": antigravitySignatureForClaude(model, part.ThoughtSignature)},
+				})
+				if err = writeEvent("content_block_delta", delta); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+			}
+			if part.Text != "" {
+				if err = startBlock("text", map[string]interface{}{"type": "text", "text": ""}); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
+				delta, _ := json.Marshal(map[string]interface{}{
+					"type": "content_block_delta", "index": blockIndex,
+					"delta": map[string]interface{}{"type": "text_delta", "text": part.Text},
+				})
+				if err = writeEvent("content_block_delta", delta); err != nil {
+					return inputTok, outputTok, cachedTok, stopReason, err
+				}
 			}
 		}
 
 		if chunk.IsLast {
+			sawTerminal = true
 			break
 		}
 	}
-	if serr := scanner.Err(); serr != nil {
-		err = serr
+	if scanErr := scanner.Err(); scanErr != nil {
+		err = scanErr
+	} else if !sawChunk || !sawTerminal {
+		err = io.ErrUnexpectedEOF
 	}
 
-	// Close open blocks.
-	if _, werr := fmt.Fprintf(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"); werr != nil {
-		return inputTok, outputTok, cachedTok, stopReason, werr
-	}
-	if toolIndex >= 0 {
-		if _, werr := fmt.Fprintf(w, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n"); werr != nil {
-			return inputTok, outputTok, cachedTok, stopReason, werr
+	if !hasContent {
+		if startErr := startBlock("text", map[string]interface{}{"type": "text", "text": ""}); startErr != nil {
+			return inputTok, outputTok, cachedTok, stopReason, startErr
 		}
 	}
-
-	// message_delta with final usage
-	if _, werr := fmt.Fprintf(w,
-		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":%q,\"stop_sequence\":null},\"usage\":{\"output_tokens\":%d}}\n\n",
-		stopReason, outputTok,
-	); werr != nil {
-		return inputTok, outputTok, cachedTok, stopReason, werr
+	if closeErr := closeBlock(); closeErr != nil {
+		return inputTok, outputTok, cachedTok, stopReason, closeErr
 	}
-	// message_stop
-	if _, werr := fmt.Fprintf(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"); werr != nil {
-		return inputTok, outputTok, cachedTok, stopReason, werr
+
+	usage := map[string]interface{}{"output_tokens": outputTok}
+	if cachedTok > 0 {
+		usage["cache_read_input_tokens"] = cachedTok
+	}
+	messageDelta, _ := json.Marshal(map[string]interface{}{
+		"type": "message_delta", "delta": map[string]interface{}{"stop_reason": stopReason, "stop_sequence": nil}, "usage": usage,
+	})
+	if writeErr := writeEvent("message_delta", messageDelta); writeErr != nil {
+		return inputTok, outputTok, cachedTok, stopReason, writeErr
+	}
+	if writeErr := writeEvent("message_stop", []byte(`{"type":"message_stop"}`)); writeErr != nil {
+		return inputTok, outputTok, cachedTok, stopReason, writeErr
 	}
 	return inputTok, outputTok, cachedTok, stopReason, err
 }
@@ -650,16 +1301,41 @@ func AntigravityChunkToAnthropicJSON(chunk *AntigravityChunk, model, msgID strin
 		stopReason = "end_turn"
 	}
 
-	type contentBlock struct {
-		Type string `json:"type"`
-		Text string `json:"text,omitempty"`
-	}
-	var content []contentBlock
-	if chunk.Text != "" {
-		content = append(content, contentBlock{Type: "text", Text: chunk.Text})
+	content := make([]map[string]interface{}, 0, len(chunk.Parts))
+	hasToolUse := false
+	for _, part := range chunk.Parts {
+		if part.FunctionCall != nil {
+			toolID := strings.TrimSpace(part.FunctionCall.ID)
+			if toolID == "" {
+				toolID = "toolu_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
+			}
+			input := map[string]interface{}{}
+			if len(part.FunctionCall.Args) > 0 {
+				_ = json.Unmarshal(part.FunctionCall.Args, &input)
+			}
+			content = append(content, map[string]interface{}{
+				"type": "tool_use", "id": toolID, "name": part.FunctionCall.Name, "input": input,
+			})
+			hasToolUse = true
+			continue
+		}
+		if part.Thought || part.ThoughtSignature != "" {
+			block := map[string]interface{}{"type": "thinking", "thinking": part.Text}
+			if signature := antigravitySignatureForClaude(model, part.ThoughtSignature); signature != "" {
+				block["signature"] = signature
+			}
+			content = append(content, block)
+			continue
+		}
+		if part.Text != "" {
+			content = append(content, map[string]interface{}{"type": "text", "text": part.Text})
+		}
 	}
 	if len(content) == 0 {
-		content = []contentBlock{{Type: "text", Text: ""}}
+		content = []map[string]interface{}{{"type": "text", "text": ""}}
+	}
+	if hasToolUse {
+		stopReason = "tool_use"
 	}
 
 	type usage struct {
@@ -667,14 +1343,14 @@ func AntigravityChunkToAnthropicJSON(chunk *AntigravityChunk, model, msgID strin
 		OutputTokens int64 `json:"output_tokens"`
 	}
 	type msg struct {
-		ID           string         `json:"id"`
-		Type         string         `json:"type"`
-		Role         string         `json:"role"`
-		Content      []contentBlock `json:"content"`
-		Model        string         `json:"model"`
-		StopReason   string         `json:"stop_reason"`
-		StopSequence interface{}    `json:"stop_sequence"`
-		Usage        usage          `json:"usage"`
+		ID           string                   `json:"id"`
+		Type         string                   `json:"type"`
+		Role         string                   `json:"role"`
+		Content      []map[string]interface{} `json:"content"`
+		Model        string                   `json:"model"`
+		StopReason   string                   `json:"stop_reason"`
+		StopSequence interface{}              `json:"stop_sequence"`
+		Usage        usage                    `json:"usage"`
 	}
 	out, _ := json.Marshal(msg{
 		ID:           msgID,
@@ -687,297 +1363,4 @@ func AntigravityChunkToAnthropicJSON(chunk *AntigravityChunk, model, msgID strin
 		Usage:        usage{InputTokens: chunk.InputTokens, OutputTokens: chunk.OutputTokens},
 	})
 	return out
-}
-
-// ── Explicit cache helpers ────────────────────────────────────────────────────
-
-// antigravityCacheCreateEndpoint is the Vertex AI endpoint used for CachedContent CRUD.
-// The Antigravity OAuth token has Vertex AI scopes, so we create caches there and
-// reference them via the top-level request.cachedContent field during inference.
-const antigravityCacheCreateEndpoint = "https://us-central1-aiplatform.googleapis.com"
-
-// AntigravityCacheCreateRequest is the input to CreateAntigravityCachedContent.
-type AntigravityCacheCreateRequest struct {
-	AccessToken  string
-	ProjectID    string
-	Model        string // Gemini model slug, e.g. "gemini-2.5-pro"
-	SystemText   string
-	PrefixTurns  []geminiContent // history turns to cache (all but the final user turn)
-	TTLSeconds   int64           // 0 → default 3600
-}
-
-// AntigravityCacheCreateResponse is the minimal subset of the Vertex AI
-// CachedContent response that we need.
-type AntigravityCacheCreateResponse struct {
-	Name        string `json:"name"`       // "projects/.../cachedContents/xxx"
-	ExpiresAt   int64  // Unix seconds parsed from expireTime
-	TotalTokens int64  // usageMetadata.totalTokenCount
-}
-
-// CreateAntigravityCachedContent calls the Vertex AI cachedContents API to create
-// an explicit cache resource for the given prefix. Returns the resource name and
-// expiry so the caller can persist an AntigravityCacheEntry.
-func CreateAntigravityCachedContent(ctx context.Context, req AntigravityCacheCreateRequest) (AntigravityCacheCreateResponse, error) {
-	if req.ProjectID == "" {
-		return AntigravityCacheCreateResponse{}, fmt.Errorf("project_id required for cache creation")
-	}
-	ttl := req.TTLSeconds
-	if ttl <= 0 {
-		ttl = 3600
-	}
-
-	// Vertex AI requires the full publisher model path.
-	model := req.Model
-	if !strings.Contains(model, "/") {
-		model = fmt.Sprintf("projects/%s/locations/us-central1/publishers/google/models/%s", req.ProjectID, req.Model)
-	}
-
-	type part struct {
-		Text string `json:"text"`
-	}
-	type content struct {
-		Role  string `json:"role,omitempty"`
-		Parts []part `json:"parts"`
-	}
-	type createReq struct {
-		Model             string    `json:"model"`
-		DisplayName       string    `json:"displayName,omitempty"`
-		SystemInstruction *content  `json:"systemInstruction,omitempty"`
-		Contents          []content `json:"contents,omitempty"`
-		TTL               string    `json:"ttl"`
-	}
-	body := createReq{
-		Model: model,
-		TTL:   fmt.Sprintf("%ds", ttl),
-	}
-	if req.SystemText != "" {
-		body.SystemInstruction = &content{Parts: []part{{Text: req.SystemText}}}
-	}
-	for _, turn := range req.PrefixTurns {
-		var parts []part
-		for _, p := range turn.Parts {
-			if p.Text != "" {
-				parts = append(parts, part{Text: p.Text})
-			}
-		}
-		if len(parts) > 0 {
-			body.Contents = append(body.Contents, content{Role: turn.Role, Parts: parts})
-		}
-	}
-	bodyJSON, err := json.Marshal(body)
-	if err != nil {
-		return AntigravityCacheCreateResponse{}, err
-	}
-
-	url := fmt.Sprintf("%s/v1/projects/%s/locations/us-central1/cachedContents",
-		antigravityCacheCreateEndpoint, req.ProjectID)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyJSON))
-	if err != nil {
-		return AntigravityCacheCreateResponse{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+req.AccessToken)
-
-	client := &http.Client{Transport: antigravityTransport, Timeout: 30 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return AntigravityCacheCreateResponse{}, fmt.Errorf("cache create request: %w", err)
-	}
-	defer resp.Body.Close()
-	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return AntigravityCacheCreateResponse{}, fmt.Errorf("cache create HTTP %d: %s", resp.StatusCode, string(respBytes))
-	}
-
-	name := gjson.GetBytes(respBytes, "name").String()
-	if name == "" {
-		return AntigravityCacheCreateResponse{}, fmt.Errorf("cache create: empty name in response: %s", string(respBytes))
-	}
-	totalTok := gjson.GetBytes(respBytes, "usageMetadata.totalTokenCount").Int()
-
-	// Parse expireTime RFC3339 → Unix seconds.
-	var expiresAt int64
-	if et := gjson.GetBytes(respBytes, "expireTime").String(); et != "" {
-		if t, tErr := time.Parse(time.RFC3339, et); tErr == nil {
-			expiresAt = t.Unix()
-		}
-	}
-	if expiresAt == 0 {
-		expiresAt = time.Now().Unix() + ttl
-	}
-	return AntigravityCacheCreateResponse{Name: name, ExpiresAt: expiresAt, TotalTokens: totalTok}, nil
-}
-
-// ExtractAntigravityPrefixForCache splits an Anthropic request body into the stable
-// prefix (system + history turns) suitable for a CachedContent resource, and the
-// single new user turn to include in the actual inference request.
-//
-// Returns:
-//   - prefixTurns: all converted Gemini turns except the last user turn
-//   - lastTurns:   just the final user turn as a slice (for request.contents)
-//   - systemText:  extracted system prompt text
-//   - convKeyHash: FNV-64a hex fingerprint over systemText+prefix turns (stable across
-//     multiple requests in the same conversation)
-//
-// approxChars is the total character count of the prefix — used by callers to
-// decide whether the prefix is large enough to be worth caching.
-func ExtractAntigravityPrefixForCache(body []byte) (prefixTurns []geminiContent, lastTurns []geminiContent, systemText string, convKeyHash string) {
-	// Extract system prompt.
-	if sys := gjson.GetBytes(body, "system"); sys.Exists() {
-		switch sys.Type {
-		case gjson.String:
-			systemText = sys.String()
-		case gjson.JSON:
-			for _, b := range sys.Array() {
-				if b.Get("type").String() == "text" {
-					systemText += b.Get("text").String()
-				}
-			}
-		}
-	}
-
-	all, err := anthropicMessagesToGeminiContents(body)
-	if err != nil || len(all) == 0 {
-		return nil, all, systemText, antigravityConvHash(systemText, nil)
-	}
-
-	// Prefix = everything except the last turn.
-	// Last turn = the final element (should be the new user message).
-	last := all[len(all)-1:]
-	prefix := all[:len(all)-1]
-	return prefix, last, systemText, antigravityConvHash(systemText, prefix)
-}
-
-// ApproxAntigravityPrefixChars returns the approximate character count of the stable
-// prefix (system + history). Used to gate cache creation.
-func ApproxAntigravityPrefixChars(body []byte) int {
-	prefix, _, sys, _ := ExtractAntigravityPrefixForCache(body)
-	n := len(sys)
-	for _, c := range prefix {
-		for _, p := range c.Parts {
-			n += len(p.Text)
-		}
-	}
-	return n
-}
-
-// antigravityConvHash computes a stable FNV-64a fingerprint over the system text and
-// the prefix turns. Two requests with the same system + same history produce the same
-// hash, allowing cache reuse across turns.
-func antigravityConvHash(systemText string, prefixTurns []geminiContent) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(systemText))
-	_, _ = h.Write([]byte{0x00})
-	for _, turn := range prefixTurns {
-		_, _ = h.Write([]byte(turn.Role))
-		_, _ = h.Write([]byte{0x01})
-		for _, p := range turn.Parts {
-			_, _ = h.Write([]byte(p.Text))
-			_, _ = h.Write([]byte{0x02})
-		}
-		_, _ = h.Write([]byte{0x03})
-	}
-	return fmt.Sprintf("%016x", h.Sum64())
-}
-
-// ── Claude-via-Vertex stream / non-stream parsers ─────────────────────────────
-//
-// Vertex AI's :streamRawPredict and :rawPredict endpoints return native Anthropic
-// wire format (identical to the direct Anthropic API). We pass the bytes through
-// unchanged and extract usage counters from the well-known event fields.
-
-// AntigravityClaudeVertexStreamToAnthropic reads native Anthropic SSE from a Vertex
-// AI :streamRawPredict response, writes each line to w unchanged, and returns the
-// token counts extracted from message_start/message_delta usage events.
-//
-// Signature is identical to AntigravityStreamToAnthropic so the API layer can call
-// either function through the same code path.
-func AntigravityClaudeVertexStreamToAnthropic(ctx context.Context, body io.Reader, w io.Writer,
-	_, _ string) (inputTok, outputTok, cachedTok int64, stopReason string, err error) {
-
-	stopReason = "end_turn"
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 512*1024), 512*1024)
-
-	for scanner.Scan() {
-		if ctx.Err() != nil {
-			return inputTok, outputTok, cachedTok, stopReason, ctx.Err()
-		}
-		line := scanner.Bytes()
-		if _, werr := w.Write(line); werr != nil {
-			return inputTok, outputTok, cachedTok, stopReason, werr
-		}
-		if _, werr := w.Write([]byte{'\n'}); werr != nil {
-			return inputTok, outputTok, cachedTok, stopReason, werr
-		}
-
-		// Extract usage from native Anthropic SSE events.
-		if !bytes.HasPrefix(line, []byte("data: ")) {
-			continue
-		}
-		data := line[6:]
-		switch gjson.GetBytes(data, "type").String() {
-		case "message_start":
-			// message_start carries input_tokens and cache counters.
-			if v := gjson.GetBytes(data, "message.usage.input_tokens"); v.Exists() {
-				inputTok = v.Int()
-			}
-			if v := gjson.GetBytes(data, "message.usage.cache_read_input_tokens"); v.Exists() {
-				cachedTok = v.Int()
-			}
-		case "message_delta":
-			// message_delta carries output_tokens and the final stop_reason.
-			if v := gjson.GetBytes(data, "usage.output_tokens"); v.Exists() {
-				outputTok = v.Int()
-			}
-			if v := gjson.GetBytes(data, "delta.stop_reason"); v.Exists() && v.String() != "" {
-				stopReason = v.String()
-			}
-		}
-	}
-	return inputTok, outputTok, cachedTok, stopReason, scanner.Err()
-}
-
-// AntigravityClaudeVertexNonStreamResult holds the parsed result from a Vertex AI
-// :rawPredict Claude response. RawBody is the original Anthropic JSON; usage fields
-// are extracted separately for billing.
-type AntigravityClaudeVertexNonStreamResult struct {
-	RawBody      []byte
-	InputTokens  int64
-	OutputTokens int64
-	CachedTokens int64
-	StopReason   string
-}
-
-// ParseAntigravityClaudeVertexNonStream reads a Vertex AI :rawPredict response body
-// (native Anthropic JSON) and returns the raw bytes together with the extracted usage
-// counters. The RawBody is forwarded as-is to the downstream client, preserving all
-// fields (thinking blocks, tool calls, etc.) that AntigravityChunkToAnthropicJSON
-// would otherwise lose.
-func ParseAntigravityClaudeVertexNonStream(body io.Reader) (AntigravityClaudeVertexNonStreamResult, error) {
-	raw, err := io.ReadAll(io.LimitReader(body, 4*1024*1024))
-	if err != nil {
-		return AntigravityClaudeVertexNonStreamResult{}, err
-	}
-	var res AntigravityClaudeVertexNonStreamResult
-	res.RawBody = raw
-	res.InputTokens = gjson.GetBytes(raw, "usage.input_tokens").Int()
-	res.OutputTokens = gjson.GetBytes(raw, "usage.output_tokens").Int()
-	res.CachedTokens = gjson.GetBytes(raw, "usage.cache_read_input_tokens").Int()
-	res.StopReason = gjson.GetBytes(raw, "stop_reason").String()
-	if res.StopReason == "" {
-		res.StopReason = "end_turn"
-	}
-	return res, nil
-}
-
-// AntigravityClaudeVertexIsCacheRejected reports whether an HTTP 400/422 response
-// body indicates that the upstream Vertex AI endpoint rejected a cache_control field.
-// When true, the caller should strip cache_control from the request and retry once.
-func AntigravityClaudeVertexIsCacheRejected(statusCode int, respBody []byte) bool {
-	if statusCode != http.StatusBadRequest && statusCode != http.StatusUnprocessableEntity {
-		return false
-	}
-	low := strings.ToLower(string(respBody))
-	return strings.Contains(low, "cache_control") || strings.Contains(low, "caching")
 }

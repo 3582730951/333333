@@ -26,8 +26,11 @@ func TestUserGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T
 	save("coding-style.md", "  Use concise Go.  \n")
 	save("testing.txt", "\nPrefer regression tests.\n")
 	routeKey := createTestAPIKeyForUserGroup(t, h, "codex-team", map[string]interface{}{
-		"model_instructions_enabled": true,
-		"model_instructions_files":   []string{"coding-style.md", "testing.txt"},
+		"model_instruction_profiles": map[string]interface{}{
+			"gpt":    map[string]interface{}{"enabled": true, "files": []string{"coding-style.md", "testing.txt"}},
+			"claude": map[string]interface{}{"enabled": false, "files": []string{}},
+			"gemini": map[string]interface{}{"enabled": false, "files": []string{}},
+		},
 	})
 	acc := h.importAccount(t, "instr", "up-instr", "access-instr")
 	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+acc+"/group", `{"group":"codex-team"}`); code != http.StatusOK {
@@ -109,6 +112,51 @@ func TestUserGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T
 	}
 	if upstream["instructions"] != want {
 		t.Fatalf("chat instructions = %#v, want %#v", upstream["instructions"], want)
+	}
+}
+
+func TestModelInstructionProfilesSelectFilesByModelFamily(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	for name, content := range map[string]string{
+		"gpt.md":    "GPT instructions",
+		"claude.md": "Claude instructions",
+		"gemini.md": "Gemini instructions",
+	} {
+		body, _ := json.Marshal(map[string]string{"name": name, "content": content})
+		if code, raw := grpReq(t, h, http.MethodPost, "/admin/model-instructions", string(body)); code != http.StatusOK {
+			t.Fatalf("save %s = %d: %s", name, code, raw)
+		}
+	}
+	group := storage.Group{Name: "family-policy", ModelInstructionProfiles: storage.ModelInstructionProfiles{
+		storage.ModelInstructionFamilyGPT:    {Enabled: true, Files: []string{"gpt.md"}},
+		storage.ModelInstructionFamilyClaude: {Enabled: true, Files: []string{"claude.md"}},
+		storage.ModelInstructionFamilyGemini: {Enabled: true, Files: []string{"gemini.md"}},
+	}}
+	for model, want := range map[string]string{
+		"gpt-5.6-sol":     "GPT instructions",
+		"claude-sonnet-5": "Claude instructions",
+		"gemini-3.1-pro":  "Gemini instructions",
+	} {
+		compiled, _, err := h.app.compileGroupModelInstructionsForModel(t.Context(), group, model)
+		if err != nil || compiled != want {
+			t.Fatalf("model %s compiled=%q want=%q err=%v", model, compiled, want, err)
+		}
+	}
+	compiled, _, err := h.app.compileGroupModelInstructionsForModel(t.Context(), group, "custom-unknown")
+	if err != nil || compiled != "" {
+		t.Fatalf("unknown model must not receive a cross-family profile: compiled=%q err=%v", compiled, err)
+	}
+}
+
+func TestAdminUserGroupRejectsEnabledInstructionProfileWithoutFiles(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
+		"name":"broken-instructions",
+		"targets":[{"kind":"account_pool_group","id":"cyber"}],
+		"model_instruction_profiles":{"claude":{"enabled":true,"files":[]}}
+	}`)
+	if code != http.StatusUnprocessableEntity || !strings.Contains(string(raw), "invalid_model_instruction_policy") {
+		t.Fatalf("enabled empty profile = %d, want 422 invalid_model_instruction_policy: %s", code, raw)
 	}
 }
 
@@ -381,10 +429,18 @@ func createTestAPIKeyForUserGroup(t *testing.T, h *testHarness, accountPoolGroup
 	if err := json.Unmarshal(raw, &userGroup); err != nil || userGroup.ID == "" {
 		t.Fatalf("decode user group for %s: %+v err=%v (%s)", accountPoolGroup, userGroup, err, raw)
 	}
-	plain := createTestAPIKeyForGroup(t, h, accountPoolGroup)
-	code, raw = grpReq(t, h, http.MethodPost, "/admin/api-keys/"+hashAPIKey(plain)+"/user-group", `{"user_group_id":"`+userGroup.ID+`"}`)
-	if code != http.StatusOK {
-		t.Fatalf("bind api key to user group %s = %d: %s", userGroup.ID, code, raw)
+	keyBody, _ := json.Marshal(map[string]string{"label": "route-" + accountPoolGroup, "user_group_id": userGroup.ID})
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/api-keys", string(keyBody))
+	if code != http.StatusCreated {
+		t.Fatalf("create api key for user group %s = %d: %s", userGroup.ID, code, raw)
+	}
+	var keyPayload map[string]interface{}
+	if err := json.Unmarshal(raw, &keyPayload); err != nil {
+		t.Fatalf("decode api key for user group %s: %v (%s)", userGroup.ID, err, raw)
+	}
+	plain, _ := keyPayload["key"].(string)
+	if plain == "" {
+		t.Fatalf("api key for user group %s missing plaintext: %s", userGroup.ID, raw)
 	}
 	return plain
 }

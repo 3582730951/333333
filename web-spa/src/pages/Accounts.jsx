@@ -1,4 +1,5 @@
 import React, { useState, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   ActionMenu, Button, ConfirmDialog, Tag, Toast, Modal, Form, Typography, Input, Select,
 } from '../components/pool/index.jsx';
@@ -16,7 +17,7 @@ import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtTokens } from '../lib/format.js';
-import { useAccountsPage } from '../features/accounts/queries/accounts.ts';
+import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
 import {
   healthBatchPresentation, healthResultPresentation, healthTestRequestBody,
   isKiroSuspended, isProtectedProbeQuarantine, requiresPaidHealthTest, selectedHasPaidProbe,
@@ -97,8 +98,21 @@ function middleEllipsis(value, head = 24, tail = 14) {
   return `${text.slice(0, head)}…${text.slice(-tail)}`;
 }
 
+function mergeAccountUpdate(account, patch) {
+  if (!account || !patch || typeof patch !== 'object') return account;
+  const isEgressBinding = Object.prototype.hasOwnProperty.call(patch, 'primary_egress_id')
+    || Object.prototype.hasOwnProperty.call(patch, 'standby_egress_ids')
+    || Object.prototype.hasOwnProperty.call(patch, 'sidecar_egress_id');
+  if (isEgressBinding) {
+    return { ...account, egress_binding: { ...(account.egress_binding || {}), ...patch } };
+  }
+  const normalized = patch.group && !patch.group_name ? { ...patch, group_name: patch.group } : patch;
+  return { ...account, ...normalized };
+}
+
 export default function Accounts() {
   const responsive = useResponsiveLayout();
+  const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [pageSize] = useState(50);
   const [importOpen, setImportOpen] = useState(false);
@@ -137,9 +151,42 @@ export default function Accounts() {
   const doSearch = () => { setPage(1); setSearch(searchInput.trim()); };
   const onPageChange = (cur) => { setPage(cur); };
 
+  const updateCachedAccount = useCallback((id, patch) => {
+    queryClient.setQueriesData({ queryKey: accountQueryKeys.all }, (current) => {
+      if (!current || !Array.isArray(current.rows)) return current;
+      return {
+        ...current,
+        rows: current.rows.map((account) => account.id === id ? mergeAccountUpdate(account, patch) : account),
+      };
+    });
+    setDrawerAcct((current) => current?.id === id ? mergeAccountUpdate(current, patch) : current);
+  }, [queryClient]);
+
+  const removeCachedAccount = useCallback((id) => {
+    queryClient.setQueriesData({ queryKey: accountQueryKeys.all }, (current) => {
+      if (!current || !Array.isArray(current.rows)) return current;
+      const rows = current.rows.filter((account) => account.id !== id);
+      return rows.length === current.rows.length ? current : {
+        ...current,
+        rows,
+        total: Math.max(0, Number(current.total || current.rows.length) - 1),
+      };
+    });
+    setDrawerAcct((current) => current?.id === id ? null : current);
+  }, [queryClient]);
+
+  const handleAccountUpdated = useCallback((id, patch = {}) => {
+    updateCachedAccount(id, patch);
+    void Promise.resolve(load()).then((nextData) => {
+      const fresh = nextData?.rows?.find((row) => row.id === id);
+      if (fresh) updateCachedAccount(id, fresh);
+    }).catch(() => {});
+  }, [load, updateCachedAccount]);
+
   const {
     run: runAccountAction,
     running: accountActionRunning,
+    activeKeys: activeAccountActionKeys,
     isRunning: isAccountActionKeyRunning,
   } = useKeyedAsyncAction(async (_key, id, act, requestBody = {}) => {
     try {
@@ -150,15 +197,16 @@ export default function Accounts() {
       } else {
         Toast.success(`${ACCOUNT_ACTION_LABEL[act] || '操作'}已完成`);
       }
-      if (drawerAcct?.id === id) {
-        if (act === 'delete') {
-          setDrawerAcct(null);
-        }
-      }
+      if (act === 'delete') removeCachedAccount(id);
+      if (act === 'clear-quarantine') updateCachedAccount(id, {
+        status: 'active',
+        quarantine_until: 0,
+        quarantine_reason: '',
+      });
       void Promise.resolve(load()).then((nextData) => {
         if (act === 'delete') return;
         const fresh = nextData?.rows?.find((row) => row.id === id);
-        if (fresh) setDrawerAcct((current) => current?.id === id ? fresh : current);
+        if (fresh) updateCachedAccount(id, fresh);
       }).catch(() => {});
       return true;
     } catch (e) {
@@ -167,16 +215,6 @@ export default function Accounts() {
     }
   });
   const action = (id, act, requestBody = {}) => runAccountAction(accountActionKey(id, act), id, act, requestBody);
-
-  const handleAccountUpdated = async (id, patch = {}) => {
-    const nextData = await load();
-    const fresh = nextData?.rows?.find((row) => row.id === id);
-    if (fresh) {
-      setDrawerAcct(fresh);
-    } else if (drawerAcct?.id === id) {
-      setDrawerAcct((current) => current ? { ...current, egress_binding: patch } : current);
-    }
-  };
 
   const { run: bulkAction, running: bulkActionRunning } = useAsyncAction(async (act, label, costConfirmed = false) => {
     if (!selected.length) return;
@@ -207,8 +245,14 @@ export default function Accounts() {
     } else {
       Toast.success(`已对 ${result.success.length} 个账号执行「${label}」`);
     }
+    if (act === 'delete') result.success.forEach(removeCachedAccount);
+    if (act === 'clear-quarantine') result.success.forEach((id) => updateCachedAccount(id, {
+      status: 'active',
+      quarantine_until: 0,
+      quarantine_reason: '',
+    }));
     setSelected(failedIDs);
-    await load();
+    void load();
   });
 
   const { run: bulkMove, running: bulkMoveRunning } = useAsyncAction(async () => {
@@ -216,23 +260,32 @@ export default function Accounts() {
     if (!ids.length) return;
     try {
       await post('/admin/accounts/assign-group', { ids, group: moveGroup });
+      const moved = new Set(ids);
+      queryClient.setQueryData(accountQueryKeys.list({ page, pageSize, search }), (current) => current ? {
+        ...current,
+        rows: (current.rows || []).map((account) => moved.has(account.id) ? { ...account, group_name: moveGroup } : account),
+      } : current);
+      setDrawerAcct((current) => current && moved.has(current.id) ? { ...current, group_name: moveGroup } : current);
       Toast.success(`已移动 ${ids.length} 个账号到「${moveGroup || '默认'}」`);
       setMoveOpen(false);
       setMoveIDs([]);
       setSelected([]);
-      await load();
+      void load();
     } catch (e) { showErrorToast(e); }
   });
   const anyAccountOperationRunning = accountActionRunning || bulkActionRunning || bulkMoveRunning;
   const isAccountActionLoading = (id, act) => isAccountActionKeyRunning(accountActionKey(id, act));
+  const isAccountRowRunning = (id) => [...activeAccountActionKeys].some((key) => String(key).startsWith(`${id}:`));
 
-  const renderAccountActions = (r) => (
-    <ActionMenu
+  const renderAccountActions = (r) => {
+    const rowRunning = isAccountRowRunning(r.id);
+    const batchRunning = bulkActionRunning || bulkMoveRunning;
+    return <ActionMenu
       label="账号操作"
       items={[
         {
           label: isAccountActionLoading(r.id, 'health-test') ? '测活中' : '测活',
-          disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'health-test'),
+          disabled: batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'health-test')),
           confirm: requiresPaidHealthTest(r) ? {
             title: '确认执行双层测活？',
             description: '将先免费检查认证；认证正常后，会绑定此账号和出口发送 1 次最小推理请求，并可能产生少量上游费用。',
@@ -242,23 +295,23 @@ export default function Accounts() {
         },
         {
           label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解隔中' : '解隔',
-          disabled: isProtectedProbeQuarantine(r) || (anyAccountOperationRunning && !isAccountActionLoading(r.id, 'clear-quarantine')),
+          disabled: isProtectedProbeQuarantine(r) || batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'clear-quarantine')),
           onSelect: () => action(r.id, 'clear-quarantine'),
         },
         {
           label: '移动分组',
-          disabled: anyAccountOperationRunning,
+          disabled: batchRunning || rowRunning,
           onSelect: () => {
             setMoveIDs([r.id]);
             setMoveGroup(r.group_name || '');
             setMoveOpen(true);
           },
         },
-        { label: '详情', disabled: anyAccountOperationRunning, onSelect: () => setDrawerAcct(r) },
+        { label: '详情', disabled: batchRunning || rowRunning, onSelect: () => setDrawerAcct(r) },
         {
           label: isAccountActionLoading(r.id, 'delete') ? '删除中' : '删除',
           destructive: true,
-          disabled: anyAccountOperationRunning && !isAccountActionLoading(r.id, 'delete'),
+          disabled: batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'delete')),
           confirm: {
             title: '确认删除该账号？',
             description: `账号 ${r.label || r.email || r.id} 删除后不可恢复。`,
@@ -268,7 +321,7 @@ export default function Accounts() {
         },
       ]}
     />
-  );
+  };
 
   const filtered = rows; // filtering is now server-side
 
@@ -487,7 +540,7 @@ export default function Accounts() {
       ) : null}
 
       <AccountDrawer account={drawerAcct} usage={drawerAcct ? drawerAcct.usage : null}
-        statusTag={statusTag} onAction={action} actionRunning={accountActionRunning}
+        statusTag={statusTag} onAction={action} actionRunning={drawerAcct ? isAccountRowRunning(drawerAcct.id) : false}
         actionDisabled={bulkActionRunning || bulkMoveRunning} isActionLoading={isAccountActionLoading}
         onUpdated={handleAccountUpdated} onClose={() => setDrawerAcct(null)} />
       <Modal title={moveIDs.length === 1 ? '移动账号到分组' : '批量移动到分组'} visible={moveOpen} onCancel={() => { if (!bulkMoveRunning) { setMoveOpen(false); setMoveIDs([]); } }} onOk={bulkMove} confirmLoading={bulkMoveRunning} okText="移动">

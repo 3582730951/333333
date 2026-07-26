@@ -13,7 +13,10 @@ import (
 	"testing"
 	"time"
 
+	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
 )
 
 func TestGeneratePKCE(t *testing.T) {
@@ -169,9 +172,210 @@ func TestOAuthProviderDescriptors(t *testing.T) {
 		t.Errorf("claude authorize must not carry codex flags")
 	}
 
+	antigravity, err := s.oauthProvider("antigravity")
+	if err != nil {
+		t.Fatalf("oauthProvider(antigravity): %v", err)
+	}
+	if antigravity.redirectURI != config.DefaultAntigravityOAuthRedirectURI {
+		t.Fatalf("antigravity redirect URI = %q", antigravity.redirectURI)
+	}
+	agq := mustQuery(t, antigravity.authorizeURL("MUST_NOT_APPEAR", "STATE"))
+	if agq.Get("code_challenge") != "" || agq.Get("code_challenge_method") != "" {
+		t.Fatalf("antigravity OAuth must not send PKCE: %v", agq)
+	}
+	for _, scope := range []string{"cloud-platform", "userinfo.email", "userinfo.profile", "cclog", "experimentsandconfigs"} {
+		if !strings.Contains(agq.Get("scope"), scope) {
+			t.Fatalf("antigravity scope missing %q: %q", scope, agq.Get("scope"))
+		}
+	}
+
 	if _, err := s.oauthProvider("bogus"); err == nil {
 		t.Errorf("unknown provider should error")
 	}
+}
+
+type oauthRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn oauthRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func oauthJSONResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestExchangeAntigravityDiscoversIdentityAndProject(t *testing.T) {
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AntigravityOAuthTokenURL = "https://oauth.test/token"
+	originalClient := apiExternalHTTPClient
+	t.Cleanup(func() { apiExternalHTTPClient = originalClient })
+	requests := []string{}
+	apiExternalHTTPClient = &http.Client{Transport: oauthRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.Method+" "+req.URL.String())
+		if req.Header.Get("X-Forwarded-For") != "" || req.Header.Get("X-Pool-Account") != "" {
+			t.Fatalf("downstream/proxy identity header leaked: %v", req.Header)
+		}
+		switch req.URL.String() {
+		case "https://oauth.test/token":
+			body, _ := io.ReadAll(req.Body)
+			form, parseErr := url.ParseQuery(string(body))
+			if parseErr != nil {
+				t.Fatal(parseErr)
+			}
+			if form.Get("code") != "oauth-code" || form.Get("redirect_uri") != config.DefaultAntigravityOAuthRedirectURI {
+				t.Fatalf("token form = %v", form)
+			}
+			if form.Get("code_verifier") != "" {
+				t.Fatalf("antigravity token exchange sent PKCE verifier: %v", form)
+			}
+			return oauthJSONResponse(http.StatusOK, `{"access_token":"access","refresh_token":"refresh","expires_in":3600,"scope":"scope-a scope-b"}`), nil
+		case antigravityUserInfoURL:
+			if req.Method != http.MethodGet || req.Header.Get("Authorization") != "Bearer access" {
+				t.Fatalf("userinfo request = %s %v", req.Method, req.Header)
+			}
+			return oauthJSONResponse(http.StatusOK, `{"email":"Admin@Example.com"}`), nil
+		case antigravityControlPlaneURL + "/v1internal:loadCodeAssist":
+			body, _ := io.ReadAll(req.Body)
+			if g := strings.TrimSpace(string(body)); !strings.Contains(g, `"ideType":"ANTIGRAVITY"`) {
+				t.Fatalf("loadCodeAssist body = %s", g)
+			}
+			return oauthJSONResponse(http.StatusOK, `{"cloudaicompanionProject":"project-123"}`), nil
+		default:
+			t.Fatalf("unexpected OAuth request: %s", req.URL)
+			return nil, nil
+		}
+	})}
+
+	parsed, err := (&Server{cfg: cfg}).exchangeAntigravityCode(context.Background(), "oauth-code", config.DefaultAntigravityOAuthRedirectURI, storage.EgressProfile{ID: storage.DefaultDirectEgressID, Type: "direct"}, "oauth-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Provider != "antigravity" || parsed.Email != "Admin@Example.com" || parsed.AntigravityProjectID != "project-123" {
+		t.Fatalf("parsed auth = %+v", parsed)
+	}
+	if parsed.AccountID == "" || parsed.AccountID != stableAntigravityAccountIDForTest(t, parsed.Email) {
+		t.Fatalf("unstable account id = %q", parsed.AccountID)
+	}
+	if len(requests) != 3 {
+		t.Fatalf("request sequence = %v", requests)
+	}
+}
+
+func TestExchangeAntigravityUsesSelectedEgressForWholeLogin(t *testing.T) {
+	cfg := config.Default()
+	cfg.RequestTimeoutSeconds = 5
+	originalUserInfo := antigravityUserInfoURL
+	originalControl := antigravityControlPlaneURL
+	originalDaily := antigravityDailyControlURL
+	t.Cleanup(func() {
+		antigravityUserInfoURL = originalUserInfo
+		antigravityControlPlaneURL = originalControl
+		antigravityDailyControlURL = originalDaily
+	})
+	cfg.AntigravityOAuthTokenURL = "http://google.test/token"
+	antigravityUserInfoURL = "http://google.test/userinfo"
+	antigravityControlPlaneURL = "http://cloudcode.test"
+	antigravityDailyControlURL = "http://daily-cloudcode.test"
+
+	var requests []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.String())
+		switch r.URL.String() {
+		case cfg.AntigravityOAuthTokenURL:
+			_, _ = io.WriteString(w, `{"access_token":"access","refresh_token":"refresh","expires_in":3600}`)
+		case antigravityUserInfoURL:
+			_, _ = io.WriteString(w, `{"email":"admin@example.com"}`)
+		case antigravityControlPlaneURL + "/v1internal:loadCodeAssist":
+			_, _ = io.WriteString(w, `{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`)
+		case antigravityDailyControlURL + "/v1internal:onboardUser":
+			if r.Header.Get("X-Goog-Api-Client") != antigravityGoogAPIClient {
+				t.Fatalf("onboard X-Goog-Api-Client = %q", r.Header.Get("X-Goog-Api-Client"))
+			}
+			_, _ = io.WriteString(w, `{"done":true,"response":{"cloudaicompanionProject":"project-proxied"}}`)
+		default:
+			t.Fatalf("unexpected proxy target %s", r.URL)
+		}
+	}))
+	defer proxy.Close()
+
+	server := &Server{cfg: cfg, upstream: upstream.NewClient(cfg)}
+	egress := storage.EgressProfile{ID: "oauth-proxy", Type: "http_proxy", Endpoint: proxy.URL}
+	parsed, err := server.exchangeAntigravityCode(context.Background(), "oauth-code", config.DefaultAntigravityOAuthRedirectURI, egress, "oauth-egress-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.AntigravityProjectID != "project-proxied" {
+		t.Fatalf("project = %q", parsed.AntigravityProjectID)
+	}
+	want := []string{
+		"POST " + cfg.AntigravityOAuthTokenURL,
+		"GET " + antigravityUserInfoURL,
+		"POST " + antigravityControlPlaneURL + "/v1internal:loadCodeAssist",
+		"POST " + antigravityDailyControlURL + "/v1internal:onboardUser",
+	}
+	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("request sequence = %#v, want %#v", requests, want)
+	}
+}
+
+func TestAntigravityOAuthStartPinsGroupInheritedEgress(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	ctx := context.Background()
+	if err := h.store.UpsertEgressProfile(ctx, storage.EgressProfile{ID: "oauth-group-primary", Name: "OAuth group primary", Type: "http_proxy", Endpoint: "http://127.0.0.1:18080", Health: "healthy"}); err != nil {
+		t.Fatal(err)
+	}
+	group, err := h.store.GetGroup(ctx, "antigravity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"oauth-group-primary", storage.DefaultDirectEgressID}
+	if err := h.store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/admin/oauth/start", "application/json", strings.NewReader(`{"provider":"antigravity","group_name":"antigravity"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("start status %d: %s", resp.StatusCode, raw)
+	}
+	var result struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	pending, ok := h.app.oauth.take(result.SessionID)
+	if !ok {
+		t.Fatal("pending OAuth session not found")
+	}
+	if pending.groupName != "antigravity" || pending.egressID != "oauth-group-primary" {
+		t.Fatalf("pending route = group %q egress %q", pending.groupName, pending.egressID)
+	}
+	if pending.importEgressID != "" {
+		t.Fatalf("group-inherited outlet must not be copied as explicit account binding: %q", pending.importEgressID)
+	}
+}
+
+func stableAntigravityAccountIDForTest(t *testing.T, email string) string {
+	t.Helper()
+	parsed, err := authparse.ParseOAuthAntigravity("access", "refresh", strings.ToLower(email), "project", time.Now().Unix()+3600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed.AccountID
 }
 
 func TestExchangeClaudeCodeSplitsInlineState(t *testing.T) {

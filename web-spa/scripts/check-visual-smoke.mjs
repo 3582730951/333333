@@ -17,7 +17,9 @@ const viteBin = path.join(root, 'node_modules', 'vite', 'bin', 'vite.js');
 const apiKeyRows = [
   {
     label: 'production-cli',
-    group_name: 'cyber',
+    key_type: 'inference',
+    user_group_id: 'ug_production',
+    group_name: '',
     force_model: 'gpt-5-codex',
     force_effort: 'medium',
     secret: '',
@@ -26,7 +28,9 @@ const apiKeyRows = [
     created_at: Math.floor(Date.now() / 1000) - 3600,
   },
   {
-    label: 'qa-smoke',
+    label: 'account-import',
+    key_type: 'pool_import',
+    user_group_id: '',
     group_name: 'staging',
     force_model: '',
     force_effort: '',
@@ -60,6 +64,10 @@ const accountRows = [
 const groupRows = [
   { name: 'cyber', force_model: 'gpt-5-codex', force_effort: 'medium' },
   { name: 'staging', force_model: '', force_effort: '' },
+];
+const userGroupRows = [
+  { id: 'ug_production', name: 'Production users', targets: [{ kind: 'account_pool_group', id: 'cyber' }] },
+  { id: 'ug_staging', name: 'Staging users', targets: [{ kind: 'account_pool_group', id: 'staging' }] },
 ];
 const providerRows = [
   {
@@ -188,6 +196,10 @@ async function installMocks(page) {
     }
     if (requestPath === '/admin/groups') {
       req.respond(json({ groups: groupRows }));
+      return;
+    }
+    if (requestPath === '/admin/user-groups') {
+      req.respond(json(userGroupRows));
       return;
     }
     if (requestPath === '/admin/providers') {

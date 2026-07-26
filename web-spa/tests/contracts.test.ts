@@ -7,6 +7,7 @@ import { adminRoutes, adminVisualRoutes, legacyRedirects, portalRoutes, settings
 import { allowedResponsiveActions } from '../src/components/ResponsiveDataView';
 import { accountImportSchema, apiKeyFormSchema, userFormSchema } from '../src/features/access/model/forms';
 import { cleanApiKeyValues } from '../src/components/ApiKeyCreateModal';
+import { cleanApiKeyUpdateValues } from '../src/components/ApiKeyEditModal';
 import { filenameFromDisposition } from '../src/features/observability/api/exports';
 import { keysResponseSchema } from '../src/features/access/api/keys';
 import { usersResponseSchema } from '../src/features/access/api/users';
@@ -28,7 +29,8 @@ import { REGISTRATION_REFETCH_INTERVAL, registrationQueryKeys } from '../src/fea
 import { systemMetricsSchema } from '../src/features/observability/api/system';
 import { SYSTEM_REFETCH_INTERVAL, systemQueryKeys } from '../src/features/observability/queries/system';
 import {
-  FULL_CACHE_FIELDS, usageCacheSchema, usageEnvelopeSchema, usageMetricRowSchema, usageTimeseriesSchema,
+  FULL_CACHE_FIELDS, PRIMARY_CACHE_FIELDS, usageCacheSchema, usageDashboardSchema, usageEnvelopeSchema,
+  usageMetricRowSchema, usageTimeseriesSchema,
 } from '../src/features/observability/api/usage';
 import { usageQueryKeys } from '../src/features/observability/queries/usage';
 import {
@@ -43,6 +45,9 @@ import { portalUsageResponseSchema } from '../src/features/portal/api/usage';
 import { portalUsageQueryKeys } from '../src/features/portal/queries/usage';
 import { invalidateQueryKeys, queryKeys } from '../src/features/shared/queries';
 import { responsiveState } from '../src/lib/breakpoints';
+import {
+  acquireDocumentOverlayLock, documentOverlayLockCount, releaseDocumentOverlayLock, resetDocumentOverlayLocks,
+} from '../src/lib/browserDocument';
 import type { ResponsiveDataView } from '../src/model/contracts';
 
 describe('API contracts', () => {
@@ -198,6 +203,16 @@ describe('API contracts', () => {
     })).toMatchObject({ summary: { latest_user_cache_control: 2 } });
     expect(parseApiResponse(usageTimeseriesSchema, { buckets: null, model_series: null, series: null }))
       .toEqual({ buckets: [], modelSeries: [], series: [] });
+    expect(parseApiResponse(usageDashboardSchema, {
+      accounts: [{ account_id: 'acc-1', total_tokens: '12' }],
+      timeseries: [{ bucket: '1700000000', total_tokens: '12' }],
+      models: [{ provider_id: 'codex', model: 'gpt-5.6-sol' }],
+      model_series: [], series: [], cache: { summary: { requests: '1' } },
+    })).toMatchObject({
+      accounts: [{ account_id: 'acc-1', total_tokens: 12 }],
+      timeseries: [{ bucket: 1_700_000_000, total_tokens: 12 }],
+      cache: { summary: { requests: 1 } },
+    });
   });
 
   it('normalizes settings sections and preserves unknown configuration fields', () => {
@@ -313,8 +328,19 @@ describe('routing, responsive actions, and forms', () => {
       label: ' CLI ', key_type: 'pool_import', group_name: ' team ', force_model: ' gpt-5 ',
       force_effort: 'high', expires_at: '2027-01-01T00:00:00Z',
     }, 'admin')).toEqual({
-      label: 'CLI', key_type: 'pool_import', group_name: 'team', force_model: 'gpt-5',
-      force_effort: 'high', user_group_id: '', expires_at: 1798761600,
+      label: 'CLI', key_type: 'pool_import', group_name: 'team', force_model: '',
+      force_effort: '', user_group_id: '', expires_at: 1798761600,
+    });
+    expect(cleanApiKeyValues({
+      label: ' CLI ', key_type: 'downstream', group_name: 'must-clear', user_group_id: ' ug-1 ',
+      force_model: ' gpt-5.6-sol ', force_effort: 'high',
+    }, 'admin')).toMatchObject({
+      group_name: '', user_group_id: 'ug-1', force_model: 'gpt-5.6-sol', force_effort: 'high',
+    });
+    expect(cleanApiKeyUpdateValues({ key_hash: 'hash-1', key_type: 'pool_import' }, {
+      group_name: ' pool-a ', user_group_id: 'must-clear', force_model: 'must-clear', force_effort: 'high', enabled: true,
+    })).toMatchObject({
+      hash: 'hash-1', group_name: 'pool-a', user_group_id: '', force_model: '', force_effort: '', enabled: true,
     });
     expect(() => cleanApiKeyValues({ label: 'CLI', expires_at: 'tomorrow-ish' }, 'admin')).toThrow('过期时间格式无效');
     expect(filenameFromDisposition("attachment; filename*=UTF-8''diagnostics%20bundle.zip")).toBe('diagnostics bundle.zip');
@@ -355,6 +381,8 @@ describe('query invalidation', () => {
       'by_provider', 'by_provider_model',
       'by_route', 'by_route_account_model', 'by_time_bucket',
     ]);
+    expect(PRIMARY_CACHE_FIELDS).toBe('summary,by_model,by_provider,by_provider_model');
+    expect(usageQueryKeys.diagnostic('today', 'by_route')).not.toEqual(usageQueryKeys.diagnostic('today', 'by_api_key'));
   });
 
   it('keeps each settings section and shared option query independently addressable', () => {
@@ -369,5 +397,26 @@ describe('query invalidation', () => {
     expect(dashboardQueryKeys.core).not.toEqual(dashboardQueryKeys.secondary);
     expect(dashboardQueryKeys.core.slice(0, 2)).toEqual(['pool', 'dashboard']);
     expect(portalUsageQueryKeys.dashboard.slice(0, 2)).toEqual(['pool', 'portal-usage']);
+  });
+});
+
+describe('overlay recovery', () => {
+  it('never restores transient Radix body locks after the final overlay closes', () => {
+    document.body.style.overflow = 'hidden';
+    document.body.style.pointerEvents = 'none';
+    const token = acquireDocumentOverlayLock('test');
+    expect(documentOverlayLockCount()).toBe(1);
+    releaseDocumentOverlayLock(token);
+    expect(documentOverlayLockCount()).toBe(0);
+    expect(document.body.style.overflow).toBe('');
+    expect(document.body.style.pointerEvents).toBe('');
+  });
+
+  it('clears dangling body locks at the route recovery boundary', () => {
+    document.body.style.overflow = 'hidden';
+    document.body.style.pointerEvents = 'none';
+    resetDocumentOverlayLocks();
+    expect(document.body.style.overflow).toBe('');
+    expect(document.body.style.pointerEvents).toBe('');
   });
 });

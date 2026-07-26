@@ -110,7 +110,7 @@ export default function AccountDrawer({
         sidecar_egress_id: selectedSidecar,
       });
       Toast.success('出口与 Sidecar 绑定已保存');
-      await onUpdated?.(account.id, saved);
+      void onUpdated?.(account.id, saved);
     } catch (err) {
       showErrorToast(err);
     }
@@ -121,7 +121,7 @@ export default function AccountDrawer({
     try {
       await post(`/admin/accounts/${encodeURIComponent(account.id)}/group`, { group: selectedGroup });
       Toast.success('分组已保存');
-      await onUpdated?.(account.id, { group_name: selectedGroup });
+      void onUpdated?.(account.id, { group_name: selectedGroup });
     } catch (err) {
       showErrorToast(err);
     }
@@ -136,7 +136,7 @@ export default function AccountDrawer({
         ignore_rate_limit_controls: enabled,
       });
       Toast.success(enabled ? '此账号已忽略 429、冷却和隔离' : '此账号已恢复正常限流保护');
-      await onUpdated?.(account.id, saved);
+      void onUpdated?.(account.id, saved);
     } catch (err) {
       setIgnoreRateLimitControls(previous);
       showErrorToast(err);
@@ -157,7 +157,7 @@ export default function AccountDrawer({
       });
       Toast.success('Codex 重登配置已保存');
       setReauthForm((current) => ({ ...current, password: '', otp_url: '' }));
-      await reload();
+      void reload();
     } catch (err) {
       showErrorToast(err);
     }
@@ -168,11 +168,11 @@ export default function AccountDrawer({
     try {
       await post(`/admin/accounts/${encodeURIComponent(account.id)}/codex-reauth/run`, {});
       Toast.success('Codex 重登成功，授权凭据已更新');
-      await onUpdated?.(account.id, { status: 'active', quarantine_until: 0, quarantine_reason: '' });
-      await reload();
+      void onUpdated?.(account.id, { status: 'active', quarantine_until: 0, quarantine_reason: '' });
+      void reload();
     } catch (err) {
       showErrorToast(err);
-      await reload();
+      void reload();
     }
   });
 
@@ -197,8 +197,8 @@ export default function AccountDrawer({
       });
       Toast.success('OAuth 重登成功，已更新原账号');
       setOauthModal({ open: false, session_id: '', auth_url: '', redirected: '', target_workspace_id: '' });
-      await onUpdated?.(account.id, updated);
-      await reload();
+      void onUpdated?.(account.id, updated);
+      void reload();
     } catch (err) {
       showErrorToast(err);
     }

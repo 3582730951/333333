@@ -3,11 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-account-pool/internal/leakfilter"
@@ -70,6 +72,70 @@ type upstreamActivityReadCloser struct {
 	heartbeatEvery time.Duration
 	heartbeat      func() error
 	pendingErr     error
+}
+
+// sseRelayReadCloser turns the frame-aware relay into an io.ReadCloser for the
+// continuation stitchers. Closing it cancels the pump and, critically, closes the
+// upstream body so the one blocked Read goroutine cannot survive a detected stall.
+type sseRelayReadCloser struct {
+	reader   *io.PipeReader
+	upstream io.Closer
+	cancel   context.CancelFunc
+	once     sync.Once
+}
+
+func (r *sseRelayReadCloser) Read(p []byte) (int, error) { return r.reader.Read(p) }
+
+func (r *sseRelayReadCloser) Close() error {
+	var closeErr error
+	r.once.Do(func() {
+		r.cancel()
+		if r.upstream != nil {
+			closeErr = r.upstream.Close()
+		}
+		_ = r.reader.Close()
+	})
+	return closeErr
+}
+
+type pipeResponseWriter struct {
+	io.Writer
+	header http.Header
+}
+
+func (w *pipeResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (*pipeResponseWriter) WriteHeader(int) {}
+func (*pipeResponseWriter) Flush()          {}
+
+// newSemanticSSERelayReadCloser preserves frame boundaries while applying the
+// response rule and the semantic stall detector. Unlike the generic per-Read
+// wrapper, control traffic such as response.in_progress and Claude ping cannot
+// keep a stuck continuation alive forever.
+func newSemanticSSERelayReadCloser(ctx context.Context, body io.ReadCloser, filter *responseRuleFilter, provider string, stallTimeout, heartbeatEvery time.Duration) io.ReadCloser {
+	if body == nil {
+		return nil
+	}
+	relayCtx, cancel := context.WithCancel(withStreamStallRecovery(ctx, stallTimeout))
+	reader, writer := io.Pipe()
+	relay := &sseRelayReadCloser{reader: reader, upstream: body, cancel: cancel}
+	go func() {
+		var relayErr error
+		defer func() {
+			if panicValue := recover(); panicValue != nil {
+				supervisor.LogPanic("semantic-sse-relay", panicValue)
+				relayErr = errUpstreamStreamReadPanic
+			}
+			_ = writer.CloseWithError(relayErr)
+		}()
+		relayErr = newRuleSSECopyWithHeartbeat(relayCtx, &pipeResponseWriter{Writer: writer}, body, filter, false, nil, provider, heartbeatEvery)
+	}()
+	return relay
 }
 
 func newUpstreamActivityReadCloser(ctx context.Context, body io.ReadCloser, stallTimeout, heartbeatEvery time.Duration, heartbeat func() error) io.ReadCloser {
@@ -432,6 +498,35 @@ func responseRuleHeartbeatInterval(rf *responseRuleFilter) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// sseFrameAdvancesModel reports semantic upstream progress rather than raw socket
+// activity. Control-plane frames can arrive forever while a generation is stuck;
+// treating those bytes as progress prevents stall recovery and leaves the client
+// seeing only relay heartbeats. Unknown valid events are progress by default so a
+// newly introduced output/tool event cannot be timed out accidentally.
+func sseFrameAdvancesModel(frame []byte, provider string) bool {
+	eventType, data := sseFrameEventData(frame)
+	if len(data) == 0 || strings.TrimSpace(string(data)) == "[DONE]" {
+		return false
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(data, &envelope) != nil {
+		return false
+	}
+	if typ := strings.TrimSpace(envelope.Type); typ != "" {
+		eventType = typ
+	}
+	switch strings.ToLower(strings.TrimSpace(eventType)) {
+	case "", "ping":
+		return false
+	case "response.in_progress", "response.queued", "response.metadata", "codex.rate_limits":
+		return !strings.EqualFold(strings.TrimSpace(provider), "codex")
+	default:
+		return true
+	}
+}
+
 func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, body io.Reader, rf *responseRuleFilter, leak bool, words *streamrewrite.Matcher, provider string, heartbeatInterval time.Duration) error {
 	// Apply the selected rule to each complete SSE event. In particular, never
 	// discard a group of pending events together: Codex requires the terminal
@@ -450,10 +545,10 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		}
 		return nil
 	}
-	emitFrame := func(frame []byte) error {
+	emitFrame := func(frame []byte) (bool, error) {
 		out := filterRuleSSEFrame(frame, rf)
 		if len(out) == 0 {
-			return nil
+			return false, nil
 		}
 		if leak {
 			out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
@@ -465,7 +560,13 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 				out = words.ReplaceAll(out)
 			}
 		}
-		return emit(out)
+		if len(out) == 0 {
+			return false, nil
+		}
+		if err := emit(out); err != nil {
+			return false, err
+		}
+		return sseFrameAdvancesModel(out, provider), nil
 	}
 
 	type readResult struct {
@@ -531,12 +632,12 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		case result, ok := <-reads:
 			if !ok {
 				if len(buf) > 0 {
-					return emitFrame(buf)
+					_, err := emitFrame(buf)
+					return err
 				}
 				return nil
 			}
 			if len(result.data) > 0 {
-				resetStall()
 				buf = append(buf, result.data...)
 			}
 			for {
@@ -547,21 +648,26 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 				frameEnd := boundary + separatorLen
 				frame := append([]byte(nil), buf[:frameEnd]...)
 				buf = buf[frameEnd:]
-				if e := emitFrame(frame); e != nil {
+				advanced, e := emitFrame(frame)
+				if e != nil {
 					return e
+				}
+				if advanced {
+					resetStall()
 				}
 			}
 			if result.err != nil {
 				if result.err == io.EOF {
 					if len(buf) > 0 {
-						return emitFrame(buf)
+						_, err := emitFrame(buf)
+						return err
 					}
 					return nil
 				}
 				return result.err
 			}
 		case <-heartbeat:
-			if err := emitFrame([]byte(heartbeatFrameFor(provider))); err != nil {
+			if _, err := emitFrame([]byte(heartbeatFrameFor(provider))); err != nil {
 				return err
 			}
 		case <-stall:

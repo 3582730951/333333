@@ -13,7 +13,7 @@ export function ActionMenu({ items = [], label = '更多操作' }) {
   useEffect(() => () => cancelBrowserAnimationFrame(dialogFrameRef.current), []);
   return (
     <>
-      <DropdownMenu.Root open={menuOpen} onOpenChange={setMenuOpen}>
+      <DropdownMenu.Root modal={false} open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenu.Trigger asChild>
           <Button theme="borderless" icon={<MoreHorizontal />} aria-label={label} />
         </DropdownMenu.Trigger>
@@ -25,16 +25,19 @@ export function ActionMenu({ items = [], label = '更多操作' }) {
                 className="pool-account-menu-item"
                 disabled={item.disabled}
                 onSelect={() => {
+                  setMenuOpen(false);
+                  cancelBrowserAnimationFrame(dialogFrameRef.current);
                   if (item.confirm) {
-                    setMenuOpen(false);
-                    cancelBrowserAnimationFrame(dialogFrameRef.current);
                     dialogFrameRef.current = requestBrowserAnimationFrame(() => {
                       dialogFrameRef.current = null;
                       setConfirmItem(item);
                     });
                     return;
                   }
-                  void item.onSelect?.();
+                  dialogFrameRef.current = requestBrowserAnimationFrame(() => {
+                    dialogFrameRef.current = null;
+                    void item.onSelect?.();
+                  });
                 }}
               >
                 {item.icon}

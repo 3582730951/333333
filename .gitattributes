@@ -1,0 +1,2 @@
+# Vite may preserve dependency code-generation template whitespace in built chunks.
+internal/console/dist/assets/*.js whitespace=-trailing-space

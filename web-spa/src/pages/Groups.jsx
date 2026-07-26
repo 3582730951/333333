@@ -14,6 +14,11 @@ import useAsyncResource from '../hooks/useAsyncResource.js';
 const TARGET_ACCOUNT_GROUP = 'account_pool_group';
 const TARGET_PROVIDER = 'model_provider';
 const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const INSTRUCTION_FAMILIES = [
+  { key: 'gpt', label: 'GPT / Codex', help: '用于 GPT 与 Codex 模型；Responses 入口写入 model instructions。' },
+  { key: 'claude', label: 'Claude', help: '用于原生 Claude、Claude Code，以及 Kiro / Antigravity 中的 Claude 模型。' },
+  { key: 'gemini', label: 'Gemini', help: '用于 Antigravity 等目标中的 Gemini 模型，并进入其 systemInstruction。' },
+];
 
 function rowsOf(value, keys = []) {
   if (Array.isArray(value)) return value;
@@ -99,11 +104,26 @@ function blankUserGroup() {
     system_prompt_apply_to_compaction: true,
     model_instructions_enabled: false,
     model_instructions_files: [],
+    model_instruction_profiles: Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => [key, { enabled: false, files: [] }])),
     force_model: '',
     force_effort: '',
     target_keys: [],
     model_routing: [],
   };
+}
+
+function normalizedInstructionProfiles(row) {
+  const configured = row?.model_instruction_profiles && typeof row.model_instruction_profiles === 'object'
+    ? row.model_instruction_profiles
+    : null;
+  const hasProfiles = configured && Object.keys(configured).length > 0;
+  return Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => {
+    const profile = hasProfiles ? configured[key] : null;
+    return [key, {
+      enabled: hasProfiles ? Boolean(profile?.enabled) : Boolean(row?.model_instructions_enabled),
+      files: hasProfiles ? uniqueStrings(profile?.files) : uniqueStrings(row?.model_instructions_files),
+    }];
+  }));
 }
 
 function userGroupDraft(row) {
@@ -113,6 +133,7 @@ function userGroupDraft(row) {
     ...row,
     target_keys: (row.targets || []).map(targetKey),
     model_instructions_files: uniqueStrings(row.model_instructions_files),
+    model_instruction_profiles: normalizedInstructionProfiles(row),
     model_routing: (row.model_routing || []).map((rule) => ({
       model: rule.model || '',
       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
@@ -123,13 +144,20 @@ function userGroupDraft(row) {
 function normalizedUserGroupPayload(draft, providers = []) {
   const selected = new Set(uniqueStrings(draft.target_keys));
   const targets = [...selected].map(parseTargetKey);
+  const profiles = Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => [key, {
+    enabled: Boolean(draft.model_instruction_profiles?.[key]?.enabled),
+    files: uniqueStrings(draft.model_instruction_profiles?.[key]?.files),
+  }]));
+  const enabledProfiles = Object.values(profiles).filter((profile) => profile.enabled);
+  const legacyFiles = uniqueStrings(enabledProfiles.flatMap((profile) => profile.files));
   return {
     name: String(draft.name || '').trim(),
     system_prompt: String(draft.system_prompt || ''),
     prompt_mode: draft.prompt_mode || 'prepend',
     system_prompt_apply_to_compaction: Boolean(draft.system_prompt_apply_to_compaction),
-    model_instructions_enabled: Boolean(draft.model_instructions_enabled),
-    model_instructions_files: uniqueStrings(draft.model_instructions_files),
+    model_instructions_enabled: enabledProfiles.length > 0,
+    model_instructions_files: legacyFiles,
+    model_instruction_profiles: profiles,
     force_model: String(draft.force_model || '').trim(),
     force_effort: String(draft.force_effort || '').trim(),
     targets,
@@ -263,7 +291,18 @@ function ModelRoutingEditor({ draft, setDraft, targetOptions, providers }) {
   );
 }
 
-function UserGroupEditor({ editor, groups, providers, instructionFiles, saving, onCancel, onSave }) {
+function UserGroupEditor({
+  editor,
+  groups,
+  providers,
+  instructionFiles,
+  catalogLoading,
+  catalogError,
+  onRetryCatalog,
+  saving,
+  onCancel,
+  onSave,
+}) {
   const [draft, setDraft] = useState(() => userGroupDraft(editor?.row));
   const targetOptions = useMemo(() => [
     ...groups.map((group) => ({ label: `账号池分组 · ${group.name}`, value: `${TARGET_ACCOUNT_GROUP}:${group.name}` })),
@@ -283,6 +322,13 @@ function UserGroupEditor({ editor, groups, providers, instructionFiles, saving, 
       })),
     };
   });
+  const updateInstructionProfile = (family, patchValue) => setDraft((current) => ({
+    ...current,
+    model_instruction_profiles: {
+      ...current.model_instruction_profiles,
+      [family]: { ...current.model_instruction_profiles?.[family], ...patchValue },
+    },
+  }));
 
   return (
     <div className="pool-user-group-editor">
@@ -298,11 +344,20 @@ function UserGroupEditor({ editor, groups, providers, instructionFiles, saving, 
             onChange={setTargets}
             optionList={targetOptions}
             placeholder="混合选择账号池分组和模型提供商"
+            disabled={catalogLoading && targetOptions.length === 0}
             style={{ width: '100%' }}
           />
           <div className="pool-field__help">可只选账号池分组、只选模型提供商，或任意混合；不能直接绑定账号或出口。</div>
         </div>
       </div>
+      {catalogError ? (
+        <Banner
+          type="warning"
+          title="部分目标目录加载失败"
+          description="已保留成功加载的账号池分组或模型提供商；重试不会清空当前编辑内容。"
+          actions={[<Button key="retry" size="small" loading={catalogLoading} onClick={onRetryCatalog}>重试目标目录</Button>]}
+        />
+      ) : null}
       <Card title="指令与模型策略" className="pool-card">
         <Form.TextArea label="系统提示词" value={draft.system_prompt} onChange={(system_prompt) => setDraft((current) => ({ ...current, system_prompt }))} rows={5} placeholder="留空则不注入额外系统提示" />
         <div className="pool-user-group-grid">
@@ -314,20 +369,32 @@ function UserGroupEditor({ editor, groups, providers, instructionFiles, saving, 
           <Form.Input label="强制模型（可选）" value={draft.force_model} onChange={(force_model) => setDraft((current) => ({ ...current, force_model }))} placeholder="尊重客户端模型" />
           <Form.Select label="强制 effort（可选）" value={draft.force_effort} onChange={(force_effort) => setDraft((current) => ({ ...current, force_effort }))} optionList={EFFORTS.map((value) => ({ label: value || '不强制', value }))} />
         </div>
-        <label className="pool-inline-switch">
-          <Switch checked={draft.model_instructions_enabled} onChange={(value) => setDraft((current) => ({ ...current, model_instructions_enabled: value }))} />
-          <span>启用指令文件</span>
-        </label>
-        <Select
-          multiple
-          filter
-          value={draft.model_instructions_files}
-          onChange={(model_instructions_files) => setDraft((current) => ({ ...current, model_instructions_files }))}
-          optionList={instructionFiles.map((file) => ({ label: file.error ? `${file.name}（异常）` : file.name, value: file.name, disabled: Boolean(file.error) }))}
-          placeholder="选择指令文件"
-          disabled={!draft.model_instructions_enabled}
-          style={{ width: '100%', marginTop: 8 }}
-        />
+        <div className="pool-instruction-profiles">
+          {INSTRUCTION_FAMILIES.map((family) => {
+            const profile = draft.model_instruction_profiles?.[family.key] || { enabled: false, files: [] };
+            return (
+              <div className="pool-instruction-profile" key={family.key}>
+                <div className="pool-instruction-profile__label">
+                  <label className="pool-inline-switch">
+                    <Switch checked={profile.enabled} onChange={(enabled) => updateInstructionProfile(family.key, { enabled })} />
+                    <strong>{family.label}</strong>
+                  </label>
+                  <span className="pool-field__help">{family.help}</span>
+                </div>
+                <Select
+                  multiple
+                  filter
+                  value={profile.files}
+                  onChange={(files) => updateInstructionProfile(family.key, { files })}
+                  optionList={instructionFiles.map((file) => ({ label: file.error ? `${file.name}（异常）` : file.name, value: file.name, disabled: Boolean(file.error) }))}
+                  placeholder={`选择 ${family.label} 指令文件`}
+                  disabled={!profile.enabled}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            );
+          })}
+        </div>
       </Card>
       <ModelRoutingEditor draft={draft} setDraft={setDraft} targetOptions={selectedTargetOptions} providers={providers} />
       <Card title="最终路由摘要" className="pool-card pool-routing-summary">
@@ -360,24 +427,64 @@ export default function Groups() {
   const [instructionName, setInstructionName] = useState('');
   const [instructionContent, setInstructionContent] = useState('');
 
-  const fetchRows = useCallback(async ({ signal }) => {
-    const [groups, instructions, egresses, userGroups, providers] = await Promise.all([
-      get('/admin/groups', undefined, { signal }),
-      get('/admin/model-instructions', undefined, { signal }),
-      get('/admin/egress-profiles', undefined, { signal }),
-      get('/admin/user-groups', undefined, { signal }),
-      get('/admin/providers', undefined, { signal }),
+  // Keep independent directories isolated: a failed optional endpoint must not
+  // erase valid account groups or providers from the user-group target picker.
+  const fetchGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/groups', undefined, { signal }), ['groups']), []);
+  const fetchInstructions = useCallback(async ({ signal }) => rowsOf(await get('/admin/model-instructions', undefined, { signal }), ['files']), []);
+  const fetchEgresses = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal }), ['profiles', 'egress_profiles']), []);
+  const fetchUserGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/user-groups', undefined, { signal }), ['user_groups']), []);
+  const fetchProviders = useCallback(async ({ signal }) => rowsOf(await get('/admin/providers', undefined, { signal }), ['providers']), []);
+
+  const groupsResource = useAsyncResource(fetchGroups, [fetchGroups], { initialData: [] });
+  const instructionsResource = useAsyncResource(fetchInstructions, [fetchInstructions], { initialData: [] });
+  const egressesResource = useAsyncResource(fetchEgresses, [fetchEgresses], { initialData: [] });
+  const userGroupsResource = useAsyncResource(fetchUserGroups, [fetchUserGroups], { initialData: [] });
+  const providersResource = useAsyncResource(fetchProviders, [fetchProviders], { initialData: [] });
+  const resources = [groupsResource, instructionsResource, egressesResource, userGroupsResource, providersResource];
+  const data = {
+    groups: groupsResource.data || [],
+    instructions: instructionsResource.data || [],
+    egresses: egressesResource.data || [],
+    userGroups: userGroupsResource.data || [],
+    providers: providersResource.data || [],
+  };
+  const loading = resources.some((resource) => resource.loading);
+  const lastRefresh = resources.reduce((latest, resource) => {
+    if (!resource.lastRefresh) return latest;
+    return !latest || resource.lastRefresh > latest ? resource.lastRefresh : latest;
+  }, null);
+  const load = useCallback(async () => {
+    await Promise.allSettled([
+      groupsResource.reload(),
+      instructionsResource.reload(),
+      egressesResource.reload(),
+      userGroupsResource.reload(),
+      providersResource.reload(),
     ]);
-    return {
-      groups: rowsOf(groups, ['groups']),
-      instructions: rowsOf(instructions, ['files']),
-      egresses: rowsOf(egresses, ['profiles', 'egress_profiles']),
-      userGroups: rowsOf(userGroups, ['user_groups']),
-      providers: rowsOf(providers, ['providers']),
-    };
-  }, []);
-  const emptyData = { groups: [], instructions: [], egresses: [], userGroups: [], providers: [] };
-  const { data = emptyData, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: emptyData });
+  }, [
+    groupsResource.reload,
+    instructionsResource.reload,
+    egressesResource.reload,
+    userGroupsResource.reload,
+    providersResource.reload,
+  ]);
+  const refreshUserGroupCatalog = useCallback(() => {
+    void Promise.allSettled([
+      groupsResource.reload(),
+      providersResource.reload(),
+      instructionsResource.reload(),
+    ]);
+  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload]);
+  const openUserGroupEditor = useCallback((editor) => {
+    setUserEditor(editor);
+    refreshUserGroupCatalog();
+  }, [refreshUserGroupCatalog]);
+  const openAccountGroupEditor = useCallback((editor) => {
+    setAccountEditor(editor);
+    void egressesResource.reload();
+  }, [egressesResource.reload]);
+  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading;
+  const targetCatalogError = groupsResource.error || providersResource.error || instructionsResource.error;
 
   const { run: saveAccountGroup, running: savingAccountGroup } = useAsyncAction(async (values) => {
     try {
@@ -456,7 +563,7 @@ export default function Groups() {
       title: '操作', key: 'ops', width: 100,
       render: (_, row) => (
         <ActionMenu label="账号池分组操作" items={[
-          { label: '编辑出口', disabled: savingAccountGroup || removingAccountGroup, onSelect: () => setAccountEditor({ mode: 'edit', row }) },
+          { label: '编辑出口', disabled: savingAccountGroup || removingAccountGroup, onSelect: () => openAccountGroupEditor({ mode: 'edit', row }) },
           {
             label: isRemovingAccountGroup(row.name) ? '删除中' : '删除', destructive: true,
             disabled: savingAccountGroup || (removingAccountGroup && !isRemovingAccountGroup(row.name)),
@@ -496,7 +603,8 @@ export default function Groups() {
       title: '策略', key: 'policy', width: 210,
       render: (_, row) => <TagList items={[
         row.system_prompt ? '系统提示词' : '',
-        row.model_instructions_enabled ? `指令 ${row.model_instructions_files?.length || 0}` : '',
+        ...INSTRUCTION_FAMILIES.filter(({ key }) => row.model_instruction_profiles?.[key]?.enabled).map(({ label }) => `${label} 指令`),
+        !row.model_instruction_profiles && row.model_instructions_enabled ? `兼容指令 ${row.model_instructions_files?.length || 0}` : '',
         row.system_prompt_apply_to_compaction ? '压缩时应用' : '',
       ].filter(Boolean)} max={3} />,
     },
@@ -504,7 +612,7 @@ export default function Groups() {
       title: '操作', key: 'ops', width: 100,
       render: (_, row) => (
         <ActionMenu label="用户分组操作" items={[
-          { label: '编辑完整策略', disabled: savingUserGroup || removingUserGroup, onSelect: () => setUserEditor({ mode: 'edit', row }) },
+          { label: '编辑完整策略', disabled: savingUserGroup || removingUserGroup, onSelect: () => openUserGroupEditor({ mode: 'edit', row }) },
           {
             label: isRemovingUserGroup(row.id) ? '删除中' : '删除', destructive: true,
             disabled: savingUserGroup || (removingUserGroup && !isRemovingUserGroup(row.id)),
@@ -540,7 +648,7 @@ export default function Groups() {
             <Button
               icon={<IconPlus />}
               theme="solid"
-              onClick={() => activeTab === 'user' ? setUserEditor({ mode: 'create', row: null }) : setAccountEditor({ mode: 'create', row: null })}
+              onClick={() => activeTab === 'user' ? openUserGroupEditor({ mode: 'create', row: null }) : openAccountGroupEditor({ mode: 'create', row: null })}
             >
               {activeTab === 'user' ? '新建用户分组' : '新建账号池分组'}
             </Button>
@@ -551,14 +659,14 @@ export default function Groups() {
         <TabPane key="account_pool" tab="账号池分组" itemKey="account_pool">
           <Banner type="info" title="动态出口继承" description="账号记录不保存分组出口副本。出口列表首项为主出口，其余按顺序备用；用户指令与模型策略请在用户分组中配置。" />
           <div className="pool-resource-split pool-group-resource-split">
-            <ResourceTable error={error} onRetry={load} loading={loading} lastRefresh={lastRefresh} dataSource={data.groups} columns={accountColumns} rowKey="name" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无账号池分组" skeletonRows={5} />
-            {!error || lastRefresh ? <MetricRail items={accountMetrics} /> : null}
+            <ResourceTable error={groupsResource.error} onRetry={groupsResource.reload} loading={groupsResource.loading} lastRefresh={groupsResource.lastRefresh} dataSource={data.groups} columns={accountColumns} rowKey="name" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无账号池分组" skeletonRows={5} />
+            {!groupsResource.error || groupsResource.lastRefresh ? <MetricRail items={accountMetrics} /> : null}
           </div>
         </TabPane>
         <TabPane key="user" tab="用户分组" itemKey="user">
           <div className="pool-resource-split pool-group-resource-split">
-            <ResourceTable error={error} onRetry={load} loading={loading} lastRefresh={lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
-            {!error || lastRefresh ? <MetricRail items={userMetrics} /> : null}
+            <ResourceTable error={userGroupsResource.error} onRetry={userGroupsResource.reload} loading={userGroupsResource.loading} lastRefresh={userGroupsResource.lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
+            {!userGroupsResource.error || userGroupsResource.lastRefresh ? <MetricRail items={userMetrics} /> : null}
           </div>
         </TabPane>
       </Tabs>
@@ -567,7 +675,21 @@ export default function Groups() {
         {accountEditor ? <AccountGroupEditor key={`${accountEditor.mode}:${accountEditor.row?.name || 'new'}`} editor={accountEditor} profiles={data.egresses} saving={savingAccountGroup} onCancel={() => setAccountEditor(null)} onSave={saveAccountGroup} /> : null}
       </Modal>
       <Modal title={userEditor?.mode === 'edit' ? `编辑用户分组 · ${userEditor.row.name}` : '新建用户分组'} visible={Boolean(userEditor)} onCancel={() => { if (!savingUserGroup) setUserEditor(null); }} footer={null} width={960} maskClosable={!savingUserGroup}>
-        {userEditor ? <UserGroupEditor key={`${userEditor.mode}:${userEditor.row?.id || 'new'}`} editor={userEditor} groups={data.groups} providers={data.providers} instructionFiles={data.instructions} saving={savingUserGroup} onCancel={() => setUserEditor(null)} onSave={saveUserGroup} /> : null}
+        {userEditor ? (
+          <UserGroupEditor
+            key={`${userEditor.mode}:${userEditor.row?.id || 'new'}`}
+            editor={userEditor}
+            groups={data.groups}
+            providers={data.providers}
+            instructionFiles={data.instructions}
+            catalogLoading={targetCatalogLoading}
+            catalogError={targetCatalogError}
+            onRetryCatalog={refreshUserGroupCatalog}
+            saving={savingUserGroup}
+            onCancel={() => setUserEditor(null)}
+            onSave={saveUserGroup}
+          />
+        ) : null}
       </Modal>
       <Modal title="用户分组指令文件库" visible={instructionLibraryOpen} onCancel={() => { if (!savingInstruction) setInstructionLibraryOpen(false); }} footer={null} maskClosable={!savingInstruction}>
         <Form onSubmit={saveInstruction} labelPosition="top">

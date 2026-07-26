@@ -14,26 +14,56 @@ import (
 )
 
 type ParsedAuth struct {
-	AccountID          string
-	UpstreamAccountID  string
-	AccessToken        string
-	RefreshToken       string
-	OpenAIAPIKey       string
-	IDTokenRaw         string
-	Email              string
-	Name               string
-	ChatGPTUserID      string
-	PlanType           string
-	Provider           string
-	ExpiresAt          int64
-	LastRefresh        int64
-	Scopes             []string
-	OAuthRateLimitTier string
-	IsFedramp          bool
-	CredentialMode     string
-	AgentRuntimeID     string
-	AgentPrivateKey    string
-	AgentTaskID        string
+	AccountID            string
+	UpstreamAccountID    string
+	AccessToken          string
+	RefreshToken         string
+	OpenAIAPIKey         string
+	IDTokenRaw           string
+	Email                string
+	Name                 string
+	ChatGPTUserID        string
+	PlanType             string
+	Provider             string
+	ExpiresAt            int64
+	LastRefresh          int64
+	Scopes               []string
+	OAuthRateLimitTier   string
+	IsFedramp            bool
+	CredentialMode       string
+	AgentRuntimeID       string
+	AgentPrivateKey      string
+	AgentTaskID          string
+	AntigravityProjectID string
+	AntigravityBaseURL   string
+	AntigravityUserAgent string
+}
+
+func ParseOAuthAntigravity(accessToken, refreshToken, email, projectID string, expiresAt int64, scopes []string) (ParsedAuth, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	email = strings.TrimSpace(email)
+	projectID = strings.TrimSpace(projectID)
+	if accessToken == "" {
+		return ParsedAuth{}, errors.New("antigravity oauth token exchange returned no access_token")
+	}
+	if email == "" {
+		return ParsedAuth{}, errors.New("antigravity oauth userinfo returned no email")
+	}
+	if projectID == "" {
+		return ParsedAuth{}, errors.New("antigravity project discovery returned no project_id")
+	}
+	return ParsedAuth{
+		AccountID:            stableAccountID("antigravity:" + strings.ToLower(email)),
+		Provider:             "antigravity",
+		AccessToken:          accessToken,
+		RefreshToken:         strings.TrimSpace(refreshToken),
+		Email:                email,
+		ExpiresAt:            expiresAt,
+		Scopes:               append([]string(nil), scopes...),
+		AntigravityProjectID: projectID,
+		AntigravityBaseURL:   "",
+		AntigravityUserAgent: "antigravity/hub/2.2.1 darwin/arm64",
+	}, nil
 }
 
 func ParseAuthJSON(raw []byte) (ParsedAuth, error) {

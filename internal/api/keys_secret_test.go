@@ -69,3 +69,63 @@ func TestAPIKeyCreateRejectsOversizedJSON(t *testing.T) {
 		t.Fatalf("oversized api-key create should not persist keys: %v", list)
 	}
 }
+
+func TestAdminAPIKeyRoutingPolicyCanBeEditedAtomically(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"key-import-pool"}`); code != http.StatusOK {
+		t.Fatalf("create account pool group = %d: %s", code, body)
+	}
+	code, body := grpReq(t, h, http.MethodPost, "/admin/user-groups", `{"name":"key-inference-users","targets":[{"kind":"account_pool_group","id":"key-import-pool"}]}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create user group = %d: %s", code, body)
+	}
+	var userGroup map[string]interface{}
+	if err := json.Unmarshal(body, &userGroup); err != nil {
+		t.Fatal(err)
+	}
+	userGroupID, _ := userGroup["id"].(string)
+	if userGroupID == "" {
+		t.Fatalf("created user group missing id: %v", userGroup)
+	}
+
+	code, body = grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"cli","user_group_id":"`+userGroupID+`"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create inference key = %d: %s", code, body)
+	}
+	var created map[string]interface{}
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	keyHash, _ := created["key_hash"].(string)
+	patchBody := `{"label":"cli-edited","user_group_id":"` + userGroupID + `","group_name":"","force_model":"gpt-5.6-sol","force_effort":"high"}`
+	if code, body = grpReq(t, h, http.MethodPatch, "/admin/api-keys/"+keyHash, patchBody); code != http.StatusOK {
+		t.Fatalf("edit inference key = %d: %s", code, body)
+	}
+	key, found, err := h.store.LookupAPIKey(t.Context(), keyHash)
+	if err != nil || !found {
+		t.Fatalf("lookup edited key: found=%v err=%v", found, err)
+	}
+	if key.Label != "cli-edited" || key.UserGroupID != userGroupID || key.GroupName != "" || key.ForceModel != "gpt-5.6-sol" || key.ForceEffort != "high" {
+		t.Fatalf("unexpected edited key: %+v", key)
+	}
+
+	code, body = grpReq(t, h, http.MethodPatch, "/admin/api-keys/"+keyHash, `{"label":"must-not-persist","user_group_id":"missing-user-group"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("invalid user group patch = %d, want 400: %s", code, body)
+	}
+	key, found, err = h.store.LookupAPIKey(t.Context(), keyHash)
+	if err != nil || !found || key.Label != "cli-edited" || key.UserGroupID != userGroupID {
+		t.Fatalf("invalid patch partially persisted: found=%v err=%v key=%+v", found, err, key)
+	}
+
+	code, body = grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"importer","key_type":"pool_import","group_name":"key-import-pool"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create pool import key = %d: %s", code, body)
+	}
+	if code, body = grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"bad-inference","group_name":"key-import-pool"}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("inference key with account pool group = %d, want 422: %s", code, body)
+	}
+	if code, body = grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"bad-import","key_type":"pool_import","user_group_id":"`+userGroupID+`"}`); code != http.StatusUnprocessableEntity {
+		t.Fatalf("pool import key with user group = %d, want 422: %s", code, body)
+	}
+}

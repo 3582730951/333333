@@ -52,13 +52,17 @@ func (s *Server) adminEmailPoolList(w http.ResponseWriter, r *http.Request) {
 		accounts[i].RefreshToken = ""
 	}
 
-	counts, _ := s.store.CountEmailAccountsByStatus(r.Context())
+	counts, err := s.store.CountEmailAccountsByStatus(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"accounts":  accounts,
-		"total":     total,
-		"page":      page,
-		"pageSize":  pageSize,
-		"counts":    counts,
+		"accounts": accounts,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+		"counts":   counts,
 	})
 }
 
@@ -225,9 +229,9 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 		acct.Status = "error"
 		_ = s.store.UpdateEmailAccount(r.Context(), acct)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"ok":       false,
-			"error":    err.Error(),
-			"email":    acct.Email,
+			"ok":    false,
+			"error": err.Error(),
+			"email": acct.Email,
 		})
 		return
 	}
@@ -241,9 +245,9 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 		acct.ErrorMessage = ""
 		_ = s.store.UpdateEmailAccount(r.Context(), acct)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"ok":          true,
-			"email":       acct.Email,
-			"has_token":   tokenResp.AccessToken != "",
+			"ok":        true,
+			"email":     acct.Email,
+			"has_token": tokenResp.AccessToken != "",
 		})
 	} else {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
@@ -252,9 +256,9 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 		acct.Status = "error"
 		_ = s.store.UpdateEmailAccount(r.Context(), acct)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"ok":       false,
-			"error":    errMsg,
-			"email":    acct.Email,
+			"ok":    false,
+			"error": errMsg,
+			"email": acct.Email,
 		})
 	}
 }

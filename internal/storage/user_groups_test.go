@@ -14,6 +14,10 @@ func TestUserGroupCRUD(t *testing.T) {
 		ID: "ug_test001", Name: "mygroup",
 		SystemPrompt: "You are helpful.", PromptMode: "prepend",
 		SystemPromptApplyToCompaction: true,
+		ModelInstructionProfiles: ModelInstructionProfiles{
+			ModelInstructionFamilyGPT:    {Enabled: true, Files: []string{"gpt.md"}},
+			ModelInstructionFamilyClaude: {Files: []string{"claude.md"}},
+		},
 		ForceModel: "", ForceEffort: "",
 	}
 	if err := s.CreateUserGroup(ctx, g); err != nil {
@@ -27,6 +31,9 @@ func TestUserGroupCRUD(t *testing.T) {
 	}
 	if got.Name != "mygroup" || got.SystemPrompt != "You are helpful." {
 		t.Errorf("unexpected: %+v", got)
+	}
+	if profile := got.ModelInstructionProfiles[ModelInstructionFamilyGPT]; !profile.Enabled || len(profile.Files) != 1 || profile.Files[0] != "gpt.md" {
+		t.Errorf("model instruction profiles not persisted: %+v", got.ModelInstructionProfiles)
 	}
 
 	// Get by name

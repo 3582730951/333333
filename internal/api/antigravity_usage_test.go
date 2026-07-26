@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,7 +64,7 @@ func TestAntigravityGeminiHandlerRecordsAttributedCacheUsage(t *testing.T) {
 	req = req.WithContext(withDownstreamKey(req.Context(), downstreamPolicy{KeyHash: keyHash, UserID: userID}))
 	w := httptest.NewRecorder()
 
-	if got := h.app.antigravityMessagesWithLease(w, req, raw, model, scheduler.Lease{Account: account}); got != outcomeDone {
+	if got := h.app.antigravityMessagesWithLease(w, req, raw, model, scheduler.Lease{Account: account}, map[string]bool{}); got != outcomeDone {
 		t.Fatalf("handler outcome = %v", got)
 	}
 	if w.Code != http.StatusOK {
@@ -102,5 +104,147 @@ func TestAntigravityGeminiHandlerRecordsAttributedCacheUsage(t *testing.T) {
 	}
 	if binding.RouteKey != affinity.Key || binding.AccountID != accountID {
 		t.Fatalf("affinity binding = %+v", binding)
+	}
+}
+
+func TestAntigravityHandlerRetriesBeforeCommitAndExcludesAccount(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+	}{
+		{name: "http status", status: http.StatusServiceUnavailable, body: `{"error":{"message":"service unavailable"}}`},
+		{name: "embedded SSE error", status: http.StatusOK, contentType: "text/event-stream", body: "data: {\"error\":{\"code\":429,\"message\":\"quota\"}}\n\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentType != "" {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+			account := storage.Account{ID: "antigravity-retry", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+			if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.store.UpsertAntigravityCredentials(context.Background(), storage.AntigravityCredentials{
+				AccountID: account.ID, ProjectID: "project", AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).Unix(), BaseURL: h.upstream.URL,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			raw := []byte(`{"model":"claude-opus-4-8","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(raw))
+			w := httptest.NewRecorder()
+			exclude := map[string]bool{}
+			if got := h.app.antigravityMessagesWithLease(w, req, raw, "claude-opus-4-8", scheduler.Lease{Account: account}, exclude); got != outcomeRetry {
+				t.Fatalf("outcome = %v, want retry; body=%s", got, w.Body.String())
+			}
+			if !exclude[account.ID] {
+				t.Fatalf("failed account was not excluded: %+v", exclude)
+			}
+			if w.Body.Len() != 0 {
+				t.Fatalf("upstream error leaked downstream: %s", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestAntigravitySafetyStopIsHiddenWithoutAccountSwitch(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"response\":{\"candidates\":[{\"finishReason\":\"SAFETY\"}]}}\n\n")
+	})
+	account := storage.Account{ID: "antigravity-safety", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAntigravityCredentials(context.Background(), storage.AntigravityCredentials{
+		AccountID: account.ID, ProjectID: "project", AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"model":"claude-opus-4-8","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(raw))
+	w := httptest.NewRecorder()
+	exclude := map[string]bool{}
+	if got := h.app.antigravityMessagesWithLease(w, req, raw, "claude-opus-4-8", scheduler.Lease{Account: account}, exclude); got != outcomeDone {
+		t.Fatalf("outcome = %v", got)
+	}
+	if len(exclude) != 0 {
+		t.Fatalf("safety-only response switched accounts: %+v", exclude)
+	}
+	if body := w.Body.String(); !strings.Contains(body, "event: message_stop") || strings.Contains(strings.ToLower(body), "safety") {
+		t.Fatalf("safety response was not silently terminated: %s", body)
+	}
+}
+
+func TestAntigravityUnsafeConversionReturnsLocal422(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unsafe request must not reach upstream")
+	})
+	account := storage.Account{ID: "antigravity-conversion", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAntigravityCredentials(context.Background(), storage.AntigravityCredentials{
+		AccountID: account.ID, ProjectID: "project", AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"model":"claude-opus-4-8","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque"}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(raw))
+	w := httptest.NewRecorder()
+	if got := h.app.antigravityMessagesWithLease(w, req, raw, "claude-opus-4-8", scheduler.Lease{Account: account}, map[string]bool{}); got != outcomeDone {
+		t.Fatalf("outcome = %v", got)
+	}
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "unsupported_protocol_conversion") {
+		t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAntigravityAccountModelProbeIsDynamicAndRetainsLastCatalog(t *testing.T) {
+	var fail atomic.Bool
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1internal:fetchAvailableModels" {
+			t.Fatalf("probe path = %q", r.URL.Path)
+		}
+		if fail.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"models":{"claude-sonnet-5-2":{"displayName":"Claude Sonnet 5.2","maxTokens":1000000,"maxOutputTokens":64000},"gemini-3.2-pro":{"displayName":"Gemini 3.2 Pro","maxTokens":1048576}}}`)
+	})
+	ctx := context.Background()
+	account := storage.Account{ID: "antigravity-model-probe", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAntigravityCredentials(ctx, storage.AntigravityCredentials{
+		AccountID: account.ID, ProjectID: "project", AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	caps, err := h.app.probeAccountModels(ctx, account)
+	if err != nil || len(caps) != 2 {
+		t.Fatalf("caps=%+v err=%v", caps, err)
+	}
+	byModel := map[string]storage.ModelCapability{}
+	for _, cap := range caps {
+		byModel[cap.ModelSlug] = cap
+	}
+	if cap := byModel["claude-sonnet-5-2"]; cap.AvailabilityState != "verified" || cap.Context1MState != "supported" || cap.Source != "antigravity_model_probe" {
+		t.Fatalf("dynamic Claude capability = %+v", cap)
+	}
+
+	fail.Store(true)
+	retained, err := h.app.probeAccountModels(ctx, account)
+	if err != nil || len(retained) != 2 {
+		t.Fatalf("failed probe did not retain prior catalog: caps=%+v err=%v", retained, err)
+	}
+	if retained[0].Source != "antigravity_model_probe" || retained[1].Source != "antigravity_model_probe" {
+		t.Fatalf("failed probe replaced authority with fallback: %+v", retained)
 	}
 }

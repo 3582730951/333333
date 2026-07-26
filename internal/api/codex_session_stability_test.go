@@ -793,7 +793,10 @@ func TestCodexMappedDownstreamWebSocketSurvivesTruncatedUpstreamTurn(t *testing.
 	for eventCount := 0; eventCount < 4; eventCount++ {
 		_, event, err := conn.ReadMessage()
 		if err != nil {
-			t.Fatalf("downstream websocket disconnected before failure terminal: %v; events=%s", err, firstEvents.String())
+			mu.Lock()
+			sessions := append([]string(nil), upstreamSessions...)
+			mu.Unlock()
+			t.Fatalf("downstream websocket disconnected before failure terminal: %v; events=%s sessions=%q", err, firstEvents.String(), sessions)
 		}
 		firstEvents.Write(event)
 		if bytes.Contains(event, []byte(`"type":"response.failed"`)) {

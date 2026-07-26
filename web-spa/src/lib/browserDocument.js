@@ -10,14 +10,26 @@ function restoreOverlayBodySnapshot() {
   setDocumentBodyStyle('overflow', snapshot.overflow);
   setDocumentBodyStyle('pointerEvents', snapshot.pointerEvents);
   setDocumentBodyAttribute('data-pool-overlay-count', null);
+  return snapshot;
+}
+
+function verifyOverlayBodyRestored(snapshot) {
+  if (!snapshot || overlayLocks.size) return;
+  if (documentBodyStyle('overflow') === 'hidden') setDocumentBodyStyle('overflow', snapshot.overflow);
+  if (documentBodyStyle('pointerEvents') === 'none') setDocumentBodyStyle('pointerEvents', snapshot.pointerEvents);
+  setDocumentBodyAttribute('data-pool-overlay-count', null);
 }
 
 export function acquireDocumentOverlayLock(owner = 'overlay') {
   const token = Symbol(String(owner));
   if (!overlayLocks.size) {
+    const overflow = documentBodyStyle('overflow');
+    const pointerEvents = documentBodyStyle('pointerEvents');
     overlayBodySnapshot = {
-      overflow: documentBodyStyle('overflow'),
-      pointerEvents: documentBodyStyle('pointerEvents'),
+      // Radix may install these temporary values before React effects run. They
+      // are overlay state, not the page's baseline and must never be restored.
+      overflow: overflow === 'hidden' ? '' : overflow,
+      pointerEvents: pointerEvents === 'none' ? '' : pointerEvents,
     };
   }
   overlayLocks.add(token);
@@ -32,13 +44,23 @@ export function releaseDocumentOverlayLock(token) {
     setDocumentBodyAttribute('data-pool-overlay-count', overlayLocks.size);
     return;
   }
-  restoreOverlayBodySnapshot();
-  if (typeof queueMicrotask === 'function') queueMicrotask(restoreOverlayBodySnapshot);
+  const snapshot = restoreOverlayBodySnapshot();
+  if (typeof queueMicrotask === 'function') queueMicrotask(() => verifyOverlayBodyRestored(snapshot));
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => verifyOverlayBodyRestored(snapshot));
 }
 
 export function resetDocumentOverlayLocks() {
   overlayLocks.clear();
-  restoreOverlayBodySnapshot();
+  const snapshot = restoreOverlayBodySnapshot();
+  if (snapshot) {
+    verifyOverlayBodyRestored(snapshot);
+    return;
+  }
+  // Route changes are the final recovery boundary for a Radix layer that was
+  // removed before its cleanup effect ran.
+  if (documentBodyStyle('overflow') === 'hidden') setDocumentBodyStyle('overflow', '');
+  if (documentBodyStyle('pointerEvents') === 'none') setDocumentBodyStyle('pointerEvents', '');
+  setDocumentBodyAttribute('data-pool-overlay-count', null);
 }
 
 export function documentOverlayLockCount() {

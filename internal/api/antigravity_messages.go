@@ -7,14 +7,14 @@ package api
 //  1. Scheduler selects an antigravity account via Lease.
 //  2. credentials are loaded from account_antigravity_credentials; access token
 //     is refreshed if within the expiry window.
-//  3. For Claude models: cache_control breakpoints are injected (max_hit policy,
-//     same as Kiro), then the request is forwarded to Vertex AI Anthropic publisher.
-//     For Gemini models: the body is converted to Gemini format and forwarded to
-//     cloudcode-pa.googleapis.com/v1internal.
-//  4. The response is forwarded to the downstream client. Claude responses are
-//     native Anthropic format (pass-through); Gemini responses are translated.
+//  3. Every model is converted to and sent through Antigravity v1internal.
+//  4. Before downstream commit, transport/status/early-stream failures return a
+//     retry outcome so the scheduler can select another account.
+//  5. Valid Gemini wire responses are translated back to Anthropic Messages.
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,11 +24,9 @@ import (
 	"strings"
 	"time"
 
-	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
-	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"github.com/google/uuid"
 )
@@ -43,149 +41,127 @@ const (
 // Antigravity upstream.  It has the same signature as kiroMessagesWithLease so
 // it can be plugged into claudeMessagesAttempt / tryAntigravityAttempt without
 // structural changes.
-func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, lease scheduler.Lease) attemptOutcome {
+func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, lease scheduler.Lease, exclude map[string]bool) attemptOutcome {
 	defer lease.Release()
 	ctx := r.Context()
 	affinity := routing.ExtractAffinityKey(r, raw)
+	retry := func() attemptOutcome {
+		if exclude != nil {
+			exclude[lease.Account.ID] = true
+		}
+		return outcomeRetry
+	}
 
 	// --- 1. Load and optionally refresh credentials ---
 	creds, err := s.store.GetAntigravityCredentials(ctx, lease.Account.ID)
 	if err != nil {
 		log.Printf("[ANTIGRAVITY] credentials not found account=%s: %v", lease.Account.ID, err)
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("antigravity credentials not configured"))
-		return outcomeDone
+		return retry()
 	}
-	token, creds, err := s.ensureAntigravityToken(ctx, creds, lease.Account)
+	token, creds, err := s.ensureAntigravityToken(ctx, creds, lease.Account, lease.Egress, lease.Binding.CookieJarKey)
 	if err != nil {
 		log.Printf("[ANTIGRAVITY] token refresh failed account=%s: %v", lease.Account.ID, err)
-		writeError(w, http.StatusBadGateway, fmt.Errorf("antigravity token refresh failed"))
-		return outcomeDone
+		return retry()
 	}
 
 	resolvedModel := resolvedAntigravityModel(model, lease)
-	isClaudePath := upstream.AntigravityIsClaudeModel(resolvedModel)
 
-	// --- 2a. Claude: inject cache_control breakpoints (max_hit policy, same as Kiro).
-	//         Gemini: resolve explicit CachedContent resource name (P8).
-	var cacheRef, convKeyHash string
-	if isClaudePath {
-		raw = prompt.EnsureAnthropicCacheControlWithOptions(raw, prompt.AnthropicCacheControlOptions{
-			Policy: "max_hit", LatestTailWrite: true, PreferRecentTurnRead: true,
-		})
-	} else {
-		cacheRef, convKeyHash = s.resolveAntigravityCache(ctx, raw, resolvedModel, creds)
-	}
-
-	// --- 3. Forward to upstream ---
+	// --- 2. Forward to upstream ---
 	stream := isStreamRequest(raw)
 	req := upstream.AntigravityRequest{
-		AccessToken:       token,
-		ProjectID:         creds.ProjectID,
-		Model:             resolvedModel,
-		BaseURL:           creds.BaseURL,
-		UserAgent:         creds.UserAgent,
-		Body:              raw,
-		Stream:            stream,
-		CachedContentName: cacheRef,
+		AccessToken: token,
+		ProjectID:   creds.ProjectID,
+		Model:       resolvedModel,
+		BaseURL:     creds.BaseURL,
+		UserAgent:   creds.UserAgent,
+		Body:        raw,
+		Stream:      stream,
 	}
-	resp, err := upstream.DoAntigravity(ctx, req)
-	if err != nil {
-		log.Printf("[ANTIGRAVITY] request error account=%s model=%s: %v", lease.Account.ID, req.Model, err)
-		writeError(w, http.StatusBadGateway, fmt.Errorf("antigravity upstream error: %v", err))
-		return outcomeDone
-	}
-
-	// --- 4a. Gemini: evict stale Vertex cachedContent on 404/410 and retry once.
-	if !isClaudePath && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone) && cacheRef != "" {
-		resp.Body.Close()
-		if convKeyHash != "" {
-			_ = s.store.DeleteAntigravityCacheEntry(ctx, lease.Account.ID, req.Model, convKeyHash)
+	doRequest := func() (*upstream.Response, storage.EgressProfile, error) {
+		resp, finalEgress, requestErr := s.doAntigravityWithEgressRetry(ctx, req, lease)
+		if requestErr != nil && upstream.IsAntigravityConversionError(requestErr) {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "unsupported_protocol_conversion", requestErr.Error())
+			return nil, finalEgress, requestErr
 		}
-		req.CachedContentName = ""
-		resp, err = upstream.DoAntigravity(ctx, req)
-		if err != nil {
-			log.Printf("[ANTIGRAVITY] retry (no-cache) error account=%s model=%s: %v", lease.Account.ID, req.Model, err)
-			writeError(w, http.StatusBadGateway, fmt.Errorf("antigravity upstream error: %v", err))
+		return resp, finalEgress, requestErr
+	}
+	resp, finalEgress, err := doRequest()
+	if err != nil {
+		if upstream.IsAntigravityConversionError(err) {
 			return outcomeDone
 		}
-		log.Printf("[ANTIGRAVITY] cache miss evicted and retried account=%s model=%s hash=%s", lease.Account.ID, req.Model, convKeyHash)
+		log.Printf("[ANTIGRAVITY] transport error account=%s model=%s: %v", lease.Account.ID, req.Model, err)
+		return retry()
 	}
 
-	// --- 4b. Claude: if Vertex rejected cache_control (400/422), strip and retry once.
-	if isClaudePath && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnprocessableEntity) {
-		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		if upstream.AntigravityClaudeVertexIsCacheRejected(resp.StatusCode, errBody) {
-			log.Printf("[ANTIGRAVITY-CLAUDE] cache_control rejected, retrying without — account=%s model=%s", lease.Account.ID, req.Model)
-			req.Body = stripAntigravityCacheControl(raw)
-			resp, err = upstream.DoAntigravity(ctx, req)
-			if err != nil {
-				log.Printf("[ANTIGRAVITY] retry (no-cc) error account=%s model=%s: %v", lease.Account.ID, req.Model, err)
-				writeError(w, http.StatusBadGateway, fmt.Errorf("antigravity upstream error: %v", err))
+	// A token can be revoked before its local expiry. Refresh once on 401, then
+	// leave the account out of this request's remaining attempts if it still fails.
+	if resp.StatusCode == http.StatusUnauthorized && strings.TrimSpace(creds.RefreshToken) != "" {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+		_ = resp.Body.Close()
+		creds.ExpiresAt = 0
+		token, creds, err = s.ensureAntigravityToken(ctx, creds, lease.Account, lease.Egress, lease.Binding.CookieJarKey)
+		if err != nil {
+			log.Printf("[ANTIGRAVITY] forced token refresh failed account=%s: %v", lease.Account.ID, err)
+			return retry()
+		}
+		req.AccessToken = token
+		resp, finalEgress, err = doRequest()
+		if err != nil {
+			if upstream.IsAntigravityConversionError(err) {
 				return outcomeDone
 			}
-		} else {
-			// Non-cache error — surface it.
-			w.WriteHeader(resp.StatusCode)
-			_, _ = w.Write(errBody)
-			return outcomeDone
+			return retry()
 		}
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		w.WriteHeader(resp.StatusCode)
-		return outcomeDone
+		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		_ = s.onUpstreamError(ctx, lease.Account, resp.StatusCode, resp.Header, errorBody)
+		log.Printf("[ANTIGRAVITY] upstream status account=%s model=%s status=%d; retrying another account", lease.Account.ID, req.Model, resp.StatusCode)
+		return retry()
 	}
 
+	s.verifyAccountModel(ctx, lease.Account, resolvedModel, requestedClaudeModelFromContext(ctx).ContextMode)
+	w.Header().Set("X-Pool-Resolved-Provider", "antigravity")
+	w.Header().Set("X-Pool-Resolved-Model", resolvedModel)
 	msgID := "msg_ag_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	displayModel := req.Model
 
 	if stream {
+		activityBody := newUpstreamActivityReadCloser(ctx, resp.Body, s.streamStallRecoveryInterval(ctx), 0, nil)
+		reader := bufio.NewReaderSize(activityBody, 64*1024)
+		prefix, probeErr := upstream.ProbeAntigravitySSE(reader)
+		if probeErr != nil {
+			_ = activityBody.Close()
+			log.Printf("[ANTIGRAVITY] early stream failure account=%s model=%s: %v", lease.Account.ID, req.Model, probeErr)
+			return retry()
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
-		var inputTok, outputTok, cachedTok int64
-		var stopReason string
-		var streamErr error
-		if isClaudePath {
-			// Vertex returns native Anthropic SSE — pass through directly.
-			inputTok, outputTok, cachedTok, stopReason, streamErr = upstream.AntigravityClaudeVertexStreamToAnthropic(ctx, resp.Body, w, displayModel, msgID)
-		} else {
-			// Gemini SSE — translate to Anthropic format.
-			inputTok, outputTok, cachedTok, stopReason, streamErr = upstream.AntigravityStreamToAnthropic(ctx, resp.Body, w, displayModel, msgID)
-		}
+		inputTok, outputTok, cachedTok, stopReason, streamErr := upstream.AntigravityStreamToAnthropic(ctx, io.MultiReader(bytes.NewReader(prefix), reader), w, displayModel, msgID)
 		if streamErr != nil {
-			log.Printf("[ANTIGRAVITY] stream error account=%s: %v", lease.Account.ID, streamErr)
+			// The converter always emits a valid Anthropic terminal sequence after
+			// downstream commit. Never replay here because tool calls or billable
+			// output may already have reached the client.
+			log.Printf("[ANTIGRAVITY] stream ended after commit account=%s: %v", lease.Account.ID, streamErr)
 		}
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 		s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, inputTok, outputTok, cachedTok, stopReason)
 	} else {
-		w.Header().Set("Content-Type", "application/json")
-		if isClaudePath {
-			// Vertex returns native Anthropic JSON — forward as-is; extract usage for billing.
-			result, parseErr := upstream.ParseAntigravityClaudeVertexNonStream(resp.Body)
-			if parseErr != nil {
-				log.Printf("[ANTIGRAVITY-CLAUDE] non-stream parse error account=%s: %v", lease.Account.ID, parseErr)
-				writeError(w, http.StatusBadGateway, fmt.Errorf("antigravity response parse error"))
-				return outcomeDone
-			}
-			_, _ = w.Write(result.RawBody)
-			s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, result.InputTokens, result.OutputTokens, result.CachedTokens, result.StopReason)
-		} else {
-			// Gemini JSON — translate to Anthropic format.
-			chunk, parseErr := upstream.ParseAntigravityNonStream(resp.Body)
-			if parseErr != nil {
-				log.Printf("[ANTIGRAVITY] non-stream parse error account=%s: %v", lease.Account.ID, parseErr)
-				writeError(w, http.StatusBadGateway, fmt.Errorf("antigravity response parse error"))
-				return outcomeDone
-			}
-			respJSON := upstream.AntigravityChunkToAnthropicJSON(chunk, displayModel, msgID)
-			_, _ = w.Write(respJSON)
-			s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, chunk.InputTokens, chunk.OutputTokens, chunk.CachedTokens, chunk.StopReason)
+		chunk, parseErr := upstream.ParseAntigravityNonStream(resp.Body)
+		if parseErr != nil {
+			log.Printf("[ANTIGRAVITY] non-stream parse failure account=%s model=%s; retrying", lease.Account.ID, req.Model)
+			return retry()
 		}
+		respJSON := upstream.AntigravityChunkToAnthropicJSON(chunk, displayModel, msgID)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(respJSON)
+		s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, chunk.InputTokens, chunk.OutputTokens, chunk.CachedTokens, chunk.StopReason)
 	}
 	// Persist session-sticky affinity binding for this account.
 	if affinity.Hash != "" {
@@ -196,14 +172,76 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 			AccountID:    lease.Account.ID,
 			Provider:     "antigravity",
 			Model:        displayModel,
+			EgressID:     finalEgress.ID,
 		})
 	}
 	return outcomeDone
 }
 
+// doAntigravityWithEgressRetry exhausts the selected account's ordered outlets
+// before the API layer is allowed to move to another account. Only transport
+// failures and upstream 5xx responses are outlet-retryable; auth, quota, safety,
+// and request validation remain account/model decisions.
+func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.AntigravityRequest, lease scheduler.Lease) (*upstream.Response, storage.EgressProfile, error) {
+	send := func(egress storage.EgressProfile) (*upstream.Response, error) {
+		cookieJarKey := lease.Binding.CookieJarKey
+		if strings.TrimSpace(egress.ID) != "" {
+			cookieJarKey = lease.Account.ID + ":" + egress.ID
+		}
+		return s.upstream.DoAntigravity(ctx, egress, cookieJarKey, req)
+	}
+
+	resp, requestErr := send(lease.Egress)
+	if upstream.IsAntigravityConversionError(requestErr) {
+		return nil, lease.Egress, requestErr
+	}
+	if requestErr == nil && (resp.StatusCode < http.StatusInternalServerError || resp.StatusCode > 599) {
+		return resp, lease.Egress, nil
+	}
+
+	lastResp, lastEgress, lastErr := resp, lease.Egress, requestErr
+	var lastBody []byte
+	if resp != nil {
+		lastBody, lastErr = upstream.DrainAndClose(resp.Body)
+	}
+	for _, standbyID := range lease.Binding.StandbyIDs() {
+		standbyID = strings.TrimSpace(standbyID)
+		if standbyID == "" || standbyID == lease.Egress.ID {
+			continue
+		}
+		standby, err := s.store.GetEgressProfile(ctx, standbyID)
+		if err != nil || !scheduler.EgressHealthy(standby, storage.Now()) {
+			continue
+		}
+		standby, err = s.store.ApplySidecarEgressBinding(ctx, lease.Binding, standby)
+		if err != nil {
+			continue
+		}
+		retryResp, err := send(standby)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if retryResp.StatusCode < http.StatusInternalServerError || retryResp.StatusCode > 599 {
+			return retryResp, standby, nil
+		}
+		retryBody, drainErr := upstream.DrainAndClose(retryResp.Body)
+		if drainErr != nil {
+			lastErr = drainErr
+			continue
+		}
+		lastResp, lastBody, lastEgress, lastErr = retryResp, retryBody, standby, nil
+	}
+	if lastResp != nil {
+		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
+		return lastResp, lastEgress, nil
+	}
+	return nil, lastEgress, lastErr
+}
+
 // ensureAntigravityToken returns a valid access token for the account, refreshing
 // it when it is within antigravityRefreshLeadSeconds of expiry.
-func (s *Server) ensureAntigravityToken(ctx context.Context, creds storage.AntigravityCredentials, account storage.Account) (string, storage.AntigravityCredentials, error) {
+func (s *Server) ensureAntigravityToken(ctx context.Context, creds storage.AntigravityCredentials, account storage.Account, egress storage.EgressProfile, cookieJarKey string) (string, storage.AntigravityCredentials, error) {
 	now := time.Now().Unix()
 	if creds.AccessToken != "" && creds.ExpiresAt > now+antigravityRefreshLeadSeconds {
 		return creds.AccessToken, creds, nil
@@ -211,7 +249,7 @@ func (s *Server) ensureAntigravityToken(ctx context.Context, creds storage.Antig
 	if creds.RefreshToken == "" {
 		return "", creds, fmt.Errorf("no refresh token for account %s", account.ID)
 	}
-	tr, err := upstream.RefreshAntigravityToken(ctx, creds.RefreshToken, &s.cfg)
+	tr, err := s.upstream.RefreshAntigravityToken(ctx, egress, cookieJarKey, creds.RefreshToken, &s.cfg)
 	if err != nil {
 		return "", creds, err
 	}
@@ -253,161 +291,4 @@ func (s *Server) recordAntigravityUsage(r *http.Request, accountID, model string
 			CacheReadPresent: cachedTok > 0,
 			AffinitySource:   affinity.Source,
 		})
-}
-
-// antigravityCacheMinChars is the approximate character threshold below which
-// creating an explicit CachedContent resource is not worthwhile. Gemini requires
-// at least ~1k-4k tokens depending on the model; ~8000 chars ≈ 2000 tokens at
-// 4 chars/token — a conservative lower bound that avoids expensive cache RPCs
-// for short conversations.
-const antigravityCacheMinChars = 8000
-
-// resolveAntigravityCache looks up or creates a Gemini explicit CachedContent
-// resource for the conversation prefix in body. It returns the cache resource
-// name (for request.cachedContent) and the conversation key hash (for eviction
-// on 404). Both strings are empty if caching is skipped or fails.
-//
-// Claude models are skipped here — they use cache_control injection instead.
-// Errors are non-fatal: the caller falls back to sending the full request body.
-func (s *Server) resolveAntigravityCache(ctx context.Context, body []byte, model string, creds storage.AntigravityCredentials) (cacheRef, convKeyHash string) {
-	// Claude models use cache_control (Anthropic-native), not Gemini cachedContent.
-	if upstream.AntigravityIsClaudeModel(model) {
-		return "", ""
-	}
-	// Explicit caching requires a GCP project ID (Vertex AI).
-	if creds.ProjectID == "" {
-		return "", ""
-	}
-	// Skip if the prefix is too small to benefit.
-	if upstream.ApproxAntigravityPrefixChars(body) < antigravityCacheMinChars {
-		return "", ""
-	}
-
-	prefixTurns, _, systemText, keyHash := upstream.ExtractAntigravityPrefixForCache(body)
-	if len(prefixTurns) == 0 && systemText == "" {
-		return "", ""
-	}
-	convKeyHash = keyHash
-
-	// Prune expired entries in the background — best-effort.
-	go func() {
-		defer supervisor.Recover("antigravity-cache-prune")
-		_ = s.store.PruneExpiredAntigravityCacheEntries(context.Background())
-	}()
-
-	// Check for a live cache entry.
-	entry, ok, err := s.store.GetAntigravityCacheEntry(ctx, creds.AccountID, model, keyHash)
-	if err != nil {
-		log.Printf("[ANTIGRAVITY-CACHE] lookup error account=%s model=%s: %v", creds.AccountID, model, err)
-	}
-	if ok && entry.CacheResourceName != "" {
-		return entry.CacheResourceName, keyHash
-	}
-
-	// Create a new cache entry via Vertex AI.
-	createReq := upstream.AntigravityCacheCreateRequest{
-		AccessToken: creds.AccessToken,
-		ProjectID:   creds.ProjectID,
-		Model:       model,
-		SystemText:  systemText,
-		PrefixTurns: prefixTurns,
-	}
-	createResp, createErr := upstream.CreateAntigravityCachedContent(ctx, createReq)
-	if createErr != nil {
-		log.Printf("[ANTIGRAVITY-CACHE] create failed account=%s model=%s: %v", creds.AccountID, model, createErr)
-		return "", convKeyHash
-	}
-
-	_ = s.store.UpsertAntigravityCacheEntry(ctx, storage.AntigravityCacheEntry{
-		AccountID:         creds.AccountID,
-		ModelID:           model,
-		ConvKeyHash:       keyHash,
-		CacheResourceName: createResp.Name,
-		TotalTokens:       createResp.TotalTokens,
-		ExpiresAt:         createResp.ExpiresAt,
-	})
-	log.Printf("[ANTIGRAVITY-CACHE] created account=%s model=%s name=%s tokens=%d",
-		creds.AccountID, model, createResp.Name, createResp.TotalTokens)
-	return createResp.Name, keyHash
-}
-
-// stripAntigravityCacheControl removes all cache_control fields from an Anthropic
-// request body using a simple JSON walk. Used for the Claude-via-Vertex fallback
-// retry when Vertex rejects the cache_control annotations.
-//
-// This removes cache_control from:
-//   - messages[*].content[*].cache_control
-//   - tools[*].cache_control
-//   - system[*].cache_control (if system is an array)
-func stripAntigravityCacheControl(body []byte) []byte {
-	// Use gjson/sjson is complex for nested deletes; use a simple recursive approach
-	// with the json.RawMessage path. For safety we fall back to the original body on
-	// any error so the retry still fires.
-	type contentBlock struct {
-		CacheControl *json.RawMessage `json:"cache_control,omitempty"`
-	}
-	// Fast path: if no cache_control exists, skip the parse entirely.
-	if !strings.Contains(string(body), "cache_control") {
-		return body
-	}
-
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(body, &root); err != nil {
-		return body
-	}
-
-	// Strip from messages[*].content[*]
-	if rawMsgs, ok := root["messages"]; ok {
-		var msgs []map[string]json.RawMessage
-		if err := json.Unmarshal(rawMsgs, &msgs); err == nil {
-			for i, msg := range msgs {
-				if rawContent, ok2 := msg["content"]; ok2 {
-					var blocks []map[string]json.RawMessage
-					if err2 := json.Unmarshal(rawContent, &blocks); err2 == nil {
-						for j := range blocks {
-							delete(blocks[j], "cache_control")
-						}
-						if b, e := json.Marshal(blocks); e == nil {
-							msgs[i]["content"] = b
-						}
-					}
-				}
-			}
-			if b, e := json.Marshal(msgs); e == nil {
-				root["messages"] = b
-			}
-		}
-	}
-
-	// Strip from system[*] when system is an array of blocks.
-	if rawSys, ok := root["system"]; ok {
-		var sysBlocks []map[string]json.RawMessage
-		if err := json.Unmarshal(rawSys, &sysBlocks); err == nil {
-			for i := range sysBlocks {
-				delete(sysBlocks[i], "cache_control")
-			}
-			if b, e := json.Marshal(sysBlocks); e == nil {
-				root["system"] = b
-			}
-		}
-	}
-
-	// Strip from tools[*].
-	if rawTools, ok := root["tools"]; ok {
-		var tools []map[string]json.RawMessage
-		if err := json.Unmarshal(rawTools, &tools); err == nil {
-			for i := range tools {
-				delete(tools[i], "cache_control")
-			}
-			if b, e := json.Marshal(tools); e == nil {
-				root["tools"] = b
-			}
-		}
-	}
-
-	out, err := json.Marshal(root)
-	if err != nil {
-		return body
-	}
-	return out
 }

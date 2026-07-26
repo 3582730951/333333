@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const emailAccountSelectColumns = `COALESCE(id,''), COALESCE(email,''), COALESCE(password,''), COALESCE(client_id,''), COALESCE(refresh_token,''), COALESCE(status,'idle'), COALESCE(group_name,''), COALESCE(error_message,''), COALESCE(last_used_at,0), COALESCE(created_at,0), COALESCE(updated_at,0)`
+
 // InsertEmailAccount inserts a single email account into the pool.
 func (s *Store) InsertEmailAccount(ctx context.Context, a EmailAccount) error {
 	now := Now()
@@ -88,7 +90,7 @@ func (s *Store) ListEmailAccounts(ctx context.Context, page, pageSize int, searc
 	}
 	offset := (page - 1) * pageSize
 	query := fmt.Sprintf(
-		"SELECT id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at FROM email_pool WHERE %s ORDER BY created_at DESC LIMIT ? OFFSET ?",
+		"SELECT "+emailAccountSelectColumns+" FROM email_pool WHERE %s ORDER BY created_at DESC LIMIT ? OFFSET ?",
 		where)
 	rows, err := s.rdb.QueryContext(ctx, query, append(args, pageSize, offset)...)
 	if err != nil {
@@ -112,7 +114,7 @@ func (s *Store) ListEmailAccounts(ctx context.Context, page, pageSize int, searc
 func (s *Store) GetEmailAccount(ctx context.Context, id string) (EmailAccount, bool, error) {
 	var a EmailAccount
 	err := s.rdb.QueryRowContext(ctx,
-		`SELECT id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at FROM email_pool WHERE id = ?`,
+		`SELECT `+emailAccountSelectColumns+` FROM email_pool WHERE id = ?`,
 		id).Scan(&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken,
 		&a.Status, &a.GroupName, &a.ErrorMessage, &a.LastUsedAt, &a.CreatedAt, &a.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -143,7 +145,7 @@ func (s *Store) DeleteEmailAccount(ctx context.Context, id string) error {
 // Returns sql.ErrNoRows if no idle accounts are available.
 func (s *Store) ReserveEmailAccount(ctx context.Context, groupName string) (EmailAccount, error) {
 	var a EmailAccount
-	query := `SELECT id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at FROM email_pool WHERE status = 'idle'`
+	query := `SELECT ` + emailAccountSelectColumns + ` FROM email_pool WHERE status = 'idle'`
 	args := []interface{}{}
 	if groupName != "" {
 		query += " AND group_name = ?"
@@ -178,7 +180,7 @@ func (s *Store) ReleaseEmailAccount(ctx context.Context, id, status, errMsg stri
 
 // CountEmailAccountsByStatus returns counts grouped by status for the summary bar.
 func (s *Store) CountEmailAccountsByStatus(ctx context.Context) (map[string]int, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT status, COUNT(*) FROM email_pool GROUP BY status`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT COALESCE(status,'idle'), COUNT(*) FROM email_pool GROUP BY COALESCE(status,'idle')`)
 	if err != nil {
 		return nil, err
 	}

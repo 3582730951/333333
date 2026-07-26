@@ -142,7 +142,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const { run: handleGenerate, running: generating } = useAsyncAction(async () => {
     const actionEpoch = actionEpochRef.current;
     try {
-      const result = await oauthStart(tab);
+	      const result = await oauthStart(tab, groupName);
       if (actionEpoch !== actionEpochRef.current) return;
       setSessionId(result.session_id || result.loginId || '');
       setAuthUrl(result.auth_url || result.authUrl || '');
@@ -188,9 +188,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       return;
     }
     try {
-      // Kiro 和 Antigravity 自动使用对应的分组
-      const finalGroupName = tab === 'antigravity' ? 'antigravity' : groupName;
-      const result = await oauthComplete(sessionId, val, label, finalGroupName);
+	      const result = await oauthComplete(sessionId, val, label, groupName);
       if (actionEpoch !== actionEpochRef.current) return;
       Toast.success({
         content: (
@@ -537,16 +535,14 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               />
             </Form.Slot>
 
-            {tab !== 'antigravity' && (
-              <Form.Slot label="分组 (可选)">
-                <Select
-                  placeholder="留空使用默认分组"
-                  value={groupName}
-                  onChange={setGroupName}
-                  optionList={groupOptions}
-                />
-              </Form.Slot>
-            )}
+	            <Form.Slot label="账号池分组 (可选)">
+	              <Select
+	                placeholder="留空使用默认账号池分组"
+	                value={groupName}
+	                onChange={setGroupName}
+	                optionList={groupOptions}
+	              />
+	            </Form.Slot>
 
             <Text type="tertiary" as="p">账号不会保存出口副本；请求时动态继承所选账号池分组的主出口与备用出口。</Text>
           </Form>

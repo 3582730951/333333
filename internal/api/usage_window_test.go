@@ -376,6 +376,104 @@ func TestAdminUsageByModelAndSeriesAreDynamicUsageRecordModels(t *testing.T) {
 	}
 }
 
+func TestAdminUsageDashboardCombinesPrimaryViewsAndValidatesOptions(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, "usage_accuracy_cutover_at", "0"); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Unix() - 600
+	insert := func(accountID, provider string, total, createdAt int64) {
+		t.Helper()
+		insertUsageAt(t, h, accountID, "gpt-shared", "hash-"+accountID, "route-"+accountID, total, 0, total, total/2, total/2, 0, createdAt)
+		if _, err := h.store.DB().ExecContext(ctx, `UPDATE usage_records SET usage_provider = ? WHERE id = (SELECT MAX(id) FROM usage_records)`, provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("codex-dashboard", "codex", 100, base+10)
+	insert("kiro-dashboard", "kiro", 70, base+70)
+
+	path := fmt.Sprintf("/admin/usage/dashboard?since=%d&until=%d&bucket=60&dimension=provider_model&series_dimension=provider_model&series_limit=2&fields=summary,by_model,by_provider,by_provider_model,by_time_bucket", base, base+180)
+	code, raw := grpReq(t, h, http.MethodGet, path, "")
+	if code != http.StatusOK {
+		t.Fatalf("usage dashboard = %d: %s", code, raw)
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode usage dashboard: %v (%s)", err, raw)
+	}
+	for _, field := range []string{"accounts", "timeseries", "models", "series", "model_series", "cache", "window"} {
+		if _, ok := payload[field]; !ok {
+			t.Fatalf("usage dashboard missing %s: %s", field, raw)
+		}
+	}
+	var models []storage.ProviderModelUsageRow
+	if err := json.Unmarshal(payload["models"], &models); err != nil {
+		t.Fatalf("decode provider models: %v (%s)", err, payload["models"])
+	}
+	if len(models) != 2 || models[0].DimensionKey != "codex::gpt-shared" || models[1].DimensionKey != "kiro::gpt-shared" {
+		t.Fatalf("dashboard must keep same-name models separated by provider: %#v", models)
+	}
+	if models[0].DisplayLabel != "Codex · gpt-shared" || models[1].DisplayLabel != "Kiro · gpt-shared" {
+		t.Fatalf("provider-model labels = %#v", models)
+	}
+	var series []storage.ProviderModelSeriesDescriptor
+	if err := json.Unmarshal(payload["series"], &series); err != nil {
+		t.Fatalf("decode dashboard series: %v (%s)", err, payload["series"])
+	}
+	if len(series) != 2 || series[0].SeriesKey != "codex::gpt-shared" || series[1].SeriesKey != "kiro::gpt-shared" {
+		t.Fatalf("dashboard provider series = %#v", series)
+	}
+	var cache map[string]json.RawMessage
+	if err := json.Unmarshal(payload["cache"], &cache); err != nil {
+		t.Fatalf("decode dashboard cache: %v (%s)", err, payload["cache"])
+	}
+	for _, field := range []string{"summary", "stable_summary", "by_model", "by_provider", "by_provider_model", "by_time_bucket"} {
+		if _, ok := cache[field]; !ok {
+			t.Fatalf("dashboard cache missing requested %s: %s", field, payload["cache"])
+		}
+	}
+	for _, field := range []string{"by_account", "by_api_key", "by_account_model", "by_route", "by_route_account_model"} {
+		if _, ok := cache[field]; ok {
+			t.Fatalf("dashboard cache included unrequested diagnostic %s: %s", field, payload["cache"])
+		}
+	}
+	var cacheBuckets []storage.CacheUsageBucket
+	if err := json.Unmarshal(cache["by_time_bucket"], &cacheBuckets); err != nil {
+		t.Fatalf("decode dashboard cache buckets: %v", err)
+	}
+	for _, row := range cacheBuckets {
+		if row.Bucket%60 != 0 {
+			t.Fatalf("dashboard ignored requested 60-second cache bucket: %#v", cacheBuckets)
+		}
+	}
+
+	code, raw = grpReq(t, h, http.MethodGet, fmt.Sprintf("/admin/usage/dashboard?since=%d&until=%d&fields=summary", base, base+180), "")
+	if code != http.StatusOK {
+		t.Fatalf("lightweight usage dashboard = %d: %s", code, raw)
+	}
+	payload = map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode lightweight dashboard: %v (%s)", err, raw)
+	}
+	for _, field := range []string{"series", "model_series", "series_dimension"} {
+		if _, ok := payload[field]; ok {
+			t.Fatalf("dashboard generated optional series without request: %s", raw)
+		}
+	}
+
+	for _, invalidPath := range []string{
+		"/admin/usage/dashboard?dimension=account",
+		"/admin/usage/dashboard?series_dimension=account",
+		"/admin/usage/dashboard?series_limit=0",
+		"/admin/usage/dashboard?fields=summary,nope",
+	} {
+		if code, raw := grpReq(t, h, http.MethodGet, invalidPath, ""); code != http.StatusBadRequest {
+			t.Fatalf("%s = %d, want 400: %s", invalidPath, code, raw)
+		}
+	}
+}
+
 func TestNewAdminUsageEndpointsRejectNonAdminAndAPIKey(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	admin := jarClient(t)
@@ -407,6 +505,7 @@ func TestNewAdminUsageEndpointsRejectNonAdminAndAPIKey(t *testing.T) {
 		adminHeaders map[string]string
 	}{
 		{method: http.MethodGet, path: "/admin/usage/window"},
+		{method: http.MethodGet, path: "/admin/usage/dashboard?fields=summary"},
 		{method: http.MethodPost, path: "/admin/usage/cache/reset", adminHeaders: map[string]string{csrfHeaderName: adminCSRF}},
 		{method: http.MethodGet, path: "/admin/export/cache-hits"},
 	}

@@ -13,6 +13,7 @@ import (
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -54,6 +55,49 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 	switch provider := s.accountProvider(account, token); provider {
 	case "claude":
 		return s.probeClaudeModels(ctx, account, token, binding, egress)
+	case "antigravity":
+		creds, credentialsErr := s.store.GetAntigravityCredentials(ctx, account.ID)
+		if credentialsErr != nil {
+			return nil, credentialsErr
+		}
+		accessToken, refreshedCreds, refreshErr := s.ensureAntigravityToken(ctx, creds, account, egress, binding.CookieJarKey)
+		if refreshErr != nil {
+			return s.existingAntigravityModels(ctx, account.ID, refreshErr)
+		}
+		models, probeErr := s.upstream.FetchAntigravityModels(ctx, egress, binding.CookieJarKey, accessToken, refreshedCreds.ProjectID, refreshedCreds.BaseURL, refreshedCreds.UserAgent)
+		if probeErr != nil {
+			return s.existingAntigravityModels(ctx, account.ID, probeErr)
+		}
+		caps := make([]storage.ModelCapability, 0, len(models))
+		for _, discovered := range models {
+			contextState := capability.Context1MUnknown
+			contextSource := ""
+			if discovered.MaxTokens > 0 {
+				contextState = capability.Context1MUnsupported
+				if discovered.MaxTokens >= 1_000_000 {
+					contextState = capability.Context1MSupported
+				}
+				contextSource = "antigravity_catalog_max_tokens"
+			}
+			rawHash := sha256.Sum256(discovered.RawJSON)
+			caps = append(caps, storage.ModelCapability{
+				AccountID: account.ID, ModelSlug: discovered.ID,
+				AvailabilityState: capability.AvailabilityVerified,
+				Context1MState:    contextState, Context1MSource: contextSource,
+				NativeContextWindow: discovered.MaxTokens, NativeMaxContextWindow: discovered.MaxTokens,
+				EffectiveContextWindowPercent: 100,
+				RawModelJSONHash:              fmt.Sprintf("%x", rawHash[:]), RawModelJSON: string(discovered.RawJSON),
+				Source: "antigravity_model_probe", LastProbeAt: storage.Now(),
+			})
+		}
+		// fetchAvailableModels is not a deletion-authoritative snapshot: current
+		// Antigravity responses may contain only capability hints or a partial models
+		// object. Merge verified observations so a partial response cannot erase a
+		// previously working account/model route.
+		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+			return nil, err
+		}
+		return caps, nil
 	case "kiro":
 		caps := capability.StaticKiroModels(account.ID)
 		cred, err := s.store.GetKiroCredentials(ctx, account.ID)
@@ -209,6 +253,18 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		return caps, nil
 	}
 	return s.existingOrStaticCodexModels(ctx, account.ID)
+}
+
+func (s *Server) existingAntigravityModels(ctx context.Context, accountID string, probeErr error) ([]storage.ModelCapability, error) {
+	existing, err := s.store.ListCapabilities(ctx, accountID)
+	if err == nil && len(existing) > 0 {
+		log.Printf("antigravity model probe %s: %v; retaining previous account catalog", accountID, probeErr)
+		return existing, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, probeErr
 }
 
 // upsertStaticCodexModels stores unverified discovery hints when the live ChatGPT

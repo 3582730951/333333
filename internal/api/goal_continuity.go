@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -621,6 +622,38 @@ func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []by
 	return string(checkpoint), string(segment), strings.TrimSpace(responseID), outputAwaitingTool(response), nil
 }
 
+// incrementalGoalRequest removes only a byte-for-byte-equivalent decoded history
+// prefix that is already durable. Claude Code and Kiro resend the complete messages
+// array on every turn; persisting that full array as every segment creates O(n^2)
+// storage. Any mismatch keeps the original body, preferring duplication over loss.
+func incrementalGoalRequest(currentBody, durableReplay []byte) []byte {
+	current, currentErr := decodeContextJSONMap(currentBody)
+	durable, durableErr := decodeContextJSONMap(durableReplay)
+	if currentErr != nil || durableErr != nil {
+		return currentBody
+	}
+	historyKey := "input"
+	if _, ok := current["messages"]; ok {
+		historyKey = "messages"
+	}
+	currentHistory, currentOK := current[historyKey].([]interface{})
+	durableHistory, durableOK := durable[historyKey].([]interface{})
+	if !currentOK || !durableOK || len(durableHistory) == 0 || len(durableHistory) > len(currentHistory) {
+		return currentBody
+	}
+	for index := range durableHistory {
+		if !reflect.DeepEqual(durableHistory[index], currentHistory[index]) {
+			return currentBody
+		}
+	}
+	current[historyKey] = append([]interface{}(nil), currentHistory[len(durableHistory):]...)
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		return currentBody
+	}
+	return encoded
+}
+
 // goalResponseFromSSE retains a protocol stream as encrypted structured segment data
 // without pretending its provider-specific events are Responses output.  Only a small
 // capture is used by the Claude path; unknown content and attachments remain verbatim
@@ -787,13 +820,28 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	if !s.goalContinuityEnabled(ctx) {
 		return storage.GoalSession{}, nil
 	}
-	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, goalOriginalBody(ctx, requestBody), responseBody)
-	if err != nil {
-		return storage.GoalSession{}, err
-	}
 	requestAliases := goalAliases(r, requestBody, protocol)
 	requestAliases = append(requestAliases, goalIdentityAliases(ctx)...)
 	resolutionSets := goalResolutionAliasSets(requestAliases, goalHasResumeAlias(requestAliases))
+	keyHash, _ := downstreamFromCtx(ctx)
+	workspaceHash := goalWorkspaceFingerprint(r, requestBody)
+	initialGoalHash := goalInitialFingerprint(requestBody)
+	// A terminal without an exact identity or the complete fallback tuple can never
+	// be resumed. Persisting it would create an unreachable goal on every ordinary
+	// stateless API call and eventually starve real long-running sessions.
+	if len(resolutionSets) == 0 && (keyHash == "" || workspaceHash == "" || initialGoalHash == "") {
+		return storage.GoalSession{}, nil
+	}
+	segmentRequestBody := goalOriginalBody(ctx, requestBody)
+	if resolved, resolveErr := s.store.ResolveGoalAliasSets(ctx, resolutionSets); resolveErr == nil {
+		if replay, _, replayErr := s.store.BuildGoalReplay(ctx, resolved.Session.ID); replayErr == nil {
+			segmentRequestBody = incrementalGoalRequest(segmentRequestBody, replay)
+		}
+	}
+	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody)
+	if err != nil {
+		return storage.GoalSession{}, err
+	}
 	aliases := goalPersistentAliases(requestAliases)
 	if responseID != "" {
 		aliases = append(aliases, storage.GoalAlias{Type: "response_id", Value: responseID})
@@ -808,10 +856,9 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 			branchHash = hashGoalFingerprint(branch)
 		}
 	}
-	keyHash, _ := downstreamFromCtx(ctx)
 	turn := storage.GoalTurn{
 		Protocol: protocol, ParentGoalID: "", BranchHash: branchHash, DownstreamKeyHash: keyHash,
-		WorkspaceHash: goalWorkspaceFingerprint(r, requestBody), InitialGoalHash: goalInitialFingerprint(requestBody),
+		WorkspaceHash: workspaceHash, InitialGoalHash: initialGoalHash,
 		ResponseID: responseID, Aliases: aliases, CheckpointPayload: checkpoint, SegmentPayload: segment,
 		ResolutionAliasSets: resolutionSets,
 		WorkingState:        goalWorkingState(requestBody), AwaitingTool: awaitingTool,
@@ -835,6 +882,39 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	// chain for the next resume rather than losing the successful response.
 	s.scheduleGoalCompaction(ctx, session.ID)
 	return session, nil
+}
+
+func goalPersistenceErrorCode(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, storage.ErrGoalStorageBudget):
+		return "storage_budget"
+	case errors.Is(err, storage.ErrGoalAmbiguous):
+		return "identity_ambiguous"
+	case errors.Is(err, context.Canceled):
+		return "request_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "storage_timeout"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "database is locked"), strings.Contains(message, "database is busy"):
+		return "storage_busy"
+	case strings.Contains(message, "constraint"):
+		return "storage_conflict"
+	case strings.Contains(message, "invalid character"), strings.Contains(message, "cannot unmarshal"), strings.Contains(message, "unexpected end of json"):
+		return "invalid_payload"
+	default:
+		return "storage_error"
+	}
+}
+
+func (s *Server) auditGoalPersistenceDegraded(ctx context.Context, terminal string, err error) {
+	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+		Action: "goal_persistence_degraded", State: "retryable", Reason: terminal,
+		Detail: "error_code=" + goalPersistenceErrorCode(err),
+	})
 }
 
 func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol string, current []byte) goalResumeResult {

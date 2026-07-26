@@ -372,12 +372,25 @@ async function handleAPI(req) {
   }));
   if (p === '/admin/accounts' || p === '/admin/accounts/summary') return req.respond(json({ accounts: fixtures.accounts, rows: fixtures.accounts, total: fixtures.accounts.length }));
   if (p === '/admin/groups') return req.respond(json({ groups: [{ name: 'cyber', force_model: 'gpt-5.5', force_effort: 'high' }, { name: 'staging', force_model: '', force_effort: '' }] }));
+  if (p === '/admin/user-groups') return req.respond(json([{ id: 'ug_fixture', name: 'Fixture users', targets: [{ kind: 'account_pool_group', id: 'cyber' }] }]));
   if (p === '/admin/api-keys') return req.respond(json({ keys: fixtures.apiKeys }));
   if (p === '/admin/users') return req.respond(json({ users: fixtures.users }));
   if (p === '/admin/providers' || p === '/admin/register/providers') return req.respond(json({ providers: [{ id: 'openai', name: 'OpenAI', base_url: 'https://api.openai.com/v1', enabled: true, auto_discover_models: true, models: ['gpt-5.5', 'gpt-5.4'] }] }));
   if (p === '/admin/egress-profiles') return req.respond(json({ profiles: [{ id: 'egress_direct', name: 'Direct', type: 'direct', region: 'us-east', health: 'ok', latency_millis: 42, stream_capable: true }] }));
   if (p === '/admin/egress-pools') return req.respond(json({ pools: [{ id: 'pool_registration', name: 'Registration Pool', purpose: 'registration', members: ['egress_direct'] }, { id: 'pool_runtime', name: 'Runtime Pool', purpose: 'runtime', members: ['egress_direct'] }] }));
   if (hasFixture(req, 'force403') && p.startsWith('/admin/usage')) return req.respond(json({ error: { message: 'admin role required' } }, 403));
+  if (p === '/admin/usage/dashboard') {
+    const trend = timeseries(req);
+    return req.respond(json({
+      ...usageWindow(req),
+      accounts: fixtures.usageRows,
+      timeseries: trend.buckets,
+      models: cacheReport(req).by_provider_model,
+      model_series: trend.model_series,
+      series: trend.series,
+      cache: cacheReport(req),
+    }));
+  }
   if (p === '/admin/usage') return req.respond(json({ ...usageWindow(req), rows: fixtures.usageRows }));
   if (p === '/admin/usage/window') return req.respond(json({ ...usageWindow(req), cache_effective_start_at: now - 1800 }));
   if (p === '/admin/usage/timeseries') return req.respond(json(timeseries(req)));

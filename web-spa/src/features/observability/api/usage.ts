@@ -7,6 +7,8 @@ import type {
 } from '../model/usage';
 
 export const FULL_CACHE_FIELDS = 'summary,by_account,by_model,by_api_key,by_account_model,by_provider,by_provider_model,by_route,by_route_account_model,by_time_bucket';
+export const PRIMARY_CACHE_FIELDS = 'summary,by_model,by_provider,by_provider_model';
+export type UsageCacheDiagnosticField = 'by_api_key' | 'by_account_model' | 'by_route' | 'by_time_bucket';
 
 const numericKeys = [
   'requests', 'real_requests', 'hit_requests', 'request_hit_rate', 'token_hit_rate', 'real_token_hit_rate',
@@ -108,6 +110,18 @@ export const usageCacheSchema = z.object({
   effective_start_at: z.coerce.number().optional(),
 }).passthrough();
 
+export const usageDashboardSchema = z.object({
+  accounts: optionalUsageRowsSchema,
+  timeseries: z.preprocess((value) => (value === null ? undefined : value), z.array(usageBucketSchema).optional()),
+  models: optionalUsageRowsSchema,
+  model_series: optionalUsageRowsSchema,
+  series: z.preprocess((value) => (value === null ? undefined : value), z.array(seriesDescriptorSchema).optional()),
+  cache: usageCacheSchema.optional(),
+  window: windowSchema.optional(),
+  effective_start_at: z.coerce.number().optional(),
+  effective_until_at: z.coerce.number().optional(),
+}).passthrough();
+
 const ranges = {
   today: { bucket: 3600 },
   604800: { bucket: 86400 },
@@ -118,31 +132,39 @@ export async function fetchUsageDashboard(range: UsageRange, signal?: AbortSigna
   const definition = ranges[range];
   const now = Math.floor(Date.now() / 1000);
   const windowParams = range === 'today' ? undefined : { since: now - Number(range) };
-  const bucketParams = range === 'today'
-    ? { bucket: definition.bucket, series_dimension: 'provider_model', series_limit: 8 }
-    : { since: now - Number(range), bucket: definition.bucket, series_dimension: 'provider_model', series_limit: 8 };
-  const modelParams = { ...(windowParams || {}), dimension: 'provider_model' };
-  const cacheParams = { bucket: definition.bucket, fields: FULL_CACHE_FIELDS };
-
-  const [usageRaw, timeseriesRaw, modelsRaw, cacheRaw] = await Promise.all([
-    get('/admin/usage', windowParams, { signal }),
-    get('/admin/usage/timeseries', bucketParams, { signal }),
-    get('/admin/usage/by-model', modelParams, { signal }),
-    get('/admin/usage/cache', cacheParams, { signal }),
-  ]);
-  const usageWindow = parseApiResponse(usageEnvelopeSchema, usageRaw) as UsageEnvelope;
-  const timeseries = parseApiResponse(usageTimeseriesSchema, timeseriesRaw) as {
-    buckets: UsageBucket[]; modelSeries: UsageMetricRow[]; series: UsageSeriesDescriptor[];
+  const params = {
+    ...(windowParams || {}),
+    bucket: definition.bucket,
+    series_dimension: 'provider_model',
+    series_limit: 8,
+    dimension: 'provider_model',
+    fields: PRIMARY_CACHE_FIELDS,
+  };
+  const parsed = parseApiResponse(usageDashboardSchema, await get('/admin/usage/dashboard', params, { signal })) as any;
+  const rows = (parsed.accounts ?? []) as UsageMetricRow[];
+  const usageWindow: UsageEnvelope = {
+    ...parsed,
+    rows,
   };
   return {
-    rows: usageWindow.rows,
-    buckets: timeseries.buckets,
-    modelSeries: timeseries.modelSeries,
-    series: timeseries.series,
-    byModel: parseApiResponse(usageByModelSchema, modelsRaw) as UsageMetricRow[],
-    cache: parseApiResponse(usageCacheSchema, cacheRaw) as UsageCacheReport,
+    rows,
+    buckets: (parsed.timeseries ?? []) as UsageBucket[],
+    modelSeries: (parsed.model_series ?? []) as UsageMetricRow[],
+    series: (parsed.series ?? []) as UsageSeriesDescriptor[],
+    byModel: (parsed.models ?? []) as UsageMetricRow[],
+    cache: (parsed.cache ?? {}) as UsageCacheReport,
     usageWindow,
   };
+}
+
+export async function fetchUsageCacheDiagnostic(
+  range: UsageRange,
+  field: UsageCacheDiagnosticField,
+  signal?: AbortSignal,
+): Promise<UsageCacheReport> {
+  const definition = ranges[range];
+  const response = await get('/admin/usage/cache', { bucket: definition.bucket, fields: field }, { signal });
+  return parseApiResponse(usageCacheSchema, response) as UsageCacheReport;
 }
 
 export async function resetUsageCacheStats() {

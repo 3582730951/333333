@@ -160,7 +160,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 func (s *Server) persistKiroGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
 	if _, err := s.persistGoalContinuity(ctx, r, "kiro", requestBody, responseBody); err != nil {
 		log.Printf("[GOAL-CONTINUITY] kiro persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
-		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "goal_persistence_degraded", State: "retryable", Reason: "kiro_terminal", Detail: "payload persistence failed"})
+		s.auditGoalPersistenceDegraded(ctx, "kiro_terminal", err)
 	}
 }
 

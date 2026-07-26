@@ -19,6 +19,7 @@ import (
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/upstream"
 )
 
 // oauth.go implements the web-login (paste-back) account import flow for both
@@ -37,6 +38,18 @@ import (
 // by fetchChatGPTSessionToken so the relay presents one consistent browser shape.
 const oauthUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+var (
+	antigravityUserInfoURL     = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json"
+	antigravityControlPlaneURL = "https://cloudcode-pa.googleapis.com"
+	antigravityDailyControlURL = "https://daily-cloudcode-pa.googleapis.com"
+)
+
+const (
+	antigravityRuntimeUserAgent = "antigravity/hub/2.2.1 darwin/arm64"
+	antigravityOnboardUserAgent = antigravityRuntimeUserAgent + " google-api-nodejs-client/10.3.0"
+	antigravityGoogAPIClient    = "gl-node/22.21.1"
+)
+
 // oauthSessionTTL bounds how long a generated login URL stays completable. The
 // flow takes a minute or two; 15 min is generous while keeping the in-memory
 // store tiny and self-cleaning.
@@ -52,6 +65,11 @@ type oauthPending struct {
 	created           time.Time
 	reauthAccountID   string
 	targetWorkspaceID string
+	groupName         string
+	egressID          string
+	// importEgressID is set only for the deprecated explicit-account outlet input.
+	// A group-inherited outlet is intentionally not copied into the account row.
+	importEgressID string
 }
 
 // oauthStore is a tiny TTL map of in-flight logins keyed by an opaque session id.
@@ -162,13 +180,15 @@ func (d oauthProviderDesc) authorizeURL(challenge, state string) string {
 
 func (d oauthProviderDesc) authorizeURLWithOptions(challenge, state string, opts oauthAuthorizeOptions) string {
 	params := url.Values{
-		"client_id":             {d.clientID},
-		"response_type":         {"code"},
-		"redirect_uri":          {d.redirectURI},
-		"scope":                 {d.scope},
-		"state":                 {state},
-		"code_challenge":        {challenge},
-		"code_challenge_method": {"S256"},
+		"client_id":     {d.clientID},
+		"response_type": {"code"},
+		"redirect_uri":  {d.redirectURI},
+		"scope":         {d.scope},
+		"state":         {state},
+	}
+	if d.provider != "antigravity" {
+		params.Set("code_challenge", challenge)
+		params.Set("code_challenge_method", "S256")
 	}
 	if d.provider == "codex" {
 		// Make this authorize request BYTE-FOR-BYTE identical to the real Codex CLI
@@ -304,6 +324,9 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Provider           string `json:"provider"`
 		AllowedWorkspaceID string `json:"allowed_workspace_id"`
+		GroupName          string `json:"group_name"`
+		EgressID           string `json:"egress_id"`
+		PrimaryEgressID    string `json:"primary_egress_id"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -314,10 +337,13 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	verifier, challenge, err := generatePKCE()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	verifier, challenge := "", ""
+	if desc.provider != "antigravity" {
+		verifier, challenge, err = generatePKCE()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	state, err := randomToken(24)
 	if err != nil {
@@ -329,7 +355,19 @@ func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.oauth.put(sid, oauthPending{provider: desc.provider, verifier: verifier, state: state})
+	pending := oauthPending{provider: desc.provider, verifier: verifier, state: state}
+	if desc.provider == "antigravity" && (strings.TrimSpace(req.GroupName) != "" || requestedImportEgressID(req.EgressID, req.PrimaryEgressID) != "") {
+		explicitEgressID := requestedImportEgressID(req.EgressID, req.PrimaryEgressID)
+		egress, groupName, resolveErr := s.resolveAntigravityOAuthEgress(r.Context(), req.GroupName, explicitEgressID)
+		if resolveErr != nil {
+			writeError(w, http.StatusBadRequest, resolveErr)
+			return
+		}
+		pending.groupName = groupName
+		pending.egressID = egress.ID
+		pending.importEgressID = explicitEgressID
+	}
+	s.oauth.put(sid, pending)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"session_id": sid,
 		"provider":   desc.provider,
@@ -390,13 +428,29 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var parsed authparse.ParsedAuth
+	groupName := strings.TrimSpace(req.GroupName)
+	importEgressID := requestedImportEgressID(req.EgressID, req.PrimaryEgressID)
 	switch pend.provider {
 	case "codex":
 		parsed, err = s.exchangeCodexCode(r.Context(), desc, code, pend.verifier)
 	case "claude":
 		parsed, err = s.exchangeClaudeCode(r.Context(), desc, code, firstNonEmpty(state, pend.state), pend.verifier)
 	case "antigravity":
-		parsed, err = s.exchangeAntigravityCode(r.Context(), code, desc.redirectURI, pend.verifier)
+		if pend.groupName != "" {
+			groupName = pend.groupName
+		}
+		if pend.importEgressID != "" {
+			importEgressID = pend.importEgressID
+		}
+		routeEgressID := pend.egressID
+		if routeEgressID == "" {
+			routeEgressID = importEgressID
+		}
+		var egress storage.EgressProfile
+		egress, groupName, err = s.resolveAntigravityOAuthEgress(r.Context(), groupName, routeEgressID)
+		if err == nil {
+			parsed, err = s.exchangeAntigravityCode(r.Context(), code, desc.redirectURI, egress, "oauth:antigravity:"+req.SessionID)
+		}
 	default:
 		err = fmt.Errorf("unknown provider %q", pend.provider)
 	}
@@ -404,7 +458,7 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, "", "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
+	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, groupName, "", "", importEgressID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -539,25 +593,70 @@ func (s *Server) exchangeClaudeCode(ctx context.Context, d oauthProviderDesc, co
 	return authparse.ParseOAuthClaudeMetadata(tr.AccessToken, tr.RefreshToken, tr.Account.EmailAddress, subscriptionType, rateLimitTier, expiresAt, scopes)
 }
 
+type antigravityOAuthRawRequest func(context.Context, string, string, http.Header, []byte) (*upstream.Response, error)
+
+func (s *Server) resolveAntigravityOAuthEgress(ctx context.Context, groupName, requestedEgressID string) (storage.EgressProfile, string, error) {
+	groupName = strings.TrimSpace(groupName)
+	if groupName == "" {
+		groupName = strings.TrimSpace(s.cfg.DefaultGroup)
+	}
+	if groupName == "" {
+		groupName = "cyber"
+	}
+	group, err := s.store.GetGroup(ctx, groupName)
+	if err != nil {
+		return storage.EgressProfile{}, "", fmt.Errorf("account pool group %q was not found", groupName)
+	}
+	egressID := strings.TrimSpace(requestedEgressID)
+	if egressID == "" && len(group.EgressIDs) > 0 {
+		egressID = strings.TrimSpace(group.EgressIDs[0])
+	}
+	if egressID == "" {
+		egressID = storage.DefaultDirectEgressID
+	}
+	egress, err := s.store.GetEgressProfile(ctx, egressID)
+	if err != nil {
+		return storage.EgressProfile{}, "", fmt.Errorf("egress %q was not found", egressID)
+	}
+	return egress, groupName, nil
+}
+
+func (s *Server) antigravityOAuthRequester(egress storage.EgressProfile, cookieJarKey string) antigravityOAuthRawRequest {
+	return func(ctx context.Context, method, target string, headers http.Header, body []byte) (*upstream.Response, error) {
+		if s.upstream != nil {
+			return s.upstream.DoRawHTTP1(ctx, egress, method, target, headers, body, cookieJarKey)
+		}
+		// Focused unit tests and deliberately minimal embedders may omit the upstream
+		// client. Production Server construction always takes the egress-aware path.
+		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header = headers.Clone()
+		resp, err := oauthHTTPClient().Do(req)
+		if err != nil {
+			return nil, err
+		}
+		return &upstream.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: resp.Body}, nil
+	}
+}
+
 // exchangeAntigravityCode runs the Google OAuth2 authorization-code → tokens exchange
-// for Antigravity credentials. Returns a ParsedAuth with provider="antigravity".
-func (s *Server) exchangeAntigravityCode(ctx context.Context, code, redirectURI, verifier string) (authparse.ParsedAuth, error) {
+// for Antigravity credentials. Every server-side login request uses the account-pool
+// group's selected outlet, matching later model discovery, refresh, and inference.
+func (s *Server) exchangeAntigravityCode(ctx context.Context, code, redirectURI string, egress storage.EgressProfile, cookieJarKey string) (authparse.ParsedAuth, error) {
+	do := s.antigravityOAuthRequester(egress, cookieJarKey)
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {s.cfg.AntigravityOAuthClientID},
 		"client_secret": {s.cfg.AntigravityOAuthClientSecret},
 		"code":          {code},
 		"redirect_uri":  {redirectURI},
-		"code_verifier": {verifier},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.AntigravityOAuthTokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return authparse.ParsedAuth{}, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", oauthUserAgent)
-	resp, err := oauthHTTPClient().Do(req)
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/x-www-form-urlencoded")
+	headers.Set("Accept", "application/json")
+	resp, err := do(ctx, http.MethodPost, s.cfg.AntigravityOAuthTokenURL, headers, []byte(form.Encode()))
 	if err != nil {
 		return authparse.ParsedAuth{}, err
 	}
@@ -576,32 +675,159 @@ func (s *Server) exchangeAntigravityCode(ctx context.Context, code, redirectURI,
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return authparse.ParsedAuth{}, fmt.Errorf("parse token response: %w", err)
 	}
-
-	expiresAt := time.Now().Unix() + tr.ExpiresIn
-
-	// Extract email from ID token or userinfo endpoint (Google doesn't return email in token response)
-	email := ""
-
-	// Persist via storage
-	creds := storage.AntigravityCredentials{
-		Email:        email,
-		ProjectID:    "", // Will be set later via admin UI
-		AccessToken:  tr.AccessToken,
-		RefreshToken: tr.RefreshToken,
-		ExpiresAt:    expiresAt,
-		BaseURL:      "https://cloudcode-pa.googleapis.com",
-		UserAgent:    "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)",
+	if strings.TrimSpace(tr.AccessToken) == "" {
+		return authparse.ParsedAuth{}, errors.New("google token exchange returned no access_token")
 	}
-
-	if err := s.store.UpsertAntigravityCredentials(ctx, creds); err != nil {
-		return authparse.ParsedAuth{}, fmt.Errorf("persist antigravity credentials: %w", err)
+	expiresIn := tr.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 3600
 	}
+	email, err := fetchAntigravityUserInfo(ctx, tr.AccessToken, do)
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	projectID, err := discoverAntigravityProject(ctx, tr.AccessToken, do)
+	if err != nil {
+		return authparse.ParsedAuth{}, err
+	}
+	return authparse.ParseOAuthAntigravity(tr.AccessToken, tr.RefreshToken, email, projectID, time.Now().Unix()+expiresIn, strings.Fields(tr.Scope))
+}
 
-	return authparse.ParsedAuth{
-		Provider:     "antigravity",
-		Email:        email,
-		AccessToken:  tr.AccessToken,
-		RefreshToken: tr.RefreshToken,
-		ExpiresAt:    expiresAt,
-	}, nil
+func fetchAntigravityUserInfo(ctx context.Context, accessToken string, do antigravityOAuthRawRequest) (string, error) {
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+	headers.Set("Accept", "application/json")
+	headers.Set("User-Agent", antigravityRuntimeUserAgent)
+	resp, err := do(ctx, http.MethodGet, antigravityUserInfoURL, headers, nil)
+	if err != nil {
+		return "", fmt.Errorf("antigravity userinfo request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read antigravity userinfo: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("antigravity userinfo failed (%d): %s", resp.StatusCode, bodySnippet(body, 300))
+	}
+	var info struct {
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return "", fmt.Errorf("parse antigravity userinfo: %w", err)
+	}
+	if strings.TrimSpace(info.Email) == "" {
+		return "", errors.New("antigravity userinfo returned no email")
+	}
+	return strings.TrimSpace(info.Email), nil
+}
+
+func discoverAntigravityProject(ctx context.Context, accessToken string, do antigravityOAuthRawRequest) (string, error) {
+	body, err := antigravityControlPlaneRequest(ctx, accessToken, antigravityControlPlaneURL+"/v1internal:loadCodeAssist", antigravityRuntimeUserAgent, "", map[string]interface{}{
+		"metadata": map[string]string{"ideType": "ANTIGRAVITY"},
+	}, do)
+	if err != nil {
+		return "", fmt.Errorf("antigravity loadCodeAssist: %w", err)
+	}
+	var loaded map[string]interface{}
+	if err := json.Unmarshal(body, &loaded); err != nil {
+		return "", fmt.Errorf("parse antigravity loadCodeAssist: %w", err)
+	}
+	if projectID := antigravityProjectID(loaded); projectID != "" {
+		return projectID, nil
+	}
+	tierID := antigravityDefaultTierID(loaded)
+	version := "2.2.1"
+	for attempt := 0; attempt < 5; attempt++ {
+		body, err = antigravityControlPlaneRequest(ctx, accessToken, antigravityDailyControlURL+"/v1internal:onboardUser", antigravityOnboardUserAgent, antigravityGoogAPIClient, map[string]interface{}{
+			"tier_id": tierID,
+			"metadata": map[string]string{
+				"ide_type": "ANTIGRAVITY", "ide_version": version, "ide_name": "antigravity",
+			},
+		}, do)
+		if err != nil {
+			return "", fmt.Errorf("antigravity onboardUser: %w", err)
+		}
+		var onboard map[string]interface{}
+		if err := json.Unmarshal(body, &onboard); err != nil {
+			return "", fmt.Errorf("parse antigravity onboardUser: %w", err)
+		}
+		if done, _ := onboard["done"].(bool); done {
+			if response, _ := onboard["response"].(map[string]interface{}); response != nil {
+				if projectID := antigravityProjectID(response); projectID != "" {
+					return projectID, nil
+				}
+			}
+			return "", errors.New("antigravity onboardUser completed without project_id")
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return "", errors.New("antigravity onboardUser did not complete after 5 attempts")
+}
+
+func antigravityControlPlaneRequest(ctx context.Context, accessToken, endpoint, userAgent, googAPIClient string, payload interface{}, do antigravityOAuthRawRequest) ([]byte, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	headers := make(http.Header)
+	headers.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+	headers.Set("Accept", "*/*")
+	headers.Set("Content-Type", "application/json")
+	headers.Set("User-Agent", userAgent)
+	if googAPIClient != "" {
+		headers.Set("X-Goog-Api-Client", googAPIClient)
+	}
+	resp, err := do(ctx, http.MethodPost, endpoint, headers, raw)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, bodySnippet(body, 300))
+	}
+	return body, nil
+}
+
+func antigravityProjectID(data map[string]interface{}) string {
+	for _, key := range []string{"cloudaicompanionProject", "projectId", "project"} {
+		switch value := data[key].(type) {
+		case string:
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		case map[string]interface{}:
+			if id, _ := value["id"].(string); strings.TrimSpace(id) != "" {
+				return strings.TrimSpace(id)
+			}
+		}
+	}
+	return ""
+}
+
+func antigravityDefaultTierID(data map[string]interface{}) string {
+	if tiers, ok := data["allowedTiers"].([]interface{}); ok {
+		for _, rawTier := range tiers {
+			tier, _ := rawTier.(map[string]interface{})
+			isDefault, _ := tier["isDefault"].(bool)
+			id, _ := tier["id"].(string)
+			if isDefault && strings.TrimSpace(id) != "" {
+				return strings.TrimSpace(id)
+			}
+		}
+	}
+	if tier, _ := data["currentTier"].(map[string]interface{}); tier != nil {
+		if id, _ := tier["id"].(string); strings.TrimSpace(id) != "" {
+			return strings.TrimSpace(id)
+		}
+	}
+	return "free-tier"
 }

@@ -42,9 +42,11 @@ export function useApiMutation<TVariables, TResult>({ mutationFn, invalidate = [
   const client = useQueryClient();
   return useMutation({
     mutationFn,
-    onSuccess: async (result, variables) => {
-      await invalidateQueryKeys(client, invalidate);
-      await onSuccess?.(result, variables);
+    onSuccess: (result, variables) => {
+      // Mutations complete when the write succeeds. List refreshes run in the
+      // background so a slow read cannot leave dialogs and buttons locked.
+      void invalidateQueryKeys(client, invalidate);
+      return onSuccess?.(result, variables);
     },
   });
 }

@@ -502,7 +502,11 @@ func (c *Client) doHTTP(ctx context.Context, spec Request) (*Response, error) {
 }
 
 func (c *Client) httpClientForEgress(spec Request) (*http.Client, error) {
-	transport, err := c.transportForEgress(spec.Egress)
+	return c.httpClientForEgressMode(spec, false)
+}
+
+func (c *Client) httpClientForEgressMode(spec Request, forceHTTP1 bool) (*http.Client, error) {
+	transport, err := c.transportForEgressMode(spec.Egress, forceHTTP1)
 	if err != nil {
 		return nil, err
 	}
@@ -524,11 +528,19 @@ func (c *Client) sidecarHTTPClient() (*http.Client, error) {
 // therefore one keep-alive connection pool — so repeated requests reuse warm
 // TCP/TLS/HTTP2 connections instead of handshaking every time.
 func transportKey(egress storage.EgressProfile) string {
+	return transportKeyForMode(egress, false)
+}
+
+func transportKeyForMode(egress storage.EgressProfile, forceHTTP1 bool) string {
+	prefix := ""
+	if forceHTTP1 {
+		prefix = "http1|"
+	}
 	switch egress.Type {
 	case "", "direct":
-		return "direct"
+		return prefix + "direct"
 	default:
-		return egress.Type + "|" + egress.Endpoint
+		return prefix + egress.Type + "|" + egress.Endpoint
 	}
 }
 
@@ -538,7 +550,14 @@ func transportKey(egress storage.EgressProfile) string {
 // Transport per request — the previous behavior — gave every request an empty pool
 // and thus a full DNS+TLS handshake, the dominant per-request latency.
 func (c *Client) transportForEgress(egress storage.EgressProfile) (*http.Transport, error) {
-	key := transportKey(egress)
+	return c.transportForEgressMode(egress, false)
+}
+
+// transportForEgressMode keeps a separate connection pool for HTTP/1.1-only
+// providers. Sharing a transport with the ordinary HTTP/2 path would let an
+// already-negotiated h2 connection violate the provider's wire contract.
+func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1 bool) (*http.Transport, error) {
+	key := transportKeyForMode(egress, forceHTTP1)
 	c.tmu.Lock()
 	defer c.tmu.Unlock()
 	if t := c.transports[key]; t != nil {
@@ -547,7 +566,7 @@ func (c *Client) transportForEgress(egress storage.EgressProfile) (*http.Transpo
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     !forceHTTP1,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConns:          128,
@@ -568,6 +587,12 @@ func (c *Client) transportForEgress(egress storage.EgressProfile) (*http.Transpo
 			MinVersion:         tls.VersionTLS12,
 			ClientSessionCache: tls.NewLRUClientSessionCache(128),
 		},
+	}
+	if forceHTTP1 {
+		// A non-nil empty map disables net/http's automatic HTTP/2 upgrade even
+		// when the TLS peer advertises h2 through ALPN.
+		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	}
 	switch egress.Type {
 	case "", "direct":

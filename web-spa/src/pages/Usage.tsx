@@ -10,7 +10,10 @@ import { COLORS, modelColor } from '../lib/chartTheme.js';
 import { fmtTokens, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
-import { useResetUsageCacheMutation, useUsageDashboardData } from '../features/observability/queries/usage';
+import {
+  useResetUsageCacheMutation, useUsageCacheDiagnosticData, useUsageDashboardData,
+} from '../features/observability/queries/usage';
+import type { UsageCacheDiagnosticField } from '../features/observability/api/usage';
 import {
   reportedCacheMetric, usageDimensionKey, usageDisplayLabel,
   type UsageMetricRow, type UsageRange,
@@ -36,6 +39,12 @@ const CACHE_METRICS = [
   { labelKey: 'usage.cache_write', value: 'cache_creation_tokens' },
   { labelKey: 'usage.input_tokens', value: 'prompt_tokens' },
 ];
+const DIAGNOSTIC_FIELDS: Record<string, UsageCacheDiagnosticField> = {
+  apiKey: 'by_api_key',
+  accountModel: 'by_account_model',
+  route: 'by_route',
+  time: 'by_time_bucket',
+};
 
 interface UsageColumn {
   title: ReactNode;
@@ -126,6 +135,14 @@ export default function Usage() {
   const [activeDiagnostic, setActiveDiagnostic] = useState('providerModel');
 
   const { data, loading, error, lastRefresh, reload: load } = useUsageDashboardData(range);
+  const diagnosticField = DIAGNOSTIC_FIELDS[activeDiagnostic] || null;
+  const {
+    data: diagnosticCache = {},
+    loading: diagnosticLoading,
+    error: diagnosticError,
+    lastRefresh: diagnosticLastRefresh,
+    reload: reloadDiagnostic,
+  } = useUsageCacheDiagnosticData(range, diagnosticField);
   const resetMutation = useResetUsageCacheMutation();
   const resetting = resetMutation.isPending;
   if (error && !lastRefresh && !loading) {
@@ -144,14 +161,13 @@ export default function Usage() {
   const cache = data?.cache || {};
   const cacheSummary = cache.summary || {};
   const stableCacheSummary = cache.stable_summary || cacheSummary;
-  const cacheByKey = cache.by_api_key || [];
-  const cacheByAccountModel = cache.by_account_model || [];
+  const cacheByKey = diagnosticCache.by_api_key || [];
+  const cacheByAccountModel = diagnosticCache.by_account_model || [];
   const cacheByProvider = cache.by_provider || [];
   const cacheByProviderModel = cache.by_provider_model || [];
   const officialProviderModelCache = cacheByProviderModel.filter((row) => String(row.provider || '').toLowerCase() !== 'kiro');
-  const cacheByRoute = cache.by_route || [];
-  const cacheByRouteAccountModel = cache.by_route_account_model || [];
-  const cacheByTimeBucket = cache.by_time_bucket || [];
+  const cacheByRoute = diagnosticCache.by_route || [];
+  const cacheByTimeBucket = diagnosticCache.by_time_bucket || [];
   const usageWindow = data?.usageWindow || { rows: [] };
   const windowInfo = usageWindow.window || cache.window || {};
 
@@ -555,8 +571,10 @@ export default function Usage() {
         </div>
         <Section title={activeDiagnosticTab.title}>
           <DataTable
-            loading={loading}
-            lastRefresh={lastRefresh}
+            error={diagnosticField ? diagnosticError : error}
+            onRetry={diagnosticField ? reloadDiagnostic : load}
+            loading={loading || diagnosticLoading}
+            lastRefresh={diagnosticField ? diagnosticLastRefresh : lastRefresh}
             dataSource={activeDiagnosticTab.data}
             columns={activeDiagnosticTab.columns}
             rowKey={activeDiagnosticTab.rowKey}

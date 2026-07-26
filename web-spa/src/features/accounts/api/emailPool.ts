@@ -74,14 +74,14 @@ export async function fetchEmailPool(params: {
   pageSize?: number;
   search?: string;
   status?: string;
-} = {}): Promise<EmailPoolListResponse> {
+} = {}, signal?: AbortSignal): Promise<EmailPoolListResponse> {
   const searchParams = new URLSearchParams();
   if (params.page) searchParams.set('page', String(params.page));
   if (params.pageSize) searchParams.set('pageSize', String(params.pageSize));
   if (params.search) searchParams.set('search', params.search);
   if (params.status) searchParams.set('status', params.status);
   const qs = searchParams.toString();
-  const response = await get(`/admin/email-pool${qs ? `?${qs}` : ''}`);
+  const response = await get(`/admin/email-pool${qs ? `?${qs}` : ''}`, undefined, { signal });
   return parseApiResponse(emailPoolResponseSchema, response);
 }
 

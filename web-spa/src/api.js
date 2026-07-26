@@ -54,7 +54,10 @@ export const registerUser = (email, password, name) =>
 export const logout = () => post('/auth/logout', {}, { suppressUnauthorizedEvent: true });
 
 // ── OAuth login helpers (web-login / paste-back import) ──
-export const oauthStart = (provider) => post('/admin/oauth/start', { provider });
+export const oauthStart = (provider, groupName = '') => post('/admin/oauth/start', {
+  provider,
+  group_name: groupName,
+});
 export const oauthComplete = (sessionId, redirected, label, groupName) =>
   post('/admin/oauth/complete', {
     session_id: sessionId,

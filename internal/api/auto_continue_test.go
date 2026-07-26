@@ -235,8 +235,12 @@ func TestStitchCodexContinuationOffsetsSuppressesAndRewritesCompleted(t *testing
 		t.Fatal("continuation reached response.completed; recorder should report terminal")
 	}
 	frames := parseSSE(t, buf.String())
-	if idxOf(frames, "response.created") != -1 || idxOf(frames, "response.in_progress") != -1 {
-		t.Fatal("continuation lifecycle preamble leaked downstream")
+	if idxOf(frames, "response.created") != -1 {
+		t.Fatal("continuation response.created leaked downstream")
+	}
+	progressIndex := idxOf(frames, "response.in_progress")
+	if progressIndex == -1 || len(frames[progressIndex].data) != 1 {
+		t.Fatal("minimal continuation heartbeat was not preserved")
 	}
 	// output_index offset by priorItemCount (1).
 	for _, f := range frames {

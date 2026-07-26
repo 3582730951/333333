@@ -1283,15 +1283,18 @@ func writeCodexSidecarStreamFailure(w io.Writer, id, model, _ string) error {
 
 func (s *Server) emitCodexNativeContinuationFailure(ctx context.Context, w io.Writer, id, model, reason string) error {
 	atomic.AddUint64(&s.codexEOFCompensations, 1)
+	if err := writeCodexNativeContinuationFailure(w, id, model); err != nil {
+		return err
+	}
 	if s.store != nil {
-		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+		s.enqueueAudit(storage.AuditLogRow{
 			Action: "codex_eof_terminal_compensation",
 			State:  "emitted",
 			Reason: firstNonEmpty(strings.TrimSpace(reason), "truncated_eof"),
 			Detail: "native_protocol_no_raw_identifiers",
 		})
 	}
-	return writeCodexNativeContinuationFailure(w, id, model)
+	return nil
 }
 
 // codexSessionMappingStats contains aggregate-only operational data. None of the

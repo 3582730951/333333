@@ -3376,6 +3376,26 @@
   font-size: 14px;
 }
 
+.pool-instruction-profiles {
+  display: grid;
+  border-top: 1px solid var(--pool-border);
+}
+
+.pool-instruction-profile {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.75fr) minmax(280px, 1.25fr);
+  gap: 16px;
+  align-items: center;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--pool-border);
+}
+
+.pool-instruction-profile__label {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
 .pool-user-routing-editor,
 .pool-route-rule-card,
 .pool-routing-summary {
@@ -3593,6 +3613,11 @@
 
   .pool-user-group-grid {
     grid-template-columns: 1fr;
+  }
+
+  .pool-instruction-profile {
+    grid-template-columns: 1fr;
+    gap: 8px;
   }
 
   .pool-provider-profile-cards {

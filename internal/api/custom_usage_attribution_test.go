@@ -49,9 +49,20 @@ func TestCustomProvidersWithSameModelProduceDistinctProviderModelRows(t *testing
 
 		groupID := "ug-" + providerID
 		createRouteTestGroup(t, h, groupID, []storage.TargetRef{{Kind: storage.TargetKindModelProvider, ID: providerID}}, nil)
-		key := createTestAPIKeyForGroup(t, h, "cyber")
-		if code, raw := grpReq(t, h, http.MethodPost, "/admin/api-keys/"+hashAPIKey(key)+"/user-group", `{"user_group_id":"`+groupID+`"}`); code != http.StatusOK {
-			t.Fatalf("bind %s api key = %d: %s", providerID, code, raw)
+		keyBody, _ := json.Marshal(map[string]string{
+			"label": "route-" + providerID, "key_type": "inference", "user_group_id": groupID,
+		})
+		code, raw := grpReq(t, h, http.MethodPost, "/admin/api-keys", string(keyBody))
+		if code != http.StatusCreated {
+			t.Fatalf("create %s api key = %d: %s", providerID, code, raw)
+		}
+		var keyResult map[string]interface{}
+		if err := json.Unmarshal(raw, &keyResult); err != nil {
+			t.Fatalf("decode %s api key: %v (%s)", providerID, err, raw)
+		}
+		key, _ := keyResult["key"].(string)
+		if key == "" {
+			t.Fatalf("%s api key response missing key: %v", providerID, keyResult)
 		}
 		keys[providerID] = key
 	}

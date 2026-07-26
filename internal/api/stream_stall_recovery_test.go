@@ -244,6 +244,168 @@ func TestCodexStallWithoutRecoverableStateDoesNotContinue(t *testing.T) {
 	}
 }
 
+func TestCodexStatelessStallIgnoresSafetyFramesAndContinuesOnSameIdentity(t *testing.T) {
+	const downstreamSession = "downstream-stateless-session-must-not-reach-upstream"
+	initialCancelled := make(chan bool, 1)
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var captures []stalledUpstreamCapture
+	var authHeaders []string
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		captures = append(captures, stalledUpstreamCapture{
+			body: string(raw), session: r.Header.Get("Session-Id"),
+			thread: r.Header.Get("Thread-Id"), turn: turnIDFromHeader(r.Header.Get("X-Codex-Turn-Metadata")),
+		})
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		mu.Unlock()
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stateless-stall\",\"model\":\"gpt\"},\"safety_buffering\":{\"reasons\":[\"user_risk\"]}}\n\n")
+			flusher, _ := w.(http.Flusher)
+			flusher.Flush()
+			ticker := time.NewTicker(8 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-r.Context().Done():
+					initialCancelled <- true
+					return
+				case <-ticker.C:
+					_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"safety_buffering\":{\"reasons\":[\"user_risk\"]}}\n\n")
+					flusher.Flush()
+				}
+			}
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stateless-final\",\"model\":\"gpt\"}}\n\n"+
+			"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"continued statelessly\"}\n\n"+
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stateless-final\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n")
+	})
+	h.importAccount(t, "stateless-stall-a", "upstream-stateless-a", "access-stateless-a")
+	h.importAccount(t, "stateless-stall-b", "upstream-stateless-b", "access-stateless-b")
+
+	headers := http.Header{}
+	headers.Set("Session-Id", downstreamSession)
+	headers.Set("Thread-Id", downstreamSession)
+	recorder := serveWithStallRecovery(t, h, "/v1/responses", `{"model":"gpt","stream":true,"session_id":"`+downstreamSession+`","thread_id":"`+downstreamSession+`","input":"long goal"}`, headers)
+	waitForUpstreamCancellation(t, initialCancelled, "stateless Codex stream")
+
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || calls.Load() != 2 || !strings.Contains(body, "response.completed") || !strings.Contains(body, "continued statelessly") || strings.Contains(body, "response.failed") || strings.Contains(strings.ToLower(body), "safety") {
+		t.Fatalf("stateless recovery status=%d calls=%d body=%s", recorder.Code, calls.Load(), body)
+	}
+	mu.Lock()
+	got := append([]stalledUpstreamCapture(nil), captures...)
+	gotAuth := append([]string(nil), authHeaders...)
+	mu.Unlock()
+	if len(got) != 2 || len(gotAuth) != 2 || gotAuth[0] == "" || gotAuth[0] != gotAuth[1] {
+		t.Fatalf("continuation changed account: captures=%+v auth=%v", got, gotAuth)
+	}
+	if got[0].session == "" || got[0].session != got[1].session || got[0].thread != got[0].session || got[1].thread != got[1].session {
+		t.Fatalf("stateless continuation identity drift: %+v", got)
+	}
+	for _, capture := range got {
+		if capture.session == downstreamSession || strings.Contains(capture.body, downstreamSession) {
+			t.Fatalf("downstream session leaked upstream: %+v", capture)
+		}
+	}
+	if !strings.Contains(got[1].body, h.app.autoContinueText(context.Background())) || strings.Contains(got[1].body, "previous_response_id") {
+		t.Fatalf("stateless continuation body is not self-contained: %s", got[1].body)
+	}
+}
+
+func TestCodexStatelessContinuationSecondStallEmitsOneGenericTerminal(t *testing.T) {
+	initialCancelled := make(chan bool, 1)
+	continuationCancelled := make(chan bool, 1)
+	var calls atomic.Int32
+	var authMu sync.Mutex
+	var authHeaders []string
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		authMu.Lock()
+		authHeaders = append(authHeaders, r.Header.Get("Authorization"))
+		authMu.Unlock()
+		call := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stateless-double\",\"model\":\"gpt\"}}\n\n")
+			w.(http.Flusher).Flush()
+			blockUntilUpstreamCancelled(r, initialCancelled)
+			return
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stateless-double-cont\",\"model\":\"gpt\"}}\n\n"+
+			"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"private partial\"}\n\n")
+		w.(http.Flusher).Flush()
+		blockUntilUpstreamCancelled(r, continuationCancelled)
+	})
+	h.importAccount(t, "stateless-double-a", "upstream-stateless-double-a", "access-stateless-double-a")
+	h.importAccount(t, "stateless-double-b", "upstream-stateless-double-b", "access-stateless-double-b")
+
+	recorder := serveWithStallRecovery(t, h, "/v1/responses", `{"model":"gpt","stream":true,"input":"work"}`, nil)
+	waitForUpstreamCancellation(t, initialCancelled, "initial stateless Codex stream")
+	waitForUpstreamCancellation(t, continuationCancelled, "stateless Codex continuation")
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || calls.Load() != 2 || strings.Count(body, "event: response.failed\n") != 1 || !strings.Contains(body, publicRetryMessage) || strings.Contains(body, "response.completed") {
+		t.Fatalf("stateless double-stall status=%d calls=%d body=%s", recorder.Code, calls.Load(), body)
+	}
+	for _, forbidden := range []string{"upstream stream stalled", "account", "quota", "usage limit", "safety"} {
+		if strings.Contains(strings.ToLower(body), forbidden) {
+			t.Fatalf("stateless failure leaked %q: %s", forbidden, body)
+		}
+	}
+	authMu.Lock()
+	defer authMu.Unlock()
+	if len(authHeaders) != 2 || authHeaders[0] == "" || authHeaders[0] != authHeaders[1] {
+		t.Fatalf("continuation changed account: %v", authHeaders)
+	}
+}
+
+func TestCodexStatelessTruncatedToolCallIsNotReissued(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-tool-truncated\",\"model\":\"gpt\"}}\n\n"+
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call-must-not-replay\",\"name\":\"apply_patch\",\"arguments\":\"{}\"}}\n\n")
+	})
+	h.importAccount(t, "stateless-tool", "upstream-stateless-tool", "access-stateless-tool")
+
+	recorder := serveWithStallRecovery(t, h, "/v1/responses", `{"model":"gpt","stream":true,"input":"use a tool"}`, nil)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || calls.Load() != 1 || strings.Count(body, "event: response.failed\n") != 1 || !strings.Contains(body, publicRetryMessage) {
+		t.Fatalf("truncated tool result status=%d calls=%d body=%s", recorder.Code, calls.Load(), body)
+	}
+}
+
+func TestCodexStatelessContinuationErrorIsNeverExposed(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-before-private-error\",\"model\":\"gpt\"}}\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"message":"service temporarily unavailable for account secret-account-id; quota remaining 2%; safety check"}}`)
+	})
+	h.importAccount(t, "stateless-private-error", "upstream-stateless-private-error", "access-stateless-private-error")
+
+	recorder := serveWithStallRecovery(t, h, "/v1/responses", `{"model":"gpt","stream":true,"input":"work"}`, nil)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || calls.Load() != 2 || strings.Count(body, "event: response.failed\n") != 1 || !strings.Contains(body, publicRetryMessage) {
+		t.Fatalf("continuation error result status=%d calls=%d body=%s", recorder.Code, calls.Load(), body)
+	}
+	for _, forbidden := range []string{"temporarily unavailable", "secret-account-id", "quota", "2%", "safety"} {
+		if strings.Contains(strings.ToLower(body), forbidden) {
+			t.Fatalf("private upstream detail %q leaked: %s", forbidden, body)
+		}
+	}
+}
+
 func TestClaudeStreamStallContinuesAndOffsetsBlocks(t *testing.T) {
 	const downstreamSession = "downstream-claude-stall-session"
 	initialCancelled := make(chan bool, 1)

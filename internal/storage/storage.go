@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/secretbox"
+	"codex-account-pool/internal/supervisor"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -75,6 +76,9 @@ type Group struct {
 	Virtual2MEnabled              bool     `json:"-"`
 	ModelInstructionsEnabled      bool     `json:"model_instructions_enabled"`
 	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
+	// ModelInstructionProfiles is populated only when a UserGroup policy is carried
+	// through the request context. Account-pool groups do not persist or execute it.
+	ModelInstructionProfiles ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
 	// Legacy policy fields are retained for one compatibility cycle only. Runtime
 	// request policy comes exclusively from UserGroup and new account-pool group
 	// writes reject non-empty policy values.
@@ -92,6 +96,22 @@ type Group struct {
 	UpdatedAt           int64 `json:"updated_at"`
 }
 
+const (
+	ModelInstructionFamilyGPT    = "gpt"
+	ModelInstructionFamilyClaude = "claude"
+	ModelInstructionFamilyGemini = "gemini"
+)
+
+type ModelInstructionProfile struct {
+	Enabled bool     `json:"enabled"`
+	Files   []string `json:"files,omitempty"`
+}
+
+// ModelInstructionProfiles stores model-family policy for a user group. A
+// completely empty map means the legacy global fields remain authoritative.
+// Once any profile exists, unlisted families are intentionally disabled.
+type ModelInstructionProfiles map[string]ModelInstructionProfile
+
 type GroupAccountCounts struct {
 	AccountCount       int `json:"account_count"`
 	ActiveAccountCount int `json:"active_account_count"`
@@ -103,19 +123,20 @@ type GroupAccountCounts struct {
 // A user group can fan out to multiple targets (base groups, relays, kiro, antigravity)
 // via UserGroupTarget rows, enabling affinity-spread and session-sticky multi-target routing.
 type UserGroup struct {
-	ID                            string             `json:"id"`
-	Name                          string             `json:"name"`
-	SystemPrompt                  string             `json:"system_prompt"`
-	PromptMode                    string             `json:"prompt_mode"`
-	SystemPromptApplyToCompaction bool               `json:"system_prompt_apply_to_compaction"`
-	ModelInstructionsEnabled      bool               `json:"model_instructions_enabled"`
-	ModelInstructionsFiles        []string           `json:"model_instructions_files,omitempty"`
-	ForceModel                    string             `json:"force_model"`
-	ForceEffort                   string             `json:"force_effort"`
-	Targets                       []TargetRef        `json:"targets"`
-	ModelRouting                  []ModelRoutingRule `json:"model_routing"`
-	CreatedAt                     int64              `json:"created_at"`
-	UpdatedAt                     int64              `json:"updated_at"`
+	ID                            string                   `json:"id"`
+	Name                          string                   `json:"name"`
+	SystemPrompt                  string                   `json:"system_prompt"`
+	PromptMode                    string                   `json:"prompt_mode"`
+	SystemPromptApplyToCompaction bool                     `json:"system_prompt_apply_to_compaction"`
+	ModelInstructionsEnabled      bool                     `json:"model_instructions_enabled"`
+	ModelInstructionsFiles        []string                 `json:"model_instructions_files,omitempty"`
+	ModelInstructionProfiles      ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
+	ForceModel                    string                   `json:"force_model"`
+	ForceEffort                   string                   `json:"force_effort"`
+	Targets                       []TargetRef              `json:"targets"`
+	ModelRouting                  []ModelRoutingRule       `json:"model_routing"`
+	CreatedAt                     int64                    `json:"created_at"`
+	UpdatedAt                     int64                    `json:"updated_at"`
 }
 
 const (
@@ -221,6 +242,69 @@ func encodeModelRouting(rules []ModelRoutingRule) string {
 		return "[]"
 	}
 	return string(raw)
+}
+
+func validModelInstructionFamily(family string) bool {
+	switch family {
+	case ModelInstructionFamilyGPT, ModelInstructionFamilyClaude, ModelInstructionFamilyGemini:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeModelInstructionProfiles(profiles ModelInstructionProfiles) (ModelInstructionProfiles, error) {
+	if len(profiles) == 0 {
+		return nil, nil
+	}
+	out := make(ModelInstructionProfiles, len(profiles))
+	for rawFamily, profile := range profiles {
+		family := strings.ToLower(strings.TrimSpace(rawFamily))
+		if !validModelInstructionFamily(family) {
+			return nil, fmt.Errorf("unsupported model instruction family %q", rawFamily)
+		}
+		seen := make(map[string]struct{}, len(profile.Files))
+		files := make([]string, 0, len(profile.Files))
+		for _, rawFile := range profile.Files {
+			file := strings.TrimSpace(rawFile)
+			if file == "" {
+				continue
+			}
+			if _, duplicate := seen[file]; duplicate {
+				continue
+			}
+			seen[file] = struct{}{}
+			files = append(files, file)
+		}
+		if profile.Enabled && len(files) == 0 {
+			return nil, fmt.Errorf("model instruction profile %q is enabled but has no files", family)
+		}
+		out[family] = ModelInstructionProfile{Enabled: profile.Enabled, Files: files}
+	}
+	return out, nil
+}
+
+func encodeModelInstructionProfiles(profiles ModelInstructionProfiles) string {
+	if len(profiles) == 0 {
+		return "{}"
+	}
+	raw, err := json.Marshal(profiles)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func decodeModelInstructionProfiles(raw string) ModelInstructionProfiles {
+	var profiles ModelInstructionProfiles
+	if err := json.Unmarshal([]byte(raw), &profiles); err != nil || len(profiles) == 0 {
+		return nil
+	}
+	normalized, err := normalizeModelInstructionProfiles(profiles)
+	if err != nil {
+		return nil
+	}
+	return normalized
 }
 
 const (
@@ -1670,7 +1754,6 @@ CREATE TABLE IF NOT EXISTS email_pool(
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name);
 
 CREATE TABLE IF NOT EXISTS turbo_gpt_register_jobs(
   id TEXT PRIMARY KEY,
@@ -1744,6 +1827,19 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE api_keys ADD COLUMN key_type TEXT NOT NULL DEFAULT 'downstream'`,
 		`ALTER TABLE api_keys ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE api_keys ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
+		// Some pre-release installations created email_pool before all management
+		// fields existed. Add columns before creating its composite index so startup
+		// can repair those databases instead of failing while executing schemaSQL.
+		`ALTER TABLE email_pool ADD COLUMN password TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE email_pool ADD COLUMN client_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE email_pool ADD COLUMN refresh_token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE email_pool ADD COLUMN status TEXT NOT NULL DEFAULT 'idle'`,
+		`ALTER TABLE email_pool ADD COLUMN group_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE email_pool ADD COLUMN error_message TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE email_pool ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE email_pool ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE email_pool ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name)`,
 		`ALTER TABLE groups ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN default_egress_id TEXT NOT NULL DEFAULT ''`,
@@ -2070,6 +2166,7 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   system_prompt_apply_to_compaction INTEGER NOT NULL DEFAULT 1,
   model_instructions_enabled INTEGER NOT NULL DEFAULT 0,
   model_instructions_files TEXT NOT NULL DEFAULT '[]',
+  model_instruction_profiles TEXT NOT NULL DEFAULT '{}',
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
   model_routing_json TEXT NOT NULL DEFAULT '[]',
@@ -2101,6 +2198,7 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_user_group_target_bindings_updated ON user_group_target_bindings(updated_at)`,
 		`ALTER TABLE user_groups ADD COLUMN model_routing_json TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE user_groups ADD COLUMN model_instruction_profiles TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -2479,16 +2577,17 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, model_routing_json, created_at, updated_at`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, model_routing_json, created_at, updated_at`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled int
-	var filesJSON, routingJSON string
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
+	var filesJSON, profilesJSON, routingJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
+	g.ModelInstructionProfiles = decodeModelInstructionProfiles(profilesJSON)
 	if err == nil {
 		_ = json.Unmarshal([]byte(routingJSON), &g.ModelRouting)
 		if g.ModelRouting == nil {
@@ -2579,9 +2678,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, routingJSON, g.CreatedAt, g.UpdatedAt)
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, routingJSON, g.CreatedAt, g.UpdatedAt)
 	return err
 }
 
@@ -2739,6 +2838,12 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g 
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
+	g.ModelInstructionsFiles = decodeStringList(encodeStringList(g.ModelInstructionsFiles))
+	profiles, err := normalizeModelInstructionProfiles(g.ModelInstructionProfiles)
+	if err != nil {
+		return UserGroup{}, err
+	}
+	g.ModelInstructionProfiles = profiles
 	targets, err := normalizeTargetRefs(g.Targets)
 	if err != nil {
 		return UserGroup{}, err
@@ -2811,8 +2916,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -2834,8 +2939,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -2855,8 +2960,8 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), Now(), g.ID)
+	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), Now(), g.ID)
 	return err
 }
 
@@ -3546,6 +3651,46 @@ func (s *Store) UpsertProject(ctx context.Context, item Project) error {
 
 func (s *Store) UpsertAccount(ctx context.Context, account Account, token AccountToken) error {
 	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.upsertAccountTx(ctx, tx, account, token, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.tokenCache.Delete(account.ID)
+	return nil
+}
+
+func (s *Store) UpsertAccountWithAntigravityCredentials(ctx context.Context, account Account, token AccountToken, credentials AntigravityCredentials) error {
+	if strings.TrimSpace(account.ID) == "" {
+		return errors.New("antigravity account id required")
+	}
+	now := Now()
+	credentials.AccountID = account.ID
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.upsertAccountTx(ctx, tx, account, token, now); err != nil {
+		return err
+	}
+	if err := s.upsertAntigravityCredentialsTx(ctx, tx, credentials, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.tokenCache.Delete(account.ID)
+	return nil
+}
+
+func (s *Store) upsertAccountTx(ctx context.Context, tx *sql.Tx, account Account, token AccountToken, now int64) error {
 	if account.CreatedAt == 0 {
 		account.CreatedAt = now
 	}
@@ -3556,12 +3701,7 @@ func (s *Store) UpsertAccount(ctx context.Context, account Account, token Accoun
 	if account.GroupName == "" {
 		account.GroupName = "cyber"
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 INSERT INTO accounts(id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status, is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -3613,11 +3753,7 @@ ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.
 	if err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	s.tokenCache.Delete(account.ID)
-	return nil
+	return err
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
@@ -4205,11 +4341,26 @@ type AntigravityCredentials struct {
 
 func (s *Store) UpsertAntigravityCredentials(ctx context.Context, c AntigravityCredentials) error {
 	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.upsertAntigravityCredentialsTx(ctx, tx, c, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) upsertAntigravityCredentialsTx(ctx context.Context, tx *sql.Tx, c AntigravityCredentials, now int64) error {
+	if strings.TrimSpace(c.AccountID) == "" {
+		return errors.New("antigravity account id required")
+	}
 	if c.CreatedAt == 0 {
 		c.CreatedAt = now
 	}
 	c.UpdatedAt = now
-	_, err := s.db.ExecContext(ctx, `
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO account_antigravity_credentials
 		  (account_id, email, project_id, access_token, refresh_token, expires_at, base_url, user_agent, created_at, updated_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -4218,7 +4369,7 @@ func (s *Store) UpsertAntigravityCredentials(ctx context.Context, c AntigravityC
 		  access_token = excluded.access_token, refresh_token = excluded.refresh_token,
 		  expires_at = excluded.expires_at, base_url = excluded.base_url,
 		  user_agent = excluded.user_agent, updated_at = excluded.updated_at`,
-		c.AccountID, c.Email, c.ProjectID, c.AccessToken, c.RefreshToken,
+		c.AccountID, c.Email, c.ProjectID, s.sealToken(c.AccessToken), s.sealToken(c.RefreshToken),
 		c.ExpiresAt, c.BaseURL, c.UserAgent, c.CreatedAt, c.UpdatedAt,
 	)
 	return err
@@ -4231,6 +4382,10 @@ func (s *Store) GetAntigravityCredentials(ctx context.Context, accountID string)
 		FROM account_antigravity_credentials WHERE account_id = ?`, accountID,
 	).Scan(&c.AccountID, &c.Email, &c.ProjectID, &c.AccessToken, &c.RefreshToken,
 		&c.ExpiresAt, &c.BaseURL, &c.UserAgent, &c.CreatedAt, &c.UpdatedAt)
+	if err == nil {
+		c.AccessToken = s.openToken(c.AccessToken)
+		c.RefreshToken = s.openToken(c.RefreshToken)
+	}
 	return c, err
 }
 
@@ -4438,6 +4593,32 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 	}
 	for _, r := range kiroPending {
 		if _, err := s.db.ExecContext(ctx, `UPDATE account_kiro_credentials SET client_secret=?, kiro_api_key=? WHERE account_id=?`, s.sealToken(r.secret), s.sealToken(r.apiKey), r.id); err != nil {
+			return n, err
+		}
+		n++
+	}
+	antigravityRows, err := s.rdb.QueryContext(ctx, `SELECT account_id, access_token, refresh_token FROM account_antigravity_credentials`)
+	if err != nil {
+		return n, err
+	}
+	type antigravityRec struct{ id, accessToken, refreshToken string }
+	var antigravityPending []antigravityRec
+	for antigravityRows.Next() {
+		var r antigravityRec
+		if err := antigravityRows.Scan(&r.id, &r.accessToken, &r.refreshToken); err != nil {
+			antigravityRows.Close()
+			return n, err
+		}
+		if anyPlaintextSecret(r.accessToken, r.refreshToken) {
+			antigravityPending = append(antigravityPending, r)
+		}
+	}
+	antigravityRows.Close()
+	if err := antigravityRows.Err(); err != nil {
+		return n, err
+	}
+	for _, r := range antigravityPending {
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_antigravity_credentials SET access_token=?, refresh_token=?, updated_at=? WHERE account_id=?`, s.sealToken(r.accessToken), s.sealToken(r.refreshToken), Now(), r.id); err != nil {
 			return n, err
 		}
 		n++
@@ -7580,68 +7761,122 @@ func (s *Store) CacheUsageMetricsWindowFields(ctx context.Context, since, until 
 func (s *Store) cacheUsageMetricsWindow(ctx context.Context, since, until int64, routeLimit int, fields map[string]bool) (CacheUsageReport, error) {
 	all := len(fields) == 0
 	want := func(name string) bool { return all || fields[name] }
-	var report CacheUsageReport
-	var err error
+	var (
+		report              CacheUsageReport
+		summary             CacheUsageMetricRow
+		byAccount           []CacheUsageMetricRow
+		byModel             []CacheUsageMetricRow
+		byAPIKey            []CacheUsageMetricRow
+		byAccountModel      []CacheUsageMetricRow
+		byProvider          []CacheUsageMetricRow
+		byProviderModel     []CacheUsageMetricRow
+		byRoute             []CacheUsageMetricRow
+		byRouteAccountModel []CacheUsageMetricRow
+		byTimeBucket        []CacheUsageBucket
+		tasks               []func() error
+	)
 	if want("summary") {
-		report.Summary, err = s.cacheUsageSummary(ctx, since, until)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			summary, err = s.cacheUsageSummary(ctx, since, until)
+			return err
+		})
 	}
 	if want("by_account") {
-		report.ByAccount, err = s.cacheUsageRows(ctx, since, until, "account", 200)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byAccount, err = s.cacheUsageRows(ctx, since, until, "account", 200)
+			return err
+		})
 	}
 	if want("by_model") {
-		report.ByModel, err = s.cacheUsageRows(ctx, since, until, "model", 200)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byModel, err = s.cacheUsageRows(ctx, since, until, "model", 200)
+			return err
+		})
 	}
 	if want("by_api_key") {
-		report.ByAPIKey, err = s.cacheUsageRows(ctx, since, until, "api_key", 200)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byAPIKey, err = s.cacheUsageRows(ctx, since, until, "api_key", 200)
+			return err
+		})
 	}
 	if want("by_account_model") {
-		report.ByAccountModel, err = s.cacheUsageRows(ctx, since, until, "account_model", 200)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byAccountModel, err = s.cacheUsageRows(ctx, since, until, "account_model", 200)
+			return err
+		})
 	}
 	if want("by_provider") {
-		report.ByProvider, err = s.cacheUsageRows(ctx, since, until, "provider", 200)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byProvider, err = s.cacheUsageRows(ctx, since, until, "provider", 200)
+			return err
+		})
 	}
 	if want("by_provider_model") {
-		report.ByProviderModel, err = s.cacheUsageRows(ctx, since, until, "provider_model", 200)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byProviderModel, err = s.cacheUsageRows(ctx, since, until, "provider_model", 200)
+			return err
+		})
 	}
 	if want("by_route") {
-		report.ByRoute, err = s.cacheUsageRows(ctx, since, until, "route", routeLimit)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byRoute, err = s.cacheUsageRows(ctx, since, until, "route", routeLimit)
+			return err
+		})
 	}
 	if want("by_route_account_model") {
-		report.ByRouteAccountModel, err = s.cacheUsageRows(ctx, since, until, "route_account_model", routeLimit)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byRouteAccountModel, err = s.cacheUsageRows(ctx, since, until, "route_account_model", routeLimit)
+			return err
+		})
 	}
 	if want("by_time_bucket") {
-		report.ByTimeBucket, err = s.CacheUsageBucketsWindow(ctx, since, until, 3600)
-		if err != nil {
-			return CacheUsageReport{}, err
-		}
+		tasks = append(tasks, func() error {
+			var err error
+			byTimeBucket, err = s.CacheUsageBucketsWindow(ctx, since, until, 3600)
+			return err
+		})
 	}
+	var wg sync.WaitGroup
+	errorsByTask := make(chan error, len(tasks))
+	for _, task := range tasks {
+		wg.Add(1)
+		go func(run func() error) {
+			defer wg.Done()
+			defer func() {
+				if panicValue := recover(); panicValue != nil {
+					supervisor.LogPanic("cache-usage-query", panicValue)
+					errorsByTask <- errors.New("cache usage query failed")
+				}
+			}()
+			if err := run(); err != nil {
+				errorsByTask <- err
+			}
+		}(task)
+	}
+	wg.Wait()
+	close(errorsByTask)
+	if err := <-errorsByTask; err != nil {
+		return CacheUsageReport{}, err
+	}
+	report.Summary = summary
+	report.ByAccount = byAccount
+	report.ByModel = byModel
+	report.ByAPIKey = byAPIKey
+	report.ByAccountModel = byAccountModel
+	report.ByProvider = byProvider
+	report.ByProviderModel = byProviderModel
+	report.ByRoute = byRoute
+	report.ByRouteAccountModel = byRouteAccountModel
+	report.ByTimeBucket = byTimeBucket
 	return report, nil
 }
 

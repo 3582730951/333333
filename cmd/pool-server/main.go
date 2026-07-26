@@ -351,12 +351,20 @@ func listenerFromSystemd() (net.Listener, bool) {
 	}
 	const firstSocketFD = 3 // SD_LISTEN_FDS_START
 	f := os.NewFile(uintptr(firstSocketFD), "systemd-socket")
+	return listenerFromSystemdFile(f)
+}
+
+// listenerFromSystemdFile converts systemd's inherited descriptor into the
+// independent descriptor owned by net.Listener. net.FileListener duplicates f, so
+// the inherited descriptor must be closed in both success and failure paths; leaving
+// it open leaks one socket descriptor on every service start.
+func listenerFromSystemdFile(f *os.File) (net.Listener, bool) {
 	if f == nil {
 		return nil, false
 	}
 	ln, err := net.FileListener(f)
+	_ = f.Close()
 	if err != nil {
-		_ = f.Close()
 		return nil, false
 	}
 	return ln, true

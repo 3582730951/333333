@@ -1,6 +1,6 @@
 import React from 'react';
 import * as PoolUI from './pool/index.jsx';
-import { IconDelete } from './pool/icons.jsx';
+import { IconDelete, IconEdit } from './pool/icons.jsx';
 import { KeyCopyActions } from './KeySecretTools.jsx';
 import ResourceTable from './ResourceTable.jsx';
 import { fmtDateTime } from '../lib/format.js';
@@ -16,11 +16,14 @@ interface ApiKeysTableProps {
   loading: boolean;
   mode?: KeyTableMode;
   onDelete?: (hash: string) => void | Promise<void>;
+  onEdit?: (row: ApiKeyRow) => void;
   onToggle?: (row: ApiKeyRow, enabled: boolean) => void | Promise<void>;
+  userGroupNames?: Record<string, string>;
   deleteRunning?: boolean;
   isDeleteRunning?: (hash: string) => boolean;
   toggleRunning?: boolean;
   isToggleRunning?: (hash: string) => boolean;
+  isEditRunning?: (hash: string) => boolean;
 }
 
 function keyHash(row: ApiKeyRow) {
@@ -41,10 +44,12 @@ function labelCell(value: unknown, row: ApiKeyRow, mode: KeyTableMode) {
   );
 }
 
-function mobileInfoCell(row: ApiKeyRow, mode: KeyTableMode) {
+function mobileInfoCell(row: ApiKeyRow, mode: KeyTableMode, userGroupNames: Record<string, string>) {
   const portal = mode === 'portal';
   const label = row.label || t('keys.unnamed');
-  const group = row.group_name || (portal ? '—' : t('keys.default_group'));
+  const group = row.user_group_id
+    ? userGroupNames[row.user_group_id] || row.user_group_id
+    : row.group_name || (portal ? '—' : t('keys.default_group'));
   const model = row.force_model || t('keys.no_model');
   const effort = row.force_effort || '';
   return (
@@ -65,31 +70,45 @@ function mobileInfoCell(row: ApiKeyRow, mode: KeyTableMode) {
   );
 }
 
-function deleteAction(
+function keyActions(
   row: ApiKeyRow,
+  mode: KeyTableMode,
+  onEdit: ApiKeysTableProps['onEdit'],
   onDelete: ApiKeysTableProps['onDelete'],
   deleteRunning: boolean,
   isDeleteRunning: (hash: string) => boolean,
+  isEditRunning: (hash: string) => boolean,
   disabled = false,
 ) {
   const hash = keyHash(row);
+  const editRunning = isEditRunning(hash);
+  const items = [];
+  if (mode === 'admin') {
+    items.push({
+      label: editRunning ? '保存中' : '编辑策略',
+      icon: <IconEdit />,
+      disabled: disabled || editRunning || isDeleteRunning(hash),
+      onSelect: () => onEdit?.(row),
+    });
+  }
+  items.push(
+    {
+      label: isDeleteRunning(hash) ? t('keys.deleting') : t('keys.delete'),
+      icon: <IconDelete />,
+      destructive: true,
+      disabled: disabled || editRunning || isDeleteRunning(hash),
+      confirm: {
+        title: t('keys.delete_title'),
+        description: t('keys.delete_desc'),
+        confirmText: t('common.delete'),
+      },
+      onSelect: () => onDelete?.(hash),
+    },
+  );
   return (
     <ActionMenu
       label={t('keys.actions')}
-      items={[
-        {
-          label: isDeleteRunning(hash) ? t('keys.deleting') : t('keys.delete'),
-          icon: <IconDelete />,
-          destructive: true,
-          disabled: disabled || (deleteRunning && !isDeleteRunning(hash)),
-          confirm: {
-            title: t('keys.delete_title'),
-            description: t('keys.delete_desc'),
-            confirmText: t('common.delete'),
-          },
-          onSelect: () => onDelete?.(hash),
-        },
-      ]}
+      items={items}
     />
   );
 }
@@ -97,17 +116,20 @@ function deleteAction(
 function mobileKeyCell(
   row: ApiKeyRow,
   mode: KeyTableMode,
+  onEdit: ApiKeysTableProps['onEdit'],
   onDelete: ApiKeysTableProps['onDelete'],
+  userGroupNames: Record<string, string>,
   deleteRunning: boolean,
   isDeleteRunning: (hash: string) => boolean,
+  isEditRunning: (hash: string) => boolean,
   disabled = false,
 ) {
   return (
     <div className="pool-key-mobile-cell">
-      {mobileInfoCell(row, mode)}
+      {mobileInfoCell(row, mode, userGroupNames)}
       <div className="pool-key-mobile-actions">
         <CopyActions secret={row.secret} compact />
-        {deleteAction(row, onDelete, deleteRunning, isDeleteRunning, disabled)}
+        {keyActions(row, mode, onEdit, onDelete, deleteRunning, isDeleteRunning, isEditRunning, disabled)}
       </div>
     </div>
   );
@@ -118,18 +140,21 @@ export default function ApiKeysTable({
   loading,
   mode = 'admin',
   onDelete,
+  onEdit,
   onToggle,
+  userGroupNames = {},
   deleteRunning = false,
   isDeleteRunning = () => false,
   toggleRunning = false,
   isToggleRunning = () => false,
+  isEditRunning = () => false,
 }: ApiKeysTableProps) {
   const portal = mode === 'portal';
   const mobileColumns = [
     {
       title: 'API Key',
       key: 'mobile_key',
-      render: (_: unknown, row: ApiKeyRow) => mobileKeyCell(row, mode, onDelete, deleteRunning, isDeleteRunning, portal && toggleRunning),
+      render: (_: unknown, row: ApiKeyRow) => mobileKeyCell(row, mode, onEdit, onDelete, userGroupNames, deleteRunning, isDeleteRunning, isEditRunning, portal && toggleRunning),
     },
   ];
   const columns = portal ? [
@@ -147,12 +172,13 @@ export default function ApiKeysTable({
       width: 90,
       fixed: 'right',
       render: (_: unknown, row: ApiKeyRow) => {
-        return deleteAction(row, onDelete, deleteRunning, isDeleteRunning, toggleRunning);
+        return keyActions(row, mode, onEdit, onDelete, deleteRunning, isDeleteRunning, isEditRunning, toggleRunning);
       },
     },
   ] : [
     { title: t('keys.label'), dataIndex: 'label', width: 160, render: (value: unknown, row: ApiKeyRow) => labelCell(value, row, mode) },
     { title: t('keys.type'), dataIndex: 'key_type', width: 120, render: (value: string | undefined) => (value === 'pool_import' ? <Tag color="violet">poolimp</Tag> : <Tag>{t('keys.inference')}</Tag>) },
+    { title: '用户分组', dataIndex: 'user_group_id', width: 150, render: (value: string | undefined) => value ? userGroupNames[value] || value : '—' },
     { title: t('keys.group'), dataIndex: 'group_name', width: 120, render: (value: string | undefined) => value || t('keys.default_group') },
     { title: t('keys.force_model'), dataIndex: 'force_model', width: 180, render: (value: string | undefined) => value || '—' },
     { title: t('keys.effort'), dataIndex: 'force_effort', width: 120, render: (value: string | undefined) => (value ? <Tag color="blue">{value}</Tag> : '—') },
@@ -166,7 +192,7 @@ export default function ApiKeysTable({
       width: 100,
       fixed: 'right',
       render: (_: unknown, row: ApiKeyRow) => {
-        return deleteAction(row, onDelete, deleteRunning, isDeleteRunning);
+        return keyActions(row, mode, onEdit, onDelete, deleteRunning, isDeleteRunning, isEditRunning);
       },
     },
   ];

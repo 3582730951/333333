@@ -17,6 +17,19 @@ import (
 // idle-timeout behavior. It is used by native adapters such as Kiro whose endpoint
 // and wire protocol are neither Codex nor Anthropic HTTP.
 func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
+	return c.doRaw(ctx, egress, method, rawURL, headers, body, cookieJarKey, false)
+}
+
+// DoRawHTTP1 is the HTTP/1.1-only counterpart to DoRaw. It is used by native
+// adapters whose first-party client does not negotiate HTTP/2. A sidecar wrapper
+// cannot guarantee the requested application protocol, so this path retains its
+// underlying chain proxy (and therefore exit IP) while using the Go HTTP/1.1
+// transport directly.
+func (c *Client) DoRawHTTP1(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
+	return c.doRaw(ctx, http1TransparentEgress(egress), method, rawURL, headers, body, cookieJarKey, true)
+}
+
+func (c *Client) doRaw(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string, forceHTTP1 bool) (*Response, error) {
 	if strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
 		// In-process fingerprint engine: route native-adapter egress (Kiro's aws-sdk-js
 		// calls, Codex/WHAM reset-credit/quota/registration calls) through tls-client with
@@ -36,7 +49,7 @@ func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method
 		return nil, err
 	}
 	req.Header = headers.Clone()
-	client, err := c.httpClientForEgress(Request{Egress: egress})
+	client, err := c.httpClientForEgressMode(Request{Egress: egress, CookieJarKey: cookieJarKey}, forceHTTP1)
 	if err != nil {
 		guard.Fail()
 		return nil, err
@@ -47,6 +60,20 @@ func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method
 		return nil, err
 	}
 	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
+}
+
+func http1TransparentEgress(egress storage.EgressProfile) storage.EgressProfile {
+	if !strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
+		return egress
+	}
+	if chainProxy := strings.TrimSpace(egress.ChainProxy); chainProxy != "" {
+		return storage.EgressProfile{
+			ID:       egress.ID,
+			Type:     proxyTypeForURL(chainProxy),
+			Endpoint: chainProxy,
+		}
+	}
+	return storage.EgressProfile{ID: egress.ID, Type: "direct"}
 }
 
 // EgressHTTPClient returns a transparent *http.Client whose transport routes
@@ -62,14 +89,7 @@ func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method
 // exit IP) and onto a direct transport otherwise. Per-request real-JA3 replay for the
 // CF-walled calls is available separately via DoViaSidecar.
 func (c *Client) EgressHTTPClient(egress storage.EgressProfile) (*http.Client, error) {
-	eg := egress
-	if strings.EqualFold(strings.TrimSpace(eg.Type), "curl_cffi_sidecar") {
-		if cp := strings.TrimSpace(eg.ChainProxy); cp != "" {
-			eg = storage.EgressProfile{Type: proxyTypeForURL(cp), Endpoint: cp}
-		} else {
-			eg = storage.EgressProfile{Type: "direct"}
-		}
-	}
+	eg := http1TransparentEgress(egress)
 	transport, err := c.transportForEgress(eg)
 	if err != nil {
 		return nil, err

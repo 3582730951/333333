@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
@@ -193,5 +194,85 @@ func TestRuleSSECopyKeepsSafetyBufferedStreamAlive(t *testing.T) {
 	}
 	if !strings.Contains(got, "response.completed") {
 		t.Fatalf("terminal event missing after heartbeat: %s", got)
+	}
+}
+
+func TestRuleSSECopySafetyControlFramesDoNotMaskStall(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	rec := httptest.NewRecorder()
+	rf := &responseRuleFilter{Mode: upstreamrules.DownstreamActionHideSafetyBuffering}
+	ctx, cancel := context.WithCancel(withStreamStallRecovery(context.Background(), 45*time.Millisecond))
+	defer cancel()
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		defer writer.Close()
+		frames := []string{
+			`data: {"type":"response.created","response":{"id":"resp_wait"},"safety_buffering":{"reasons":["user_risk"]}}` + "\n\n",
+			`data: {"type":"response.in_progress","safety_buffering":{"reasons":["user_risk"]}}` + "\n\n",
+		}
+		if _, err := writer.Write([]byte(frames[0])); err != nil {
+			return
+		}
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := writer.Write([]byte(frames[1])); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	err := newRuleSSECopyWithHeartbeat(ctx, rec, reader, rf, false, nil, "codex", 10*time.Millisecond)
+	if !errors.Is(err, errUpstreamStreamStalled) {
+		t.Fatalf("control-only stream error = %v, want stall", err)
+	}
+	cancel()
+	_ = reader.Close()
+	select {
+	case <-writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("control-frame producer did not stop")
+	}
+	got := rec.Body.String()
+	if strings.Contains(got, "safety_buffering") {
+		t.Fatalf("safety metadata leaked downstream: %s", got)
+	}
+	if !strings.Contains(got, "response.in_progress") {
+		t.Fatalf("downstream keepalive missing before recovery: %s", got)
+	}
+}
+
+func TestSSEFrameAdvancesModelIgnoresOnlyControlTraffic(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		frame    string
+		want     bool
+	}{
+		{name: "codex progress", provider: "codex", frame: `data: {"type":"response.in_progress"}` + "\n\n"},
+		{name: "codex metadata", provider: "codex", frame: `data: {"type":"response.metadata"}` + "\n\n"},
+		{name: "codex quota", provider: "codex", frame: `data: {"type":"codex.rate_limits"}` + "\n\n"},
+		{name: "claude ping", provider: "claude", frame: `event: ping` + "\n" + `data: {"type":"ping"}` + "\n\n"},
+		{name: "comment", provider: "codex", frame: ": keepalive\n\n"},
+		{name: "text", provider: "codex", frame: `data: {"type":"response.output_text.delta","delta":"x"}` + "\n\n", want: true},
+		{name: "reasoning", provider: "codex", frame: `data: {"type":"response.reasoning_summary_text.delta","delta":"x"}` + "\n\n", want: true},
+		{name: "tool", provider: "codex", frame: `data: {"type":"response.output_item.added","item":{"type":"function_call"}}` + "\n\n", want: true},
+		{name: "claude text", provider: "claude", frame: `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}` + "\n\n", want: true},
+		{name: "unknown valid event", provider: "codex", frame: `data: {"type":"response.future_output.delta"}` + "\n\n", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sseFrameAdvancesModel([]byte(test.frame), test.provider); got != test.want {
+				t.Fatalf("sseFrameAdvancesModel() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }

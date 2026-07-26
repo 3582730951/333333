@@ -290,6 +290,91 @@ func TestGoalCleanupNeverEvictsExpiredLiveRun(t *testing.T) {
 	}
 }
 
+func goalEncryptedPayloadBytes(t *testing.T, store *Store) int64 {
+	t.Helper()
+	var checkpoints, segments int64
+	if err := store.DB().QueryRow(`SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_checkpoint`).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRow(`SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_segment`).Scan(&segments); err != nil {
+		t.Fatal(err)
+	}
+	return checkpoints + segments
+}
+
+func TestGoalStorageBudgetReclaimsLeastRecentlyUsedInactiveGoal(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("x", 4096)
+	first := goalTurnForTest("budget-old", "budget-old-response", large, large)
+	oldGoal, err := store.CommitGoalTurn(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := goalEncryptedPayloadBytes(t, store)
+	second := goalTurnForTest("budget-new", "budget-new-response", large, large)
+	second.DownstreamKeyHash = "other-key"
+	second.WorkspaceHash = "other-workspace"
+	second.InitialGoalHash = "other-initial"
+	second.StorageMaxBytes = used + 256
+	newGoal, err := store.CommitGoalTurn(ctx, second)
+	if err != nil {
+		t.Fatalf("new goal should reclaim inactive storage: %v", err)
+	}
+	if newGoal.ID == oldGoal.ID {
+		t.Fatal("new goal unexpectedly reused the old identity")
+	}
+	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "budget-old"}}); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("least-recently-used goal was not reclaimed: %v", err)
+	}
+	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "budget-new"}}); err != nil {
+		t.Fatalf("new goal was not committed: %v", err)
+	}
+	var reclaimed int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='goal_storage_reclaimed' AND reason='storage_budget_lru'`).Scan(&reclaimed); err != nil || reclaimed != 1 {
+		t.Fatalf("reclaim audit count=%d err=%v", reclaimed, err)
+	}
+}
+
+func TestGoalStorageBudgetNeverReclaimsLiveGoal(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("y", 4096)
+	oldGoal, err := store.CommitGoalTurn(ctx, goalTurnForTest("budget-live", "budget-live-response", large, large))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireGoalRun(ctx, oldGoal.ID, "live-budget-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	used := goalEncryptedPayloadBytes(t, store)
+	second := goalTurnForTest("budget-blocked", "budget-blocked-response", large, large)
+	second.DownstreamKeyHash = "blocked-key"
+	second.WorkspaceHash = "blocked-workspace"
+	second.InitialGoalHash = "blocked-initial"
+	second.StorageMaxBytes = used + 256
+	if _, err := store.CommitGoalTurn(ctx, second); !errors.Is(err, ErrGoalStorageBudget) {
+		t.Fatalf("live goal storage error=%v, want %v", err, ErrGoalStorageBudget)
+	}
+	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "budget-live"}}); err != nil {
+		t.Fatalf("live goal was reclaimed: %v", err)
+	}
+}
+
 func TestGoalCompactionPreservesUnknownAttachmentBlocks(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,25 @@ import (
 
 	"codex-account-pool/internal/storage"
 )
+
+func TestIncrementalGoalRequestStoresOnlyDurableHistorySuffix(t *testing.T) {
+	durable := []byte(`{"model":"claude","messages":[{"role":"user","content":"first"},{"role":"assistant","content":"answer"}]}`)
+	current := []byte(`{"model":"claude","messages":[{"role":"user","content":"first"},{"role":"assistant","content":"answer"},{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"done"}]}]}`)
+	trimmed := incrementalGoalRequest(current, durable)
+	var root map[string]interface{}
+	if err := json.Unmarshal(trimmed, &root); err != nil {
+		t.Fatal(err)
+	}
+	messages, _ := root["messages"].([]interface{})
+	if len(messages) != 1 || !strings.Contains(string(trimmed), "tool_result") || strings.Contains(string(trimmed), `"content":"first"`) || strings.Contains(string(trimmed), `"content":"answer"`) {
+		t.Fatalf("incremental history was not trimmed safely: %s", trimmed)
+	}
+
+	mismatch := []byte(`{"model":"claude","messages":[{"role":"user","content":"changed"},{"role":"user","content":"new"}]}`)
+	if got := incrementalGoalRequest(mismatch, durable); string(got) != string(mismatch) {
+		t.Fatalf("mismatched history must be preserved: %s", got)
+	}
+}
 
 // skipLegacyCodexGoalReplay marks tests for the v1 Codex goal/checkpoint engine.
 // CPA-v2 deliberately keeps Codex context only in the original upstream session;

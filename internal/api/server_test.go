@@ -215,7 +215,9 @@ func TestGatewayResponsesRawStreamingAndHeaders(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("ChatGPT-Account-ID", "should-not-leak")
 		w.Header().Set("x-sidecar-debug", "should-not-leak")
-		_, _ = w.Write([]byte("data: {\"ok\":true}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_raw\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[]}}\n\n" +
+			"data: [DONE]\n\n"))
 	})
 	h.importAccount(t, "a", "upstream-a", "access-a")
 	body := `{"model":"gpt","input":[{"role":"user","content":"hello"}],"prompt_cache_key":"pc-1"}`
@@ -225,7 +227,10 @@ func TestGatewayResponsesRawStreamingAndHeaders(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	got, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK || string(got) != "data: {\"ok\":true}\n\n" {
+	wantStream := "event: response.completed\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_raw\",\"object\":\"response\",\"model\":\"gpt\",\"status\":\"completed\",\"output\":[]}}\n\n" +
+		"data: [DONE]\n\n"
+	if resp.StatusCode != http.StatusOK || string(got) != wantStream {
 		t.Fatalf("status/body = %d %q", resp.StatusCode, got)
 	}
 	if resp.Header.Get("ChatGPT-Account-ID") != "" || resp.Header.Get("x-sidecar-debug") != "" {

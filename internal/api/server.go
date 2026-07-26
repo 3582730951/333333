@@ -608,6 +608,11 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// relayed to the Anthropic upstream (format-converted both ways) instead of
 	// Codex; everything else continues down the Codex/Responses path.
 	if isChat && (userGroupProvider == "claude" || (userGroupProvider == "" && isClaudeModel(model))) {
+		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
+		if err != nil {
+			writeCodexInstructionConfigurationError(w, err)
+			return
+		}
 		raw = s.moderateHistory(r.Context(), raw, "chat")
 		s.handleChatViaClaude(w, r, raw, model, pol)
 		return
@@ -625,6 +630,11 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if selectedCustomOK {
 		prov := selectedCustom
+		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
+		if err != nil {
+			writeCodexInstructionConfigurationError(w, err)
+			return
+		}
 		if isChat {
 			raw = s.moderateHistory(r.Context(), raw, "chat")
 		} else {
@@ -649,7 +659,15 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// accounts are available while pressure remains below 50%. This happens before
 	// native Codex CPA mapping because Kiro has no compatible
 	// previous_response_id/session state.
-	if s.tryServeAutoKiroGPT(w, r, raw, model, affinityGroup, isChat, isCompact, pol) {
+	kiroRaw := raw
+	if !routing.HasServerSideState(path, r, raw) {
+		kiroRaw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
+		if err != nil {
+			writeCodexInstructionConfigurationError(w, err)
+			return
+		}
+	}
+	if s.tryServeAutoKiroGPT(w, r, kiroRaw, model, affinityGroup, isChat, isCompact, pol) {
 		return
 	}
 	// CPA-style stateless passthrough (default). Make every native Codex turn
@@ -777,7 +795,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	group := requestUserGroupPolicy(r.Context())
-	instructionPlan, err := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA)
+	instructionPlan, err := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA, model)
 	if err != nil {
 		// A configured instruction file is part of the administrator's session
 		// policy. Report missing/empty files before any account lease or upstream
@@ -885,7 +903,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				}
 				if recovered {
 					codexMapping = migration.Mapping
-					freshPlan, planErr := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA)
+					freshPlan, planErr := s.codexInstructionPlan(r.Context(), group, codexMapping, strictNativeCPA, routing.Model(migration.Retry.Raw))
 					if planErr != nil {
 						writeCodexInstructionConfigurationError(w, planErr)
 						return
@@ -2163,13 +2181,13 @@ codexSuccess:
 		continuationFailed := false
 		nativeContinueAttempted := false
 		continuationSidecarInterrupted := false
-		if streamErr == nil && !sidecarStreamInterrupted && !streamRecorder.reachedTerminal() {
+		compatContinuationFailed := false
+		mapping := codexSessionMappingFromContext(r.Context())
+		if !sidecarStreamInterrupted && !streamRecorder.reachedTerminal() && r.Context().Err() == nil {
 			responseID, responseModel, _ := streamRecorder.metadata()
-			mapping := codexSessionMappingFromContext(r.Context())
-			// Native EOF compensation belongs only to the strict persistent CPA
-			// protocol. Compatibility-mode streams historically end at an ordinary
-			// upstream EOF and must remain a byte-for-byte relay.
-			if mapping != nil && mapping.enabled {
+			if mapping != nil && mapping.enabled && streamErr != nil {
+				_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "stream_interrupted")
+			} else if mapping != nil && mapping.enabled {
 				if responseID == "" || hasPendingClientToolCall(streamRecorder.partialItems()) {
 					continuationFailed = true
 					_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "truncated_eof_uncontinuable")
@@ -2243,14 +2261,110 @@ codexSuccess:
 						}
 					}
 				}
+			} else if mapping == nil || !mapping.enabled {
+				// Stateless compatibility mode has the full request context locally, so
+				// it can recover a truncated stream without relying on an upstream
+				// previous_response_id. Keep the exact account and egress: once any SSE
+				// bytes have reached the client, replaying on another account could
+				// duplicate model output or tool effects.
+				rfForContinue, _ := streamCtx.Value(responseRuleFilterKey{}).(*responseRuleFilter)
+				continueEnabled := s.goalContinuityEnabled(r.Context()) || s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForContinue))
+				if continueEnabled {
+					continueReason := "truncated_eof"
+					if streamStalled {
+						continueReason = "upstream_idle_stall"
+					} else if streamErr != nil {
+						continueReason = "upstream_stream_error"
+					}
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+						AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+						Action: "codex_stateless_continue", State: "attempted", Reason: continueReason,
+						Detail: "same_account_same_egress",
+					})
+					continuationToken := token
+					continuationHeader := http.Header(nil)
+					reissue := func(cctx context.Context, continuationBody []byte) (io.ReadCloser, error) {
+						if latest, tokenErr := s.store.GetToken(cctx, lease.Account.ID); tokenErr == nil {
+							continuationToken = latest
+						}
+						if continuationToken.ExpiresAt > 0 && continuationToken.ExpiresAt <= time.Now().Add(time.Minute).Unix() &&
+							!upstream.AccountUsesAPIKey(continuationToken) && !isAgentIdentityToken(continuationToken) {
+							if refreshed, refreshErr := s.refreshCodexToken(cctx, continuationToken); refreshErr == nil && refreshed.Refreshed {
+								continuationToken = refreshed.Token
+							}
+						}
+						for authAttempt := 0; authAttempt < 2; authAttempt++ {
+							continuationReq := requestForTokenWithIdentity(continuationToken, continuationBody, hdr.Clone(), codexIdentity)
+							continuationReq.Egress = finalEgress
+							continuationResp, continuationErr := s.upstream.Do(cctx, continuationReq)
+							if continuationErr != nil {
+								return nil, continuationErr
+							}
+							if continuationResp.StatusCode < http.StatusBadRequest && isEventStream(continuationResp.Header) {
+								continuationHeader = continuationResp.Header.Clone()
+								heartbeatEvery := s.streamKeepAliveInterval(cctx)
+								if ruleInterval := responseRuleHeartbeatInterval(rfForContinue); ruleInterval > 0 {
+									heartbeatEvery = ruleInterval
+								}
+								return newSemanticSSERelayReadCloser(cctx, continuationResp.Body, rfForContinue, "codex", s.streamStallRecoveryInterval(cctx), heartbeatEvery), nil
+							}
+							errorHeader := continuationResp.Header.Clone()
+							errorBody := readUpstreamErrorBody(continuationResp.Body)
+							_ = continuationResp.Body.Close()
+							if authAttempt == 0 && isInvalidAgentIdentityTask(continuationResp.StatusCode, errorBody, continuationToken) {
+								if recovered, recoverErr := s.ensureAgentIdentityTask(cctx, lease.Account, continuationToken, finalEgress, lease.Binding.CookieJarKey, continuationToken.AgentTaskID); recoverErr == nil {
+									continuationToken = recovered
+									continue
+								}
+							}
+							verdict := ban.Classify(false, continuationResp.StatusCode, errorHeader, errorBody)
+							if authAttempt == 0 && verdict.State == ban.AuthExpired && !upstream.AccountUsesAPIKey(continuationToken) && !isAgentIdentityToken(continuationToken) {
+								if refreshed, refreshErr := s.refreshCodexToken(cctx, continuationToken); refreshErr == nil && refreshed.Refreshed {
+									continuationToken = refreshed.Token
+									continue
+								}
+							}
+							s.onUpstreamError(cctx, lease.Account, continuationResp.StatusCode, errorHeader, errorBody)
+							return nil, fmt.Errorf("codex continuation unavailable (status %d)", continuationResp.StatusCode)
+						}
+						return nil, errors.New("codex continuation authentication retry exhausted")
+					}
+					scrubbedWriter := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), codexScrubber, "codex")
+					continuationRecorder, continueErr := s.maybeAutoContinueCodex(r.Context(), scrubbedWriter, body, streamRecorder, reissue)
+					if continueErr != nil {
+						compatContinuationFailed = true
+						log.Printf("[AUTO-CONTINUE] codex stateless request_id=%s: %v", requestIDFromContext(r.Context()), continueErr)
+						_ = closeCodexStreamGracefully(scrubbedWriter, streamRecorder.partialItems(), streamRecorder.partialText(), responseID, responseModel)
+					} else if continuationRecorder != nil && continuationRecorder.completedSuccessfully() {
+						streamErr = nil
+						if err := commitStreamMapping(continuationRecorder, continuationHeader, finalEgress); err != nil {
+							log.Printf("[GOAL-CONTINUITY] codex stateless continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), err)
+						}
+						s.recordUsage(r.Context(), lease.Account.ID, affinity.Hash, continuationRecorder.ResponseJSON())
+					} else {
+						compatContinuationFailed = true
+					}
+					scrubbedWriter.Flush()
+				} else {
+					compatContinuationFailed = true
+					_ = closeCodexStreamGracefully(w, streamRecorder.partialItems(), streamRecorder.partialText(), responseID, responseModel)
+				}
+				if compatContinuationFailed {
+					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+						AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+						Action: "goal_stream_terminal_synthesized", State: "retryable",
+						Reason: "codex_stateless_continuation_unavailable", Detail: "generic response.failed emitted",
+					})
+					s.markGoalStreamRetryable(r.Context(), r, "codex", body, "continuation_unavailable")
+				}
 			}
 		} else if sidecarStreamInterrupted {
-			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+			if mapping != nil && mapping.enabled {
 				id, streamModel, _ := streamRecorder.metadata()
 				_ = writeCodexSidecarStreamFailure(w, id, streamModel, sidecarFailurePhase)
 			}
 		} else if streamErr != nil {
-			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
+			if mapping != nil && mapping.enabled {
 				id, streamModel, _ := streamRecorder.metadata()
 				_ = s.emitCodexNativeContinuationFailure(r.Context(), w, id, streamModel, "stream_interrupted")
 			}
@@ -2266,7 +2380,7 @@ codexSuccess:
 		if streamRateLimits.any() {
 			s.captureCodexStreamRateLimits(lease.Account.ID, streamRateLimits)
 		}
-		if streamErr != nil || sidecarStreamInterrupted {
+		if streamErr != nil || sidecarStreamInterrupted || compatContinuationFailed {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 		} else {
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
@@ -2445,9 +2559,7 @@ func (s *Server) persistCodexGoalContinuity(ctx context.Context, r *http.Request
 	}
 	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {
 		log.Printf("[GOAL-CONTINUITY] codex persistence degraded request_id=%s: %v", requestIDFromContext(ctx), err)
-		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
-			Action: "goal_persistence_degraded", State: "retryable", Reason: "codex_terminal", Detail: "payload persistence failed",
-		})
+		s.auditGoalPersistenceDegraded(ctx, "codex_terminal", err)
 	}
 }
 

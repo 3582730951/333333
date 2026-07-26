@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -209,6 +210,12 @@ func (s *Server) maybeAutoContinueCodex(ctx context.Context, w io.Writer, origin
 	if rec == nil || rec.reachedTerminal() {
 		return rec, nil
 	}
+	if hasPendingClientToolCall(rec.partialItems()) {
+		// A model-emitted client tool call cannot be replayed as assistant history
+		// until the downstream supplies its matching output. Reissuing here would
+		// either duplicate the tool or produce a missing-tool-output failure.
+		return nil, errAutoContinueUnavailable
+	}
 	resolved := originalBody
 	if bodyHasPreviousResponseID(originalBody) {
 		expanded, ok := s.journalReplayBody(ctx, originalBody)
@@ -361,9 +368,17 @@ func stitchClaudeContinuation(w io.Writer, src io.Reader, priorBlocks, priorOpen
 		// Record raw continuation state for a possible further round.
 		tap.observe(frame)
 		switch typ {
-		case "message_start", "ping":
+		case "message_start":
 			// The downstream already has message_start from the first stream; a second
-			// would reset the client's message. Drop it and stray pings.
+			// would reset the client's message.
+			return nil
+		case "ping":
+			// Preserve Anthropic's protocol-native heartbeat while the continuation is
+			// thinking. It carries no message identity or model content.
+			if _, err := w.Write(frame); err != nil {
+				return err
+			}
+			flushWriter(w)
 			return nil
 		case "content_block_start", "content_block_delta", "content_block_stop":
 			ev["index"] = jsonIntValue(ev["index"]) + priorBlocks
@@ -421,9 +436,9 @@ func buildCodexContinueBody(resolvedBody []byte, partialItems []interface{}, con
 func stitchCodexContinuation(w io.Writer, src io.Reader, priorItems []interface{}, priorText string, priorItemCount int) (*codexStreamLedgerRecorder, error) {
 	rec := newCodexStreamLedgerRecorder()
 	err := forEachSSEFrame(src, func(frame []byte) error {
-		rec.observeFrame(frame)
 		eventType, data := sseFrameEventData(frame)
 		if len(data) == 0 {
+			rec.observeFrame(frame)
 			if _, err := w.Write(frame); err != nil {
 				return err
 			}
@@ -431,6 +446,7 @@ func stitchCodexContinuation(w io.Writer, src io.Reader, priorItems []interface{
 		}
 		var ev map[string]interface{}
 		if json.Unmarshal(data, &ev) != nil {
+			rec.observeFrame(frame)
 			if _, err := w.Write(frame); err != nil {
 				return err
 			}
@@ -441,8 +457,18 @@ func stitchCodexContinuation(w io.Writer, src io.Reader, priorItems []interface{
 			typ = eventType
 		}
 		switch typ {
-		case "response.created", "response.in_progress":
+		case "response.created":
+			rec.observeFrame(frame)
 			// Suppress the continuation's duplicate lifecycle preamble.
+			return nil
+		case "response.in_progress":
+			rec.observeFrame(frame)
+			// A minimal in_progress event is the relay's downstream heartbeat. It has
+			// no replacement response id and is safe to preserve while a continuation
+			// is thinking. Suppress upstream lifecycle snapshots with extra fields.
+			if len(ev) == 1 {
+				return writeSSEEvent(w, typ, ev)
+			}
 			return nil
 		case "response.completed", "response.incomplete", "response.failed":
 			if resp, ok := ev["response"].(map[string]interface{}); ok {
@@ -451,8 +477,15 @@ func stitchCodexContinuation(w io.Writer, src io.Reader, priorItems []interface{
 					resp["output_text"] = t
 				}
 			}
-			return writeSSEEvent(w, typ, ev)
+			var rewritten bytes.Buffer
+			if err := writeSSEEvent(&rewritten, typ, ev); err != nil {
+				return err
+			}
+			rec.observeFrame(rewritten.Bytes())
+			_, err := w.Write(rewritten.Bytes())
+			return err
 		default:
+			rec.observeFrame(frame)
 			// Content/structure events: offset output_index so items append after the
 			// already-relayed ones, then relay with the same event name.
 			if _, ok := ev["output_index"]; ok {

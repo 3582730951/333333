@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import * as AlertDialogPrimitive from '@radix-ui/react-alert-dialog';
 
@@ -107,10 +107,16 @@ export function Drawer({ open, visible, onOpenChange, onCancel, onClose, title, 
 }
 
 export function ConfirmDialog({ open, title, description, confirmText = '确认', cancelText = '取消', destructive, onConfirm, onCancel, children }) {
+  const controlled = open !== undefined;
+  const [internalOpen, setInternalOpen] = useState(false);
+  const isOpen = controlled ? Boolean(open) : internalOpen;
   const trigger = children ? <AlertDialogPrimitive.Trigger asChild>{children}</AlertDialogPrimitive.Trigger> : null;
-  useBodyScrollLock(Boolean(open), 'confirm');
+  useBodyScrollLock(isOpen, 'confirm');
   return (
-    <AlertDialogPrimitive.Root open={open} onOpenChange={(next) => { if (!next) onCancel?.(); }}>
+    <AlertDialogPrimitive.Root open={isOpen} onOpenChange={(next) => {
+      if (!controlled) setInternalOpen(next);
+      if (!next) onCancel?.();
+    }}>
       {trigger}
       <AlertDialogPrimitive.Portal>
         <AlertDialogPrimitive.Overlay className="pool-modal-overlay" />

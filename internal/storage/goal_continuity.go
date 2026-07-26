@@ -442,15 +442,33 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_segment`).Scan(&segmentUsed); err != nil {
 			return GoalSession{}, err
 		}
-		estimate := int64(len(turn.SegmentPayload))
+		estimate := int64(len(s.sealToken(turn.SegmentPayload)))
 		if created {
-			estimate += int64(len(turn.CheckpointPayload))
+			estimate += int64(len(s.sealToken(turn.CheckpointPayload)))
 		}
 		// Existing turns append one segment only; charging their base checkpoint a
 		// second time would prematurely reject long jobs even though the chain is
 		// incremental.  Encryption overhead is checked conservatively by the next
 		// write/cleanup pass without evicting active work.
-		if checkpointUsed+segmentUsed+estimate > turn.StorageMaxBytes {
+		used := checkpointUsed + segmentUsed
+		if used+estimate > turn.StorageMaxBytes {
+			protectedGoalID := ""
+			if !created {
+				protectedGoalID = resolution.Session.ID
+			}
+			freed, deleted, reclaimErr := s.reclaimGoalStorageBudget(ctx, tx, protectedGoalID, now, used+estimate-turn.StorageMaxBytes)
+			if reclaimErr != nil {
+				return GoalSession{}, reclaimErr
+			}
+			used -= freed
+			if deleted > 0 {
+				if _, auditErr := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
+					"goal_storage_reclaimed", "completed", "storage_budget_lru", fmt.Sprintf("goals=%d bytes=%d", deleted, freed), now); auditErr != nil {
+					return GoalSession{}, auditErr
+				}
+			}
+		}
+		if used+estimate > turn.StorageMaxBytes {
 			return GoalSession{}, ErrGoalStorageBudget
 		}
 	}
@@ -560,6 +578,67 @@ ON CONFLICT(id) DO UPDATE SET parent_goal_id=excluded.parent_goal_id, branch_has
 		return GoalSession{}, err
 	}
 	return session, nil
+}
+
+// reclaimGoalStorageBudget evicts the least-recently-used inactive goals. The
+// current goal and every live run are protected, so a storage cap cannot delete a
+// task while a relay, resume, or compaction lease is active.
+func (s *Store) reclaimGoalStorageBudget(ctx context.Context, tx *sql.Tx, protectedGoalID string, now, bytesNeeded int64) (int64, int64, error) {
+	if bytesNeeded <= 0 {
+		return 0, 0, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT s.id,
+ COALESCE((SELECT SUM(LENGTH(c.encrypted_payload)) FROM goal_checkpoint c WHERE c.goal_id=s.id),0) +
+ COALESCE((SELECT SUM(LENGTH(g.encrypted_payload)) FROM goal_segment g WHERE g.goal_id=s.id),0) AS payload_bytes
+FROM goal_session s
+WHERE (?='' OR s.id<>?)
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
+ORDER BY CASE s.state WHEN 'retryable' THEN 0 WHEN 'ready' THEN 1 WHEN 'awaiting_tool_result' THEN 2 ELSE 3 END,
+         s.updated_at ASC, s.id ASC`, protectedGoalID, protectedGoalID, now)
+	if err != nil {
+		return 0, 0, err
+	}
+	type candidate struct {
+		id    string
+		bytes int64
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var item candidate
+		if err := rows.Scan(&item.id, &item.bytes); err != nil {
+			_ = rows.Close()
+			return 0, 0, err
+		}
+		candidates = append(candidates, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, 0, err
+	}
+	var freed, deleted int64
+	for _, item := range candidates {
+		result, err := tx.ExecContext(ctx, `DELETE FROM goal_session
+WHERE id=? AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`, item.id, now)
+		if err != nil {
+			return freed, deleted, err
+		}
+		removed, err := result.RowsAffected()
+		if err != nil {
+			return freed, deleted, err
+		}
+		if removed == 0 {
+			continue
+		}
+		freed += item.bytes
+		deleted += removed
+		if freed >= bytesNeeded {
+			break
+		}
+	}
+	return freed, deleted, nil
 }
 
 type goalReplaySegment struct {

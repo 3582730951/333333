@@ -1,12 +1,14 @@
 // @ts-nocheck
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
-  Button, Modal, Tag, Toast, Typography, Input,
+  Button, ConfirmDialog, Modal, Tag, Toast, Typography, Input,
 } from '../components/pool/index.jsx';
 import { IconRefresh, IconPlus, IconSearch, IconDelete } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import PageScaffold from '../components/PageScaffold.tsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
+import useAsyncResource from '../hooks/useAsyncResource.js';
+import { showErrorToast } from '../components/ErrorToast.jsx';
 import {
   fetchEmailPool, importEmailAccounts, deleteEmailAccounts, testEmailAccount,
 } from '../features/accounts/api/emailPool';
@@ -25,52 +27,67 @@ function StatusTag({ status }: { status: string }) {
 }
 
 export default function EmailPool() {
-  const [accounts, setAccounts] = useState<EmailAccount[]>([]);
-  const [total, setTotal] = useState(0);
-  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [importText, setImportText] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [deleteRequest, setDeleteRequest] = useState<{ ids: string[]; label: string } | null>(null);
 
-  const loadData = useCallback(async () => {
-    const result = await fetchEmailPool({ page, pageSize: 50, search });
-    setAccounts(result.accounts);
-    setTotal(result.total);
-    setCounts(result.counts || {});
+  const loadData = useCallback(async ({ signal }: { signal?: AbortSignal } = {}) => {
+    return fetchEmailPool({ page, pageSize: 50, search }, signal);
   }, [page, search]);
-
-  const { run: load, running: loading, error: loadError } = useAsyncAction(loadData);
+  const emptyData = { accounts: [], total: 0, page: 1, pageSize: 50, counts: {} };
+  const { data = emptyData, reload: load, loading, error: loadError } = useAsyncResource(
+    loadData,
+    [page, search],
+    { initialData: emptyData },
+  );
+  const accounts = data.accounts || [];
+  const total = data.total || 0;
+  const counts = data.counts || {};
 
   const { run: doImport, running: importing } = useAsyncAction(async () => {
-    const result = await importEmailAccounts({ text: importText });
-    Toast.success(`Imported ${result.imported} email accounts`);
-    setImportModalOpen(false);
-    setImportText('');
-    await load();
+    try {
+      const result = await importEmailAccounts({ text: importText });
+      Toast.success(`Imported ${result.imported} email accounts`);
+      setImportModalOpen(false);
+      setImportText('');
+      void load();
+    } catch (error) {
+      showErrorToast(error);
+    }
   });
 
-  const { run: doDelete } = useAsyncAction(async () => {
-    if (selectedIds.size === 0) return;
-    if (!confirm(`Delete ${selectedIds.size} email account(s)?`)) return;
-    await deleteEmailAccounts(Array.from(selectedIds));
-    Toast.success(`Deleted ${selectedIds.size} email account(s)`);
-    setSelectedIds(new Set());
-    await load();
+  const { run: doDelete, running: deleting } = useAsyncAction(async (ids: string[]) => {
+    if (!ids.length) return;
+    setDeleteRequest(null);
+    try {
+      await deleteEmailAccounts(ids);
+      Toast.success(`Deleted ${ids.length} email account(s)`);
+      setSelectedIds((current) => new Set([...current].filter((id) => !ids.includes(id))));
+      void load();
+    } catch (error) {
+      showErrorToast(error);
+    }
   });
 
   const { run: doTest } = useAsyncAction(async (id: string) => {
-    const result = await testEmailAccount(id);
-    if (result.ok) {
-      Toast.success(`Email ${result.email} is working`);
-    } else {
-      Toast.error(`Email test failed: ${result.error || 'unknown'}`);
+    try {
+      const result = await testEmailAccount(id);
+      if (result.ok) Toast.success(`Email ${result.email} is working`);
+      else Toast.error(`Email test failed: ${result.error || 'unknown'}`);
+      void load();
+    } catch (error) {
+      showErrorToast(error);
     }
-    await load();
   });
 
-  useEffect(() => { load(); }, [load]);
+  const applySearch = () => {
+    setPage(1);
+    setSearch(searchInput.trim());
+  };
 
   const toggleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -106,13 +123,17 @@ export default function EmailPool() {
       <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
         <Input
           placeholder="Search email..."
-          value={search}
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) => { setSearch(e.target.value); setPage(1); }}
+          value={searchInput}
+          onChange={setSearchInput}
+          onEnterPress={applySearch}
           prefix={<IconSearch />}
+          showClear
+          onClear={() => { setSearch(''); setPage(1); }}
           style={{ maxWidth: 300 }}
         />
+        <Button icon={<IconSearch />} onClick={applySearch}>Search</Button>
         {selectedIds.size > 0 && (
-          <Button type="danger" onClick={doDelete}>
+          <Button type="danger" onClick={() => setDeleteRequest({ ids: [...selectedIds], label: `${selectedIds.size} email account(s)` })}>
             <IconDelete /> Delete ({selectedIds.size})
           </Button>
         )}
@@ -159,11 +180,7 @@ export default function EmailPool() {
                 <td>
                   <div style={{ display: 'flex', gap: 4 }}>
                     <Button size="small" onClick={() => doTest(a.id)}>Test</Button>
-                    <Button size="small" type="danger" onClick={() => {
-                      if (confirm(`Delete ${a.email}?`)) {
-                        deleteEmailAccounts([a.id]).then(() => load());
-                      }
-                    }}>Delete</Button>
+                    <Button size="small" type="danger" onClick={() => setDeleteRequest({ ids: [a.id], label: a.email })}>Delete</Button>
                   </div>
                 </td>
               </tr>
@@ -182,7 +199,7 @@ export default function EmailPool() {
       )}
 
       {/* Import Modal */}
-      <Modal open={importModalOpen} onClose={() => setImportModalOpen(false)} title="Import Email Accounts">
+      <Modal open={importModalOpen} onCancel={() => setImportModalOpen(false)} title="Import Email Accounts" footer={null}>
         <Typography.Text style={{ display: 'block', marginBottom: 8 }}>
           Paste email accounts, one per line:<br />
           <code>email----password----client_id----refresh_token</code>
@@ -199,6 +216,16 @@ export default function EmailPool() {
           <Button theme="solid" onClick={doImport} disabled={!importText.trim() || importing}>Import</Button>
         </div>
       </Modal>
+      <ConfirmDialog
+        open={Boolean(deleteRequest)}
+        title={`Delete ${deleteRequest?.label || 'email account'}?`}
+        description="Deleted email pool entries cannot be recovered."
+        confirmText="Delete"
+        cancelText="Cancel"
+        destructive
+        onCancel={() => { if (!deleting) setDeleteRequest(null); }}
+        onConfirm={() => { if (deleteRequest) void doDelete(deleteRequest.ids); }}
+      />
     </PageScaffold>
   );
 }
