@@ -1220,7 +1220,6 @@ CREATE TABLE IF NOT EXISTS affinity_bindings(
 	expires_at INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_affinity_bindings_expiry ON affinity_bindings(expires_at, egress_id);
 CREATE TABLE IF NOT EXISTS egress_profiles(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,

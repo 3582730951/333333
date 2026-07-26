@@ -1006,6 +1006,40 @@ systemd_running() {
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
 }
 
+wait_for_service_health() {
+  local url="$1" max="$2" phase="$3"
+  local started="$SECONDS" deadline=$((SECONDS + max)) next_report=$((SECONDS + 10)) state
+
+  while (( SECONDS < deadline )); do
+    if curl -fsS --connect-timeout 1 --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( SECONDS >= next_report )); then
+      state="$(run_root systemctl show "${SERVICE_NAME}.service" \
+        --property=ActiveState --property=SubState --property=Result --property=NRestarts \
+        2>/dev/null | tr '\n' ' ' || true)"
+      warn "Still waiting for ${phase} health ($((SECONDS - started))s/${max}s): ${state:-service state unavailable}"
+      next_report=$((next_report + 10))
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+print_service_start_diagnostics() {
+  local since="${1:-}"
+  warn "${SERVICE_NAME}.service failed its health gate; startup diagnostics follow."
+  run_root systemctl --no-pager --full status "${SERVICE_NAME}.service" >&2 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    warn "Complete service journal from this restart:"
+    if [[ -n "$since" ]]; then
+      run_root journalctl -u "${SERVICE_NAME}.service" --since "$since" -n 120 --no-pager -l >&2 || true
+    else
+      run_root journalctl -u "${SERVICE_NAME}.service" -n 120 --no-pager -l >&2 || true
+    fi
+  fi
+}
+
 # health_check_or_rollback polls the local /healthz after a (re)start. If the new
 # binary does not become healthy within HEALTH_TIMEOUT, it restores the previous binary
 # (<name>.prev, saved in install_binary_and_config), pauses the activation socket so even
@@ -1013,11 +1047,13 @@ systemd_running() {
 # never leaves the gateway down. No-op when there is nothing to roll back to or the
 # service was not started.
 health_check_or_rollback() {
+  local restart_since="${1:-}"
   bool_enabled "$START_SERVICE" || return 0
   systemd_running || return 0
   command -v curl >/dev/null 2>&1 || { warn "curl missing; skipping health gate"; return 0; }
 
-  local port host url i max="$HEALTH_TIMEOUT"
+  local port host url max="$HEALTH_TIMEOUT"
+  [[ "$max" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_TIMEOUT must be a positive integer: ${max}"
   port="$(listen_port "$LISTEN_ADDR")"
   if [[ ! "$port" =~ ^[0-9]+$ ]]; then
     warn "cannot infer port from LISTEN_ADDR=${LISTEN_ADDR}; skipping health gate"
@@ -1029,15 +1065,13 @@ health_check_or_rollback() {
   url="http://${host}:${port}/healthz"
 
   log "Health-checking new version at ${url} (up to ${max}s)"
-  for (( i=1; i<=max; i++ )); do
-    if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
-      log "New version is healthy."
-      return 0
-    fi
-    sleep 1
-  done
+  if wait_for_service_health "$url" "$max" "new version"; then
+    log "New version is healthy."
+    return 0
+  fi
 
   warn "New version did not pass health check within ${max}s."
+  print_service_start_diagnostics "$restart_since"
   if [[ -f "${BIN_DIR}/${APP_NAME}.prev" ]]; then
     warn "Auto-rolling back to ${BIN_DIR}/${APP_NAME}.prev"
     run_root install -m 0755 "${BIN_DIR}/${APP_NAME}.prev" "${BIN_DIR}/${APP_NAME}"
@@ -1045,12 +1079,9 @@ health_check_or_rollback() {
     # port directly during rollback.
     run_root systemctl stop "${SERVICE_NAME}.socket" 2>/dev/null || true
     run_root systemctl restart "${SERVICE_NAME}.service" || true
-    for (( i=1; i<=max; i++ )); do
-      if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
-        die "新版本启动失败，已自动回滚到上一版本并恢复服务（socket 已暂停、直接绑定端口）。排查后重试：journalctl -u ${SERVICE_NAME}.service -n 100"
-      fi
-      sleep 1
-    done
+    if wait_for_service_health "$url" "$max" "rolled-back version"; then
+      die "新版本启动失败，已自动回滚到上一版本并恢复服务（socket 已暂停、直接绑定端口）。失败日志已在回滚前输出。"
+    fi
     die "新版本启动失败，且回滚后仍不健康！请立即人工介入：journalctl -u ${SERVICE_NAME}.service -n 200（数据库已由 update.sh 预先备份）"
   fi
   die "新版本未通过健康检查，且无可回滚的旧二进制（首次安装？）。排查：journalctl -u ${SERVICE_NAME}.service -n 100"
@@ -1062,7 +1093,7 @@ install_systemd_unit() {
     return 0
   fi
 
-  local database_parent read_write_paths tmp unit sidecar_unit extra_env admin_env no_new_priv warp_dir_env
+  local database_parent read_write_paths tmp unit sidecar_unit extra_env admin_env no_new_priv warp_dir_env restart_since
   database_parent="$(dirname "$DATABASE_PATH")"
   if [[ "$database_parent" == "$DATA_DIR" ]]; then
     read_write_paths="$DATA_DIR"
@@ -1319,8 +1350,9 @@ EOF
       # sidecar. NOTE: with one instance, a long drain means new requests QUEUE on the
       # socket (not refused) until the new process is up — tune CODEX_POOL_SHUTDOWN_DRAIN_SECONDS.
       log "Restarting ${SERVICE_NAME}.service"
+      restart_since="$(date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')"
       run_root systemctl restart "${SERVICE_NAME}.service" || true
-      health_check_or_rollback
+      health_check_or_rollback "$restart_since"
       run_root systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 
       # Restart the sidecar only when its source changed (or it is not running): an
