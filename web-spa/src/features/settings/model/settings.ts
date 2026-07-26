@@ -2,6 +2,9 @@ import type { ApiError } from '../../../model/contracts';
 
 export type SettingsSection = 'config' | 'automation' | 'registrar' | 'lifecycle' | 'logging' | 'memory';
 export type SettingsValues = Record<string, unknown>;
+export type ConfigPlacement = 'ai_settings' | 'system_settings' | 'feature_page';
+export type AISettingsDomain = 'chatgpt' | 'claude' | 'kiro' | 'antigravity' | 'codex' | 'claude_code';
+export type ConfigScope = 'model' | 'global';
 
 export interface ConfigField {
   key: string;
@@ -11,6 +14,11 @@ export interface ConfigField {
   effect: string;
   options: string[];
   help: string;
+  placement: ConfigPlacement;
+  domain: AISettingsDomain | null;
+  scope: ConfigScope;
+  section: string;
+  order: number;
   value?: unknown;
   overridden: boolean;
   settings_error: string;

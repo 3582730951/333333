@@ -148,6 +148,18 @@ func TestClaudeStreamTapTruncatedVsComplete(t *testing.T) {
 	if tap2.openBlock {
 		t.Fatal("complete stream should have no open block")
 	}
+	if !tap2.completedSuccessfully() {
+		t.Fatal("message_stop must be recorded as a successful terminal")
+	}
+
+	errorTap := &claudeStreamTap{}
+	_, _ = errorTap.Write([]byte("event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream failed\"}}\n\n"))
+	if !errorTap.reachedTerminal() {
+		t.Fatal("Claude error event must be recorded as terminal")
+	}
+	if errorTap.completedSuccessfully() {
+		t.Fatal("Claude error event must not be recorded as successful")
+	}
 }
 
 func tap2Feed() string {

@@ -1,4 +1,6 @@
+import { z } from 'zod';
 import { get, post, del } from '../../../api.js';
+import { parseApiResponse } from '../../../api/contracts';
 
 export interface EmailAccount {
   id: string;
@@ -38,6 +40,35 @@ export interface EmailPoolTestResponse {
   has_token?: boolean;
 }
 
+const emailAccountSchema = z.object({
+  id: z.string(),
+  email: z.string(),
+  client_id: z.string().optional(),
+  status: z.string(),
+  group_name: z.string().optional(),
+  error_message: z.string().optional(),
+  last_used_at: z.coerce.number().optional(),
+  created_at: z.coerce.number(),
+  updated_at: z.coerce.number(),
+}).passthrough();
+
+export const emailPoolResponseSchema = z.object({
+  accounts: z.array(emailAccountSchema).optional(),
+  total: z.coerce.number().int().nonnegative().optional(),
+  page: z.coerce.number().int().positive().optional(),
+  pageSize: z.coerce.number().int().positive().optional(),
+  counts: z.record(z.string(), z.coerce.number().int().nonnegative()).optional(),
+}).passthrough().transform((value): EmailPoolListResponse => {
+  const accounts = value.accounts ?? [];
+  return {
+    accounts,
+    total: value.total ?? accounts.length,
+    page: value.page ?? 1,
+    pageSize: value.pageSize ?? Math.max(accounts.length, 1),
+    counts: value.counts ?? {},
+  };
+});
+
 export async function fetchEmailPool(params: {
   page?: number;
   pageSize?: number;
@@ -50,7 +81,8 @@ export async function fetchEmailPool(params: {
   if (params.search) searchParams.set('search', params.search);
   if (params.status) searchParams.set('status', params.status);
   const qs = searchParams.toString();
-  return get(`/admin/email-pool${qs ? `?${qs}` : ''}`);
+  const response = await get(`/admin/email-pool${qs ? `?${qs}` : ''}`);
+  return parseApiResponse(emailPoolResponseSchema, response);
 }
 
 export async function importEmailAccounts(data: EmailPoolImportRequest): Promise<EmailPoolImportResponse> {

@@ -1,5 +1,50 @@
 const noop = () => {};
 
+const overlayLocks = new Set();
+let overlayBodySnapshot = null;
+
+function restoreOverlayBodySnapshot() {
+  if (overlayLocks.size || !overlayBodySnapshot) return;
+  const snapshot = overlayBodySnapshot;
+  overlayBodySnapshot = null;
+  setDocumentBodyStyle('overflow', snapshot.overflow);
+  setDocumentBodyStyle('pointerEvents', snapshot.pointerEvents);
+  setDocumentBodyAttribute('data-pool-overlay-count', null);
+}
+
+export function acquireDocumentOverlayLock(owner = 'overlay') {
+  const token = Symbol(String(owner));
+  if (!overlayLocks.size) {
+    overlayBodySnapshot = {
+      overflow: documentBodyStyle('overflow'),
+      pointerEvents: documentBodyStyle('pointerEvents'),
+    };
+  }
+  overlayLocks.add(token);
+  setDocumentBodyStyle('overflow', 'hidden');
+  setDocumentBodyAttribute('data-pool-overlay-count', overlayLocks.size);
+  return token;
+}
+
+export function releaseDocumentOverlayLock(token) {
+  if (!token || !overlayLocks.delete(token)) return;
+  if (overlayLocks.size) {
+    setDocumentBodyAttribute('data-pool-overlay-count', overlayLocks.size);
+    return;
+  }
+  restoreOverlayBodySnapshot();
+  if (typeof queueMicrotask === 'function') queueMicrotask(restoreOverlayBodySnapshot);
+}
+
+export function resetDocumentOverlayLocks() {
+  overlayLocks.clear();
+  restoreOverlayBodySnapshot();
+}
+
+export function documentOverlayLockCount() {
+  return overlayLocks.size;
+}
+
 export function getDocumentElementById(id) {
   try {
     if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return null;

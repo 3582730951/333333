@@ -1,6 +1,6 @@
 import type { ApiError } from '../../../model/contracts';
 import type { SystemMetrics } from './system';
-import type { UsageBucket, UsageCacheReport, UsageMetricRow } from './usage';
+import type { UsageBucket, UsageCacheReport, UsageMetricRow, UsageSeriesDescriptor } from './usage';
 
 export interface AccountPoolSummary {
   total: number;
@@ -35,6 +35,8 @@ export interface DashboardCore {
   accountSummary: AccountPoolSummary;
   health: DashboardHealth | null;
   buckets: UsageBucket[];
+  modelSeries: UsageMetricRow[];
+  series: UsageSeriesDescriptor[];
   healthAvailable: boolean;
   timeseriesAvailable: boolean;
   error: ApiError | null;

@@ -3,6 +3,7 @@ package prompt
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -62,6 +63,34 @@ func InjectChatSystemPrompt(raw []byte, systemPrompt string) ([]byte, bool, erro
 		}
 	}
 	root["messages"] = append([]interface{}{systemMessage}, messages...)
+	out, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, true, nil
+}
+
+func InjectAnthropicSystemPrompt(raw []byte, systemPrompt string) ([]byte, bool, error) {
+	systemPrompt = strings.TrimSpace(systemPrompt)
+	if systemPrompt == "" {
+		return raw, false, nil
+	}
+	root, err := decodeJSONMapUseNumber(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	switch existing := root["system"].(type) {
+	case string:
+		if strings.TrimSpace(existing) != "" && !strings.HasPrefix(existing, systemPrompt) {
+			root["system"] = systemPrompt + "\n\n" + existing
+		} else if strings.TrimSpace(existing) == "" {
+			root["system"] = systemPrompt
+		}
+	case []interface{}:
+		root["system"] = append([]interface{}{map[string]interface{}{"type": "text", "text": systemPrompt}}, existing...)
+	default:
+		root["system"] = systemPrompt
+	}
 	out, err := json.Marshal(root)
 	if err != nil {
 		return nil, false, err
@@ -244,7 +273,7 @@ func firstPresent(vs ...interface{}) interface{} {
 func ResponsesToChatCompletion(raw []byte, requestID, model string, plans ...*ResponsesToolBridgePlan) ([]byte, error) {
 	root, err := decodeJSONMapUseNumber(raw)
 	if err != nil {
-		return raw, nil
+		return nil, fmt.Errorf("invalid Responses response: %w", err)
 	}
 	content := extractResponseText(root)
 	toolCalls := extractResponseToolCalls(root, plans...)

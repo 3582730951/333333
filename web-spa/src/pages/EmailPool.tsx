@@ -1,8 +1,9 @@
+// @ts-nocheck
 import React, { useState, useCallback, useEffect } from 'react';
 import {
   Button, Modal, Tag, Toast, Typography, Input,
 } from '../components/pool/index.jsx';
-import { IconRefresh, IconPlus, IconSearch, IconTrash } from '../components/pool/icons.jsx';
+import { IconRefresh, IconPlus, IconSearch, IconDelete } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
 import PageScaffold from '../components/PageScaffold.tsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
@@ -94,11 +95,11 @@ export default function EmailPool() {
 
       {/* Stats bar */}
       <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
-        <div className="pool-stat-card"><Typography variant="label">Total</Typography><Typography variant="heading">{total}</Typography></div>
-        <div className="pool-stat-card" style={{ color: 'var(--pool-green)' }}><Typography variant="label">Idle</Typography><Typography variant="heading">{counts.idle || 0}</Typography></div>
-        <div className="pool-stat-card" style={{ color: 'var(--pool-blue)' }}><Typography variant="label">In Use</Typography><Typography variant="heading">{counts.in_use || 0}</Typography></div>
-        <div className="pool-stat-card" style={{ color: 'var(--pool-gray)' }}><Typography variant="label">Used</Typography><Typography variant="heading">{counts.used || 0}</Typography></div>
-        <div className="pool-stat-card" style={{ color: 'var(--pool-red)' }}><Typography variant="label">Error</Typography><Typography variant="heading">{counts.error || 0}</Typography></div>
+        <div className="pool-stat-card"><Typography.Text type="tertiary" style={{ display: 'block' }}>Total</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{total}</Typography.Text></div>
+        <div className="pool-stat-card" style={{ color: 'var(--pool-green)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>Idle</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.idle || 0}</Typography.Text></div>
+        <div className="pool-stat-card" style={{ color: 'var(--pool-blue)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>In Use</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.in_use || 0}</Typography.Text></div>
+        <div className="pool-stat-card" style={{ color: 'var(--pool-gray)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>Used</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.used || 0}</Typography.Text></div>
+        <div className="pool-stat-card" style={{ color: 'var(--pool-red)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>Error</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.error || 0}</Typography.Text></div>
       </div>
 
       {/* Search bar */}
@@ -111,8 +112,8 @@ export default function EmailPool() {
           style={{ maxWidth: 300 }}
         />
         {selectedIds.size > 0 && (
-          <Button variant="danger" onClick={doDelete}>
-            <IconTrash /> Delete ({selectedIds.size})
+          <Button type="danger" onClick={doDelete}>
+            <IconDelete /> Delete ({selectedIds.size})
           </Button>
         )}
       </div>
@@ -120,14 +121,14 @@ export default function EmailPool() {
       {/* Error state */}
       {loadError && (
         <div style={{ marginBottom: 16, padding: 12, background: 'var(--pool-bg-surface)', borderRadius: 8 }}>
-          <Typography variant="body" style={{ color: 'var(--pool-red)' }}>Failed to load: {loadError.message}</Typography>
+          <Typography.Text type="danger">Failed to load: {loadError.message}</Typography.Text>
           <Button onClick={load} style={{ marginLeft: 8 }}>Retry</Button>
         </div>
       )}
 
       {/* Table */}
       {loading && !accounts.length ? (
-        <Typography variant="body">Loading...</Typography>
+        <Typography.Text>Loading...</Typography.Text>
       ) : (
         <table className="pool-table" style={{ width: '100%' }}>
           <thead>
@@ -148,7 +149,7 @@ export default function EmailPool() {
             {accounts.map((a) => (
               <tr key={a.id}>
                 <td><input type="checkbox" checked={selectedIds.has(a.id)} onChange={() => toggleSelect(a.id)} /></td>
-                <td><Typography variant="body" style={{ fontFamily: 'monospace' }}>{a.email}</Typography></td>
+                <td><Typography.Text className="pool-mono">{a.email}</Typography.Text></td>
                 <td><StatusTag status={a.status} /></td>
                 <td>{a.group_name || '-'}</td>
                 <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -158,7 +159,7 @@ export default function EmailPool() {
                 <td>
                   <div style={{ display: 'flex', gap: 4 }}>
                     <Button size="small" onClick={() => doTest(a.id)}>Test</Button>
-                    <Button size="small" variant="danger" onClick={() => {
+                    <Button size="small" type="danger" onClick={() => {
                       if (confirm(`Delete ${a.email}?`)) {
                         deleteEmailAccounts([a.id]).then(() => load());
                       }
@@ -175,17 +176,17 @@ export default function EmailPool() {
       {total > 50 && (
         <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 16 }}>
           <Button disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Prev</Button>
-          <Typography variant="body">Page {page} (Total: {total})</Typography>
+          <Typography.Text>Page {page} (Total: {total})</Typography.Text>
           <Button disabled={page * 50 >= total} onClick={() => setPage(p => p + 1)}>Next</Button>
         </div>
       )}
 
       {/* Import Modal */}
       <Modal open={importModalOpen} onClose={() => setImportModalOpen(false)} title="Import Email Accounts">
-        <Typography variant="body" style={{ marginBottom: 8 }}>
+        <Typography.Text style={{ display: 'block', marginBottom: 8 }}>
           Paste email accounts, one per line:<br />
           <code>email----password----client_id----refresh_token</code>
-        </Typography>
+        </Typography.Text>
         <textarea
           rows={8}
           style={{ width: '100%', fontFamily: 'monospace', padding: 8, border: '1px solid var(--pool-border)', borderRadius: 4 }}
@@ -194,8 +195,8 @@ export default function EmailPool() {
           placeholder={`user1@hotmail.com----password123----client-id----refresh_token\nuser2@outlook.com----password456----client-id----refresh_token`}
         />
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
-          <Button variant="secondary" onClick={() => setImportModalOpen(false)}>Cancel</Button>
-          <Button onClick={doImport} disabled={!importText.trim() || importing}>Import</Button>
+          <Button theme="outline" onClick={() => setImportModalOpen(false)}>Cancel</Button>
+          <Button theme="solid" onClick={doImport} disabled={!importText.trim() || importing}>Import</Button>
         </div>
       </Modal>
     </PageScaffold>

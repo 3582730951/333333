@@ -233,7 +233,7 @@ func TestStrictCPASidecarTrailerDoesNotNativeContinueOrRetireTree(t *testing.T) 
 	h.app.scheduler.InvalidateAccountCache()
 
 	status, body := post(`{"model":"gpt","stream":true,"previous_response_id":"resp-sidecar-root","input":"resume"}`)
-	if status != http.StatusOK || !strings.Contains(body, "sidecar_stream_interrupted") || strings.Contains(body, "codex_native_continue_failed") {
+	if status != http.StatusOK || !strings.Contains(body, `"code":"server_error"`) || !strings.Contains(body, publicRetryMessage) || strings.Contains(body, "sidecar_stream_interrupted") || strings.Contains(body, `"phase"`) {
 		t.Fatalf("sidecar terminal status=%d body=%s", status, body)
 	}
 	if got := sidecarCalls.Load(); got != 1 {

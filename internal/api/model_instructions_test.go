@@ -11,7 +11,7 @@ import (
 	"codex-account-pool/internal/storage"
 )
 
-func TestGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
+func TestUserGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp_instr","status":"completed","output_text":"ok"}`))
@@ -25,10 +25,10 @@ func TestGroupModelInstructionsFilesBecomeResponsesInstructions(t *testing.T) {
 	}
 	save("coding-style.md", "  Use concise Go.  \n")
 	save("testing.txt", "\nPrefer regression tests.\n")
-	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"codex-team","model_instructions_enabled":true,"model_instructions_files":["coding-style.md","testing.txt"]}`); code != http.StatusOK {
-		t.Fatalf("create group = %d: %s", code, raw)
-	}
-	routeKey := createTestAPIKeyForGroup(t, h, "codex-team")
+	routeKey := createTestAPIKeyForUserGroup(t, h, "codex-team", map[string]interface{}{
+		"model_instructions_enabled": true,
+		"model_instructions_files":   []string{"coding-style.md", "testing.txt"},
+	})
 	acc := h.importAccount(t, "instr", "up-instr", "access-instr")
 	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+acc+"/group", `{"group":"codex-team"}`); code != http.StatusOK {
 		t.Fatalf("assign group = %d: %s", code, raw)
@@ -179,16 +179,16 @@ func TestSetResponsesInstructionsDoesNotInventLitePrefix(t *testing.T) {
 	}
 }
 
-func TestGroupModelInstructionsMissingFileIsConfigurationError(t *testing.T) {
+func TestUserGroupModelInstructionsMissingFileIsConfigurationError(t *testing.T) {
 	var upstreamCalls int
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls++
 		_, _ = w.Write([]byte(`{"id":"resp"}`))
 	})
-	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"broken-instr","model_instructions_enabled":true,"model_instructions_files":["missing.md"]}`); code != http.StatusOK {
-		t.Fatalf("create group = %d: %s", code, raw)
-	}
-	routeKey := createTestAPIKeyForGroup(t, h, "broken-instr")
+	routeKey := createTestAPIKeyForUserGroup(t, h, "broken-instr", map[string]interface{}{
+		"model_instructions_enabled": true,
+		"model_instructions_files":   []string{"missing.md"},
+	})
 	acc := h.importAccount(t, "broken", "up-broken", "access-broken")
 	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+acc+"/group", `{"group":"broken-instr"}`); code != http.StatusOK {
 		t.Fatalf("assign group = %d: %s", code, raw)
@@ -238,10 +238,10 @@ func TestStrictCPAModelInstructionsAreTreeSnapshots(t *testing.T) {
 		}
 	}
 	save("first immutable administrator instructions")
-	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"strict-snapshot","model_instructions_enabled":true,"model_instructions_files":["strict.md"]}`); code != http.StatusOK {
-		t.Fatalf("create group = %d: %s", code, raw)
-	}
-	key := createTestAPIKeyForGroup(t, h, "strict-snapshot")
+	key := createTestAPIKeyForUserGroup(t, h, "strict-snapshot", map[string]interface{}{
+		"model_instructions_enabled": true,
+		"model_instructions_files":   []string{"strict.md"},
+	})
 	accountID := h.importAccount(t, "strict-snapshot", "up-strict-snapshot", "access-strict-snapshot")
 	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/group", `{"group":"strict-snapshot"}`); code != http.StatusOK {
 		t.Fatalf("assign group = %d: %s", code, raw)
@@ -314,10 +314,10 @@ func TestStrictCPAModelInstructionsRejectBrokenNewRootBeforeUpstream(t *testing.
 		_, _ = w.Write([]byte(`{"id":"unexpected"}`))
 	})
 	enableCodexSessionMappingForTest(h)
-	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"strict-broken","model_instructions_enabled":true,"model_instructions_files":["missing.md"]}`); code != http.StatusOK {
-		t.Fatalf("create group = %d: %s", code, raw)
-	}
-	key := createTestAPIKeyForGroup(t, h, "strict-broken")
+	key := createTestAPIKeyForUserGroup(t, h, "strict-broken", map[string]interface{}{
+		"model_instructions_enabled": true,
+		"model_instructions_files":   []string{"missing.md"},
+	})
 	accountID := h.importAccount(t, "strict-broken", "up-strict-broken", "access-strict-broken")
 	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/group", `{"group":"strict-broken"}`); code != http.StatusOK {
 		t.Fatalf("assign group = %d: %s", code, raw)
@@ -354,4 +354,37 @@ func createTestAPIKeyForGroup(t *testing.T, h *testHarness, group string) string
 		t.Fatalf("api key response missing key: %v", out)
 	}
 	return key
+}
+
+func createTestAPIKeyForUserGroup(t *testing.T, h *testHarness, accountPoolGroup string, policy map[string]interface{}) string {
+	t.Helper()
+	groupBody, _ := json.Marshal(map[string]interface{}{"name": accountPoolGroup})
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/groups", string(groupBody)); code != http.StatusOK {
+		t.Fatalf("create account pool group %s = %d: %s", accountPoolGroup, code, raw)
+	}
+	definition := map[string]interface{}{
+		"name": accountPoolGroup + " users",
+		"targets": []map[string]string{{
+			"kind": storage.TargetKindAccountPoolGroup,
+			"id":   accountPoolGroup,
+		}},
+	}
+	for key, value := range policy {
+		definition[key] = value
+	}
+	definitionBody, _ := json.Marshal(definition)
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/user-groups", string(definitionBody))
+	if code != http.StatusCreated {
+		t.Fatalf("create user group for %s = %d: %s", accountPoolGroup, code, raw)
+	}
+	var userGroup storage.UserGroup
+	if err := json.Unmarshal(raw, &userGroup); err != nil || userGroup.ID == "" {
+		t.Fatalf("decode user group for %s: %+v err=%v (%s)", accountPoolGroup, userGroup, err, raw)
+	}
+	plain := createTestAPIKeyForGroup(t, h, accountPoolGroup)
+	code, raw = grpReq(t, h, http.MethodPost, "/admin/api-keys/"+hashAPIKey(plain)+"/user-group", `{"user_group_id":"`+userGroup.ID+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("bind api key to user group %s = %d: %s", userGroup.ID, code, raw)
+	}
+	return plain
 }

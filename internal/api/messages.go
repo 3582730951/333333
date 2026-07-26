@@ -76,6 +76,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, err)
 		return
 	}
+	originalRaw := append([]byte(nil), raw...)
 	path := r.URL.Path
 	clientRequestedModel := routing.Model(raw)
 
@@ -87,6 +88,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Codex and OpenAI-compat paths ("claude 也适用"); it also enforces
 	// RequireDownstreamKey here, which this handler previously bypassed.
 	pol, ok := s.resolveDownstreamPolicy(w, r)
+	if !ok {
+		return
+	}
+	r, ok = s.attachUserGroupPolicy(w, r, pol)
 	if !ok {
 		return
 	}
@@ -102,11 +107,31 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if pol.ForceEffort != "" {
 		raw = applyForcedThinkingClaude(raw, pol.ForceEffort)
 	}
+	requestPolicy := requestUserGroupPolicy(r.Context())
+	policyPrompt := strings.TrimSpace(requestPolicy.SystemPrompt)
+	if requestPolicy.ModelInstructionsEnabled {
+		compiled, _, compileErr := s.compileGroupModelInstructions(r.Context(), requestPolicy)
+		if compileErr != nil {
+			writeCodexInstructionConfigurationError(w, compileErr)
+			return
+		}
+		policyPrompt = strings.TrimSpace(strings.Join([]string{policyPrompt, compiled}, "\n\n"))
+	}
+	if prompt.ShouldRewrite(policyPrompt, routing.IsCompaction(path, raw), requestPolicy.SystemPromptApplyToCompaction) {
+		raw, _, err = prompt.InjectAnthropicSystemPrompt(raw, policyPrompt)
+		if err != nil {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_user_group_prompt", err.Error())
+			return
+		}
+	}
 	policyResolvedModel := routing.Model(raw)
 	r = r.WithContext(withModelDiagnostics(r.Context(), clientRequestedModel, policyResolvedModel, pol.ModelOverrideSource))
 	w.Header().Set("X-Pool-Requested-Model", clientRequestedModel)
 	w.Header().Set("X-Pool-Resolved-Model", policyResolvedModel)
 	w.Header().Set("X-Pool-Model-Override-Source", firstNonEmpty(pol.ModelOverrideSource, "none"))
+	if s.dispatchUserGroupRouteCandidates(w, r, originalRaw, raw, pol, s.handleMessages) {
+		return
+	}
 	// Server-side token compression (opt-in, default OFF): conservatively compress large
 	// tool-result blocks before forwarding upstream, cutting billed input tokens (the
 	// rtk-style server-side analogue). Only tool_result content is touched.
@@ -149,28 +174,51 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	strict := routing.IsStrictSticky(path, r, raw)
 	model := routing.Model(raw)
+	if pol.UserGroupID != "" {
+		routeGroup, routeProvider, routeErr := resolveUserGroupRoute(r.Context(), s.store, pol, r, raw)
+		if routeErr != nil {
+			writePoolCodeError(w, http.StatusUnprocessableEntity, "user_group_route_unavailable", routeErr.Error())
+			return
+		}
+		if routeGroup != "" {
+			pol.Group = routeGroup
+		}
+		if routeProvider != "" {
+			pol.ProviderHint = routeProvider
+		}
+	}
 	// Custom models and built-in GPT/Codex models are resolved before Claude-family
 	// provider validation. This lets the same Anthropic Messages endpoint serve Claude
 	// Code through either a custom Chat provider or the pool's native Codex/Responses
 	// accounts instead of restricting every request to Claude/Kiro up front.
-	if prov, ok := s.customProviderForModel(r.Context(), model); ok {
+	var selectedCustom storage.CustomProvider
+	var selectedCustomOK bool
+	if strings.HasPrefix(pol.ProviderHint, "custom:") {
+		selectedCustom, selectedCustomOK = s.customProviderByID(r.Context(), strings.TrimPrefix(pol.ProviderHint, "custom:"))
+	} else {
+		selectedCustom, selectedCustomOK = s.customProviderForModel(r.Context(), model)
+	}
+	if selectedCustomOK {
+		prov := selectedCustom
 		if strings.HasSuffix(path, "/count_tokens") {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 			return
 		}
-		if caps := claudeOnlyCapabilitiesForChatBridge(r.Header, raw); len(caps) > 0 {
-			s.writeCapabilityUnavailable(w, http.StatusBadRequest,
-				"Claude-only capability cannot be represented through the Chat Completions bridge",
-				caps,
-				"official_claude",
-				"custom_chat_completions_bridge:"+prov.ID,
-				"Route this request to an official Claude account, or remove Claude-only beta/features for this Chat Completions provider.")
-			return
+		if prov.UpstreamProtocol == storage.CustomProviderProtocolChatCompletions {
+			if caps := claudeOnlyCapabilitiesForChatBridge(r.Header, raw); len(caps) > 0 {
+				s.writeCapabilityUnavailable(w, http.StatusBadRequest,
+					"Claude-only capability cannot be represented through the Chat Completions bridge",
+					caps,
+					"official_claude",
+					"custom_chat_completions_bridge:"+prov.ID,
+					"Route this request to an official Claude account, or remove Claude-only beta/features for this Chat Completions provider.")
+				return
+			}
 		}
 		s.handleMessagesViaCustom(w, r, raw, model, pol.Group, prov)
 		return
 	}
-	if isCodexMessagesModel(model) {
+	if pol.ProviderHint == "codex" || isCodexMessagesModel(model) {
 		s.handleMessagesViaCodex(w, r, raw, model)
 		return
 	}
@@ -192,22 +240,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
-	}
-	// Two-layer group model: override pol.Group / allowedProviders from user_group targets.
-	if pol.UserGroupID != "" {
-		if rg, rp, ugErr := resolveUserGroupRoute(r.Context(), s.store, pol, r, raw); ugErr == nil {
-			if rg != "" {
-				pol.Group = rg
-			}
-			if rp != "" && rp != "auto" {
-				pol.ProviderHint = rp
-				allowedProviders, routeMode, err = s.resolveClaudeProviders(r.Context(), r, pol)
-				if err != nil {
-					writeError(w, http.StatusBadRequest, err)
-					return
-				}
-			}
-		}
 	}
 	affinity := namespaceClaudeAffinity(s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, requestedModel.RequestedModel), routeMode, requestedModel.ContextMode)
 	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
@@ -659,7 +691,17 @@ claudeSuccess:
 			}
 			streamCtx = withResponseRuleFilter(streamCtx, rf)
 		}
-		if err := s.streamSSE(streamCtx, w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash); err != nil {
+		streamErr := s.streamSSE(streamCtx, w, streamBody, result.Scrubber, "claude", lease.Account.ID, affinity.Hash)
+		if errors.Is(streamErr, errUpstreamStreamStalled) {
+			_ = resp.Body.Close()
+			streamErr = nil
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+				AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+				Action: "goal_stream_stall_detected", State: "recovering",
+				Reason: "upstream_idle_without_terminal", Detail: "claude old stream cancelled before continuation",
+			})
+		}
+		if streamErr != nil {
 			_ = s.settleBillingHold(r.Context(), holdID, "stream_interrupted_compensated")
 			if synthErr := closeClaudeStreamGracefully(w, continueTap.openBlock, continueTap.openBlockIndex); synthErr != nil {
 				log.Printf("[GOAL-STREAM] claude interrupted terminal synthesis failed request_id=%s: %v", requestIDFromContext(r.Context()), synthErr)
@@ -668,7 +710,7 @@ claudeSuccess:
 			s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "upstream_stream_error")
 		} else {
 			s.persistClaudeItemAliases(r.Context(), raw, aliasCapture.Bytes(), lease, model)
-			if continueTap.reachedTerminal() {
+			if continueTap.completedSuccessfully() {
 				if response := goalResponseFromSSE(aliasCapture.Bytes()); len(response) > 0 {
 					if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
 						log.Printf("[GOAL-CONTINUITY] claude stream persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
@@ -685,6 +727,8 @@ claudeSuccess:
 				// message_stop is a closed upstream stream; v2 retries it once with the
 				// same account and full self-contained history before emitting an error.
 				if s.goalContinuityEnabled(r.Context()) || s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
+					var continuationCapture bytes.Buffer
+					sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), result.Scrubber, "claude")
 					reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
 						creq := requestForToken(token)
 						creq.Body = cbody
@@ -698,16 +742,24 @@ claudeSuccess:
 							}
 							return nil, fmt.Errorf("claude continuation upstream status %d", cresp.StatusCode)
 						}
-						return cresp.Body, nil
+						return newUpstreamActivityReadCloser(
+							cctx,
+							cresp.Body,
+							s.streamStallRecoveryInterval(cctx),
+							s.streamKeepAliveInterval(cctx),
+							func() error {
+								_, err := io.WriteString(sw, heartbeatFrameFor("claude"))
+								sw.Flush()
+								return err
+							},
+						), nil
 					}
-					var continuationCapture bytes.Buffer
-					sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), result.Scrubber, "claude")
 					continuation, acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue, &continuationCapture)
 					if acErr != nil {
 						log.Printf("[AUTO-CONTINUE] claude request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
 						_ = closeClaudeStreamGracefully(sw, continueTap.openBlock, continueTap.openBlockIndex)
 						s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "continuation_unavailable")
-					} else if continuation != nil && continuation.reachedTerminal() {
+					} else if continuation != nil && continuation.completedSuccessfully() {
 						mergedFrames := append(append([]byte(nil), aliasCapture.Bytes()...), continuationCapture.Bytes()...)
 						s.persistClaudeItemAliases(r.Context(), raw, mergedFrames, lease, model)
 						if response := goalResponseFromSSE(mergedFrames); len(response) > 0 {

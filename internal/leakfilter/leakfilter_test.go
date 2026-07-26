@@ -66,8 +66,8 @@ func TestNeutralizeErrorBodyCodexUsageLimit(t *testing.T) {
 	if !changed {
 		t.Fatal("expected neutralization")
 	}
-	if status != 429 {
-		t.Fatalf("expected 429, got %d", status)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", status)
 	}
 	low := strings.ToLower(string(out))
 	for _, leak := range []string{"usage limit", "switch to another model", "resets_at", "plan_type", "pro"} {
@@ -75,8 +75,8 @@ func TestNeutralizeErrorBodyCodexUsageLimit(t *testing.T) {
 			t.Fatalf("neutralized body still leaks %q: %s", leak, out)
 		}
 	}
-	if !strings.Contains(low, "rate_limit_exceeded") {
-		t.Fatalf("expected generic rate_limit_exceeded type, got %s", out)
+	if !strings.Contains(low, "server_error") || !strings.Contains(string(out), responsesPublicRetryMessage) {
+		t.Fatalf("expected generic server error, got %s", out)
 	}
 }
 
@@ -89,7 +89,7 @@ func TestNeutralizeErrorBodyClaudeOverloaded(t *testing.T) {
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", status)
 	}
-	if !strings.Contains(string(out), `"overloaded_error"`) || !strings.Contains(string(out), `"type":"error"`) {
+	if !strings.Contains(string(out), `"type":"api_error"`) || !strings.Contains(string(out), responsesPublicRetryMessage) || strings.Contains(string(out), "overloaded_error") {
 		t.Fatalf("expected anthropic error envelope, got %s", out)
 	}
 }
@@ -155,11 +155,16 @@ func TestSSEFilterDropsCodexRateLimitFrames(t *testing.T) {
 	}
 }
 
-func TestSSEFilterDropsResponseFailedLimit(t *testing.T) {
+func TestSSEFilterNeutralizesResponseFailedLimit(t *testing.T) {
 	stream := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"You've hit your usage limit.\"}}}\n\n"
 	got := runSSE(t, "codex", stream, 5)
-	if strings.TrimSpace(got) != "" {
-		t.Fatalf("limit response.failed frame should be dropped, got %q", got)
+	if !strings.Contains(got, "event: response.failed") || !strings.Contains(got, `"code":"server_error"`) {
+		t.Fatalf("limit response.failed frame was not neutralized: %q", got)
+	}
+	for _, leak := range []string{"rate_limit_exceeded", "usage limit"} {
+		if strings.Contains(strings.ToLower(got), leak) {
+			t.Fatalf("neutralized terminal leaked %q: %s", leak, got)
+		}
 	}
 }
 
@@ -180,8 +185,43 @@ func TestRetryableCodexFailureFrameAcceptsWebSocketUsageLimitError(t *testing.T)
 		t.Fatalf("failure body = %s", failure.Body)
 	}
 	got := runSSE(t, "codex", string(frame), 7)
-	if strings.TrimSpace(got) != "" {
-		t.Fatalf("retryable WebSocket error frame should be filtered, got %q", got)
+	if !strings.Contains(got, "response.failed") || !strings.Contains(got, `"code":"server_error"`) || strings.Contains(got, "usage_limit_reached") {
+		t.Fatalf("retryable WebSocket error was not safely terminated: %q", got)
+	}
+}
+
+func TestRetryableCodexFailureFrameAcceptsResponseError(t *testing.T) {
+	frame := []byte("event: response.error\n" +
+		`data: {"type":"response.error","error":{"type":"server_error","message":"session blocked by risk control"},"status_code":503}` + "\n\n")
+	failure, ok := ParseRetryableCodexFailureFrame(frame)
+	if !ok || failure.EventType != "response.error" || failure.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("response.error failure = %+v ok=%v", failure, ok)
+	}
+	if got := runSSE(t, "codex", string(frame), 3); !strings.Contains(got, "response.failed") || strings.Contains(got, "risk control") {
+		t.Fatalf("retryable response.error frame was not safely terminated: %q", got)
+	}
+}
+
+func TestSSEFilterDoesNotDropAssistantModelSwitchText(t *testing.T) {
+	stream := "event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"You can switch to another model manually."}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_text","status":"completed"}}` + "\n\n"
+	got := runSSE(t, "codex", stream, 1)
+	if !strings.Contains(got, "switch to another model") || !strings.Contains(got, "response.completed") {
+		t.Fatalf("ordinary assistant text was removed: %s", got)
+	}
+}
+
+func TestSSEFilterNeutralizesContextFailureAsResponsesTerminal(t *testing.T) {
+	frame := "event: error\r\n" +
+		`data: {"type":"error","status":400,"error":{"type":"previous_response_not_found","message":"Previous response resp_private was not found."}}` + "\r\n\r\n"
+	got := runSSE(t, "codex", frame, 1)
+	if !strings.Contains(got, "event: response.failed") || !strings.Contains(got, `"code":"server_error"`) {
+		t.Fatalf("context error did not become a Responses terminal: %q", got)
+	}
+	if strings.Contains(got, "previous_response_not_found") || strings.Contains(got, "resp_private") {
+		t.Fatalf("context details leaked in terminal: %q", got)
 	}
 }
 
@@ -219,6 +259,7 @@ func TestRetryableCodexFailureFrameAcceptsWrappedOrphanStatusAndStatusCode(t *te
 	}{
 		{name: "http_sse_status", event: "response.failed", typ: "response.failed", field: "status"},
 		{name: "websocket_status_code", event: "error", typ: "error", field: "status_code"},
+		{name: "websocket_response_error", event: "response.error", typ: "response.error", field: "status_code"},
 	} {
 		payload, _ := json.Marshal(map[string]interface{}{
 			"type":   tc.typ,
@@ -242,6 +283,7 @@ func TestRetryableCodexFailureFrameAcceptsPreviousResponseNotFoundStatusFields(t
 	}{
 		{name: "http_sse_status", event: "response.failed", typ: "response.failed", field: "status"},
 		{name: "websocket_status_code", event: "error", typ: "error", field: "status_code"},
+		{name: "websocket_response_error", event: "response.error", typ: "response.error", field: "status_code"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inner, _ := json.Marshal(map[string]interface{}{
@@ -346,7 +388,9 @@ func TestResponsesContextErrorNeutralizationNeverLeaksObservedWrapper(t *testing
 			t.Fatalf("neutralized SSE frame leaked %q: %s", leak, neutralFrame)
 		}
 	}
-	if !bytes.Contains(neutralFrame, []byte(`"status":503`)) || !bytes.Contains(neutralFrame, []byte(`"type":"server_error"`)) {
+	if !bytes.Contains(neutralFrame, []byte(`event: response.failed`)) ||
+		!bytes.Contains(neutralFrame, []byte(`"status":"failed"`)) ||
+		!bytes.Contains(neutralFrame, []byte(`"code":"server_error"`)) {
 		t.Fatalf("neutralized SSE frame is not a stable terminal error: %s", neutralFrame)
 	}
 	filtered := runSSE(t, "codex", string(frame), 7)
@@ -443,8 +487,8 @@ func TestSSEFilterNeutralizesClaudeError(t *testing.T) {
 				t.Fatalf("step=%d: neutralized error still leaks %q: %s", step, leak, got)
 			}
 		}
-		if !strings.Contains(got, "rate_limit_error") {
-			t.Fatalf("step=%d: expected generic rate_limit_error type, got %s", step, got)
+		if !strings.Contains(got, `"type":"api_error"`) || !strings.Contains(got, responsesPublicRetryMessage) || strings.Contains(got, "rate_limit_error") {
+			t.Fatalf("step=%d: expected generic api_error type, got %s", step, got)
 		}
 	}
 }
@@ -464,6 +508,9 @@ func TestSSEFilterDropsModelSwitchSuggestion(t *testing.T) {
 	got := runSSE(t, "codex", stream, 11)
 	if strings.Contains(strings.ToLower(got), "switch to another model") {
 		t.Fatalf("model-switch suggestion leaked: %s", got)
+	}
+	if !strings.Contains(got, "response.failed") || !strings.Contains(got, `"code":"server_error"`) {
+		t.Fatalf("model-switch error lost its terminal: %s", got)
 	}
 }
 
@@ -492,13 +539,17 @@ func TestSSEFilterDropsServerOverloaded(t *testing.T) {
 				t.Fatalf("step=%d: server-overload suggestion leaked %q: %s", step, leak, got)
 			}
 		}
+		if !strings.Contains(got, "response.failed") || !strings.Contains(got, `"code":"server_error"`) {
+			t.Fatalf("step=%d: server-overload error lost its terminal: %s", step, got)
+		}
 	}
 }
 
 func TestSSEFilterDropsSlowDown(t *testing.T) {
 	stream := "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"slow_down\",\"message\":\"Please slow down.\"}}}\n\n"
-	if got := strings.TrimSpace(runSSE(t, "codex", stream, 7)); got != "" {
-		t.Fatalf("slow_down response.failed should be dropped, got %q", got)
+	got := runSSE(t, "codex", stream, 7)
+	if !strings.Contains(got, "response.failed") || !strings.Contains(got, `"code":"server_error"`) || strings.Contains(got, "slow_down") {
+		t.Fatalf("slow_down response.failed was not safely terminated: %q", got)
 	}
 }
 

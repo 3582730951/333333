@@ -97,7 +97,7 @@ func startSchedulerWaitKeepalive(ctx context.Context, interval time.Duration) fu
 		<-done
 	}
 }
-func schedulerWaitTerminal(ctx context.Context, message string) bool {
+func schedulerWaitTerminal(ctx context.Context, _ string) bool {
 	state, _ := ctx.Value(schedulerWaitKey{}).(*schedulerWaitState)
 	if state == nil {
 		return false
@@ -107,9 +107,9 @@ func schedulerWaitTerminal(ctx context.Context, message string) bool {
 	if !state.committed {
 		return false
 	}
-	data, _ := json.Marshal(map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": message}})
+	data, _ := json.Marshal(map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": publicRetryMessage}})
 	if state.protocol == "openai" {
-		data, _ = json.Marshal(map[string]interface{}{"error": map[string]interface{}{"type": "server_error", "message": message}})
+		data, _ = json.Marshal(map[string]interface{}{"error": map[string]interface{}{"type": "server_error", "message": publicRetryMessage}})
 	}
 	_, _ = fmt.Fprintf(state.w, "event: error\ndata: %s\n\n", data)
 	if state.protocol == "openai" {

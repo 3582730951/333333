@@ -11,7 +11,10 @@ import { fmtTokens, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { useResetUsageCacheMutation, useUsageDashboardData } from '../features/observability/queries/usage';
-import type { UsageMetricRow, UsageRange } from '../features/observability/model/usage';
+import {
+  reportedCacheMetric, usageDimensionKey, usageDisplayLabel,
+  type UsageMetricRow, type UsageRange,
+} from '../features/observability/model/usage';
 
 const { Button, ConfirmDialog, Select, Toast } = PoolUI as any;
 const DataTable = ResourceTable as any;
@@ -84,11 +87,11 @@ function fmtOffset(seconds: unknown) {
 }
 
 function modelKey(row: UsageMetricRow) {
-  return row?.model_key || row?.series_key || row?.model || '__unknown__';
+  return usageDimensionKey(row);
 }
 
 function modelLabel(row: UsageMetricRow) {
-  return row?.model_label || row?.series_label || row?.model || `(${t('usage.unknown_model')})`;
+  return usageDisplayLabel(row, `(${t('usage.unknown_model')})`);
 }
 
 function mobileDiagnosticRenderer(columns: any[], titleForRow?: (row: UsageMetricRow) => ReactNode) {
@@ -116,11 +119,11 @@ function mobileDiagnosticRenderer(columns: any[], titleForRow?: (row: UsageMetri
 export default function Usage() {
   const [range, setRange] = useState<UsageRange>('today');
   const [resetOpen, setResetOpen] = useState(false);
-  const [trendMode, setTrendMode] = useState('model');
+  const [trendMode, setTrendMode] = useState('provider_model');
   const [cacheMetric, setCacheMetric] = useState('cache_read_tokens');
   const [selectedCacheModels, setSelectedCacheModels] = useState<string[]>([]);
   const [hoveredModel, setHoveredModel] = useState<any>(null);
-  const [activeDiagnostic, setActiveDiagnostic] = useState('apiKey');
+  const [activeDiagnostic, setActiveDiagnostic] = useState('providerModel');
 
   const { data, loading, error, lastRefresh, reload: load } = useUsageDashboardData(range);
   const resetMutation = useResetUsageCacheMutation();
@@ -144,6 +147,8 @@ export default function Usage() {
   const cacheByKey = cache.by_api_key || [];
   const cacheByAccountModel = cache.by_account_model || [];
   const cacheByProvider = cache.by_provider || [];
+  const cacheByProviderModel = cache.by_provider_model || [];
+  const officialProviderModelCache = cacheByProviderModel.filter((row) => String(row.provider || '').toLowerCase() !== 'kiro');
   const cacheByRoute = cache.by_route || [];
   const cacheByRouteAccountModel = cache.by_route_account_model || [];
   const cacheByTimeBucket = cache.by_time_bucket || [];
@@ -158,21 +163,35 @@ export default function Usage() {
   const fallbackCacheRead = ts.reduce((s, b) => s + (b.cache_read_tokens || 0), 0);
   const fallbackCacheCreation = ts.reduce((s, b) => s + (b.cache_creation_tokens || 0), 0);
   const fallbackCacheInput = ts.reduce((s, b) => s + (b.cache_input_tokens ?? b.prompt_tokens ?? 0), 0);
-  const cacheRead = cacheSummary.cache_read_tokens ?? fallbackCacheRead;
-  const cacheCreation = cacheSummary.cache_creation_tokens ?? fallbackCacheCreation;
-  const promptForCache = cacheSummary.cache_input_tokens ?? cacheSummary.prompt_tokens ?? fallbackCacheInput;
-  const cacheMiss = cacheSummary.cache_miss_tokens ?? Math.max(0, promptForCache - cacheRead);
-  const cacheRate = cacheSummary.token_hit_rate ?? (promptForCache ? cacheRead / promptForCache : 0);
-  const realTokenHitRate = stableCacheSummary.real_token_hit_rate ?? stableCacheSummary.token_hit_rate ?? cacheRate;
-  const cacheCreationReported = Number(cacheSummary.cache_creation_reported_requests || 0) > 0;
+  const officialCacheRows = cacheByProvider.filter((row) => String(row.provider || '').toLowerCase() !== 'kiro');
+  const officialCacheAvailable = officialCacheRows.length > 0;
+  const sumOfficial = (key: keyof UsageMetricRow) => officialCacheRows.reduce((sum, row) => sum + Number(row[key] || 0), 0);
+  const cacheRead = officialCacheAvailable ? sumOfficial('cache_read_tokens') : (cacheSummary.cache_read_tokens ?? fallbackCacheRead);
+  const cacheCreation = officialCacheAvailable ? sumOfficial('cache_creation_tokens') : (cacheSummary.cache_creation_tokens ?? fallbackCacheCreation);
+  const promptForCache = officialCacheAvailable ? sumOfficial('cache_input_tokens') : (cacheSummary.cache_input_tokens ?? cacheSummary.prompt_tokens ?? fallbackCacheInput);
+  const cacheMiss = officialCacheAvailable ? Math.max(0, promptForCache - cacheRead) : (cacheSummary.cache_miss_tokens ?? Math.max(0, promptForCache - cacheRead));
+  const cacheRate = promptForCache ? cacheRead / promptForCache : 0;
+  const officialRealInput = officialCacheAvailable ? sumOfficial('cache_input_tokens') : 0;
+  const officialRealRead = officialCacheAvailable ? sumOfficial('cache_read_tokens') : 0;
+  const realTokenHitRate = officialCacheAvailable && officialRealInput > 0
+    ? officialRealRead / officialRealInput
+    : (stableCacheSummary.real_token_hit_rate ?? stableCacheSummary.token_hit_rate ?? cacheRate);
+  const cacheCreationReported = officialCacheAvailable
+    ? sumOfficial('cache_creation_reported_requests') > 0
+    : Number(cacheSummary.cache_creation_reported_requests || 0) > 0;
   const eligibleHitRate = cacheCreationReported ? (cacheSummary.eligible_cache_hit_rate ?? (cacheRead + cacheCreation > 0 ? cacheRead / (cacheRead + cacheCreation) : 0)) : null;
   const cacheWriteShare = cacheCreationReported ? (cacheSummary.cache_write_share ?? (promptForCache ? cacheCreation / promptForCache : 0)) : null;
-  const requestHitRate = stableCacheSummary.request_hit_rate ?? 0;
-  const kiroCredits = Number(cacheSummary.kiro_credits || 0);
+  const officialRealRequests = officialCacheAvailable ? sumOfficial('real_requests') : 0;
+  const officialHitRequests = officialCacheAvailable ? sumOfficial('hit_requests') : 0;
+  const requestHitRate = officialRealRequests > 0 ? officialHitRequests / officialRealRequests : (stableCacheSummary.request_hit_rate ?? 0);
+  const kiroCache = cacheByProvider.find((row) => String(row.provider || '').toLowerCase() === 'kiro');
+  const kiroUnreported = kiroCache?.cache_reporting_state === 'unreported';
+  const kiroCreditsReported = Number(kiroCache?.kiro_credits_reported_requests || 0) > 0;
+  const kiroCredits = Number(kiroCache?.kiro_credits || 0);
   const cachedPct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheRead / promptForCache) * 100))) : 0;
   const cacheWritePct = promptForCache > 0 ? Math.max(0, Math.min(100, Math.round((cacheCreation / promptForCache) * 100))) : 0;
   const missedPct = promptForCache > 0 ? Math.max(0, 100 - cachedPct - cacheWritePct) : 0;
-  const cacheCompositionSegments = (cache.by_model || []).slice(0, 8).map((m) => ({
+  const cacheCompositionSegments = (officialProviderModelCache.length ? officialProviderModelCache : cache.by_model || []).slice(0, 8).map((m) => ({
     key: modelKey(m),
     label: modelLabel(m),
     color: modelColor(modelKey(m)),
@@ -185,20 +204,25 @@ export default function Usage() {
     total_tokens: m.total_tokens,
   }));
   const cacheSegmentTotal = cacheCompositionSegments.reduce((s, m) => s + m.read, 0);
-  const selectedKeySet = new Set(selectedCacheModels.length ? selectedCacheModels : series.map((s) => s.series_key));
+  const cacheSeries = series.filter((descriptor) => descriptor.provider_type !== 'kiro' && descriptor.provider_id !== 'kiro');
+  const cacheSeriesKeys = new Set(cacheSeries.map((descriptor) => descriptor.series_key));
+  const cacheModelSeries = modelSeries.filter((row) => cacheSeriesKeys.has(String(row.series_key || '')));
+  const selectedKeySet = new Set(selectedCacheModels.length ? selectedCacheModels : cacheSeries.map((descriptor) => descriptor.series_key));
   const hasModelTrend = modelSeries.length > 0 && series.length > 0;
+  const hasCacheModelTrend = cacheModelSeries.length > 0 && cacheSeries.length > 0;
 
   const toggleCacheModel = (key: string) => {
-    const all = series.map((s) => s.series_key);
+    const all = cacheSeries.map((s) => s.series_key);
     const base = selectedCacheModels.length ? selectedCacheModels : all;
     const next = base.includes(key) ? base.filter((x) => x !== key) : [...base, key];
     setSelectedCacheModels(next.length ? next : all);
   };
 
-  const topAccts = [...rows].sort((a, b) => (b.total_tokens || 0) - (a.total_tokens || 0)).slice(0, 10)
-    .map((a) => ({ x: (a.label || a.account_id || '').slice(0, 10), input: a.prompt_tokens || 0, output: a.completion_tokens || 0 }));
+  const topAccts = [...rows].sort((a, b) => Number(b.combined_total_tokens ?? b.total_tokens ?? 0) - Number(a.combined_total_tokens ?? a.total_tokens ?? 0)).slice(0, 10)
+    .map((a) => ({ x: (a.label || a.account_id || '').slice(0, 10), input: Number(a.actual_prompt_tokens ?? a.prompt_tokens ?? 0), output: Number(a.actual_completion_tokens ?? a.completion_tokens ?? 0) }));
   const hasTopAccts = topAccts.some((item) => item.input || item.output);
-  const hasModelCacheBars = byModel.some((item) => (item.cache_input_tokens || item.prompt_tokens || 0) > 0);
+  const officialByModel = byModel.filter((item) => item.provider_type !== 'kiro' && item.provider_id !== 'kiro');
+  const hasModelCacheBars = officialByModel.some((item) => (item.cache_input_tokens || item.prompt_tokens || 0) > 0);
 
   const exportCSV = () => {
     const ok = downloadCSV('usage-by-account.csv', toCSV(rows, [
@@ -262,6 +286,27 @@ export default function Usage() {
     { title: t('usage.cache_miss'), dataIndex: 'cache_miss_tokens', sorter: (a, b) => (a.cache_miss_tokens || 0) - (b.cache_miss_tokens || 0), render: fmtTokens },
   ];
 
+  const providerModelCols: UsageColumn[] = [
+    { title: 'Provider', dataIndex: 'provider', render: (value) => textOrDash(value) },
+    { title: t('usage.model'), dataIndex: 'model', render: (_, row) => row.model_label || row.model || t('usage.unknown_model') },
+    { title: t('usage.request_unit'), dataIndex: 'requests', render: fmtInt },
+    { title: t('usage.total_tokens'), dataIndex: 'combined_total_tokens', render: fmtTokens },
+    { title: '缓存单位', key: 'cache_unit', render: (_, row) => String(row.provider || '').toLowerCase() === 'kiro' ? 'cache point / credit' : 'Token' },
+    {
+      title: t('usage.cache_read'), dataIndex: 'cache_read_tokens',
+      render: (value, row) => reportedCacheMetric(row, value, t('usage.upstream_unreported'), fmtTokens),
+    },
+    {
+      title: t('usage.cache_write'), dataIndex: 'cache_creation_tokens',
+      render: (value, row) => reportedCacheMetric(row, value, t('usage.upstream_unreported'), fmtTokens),
+    },
+    {
+      title: t('usage.real_token_hit'), dataIndex: 'real_token_hit_rate',
+      render: (value, row) => String(row.provider || '').toLowerCase() === 'kiro' || row.cache_reporting_state === 'unreported' ? '—' : fmtOptionalPct(value),
+    },
+    { title: 'Credits', dataIndex: 'kiro_credits', render: (value, row) => Number(row.kiro_credits_reported_requests || 0) > 0 ? Number(value || 0).toFixed(2) : (String(row.provider || '').toLowerCase() === 'kiro' ? t('usage.upstream_unreported') : '—') },
+  ];
+
   const cacheRouteCols: UsageColumn[] = [
     { title: t('usage.route'), dataIndex: 'route_key_hash_prefix', width: 130, render: (v) => v || t('usage.unattributed') },
     { title: t('usage.route_type'), dataIndex: 'route_class', width: 130, render: textOrDash },
@@ -320,6 +365,7 @@ export default function Usage() {
   ].join(':');
 
   const diagnosticTabs: DiagnosticTab[] = [
+    { key: 'providerModel', label: t('usage.by_provider_model'), title: t('usage.provider_model_diagnostic'), data: cacheByProviderModel, columns: providerModelCols, rowKey: (row) => `${row.provider || 'unknown'}:${row.model_key || row.model || 'unknown'}`, minScrollX: 1000, mobileTitle: (row) => modelLabel(row) },
     { key: 'apiKey', label: 'API Key', title: t('usage.api_key_diagnostic'), data: cacheByKey, columns: cacheKeyCols, rowKey: (r) => r.api_key_hash_prefix || 'none', minScrollX: 1080, mobileTitle: (r) => r.api_key_hash_prefix || t('usage.unattributed') },
     { key: 'accountModel', label: t('usage.account_model'), title: t('usage.account_model_diagnostic'), data: cacheByAccountModel, columns: cacheAccountModelCols, rowKey: (r) => `${r.account_id || 'none'}:${r.model || 'unknown'}`, minScrollX: 1180, mobileTitle: (r) => `${r.account_id || t('usage.unattributed')} · ${r.model || 'unknown'}` },
     { key: 'provider', label: 'Provider', title: 'Provider / Kiro 用量诊断', data: cacheByProvider, columns: [
@@ -374,13 +420,21 @@ export default function Usage() {
         <MetricCard label="估算请求" value={fmtInt(estimatedReqs)} color={C.amber} />
         <MetricCard label="稳定请求命中率" value={fmtPct(requestHitRate)} color={C.green} />
         <MetricCard label="稳定 Token 命中率" value={fmtPct(realTokenHitRate)} color={C.cyan} />
-        <MetricCard label="Kiro credits" value={kiroCredits.toFixed(2)} color={C.teal} />
+        <MetricCard label="缓存统计口径" value="官方 Token" sub="不包含 Kiro cache point / credit" color={C.teal} />
       </div>
+
+      {kiroCache ? (
+        <div className="pool-stat-grid pool-kiro-stat-grid" style={{ marginBottom: 18 }}>
+          <MetricCard label="Kiro credits" value={kiroCreditsReported ? kiroCredits.toFixed(2) : t('usage.upstream_unreported')} sub="单位：credit" color={C.teal} />
+          <MetricCard label="Kiro cache points" value={kiroUnreported ? t('usage.upstream_unreported') : fmtInt(kiroCache.cache_control_injected || 0)} sub="单位：cache point" color={C.violet} />
+          <MetricCard label="Kiro verified reuse" value={kiroUnreported ? t('usage.upstream_unreported') : fmtInt(kiroCache.cache_hit_after_prewarm || 0)} sub="单位：request" color={C.green} />
+        </div>
+      ) : null}
 
       <div className="pool-cache-breakdown" style={{ marginBottom: 18 }}>
         <div className="pool-cache-breakdown__head">
           <div>
-            <div className="pool-section-title">{t('usage.cache_composition')}</div>
+            <div className="pool-section-title">{t('usage.cache_composition')} · Token</div>
             <div className="pool-text-tertiary">{t('usage.cache_composition_desc')}</div>
           </div>
           <b>{fmtPct(cacheRate)}</b>
@@ -428,25 +482,25 @@ export default function Usage() {
         <div className="head">
           <div><div className="t">{t('usage.trend')}</div><div className="s">{t('usage.trend_desc')}</div></div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <Button size="small" theme={trendMode === 'model' ? 'solid' : 'outline'} onClick={() => setTrendMode('model')}>{t('usage.by_model')}</Button>
+            <Button size="small" theme={trendMode === 'provider_model' ? 'solid' : 'outline'} onClick={() => setTrendMode('provider_model')}>{t('usage.by_provider_model')}</Button>
             <Button size="small" theme={trendMode === 'type' ? 'solid' : 'outline'} onClick={() => setTrendMode('type')}>{t('usage.by_type')}</Button>
           </div>
         </div>
         <div style={{ height: 280 }}>
-          {trendMode === 'model' && hasModelTrend
-            ? <ModelAreaChart modelSeries={modelSeries} series={series} height={280} selectedKeys={selectedKeySet} />
+          {trendMode === 'provider_model' && hasModelTrend
+            ? <ModelAreaChart modelSeries={modelSeries} series={series} height={280} />
             : <AreaChart buckets={ts} height={280} />}
         </div>
       </div>
 
-      {hasModelTrend ? (
+      {hasCacheModelTrend ? (
         <div className="pool-chart-card" style={{ marginBottom: 18 }}>
           <div className="head">
             <div><div className="t">{t('usage.model_cache_trend')}</div><div className="s">{t('usage.model_cache_trend_desc')}</div></div>
             <Select aria-label={t('usage.cache_metric')} value={cacheMetric} onChange={(value: string) => setCacheMetric(value)} optionList={CACHE_METRICS.map((item) => ({ label: t(item.labelKey), value: item.value }))} style={{ width: 130 }} />
           </div>
           <div className="pool-model-toggle-row">
-            {series.map((s) => {
+            {cacheSeries.map((s) => {
               const active = selectedKeySet.has(s.series_key);
               const color = modelColor(s.series_key);
               return (
@@ -458,7 +512,7 @@ export default function Usage() {
             })}
           </div>
           <div style={{ height: 260 }}>
-            <ModelAreaChart modelSeries={modelSeries} series={series} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} />
+            <ModelAreaChart modelSeries={cacheModelSeries} series={cacheSeries} height={260} metric={cacheMetric} selectedKeys={selectedKeySet} />
           </div>
         </div>
       ) : null}
@@ -473,7 +527,7 @@ export default function Usage() {
           {hasModelCacheBars ? (
             <div className="pool-chart-card">
               <div className="head"><div><div className="t">{t('usage.model_cache_rate')}</div><div className="s">{t('usage.model_cache_rate_desc')}</div></div></div>
-              <div style={{ paddingTop: 6 }}><CacheBars data={byModel} /></div>
+              <div style={{ paddingTop: 6 }}><CacheBars data={officialByModel} /></div>
             </div>
           ) : null}
         </div>

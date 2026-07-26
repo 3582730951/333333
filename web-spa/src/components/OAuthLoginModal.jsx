@@ -16,25 +16,6 @@ import { openExternalURL } from '../lib/browserNavigation.js';
 
 const { Text } = Typography;
 
-function egressOptionList(profiles = []) {
-  const out = [];
-  const seen = new Set();
-  const add = (profile) => {
-    const id = String(profile?.id || '').trim();
-    if (!id || seen.has(id)) return;
-    seen.add(id);
-    out.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
-  };
-  add({ id: 'egress_direct', name: 'egress_direct', type: 'direct' });
-  for (const profile of profiles || []) add(profile);
-  return out;
-}
-
-function normalizeEgressResponse(data) {
-  if (Array.isArray(data)) return data;
-  return data?.profiles || data?.egress_profiles || [];
-}
-
 // OAuthLoginModal - 新版账号导入弹窗，支持：
 // 1. ChatGPT/Codex OAuth 授权登录
 // 2. Claude OAuth 授权登录
@@ -60,8 +41,6 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [providerApiKey, setProviderApiKey] = useState('');
   const [confirmProviderCost, setConfirmProviderCost] = useState(false);
   const [providerKeyResult, setProviderKeyResult] = useState(null);
-  const [egressId, setEgressId] = useState('egress_direct');
-  const [egressProfiles, setEgressProfiles] = useState([]);
   const [groups, setGroups] = useState([]);
   const countdownRef = useRef(null);
   const copyResetRef = useRef(null);
@@ -72,11 +51,14 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [label, setLabel] = useState('');
   const [groupName, setGroupName] = useState('');
   const [note, setNote] = useState('');
-  const egressOptions = useMemo(() => egressOptionList(egressProfiles), [egressProfiles]);
   const groupOptions = useMemo(() => {
-    const opts = [{ label: '留空使用默认分组', value: '' }];
+    const opts = [];
+    const seen = new Set();
     for (const g of groups) {
-      opts.push({ label: g.name || g, value: g.name || g });
+      const name = typeof g === 'string' ? g.trim() : String(g?.name || '').trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      opts.push({ label: name, value: name });
     }
     return opts;
   }, [groups]);
@@ -84,13 +66,9 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   useEffect(() => {
     if (!isVisible) return undefined;
     let cancelled = false;
-    Promise.all([
-      get('/admin/egress-profiles'),
-      get('/admin/groups'),
-    ])
-      .then(([egressData, groupsData]) => {
+    get('/admin/groups')
+      .then((groupsData) => {
         if (!cancelled) {
-          setEgressProfiles(normalizeEgressResponse(egressData));
           setGroups(Array.isArray(groupsData) ? groupsData : groupsData?.groups || []);
         }
       })
@@ -151,7 +129,6 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setLabel('');
     setGroupName('');
     setNote('');
-    setEgressId('egress_direct');
     setCountdown(0);
     clearBrowserInterval(countdownRef.current);
     clearBrowserTimeout(copyResetRef.current);
@@ -213,7 +190,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     try {
       // Kiro 和 Antigravity 自动使用对应的分组
       const finalGroupName = tab === 'antigravity' ? 'antigravity' : groupName;
-      const result = await oauthComplete(sessionId, val, label, finalGroupName, egressId);
+      const result = await oauthComplete(sessionId, val, label, finalGroupName);
       if (actionEpoch !== actionEpochRef.current) return;
       Toast.success({
         content: (
@@ -244,7 +221,6 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         label,
         note,
         group_name: groupName,
-        egress_id: egressId,
         auth_json_text: val,
       });
       if (actionEpoch !== actionEpochRef.current) return;
@@ -290,7 +266,6 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         kiro_client_json_text: kiroClientRaw,
         label,
         group_name: 'kiro', // claude-opus-4-8 自动使用 kiro 分组
-        egress_id: egressId,
       }, { timeout: 120000 });
       setKiroResult(result);
       if (result.imported > 0) {
@@ -305,7 +280,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     try {
       const result = await post('/admin/accounts/import-kiro-api-key', {
         kiro_api_key: kiroApiKey.trim(), label, group_name: 'kiro', // Kiro 自动使用 kiro 分组
-        egress_id: egressId, api_region: kiroApiRegion.trim(),
+        api_region: kiroApiRegion.trim(),
       }, { timeout: 120000 });
       Toast.success(`Kiro API Key 账号 ${result.label || result.id} 已导入并验活`);
       handleClose();
@@ -323,7 +298,6 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         api_key: providerApiKey.trim(),
         label,
         group_name: groupName,
-        egress_id: egressId,
         confirm_cost: true,
       }, { timeout: 120000 });
       setProviderKeyResult(result);
@@ -395,14 +369,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
           />
         </Form.Slot>
 
-        <Form.Slot label="账号默认出口">
-          <Select
-            value={egressId}
-            onChange={setEgressId}
-            optionList={egressOptions}
-            placeholder="选择默认出口"
-          />
-        </Form.Slot>
+        <Text type="tertiary" as="p">出口在请求时动态继承账号池分组：首项为主出口，其余按顺序备用，不复制到账号记录。</Text>
 
         <Divider margin="16px 0" />
 
@@ -472,7 +439,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       </div>
       <Form>
         <Form.Slot label="标签 (可选)"><Input value={label} onChange={setLabel} placeholder="批量导入时会自动追加序号" /></Form.Slot>
-        <Form.Slot label="账号默认出口"><Select value={egressId} onChange={setEgressId} optionList={egressOptions} /></Form.Slot>
+        <Text type="tertiary" as="p">Kiro 账号动态继承 Kiro 账号池分组的有序出口。</Text>
       </Form>
       <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
         <Button type={kiroImportMode === 'api_key' ? 'primary' : 'tertiary'} onClick={() => setKiroImportMode('api_key')}>API Key</Button>
@@ -581,14 +548,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               </Form.Slot>
             )}
 
-            <Form.Slot label="账号默认出口">
-              <Select
-                value={egressId}
-                onChange={setEgressId}
-                optionList={egressOptions}
-                placeholder="选择默认出口"
-              />
-            </Form.Slot>
+            <Text type="tertiary" as="p">账号不会保存出口副本；请求时动态继承所选账号池分组的主出口与备用出口。</Text>
           </Form>
 
           {authMode === 'api_key' ? (

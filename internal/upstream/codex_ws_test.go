@@ -234,41 +234,45 @@ func TestCodexWebSocketClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T
 }
 
 func TestCodexResponsesWebSocketTerminalErrorFrameClosesCleanly(t *testing.T) {
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Fatalf("upgrade: %v", err)
-		}
-		defer conn.Close()
-		if _, _, err := conn.ReadMessage(); err != nil {
-			t.Fatalf("read request: %v", err)
-		}
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","error":{"message":"invalid cache request"}}`))
-	}))
-	defer server.Close()
+	for _, eventType := range []string{"error", "response.error"} {
+		t.Run(eventType, func(t *testing.T) {
+			upgrader := websocket.Upgrader{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					t.Fatalf("upgrade: %v", err)
+				}
+				defer conn.Close()
+				if _, _, err := conn.ReadMessage(); err != nil {
+					t.Fatalf("read request: %v", err)
+				}
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"`+eventType+`","error":{"message":"invalid cache request"}}`))
+			}))
+			defer server.Close()
 
-	cfg := config.Default()
-	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
-	client := NewClient(cfg)
-	resp, err := client.Do(context.Background(), Request{
-		DownstreamPath:          "/v1/responses",
-		Body:                    []byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"low"},"input":"hi"}`),
-		Account:                 storage.Account{ID: "acc-ws-error", UpstreamAccountID: "workspace"},
-		Token:                   storage.AccountToken{AccessToken: "access"},
-		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
-		CodexResponsesWebSocket: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("terminal error frame became a transport error: %v", err)
-	}
-	if !strings.Contains(string(body), `"type":"error"`) || !strings.Contains(string(body), "data: [DONE]") {
-		t.Fatalf("terminal error frame was not preserved: %s", body)
+			cfg := config.Default()
+			cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+			client := NewClient(cfg)
+			resp, err := client.Do(context.Background(), Request{
+				DownstreamPath:          "/v1/responses",
+				Body:                    []byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"low"},"input":"hi"}`),
+				Account:                 storage.Account{ID: "acc-ws-error", UpstreamAccountID: "workspace"},
+				Token:                   storage.AccountToken{AccessToken: "access"},
+				Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
+				CodexResponsesWebSocket: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("terminal %s frame became a transport error: %v", eventType, err)
+			}
+			if !strings.Contains(string(body), `"type":"`+eventType+`"`) || !strings.Contains(string(body), "data: [DONE]") {
+				t.Fatalf("terminal %s frame was not preserved: %s", eventType, body)
+			}
+		})
 	}
 }
 

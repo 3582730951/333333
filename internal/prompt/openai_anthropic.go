@@ -2,6 +2,7 @@ package prompt
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -282,7 +283,7 @@ func anthropicToolChoiceToChat(v interface{}) interface{} {
 func ChatCompletionToAnthropicResponse(raw []byte, model string) ([]byte, error) {
 	root, err := decodeJSONMapUseNumber(raw)
 	if err != nil {
-		return raw, nil
+		return nil, fmt.Errorf("invalid Chat Completions response: %w", err)
 	}
 	id, _ := root["id"].(string)
 	if id == "" {
@@ -310,11 +311,15 @@ func ChatCompletionToAnthropicResponse(raw []byte, model string) ([]byte, error)
 			continue
 		}
 		fn, _ := tcm["function"].(map[string]interface{})
+		input, parseErr := parseJSONObject(mapGet(fn, "arguments"))
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid Chat Completions tool arguments for %q: %w", stringOr(mapGet(fn, "name"), ""), parseErr)
+		}
 		content = append(content, map[string]interface{}{
 			"type":  "tool_use",
 			"id":    stringOr(tcm["id"], ""),
 			"name":  stringOr(mapGet(fn, "name"), ""),
-			"input": parseJSONObject(mapGet(fn, "arguments")),
+			"input": input,
 		})
 	}
 	if len(content) == 0 {

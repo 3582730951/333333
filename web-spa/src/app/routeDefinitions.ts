@@ -11,8 +11,8 @@ export const adminRoutes = [
   { path: '/registration', role: 'admin', navGroup: 'automation', titleKey: 'nav.auto_register', descriptionKey: 'page.registration.desc', lazyLoader: () => import('../pages/Registration.tsx'), prefetch: 'idle' },
   { path: '/lifecycle', role: 'admin', navGroup: 'automation', titleKey: 'nav.lifecycle', descriptionKey: 'page.lifecycle.desc', lazyLoader: () => import('../pages/Lifecycle.tsx') },
   { path: '/gopay', role: 'admin', navGroup: 'automation', titleKey: 'nav.gopay', descriptionKey: 'page.gopay.desc', lazyLoader: () => import('../pages/Gopay.jsx') },
-  // { path: '/email-pool', role: 'admin', navGroup: 'accounts', titleKey: 'nav.email_pool', descriptionKey: 'page.email_pool.desc', lazyLoader: () => import('../pages/EmailPool.tsx') },
-  // { path: '/email-registration', role: 'admin', navGroup: 'automation', titleKey: 'nav.email_register', descriptionKey: 'page.email_reg.desc', lazyLoader: () => import('../features/automation/email/EmailRegistrationPage.tsx') },
+  { path: '/email-pool', role: 'admin', navGroup: 'accounts', titleKey: 'nav.email_pool', descriptionKey: 'page.email_pool.desc', lazyLoader: () => import('../pages/EmailPool.tsx') },
+  { path: '/email-registration', role: 'admin', navGroup: 'automation', titleKey: 'nav.email_register', descriptionKey: 'page.email_reg.desc', lazyLoader: () => import('../features/automation/email/EmailRegistrationPage.tsx') },
   { path: '/usage', role: 'admin', navGroup: 'observability', titleKey: 'nav.usage', descriptionKey: 'page.usage.desc', lazyLoader: () => import('../pages/Usage.tsx'), prefetch: 'eager' },
   { path: '/quota', role: 'admin', navGroup: 'observability', titleKey: 'nav.quota', descriptionKey: 'page.quota.desc', lazyLoader: () => import('../pages/Quota.tsx') },
   { path: '/model-quality', role: 'admin', navGroup: 'observability', titleKey: 'nav.model_quality', descriptionKey: 'page.quality.desc', lazyLoader: () => import('../pages/ModelQuality.jsx') },
@@ -22,6 +22,12 @@ export const adminRoutes = [
   { path: '/keys', role: 'admin', navGroup: 'security', titleKey: 'nav.keys', descriptionKey: 'page.keys.desc', lazyLoader: () => import('../pages/Keys.tsx'), prefetch: 'eager' },
   { path: '/users', role: 'admin', navGroup: 'security', titleKey: 'nav.users', descriptionKey: 'page.users.desc', lazyLoader: () => import('../pages/Users.tsx') },
   { path: '/settings-v2', role: 'admin', navGroup: 'settings', titleKey: 'nav.settings', descriptionKey: 'page.settings.desc', lazyLoader: () => import('../pages/SettingsV2.tsx'), prefetch: 'eager' },
+  { path: '/settings/ai/chatgpt', role: 'admin', navGroup: 'ai_settings', titleKey: 'ai_settings.chatgpt', descriptionKey: 'page.ai_settings.desc', lazyLoader: () => import('../pages/AISettings.tsx') },
+  { path: '/settings/ai/claude', role: 'admin', navGroup: 'ai_settings', titleKey: 'ai_settings.claude', descriptionKey: 'page.ai_settings.desc', lazyLoader: () => import('../pages/AISettings.tsx') },
+  { path: '/settings/ai/kiro', role: 'admin', navGroup: 'ai_settings', titleKey: 'ai_settings.kiro', descriptionKey: 'page.ai_settings.desc', lazyLoader: () => import('../pages/AISettings.tsx') },
+  { path: '/settings/ai/antigravity', role: 'admin', navGroup: 'ai_settings', titleKey: 'ai_settings.antigravity', descriptionKey: 'page.ai_settings.desc', lazyLoader: () => import('../pages/AISettings.tsx') },
+  { path: '/settings/ai/codex', role: 'admin', navGroup: 'ai_settings', titleKey: 'ai_settings.codex', descriptionKey: 'page.ai_settings.desc', lazyLoader: () => import('../pages/AISettings.tsx') },
+  { path: '/settings/ai/claude-code', role: 'admin', navGroup: 'ai_settings', titleKey: 'ai_settings.claude_code', descriptionKey: 'page.ai_settings.desc', lazyLoader: () => import('../pages/AISettings.tsx') },
 ] as const satisfies ReadonlyArray<RouteDefinition>;
 
 export const portalRoutes = [
@@ -36,6 +42,16 @@ export const legacyRedirects = [
   { path: '/automation', to: '/settings-v2?tab=automation' },
   { path: '/thinking', to: '/settings-v2?tab=thinking' },
   { path: '/moderation', to: '/settings-v2?tab=moderation' },
+  { path: '/settings/ai', to: '/settings/ai/chatgpt' },
+  { path: '/ai-settings', to: '/settings/ai/chatgpt' },
+  { path: '/model-settings', to: '/settings/ai/chatgpt' },
+  { path: '/settings/models', to: '/settings/ai/chatgpt' },
+  { path: '/settings/models/chatgpt', to: '/settings/ai/chatgpt' },
+  { path: '/settings/models/claude', to: '/settings/ai/claude' },
+  { path: '/settings/models/kiro', to: '/settings/ai/kiro' },
+  { path: '/settings/models/antigravity', to: '/settings/ai/antigravity' },
+  { path: '/settings/models/codex', to: '/settings/ai/codex' },
+  { path: '/settings/models/claude-code', to: '/settings/ai/claude-code' },
 ] as const;
 
 export const settingsSections = [

@@ -1007,7 +1007,7 @@ func TestGatewayChatCompletionsConvertsToResponsesAndBack(t *testing.T) {
 	}
 }
 
-func TestCyberPromptPatchInjectsWithoutOverwritingDownstreamInstructions(t *testing.T) {
+func TestUserGroupPromptInjectsWithoutOverwritingDownstreamInstructions(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		body := readBody(t, r)
 		if !strings.Contains(body, `"instructions":"cyber\n\ndownstream"`) {
@@ -1015,19 +1015,18 @@ func TestCyberPromptPatchInjectsWithoutOverwritingDownstreamInstructions(t *test
 		}
 		_, _ = w.Write([]byte(`{"id":"resp","output_text":"ok"}`))
 	})
-	h.importAccount(t, "a", "upstream-a", "access-a")
-	patch := `{"system_prompt":"cyber"}`
-	req, _ := http.NewRequest(http.MethodPatch, h.pool.URL+"/admin/groups/cyber", strings.NewReader(patch))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	key := createTestAPIKeyForUserGroup(t, h, "prompt-cyber", map[string]interface{}{"system_prompt": "cyber"})
+	accountID := h.importAccount(t, "a", "upstream-a", "access-a")
+	if code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/group", `{"group":"prompt-cyber"}`); code != http.StatusOK {
+		t.Fatalf("assign prompt account group = %d: %s", code, raw)
+	}
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","instructions":"downstream","input":"hi"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("patch status = %d", resp.StatusCode)
-	}
-	resp, err = http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt","instructions":"downstream","input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3987,7 +3986,7 @@ func TestClaudeMessagesStreamingContentThenErrorDoesNotRetryAfterCommit(t *testi
 	if bCalled {
 		t.Fatalf("Claude stream retried after content was already committed; body=%s", body)
 	}
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "partial-from-a") || !strings.Contains(string(body), "rate_limit_error") || strings.Contains(string(body), "ok-from-b") {
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "partial-from-a") || !strings.Contains(string(body), publicRetryMessage) || !strings.Contains(string(body), `"type":"api_error"`) || strings.Contains(string(body), "rate_limit_error") || strings.Contains(string(body), "usage limit") || strings.Contains(string(body), "ok-from-b") || strings.Count(string(body), "event: error") != 1 {
 		t.Fatalf("downstream did not see the committed account A stream: status=%d body=%s", resp.StatusCode, body)
 	}
 }
@@ -4369,6 +4368,9 @@ func TestRateLimitGivesNoBanDelete(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"error":{"message":"You've hit your usage limit."}}`))
 	})
+	// Reset-credit recovery has its own focused tests and performs a quota preflight.
+	// Keep this test isolated to the cooldown contract and free of external I/O.
+	h.app.cfg.CodexResetCreditsAutoEnabled = false
 	acc := h.importAccount(t, "limited", "upstream-l", "access-l")
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","input":"hi"}`))

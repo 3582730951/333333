@@ -7,7 +7,7 @@ import type {
   AccountPoolSummary, DashboardCore, DashboardHealth, DashboardSecondary, RegistrationStats,
 } from '../model/dashboard';
 import type { SystemMetrics } from '../model/system';
-import type { UsageBucket, UsageCacheReport, UsageMetricRow } from '../model/usage';
+import type { UsageBucket, UsageCacheReport, UsageMetricRow, UsageSeriesDescriptor } from '../model/usage';
 
 export const dashboardHealthSchema = z.object({ ok: z.boolean() }).passthrough();
 export const accountPoolSummarySchema = z.object({
@@ -47,10 +47,14 @@ async function fetchAccountSummary(signal?: AbortSignal): Promise<AccountPoolSum
   return parseApiResponse(accountPoolSummarySchema, await get('/admin/accounts/summary', undefined, { signal }));
 }
 
-async function fetchDashboardTimeseries(signal?: AbortSignal): Promise<UsageBucket[]> {
+async function fetchDashboardTimeseries(signal?: AbortSignal): Promise<{ buckets: UsageBucket[]; modelSeries: UsageMetricRow[]; series: UsageSeriesDescriptor[] }> {
   const now = Math.floor(Date.now() / 1000);
-  const result = parseApiResponse(usageTimeseriesSchema, await get('/admin/usage/timeseries', { since: now - 86400, bucket: 3600 }, { signal }));
-  return result.buckets;
+  return parseApiResponse(usageTimeseriesSchema, await get('/admin/usage/timeseries', {
+    since: now - 86400,
+    bucket: 3600,
+    series_dimension: 'provider_model',
+    series_limit: 8,
+  }, { signal }));
 }
 
 async function fetchRegistrationStats(signal?: AbortSignal): Promise<RegistrationStats> {
@@ -63,11 +67,11 @@ async function fetchDashboardSystem(signal?: AbortSignal): Promise<SystemMetrics
 
 async function fetchDashboardModels(signal?: AbortSignal): Promise<UsageMetricRow[]> {
   const now = Math.floor(Date.now() / 1000);
-  return parseApiResponse(usageByModelSchema, await get('/admin/usage/by-model', { since: now - 7 * 86400 }, { signal })) as UsageMetricRow[];
+  return parseApiResponse(usageByModelSchema, await get('/admin/usage/by-model', { since: now - 7 * 86400, dimension: 'provider_model' }, { signal })) as UsageMetricRow[];
 }
 
 async function fetchDashboardCache(signal?: AbortSignal): Promise<UsageCacheReport> {
-  return parseApiResponse(usageCacheSchema, await get('/admin/usage/cache', { fields: 'summary,by_model' }, { signal })) as UsageCacheReport;
+  return parseApiResponse(usageCacheSchema, await get('/admin/usage/cache', { fields: 'summary,by_account,by_provider,by_provider_model' }, { signal })) as UsageCacheReport;
 }
 
 export async function fetchDashboardCore(signal?: AbortSignal): Promise<DashboardCore> {
@@ -79,7 +83,9 @@ export async function fetchDashboardCore(signal?: AbortSignal): Promise<Dashboar
   return {
     health: results[0].status === 'fulfilled' ? results[0].value : null,
     accountSummary: results[1].value,
-    buckets: results[2].status === 'fulfilled' ? results[2].value : [],
+    buckets: results[2].status === 'fulfilled' ? results[2].value.buckets : [],
+    modelSeries: results[2].status === 'fulfilled' ? results[2].value.modelSeries : [],
+    series: results[2].status === 'fulfilled' ? results[2].value.series : [],
     healthAvailable: results[0].status === 'fulfilled',
     timeseriesAvailable: results[2].status === 'fulfilled',
     error: failures.length ? partialError('DASHBOARD_CORE_PARTIAL', '部分核心指标暂时不可用。', failures) : null,

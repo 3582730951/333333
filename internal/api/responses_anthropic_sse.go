@@ -56,7 +56,6 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 	model := requestedModel
 	started := false
 	terminal := false
-	sawContent := false
 	sawText := false
 	nextBlock := 0
 	textBlock := -1
@@ -103,7 +102,6 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		textBlock = nextBlock
 		nextBlock++
 		textOpen = true
-		sawContent = true
 		emit("content_block_start", map[string]interface{}{
 			"index": textBlock, "content_block": map[string]interface{}{"type": "text", "text": ""},
 		})
@@ -141,7 +139,6 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		ensureStarted()
 		state.started = true
 		hasTools = true
-		sawContent = true
 		name := state.name
 		if original := toolNames[name]; original != "" {
 			name = original
@@ -236,7 +233,6 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		closeText()
 		ensureStarted()
 		state.started = true
-		sawContent = true
 		emit("content_block_start", map[string]interface{}{
 			"index": state.blockIndex, "content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
 		})
@@ -258,7 +254,6 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			closeText()
 			ensureStarted()
 			state.started = true
-			sawContent = true
 			emit("content_block_start", map[string]interface{}{
 				"index": state.blockIndex,
 				"content_block": map[string]interface{}{
@@ -301,7 +296,9 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		terminal = true
 		if response != nil {
 			if terminalError := responsesStreamError(response); terminalError != "" {
-				emit("error", map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": terminalError}})
+				emit("error", map[string]interface{}{"error": map[string]interface{}{
+					"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+				}})
 				return
 			}
 			usage = prompt.ResponsesUsageToAnthropic(response["usage"])
@@ -453,14 +450,9 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			emitTerminal(response, typ)
 		case "response.failed", "response.error", "error":
 			terminal = true
-			message := responsesStreamError(event)
-			if response, ok := event["response"].(map[string]interface{}); ok {
-				message = responsesStreamError(response)
-			}
-			if message == "" {
-				message = "Codex upstream stream failed"
-			}
-			emit("error", map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": message}})
+			emit("error", map[string]interface{}{"error": map[string]interface{}{
+				"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+			}})
 		}
 	}
 
@@ -481,11 +473,9 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		process(frame.Bytes())
 	}
 	if !terminal {
-		if sawContent {
-			emitTerminal(nil, "response.completed")
-		} else {
-			emit("error", map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": "Codex upstream stream ended before a terminal event"}})
-		}
+		emit("error", map[string]interface{}{"error": map[string]interface{}{
+			"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+		}})
 	}
 	return usage
 }

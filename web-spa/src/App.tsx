@@ -4,7 +4,7 @@ import { useIsFetching } from '@tanstack/react-query';
 import * as PoolUI from './components/pool/index.jsx';
 import {
   IconChevronDown, IconExit, IconHistogram, IconHome, IconKey, IconLanguage,
-  IconList, IconMoon, IconPulse, IconSetting, IconSun, IconUserGroup,
+  IconList, IconMoon, IconPulse, IconSetting, IconSun, IconUser, IconUserGroup,
 } from './components/pool/icons.jsx';
 import AppErrorBoundary, { isChunkLoadError, notifyChunkUpdateAvailable, reportClientError } from './components/AppErrorBoundary.jsx';
 import LoadErrorBanner from './components/LoadErrorBanner.jsx';
@@ -15,6 +15,7 @@ import useResponsiveLayout from './hooks/useResponsiveLayout.js';
 import { getLocale, setLocale, t } from './lib/i18n.js';
 import { addDocumentListener, addWindowListener, cancelBrowserIdleCallback, requestBrowserIdleCallback } from './lib/browserLifecycle.js';
 import { prefersReducedNetworkData } from './lib/browserNetwork.js';
+import { resetDocumentOverlayLocks } from './lib/browserDocument.js';
 import type { RouteDefinition } from './model/contracts';
 
 const { Avatar, Button, Layout, Nav, Toast } = PoolUI as any;
@@ -114,6 +115,7 @@ function adminNavigation() {
       .map((route) => ({ itemKey: route.path, text: t(route.titleKey) }));
     if (children.length) items.push({ itemKey: `group:${group.key}`, text: t(group.labelKey), icon: <Icon />, items: children });
   }
+  items.push({ itemKey: '/settings/ai/chatgpt', text: t('nav.ai_settings'), icon: <IconSetting /> });
   items.push({
     itemKey: 'group:settings',
     text: t('nav.settings'),
@@ -127,9 +129,14 @@ function adminNavigation() {
 }
 
 function portalNavigation() {
-  const icons = [IconHistogram, IconKey, IconSetting];
-  return portalRoutes.map((route, index) => {
-    const Icon = icons[index];
+  const icons: Record<string, ComponentType<any>> = {
+    '/portal': IconHistogram,
+    '/portal/keys': IconKey,
+    '/portal/models': IconSetting,
+    '/portal/profile': IconUser,
+  };
+  return portalRoutes.map((route) => {
+    const Icon = icons[route.path] || IconList;
     return { itemKey: route.path, text: t(route.titleKey), icon: <Icon /> };
   });
 }
@@ -169,10 +176,17 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(responsive.collapsedByWidth);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [aiSettingsDirty, setAISettingsDirty] = useState(false);
   const accountMenuRef = useRef<HTMLDivElement | null>(null);
   const isAdmin = auth.role === 'admin';
 
+  useEffect(() => {
+    resetDocumentOverlayLocks();
+    return resetDocumentOverlayLocks;
+  }, [location.pathname, location.search]);
+
   useEffect(() => addWindowListener('pool-locale-change', (event: CustomEvent<string>) => setLocaleState(event.detail === 'en' ? 'en' : 'zh')), []);
+  useEffect(() => addWindowListener('pool-ai-settings-dirty', (event: CustomEvent<boolean>) => setAISettingsDirty(Boolean(event.detail))), []);
   useEffect(() => {
     setCollapsed(responsive.collapsedByWidth);
     if (!responsive.isMobile) setMobileOpen(false);
@@ -205,12 +219,23 @@ export default function App() {
 
   const navigation = useMemo(() => isAdmin ? adminNavigation() : portalNavigation(), [isAdmin, locale]);
   const activeSettingsTab = new URLSearchParams(location.search).get('tab') || 'config';
-  const currentNavKey = location.pathname === '/settings-v2' ? `/settings-v2?tab=${activeSettingsTab}` : location.pathname;
+  const currentNavKey = location.pathname === '/settings-v2'
+    ? `/settings-v2?tab=${activeSettingsTab}`
+    : location.pathname.startsWith('/settings/ai/')
+      ? '/settings/ai/chatgpt'
+      : location.pathname;
   const activeRoute = (isAdmin ? adminRoutes : portalRoutes).find((route) => route.path === location.pathname);
   const ident = auth.user?.email || auth.user?.name || (isAdmin ? 'admin' : 'user');
   const identInitial = String(ident).trim().charAt(0).toUpperCase();
   const navCollapsed = responsive.isMobile ? false : collapsed;
   const sidebarWidth = responsive.isMobile ? SIDEBAR_EXPANDED_WIDTH : navCollapsed ? SIDEBAR_COLLAPSED_WIDTH : SIDEBAR_EXPANDED_WIDTH;
+  const navigateFromShell = (target: string) => {
+    if (target === `${location.pathname}${location.search}` || target === location.pathname) return;
+    if (aiSettingsDirty && !window.confirm(t('ai_settings.leave_description'))) return;
+    setAISettingsDirty(false);
+    navigate(target);
+    setMobileOpen(false);
+  };
 
   if (!auth.ready) return <BootScreen />;
   if (auth.error) {
@@ -239,7 +264,7 @@ export default function App() {
           onCollapseChange={(value: boolean) => { if (!responsive.isMobile) setCollapsed(Boolean(value)); }}
           onClick={({ itemKey, group }: { itemKey: string; group?: boolean }) => {
             if (group && navCollapsed && !responsive.isMobile) { setCollapsed(false); return; }
-            if (itemKey?.startsWith('/')) { navigate(itemKey); setMobileOpen(false); }
+            if (itemKey?.startsWith('/')) navigateFromShell(itemKey);
           }}
           className="pool-nav-scroll"
           key={`${locale}:${currentNavKey}:${navCollapsed}`}

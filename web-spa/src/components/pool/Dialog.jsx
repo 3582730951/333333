@@ -4,7 +4,7 @@ import * as AlertDialogPrimitive from '@radix-ui/react-alert-dialog';
 
 import { Button } from './Button.jsx';
 import { X } from './icons.jsx';
-import { documentBodyStyle, setDocumentBodyStyle } from '../../lib/browserDocument.js';
+import { acquireDocumentOverlayLock, releaseDocumentOverlayLock } from '../../lib/browserDocument.js';
 
 function cx(...parts) {
   return parts.filter(Boolean).join(' ');
@@ -22,15 +22,12 @@ function useOpenProps({ open, visible, onOpenChange, onCancel, onClose }) {
   return [isOpen, setOpen];
 }
 
-function useBodyScrollLock(isOpen) {
+function useBodyScrollLock(isOpen, owner) {
   useEffect(() => {
     if (!isOpen) return undefined;
-    const previous = documentBodyStyle('overflow');
-    setDocumentBodyStyle('overflow', 'hidden');
-    return () => {
-      setDocumentBodyStyle('overflow', previous);
-    };
-  }, [isOpen]);
+    const token = acquireDocumentOverlayLock(owner);
+    return () => releaseDocumentOverlayLock(token);
+  }, [isOpen, owner]);
 }
 
 export function Modal({
@@ -52,7 +49,7 @@ export function Modal({
 }) {
   const [isOpen, setOpen] = useOpenProps({ open, visible, onOpenChange, onCancel });
   const cssVars = useMemo(() => ({ '--pool-modal-width': typeof width === 'number' ? `${width}px` : width }), [width]);
-  useBodyScrollLock(isOpen);
+  useBodyScrollLock(isOpen, 'modal');
   return (
     <DialogPrimitive.Root open={isOpen} onOpenChange={setOpen}>
       <DialogPrimitive.Portal>
@@ -89,7 +86,7 @@ export function Modal({
 export function Drawer({ open, visible, onOpenChange, onCancel, onClose, title, children, width = 560, className, footer, ...props }) {
   const [isOpen, setOpen] = useOpenProps({ open, visible, onOpenChange, onCancel, onClose });
   const cssVars = useMemo(() => ({ '--pool-drawer-width': typeof width === 'number' ? `${width}px` : width }), [width]);
-  useBodyScrollLock(isOpen);
+  useBodyScrollLock(isOpen, 'drawer');
   return (
     <DialogPrimitive.Root open={isOpen} onOpenChange={setOpen}>
       <DialogPrimitive.Portal>
@@ -111,7 +108,7 @@ export function Drawer({ open, visible, onOpenChange, onCancel, onClose, title, 
 
 export function ConfirmDialog({ open, title, description, confirmText = '确认', cancelText = '取消', destructive, onConfirm, onCancel, children }) {
   const trigger = children ? <AlertDialogPrimitive.Trigger asChild>{children}</AlertDialogPrimitive.Trigger> : null;
-  useBodyScrollLock(Boolean(open));
+  useBodyScrollLock(Boolean(open), 'confirm');
   return (
     <AlertDialogPrimitive.Root open={open} onOpenChange={(next) => { if (!next) onCancel?.(); }}>
       {trigger}

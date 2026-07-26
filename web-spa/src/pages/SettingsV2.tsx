@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import * as PoolUI from '../components/pool/index.jsx';
-import { IconSave, IconRefresh } from '../components/pool/icons.jsx';
+import { IconSave, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
 import SettingsTabShellBase from '../components/SettingsTabShell.jsx';
@@ -175,13 +175,13 @@ function ConfigTab() {
 
   const applyOptimalTemplate = async () => {
     try {
-      const r = await templateMutation.mutateAsync('kiro-no-degradation');
+      const r = await templateMutation.mutateAsync('optimal-stable-models-v1');
       const savedDiffs = r?.saved || [];
       const oldSnap: SettingsValues = {};
       savedDiffs.forEach((d) => {
         if (d?.section === 'config' && d?.key) oldSnap[d.key] = d.old_value;
       });
-      setPrevSnapshot({ oldSnap, pending: {} });
+      setPrevSnapshot(savedDiffs.length > 0 ? { oldSnap, pending: {} } : null);
       setDiffs(savedDiffs);
       setPending({});
       Toast.success(`${t('settings.applied_template')}: ${r?.name || t('settings.recommended_template')}`);
@@ -209,11 +209,11 @@ function ConfigTab() {
       settingsErrors={configErrors}
       toolbar={
         <>
-          <Button icon={<IconRefresh />} onClick={refresh}>{t('common.refresh')}</Button>
-          <Button icon={<IconSave />} loading={applyingTemplate} onClick={applyOptimalTemplate}>
+          <Button icon={<IconRefresh />} onClick={refresh} disabled={saving || undoing || applyingTemplate}>{t('common.refresh')}</Button>
+          <Button icon={<IconSetting />} loading={applyingTemplate} disabled={saving || undoing} onClick={applyOptimalTemplate}>
             {t('settings.apply_recommended')}
           </Button>
-          <Button icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0}>
+          <Button icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0 || applyingTemplate || undoing}>
             {t('settings.save_changes')} ({Object.keys(pending).length})
           </Button>
         </>

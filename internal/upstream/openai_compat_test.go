@@ -1,6 +1,26 @@
 package upstream
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+
+	"codex-account-pool/internal/storage"
+)
+
+func TestApplyOpenAICompatHeadersUsesAnthropicAuthForMessages(t *testing.T) {
+	headers := http.Header{}
+	applyOpenAICompatHeaders(headers, Request{
+		Headers: http.Header{"Anthropic-Version": []string{"2023-06-01"}, "Anthropic-Beta": []string{"test-beta"}},
+		Account: storage.Account{Provider: "claude-relay"},
+		Token:   storage.AccountToken{AccessToken: "relay-key"},
+	}, false)
+	if headers.Get("Authorization") != "Bearer relay-key" || headers.Get("X-Api-Key") != "relay-key" {
+		t.Fatalf("anthropic relay auth headers = %#v", headers)
+	}
+	if headers.Get("Anthropic-Version") != "2023-06-01" || headers.Get("Anthropic-Beta") != "test-beta" {
+		t.Fatalf("anthropic headers not preserved: %#v", headers)
+	}
+}
 
 func TestIsCustomProviderExcludesBuiltIns(t *testing.T) {
 	for _, provider := range []string{"", "codex", "claude", "kiro"} {

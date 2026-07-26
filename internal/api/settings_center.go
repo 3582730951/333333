@@ -1107,14 +1107,40 @@ func kiroNoDegradationTemplateValues() map[string]interface{} {
 	}
 }
 
+func optimalStableModelsTemplateValues() map[string]interface{} {
+	values := kiroNoDegradationTemplateValues()
+	for key, value := range map[string]interface{}{
+		"stream_keepalive_seconds":             float64(15),
+		"stream_stall_recovery_seconds":        float64(360),
+		"stream_auto_continue_enabled":         true,
+		"stream_auto_continue_max_attempts":    float64(1),
+		"stream_continue_text":                 "Please continue from exactly where you left off, without repeating anything.",
+		"codex_session_mapping_enabled":        true,
+		"codex_session_mapping_retention_days": float64(7),
+		"codex_cpa_strict":                     true,
+		"codex_stateless_passthrough":          false,
+		"goal_continuity_enabled":              true,
+		"goal_retention_days":                  float64(7),
+		"context_journal_ttl_seconds":          float64(7 * 24 * 60 * 60),
+		"conversation_isolation":               true,
+		"rate_limit_guard_enabled":             true,
+		"seamless_failover":                    true,
+		"failover_max_attempts":                float64(3),
+		"leak_scrub":                           true,
+	} {
+		values[key] = value
+	}
+	return values
+}
+
 func systemConfigTemplates() []map[string]interface{} {
 	return []map[string]interface{}{
 		{
-			"id":          "kiro-no-degradation",
-			"name":        "Kiro 不降智推荐配置",
-			"description": "强制 adaptive thinking + max effort，启用原生 cachePoint 与 1500ms 缓存亲和等待；禁用输入压缩，不跨模型/Provider 降级，超限要求下游 /compact。",
+			"id":          "optimal-stable-models-v1",
+			"name":        "全模型稳定推荐配置",
+			"description": "启用会话隔离、Codex UUIDv7 映射、严格 CPA、长任务连续性、流式保活与停滞续接、故障转移和泄漏擦除；同时保留 Kiro 原生高质量与缓存配置。",
 			"section":     "config",
-			"values":      kiroNoDegradationTemplateValues(),
+			"values":      optimalStableModelsTemplateValues(),
 		},
 	}
 }
@@ -1135,11 +1161,11 @@ func (s *Server) handleSettingsCenterTemplate(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	// Backward compatibility for bookmarks/scripts created before the recommended
-	// profile became Kiro-only. The old id now applies the same no-degradation
-	// Kiro template; it can no longer re-enable Claude/Codex recommendations.
-	if req.TemplateID == "optimal-codex-pool" {
-		req.TemplateID = "kiro-no-degradation"
+	// Preserve old bookmarks and automation while returning the canonical template
+	// id. Both legacy profiles are strict subsets of the current stable all-model
+	// profile, so upgrading them is safe and fixes previously disabled session mapping.
+	if req.TemplateID == "optimal-codex-pool" || req.TemplateID == "kiro-no-degradation" {
+		req.TemplateID = "optimal-stable-models-v1"
 	}
 	for _, t := range systemConfigTemplates() {
 		if t["id"] == req.TemplateID {

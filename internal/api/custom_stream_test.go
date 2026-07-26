@@ -412,8 +412,11 @@ func TestChatStreamToResponsesSSEPreservesTerminalChatError(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	chatStreamToResponsesSSE(recorder, strings.NewReader(stream), "gpt-5.6-sol", streamrewrite.New(nil))
 	got := recorder.Body.String()
-	if !strings.Contains(got, "response.failed") || !strings.Contains(got, "Kiro stream failed") {
-		t.Fatalf("Responses stream lost chat error:\n%s", got)
+	if !strings.Contains(got, "response.failed") || !strings.Contains(got, `"code":"server_error"`) || !strings.Contains(got, publicRetryMessage) {
+		t.Fatalf("Responses stream lost its public terminal:\n%s", got)
+	}
+	if strings.Contains(got, "Kiro stream failed") {
+		t.Fatalf("Responses stream leaked the upstream error:\n%s", got)
 	}
 	if strings.Contains(got, "response.completed") {
 		t.Fatalf("Responses stream completed after a terminal chat error:\n%s", got)

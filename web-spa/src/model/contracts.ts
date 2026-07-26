@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 
 export type AppRole = 'admin' | 'user';
-export type NavGroup = 'overview' | 'accounts' | 'access' | 'automation' | 'observability' | 'security' | 'settings' | 'portal';
+export type NavGroup = 'overview' | 'accounts' | 'access' | 'automation' | 'observability' | 'security' | 'settings' | 'ai_settings' | 'portal';
 
 export interface RouteDefinition {
   path: string;

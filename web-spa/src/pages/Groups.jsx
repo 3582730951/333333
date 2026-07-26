@@ -1,471 +1,582 @@
-import React, { useState, useCallback } from 'react';
-import { ActionMenu, Button, Toast, Modal, Form, Tag, Switch, Tabs } from '../components/pool/index.jsx';
+import React, { useCallback, useMemo, useState } from 'react';
+import { ActionMenu, Banner, Button, Card, Form, Modal, Select, Switch, Tabs, TabPane, Tag, Toast } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
-import { get, post, patch, del } from '../api.js';
+import { del, get, patch, post, put } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import { MetricRail, TagList, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
+import OrderedEgressSelect from '../components/OrderedEgressSelect.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 
-function groupPolicyTags(row) {
-  const tags = [];
-  if (row.force_model) tags.push({ label: row.force_model, color: 'blue' });
-  if (row.force_effort) tags.push({ label: `effort ${row.force_effort}`, color: 'violet' });
-  if (row.default_egress_id) tags.push({ label: `出口 ${row.default_egress_id}`, color: 'blue' });
-  if (row.model_instructions_enabled) tags.push({ label: `指令文件 ${row.model_instructions_files?.length || 0}`, color: row.model_instructions_error ? 'red' : 'green' });
-  if (!row.force_model && !row.force_effort) tags.unshift({ label: '继承默认', color: 'grey' });
-  return tags;
+const TARGET_ACCOUNT_GROUP = 'account_pool_group';
+const TARGET_PROVIDER = 'model_provider';
+const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+
+function rowsOf(value, keys = []) {
+  if (Array.isArray(value)) return value;
+  for (const key of keys) if (Array.isArray(value?.[key])) return value[key];
+  return [];
 }
 
-function cleanGroupValues(values) {
-  return {
-    name: String(values.name || '').trim(),
-    force_model: String(values.force_model || '').trim(),
-    force_effort: String(values.force_effort || '').trim(),
-    model_instructions_enabled: !!values.model_instructions_enabled,
-    model_instructions_files: String(values.model_instructions_files_csv || '')
-      .split(',')
-      .map((item) => item.trim())
-      .filter(Boolean),
-    default_egress_id: String(values.default_egress_id || '').trim(),
-  };
+function uniqueStrings(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).map((value) => String(value || '').trim()).filter((value) => {
+    if (!value || seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
 }
 
-function cleanGroupPolicyValues(values) {
-  return {
-    name: String(values.name || '').trim(),
-    force_model: String(values.force_model || '').trim(),
-    force_effort: String(values.force_effort || '').trim(),
-    default_egress_id: String(values.default_egress_id || '').trim(),
-  };
+function groupEgressIDs(group) {
+  if (Array.isArray(group?.egress_ids)) return uniqueStrings(group.egress_ids);
+  return group?.default_egress_id ? [group.default_egress_id] : [];
 }
 
-const egressOptionList = (profiles = []) => {
-  const out = [{ label: '不设置（未显式选择时导入回退 egress_direct）', value: '' }];
-  const seen = new Set(['']);
+function egressOptions(profiles) {
+  const seen = new Set();
+  const options = [];
   const add = (profile) => {
     const id = String(profile?.id || '').trim();
     if (!id || seen.has(id)) return;
     seen.add(id);
-    out.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
+    options.push({ label: `${profile.name || id} (${profile.type || 'direct'})`, value: id });
   };
   add({ id: 'egress_direct', name: 'egress_direct', type: 'direct' });
-  for (const profile of profiles || []) add(profile);
-  return out;
-};
+  (profiles || []).forEach(add);
+  return options;
+}
 
-function normalizedFileList(values = []) {
-  const seen = new Set();
-  const out = [];
-  for (const raw of values || []) {
-    const value = String(raw || '').trim();
-    if (!value || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
+function canonicalTarget(target) {
+  if (target?.kind && target?.id) return { kind: target.kind, id: target.id };
+  const legacy = target?.target_type;
+  if (legacy === 'relay') return { kind: TARGET_PROVIDER, id: target.target_ref };
+  return { kind: TARGET_ACCOUNT_GROUP, id: target?.target_ref || legacy || '' };
+}
+
+function targetKey(target) {
+  const normalized = canonicalTarget(target);
+  return `${normalized.kind}:${normalized.id}`;
+}
+
+function parseTargetKey(key) {
+  const separator = String(key).indexOf(':');
+  return separator > 0
+    ? { kind: String(key).slice(0, separator), id: String(key).slice(separator + 1) }
+    : { kind: TARGET_ACCOUNT_GROUP, id: String(key) };
+}
+
+function targetLabel(target, groups, providers) {
+  const normalized = canonicalTarget(target);
+  if (normalized.kind === TARGET_PROVIDER) {
+    const provider = providers.find((item) => item.id === normalized.id);
+    return provider?.name || provider?.display_name || normalized.id;
   }
-  return out;
+  return groups.find((item) => item.name === normalized.id)?.name || normalized.id;
+}
+
+function providerSupportsModel(provider, model) {
+  const requested = String(model || '').trim().toLowerCase();
+  if (!requested || !provider || !Array.isArray(provider.models) || provider.models.length === 0) return true;
+  return provider.models.some((raw) => {
+    const candidate = String(raw || '').trim().toLowerCase();
+    return candidate === '*' || candidate === requested || (candidate.endsWith('*') && requested.startsWith(candidate.slice(0, -1)));
+  });
+}
+
+function targetSupportsModel(key, model, providers) {
+  const target = parseTargetKey(key);
+  return target.kind !== TARGET_PROVIDER || providerSupportsModel(providers.find((provider) => provider.id === target.id), model);
+}
+
+function blankUserGroup() {
+  return {
+    name: '',
+    system_prompt: '',
+    prompt_mode: 'prepend',
+    system_prompt_apply_to_compaction: true,
+    model_instructions_enabled: false,
+    model_instructions_files: [],
+    force_model: '',
+    force_effort: '',
+    target_keys: [],
+    model_routing: [],
+  };
+}
+
+function userGroupDraft(row) {
+  if (!row) return blankUserGroup();
+  return {
+    ...blankUserGroup(),
+    ...row,
+    target_keys: (row.targets || []).map(targetKey),
+    model_instructions_files: uniqueStrings(row.model_instructions_files),
+    model_routing: (row.model_routing || []).map((rule) => ({
+      model: rule.model || '',
+      tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
+    })),
+  };
+}
+
+function normalizedUserGroupPayload(draft, providers = []) {
+  const selected = new Set(uniqueStrings(draft.target_keys));
+  const targets = [...selected].map(parseTargetKey);
+  return {
+    name: String(draft.name || '').trim(),
+    system_prompt: String(draft.system_prompt || ''),
+    prompt_mode: draft.prompt_mode || 'prepend',
+    system_prompt_apply_to_compaction: Boolean(draft.system_prompt_apply_to_compaction),
+    model_instructions_enabled: Boolean(draft.model_instructions_enabled),
+    model_instructions_files: uniqueStrings(draft.model_instructions_files),
+    force_model: String(draft.force_model || '').trim(),
+    force_effort: String(draft.force_effort || '').trim(),
+    targets,
+    model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
+      const mentioned = new Set();
+      const tiers = (rule.tiers || []).map((tier) => uniqueStrings(tier).filter((key) => {
+        if (!selected.has(key) || mentioned.has(key) || !targetSupportsModel(key, rule.model, providers)) return false;
+        mentioned.add(key);
+        return true;
+      }).map(parseTargetKey)).filter((tier) => tier.length);
+      return { model: String(rule.model).trim(), tiers };
+    }),
+  };
+}
+
+function formatTime(value) {
+  const timestamp = Number(value) || 0;
+  if (!timestamp) return '尚无记录';
+  return new Date(timestamp * 1000).toLocaleString();
+}
+
+function AccountGroupEditor({ editor, profiles, saving, onCancel, onSave }) {
+  const [name, setName] = useState(editor?.row?.name || '');
+  const [selectedEgresses, setSelectedEgresses] = useState(groupEgressIDs(editor?.row));
+  const options = useMemo(() => egressOptions(profiles), [profiles]);
+  const editing = editor?.mode === 'edit';
+  return (
+    <div className="pool-form pool-group-editor">
+      <Form.Input label="分组名" value={name} onChange={setName} disabled={editing} placeholder="例如：codex-primary" />
+      <div className="pool-field pool-field--top">
+        <span className="pool-field__label">有序出口</span>
+        <OrderedEgressSelect
+          value={selectedEgresses}
+          onChange={setSelectedEgresses}
+          options={options}
+          disabled={saving}
+          help="账号导入或移动到此分组后，请求时动态继承这里的出口顺序；不会复制到账号记录。"
+        />
+      </div>
+      {editing ? (
+        <Banner
+          type="info"
+          title={`${editor.row.account_count || 0} 个账号动态继承`}
+          description="首项为主出口，其余按顺序作为备用出口。修改后下一次请求立即使用新顺序。"
+        />
+      ) : null}
+      <div className="pool-modal-actions">
+        <Button onClick={onCancel} disabled={saving}>取消</Button>
+        <Button theme="solid" loading={saving} disabled={!name.trim()} onClick={() => onSave({ name: name.trim(), egress_ids: selectedEgresses })}>保存</Button>
+      </div>
+    </div>
+  );
+}
+
+function ModelRoutingEditor({ draft, setDraft, targetOptions, providers }) {
+  const updateRule = (index, patchValue) => setDraft((current) => ({
+    ...current,
+    model_routing: current.model_routing.map((rule, ruleIndex) => ruleIndex === index ? { ...rule, ...patchValue } : rule),
+  }));
+  const updateRuleModel = (index, model) => setDraft((current) => ({
+    ...current,
+    model_routing: current.model_routing.map((rule, ruleIndex) => ruleIndex === index ? {
+      ...rule,
+      model,
+      tiers: (rule.tiers || []).map((tier) => tier.filter((key) => targetSupportsModel(key, model, providers))),
+    } : rule),
+  }));
+  const removeRule = (index) => setDraft((current) => ({ ...current, model_routing: current.model_routing.filter((_, ruleIndex) => ruleIndex !== index) }));
+
+  return (
+    <section className="pool-user-routing-editor">
+      <div className="pool-user-routing-editor__head">
+        <div>
+          <strong>模型目标优先层级</strong>
+          <div className="pool-field__help">层内目标等权；先穷尽当前层，再进入下一层。未写入规则的兼容目标会自动成为最后备用层。</div>
+        </div>
+        <Button onClick={() => setDraft((current) => ({ ...current, model_routing: [...current.model_routing, { model: '', tiers: [[]] }] }))}>添加模型规则</Button>
+      </div>
+      {draft.model_routing.length ? draft.model_routing.map((rule, ruleIndex) => {
+        const compatibleOptions = targetOptions.map((option) => ({
+          ...option,
+          disabled: !targetSupportsModel(option.value, rule.model, providers),
+        }));
+        const incompatible = draft.target_keys.filter((key) => !targetSupportsModel(key, rule.model, providers));
+        const assigned = new Set((rule.tiers || []).flat());
+        const fallback = draft.target_keys.filter((key) => targetSupportsModel(key, rule.model, providers) && !assigned.has(key));
+        return (
+          <Card key={ruleIndex} className="pool-route-rule-card">
+            <div className="pool-route-rule-card__head">
+              <Form.Input label={`逻辑模型 ${ruleIndex + 1}`} value={rule.model} onChange={(model) => updateRuleModel(ruleIndex, model)} placeholder="gpt-5.3-codex" />
+              <Button type="danger" onClick={() => removeRule(ruleIndex)}>删除规则</Button>
+            </div>
+            {(rule.tiers || []).map((tier, tierIndex) => (
+              <div className="pool-route-tier" key={tierIndex}>
+                <Tag color={tierIndex === 0 ? 'green' : 'blue'}>{tierIndex === 0 ? '优先层' : `备用层 ${tierIndex}`}</Tag>
+                <Select
+                  multiple
+                  filter
+                  value={tier}
+                  onChange={(values) => updateRule(ruleIndex, {
+                    tiers: rule.tiers.map((item, index) => index === tierIndex ? values : item.filter((key) => !values.includes(key))),
+                  })}
+                  optionList={compatibleOptions}
+                  placeholder="选择本层等权目标"
+                  style={{ width: '100%' }}
+                />
+                <div className="pool-route-tier__actions">
+                  <Button size="small" disabled={tierIndex === 0} onClick={() => {
+                    const tiers = [...rule.tiers];
+                    [tiers[tierIndex - 1], tiers[tierIndex]] = [tiers[tierIndex], tiers[tierIndex - 1]];
+                    updateRule(ruleIndex, { tiers });
+                  }}>↑</Button>
+                  <Button size="small" disabled={tierIndex === rule.tiers.length - 1} onClick={() => {
+                    const tiers = [...rule.tiers];
+                    [tiers[tierIndex + 1], tiers[tierIndex]] = [tiers[tierIndex], tiers[tierIndex + 1]];
+                    updateRule(ruleIndex, { tiers });
+                  }}>↓</Button>
+                  <Button size="small" type="danger" onClick={() => updateRule(ruleIndex, { tiers: rule.tiers.filter((_, index) => index !== tierIndex) })}>移除层</Button>
+                </div>
+              </div>
+            ))}
+            <Button size="small" onClick={() => updateRule(ruleIndex, { tiers: [...(rule.tiers || []), []] })}>添加备用层</Button>
+            <div className="pool-route-compatibility">
+              {incompatible.map((key) => <Tag size="small" color="red" key={key}>{targetOptions.find((option) => option.value === key)?.label || key} 不兼容</Tag>)}
+              {fallback.length ? <span className="pool-muted">自动末级备用：{fallback.map((key) => targetOptions.find((option) => option.value === key)?.label || key).join('、')}</span> : null}
+            </div>
+          </Card>
+        );
+      }) : <Banner type="info" title="默认等权路由" description="未配置模型规则时，所有兼容目标处于同一等权层。" />}
+    </section>
+  );
+}
+
+function UserGroupEditor({ editor, groups, providers, instructionFiles, saving, onCancel, onSave }) {
+  const [draft, setDraft] = useState(() => userGroupDraft(editor?.row));
+  const targetOptions = useMemo(() => [
+    ...groups.map((group) => ({ label: `账号池分组 · ${group.name}`, value: `${TARGET_ACCOUNT_GROUP}:${group.name}` })),
+    ...providers.map((provider) => ({ label: `模型提供商 · ${provider.name || provider.id}`, value: `${TARGET_PROVIDER}:${provider.id}` })),
+  ], [groups, providers]);
+  const selectedTargetOptions = targetOptions.filter((option) => draft.target_keys.includes(option.value));
+  const payload = normalizedUserGroupPayload(draft, providers);
+
+  const setTargets = (targetKeys) => setDraft((current) => {
+    const selected = new Set(targetKeys);
+    return {
+      ...current,
+      target_keys: targetKeys,
+      model_routing: current.model_routing.map((rule) => ({
+        ...rule,
+        tiers: rule.tiers.map((tier) => tier.filter((key) => selected.has(key))),
+      })),
+    };
+  });
+
+  return (
+    <div className="pool-user-group-editor">
+      <div className="pool-user-group-grid">
+        <Form.Input label="用户分组名" value={draft.name} onChange={(name) => setDraft((current) => ({ ...current, name }))} placeholder="例如：team-coding" />
+        <div className="pool-field pool-field--top">
+          <span className="pool-field__label">路由目标</span>
+          <Select
+            multiple
+            filter
+            maxTagCount={8}
+            value={draft.target_keys}
+            onChange={setTargets}
+            optionList={targetOptions}
+            placeholder="混合选择账号池分组和模型提供商"
+            style={{ width: '100%' }}
+          />
+          <div className="pool-field__help">可只选账号池分组、只选模型提供商，或任意混合；不能直接绑定账号或出口。</div>
+        </div>
+      </div>
+      <Card title="指令与模型策略" className="pool-card">
+        <Form.TextArea label="系统提示词" value={draft.system_prompt} onChange={(system_prompt) => setDraft((current) => ({ ...current, system_prompt }))} rows={5} placeholder="留空则不注入额外系统提示" />
+        <div className="pool-user-group-grid">
+          <Form.Select label="提示词模式" value={draft.prompt_mode} onChange={(prompt_mode) => setDraft((current) => ({ ...current, prompt_mode }))} optionList={[{ label: '前置（prepend）', value: 'prepend' }, { label: '替换（replace）', value: 'replace' }]} />
+          <label className="pool-inline-switch">
+            <Switch checked={draft.system_prompt_apply_to_compaction} onChange={(value) => setDraft((current) => ({ ...current, system_prompt_apply_to_compaction: value }))} />
+            <span>压缩上下文时继续应用</span>
+          </label>
+          <Form.Input label="强制模型（可选）" value={draft.force_model} onChange={(force_model) => setDraft((current) => ({ ...current, force_model }))} placeholder="尊重客户端模型" />
+          <Form.Select label="强制 effort（可选）" value={draft.force_effort} onChange={(force_effort) => setDraft((current) => ({ ...current, force_effort }))} optionList={EFFORTS.map((value) => ({ label: value || '不强制', value }))} />
+        </div>
+        <label className="pool-inline-switch">
+          <Switch checked={draft.model_instructions_enabled} onChange={(value) => setDraft((current) => ({ ...current, model_instructions_enabled: value }))} />
+          <span>启用指令文件</span>
+        </label>
+        <Select
+          multiple
+          filter
+          value={draft.model_instructions_files}
+          onChange={(model_instructions_files) => setDraft((current) => ({ ...current, model_instructions_files }))}
+          optionList={instructionFiles.map((file) => ({ label: file.error ? `${file.name}（异常）` : file.name, value: file.name, disabled: Boolean(file.error) }))}
+          placeholder="选择指令文件"
+          disabled={!draft.model_instructions_enabled}
+          style={{ width: '100%', marginTop: 8 }}
+        />
+      </Card>
+      <ModelRoutingEditor draft={draft} setDraft={setDraft} targetOptions={selectedTargetOptions} providers={providers} />
+      <Card title="最终路由摘要" className="pool-card pool-routing-summary">
+        {payload.targets.length ? (
+          <>
+            <div>默认：{payload.targets.map((target) => targetLabel(target, groups, providers)).join(' ⇄ ')}</div>
+            {payload.model_routing.map((rule) => (
+              <div key={rule.model}>
+                <strong>{rule.model}</strong>：{rule.tiers.length
+                  ? rule.tiers.map((tier) => tier.map((target) => targetLabel(target, groups, providers)).join(' ⇄ ')).join(' → ')
+                  : '所有兼容目标等权'}
+              </div>
+            ))}
+          </>
+        ) : <span className="pool-muted">至少选择一个目标后显示路由摘要。</span>}
+      </Card>
+      <div className="pool-modal-actions">
+        <Button onClick={onCancel} disabled={saving}>取消</Button>
+        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0} onClick={() => onSave(payload)}>保存用户分组</Button>
+      </div>
+    </div>
+  );
 }
 
 export default function Groups() {
-  const [activeTab, setActiveTab] = useState('base');
-  const [open, setOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState('account_pool');
+  const [accountEditor, setAccountEditor] = useState(null);
+  const [userEditor, setUserEditor] = useState(null);
   const [instructionLibraryOpen, setInstructionLibraryOpen] = useState(false);
   const [instructionName, setInstructionName] = useState('');
   const [instructionContent, setInstructionContent] = useState('');
-  const [editingGroup, setEditingGroup] = useState(null);
-  const [policyEditor, setPolicyEditor] = useState(null);
-  const [editFiles, setEditFiles] = useState([]);
 
   const fetchRows = useCallback(async ({ signal }) => {
-    const [g, files, egresses, userGroups] = await Promise.all([
+    const [groups, instructions, egresses, userGroups, providers] = await Promise.all([
       get('/admin/groups', undefined, { signal }),
       get('/admin/model-instructions', undefined, { signal }),
       get('/admin/egress-profiles', undefined, { signal }),
-      get('/admin/user-groups', undefined, { signal }).catch(() => ({ user_groups: [] })),
+      get('/admin/user-groups', undefined, { signal }),
+      get('/admin/providers', undefined, { signal }),
     ]);
     return {
-      groups: Array.isArray(g) ? g : g?.groups || [],
-      files: Array.isArray(files) ? files : files?.files || [],
-      egresses: Array.isArray(egresses) ? egresses : egresses?.profiles || egresses?.egress_profiles || [],
-      userGroups: Array.isArray(userGroups) ? userGroups : userGroups?.user_groups || [],
+      groups: rowsOf(groups, ['groups']),
+      instructions: rowsOf(instructions, ['files']),
+      egresses: rowsOf(egresses, ['profiles', 'egress_profiles']),
+      userGroups: rowsOf(userGroups, ['user_groups']),
+      providers: rowsOf(providers, ['providers']),
     };
   }, []);
-  const { data = { groups: [], files: [], egresses: [], userGroups: [] }, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: { groups: [], files: [], egresses: [], userGroups: [] } });
-  const rows = data.groups || [];
-  const userGroupRows = data.userGroups || [];
-  const instructionFiles = data.files || [];
-  const egressOptions = egressOptionList(data.egresses || []);
-  const groupMetrics = [
-    { label: '分组数', value: rows.length },
-    { label: '强制模型', value: rows.filter((row) => row.force_model).length },
-    { label: '推理强度', value: rows.filter((row) => row.force_effort).length },
-    { label: '默认出口', value: rows.filter((row) => row.default_egress_id).length },
-    { label: '模型指令', value: rows.filter((row) => row.model_instructions_enabled).length, tone: 'success' },
-  ];
+  const emptyData = { groups: [], instructions: [], egresses: [], userGroups: [], providers: [] };
+  const { data = emptyData, loading, error, lastRefresh, reload: load } = useAsyncResource(fetchRows, [fetchRows], { initialData: emptyData });
 
-  const userGroupMetrics = [
-    { label: '用户分组数', value: userGroupRows.length },
-    { label: '多目标', value: userGroupRows.filter((row) => (row.targets?.length || 0) > 1).length },
-  ];
+  const { run: saveAccountGroup, running: savingAccountGroup } = useAsyncAction(async (values) => {
+    try {
+      if (accountEditor?.mode === 'edit') await patch(`/admin/groups/${encodeURIComponent(accountEditor.row.name)}`, { egress_ids: values.egress_ids });
+      else await post('/admin/groups', values);
+      Toast.success(accountEditor?.mode === 'edit' ? '账号池分组已更新' : '账号池分组已创建');
+      setAccountEditor(null);
+      void load();
+    } catch (saveError) { showErrorToast(saveError); }
+  });
 
-  const { run: create, running: creating } = useAsyncAction(async (values) => {
-    try { await post('/admin/groups', cleanGroupValues(values)); Toast.success('已创建'); setOpen(false); await load(); }
-    catch (e) { showErrorToast(e); }
+  const { run: saveUserGroup, running: savingUserGroup } = useAsyncAction(async (payload) => {
+    try {
+      if (userEditor?.mode === 'edit') await put(`/admin/user-groups/${encodeURIComponent(userEditor.row.id)}`, payload);
+      else await post('/admin/user-groups', payload);
+      Toast.success(userEditor?.mode === 'edit' ? '用户分组已更新' : '用户分组已创建');
+      setUserEditor(null);
+      void load();
+    } catch (saveError) { showErrorToast(saveError); }
+  });
+
+  const { run: removeAccountGroup, running: removingAccountGroup, isRunning: isRemovingAccountGroup } = useKeyedAsyncAction(async (name) => {
+    try {
+      await del(`/admin/groups/${encodeURIComponent(name)}`);
+      Toast.success('账号池分组已删除');
+      void load();
+    } catch (removeError) { showErrorToast(removeError); }
+  });
+
+  const { run: removeUserGroup, running: removingUserGroup, isRunning: isRemovingUserGroup } = useKeyedAsyncAction(async (id) => {
+    try {
+      await del(`/admin/user-groups/${encodeURIComponent(id)}`);
+      Toast.success('用户分组已删除');
+      void load();
+    } catch (removeError) { showErrorToast(removeError); }
   });
 
   const { run: saveInstruction, running: savingInstruction } = useAsyncAction(async () => {
     try {
-      await post('/admin/model-instructions', { name: instructionName, content: instructionContent });
-      Toast.success('模型指令文件已保存');
-      await load();
-    } catch (e) { showErrorToast(e); }
+      await post('/admin/model-instructions', { name: instructionName.trim(), content: instructionContent });
+      Toast.success('指令文件已保存');
+      setInstructionName('');
+      setInstructionContent('');
+      void load();
+    } catch (saveError) { showErrorToast(saveError); }
   });
 
-  const openInstructionEditor = useCallback((group) => {
-    setEditingGroup({ ...group });
-    setEditFiles(normalizedFileList(group.model_instructions_files));
-  }, []);
-
-  const toggleEditFile = useCallback((name) => {
-    setEditFiles((current) => (
-      current.includes(name)
-        ? current.filter((item) => item !== name)
-        : [...current, name]
-    ));
-  }, []);
-
-  const moveEditFile = useCallback((index, delta) => {
-    setEditFiles((current) => {
-      const next = [...current];
-      const target = index + delta;
-      if (target < 0 || target >= next.length) return current;
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  }, []);
-
-  const { run: saveGroupInstructions, running: savingGroupInstructions } = useAsyncAction(async () => {
-    if (!editingGroup?.name) return;
-    try {
-      await patch(`/admin/groups/${encodeURIComponent(editingGroup.name)}`, {
-        model_instructions_enabled: !!editingGroup.model_instructions_enabled,
-        model_instructions_files: editFiles,
-      });
-      Toast.success('分组模型指令已保存');
-      setEditingGroup(null);
-      await load();
-    } catch (e) { showErrorToast(e); }
-  });
-
-  const { run: saveGroupPolicy, running: savingGroupPolicy } = useAsyncAction(async (values) => {
-    if (!policyEditor?.name) return;
-    try {
-      await patch(`/admin/groups/${encodeURIComponent(policyEditor.name)}`, cleanGroupPolicyValues(values));
-      Toast.success('分组策略已保存');
-      setPolicyEditor(null);
-      await load();
-    } catch (e) { showErrorToast(e); }
-  });
-
-  const { run: remove, running: removing, isRunning: isRemoving } = useKeyedAsyncAction(async (name) => {
-    try { await del(`/admin/groups/${encodeURIComponent(name)}`); Toast.success('已删除'); await load(); }
-    catch (e) { showErrorToast(e); }
-  });
-
-  const columns = [
+  const accountColumns = [
     {
-      title: '分组',
-      dataIndex: 'name',
-      width: 260,
-      render: (_, r) => (
-          <div className="pool-resource-summary">
-            <TextClamp strong>{r.name || '默认分组'}</TextClamp>
-          <div className="pool-resource-summary__meta">
-            {r.model_instructions_error ? `指令错误：${r.model_instructions_error}` : '账号策略按分组继承，可被账号或 Key 覆盖'}
-          </div>
-          </div>
+      title: '账号池分组', dataIndex: 'name', width: 220,
+      render: (value, row) => (
+        <div className="pool-resource-summary">
+          <TextClamp strong>{value || '默认分组'}</TextClamp>
+          <div className="pool-resource-summary__meta">{row.account_count || 0} 个账号 · 请求时动态继承出口</div>
+        </div>
       ),
     },
     {
-      title: '策略',
-      key: 'policy',
-      width: 300,
-      render: (_, r) => (
+      title: '健康', key: 'health', width: 150,
+      render: (_, row) => {
+        const total = Number(row.account_count) || 0;
+        const active = Number(row.active_account_count) || 0;
+        const rate = total ? Math.round(active / total * 100) : 0;
+        return <Tag color={rate >= 80 ? 'green' : rate > 0 ? 'orange' : 'grey'}>{active}/{total} · {rate}%</Tag>;
+      },
+    },
+    {
+      title: '有序出口', key: 'egresses',
+      render: (_, row) => {
+        const ids = groupEgressIDs(row);
+        return ids.length ? <TagList items={ids.map((id, index) => `${index === 0 ? '主' : `备${index}`} · ${id}`)} max={4} /> : <span className="pool-muted">系统默认</span>;
+      },
+    },
+    { title: '最近测活/更新', key: 'updated', width: 190, render: (_, row) => <TextClamp muted>{formatTime(row.last_probe_at || row.updated_at)}</TextClamp> },
+    {
+      title: '操作', key: 'ops', width: 100,
+      render: (_, row) => (
+        <ActionMenu label="账号池分组操作" items={[
+          { label: '编辑出口', disabled: savingAccountGroup || removingAccountGroup, onSelect: () => setAccountEditor({ mode: 'edit', row }) },
+          {
+            label: isRemovingAccountGroup(row.name) ? '删除中' : '删除', destructive: true,
+            disabled: savingAccountGroup || (removingAccountGroup && !isRemovingAccountGroup(row.name)),
+            confirm: { title: `删除账号池分组 ${row.name}？`, description: '请先移动该分组内的账号。出口配置不会被删除。', confirmText: '删除' },
+            onSelect: () => removeAccountGroup(row.name),
+          },
+        ]} />
+      ),
+    },
+  ];
+
+  const userColumns = [
+    {
+      title: '用户分组', dataIndex: 'name', width: 210,
+      render: (value, row) => (
+        <div className="pool-resource-summary">
+          <TextClamp strong>{value}</TextClamp>
+          <div className="pool-resource-summary__meta">{row.force_model ? `强制 ${row.force_model}` : '尊重客户端模型'}{row.force_effort ? ` · ${row.force_effort}` : ''}</div>
+        </div>
+      ),
+    },
+    {
+      title: '混合目标', dataIndex: 'targets',
+      render: (targets) => (
         <TagList
-          items={groupPolicyTags(r)}
+          items={(targets || []).map((target) => ({
+            label: `${canonicalTarget(target).kind === TARGET_PROVIDER ? '提供商' : '账号池'} · ${targetLabel(target, data.groups, data.providers)}`,
+            color: canonicalTarget(target).kind === TARGET_PROVIDER ? 'violet' : 'blue',
+          }))}
           max={4}
           renderItem={(item) => <Tag key={item.label} size="small" color={item.color}>{item.label}</Tag>}
         />
       ),
     },
+    { title: '模型规则', dataIndex: 'model_routing', width: 110, render: (rules) => <Tag color={rules?.length ? 'green' : 'grey'}>{rules?.length || 0} 条</Tag> },
     {
-      title: '模型',
-      dataIndex: 'force_model',
-      width: 180,
-      render: (v) => <TextClamp muted={!v}>{v || '继承默认'}</TextClamp>,
+      title: '策略', key: 'policy', width: 210,
+      render: (_, row) => <TagList items={[
+        row.system_prompt ? '系统提示词' : '',
+        row.model_instructions_enabled ? `指令 ${row.model_instructions_files?.length || 0}` : '',
+        row.system_prompt_apply_to_compaction ? '压缩时应用' : '',
+      ].filter(Boolean)} max={3} />,
     },
     {
-      title: '默认出口',
-      dataIndex: 'default_egress_id',
-      width: 180,
-      render: (v) => <TextClamp muted={!v}>{v || '未设置'}</TextClamp>,
+      title: '操作', key: 'ops', width: 100,
+      render: (_, row) => (
+        <ActionMenu label="用户分组操作" items={[
+          { label: '编辑完整策略', disabled: savingUserGroup || removingUserGroup, onSelect: () => setUserEditor({ mode: 'edit', row }) },
+          {
+            label: isRemovingUserGroup(row.id) ? '删除中' : '删除', destructive: true,
+            disabled: savingUserGroup || (removingUserGroup && !isRemovingUserGroup(row.id)),
+            confirm: { title: `删除用户分组 ${row.name}？`, description: '关联此分组的 API Key 将无法继续使用该路由策略。', confirmText: '删除' },
+            onSelect: () => removeUserGroup(row.id),
+          },
+        ]} />
+      ),
     },
-    {
-      title: '操作',
-      key: 'ops',
-      width: 116,
-      render: (_, r) => (
-        <ActionMenu
-          label="分组操作"
-          items={[
-            {
-              label: '编辑策略',
-              disabled: creating || removing || savingGroupPolicy,
-              onSelect: () => setPolicyEditor(r),
-            },
-            {
-              label: '配置指令文件',
-              disabled: creating || removing || savingGroupPolicy,
-              onSelect: () => openInstructionEditor(r),
-            },
-            {
-              label: isRemoving(r.name) ? '删除中' : '删除',
-              destructive: true,
-              disabled: creating || (removing && !isRemoving(r.name)),
-              confirm: {
-                title: `删除分组 ${r.name}?`,
-                description: '删除分组会移除该分组配置，不会删除账号。',
-                confirmText: '删除',
-              },
-              onSelect: () => remove(r.name),
-            },
-          ]}
-        />
-    ) },
   ];
 
-  const userGroupColumns = [
-    {
-      title: '用户分组',
-      dataIndex: 'name',
-      width: 200,
-      render: (v) => <TextClamp strong>{v || '-'}</TextClamp>,
-    },
-    {
-      title: '目标',
-      dataIndex: 'targets',
-      render: (targets) => (
-        <TagList
-          items={(targets || []).map((t) => ({ label: `${t.base_group_name} (${t.weight})`, color: 'blue' }))}
-          max={3}
-          renderItem={(item) => <Tag key={item.label} size="small" color={item.color}>{item.label}</Tag>}
-        />
-      ),
-    },
-    {
-      title: '操作',
-      key: 'ops',
-      width: 80,
-      render: (_, r) => (
-        <ActionMenu
-          label="操作"
-          items={[
-            {
-              label: '删除',
-              destructive: true,
-              confirm: {
-                title: `删除用户分组 ${r.name}?`,
-                description: '删除后关联的 API Key 将无法使用此分组。',
-                confirmText: '删除',
-              },
-              onSelect: async () => {
-                try {
-                  await del(`/admin/user-groups/${encodeURIComponent(r.id)}`);
-                  Toast.success('已删除');
-                  await load();
-                } catch (e) {
-                  showErrorToast(e);
-                }
-              },
-            },
-          ]}
-        />
-      ),
-    },
+  const accountMetrics = [
+    { label: '账号池分组', value: data.groups.length },
+    { label: '账号总数', value: data.groups.reduce((sum, row) => sum + (Number(row.account_count) || 0), 0) },
+    { label: '健康账号', value: data.groups.reduce((sum, row) => sum + (Number(row.active_account_count) || 0), 0), tone: 'success' },
+    { label: '多出口分组', value: data.groups.filter((row) => groupEgressIDs(row).length > 1).length },
+  ];
+  const userMetrics = [
+    { label: '用户分组', value: data.userGroups.length },
+    { label: '混合目标', value: data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length },
+    { label: '模型分层', value: data.userGroups.filter((row) => row.model_routing?.length).length, tone: 'success' },
   ];
 
   return (
     <div>
-      <PageHeader title="分组" subtitle="Base Groups = 账号池物理分组；User Groups = 多目标权重路由"
-        actions={<>
-          <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
-          <Button onClick={() => setInstructionLibraryOpen(true)}>模型指令文件</Button>
-          <Button icon={<IconPlus />} theme="solid" disabled={removing} onClick={() => setOpen(true)}>新建分组</Button>
-        </>} />
-
+      <PageHeader
+        title="分组"
+        subtitle="账号池分组管理账号与出口；用户分组管理指令、模型策略与目标层级。"
+        actions={(
+          <>
+            <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
+            {activeTab === 'user' ? <Button onClick={() => setInstructionLibraryOpen(true)}>指令文件库</Button> : null}
+            <Button
+              icon={<IconPlus />}
+              theme="solid"
+              onClick={() => activeTab === 'user' ? setUserEditor({ mode: 'create', row: null }) : setAccountEditor({ mode: 'create', row: null })}
+            >
+              {activeTab === 'user' ? '新建用户分组' : '新建账号池分组'}
+            </Button>
+          </>
+        )}
+      />
       <Tabs activeKey={activeTab} onChange={setActiveTab} type="line">
-        <Tabs.TabPane tab="Base Groups（账号池分组）" itemKey="base">
-          <div className="pool-resource-split">
-            <ResourceTable
-              error={error}
-              onRetry={load}
-              loading={loading}
-              lastRefresh={lastRefresh}
-              dataSource={rows}
-              columns={columns}
-              rowKey="name"
-              pagination={false}
-              density="compact"
-              layout="fit"
-              className="pool-groups-table"
-              scroll={false}
-              rowHeight={68}
-              emptyTitle="暂无分组"
-              emptyType="groups"
-              skeletonRows={5}
-            />
-            {!error || lastRefresh ? <MetricRail items={groupMetrics} /> : null}
+        <TabPane key="account_pool" tab="账号池分组" itemKey="account_pool">
+          <Banner type="info" title="动态出口继承" description="账号记录不保存分组出口副本。出口列表首项为主出口，其余按顺序备用；用户指令与模型策略请在用户分组中配置。" />
+          <div className="pool-resource-split pool-group-resource-split">
+            <ResourceTable error={error} onRetry={load} loading={loading} lastRefresh={lastRefresh} dataSource={data.groups} columns={accountColumns} rowKey="name" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无账号池分组" skeletonRows={5} />
+            {!error || lastRefresh ? <MetricRail items={accountMetrics} /> : null}
           </div>
-        </Tabs.TabPane>
-
-        <Tabs.TabPane tab="User Groups（用户分组）" itemKey="user">
-          <div className="pool-resource-split">
-            <ResourceTable
-              error={error}
-              onRetry={load}
-              loading={loading}
-              lastRefresh={lastRefresh}
-              dataSource={userGroupRows}
-              columns={userGroupColumns}
-              rowKey="id"
-              pagination={false}
-              density="compact"
-              layout="fit"
-              scroll={false}
-              rowHeight={56}
-              emptyTitle="暂无用户分组"
-              emptyDescription="用户分组支持多目标 + 权重路由，可在 API Key 创建时选择"
-              skeletonRows={5}
-            />
-            {!error || lastRefresh ? <MetricRail items={userGroupMetrics} /> : null}
+        </TabPane>
+        <TabPane key="user" tab="用户分组" itemKey="user">
+          <div className="pool-resource-split pool-group-resource-split">
+            <ResourceTable error={error} onRetry={load} loading={loading} lastRefresh={lastRefresh} dataSource={data.userGroups} columns={userColumns} rowKey="id" pagination={false} density="compact" layout="fit" scroll={false} rowHeight={68} emptyTitle="暂无用户分组" emptyDescription="创建后可混合选择账号池分组与模型提供商，并按模型设置优先层级。" skeletonRows={5} />
+            {!error || lastRefresh ? <MetricRail items={userMetrics} /> : null}
           </div>
-        </Tabs.TabPane>
+        </TabPane>
       </Tabs>
 
-      <Modal title="模型指令文件" visible={instructionLibraryOpen} onCancel={() => { if (!savingInstruction) setInstructionLibraryOpen(false); }} footer={null} maskClosable={!savingInstruction}>
+      <Modal title={accountEditor?.mode === 'edit' ? `编辑账号池分组 · ${accountEditor.row.name}` : '新建账号池分组'} visible={Boolean(accountEditor)} onCancel={() => { if (!savingAccountGroup) setAccountEditor(null); }} footer={null} width={700} maskClosable={!savingAccountGroup}>
+        {accountEditor ? <AccountGroupEditor key={`${accountEditor.mode}:${accountEditor.row?.name || 'new'}`} editor={accountEditor} profiles={data.egresses} saving={savingAccountGroup} onCancel={() => setAccountEditor(null)} onSave={saveAccountGroup} /> : null}
+      </Modal>
+      <Modal title={userEditor?.mode === 'edit' ? `编辑用户分组 · ${userEditor.row.name}` : '新建用户分组'} visible={Boolean(userEditor)} onCancel={() => { if (!savingUserGroup) setUserEditor(null); }} footer={null} width={960} maskClosable={!savingUserGroup}>
+        {userEditor ? <UserGroupEditor key={`${userEditor.mode}:${userEditor.row?.id || 'new'}`} editor={userEditor} groups={data.groups} providers={data.providers} instructionFiles={data.instructions} saving={savingUserGroup} onCancel={() => setUserEditor(null)} onSave={saveUserGroup} /> : null}
+      </Modal>
+      <Modal title="用户分组指令文件库" visible={instructionLibraryOpen} onCancel={() => { if (!savingInstruction) setInstructionLibraryOpen(false); }} footer={null} maskClosable={!savingInstruction}>
         <Form onSubmit={saveInstruction} labelPosition="top">
-          <Form.Input field="instruction_name" label="保存名称" value={instructionName} onChange={setInstructionName} placeholder="coding-style.md" />
-          <Form.TextArea field="instruction_content" label="内容" value={instructionContent} onChange={setInstructionContent} rows={10} />
+          <Form.Input label="文件名" value={instructionName} onChange={setInstructionName} placeholder="coding-style.md" />
+          <Form.TextArea label="内容" value={instructionContent} onChange={setInstructionContent} rows={10} />
           <Button htmlType="submit" theme="solid" loading={savingInstruction} disabled={!instructionName.trim()}>保存文件</Button>
         </Form>
         <div className="pool-instruction-files">
-          {instructionFiles.length ? instructionFiles.map((file) => (
-            <Tag key={file.name} size="small" color={file.error ? 'red' : 'blue'}>{file.name}</Tag>
-          )) : <Tag size="small">暂无文件</Tag>}
-        </div>
-      </Modal>
-      <Modal title="新建分组" visible={open} onCancel={() => { if (!creating) setOpen(false); }} footer={null} maskClosable={!creating}>
-        <Form onSubmit={create}>
-          <Form.Input field="name" label="分组名" rules={[{ required: true }]} />
-          <Form.Input field="force_model" label="强制模型 (可选)" />
-          <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((x) => ({ label: x || '不强制', value: x }))} />
-          <Form.Select field="default_egress_id" label="默认出口" optionList={egressOptions} />
-          <Form.Switch field="model_instructions_enabled" label="启用模型指令文件" />
-          <Form.Input
-            field="model_instructions_files_csv"
-            label="指令文件顺序"
-            placeholder={instructionFiles.map((file) => file.name).join(',') || 'coding-style.md,testing.txt'}
-            help="逗号分隔，按填写顺序拼接；仅对 ChatGPT/Codex 路由生效。Codex 会话会固定创建时的快照，修改仅影响新会话。"
-          />
-          <Button htmlType="submit" theme="solid" loading={creating} style={{ marginTop: 12 }}>创建</Button>
-        </Form>
-      </Modal>
-      <Modal
-        title={`编辑分组策略 · ${policyEditor?.name || ''}`}
-        visible={!!policyEditor}
-        onCancel={() => { if (!savingGroupPolicy) setPolicyEditor(null); }}
-        footer={null}
-        maskClosable={!savingGroupPolicy}
-      >
-        {policyEditor ? (
-          <Form
-            initValues={{
-              name: policyEditor.name,
-              force_model: policyEditor.force_model || '',
-              force_effort: policyEditor.force_effort || '',
-              default_egress_id: policyEditor.default_egress_id || '',
-            }}
-            onSubmit={saveGroupPolicy}
-          >
-            <Form.Input field="name" label="分组名" disabled />
-            <Form.Input field="force_model" label="强制模型 (可选)" />
-            <Form.Select field="force_effort" label="强制 effort (可选)" optionList={['', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map((x) => ({ label: x || '不强制', value: x }))} />
-            <Form.Select field="default_egress_id" label="默认出口" optionList={egressOptions} />
-            <Button htmlType="submit" theme="solid" loading={savingGroupPolicy} style={{ marginTop: 12 }}>保存</Button>
-          </Form>
-        ) : null}
-      </Modal>
-      <Modal
-        title={`模型指令文件 · ${editingGroup?.name || ''}`}
-        visible={!!editingGroup}
-        onCancel={() => { if (!savingGroupInstructions) setEditingGroup(null); }}
-        footer={null}
-        maskClosable={!savingGroupInstructions}
-      >
-        <div className="pool-form">
-          <label className="pool-field pool-field--left">
-            <span className="pool-field__label">启用</span>
-            <span>
-              <Switch
-                checked={!!editingGroup?.model_instructions_enabled}
-                disabled={savingGroupInstructions}
-                onChange={(checked) => setEditingGroup((current) => ({ ...(current || {}), model_instructions_enabled: checked }))}
-              />
-              <div className="pool-field__help">启用后覆盖 ChatGPT/Codex 的基础指令。Codex 会话在创建时固定快照，修改、删除文件或开关仅影响新会话。</div>
-            </span>
-          </label>
-          <div className="pool-field pool-field--left">
-            <span className="pool-field__label">多选文件</span>
-            <span>
-              <div style={{ display: 'grid', gap: 6 }}>
-                {instructionFiles.length ? instructionFiles.map((file) => (
-                  <label key={file.name} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <input
-                      type="checkbox"
-                      checked={editFiles.includes(file.name)}
-                      disabled={savingGroupInstructions}
-                      onChange={() => toggleEditFile(file.name)}
-                    />
-                    <span>{file.name}</span>
-                    {file.error ? <Tag size="small" color="red">{file.error}</Tag> : null}
-                  </label>
-                )) : <span className="pool-muted">暂无已保存文件，请先在右侧"模型指令文件"卡片保存 .md/.txt。</span>}
-              </div>
-              <div className="pool-field__help">勾选即挂载；下方列表顺序就是拼接顺序。</div>
-            </span>
-          </div>
-          <div className="pool-field pool-field--left">
-            <span className="pool-field__label">排序</span>
-            <span>
-              <div style={{ display: 'grid', gap: 6 }}>
-                {editFiles.map((name, i) => (
-                  <div key={name} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <Tag size="small" color="blue">{i + 1}</Tag>
-                    <span>{name}</span>
-                    <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
-                      <Button size="small" disabled={i === 0 || savingGroupInstructions} onClick={() => moveEditFile(i, -1)}>↑</Button>
-                      <Button size="small" disabled={i === editFiles.length - 1 || savingGroupInstructions} onClick={() => moveEditFile(i, 1)}>↓</Button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {!editFiles.length ? <span className="pool-muted">勾选文件后显示顺序</span> : null}
-            </span>
-          </div>
-          <Button theme="solid" loading={savingGroupInstructions} onClick={saveGroupInstructions} style={{ marginTop: 12 }}>保存</Button>
+          {data.instructions.length ? data.instructions.map((file) => <Tag key={file.name} color={file.error ? 'red' : 'blue'}>{file.name}</Tag>) : <span className="pool-muted">暂无指令文件</span>}
         </div>
       </Modal>
     </div>

@@ -2,7 +2,9 @@ package api
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -29,42 +31,58 @@ func (w *terminalCommitWriter) WriteHeader(status int) { w.dst.WriteHeader(statu
 func (w *terminalCommitWriter) Write(p []byte) (int, error) {
 	w.buf = append(w.buf, p...)
 	for {
-		idx := bytes.Index(w.buf, []byte("\n\n"))
-		if idx < 0 {
+		boundary, separatorLen := sseFrameBoundary(w.buf)
+		if boundary < 0 {
 			break
 		}
-		frame := append([]byte(nil), w.buf[:idx+2]...)
-		w.buf = w.buf[idx+2:]
-		isCompleted := bytes.Contains(frame, []byte(`"type":"response.completed"`)) || bytes.Contains(frame, []byte("event: response.completed"))
-		isTerminal := isCompleted || bytes.Contains(frame, []byte(`"type":"response.incomplete"`)) || bytes.Contains(frame, []byte("event: response.incomplete")) ||
-			bytes.Contains(frame, []byte(`"type":"response.failed"`)) || bytes.Contains(frame, []byte("event: response.failed"))
-		isDone := bytes.Contains(frame, []byte("data: [DONE]"))
-		if isDone && !w.terminal {
-			// A malformed/truncated upstream can emit [DONE] without a Responses
-			// terminal. Keep it off the wire until we know whether a native EOF
-			// continuation is needed; otherwise a client would close before it.
-			w.deferred = append(w.deferred, frame)
-			continue
-		}
-		if isCompleted {
-			w.once.Do(func() { w.commitErr = w.commit() })
-		}
-		if isTerminal {
-			w.terminal = true
-		}
-		if _, err := w.dst.Write(frame); err != nil {
+		frameEnd := boundary + separatorLen
+		frame := append([]byte(nil), w.buf[:frameEnd]...)
+		w.buf = w.buf[frameEnd:]
+		if err := w.writeFrame(frame); err != nil {
 			return len(p), err
-		}
-		if isTerminal && len(w.deferred) > 0 {
-			for _, deferred := range w.deferred {
-				if _, err := w.dst.Write(deferred); err != nil {
-					return len(p), err
-				}
-			}
-			w.deferred = nil
 		}
 	}
 	return len(p), nil
+}
+
+func (w *terminalCommitWriter) writeFrame(frame []byte) error {
+	eventType, data := sseFrameEventData(frame)
+	if len(data) > 0 && !bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(data, &envelope) == nil && strings.TrimSpace(envelope.Type) != "" {
+			eventType = strings.TrimSpace(envelope.Type)
+		}
+	}
+	isCompleted := eventType == "response.completed"
+	isTerminal := isCompleted || eventType == "response.incomplete" || eventType == "response.failed" || eventType == "response.error" || eventType == "error"
+	isDone := bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]"))
+	if isDone && !w.terminal {
+		// A malformed/truncated upstream can emit [DONE] without a Responses
+		// terminal. Keep it off the wire until we know whether a native EOF
+		// continuation is needed; otherwise a client would close before it.
+		w.deferred = append(w.deferred, append([]byte(nil), frame...))
+		return nil
+	}
+	if isCompleted {
+		w.once.Do(func() { w.commitErr = w.commit() })
+	}
+	if isTerminal {
+		w.terminal = true
+	}
+	if _, err := w.dst.Write(frame); err != nil {
+		return err
+	}
+	if isTerminal && len(w.deferred) > 0 {
+		for _, deferred := range w.deferred {
+			if _, err := w.dst.Write(deferred); err != nil {
+				return err
+			}
+		}
+		w.deferred = nil
+	}
+	return nil
 }
 func (w *terminalCommitWriter) Flush() {
 	if f, ok := w.dst.(http.Flusher); ok {
@@ -73,9 +91,11 @@ func (w *terminalCommitWriter) Flush() {
 }
 func (w *terminalCommitWriter) Close() error {
 	if len(w.buf) > 0 {
-		_, err := w.dst.Write(w.buf)
+		frame := append([]byte(nil), w.buf...)
 		w.buf = nil
-		return err
+		if err := w.writeFrame(frame); err != nil {
+			return err
+		}
 	}
 	// A deferred [DONE] without a preceding terminal is intentionally discarded:
 	// the caller either starts one native continuation or writes response.failed.

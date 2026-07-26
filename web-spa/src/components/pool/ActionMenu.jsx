@@ -1,15 +1,19 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 
 import { Button } from './Button.jsx';
 import { ConfirmDialog } from './Dialog.jsx';
 import { MoreHorizontal } from './icons.jsx';
+import { cancelBrowserAnimationFrame, requestBrowserAnimationFrame } from '../../lib/browserLifecycle.js';
 
 export function ActionMenu({ items = [], label = '更多操作' }) {
   const [confirmItem, setConfirmItem] = useState(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const dialogFrameRef = useRef(null);
+  useEffect(() => () => cancelBrowserAnimationFrame(dialogFrameRef.current), []);
   return (
     <>
-      <DropdownMenu.Root>
+      <DropdownMenu.Root open={menuOpen} onOpenChange={setMenuOpen}>
         <DropdownMenu.Trigger asChild>
           <Button theme="borderless" icon={<MoreHorizontal />} aria-label={label} />
         </DropdownMenu.Trigger>
@@ -20,13 +24,17 @@ export function ActionMenu({ items = [], label = '更多操作' }) {
                 key={item.label}
                 className="pool-account-menu-item"
                 disabled={item.disabled}
-                onSelect={(event) => {
-                  event.preventDefault();
+                onSelect={() => {
                   if (item.confirm) {
-                    setConfirmItem(item);
+                    setMenuOpen(false);
+                    cancelBrowserAnimationFrame(dialogFrameRef.current);
+                    dialogFrameRef.current = requestBrowserAnimationFrame(() => {
+                      dialogFrameRef.current = null;
+                      setConfirmItem(item);
+                    });
                     return;
                   }
-                  item.onSelect?.();
+                  void item.onSelect?.();
                 }}
               >
                 {item.icon}
@@ -45,9 +53,10 @@ export function ActionMenu({ items = [], label = '更多操作' }) {
           confirmText={confirmItem.confirm.confirmText}
           cancelText={confirmItem.confirm.cancelText}
           onCancel={() => setConfirmItem(null)}
-          onConfirm={async () => {
-            await confirmItem.onSelect?.();
+          onConfirm={() => {
+            const action = confirmItem.onSelect;
             setConfirmItem(null);
+            void action?.();
           }}
         />
       ) : null}

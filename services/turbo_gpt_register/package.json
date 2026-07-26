@@ -1,0 +1,10 @@
+{
+  "name": "turbo-gpt-register-executor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}

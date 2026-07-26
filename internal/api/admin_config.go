@@ -109,7 +109,32 @@ func (s *Server) adminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.settingsViewJSON(r.Context()))
+		rows := s.settingsViewJSON(r.Context())
+		placement := strings.TrimSpace(r.URL.Query().Get("placement"))
+		domain := strings.TrimSpace(r.URL.Query().Get("domain"))
+		if placement != "" || domain != "" {
+			if placement != "" && placement != configPlacementAI && placement != configPlacementSystem && placement != configPlacementFeature {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown config placement %q", placement))
+				return
+			}
+			validDomain := map[string]bool{"chatgpt": true, "claude": true, "kiro": true, "antigravity": true, "codex": true, "claude_code": true}
+			if domain != "" && !validDomain[domain] {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown config domain %q", domain))
+				return
+			}
+			filtered := make([]map[string]interface{}, 0, len(rows))
+			for _, row := range rows {
+				if placement != "" && row["placement"] != placement {
+					continue
+				}
+				if domain != "" && row["domain"] != domain {
+					continue
+				}
+				filtered = append(filtered, row)
+			}
+			rows = filtered
+		}
+		writeJSON(w, http.StatusOK, rows)
 	case http.MethodPatch, http.MethodPost:
 		var req map[string]interface{}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
@@ -808,12 +833,20 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 		}
 		g := storage.Group{Name: name, PromptMode: "prepend", Virtual2MEnabled: false, SystemPromptApplyToCompaction: true}
 		if err := applyGroupFieldsFromBody(&g, bytes.NewReader(raw)); err != nil {
+			writeGroupFieldError(w, err)
+			return
+		}
+		if err := s.validateOrderedEgressIDs(r, g.EgressIDs); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		writeGroupEgressDeprecationWarning(w, raw)
 		if err := s.store.CreateGroup(r.Context(), g); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if stored, err := s.store.GetGroup(r.Context(), g.Name); err == nil {
+			g = stored
 		}
 		writeJSON(w, http.StatusOK, g)
 	default:
@@ -824,19 +857,31 @@ func (s *Server) adminGroups(w http.ResponseWriter, r *http.Request) {
 // applyGroupFieldsFromBody decodes a partial group update (pointer fields = only the
 // provided keys change) from the request body and applies it onto g. Shared by the
 // cyber back-compat handler, group create, and the generic PATCH /admin/groups/<name>.
+var errInvalidGroupPolicy = errors.New("account pool groups cannot contain user policy")
+
 func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	var req struct {
-		SystemPrompt                  *string  `json:"system_prompt"`
-		PromptMode                    *string  `json:"prompt_mode"`
-		SystemPromptApplyToCompaction *bool    `json:"system_prompt_apply_to_compaction"`
-		ModelInstructionsEnabled      *bool    `json:"model_instructions_enabled"`
-		ModelInstructionsFiles        []string `json:"model_instructions_files"`
-		ForceModel                    *string  `json:"force_model"`
-		ForceEffort                   *string  `json:"force_effort"`
-		DefaultEgressID               *string  `json:"default_egress_id"`
+		SystemPrompt                  *string   `json:"system_prompt"`
+		PromptMode                    *string   `json:"prompt_mode"`
+		SystemPromptApplyToCompaction *bool     `json:"system_prompt_apply_to_compaction"`
+		ModelInstructionsEnabled      *bool     `json:"model_instructions_enabled"`
+		ModelInstructionsFiles        []string  `json:"model_instructions_files"`
+		ForceModel                    *string   `json:"force_model"`
+		ForceEffort                   *string   `json:"force_effort"`
+		DefaultEgressID               *string   `json:"default_egress_id"`
+		EgressIDs                     *[]string `json:"egress_ids"`
+		Virtual2MEnabled              *bool     `json:"virtual_2m_enabled"`
 	}
 	if err := decodeJSONRequestBody(body, &req, adminJSONBodyLimit); err != nil {
 		return err
+	}
+	if (req.SystemPrompt != nil && strings.TrimSpace(*req.SystemPrompt) != "") ||
+		(req.ModelInstructionsEnabled != nil && *req.ModelInstructionsEnabled) ||
+		(req.ModelInstructionsFiles != nil && len(req.ModelInstructionsFiles) > 0) ||
+		(req.ForceModel != nil && strings.TrimSpace(*req.ForceModel) != "") ||
+		(req.ForceEffort != nil && strings.TrimSpace(*req.ForceEffort) != "") ||
+		(req.Virtual2MEnabled != nil && *req.Virtual2MEnabled) {
+		return fmt.Errorf("%w: configure prompts, instructions, model, and effort on a user group", errInvalidGroupPolicy)
 	}
 	if req.SystemPrompt != nil {
 		g.SystemPrompt = *req.SystemPrompt
@@ -865,14 +910,33 @@ func applyGroupFieldsFromBody(g *storage.Group, body io.Reader) error {
 	}
 	if req.DefaultEgressID != nil {
 		g.DefaultEgressID = strings.TrimSpace(*req.DefaultEgressID)
+		g.EgressIDs = []string{g.DefaultEgressID}
+	}
+	if req.EgressIDs != nil {
+		g.EgressIDs = *req.EgressIDs
 	}
 	return nil
 }
 
+func writeGroupFieldError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errInvalidGroupPolicy) {
+		writePoolCodeError(w, http.StatusUnprocessableEntity, "invalid_group_policy", err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
+}
+
+func writeGroupEgressDeprecationWarning(w http.ResponseWriter, raw []byte) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) == nil && fields["default_egress_id"] != nil && fields["egress_ids"] != nil {
+		w.Header().Add("Warning", `299 codex-pool "default_egress_id is deprecated; egress_ids was used"`)
+	}
+}
+
 // adminGroupAction handles the /admin/groups/<name> subtree. PATCH/DELETE are the
-// active group-management surface. The assign-egress and egress-policy subroutes are
-// retained for legacy clients only; the console and runtime routing no longer use group
-// egress policy to decide an account's default outlet.
+// active group-management surface. The assign-egress subroute is retained for legacy
+// clients and now updates the same ordered group egress list as PATCH; it never copies
+// that list into account records. The egress-policy subroute remains registration-only.
 func (s *Server) adminGroupAction(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
@@ -902,13 +966,26 @@ func (s *Server) adminGroupAction(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("group %q not found", name))
 			return
 		}
-		if err := applyGroupFieldsFromBody(&group, r.Body); err != nil {
+		raw, readErr := readLimited(r.Body, s.cfg.MaxBodyBytes)
+		if readErr != nil {
+			writeError(w, http.StatusRequestEntityTooLarge, readErr)
+			return
+		}
+		if err := applyGroupFieldsFromBody(&group, bytes.NewReader(raw)); err != nil {
+			writeGroupFieldError(w, err)
+			return
+		}
+		if err := s.validateOrderedEgressIDs(r, group.EgressIDs); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		writeGroupEgressDeprecationWarning(w, raw)
 		if err := s.store.UpdateGroup(r.Context(), group); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if stored, err := s.store.GetGroup(r.Context(), name); err == nil {
+			group = stored
 		}
 		writeJSON(w, http.StatusOK, group)
 	case http.MethodDelete:
@@ -921,6 +998,14 @@ func (s *Server) adminGroupAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.store.DeleteGroup(r.Context(), name); err != nil {
+			if errors.Is(err, storage.ErrTargetInUse) {
+				writePoolCodeError(w, http.StatusConflict, "target_in_use", err.Error())
+				return
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				http.NotFound(w, r)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -985,9 +1070,10 @@ func (s *Server) adminGroupEgressPolicy(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-// adminGroupAssignEgress is a legacy bulk compatibility endpoint. Runtime routing still
-// reads only the per-account binding written here; the group itself is not consulted by
-// schedulers, registration, imports, or account moves.
+// adminGroupAssignEgress is a legacy compatibility endpoint for clients that still send
+// primary_egress_id + standby_egress_ids. It updates the account-pool group's ordered
+// outlet list only. Accounts inherit that list dynamically at selection time, so no
+// account egress binding is copied or rewritten here.
 func (s *Server) adminGroupAssignEgress(w http.ResponseWriter, r *http.Request, groupName string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -1014,65 +1100,48 @@ func (s *Server) adminGroupAssignEgress(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	standby := make([]string, 0, len(req.StandbyEgressID))
+	seen := map[string]bool{}
+	if primary != "" {
+		seen[primary] = true
+	}
 	for _, id := range req.StandbyEgressID {
-		if id = strings.TrimSpace(id); id != "" {
+		if id = strings.TrimSpace(id); id != "" && !seen[id] {
+			seen[id] = true
 			standby = append(standby, id)
 		}
 	}
-	accounts, err := s.store.ListActiveAccountsByGroup(r.Context(), groupName)
+	group, err := s.store.GetGroup(r.Context(), groupName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	group.EgressIDs = append([]string{}, standby...)
+	if primary != "" {
+		group.EgressIDs = append([]string{primary}, standby...)
+	}
+	if err := s.store.UpdateGroup(r.Context(), group); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	accountCount, err := s.store.CountAccountsByGroup(r.Context(), groupName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	accountIDs := make([]string, 0, len(accounts))
-	for _, acc := range accounts {
-		accountIDs = append(accountIDs, acc.ID)
-	}
-	bindings, err := s.store.ListEgressBindingsByAccountIDs(r.Context(), accountIDs)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	updated := 0
-	for _, acc := range accounts {
-		binding, ok := bindings[acc.ID]
-		if !ok {
-			continue
-		}
-		if primary != "" {
-			binding.PrimaryEgressID = primary
-			binding.CookieJarKey = acc.ID + ":" + primary
-		}
-		if len(standby) > 0 {
-			binding.StandbyEgressIDs = strings.Join(standby, ",")
-		}
-		if err := s.store.UpsertEgressBinding(r.Context(), binding); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("update egress binding for %s: %w", acc.ID, err))
-			return
-		}
-		updated++
-	}
-	if req.SetGroupDefault && primary != "" {
-		group, err := s.store.GetGroup(r.Context(), groupName)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				writeError(w, http.StatusNotFound, err)
-				return
-			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		group.DefaultEgressID = primary
-		if err := s.store.UpdateGroup(r.Context(), group); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
+	w.Header().Add("Warning", `299 codex-pool "assign-egress no longer rewrites accounts; the group egress order is inherited dynamically"`)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"group":            groupName,
-		"accounts_updated": updated,
-		"primary_egress":   primary,
-		"standby_egress":   standby,
+		"group":               groupName,
+		"accounts_updated":    0,
+		"accounts_inheriting": accountCount,
+		"primary_egress":      primary,
+		"standby_egress":      standby,
+		"egress_ids":          group.EgressIDs,
+		"set_group_default":   true,
+		"deprecated_request":  req.SetGroupDefault,
 	})
 }
 

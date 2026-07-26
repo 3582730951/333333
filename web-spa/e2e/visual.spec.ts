@@ -19,6 +19,7 @@ function apiFixture(pathname: string, search: URLSearchParams): unknown {
   if (pathname === '/healthz') return { ok: true };
   if (pathname === '/admin/accounts/summary') return { total: 3, active: 2, quarantined: 1, cooling: 0, recheck: 0, codex: 2, claude: 1 };
   if (pathname === '/admin/accounts') return { accounts: [], total: 0 };
+  if (pathname === '/admin/email-pool') return { accounts: [], total: 0, page: 1, pageSize: 50, counts: {} };
   if (pathname === '/admin/usage/timeseries' || pathname === '/user/usage/timeseries') return { buckets: [] };
   if (pathname === '/admin/usage/by-model') return { models: [] };
   if (pathname === '/admin/usage/cache') return { summary: {}, by_model: [], by_api_key: [], by_account_model: [], by_route: [], by_route_account_model: [] };
@@ -148,7 +149,7 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
       ] });
     }
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/settings-center/apply-template') {
-      return route.fulfill({ json: { id: 'optimal-codex-pool', name: '推荐默认系统配置', description: '测试模板', saved: [{ section: 'config', key: 'require_downstream_key', old_value: false, new_value: true }] } });
+      return route.fulfill({ json: { id: 'kiro-no-degradation', name: 'Kiro 不降智推荐配置', description: '测试模板', saved: [{ section: 'config', key: 'require_downstream_key', old_value: false, new_value: true }] } });
     }
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/settings-center') {
       const body = request.postDataJSON();
@@ -209,6 +210,20 @@ function slug(value: string) {
   return value.replace(/^\//, '').replace(/[^a-z0-9]+/gi, '-') || 'dashboard';
 }
 
+function watchRuntimeIssues(page: Page) {
+  const issues: string[] = [];
+  page.on('pageerror', (error) => issues.push(`pageerror: ${error.message}`));
+  page.on('console', (message) => {
+    if (message.type() === 'error') issues.push(`console.error: ${message.text()}`);
+  });
+  return issues;
+}
+
+async function expectHealthyRender(page: Page, issues: string[], context: string) {
+  await expect(page.locator('.pool-error-boundary'), `${context} rendered the application error boundary`).toHaveCount(0);
+  expect(issues, `${context} emitted browser runtime errors:\n${issues.join('\n')}`).toEqual([]);
+}
+
 async function capture(page: Page, routePath: string, viewport: { name: string; width: number; height: number }, theme: 'light' | 'dark', outputPath: (name: string) => string) {
   await page.setViewportSize(viewport);
   await page.addInitScript((selectedTheme) => localStorage.setItem('pool_theme', selectedTheme), theme);
@@ -220,11 +235,15 @@ async function capture(page: Page, routePath: string, viewport: { name: string; 
 
 for (const entry of [...adminVisualRoutes, ...portalVisualRoutes]) {
   const role: Role = entry.path.startsWith('/portal') ? 'user' : 'admin';
-  test(`${entry.name} visual matrix`, async ({ page }, testInfo) => {
+  test(`${entry.name} ${entry.path} visual matrix`, async ({ page }, testInfo) => {
+    const runtimeIssues = watchRuntimeIssues(page);
     await mockBackend(page, role);
     const viewports = extendedPaths.has(entry.path) ? [...baseViewports, ...extraViewports] : baseViewports;
     for (const viewport of viewports) {
-      for (const theme of themes) await capture(page, entry.path, viewport, theme, testInfo.outputPath.bind(testInfo));
+      for (const theme of themes) {
+        await capture(page, entry.path, viewport, theme, testInfo.outputPath.bind(testInfo));
+        await expectHealthyRender(page, runtimeIssues, `${entry.path} at ${viewport.name} in ${theme} mode`);
+      }
     }
   });
 }
@@ -309,7 +328,8 @@ test('account import provider marks stay bounded and model donut has one readabl
   expect(boundedMarks.length).toBeGreaterThanOrEqual(4);
   expect(boundedMarks.every((mark) => mark.width <= 40 && mark.height <= 40)).toBe(true);
   await dialog.getByRole('tab').filter({ hasText: 'Kiro' }).click();
-  await expect(dialog.getByText('Kiro 凭证 JSON', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('Kiro API Key', { exact: true })).toBeVisible();
+  await dialog.getByRole('button', { name: '凭证 JSON', exact: true }).click();
   await expect(dialog.getByText('Token / 账号 JSON', { exact: true })).toBeVisible();
   await expect(dialog.getByText('客户端注册 JSON', { exact: true })).toBeVisible();
   await expect(dialog.locator('textarea.pool-textarea')).toHaveCount(2);
@@ -347,7 +367,7 @@ test('access and audit pages switch locale without remounting', async ({ browser
   await adminPage.goto('/console/settings-v2');
   await expect(adminPage.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
   await expect(adminPage.getByRole('tab', { name: 'General' })).toBeVisible();
-  await expect(adminPage.getByRole('button', { name: 'Apply recommended template' })).toBeVisible();
+  await expect(adminPage.getByRole('button', { name: 'Apply Kiro no-degradation template' })).toBeVisible();
   await adminPage.getByRole('tab', { name: 'Reasoning' }).click();
   await expect(adminPage.getByRole('heading', { name: 'Reasoning', exact: true })).toBeVisible();
   await expect(adminPage.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
@@ -455,7 +475,7 @@ test('usage range, reset, locale, and first-load failure states are explicit', a
   });
   await usagePage.goto('/console/usage');
   await expect(usagePage.locator('[data-page-ready="true"]')).toBeVisible();
-  await expect(usagePage.locator('.pool-stat').filter({ hasText: '总 Token' }).locator('.value')).toHaveText('1234');
+  await expect(usagePage.locator('.pool-stat').filter({ hasText: '实际 Token' }).locator('.value')).toHaveText('1234');
 
   const rangeRequest = usagePage.waitForRequest((request) => {
     const url = new URL(request.url());
@@ -463,7 +483,7 @@ test('usage range, reset, locale, and first-load failure states are explicit', a
   });
   await usagePage.getByLabel('窗口').selectOption('604800');
   await rangeRequest;
-  await expect(usagePage.locator('.pool-stat').filter({ hasText: '总 Token' }).locator('.value')).toHaveText('7654');
+  await expect(usagePage.locator('.pool-stat').filter({ hasText: '实际 Token' }).locator('.value')).toHaveText('7654');
 
   const beforeReset = dashboardRequests;
   await usagePage.getByRole('button', { name: '重置用量统计视图' }).click();
@@ -483,7 +503,7 @@ test('usage range, reset, locale, and first-load failure states are explicit', a
   await failurePage.goto('/console/usage');
   await expect(failurePage.getByRole('alert')).toContainText('用量数据读取失败');
   await expect(failurePage.getByRole('alert')).toContainText('e2e-usage-failure-1');
-  await expect(failurePage.getByText('总 Token', { exact: true })).toHaveCount(0);
+  await expect(failurePage.locator('.pool-stat').filter({ hasText: '实际 Token' })).toHaveCount(0);
   await failurePage.close();
 });
 
@@ -507,10 +527,14 @@ test('settings save, template, lazy section query, and failure states are explic
   await expect(settingsPage.getByText('已保存 1 项配置', { exact: true })).toBeVisible();
   await expect.poll(() => configRequests).toBeGreaterThan(beforeSave);
 
-  const templateRequest = settingsPage.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/settings-center/apply-template');
-  await settingsPage.getByRole('button', { name: '应用推荐模板' }).click();
-  expect((await templateRequest).postDataJSON()).toEqual({ template_id: 'optimal-codex-pool' });
-  await expect(settingsPage.getByText('已应用模板: 推荐默认系统配置', { exact: true })).toBeVisible();
+  const templateButton = settingsPage.getByRole('button', { name: '应用 Kiro 不降智模板' });
+  await expect(templateButton).toBeVisible();
+  const [templateRequest] = await Promise.all([
+    settingsPage.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/settings-center/apply-template'),
+    templateButton.click(),
+  ]);
+  expect(templateRequest.postDataJSON()).toEqual({ template_id: 'kiro-no-degradation' });
+  await expect(settingsPage.getByText('已应用模板: Kiro 不降智推荐配置', { exact: true })).toBeVisible();
 
   const memoryRequest = settingsPage.waitForRequest((request) => {
     const url = new URL(request.url());

@@ -200,7 +200,7 @@ func (s *Server) writeRuleCustomError(w http.ResponseWriter, rule storage.Upstre
 func (s *Server) writeRuleNeutralError(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusServiceUnavailable)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": map[string]interface{}{"message": "upstream temporarily unavailable"}})
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": map[string]interface{}{"type": "server_error", "message": "Please retry."}})
 }
 
 func (s *Server) writeIdleStreamForRule(w http.ResponseWriter, rule storage.UpstreamErrorRule) {

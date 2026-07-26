@@ -369,11 +369,16 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 	}
 	var discovered []string
 	if prov.AutoDiscoverModels && strings.TrimSpace(prov.BaseURL) != "" {
+		headers := http.Header{}
+		if prov.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages {
+			headers.Set("Anthropic-Version", "2023-06-01")
+		}
 		resp, derr := s.upstream.Do(ctx, upstream.Request{
 			Method:         http.MethodGet,
 			Provider:       providerID,
 			BaseURL:        prov.BaseURL,
 			DownstreamPath: "/models",
+			Headers:        headers,
 			Account:        account,
 			Token:          token,
 			Egress:         egress,
@@ -389,13 +394,20 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 			case resp.StatusCode >= 400:
 				log.Printf("custom model probe %s (%s): upstream %d (%s)", account.ID, providerID, resp.StatusCode, bodySnippet(raw, 160))
 			default:
-				if caps, perr := capability.Parse(account.ID, raw, ""); perr == nil {
+				var caps []storage.ModelCapability
+				var perr error
+				if prov.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages {
+					caps, perr = capability.ParseClaudeModels(account.ID, raw, capability.ETagFromHeader(resp.Header))
+				} else {
+					caps, perr = capability.Parse(account.ID, raw, capability.ETagFromHeader(resp.Header))
+				}
+				if perr == nil {
 					for _, c := range caps {
 						discovered = append(discovered, c.ModelSlug)
 						add(c.ModelSlug)
 					}
 				} else {
-					log.Printf("custom model probe %s (%s): parse: %v", account.ID, providerID, perr)
+					log.Printf("custom model probe %s (%s, protocol=%s): parse: %v", account.ID, providerID, prov.UpstreamProtocol, perr)
 				}
 			}
 		}

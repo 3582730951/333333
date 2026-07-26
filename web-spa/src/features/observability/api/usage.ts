@@ -33,6 +33,11 @@ export const usageMetricRowSchema = z.object({
   series_key: z.string().optional(),
   series_label: z.string().optional(),
   provider: z.string().optional(),
+  provider_id: z.string().optional(),
+  provider_name: z.string().optional(),
+  provider_type: z.string().optional(),
+  dimension_key: z.string().optional(),
+  display_label: z.string().optional(),
   cache_reporting_state: z.string().optional(),
   partial: z.boolean().optional(),
   risk_flags: z.array(z.string()).optional(),
@@ -67,6 +72,10 @@ const seriesDescriptorSchema = z.object({
   series_dimension: z.string().optional(),
   series_key: z.string(),
   series_label: z.string().optional(),
+  provider_id: z.string().optional(),
+  provider_name: z.string().optional(),
+  provider_type: z.string().optional(),
+  model: z.string().optional(),
 }).passthrough();
 export const usageTimeseriesSchema = z.object({
   buckets: z.preprocess((value) => (value === null ? undefined : value), z.array(usageBucketSchema).optional()),
@@ -110,14 +119,15 @@ export async function fetchUsageDashboard(range: UsageRange, signal?: AbortSigna
   const now = Math.floor(Date.now() / 1000);
   const windowParams = range === 'today' ? undefined : { since: now - Number(range) };
   const bucketParams = range === 'today'
-    ? { bucket: definition.bucket, series_dimension: 'model', series_limit: 6 }
-    : { since: now - Number(range), bucket: definition.bucket, series_dimension: 'model', series_limit: 6 };
+    ? { bucket: definition.bucket, series_dimension: 'provider_model', series_limit: 8 }
+    : { since: now - Number(range), bucket: definition.bucket, series_dimension: 'provider_model', series_limit: 8 };
+  const modelParams = { ...(windowParams || {}), dimension: 'provider_model' };
   const cacheParams = { bucket: definition.bucket, fields: FULL_CACHE_FIELDS };
 
   const [usageRaw, timeseriesRaw, modelsRaw, cacheRaw] = await Promise.all([
     get('/admin/usage', windowParams, { signal }),
     get('/admin/usage/timeseries', bucketParams, { signal }),
-    get('/admin/usage/by-model', windowParams, { signal }),
+    get('/admin/usage/by-model', modelParams, { signal }),
     get('/admin/usage/cache', cacheParams, { signal }),
   ]);
   const usageWindow = parseApiResponse(usageEnvelopeSchema, usageRaw) as UsageEnvelope;

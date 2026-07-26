@@ -79,6 +79,18 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			flusher.Flush()
 		}
 	}
+	emitError := func() {
+		payload := map[string]interface{}{"error": map[string]interface{}{
+			"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+		}}
+		encoded, _ := json.Marshal(payload)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(encoded)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 	ensureRole := func() {
 		if !roleSent {
 			emit(map[string]interface{}{"role": "assistant"}, nil)
@@ -271,11 +283,11 @@ func responsesStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			done(response)
 			return
 		case "response.failed", "error", "response.error":
-			done(nil)
+			emitError()
 			return
 		}
 	}
-	done(nil)
+	emitError()
 }
 
 func responsesUsageToChat(value interface{}) (map[string]interface{}, bool) {

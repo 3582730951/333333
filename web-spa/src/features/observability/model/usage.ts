@@ -9,6 +9,11 @@ export interface UsageMetricRow {
   series_key?: string;
   series_label?: string;
   provider?: string;
+  provider_id?: string;
+  provider_name?: string;
+  provider_type?: string;
+  dimension_key?: string;
+  display_label?: string;
   cache_reporting_state?: string;
   partial?: boolean;
   api_key_hash_prefix?: string;
@@ -60,6 +65,10 @@ export interface UsageSeriesDescriptor {
   series_dimension?: string;
   series_key: string;
   series_label?: string;
+  provider_id?: string;
+  provider_name?: string;
+  provider_type?: string;
+  model?: string;
   [key: string]: unknown;
 }
 
@@ -103,4 +112,30 @@ export interface UsageDashboard {
   byModel: UsageMetricRow[];
   cache: UsageCacheReport;
   usageWindow: UsageEnvelope;
+}
+
+export function usageDimensionKey(row: UsageMetricRow): string {
+  if (row.dimension_key || row.series_key || row.model_key) {
+    return String(row.dimension_key || row.series_key || row.model_key);
+  }
+  const provider = row.provider_id || row.provider || row.provider_type;
+  const model = row.model || row.model_label;
+  if (provider && model) return `provider:${provider}\u0000model:${model}`;
+  return String(model || '__unknown__');
+}
+
+export function usageDisplayLabel(row: UsageMetricRow, unknownModelLabel = 'Unknown model'): string {
+  if (row.display_label || row.series_label) return String(row.display_label || row.series_label);
+  const model = row.model_label || row.model || unknownModelLabel;
+  const provider = row.provider_name || row.provider_id || row.provider;
+  return provider ? `${provider} · ${model}` : String(model);
+}
+
+export function reportedCacheMetric(
+  row: UsageMetricRow,
+  value: unknown,
+  unreportedLabel: string,
+  formatter: (metric: unknown) => string,
+): string {
+  return row.cache_reporting_state === 'unreported' ? unreportedLabel : formatter(value);
 }

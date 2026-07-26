@@ -234,8 +234,12 @@ type Route struct {
 	// the Codex CPA mapper. Unlike ordinary affinity it may never fall through to a
 	// fresh account: previous_response_id / turn-state belongs to one upstream
 	// session. RequiredEgressID completes that same identity boundary.
-	RequiredAccountID     string
-	RequiredEgressID      string
+	RequiredAccountID string
+	RequiredEgressID  string
+	// PreferredEgressIDs is an ordered provider-level override. The first outlet
+	// is primary and the remaining outlets are attempted before another account.
+	// Account bindings remain operational metadata and are not rewritten.
+	PreferredEgressIDs    []string
 	KiroEndpointAllowlist []string
 	KiroDefaultRegion     string
 	// KiroFallbackModel lets a mixed Codex/Kiro fair route retain the downstream
@@ -421,6 +425,18 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	if route.Group == "" {
 		route.Group = cfg.DefaultGroup
 	}
+	// Account-pool groups own the runtime outlet order. Resolve it for every
+	// selection so imports and account moves inherit group changes dynamically;
+	// no egress configuration is copied back to the account binding. An explicit
+	// provider-level order takes precedence for custom provider routes.
+	if len(route.PreferredEgressIDs) == 0 {
+		group, err := s.store.GetGroup(ctx, route.Group)
+		if err == nil {
+			route.PreferredEgressIDs = append([]string(nil), group.EgressIDs...)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return Lease{}, err
+		}
+	}
 	if strings.TrimSpace(route.RequiredAccountID) != "" {
 		if route.Exclude[route.RequiredAccountID] {
 			return Lease{}, fmt.Errorf("%w: account=%s", ErrBoundAccountUnavailable, route.RequiredAccountID)
@@ -541,19 +557,9 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 			lease, err = s.selectFresh(ctx, route)
 		}
 	}
-	// Once every compatible account in a retry round has failed, begin the next
-	// round with a clean exclusion set. The failed accounts have already been cooled
-	// or invalidated by the API layer, so this transitions into the normal wait queue
-	// instead of leaking a synthetic no-account response.
-	if err != nil && len(route.Exclude) > 0 {
-		var nae *NoAccountError
-		if errors.As(err, &nae) && nae.Counters.Excluded > 0 {
-			for id := range route.Exclude {
-				delete(route.Exclude, id)
-			}
-			lease, err = s.selectFresh(ctx, route)
-		}
-	}
+	// Exclusions belong to the caller's current failover round. If every compatible
+	// account has already failed, return the no-account result so the API layer can
+	// advance to the next routing target; never replay a failed account in-place.
 	if err != nil && transientlySaturated(err) && ctx.Done() != nil {
 		lease, err = s.waitForFreshLease(ctx, route, err)
 	}
@@ -919,17 +925,13 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 	var counters NoAccountCounters
 	for _, awe := range accountsWithEgress {
 		account := awe.Account
-		binding := awe.Binding
+		binding := routeEgressBinding(awe.Binding, account.ID, route.PreferredEgressIDs)
 		if account.Status != "active" {
 			counters.Inactive++
 			continue
 		}
 		if account.QuarantineUntil > now && !account.IgnoreRateLimitControls {
 			counters.Quarantined++
-			continue
-		}
-		if route.Exclude[account.ID] {
-			counters.Excluded++
 			continue
 		}
 		accountProvider := s.providerOfAccountCached(ctx, account)
@@ -991,6 +993,13 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 			counters.EgressUnavailable++
 			continue
 		}
+		// Exclusions prevent selection but should not hide a more actionable reason
+		// that already makes the account unavailable. In particular, callers need
+		// model_unsupported to produce a manual fallback and cooldown to remain queued.
+		if route.Exclude[account.ID] {
+			counters.Excluded++
+			continue
+		}
 		inflight, tokens := s.currentLoad(account.ID)
 		egressLoad := s.currentEgressLoad(egress.ID)
 		if concurrencyLimited(egress.MaxConcurrency, egressLoad) {
@@ -1004,6 +1013,9 @@ func (s *Scheduler) selectFresh(ctx context.Context, route Route) (Lease, error)
 				counters.Concurrency++
 				continue
 			}
+		}
+		if len(route.PreferredEgressIDs) > 0 {
+			binding.CookieJarKey = account.ID + ":" + egress.ID
 		}
 		// Token budget guards CONCURRENT over-commit, not single-request size: only
 		// reject when the account is already serving traffic (inflight > 0). A solo
@@ -1560,8 +1572,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 			return Lease{}, leaseBlockRateLimitCooldown, false
 		}
 	}
-	binding := snapshot.Binding
-	binding.AccountID = accountID
+	binding := routeEgressBinding(snapshot.Binding, accountID, route.PreferredEgressIDs)
 	if binding.PrimaryEgressID == "" {
 		return Lease{}, leaseBlockEgressUnavailable, false
 	}
@@ -1594,6 +1605,9 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	egress, ok = s.applyBoundSidecar(ctx, binding, egress, now, egressCache)
 	if !ok {
 		return Lease{}, leaseBlockEgressUnavailable, false
+	}
+	if len(route.PreferredEgressIDs) > 0 {
+		binding.CookieJarKey = accountID + ":" + egress.ID
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1641,6 +1655,35 @@ func bindingContainsEgress(binding storage.AccountEgressBinding, egressID string
 		}
 	}
 	return false
+}
+
+func routeEgressBinding(binding storage.AccountEgressBinding, accountID string, orderedIDs []string) storage.AccountEgressBinding {
+	binding.AccountID = strings.TrimSpace(accountID)
+	if len(orderedIDs) == 0 {
+		return binding
+	}
+	seen := make(map[string]struct{}, len(orderedIDs))
+	clean := make([]string, 0, len(orderedIDs))
+	for _, id := range orderedIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		clean = append(clean, id)
+	}
+	if len(clean) == 0 {
+		return binding
+	}
+	binding.PrimaryEgressID = clean[0]
+	binding.StandbyEgressIDs = strings.Join(clean[1:], ",")
+	if binding.AccountID != "" {
+		binding.CookieJarKey = binding.AccountID + ":" + clean[0]
+	}
+	return binding
 }
 
 func (s *Scheduler) currentLoad(accountID string) (int, int64) {

@@ -306,17 +306,12 @@ func (w *responsesWebSocketWriter) Close() error {
 
 func (w *responsesWebSocketWriter) flushSSEBlocks(final bool) error {
 	for {
-		idx := bytes.Index(w.sseBuffer, []byte("\n\n"))
-		sepLen := 2
-		if idx < 0 {
-			idx = bytes.Index(w.sseBuffer, []byte("\r\n\r\n"))
-			sepLen = 4
-		}
-		if idx < 0 {
+		boundary, separatorLen := sseFrameBoundary(w.sseBuffer)
+		if boundary < 0 {
 			break
 		}
-		block := append([]byte(nil), w.sseBuffer[:idx]...)
-		w.sseBuffer = w.sseBuffer[idx+sepLen:]
+		block := append([]byte(nil), w.sseBuffer[:boundary]...)
+		w.sseBuffer = w.sseBuffer[boundary+separatorLen:]
 		if err := w.writeSSEBlock(block); err != nil {
 			return err
 		}

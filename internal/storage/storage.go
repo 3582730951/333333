@@ -25,6 +25,9 @@ const DefaultDirectEgressID = "egress_direct"
 var (
 	ErrUserEmailExists    = errors.New("user email already exists")
 	ErrRegistrationClosed = errors.New("user registration is disabled")
+	ErrUserGroupNotFound  = errors.New("user group not found")
+	ErrEgressInUse        = errors.New("egress is in use")
+	ErrTargetInUse        = errors.New("routing target is in use")
 )
 
 type Store struct {
@@ -72,17 +75,21 @@ type Group struct {
 	Virtual2MEnabled              bool     `json:"-"`
 	ModelInstructionsEnabled      bool     `json:"model_instructions_enabled"`
 	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
-	// ForceModel / ForceEffort, when set, are the group-level default override that
-	// rewrites the downstream-requested model / reasoning effort for any key in this
-	// group that does not set its own. Empty means "respect the client's request".
+	// Legacy policy fields are retained for one compatibility cycle only. Runtime
+	// request policy comes exclusively from UserGroup and new account-pool group
+	// writes reject non-empty policy values.
 	ForceModel  string `json:"force_model"`
 	ForceEffort string `json:"force_effort"`
-	// DefaultEgressID is a legacy operator note kept for backward-compatible group
-	// payloads. Runtime routing no longer reads it; account_egress_bindings owns the
-	// account's default egress.
-	DefaultEgressID string `json:"default_egress_id"`
-	CreatedAt       int64  `json:"created_at"`
-	UpdatedAt       int64  `json:"updated_at"`
+	// DefaultEgressID is the deprecated single-outlet alias. EgressIDs is the ordered
+	// runtime source of truth (primary first, then standbys); a legacy row with only
+	// DefaultEgressID is exposed as a one-element EgressIDs list.
+	DefaultEgressID string   `json:"default_egress_id"`
+	EgressIDs       []string `json:"egress_ids"`
+	// egressIDsConfigured distinguishes an explicitly saved [] from a legacy row
+	// whose egress_ids column has not been populated yet.
+	egressIDsConfigured bool
+	CreatedAt           int64 `json:"created_at"`
+	UpdatedAt           int64 `json:"updated_at"`
 }
 
 type GroupAccountCounts struct {
@@ -96,17 +103,124 @@ type GroupAccountCounts struct {
 // A user group can fan out to multiple targets (base groups, relays, kiro, antigravity)
 // via UserGroupTarget rows, enabling affinity-spread and session-sticky multi-target routing.
 type UserGroup struct {
-	ID                            string   `json:"id"`
-	Name                          string   `json:"name"`
-	SystemPrompt                  string   `json:"system_prompt"`
-	PromptMode                    string   `json:"prompt_mode"`
-	SystemPromptApplyToCompaction bool     `json:"system_prompt_apply_to_compaction"`
-	ModelInstructionsEnabled      bool     `json:"model_instructions_enabled"`
-	ModelInstructionsFiles        []string `json:"model_instructions_files,omitempty"`
-	ForceModel                    string   `json:"force_model"`
-	ForceEffort                   string   `json:"force_effort"`
-	CreatedAt                     int64    `json:"created_at"`
-	UpdatedAt                     int64    `json:"updated_at"`
+	ID                            string             `json:"id"`
+	Name                          string             `json:"name"`
+	SystemPrompt                  string             `json:"system_prompt"`
+	PromptMode                    string             `json:"prompt_mode"`
+	SystemPromptApplyToCompaction bool               `json:"system_prompt_apply_to_compaction"`
+	ModelInstructionsEnabled      bool               `json:"model_instructions_enabled"`
+	ModelInstructionsFiles        []string           `json:"model_instructions_files,omitempty"`
+	ForceModel                    string             `json:"force_model"`
+	ForceEffort                   string             `json:"force_effort"`
+	Targets                       []TargetRef        `json:"targets"`
+	ModelRouting                  []ModelRoutingRule `json:"model_routing"`
+	CreatedAt                     int64              `json:"created_at"`
+	UpdatedAt                     int64              `json:"updated_at"`
+}
+
+const (
+	TargetKindAccountPoolGroup = "account_pool_group"
+	TargetKindModelProvider    = "model_provider"
+)
+
+// TargetRef is the canonical public reference used by user-group targets and
+// model-routing tiers. UnmarshalJSON also accepts the legacy
+// {target_type,target_ref} representation.
+type TargetRef struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
+// TargetRefWithLegacyID keeps the canonical target response while exposing the
+// row identifier required by the deprecated numeric target DELETE endpoint.
+type TargetRefWithLegacyID struct {
+	TargetRef
+	LegacyID int64 `json:"legacy_id"`
+}
+
+func (t *TargetRef) UnmarshalJSON(raw []byte) error {
+	var value struct {
+		Kind       string          `json:"kind"`
+		ID         json.RawMessage `json:"id"`
+		TargetType string          `json:"target_type"`
+		TargetRef  string          `json:"target_ref"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	id := strings.TrimSpace(value.TargetRef)
+	if len(value.ID) > 0 && string(value.ID) != "null" {
+		var stringID string
+		if err := json.Unmarshal(value.ID, &stringID); err == nil {
+			id = strings.TrimSpace(stringID)
+		} else if id == "" {
+			return errors.New("target id must be a string")
+		}
+	}
+	kind := strings.TrimSpace(value.Kind)
+	if kind == "" {
+		kind = strings.TrimSpace(value.TargetType)
+	}
+	normalized, err := NormalizeTargetRef(TargetRef{Kind: kind, ID: id})
+	if err != nil {
+		return err
+	}
+	*t = normalized
+	return nil
+}
+
+func NormalizeTargetRef(target TargetRef) (TargetRef, error) {
+	kind := strings.ToLower(strings.TrimSpace(target.Kind))
+	id := strings.TrimSpace(target.ID)
+	switch kind {
+	case TargetKindAccountPoolGroup, UserGroupTargetTypeBaseGroup:
+		kind = TargetKindAccountPoolGroup
+	case TargetKindModelProvider, UserGroupTargetTypeRelay:
+		kind = TargetKindModelProvider
+	case UserGroupTargetTypeKiro, UserGroupTargetTypeAntigravity:
+		if id == "" {
+			id = kind
+		}
+		kind = TargetKindAccountPoolGroup
+	case "codex", "claude":
+		if id == "" {
+			id = kind
+		}
+		kind = TargetKindModelProvider
+	default:
+		return TargetRef{}, fmt.Errorf("unsupported user group target kind %q", target.Kind)
+	}
+	if id == "" {
+		return TargetRef{}, fmt.Errorf("target id required for %s", kind)
+	}
+	return TargetRef{Kind: kind, ID: id}, nil
+}
+
+func (t TargetRef) key() string { return t.Kind + "\x00" + t.ID }
+
+type ModelRoutingRule struct {
+	Model string        `json:"model"`
+	Tiers [][]TargetRef `json:"tiers"`
+}
+
+type UserGroupTargetBinding struct {
+	UserGroupID string    `json:"user_group_id"`
+	AffinityKey string    `json:"affinity_key"`
+	Model       string    `json:"model"`
+	Target      TargetRef `json:"target"`
+	CreatedAt   int64     `json:"created_at"`
+	UpdatedAt   int64     `json:"updated_at"`
+}
+
+func encodeModelRouting(rules []ModelRoutingRule) string {
+	if rules == nil {
+		rules = []ModelRoutingRule{}
+	}
+	raw, err := json.Marshal(rules)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
 }
 
 const (
@@ -527,6 +641,10 @@ type AffinityBinding struct {
 	Epoch        int64  `json:"epoch"`
 	CreatedAt    int64  `json:"created_at"`
 	UpdatedAt    int64  `json:"updated_at"`
+	// ExpiresAt is optional for backward compatibility. Zero means the binding has
+	// no explicit expiry; positive values make both routing reads and resource
+	// deletion guards ignore the row once its retention window has elapsed.
+	ExpiresAt int64 `json:"expires_at,omitempty"`
 }
 
 type VirtualLedgerItem struct {
@@ -633,6 +751,8 @@ type CustomProvider struct {
 	Name               string   `json:"name"`
 	BaseURL            string   `json:"base_url"`
 	UpstreamProtocol   string   `json:"upstream_protocol"`
+	TransportProfile   string   `json:"transport_profile"`
+	EgressIDs          []string `json:"egress_ids"`
 	Enabled            bool     `json:"enabled"`
 	AutoDiscoverModels bool     `json:"auto_discover_models"`
 	Models             []string `json:"models"`
@@ -645,6 +765,25 @@ const (
 	CustomProviderProtocolResponses         = "responses"
 	CustomProviderProtocolAnthropicMessages = "anthropic_messages"
 )
+
+const (
+	CustomProviderTransportGeneric    = "generic"
+	CustomProviderTransportCodexCLI   = "codex_cli"
+	CustomProviderTransportClaudeCode = "claude_code"
+)
+
+func NormalizeCustomProviderTransportProfile(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", CustomProviderTransportGeneric:
+		return CustomProviderTransportGeneric, true
+	case CustomProviderTransportCodexCLI:
+		return CustomProviderTransportCodexCLI, true
+	case CustomProviderTransportClaudeCode:
+		return CustomProviderTransportClaudeCode, true
+	default:
+		return "", false
+	}
+}
 
 func NormalizeCustomProviderProtocol(raw string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -824,8 +963,11 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, created_at, updated_at)
-VALUES('cyber', '', 'prepend', 1, 0, ?, ?)
-ON CONFLICT(name) DO NOTHING`, now, now); err != nil {
+VALUES
+  ('cyber', '', 'prepend', 1, 0, ?, ?),
+  ('kiro', '', 'prepend', 0, 0, ?, ?),
+  ('antigravity', '', 'prepend', 0, 0, ?, ?)
+ON CONFLICT(name) DO NOTHING`, now, now, now, now, now, now); err != nil {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `
@@ -954,6 +1096,7 @@ CREATE TABLE IF NOT EXISTS groups(
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
   default_egress_id TEXT NOT NULL DEFAULT '',
+  egress_ids TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -1074,8 +1217,10 @@ CREATE TABLE IF NOT EXISTS affinity_bindings(
   epoch INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS idx_affinity_bindings_expiry ON affinity_bindings(expires_at, egress_id);
 CREATE TABLE IF NOT EXISTS egress_profiles(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -1370,6 +1515,8 @@ CREATE TABLE IF NOT EXISTS custom_providers(
   name TEXT NOT NULL DEFAULT '',
   base_url TEXT NOT NULL DEFAULT '',
   upstream_protocol TEXT NOT NULL DEFAULT 'chat_completions',
+  transport_profile TEXT NOT NULL DEFAULT 'generic',
+  egress_ids TEXT NOT NULL DEFAULT '[]',
   enabled INTEGER NOT NULL DEFAULT 1,
   auto_discover_models INTEGER NOT NULL DEFAULT 1,
   models_json TEXT NOT NULL DEFAULT '',
@@ -1525,6 +1672,58 @@ CREATE TABLE IF NOT EXISTS email_pool(
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name);
+
+CREATE TABLE IF NOT EXISTS turbo_gpt_register_jobs(
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'pending',
+  phase TEXT NOT NULL DEFAULT 'phase1',
+  phone TEXT NOT NULL DEFAULT '',
+  email TEXT NOT NULL DEFAULT '',
+  password TEXT NOT NULL DEFAULT '',
+  full_name TEXT NOT NULL DEFAULT '',
+  birth_date TEXT NOT NULL DEFAULT '',
+  phone_country_code TEXT NOT NULL DEFAULT '',
+  phone_country_dial_code TEXT NOT NULL DEFAULT '',
+  sms_platform TEXT NOT NULL DEFAULT '',
+  sms_operator TEXT NOT NULL DEFAULT '',
+  sms_activation_id TEXT NOT NULL DEFAULT '',
+  mail_domain TEXT NOT NULL DEFAULT '',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  auto_import INTEGER NOT NULL DEFAULT 1,
+  imported_account_id TEXT NOT NULL DEFAULT '',
+  phase1_completed_at INTEGER NOT NULL DEFAULT 0,
+  phase2_completed_at INTEGER NOT NULL DEFAULT 0,
+  phase3_completed_at INTEGER NOT NULL DEFAULT 0,
+  started_at INTEGER NOT NULL DEFAULT 0,
+  completed_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turbo_gpt_register_jobs_status ON turbo_gpt_register_jobs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_turbo_gpt_register_jobs_email ON turbo_gpt_register_jobs(email);
+
+CREATE TABLE IF NOT EXISTS turbo_gpt_register_tokens(
+  job_id TEXT PRIMARY KEY,
+  email TEXT NOT NULL DEFAULT '',
+  access_token TEXT NOT NULL DEFAULT '',
+  refresh_token TEXT NOT NULL DEFAULT '',
+  id_token TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  raw_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(job_id) REFERENCES turbo_gpt_register_jobs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS turbo_gpt_register_config(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL
+);
 `
 
 // migrate applies additive schema changes to databases created by an older
@@ -1549,8 +1748,11 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE groups ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN default_egress_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE groups ADD COLUMN egress_ids TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN model_instructions_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE groups ADD COLUMN model_instructions_files TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE custom_providers ADD COLUMN transport_profile TEXT NOT NULL DEFAULT 'generic'`,
+		`ALTER TABLE custom_providers ADD COLUMN egress_ids TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
@@ -1591,6 +1793,8 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE affinity_bindings ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE affinity_bindings ADD COLUMN model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE affinity_bindings ADD COLUMN egress_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE affinity_bindings ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS idx_affinity_bindings_expiry ON affinity_bindings(expires_at, egress_id)`,
 		// Multi-user portal: end-user credentials/roles, key ownership, and per-user
 		// usage attribution (older DBs created before the portal existed).
 		`ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''`,
@@ -1869,6 +2073,7 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   model_instructions_files TEXT NOT NULL DEFAULT '[]',
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
+  model_routing_json TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 )`,
@@ -1884,6 +2089,19 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   UNIQUE(user_group_id, target_type, target_ref)
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_user_group_targets_group ON user_group_targets(user_group_id)`,
+		`CREATE TABLE IF NOT EXISTS user_group_target_bindings(
+  user_group_id TEXT NOT NULL,
+  affinity_key TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(user_group_id, affinity_key, model),
+  FOREIGN KEY(user_group_id) REFERENCES user_groups(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_group_target_bindings_updated ON user_group_target_bindings(updated_at)`,
+		`ALTER TABLE user_groups ADD COLUMN model_routing_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -2010,13 +2228,13 @@ func (s *Store) migrateLifecycle(ctx context.Context) error {
 }
 
 func (s *Store) GetGroup(ctx context.Context, name string) (Group, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups WHERE name = ?`, name)
+	row := s.rdb.QueryRowContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, egress_ids, created_at, updated_at FROM groups WHERE name = ?`, name)
 	var g Group
 	return scanGroup(row.Scan, &g)
 }
 
 func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, created_at, updated_at FROM groups ORDER BY name`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, egress_ids, created_at, updated_at FROM groups ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -2034,8 +2252,8 @@ func (s *Store) ListGroups(ctx context.Context) ([]Group, error) {
 
 func scanGroup(scan func(...interface{}) error, g *Group) (Group, error) {
 	var apply, virtual, modelInstructionsEnabled int
-	var filesJSON string
-	err := scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &modelInstructionsEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &g.CreatedAt, &g.UpdatedAt)
+	var filesJSON, egressJSON string
+	err := scan(&g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &virtual, &modelInstructionsEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &g.DefaultEgressID, &egressJSON, &g.CreatedAt, &g.UpdatedAt)
 	if err != nil {
 		return *g, err
 	}
@@ -2043,7 +2261,55 @@ func scanGroup(scan func(...interface{}) error, g *Group) (Group, error) {
 	g.Virtual2MEnabled = virtual != 0
 	g.ModelInstructionsEnabled = modelInstructionsEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
+	g.egressIDsConfigured = strings.TrimSpace(egressJSON) != ""
+	if g.egressIDsConfigured {
+		g.EgressIDs = decodeStringList(egressJSON)
+	} else if strings.TrimSpace(g.DefaultEgressID) != "" {
+		g.EgressIDs = []string{strings.TrimSpace(g.DefaultEgressID)}
+	} else {
+		g.EgressIDs = []string{}
+	}
 	return *g, nil
+}
+
+func normalizeOrderedIDs(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func encodeOrderedIDs(values []string) string {
+	raw, err := json.Marshal(normalizeOrderedIDs(values))
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func prepareGroupEgress(g *Group) string {
+	ids := g.EgressIDs
+	if ids == nil && strings.TrimSpace(g.DefaultEgressID) != "" {
+		ids = []string{g.DefaultEgressID}
+	}
+	ids = normalizeOrderedIDs(ids)
+	g.EgressIDs = ids
+	if len(ids) > 0 {
+		g.DefaultEgressID = ids[0]
+	} else if g.EgressIDs != nil {
+		g.DefaultEgressID = ""
+	}
+	return encodeOrderedIDs(ids)
 }
 
 func encodeStringList(values []string) string {
@@ -2077,8 +2343,9 @@ func decodeStringList(raw string) []string {
 }
 
 func (s *Store) UpdateGroup(ctx context.Context, g Group) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE groups SET system_prompt = ?, prompt_mode = ?, system_prompt_apply_to_compaction = ?, virtual_2m_enabled = ?, model_instructions_enabled = ?, model_instructions_files = ?, force_model = ?, force_effort = ?, default_egress_id = ?, updated_at = ? WHERE name = ?`,
-		g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, Now(), g.Name)
+	egressJSON := prepareGroupEgress(&g)
+	_, err := s.db.ExecContext(ctx, `UPDATE groups SET system_prompt = ?, prompt_mode = ?, system_prompt_apply_to_compaction = ?, virtual_2m_enabled = ?, model_instructions_enabled = ?, model_instructions_files = ?, force_model = ?, force_effort = ?, default_egress_id = ?, egress_ids = ?, updated_at = ? WHERE name = ?`,
+		g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, egressJSON, Now(), g.Name)
 	return err
 }
 
@@ -2093,32 +2360,155 @@ func (s *Store) CreateGroup(ctx context.Context, g Group) error {
 		g.PromptMode = "prepend"
 	}
 	now := Now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, now, now)
+	egressJSON := prepareGroupEgress(&g)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO groups(name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, virtual_2m_enabled, model_instructions_enabled, model_instructions_files, force_model, force_effort, default_egress_id, egress_ids, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.Virtual2MEnabled), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.DefaultEgressID, egressJSON, now, now)
 	return err
 }
 
-// DeleteGroup removes a group by name. The caller must guard against deleting the
-// configured default group and against orphaning members (see CountAccountsByGroup).
+func routingTargetReferences(ctx context.Context, tx *sql.Tx, target TargetRef) ([]string, error) {
+	target, err := NormalizeTargetRef(target)
+	if err != nil {
+		return nil, err
+	}
+	references := map[string]struct{}{}
+	targetRows, err := tx.QueryContext(ctx, `SELECT user_group_id, target_type, target_ref FROM user_group_targets`)
+	if err != nil {
+		return nil, err
+	}
+	for targetRows.Next() {
+		var userGroupID, kind, id string
+		if err := targetRows.Scan(&userGroupID, &kind, &id); err != nil {
+			_ = targetRows.Close()
+			return nil, err
+		}
+		canonical, normalizeErr := NormalizeTargetRef(TargetRef{Kind: kind, ID: id})
+		if normalizeErr != nil {
+			_ = targetRows.Close()
+			return nil, fmt.Errorf("invalid target row for user group %q: %w", userGroupID, normalizeErr)
+		}
+		if canonical.key() == target.key() {
+			references["user_group_target:"+userGroupID] = struct{}{}
+		}
+	}
+	if err := targetRows.Err(); err != nil {
+		_ = targetRows.Close()
+		return nil, err
+	}
+	if err := targetRows.Close(); err != nil {
+		return nil, err
+	}
+
+	routingRows, err := tx.QueryContext(ctx, `SELECT id, model_routing_json FROM user_groups`)
+	if err != nil {
+		return nil, err
+	}
+	for routingRows.Next() {
+		var userGroupID, raw string
+		if err := routingRows.Scan(&userGroupID, &raw); err != nil {
+			_ = routingRows.Close()
+			return nil, err
+		}
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		var rules []ModelRoutingRule
+		if err := json.Unmarshal([]byte(raw), &rules); err != nil {
+			_ = routingRows.Close()
+			return nil, fmt.Errorf("invalid model routing for user group %q: %w", userGroupID, err)
+		}
+		for _, rule := range rules {
+			for _, tier := range rule.Tiers {
+				for _, candidate := range tier {
+					canonical, normalizeErr := NormalizeTargetRef(candidate)
+					if normalizeErr != nil {
+						_ = routingRows.Close()
+						return nil, fmt.Errorf("invalid model routing target for user group %q: %w", userGroupID, normalizeErr)
+					}
+					if canonical.key() == target.key() {
+						references["model_routing:"+userGroupID] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	if err := routingRows.Err(); err != nil {
+		_ = routingRows.Close()
+		return nil, err
+	}
+	if err := routingRows.Close(); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(references))
+	for reference := range references {
+		out = append(out, reference)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// DeleteGroup removes an account-pool group only when no user-group target or
+// model-routing tier still names it. The caller separately guards the configured
+// default group and account membership (see CountAccountsByGroup).
 func (s *Store) DeleteGroup(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM groups WHERE name = ?`, name)
-	return err
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("group name required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	references, err := routingTargetReferences(ctx, tx, TargetRef{Kind: TargetKindAccountPoolGroup, ID: name})
+	if err != nil {
+		return err
+	}
+	if len(references) > 0 {
+		return fmt.Errorf("%w: account_pool_group/%s referenced by %s", ErrTargetInUse, name, strings.Join(references, ", "))
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM groups WHERE name = ?`, name)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
 }
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, created_at, updated_at`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, model_routing_json, created_at, updated_at`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled int
-	var filesJSON string
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &g.CreatedAt, &g.UpdatedAt)
+	var filesJSON, routingJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &g.ForceModel, &g.ForceEffort, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
+	if err == nil {
+		_ = json.Unmarshal([]byte(routingJSON), &g.ModelRouting)
+		if g.ModelRouting == nil {
+			g.ModelRouting = []ModelRoutingRule{}
+		}
+	}
 	return g, err
+}
+
+func (s *Store) hydrateUserGroup(ctx context.Context, g *UserGroup) error {
+	targets, err := s.GetUserGroupTargetRefs(ctx, g.ID)
+	if err != nil {
+		return err
+	}
+	if targets == nil {
+		targets = []TargetRef{}
+	}
+	g.Targets = targets
+	return nil
 }
 
 func (s *Store) GetUserGroup(ctx context.Context, id string) (UserGroup, bool, error) {
@@ -2126,6 +2516,9 @@ func (s *Store) GetUserGroup(ctx context.Context, id string) (UserGroup, bool, e
 	g, err := scanUserGroup(row.Scan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserGroup{}, false, nil
+	}
+	if err == nil {
+		err = s.hydrateUserGroup(ctx, &g)
 	}
 	return g, err == nil, err
 }
@@ -2136,6 +2529,9 @@ func (s *Store) GetUserGroupByName(ctx context.Context, name string) (UserGroup,
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserGroup{}, false, nil
 	}
+	if err == nil {
+		err = s.hydrateUserGroup(ctx, &g)
+	}
 	return g, err == nil, err
 }
 
@@ -2144,16 +2540,28 @@ func (s *Store) ListUserGroups(ctx context.Context) ([]UserGroup, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []UserGroup
 	for rows.Next() {
 		g, err := scanUserGroup(rows.Scan)
 		if err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		out = append(out, g)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.hydrateUserGroup(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
@@ -2171,18 +2579,285 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+	routingJSON := encodeModelRouting(g.ModelRouting)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, g.CreatedAt, g.UpdatedAt)
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, routingJSON, g.CreatedAt, g.UpdatedAt)
 	return err
+}
+
+// CreateUserGroupWithTargets atomically creates a user-facing group and all of
+// its routing targets. A failed target insert never leaves an unusable empty
+// user group behind.
+func (s *Store) CreateUserGroupWithTargets(ctx context.Context, g UserGroup, targets []UserGroupTarget) error {
+	refs := make([]TargetRef, 0, len(targets))
+	for _, target := range targets {
+		ref, err := targetRefFromLegacy(target)
+		if err != nil {
+			return err
+		}
+		refs = append(refs, ref)
+	}
+	g.Targets = refs
+	return s.CreateUserGroupDefinition(ctx, g)
+}
+
+func targetRefFromLegacy(target UserGroupTarget) (TargetRef, error) {
+	switch strings.TrimSpace(target.TargetType) {
+	case UserGroupTargetTypeBaseGroup:
+		return NormalizeTargetRef(TargetRef{Kind: TargetKindAccountPoolGroup, ID: target.TargetRef})
+	case UserGroupTargetTypeRelay:
+		return NormalizeTargetRef(TargetRef{Kind: TargetKindModelProvider, ID: target.TargetRef})
+	case UserGroupTargetTypeKiro, UserGroupTargetTypeAntigravity:
+		return NormalizeTargetRef(TargetRef{Kind: TargetKindAccountPoolGroup, ID: target.TargetType})
+	default:
+		return TargetRef{}, fmt.Errorf("unsupported user group target_type %q", target.TargetType)
+	}
+}
+
+func legacyTargetFromRef(userGroupID string, target TargetRef, now int64) (UserGroupTarget, error) {
+	target, err := NormalizeTargetRef(target)
+	if err != nil {
+		return UserGroupTarget{}, err
+	}
+	t := UserGroupTarget{UserGroupID: userGroupID, TargetRef: target.ID, AffinityWeight: 1, CreatedAt: now}
+	switch target.Kind {
+	case TargetKindAccountPoolGroup:
+		t.TargetType = UserGroupTargetTypeBaseGroup
+	case TargetKindModelProvider:
+		t.TargetType = UserGroupTargetTypeRelay
+	default:
+		return UserGroupTarget{}, fmt.Errorf("unsupported user group target kind %q", target.Kind)
+	}
+	return t, nil
+}
+
+func normalizeTargetRefs(targets []TargetRef) ([]TargetRef, error) {
+	seen := make(map[string]struct{}, len(targets))
+	out := make([]TargetRef, 0, len(targets))
+	for _, target := range targets {
+		normalized, err := NormalizeTargetRef(target)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[normalized.key()]; duplicate {
+			continue
+		}
+		seen[normalized.key()] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out, nil
+}
+
+func targetSupportsModel(target TargetRef, model string, providerModels map[string][]string) bool {
+	if target.Kind != TargetKindModelProvider {
+		return true
+	}
+	models, known := providerModels[target.key()]
+	if !known || len(models) == 0 {
+		return true
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, candidate := range models {
+		candidate = strings.ToLower(strings.TrimSpace(candidate))
+		if candidate == "*" || candidate == model || (strings.HasSuffix(candidate, "*") && strings.HasPrefix(model, strings.TrimSuffix(candidate, "*"))) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeModelRouting(rules []ModelRoutingRule, targets []TargetRef, providerModels map[string][]string) ([]ModelRoutingRule, error) {
+	selected := make(map[string]TargetRef, len(targets))
+	for _, target := range targets {
+		selected[target.key()] = target
+	}
+	seenModels := make(map[string]struct{}, len(rules))
+	out := make([]ModelRoutingRule, 0, len(rules))
+	for _, rule := range rules {
+		model := strings.TrimSpace(rule.Model)
+		if model == "" {
+			return nil, errors.New("model_routing model required")
+		}
+		modelKey := strings.ToLower(model)
+		if _, duplicate := seenModels[modelKey]; duplicate {
+			return nil, fmt.Errorf("duplicate model_routing rule for %q", model)
+		}
+		seenModels[modelKey] = struct{}{}
+		mentioned := make(map[string]struct{}, len(targets))
+		tiers := make([][]TargetRef, 0, len(rule.Tiers)+1)
+		for _, tier := range rule.Tiers {
+			cleanTier := make([]TargetRef, 0, len(tier))
+			for _, rawTarget := range tier {
+				target, err := NormalizeTargetRef(rawTarget)
+				if err != nil {
+					return nil, err
+				}
+				canonical, ok := selected[target.key()]
+				if !ok {
+					return nil, fmt.Errorf("model_routing target %s/%s is not selected", target.Kind, target.ID)
+				}
+				if !targetSupportsModel(canonical, model, providerModels) {
+					return nil, fmt.Errorf("target %s/%s does not support model %q", canonical.Kind, canonical.ID, model)
+				}
+				if _, duplicate := mentioned[canonical.key()]; duplicate {
+					continue
+				}
+				mentioned[canonical.key()] = struct{}{}
+				cleanTier = append(cleanTier, canonical)
+			}
+			if len(cleanTier) > 0 {
+				tiers = append(tiers, cleanTier)
+			}
+		}
+		fallback := make([]TargetRef, 0, len(targets))
+		for _, target := range targets {
+			if _, alreadyMentioned := mentioned[target.key()]; alreadyMentioned || !targetSupportsModel(target, model, providerModels) {
+				continue
+			}
+			fallback = append(fallback, target)
+		}
+		if len(fallback) > 0 {
+			tiers = append(tiers, fallback)
+		}
+		if len(tiers) == 0 {
+			return nil, fmt.Errorf("no compatible targets for model %q", model)
+		}
+		out = append(out, ModelRoutingRule{Model: model, Tiers: tiers})
+	}
+	return out, nil
+}
+
+func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g UserGroup) (UserGroup, error) {
+	g.ID = strings.TrimSpace(g.ID)
+	g.Name = strings.TrimSpace(g.Name)
+	if g.ID == "" {
+		return UserGroup{}, errors.New("user group id required")
+	}
+	if g.Name == "" {
+		return UserGroup{}, errors.New("user group name required")
+	}
+	if strings.TrimSpace(g.PromptMode) == "" {
+		g.PromptMode = "prepend"
+	}
+	targets, err := normalizeTargetRefs(g.Targets)
+	if err != nil {
+		return UserGroup{}, err
+	}
+	if len(targets) == 0 {
+		return UserGroup{}, errors.New("at least one user group target required")
+	}
+	providerModels := make(map[string][]string)
+	for _, target := range targets {
+		switch target.Kind {
+		case TargetKindAccountPoolGroup:
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM groups WHERE name = ?`, target.ID).Scan(&exists); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return UserGroup{}, fmt.Errorf("account pool group %q not found", target.ID)
+				}
+				return UserGroup{}, err
+			}
+		case TargetKindModelProvider:
+			if target.ID == "codex" || target.ID == "claude" || target.ID == "kiro" || target.ID == "antigravity" {
+				providerModels[target.key()] = nil
+				continue
+			}
+			var modelsJSON string
+			if err := tx.QueryRowContext(ctx, `SELECT models_json FROM custom_providers WHERE id = ?`, target.ID).Scan(&modelsJSON); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return UserGroup{}, fmt.Errorf("model provider %q not found", target.ID)
+				}
+				return UserGroup{}, err
+			}
+			providerModels[target.key()] = decodeProviderModels(modelsJSON)
+		}
+	}
+	g.Targets = targets
+	g.ModelRouting, err = normalizeModelRouting(g.ModelRouting, targets, providerModels)
+	if err != nil {
+		return UserGroup{}, err
+	}
+	return g, nil
+}
+
+func insertUserGroupTargets(ctx context.Context, tx *sql.Tx, g UserGroup, now int64) error {
+	for _, target := range g.Targets {
+		legacy, err := legacyTargetFromRef(g.ID, target, now)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO user_group_targets(user_group_id, target_type, target_ref, affinity_weight, created_at) VALUES(?,?,?,?,?)`,
+			legacy.UserGroupID, legacy.TargetType, legacy.TargetRef, legacy.AffinityWeight, legacy.CreatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateUserGroupDefinition atomically persists the full user-group policy,
+// selected targets, and per-model routing tiers.
+func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	g, err = s.normalizeUserGroupDefinition(ctx, tx, g)
+	if err != nil {
+		return err
+	}
+	now := Now()
+	if g.CreatedAt == 0 {
+		g.CreatedAt = now
+	}
+	g.UpdatedAt = now
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+		return err
+	}
+	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ReplaceUserGroupDefinition atomically replaces base fields, targets, and
+// model-routing rules. Readers can never observe a partially updated group.
+func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	g, err = s.normalizeUserGroupDefinition(ctx, tx, g)
+	if err != nil {
+		return err
+	}
+	now := Now()
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), now, g.ID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrUserGroupNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_group_targets WHERE user_group_id = ?`, g.ID); err != nil {
+		return err
+	}
+	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, force_model=?, force_effort=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, Now(), g.ID)
+	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), Now(), g.ID)
 	return err
 }
 
@@ -2209,6 +2884,102 @@ func (s *Store) GetUserGroupTargets(ctx context.Context, userGroupID string) ([]
 	return out, rows.Err()
 }
 
+// GetUserGroupTargetRefs exposes legacy target rows through the canonical public
+// {kind,id} representation. Ordering follows insertion order and is stable.
+func (s *Store) GetUserGroupTargetRefs(ctx context.Context, userGroupID string) ([]TargetRef, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT target_type, target_ref FROM user_group_targets WHERE user_group_id = ? ORDER BY id`, userGroupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]TargetRef, 0)
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var targetType, targetRef string
+		if err := rows.Scan(&targetType, &targetRef); err != nil {
+			return nil, err
+		}
+		canonical, err := targetRefFromLegacy(UserGroupTarget{TargetType: targetType, TargetRef: targetRef})
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[canonical.key()]; duplicate {
+			continue
+		}
+		seen[canonical.key()] = struct{}{}
+		out = append(out, canonical)
+	}
+	return out, rows.Err()
+}
+
+// GetUserGroupTargetRefsWithLegacyIDs exposes the numeric row identifiers used
+// by the deprecated /targets/{id} DELETE route without reverting the public
+// target representation to base_group/relay.
+func (s *Store) GetUserGroupTargetRefsWithLegacyIDs(ctx context.Context, userGroupID string) ([]TargetRefWithLegacyID, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id, target_type, target_ref FROM user_group_targets WHERE user_group_id = ? ORDER BY id`, strings.TrimSpace(userGroupID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]TargetRefWithLegacyID, 0)
+	for rows.Next() {
+		var legacyID int64
+		var kind, id string
+		if err := rows.Scan(&legacyID, &kind, &id); err != nil {
+			return nil, err
+		}
+		canonical, err := NormalizeTargetRef(TargetRef{Kind: kind, ID: id})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, TargetRefWithLegacyID{TargetRef: canonical, LegacyID: legacyID})
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetUserGroupTargetBinding(ctx context.Context, userGroupID, affinityKey, model string) (UserGroupTargetBinding, bool, error) {
+	var binding UserGroupTargetBinding
+	var kind, targetID string
+	err := s.rdb.QueryRowContext(ctx, `SELECT user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at FROM user_group_target_bindings WHERE user_group_id=? AND affinity_key=? AND model=?`,
+		strings.TrimSpace(userGroupID), strings.TrimSpace(affinityKey), strings.TrimSpace(model)).Scan(
+		&binding.UserGroupID, &binding.AffinityKey, &binding.Model, &kind, &targetID, &binding.CreatedAt, &binding.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return UserGroupTargetBinding{}, false, nil
+	}
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	target, err := NormalizeTargetRef(TargetRef{Kind: kind, ID: targetID})
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	binding.Target = target
+	return binding, true, nil
+}
+
+func (s *Store) UpsertUserGroupTargetBinding(ctx context.Context, binding UserGroupTargetBinding) error {
+	target, err := NormalizeTargetRef(binding.Target)
+	if err != nil {
+		return err
+	}
+	binding.UserGroupID = strings.TrimSpace(binding.UserGroupID)
+	binding.AffinityKey = strings.TrimSpace(binding.AffinityKey)
+	binding.Model = strings.TrimSpace(binding.Model)
+	if binding.UserGroupID == "" || binding.AffinityKey == "" {
+		return errors.New("user group target binding requires group and affinity key")
+	}
+	now := Now()
+	if binding.CreatedAt == 0 {
+		binding.CreatedAt = now
+	}
+	binding.UpdatedAt = now
+	_, err = s.db.ExecContext(ctx, `INSERT INTO user_group_target_bindings(user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?)
+ON CONFLICT(user_group_id, affinity_key, model) DO UPDATE SET target_kind=excluded.target_kind, target_id=excluded.target_id, updated_at=excluded.updated_at`,
+		binding.UserGroupID, binding.AffinityKey, binding.Model, target.Kind, target.ID, binding.CreatedAt, binding.UpdatedAt)
+	return err
+}
+
 func (s *Store) UpsertUserGroupTarget(ctx context.Context, t UserGroupTarget) error {
 	if t.AffinityWeight < 1 {
 		t.AffinityWeight = 1
@@ -2225,6 +2996,20 @@ func (s *Store) UpsertUserGroupTarget(ctx context.Context, t UserGroupTarget) er
 func (s *Store) RemoveUserGroupTarget(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM user_group_targets WHERE id = ?`, id)
 	return err
+}
+
+// RemoveUserGroupTargetForGroup is the scoped form used by the legacy admin
+// route. A row ID discovered under one user group can never delete another
+// group's target.
+func (s *Store) RemoveUserGroupTargetForGroup(ctx context.Context, userGroupID string, id int64) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM user_group_targets WHERE user_group_id = ? AND id = ?`, strings.TrimSpace(userGroupID), id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // SetAPIKeyUserGroup links an api key to a user_group by ID.
@@ -3078,11 +3863,15 @@ type AccountWithEgress struct {
 // their bindings and primary egress profiles in a single query. Used by the scheduler's
 // optimized selectFresh path to collapse N+1 DB round-trips into one.
 func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) ([]AccountWithEgress, error) {
+	var inheritedEgressIDs []string
+	if configuredGroup, err := s.GetGroup(ctx, group); err == nil && len(configuredGroup.EgressIDs) > 0 {
+		inheritedEgressIDs = append([]string(nil), configuredGroup.EgressIDs...)
+	}
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
 		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.ignore_rate_limit_controls, a.quarantine_until,
 		       a.quarantine_reason, a.created_at, a.updated_at,
-		       b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cookie_jar_key, b.cooldown_until,
+		       b.account_id, b.primary_egress_id, b.standby_egress_ids, b.sidecar_egress_id, b.cookie_jar_key, b.cooldown_until,
 		       b.recheck_pending, b.created_at, b.updated_at,
 		       COALESCE(e.id,''), COALESCE(e.name,''), COALESCE(e.type,''), COALESCE(e.endpoint,''),
 		       COALESCE(e.chain_proxy,''), COALESCE(e.region,''), COALESCE(e.exit_ip,''),
@@ -3103,7 +3892,6 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []AccountWithEgress
 	for rows.Next() {
 		var a AccountWithEgress
@@ -3116,7 +3904,7 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 			&a.Account.ChatGPTUserID, &a.Account.Email, &a.Account.PlanType, &a.Account.Provider,
 			&a.Account.Status, &isFedramp, &ignoreRateLimitControls, &a.Account.QuarantineUntil, &a.Account.QuarantineReason,
 			&a.Account.CreatedAt, &a.Account.UpdatedAt,
-			&a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.CookieJarKey,
+			&a.Binding.AccountID, &a.Binding.PrimaryEgressID, &a.Binding.StandbyEgressIDs, &a.Binding.SidecarEgressID, &a.Binding.CookieJarKey,
 			&a.Binding.CooldownUntil, &recheck, &a.Binding.CreatedAt, &a.Binding.UpdatedAt,
 			&a.Egress.ID, &a.Egress.Name, &a.Egress.Type, &a.Egress.Endpoint,
 			&a.Egress.ChainProxy, &a.Egress.Region, &a.Egress.ExitIP,
@@ -3127,15 +3915,40 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 			&a.Egress.IPMode, &a.Egress.ProviderKey, &a.Egress.DynamicConfigJSON,
 		)
 		if err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
 		a.Account.IsFedramp = isFedramp != 0
 		a.Account.IgnoreRateLimitControls = ignoreRateLimitControls != 0
+		// The JOIN guarantees equality, but the account row is the canonical
+		// identity for the returned aggregate even on a legacy database.
+		a.Binding.AccountID = a.Account.ID
 		a.Binding.RecheckPending = recheck != 0
 		a.Egress.StreamCapable = streamCapable != 0
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(inheritedEgressIDs) > 0 {
+		primary := inheritedEgressIDs[0]
+		primaryProfile, profileErr := s.GetEgressProfile(ctx, primary)
+		if profileErr != nil {
+			primaryProfile = EgressProfile{}
+		}
+		standby := strings.Join(inheritedEgressIDs[1:], ",")
+		for i := range out {
+			out[i].Binding.PrimaryEgressID = primary
+			out[i].Binding.StandbyEgressIDs = standby
+			out[i].Binding.CookieJarKey = out[i].Account.ID + ":" + primary
+			out[i].Egress = primaryProfile
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
@@ -4497,6 +5310,168 @@ func (s *Store) ListEgressProfiles(ctx context.Context) ([]EgressProfile, error)
 	return out, rows.Err()
 }
 
+// DeleteEgressProfile refuses to remove an outlet while any live routing
+// configuration still references it. References are never silently detached.
+func (s *Store) DeleteEgressProfile(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("egress id required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	references := make([]string, 0)
+
+	groupRows, err := tx.QueryContext(ctx, `SELECT name, default_egress_id, egress_ids FROM groups`)
+	if err != nil {
+		return err
+	}
+	for groupRows.Next() {
+		var name, legacyID, idsJSON string
+		if err := groupRows.Scan(&name, &legacyID, &idsJSON); err != nil {
+			_ = groupRows.Close()
+			return err
+		}
+		ids := decodeStringList(idsJSON)
+		if strings.TrimSpace(idsJSON) == "" && strings.TrimSpace(legacyID) != "" {
+			ids = []string{strings.TrimSpace(legacyID)}
+		}
+		for _, candidate := range ids {
+			if candidate == id {
+				references = append(references, "account_pool_group:"+name)
+				break
+			}
+		}
+	}
+	if err := groupRows.Err(); err != nil {
+		_ = groupRows.Close()
+		return err
+	}
+	_ = groupRows.Close()
+
+	providerRows, err := tx.QueryContext(ctx, `SELECT id, egress_ids FROM custom_providers`)
+	if err != nil {
+		return err
+	}
+	for providerRows.Next() {
+		var providerID, idsJSON string
+		if err := providerRows.Scan(&providerID, &idsJSON); err != nil {
+			_ = providerRows.Close()
+			return err
+		}
+		for _, candidate := range decodeStringList(idsJSON) {
+			if candidate == id {
+				references = append(references, "model_provider:"+providerID)
+				break
+			}
+		}
+	}
+	if err := providerRows.Err(); err != nil {
+		_ = providerRows.Close()
+		return err
+	}
+	_ = providerRows.Close()
+
+	poolRows, err := tx.QueryContext(ctx, `SELECT pool_id FROM egress_pool_members WHERE egress_id = ?`, id)
+	if err != nil {
+		return err
+	}
+	for poolRows.Next() {
+		var poolID string
+		if err := poolRows.Scan(&poolID); err != nil {
+			_ = poolRows.Close()
+			return err
+		}
+		references = append(references, "egress_pool:"+poolID)
+	}
+	if err := poolRows.Err(); err != nil {
+		_ = poolRows.Close()
+		return err
+	}
+	_ = poolRows.Close()
+
+	bindingRows, err := tx.QueryContext(ctx, `SELECT account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id FROM account_egress_bindings`)
+	if err != nil {
+		return err
+	}
+	for bindingRows.Next() {
+		var accountID, primaryID, standbyIDs, sidecarID string
+		if err := bindingRows.Scan(&accountID, &primaryID, &standbyIDs, &sidecarID); err != nil {
+			_ = bindingRows.Close()
+			return err
+		}
+		inUse := primaryID == id || sidecarID == id
+		if !inUse {
+			for _, candidate := range (AccountEgressBinding{StandbyEgressIDs: standbyIDs}).StandbyIDs() {
+				if candidate == id {
+					inUse = true
+					break
+				}
+			}
+		}
+		if inUse {
+			references = append(references, "account_binding:"+accountID)
+		}
+	}
+	if err := bindingRows.Err(); err != nil {
+		_ = bindingRows.Close()
+		return err
+	}
+	_ = bindingRows.Close()
+
+	now := Now()
+	affinityRows, err := tx.QueryContext(ctx, `SELECT route_key_hash FROM affinity_bindings WHERE egress_id = ? AND (expires_at = 0 OR expires_at > ?)`, id, now)
+	if err != nil {
+		return err
+	}
+	for affinityRows.Next() {
+		var routeKeyHash string
+		if err := affinityRows.Scan(&routeKeyHash); err != nil {
+			_ = affinityRows.Close()
+			return err
+		}
+		references = append(references, "affinity_binding:"+routeKeyHash)
+	}
+	if err := affinityRows.Err(); err != nil {
+		_ = affinityRows.Close()
+		return err
+	}
+	_ = affinityRows.Close()
+
+	sessionRows, err := tx.QueryContext(ctx, `SELECT id FROM codex_session_binding WHERE egress_id = ? AND state = 'active' AND expires_at > ?`, id, now)
+	if err != nil {
+		return err
+	}
+	for sessionRows.Next() {
+		var bindingID string
+		if err := sessionRows.Scan(&bindingID); err != nil {
+			_ = sessionRows.Close()
+			return err
+		}
+		references = append(references, "codex_session:"+bindingID)
+	}
+	if err := sessionRows.Err(); err != nil {
+		_ = sessionRows.Close()
+		return err
+	}
+	_ = sessionRows.Close()
+
+	if len(references) > 0 {
+		sort.Strings(references)
+		return fmt.Errorf("%w: %s", ErrEgressInUse, strings.Join(references, ", "))
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM egress_profiles WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func normalizeEgressPoolStrategy(strategy string) string {
 	if strings.TrimSpace(strategy) == "" {
 		return "sticky_least_used"
@@ -4978,9 +5953,9 @@ func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding,
 }
 
 func (s *Store) GetAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at FROM affinity_bindings WHERE route_key_hash = ?`, routeKeyHash)
+	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at, expires_at FROM affinity_bindings WHERE route_key_hash = ? AND (expires_at = 0 OR expires_at > ?)`, routeKeyHash, Now())
 	var b AffinityBinding
-	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt)
+	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt)
 	return b, err
 }
 
@@ -4991,8 +5966,8 @@ func (s *Store) UpsertAffinityBinding(ctx context.Context, b AffinityBinding) er
 	}
 	b.UpdatedAt = now
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO affinity_bindings(route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO affinity_bindings(route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at, expires_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(route_key_hash) DO UPDATE SET
  account_id = excluded.account_id,
  source = excluded.source,
@@ -5000,9 +5975,10 @@ ON CONFLICT(route_key_hash) DO UPDATE SET
  provider = excluded.provider,
  model = excluded.model,
  egress_id = excluded.egress_id,
+	expires_at = excluded.expires_at,
  epoch = affinity_bindings.epoch + 1,
  updated_at = excluded.updated_at`,
-		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Provider, b.Model, b.EgressID, b.Epoch, b.CreatedAt, b.UpdatedAt)
+		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Provider, b.Model, b.EgressID, b.Epoch, b.CreatedAt, b.UpdatedAt, b.ExpiresAt)
 	if err == nil {
 		s.affinityGen.Add(1)
 	}
@@ -5019,7 +5995,7 @@ func (s *Store) ListAffinityBindingsByAccount(ctx context.Context, accountID str
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at FROM affinity_bindings WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?`, accountID, limit)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at, expires_at FROM affinity_bindings WHERE account_id = ? AND (expires_at = 0 OR expires_at > ?) ORDER BY updated_at DESC LIMIT ?`, accountID, Now(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -5027,7 +6003,7 @@ func (s *Store) ListAffinityBindingsByAccount(ctx context.Context, accountID str
 	var out []AffinityBinding
 	for rows.Next() {
 		var b AffinityBinding
-		if err := rows.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
@@ -5039,7 +6015,7 @@ func (s *Store) ListAffinityBindingsByAccount(ctx context.Context, accountID str
 // account (for the dashboard / account view summary).
 func (s *Store) CountAffinityBindingsByAccount(ctx context.Context, accountID string) (int, error) {
 	var n int
-	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM affinity_bindings WHERE account_id = ?`, accountID).Scan(&n)
+	err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM affinity_bindings WHERE account_id = ? AND (expires_at = 0 OR expires_at > ?)`, accountID, Now()).Scan(&n)
 	return n, err
 }
 
@@ -5176,14 +6152,23 @@ func (s *Store) SetModerationConfig(ctx context.Context, cfg ModerationConfig) e
 func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error) {
 	var p CustomProvider
 	var enabled, auto int
-	var modelsJSON string
-	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &enabled, &auto, &modelsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var modelsJSON, egressJSON string
+	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &p.TransportProfile, &egressJSON, &enabled, &auto, &modelsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return CustomProvider{}, err
 	}
 	if proto, ok := NormalizeCustomProviderProtocol(p.UpstreamProtocol); ok {
 		p.UpstreamProtocol = proto
 	} else {
 		p.UpstreamProtocol = CustomProviderProtocolChatCompletions
+	}
+	if profile, ok := NormalizeCustomProviderTransportProfile(p.TransportProfile); ok {
+		p.TransportProfile = profile
+	} else {
+		p.TransportProfile = CustomProviderTransportGeneric
+	}
+	p.EgressIDs = decodeStringList(egressJSON)
+	if p.EgressIDs == nil {
+		p.EgressIDs = []string{}
 	}
 	p.Enabled = enabled != 0
 	p.AutoDiscoverModels = auto != 0
@@ -5215,7 +6200,7 @@ func decodeProviderModels(raw string) []string {
 	return out
 }
 
-const customProviderCols = `id, name, base_url, upstream_protocol, enabled, auto_discover_models, models_json, created_at, updated_at`
+const customProviderCols = `id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, created_at, updated_at`
 
 func (s *Store) ListCustomProviders(ctx context.Context) ([]CustomProvider, error) {
 	rows, err := s.rdb.QueryContext(ctx, `SELECT `+customProviderCols+` FROM custom_providers ORDER BY id`)
@@ -5261,6 +6246,12 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 	} else {
 		p.UpstreamProtocol = CustomProviderProtocolChatCompletions
 	}
+	if profile, ok := NormalizeCustomProviderTransportProfile(p.TransportProfile); ok {
+		p.TransportProfile = profile
+	} else {
+		p.TransportProfile = CustomProviderTransportGeneric
+	}
+	p.EgressIDs = normalizeOrderedIDs(p.EgressIDs)
 	now := Now()
 	if p.CreatedAt == 0 {
 		p.CreatedAt = now
@@ -5273,17 +6264,19 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 		}
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, upstream_protocol, enabled, auto_discover_models, models_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name = excluded.name,
  base_url = excluded.base_url,
  upstream_protocol = excluded.upstream_protocol,
+ transport_profile = excluded.transport_profile,
+ egress_ids = excluded.egress_ids,
  enabled = excluded.enabled,
  auto_discover_models = excluded.auto_discover_models,
  models_json = excluded.models_json,
  updated_at = excluded.updated_at`,
-		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, p.CreatedAt, p.UpdatedAt)
+		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, p.TransportProfile, encodeOrderedIDs(p.EgressIDs), boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, p.CreatedAt, p.UpdatedAt)
 	return err
 }
 
@@ -5304,8 +6297,30 @@ func decodeProviderModelsFromSlice(in []string) []string {
 }
 
 func (s *Store) DeleteCustomProvider(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM custom_providers WHERE id = ?`, id)
-	return err
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("provider id required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	references, err := routingTargetReferences(ctx, tx, TargetRef{Kind: TargetKindModelProvider, ID: id})
+	if err != nil {
+		return err
+	}
+	if len(references) > 0 {
+		return fmt.Errorf("%w: model_provider/%s referenced by %s", ErrTargetInUse, id, strings.Join(references, ", "))
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM custom_providers WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
 }
 
 // ── Upstream error rules ──
@@ -6190,8 +7205,8 @@ func (s *Store) backfillUserGroups(ctx context.Context) error {
 	}
 	type legacyGroup struct {
 		name, systemPrompt, promptMode, filesJSON, forceModel, forceEffort string
-		apply, miEnabled                                                    int
-		createdAt                                                           int64
+		apply, miEnabled                                                   int
+		createdAt                                                          int64
 	}
 	var groups []legacyGroup
 	for gRows.Next() {

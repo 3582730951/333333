@@ -65,12 +65,12 @@ const (
 	DefaultClaudeOAuthRedirectURI = "http://localhost:54545/callback"
 	DefaultClaudeOAuthScope       = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 	// Antigravity (Google Cloud Code) OAuth defaults for web-login import flow.
-	DefaultAntigravityOAuthAuthURL     = "https://accounts.google.com/o/oauth2/v2/auth"
-	DefaultAntigravityOAuthTokenURL    = "https://oauth2.googleapis.com/token"
-	DefaultAntigravityOAuthClientID    = "\x31\x30\x37\x31\x30\x30\x36\x30\x36\x30\x35\x39\x31\x2d\x74\x6d\x68\x73\x73\x69\x6e\x32\x68\x32\x31\x6c\x63\x72\x65\x32\x33\x35\x76\x74\x6f\x6c\x6f\x6a\x68\x34\x67\x34\x30\x33\x65\x70\x2e\x61\x70\x70\x73\x2e\x67\x6f\x6f\x67\x6c\x65\x75\x73\x65\x72\x63\x6f\x6e\x74\x65\x6e\x74\x2e\x63\x6f\x6d"
+	DefaultAntigravityOAuthAuthURL      = "https://accounts.google.com/o/oauth2/v2/auth"
+	DefaultAntigravityOAuthTokenURL     = "https://oauth2.googleapis.com/token"
+	DefaultAntigravityOAuthClientID     = "\x31\x30\x37\x31\x30\x30\x36\x30\x36\x30\x35\x39\x31\x2d\x74\x6d\x68\x73\x73\x69\x6e\x32\x68\x32\x31\x6c\x63\x72\x65\x32\x33\x35\x76\x74\x6f\x6c\x6f\x6a\x68\x34\x67\x34\x30\x33\x65\x70\x2e\x61\x70\x70\x73\x2e\x67\x6f\x6f\x67\x6c\x65\x75\x73\x65\x72\x63\x6f\x6e\x74\x65\x6e\x74\x2e\x63\x6f\x6d"
 	DefaultAntigravityOAuthClientSecret = "\x47\x4f\x43\x53\x50\x58\x2d\x4b\x35\x38\x46\x57\x52\x34\x38\x36\x4c\x64\x4c\x4a\x31\x6d\x4c\x42\x38\x73\x58\x43\x34\x7a\x36\x71\x44\x41\x66"
-	DefaultAntigravityOAuthRedirectURI = "https://cloudcode-pa.googleapis.com/oauth-callback"
-	DefaultAntigravityOAuthScope       = "https://www.googleapis.com/auth/cloud-platform"
+	DefaultAntigravityOAuthRedirectURI  = "https://cloudcode-pa.googleapis.com/oauth-callback"
+	DefaultAntigravityOAuthScope        = "https://www.googleapis.com/auth/cloud-platform"
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
@@ -189,9 +189,9 @@ type Config struct {
 	// engine. Normal turns use encrypted identity metadata plus HMAC aliases; when
 	// the bound account or previous_response_id is lost, the encrypted goal chain
 	// can rebuild one fresh root so active work survives a pool refill.
-	CodexSessionMappingEnabled       bool   `json:"codex_session_mapping_enabled"`
-	CodexSessionMappingRetentionDays int    `json:"codex_session_mapping_retention_days"`
-	CodexCPAStrict                   bool   `json:"codex_cpa_strict"`
+	CodexSessionMappingEnabled       bool `json:"codex_session_mapping_enabled"`
+	CodexSessionMappingRetentionDays int  `json:"codex_session_mapping_retention_days"`
+	CodexCPAStrict                   bool `json:"codex_cpa_strict"`
 	// CodexStatelessPassthrough makes native Codex /v1/responses fully self-contained
 	// (CPA-style). When on (default) the durable session-mapping / goal-continuity /
 	// context-journal engine is bypassed and every turn strips previous_response_id +
@@ -200,8 +200,8 @@ type Config struct {
 	// (more input tokens per turn) for stability: the "bound_account_unavailable" 409 and
 	// upstream "previous_response_not_found" 400 become structurally impossible. Set to
 	// false to restore the strict native session-mapping engine.
-	CodexStatelessPassthrough        bool   `json:"codex_stateless_passthrough"`
-	AdminToken                       string `json:"admin_token"`
+	CodexStatelessPassthrough bool   `json:"codex_stateless_passthrough"`
+	AdminToken                string `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
 	// cookie security, or generated public URLs. Direct internet clients cannot
 	// spoof X-Forwarded-* unless their immediate peer is in this list.
@@ -270,14 +270,14 @@ type Config struct {
 	// have built-in defaults (the official client values); set them only to track an
 	// upstream rotation without recompiling. CodexOAuthTokenURL also seeds the Codex
 	// refresh endpoint when OAuthTokenURL is unset.
-	CodexOAuthAuthURL      string `json:"codex_oauth_auth_url"`
-	CodexOAuthTokenURL     string `json:"codex_oauth_token_url"`
-	CodexOAuthClientID     string `json:"codex_oauth_client_id"`
-	CodexOAuthRedirectURI  string `json:"codex_oauth_redirect_uri"`
-	CodexOAuthScope        string `json:"codex_oauth_scope"`
-	ClaudeOAuthAuthURL     string `json:"claude_oauth_auth_url"`
-	ClaudeOAuthRedirectURI string `json:"claude_oauth_redirect_uri"`
-	ClaudeOAuthScope       string `json:"claude_oauth_scope"`
+	CodexOAuthAuthURL            string `json:"codex_oauth_auth_url"`
+	CodexOAuthTokenURL           string `json:"codex_oauth_token_url"`
+	CodexOAuthClientID           string `json:"codex_oauth_client_id"`
+	CodexOAuthRedirectURI        string `json:"codex_oauth_redirect_uri"`
+	CodexOAuthScope              string `json:"codex_oauth_scope"`
+	ClaudeOAuthAuthURL           string `json:"claude_oauth_auth_url"`
+	ClaudeOAuthRedirectURI       string `json:"claude_oauth_redirect_uri"`
+	ClaudeOAuthScope             string `json:"claude_oauth_scope"`
 	AntigravityOAuthAuthURL      string `json:"antigravity_oauth_auth_url"`
 	AntigravityOAuthTokenURL     string `json:"antigravity_oauth_token_url"`
 	AntigravityOAuthClientID     string `json:"antigravity_oauth_client_id"`
@@ -341,6 +341,11 @@ type Config struct {
 	// untouched); the value is capped well below common intermediary idle timeouts at
 	// read time. Default 15.
 	StreamKeepAliveSeconds int `json:"stream_keepalive_seconds"`
+	// StreamStallRecoverySeconds bounds how long an open upstream stream may emit no
+	// bytes before the relay treats it as stalled and enters the same lossless
+	// continuation path used for an EOF without a terminal event. 0 disables stall
+	// recovery. Default 360 seconds, just beyond the upstream's normal idle window.
+	StreamStallRecoverySeconds int `json:"stream_stall_recovery_seconds"`
 	// StreamAutoContinueEnabled is the master switch for the auto-continue subsystem:
 	// when a streaming response ends WITHOUT its terminal event (Codex
 	// response.completed / Anthropic message_stop), the relay re-issues the request
@@ -850,6 +855,7 @@ func Default() Config {
 		KiroCacheUnreportedThreshold:     DefaultKiroCacheUnreportedThreshold,
 		SchedulerHeartbeatSeconds:        15,
 		StreamKeepAliveSeconds:           15,
+		StreamStallRecoverySeconds:       360,
 		StreamContinueText:               "Please continue from exactly where you left off, without repeating anything.",
 		StreamAutoContinueMaxAttempts:    1,
 		ConversationIsolation:            true,
@@ -1427,6 +1433,9 @@ func (c *Config) normalize() {
 	// operator choice (off), so it is never forced back to the default here.
 	if c.StreamKeepAliveSeconds < 0 {
 		c.StreamKeepAliveSeconds = 0
+	}
+	if c.StreamStallRecoverySeconds < 0 {
+		c.StreamStallRecoverySeconds = 0
 	}
 	if strings.TrimSpace(c.StreamContinueText) == "" {
 		c.StreamContinueText = "Please continue from exactly where you left off, without repeating anything."

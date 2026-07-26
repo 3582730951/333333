@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"net/http"
@@ -38,13 +39,15 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, ps)
 	case http.MethodPost, http.MethodPatch:
 		var req struct {
-			ID                 string   `json:"id"`
-			Name               string   `json:"name"`
-			BaseURL            string   `json:"base_url"`
-			UpstreamProtocol   string   `json:"upstream_protocol"`
-			Enabled            *bool    `json:"enabled"`
-			AutoDiscoverModels *bool    `json:"auto_discover_models"`
-			Models             []string `json:"models"`
+			ID                 string    `json:"id"`
+			Name               string    `json:"name"`
+			BaseURL            string    `json:"base_url"`
+			UpstreamProtocol   *string   `json:"upstream_protocol"`
+			TransportProfile   *string   `json:"transport_profile"`
+			EgressIDs          *[]string `json:"egress_ids"`
+			Enabled            *bool     `json:"enabled"`
+			AutoDiscoverModels *bool     `json:"auto_discover_models"`
+			Models             []string  `json:"models"`
 		}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -62,24 +65,61 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("'codex' and 'claude' are reserved provider ids"))
 			return
 		}
-		baseURL := strings.TrimSpace(req.BaseURL)
-		if err := validateCustomProviderBaseURL(baseURL); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		proto, ok := storage.NormalizeCustomProviderProtocol(req.UpstreamProtocol)
-		if !ok {
-			writeError(w, http.StatusBadRequest, errors.New("upstream_protocol must be chat_completions or responses"))
+		existing, exists, err := s.store.GetCustomProvider(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		p := storage.CustomProvider{
 			ID:                 id,
 			Name:               strings.TrimSpace(req.Name),
-			BaseURL:            baseURL,
-			UpstreamProtocol:   proto,
+			BaseURL:            strings.TrimSpace(req.BaseURL),
 			Enabled:            true,
 			AutoDiscoverModels: true,
 			Models:             req.Models,
+			TransportProfile:   inferredProviderTransportProfile(id, req.Name),
+		}
+		if exists {
+			p = existing
+			if strings.TrimSpace(req.Name) != "" {
+				p.Name = strings.TrimSpace(req.Name)
+			}
+			if strings.TrimSpace(req.BaseURL) != "" {
+				p.BaseURL = strings.TrimSpace(req.BaseURL)
+			}
+			if req.Models != nil {
+				p.Models = req.Models
+			}
+		}
+		baseURL := p.BaseURL
+		if err := validateCustomProviderBaseURL(baseURL); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if req.TransportProfile != nil {
+			profile, ok := storage.NormalizeCustomProviderTransportProfile(*req.TransportProfile)
+			if !ok {
+				writeError(w, http.StatusBadRequest, errors.New("transport_profile must be generic, codex_cli, or claude_code"))
+				return
+			}
+			p.TransportProfile = profile
+		}
+		if req.UpstreamProtocol != nil {
+			proto, ok := storage.NormalizeCustomProviderProtocol(*req.UpstreamProtocol)
+			if !ok {
+				writeError(w, http.StatusBadRequest, errors.New("upstream_protocol must be chat_completions, responses, or anthropic_messages"))
+				return
+			}
+			p.UpstreamProtocol = proto
+		} else if !exists {
+			p.UpstreamProtocol = defaultProtocolForTransportProfile(p.TransportProfile)
+		}
+		if req.EgressIDs != nil {
+			if err := s.validateOrderedEgressIDs(r, *req.EgressIDs); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			p.EgressIDs = *req.EgressIDs
 		}
 		if req.Enabled != nil {
 			p.Enabled = *req.Enabled
@@ -106,6 +146,47 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func inferredProviderTransportProfile(id, name string) string {
+	identity := strings.ToLower(strings.TrimSpace(id + " " + name))
+	switch {
+	case strings.Contains(identity, "claude-code"), strings.Contains(identity, "claude_code"):
+		return storage.CustomProviderTransportClaudeCode
+	case strings.Contains(identity, "codex"):
+		return storage.CustomProviderTransportCodexCLI
+	default:
+		return storage.CustomProviderTransportGeneric
+	}
+}
+
+func defaultProtocolForTransportProfile(profile string) string {
+	switch profile {
+	case storage.CustomProviderTransportCodexCLI:
+		return storage.CustomProviderProtocolResponses
+	case storage.CustomProviderTransportClaudeCode:
+		return storage.CustomProviderProtocolAnthropicMessages
+	default:
+		return storage.CustomProviderProtocolChatCompletions
+	}
+}
+
+func (s *Server) validateOrderedEgressIDs(r *http.Request, ids []string) error {
+	seen := make(map[string]struct{}, len(ids))
+	for _, rawID := range ids {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, err := s.store.GetEgressProfile(r.Context(), id); err != nil {
+			return errors.New("egress " + id + " not found")
+		}
+	}
+	return nil
+}
+
 // adminProviderAction handles DELETE /admin/providers/{id}.
 func (s *Server) adminProviderAction(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
@@ -121,6 +202,14 @@ func (s *Server) adminProviderAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteCustomProvider(r.Context(), id); err != nil {
+		if errors.Is(err, storage.ErrTargetInUse) {
+			writePoolCodeError(w, http.StatusConflict, "target_in_use", err.Error())
+			return
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

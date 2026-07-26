@@ -8,8 +8,10 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -18,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/scheduler"
@@ -29,6 +33,11 @@ import (
 
 type codexSessionMappingContextKey struct{}
 type codexStrictCPAContextKey struct{}
+
+type codexSessionGate struct {
+	semaphore chan struct{}
+	refs      int
+}
 
 type codexDownstreamIdentity struct {
 	RootID       string
@@ -137,6 +146,8 @@ type codexContextMigration struct {
 	Mode    string
 }
 
+var errCodexToolContextUnrecoverable = errors.New("codex tool context cannot be recovered without a paired durable checkpoint")
+
 func withCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping) context.Context {
 	if mapping == nil {
 		return ctx
@@ -162,15 +173,9 @@ func codexStrictCPAFromContext(ctx context.Context) bool {
 }
 
 func (s *Server) codexSessionMappingEnabled(ctx context.Context) bool {
-	// CPA-style stateless passthrough takes precedence. When it is on, the entire
-	// durable session-mapping / goal-continuity / context-journal engine is bypassed so
-	// every native Codex turn is self-contained and portable across accounts. Reporting
-	// "not enabled" here is the single choke point that keeps that engine dormant at
-	// every call site (routing gate, movable guard, terminal goal persistence) without
-	// deleting it, so setting the flag back to false instantly restores strict mapping.
-	if s.codexStatelessPassthrough(ctx) {
-		return false
-	}
+	// Mapping is the identity boundary: downstream session/thread ids are lookup
+	// aliases only, while the upstream sees locally generated UUIDv7 values. When
+	// mapping is enabled it therefore takes precedence over legacy stateless mode.
 	return s.flagEnabled(ctx, "codex_session_mapping_enabled", s.cfg.CodexSessionMappingEnabled)
 }
 
@@ -184,6 +189,9 @@ func (s *Server) codexStatelessPassthrough(ctx context.Context) bool {
 	// This also keeps codexSessionMappingEnabled at its configured value for the WS path,
 	// matching its pre-passthrough behavior exactly.
 	if forceCodexResponsesWebSocket(ctx) {
+		return false
+	}
+	if s.flagEnabled(ctx, "codex_session_mapping_enabled", s.cfg.CodexSessionMappingEnabled) {
 		return false
 	}
 	return s.flagEnabled(ctx, "codex_stateless_passthrough", s.cfg.CodexStatelessPassthrough)
@@ -444,7 +452,18 @@ func stripCodexStateForRecoveredRoot(body []byte, header http.Header) ([]byte, h
 // encrypted journal/degraded body remains a compatibility fallback.  The caller
 // retries exactly once with the returned self-contained request.
 func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request, body []byte, header http.Header, pol downstreamPolicy, mapping *codexSessionMapping, contextError leakfilter.ResponsesContextErrorKind, reason string) (codexContextMigration, bool, error) {
-	if s == nil || mapping == nil || !mapping.enabled || mapping.binding == nil {
+	if s == nil || mapping == nil || !mapping.enabled {
+		return codexContextMigration{}, false, nil
+	}
+	mapping.mu.Lock()
+	hasBinding := mapping.binding != nil
+	hasProspective := mapping.prospective != nil
+	mapping.mu.Unlock()
+	// A first root already has an in-memory upstream UUID by the time an upstream
+	// risk response arrives, but it has no durable binding until response.completed.
+	// Permit that one case to rotate too; all other recovery still requires a known
+	// durable epoch.
+	if !hasBinding && (!hasProspective || reason != "mapped_session_risk") {
 		return codexContextMigration{}, false, nil
 	}
 
@@ -457,8 +476,22 @@ func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request
 		var ok bool
 		retry, mode, ok = s.recoverResponsesContext(ctx, body, header, contextError)
 		if !ok {
-			return codexContextMigration{}, false, nil
+			// A root turn without previous_response_id already carries all context
+			// required for this request. It can rotate the mapped upstream UUID without
+			// reconstructing or weakening the payload.
+			if codexDownstreamSessionIdentity(header, body).stateful() {
+				return codexContextMigration{}, false, nil
+			}
+			retry = codexRetryRequest{Raw: append([]byte(nil), body...), Header: stripCodexServerStateHeaders(header)}
+			mode = "rotated"
 		}
+	}
+	if mode == "rebuilt" {
+		if responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone) {
+			return codexContextMigration{}, false, errCodexToolContextUnrecoverable
+		}
+	} else if responsesHasUnpairedToolOutput(body, contextError) {
+		return codexContextMigration{}, false, errCodexToolContextUnrecoverable
 	}
 	cleanBody, cleanHeader, cleaned := stripCodexStateForRecoveredRoot(retry.Raw, retry.Header)
 	if !cleaned {
@@ -467,9 +500,11 @@ func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request
 	retry.Raw, retry.Header = cleanBody, cleanHeader
 
 	retiredIdentity := codexDownstreamSessionIdentity(header, body)
-	if err := s.retireCodexSessionMapping(ctx, mapping, reason); err != nil &&
-		!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
-		return codexContextMigration{}, false, err
+	if hasBinding {
+		if err := s.retireCodexSessionMapping(ctx, mapping, reason); err != nil &&
+			!errors.Is(err, storage.ErrCodexSessionMappingNotFound) && !errors.Is(err, storage.ErrCodexSessionEpochRetired) {
+			return codexContextMigration{}, false, err
+		}
 	}
 
 	recoveryRequest := r.Clone(ctx)
@@ -538,6 +573,75 @@ func codexSessionNamespace(pol downstreamPolicy, r *http.Request) string {
 	// Open-mode requests still need a namespace, but this is never used by itself
 	// to resolve a session: an exact root/thread/response/turn alias is mandatory.
 	return "unauthenticated"
+}
+
+// codexSessionGateKey identifies the exact downstream branch that must commit in
+// order. It is hashed before entering process memory shared state: neither raw
+// session/response ids nor bearer values are retained in the gate map. Child agent
+// threads use their own branch key and therefore remain independently concurrent.
+func codexSessionGateKey(pol downstreamPolicy, r *http.Request, body []byte) string {
+	if r == nil {
+		return ""
+	}
+	id := codexDownstreamSessionIdentity(r.Header, body)
+	kind, value := "branch", id.ThreadID
+	if value == "" {
+		kind, value = "root", id.RootID
+	}
+	if value == "" {
+		kind, value = "response", id.ResponseID
+	}
+	if value == "" {
+		kind, value = "turn_state", id.TurnState
+	}
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(codexSessionNamespace(pol, r) + "\x00" + kind + "\x00" + value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func (s *Server) releaseCodexSessionGateRef(key string, gate *codexSessionGate) {
+	if s == nil || key == "" || gate == nil {
+		return
+	}
+	s.codexSessionGatesMu.Lock()
+	defer s.codexSessionGatesMu.Unlock()
+	gate.refs--
+	if gate.refs == 0 && s.codexSessionGates[key] == gate {
+		delete(s.codexSessionGates, key)
+	}
+}
+
+// acquireCodexSessionGate serializes commits for one downstream branch. Waiting is
+// context-aware so a disconnected CLI cannot leave a stale waiter or retain the
+// gate indefinitely.
+func (s *Server) acquireCodexSessionGate(ctx context.Context, key string) (func(), error) {
+	if s == nil || key == "" {
+		return func() {}, nil
+	}
+	s.codexSessionGatesMu.Lock()
+	gate := s.codexSessionGates[key]
+	if gate == nil {
+		gate = &codexSessionGate{semaphore: make(chan struct{}, 1)}
+		s.codexSessionGates[key] = gate
+	}
+	gate.refs++
+	s.codexSessionGatesMu.Unlock()
+
+	select {
+	case gate.semaphore <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				<-gate.semaphore
+				s.releaseCodexSessionGateRef(key, gate)
+			})
+		}, nil
+	case <-ctx.Done():
+		s.releaseCodexSessionGateRef(key, gate)
+		return nil, ctx.Err()
+	}
 }
 
 func oneBinding(rows []storage.CodexSessionBinding) (*storage.CodexSessionBinding, error) {
@@ -796,6 +900,111 @@ func (m *codexSessionMapping) requiredRoute() (string, string) {
 	return m.requiredAccount, m.requiredEgress
 }
 
+// mainCLI reports whether this mapping is the root CLI session rather than a
+// child/fork. A root risk rotation retires the tree atomically; child failures do
+// not independently rewrite the root session identity.
+func (m *codexSessionMapping) mainCLI() bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding := m.binding
+	if binding == nil {
+		binding = m.prospective
+	}
+	if binding == nil {
+		return false
+	}
+	return strings.TrimSpace(binding.RootSessionID) != "" &&
+		binding.RootSessionID == binding.ThreadID &&
+		strings.TrimSpace(binding.ParentThreadID) == "" &&
+		strings.TrimSpace(binding.ForkedFromThreadID) == ""
+}
+
+// durableMainCLI excludes a prospective first turn: there is no persisted epoch
+// to retire until a root has completed successfully. Child and fork mappings are
+// also excluded so their failures cannot invalidate the main CLI tree.
+func (m *codexSessionMapping) durableMainCLI() bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding := m.binding
+	if binding == nil {
+		return false
+	}
+	return strings.TrimSpace(binding.RootSessionID) != "" &&
+		binding.RootSessionID == binding.ThreadID &&
+		strings.TrimSpace(binding.ParentThreadID) == "" &&
+		strings.TrimSpace(binding.ForkedFromThreadID) == ""
+}
+
+// codexMappedSessionRiskError identifies transport/account responses for which
+// reusing the same upstream session identity creates a repeated-risk loop. Client
+// schema/model errors are deliberately excluded because a new UUID cannot fix them.
+func codexMappedSessionRiskError(status int, body []byte) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusRequestTimeout,
+		http.StatusConflict, http.StatusLocked, http.StatusTooEarly,
+		http.StatusTooManyRequests:
+		return true
+	}
+	if status >= http.StatusInternalServerError {
+		return true
+	}
+	if status != http.StatusBadRequest {
+		return false
+	}
+	return codexExplicitSessionRisk(body)
+}
+
+func codexExplicitSessionRisk(body []byte) bool {
+	lower := strings.ToLower(string(body))
+	if !strings.Contains(lower, "session") {
+		return false
+	}
+	for _, marker := range []string{"risk", "flagged", "blocked", "invalid", "expired", "revoked", "suspicious", "abuse"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// codexMappedSessionRotationRequired separates errors that may be tied to the
+// generated upstream UUID from failures with a proven account/egress cause. A
+// self-contained root can use the normal account failover path for the latter;
+// a stateful root must first rebuild its durable context, but only when another
+// account can actually serve it. CF/region failures are the exception because a
+// new epoch can also elect a replacement egress on the same account.
+func codexMappedSessionRotationRequired(status int, header http.Header, body []byte, movable, hasFailoverCandidate bool) bool {
+	if !codexMappedSessionRiskError(status, body) {
+		return false
+	}
+	detection := cf.Detect(status, header, body)
+	if detection.Matched {
+		return !movable
+	}
+	verdict := ban.Classify(false, status, header, body)
+	switch verdict.State {
+	case ban.RegionBlocked:
+		return !movable
+	case ban.PermissionDenied, ban.Banned:
+		return !movable && hasFailoverCandidate
+	case ban.AuthExpired:
+		if verdict.Reason != "http_401" && verdict.Reason != "http_403" {
+			return !movable && hasFailoverCandidate
+		}
+	case ban.RateLimited:
+		if verdict.Reason != "http_429" {
+			return !movable && hasFailoverCandidate
+		}
+	}
+	return true
+}
+
 // instructionTreeID returns the tree whose administrator configuration a strict
 // request belongs to. A child inherits its parent tree; a fork deliberately does
 // not, because it is a new root/session under current operator configuration.
@@ -969,7 +1178,7 @@ func (m *codexSessionMapping) nextContinueSnapshot(turnState string) *upstream.C
 // nativeCodexContinueBody intentionally creates no local replay context. The
 // upstream owns the previous response chain, so the only new input is one native
 // continue turn paired with the latest upstream response id.
-func nativeCodexContinueBody(original []byte, previousResponseID string) ([]byte, error) {
+func nativeCodexContinueBody(original []byte, previousResponseID string, continueText ...string) ([]byte, error) {
 	previousResponseID = strings.TrimSpace(previousResponseID)
 	if previousResponseID == "" {
 		return nil, storage.ErrCodexSessionMappingNotFound
@@ -981,11 +1190,15 @@ func nativeCodexContinueBody(original []byte, previousResponseID string) ([]byte
 		}
 		return nil, err
 	}
+	text := "continue"
+	if len(continueText) > 0 && strings.TrimSpace(continueText[0]) != "" {
+		text = strings.TrimSpace(continueText[0])
+	}
 	continueItem, err := json.Marshal(map[string]interface{}{
 		"role": "user",
 		"content": []interface{}{map[string]interface{}{
 			"type": "input_text",
-			"text": "continue",
+			"text": text,
 		}},
 	})
 	if err != nil {
@@ -1024,8 +1237,8 @@ func writeCodexNativeContinuationFailure(w io.Writer, id, model string) error {
 		"object": "response",
 		"status": "failed",
 		"error": map[string]string{
-			"code":    "codex_native_continue_failed",
-			"message": "Upstream ended without a terminal response and its native continuation failed.",
+			"code":    "server_error",
+			"message": publicRetryMessage,
 		},
 	}
 	if strings.TrimSpace(model) != "" {
@@ -1045,21 +1258,18 @@ func writeCodexNativeContinuationFailure(w io.Writer, id, model string) error {
 // a protocol-valid failure when sidecar v2 reports a post-header transport break.
 // It intentionally does not claim the upstream reached a native EOF, so callers
 // must not invoke a continuation or rotate the CPA epoch from this condition.
-func writeCodexSidecarStreamFailure(w io.Writer, id, model, phase string) error {
+func writeCodexSidecarStreamFailure(w io.Writer, id, model, _ string) error {
 	response := map[string]interface{}{
 		"id":     firstNonEmpty(strings.TrimSpace(id), "resp_pool_sidecar_stream"),
 		"object": "response",
 		"status": "failed",
 		"error": map[string]string{
-			"code":    "sidecar_stream_interrupted",
-			"message": "The sidecar interrupted the upstream stream after response headers were sent.",
+			"code":    "server_error",
+			"message": publicRetryMessage,
 		},
 	}
 	if strings.TrimSpace(model) != "" {
 		response["model"] = strings.TrimSpace(model)
-	}
-	if strings.TrimSpace(phase) != "" {
-		response["error"].(map[string]string)["phase"] = strings.TrimSpace(phase)
 	}
 	if err := writeSSEEvent(w, "response.failed", map[string]interface{}{"response": response}); err != nil {
 		return err
@@ -1244,6 +1454,7 @@ func (s *Server) writeCodexSessionMappingError(w http.ResponseWriter, stream boo
 		"codex_session_mapping_unidentified": "Codex stateful request has no exact session mapping; start a new session or retry with its original response id.",
 		"codex_session_mapping_ambiguous":    "Codex session aliases resolve to more than one internal session.",
 		"codex_context_epoch_retired":        "Codex context epoch was retired and no recoverable checkpoint is available for this previous_response_id.",
+		"codex_tool_context_unrecoverable":   "The mapped session cannot be rotated because this tool result has no recoverable matching call. Start a new root turn instead of replaying the tool result.",
 	}[code]
 	if message == "" {
 		message = "Codex session mapping failed."
@@ -1271,6 +1482,8 @@ func (s *Server) writeCodexSessionMappingError(w http.ResponseWriter, stream boo
 
 func codexMappingErrorCode(err error) string {
 	switch {
+	case errors.Is(err, errCodexToolContextUnrecoverable):
+		return "codex_tool_context_unrecoverable"
 	case errors.Is(err, storage.ErrCodexSessionMappingAmbiguous):
 		return "codex_session_mapping_ambiguous"
 	case errors.Is(err, storage.ErrCodexSessionEpochRetired), errors.Is(err, storage.ErrCodexSessionEpochConflict):

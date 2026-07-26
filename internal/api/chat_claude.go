@@ -323,7 +323,7 @@ chatClaudeSuccess:
 		// rewritten chat chunks).
 		uscan := usage.NewStreamScanner("claude")
 		aliasCapture := &claudeAliasCapture{}
-		anthropicStreamToChatSSE(w, io.TeeReader(resp.Body, io.MultiWriter(uscan, aliasCapture)), model, result.Scrubber)
+		anthropicStreamToChatSSE(w, io.TeeReader(resp.Body, io.MultiWriter(uscan, aliasCapture)), model, result.Scrubber, chatStreamUsageRequested(raw))
 		if parsed, ok := uscan.Parsed(); ok {
 			s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
 		}
@@ -355,7 +355,7 @@ chatClaudeSuccess:
 
 // anthropicStreamToChatSSE transforms an Anthropic Messages SSE stream into an
 // OpenAI chat.completion.chunk SSE stream, scrubbing each text delta.
-func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher) {
+func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, usageOptions ...bool) {
 	flusher, _ := w.(http.Flusher)
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
@@ -363,6 +363,15 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 	roleSent := false
 	toolIdx := -1
 	var finishReason interface{}
+	includeUsage := len(usageOptions) > 0 && usageOptions[0]
+	if len(usageOptions) == 0 {
+		// The Anthropic -> Responses bridge pipes this Chat stream into the Responses
+		// converter. It always needs the terminal usage chunk so response.completed can
+		// expose usage, even though no Chat client supplied stream_options.
+		_, includeUsage = w.(*customProtocolPipeWriter)
+	}
+	var inputTokens, outputTokens, cacheReadTokens int64
+	usageSeen := false
 
 	emit := func(delta map[string]interface{}, finish interface{}) {
 		chunk := map[string]interface{}{
@@ -381,27 +390,42 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			flusher.Flush()
 		}
 	}
-	done := func() {
-		if finishReason == nil {
-			finishReason = "stop"
-		}
-		emit(map[string]interface{}{}, finishReason)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 	emitError := func(value map[string]interface{}) {
 		// OpenAI Chat Completions SSE represents a terminal failure as an error
 		// payload, not a successful finish chunk followed by [DONE].  This is
 		// particularly important for the Kiro bridge: its EventStream decoder emits
 		// an Anthropic `error` frame after a stream has started.
-		if value == nil {
-			value = map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": "Anthropic upstream stream failed"}}
-		}
+		_ = value
+		value = map[string]interface{}{"error": map[string]interface{}{
+			"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+		}}
 		b, _ := json.Marshal(value)
 		_, _ = w.Write([]byte("data: "))
 		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	emitUsage := func() {
+		if !includeUsage || !usageSeen {
+			return
+		}
+		usage := map[string]interface{}{
+			"prompt_tokens":     inputTokens,
+			"completion_tokens": outputTokens,
+			"total_tokens":      inputTokens + outputTokens,
+		}
+		if cacheReadTokens > 0 {
+			usage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": cacheReadTokens}
+		}
+		chunk := map[string]interface{}{
+			"id": chatID, "object": "chat.completion.chunk", "model": model,
+			"choices": []interface{}{}, "usage": usage,
+		}
+		encoded, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(encoded)
 		_, _ = w.Write([]byte("\n\n"))
 		if flusher != nil {
 			flusher.Flush()
@@ -429,6 +453,12 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 			if m, ok := ev["message"].(map[string]interface{}); ok {
 				if idv, ok := m["id"].(string); ok && idv != "" {
 					chatID = idv
+				}
+				if streamUsage, ok := m["usage"].(map[string]interface{}); ok {
+					inputTokens = anthropicStreamUsageInt64(streamUsage["input_tokens"])
+					outputTokens = anthropicStreamUsageInt64(streamUsage["output_tokens"])
+					cacheReadTokens = anthropicStreamUsageInt64(streamUsage["cache_read_input_tokens"])
+					usageSeen = true
 				}
 			}
 			if !roleSent {
@@ -477,17 +507,55 @@ func anthropicStreamToChatSSE(w http.ResponseWriter, body io.Reader, model strin
 				}
 			}
 		case "message_delta":
+			if streamUsage, ok := ev["usage"].(map[string]interface{}); ok {
+				if value := anthropicStreamUsageInt64(streamUsage["input_tokens"]); value > 0 {
+					inputTokens = value
+				}
+				if value := anthropicStreamUsageInt64(streamUsage["output_tokens"]); value > 0 {
+					outputTokens = value
+				}
+				if value := anthropicStreamUsageInt64(streamUsage["cache_read_input_tokens"]); value > 0 {
+					cacheReadTokens = value
+				}
+				usageSeen = true
+			}
 			if d, ok := ev["delta"].(map[string]interface{}); ok {
 				if sr, ok := d["stop_reason"].(string); ok && sr != "" {
 					finishReason = prompt.StopReasonToFinish(sr)
 				}
 			}
 		case "message_stop":
-			done()
+			if finishReason == nil {
+				finishReason = "stop"
+			}
+			emit(map[string]interface{}{}, finishReason)
+			emitUsage()
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
 			return
 		}
 	}
-	done()
+	emitError(map[string]interface{}{"error": map[string]interface{}{
+		"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+	}})
+}
+
+func anthropicStreamUsageInt64(value interface{}) int64 {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func asString(v interface{}) string {

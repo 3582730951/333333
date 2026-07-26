@@ -9,6 +9,7 @@ import AppErrorBoundary, { installGlobalErrorHandlers } from './components/AppEr
 import AppUpdateNotice from './components/AppUpdateNotice.jsx';
 import { ToastViewport } from './components/pool/index.jsx';
 import { requireDocumentElement } from './lib/browserDocument.js';
+import { getLocalItem } from './lib/browserStorage.js';
 import { addWindowListener } from './lib/browserLifecycle.js';
 import { getLocale } from './lib/i18n.js';
 import './styles/tokens.css';
@@ -16,6 +17,17 @@ import './styles/base.css';
 import './styles/layout.css';
 import './styles/components.css';
 import './styles/utilities.css';
+
+try {
+  const preference = getLocalItem('pool_theme', 'auto') || 'auto';
+  const resolved = preference === 'auto'
+    ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+    : preference;
+  document.documentElement.dataset.theme = resolved === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.themePreference = preference;
+} catch {
+  document.documentElement.dataset.theme = 'light';
+}
 
 const disposeGlobalErrorHandlers = installGlobalErrorHandlers();
 if (import.meta.hot) {

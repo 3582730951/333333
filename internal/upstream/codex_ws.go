@@ -453,7 +453,7 @@ func pipeCodexWebSocketSSEFrames(conn *websocket.Conn, pw *io.PipeWriter, closeC
 			return ""
 		}
 		switch kind {
-		case "response.completed", "response.failed", "response.incomplete", "error":
+		case "response.completed", "response.failed", "response.incomplete", "response.error", "error":
 			_, _ = pw.Write([]byte("data: [DONE]\n\n"))
 			return kind
 		}

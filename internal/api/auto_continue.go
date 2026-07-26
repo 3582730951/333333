@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,9 +69,8 @@ func (s *Server) autoContinueMaxAttempts(ctx context.Context) int {
 	return n
 }
 
-// forEachSSEFrame reads src and invokes fn for each complete "\n\n"-terminated SSE frame,
-// then once more for any unterminated trailing bytes. It mirrors the framing every other
-// relay path uses so stitched output aligns with upstream framing.
+// forEachSSEFrame reads src and invokes fn for each complete LF- or CRLF-delimited
+// SSE frame, then once more for any unterminated trailing bytes.
 func forEachSSEFrame(src io.Reader, fn func(frame []byte) error) error {
 	buf := make([]byte, 0, 32768)
 	tmp := make([]byte, 32768)
@@ -81,12 +79,13 @@ func forEachSSEFrame(src io.Reader, fn func(frame []byte) error) error {
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 			for {
-				idx := bytes.Index(buf, []byte("\n\n"))
-				if idx < 0 {
+				boundary, separatorLen := sseFrameBoundary(buf)
+				if boundary < 0 {
 					break
 				}
-				frame := append([]byte(nil), buf[:idx+2]...)
-				buf = buf[idx+2:]
+				frameEnd := boundary + separatorLen
+				frame := append([]byte(nil), buf[:frameEnd]...)
+				buf = buf[frameEnd:]
 				if err := fn(frame); err != nil {
 					return err
 				}
@@ -149,12 +148,13 @@ func newScrubbingFrameWriter(dst io.Writer, leak bool, words *streamrewrite.Matc
 func (s *scrubbingFrameWriter) Write(p []byte) (int, error) {
 	s.buf = append(s.buf, p...)
 	for {
-		idx := bytes.Index(s.buf, []byte("\n\n"))
-		if idx < 0 {
+		boundary, separatorLen := sseFrameBoundary(s.buf)
+		if boundary < 0 {
 			break
 		}
-		frame := append([]byte(nil), s.buf[:idx+2]...)
-		s.buf = s.buf[idx+2:]
+		frameEnd := boundary + separatorLen
+		frame := append([]byte(nil), s.buf[:frameEnd]...)
+		s.buf = s.buf[frameEnd:]
 		out := frame
 		if s.leak {
 			out = leakfilter.NewSSEFilter(s.provider, s.words).ProcessFrameForRelay(out)
@@ -236,17 +236,19 @@ type claudeStreamTap struct {
 	openBlockIndex int
 	openBlock      bool
 	messageStopped bool
+	terminalError  bool
 }
 
 func (t *claudeStreamTap) Write(p []byte) (int, error) {
 	t.buf = append(t.buf, p...)
 	for {
-		idx := bytes.Index(t.buf, []byte("\n\n"))
-		if idx < 0 {
+		boundary, separatorLen := sseFrameBoundary(t.buf)
+		if boundary < 0 {
 			break
 		}
-		t.observe(t.buf[:idx+2])
-		t.buf = t.buf[idx+2:]
+		frameEnd := boundary + separatorLen
+		t.observe(t.buf[:frameEnd])
+		t.buf = t.buf[frameEnd:]
 	}
 	if len(t.buf) > streamLedgerMaxPartialFrame {
 		t.buf = t.buf[len(t.buf)-streamLedgerMaxPartialFrame:]
@@ -282,11 +284,17 @@ func (t *claudeStreamTap) observe(frame []byte) {
 		t.openBlock = false
 	case "message_stop":
 		t.messageStopped = true
+	case "error":
+		// An Anthropic error event is already a terminal event. Treating it as a
+		// truncated EOF would reissue the turn after output has committed, duplicate
+		// content/tool effects, and append a second synthetic error downstream.
+		t.terminalError = true
 	}
 }
 
-func (t *claudeStreamTap) reachedTerminal() bool { return t.messageStopped }
-func (t *claudeStreamTap) partialText() string   { return t.text.String() }
+func (t *claudeStreamTap) reachedTerminal() bool       { return t.messageStopped || t.terminalError }
+func (t *claudeStreamTap) completedSuccessfully() bool { return t.messageStopped && !t.terminalError }
+func (t *claudeStreamTap) partialText() string         { return t.text.String() }
 
 func jsonIntValue(v interface{}) int {
 	switch n := v.(type) {
@@ -503,7 +511,16 @@ func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBo
 		tap, stitchErr := stitchClaudeContinuation(w, io.TeeReader(stream, capture), priorBlocks, priorOpenIndex, priorOpen)
 		_ = stream.Close()
 		if stitchErr != nil {
-			return nil, stitchErr
+			// stitchClaudeContinuation closes the prior block before it starts the
+			// continuation. If the new upstream stream then stalls or breaks, terminate
+			// using the new block's offset index here. Returning nil,nil means the
+			// protocol terminal has already been emitted and prevents the caller from
+			// closing the old block a second time.
+			openIndex := priorBlocks + tap.openBlockIndex
+			if terminalErr := closeClaudeStreamGracefully(w, tap.openBlock, openIndex); terminalErr != nil {
+				return tap, errors.Join(stitchErr, terminalErr)
+			}
+			return nil, nil
 		}
 		if tap.reachedTerminal() {
 			return tap, nil
@@ -533,8 +550,8 @@ func closeClaudeStreamGracefully(w io.Writer, open bool, openIndex int) error {
 		"type": "error",
 		"error": map[string]interface{}{
 			"type":    "api_error",
-			"code":    "goal_stream_interrupted",
-			"message": "Upstream ended without message_stop; resume from the last checkpoint.",
+			"code":    "server_error",
+			"message": publicRetryMessage,
 		},
 	}); err != nil {
 		return err
@@ -603,8 +620,8 @@ func closeCodexStreamGracefully(w io.Writer, items []interface{}, text, id, mode
 		"object": "response",
 		"status": "failed",
 		"error": map[string]interface{}{
-			"code":    "goal_stream_interrupted",
-			"message": "Upstream ended without a terminal response event; resume from the last checkpoint.",
+			"code":    "server_error",
+			"message": publicRetryMessage,
 		},
 	}
 	if model != "" {

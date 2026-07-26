@@ -176,14 +176,17 @@ type Request struct {
 	// (including any "/v1" prefix). doOpenAICompatible appends DownstreamPath
 	// (/chat/completions or /models). Ignored by the codex/claude paths, which derive
 	// their base from config.
-	BaseURL        string
-	DownstreamPath string
-	Headers        http.Header
-	Body           []byte
-	Account        storage.Account
-	Token          storage.AccountToken
-	Egress         storage.EgressProfile
-	CookieJarKey   string
+	BaseURL string
+	// TransportProfile selects the first-party request identity simulated for a
+	// custom provider: generic, codex_cli, or claude_code.
+	TransportProfile string
+	DownstreamPath   string
+	Headers          http.Header
+	Body             []byte
+	Account          storage.Account
+	Token            storage.AccountToken
+	Egress           storage.EgressProfile
+	CookieJarKey     string
 	// Model is the downstream-requested model name (may include thinking suffix like
 	// "claude-opus-4-8(high)"). Used by thinking configuration resolution to apply
 	// model-specific overrides and parse suffix-based thinking hints.
@@ -995,7 +998,10 @@ func (c *Client) postDirectThroughSidecarChain(ctx context.Context, spec Request
 // on this list (random User-Agent, x-stainless-*, x-forwarded-*, cookies, etc.)
 // is dropped so the upstream sees a clean, official-looking request.
 var codexProtocolHeaders = map[string]bool{
-	"accept":                                true,
+	"accept": true,
+	// Claude Code requests bridged to Responses retain non-1M beta markers. The
+	// bridge strips the Anthropic-only context marker before this allowlist runs.
+	"anthropic-beta":                        true,
 	"openai-beta":                           true,
 	"conversation_id":                       true,
 	"x-codex-turn-state":                    true,

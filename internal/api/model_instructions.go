@@ -137,6 +137,32 @@ func normalizeModelInstructionFileName(value string) (string, error) {
 	return name, nil
 }
 
+type requestUserGroupPolicyContextKey struct{}
+
+func userGroupPolicyAsAccountGroup(group storage.UserGroup) storage.Group {
+	return storage.Group{
+		Name:                          group.ID,
+		SystemPrompt:                  group.SystemPrompt,
+		PromptMode:                    group.PromptMode,
+		SystemPromptApplyToCompaction: group.SystemPromptApplyToCompaction,
+		ModelInstructionsEnabled:      group.ModelInstructionsEnabled,
+		ModelInstructionsFiles:        append([]string(nil), group.ModelInstructionsFiles...),
+		ForceModel:                    group.ForceModel,
+		ForceEffort:                   group.ForceEffort,
+	}
+}
+
+func withRequestUserGroupPolicy(ctx context.Context, group storage.UserGroup) context.Context {
+	return context.WithValue(ctx, requestUserGroupPolicyContextKey{}, userGroupPolicyAsAccountGroup(group))
+}
+
+func requestUserGroupPolicy(ctx context.Context) storage.Group {
+	if group, ok := ctx.Value(requestUserGroupPolicyContextKey{}).(storage.Group); ok {
+		return group
+	}
+	return storage.Group{}
+}
+
 func (s *Server) compileGroupModelInstructions(ctx context.Context, group storage.Group) (string, string, error) {
 	_ = ctx
 	if !group.ModelInstructionsEnabled {

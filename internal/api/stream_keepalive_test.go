@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http/httptest"
 	"strings"
@@ -18,6 +19,19 @@ type chunkReader struct {
 	data []byte
 	size int
 	pos  int
+}
+
+type panicReadCloser struct {
+	closed bool
+}
+
+func (p *panicReadCloser) Read([]byte) (int, error) {
+	panic("reader implementation details must stay private")
+}
+
+func (p *panicReadCloser) Close() error {
+	p.closed = true
+	return nil
 }
 
 func (c *chunkReader) Read(p []byte) (int, error) {
@@ -185,5 +199,27 @@ func TestStreamKeepAliveEmitsHeartbeatDuringSilence(t *testing.T) {
 				t.Fatalf("terminal event missing after heartbeat: %q", got)
 			}
 		})
+	}
+}
+
+func TestUpstreamActivityReadCloserReturnsReaderPanicImmediately(t *testing.T) {
+	source := &panicReadCloser{}
+	reader := newUpstreamActivityReadCloser(context.Background(), source, time.Hour, 0, nil)
+	started := time.Now()
+	_, err := reader.Read(make([]byte, 1))
+	if !errors.Is(err, errUpstreamStreamReadPanic) {
+		t.Fatalf("read error=%v, want fixed upstream reader failure", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("reader panic waited for the stall timeout: %s", elapsed)
+	}
+	if strings.Contains(err.Error(), "implementation details") {
+		t.Fatalf("reader panic details leaked through the returned error: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !source.closed {
+		t.Fatal("wrapped upstream body was not closed")
 	}
 }

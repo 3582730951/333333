@@ -2,10 +2,12 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/identity"
 )
@@ -110,5 +112,22 @@ func TestUsageLimitCooldown(t *testing.T) {
 	}
 	if usageLimitCooldown(401, []byte(`{"error":{"type":"usage_limit_reached"}}`)) != 1800 {
 		t.Fatal("usage_limit body → 1800s even on 401")
+	}
+}
+
+func TestBenchOnLimitSurvivesCanceledRequestContext(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	accountID := h.importAccount(t, "limited-canceled", "upstream-canceled", "access-canceled")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.app.benchOnLimit(ctx, accountID, http.StatusTooManyRequests, http.Header{"Retry-After": {"120"}}, []byte(`{"error":"usage limit"}`))
+
+	binding, err := h.store.GetEgressBinding(context.Background(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.CooldownUntil <= time.Now().Unix() || !binding.RecheckPending {
+		t.Fatalf("canceled request did not persist cooldown and recheck: %+v", binding)
 	}
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -40,9 +41,13 @@ func (s *Server) adminUserGroups(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("name required"))
 			return
 		}
+		if len(req.Targets) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("at least one target required"))
+			return
+		}
 		req.ID = "ug_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-		if err := s.store.CreateUserGroup(r.Context(), req); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+		if err := s.store.CreateUserGroupDefinition(r.Context(), req); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err)
 			return
 		}
 		created, ok, err := s.store.GetUserGroup(r.Context(), req.ID)
@@ -104,6 +109,9 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id 
 			http.NotFound(w, r)
 			return
 		}
+		if g.Targets == nil {
+			g.Targets = []storage.TargetRef{}
+		}
 		writeJSON(w, http.StatusOK, g)
 	case http.MethodPut:
 		var req storage.UserGroup
@@ -116,8 +124,16 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id 
 			return
 		}
 		req.ID = id
-		if err := s.store.UpdateUserGroup(r.Context(), req); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+		if len(req.Targets) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("at least one target required"))
+			return
+		}
+		if err := s.store.ReplaceUserGroupDefinition(r.Context(), req); err != nil {
+			if errors.Is(err, storage.ErrUserGroupNotFound) {
+				http.NotFound(w, r)
+				return
+			}
+			writeError(w, http.StatusUnprocessableEntity, err)
 			return
 		}
 		updated, ok, err := s.store.GetUserGroup(r.Context(), id)
@@ -145,37 +161,46 @@ func (s *Server) adminUserGroupTargets(w http.ResponseWriter, r *http.Request, g
 	}
 	switch r.Method {
 	case http.MethodGet:
-		targets, err := s.store.GetUserGroupTargets(r.Context(), groupID)
+		targets, err := s.store.GetUserGroupTargetRefsWithLegacyIDs(r.Context(), groupID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		if targets == nil {
-			targets = []storage.UserGroupTarget{}
+			targets = []storage.TargetRefWithLegacyID{}
 		}
 		writeJSON(w, http.StatusOK, targets)
 	case http.MethodPost:
-		var req storage.UserGroupTarget
+		var req storage.TargetRef
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		req.UserGroupID = groupID
-		if strings.TrimSpace(req.TargetType) == "" {
-			writeError(w, http.StatusBadRequest, errors.New("target_type required"))
+		if strings.TrimSpace(req.Kind) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("target kind required"))
 			return
 		}
-		if err := s.store.UpsertUserGroupTarget(r.Context(), req); err != nil {
+		group, ok, err := s.store.GetUserGroup(r.Context(), groupID)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		targets, err := s.store.GetUserGroupTargets(r.Context(), groupID)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		group.Targets = append(group.Targets, req)
+		if err := s.store.ReplaceUserGroupDefinition(r.Context(), group); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err)
+			return
+		}
+		targets, err := s.store.GetUserGroupTargetRefsWithLegacyIDs(r.Context(), groupID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		if targets == nil {
-			targets = []storage.UserGroupTarget{}
+			targets = []storage.TargetRefWithLegacyID{}
 		}
 		writeJSON(w, http.StatusCreated, targets)
 	default:
@@ -198,7 +223,11 @@ func (s *Server) adminUserGroupTargetItem(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid target id: %w", err))
 		return
 	}
-	if err := s.store.RemoveUserGroupTarget(r.Context(), tid); err != nil {
+	if err := s.store.RemoveUserGroupTargetForGroup(r.Context(), groupID, tid); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

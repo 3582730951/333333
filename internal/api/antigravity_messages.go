@@ -28,6 +28,7 @@ import (
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"github.com/google/uuid"
 )
@@ -45,6 +46,7 @@ const (
 func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, lease scheduler.Lease) attemptOutcome {
 	defer lease.Release()
 	ctx := r.Context()
+	affinity := routing.ExtractAffinityKey(r, raw)
 
 	// --- 1. Load and optionally refresh credentials ---
 	creds, err := s.store.GetAntigravityCredentials(ctx, lease.Account.ID)
@@ -159,7 +161,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
-		s.recordAntigravityUsage(r, lease.Account.ID, displayModel, inputTok, outputTok, cachedTok, stopReason)
+		s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, inputTok, outputTok, cachedTok, stopReason)
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 		if isClaudePath {
@@ -171,7 +173,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 				return outcomeDone
 			}
 			_, _ = w.Write(result.RawBody)
-			s.recordAntigravityUsage(r, lease.Account.ID, displayModel, result.InputTokens, result.OutputTokens, result.CachedTokens, result.StopReason)
+			s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, result.InputTokens, result.OutputTokens, result.CachedTokens, result.StopReason)
 		} else {
 			// Gemini JSON — translate to Anthropic format.
 			chunk, parseErr := upstream.ParseAntigravityNonStream(resp.Body)
@@ -182,14 +184,14 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 			}
 			respJSON := upstream.AntigravityChunkToAnthropicJSON(chunk, displayModel, msgID)
 			_, _ = w.Write(respJSON)
-			s.recordAntigravityUsage(r, lease.Account.ID, displayModel, chunk.InputTokens, chunk.OutputTokens, chunk.CachedTokens, chunk.StopReason)
+			s.recordAntigravityUsage(r, lease.Account.ID, displayModel, affinity, chunk.InputTokens, chunk.OutputTokens, chunk.CachedTokens, chunk.StopReason)
 		}
 	}
 	// Persist session-sticky affinity binding for this account.
-	if affinityKey := routing.ExtractAffinityKey(r, []byte{}); affinityKey.Hash != "" {
+	if affinity.Hash != "" {
 		_ = s.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
-			RouteKeyHash: affinityKey.Hash,
-			RouteKey:     affinityKey.Hash,
+			RouteKeyHash: affinity.Hash,
+			RouteKey:     affinity.Key,
 			Source:       "antigravity",
 			AccountID:    lease.Account.ID,
 			Provider:     "antigravity",
@@ -236,16 +238,21 @@ func resolvedAntigravityModel(requested string, lease scheduler.Lease) string {
 
 // recordAntigravityUsage writes a lightweight usage row for billing/analytics.
 // cachedTok is the number of tokens served from the Gemini explicit cache (0 = no hit).
-func (s *Server) recordAntigravityUsage(r *http.Request, accountID, model string, inputTok, outputTok, cachedTok int64, stopReason string) {
+func (s *Server) recordAntigravityUsage(r *http.Request, accountID, model string, affinity routing.AffinityKey, inputTok, outputTok, cachedTok int64, stopReason string) {
 	ctx := context.Background()
-	keyHash, _ := downstreamFromCtx(r.Context())
+	keyHash, userID := downstreamFromCtx(r.Context())
 	raw, _ := json.Marshal(map[string]interface{}{
 		"stop_reason":           stopReason,
 		"provider":              "antigravity",
 		"cached_content_tokens": cachedTok,
 	})
-	_ = s.store.InsertUsageRecord(ctx, accountID, keyHash, "", "", model,
-		inputTok, outputTok, inputTok+outputTok, 0, json.RawMessage(raw))
+	_ = s.store.InsertUsageRecordWithDiagnostics(ctx, accountID, affinity.Hash, keyHash, userID, model,
+		inputTok, outputTok, inputTok+outputTok, cachedTok, cachedTok, 0, json.RawMessage(raw), storage.UsageDiagnostics{
+			UsageProvider:    "antigravity",
+			UsageSource:      "upstream",
+			CacheReadPresent: cachedTok > 0,
+			AffinitySource:   affinity.Source,
+		})
 }
 
 // antigravityCacheMinChars is the approximate character threshold below which
@@ -283,7 +290,10 @@ func (s *Server) resolveAntigravityCache(ctx context.Context, body []byte, model
 	convKeyHash = keyHash
 
 	// Prune expired entries in the background — best-effort.
-	go func() { _ = s.store.PruneExpiredAntigravityCacheEntries(context.Background()) }()
+	go func() {
+		defer supervisor.Recover("antigravity-cache-prune")
+		_ = s.store.PruneExpiredAntigravityCacheEntries(context.Background())
+	}()
 
 	// Check for a live cache entry.
 	entry, ok, err := s.store.GetAntigravityCacheEntry(ctx, creds.AccountID, model, keyHash)

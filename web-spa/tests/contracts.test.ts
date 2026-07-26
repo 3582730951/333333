@@ -11,6 +11,7 @@ import { filenameFromDisposition } from '../src/features/observability/api/expor
 import { keysResponseSchema } from '../src/features/access/api/keys';
 import { usersResponseSchema } from '../src/features/access/api/users';
 import { accountsResponseSchema } from '../src/features/accounts/api/accounts';
+import { emailPoolResponseSchema } from '../src/features/accounts/api/emailPool';
 import { cfEventsResponseSchema, quotaResponseSchema } from '../src/features/observability/api/events';
 import {
   lifecycleProviderOptionsSchema, lifecycleServicesResponseSchema, lifecycleTasksResponseSchema,
@@ -92,6 +93,22 @@ describe('API contracts', () => {
     expect(() => parseApiResponse(quotaResponseSchema, { rows: [{ account_id: 123 }] }))
       .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
     expect(() => parseApiResponse(usersResponseSchema, [{ id: 'user-1', role: 'user' }]))
+      .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
+  });
+
+  it('normalizes email pool pagination and rejects non-object responses', () => {
+    expect(parseApiResponse(emailPoolResponseSchema, {
+      accounts: [{
+        id: 'email-1', email: 'operator@example.test', status: 'idle', created_at: '1700000000', updated_at: 1_700_000_001,
+      }],
+      total: '4', page: '2', pageSize: '1', counts: { idle: '3', error: 1 },
+    })).toEqual({
+      accounts: [{
+        id: 'email-1', email: 'operator@example.test', status: 'idle', created_at: 1_700_000_000, updated_at: 1_700_000_001,
+      }],
+      total: 4, page: 2, pageSize: 1, counts: { idle: 3, error: 1 },
+    });
+    expect(() => parseApiResponse(emailPoolResponseSchema, []))
       .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
   });
 
@@ -186,12 +203,12 @@ describe('API contracts', () => {
   it('normalizes settings sections and preserves unknown configuration fields', () => {
     expect(parseApiResponse(configFieldsResponseSchema, {
       fields: [
-        { key: 'require_downstream_key', type: 'bool', value: true },
+        { key: 'require_downstream_key', type: 'bool', value: true, placement: 'system_settings', domain: null, scope: 'global', section: 'access', order: 7 },
         { key: 'registration_concurrency', type: 'int', value: 3 },
         { key: 'model_quality_models', type: 'csv', value: 'gpt-5,gpt-5-mini' },
       ],
     })).toMatchObject([
-      { key: 'require_downstream_key', type: 'bool', value: true, category: '运行时配置' },
+      { key: 'require_downstream_key', type: 'bool', value: true, category: '运行时配置', placement: 'system_settings', domain: null, scope: 'global', section: 'access', order: 7 },
       { key: 'registration_concurrency', type: 'int', value: 3, category: '运行时配置' },
       { key: 'model_quality_models', type: 'csv', value: 'gpt-5,gpt-5-mini', category: '运行时配置' },
     ]);
@@ -258,11 +275,15 @@ describe('API contracts', () => {
 
 describe('routing, responsive actions, and forms', () => {
   it('keeps every management and portal screen in the visual route matrix', () => {
-    expect(adminVisualRoutes).toHaveLength(21);
+    expect(adminVisualRoutes).toHaveLength(29);
     expect(portalRoutes).toHaveLength(4);
     expect(new Set(adminRoutes.map((route) => route.path)).size).toBe(adminRoutes.length);
     expect(settingsSections.map((section) => section.key)).toEqual(['config', 'automation', 'registrar', 'lifecycle', 'logging', 'memory', 'thinking', 'moderation']);
     expect(legacyRedirects.find((route) => route.path === '/thinking')?.to).toContain('?tab=thinking');
+    expect(adminRoutes.filter((route) => route.path.startsWith('/settings/ai/')).map((route) => route.path)).toEqual([
+      '/settings/ai/chatgpt', '/settings/ai/claude', '/settings/ai/kiro', '/settings/ai/antigravity', '/settings/ai/codex', '/settings/ai/claude-code',
+    ]);
+    expect(legacyRedirects.find((route) => route.path === '/model-settings')?.to).toBe('/settings/ai/chatgpt');
   });
 
   it('uses the same 768px mobile boundary for shell and data actions', () => {
@@ -293,7 +314,7 @@ describe('routing, responsive actions, and forms', () => {
       force_effort: 'high', expires_at: '2027-01-01T00:00:00Z',
     }, 'admin')).toEqual({
       label: 'CLI', key_type: 'pool_import', group_name: 'team', force_model: 'gpt-5',
-      force_effort: 'high', expires_at: 1798761600,
+      force_effort: 'high', user_group_id: '', expires_at: 1798761600,
     });
     expect(() => cleanApiKeyValues({ label: 'CLI', expires_at: 'tomorrow-ish' }, 'admin')).toThrow('过期时间格式无效');
     expect(filenameFromDisposition("attachment; filename*=UTF-8''diagnostics%20bundle.zip")).toBe('diagnostics bundle.zip');

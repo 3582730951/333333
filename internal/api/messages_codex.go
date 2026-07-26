@@ -45,7 +45,10 @@ func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	inner := r.Clone(r.Context())
+	// The 1M marker describes Anthropic model capability and is invalid once the
+	// final target is Codex/Responses. Other client beta markers remain part of the
+	// Claude Code session contract and must survive the protocol bridge.
+	inner := withoutAnthropicContext1MBeta(r)
 	urlCopy := *r.URL
 	urlCopy.Path = "/v1/responses"
 	urlCopy.RawPath = ""
@@ -54,7 +57,6 @@ func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, 
 	inner.RequestURI = ""
 	inner.Body = io.NopCloser(bytes.NewReader(converted.Body))
 	inner.ContentLength = int64(len(converted.Body))
-	inner.Header = r.Header.Clone()
 	inner.Header.Set("Content-Type", "application/json")
 	inner.Header.Del("Content-Length")
 

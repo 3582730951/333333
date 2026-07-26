@@ -40,15 +40,32 @@ func (s *Server) adminUsageByModel(w http.ResponseWriter, r *http.Request) {
 	if completeness.UsageCompleteThroughAt < stableUntil {
 		stableUntil = completeness.UsageCompleteThroughAt
 	}
-	models, err := s.store.UsageByModelWindow(r.Context(), win.EffectiveStartAt, stableUntil)
+	dimension := strings.TrimSpace(r.URL.Query().Get("dimension"))
+	if dimension == "" {
+		dimension = "model"
+	}
+	if dimension != "model" && dimension != "provider_model" {
+		writeError(w, http.StatusBadRequest, errors.New("dimension must be model or provider_model"))
+		return
+	}
+	var models interface{}
+	if dimension == "provider_model" {
+		models, err = s.store.UsageByProviderModelWindow(r.Context(), win.EffectiveStartAt, stableUntil)
+	} else {
+		models, err = s.store.UsageByModelWindow(r.Context(), win.EffectiveStartAt, stableUntil)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if models == nil {
-		models = []storage.UserUsageRow{}
+		if dimension == "provider_model" {
+			models = []storage.ProviderModelUsageRow{}
+		} else {
+			models = []storage.UserUsageRow{}
+		}
 	}
-	writeJSON(w, http.StatusOK, mergeCompletenessFields(mergeWindowFields(map[string]interface{}{"since": win.EffectiveStartAt, "now": win.EffectiveUntilAt, "models": models}, win), completeness))
+	writeJSON(w, http.StatusOK, mergeCompletenessFields(mergeWindowFields(map[string]interface{}{"since": win.EffectiveStartAt, "now": win.EffectiveUntilAt, "dimension": dimension, "models": models}, win), completeness))
 }
 
 // adminUsageCache returns cache-hit diagnostics since `since` (default last 24h).

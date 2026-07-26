@@ -60,6 +60,91 @@ type configField struct {
 	boot     func(c config.Config) interface{}
 }
 
+type configFieldMetadata struct {
+	Placement string
+	Domain    interface{}
+	Scope     string
+	Section   string
+	Order     int
+}
+
+const (
+	configPlacementAI      = "ai_settings"
+	configPlacementSystem  = "system_settings"
+	configPlacementFeature = "feature_page"
+)
+
+// configMetadata is the single ownership map used by both the system settings and
+// AI settings clients. A field is emitted once, with one placement and (for AI
+// settings) one domain. Keeping the classification server-side prevents the two
+// frontends from drifting into duplicate controls for the same setting key.
+func configMetadata(f configField, index int) configFieldMetadata {
+	meta := configFieldMetadata{
+		Placement: configPlacementSystem,
+		Domain:    nil,
+		Scope:     "global",
+		Section:   configSection(f),
+		Order:     index + 1,
+	}
+	key := strings.ToLower(strings.TrimSpace(f.Key))
+
+	if f.Category == catQuality {
+		meta.Placement = configPlacementFeature
+		return meta
+	}
+
+	domain := ""
+	switch {
+	case strings.HasPrefix(key, "openai_"):
+		domain = "chatgpt"
+	case strings.HasPrefix(key, "kiro_"):
+		domain = "kiro"
+	case strings.HasPrefix(key, "antigravity_"):
+		domain = "antigravity"
+	case strings.HasPrefix(key, "claude_gateway_"),
+		key == "claude_cli_version", key == "claude_node_version",
+		key == "claude_stainless_version", key == "claude_cch_signing":
+		domain = "claude_code"
+	case strings.HasPrefix(key, "claude_"):
+		domain = "claude"
+	case strings.HasPrefix(key, "codex_"):
+		domain = "codex"
+	case key == "conversation_isolation":
+		domain = "claude_code"
+	}
+	if domain != "" {
+		meta.Placement = configPlacementAI
+		meta.Domain = domain
+	}
+	if strings.Contains(key, "model") || strings.Contains(key, "thinking") || strings.Contains(key, "effort") || strings.Contains(key, "reasoning") {
+		meta.Scope = "model"
+	}
+	return meta
+}
+
+func configSection(f configField) string {
+	switch f.Category {
+	case catIdentity:
+		return "client_profile"
+	case catBehavior:
+		return "behavior_cache"
+	case catKiro:
+		return "provider_cache"
+	case catClaudeGateway:
+		return "gateway_transport"
+	case catLimits:
+		return "routing_limits"
+	case catQuality:
+		return "model_quality"
+	case catReg:
+		return "registration"
+	case catBoot:
+		return "bootstrap"
+	default:
+		return "general"
+	}
+}
+
 const (
 	catIdentity      = "虚拟身份 / 指纹"
 	catBehavior      = "行为 / 缓存"
@@ -245,13 +330,13 @@ func configFields() []configField {
 		{Key: "goal_compression_concurrency", Label: "目标压缩并发", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "全局可同时执行的目标压缩作业数，默认 1。", boot: func(c config.Config) interface{} { return c.GoalCompressionConcurrency }},
 		{Key: "codex_session_mapping_enabled", Label: "Codex 会话映射", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=Codex 正常以加密映射维持原生会话；绑定账号补号或上游丢失 previous_response_id 时，用加密目标检查点重建一个新根继续任务。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
+			Help: "开(默认)=下游 session/thread 仅作为加密查询别名，上游始终使用本地生成的 UUIDv7；主 CLI 会话遇到风控类错误时轮换为新的上游映射，并用目标检查点恢复任务。开启时优先于无状态直通。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
 		{Key: "codex_session_mapping_retention_days", Label: "Codex 映射保留天数", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "Codex 会话映射的滑动保留期，默认 7 天；仅保留 HMAC 别名和加密身份元数据。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingRetentionDays }},
 		{Key: "codex_cpa_strict", Label: "Codex 严格 CPA", Category: catLimits, Type: fieldBool, Effect: effectHot,
 			Help: "开(默认)=previous_response_id 与工具输出只原样交给同一上游会话；找不到映射时显式失败，不降级重放。管理员配置的上游错误规则仍会执行。", boot: func(c config.Config) interface{} { return c.CodexCPAStrict }},
 		{Key: "codex_stateless_passthrough", Label: "Codex 无状态直通", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=原生 Codex 学 CPA 走无状态直通：剥掉 previous_response_id / x-codex-turn-state，每轮自包含，任意账号可接、换号无损，从根本上消除 bound_account_unavailable(409) 与 previous_response_not_found(400)；代价是每轮重发全量上下文、额度消耗更多。优先级高于上面的“Codex 会话映射 / 严格 CPA”，开启时后两者对 Codex 自动失效。关=恢复严格原生会话映射引擎(旧行为)。", boot: func(c config.Config) interface{} { return c.CodexStatelessPassthrough }},
+			Help: "仅在关闭 Codex 会话映射时生效：剥掉 previous_response_id / x-codex-turn-state，并以自包含请求转发。会话映射开启时始终优先，以保证上游不接触下游 session_id。", boot: func(c config.Config) interface{} { return c.CodexStatelessPassthrough }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
@@ -260,6 +345,8 @@ func configFields() []configField {
 			Help: "流式推理在等待账号容量时发送 SSE 注释的间隔。", boot: func(c config.Config) interface{} { return c.SchedulerHeartbeatSeconds }},
 		{Key: "stream_keepalive_seconds", Label: "流式保活间隔", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "上游长时间静默时向下游发送协议保活帧(Codex response.in_progress / Claude ping)的间隔秒数，避免中间层/客户端在长流式任务未完成前断开；读取时上限约束在中间层空闲超时之下。0=关闭。默认 15。", boot: func(c config.Config) interface{} { return c.StreamKeepAliveSeconds }},
+		{Key: "stream_stall_recovery_seconds", Label: "流式停滞恢复秒数", Category: catLimits, Type: fieldInt, Effect: effectHot,
+			Help: "上游保持连接但持续无任何新事件达到该时长时，取消旧流并从已记录的 response/checkpoint 发送一次仅上游可见的继续指令。0=关闭；建议 360 秒。", boot: func(c config.Config) interface{} { return c.StreamStallRecoverySeconds }},
 		{Key: "stream_auto_continue_enabled", Label: "流式自动续写", Category: catLimits, Type: fieldBool, Effect: effectHot,
 			Help: "开=流式响应在未收到终止事件(Codex response.completed / Claude message_stop)就中断时，自动携带一次“继续”指令按原上下文重发一次并无缝拼接(重发会消耗上游额度)。默认关。绝不伪造内容，仅向上游发送续写指令。", boot: func(c config.Config) interface{} { return c.StreamAutoContinueEnabled }},
 		{Key: "stream_continue_text", Label: "续写指令文本", Category: catLimits, Type: fieldString, Effect: effectHot,
@@ -480,6 +567,7 @@ func (s *Server) settingsViewJSON(ctx context.Context) []map[string]interface{} 
 	fields := configFields()
 	out := make([]map[string]interface{}, 0, len(fields))
 	for _, f := range fields {
+		index := len(out)
 		value, overridden, err := s.configFieldResolvedValue(ctx, f)
 		settingsError := ""
 		if err != nil {
@@ -489,6 +577,7 @@ func (s *Server) settingsViewJSON(ctx context.Context) []map[string]interface{} 
 		if opts == nil {
 			opts = []string{}
 		}
+		meta := configMetadata(f, index)
 		out = append(out, map[string]interface{}{
 			"key":            f.Key,
 			"label":          f.Label,
@@ -500,6 +589,11 @@ func (s *Server) settingsViewJSON(ctx context.Context) []map[string]interface{} 
 			"value":          value,
 			"overridden":     overridden,
 			"settings_error": settingsError,
+			"placement":      meta.Placement,
+			"domain":         meta.Domain,
+			"scope":          meta.Scope,
+			"section":        meta.Section,
+			"order":          meta.Order,
 		})
 	}
 	return out
@@ -621,6 +715,16 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		n, _ := strconv.Atoi(raw)
 		if n < 60 {
 			return "", fmt.Errorf("must be at least 60")
+		}
+		return raw, nil
+	case "stream_stall_recovery_seconds":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n != 0 && (n < 60 || n > 3600) {
+			return "", fmt.Errorf("must be zero or between 60 and 3600")
 		}
 		return raw, nil
 	case "goal_retention_days", "goal_storage_max_mb", "goal_compression_max_stages", "goal_lease_seconds", "goal_heartbeat_seconds", "goal_compression_concurrency":

@@ -20,6 +20,25 @@ import (
 )
 
 type responseRuleFilterKey struct{}
+type streamStallRecoveryKey struct{}
+
+var errUpstreamStreamStalled = errors.New("upstream stream stalled without a terminal event")
+var errUpstreamStreamReadPanic = errors.New("upstream stream reader failed")
+
+const publicRetryMessage = "Please retry."
+
+func withStreamStallRecovery(ctx context.Context, timeout time.Duration) context.Context {
+	if timeout <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, streamStallRecoveryKey{}, timeout)
+}
+
+func streamStallRecoveryFromContext(ctx context.Context) time.Duration {
+	timeout, _ := ctx.Value(streamStallRecoveryKey{}).(time.Duration)
+	return timeout
+}
+
 type responseRuleFilter struct {
 	Keywords      []string
 	CaseSensitive bool
@@ -34,15 +53,106 @@ type ruleFilteringWriter struct {
 	buf      []byte
 }
 
+type activityReadResult struct {
+	data []byte
+	err  error
+}
+
+// upstreamActivityReadCloser bounds each blocked upstream read independently. New
+// bytes reset the stall window naturally by starting the next Read, while heartbeat
+// writes keep the downstream connection alive and never count as upstream activity.
+// The underlying body is closed by the caller after a timeout, which releases the
+// single in-flight read goroutine.
+type upstreamActivityReadCloser struct {
+	io.ReadCloser
+	ctx            context.Context
+	stallTimeout   time.Duration
+	heartbeatEvery time.Duration
+	heartbeat      func() error
+	pendingErr     error
+}
+
+func newUpstreamActivityReadCloser(ctx context.Context, body io.ReadCloser, stallTimeout, heartbeatEvery time.Duration, heartbeat func() error) io.ReadCloser {
+	if body == nil || (stallTimeout <= 0 && (heartbeatEvery <= 0 || heartbeat == nil)) {
+		return body
+	}
+	return &upstreamActivityReadCloser{
+		ReadCloser: body, ctx: ctx, stallTimeout: stallTimeout,
+		heartbeatEvery: heartbeatEvery, heartbeat: heartbeat,
+	}
+}
+
+func (r *upstreamActivityReadCloser) Read(p []byte) (int, error) {
+	if r.pendingErr != nil {
+		err := r.pendingErr
+		r.pendingErr = nil
+		return 0, err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	result := make(chan activityReadResult, 1)
+	buf := make([]byte, len(p))
+	go func() {
+		defer func() {
+			if panicValue := recover(); panicValue != nil {
+				supervisor.LogPanic("upstream-activity-reader", panicValue)
+				select {
+				case result <- activityReadResult{err: errUpstreamStreamReadPanic}:
+				case <-r.ctx.Done():
+				}
+			}
+		}()
+		n, err := r.ReadCloser.Read(buf)
+		result <- activityReadResult{data: buf[:n], err: err}
+	}()
+
+	var stall <-chan time.Time
+	var stallTimer *time.Timer
+	if r.stallTimeout > 0 {
+		stallTimer = time.NewTimer(r.stallTimeout)
+		stall = stallTimer.C
+		defer stallTimer.Stop()
+	}
+	var heartbeat <-chan time.Time
+	var heartbeatTicker *time.Ticker
+	if r.heartbeatEvery > 0 && r.heartbeat != nil {
+		heartbeatTicker = time.NewTicker(r.heartbeatEvery)
+		heartbeat = heartbeatTicker.C
+		defer heartbeatTicker.Stop()
+	}
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return 0, r.ctx.Err()
+		case <-stall:
+			return 0, errUpstreamStreamStalled
+		case <-heartbeat:
+			if err := r.heartbeat(); err != nil {
+				return 0, err
+			}
+		case got := <-result:
+			copy(p, got.data)
+			if len(got.data) > 0 && got.err != nil {
+				r.pendingErr = got.err
+				return len(got.data), nil
+			}
+			return len(got.data), got.err
+		}
+	}
+}
+
 func (w *ruleFilteringWriter) Write(p []byte) (int, error) {
 	w.buf = append(w.buf, p...)
 	for {
-		idx := bytes.Index(w.buf, []byte("\n\n"))
-		if idx < 0 {
+		boundary, separatorLen := sseFrameBoundary(w.buf)
+		if boundary < 0 {
 			break
 		}
-		frame := append([]byte(nil), w.buf[:idx+2]...)
-		w.buf = w.buf[idx+2:]
+		frameEnd := boundary + separatorLen
+		frame := append([]byte(nil), w.buf[:frameEnd]...)
+		w.buf = w.buf[frameEnd:]
 		out := filterRuleSSEFrame(frame, w.filter)
 		if len(out) > 0 {
 			if _, err := w.ResponseWriter.Write(out); err != nil {
@@ -180,6 +290,7 @@ func (sw *scannerResponseWriter) Flush() {
 // copy ends in an error, so a client that disconnects mid-stream after the upstream
 // already reported its counts is still billed/metered for what was produced.
 func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.Reader, words *streamrewrite.Matcher, provider, accountID, routeHash string) error {
+	ctx = withStreamStallRecovery(ctx, s.streamStallRecoveryInterval(ctx))
 	scanner := usage.NewStreamScanner(provider)
 	// Wrap the client writer so every byte forwarded to the downstream also feeds
 	// the scanner — no TeeReader copy on the read side.
@@ -203,10 +314,10 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 			// does, so an administrator sees the same behavior on either path.
 			interval = ruleInterval
 		}
-		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, rf, false, nil, provider, interval)
+		err = newRuleSSECopyWithHeartbeat(ctx, sw, body, rf, s.leakScrubEnabled(ctx), words, provider, interval)
 	} else if rf != nil {
 		err = newRuleSSECopy(ctx, sw, body, rf, s.leakScrubEnabled(ctx), words, provider)
-	} else if interval := s.streamKeepAliveInterval(ctx); interval > 0 {
+	} else if interval := s.streamKeepAliveInterval(ctx); interval > 0 || streamStallRecoveryFromContext(ctx) > 0 {
 		// General downstream keepalive: route the no-rule stream through the
 		// frame-aligned heartbeat pump so a long upstream silence is bridged with a
 		// provider protocol keepalive frame, preventing an intermediary or client from
@@ -260,6 +371,28 @@ func (s *Server) streamKeepAliveInterval(ctx context.Context) time.Duration {
 	}
 	if seconds > streamKeepAliveMaxSeconds {
 		seconds = streamKeepAliveMaxSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (s *Server) streamStallRecoveryInterval(ctx context.Context) time.Duration {
+	// An explicit in-process override is used by internal transports and focused
+	// fault-injection tests. It is never populated from downstream headers or JSON.
+	if timeout := streamStallRecoveryFromContext(ctx); timeout > 0 {
+		return timeout
+	}
+	if !s.goalContinuityEnabled(ctx) && !s.autoContinueEnabled(ctx, nil) {
+		return 0
+	}
+	seconds := s.settingInt(ctx, "stream_stall_recovery_seconds", s.cfg.StreamStallRecoverySeconds)
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds < 60 {
+		seconds = 60
+	}
+	if seconds > 3600 {
+		seconds = 3600
 	}
 	return time.Duration(seconds) * time.Second
 }
@@ -325,7 +458,7 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		if leak {
 			out = leakfilter.NewSSEFilter(provider, words).ProcessFrameForRelay(out)
 		} else {
-			if provider == "codex" && !codexStrictCPAFromContext(ctx) {
+			if provider == "codex" {
 				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
 			}
 			if words != nil && !words.Empty() {
@@ -371,6 +504,26 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 		defer heartbeatTicker.Stop()
 	}
 
+	var stall <-chan time.Time
+	var stallTimer *time.Timer
+	if timeout := streamStallRecoveryFromContext(ctx); timeout > 0 {
+		stallTimer = time.NewTimer(timeout)
+		stall = stallTimer.C
+		defer stallTimer.Stop()
+	}
+	resetStall := func() {
+		if stallTimer == nil {
+			return
+		}
+		if !stallTimer.Stop() {
+			select {
+			case <-stallTimer.C:
+			default:
+			}
+		}
+		stallTimer.Reset(streamStallRecoveryFromContext(ctx))
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -383,15 +536,17 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 				return nil
 			}
 			if len(result.data) > 0 {
+				resetStall()
 				buf = append(buf, result.data...)
 			}
 			for {
-				idx := bytes.Index(buf, []byte("\n\n"))
-				if idx < 0 {
+				boundary, separatorLen := sseFrameBoundary(buf)
+				if boundary < 0 {
 					break
 				}
-				frame := append([]byte(nil), buf[:idx+2]...)
-				buf = buf[idx+2:]
+				frameEnd := boundary + separatorLen
+				frame := append([]byte(nil), buf[:frameEnd]...)
+				buf = buf[frameEnd:]
 				if e := emitFrame(frame); e != nil {
 					return e
 				}
@@ -409,6 +564,8 @@ func newRuleSSECopyWithHeartbeat(ctx context.Context, w http.ResponseWriter, bod
 			if err := emitFrame([]byte(heartbeatFrameFor(provider))); err != nil {
 				return err
 			}
+		case <-stall:
+			return errUpstreamStreamStalled
 		}
 	}
 }
@@ -556,11 +713,11 @@ func probeEarlyCodexSSEFailureWithIdleRelease(body io.Reader, idle time.Duration
 	for len(buf) < earlySSEMaxBytes && frames < earlySSEMaxFrames {
 		committedInBatch := false
 		for {
-			idx := bytes.Index(buf[processed:], []byte("\n\n"))
-			if idx < 0 {
+			boundary, separatorLen := sseFrameBoundary(buf[processed:])
+			if boundary < 0 {
 				break
 			}
-			end := processed + idx + 2
+			end := processed + boundary + separatorLen
 			frame := buf[processed:end]
 			frames++
 			if parsed, ok := leakfilter.ParseCodexFailureFrame(frame); ok {
@@ -617,11 +774,11 @@ func probeEarlySSEFailure(body io.Reader, retryableFrame func([]byte) bool, cont
 	for len(buf) < earlySSEMaxBytes && frames < earlySSEMaxFrames {
 		committedInBatch := false
 		for {
-			idx := bytes.Index(buf[processed:], []byte("\n\n"))
-			if idx < 0 {
+			boundary, separatorLen := sseFrameBoundary(buf[processed:])
+			if boundary < 0 {
 				break
 			}
-			end := processed + idx + 2
+			end := processed + boundary + separatorLen
 			frame := buf[processed:end]
 			frames++
 			if retryableFrame(frame) {
@@ -710,10 +867,6 @@ func claudeSSEFrameCommitsContent(frame []byte) bool {
 // account-agnostic error when leak-scrub is on, and always filtering headers.
 // provider is "claude" for the Anthropic protocol, "codex" otherwise.
 func (s *Server) writeFilteredError(ctx context.Context, w http.ResponseWriter, provider string, status int, header http.Header, body []byte, words *streamrewrite.Matcher) {
-	if strings.EqualFold(provider, "codex") && codexStrictCPAFromContext(ctx) {
-		writeRaw(w, status, header, body)
-		return
-	}
 	out := body
 	filteredHeader := header
 	if !strings.EqualFold(provider, "claude") {

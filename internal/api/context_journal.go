@@ -442,6 +442,23 @@ func responsesNeedsDegrade(body []byte) bool {
 	return false
 }
 
+// responsesHasUnpairedToolOutput reports whether removing upstream-owned response
+// state would strand a client tool result. Such a result must never be disguised as
+// an ordinary user message during mapped-session rotation: either a durable replay
+// restores its matching call, or recovery stops before contacting a fresh session.
+func responsesHasUnpairedToolOutput(body []byte, contextError leakfilter.ResponsesContextErrorKind) bool {
+	root, err := decodeContextJSONMap(body)
+	if err != nil {
+		return bodyHasClientToolResult(body)
+	}
+	input, _ := root["input"].([]interface{})
+	if contextError == leakfilter.ResponsesContextErrorOrphanedToolOutput {
+		return bodyHasClientToolResult(body)
+	}
+	_, unpaired := neutralizeOrphanedToolOutputs(input)
+	return unpaired > 0
+}
+
 func decodeContextJSONMap(raw []byte) (map[string]interface{}, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()

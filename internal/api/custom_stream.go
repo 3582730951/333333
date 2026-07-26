@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
 )
@@ -46,6 +47,9 @@ type chatChunk struct {
 		TotalTokens           int64 `json:"total_tokens"`
 		PromptCacheHitTokens  int64 `json:"prompt_cache_hit_tokens"`
 		PromptCacheMissTokens int64 `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   *struct {
+			CachedTokens int64 `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
 }
 
@@ -69,6 +73,229 @@ func chatChunkData(line string) (string, bool) {
 	return data, true
 }
 
+type customSSEProtocol int
+
+const (
+	customSSEChatCompletions customSSEProtocol = iota
+	customSSEResponses
+	customSSEAnthropicMessages
+	maxTrackedCustomSSEFrameBytes = 16 << 20
+)
+
+// customSSETerminalTracker observes raw SSE frames without delaying passthrough.
+// It retains only the current frame and accepts a stream as complete only when the
+// upstream protocol's real terminal event has arrived.
+type customSSETerminalTracker struct {
+	protocol customSSEProtocol
+	pending  []byte
+	terminal bool
+}
+
+func (t *customSSETerminalTracker) Write(p []byte) (int, error) {
+	t.pending = append(t.pending, p...)
+	for {
+		boundary, separatorLen := sseFrameBoundary(t.pending)
+		if boundary < 0 {
+			break
+		}
+		t.observe(t.pending[:boundary])
+		t.pending = append(t.pending[:0], t.pending[boundary+separatorLen:]...)
+	}
+	if len(t.pending) > maxTrackedCustomSSEFrameBytes {
+		// An oversized frame cannot be validated safely. Keep passthrough streaming,
+		// but require a later well-formed terminal frame before treating it as complete.
+		t.pending = t.pending[:0]
+	}
+	return len(p), nil
+}
+
+func (t *customSSETerminalTracker) finish() {
+	if len(t.pending) > 0 {
+		t.observe(t.pending)
+		t.pending = nil
+	}
+}
+
+func (t *customSSETerminalTracker) observe(frame []byte) {
+	if t.terminal {
+		return
+	}
+	eventName, data := sseFrameEventData(frame)
+	trimmed := strings.TrimSpace(string(data))
+	if t.protocol == customSSEChatCompletions && trimmed == "[DONE]" {
+		t.terminal = true
+		return
+	}
+	if trimmed == "" || trimmed == "[DONE]" {
+		return
+	}
+	var envelope map[string]interface{}
+	if json.Unmarshal(data, &envelope) != nil {
+		return
+	}
+	eventType, _ := envelope["type"].(string)
+	if eventType == "" {
+		eventType = eventName
+	}
+	switch t.protocol {
+	case customSSEChatCompletions:
+		_, hasError := envelope["error"]
+		t.terminal = hasError || eventType == "error"
+	case customSSEResponses:
+		switch eventType {
+		case "response.completed", "response.incomplete", "response.failed", "response.error", "error":
+			t.terminal = true
+		}
+	case customSSEAnthropicMessages:
+		t.terminal = eventType == "message_stop" || eventType == "error"
+	}
+}
+
+func streamCopyRewriteValidated(w http.ResponseWriter, body io.Reader, scrubber *streamrewrite.Matcher, protocol customSSEProtocol, privacyOptions ...bool) (bool, error) {
+	tracker := &customSSETerminalTracker{protocol: protocol}
+	source := io.TeeReader(body, tracker)
+	privacy := len(privacyOptions) > 0 && privacyOptions[0]
+	var err error
+	if privacy {
+		err = forEachSSEFrame(source, func(frame []byte) error {
+			out := sanitizeCustomSSEFrame(frame, protocol)
+			if len(out) == 0 {
+				return nil
+			}
+			if scrubber != nil && !scrubber.Empty() {
+				out = scrubber.ReplaceAll(out)
+			}
+			if _, writeErr := w.Write(out); writeErr != nil {
+				return writeErr
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			return nil
+		})
+	} else {
+		err = streamCopyRewrite(w, source, scrubber)
+	}
+	tracker.finish()
+	if tracker.terminal {
+		return true, err
+	}
+	writeCustomSSEInterrupted(w, protocol, err != nil)
+	return false, err
+}
+
+// sanitizeCustomSSEFrame enforces the leak-scrub contract for native custom
+// provider streams. Informational quota/safety fields are removed, while an error
+// remains a protocol-valid terminal carrying no vendor, account, quota, or risk text.
+func sanitizeCustomSSEFrame(frame []byte, protocol customSSEProtocol) []byte {
+	out := frame
+	switch protocol {
+	case customSSEResponses:
+		out = leakfilter.NewSSEFilter("codex", nil).ProcessFrameForRelay(out)
+	case customSSEAnthropicMessages:
+		out = leakfilter.NewSSEFilter("claude", nil).ProcessFrameForRelay(out)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+
+	eventName, data := sseFrameEventData(out)
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "[DONE]" {
+		return out
+	}
+	var envelope map[string]interface{}
+	if json.Unmarshal(data, &envelope) != nil {
+		return out
+	}
+	eventType := streamString(envelope["type"])
+	if eventType == "" {
+		eventType = eventName
+	}
+	isError := false
+	switch protocol {
+	case customSSEChatCompletions:
+		_, hasError := envelope["error"]
+		isError = hasError || eventType == "error"
+	case customSSEResponses:
+		isError = eventType == "response.failed" || eventType == "response.error" || eventType == "error"
+	case customSSEAnthropicMessages:
+		isError = eventType == "error"
+	}
+	if !isError {
+		return out
+	}
+
+	streamError := map[string]interface{}{
+		"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+	}
+	var terminalEvent string
+	var payload map[string]interface{}
+	switch protocol {
+	case customSSEResponses:
+		terminalEvent = "response.failed"
+		payload = map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id": "resp_custom_stream_error", "object": "response", "status": "failed",
+				"output": []interface{}{}, "error": streamError,
+			},
+		}
+	case customSSEAnthropicMessages:
+		terminalEvent = "error"
+		streamError["type"] = "api_error"
+		payload = map[string]interface{}{"type": "error", "error": streamError}
+	default:
+		payload = map[string]interface{}{"error": streamError}
+	}
+	encoded, _ := json.Marshal(payload)
+	var rebuilt strings.Builder
+	if terminalEvent != "" {
+		rebuilt.WriteString("event: ")
+		rebuilt.WriteString(terminalEvent)
+		rebuilt.WriteByte('\n')
+	}
+	rebuilt.WriteString("data: ")
+	rebuilt.Write(encoded)
+	rebuilt.WriteString("\n\n")
+	return []byte(rebuilt.String())
+}
+
+func writeCustomSSEInterrupted(w http.ResponseWriter, protocol customSSEProtocol, readFailed bool) {
+	_ = readFailed
+	streamError := map[string]interface{}{
+		"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+	}
+	var eventName string
+	var payload map[string]interface{}
+	switch protocol {
+	case customSSEResponses:
+		eventName = "response.failed"
+		payload = map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id": "resp_custom_stream_error", "object": "response", "status": "failed",
+				"output": []interface{}{}, "error": streamError,
+			},
+		}
+	case customSSEAnthropicMessages:
+		eventName = "error"
+		payload = map[string]interface{}{"type": "error", "error": streamError}
+	default:
+		payload = map[string]interface{}{"error": streamError}
+	}
+	encoded, _ := json.Marshal(payload)
+	if eventName != "" {
+		_, _ = io.WriteString(w, "event: "+eventName+"\n")
+	}
+	_, _ = io.WriteString(w, "data: ")
+	_, _ = w.Write(encoded)
+	_, _ = io.WriteString(w, "\n\n")
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func usageMap(c chatChunk) map[string]interface{} {
 	if c.Usage == nil {
 		return nil
@@ -78,8 +305,12 @@ func usageMap(c chatChunk) map[string]interface{} {
 		"completion_tokens": c.Usage.CompletionTokens,
 		"total_tokens":      c.Usage.TotalTokens,
 	}
-	if c.Usage.PromptCacheHitTokens > 0 {
-		u["prompt_cache_hit_tokens"] = c.Usage.PromptCacheHitTokens
+	cachedTokens := c.Usage.PromptCacheHitTokens
+	if cachedTokens == 0 && c.Usage.PromptTokensDetails != nil {
+		cachedTokens = c.Usage.PromptTokensDetails.CachedTokens
+	}
+	if cachedTokens > 0 {
+		u["prompt_cache_hit_tokens"] = cachedTokens
 	}
 	if c.Usage.PromptCacheMissTokens > 0 {
 		u["prompt_cache_miss_tokens"] = c.Usage.PromptCacheMissTokens
@@ -127,6 +358,7 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	tools := map[int]*toolAcc{}
 	var toolOrder []int
 	var usage map[string]interface{}
+	sawDone := false
 
 	ensureCreated := func(id string) {
 		if created {
@@ -205,7 +437,12 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 
 	sc := newChatSSEScanner(body)
 	for sc.Scan() {
-		data, ok := chatChunkData(sc.Text())
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "data:") && strings.TrimSpace(line[len("data:"):]) == "[DONE]" {
+			sawDone = true
+			break
+		}
+		data, ok := chatChunkData(line)
 		if !ok {
 			continue
 		}
@@ -214,13 +451,15 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 		// its lack of `choices` as an empty successful assistant response.
 		var raw map[string]interface{}
 		if json.Unmarshal([]byte(data), &raw) == nil {
-			if streamError, failed := raw["error"].(map[string]interface{}); failed && streamError != nil {
+			if _, failed := raw["error"].(map[string]interface{}); failed {
 				ensureCreated("")
 				emit(map[string]interface{}{
 					"type": "response.failed",
 					"response": map[string]interface{}{
 						"id": respID, "object": "response", "status": "failed", "model": model,
-						"error": streamError,
+						"error": map[string]interface{}{
+							"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+						},
 					},
 				})
 				return usage
@@ -277,6 +516,19 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 				}
 			}
 		}
+	}
+	if sc.Err() != nil || !sawDone {
+		ensureCreated("")
+		emit(map[string]interface{}{
+			"type": "response.failed",
+			"response": map[string]interface{}{
+				"id": respID, "object": "response", "status": "failed", "model": model,
+				"error": map[string]interface{}{
+					"type": "server_error", "code": "server_error", "message": publicRetryMessage,
+				},
+			},
+		})
+		return usage
 	}
 
 	ensureCreated("")
@@ -411,6 +663,7 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 	toolBlocks := map[int]*toolBlock{}
 	finish := ""
 	var usage map[string]interface{}
+	sawDone := false
 
 	ensureStarted := func(id string) {
 		if started {
@@ -435,7 +688,12 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 
 	sc := newChatSSEScanner(body)
 	for sc.Scan() {
-		data, ok := chatChunkData(sc.Text())
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "data:") && strings.TrimSpace(line[len("data:"):]) == "[DONE]" {
+			sawDone = true
+			break
+		}
+		data, ok := chatChunkData(line)
 		if !ok {
 			continue
 		}
@@ -445,12 +703,10 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 		// chunk and ending with a misleading successful message_stop.
 		var envelope map[string]interface{}
 		if json.Unmarshal([]byte(data), &envelope) == nil {
-			if upstreamError, ok := envelope["error"].(map[string]interface{}); ok {
-				message, _ := upstreamError["message"].(string)
-				if message == "" {
-					message = "Codex upstream error"
-				}
-				emit("error", map[string]interface{}{"error": map[string]interface{}{"type": "api_error", "message": message}})
+			if _, ok := envelope["error"].(map[string]interface{}); ok {
+				emit("error", map[string]interface{}{"error": map[string]interface{}{
+					"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+				}})
 				return usage
 			}
 		}
@@ -507,6 +763,12 @@ func chatStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, model strin
 				}
 			}
 		}
+	}
+	if sc.Err() != nil || !sawDone {
+		emit("error", map[string]interface{}{"error": map[string]interface{}{
+			"type": "api_error", "code": "server_error", "message": publicRetryMessage,
+		}})
+		return usage
 	}
 
 	ensureStarted("")

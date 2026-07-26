@@ -403,15 +403,12 @@ func (h *claudeRefreshSSEHeartbeat) writeError(err error) bool {
 	if !h.Committed() {
 		return false
 	}
-	msg := "claude authentication refresh failed"
-	if err != nil {
-		msg = err.Error()
-	}
+	_ = err
 	if h.openAI {
 		payload, _ := json.Marshal(map[string]interface{}{
 			"error": map[string]interface{}{
-				"message": msg,
-				"type":    "authentication_error",
+				"message": publicRetryMessage,
+				"type":    "server_error",
 			},
 		})
 		_, _ = h.w.Write([]byte("data: "))
@@ -422,8 +419,8 @@ func (h *claudeRefreshSSEHeartbeat) writeError(err error) bool {
 		payload, _ := json.Marshal(map[string]interface{}{
 			"type": "error",
 			"error": map[string]interface{}{
-				"message": msg,
-				"type":    "authentication_error",
+				"message": publicRetryMessage,
+				"type":    "api_error",
 			},
 		})
 		_, _ = h.w.Write([]byte("event: error\n"))

@@ -25,8 +25,12 @@ type codexStreamLedgerRecorder struct {
 	// previous_response epoch; ordinary missing tool output remains visible but
 	// does not rotate the mapping.
 	contextError leakfilter.ResponsesContextErrorKind
-	added        []interface{}
-	done         []interface{}
+	// failure retains the last raw terminal failure before downstream filtering.
+	// It drives late mapped-session retirement after output has already committed,
+	// while the downstream receives only a neutral protocol terminal.
+	failure *leakfilter.CodexFailureFrame
+	added   []interface{}
+	done    []interface{}
 	// rateLimits holds the most recent codex.rate_limits frame's windows (workstream B:
 	// real-time Codex quota captured before leakfilter drops the frame).
 	rateLimits codexStreamRateLimits
@@ -50,18 +54,32 @@ func (r *codexStreamLedgerRecorder) Write(p []byte) (int, error) {
 	defer r.mu.Unlock()
 	r.buf = append(r.buf, p...)
 	for {
-		idx := bytes.Index(r.buf, []byte("\n\n"))
-		if idx < 0 {
+		boundary, separatorLen := sseFrameBoundary(r.buf)
+		if boundary < 0 {
 			break
 		}
-		frame := r.buf[:idx+2]
+		frameEnd := boundary + separatorLen
+		frame := r.buf[:frameEnd]
 		r.observeFrame(frame)
-		r.buf = r.buf[idx+2:]
+		r.buf = r.buf[frameEnd:]
 	}
 	if len(r.buf) > streamLedgerMaxPartialFrame {
 		r.buf = r.buf[len(r.buf)-streamLedgerMaxPartialFrame:]
 	}
 	return len(p), nil
+}
+
+// finish observes a final valid SSE event even when the upstream omits the
+// optional trailing blank line. Truncated JSON remains unrecognized.
+func (r *codexStreamLedgerRecorder) finish() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(bytes.TrimSpace(r.buf)) == 0 {
+		r.buf = nil
+		return
+	}
+	r.observeFrame(r.buf)
+	r.buf = nil
 }
 
 func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
@@ -112,19 +130,18 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 	return out
 }
 
-// reachedTerminal reports whether the stream observed a terminal Responses event
-// (response.completed / response.incomplete / response.failed). When false after the
-// upstream body ends, the stream was truncated — the signal the auto-continue relay
-// uses to decide whether to re-issue.
+// reachedTerminal reports whether the stream observed a terminal Responses event,
+// including an explicit error event. When false after the upstream body ends, the
+// stream was truncated and may be eligible for a continuation.
 func (r *codexStreamLedgerRecorder) reachedTerminal() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.completed != nil
 }
 
-// completedSuccessfully distinguishes a real response.completed from an upstream
-// response.failed/response.incomplete.  All three are terminals for the transport,
-// but only the first may advance a goal checkpoint as a successful turn.
+// completedSuccessfully distinguishes a real response.completed from every failure
+// or incomplete terminal. Only response.completed may advance a goal checkpoint as
+// a successful turn.
 func (r *codexStreamLedgerRecorder) completedSuccessfully() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -135,6 +152,18 @@ func (r *codexStreamLedgerRecorder) terminalContextError() leakfilter.ResponsesC
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.contextError
+}
+
+func (r *codexStreamLedgerRecorder) terminalFailure() (leakfilter.CodexFailureFrame, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure == nil {
+		return leakfilter.CodexFailureFrame{}, false
+	}
+	failure := *r.failure
+	failure.Header = r.failure.Header.Clone()
+	failure.Body = append([]byte(nil), r.failure.Body...)
+	return failure, true
 }
 
 // responseTurnState returns the opaque upstream continuation token observed in a
@@ -186,8 +215,14 @@ func (r *codexStreamLedgerRecorder) metadata() (string, string, codexStreamRateL
 }
 
 func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
-	if failure, ok := leakfilter.ParseCodexFailureFrame(frame); ok && failure.ContextError != leakfilter.ResponsesContextErrorNone {
-		r.contextError = failure.ContextError
+	if failure, ok := leakfilter.ParseCodexFailureFrame(frame); ok {
+		copyFailure := failure
+		copyFailure.Header = failure.Header.Clone()
+		copyFailure.Body = append([]byte(nil), failure.Body...)
+		r.failure = &copyFailure
+		if failure.ContextError != leakfilter.ResponsesContextErrorNone {
+			r.contextError = failure.ContextError
+		}
 	}
 	eventType, data := sseFrameEventData(frame)
 	if len(data) == 0 || strings.TrimSpace(string(data)) == "[DONE]" {
@@ -225,7 +260,7 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		if item := cloneJSONValue(ev["item"]); item != nil {
 			r.done = append(r.done, item)
 		}
-	case "response.completed", "response.incomplete", "response.failed":
+	case "response.completed", "response.incomplete", "response.failed", "response.error", "error":
 		r.terminal = typ
 		if resp, ok := ev["response"].(map[string]interface{}); ok {
 			r.completed = cloneJSONMap(resp)
@@ -235,9 +270,19 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 			if model := strings.TrimSpace(streamString(resp["model"])); model != "" {
 				r.model = model
 			}
-		} else if typ == "response.failed" {
+		} else {
+			// A terminal event without a response object is still a real protocol
+			// terminal. Treat it as such so EOF compensation does not append a second,
+			// misleading "stream closed before response.completed" failure.
 			r.completed = cloneJSONMap(ev)
-			r.completed["status"] = "failed"
+			switch typ {
+			case "response.completed":
+				r.completed["status"] = "completed"
+			case "response.incomplete":
+				r.completed["status"] = "incomplete"
+			default:
+				r.completed["status"] = "failed"
+			}
 		}
 	case "codex.rate_limits":
 		if rl, ok := parseCodexRateLimitsEvent(ev); ok {

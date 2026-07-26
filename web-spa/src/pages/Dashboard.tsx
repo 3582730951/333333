@@ -6,7 +6,7 @@ import LoadErrorBannerBase from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
 import SystemHealthSummaryBase from '../components/SystemHealthSummary.jsx';
 import useVisibleInterval, { usePageVisible } from '../hooks/useVisibleInterval.js';
-import { UsageAreaChart, DonutChart, GroupedBar, CacheRateBars } from '../components/LazyCharts.jsx';
+import { UsageAreaChart, UsageModelAreaChart, DonutChart, GroupedBar, CacheRateBars } from '../components/LazyCharts.jsx';
 import { COLORS, modelColor } from '../lib/chartTheme.js';
 import { fmtTokens, fmtInt } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
@@ -19,6 +19,7 @@ const LoadErrorBanner = LoadErrorBannerBase as any;
 const PageHeader = PageHeaderBase as any;
 const SystemHealthSummary = SystemHealthSummaryBase as any;
 const AreaChart = UsageAreaChart as any;
+const ModelAreaChart = UsageModelAreaChart as any;
 const Donut = DonutChart as any;
 const BarChart = GroupedBar as any;
 const CacheBars = CacheRateBars as any;
@@ -92,13 +93,28 @@ export default function Dashboard() {
   const claude = summary?.claude || 0;
   const other = summary?.other || 0;
   const buckets = core?.buckets || [];
+  const providerModelSeries = core?.modelSeries || [];
+  const providerModelDescriptors = core?.series || [];
   const tokens = buckets.reduce((sum, bucket) => sum + (bucket.total_tokens || 0), 0);
   const requests = buckets.reduce((sum, bucket) => sum + (bucket.requests || 0), 0);
-  const cacheByModel = secondary?.cache?.by_model || [];
+  const cacheByModel = secondary?.cache?.by_provider_model || secondary?.cache?.by_model || [];
+  const officialCacheByModel = cacheByModel.filter((row) => String(row.provider || '').toLowerCase() !== 'kiro');
+  const cacheByProvider = secondary?.cache?.by_provider || [];
   const cacheSummary = secondary?.cache?.summary || {};
-  const cacheInput = cacheSummary.cache_input_tokens ?? cacheByModel.reduce((sum, row) => sum + (row.cache_input_tokens || row.prompt_tokens || 0), 0);
-  const cacheRead = cacheSummary.cache_read_tokens ?? cacheByModel.reduce((sum, row) => sum + (row.cache_read_tokens || row.cached_tokens || 0), 0);
+  const officialCacheRows = cacheByProvider.filter((row) => String(row.provider || '').toLowerCase() !== 'kiro');
+  const cacheInput = officialCacheRows.length
+    ? officialCacheRows.reduce((sum, row) => sum + Number(row.cache_input_tokens || row.prompt_tokens || 0), 0)
+    : (cacheSummary.cache_input_tokens ?? cacheByModel.reduce((sum, row) => sum + (row.cache_input_tokens || row.prompt_tokens || 0), 0));
+  const cacheRead = officialCacheRows.length
+    ? officialCacheRows.reduce((sum, row) => sum + Number(row.cache_read_tokens || row.cached_tokens || 0), 0)
+    : (cacheSummary.cache_read_tokens ?? cacheByModel.reduce((sum, row) => sum + (row.cache_read_tokens || row.cached_tokens || 0), 0));
   const cacheHitRate = cacheInput > 0 ? cacheRead / cacheInput : 0;
+  const kiroCache = cacheByProvider.find((row) => String(row.provider || '').toLowerCase() === 'kiro');
+  const cacheCompleteness = kiroCache?.cache_reporting_state === 'unreported'
+    ? t('usage.upstream_unreported')
+    : kiroCache?.cache_reporting_state === 'partial'
+      ? `${Math.round(Number(kiroCache.cache_reporting_rate || 0) * 100)}%`
+      : t('dashboard.cache_complete');
   const registrationRate = secondary?.registration?.totals?.success_rate || 0;
   const byModel = secondary?.byModel || [];
 
@@ -117,9 +133,14 @@ export default function Dashboard() {
     x: (row.date || '').slice(5), success: row.succeeded || 0, failed: row.failed || 0,
   }));
   const modelTokenDonut = byModel.slice(0, 6).map((row) => ({
-    name: row.model_label || row.model || `(${t('common.unknown')})`,
+    name: row.display_label || row.series_label || `${row.provider_name || row.provider_id || ''}${row.provider_name || row.provider_id ? ' · ' : ''}${row.model_label || row.model || `(${t('common.unknown')})`}`,
     value: row.total_tokens || 0,
-    color: modelColor(row.model_key || row.model),
+    color: modelColor(row.dimension_key || row.model_key || row.model),
+  }));
+  const topAccounts = (secondary?.cache?.by_account || []).slice(0, 8).map((row) => ({
+    x: String(row.account_id || t('common.unknown')).slice(0, 12),
+    input: Number(row.actual_prompt_tokens || row.prompt_tokens || 0),
+    output: Number(row.actual_completion_tokens || 0),
   }));
   const modelTokenFormatter = (value: unknown) => {
     const number = Number(value) || 0;
@@ -183,6 +204,10 @@ export default function Dashboard() {
               <span>{t('dashboard.model_coverage')}</span><b>{secondary?.modelAvailable ? fmtInt(byModel.length) : '—'}</b>
               <p>{t('dashboard.model_coverage_desc')}</p>
             </div>
+            <div>
+              <span>{t('dashboard.cache_completeness')}</span><b>{secondary?.cacheAvailable ? cacheCompleteness : '—'}</b>
+              <p>{kiroCache?.cache_reporting_state === 'unreported' ? t('dashboard.kiro_cache_unreported') : t('dashboard.cache_completeness_desc')}</p>
+            </div>
           </div>
         </div>
       </section>
@@ -198,8 +223,12 @@ export default function Dashboard() {
 
       {core?.timeseriesAvailable ? (
         <div className="pool-chart-card" style={{ marginBottom: 18 }}>
-          <div className="head"><div><div className="t">{t('dashboard.token_trend')}</div><div className="s">{t('dashboard.token_trend_desc')}</div></div></div>
-          <div style={{ height: 280 }}><AreaChart buckets={buckets} height={280} /></div>
+          <div className="head"><div><div className="t">{t('dashboard.provider_model_trend')}</div><div className="s">{t('dashboard.provider_model_trend_desc')}</div></div></div>
+          <div style={{ height: 280 }}>
+            {providerModelSeries.length && providerModelDescriptors.length
+              ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height={280} />
+              : <AreaChart buckets={buckets} height={280} />}
+          </div>
         </div>
       ) : null}
 
@@ -213,13 +242,19 @@ export default function Dashboard() {
         </div>
       ) : null}
 
-      {(cacheByModel.length || hasModelTokens) ? (
-        <div className="pool-grid cols-2" style={{ marginBottom: 18 }}>
-          {secondary?.cacheAvailable && cacheByModel.length ? <div className="pool-chart-card">
+      {(officialCacheByModel.length || hasModelTokens || topAccounts.length) ? (
+        <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
+          {secondary?.cacheAvailable && officialCacheByModel.length ? <div className="pool-chart-card">
             <div className="head"><div><div className="t">{t('dashboard.model_cache_rate')}</div><div className="s">{t('dashboard.model_cache_desc')}</div></div></div>
-            <div style={{ paddingTop: 6 }}><CacheBars data={cacheByModel} /></div>
+            <div style={{ paddingTop: 6 }}><CacheBars data={officialCacheByModel} /></div>
           </div> : null}
           {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} /></div> : null}
+          {topAccounts.length ? (
+            <div className="pool-chart-card">
+              <div className="head"><div><div className="t">{t('dashboard.top_accounts')}</div><div className="s">{t('dashboard.top_accounts_desc')}</div></div></div>
+              <BarChart data={topAccounts} series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]} stacked />
+            </div>
+          ) : null}
         </div>
       ) : null}
 

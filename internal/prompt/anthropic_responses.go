@@ -157,13 +157,16 @@ func anthropicMessagesToResponsesInput(value interface{}, names map[string]strin
 	for _, item := range messages {
 		message, _ := item.(map[string]interface{})
 		if message == nil {
-			continue
+			return nil, errors.New("Anthropic messages must contain objects")
 		}
 		role := strings.ToLower(strings.TrimSpace(stringOr(message["role"], "user")))
 		if role == "system" {
 			role = "developer"
 		}
-		if role != "assistant" && role != "developer" {
+		if role != "assistant" && role != "developer" && role != "user" {
+			return nil, fmt.Errorf("Anthropic message role %q cannot be represented by Responses", role)
+		}
+		if role == "user" {
 			role = "user"
 		}
 		messageStart := len(input)
@@ -192,19 +195,24 @@ func anthropicMessagesToResponsesInput(value interface{}, names map[string]strin
 			for _, rawBlock := range content {
 				block, _ := rawBlock.(map[string]interface{})
 				if block == nil {
-					continue
+					return nil, errors.New("Anthropic content blocks must be objects")
 				}
-				switch stringOr(block["type"], "") {
+				blockType := stringOr(block["type"], "")
+				switch blockType {
 				case "text":
 					appendText(stringOr(block["text"], ""))
 				case "image":
-					if image := anthropicImageToResponsesPart(block); image != nil {
-						parts = append(parts, image)
+					image := anthropicImageToResponsesPart(block)
+					if image == nil {
+						return nil, errors.New("Anthropic image source cannot be represented by Responses")
 					}
+					parts = append(parts, image)
 				case "document":
-					if file := anthropicDocumentToResponsesPart(block); file != nil {
-						parts = append(parts, file)
+					file := anthropicDocumentToResponsesPart(block)
+					if file == nil {
+						return nil, errors.New("Anthropic document source cannot be represented by Responses")
 					}
+					parts = append(parts, file)
 				case "tool_use":
 					flush()
 					name := stringOr(block["name"], "")
@@ -226,12 +234,18 @@ func anthropicMessagesToResponsesInput(value interface{}, names map[string]strin
 						"output": anthropicToolResultToResponsesOutput(block),
 					})
 				case "thinking", "redacted_thinking":
-					if reasoning := openAIReasoningItemFromAnthropicBlock(block); reasoning != nil {
-						flush()
-						input = append(input, reasoning)
+					reasoning := openAIReasoningItemFromAnthropicBlock(block)
+					if reasoning == nil {
+						return nil, fmt.Errorf("Anthropic %s block does not contain a replayable Responses reasoning envelope", blockType)
 					}
+					flush()
+					input = append(input, reasoning)
+				default:
+					return nil, fmt.Errorf("Anthropic content block %q cannot be represented by Responses", blockType)
 				}
 			}
+		default:
+			return nil, fmt.Errorf("Anthropic message content has unsupported type %T", message["content"])
 		}
 		flush()
 

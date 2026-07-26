@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/cf"
@@ -465,14 +466,22 @@ func (s *Server) benchOnLimit(ctx context.Context, accountID string, status int,
 	if cd == 0 {
 		return
 	}
-	if s.flagEnabled(ctx, "rate_limit_guard_enabled", s.cfg.RateLimitGuardEnabled) && header != nil {
+	// A downstream disconnect may cancel the request while reset-credit recovery is
+	// finishing. The upstream 429 is already authoritative, so persist its account
+	// state independently while retaining request-scoped values used by settings.
+	stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if s.flagEnabled(stateCtx, "rate_limit_guard_enabled", s.cfg.RateLimitGuardEnabled) && header != nil {
 		cd = limitCooldownSeconds(header, storage.Now(), cd)
 	}
 	log.Printf("[RATE-LIMIT] COOLDOWN: account=%s, status=%d, duration=%ds, reason=usage_limit", accountID, status, cd)
 	// Bench-for-recheck (not a plain cooldown): a rate-/usage-limited account must
 	// pass a liveness probe before it re-enters the pool, so it can never silently
 	// resurface still-limited the instant its cooldown elapses.
-	_ = s.store.BenchBindingForRecheck(ctx, accountID, storage.Now()+cd)
+	if err := s.store.BenchBindingForRecheck(stateCtx, accountID, storage.Now()+cd); err != nil {
+		log.Printf("[RATE-LIMIT] cooldown persistence failed: account=%s: %v", accountID, err)
+		return
+	}
 	if s.scheduler != nil {
 		s.scheduler.NotifyStateChanged()
 	}

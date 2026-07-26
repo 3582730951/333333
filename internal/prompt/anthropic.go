@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -49,7 +50,14 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 		out["tools"] = tools
 	}
 	if tc := convertToolChoice(root["tool_choice"]); tc != nil {
+		if choice, ok := tc.(map[string]interface{}); ok {
+			if parallel, present := root["parallel_tool_calls"].(bool); present {
+				choice["disable_parallel_tool_use"] = !parallel
+			}
+		}
 		out["tool_choice"] = tc
+	} else if parallel, present := root["parallel_tool_calls"].(bool); present {
+		out["tool_choice"] = map[string]interface{}{"type": "auto", "disable_parallel_tool_use": !parallel}
 	}
 
 	var systemParts []string
@@ -99,11 +107,15 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 					continue
 				}
 				fn, _ := tcm["function"].(map[string]interface{})
+				input, parseErr := parseJSONObject(mapGet(fn, "arguments"))
+				if parseErr != nil {
+					return nil, fmt.Errorf("invalid Chat Completions tool arguments for %q: %w", stringOr(mapGet(fn, "name"), ""), parseErr)
+				}
 				blocks = append(blocks, map[string]interface{}{
 					"type":  "tool_use",
 					"id":    stringOr(tcm["id"], ""),
 					"name":  stringOr(mapGet(fn, "name"), ""),
-					"input": parseJSONObject(mapGet(fn, "arguments")),
+					"input": input,
 				})
 			}
 			if len(blocks) == 0 {
@@ -131,7 +143,7 @@ func ChatCompletionToAnthropic(raw []byte) ([]byte, error) {
 func AnthropicToChatCompletion(raw []byte, model string) ([]byte, error) {
 	root, err := decodeJSONMapUseNumber(raw)
 	if err != nil {
-		return raw, nil
+		return nil, fmt.Errorf("invalid Anthropic response: %w", err)
 	}
 	text, toolCalls := anthropicContentToOpenAI(root["content"])
 	if model == "" {
@@ -1312,19 +1324,22 @@ func isToolResultContent(blocks []interface{}) bool {
 	return false
 }
 
-func parseJSONObject(v interface{}) interface{} {
+func parseJSONObject(v interface{}) (map[string]interface{}, error) {
 	switch t := v.(type) {
 	case string:
 		if strings.TrimSpace(t) == "" {
-			return map[string]interface{}{}
+			return map[string]interface{}{}, nil
 		}
-		if obj, err := decodeJSONValueUseNumber([]byte(t)); err == nil {
-			return obj
+		obj, err := decodeJSONMapUseNumber([]byte(t))
+		if err != nil {
+			return nil, err
 		}
-		return map[string]interface{}{}
+		return obj, nil
 	case map[string]interface{}:
-		return t
+		return t, nil
+	case nil:
+		return map[string]interface{}{}, nil
 	default:
-		return map[string]interface{}{}
+		return nil, fmt.Errorf("expected JSON object, got %T", v)
 	}
 }

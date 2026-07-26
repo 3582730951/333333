@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/streamrewrite"
 )
 
@@ -170,42 +171,43 @@ func NeutralizeErrorBody(provider string, status int, body []byte) (int, []byte,
 	if !looksLikeLimitError(status, body) {
 		return status, body, false
 	}
-	outStatus := http.StatusServiceUnavailable
-	rateLimited := status == 429
-	if rateLimited {
-		outStatus = http.StatusTooManyRequests
-	}
-	msg := "The service is temporarily unavailable. Please retry shortly."
-	if rateLimited {
-		msg = "Rate limit reached. Please retry shortly."
-	}
+	const msg = responsesPublicRetryMessage
 	var payload map[string]interface{}
 	if provider == "claude" {
-		etype := "overloaded_error"
-		if rateLimited {
-			etype = "rate_limit_error"
-		}
 		payload = map[string]interface{}{
 			"type":  "error",
-			"error": map[string]interface{}{"type": etype, "message": msg},
+			"error": map[string]interface{}{"type": "api_error", "message": msg},
 		}
 	} else {
-		etype := "server_error"
-		if rateLimited {
-			etype = "rate_limit_exceeded"
-		}
 		payload = map[string]interface{}{
-			"error": map[string]interface{}{"message": msg, "type": etype},
+			"error": map[string]interface{}{"message": msg, "type": "server_error"},
 		}
 	}
 	nb, err := json.Marshal(payload)
 	if err != nil {
 		return status, body, false
 	}
-	return outStatus, nb, true
+	return http.StatusServiceUnavailable, nb, true
 }
 
-const responsesContextUnavailableMessage = "The service is temporarily unavailable. Please retry shortly."
+const responsesPublicRetryMessage = "Please retry."
+
+func neutralResponsesFailureSSEFrame() []byte {
+	payload, err := json.Marshal(map[string]interface{}{
+		"type": "response.failed",
+		"response": map[string]interface{}{
+			"status": "failed",
+			"error": map[string]interface{}{
+				"code":    "server_error",
+				"message": responsesPublicRetryMessage,
+			},
+		},
+	})
+	if err != nil {
+		return nil
+	}
+	return []byte("event: response.failed\ndata: " + string(payload) + "\n\n")
+}
 
 // NeutralizeResponsesContextErrorBody replaces an internal Responses context-loss
 // error with an account-agnostic server error. Unlike quota leak scrubbing, this is a
@@ -217,7 +219,7 @@ func NeutralizeResponsesContextErrorBody(status int, body []byte) (int, []byte, 
 	}
 	payload := map[string]interface{}{
 		"error": map[string]interface{}{
-			"message": responsesContextUnavailableMessage,
+			"message": responsesPublicRetryMessage,
 			"type":    "server_error",
 		},
 	}
@@ -236,19 +238,26 @@ func NeutralizeResponsesContextErrorSSEFrame(frame []byte) ([]byte, bool) {
 	if !ok || failure.ContextError == ResponsesContextErrorNone {
 		return frame, false
 	}
-	payload := map[string]interface{}{
-		"type":   "error",
-		"status": http.StatusServiceUnavailable,
-		"error": map[string]interface{}{
-			"message": responsesContextUnavailableMessage,
-			"type":    "server_error",
-		},
-	}
-	nb, err := json.Marshal(payload)
-	if err != nil {
+	neutral := neutralResponsesFailureSSEFrame()
+	if len(neutral) == 0 {
 		return frame, false
 	}
-	return []byte("event: error\ndata: " + string(nb) + "\n\n"), true
+	return neutral, true
+}
+
+// NeutralizeCodexRetryableFailureSSEFrame removes pool-local quota, overload,
+// authentication, and risk-control details while preserving a terminal event that
+// the Responses clients recognize. Early failures are retried before reaching this
+// function; this path is for failures received after downstream output committed.
+func NeutralizeCodexRetryableFailureSSEFrame(frame []byte) ([]byte, bool) {
+	if _, ok := ParseRetryableCodexFailureFrame(frame); !ok {
+		return frame, false
+	}
+	neutral := neutralResponsesFailureSSEFrame()
+	if len(neutral) == 0 {
+		return frame, false
+	}
+	return neutral, true
 }
 
 // NeutralizeResponsesJSON inspects a NON-streaming Codex /v1/responses body that
@@ -276,7 +285,7 @@ func NeutralizeResponsesJSON(body []byte) ([]byte, bool) {
 	}
 	nb, err := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{
-			"message": "The service is temporarily unavailable. Please retry shortly.",
+			"message": responsesPublicRetryMessage,
 			"type":    "server_error",
 		},
 	})
@@ -304,9 +313,9 @@ func NewSSEFilter(provider string, words *streamrewrite.Matcher) *SSEFilter {
 
 // CodexFailureFrame is a terminal error carried inside a successful HTTP SSE
 // response that can be handled before downstream content is committed. The
-// Responses HTTP transport normally emits response.failed, while the official
-// Responses-over-WebSocket transport emits type:error with the real status and
-// quota headers embedded in the JSON body.
+// Responses HTTP transport normally emits response.failed, while WebSocket
+// transports may emit error or response.error with the real status and quota
+// headers embedded in the JSON body.
 type CodexFailureFrame struct {
 	EventType        string
 	StatusCode       int
@@ -347,10 +356,10 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	}
 	kind := strings.ToLower(strings.TrimSpace(eventType))
 	bodyKind := strings.ToLower(strings.TrimSpace(envelope.Type))
-	if kind != "response.failed" && kind != "error" {
+	if kind != "response.failed" && kind != "response.error" && kind != "error" {
 		kind = bodyKind
 	}
-	if kind != "response.failed" && kind != "error" {
+	if kind != "response.failed" && kind != "response.error" && kind != "error" {
 		return CodexFailureFrame{}, false
 	}
 
@@ -621,12 +630,13 @@ func (f *SSEFilter) Copy(w io.Writer, src io.Reader) error {
 		if n > 0 {
 			f.buf = append(f.buf, rb[:n]...)
 			for {
-				idx := bytes.Index(f.buf, []byte("\n\n"))
-				if idx < 0 {
+				boundary, separatorLen := sseFrameBoundary(f.buf)
+				if boundary < 0 {
 					break
 				}
-				frame := f.buf[:idx+2]
-				f.buf = f.buf[idx+2:]
+				frameEnd := boundary + separatorLen
+				frame := f.buf[:frameEnd]
+				f.buf = f.buf[frameEnd:]
 				if err := emit(f.processFrame(frame)); err != nil {
 					return err
 				}
@@ -664,7 +674,13 @@ func (f *SSEFilter) processFrame(frame []byte) []byte {
 			frame = nb
 		}
 	} else {
+		// safety_buffering is an upstream-only UI control signal. When pool leak
+		// scrubbing is enabled it must never reach any Responses client, regardless
+		// of whether an administrator also configured a dedicated heartbeat rule.
+		frame, _ = responsefilter.StripSafetyBufferingSSE(frame)
 		if nb, ok := NeutralizeResponsesContextErrorSSEFrame(frame); ok {
+			frame = nb
+		} else if nb, ok := NeutralizeCodexRetryableFailureSSEFrame(frame); ok {
 			frame = nb
 		} else if f.shouldDropCodex(frame) {
 			return nil
@@ -698,15 +714,9 @@ func (f *SSEFilter) neutralizeClaudeError(frame []byte) ([]byte, bool) {
 	if !containsAnyFold(lowerData, claudeRetryableErrorSignatures) {
 		return nil, false
 	}
-	etype := "overloaded_error"
-	msg := "The service is temporarily unavailable. Please retry shortly."
-	if strings.Contains(lowerData, "rate_limit") || strings.Contains(lowerData, "too many requests") {
-		etype = "rate_limit_error"
-		msg = "Rate limit reached. Please retry shortly."
-	}
 	payload, err := json.Marshal(map[string]interface{}{
 		"type":  "error",
-		"error": map[string]interface{}{"type": etype, "message": msg},
+		"error": map[string]interface{}{"type": "api_error", "message": responsesPublicRetryMessage},
 	})
 	if err != nil {
 		return nil, false
@@ -718,27 +728,17 @@ func (f *SSEFilter) neutralizeClaudeError(frame []byte) ([]byte, bool) {
 	return []byte("event: " + name + "\ndata: " + string(payload) + "\n\n"), true
 }
 
-// shouldDropCodex reports whether a complete Codex/OpenAI SSE frame is a
-// purely-informational pool-internal leak frame (rate-limit snapshot, a soft
-// failure carrying limit state, a model-switch suggestion, or a verification
-// recommendation) that should be dropped. Ordinary content is never dropped.
+// shouldDropCodex reports whether a complete Codex/OpenAI SSE frame is purely
+// informational pool state. Terminal failures are rewritten by processFrame and
+// must never be dropped, otherwise clients remain stuck waiting for completion.
 func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 	eventType, data := parseSSEFrame(frame)
 	if len(data) == 0 {
 		return false
 	}
-	// This runs on every streamed token, so it must not lower the whole frame.
-	// The model-switch suggestion only ever appears inside a limit error, but it
-	// can ride in any frame type, so it is still checked unconditionally — via an
-	// allocation-free case-insensitive scan rather than strings.ToLower(string(data)).
-	if asciiContainsFold(data, "switch to another model") {
-		return true
-	}
 	switch jsonStringField(data, "type") {
 	case "codex.rate_limits":
 		return true
-	case "response.failed", "error":
-		return IsRetryableCodexFailureFrame(frame)
 	case "response.metadata":
 		return asciiContainsFold(data, "openai_verification_recommendation")
 	}
@@ -746,6 +746,24 @@ func (f *SSEFilter) shouldDropCodex(frame []byte) bool {
 		return true
 	}
 	return false
+}
+
+// sseFrameBoundary accepts all legal/common blank-line forms. Intermediaries may
+// normalize individual newlines, so mixed pairs must be handled as well.
+func sseFrameBoundary(raw []byte) (int, int) {
+	boundary, separatorLen := -1, 0
+	for _, separator := range [][]byte{
+		[]byte("\r\n\r\n"),
+		[]byte("\n\n"),
+		[]byte("\r\n\n"),
+		[]byte("\n\r\n"),
+	} {
+		if index := bytes.Index(raw, separator); index >= 0 &&
+			(boundary < 0 || index < boundary || (index == boundary && len(separator) > separatorLen)) {
+			boundary, separatorLen = index, len(separator)
+		}
+	}
+	return boundary, separatorLen
 }
 
 // parseSSEFrame extracts the event type (from an "event:" line) and the joined

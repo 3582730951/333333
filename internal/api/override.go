@@ -27,9 +27,9 @@ type downstreamPolicy struct {
 	// KeyHash / UserID identify the matched downstream api key and its owning portal
 	// user (both empty for an unauthenticated/legacy request). They are attributed onto
 	// each usage_records row so a user's own console can show their usage.
-	KeyHash             string
-	UserID              string
-	Authed              bool
+	KeyHash string
+	UserID  string
+	Authed  bool
 	// UserGroupID, when set, means the key uses the two-layer group model.
 	UserGroupID         string
 	ModelOverrideSource string
@@ -219,7 +219,8 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusUnauthorized, errors.New("api key required"))
 		return downstreamPolicy{}, false
 	}
-	// Group-level fallback for any force value the key did not set.
+	// User-facing policy lives exclusively on user groups. Account-pool groups are
+	// routing inventory and must never override model or effort.
 	if pol.ForceModel == "" || pol.ForceEffort == "" {
 		if pol.UserGroupID != "" {
 			if ug, ok, ugErr := s.store.GetUserGroup(ctx, pol.UserGroupID); ugErr == nil && ok {
@@ -234,19 +235,6 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 				}
 			}
 		}
-		if pol.ForceModel == "" || pol.ForceEffort == "" {
-			if g, err := s.store.GetGroup(ctx, pol.Group); err == nil {
-				if pol.ForceModel == "" {
-					pol.ForceModel = strings.TrimSpace(g.ForceModel)
-					if pol.ForceModel != "" {
-						pol.ModelOverrideSource = "group"
-					}
-				}
-				if pol.ForceEffort == "" {
-					pol.ForceEffort = strings.TrimSpace(g.ForceEffort)
-				}
-			}
-		}
 	}
 	return pol, true
 }
@@ -257,6 +245,22 @@ func normalizeProviderHintLoose(v string) string {
 		return "auto"
 	}
 	return v
+}
+
+func (s *Server) attachUserGroupPolicy(w http.ResponseWriter, r *http.Request, pol downstreamPolicy) (*http.Request, bool) {
+	if strings.TrimSpace(pol.UserGroupID) == "" {
+		return r, true
+	}
+	group, ok, err := s.store.GetUserGroup(r.Context(), pol.UserGroupID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return r, false
+	}
+	if !ok {
+		writePoolCodeError(w, http.StatusUnprocessableEntity, "user_group_not_found", "configured user group was not found")
+		return r, false
+	}
+	return r.WithContext(withRequestUserGroupPolicy(r.Context(), group)), true
 }
 
 func normalizeProviderHint(v string) (string, bool) {

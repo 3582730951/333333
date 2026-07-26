@@ -30,27 +30,12 @@ type codexNativeIdentityCapture struct {
 }
 
 func enableCodexSessionMappingForTest(h *testHarness) {
-	// The strict native session-mapping engine is dormant by default now that CPA-style
-	// stateless passthrough is the default. Tests that exercise the mapping/goal/journal
-	// engine must opt back in by turning passthrough off (its single choke point).
+	// Mapping is the upstream identity boundary and takes precedence over the legacy
+	// stateless compatibility flag. Set every switch explicitly so focused tests do
+	// not depend on configuration defaults.
 	h.app.cfg.CodexStatelessPassthrough = false
 	h.app.cfg.CodexSessionMappingEnabled = true
 	h.app.cfg.CodexCPAStrict = true
-}
-
-// skipLegacyStrictCPARecovery quarantines tests that assert the PRE-d2a2cce strict-CPA
-// retire/recover semantics. Commit d2a2cce ("sync Codex 0.144.5 and repair tool context
-// failover") reworked that recovery path — recoverCodexSessionMapping now auto-replays a
-// context-loss turn from a checkpoint/degraded body instead of surfacing a retired-epoch
-// 409 — which left these assertions stale. Verified with git bisect: all five pass at
-// 017e87c and every earlier commit and fail at d2a2cce, so this is a pre-existing
-// regression in that commit, NOT a consequence of the stateless-passthrough change. The
-// engine is dormant by default under codex_stateless_passthrough and is slated for
-// Phase-2 removal; delete these tests with the engine, or drop this guard if the engine's
-// recovery path is repaired and re-enabled.
-func skipLegacyStrictCPARecovery(t *testing.T) {
-	t.Helper()
-	t.Skip("legacy strict-CPA retire/recover semantics regressed in d2a2cce; engine dormant by default (codex_stateless_passthrough), slated for Phase-2 removal")
 }
 
 func TestCodexSessionMappingKeepsNativeIdentityAndToolOutput(t *testing.T) {
@@ -592,18 +577,23 @@ func TestCodexSessionMappingPassesToolOutput400WithoutRotation(t *testing.T) {
 	}
 }
 
-func TestCodexSessionMappingRetiresOnlyAfterUpstreamContextLoss(t *testing.T) {
-	skipLegacyStrictCPARecovery(t)
+func TestCodexSessionMappingRecoversOnlyAfterUpstreamContextLoss(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
+		switch calls.Add(1) {
+		case 1:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"resp-retired-origin","object":"response","model":"gpt","status":"completed","output":[]}`))
-			return
+		case 2:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"previous_response_not_found","message":"Previous response resp-retired-origin was not found."}}`))
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-retired-recovered","object":"response","model":"gpt","status":"completed","output":[]}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"type":"previous_response_not_found","message":"Previous response resp-retired-origin was not found."}}`))
 	})
 	enableCodexSessionMappingForTest(h)
 	h.importAccount(t, "retire", "upstream-retire", "access-retire")
@@ -627,17 +617,17 @@ func TestCodexSessionMappingRetiresOnlyAfterUpstreamContextLoss(t *testing.T) {
 	if status, body := post(`{"model":"gpt","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp-retired-origin") {
 		t.Fatalf("initial status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt","previous_response_id":"resp-retired-origin","input":"resume"}`); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
-		t.Fatalf("context loss must stay native status=%d body=%s", status, body)
+	if status, body := post(`{"model":"gpt","previous_response_id":"resp-retired-origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "resp-retired-recovered") {
+		t.Fatalf("context loss was not recovered status=%d body=%s", status, body)
 	}
-	status, body := post(`{"model":"gpt","previous_response_id":"resp-retired-origin","input":[{"type":"custom_tool_call_output","call_id":"call-retired","output":"must remain native"}]}`)
-	if status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
-		t.Fatalf("retired tool epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-retired-origin"})
+	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-retired-recovered"})
+	if calls.Load() != 3 || oldErr != nil || len(oldRows) != 1 || oldRows[0].State != "retired" || newErr != nil || len(newRows) != 1 || newRows[0].State != "active" {
+		t.Fatalf("recovery calls=%d old=%+v old_err=%v new=%+v new_err=%v", calls.Load(), oldRows, oldErr, newRows, newErr)
 	}
 }
 
 func TestCodexSessionMappingGoalResumeStartsFreshRootAfterContextLoss(t *testing.T) {
-	skipLegacyStrictCPARecovery(t)
 	type capturedCall struct {
 		body         string
 		session      string
@@ -709,13 +699,10 @@ func TestCodexSessionMappingGoalResumeStartsFreshRootAfterContextLoss(t *testing
 	if status, _, body := post(`{"model":"gpt","input":"start"}`, "goal-resume-root", "goal-resume-root", "", ""); status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-origin") {
 		t.Fatalf("initial status=%d body=%s", status, body)
 	}
-	if status, _, body := post(`{"model":"gpt","previous_response_id":"resp-goal-resume-origin","input":"resume"}`, "goal-resume-root", "goal-resume-root", "stale-goal-turn-state", ""); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
-		t.Fatalf("context loss must remain visible once status=%d body=%s", status, body)
-	}
 	resumeMetadata := `{"thread_id":"goal-resume-root","session_id":"goal-resume-root","turn_state":"stale-goal-turn-state","request_kind":"turn"}`
 	resumeBody := `{"model":"gpt","previous_response_id":"resp-goal-resume-origin","turn_state":"stale-goal-turn-state","session_id":"goal-resume-root","client_metadata":{"x-codex-turn-state":"stale-goal-turn-state","session_id":"goal-resume-root","x-codex-turn-metadata":"{\"thread_id\":\"goal-resume-root\",\"session_id\":\"goal-resume-root\",\"turn_state\":\"stale-goal-turn-state\",\"request_kind\":\"turn\"}"},"input":[{"role":"user","content":[{"type":"input_text","text":"resume"}],"exact":900719925474099312345}]}`
 	status, headers, body := post(resumeBody, "goal-resume-root", "goal-resume-root", "stale-goal-turn-state", resumeMetadata)
-	if status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-fresh") || headers.Get("X-MiCliProxy-Context-Status") != "new_root_after_context_loss" {
+	if status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-fresh") || headers.Get("X-MiCliProxy-Context-Status") != "rebuilt" {
 		t.Fatalf("goal resume fresh root status=%d headers=%v body=%s", status, headers, body)
 	}
 	if status, _, body := post(`{"model":"gpt","previous_response_id":"resp-goal-resume-fresh","input":"follow up"}`, "goal-resume-root", "goal-resume-root", "fresh-goal-turn-state", ""); status != http.StatusOK || !strings.Contains(body, "resp-goal-resume-followup") {
@@ -743,18 +730,23 @@ func TestCodexSessionMappingGoalResumeStartsFreshRootAfterContextLoss(t *testing
 }
 
 func TestCodexSessionMappingRetiresOnSoft200PreviousResponseNotFound(t *testing.T) {
-	skipLegacyStrictCPARecovery(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
+		switch calls.Add(1) {
+		case 1:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"resp-soft-retired-origin","object":"response","model":"gpt","status":"completed","output":[]}`))
-			return
+		case 2:
+			// The backend sometimes returns this error envelope with HTTP 200. The
+			// semantic status is nested in error.message and must still rotate CPA.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"error":{"message":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp-soft-retired-origin' not found.\",\"param\":\"previous_response_id\"},\"status\":400}"},"status":400,"type":"error"}`))
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"resp-soft-recovered","object":"response","model":"gpt","status":"completed","output":[]}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-		// The backend sometimes returns this error envelope with HTTP 200. The
-		// semantic status is nested in error.message and must still retire CPA.
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"error":{"message":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp-soft-retired-origin' not found.\",\"param\":\"previous_response_id\"},\"status\":400}"},"status":400,"type":"error"}`))
 	})
 	enableCodexSessionMappingForTest(h)
 	h.importAccount(t, "soft-retire", "upstream-soft-retire", "access-soft-retire")
@@ -778,27 +770,28 @@ func TestCodexSessionMappingRetiresOnSoft200PreviousResponseNotFound(t *testing.
 	if status, body := post(`{"model":"gpt","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp-soft-retired-origin") {
 		t.Fatalf("initial status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":"resume"}`); status != http.StatusBadRequest || !strings.Contains(body, "previous_response_not_found") {
-		t.Fatalf("soft context loss must surface as native 400 status=%d body=%s", status, body)
-	}
-	status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":[{"type":"custom_tool_call_output","call_id":"call-soft-retired","output":"must remain native"}]}`)
-	if status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
-		t.Fatalf("soft-retired tool epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+	if status, body := post(`{"model":"gpt","previous_response_id":"resp-soft-retired-origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "resp-soft-recovered") || calls.Load() != 3 {
+		t.Fatalf("soft context recovery status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }
 
 func TestCodexSessionMappingRetiresAfterNativeStreamContextLoss(t *testing.T) {
-	skipLegacyStrictCPARecovery(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
+		switch calls.Add(1) {
+		case 1:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"resp-stream-retired-origin","object":"response","model":"gpt","status":"completed","output":[]}`))
-			return
+		case 2:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"status\":400,\"response\":{\"id\":\"resp-stream-retired-origin\",\"object\":\"response\",\"status\":\"failed\",\"error\":{\"type\":\"previous_response_not_found\",\"message\":\"Previous response was not found.\"}}}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		case 3:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-stream-context-recovered\",\"object\":\"response\",\"status\":\"completed\",\"output\":[]}}\r\n\r\n")
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: response.failed\ndata: {\"type\":\"response.failed\",\"status\":400,\"response\":{\"id\":\"resp-stream-retired-origin\",\"object\":\"response\",\"status\":\"failed\",\"error\":{\"type\":\"previous_response_not_found\",\"message\":\"Previous response was not found.\"}}}\n\n")
-		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
 	enableCodexSessionMappingForTest(h)
 	h.importAccount(t, "stream-retire", "upstream-stream-retire", "access-stream-retire")
@@ -822,11 +815,8 @@ func TestCodexSessionMappingRetiresAfterNativeStreamContextLoss(t *testing.T) {
 	if status, body := post(`{"model":"gpt","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp-stream-retired-origin") {
 		t.Fatalf("initial status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt","stream":true,"previous_response_id":"resp-stream-retired-origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "previous_response_not_found") || strings.Contains(body, "codex_native_continue_failed") {
-		t.Fatalf("native stream context loss status=%d body=%s", status, body)
-	}
-	if status, body := post(`{"model":"gpt","previous_response_id":"resp-stream-retired-origin","input":[{"type":"custom_tool_call_output","call_id":"call-stream-retired","output":"must remain native"}]}`); status != http.StatusConflict || calls.Load() != 2 || !strings.Contains(body, "codex_context_epoch_retired") {
-		t.Fatalf("retired stream tool epoch status=%d calls=%d body=%s", status, calls.Load(), body)
+	if status, body := post(`{"model":"gpt","stream":true,"previous_response_id":"resp-stream-retired-origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "resp-stream-context-recovered") || strings.Contains(body, "previous_response_not_found") || strings.Contains(body, "codex_native_continue_failed") || calls.Load() != 3 {
+		t.Fatalf("native stream context recovery status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }
 
@@ -884,7 +874,7 @@ func TestCodexSessionMappingEOFUsesOneNativeContinue(t *testing.T) {
 		t.Fatalf("continuation must use only native upstream state: %s", gotBodies[1])
 	}
 	input, _ := continuation["input"].([]interface{})
-	if len(input) != 1 || !strings.Contains(gotBodies[1], `"text":"continue"`) {
+	if len(input) != 1 || !strings.Contains(gotBodies[1], h.app.autoContinueText(context.Background())) {
 		t.Fatalf("continuation input=%v body=%s", input, gotBodies[1])
 	}
 	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-eof-final"})
@@ -943,7 +933,7 @@ func TestCodexSessionMappingEOFPendingClientToolDoesNotContinue(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || calls.Load() != 1 || !bytes.Contains(body, []byte("codex_native_continue_failed")) || bytes.Count(body, []byte("data: [DONE]")) != 1 {
+	if resp.StatusCode != http.StatusOK || calls.Load() != 1 || !bytes.Contains(body, []byte(`"code":"server_error"`)) || !bytes.Contains(body, []byte(publicRetryMessage)) || bytes.Count(body, []byte("data: [DONE]")) != 1 {
 		t.Fatalf("pending tool EOF status=%d calls=%d body=%s", resp.StatusCode, calls.Load(), body)
 	}
 }

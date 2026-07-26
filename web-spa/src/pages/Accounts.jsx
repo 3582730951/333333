@@ -150,15 +150,16 @@ export default function Accounts() {
       } else {
         Toast.success(`${ACCOUNT_ACTION_LABEL[act] || '操作'}已完成`);
       }
-      const nextData = await load();
       if (drawerAcct?.id === id) {
         if (act === 'delete') {
           setDrawerAcct(null);
-        } else {
-          const fresh = nextData?.rows?.find((row) => row.id === id);
-          if (fresh) setDrawerAcct(fresh);
         }
       }
+      void Promise.resolve(load()).then((nextData) => {
+        if (act === 'delete') return;
+        const fresh = nextData?.rows?.find((row) => row.id === id);
+        if (fresh) setDrawerAcct((current) => current?.id === id ? fresh : current);
+      }).catch(() => {});
       return true;
     } catch (e) {
       showErrorToast(e);

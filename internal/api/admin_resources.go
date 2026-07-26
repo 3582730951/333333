@@ -521,6 +521,25 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 	parts := strings.Split(rest, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		if r.Method != http.MethodDelete {
+			methodNotAllowed(w)
+			return
+		}
+		if err := s.store.DeleteEgressProfile(r.Context(), parts[0]); err != nil {
+			switch {
+			case errors.Is(err, storage.ErrEgressInUse):
+				writePoolCodeError(w, http.StatusConflict, "egress_in_use", err.Error())
+			case errors.Is(err, sql.ErrNoRows):
+				http.NotFound(w, r)
+			default:
+				writeError(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"id": parts[0], "deleted": true})
+		return
+	}
 	if len(parts) != 2 {
 		http.NotFound(w, r)
 		return
@@ -1154,7 +1173,12 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 	cutover := s.store.UsageAccuracyCutover(r.Context())
 	body["accuracy_cutover_at"] = cutover
 	body["legacy_unverified"] = win.EffectiveStartAt < cutover
-	if strings.TrimSpace(r.URL.Query().Get("series_dimension")) == "model" {
+	seriesDimension := strings.TrimSpace(r.URL.Query().Get("series_dimension"))
+	if seriesDimension != "" && seriesDimension != "model" && seriesDimension != "provider_model" {
+		writeError(w, http.StatusBadRequest, errors.New("series_dimension must be model or provider_model"))
+		return
+	}
+	if seriesDimension != "" {
 		limit := 6
 		if raw := strings.TrimSpace(r.URL.Query().Get("series_limit")); raw != "" {
 			n, err := strconv.Atoi(raw)
@@ -1164,12 +1188,18 @@ func (s *Server) adminUsageTimeseries(w http.ResponseWriter, r *http.Request) {
 			}
 			limit = n
 		}
-		series, rows, err := s.store.UsageModelSeriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket, limit)
+		var series interface{}
+		var rows interface{}
+		if seriesDimension == "provider_model" {
+			series, rows, err = s.store.UsageProviderModelSeriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket, limit)
+		} else {
+			series, rows, err = s.store.UsageModelSeriesWindow(r.Context(), win.EffectiveStartAt, win.storageUntilAt(), bucket, limit)
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		body["series_dimension"] = "model"
+		body["series_dimension"] = seriesDimension
 		body["series"] = series
 		body["model_series"] = rows
 	}

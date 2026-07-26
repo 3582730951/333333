@@ -26,6 +26,7 @@ import {
   Save,
   Search,
   Settings,
+  Square,
   Sun,
   Trash2,
   Undo2,
@@ -68,6 +69,7 @@ export const IconRefresh = icon(RefreshCw);
 export const IconSave = icon(Save);
 export const IconSearch = icon(Search);
 export const IconSetting = icon(Settings);
+export const IconStop = icon(Square);
 export const IconSun = icon(Sun);
 export const IconTick = icon(Check);
 export const IconUndo = icon(Undo2);

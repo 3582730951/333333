@@ -79,6 +79,142 @@ func TestSelectComposesAccountSidecarOverRealProxyEgress(t *testing.T) {
 	}
 }
 
+func TestSelectDynamicallyInheritsOrderedGroupEgressWithoutRewritingAccount(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "group-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range []storage.EgressProfile{
+		{ID: "group-primary", Type: "http_proxy", Endpoint: "http://primary.example:8080", Health: "healthy", MaxConcurrency: 4},
+		{ID: "group-standby", Type: "http_proxy", Endpoint: "http://standby.example:8080", Health: "healthy", MaxConcurrency: 4},
+	} {
+		if err := store.UpsertEgressProfile(ctx, profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"group-primary", "group-standby"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Egress.ID != "group-primary" || lease.Binding.PrimaryEgressID != "group-primary" || lease.Binding.StandbyEgressIDs != "group-standby" {
+		lease.Release()
+		t.Fatalf("lease did not inherit ordered group egress: egress=%+v binding=%+v", lease.Egress, lease.Binding)
+	}
+	lease.Release()
+	stored, err := store.GetEgressBinding(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.PrimaryEgressID != storage.DefaultDirectEgressID || stored.StandbyEgressIDs != "" {
+		t.Fatalf("group egress was copied into account binding: %+v", stored)
+	}
+
+	group.EgressIDs = []string{"group-standby", "group-primary"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Egress.ID != "group-standby" {
+		t.Fatalf("updated group order was not inherited dynamically: %+v", lease.Egress)
+	}
+}
+
+func TestSelectProviderEgressOrderOverridesAccountPoolGroup(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "provider-egress-account", GroupName: "cyber", Provider: "relay", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range []storage.EgressProfile{
+		{ID: "pool-outlet", Type: "http_proxy", Endpoint: "http://pool.example:8080", Health: "healthy", MaxConcurrency: 4},
+		{ID: "provider-outlet", Type: "http_proxy", Endpoint: "http://provider.example:8080", Health: "healthy", MaxConcurrency: 4},
+	} {
+		if err := store.UpsertEgressProfile(ctx, profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"pool-outlet"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "relay", PreferredEgressIDs: []string{"provider-outlet"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Egress.ID != "provider-outlet" {
+		t.Fatalf("provider egress did not override group egress: %+v", lease.Egress)
+	}
+	if lease.Binding.CookieJarKey != account.ID+":provider-outlet" {
+		t.Fatalf("provider cookie namespace = %q", lease.Binding.CookieJarKey)
+	}
+}
+
+func TestProviderEgressReorderRefreshesFreshAndStickyCookieNamespace(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "provider-cookie-account", GroupName: "cyber", Provider: "relay-cookie", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"provider-cookie-a", "provider-cookie-b"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 4,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := New(store, config.Default())
+	affinity := routing.AffinityKey{Hash: "provider-cookie-affinity", Key: "provider-cookie-key", Source: "test"}
+	lease, err := s.Select(ctx, Route{
+		Group: "cyber", Provider: "relay-cookie", Affinity: affinity,
+		PreferredEgressIDs: []string{"provider-cookie-a", "provider-cookie-b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Egress.ID != "provider-cookie-a" || lease.Binding.CookieJarKey != account.ID+":provider-cookie-a" {
+		lease.Release()
+		t.Fatalf("fresh provider namespace = egress=%s key=%q", lease.Egress.ID, lease.Binding.CookieJarKey)
+	}
+	lease.Release()
+
+	lease, err = s.Select(ctx, Route{
+		Group: "cyber", Provider: "relay-cookie", Affinity: affinity,
+		PreferredEgressIDs: []string{"provider-cookie-b", "provider-cookie-a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Egress.ID != "provider-cookie-b" || lease.Binding.CookieJarKey != account.ID+":provider-cookie-b" {
+		t.Fatalf("sticky reordered provider namespace = egress=%s key=%q", lease.Egress.ID, lease.Binding.CookieJarKey)
+	}
+}
+
 func TestSelectFailsClosedWhenBoundSidecarIsMissing(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
@@ -621,6 +757,24 @@ func TestExcludeBypassesStickyAndRebinds(t *testing.T) {
 	}
 	if b.AccountID != "acc-2" {
 		t.Fatalf("affinity rebound to %q, want acc-2", b.AccountID)
+	}
+}
+
+func TestExcludeAllAccountsReturnsWithoutResettingCallerSet(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"acc-1", "acc-2"} {
+		if err := store.UpsertAccount(ctx, storage.Account{ID: id, Label: id, GroupName: "cyber", Status: "active"}, storage.AccountToken{AccessToken: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exclude := map[string]bool{"acc-1": true, "acc-2": true}
+	s := New(store, config.Default())
+	if _, err := s.Select(ctx, Route{Group: "cyber", Exclude: exclude}); !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("all excluded Select error = %v, want ErrNoAccount", err)
+	}
+	if len(exclude) != 2 || !exclude["acc-1"] || !exclude["acc-2"] {
+		t.Fatalf("Select mutated caller exclusions: %#v", exclude)
 	}
 }
 

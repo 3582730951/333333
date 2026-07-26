@@ -51,15 +51,16 @@ func captureSSEForFailoverWithOptions(body io.Reader, retryableFrame func([]byte
 			}
 			frameBuf = append(frameBuf, chunk...)
 			for {
-				idx := bytes.Index(frameBuf, []byte("\n\n"))
-				if idx < 0 {
+				boundary, separatorLen := sseFrameBoundary(frameBuf)
+				if boundary < 0 {
 					break
 				}
-				frame := frameBuf[:idx+2]
+				frameEnd := boundary + separatorLen
+				frame := frameBuf[:frameEnd]
 				if retryableFrame(frame) {
 					return captured, true, nil
 				}
-				frameBuf = frameBuf[idx+2:]
+				frameBuf = frameBuf[frameEnd:]
 			}
 			if len(frameBuf) > streamLedgerMaxPartialFrame {
 				frameBuf = frameBuf[len(frameBuf)-streamLedgerMaxPartialFrame:]

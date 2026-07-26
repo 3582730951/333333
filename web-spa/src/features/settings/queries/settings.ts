@@ -1,16 +1,17 @@
 import { useQuery } from '@tanstack/react-query';
 import {
-  applySettingsTemplate, clearContextJournal, clearLogRecords, fetchAdvancedSettings, fetchAutomationSettings, fetchConfigSettings, fetchLifecycleSettings,
+  applySettingsTemplate, clearContextJournal, clearLogRecords, fetchAdvancedSettings, fetchAIConfigSettings, fetchAutomationSettings, fetchConfigSettings, fetchLifecycleSettings,
   fetchLoggingSettings, fetchMemorySettings, fetchRegistrarSettings, fetchSharedSettingsOptions,
   saveAdvancedSettings, saveRegistrarSettings, saveSettingsPatches,
 } from '../api/settings';
-import type { AdvancedSettingsKind, AdvancedSettingsSaveInput, RegistrarSaveInput, SettingsPatch, SettingsSection } from '../model/settings';
+import type { AdvancedSettingsKind, AdvancedSettingsSaveInput, AISettingsDomain, RegistrarSaveInput, SettingsPatch, SettingsSection } from '../model/settings';
 import { queryKeys, useApiMutation, useQueryView } from '../../shared/queries';
 
 export const settingsQueryKeys = {
   all: queryKeys.domain('settings'),
   section: (section: SettingsSection) => queryKeys.list('settings', { section }),
   advanced: (kind: AdvancedSettingsKind) => queryKeys.list('settings', { advanced: kind }),
+  ai: (domain: AISettingsDomain) => queryKeys.list('settings', { placement: 'ai_settings', domain }),
   sharedOptions: queryKeys.list('settings', { resource: 'shared-options' }),
 };
 
@@ -23,6 +24,13 @@ function useSettingsQuery<T>(section: SettingsSection, queryFn: (signal?: AbortS
 
 export function useConfigSettingsData() {
   return useSettingsQuery('config', fetchConfigSettings);
+}
+
+export function useAIConfigSettingsData(domain: AISettingsDomain) {
+  return useQueryView(useQuery({
+    queryKey: settingsQueryKeys.ai(domain),
+    queryFn: ({ signal }) => fetchAIConfigSettings(domain, signal),
+  }));
 }
 
 export function useAutomationSettingsData() {

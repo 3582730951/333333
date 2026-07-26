@@ -242,8 +242,8 @@ export function CacheRateBars({ data = [] }) {
   const rows = (data || [])
     .filter((d) => (d.cache_input_tokens || d.prompt_tokens || 0) > 0)
     .map((d) => ({
-      model: d.model_label || d.model || '(未知)',
-      modelKey: d.model_key || d.model || '(未知)',
+      model: d.display_label || d.series_label || d.model_label || d.model || '(未知)',
+      modelKey: d.dimension_key || d.series_key || d.model_key || d.model || '(未知)',
       rate: Math.max(0, Math.min(100, Math.round((100 * (d.cache_read_tokens || d.cached_tokens || 0)) / (d.cache_input_tokens || d.prompt_tokens || 1)))),
       prompt: d.cache_input_tokens || d.prompt_tokens || 0,
     }));

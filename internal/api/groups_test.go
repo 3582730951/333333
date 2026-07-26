@@ -9,10 +9,8 @@ import (
 	"testing"
 )
 
-// groups_test.go guards Phase ④: multi-group CRUD + account reassignment + the delete
-// guards (default group, non-empty group). The per-group ForceModel/ForceEffort routing
-// already existed (override.resolveDownstreamPolicy); what's new is creating/deleting
-// arbitrary groups and moving accounts between them.
+// groups_test.go guards account-pool group CRUD, account reassignment, and delete
+// guards. User policy belongs to user groups; account-pool group endpoints reject it.
 
 func grpReq(t *testing.T, h *testHarness, method, path, body string) (int, []byte) {
 	t.Helper()
@@ -56,24 +54,26 @@ func TestMultiGroupCRUDAndReassign(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"id":"resp"}`)) })
 	acc := h.importAccount(t, "a", "up-a", "tok-a")
 
-	// Create a new group with a forced model + effort.
-	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","force_model":"gpt-5","force_effort":"high","virtual_2m_enabled":false}`); code != http.StatusOK {
+	// Account-pool groups reject user policy instead of silently retaining it.
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","force_model":"gpt-5","force_effort":"high"}`); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), "invalid_group_policy") {
+		t.Fatalf("create group with user policy = %d: %s", code, body)
+	}
+	if code, body := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a","egress_ids":[]}`); code != http.StatusOK {
 		t.Fatalf("create group = %d: %s", code, body)
 	}
 	// Duplicate create → 409.
 	if code, _ := grpReq(t, h, http.MethodPost, "/admin/groups", `{"name":"team-a"}`); code != http.StatusConflict {
 		t.Fatalf("duplicate create = %d, want 409", code)
 	}
-	// List includes team-a with the forced fields.
-	if g := findGroup(listGroups(t, h), "team-a"); g == nil || g["force_model"] != "gpt-5" || g["force_effort"] != "high" {
-		t.Fatalf("team-a not created with forced fields: %v", g)
+	// List includes team-a without user policy fields populated.
+	if g := findGroup(listGroups(t, h), "team-a"); g == nil || g["force_model"] != "" || g["force_effort"] != "" {
+		t.Fatalf("team-a retained user policy: %v", g)
 	}
-	// Generic PATCH updates the new group without lowering the model-native max tier.
-	if code, body := grpReq(t, h, http.MethodPatch, "/admin/groups/team-a", `{"force_effort":"max"}`); code != http.StatusOK {
-		t.Fatalf("patch group = %d: %s", code, body)
+	if code, body := grpReq(t, h, http.MethodPatch, "/admin/groups/team-a", `{"force_effort":"max"}`); code != http.StatusUnprocessableEntity || !strings.Contains(string(body), "invalid_group_policy") {
+		t.Fatalf("patch group with user policy = %d: %s", code, body)
 	}
-	if g := findGroup(listGroups(t, h), "team-a"); g["force_effort"] != "max" {
-		t.Fatalf("force_effort not normalized/updated: %v", g["force_effort"])
+	if code, body := grpReq(t, h, http.MethodPatch, "/admin/groups/team-a", `{"egress_ids":[]}`); code != http.StatusOK {
+		t.Fatalf("patch group egresses = %d: %s", code, body)
 	}
 
 	// Single reassign → team-a.

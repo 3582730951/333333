@@ -6,6 +6,7 @@ import type {
   ContextJournalClearResponse, LogClearResponse, RegistrarSaveInput, RegistrarSettings, SettingsEgress, SettingsGroup, SettingsPatch,
   SettingsSaveResponse, SettingsSection, SettingsTemplate, SettingsValues, SharedSettingsOptions,
 } from '../model/settings';
+import type { AISettingsDomain } from '../model/settings';
 
 const valuesSchema = z.record(z.string(), z.unknown());
 const settingsDiffSchema = z.object({
@@ -55,6 +56,11 @@ const configFieldSchema = z.object({
   effect: z.string().optional(),
   options: z.array(z.string()).optional(),
   help: z.string().optional(),
+  placement: z.enum(['ai_settings', 'system_settings', 'feature_page']).optional(),
+  domain: z.enum(['chatgpt', 'claude', 'kiro', 'antigravity', 'codex', 'claude_code']).nullable().optional(),
+  scope: z.enum(['model', 'global']).optional(),
+  section: z.string().optional(),
+  order: z.coerce.number().int().nonnegative().optional(),
   value: z.unknown().optional(),
   overridden: z.boolean().optional(),
   settings_error: z.string().optional(),
@@ -66,6 +72,11 @@ const configFieldSchema = z.object({
   effect: field.effect ?? 'hot',
   options: field.options ?? [],
   help: field.help ?? '',
+  placement: field.placement ?? 'system_settings',
+  domain: field.domain ?? null,
+  scope: field.scope ?? 'global',
+  section: field.section ?? 'general',
+  order: field.order ?? 0,
   overridden: field.overridden ?? false,
   settings_error: field.settings_error ?? '',
 }));
@@ -226,7 +237,14 @@ function settingsCenterURL(...sections: SettingsSection[]) {
 }
 
 export async function fetchConfigSettings(signal?: AbortSignal): Promise<ConfigField[]> {
-  return parseApiResponse(configFieldsResponseSchema, await get('/admin/config', undefined, { signal })) as ConfigField[];
+  return parseApiResponse(configFieldsResponseSchema, await get('/admin/config', { placement: 'system_settings' }, { signal })) as ConfigField[];
+}
+
+export async function fetchAIConfigSettings(domain: AISettingsDomain, signal?: AbortSignal): Promise<ConfigField[]> {
+  return parseApiResponse(configFieldsResponseSchema, await get('/admin/config', {
+    placement: 'ai_settings',
+    domain,
+  }, { signal })) as ConfigField[];
 }
 
 export async function fetchAutomationSettings(signal?: AbortSignal): Promise<AutomationSettings> {

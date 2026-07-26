@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/identity"
+	"codex-account-pool/internal/storage"
 )
 
 // openAICompatUserAgent is sent on custom-provider traffic. It mimics the official
@@ -51,11 +53,27 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		path = "/" + path
 	}
 	target := base + path
+	if spec.TransportProfile == storage.CustomProviderTransportClaudeCode && strings.Contains(path, "/messages") && !strings.Contains(target, "beta=") {
+		if strings.Contains(target, "?") {
+			target += "&beta=true"
+		} else {
+			target += "?beta=true"
+		}
+	}
 	method := firstNonEmpty(spec.Method, http.MethodPost)
 	stream := bodyStreamTrue(spec.Body)
 
 	built := http.Header{}
-	applyOpenAICompatHeaders(built, spec, stream)
+	switch spec.TransportProfile {
+	case storage.CustomProviderTransportClaudeCode:
+		id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+		c.applyClaudeHeaders(built, spec, id, stream)
+	case storage.CustomProviderTransportCodexCLI:
+		applyOpenAICompatHeaders(built, spec, stream)
+		c.applyOpenAICompatCodexIdentity(built, spec)
+	default:
+		applyOpenAICompatHeaders(built, spec, stream)
+	}
 
 	// Sidecar egress: present a real client TLS/JA3 + HTTP2 fingerprint and (optionally)
 	// chain through a proxy/WARP exit, exactly like the Codex/Claude sidecar paths. ja3=""
@@ -99,13 +117,45 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 	return &Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: guard.Wrap(resp.Body)}, nil
 }
 
+func (c *Client) applyOpenAICompatCodexIdentity(dst http.Header, spec Request) {
+	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
+	originator := codexThreadOriginator(spec.Headers)
+	version := c.cfgSnapshot().CodexCLIVersionOrDefault(id.CodexCLIVersion)
+	if value := strings.TrimSpace(spec.CodexClientVersion); value != "" {
+		version = value
+	}
+	dst.Set("User-Agent", id.CodexUserAgentForOriginator(originator, version))
+	setHeaderPreserveCase(dst, "Originator", originator)
+	setHeaderPreserveCase(dst, "version", version)
+	if beta := mergeCodexBetaFeatures(getHeaderFold(spec.Headers, "x-codex-beta-features")); beta != "" {
+		setHeaderPreserveCase(dst, "x-codex-beta-features", beta)
+	}
+	if strings.Contains(strings.ToLower(spec.DownstreamPath), "responses") {
+		metadata := c.newCodexRequestMetadata(spec)
+		setHeaderPreserveCase(dst, "session-id", metadata.sessionID)
+		setHeaderPreserveCase(dst, "thread-id", metadata.threadID)
+		setHeaderPreserveCase(dst, "x-client-request-id", metadata.threadID)
+		setHeaderPreserveCase(dst, "x-codex-window-id", metadata.windowID)
+	}
+}
+
 // applyOpenAICompatHeaders builds the upstream header set for a custom provider from
 // scratch: Bearer auth (the account's API key), JSON content type when there is a
 // body, the streaming-appropriate Accept, and a generic OpenAI-SDK User-Agent. It
 // deliberately forwards NONE of the downstream client's headers.
 func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
-	if bearer := accountprovider.Credential(spec.Account.Provider, spec.Token); bearer != "" {
-		dst.Set("Authorization", "Bearer "+bearer)
+	credential := accountprovider.Credential(spec.Account.Provider, spec.Token)
+	if credential != "" {
+		dst.Set("Authorization", "Bearer "+credential)
+	}
+	if anthropicVersion := strings.TrimSpace(spec.Headers.Get("Anthropic-Version")); anthropicVersion != "" {
+		dst.Set("Anthropic-Version", anthropicVersion)
+		if credential != "" {
+			dst.Set("X-Api-Key", credential)
+		}
+		if beta := strings.TrimSpace(spec.Headers.Get("Anthropic-Beta")); beta != "" {
+			dst.Set("Anthropic-Beta", beta)
+		}
 	}
 	if len(spec.Body) > 0 {
 		dst.Set("Content-Type", "application/json")
@@ -115,5 +165,9 @@ func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
 	} else {
 		dst.Set("Accept", "application/json")
 	}
-	dst.Set("User-Agent", openAICompatUserAgent)
+	if dst.Get("Anthropic-Version") != "" {
+		dst.Set("User-Agent", "claude-cli/2.1.0")
+	} else {
+		dst.Set("User-Agent", openAICompatUserAgent)
+	}
 }

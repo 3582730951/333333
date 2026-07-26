@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -341,8 +342,8 @@ func TestCodexStrictCPARespectsTerminalRuleActions(t *testing.T) {
 		wantStatus int
 		wantBody   string
 	}{
-		{name: "pass", action: "pass", wantStatus: http.StatusTooManyRequests, wantBody: "strict terminal action sentinel"},
-		{name: "neutralize", action: "neutralize", wantStatus: http.StatusServiceUnavailable, wantBody: "upstream temporarily unavailable"},
+		{name: "pass", action: "pass", wantStatus: http.StatusServiceUnavailable, wantBody: publicRetryMessage},
+		{name: "neutralize", action: "neutralize", wantStatus: http.StatusServiceUnavailable, wantBody: publicRetryMessage},
 		{name: "idle", action: "idle_stream", stream: true, wantStatus: http.StatusOK, wantBody: "strict idle action"},
 		{name: "heartbeat finish", action: "heartbeat_finish", stream: true, wantStatus: http.StatusOK, wantBody: "response.in_progress"},
 	}
@@ -388,7 +389,7 @@ func TestCodexStrictCPARespectsTerminalRuleActions(t *testing.T) {
 			}
 			payload, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode != tc.wantStatus || !strings.Contains(string(payload), tc.wantBody) {
+			if resp.StatusCode != tc.wantStatus || !strings.Contains(string(payload), tc.wantBody) || strings.Contains(string(payload), "strict terminal action sentinel") {
 				t.Fatalf("action=%s status=%d body=%s", tc.action, resp.StatusCode, payload)
 			}
 		})
@@ -487,9 +488,14 @@ func TestCodexStrictCPAUsesEarlySSETerminalRuleViaSidecar(t *testing.T) {
 	}
 }
 
-func TestCodexStrictCPAStatefulFailoverRuleRecoversSameBinding(t *testing.T) {
+func TestCodexStrictCPAStatefulFailoverRuleRotatesMappedBinding(t *testing.T) {
 	var calls atomic.Int32
+	var sessionsMu sync.Mutex
+	var sessions []string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		sessionsMu.Lock()
+		sessions = append(sessions, r.Header.Get("Session-Id"))
+		sessionsMu.Unlock()
 		switch calls.Add(1) {
 		case 1:
 			w.Header().Set("Content-Type", "application/json")
@@ -540,17 +546,22 @@ func TestCodexStrictCPAStatefulFailoverRuleRecoversSameBinding(t *testing.T) {
 	if status, body := post(`{"model":"gpt-5.5","input":"start"}`); status != http.StatusOK || !strings.Contains(body, "resp_rule_failover_origin") {
 		t.Fatalf("initial strict stateful status=%d body=%s", status, body)
 	}
-	// A second eligible account makes the assertion meaningful: strict CPA must
-	// not migrate a previous_response_id to it. The configured failover retries
-	// once on the original account+real egress before it can surface a terminal.
+	// A second eligible account makes the rotation meaningful. The previous
+	// response is rebuilt as a fresh root and never sent to another account as-is.
 	accB := h.importAccount(t, "strict-failover-b", "upstream-strict-failover-b", "access-strict-failover-b")
 	setTestCapability(t, h, accB, "gpt-5.5", 1024)
 	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_failover_origin","input":"resume"}`); status != http.StatusOK || !strings.Contains(body, "resp_rule_failover_recovered") {
 		t.Fatalf("stateful failover status=%d body=%s", status, body)
 	}
 	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp_rule_failover_origin"})
-	if err != nil || len(rows) != 1 || rows[0].State != "active" || rows[0].AccountID != accA || calls.Load() != 3 {
-		t.Fatalf("stateful failover migrated/retired rows=%+v calls=%d err=%v", rows, calls.Load(), err)
+	recoveredRows, recoveredErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp_rule_failover_recovered"})
+	sessionsMu.Lock()
+	gotSessions := append([]string(nil), sessions...)
+	sessionsMu.Unlock()
+	if err != nil || len(rows) != 1 || rows[0].State != "retired" || rows[0].AccountID != accA ||
+		recoveredErr != nil || len(recoveredRows) != 1 || recoveredRows[0].State != "active" ||
+		calls.Load() != 3 || len(gotSessions) != 3 || gotSessions[0] == "" || gotSessions[0] != gotSessions[1] || gotSessions[2] == gotSessions[1] {
+		t.Fatalf("stateful rotation old=%+v new=%+v sessions=%v calls=%d err=%v recovered_err=%v", rows, recoveredRows, gotSessions, calls.Load(), err, recoveredErr)
 	}
 }
 
@@ -570,6 +581,11 @@ func TestCodexStrictCPAStatelessFailoverRuleSwitchesAccount(t *testing.T) {
 		}
 	})
 	enableCodexSessionMappingForTest(h)
+	// This test intentionally exercises the legacy stateless mode. Mapping is the
+	// normal identity boundary and must be explicitly disabled before passthrough
+	// can become active.
+	h.app.cfg.CodexSessionMappingEnabled = false
+	h.app.cfg.CodexStatelessPassthrough = true
 	accA := h.importAccount(t, "strict-stateless-a", "upstream-strict-stateless-a", "access-strict-stateless-a")
 	accB := h.importAccount(t, "strict-stateless-b", "upstream-strict-stateless-b", "access-strict-stateless-b")
 	setTestCapability(t, h, accA, "gpt-5.5", 1024)
@@ -621,7 +637,6 @@ func TestCodexStrictCPAStatelessFailoverRuleSwitchesAccount(t *testing.T) {
 }
 
 func TestCodexStrictCPAContextRuleChangesPresentationAndRetiresEpoch(t *testing.T) {
-	skipLegacyStrictCPARecovery(t)
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
@@ -673,7 +688,7 @@ func TestCodexStrictCPAContextRuleChangesPresentationAndRetiresEpoch(t *testing.
 	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":"resume"}`); status != http.StatusServiceUnavailable || !strings.Contains(body, "administrator handled context loss") {
 		t.Fatalf("strict context rule status=%d body=%s", status, body)
 	}
-	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":[{"type":"custom_tool_call_output","call_id":"call-rule-context","output":"must remain native"}]}`); status != http.StatusConflict || !strings.Contains(body, "codex_context_epoch_retired") || calls.Load() != 2 {
+	if status, body := post(`{"model":"gpt-5.5","previous_response_id":"resp_rule_context_origin","input":[{"type":"custom_tool_call_output","call_id":"call-rule-context","output":"must remain native"}]}`); status != http.StatusConflict || !strings.Contains(body, "codex_tool_context_unrecoverable") || calls.Load() != 2 {
 		t.Fatalf("strict context epoch status=%d calls=%d body=%s", status, calls.Load(), body)
 	}
 }

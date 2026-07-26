@@ -137,7 +137,7 @@ func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatalf("decode template response: %v\n%s", err, body)
 	}
-	if got["id"] != "kiro-no-degradation" {
+	if got["id"] != "optimal-stable-models-v1" {
 		t.Fatalf("template id = %#v", got["id"])
 	}
 	saved, _ := got["saved"].([]interface{})
@@ -162,6 +162,13 @@ func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 		"rate_limit_guard_enabled":        true,
 		"seamless_failover":               true,
 		"leak_scrub":                      true,
+		"stream_keepalive_seconds":        float64(15),
+		"stream_stall_recovery_seconds":   float64(360),
+		"stream_auto_continue_enabled":    true,
+		"codex_session_mapping_enabled":   true,
+		"codex_cpa_strict":                true,
+		"codex_stateless_passthrough":     false,
+		"goal_continuity_enabled":         true,
 		"token_save_enabled":              false,
 		"kiro_version":                    "0.11.107",
 		"kiro_node_version":               "22.22.0",
@@ -189,7 +196,7 @@ func TestLegacyOptimalTemplateIDMapsToKiroNoDegradation(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["id"] != "kiro-no-degradation" {
+	if got["id"] != "optimal-stable-models-v1" {
 		t.Fatalf("legacy template resolved to %#v", got["id"])
 	}
 }

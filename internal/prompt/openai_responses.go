@@ -576,7 +576,7 @@ func responsesToolChoiceToChatBridge(v interface{}, plan *ResponsesToolBridgePla
 func ChatCompletionToResponsesResponse(raw []byte, model string, plans ...*ResponsesToolBridgePlan) ([]byte, error) {
 	root, err := decodeJSONMapUseNumber(raw)
 	if err != nil {
-		return raw, nil
+		return nil, fmt.Errorf("invalid Chat Completions response: %w", err)
 	}
 	var plan *ResponsesToolBridgePlan
 	if len(plans) > 0 {

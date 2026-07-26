@@ -11,10 +11,12 @@ import (
 )
 
 func TestMessagesRoutesGPTToBuiltInCodexNonStreaming(t *testing.T) {
+	upstreamBeta := make(chan string, 1)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/codex/responses" {
 			t.Fatalf("Codex bridge upstream path = %s", r.URL.Path)
 		}
+		upstreamBeta <- r.Header.Get("Anthropic-Beta")
 		upstreamStream := "event: response.created\n" +
 			`data: {"type":"response.created","response":{"id":"resp_msg_codex","model":"gpt-5.6-sol"}}` + "\n\n" +
 			"event: response.output_text.delta\n" +
@@ -57,7 +59,14 @@ func TestMessagesRoutesGPTToBuiltInCodexNonStreaming(t *testing.T) {
 	h.importAccount(t, "messages-codex", "upstream-messages-codex", "access-messages-codex")
 
 	body := `{"model":"gpt-5.6-sol","max_tokens":64000,"stream":false,"output_config":{"effort":"xhigh"},"messages":[{"role":"user","content":"reply"}],"tools":[{"name":"read_file","description":"read","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}`
-	resp, err := http.Post(h.pool.URL+"/v1/messages", "application/json", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Anthropic-Beta", anthropicContext1MBeta+",prompt-caching-2024-07-31")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +74,9 @@ func TestMessagesRoutesGPTToBuiltInCodexNonStreaming(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("Messages -> Codex status=%d body=%s", resp.StatusCode, raw)
+	}
+	if beta := <-upstreamBeta; beta != "prompt-caching-2024-07-31" {
+		t.Fatalf("Codex bridge Anthropic-Beta = %q, want only the non-1M marker", beta)
 	}
 	var got map[string]interface{}
 	if err := json.Unmarshal(raw, &got); err != nil {

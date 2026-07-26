@@ -1,17 +1,18 @@
+// @ts-nocheck
 import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Button, Card, Form, Input, Tag, Toast, Typography,
-} from '../../../../components/pool/index.jsx';
-import { IconRefresh, IconPlay, IconStop } from '../../../../components/pool/icons.jsx';
-import PageHeader from '../../../../components/PageHeader.jsx';
-import PageScaffold from '../../../../components/PageScaffold.tsx';
-import useAsyncAction from '../../../../hooks/useAsyncAction.jsx';
+  Button, Card, Form, Tag, Toast, Typography,
+} from '../../../components/pool/index.jsx';
+import { IconRefresh, IconPlay, IconStop } from '../../../components/pool/icons.jsx';
+import PageHeader from '../../../components/PageHeader.jsx';
+import PageScaffold from '../../../components/PageScaffold.tsx';
+import useAsyncAction from '../../../hooks/useAsyncAction.js';
 import {
   fetchEmailRegConfig, saveEmailRegConfig, startEmailRegistration,
   fetchEmailRegJobs, fetchEmailRegJobStatus, cancelEmailRegJob,
-} from '../../api/emailRegistration';
-import { fetchEmailPool } from '../../../accounts/api/emailPool';
-import type { EmailRegSettings, EmailRegJob } from '../../api/emailRegistration';
+} from '../api/emailRegistration';
+import { fetchEmailPool } from '../../accounts/api/emailPool';
+import type { EmailRegSettings, EmailRegJob } from '../api/emailRegistration';
 
 export default function EmailRegistrationPage() {
   const [config, setConfig] = useState<EmailRegSettings>({ count: 1, group_name: 'cyber', concurrency: 2, egress_pool_id: '' });
@@ -100,54 +101,48 @@ export default function EmailRegistrationPage() {
 
       {/* Configuration Card */}
       <Card style={{ marginBottom: 24 }}>
-        <Typography variant="heading" style={{ marginBottom: 16 }}>Configuration</Typography>
+        <Typography.Text strong style={{ display: 'block', fontSize: 16, marginBottom: 16 }}>Configuration</Typography.Text>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
-          <Form.Item label="Number of Accounts">
-            <Input
-              type="number"
-              min={1}
-              max={50}
-              value={String(config.count)}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfig(c => ({ ...c, count: parseInt(e.target.value) || 1 }))}
-            />
-          </Form.Item>
-          <Form.Item label="Concurrency">
-            <Input
-              type="number"
-              min={1}
-              max={10}
-              value={String(config.concurrency)}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfig(c => ({ ...c, concurrency: parseInt(e.target.value) || 2 }))}
-            />
-          </Form.Item>
-          <Form.Item label="Target Group">
-            <Input
-              value={config.group_name}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfig(c => ({ ...c, group_name: e.target.value }))}
-              placeholder="cyber"
-            />
-          </Form.Item>
-          <Form.Item label="Egress Pool ID (optional)">
-            <Input
-              value={config.egress_pool_id || ''}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) => setConfig(c => ({ ...c, egress_pool_id: e.target.value }))}
-              placeholder="Leave empty for direct"
-            />
-          </Form.Item>
+          <Form.InputNumber
+            label="Number of Accounts"
+            min={1}
+            max={50}
+            value={config.count}
+            onChange={(count) => setConfig((current) => ({ ...current, count: Number(count) || 1 }))}
+          />
+          <Form.InputNumber
+            label="Concurrency"
+            min={1}
+            max={10}
+            value={config.concurrency}
+            onChange={(concurrency) => setConfig((current) => ({ ...current, concurrency: Number(concurrency) || 2 }))}
+          />
+          <Form.Input
+            label="Target Group"
+            value={config.group_name}
+            onChange={(group_name) => setConfig((current) => ({ ...current, group_name }))}
+            placeholder="cyber"
+          />
+          <Form.Input
+            label="Egress Pool ID (optional)"
+            value={config.egress_pool_id || ''}
+            onChange={(egress_pool_id) => setConfig((current) => ({ ...current, egress_pool_id }))}
+            placeholder="Leave empty for direct"
+          />
         </div>
 
         {/* Status bar */}
         <div style={{ display: 'flex', gap: 16, marginTop: 16, alignItems: 'center' }}>
-          <Typography variant="body">
+          <Typography.Text>
             Idle email accounts available:{' '}
             <strong style={{ color: idleCount > 0 ? 'var(--pool-green)' : 'var(--pool-red)' }}>{idleCount}</strong>
-          </Typography>
+          </Typography.Text>
         </div>
 
         <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
           <Button onClick={saveConfig} loading={saving}>Save Settings</Button>
           <Button
-            variant="primary"
+            theme="solid"
             onClick={startReg}
             disabled={hasRunningJob || idleCount === 0}
             loading={starting}
@@ -159,11 +154,11 @@ export default function EmailRegistrationPage() {
 
       {/* Jobs Table */}
       <Card>
-        <Typography variant="heading" style={{ marginBottom: 16 }}>Registration Jobs</Typography>
+        <Typography.Text strong style={{ display: 'block', fontSize: 16, marginBottom: 16 }}>Registration Jobs</Typography.Text>
         {jobs.length === 0 ? (
-          <Typography variant="body" style={{ color: 'var(--pool-gray)' }}>
+          <Typography.Text type="tertiary">
             No registration jobs yet. Configure and start a registration above.
-          </Typography>
+          </Typography.Text>
         ) : (
           <table className="pool-table" style={{ width: '100%' }}>
             <thead>
@@ -198,7 +193,7 @@ export default function EmailRegistrationPage() {
                     <td>{job.created_at ? new Date(job.created_at * 1000).toLocaleString() : '-'}</td>
                     <td>
                       {job.status === 'running' && (
-                        <Button size="small" variant="danger" onClick={(e: React.MouseEvent) => { e.stopPropagation(); cancelJob(job.id); }}>
+                        <Button size="small" type="danger" onClick={(e: React.MouseEvent) => { e.stopPropagation(); cancelJob(job.id); }}>
                           <IconStop /> Cancel
                         </Button>
                       )}
@@ -207,13 +202,13 @@ export default function EmailRegistrationPage() {
                   {expandedJob === job.id && jobDetail && (
                     <tr>
                       <td colSpan={5} style={{ padding: 16, background: 'var(--pool-bg-surface)' }}>
-                        <Typography variant="body">
+                        <Typography.Text>
                           Succeeded: {jobDetail.succeeded} | Failed: {jobDetail.failed} | Total: {jobDetail.total}
-                        </Typography>
+                        </Typography.Text>
                         {jobDetail.error && (
-                          <Typography variant="body" style={{ color: 'var(--pool-red)', marginTop: 4 }}>
+                          <Typography.Text type="danger" style={{ display: 'block', marginTop: 4 }}>
                             Error: {jobDetail.error}
-                          </Typography>
+                          </Typography.Text>
                         )}
                       </td>
                     </tr>

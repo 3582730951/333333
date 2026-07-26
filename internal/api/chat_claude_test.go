@@ -81,8 +81,11 @@ func TestAnthropicStreamToChatSSEErrorIsNotReportedAsSuccessfulDone(t *testing.T
 	rec := httptest.NewRecorder()
 	anthropicStreamToChatSSE(rec, strings.NewReader(anthSSE), "gpt-5.6-sol", streamrewrite.New(nil))
 	body := rec.Body.String()
-	if !strings.Contains(body, `"Kiro stream failed"`) {
-		t.Fatalf("stream error was lost:\n%s", body)
+	if !strings.Contains(body, `"type":"server_error"`) || !strings.Contains(body, publicRetryMessage) {
+		t.Fatalf("stream error did not become a public terminal:\n%s", body)
+	}
+	if strings.Contains(body, "Kiro stream failed") {
+		t.Fatalf("upstream stream error leaked:\n%s", body)
 	}
 	if strings.Contains(body, "data: [DONE]") || strings.Contains(body, `"finish_reason":"stop"`) {
 		t.Fatalf("failed stream was incorrectly completed:\n%s", body)

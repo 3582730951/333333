@@ -234,7 +234,7 @@ func writePublicUnavailable(w http.ResponseWriter, status int) {
 		status = http.StatusServiceUnavailable
 	}
 	errorBody := map[string]interface{}{
-		"message": "The model is temporarily unavailable. Please retry shortly.",
+		"message": "Please retry.",
 		"type":    "server_error",
 	}
 	if requestID := strings.TrimSpace(w.Header().Get(requestIDHeader)); requestID != "" {

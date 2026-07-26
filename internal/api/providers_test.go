@@ -88,6 +88,58 @@ func TestAdminProvidersDefaultsToChatCompletionsProtocol(t *testing.T) {
 	}
 }
 
+func TestAdminProvidersAcceptsAnthropicMessagesProtocol(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"claude-relay",
+		"name":"Claude Relay",
+		"base_url":"https://relay.example/v1",
+		"upstream_protocol":"anthropic_messages",
+		"auto_discover_models":true
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("POST anthropic provider = %d: %s", code, raw)
+	}
+	var got storage.CustomProvider
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.UpstreamProtocol != storage.CustomProviderProtocolAnthropicMessages {
+		t.Fatalf("protocol = %q", got.UpstreamProtocol)
+	}
+}
+
+func TestAdminProvidersPartialPatchPreservesProtocolAndRoutingFields(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	upsertTestEgressProfile(t, h, "provider-patch-egress")
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"provider-patch",
+		"name":"Provider Patch",
+		"base_url":"https://relay.example/v1",
+		"upstream_protocol":"anthropic_messages",
+		"transport_profile":"claude_code",
+		"egress_ids":["provider-patch-egress"],
+		"models":["claude-test"]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("create provider = %d: %s", code, raw)
+	}
+	code, raw = grpReq(t, h, http.MethodPatch, "/admin/providers", `{"id":"provider-patch","enabled":false}`)
+	if code != http.StatusOK {
+		t.Fatalf("patch provider = %d: %s", code, raw)
+	}
+	var got storage.CustomProvider
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled || got.UpstreamProtocol != storage.CustomProviderProtocolAnthropicMessages || got.TransportProfile != storage.CustomProviderTransportClaudeCode {
+		t.Fatalf("partial patch changed provider protocol/profile: %+v", got)
+	}
+	if len(got.EgressIDs) != 1 || got.EgressIDs[0] != "provider-patch-egress" || len(got.Models) != 1 || got.Models[0] != "claude-test" {
+		t.Fatalf("partial patch changed provider routing fields: %+v", got)
+	}
+}
+
 func TestAdminProvidersRejectsInvalidProtocol(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 
