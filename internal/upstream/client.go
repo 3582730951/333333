@@ -387,6 +387,9 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if req.Provider == "claude" {
 		return c.doClaude(ctx, req)
 	}
+	if req.Provider == "antigravity" {
+		return nil, errors.New("antigravity requests must use the native Antigravity transport")
+	}
 	// Custom OpenAI-Chat-Completions-compatible provider (DeepSeek, Kimi, …): a clean
 	// Bearer-auth OpenAI client, no Codex/Claude fingerprint and no body normalization.
 	if IsCustomProvider(req.Provider) {

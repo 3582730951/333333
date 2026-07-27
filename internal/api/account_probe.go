@@ -688,6 +688,46 @@ func (s *Server) adminRefresh(w http.ResponseWriter, r *http.Request, accountID 
 	case provider == "claude":
 		s.refreshClaude(w, r, token)
 		return
+	case provider == "antigravity":
+		cred, err := s.store.GetAntigravityCredentials(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		if strings.TrimSpace(cred.RefreshToken) == "" {
+			writeError(w, http.StatusBadGateway, errors.New("antigravity refresh token is missing"))
+			return
+		}
+		binding, err := s.store.GetEgressBinding(r.Context(), accountID)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		egress, err := s.store.ResolvePrimaryEgressBinding(r.Context(), binding)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		refreshed, err := s.upstream.RefreshAntigravityToken(r.Context(), egress, binding.CookieJarKey, cred.RefreshToken, &s.cfg)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		if strings.TrimSpace(refreshed.AccessToken) == "" {
+			writeError(w, http.StatusBadGateway, errors.New("antigravity token refresh returned no access_token"))
+			return
+		}
+		cred.AccessToken = refreshed.AccessToken
+		if strings.TrimSpace(refreshed.RefreshToken) != "" {
+			cred.RefreshToken = refreshed.RefreshToken
+		}
+		cred.ExpiresAt = time.Now().Unix() + refreshed.ExpiresIn
+		if err := s.store.UpsertAntigravityCredentials(r.Context(), cred); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "refreshed": true, "method": "antigravity_oauth"})
+		return
 	case provider == "kiro":
 		cred, err := s.store.GetKiroCredentials(r.Context(), accountID)
 		if err != nil {

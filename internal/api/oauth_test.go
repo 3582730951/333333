@@ -58,8 +58,15 @@ func TestParseRedirected(t *testing.T) {
 		{"leading question query", "?code=ABC&state=XYZ", "ABC", "XYZ"},
 		{"code#state", "ABC#XYZ", "ABC", "XYZ"},
 		{"bare code", "ABC", "ABC", ""},
+		{"bare padded code", "ABC=", "ABC=", ""},
 		{"whitespace trimmed", "  ABC#XYZ  ", "ABC", "XYZ"},
 		{"url without state", "http://localhost:1455/auth/callback?code=ABC", "ABC", ""},
+		{"quoted callback", `"http://localhost:51121/oauth-callback?code=ABC&state=XYZ"`, "ABC", "XYZ"},
+		{"backtick callback", "`http://localhost:51121/oauth-callback?code=ABC&state=XYZ`", "ABC", "XYZ"},
+		{"html escaped callback", "http://localhost:51121/oauth-callback?code=ABC&amp;state=XYZ", "ABC", "XYZ"},
+		{"localhost without scheme", "localhost:51121/oauth-callback?code=ABC&state=XYZ", "ABC", "XYZ"},
+		{"browser error page text", "This site cannot be reached\nhttp://localhost:51121/oauth-callback?code=ABC&state=XYZ\nERR_CONNECTION_REFUSED", "ABC", "XYZ"},
+		{"unparseable prose", "This is not an OAuth callback", "", ""},
 		{"empty", "", "", ""},
 	}
 	for _, tc := range cases {
@@ -72,9 +79,26 @@ func TestParseRedirected(t *testing.T) {
 	}
 }
 
+func TestParseOAuthRedirectedPreservesAuthorizationError(t *testing.T) {
+	parsed := parseOAuthRedirected("http://localhost:51121/oauth-callback?error=access_denied&error_description=User+cancelled&state=XYZ")
+	if parsed.Code != "" || parsed.State != "XYZ" || parsed.Error != "access_denied" || parsed.ErrorDescription != "User cancelled" {
+		t.Fatalf("parsed authorization error = %+v", parsed)
+	}
+	if err := oauthCallbackFailure(parsed); err == nil || !strings.Contains(err.Error(), "access_denied") || !strings.Contains(err.Error(), "User cancelled") {
+		t.Fatalf("authorization error was not surfaced: %v", err)
+	}
+}
+
 func TestOAuthStoreSingleUse(t *testing.T) {
 	st := newOAuthStore(time.Hour)
 	st.put("s1", oauthPending{provider: "codex", verifier: "v", state: "st"})
+	peeked, ok := st.get("s1")
+	if !ok || peeked.provider != "codex" {
+		t.Fatalf("get(s1) = %+v, ok=%v; want pending session", peeked, ok)
+	}
+	if _, ok := st.get("s1"); !ok {
+		t.Fatal("get must not consume the pending session")
+	}
 	p, ok := st.take("s1")
 	if !ok || p.provider != "codex" || p.verifier != "v" || p.state != "st" {
 		t.Fatalf("take(s1) = %+v, ok=%v; want the stored pending", p, ok)
@@ -84,6 +108,38 @@ func TestOAuthStoreSingleUse(t *testing.T) {
 	}
 	if _, ok := st.take("unknown"); ok {
 		t.Errorf("take(unknown) should miss")
+	}
+}
+
+func TestOAuthCompleteValidationDoesNotConsumeSession(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("invalid callback must not reach an upstream")
+	})
+	tests := []struct {
+		name       string
+		redirected string
+		want       string
+	}{
+		{name: "unparseable paste", redirected: "This is not an OAuth callback", want: "解析"},
+		{name: "state mismatch", redirected: "http://localhost:51121/oauth-callback?code=ABC&state=WRONG", want: "state"},
+		{name: "authorization denied", redirected: "http://localhost:51121/oauth-callback?error=access_denied&error_description=User+cancelled&state=EXPECTED", want: "access_denied"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := "session-" + strings.ReplaceAll(tt.name, " ", "-")
+			h.app.oauth.put(sessionID, oauthPending{provider: "antigravity", state: "EXPECTED"})
+			payload, _ := json.Marshal(map[string]string{"session_id": sessionID, "redirected": tt.redirected})
+			req := httptest.NewRequest(http.MethodPost, "/admin/oauth/complete", strings.NewReader(string(payload)))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.app.adminOAuthComplete(w, req)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), tt.want) {
+				t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
+			}
+			if _, ok := h.app.oauth.get(sessionID); !ok {
+				t.Fatal("invalid callback consumed the OAuth session")
+			}
+		})
 	}
 }
 

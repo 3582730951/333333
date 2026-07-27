@@ -433,6 +433,9 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		}
 		return res
 	}
+	if provider == "antigravity" {
+		return s.probeAntigravityLiveness(ctx, account, binding, egress)
+	}
 	model := ""
 	if provider != "kiro" {
 		model = s.probeModel(ctx, account.ID, provider)
@@ -641,6 +644,45 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 	res.Verdict = ban.Classify(resp.StatusCode < 400, resp.StatusCode, resp.Header, body)
 	res.Alive = resp.StatusCode < 400 || res.Verdict.State == ban.RateLimited || res.Verdict.State == ban.Unknown
 	res.Ready = resp.StatusCode < 400
+	return res
+}
+
+// probeAntigravityLiveness uses the account-scoped, non-billable model catalog.
+// It exercises token refresh and the same bound outlet as live inference without
+// sending a synthetic prompt or routing the built-in provider through the custom
+// OpenAI-compatible adapter.
+func (s *Server) probeAntigravityLiveness(ctx context.Context, account storage.Account, binding storage.AccountEgressBinding, egress storage.EgressProfile) livenessResult {
+	res := livenessResult{
+		Provider:     "antigravity",
+		ProbeScope:   "account_auth_models",
+		ModelChecked: true,
+	}
+	creds, err := s.store.GetAntigravityCredentials(ctx, account.ID)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	accessToken, refreshedCreds, err := s.ensureAntigravityToken(ctx, creds, account, egress, binding.CookieJarKey)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	models, err := s.upstream.FetchAntigravityModels(ctx, egress, binding.CookieJarKey, accessToken, refreshedCreds.ProjectID, refreshedCreds.BaseURL, refreshedCreds.UserAgent)
+	if err != nil {
+		res.Err = err
+		return res
+	}
+	if len(models) > 0 {
+		res.Model = models[0].ID
+	}
+	res.Status = http.StatusOK
+	res.Body, _ = json.Marshal(map[string]interface{}{
+		"model_count": len(models),
+		"model":       res.Model,
+	})
+	res.Verdict = ban.Classify(true, res.Status, http.Header{}, res.Body)
+	res.Alive = true
+	res.Ready = true
 	return res
 }
 

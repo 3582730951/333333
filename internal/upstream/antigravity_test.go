@@ -61,6 +61,17 @@ func TestRefreshAntigravityTokenMatchesNativeOAuthProfile(t *testing.T) {
 	}
 }
 
+func TestRefreshAntigravityTokenRejectsMissingAccessToken(t *testing.T) {
+	cfg := &config.Config{AntigravityOAuthTokenURL: "https://oauth2.googleapis.com/token"}
+	_, err := refreshAntigravityToken(context.Background(), "refresh-token", cfg,
+		func(context.Context, string, http.Header, []byte) (*Response, error) {
+			return &Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"expires_in":3600}`))}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "missing access_token") {
+		t.Fatalf("missing access token was accepted: %v", err)
+	}
+}
+
 func TestAnthropicToAntigravityPreservesStructuredMessages(t *testing.T) {
 	body := []byte(`{
 		"model":"claude-opus-4-8","max_tokens":4096,"stop_sequences":["END"],

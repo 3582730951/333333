@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/identity"
@@ -94,6 +96,18 @@ func (s *oauthStore) putAt(id string, p oauthPending, now time.Time) {
 	s.gcLocked(now)
 	p.created = now
 	s.m[id] = p
+}
+
+// get returns a pending login without consuming it. Callers use it for parsing,
+// ownership, and state validation before take atomically claims the valid callback.
+func (s *oauthStore) get(id string) (oauthPending, bool) { return s.getAt(id, time.Now()) }
+
+func (s *oauthStore) getAt(id string, now time.Time) (oauthPending, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcLocked(now)
+	p, ok := s.m[id]
+	return p, ok
 }
 
 // take returns and removes a pending login (single-use). ok is false when the id
@@ -245,60 +259,193 @@ func randomToken(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
-// parseRedirected extracts the authorization code and (optional) state from
-// whatever the operator pasted back, covering both providers' "the URL changed"
-// experience:
-//   - a full redirect URL (OpenAI redirects to http://localhost:1455/... which
-//     fails to load but leaves ?code=&state= in the address bar) -> read query
-//     params, and also handle fragment params / "?code=abc#state";
-//   - a raw query string ("code=..." or "?code=...");
-//   - a "code#state" string (claude.ai prints this when code=true);
-//   - a bare code.
+type oauthRedirected struct {
+	Code             string
+	State            string
+	Error            string
+	ErrorDescription string
+}
+
+// parseRedirected preserves the original helper contract for callers that only
+// need code and state. New completion handlers use parseOAuthRedirected so an
+// upstream authorization error is not mistaken for a malformed or bare code.
 func parseRedirected(raw string) (code, state string) {
-	raw = strings.TrimSpace(raw)
+	parsed := parseOAuthRedirected(raw)
+	return parsed.Code, parsed.State
+}
+
+// parseOAuthRedirected accepts the callback forms operators can realistically
+// paste from a browser: a URL, a raw query, code#state, a bare code, a quoted or
+// HTML-escaped value, or surrounding browser error text containing the URL.
+func parseOAuthRedirected(raw string) oauthRedirected {
+	raw = trimOAuthCallbackWrapper(html.UnescapeString(strings.TrimSpace(raw)))
 	if raw == "" {
-		return "", ""
+		return oauthRedirected{}
 	}
-	if strings.Contains(raw, "://") {
-		if u, err := url.Parse(raw); err == nil && u.Host != "" {
-			q := u.Query()
-			code = strings.TrimSpace(q.Get("code"))
-			state = strings.TrimSpace(q.Get("state"))
-			if fragment := strings.TrimSpace(u.Fragment); fragment != "" {
-				if fq, err := url.ParseQuery(fragment); err == nil {
-					if code == "" {
-						code = strings.TrimSpace(fq.Get("code"))
-					}
-					if state == "" {
-						state = strings.TrimSpace(fq.Get("state"))
-					}
-				}
-				if state == "" && code != "" && !strings.Contains(fragment, "=") {
-					state = fragment
-				}
-			}
-			code, inlineState := splitCodeAndState(code)
-			if state == "" {
-				state = inlineState
-			}
-			return code, state
+	candidates := make([]string, 0, 2)
+	if embedded := embeddedOAuthCallbackURL(raw); embedded != "" && embedded != raw {
+		candidates = append(candidates, embedded)
+	}
+	candidates = append(candidates, raw)
+	for _, candidate := range candidates {
+		if parsed, recognized := parseOAuthCallbackCandidate(candidate); recognized {
+			return parsed
 		}
+	}
+	return oauthRedirected{}
+}
+
+func parseOAuthCallbackCandidate(raw string) (oauthRedirected, bool) {
+	raw = trimOAuthCallbackWrapper(strings.TrimSpace(raw))
+	if raw == "" {
+		return oauthRedirected{}, false
+	}
+	lower := strings.ToLower(raw)
+	isURL := strings.Contains(lower, "://") || strings.HasPrefix(lower, "localhost:") || strings.HasPrefix(lower, "127.0.0.1:") || strings.HasPrefix(lower, "[::1]:")
+	if isURL {
+		candidate := raw
+		if !strings.Contains(lower, "://") {
+			candidate = "http://" + candidate
+		}
+		u, err := url.Parse(candidate)
+		if err != nil || strings.TrimSpace(u.Host) == "" {
+			return oauthRedirected{}, true
+		}
+		parsed := oauthRedirectedFromValues(u.Query())
+		fragment := strings.TrimSpace(u.Fragment)
+		if fragment != "" {
+			if values, err := url.ParseQuery(fragment); err == nil {
+				mergeOAuthRedirected(&parsed, oauthRedirectedFromValues(values))
+			}
+			if parsed.State == "" && parsed.Code != "" && !strings.Contains(fragment, "=") {
+				parsed.State = fragment
+			}
+		}
+		normalizeOAuthRedirected(&parsed)
+		return parsed, true
 	}
 	if strings.Contains(raw, "=") {
-		query := strings.TrimPrefix(raw, "?")
-		if q, err := url.ParseQuery(query); err == nil {
-			code = strings.TrimSpace(q.Get("code"))
-			state = strings.TrimSpace(q.Get("state"))
-			if code != "" || state != "" {
-				code, inlineState := splitCodeAndState(code)
-				if state == "" {
-					state = inlineState
-				}
-				return code, state
-			}
+		values, err := url.ParseQuery(strings.TrimPrefix(raw, "?"))
+		if err == nil && oauthCallbackValuesPresent(values) {
+			parsed := oauthRedirectedFromValues(values)
+			normalizeOAuthRedirected(&parsed)
+			return parsed, true
+		}
+		if strings.HasPrefix(raw, "?") || strings.Contains(raw, "&") {
+			return oauthRedirected{}, true
 		}
 	}
-	return splitCodeAndState(raw)
+	if strings.IndexFunc(raw, unicode.IsSpace) >= 0 || strings.ContainsAny(raw, "<>\"'`") {
+		return oauthRedirected{}, false
+	}
+	code, state := splitCodeAndState(raw)
+	return oauthRedirected{Code: code, State: state}, true
+}
+
+func oauthCallbackValuesPresent(values url.Values) bool {
+	for _, key := range []string{"code", "state", "error", "error_description"} {
+		if _, ok := values[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func oauthRedirectedFromValues(values url.Values) oauthRedirected {
+	return oauthRedirected{
+		Code:             strings.TrimSpace(values.Get("code")),
+		State:            strings.TrimSpace(values.Get("state")),
+		Error:            strings.TrimSpace(values.Get("error")),
+		ErrorDescription: strings.TrimSpace(values.Get("error_description")),
+	}
+}
+
+func mergeOAuthRedirected(dst *oauthRedirected, src oauthRedirected) {
+	if dst.Code == "" {
+		dst.Code = src.Code
+	}
+	if dst.State == "" {
+		dst.State = src.State
+	}
+	if dst.Error == "" {
+		dst.Error = src.Error
+	}
+	if dst.ErrorDescription == "" {
+		dst.ErrorDescription = src.ErrorDescription
+	}
+}
+
+func normalizeOAuthRedirected(parsed *oauthRedirected) {
+	parsed.Code = strings.TrimSpace(parsed.Code)
+	parsed.State = strings.TrimSpace(parsed.State)
+	parsed.Error = strings.TrimSpace(parsed.Error)
+	parsed.ErrorDescription = strings.TrimSpace(parsed.ErrorDescription)
+	code, inlineState := splitCodeAndState(parsed.Code)
+	parsed.Code = code
+	if parsed.State == "" {
+		parsed.State = inlineState
+	}
+}
+
+func trimOAuthCallbackWrapper(raw string) string {
+	for {
+		raw = strings.TrimSpace(raw)
+		if len(raw) < 2 {
+			return raw
+		}
+		first, last := raw[0], raw[len(raw)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') || (first == '`' && last == '`') {
+			raw = raw[1 : len(raw)-1]
+			continue
+		}
+		return raw
+	}
+}
+
+func embeddedOAuthCallbackURL(raw string) string {
+	lower := strings.ToLower(raw)
+	start := -1
+	for _, marker := range []string{"https://", "http://", "localhost:", "127.0.0.1:", "[::1]:"} {
+		if i := strings.Index(lower, marker); i >= 0 && (start < 0 || i < start) {
+			start = i
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	tail := raw[start:]
+	end := len(tail)
+	for i, r := range tail {
+		if unicode.IsSpace(r) || strings.ContainsRune("<>\"'`", r) {
+			end = i
+			break
+		}
+	}
+	return strings.TrimRight(tail[:end], ".,;)")
+}
+
+func oauthCallbackFailure(parsed oauthRedirected) error {
+	code := compactOAuthErrorText(parsed.Error, 100)
+	description := compactOAuthErrorText(parsed.ErrorDescription, 300)
+	if code == "" && description == "" {
+		return nil
+	}
+	if code == "" {
+		code = "authorization_error"
+	}
+	if description == "" {
+		return fmt.Errorf("OAuth 授权失败 (%s)，请重新打开登录链接完成授权", code)
+	}
+	return fmt.Errorf("OAuth 授权失败 (%s): %s", code, description)
+}
+
+func compactOAuthErrorText(value string, maxRunes int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) > maxRunes {
+		value = string(runes[:maxRunes])
+	}
+	return value
 }
 
 func splitCodeAndState(raw string) (code, state string) {
@@ -311,7 +458,7 @@ func splitCodeAndState(raw string) (code, state string) {
 
 // adminOAuthStart mints a login URL.
 //
-//	POST /admin/oauth/start  {provider:"codex"|"claude"}
+//	POST /admin/oauth/start  {provider:"codex"|"claude"|"antigravity"}
 //	  -> {session_id, provider, auth_url, expires_in}
 func (s *Server) adminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
@@ -406,19 +553,23 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("session_id and redirected are required"))
 		return
 	}
-	pend, ok := s.oauth.take(req.SessionID)
+	redirected := parseOAuthRedirected(req.Redirected)
+	if redirected.Code == "" && redirected.Error == "" && redirected.ErrorDescription == "" {
+		writeError(w, http.StatusBadRequest, errors.New("未能从粘贴内容中解析出授权码（请粘贴登录后地址栏的完整网址，或页面显示的 code）"))
+		return
+	}
+	pend, ok := s.oauth.get(req.SessionID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, errors.New("登录会话已过期或不存在，请重新生成登录链接"))
 		return
 	}
-	code, state := parseRedirected(req.Redirected)
-	if code == "" {
-		writeError(w, http.StatusBadRequest, errors.New("未能从粘贴内容中解析出授权码（请粘贴登录后地址栏的完整网址，或页面显示的 code）"))
+	// CSRF: when the paste carried a state, it must match the one we issued.
+	if redirected.State != "" && pend.state != "" && redirected.State != pend.state {
+		writeError(w, http.StatusBadRequest, errors.New("state 不匹配，可能不是本次登录的回调，请重新登录"))
 		return
 	}
-	// CSRF: when the paste carried a state, it must match the one we issued.
-	if state != "" && pend.state != "" && state != pend.state {
-		writeError(w, http.StatusBadRequest, errors.New("state 不匹配，可能不是本次登录的回调，请重新登录"))
+	if err := oauthCallbackFailure(redirected); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	desc, err := s.oauthProvider(pend.provider)
@@ -427,15 +578,10 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var parsed authparse.ParsedAuth
 	groupName := strings.TrimSpace(req.GroupName)
 	importEgressID := requestedImportEgressID(req.EgressID, req.PrimaryEgressID)
-	switch pend.provider {
-	case "codex":
-		parsed, err = s.exchangeCodexCode(r.Context(), desc, code, pend.verifier)
-	case "claude":
-		parsed, err = s.exchangeClaudeCode(r.Context(), desc, code, firstNonEmpty(state, pend.state), pend.verifier)
-	case "antigravity":
+	var antigravityEgress storage.EgressProfile
+	if pend.provider == "antigravity" {
 		if pend.groupName != "" {
 			groupName = pend.groupName
 		}
@@ -446,11 +592,26 @@ func (s *Server) adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
 		if routeEgressID == "" {
 			routeEgressID = importEgressID
 		}
-		var egress storage.EgressProfile
-		egress, groupName, err = s.resolveAntigravityOAuthEgress(r.Context(), groupName, routeEgressID)
-		if err == nil {
-			parsed, err = s.exchangeAntigravityCode(r.Context(), code, desc.redirectURI, egress, "oauth:antigravity:"+req.SessionID)
+		antigravityEgress, groupName, err = s.resolveAntigravityOAuthEgress(r.Context(), groupName, routeEgressID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
+	}
+	claimed, ok := s.oauth.take(req.SessionID)
+	if !ok {
+		writeError(w, http.StatusConflict, errors.New("登录回调正在处理或已被使用，请重新生成登录链接"))
+		return
+	}
+	pend = claimed
+	var parsed authparse.ParsedAuth
+	switch pend.provider {
+	case "codex":
+		parsed, err = s.exchangeCodexCode(r.Context(), desc, redirected.Code, pend.verifier)
+	case "claude":
+		parsed, err = s.exchangeClaudeCode(r.Context(), desc, redirected.Code, firstNonEmpty(redirected.State, pend.state), pend.verifier)
+	case "antigravity":
+		parsed, err = s.exchangeAntigravityCode(r.Context(), redirected.Code, desc.redirectURI, antigravityEgress, "oauth:antigravity:"+req.SessionID)
 	default:
 		err = fmt.Errorf("unknown provider %q", pend.provider)
 	}

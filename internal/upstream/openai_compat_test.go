@@ -23,7 +23,7 @@ func TestApplyOpenAICompatHeadersUsesAnthropicAuthForMessages(t *testing.T) {
 }
 
 func TestIsCustomProviderExcludesBuiltIns(t *testing.T) {
-	for _, provider := range []string{"", "codex", "claude", "kiro"} {
+	for _, provider := range []string{"", "codex", "claude", "kiro", "antigravity"} {
 		if IsCustomProvider(provider) {
 			t.Fatalf("built-in provider %q classified as custom", provider)
 		}

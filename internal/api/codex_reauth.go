@@ -249,18 +249,22 @@ func (s *Server) adminCodexReauthOAuthComplete(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, errors.New("session_id and redirected are required"))
 		return
 	}
-	pend, ok := s.oauth.take(req.SessionID)
+	redirected := parseOAuthRedirected(req.Redirected)
+	if redirected.Code == "" && redirected.Error == "" && redirected.ErrorDescription == "" {
+		writeError(w, http.StatusBadRequest, errors.New("未能从粘贴内容中解析出授权码"))
+		return
+	}
+	pend, ok := s.oauth.get(req.SessionID)
 	if !ok || pend.provider != "codex" || pend.reauthAccountID != account.ID {
 		writeError(w, http.StatusBadRequest, errors.New("登录会话已过期或不属于该账号，请重新生成登录链接"))
 		return
 	}
-	code, state := parseRedirected(req.Redirected)
-	if code == "" {
-		writeError(w, http.StatusBadRequest, errors.New("未能从粘贴内容中解析出授权码"))
+	if redirected.State != "" && pend.state != "" && redirected.State != pend.state {
+		writeError(w, http.StatusBadRequest, errors.New("state 不匹配，可能不是本次登录的回调，请重新登录"))
 		return
 	}
-	if state != "" && pend.state != "" && state != pend.state {
-		writeError(w, http.StatusBadRequest, errors.New("state 不匹配，可能不是本次登录的回调，请重新登录"))
+	if err := oauthCallbackFailure(redirected); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	desc, err := s.oauthProvider("codex")
@@ -268,12 +272,17 @@ func (s *Server) adminCodexReauthOAuthComplete(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	parsed, err := s.exchangeCodexCode(r.Context(), desc, code, pend.verifier)
+	claimed, ok := s.oauth.take(req.SessionID)
+	if !ok {
+		writeError(w, http.StatusConflict, errors.New("登录回调正在处理或已被使用，请重新生成登录链接"))
+		return
+	}
+	parsed, err := s.exchangeCodexCode(r.Context(), desc, redirected.Code, claimed.verifier)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	if err := validateCodexTargetWorkspace(parsed, pend.targetWorkspaceID); err != nil {
+	if err := validateCodexTargetWorkspace(parsed, claimed.targetWorkspaceID); err != nil {
 		_ = s.store.UpdateCodexReauthConfigStatus(r.Context(), account.ID, storage.CodexReauthJobWorkspaceMismatch, err.Error())
 		writeError(w, http.StatusConflict, err)
 		return

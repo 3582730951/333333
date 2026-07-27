@@ -239,6 +239,9 @@ func refreshAntigravityToken(ctx context.Context, refreshToken string, cfg *conf
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
 		return AntigravityTokenResponse{}, err
 	}
+	if strings.TrimSpace(tr.AccessToken) == "" {
+		return AntigravityTokenResponse{}, errors.New("antigravity token refresh response missing access_token")
+	}
 	if tr.ExpiresIn <= 0 {
 		tr.ExpiresIn = 3600
 	}

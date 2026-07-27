@@ -19,11 +19,11 @@ import (
 const openAICompatUserAgent = "OpenAI/Python 1.61.0"
 
 // IsCustomProvider reports whether a provider id names a custom OpenAI-compatible
-// provider (anything other than the built-in codex/claude/kiro upstreams or the empty
+// provider (anything other than the built-in codex/claude/kiro/antigravity upstreams or the empty
 // legacy value). Exported so the API layer routes consistently with Client.Do.
 func IsCustomProvider(provider string) bool {
 	switch strings.TrimSpace(provider) {
-	case "", "codex", "claude", "kiro":
+	case "", "codex", "claude", "kiro", "antigravity":
 		return false
 	default:
 		return true

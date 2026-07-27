@@ -248,3 +248,78 @@ func TestAntigravityAccountModelProbeIsDynamicAndRetainsLastCatalog(t *testing.T
 		t.Fatalf("failed probe replaced authority with fallback: %+v", retained)
 	}
 }
+
+func TestAntigravityLivenessUsesNativeModelCatalog(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1internal:fetchAvailableModels" {
+			t.Fatalf("liveness used unexpected upstream path %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer health-access" {
+			t.Fatalf("liveness authorization = %q", got)
+		}
+		_, _ = io.WriteString(w, `{"models":{"claude-sonnet-4-6":{"displayName":"Claude Sonnet 4.6","maxTokens":250000},"gemini-3.1-pro":{"displayName":"Gemini 3.1 Pro","maxTokens":1048576}}}`)
+	})
+	ctx := context.Background()
+	account := storage.Account{ID: "antigravity-health", GroupName: "antigravity", Provider: "antigravity", Status: "active"}
+	token := storage.AccountToken{}
+	if err := h.store.UpsertAccountWithAntigravityCredentials(ctx, account, token, storage.AntigravityCredentials{
+		ProjectID: "health-project", AccessToken: "health-access", RefreshToken: "health-refresh",
+		ExpiresAt: time.Now().Add(time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := h.app.probeAccountLiveness(ctx, account, token)
+	if result.Err != nil || !result.Alive || !result.Ready || result.Status != http.StatusOK {
+		t.Fatalf("liveness result = %+v", result)
+	}
+	if result.Provider != "antigravity" || result.ProbeScope != "account_auth_models" || !result.ModelChecked || result.Model != "claude-sonnet-4-6" {
+		t.Fatalf("liveness classification = %+v", result)
+	}
+	if strings.Contains(string(result.Body), "health-access") || !strings.Contains(string(result.Body), `"model_count":2`) {
+		t.Fatalf("liveness response was unsafe or incomplete: %s", result.Body)
+	}
+}
+
+func TestAdminRefreshAntigravityUsesOAuthRefresh(t *testing.T) {
+	var refreshCalls atomic.Int32
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls.Add(1)
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "old-refresh" {
+			t.Fatalf("refresh form = %v", r.Form)
+		}
+		_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`)
+	}))
+	defer oauth.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("admin token refresh must not use the inference upstream")
+	})
+	h.app.cfg.AntigravityOAuthTokenURL = oauth.URL
+	ctx := context.Background()
+	account := storage.Account{ID: "antigravity-refresh", GroupName: "antigravity", Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccountWithAntigravityCredentials(ctx, account, storage.AccountToken{}, storage.AntigravityCredentials{
+		ProjectID: "refresh-project", AccessToken: "old-access", RefreshToken: "old-refresh", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/admin/accounts/"+account.ID+"/refresh", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("refresh status/body = %d %s", resp.StatusCode, raw)
+	}
+	creds, err := h.store.GetAntigravityCredentials(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshCalls.Load() != 1 || creds.AccessToken != "fresh-access" || creds.RefreshToken != "fresh-refresh" || creds.ExpiresAt <= time.Now().Unix() {
+		t.Fatalf("refresh calls=%d credentials=%+v", refreshCalls.Load(), creds)
+	}
+}
