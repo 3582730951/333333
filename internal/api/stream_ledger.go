@@ -82,7 +82,7 @@ func newCodexStreamLedgerRecorderWithOptions(ctx context.Context, options bodyso
 func (s *Server) newCodexStreamLedgerRecorder(ctx context.Context) *codexStreamLedgerRecorder {
 	return newCodexStreamLedgerRecorderWithOptions(ctx, bodysource.CaptureOptions{
 		MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
-		MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver,
+		Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver,
 	})
 }
 

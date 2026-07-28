@@ -153,6 +153,26 @@ func TestAntigravityFinalWireIdentitySafetyAndCatalogLimit(t *testing.T) {
 	}
 }
 
+func TestAntigravityFinalWireOmitsContextManagement(t *testing.T) {
+	body := []byte(`{
+		"max_tokens":4096,
+		"context_management":{"edits":[{"type":"clear_tool_uses_20250919","trigger":{"type":"input_tokens","value":272000},"keep":{"type":"tool_uses","value":5}}]},
+		"messages":[{"role":"user","content":"continue the full conversation"}]
+	}`)
+	out, err := anthropicToAntigravityForAccount(body, "claude-opus-4-8", "project", "account-a", 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"context_management", "contextManagement", "request.context_management", "request.contextManagement"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("final Antigravity wire retained %s: %s", path, out)
+		}
+	}
+	if got := gjson.GetBytes(out, "request.contents.0.parts.0.text").String(); got != "continue the full conversation" {
+		t.Fatalf("message content changed while stripping context management: %q; body=%s", got, out)
+	}
+}
+
 func TestAntigravityEndpointOrderAndFailureClassifier(t *testing.T) {
 	bases := AntigravityEndpointBases("")
 	if len(bases) != 2 || bases[0] != antigravityDailyBaseURL || bases[1] != antigravityProdBaseURL {

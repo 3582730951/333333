@@ -158,7 +158,7 @@ func (s *Server) responseBodyCaptureOptions(ctx context.Context) bodysource.Capt
 	_ = ctx
 	return bodysource.CaptureOptions{
 		MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes,
-		TempDir: s.cfg.BodySpoolDir, MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver,
+		TempDir: s.cfg.BodySpoolDir, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver,
 		TempFileNamePrefix: "codex-pool-response-*",
 	}
 }

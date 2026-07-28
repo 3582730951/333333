@@ -239,11 +239,11 @@ func writeBodyStorageError(w http.ResponseWriter, err error) bool {
 }
 
 func captureRequestBody(ctx context.Context, src io.Reader, cfg config.Config, budget *bodysource.Budget, expectedBytes ...int64) (bodysource.BodySource, error) {
-	return bodysource.Capture(ctx, src, bodysource.CaptureOptions{MaxBytes: cfg.MaxBodyBytes, MemoryThreshold: cfg.BodyMemoryThresholdBytes, ExpectedBytes: positiveExpectedBytes(expectedBytes), TempDir: cfg.BodySpoolDir, MinDiskFreeBytes: cfg.BodyDiskReserveBytes, Budget: budget})
+	return bodysource.Capture(ctx, src, bodysource.CaptureOptions{MaxBytes: cfg.MaxBodyBytes, MemoryThreshold: cfg.BodyMemoryThresholdBytes, ExpectedBytes: positiveExpectedBytes(expectedBytes), TempDir: cfg.BodySpoolDir, Budget: budget})
 }
 
 func captureJSONRequestBody(ctx context.Context, src io.Reader, cfg config.Config, budget *bodysource.Budget, hmacKey []byte, expectedBytes ...int64) (bodysource.BodySource, bodysource.BodyMeta, error) {
-	return bodysource.CaptureJSON(ctx, src, bodysource.CaptureOptions{MaxBytes: cfg.MaxBodyBytes, MemoryThreshold: cfg.BodyMemoryThresholdBytes, ExpectedBytes: positiveExpectedBytes(expectedBytes), TempDir: cfg.BodySpoolDir, MinDiskFreeBytes: cfg.BodyDiskReserveBytes, Budget: budget}, hmacKey)
+	return bodysource.CaptureJSON(ctx, src, bodysource.CaptureOptions{MaxBytes: cfg.MaxBodyBytes, MemoryThreshold: cfg.BodyMemoryThresholdBytes, ExpectedBytes: positiveExpectedBytes(expectedBytes), TempDir: cfg.BodySpoolDir, Budget: budget}, hmacKey)
 }
 
 func positiveExpectedBytes(values []int64) int64 {

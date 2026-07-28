@@ -675,9 +675,11 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 		// The real client overrides AUTO/ANY/NONE at the final transport boundary.
 		out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
 	}
-	if gjson.GetBytes(body, "context_management").Exists() {
-		return nil, antigravityConversionError("context_management is not supported by the Antigravity protocol")
-	}
+	// context_management is an Anthropic request-side history policy. The Antigravity
+	// envelope is rebuilt field-by-field above, so it is intentionally consumed only by
+	// the local context/compaction pipeline and omitted from the final provider wire.
+	// Rejecting it here caused Claude Code's automatic context management to fail with a
+	// local 422 even though no unsupported field would have reached Antigravity.
 	if gjson.GetBytes(body, "mcp_servers").Exists() {
 		return nil, antigravityConversionError("mcp_servers are not supported by the Antigravity protocol")
 	}

@@ -39,7 +39,7 @@ const (
 	DefaultBodyMemoryThresholdBytes       = 8 << 20
 	DefaultBodyMemoryBudgetMaxBytes       = 256 << 20
 	DefaultBodySpoolMaxBytes              = 32 << 30
-	DefaultBodyDiskReserveBytes           = 10 << 30
+	DefaultBodyDiskReserveBytes           = 0
 	DefaultUsageJournalSegmentBytes       = 8 << 20
 	DefaultStreamFailoverHoldMemoryBytes  = 8 << 20
 	DefaultStreamFailoverHoldDiskBytes    = 0
@@ -175,8 +175,11 @@ type Config struct {
 	BodyV2Enabled            bool  `json:"body_v2_enabled"`
 	BodyMemoryThresholdBytes int64 `json:"body_memory_threshold_bytes"`
 	// BodyMemoryBudgetBytes is process-wide. Zero selects min(256 MiB, 12.5% of the cgroup/system memory limit).
-	BodyMemoryBudgetBytes    int64  `json:"body_memory_budget_bytes"`
-	BodySpoolMaxBytes        int64  `json:"body_spool_max_bytes"`
+	BodyMemoryBudgetBytes int64 `json:"body_memory_budget_bytes"`
+	BodySpoolMaxBytes     int64 `json:"body_spool_max_bytes"`
+	// BodyDiskReserveBytes is retained only so older config files round-trip. The
+	// request pipeline admits actual bytes like CLIProxyAPI and does not enforce a
+	// fixed free-space floor; capacity and BodySpoolMaxBytes remain hard limits.
 	BodyDiskReserveBytes     int64  `json:"body_disk_reserve_bytes"`
 	BodySpoolDir             string `json:"body_spool_dir"`
 	UsageJournalEnabled      bool   `json:"usage_journal_enabled"`

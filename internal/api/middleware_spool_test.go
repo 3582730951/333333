@@ -10,12 +10,15 @@ import (
 	"codex-account-pool/internal/config"
 )
 
-func TestCaptureRequestBodySpillsAndReplays(t *testing.T) {
+func TestCaptureRequestBodyIgnoresLegacyFixedReserveAndReplays(t *testing.T) {
 	payload := strings.Repeat("x", (1<<20)+17)
 	cfg := config.Default()
 	cfg.MaxBodyBytes = 2 << 20
 	cfg.BodyMemoryThresholdBytes = 1 << 20
-	cfg.BodyDiskReserveBytes = 0
+	// Existing installations may still contain the former 10 GiB default. API
+	// request capture must follow CLIProxyAPI-style actual-byte admission instead
+	// of rejecting a fitting body because of this legacy value.
+	cfg.BodyDiskReserveBytes = 1 << 62
 	cfg.BodySpoolDir = t.TempDir()
 	budget := bodysource.NewBudget(2<<20, 2<<20)
 	body, err := captureRequestBody(context.Background(), strings.NewReader(payload), cfg, budget)

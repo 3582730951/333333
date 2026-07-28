@@ -215,6 +215,9 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if runtimeStorage.Filesystem.FilesystemTotalBytes <= 0 || runtimeStorage.Filesystem.FilesystemAvailableBytes <= 0 || runtimeStorage.Filesystem.GlobalLimitBytes <= 0 {
 		t.Fatalf("runtime_storage filesystem/reserver missing: %+v", runtimeStorage.Filesystem)
 	}
+	if runtimeStorage.Filesystem.MinimumFreeBytes != 0 {
+		t.Fatalf("runtime_storage retained a fixed filesystem reserve: %+v", runtimeStorage.Filesystem)
+	}
 	if runtimeStorage.Rejections["request_body_storage_exhausted"] != 1 || runtimeStorage.Rejections["local_spool_capacity"] != 1 {
 		t.Fatalf("runtime_storage rejection counts: %+v", runtimeStorage.Rejections)
 	}

@@ -131,6 +131,22 @@ func TestAntigravityGeminiHandlerRecordsAttributedCacheUsage(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer antigravity-access-token" {
 			t.Fatalf("antigravity authorization = %q", got)
 		}
+		wire, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope map[string]interface{}
+		if err := json.Unmarshal(wire, &envelope); err != nil {
+			t.Fatalf("decode Antigravity wire: %v body=%s", err, wire)
+		}
+		if _, exists := envelope["context_management"]; exists {
+			t.Fatalf("Antigravity wire retained context_management: %s", wire)
+		}
+		if request, _ := envelope["request"].(map[string]interface{}); request != nil {
+			if _, exists := request["context_management"]; exists {
+				t.Fatalf("Antigravity inner request retained context_management: %s", wire)
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{
 			"response": {
@@ -154,7 +170,7 @@ func TestAntigravityGeminiHandlerRecordsAttributedCacheUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw := []byte(`{"model":"` + model + `","max_tokens":128,"messages":[{"role":"user","content":"hello"}]}`)
+	raw := []byte(`{"model":"` + model + `","max_tokens":128,"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"messages":[{"role":"user","content":"hello"}]}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(raw)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Thread-Id", "antigravity-thread")

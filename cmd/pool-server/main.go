@@ -225,7 +225,7 @@ func run() int {
 	// potentially large JSON backfill only after the listener is accepting health
 	// checks; synchronous execution here previously made an active systemd service look
 	// dead long enough for install.sh to roll back both the new and previous binaries.
-	supervisor.Go(ctx, "storage-deferred-migrations", func(ctx context.Context) {
+	supervisor.GoOnce("storage-deferred-migrations", func() {
 		started := time.Now()
 		if err := store.RunDeferredMigrations(ctx); err != nil {
 			if !errors.Is(err, context.Canceled) {

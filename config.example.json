@@ -22,7 +22,7 @@
   "body_memory_threshold_bytes": 8388608,
   "body_memory_budget_bytes": 0,
   "body_spool_max_bytes": 34359738368,
-  "body_disk_reserve_bytes": 10737418240,
+  "body_disk_reserve_bytes": 0,
   "body_spool_dir": "",
   "usage_journal_enabled": true,
   "usage_journal_dir": "",

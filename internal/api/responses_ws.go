@@ -324,7 +324,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			req.Header.Set("Content-Type", "application/json")
 			writer := newResponsesWebSocketWriter(baseCtx, downstream, state.observeMeta, bodysource.CaptureOptions{
 				MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
-				MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-ws-response-*",
+				Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-ws-response-*",
 			}, s.identitySecretCached)
 			downstream.resetIdleClock()
 			heartbeatDone := make(chan error, 1)

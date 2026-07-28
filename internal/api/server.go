@@ -176,7 +176,11 @@ func NewServer(dep Dependencies) *Server {
 	requestBodyBudget, responseBodyBudget := bodysource.NewSplitBudget(
 		dep.Config.EffectiveBodyMemoryBudgetBytes(), dep.Config.BodySpoolMaxBytes, .25,
 	)
-	bodyDiskReserver := bodysource.NewDiskReserver(dep.Config.BodySpoolDir, dep.Config.BodyDiskReserveBytes, dep.Config.BodySpoolMaxBytes)
+	// Match CLIProxyAPI's request-body behavior: admit against the bytes actually
+	// needed and the configured spool ceiling, not an arbitrary fixed free-space
+	// floor. Keep the legacy config field readable for config compatibility, but do
+	// not let an old saved 10 GiB value reject otherwise fitting requests.
+	bodyDiskReserver := bodysource.NewDiskReserver(dep.Config.BodySpoolDir, 0, dep.Config.BodySpoolMaxBytes)
 	requestBodyBudget.SetDiskReserver(bodyDiskReserver)
 	responseBodyBudget.SetDiskReserver(bodyDiskReserver)
 	s := &Server{

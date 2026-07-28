@@ -258,7 +258,7 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 		speculative := replaySafe && (moreUnits || len(unit.Targets) > 1)
 		attempt := newUserGroupAttemptWriter(r.Context(), w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"), bodysource.CaptureOptions{
 			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
-			MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-route-response-*",
+			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-route-response-*",
 		}, speculative)
 		candidateContext := withUserGroupRouteOverride(r.Context(), target)
 		var choiceState *scheduler.RouteChoiceState

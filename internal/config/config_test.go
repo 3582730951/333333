@@ -26,7 +26,7 @@ func TestLoadMigratesLegacyClaudeOAuthTokenURL(t *testing.T) {
 
 func TestBodyResourceDefaults(t *testing.T) {
 	cfg := Default()
-	if cfg.MaxBodyBytes != 1<<30 || cfg.BodyMemoryThresholdBytes != 8<<20 || cfg.BodySpoolMaxBytes != 32<<30 || cfg.BodyDiskReserveBytes != 10<<30 {
+	if cfg.MaxBodyBytes != 1<<30 || cfg.BodyMemoryThresholdBytes != 8<<20 || cfg.BodySpoolMaxBytes != 32<<30 || cfg.BodyDiskReserveBytes != 0 {
 		t.Fatalf("body defaults: max=%d threshold=%d spool=%d reserve=%d", cfg.MaxBodyBytes, cfg.BodyMemoryThresholdBytes, cfg.BodySpoolMaxBytes, cfg.BodyDiskReserveBytes)
 	}
 	if got := cfg.EffectiveBodyMemoryBudgetBytes(); got < 8<<20 || got > 256<<20 {
