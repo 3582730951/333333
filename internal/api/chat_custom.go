@@ -245,6 +245,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 		Model:              model,
 		EstimatedTokens:    virtual.EstimateTokensJSON(body),
 		Exclude:            exclude,
+		SkipWait:           userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
 		status, _ := noAccountHTTPStatus(err)

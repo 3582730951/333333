@@ -22,6 +22,7 @@ type authDocumentImportResult struct {
 	Format       string                   `json:"format"`
 	Total        int                      `json:"total"`
 	Imported     int                      `json:"imported"`
+	Updated      int                      `json:"updated"`
 	Duplicates   int                      `json:"duplicates"`
 	Failed       int                      `json:"failed"`
 	ProxyCreated int                      `json:"proxy_created,omitempty"`
@@ -54,6 +55,10 @@ func (s *Server) adminImportAuthDocument(w http.ResponseWriter, r *http.Request,
 	result := authDocumentImportResult{
 		Format: doc.Format, Total: len(doc.Entries), Items: make([]authDocumentImportItem, 0, len(doc.Entries)),
 	}
+	if strings.TrimSpace(req.SessionCookie) != "" && len(doc.Entries) != 1 {
+		writeError(w, http.StatusBadRequest, errors.New("session_cookie can only accompany a single imported account"))
+		return
+	}
 	proxyEgress := map[string]string{}
 	if doc.Format == authparse.ImportFormatSub2API {
 		proxyEgress = s.importSub2APIProxies(r.Context(), doc.Proxies, &result)
@@ -83,6 +88,13 @@ func (s *Server) adminImportAuthDocument(w http.ResponseWriter, r *http.Request,
 			}
 		}
 		parsed := entry.Parsed
+		sessionCookie, cookieErr := normalizeImportedSessionCookie(req.SessionCookie, parsed)
+		if cookieErr != nil {
+			s.failAuthDocumentItem(&result, &item, cookieErr)
+			continue
+		}
+		parsed.SessionCookie = sessionCookie
+		item.Warnings = append(item.Warnings, importedAuthWarnings(parsed, sessionCookie)...)
 		tokenShape := accountTokenFromParsed(parsed, parsed.RefreshToken)
 		provider := firstNonEmpty(parsed.Provider, accountprovider.InferProviderFromToken(tokenShape))
 		credential := accountprovider.Credential(provider, tokenShape)
@@ -92,17 +104,27 @@ func (s *Server) adminImportAuthDocument(w http.ResponseWriter, r *http.Request,
 			continue
 		}
 		if existing, err := s.findExistingImportedAccount(r.Context(), parsed); err == nil {
-			item.AccountID = existing.ID
-			item.Name = firstNonEmpty(existing.Label, item.Name)
-			item.Action = "duplicate"
-			result.Duplicates++
+			updatedAccount, updated, updateErr := s.updateExistingExternalChatGPTTokens(r.Context(), existing, parsed, sessionCookie)
+			if updateErr != nil {
+				s.failAuthDocumentItem(&result, &item, updateErr)
+				continue
+			}
+			item.AccountID = updatedAccount.ID
+			item.Name = firstNonEmpty(updatedAccount.Label, item.Name)
+			if updated {
+				item.Action = "updated"
+				result.Updated++
+			} else {
+				item.Action = "duplicate"
+				result.Duplicates++
+			}
 			result.Items = append(result.Items, item)
 			continue
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			s.failAuthDocumentItem(&result, &item, err)
 			continue
 		}
-		account, err := s.saveImportedAccount(r.Context(), parsed, label, req.GroupName, "", provider, egressID)
+		account, err := s.saveImportedAccount(r.Context(), parsed, label, req.GroupName, parsed.RefreshToken, provider, egressID)
 		if err != nil {
 			s.failAuthDocumentItem(&result, &item, err)
 			continue
@@ -147,6 +169,9 @@ func accountTokenFromParsed(parsed authparse.ParsedAuth, refreshToken string) st
 		LastRefresh: lastRefresh, ExpiresAt: parsed.ExpiresAt, Scopes: strings.Join(parsed.Scopes, " "), OAuthRateLimitTier: parsed.OAuthRateLimitTier,
 	}
 	token.AuthMethod = accountprovider.EffectiveAuthMethod(parsed.Provider, token)
+	if parsed.CredentialMode == authparse.CredentialModeChatGPTAuthTokens && strings.TrimSpace(refreshToken) == "" {
+		token.AuthMethod = accountprovider.AuthMethodAccessToken
+	}
 	return token
 }
 

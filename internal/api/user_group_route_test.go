@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
@@ -247,6 +248,98 @@ func TestUserGroupHTTPHandlerFallsBackAcrossModelProviders(t *testing.T) {
 	binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
 	if err != nil || !found || binding.Target != targets[1] {
 		t.Fatalf("persisted fallback binding=%+v found=%v err=%v, want %+v", binding, found, err, targets[1])
+	}
+}
+
+func TestUserGroupExhaustedPlusFallsThroughToAuthorizedPro(t *testing.T) {
+	const (
+		plusGroup = "route-plus-exhausted"
+		proGroup  = "route-pro-healthy"
+		groupID   = "ug_plus_to_pro"
+		model     = "gpt-5.6-sol"
+	)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("ChatGPT-Account-ID") != "upstream-pro" {
+			t.Fatalf("request reached non-Pro account: %q", r.Header.Get("ChatGPT-Account-ID"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp_pro_fallback","status":"completed","output":[]}}`+"\n\n"+
+			"data: [DONE]\n\n")
+	})
+	for _, name := range []string{plusGroup, proGroup} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moveAccount := func(id, group string) {
+		account, err := h.store.GetAccount(t.Context(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		token, err := h.store.GetToken(t.Context(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		account.GroupName = group
+		if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+			t.Fatal(err)
+		}
+		setTestCapability(t, h, id, model, 272000)
+	}
+	plusID := h.importAccount(t, "plus-exhausted", "upstream-plus", "access-plus")
+	proID := h.importAccount(t, "pro-healthy", "upstream-pro", "access-pro")
+	moveAccount(plusID, plusGroup)
+	moveAccount(proID, proGroup)
+	now := storage.Now()
+	if err := h.store.UpsertAccountRateLimit(t.Context(), storage.AccountRateLimit{
+		AccountID: plusID, Provider: "codex", LimiterType: "5h_polled", Source: "test",
+		UsedPercent: 100, Status: "rejected", ResetAt: now + 3600, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	plus := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: plusGroup}
+	pro := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: proGroup}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{plus, pro}, []storage.ModelRoutingRule{{
+		Model: model,
+		Tiers: [][]storage.TargetRef{{plus}, {pro}},
+	}})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"plus-to-pro","user_group_id":"`+groupID+`"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create API key = %d: %s", code, raw)
+	}
+	var created map[string]interface{}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := created["key"].(string)
+	if key == "" {
+		t.Fatalf("created key missing plaintext secret: %s", raw)
+	}
+
+	body := `{"model":"` + model + `","input":"use any authorized capacity","stream":true}`
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "plus-to-pro-session")
+	started := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("authorized Pro fallback queued behind exhausted Plus for %s", elapsed)
+	}
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(responseBody, []byte("resp_pro_fallback")) {
+		t.Fatalf("fallback status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	requests := h.requests()
+	if len(requests) != 1 || requests[0].AccountID != "upstream-pro" {
+		t.Fatalf("upstream requests=%+v, want one Pro request", requests)
 	}
 }
 

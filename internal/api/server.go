@@ -599,7 +599,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	if meta, ok := bodyMetaFromContext(r.Context()); ok && meta.Size == int64(len(raw)) {
 		capturedMeta = &meta
 	}
-	r = r.WithContext(withSchedulerWait(r.Context(), w, streamRequestWithMeta(raw, capturedMeta), "openai"))
+	r = r.WithContext(withSchedulerWait(r.Context(), w, streamRequestWithMeta(raw, capturedMeta), schedulerWaitProtocol(r.URL.Path)))
 	requestedModel := modelWithMeta(raw, capturedMeta)
 	// Authenticate the downstream api key (if any) and resolve its routing group +
 	// forced model/effort policy. The forced model is applied to the body BEFORE
@@ -1148,6 +1148,23 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// the (potentially multi-MB) body, and it was previously called up to 7× on the
 	// same unchanged `raw` within this function. `raw` is a stable parameter here.
 	streamReq := streamRequestWithMeta(raw, replayMeta)
+	waitHeartbeat := schedulerWaitCallback(r.Context())
+	var waitAuditOnce sync.Once
+	onSchedulerWait := func(reason string, waited time.Duration) {
+		waitAuditOnce.Do(func() {
+			auditModel := strings.TrimSpace(model)
+			if len(auditModel) > 128 {
+				auditModel = auditModel[:128]
+			}
+			_ = s.store.InsertAuditLog(context.WithoutCancel(r.Context()), storage.AuditLogRow{
+				Action: "codex_scheduler_wait", State: "queued", Reason: strings.TrimSpace(reason),
+				Detail: fmt.Sprintf("model=%q waited_ms=%d", auditModel, waited.Milliseconds()),
+			})
+		})
+		if waitHeartbeat != nil {
+			waitHeartbeat(reason, waited)
+		}
+	}
 	route := scheduler.Route{
 		Group:             routeGroup,
 		Provider:          "codex",
@@ -1160,7 +1177,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		EstimatedTokens:   estimatedTokensWithMeta(raw, replayMeta),
 		Compaction:        compactionRequestWithMeta(path, raw, replayMeta),
 		Exclude:           exclude,
-		OnWait:            schedulerWaitCallback(r.Context()),
+		OnWait:            onSchedulerWait,
+		SkipWait:          userGroupFallbackProbe(r.Context()),
 	}
 	route = codexMappingRequiredRoute(codexSessionMappingFromContext(r.Context()), route)
 	lease, err := s.scheduler.Select(r.Context(), route)
@@ -1379,7 +1397,11 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 
 	codexClientVersion := s.codexClientVersionForModel(model)
+	webSocketSession := codexResponsesWebSocketSession(r.Context())
 	codexUseWebSocket := forceCodexResponsesWebSocket(r.Context()) || !isChat && !isCompact && streamReq && capability.CodexPrefersWebSocket(model)
+	if webSocketSession != nil && webSocketSession.UseHTTPSFallback() {
+		codexUseWebSocket = false
+	}
 	// A preferred Responses WebSocket opened for an ordinary HTTP request is a
 	// one-shot upstream connection. Some Codex backend response ids are scoped to
 	// that connection, so a later HTTP continuation would necessarily open a new
@@ -1387,17 +1409,21 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// egress and virtual device. Strict CPA therefore uses HTTP/SSE for the whole
 	// HTTP-originated tree. A real downstream WebSocket carries the session object
 	// below and still reuses its matching upstream connection across turns.
-	if strictNativeCPA && codexResponsesWebSocketSession(r.Context()) == nil {
+	if strictNativeCPA && webSocketSession == nil {
 		codexUseWebSocket = false
 	}
 	// A sidecar-bound account presents the real Codex JA3 only on the HTTP/SSE path
 	// (postViaSidecar replays it); the WS dialer cannot, so it would dial with Go-stdlib
 	// TLS and throw away the fingerprint the sidecar binding exists for. Prefer the SSE
-	// path for those accounts (the version-gated models still work over SSE). A forced
-	// WS request (the explicit responses-WS upgrade) is honored regardless.
-	if codexUseWebSocket && s.flagEnabled(r.Context(), "codex_prefer_sidecar_ja3_over_ws", s.cfg.CodexPreferSidecarJA3OverWS) && !forceCodexResponsesWebSocket(r.Context()) &&
+	// path for those accounts (the version-gated models still work over SSE). A
+	// downstream Responses WebSocket can bridge this SSE stream without coupling
+	// the two transport legs.
+	if codexUseWebSocket && s.flagEnabled(r.Context(), "codex_prefer_sidecar_ja3_over_ws", s.cfg.CodexPreferSidecarJA3OverWS) &&
 		strings.EqualFold(strings.TrimSpace(lease.Egress.Type), "curl_cffi_sidecar") {
 		codexUseWebSocket = false
+	}
+	if forceCodexResponsesWebSocket(r.Context()) && webSocketSession != nil && !codexUseWebSocket {
+		webSocketSession.MarkHTTPSFallback()
 	}
 	requestForTokenWithIdentity := func(t storage.AccountToken, requestBody []byte, requestHeaders http.Header, requestIdentity *upstream.CodexIdentitySnapshot) upstream.Request {
 		requestOSHint := osHint
@@ -1418,7 +1444,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			OSHint:                  requestOSHint,
 			CodexClientVersion:      codexClientVersion,
 			CodexResponsesWebSocket: codexUseWebSocket,
-			CodexWebSocketSession:   codexResponsesWebSocketSession(r.Context()),
+			CodexWebSocketSession:   webSocketSession,
 			CodexIdentity:           requestIdentity,
 		}
 	}
@@ -1489,9 +1515,39 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		r = r.WithContext(withUsageDiagnostics(withBillingHold(r.Context(), holdID), codexRetentionDiagnosticsForTransport(logicalUsageDiag, codexUseWebSocket)))
 	}
 	withCodexUsageContext()
+	var webSocketFallbackAuditOnce sync.Once
+	fallbackToHTTPS := func(reason string) (*upstream.Response, storage.EgressProfile, error) {
+		codexUseWebSocket = false
+		if webSocketSession != nil {
+			webSocketSession.MarkHTTPSFallback()
+		}
+		withCodexUsageContext()
+		webSocketFallbackAuditOnce.Do(func() {
+			_ = s.store.InsertAuditLog(context.WithoutCancel(r.Context()), storage.AuditLogRow{
+				AccountID: lease.Account.ID, AccountLabel: lease.Account.Label,
+				Action: "codex_upstream_websocket_fallback", State: "attempted", Reason: reason,
+				Detail: "same_account_same_egress_https_sse_bridge",
+			})
+		})
+		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "https_fallback_attempted", 0)
+		fallbackRequest := requestForToken(token)
+		fallbackRequest.CodexResponsesWebSocket = false
+		fallbackResponse, fallbackEgress, fallbackErr := s.doWithCFRetry(r.Context(), fallbackRequest, lease, mappingTransportStrict)
+		if fallbackErr != nil {
+			s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "https_fallback_transport_error", 0)
+			return nil, fallbackEgress, fallbackErr
+		}
+		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, fallbackEgress, "https_fallback_headers", fallbackResponse.StatusCode)
+		return fallbackResponse, fallbackEgress, nil
+	}
+	attemptedWebSocket := codexUseWebSocket
 	s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "attempted", 0)
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
 	releaseCacheFlight()
+	if err != nil && attemptedWebSocket {
+		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "websocket_transport_error", 0)
+		resp, finalEgress, err = fallbackToHTTPS("transport_error")
+	}
 	if err != nil {
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "transport_error", 0)
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
@@ -1500,6 +1556,26 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		writeError(w, http.StatusBadGateway, err)
 		return codexAttemptResult{Outcome: outcomeDone}
+	}
+	if attemptedWebSocket && resp.StatusCode >= http.StatusBadRequest {
+		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "websocket_handshake_response", resp.StatusCode)
+		originalStatus := resp.StatusCode
+		originalHeader := resp.Header.Clone()
+		originalBody := readUpstreamErrorBody(resp.Body)
+		originalEgress := finalEgress
+		_ = resp.Body.Close()
+		fallbackResponse, fallbackEgress, fallbackErr := fallbackToHTTPS("handshake_http_status")
+		if fallbackErr != nil {
+			log.Printf("codex websocket HTTPS fallback %s: %v", lease.Account.ID, fallbackErr)
+			resp = &upstream.Response{
+				StatusCode: originalStatus,
+				Header:     originalHeader,
+				Body:       io.NopCloser(bytes.NewReader(originalBody)),
+			}
+			finalEgress = originalEgress
+		} else {
+			resp, finalEgress = fallbackResponse, fallbackEgress
+		}
 	}
 	s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "response_headers", resp.StatusCode)
 	defer func() {
@@ -1651,40 +1727,10 @@ codexResponse:
 				s.handleCodexRefreshFailure(r.Context(), lease.Account, refreshed, rerr, "gateway")
 			}
 		}
-		if codexUseWebSocket && v.State == ban.PermissionDenied && !forceCodexResponsesWebSocket(r.Context()) {
-			originalStatus := resp.StatusCode
-			originalHeader := resp.Header.Clone()
-			originalBody := append([]byte(nil), errorBody...)
-			_ = resp.Body.Close()
-			fallbackReq := requestForToken(token)
-			fallbackReq.CodexResponsesWebSocket = false
-			resp, finalEgress, err = s.doWithCFRetry(r.Context(), fallbackReq, lease, mappingTransportStrict)
-			if err != nil {
-				log.Printf("codex websocket permission fallback %s: %v", lease.Account.ID, err)
-				resp = &upstream.Response{
-					StatusCode: originalStatus,
-					Header:     originalHeader,
-					Body:       io.NopCloser(bytes.NewReader(originalBody)),
-				}
-				errorBody = originalBody
-				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
-				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
-			} else if resp.StatusCode < 400 {
-				codexUseWebSocket = false
-				withCodexUsageContext()
-				goto codexSuccess
-			} else {
-				errorBody = redactAgentIdentityError(token, readUpstreamErrorBody(resp.Body))
-				if handled, ok := handleResponsesContextAttemptError(resp.StatusCode, resp.Header, errorBody, "http_context_error_after_ws_fallback"); ok {
-					return handled
-				}
-				detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
-				v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
-			}
-		}
 		if codexClientVersion == "" && codexRequiresNewerVersion(errorBody) {
 			codexClientVersion = s.cfg.ClientVersion
-			if !isChat && !isCompact && streamRequestWithMeta(body, forwardMeta) {
+			if !isChat && !isCompact && streamRequestWithMeta(body, forwardMeta) &&
+				(webSocketSession == nil || !webSocketSession.UseHTTPSFallback()) {
 				codexUseWebSocket = true
 			}
 			withCodexUsageContext()
@@ -2020,6 +2066,19 @@ codexSuccess:
 				prefix, streamFailure, terminalStream, probeErr = probeEarlyCodexSSEFailure(resp.Body)
 			}
 			if probeErr != nil {
+				if codexUseWebSocket {
+					s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "websocket_stream_probe_error", 0)
+					_ = resp.Body.Close()
+					fallbackResponse, fallbackEgress, fallbackErr := fallbackToHTTPS("stream_probe_error")
+					if fallbackErr == nil {
+						resp, finalEgress = fallbackResponse, fallbackEgress
+						if resp.StatusCode < http.StatusBadRequest {
+							goto codexSuccess
+						}
+						goto codexResponse
+					}
+					log.Printf("codex websocket stream-probe HTTPS fallback %s: %v", lease.Account.ID, fallbackErr)
+				}
 				_ = s.settleBillingHold(r.Context(), holdID, "stream_probe_failed")
 				if allowRetry && movable {
 					return retry()

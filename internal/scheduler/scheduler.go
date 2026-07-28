@@ -288,6 +288,11 @@ type Route struct {
 	// queued. Streaming HTTP callers use it for a legal SSE comment; non-streaming
 	// callers leave it nil and no response bytes are committed.
 	OnWait func(reason string, waited time.Duration)
+	// SkipWait makes this selection an immediate availability probe. The API layer
+	// uses it only while another target explicitly authorized by the same user group
+	// remains to be tried; the final target retains the normal cancellation-aware
+	// FIFO behavior when every authorized target is saturated.
+	SkipWait bool
 }
 
 type NoAccountCounters struct {
@@ -617,7 +622,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	// Once a route has queued work, new requests join behind it instead of racing
 	// the head waiter for a newly released lease. Affinity selections above retain
 	// priority because they preserve an existing conversation's account binding.
-	if ctx.Done() != nil && s.routeHasWaiters(route) {
+	if !route.SkipWait && ctx.Done() != nil && s.routeHasWaiters(route) {
 		lease, err = s.waitForFreshLease(ctx, route, &NoAccountError{
 			Group: route.Group, Provider: route.Provider, AllowedProviders: append([]string(nil), route.AllowedProviders...), Model: route.Model,
 			Counters: NoAccountCounters{Concurrency: 1},
@@ -635,7 +640,7 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 	// Exclusions belong to the caller's current failover round. If every compatible
 	// account has already failed, return the no-account result so the API layer can
 	// advance to the next routing target; never replay a failed account in-place.
-	if err != nil && transientlySaturated(err) && ctx.Done() != nil {
+	if err != nil && transientlySaturated(err) && ctx.Done() != nil && !route.SkipWait {
 		lease, err = s.waitForFreshLease(ctx, route, err)
 	}
 	if err != nil {

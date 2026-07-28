@@ -18,7 +18,7 @@
 - SQLite WAL 存储，初始化默认 `cyber` 分组，系统提示词为空。
 - 官方 ChatGPT Codex upstream 默认：`https://chatgpt.com/backend-api/codex`。
 - **Codex 官方 Skills 兼容分层**：Tier 1 为官方 Codex 账号通道（完整官方 CLI skills / plugins / Browser Use / Responses 新字段优先兼容）；Tier 2 为第三方原生 Responses 供应商（原生透明转发，云插件 best-effort）；Tier 3 为第三方 Chat Completions 桥接（支持 function、namespace、custom 与客户端 tool-search；无法执行的 hosted/server tools 会删除并通过 `X-Pool-Compatibility-Losses` 及用量诊断显式报告）。诊断：`GET /admin/compat/skills`。
-- 导入官方 `auth.json`、auth.json 数组及 other_sub2api `sub2api-data` v1 备份；Agent Identity 私钥加密保存，请求时动态生成 `AgentAssertion`，并支持 task 自动注册/失效恢复。
+- 导入官方 `auth.json`、CPA 顶层凭据 JSON、ChatGPT `/api/auth/session` JSON、auth.json 数组及 other_sub2api `sub2api-data` v1 备份；无 `refresh_token` 的 Web session 按官方 Codex `chatgptAuthTokens` 语义保存，实际转发只使用真实 `accessToken`，可选 Session Cookie 加密保存用于续期；Agent Identity 私钥同样加密保存，并支持 task 自动注册/失效恢复。
 - 空 prompt raw fast path：普通 responses 在不需要注入和不需要 Virtual 2M 时保持原始 body。
 - affinity/sticky 路由：parent thread、thread/conversation、window、prompt_cache_key、turn metadata、下游 key/project/model、稳定消息 hash。
 - strict sticky：compact、`previous_response_id`、`x-codex-turn-state`、`compaction_trigger`、tool-result continuation 不跨账号。
@@ -129,6 +129,19 @@ curl -sS http://127.0.0.1:8787/admin/accounts/import-auth-json \
 ```
 
 同一接口也可直接粘贴 `{"type":"sub2api-data","version":1,"proxies":[...],"accounts":[...]}`。OpenAI OAuth 账号逐条导入并隔离错误；备份中的 HTTP/SOCKS 出口会创建或复用本地 egress，再按 `proxy_key` 绑定账号。两套调度器语义不同，因此 `concurrency`、`priority`、`rate_multiplier` 等字段只返回可见警告，不会静默套用。
+
+也可粘贴 CPA 格式 `{"type":"codex","access_token":"...","id_token":"...","account_id":"..."}`，或 ChatGPT Web session：
+
+```json
+{
+  "user": {"id": "user-...", "email": "name@example.com"},
+  "account": {"id": "workspace-...", "planType": "pro"},
+  "expires": "2026-07-28T00:00:00Z",
+  "accessToken": "eyJ..."
+}
+```
+
+缺少真实 `id_token` 时，导入器会生成仅承载 claims 的三段兼容 JWT；它不会被当作上游凭据。导入前会验证真实 `accessToken` 的 JWT 结构、`exp` 和 workspace ID，避免“能入池、调用才 401/403”。Web session 通常没有 `refresh_token`；可在请求外层同时传入 `"session_cookie":"完整 Cookie 头或 session-token 值"`，服务端会加密保存并在 bearer 失效后重新读取 `/api/auth/session`。未提供 Cookie 时必须在 access token 到期前重新导入。
 
 探测模型：
 

@@ -159,9 +159,10 @@ type CodexInstructionSnapshot struct {
 	ExpiresAt    int64
 }
 
-// CodexUpstreamAttempt is intentionally metadata-only. It is enough to correlate
-// a strict CPA upstream attempt with the durable tree/account/real-exit epoch in
-// a support bundle without retaining input, output, aliases, or upstream ids.
+// CodexUpstreamAttempt is intentionally metadata-only. Durable CPA traffic uses its
+// tree id; stateless traffic uses a server-owned per-turn id. Both let a support
+// bundle correlate transport/account/real-exit outcomes without retaining input,
+// output, aliases, or upstream ids.
 type CodexUpstreamAttempt struct {
 	TreeID     string
 	AccountID  string
@@ -944,9 +945,8 @@ func (s *Store) ListCodexInstructionSnapshotDiagnostics(ctx context.Context) ([]
 	return out, rows.Err()
 }
 
-// InsertCodexUpstreamAttempt persists one safe strict-CPA transport observation.
-// An empty tree means a root/fork has not committed yet and therefore has no durable
-// session configuration to diagnose; callers intentionally skip that case.
+// InsertCodexUpstreamAttempt persists one safe Codex transport observation. TreeID
+// is either a durable CPA tree or a server-owned stateless request namespace.
 func (s *Store) InsertCodexUpstreamAttempt(ctx context.Context, attempt CodexUpstreamAttempt) error {
 	attempt.TreeID = strings.TrimSpace(attempt.TreeID)
 	attempt.AccountID = strings.TrimSpace(attempt.AccountID)

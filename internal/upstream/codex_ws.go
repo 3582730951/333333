@@ -42,8 +42,9 @@ type CodexResponsesWebSocketSession struct {
 	// WebSocket may be reused for sequential turns of one mapped thread, but never
 	// for a different root/branch or a post-compaction window whose handshake
 	// headers would otherwise describe the prior identity.
-	identityKey string
-	closed      bool
+	identityKey  string
+	closed       bool
+	httpFallback bool
 }
 
 func NewCodexResponsesWebSocketSession() *CodexResponsesWebSocketSession {
@@ -64,6 +65,29 @@ func (s *CodexResponsesWebSocketSession) Close() error {
 	return err
 }
 
+// UseHTTPSFallback reports whether this downstream WebSocket session has already
+// observed an upstream WebSocket handshake/transport failure. Once set, later
+// turns stay on the HTTP/SSE bridge instead of repeating a known-broken handshake.
+func (s *CodexResponsesWebSocketSession) UseHTTPSFallback() bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.httpFallback
+}
+
+// MarkHTTPSFallback atomically retires any upstream WebSocket and makes the
+// session's remaining turns use HTTP/SSE. The downstream WebSocket remains open.
+func (s *CodexResponsesWebSocketSession) MarkHTTPSFallback() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.httpFallback = true
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+	s.egressID = ""
+	s.identityKey = ""
+}
+
 // ForwardProcessed relays Codex's response.processed acknowledgement on the same
 // upstream connection that produced the response being acknowledged.
 func (s *CodexResponsesWebSocketSession) ForwardProcessed(raw []byte) error {
@@ -71,6 +95,9 @@ func (s *CodexResponsesWebSocketSession) ForwardProcessed(raw []byte) error {
 	defer s.connMu.Unlock()
 	if s.closed {
 		return errors.New("codex websocket session is closed")
+	}
+	if s.httpFallback {
+		return nil
 	}
 	if s.conn == nil {
 		return errors.New("codex websocket session is not connected")
@@ -85,6 +112,9 @@ func (s *CodexResponsesWebSocketSession) ForwardProcessedSource(source bodysourc
 	defer s.connMu.Unlock()
 	if s.closed {
 		return errors.New("codex websocket session is closed")
+	}
+	if s.httpFallback {
+		return nil
 	}
 	if s.conn == nil {
 		return errors.New("codex websocket session is not connected")
@@ -261,6 +291,9 @@ func (s *CodexResponsesWebSocketSession) connection(ctx context.Context, c *Clie
 	defer s.connMu.Unlock()
 	if s.closed {
 		return nil, nil, errors.New("codex websocket session is closed")
+	}
+	if s.httpFallback {
+		return nil, nil, errors.New("codex websocket session uses HTTPS fallback")
 	}
 	identityKey := codexWebSocketSessionIdentityKey(spec)
 	if s.conn != nil && s.target == target && s.accountID == spec.Account.ID && s.egressID == spec.Egress.ID && s.identityKey == identityKey {

@@ -3,8 +3,151 @@ package auth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
+
+func codexJWTForTest(t *testing.T, claims map[string]interface{}) string {
+	t.Helper()
+	headerRaw, err := json.Marshal(map[string]interface{}{"alg": "none", "typ": "JWT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimsRaw, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encode := base64.RawURLEncoding.EncodeToString
+	return encode(headerRaw) + "." + encode(claimsRaw) + "." + encode([]byte("sig"))
+}
+
+func TestParseChatGPTWebSessionBuildsUsableExternalCredentials(t *testing.T) {
+	expiresAt := time.Now().Add(20 * time.Minute).Unix()
+	accessToken := codexJWTForTest(t, map[string]interface{}{
+		"email": "web@example.internal",
+		"exp":   expiresAt,
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_user_id":            "user-web",
+			"chatgpt_account_id":         "workspace-web",
+			"chatgpt_plan_type":          "pro",
+			"chatgpt_account_is_fedramp": true,
+		},
+	})
+	raw, _ := json.Marshal(map[string]interface{}{
+		"session": map[string]interface{}{
+			"user":         map[string]interface{}{"id": "user-web", "name": "Web User", "email": "web@example.internal"},
+			"account":      map[string]interface{}{"id": "workspace-web", "planType": "pro"},
+			"expires":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+			"accessToken":  accessToken,
+			"authProvider": "auth0",
+		},
+	})
+	parsed, err := ParseAuthJSON(raw)
+	if err != nil {
+		t.Fatalf("parse Web session: %v", err)
+	}
+	if parsed.Provider != "codex" || parsed.CredentialMode != CredentialModeChatGPTAuthTokens || parsed.RefreshToken != "" {
+		t.Fatalf("external credential classification = %+v", parsed)
+	}
+	if parsed.AccessToken != accessToken || parsed.UpstreamAccountID != "workspace-web" || parsed.ChatGPTUserID != "user-web" {
+		t.Fatalf("Web identity/token mismatch: %+v", parsed)
+	}
+	if parsed.Email != "web@example.internal" || parsed.Name != "Web User" || parsed.PlanType != "pro" || !parsed.IsFedramp {
+		t.Fatalf("Web metadata mismatch: %+v", parsed)
+	}
+	if parsed.ExpiresAt != expiresAt {
+		t.Fatalf("expires_at = %d, want access-token exp %d", parsed.ExpiresAt, expiresAt)
+	}
+	if !parsed.SyntheticIDToken || parsed.IDTokenRaw == accessToken || !codexParsableJWT(parsed.IDTokenRaw) {
+		t.Fatalf("synthetic id_token is not Codex-compatible: synthetic=%v token=%q", parsed.SyntheticIDToken, parsed.IDTokenRaw)
+	}
+	claims := decodeIDClaims(parsed.IDTokenRaw)
+	if claims.ChatGPTAccountID != "workspace-web" || claims.ChatGPTUserID != "user-web" || claims.PlanType != "pro" {
+		t.Fatalf("synthetic id_token claims = %+v", claims)
+	}
+}
+
+func TestParseCPAExternalCredentialsReplacesInvalidPlaceholder(t *testing.T) {
+	expiresAt := time.Now().Add(30 * time.Minute).Unix()
+	lastRefresh := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
+	accessToken := codexJWTForTest(t, map[string]interface{}{
+		"exp": expiresAt,
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_user_id": "user-cpa",
+		},
+	})
+	raw, _ := json.Marshal(map[string]interface{}{
+		"type": "codex", "access_token": accessToken, "id_token": "placeholder",
+		"account_id": "workspace-cpa", "email": "cpa@example.internal", "plan_type": "plus",
+		"expired":      time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+		"last_refresh": lastRefresh.Format(time.RFC3339),
+	})
+	parsed, err := ParseAuthJSON(raw)
+	if err != nil {
+		t.Fatalf("parse CPA JSON: %v", err)
+	}
+	if parsed.Provider != "codex" || parsed.CredentialMode != CredentialModeChatGPTAuthTokens {
+		t.Fatalf("CPA credential classification = %+v", parsed)
+	}
+	if !parsed.SyntheticIDToken || parsed.IDTokenRaw == "placeholder" || !codexParsableJWT(parsed.IDTokenRaw) {
+		t.Fatalf("CPA placeholder was not repaired: %+v", parsed)
+	}
+	if parsed.ExpiresAt != expiresAt {
+		t.Fatalf("expires_at = %d, want authoritative JWT exp %d", parsed.ExpiresAt, expiresAt)
+	}
+	if parsed.LastRefresh != lastRefresh.Unix() {
+		t.Fatalf("last_refresh = %d, want %d", parsed.LastRefresh, lastRefresh.Unix())
+	}
+}
+
+func TestParseExternalChatGPTCredentialsRejectsGuaranteedRuntimeFailures(t *testing.T) {
+	future := time.Now().Add(time.Hour).Unix()
+	expired := time.Now().Add(-time.Minute).Unix()
+	validWithoutWorkspace := codexJWTForTest(t, map[string]interface{}{"exp": future})
+	expiredWithWorkspace := codexJWTForTest(t, map[string]interface{}{
+		"exp":                         expired,
+		"https://api.openai.com/auth": map[string]interface{}{"chatgpt_account_id": "workspace"},
+	})
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"malformed bearer", `{"type":"codex","access_token":"not-a-jwt","account_id":"workspace"}`, "Codex-parseable JWT"},
+		{"missing workspace", `{"type":"codex","access_token":"` + validWithoutWorkspace + `"}`, "chatgpt_account_id"},
+		{"expired bearer", `{"type":"codex","access_token":"` + expiredWithWorkspace + `"}`, "expired"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAuthJSON([]byte(tc.raw))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+			if strings.Contains(err.Error(), validWithoutWorkspace) || strings.Contains(err.Error(), expiredWithWorkspace) {
+				t.Fatalf("error leaked bearer token: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseCodexAppServerExternalTokenShape(t *testing.T) {
+	accessToken := codexJWTForTest(t, map[string]interface{}{
+		"exp":                         time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]interface{}{"chatgpt_user_id": "user-app-server"},
+	})
+	raw, _ := json.Marshal(map[string]interface{}{
+		"type": "chatgptAuthTokens", "accessToken": accessToken,
+		"chatgptAccountId": "workspace-app-server", "chatgptPlanType": "business",
+	})
+	parsed, err := ParseAuthJSON(raw)
+	if err != nil {
+		t.Fatalf("parse app-server token shape: %v", err)
+	}
+	if parsed.UpstreamAccountID != "workspace-app-server" || parsed.ChatGPTUserID != "user-app-server" ||
+		parsed.CredentialMode != CredentialModeChatGPTAuthTokens {
+		t.Fatalf("app-server token shape = %+v", parsed)
+	}
+}
 
 func TestParseOfficialAuthJSONShape(t *testing.T) {
 	claims := map[string]interface{}{
@@ -182,7 +325,8 @@ func TestParseClaudeCredentialsDoesNotDedupeByEmailWhenTokenDiffers(t *testing.T
 func TestParseCodexOAuthAndAccessTokenUseChatGPTUserIDDedupe(t *testing.T) {
 	claims := map[string]interface{}{
 		"https://api.openai.com/auth": map[string]interface{}{
-			"chatgpt_user_id": "user-stable",
+			"chatgpt_user_id":    "user-stable",
+			"chatgpt_account_id": "workspace-stable",
 		},
 	}
 	claimsRaw, _ := json.Marshal(claims)

@@ -264,6 +264,43 @@ func TestGatewayResponsesRawStreamingAndHeaders(t *testing.T) {
 	}
 }
 
+func TestStatelessCodexRequestsRemainVisibleInAttemptDiagnostics(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_observed","status":"completed","output":[]}`)
+	})
+	accountID := h.importAccount(t, "stateless-observed", "upstream-observed", "access-observed")
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"gpt-5.5","input":"observe me"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]bool{}
+	tree := ""
+	for _, row := range rows {
+		if row.AccountID != accountID {
+			continue
+		}
+		states[row.State] = true
+		if tree == "" {
+			tree = row.TreeHMACPrefix
+		} else if row.TreeHMACPrefix != tree {
+			t.Fatalf("one stateless turn used multiple diagnostic namespaces: %q != %q", row.TreeHMACPrefix, tree)
+		}
+	}
+	if tree == "" || !states["attempted"] || !states["response_headers"] {
+		t.Fatalf("stateless attempt diagnostics tree=%q states=%v rows=%+v", tree, states, rows)
+	}
+}
+
 func TestCodexResponsesDoesNotVirtualTrimInput(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1652,6 +1689,90 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 		if _, present := gotPayload[unsupported]; present {
 			t.Fatalf("unsupported top-level transport field %q leaked upstream: %+v", unsupported, gotPayload)
 		}
+	}
+}
+
+func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T) {
+	var webSocketAttempts atomic.Int32
+	var httpAttempts atomic.Int32
+	upgrader := websocket.Upgrader{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			webSocketAttempts.Add(1)
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("upstream upgrade: %v", err)
+				return
+			}
+			_, _, _ = conn.ReadMessage()
+			_ = conn.Close() // protocol ends before any response event
+		case http.MethodPost:
+			attempt := httpAttempts.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			if attempt == 1 && (!bytes.Contains(body, []byte(`"name":"tool_search"`)) || !bytes.Contains(body, []byte("SKILL.md"))) {
+				t.Errorf("HTTPS bridge lost Codex skills/tool payload: %s", body)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_https_%d\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n", attempt)
+		default:
+			t.Fatalf("unexpected upstream method %s", r.Method)
+		}
+	})
+	h.importAccount(t, "downstream-ws-https-bridge", "upstream-ws-https-bridge", "access-ws-https-bridge")
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	dialer := *websocket.DefaultDialer
+	dialer.EnableCompression = true
+	conn, handshake, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		if handshake != nil && handshake.Body != nil {
+			body, _ := io.ReadAll(handshake.Body)
+			handshake.Body.Close()
+			t.Fatalf("downstream handshake: %v status=%d body=%s", err, handshake.StatusCode, body)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if handshake.Header.Get(requestIDHeader) == "" {
+		t.Fatal("downstream WebSocket handshake omitted X-Request-ID")
+	}
+	if extension := handshake.Header.Get("Sec-WebSocket-Extensions"); !strings.Contains(extension, "permessage-deflate") {
+		t.Fatalf("downstream WebSocket did not negotiate compression: %q", extension)
+	}
+	readCompleted := func(wantID string) {
+		t.Helper()
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			_, raw, readErr := conn.ReadMessage()
+			if readErr != nil {
+				t.Fatalf("read %s: %v", wantID, readErr)
+			}
+			if bytes.Contains(raw, []byte(`"type":"response.completed"`)) {
+				if !bytes.Contains(raw, []byte(wantID)) {
+					t.Fatalf("completed event=%s, want %s", raw, wantID)
+				}
+				return
+			}
+		}
+	}
+	for turn := 1; turn <= 2; turn++ {
+		if turn == 2 {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.processed","response_id":"resp_https_1"}`)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		request := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.5","input":[{"role":"developer","content":"Use the repository SKILL.md instructions."},{"role":"user","content":"turn %d"}],"tools":[{"type":"function","name":"tool_search","description":"Find an installed skill","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"stream":true}`, turn)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+			t.Fatal(err)
+		}
+		readCompleted(fmt.Sprintf("resp_https_%d", turn))
+	}
+	if got := webSocketAttempts.Load(); got != 1 {
+		t.Fatalf("known-broken upstream WebSocket was retried %d times", got)
+	}
+	if got := httpAttempts.Load(); got != 2 {
+		t.Fatalf("HTTPS bridge attempts=%d, want one per downstream turn", got)
 	}
 }
 

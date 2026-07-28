@@ -8,10 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/agentidentity"
 )
+
+const CredentialModeChatGPTAuthTokens = "chatgpt_auth_tokens"
 
 type ParsedAuth struct {
 	AccountID            string
@@ -37,6 +41,8 @@ type ParsedAuth struct {
 	AntigravityProjectID string
 	AntigravityBaseURL   string
 	AntigravityUserAgent string
+	SessionCookie        string
+	SyntheticIDToken     bool
 }
 
 func ParseOAuthAntigravity(accessToken, refreshToken, email, projectID string, expiresAt int64, scopes []string) (ParsedAuth, error) {
@@ -71,6 +77,7 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return ParsedAuth{}, err
 	}
+	root, webSession := normalizeChatGPTWebSession(root)
 
 	if claude, ok := objectField(root, "claudeAiOauth", "claude_ai_oauth"); ok {
 		return parseClaudeCredentialsJSON(claude)
@@ -83,14 +90,17 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	out.OpenAIAPIKey = stringField(root, "OPENAI_API_KEY")
 	out.AccessToken = stringFieldAny(root, "access_token", "accessToken")
 	out.RefreshToken = stringFieldAny(root, "refresh_token", "refreshToken")
-	out.UpstreamAccountID = stringFieldAny(root, "account_id", "chatgpt_account_id", "chatgptAccountID")
-	out.ChatGPTUserID = stringFieldAny(root, "chatgpt_user_id", "chatgptUserID", "user_id")
+	out.UpstreamAccountID = stringFieldAny(root, "account_id", "accountId", "chatgpt_account_id", "chatgptAccountId", "chatgptAccountID")
+	out.ChatGPTUserID = stringFieldAny(root, "chatgpt_user_id", "chatgptUserId", "chatgptUserID", "user_id", "userId")
 	out.Email = stringFieldAny(root, "email", "email_address", "emailAddress")
 	out.Name = stringFieldAny(root, "name", "full_name", "display_name", "displayName")
-	out.PlanType = stringFieldAny(root, "plan_type", "planType", "chatgpt_plan_type")
+	out.PlanType = stringFieldAny(root, "plan_type", "planType", "chatgpt_plan_type", "chatgptPlanType")
 	out.ExpiresAt = epochSecondsField(root, "expired", "expires_at", "expiresAt", "expires", "expiry")
 	out.LastRefresh = epochSecondsField(root, "last_refresh", "lastRefresh")
 	out.IDTokenRaw = extractIDTokenRaw(firstPresent(root["id_token"], root["idToken"]))
+	out.Provider = importedProvider(root)
+	out.SessionCookie = stringFieldAny(root, "cookie_header", "cookieHeader", "session_cookie", "sessionCookie", "cookie")
+	fillChatGPTWebSessionMetadata(&out, root)
 	if tokens, ok := root["tokens"].(map[string]interface{}); ok {
 		if out.AccessToken == "" {
 			out.AccessToken = stringField(tokens, "access_token")
@@ -113,25 +123,48 @@ func ParseAuthJSON(raw []byte) (ParsedAuth, error) {
 	}
 	if out.IDTokenRaw != "" {
 		claims := decodeIDClaims(out.IDTokenRaw)
-		if out.Email == "" {
-			out.Email = claims.Email
-		}
-		if out.ChatGPTUserID == "" {
-			out.ChatGPTUserID = claims.ChatGPTUserID
-		}
-		if out.UpstreamAccountID == "" {
-			out.UpstreamAccountID = claims.ChatGPTAccountID
-		}
-		if out.PlanType == "" {
-			out.PlanType = claims.PlanType
-		}
-		out.IsFedramp = claims.IsFedramp
+		fillMissingIDClaims(&out, claims)
 	}
+	accessClaims := decodeIDClaims(out.AccessToken)
+	fillMissingIDClaims(&out, accessClaims)
 	if out.AccessToken == "" {
 		out.AccessToken = out.OpenAIAPIKey
 	}
 	if out.AccessToken == "" && out.OpenAIAPIKey == "" {
 		return ParsedAuth{}, errors.New("auth.json has neither tokens.access_token, access_token nor OPENAI_API_KEY")
+	}
+	authMode := strings.TrimSpace(stringFieldAny(root, "auth_mode", "authMode"))
+	externalChatGPTTokens := webSession || isExternalChatGPTAuthMode(authMode) ||
+		(strings.EqualFold(out.Provider, "codex") && out.RefreshToken == "" && out.OpenAIAPIKey == "")
+	if externalChatGPTTokens {
+		out.CredentialMode = CredentialModeChatGPTAuthTokens
+		out.Provider = "codex"
+	}
+	if externalChatGPTTokens && accessClaims.ExpiresAt > 0 {
+		// /api/auth/session "expires" is the browser session lifetime, and CPA's
+		// copied expiry can be stale. The bearer JWT exp controls request validity.
+		out.ExpiresAt = accessClaims.ExpiresAt
+	} else if out.ExpiresAt == 0 {
+		out.ExpiresAt = accessClaims.ExpiresAt
+	}
+	if externalChatGPTTokens {
+		if !codexParsableJWT(out.AccessToken) {
+			return ParsedAuth{}, errors.New("external ChatGPT access_token is not a Codex-parseable JWT")
+		}
+		if out.UpstreamAccountID == "" {
+			return ParsedAuth{}, errors.New("external ChatGPT credentials have no chatgpt_account_id in either JSON or access_token")
+		}
+		if out.ExpiresAt > 0 && out.ExpiresAt <= time.Now().Unix() {
+			return ParsedAuth{}, errors.New("external ChatGPT access_token is expired; import a fresh session")
+		}
+	}
+	if shouldSynthesizeCodexIDToken(root, out, webSession) {
+		idToken, err := synthesizeCodexIDToken(out)
+		if err != nil {
+			return ParsedAuth{}, err
+		}
+		out.IDTokenRaw = idToken
+		out.SyntheticIDToken = true
 	}
 	out.AccountID = stableAccountID(codexAccountIdentity(out.ChatGPTUserID, out.UpstreamAccountID), out.AccessToken, out.OpenAIAPIKey)
 	return out, nil
@@ -274,15 +307,28 @@ func ParseAccessToken(accessToken, accountID string) (ParsedAuth, error) {
 	if accessToken == "" {
 		return ParsedAuth{}, errors.New("access_token required")
 	}
-	out := ParsedAuth{AccessToken: accessToken, UpstreamAccountID: strings.TrimSpace(accountID)}
-	claims := decodeIDClaims(accessToken)
-	out.Email = claims.Email
-	out.ChatGPTUserID = claims.ChatGPTUserID
-	if out.UpstreamAccountID == "" {
-		out.UpstreamAccountID = claims.ChatGPTAccountID
+	if !codexParsableJWT(accessToken) {
+		return ParsedAuth{}, errors.New("access_token is not a Codex-parseable JWT")
 	}
-	out.PlanType = claims.PlanType
-	out.IsFedramp = claims.IsFedramp
+	out := ParsedAuth{
+		AccessToken: accessToken, UpstreamAccountID: strings.TrimSpace(accountID),
+		Provider: "codex", CredentialMode: CredentialModeChatGPTAuthTokens,
+	}
+	claims := decodeIDClaims(accessToken)
+	fillMissingIDClaims(&out, claims)
+	out.ExpiresAt = claims.ExpiresAt
+	if out.UpstreamAccountID == "" {
+		return ParsedAuth{}, errors.New("ChatGPT account_id required when it is absent from access_token claims")
+	}
+	if out.ExpiresAt > 0 && out.ExpiresAt <= time.Now().Unix() {
+		return ParsedAuth{}, errors.New("access_token is expired")
+	}
+	idToken, err := synthesizeCodexIDToken(out)
+	if err != nil {
+		return ParsedAuth{}, err
+	}
+	out.IDTokenRaw = idToken
+	out.SyntheticIDToken = true
 	out.AccountID = stableAccountID(codexAccountIdentity(out.ChatGPTUserID, out.UpstreamAccountID), out.AccessToken)
 	return out, nil
 }
@@ -383,9 +429,11 @@ func epochSecondsField(m map[string]interface{}, keys ...string) int64 {
 			parsed, _ := t.Int64()
 			n = parsed
 		case string:
-			var parsed int64
-			if _, err := fmt.Sscanf(strings.TrimSpace(t), "%d", &parsed); err == nil {
+			value := strings.TrimSpace(t)
+			if parsed, err := strconv.ParseInt(value, 10, 64); err == nil {
 				n = parsed
+			} else if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+				n = parsed.Unix()
 			}
 		}
 		if n > 1_000_000_000_000 {
@@ -458,10 +506,12 @@ func extractIDTokenRaw(v interface{}) string {
 
 type idClaims struct {
 	Email            string
+	Name             string
 	ChatGPTUserID    string
 	ChatGPTAccountID string
 	PlanType         string
 	IsFedramp        bool
+	ExpiresAt        int64
 }
 
 func decodeIDClaims(jwt string) idClaims {
@@ -480,7 +530,11 @@ func decodeIDClaims(jwt string) idClaims {
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return idClaims{}
 	}
-	claims := idClaims{Email: stringField(raw, "email")}
+	claims := idClaims{
+		Email:     stringField(raw, "email"),
+		Name:      stringFieldAny(raw, "name", "display_name", "displayName"),
+		ExpiresAt: epochSecondsField(raw, "exp"),
+	}
 	if profile, ok := raw["https://api.openai.com/profile"].(map[string]interface{}); ok && claims.Email == "" {
 		claims.Email = stringField(profile, "email")
 	}

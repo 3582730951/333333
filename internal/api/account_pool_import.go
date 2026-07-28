@@ -40,6 +40,12 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parsed := doc.Entries[0].Parsed
+	sessionCookie, err := normalizeImportedSessionCookie(req.SessionCookie, parsed)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	warnings := importedAuthWarnings(parsed, sessionCookie)
 	if req.Label == "" {
 		req.Label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
@@ -59,34 +65,37 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 		IsFedramp:         parsed.IsFedramp,
 	}
 	if existing, err := s.findExistingImportedAccount(r.Context(), parsed); err == nil {
+		updatedAccount, updated, updateErr := s.updateExistingExternalChatGPTTokens(r.Context(), existing, parsed, sessionCookie)
+		if updateErr != nil {
+			writeError(w, http.StatusBadRequest, updateErr)
+			return
+		}
 		key.LastUsedAt = storage.Now()
 		_ = s.store.UpsertAPIKey(r.Context(), key)
-		writeJSON(w, http.StatusOK, accountImportResponse{Account: existing, Duplicate: true, ImportStatus: "duplicate"})
+		status := "duplicate"
+		if updated {
+			status = "updated"
+		}
+		writeJSON(w, http.StatusOK, accountImportResponse{
+			Account: updatedAccount, Duplicate: !updated, Updated: updated, ImportStatus: status,
+			CredentialMode: parsed.CredentialMode, Warnings: warnings,
+		})
 		return
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	lastRefresh := parsed.LastRefresh
-	if lastRefresh == 0 {
-		lastRefresh = storage.Now()
+	token := accountTokenFromParsed(parsed, parsed.RefreshToken)
+	if strings.TrimSpace(account.Provider) == "" {
+		if inferred := accountprovider.InferProviderFromToken(token); inferred != accountprovider.UnknownProvider {
+			account.Provider = inferred
+		}
 	}
-	token := storage.AccountToken{
-		CredentialMode:     parsed.CredentialMode,
-		AccessToken:        parsed.AccessToken,
-		RefreshToken:       parsed.RefreshToken,
-		OpenAIAPIKey:       parsed.OpenAIAPIKey,
-		IDTokenRaw:         parsed.IDTokenRaw,
-		AgentRuntimeID:     parsed.AgentRuntimeID,
-		AgentPrivateKey:    parsed.AgentPrivateKey,
-		AgentTaskID:        parsed.AgentTaskID,
-		LastRefresh:        lastRefresh,
-		ExpiresAt:          parsed.ExpiresAt,
-		Scopes:             strings.Join(parsed.Scopes, " "),
-		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
-	}
-	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.storeImportedSessionCookie(r.Context(), account.ID, sessionCookie); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -96,7 +105,9 @@ func (s *Server) accountPoolImport(w http.ResponseWriter, r *http.Request) {
 	}
 	key.LastUsedAt = storage.Now()
 	_ = s.store.UpsertAPIKey(r.Context(), key)
-	writeJSON(w, http.StatusOK, accountImportResponse{Account: account, ImportStatus: "imported"})
+	writeJSON(w, http.StatusOK, accountImportResponse{
+		Account: account, ImportStatus: "imported", CredentialMode: parsed.CredentialMode, Warnings: warnings,
+	})
 }
 
 func (s *Server) authorizePoolImportKey(w http.ResponseWriter, r *http.Request) (storage.APIKey, bool) {

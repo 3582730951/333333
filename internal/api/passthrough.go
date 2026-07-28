@@ -94,6 +94,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		Provider:          "claude",
 		Affinity:          affinity,
 		ImmutableAffinity: immutableResource,
+		SkipWait:          userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {

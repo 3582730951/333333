@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"github.com/gorilla/websocket"
@@ -221,11 +223,20 @@ func isResponsesWebSocketUpgrade(r *http.Request) bool {
 }
 
 func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) {
-	upgrader := websocket.Upgrader{}
-	conn, err := upgrader.Upgrade(w, r, nil)
+	upgrader := websocket.Upgrader{HandshakeTimeout: 15 * time.Second, EnableCompression: true}
+	responseHeader := http.Header{}
+	responseHeader.Set(requestIDHeader, requestIDFromContext(r.Context()))
+	conn, err := upgrader.Upgrade(w, r, responseHeader)
 	if err != nil {
+		log.Printf("[RESPONSES-WS] downstream upgrade failed request_id=%s: %v", requestIDFromContext(r.Context()), err)
+		_ = s.store.InsertAuditLog(context.WithoutCancel(r.Context()), storage.AuditLogRow{
+			Action: "codex_downstream_websocket_upgrade", State: "failed", Reason: "handshake_failed", Detail: "path=/v1/responses",
+		})
 		return
 	}
+	_ = s.store.InsertAuditLog(context.WithoutCancel(r.Context()), storage.AuditLogRow{
+		Action: "codex_downstream_websocket_upgrade", State: "connected", Reason: "switching_protocols", Detail: "path=/v1/responses compression=negotiated_if_requested",
+	})
 	defer conn.Close()
 	downstream := newResponsesWebSocketConn(conn)
 	state := &responsesWebSocketState{}

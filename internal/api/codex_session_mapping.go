@@ -1388,6 +1388,7 @@ func responseTurnState(header http.Header, body []byte) string {
 // upstream response into a fake failure.
 func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSessionMapping, lease scheduler.Lease, egress storage.EgressProfile, responseID, turnState string, compact bool) error {
 	if mapping == nil || !mapping.enabled || mapping.snapshot == nil {
+		s.recordCodexUpstreamAttempt(ctx, mapping, lease, egress, "terminal_success", http.StatusOK)
 		return nil
 	}
 	mapping.mu.Lock()
@@ -1455,7 +1456,23 @@ func (s *Server) recordCodexUpstreamAttempt(ctx context.Context, mapping *codexS
 	}
 	binding, ok := mapping.upstreamAttemptBinding()
 	if !ok {
-		return
+		// Stateless passthrough deliberately has no durable CPA tree. Keep those
+		// transport attempts observable under a server-owned per-turn identifier so
+		// diagnostics still cover current traffic without retaining client aliases,
+		// request bodies, response ids, or other protocol state.
+		eventID := strings.TrimSpace(usageEventIDFromContext(ctx))
+		if eventID == "" {
+			eventID = strings.TrimSpace(requestIDFromContext(ctx))
+		}
+		if eventID == "" {
+			return
+		}
+		binding = storage.CodexSessionBinding{
+			TreeID:    "request:" + eventID,
+			AccountID: lease.Account.ID,
+			EgressID:  egress.ID,
+			Epoch:     lease.RouteEpoch,
+		}
 	}
 	s.recordCodexUpstreamAttemptBinding(ctx, binding, lease, egress, state, statusCode)
 }

@@ -32,15 +32,21 @@ func schedulerWaitCallback(ctx context.Context) func(string, time.Duration) {
 		return nil
 	}
 	return func(_ string, _ time.Duration) {
-		state.writeComment(": pool-scheduler-wait\n\n")
+		state.writeKeepalive(": pool-scheduler-wait\n\n")
 	}
 }
 
-// writeComment emits a single SSE comment frame, committing the response (and its
-// SSE headers) on first use. It holds the same lock as the terminal error writer, so
-// a keepalive comment can never interleave with an `event: error` frame. SSE comments
-// are ignored by clients but still reset intermediary/client idle timers.
-func (state *schedulerWaitState) writeComment(comment string) {
+func schedulerWaitProtocol(path string) string {
+	if path == "/v1/responses" || path == "/v1/responses/compact" {
+		return "responses"
+	}
+	return "openai"
+}
+
+// writeKeepalive emits a protocol event for Responses and Anthropic streams because
+// their official eventsource consumers discard SSE comments without resetting the
+// per-event idle timeout. Generic OpenAI streams retain the non-semantic comment.
+func (state *schedulerWaitState) writeKeepalive(comment string) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if state.closed {
@@ -51,13 +57,20 @@ func (state *schedulerWaitState) writeComment(comment string) {
 		state.w.Header().Set("Cache-Control", "no-cache")
 		state.committed = true
 	}
-	_, _ = state.w.Write([]byte(comment))
+	frame := comment
+	switch state.protocol {
+	case "responses":
+		frame = safetyBufferingHeartbeatFrame
+	case "anthropic":
+		frame = claudePingHeartbeatFrame
+	}
+	_, _ = state.w.Write([]byte(frame))
 	if f, ok := state.w.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
-// startSchedulerWaitKeepalive emits SSE keepalive comments every interval until the
+// startSchedulerWaitKeepalive emits protocol keepalives every interval until the
 // returned stop func is called. It bridges a silent pre-first-token window (e.g. a
 // Kiro cache-singleflight wait + token refresh + upstream time-to-first-byte) so the
 // downstream SSE idle timer never fires ("idle timeout waiting for SSE").
@@ -87,7 +100,7 @@ func startSchedulerWaitKeepalive(ctx context.Context, interval time.Duration) fu
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				state.writeComment(": pool-keepalive\n\n")
+				state.writeKeepalive(": pool-keepalive\n\n")
 			}
 		}
 	}()
@@ -106,6 +119,21 @@ func schedulerWaitTerminal(ctx context.Context, _ string) bool {
 	defer state.mu.Unlock()
 	if !state.committed {
 		return false
+	}
+	if state.protocol == "responses" {
+		resp := map[string]interface{}{
+			"id":     "resp_pool_scheduler_wait",
+			"object": "response",
+			"status": "failed",
+			"error":  map[string]string{"code": "server_error", "message": publicRetryMessage},
+		}
+		_ = writeSSEEvent(state.w, "response.failed", map[string]interface{}{"response": resp})
+		_, _ = state.w.Write([]byte("data: [DONE]\n\n"))
+		if f, ok := state.w.(http.Flusher); ok {
+			f.Flush()
+		}
+		state.closed = true
+		return true
 	}
 	data, _ := json.Marshal(map[string]interface{}{"type": "error", "error": map[string]interface{}{"type": "api_error", "message": publicRetryMessage}})
 	if state.protocol == "openai" {

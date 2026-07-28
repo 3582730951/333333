@@ -30,6 +30,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [redirected, setRedirected] = useState('');
   const [copied, setCopied] = useState(false);
   const [manualRaw, setManualRaw] = useState('');
+  const [manualSessionCookie, setManualSessionCookie] = useState('');
   const [manualResult, setManualResult] = useState(null);
   const [kiroRaw, setKiroRaw] = useState('');
   const [kiroClientRaw, setKiroClientRaw] = useState('');
@@ -115,6 +116,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
     setRedirected('');
     setCopied(false);
     setManualRaw('');
+    setManualSessionCookie('');
     setManualResult(null);
     setKiroRaw('');
     setKiroClientRaw('');
@@ -220,16 +222,20 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         note,
         group_name: groupName,
         auth_json_text: val,
+        session_cookie: manualSessionCookie.trim(),
       });
       if (actionEpoch !== actionEpochRef.current) return;
       if (Array.isArray(result.items)) {
         setManualResult(result);
-        const summary = `导入 ${result.imported || 0}，重复 ${result.duplicates || 0}，失败 ${result.failed || 0}`;
+        const summary = `导入 ${result.imported || 0}，更新 ${result.updated || 0}，重复 ${result.duplicates || 0}，失败 ${result.failed || 0}`;
         if ((result.failed || 0) > 0) Toast.warning(summary);
         else Toast.success(summary);
-        if ((result.imported || 0) > 0 && onSuccess) onSuccess(result);
+        if (((result.imported || 0) > 0 || (result.updated || 0) > 0) && onSuccess) onSuccess(result);
         if ((result.failed || 0) === 0) handleClose();
         return;
+      }
+      if (Array.isArray(result.warnings) && result.warnings.length > 0) {
+        Toast.warning(result.warnings.join('；'));
       }
       Toast.success({
         content: (
@@ -337,7 +343,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
         <span className="pool-oauth-manual-icon"><IconFile /></span>
         <div className="pool-oauth-identity__copy">
           <Text strong className="pool-oauth-identity__name">手动导入</Text>
-          <Text type="tertiary" className="pool-oauth-identity__desc">支持 auth.json、数组及 sub2api-data 备份</Text>
+          <Text type="tertiary" className="pool-oauth-identity__desc">支持 Codex auth.json、CPA JSON、ChatGPT Web session、数组及 sub2api-data</Text>
         </div>
       </div>
 
@@ -373,12 +379,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
 
         <div style={{ marginBottom: 12 }}>
           <Text type="tertiary" style={{ fontSize: 13 }}>
-            支持单个 auth.json、auth.json 数组或 other_sub2api 导出的 sub2api-data：
+            Web session 无 Refresh Token 时会按 Codex 的 chatgptAuthTokens 模式导入；占位 id_token 只承载账号元数据，实际认证始终使用 accessToken：
           </Text>
         </div>
         <textarea
           className="pool-textarea"
-          placeholder={'{\n  "tokens": {\n    "access_token": "...",\n    "refresh_token": "..."\n  }\n}'}
+          placeholder={'{\n  "user": { "id": "user-...", "email": "name@example.com" },\n  "expires": "2026-07-28T00:00:00.000Z",\n  "accessToken": "eyJ..."\n}\n\n也可粘贴 CPA 顶层 access_token/id_token/account_id JSON'}
           value={manualRaw}
           onChange={(e) => { setManualRaw(e.target.value); setManualResult(null); }}
           style={{
@@ -394,11 +400,24 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
             color: 'var(--pool-text)',
           }}
         />
+        <div style={{ marginTop: 12 }}>
+          <Form.Slot label="ChatGPT Session Cookie (可选)">
+            <Input
+              type="password"
+              value={manualSessionCookie}
+              onChange={setManualSessionCookie}
+              placeholder="完整 Cookie 头或 __Secure-next-auth.session-token 值"
+            />
+          </Form.Slot>
+          <Text type="tertiary" as="p" style={{ marginTop: 6 }}>
+            提供后会加密保存，并在 access token 过期时重新读取 /api/auth/session；留空则需要到期前重新导入。
+          </Text>
+        </div>
         {manualResult ? (
           <div style={{ marginTop: 12, padding: 12, border: '1px solid var(--pool-border)', borderRadius: 6 }}>
             <Text strong>批量导入结果</Text>
             <Text as="p" type="tertiary" style={{ margin: '6px 0' }}>
-              账号：导入 {manualResult.imported || 0} / 重复 {manualResult.duplicates || 0} / 失败 {manualResult.failed || 0}
+              账号：导入 {manualResult.imported || 0} / 更新 {manualResult.updated || 0} / 重复 {manualResult.duplicates || 0} / 失败 {manualResult.failed || 0}
               {manualResult.proxy_created || manualResult.proxy_reused || manualResult.proxy_failed
                 ? `；出口：新建 ${manualResult.proxy_created || 0} / 复用 ${manualResult.proxy_reused || 0} / 失败 ${manualResult.proxy_failed || 0}` : ''}
             </Text>

@@ -5,6 +5,7 @@ package api
 
 import (
 	"codex-account-pool/internal/accountprovider"
+	authparse "codex-account-pool/internal/auth"
 	"codex-account-pool/internal/ban"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
@@ -796,16 +797,15 @@ func (s *Server) refreshCodexToken(ctx context.Context, token storage.AccountTok
 		// Cookie-imported "AT" accounts (no refresh_token) refresh by re-minting
 		// the access token from the stored chatgpt.com session cookie.
 		if cookie, _ := s.store.GetSessionCookie(ctx, token.AccountID); cookie != "" {
-			if accessToken, ferr := fetchChatGPTSessionToken(ctx, cookie); ferr == nil && accessToken != "" {
-				token.AccessToken = accessToken
-				token.LastRefresh = storage.Now()
-				if err := s.store.UpdateToken(ctx, token); err != nil {
-					return result, err
-				}
-				result.Token = token
+			if reminted, ferr := s.remintCodexTokenFromSessionCookie(ctx, token, cookie, false); ferr == nil {
+				result.Token = reminted
 				result.Refreshed = true
 				result.Method = "session_cookie"
 				return result, nil
+			} else {
+				result.Reason = "session cookie re-mint failed"
+				s.enqueueCodexReauthIfEligible(ctx, token.AccountID, result.Reason)
+				return result, ferr
 			}
 		}
 		token.LastRefresh = storage.Now()
@@ -840,13 +840,8 @@ func (s *Server) refreshCodexToken(ctx context.Context, token storage.AccountTok
 		result.Reason, result.TerminalAuthFailure = codexRefreshFailureReason(resp.StatusCode, raw)
 		if result.TerminalAuthFailure {
 			if cookie, _ := s.store.GetSessionCookie(ctx, token.AccountID); cookie != "" {
-				if accessToken, ferr := fetchChatGPTSessionToken(ctx, cookie); ferr == nil && accessToken != "" {
-					token.AccessToken = accessToken
-					token.LastRefresh = storage.Now()
-					if err := s.store.UpdateToken(ctx, token); err != nil {
-						return result, err
-					}
-					result.Token = token
+				if reminted, ferr := s.remintCodexTokenFromSessionCookie(ctx, token, cookie, true); ferr == nil {
+					result.Token = reminted
 					result.Refreshed = true
 					result.Method = "session_cookie"
 					return result, nil
@@ -876,6 +871,34 @@ func (s *Server) refreshCodexToken(ctx context.Context, token storage.AccountTok
 	result.Refreshed = true
 	result.Method = "openai_oauth"
 	return result, nil
+}
+
+func (s *Server) remintCodexTokenFromSessionCookie(ctx context.Context, token storage.AccountToken, cookie string, discardRefreshToken bool) (storage.AccountToken, error) {
+	accessToken, err := fetchChatGPTSessionToken(ctx, cookie)
+	if err != nil {
+		return token, err
+	}
+	account, err := s.store.GetAccount(ctx, token.AccountID)
+	if err != nil {
+		return token, err
+	}
+	parsed, err := authparse.ParseAccessToken(accessToken, account.UpstreamAccountID)
+	if err != nil {
+		return token, fmt.Errorf("ChatGPT session returned unusable accessToken: %w", err)
+	}
+	token.AccessToken = parsed.AccessToken
+	token.IDTokenRaw = parsed.IDTokenRaw
+	token.ExpiresAt = parsed.ExpiresAt
+	token.LastRefresh = storage.Now()
+	token.CredentialMode = authparse.CredentialModeChatGPTAuthTokens
+	token.AuthMethod = accountprovider.AuthMethodAccessToken
+	if discardRefreshToken {
+		token.RefreshToken = ""
+	}
+	if err := s.store.UpdateToken(ctx, token); err != nil {
+		return token, err
+	}
+	return token, nil
 }
 
 func codexRefreshFailureReason(status int, body []byte) (string, bool) {

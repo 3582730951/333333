@@ -71,14 +71,49 @@ func TestStreamingSaturationWaitsWithSSEHeartbeatThenResumes(t *testing.T) {
 	}
 	reader := bufio.NewReader(resp.Body)
 	line, err := reader.ReadString('\n')
-	if err != nil || line != ": pool-scheduler-wait\n" {
-		t.Fatalf("heartbeat line=%q err=%v", line, err)
+	if err != nil || line != "event: response.in_progress\n" {
+		t.Fatalf("heartbeat event line=%q err=%v", line, err)
+	}
+	line, err = reader.ReadString('\n')
+	if err != nil || line != "data: {\"type\":\"response.in_progress\"}\n" {
+		t.Fatalf("heartbeat data line=%q err=%v", line, err)
 	}
 	_, _ = reader.ReadString('\n')
+	var action, state, reason string
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT action,state,reason FROM audit_log WHERE action='codex_scheduler_wait' ORDER BY id DESC LIMIT 1`).Scan(&action, &state, &reason); err != nil {
+		t.Fatalf("scheduler wait audit missing: %v", err)
+	}
+	if action != "codex_scheduler_wait" || state != "queued" || reason == "" {
+		t.Fatalf("scheduler wait audit=%q/%q/%q", action, state, reason)
+	}
 	held.Release()
 	rest, err := io.ReadAll(reader)
 	if err != nil || !bytes.Contains(rest, []byte("resp_ok")) {
 		t.Fatalf("resumed stream body=%s err=%v", rest, err)
+	}
+}
+
+func TestResponsesSchedulerWaitTerminalIsCanonicalSSE(t *testing.T) {
+	recorder := &flushRecorder{header: make(http.Header)}
+	ctx := withSchedulerWait(context.Background(), recorder, true, "responses")
+	schedulerWaitCallback(ctx)("capacity", time.Second)
+	if !schedulerWaitTerminal(ctx, context.DeadlineExceeded.Error()) {
+		t.Fatal("committed scheduler wait was not terminated as SSE")
+	}
+	body := recorder.body.String()
+	for _, want := range []string{
+		"event: response.in_progress\n",
+		"event: response.failed\n",
+		`"code":"server_error"`,
+		publicRetryMessage,
+		"data: [DONE]\n\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("terminal stream missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "idle timeout") {
+		t.Fatalf("terminal stream leaked an idle-timeout implementation detail:\n%s", body)
 	}
 }
 

@@ -17,8 +17,9 @@ import (
 //
 // Config shape is verified against codex-rs (codex-model-provider-info):
 //   - wire_api MUST be "responses" ("chat" was removed upstream).
-//   - supports_websockets enables the current Responses WebSocket transport;
-//     pool_server accepts it and bridges to the selected upstream transport.
+//   - supports_websockets enables the current Responses WebSocket transport; the
+//     installer probes the public ingress and disables it when a 101 upgrade cannot
+//     complete, while pool_server can bridge an accepted downstream socket to SSE.
 //   - experimental_bearer_token carries the key as `Authorization: Bearer <token>`;
 //     it is the field codex documents for programmatic/self-hosted setups, so no
 //     env var, auth.json, or shell-rc edit is needed.
@@ -248,6 +249,7 @@ Environment:
   POOL_CLIENT=claude|codex
   POOL_INSTALL_RTK=1|0
   POOL_CLIENT_RUNTIME=compat|strict
+  POOL_CODEX_WEBSOCKETS=auto|1|0  Probe the public ingress by default; force only when needed.
   ADMIN_TOKEN=<token>              Optional admin token for --doctor-only.
 EOF_USAGE
 }
@@ -397,10 +399,34 @@ ensure_user_local_bin_on_path() {
   fi
 }
 
+probe_codex_websocket() {
+  local status
+  status="$(curl --http1.1 --silent --output /dev/null --write-out '%%{http_code}' \
+    --max-time "${POOL_CODEX_WS_PROBE_TIMEOUT_SECONDS:-3}" \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "$ORIGIN/v1/responses" 2>/dev/null || true)"
+  [ "$status" = "101" ]
+}
+
 configure_codex() {
   local install_rtk="$1"
   local CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
   local CONFIG="$CODEX_HOME/config.toml"
+  local supports_websockets=false
+
+  case "${POOL_CODEX_WEBSOCKETS:-auto}" in
+    auto)
+      if probe_codex_websocket; then
+        supports_websockets=true
+      fi
+      ;;
+    1|true|TRUE|yes|YES) supports_websockets=true ;;
+    0|false|FALSE|no|NO) supports_websockets=false ;;
+    *) say "Invalid POOL_CODEX_WEBSOCKETS=${POOL_CODEX_WEBSOCKETS}. Use auto, 1 or 0."; exit 1 ;;
+  esac
 
   say "配置 Codex 接入 Pool: $ORIGIN"
   mkdir -p "$CODEX_HOME"
@@ -437,13 +463,14 @@ model_provider = "$PROVIDER_ID"
 name = "Pool Server"
 base_url = "$ORIGIN/v1"
 wire_api = "responses"
-supports_websockets = true
+supports_websockets = $supports_websockets
 %s
 EOF
   mv "$TMP" "$CONFIG"
 
   say "已写入 $CONFIG"
   say "model=$MODEL"
+  say "supports_websockets=$supports_websockets"
   say "提示: Codex 官方 skills / plugins / Browser Use 最大兼容需要路由到官方 Codex 账号通道；第三方供应商为 best-effort。"
   if [ "$install_rtk" = "1" ]; then
     say "安装并接入 RTK (Codex)..."

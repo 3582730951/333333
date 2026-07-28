@@ -192,6 +192,45 @@ func TestAdminImportSub2APIDataSeparatesAgentUsersInSharedWorkspace(t *testing.T
 	}
 }
 
+func TestAdminImportCPAArrayPreservesManagedRefreshTokens(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	payload := []map[string]interface{}{
+		{
+			"type": "codex", "access_token": "cpa-access-one", "refresh_token": "cpa-refresh-one",
+			"id_token": "legacy-placeholder", "account_id": "cpa-workspace-one", "email": "cpa-one@example.internal",
+		},
+		{
+			"type": "codex", "access_token": "cpa-access-two", "refresh_token": "cpa-refresh-two",
+			"id_token": "legacy-placeholder", "account_id": "cpa-workspace-two", "email": "cpa-two@example.internal",
+		},
+	}
+	requestBody, _ := json.Marshal(map[string]interface{}{"auth_json": payload, "group_name": "cyber"})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/import-auth-json", string(requestBody))
+	if code != http.StatusOK {
+		t.Fatalf("CPA array import = %d: %s", code, raw)
+	}
+	var result authDocumentImportResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Format != "auth-json-array" || result.Imported != 2 || result.Failed != 0 {
+		t.Fatalf("CPA array result = %+v body=%s", result, raw)
+	}
+	for index, item := range result.Items {
+		token, err := h.store.GetToken(context.Background(), item.AccountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantRefresh := fmt.Sprintf("cpa-refresh-%s", []string{"one", "two"}[index])
+		if token.RefreshToken != wantRefresh || token.AuthMethod != "oauth" || token.IDTokenRaw == "" || token.IDTokenRaw == "legacy-placeholder" {
+			t.Fatalf("CPA token %d = %+v", index, token)
+		}
+	}
+}
+
 func TestAdminImportSub2APIDataKeepsLegacyAgentIdentityDuplicateScopedToUser(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

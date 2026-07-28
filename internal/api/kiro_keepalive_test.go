@@ -17,9 +17,9 @@ import (
 // TestKiroStreamingEmitsKeepaliveDuringSilentPreTokenWindow proves the fix for
 // "Stream disconnected before completion: idle timeout waiting for SSE": while a
 // streaming Kiro attempt is stalled in its silent pre-first-token window (here the
-// upstream is held open), the client must receive SSE keepalive comments so its
-// idle-SSE timer never fires. It also asserts the keepalive stops synchronously —
-// no keepalive comment may trail the first real emitted frame, since the emitter
+// upstream is held open), the client must receive protocol-visible SSE ping events
+// so its idle-SSE timer never fires. It also asserts the keepalive stops synchronously —
+// no ping may trail the first real emitted frame, since the emitter
 // writes straight to the ResponseWriter and would otherwise race a late tick.
 func TestKiroStreamingEmitsKeepaliveDuringSilentPreTokenWindow(t *testing.T) {
 	release := make(chan struct{})
@@ -101,7 +101,7 @@ func TestKiroStreamingEmitsKeepaliveDuringSilentPreTokenWindow(t *testing.T) {
 			collected.WriteString(line)
 			trimmed := strings.TrimRight(line, "\r\n")
 			switch {
-			case strings.HasPrefix(trimmed, ": pool-keepalive"):
+			case trimmed == "event: ping":
 				sawKeepalive = true
 				if firstEventSeen {
 					keepaliveAfterContent = true
@@ -116,10 +116,10 @@ func TestKiroStreamingEmitsKeepaliveDuringSilentPreTokenWindow(t *testing.T) {
 	}
 
 	if !sawKeepalive {
-		t.Fatalf("no ': pool-keepalive' comment during the silent pre-first-token window; downstream would hit the idle-SSE timeout:\n%s", collected.String())
+		t.Fatalf("no protocol-visible ping event during the silent pre-first-token window; downstream would hit the idle-SSE timeout:\n%s", collected.String())
 	}
 	if keepaliveAfterContent {
-		t.Fatalf("keepalive comment emitted after real content began; stopKeepalive did not stop synchronously:\n%s", collected.String())
+		t.Fatalf("keepalive ping emitted after real content began; stopKeepalive did not stop synchronously:\n%s", collected.String())
 	}
 	if !strings.Contains(collected.String(), "first") {
 		t.Fatalf("stream did not deliver upstream content after the keepalive window:\n%s", collected.String())

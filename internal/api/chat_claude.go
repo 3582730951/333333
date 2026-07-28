@@ -98,6 +98,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			EstimatedTokens:       virtual.EstimateTokensJSON(raw),
 			Exclude:               exclude,
 			OnWait:                schedulerWaitCallback(r.Context()),
+			SkipWait:              userGroupFallbackProbe(r.Context()),
 		})
 		if err != nil {
 			if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {

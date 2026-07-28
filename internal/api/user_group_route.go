@@ -18,6 +18,7 @@ import (
 )
 
 type userGroupRouteOverrideKey struct{}
+type userGroupFallbackProbeKey struct{}
 
 type userGroupRoutePlan struct {
 	UserGroupID  string
@@ -33,6 +34,15 @@ func withUserGroupRouteOverride(ctx context.Context, target storage.TargetRef) c
 func userGroupRouteOverride(ctx context.Context) (storage.TargetRef, bool) {
 	target, ok := ctx.Value(userGroupRouteOverrideKey{}).(storage.TargetRef)
 	return target, ok
+}
+
+func withUserGroupFallbackProbe(ctx context.Context) context.Context {
+	return context.WithValue(ctx, userGroupFallbackProbeKey{}, true)
+}
+
+func userGroupFallbackProbe(ctx context.Context) bool {
+	probe, _ := ctx.Value(userGroupFallbackProbeKey{}).(bool)
+	return probe
 }
 
 // resolveUserGroupRoute selects the routing target for a request that uses the
@@ -187,7 +197,12 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
 			MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.bodyBudget, TempFileNamePrefix: "codex-pool-route-response-*",
 		})
-		candidate := r.Clone(withUserGroupRouteOverride(r.Context(), target))
+		candidateContext := withUserGroupRouteOverride(r.Context(), target)
+		moreTargets := index+1 < len(plan.Candidates)
+		if replaySafe && moreTargets {
+			candidateContext = withUserGroupFallbackProbe(candidateContext)
+		}
+		candidate := r.Clone(candidateContext)
 		candidate.Body = io.NopCloser(bytes.NewReader(originalRaw))
 		candidate.ContentLength = int64(len(originalRaw))
 		dispatch(attempt, candidate)
@@ -217,7 +232,6 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			_ = attempt.Close()
 			return true
 		}
-		moreTargets := index+1 < len(plan.Candidates)
 		if !moreTargets || !replaySafe || !attempt.RetryableFailure() {
 			attempt.Commit()
 			return true

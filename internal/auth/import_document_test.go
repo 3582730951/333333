@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func agentPrivateKeyForTest(t *testing.T) string {
@@ -109,6 +110,35 @@ func TestParseImportDocumentKeepsSingleAuthJSONCompatibility(t *testing.T) {
 	}
 	if doc.Format != ImportFormatSingle || len(doc.Entries) != 1 || doc.Entries[0].Parsed.AccessToken != "access" {
 		t.Fatalf("unexpected document: %+v", doc)
+	}
+}
+
+func TestParseImportDocumentAcceptsCPAAndChatGPTWebSessionJSON(t *testing.T) {
+	claims := map[string]interface{}{
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_user_id":    "user-pasted",
+			"chatgpt_account_id": "workspace-pasted",
+		},
+	}
+	claimsRaw, _ := json.Marshal(claims)
+	accessToken := "header." + base64.RawURLEncoding.EncodeToString(claimsRaw) + ".sig"
+	for _, raw := range [][]byte{
+		[]byte(`{"type":"codex","access_token":"` + accessToken + `","account_id":"workspace-pasted","id_token":"invalid-placeholder"}`),
+		[]byte(`{"user":{"id":"user-pasted"},"account":{"id":"workspace-pasted"},"accessToken":"` + accessToken + `"}`),
+	} {
+		doc, err := ParseImportDocument(raw)
+		if err != nil {
+			t.Fatalf("parse pasted credentials: %v", err)
+		}
+		if doc.Format != ImportFormatSingle || len(doc.Entries) != 1 || doc.Entries[0].Err != nil {
+			t.Fatalf("unexpected pasted document: %+v", doc)
+		}
+		parsed := doc.Entries[0].Parsed
+		if parsed.CredentialMode != CredentialModeChatGPTAuthTokens || parsed.UpstreamAccountID != "workspace-pasted" ||
+			!parsed.SyntheticIDToken || parsed.IDTokenRaw == "invalid-placeholder" {
+			t.Fatalf("pasted credentials not normalized: %+v", parsed)
+		}
 	}
 }
 

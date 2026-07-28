@@ -333,6 +333,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 		EstimatedTokens:       virtual.EstimateTokensJSON(raw),
 		Exclude:               exclude,
 		OnWait:                schedulerWaitCallback(r.Context()),
+		SkipWait:              userGroupFallbackProbe(r.Context()),
 	})
 	if err != nil {
 		if errors.Is(err, scheduler.ErrBoundAccountUnavailable) {

@@ -85,8 +85,11 @@ type accountView struct {
 
 type accountImportResponse struct {
 	storage.Account
-	Duplicate    bool   `json:"duplicate,omitempty"`
-	ImportStatus string `json:"import_status,omitempty"`
+	Duplicate      bool     `json:"duplicate,omitempty"`
+	Updated        bool     `json:"updated,omitempty"`
+	ImportStatus   string   `json:"import_status,omitempty"`
+	CredentialMode string   `json:"credential_mode,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 type authJSONImportRequest struct {
@@ -96,6 +99,7 @@ type authJSONImportRequest struct {
 	PrimaryEgressID string          `json:"primary_egress_id"`
 	AuthJSON        json.RawMessage `json:"auth_json"`
 	AuthJSONText    string          `json:"auth_json_text"`
+	SessionCookie   string          `json:"session_cookie"`
 }
 
 func (s *Server) accountViews(ctx context.Context, accounts []storage.Account) ([]accountView, error) {
@@ -219,6 +223,12 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parsed := doc.Entries[0].Parsed
+	sessionCookie, err := normalizeImportedSessionCookie(req.SessionCookie, parsed)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	warnings := importedAuthWarnings(parsed, sessionCookie)
 	if req.Label == "" {
 		req.Label = firstNonEmpty(parsed.Name, parsed.Email, parsed.UpstreamAccountID, parsed.AccountID)
 	}
@@ -237,30 +247,15 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		Status:            "active",
 		IsFedramp:         parsed.IsFedramp,
 	}
-	lastRefresh := parsed.LastRefresh
-	if lastRefresh == 0 {
-		lastRefresh = storage.Now()
-	}
-	token := storage.AccountToken{
-		CredentialMode:     parsed.CredentialMode,
-		AccessToken:        parsed.AccessToken,
-		RefreshToken:       parsed.RefreshToken,
-		OpenAIAPIKey:       parsed.OpenAIAPIKey,
-		IDTokenRaw:         parsed.IDTokenRaw,
-		AgentRuntimeID:     parsed.AgentRuntimeID,
-		AgentPrivateKey:    parsed.AgentPrivateKey,
-		AgentTaskID:        parsed.AgentTaskID,
-		LastRefresh:        lastRefresh,
-		ExpiresAt:          parsed.ExpiresAt,
-		Scopes:             strings.Join(parsed.Scopes, " "),
-		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
-	}
+	token := accountTokenFromParsed(parsed, parsed.RefreshToken)
 	if strings.TrimSpace(account.Provider) == "" {
 		if inferred := accountprovider.InferProviderFromToken(token); inferred != accountprovider.UnknownProvider {
 			account.Provider = inferred
 		}
 	}
-	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
+	if token.AuthMethod == "" {
+		token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
+	}
 	credential := accountprovider.Credential(account.Provider, token)
 	if (account.Provider == "codex" || account.Provider == "claude") &&
 		(accountprovider.UsesAPIKey(account.Provider, token) || accountprovider.LooksLikeAPIKey(account.Provider, credential)) {
@@ -268,13 +263,29 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing, err := s.findExistingImportedAccount(r.Context(), parsed); err == nil {
-		writeJSON(w, http.StatusOK, accountImportResponse{Account: existing, Duplicate: true, ImportStatus: "duplicate"})
+		updatedAccount, updated, updateErr := s.updateExistingExternalChatGPTTokens(r.Context(), existing, parsed, sessionCookie)
+		if updateErr != nil {
+			writeError(w, http.StatusBadRequest, updateErr)
+			return
+		}
+		status := "duplicate"
+		if updated {
+			status = "updated"
+		}
+		writeJSON(w, http.StatusOK, accountImportResponse{
+			Account: updatedAccount, Duplicate: !updated, Updated: updated, ImportStatus: status,
+			CredentialMode: parsed.CredentialMode, Warnings: warnings,
+		})
 		return
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if err := s.store.UpsertAccount(r.Context(), account, token); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.storeImportedSessionCookie(r.Context(), account.ID, sessionCookie); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -286,7 +297,9 @@ func (s *Server) adminImportAuthJSON(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, accountImportResponse{Account: account, ImportStatus: "imported"})
+	writeJSON(w, http.StatusOK, accountImportResponse{
+		Account: account, ImportStatus: "imported", CredentialMode: parsed.CredentialMode, Warnings: warnings,
+	})
 }
 
 func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.ParsedAuth, label, groupName, refreshToken, provider, egressID string) (storage.Account, error) {
@@ -301,6 +314,10 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	}
 	if provider == "" {
 		provider = parsed.Provider
+	}
+	sessionCookie, err := normalizeImportedSessionCookie("", parsed)
+	if err != nil {
+		return storage.Account{}, err
 	}
 	if strings.TrimSpace(provider) == "" {
 		shape := storage.AccountToken{
@@ -328,23 +345,15 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	if lastRefresh == 0 {
 		lastRefresh = storage.Now()
 	}
-	token := storage.AccountToken{
-		CredentialMode:     parsed.CredentialMode,
-		AccessToken:        parsed.AccessToken,
-		RefreshToken:       refreshToken,
-		OpenAIAPIKey:       parsed.OpenAIAPIKey,
-		IDTokenRaw:         parsed.IDTokenRaw,
-		AgentRuntimeID:     parsed.AgentRuntimeID,
-		AgentPrivateKey:    parsed.AgentPrivateKey,
-		AgentTaskID:        parsed.AgentTaskID,
-		LastRefresh:        lastRefresh,
-		ExpiresAt:          parsed.ExpiresAt,
-		Scopes:             strings.Join(parsed.Scopes, " "),
-		OAuthRateLimitTier: parsed.OAuthRateLimitTier,
-	}
+	token := accountTokenFromParsed(parsed, refreshToken)
+	token.LastRefresh = lastRefresh
 	token.AuthMethod = accountprovider.EffectiveAuthMethod(account.Provider, token)
+	if parsed.CredentialMode == authparse.CredentialModeChatGPTAuthTokens && strings.TrimSpace(refreshToken) == "" {
+		token.AuthMethod = accountprovider.AuthMethodAccessToken
+	}
 	if existing, err := s.findExistingImportedAccount(ctx, parsed); err == nil {
-		return existing, nil
+		updatedAccount, _, updateErr := s.updateExistingExternalChatGPTTokens(ctx, existing, parsed, sessionCookie)
+		return updatedAccount, updateErr
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return storage.Account{}, err
 	}
@@ -360,6 +369,9 @@ func (s *Server) saveImportedAccount(ctx context.Context, parsed authparse.Parse
 	}
 	if persistErr != nil {
 		return storage.Account{}, persistErr
+	}
+	if err := s.storeImportedSessionCookie(ctx, account.ID, sessionCookie); err != nil {
+		return storage.Account{}, err
 	}
 	if err := s.bindImportedAccountPrimaryEgress(ctx, account.ID, egressID); err != nil {
 		return storage.Account{}, err
@@ -460,15 +472,18 @@ func (s *Server) adminImportToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	provider := accountprovider.InferProviderFromToken(storage.AccountToken{AccessToken: strings.TrimSpace(req.AccessToken)})
+	if (provider == "codex" || provider == "claude") && accountprovider.LooksLikeAPIKey(provider, req.AccessToken) {
+		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "upstream API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
+		return
+	}
 	parsed, err := authparse.ParseAccessToken(req.AccessToken, req.AccountID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	provider := accountprovider.InferProviderFromToken(storage.AccountToken{AccessToken: parsed.AccessToken})
-	if (provider == "codex" || provider == "claude") && accountprovider.LooksLikeAPIKey(provider, parsed.AccessToken) {
-		writePoolCodeError(w, http.StatusBadRequest, "cost_confirmation_required", "upstream API keys must be imported with /admin/accounts/import-key and confirm_cost:true")
-		return
+	if strings.TrimSpace(req.RefreshToken) != "" {
+		parsed.CredentialMode = ""
 	}
 	account, err := s.saveImportedAccount(r.Context(), parsed, req.Label, req.GroupName, req.RefreshToken, "", requestedImportEgressID(req.EgressID, req.PrimaryEgressID))
 	if err != nil {
