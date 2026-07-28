@@ -413,3 +413,28 @@ func stripCodexResponsesMaxOutputTokensWithFields(raw []byte, fields map[string]
 	}
 	return out
 }
+
+// stripCodexResponsesHTTPGenerate removes the Responses WebSocket frame control
+// before an HTTP/SSE request is sent. `generate` is valid on response.create /
+// response.append WebSocket frames, but it is not part of either the classic
+// Responses or ApiCompactionInput HTTP schema; WHAM rejects even a false/null value
+// with "Unsupported parameter: generate". The caller must inspect the field first
+// when it needs to classify a generate:false frame as a prewarm request.
+func stripCodexResponsesHTTPGenerate(raw []byte) []byte {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return raw
+	}
+	return stripCodexResponsesHTTPGenerateWithFields(raw, fields)
+}
+
+func stripCodexResponsesHTTPGenerateWithFields(raw []byte, fields map[string]json.RawMessage) []byte {
+	if _, present := fields["generate"]; !present {
+		return raw
+	}
+	out, err := sjson.DeleteBytes(raw, "generate")
+	if err != nil {
+		return raw
+	}
+	return out
+}

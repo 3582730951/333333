@@ -337,3 +337,30 @@ func TestStripCodexResponsesMaxOutputTokensPreservesContext(t *testing.T) {
 		}
 	}
 }
+
+func TestStripCodexResponsesHTTPGeneratePreservesContext(t *testing.T) {
+	for _, value := range []string{"false", "true", "null"} {
+		raw := []byte(`{"model":"gpt-5.6-sol","generate":` + value + `,"previous_response_id":"resp_keep","tools":[{"parameters":{"const":900719925474099312345}}],"input":[{"value":900719925474099312345}]}`)
+		got := stripCodexResponsesHTTPGenerate(raw)
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(got, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, present := payload["generate"]; present {
+			t.Fatalf("HTTP payload retained generate=%s: %s", value, got)
+		}
+		if !bytes.Equal(payload["previous_response_id"], json.RawMessage(`"resp_keep"`)) ||
+			!bytes.Contains(got, []byte(`900719925474099312345`)) {
+			t.Fatalf("generate strip changed conversation context: %s", got)
+		}
+	}
+
+	for _, unchanged := range [][]byte{
+		[]byte(`{"model":"gpt-5.6-sol","input":"keep spacing"}`),
+		[]byte(`{broken`),
+	} {
+		if out := stripCodexResponsesHTTPGenerate(unchanged); !bytes.Equal(out, unchanged) {
+			t.Fatalf("body without a valid generate member changed:\nwant %s\n got %s", unchanged, out)
+		}
+	}
+}

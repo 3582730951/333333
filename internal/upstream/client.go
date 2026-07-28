@@ -569,6 +569,13 @@ func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error
 				setRequestBody(&req, applyCodexClientMetadataWithFields(req.bodyBytes, codexFields, metadata, req.CodexResponsesWebSocket))
 			}
 		}
+		// A downstream Responses WebSocket frame may be bridged to HTTP after a
+		// handshake/transport fallback. Preserve `generate` on the actual WS path,
+		// but remove it from every HTTP/SSE path after request_kind metadata has
+		// observed generate:false.
+		if !req.CodexResponsesWebSocket {
+			setRequestBody(&req, stripCodexResponsesHTTPGenerateWithFields(req.bodyBytes, codexFields))
+		}
 		// Downstream Codex WebSocket clients may include transport correlators at
 		// the request root. They are useful for routing/identity derivation above,
 		// but are not valid upstream Responses parameters.

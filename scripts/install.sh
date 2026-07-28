@@ -19,6 +19,7 @@ WITH_SIDECAR="${WITH_SIDECAR:-1}"
 WITH_GOPAY="${WITH_GOPAY:-1}"
 WITH_WARP="${WITH_WARP:-0}"
 WITH_LIFECYCLE="${WITH_LIFECYCLE:-1}"
+MIGRATE_USER_GROUPS="${MIGRATE_USER_GROUPS:-0}"
 # Node registration engine (other_new_gpt_register): installs Node.js + a headless
 # Chrome + Xvfb and the puppeteer-real-browser registrar so the pool can auto-register
 # accounts on a no-display cloud VPS. Default on; disable with --without-registration.
@@ -160,6 +161,8 @@ Options:
                             puppeteer-real-browser registrar (other_new_gpt_register). Default. Works on a
                             no-display cloud VPS (Chrome runs headed inside a per-process Xvfb).
   --without-registration    Do not install the Node auto-registration engine
+  --migrate-user-groups     Copy missing account-pool groups to same-named user groups on service start
+  --no-migrate-user-groups  Keep account-pool groups separate (default)
   --with-warp               Provision the multi-exit WARP CF-fallback pool (wgcf + wireproxy)
   --without-warp            Do not provision WARP (default)
   --warp-exits N            Independent WARP exits to provision (implies --with-warp; default ${WARP_EXITS})
@@ -178,6 +181,7 @@ Environment overrides:
   SERVICE_NAME, SERVICE_USER, SERVICE_GROUP, INSTALL_PREFIX, BIN_DIR, APP_DIR,
   CONFIG_DIR, CONFIG_FILE, DATA_DIR, DATABASE_PATH, SYSTEMD_DIR,
   RUN_TESTS, INSTALL_SYSTEMD, START_SERVICE, WITH_SIDECAR, WITH_GOPAY, WITH_LIFECYCLE,
+  MIGRATE_USER_GROUPS,
   WITH_WARP, WARP_EXITS, WARP_BASE_PORT, WARP_ACCOUNTS_PER_EXIT, WARP_DIR, CF_SOLVER_URL,
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
@@ -369,6 +373,14 @@ while [[ $# -gt 0 ]]; do
       WITH_REGISTRATION=0
       shift
       ;;
+    --migrate-user-groups)
+      MIGRATE_USER_GROUPS=1
+      shift
+      ;;
+    --no-migrate-user-groups)
+      MIGRATE_USER_GROUPS=0
+      shift
+      ;;
     --with-warp)
       WITH_WARP=1
       shift
@@ -488,6 +500,14 @@ bool_enabled() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|on|ON) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+normalize_migrate_user_groups() {
+  case "${MIGRATE_USER_GROUPS:-}" in
+    1|true|TRUE|yes|YES|on|ON) MIGRATE_USER_GROUPS=1 ;;
+    ""|0|false|FALSE|no|NO|off|OFF) MIGRATE_USER_GROUPS=0 ;;
+    *) die "MIGRATE_USER_GROUPS must be a boolean (0/1, false/true, no/yes, off/on)" ;;
   esac
 }
 
@@ -1169,6 +1189,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${DATA_DIR}
 Environment="CODEX_POOL_DATABASE=${DATABASE_PATH}"
+Environment="CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS}"
 Environment="CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}"${admin_env}${extra_env}
 ExecStart=${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}
 Restart=always
@@ -1806,7 +1827,7 @@ frontend_url_hint() {
 }
 
 print_summary() {
-  local sidecar_summary gopay_summary lifecycle_summary warp_summary frontend_url manual_admin_env
+  local sidecar_summary gopay_summary lifecycle_summary migration_summary warp_summary frontend_url manual_admin_env
   if bool_enabled "$WITH_SIDECAR"; then
     sidecar_summary="${SERVICE_NAME}-sidecar.service (${SIDECAR_ADDR})"
   else
@@ -1833,6 +1854,11 @@ print_summary() {
   else
     warp_summary="disabled"
   fi
+  if bool_enabled "$MIGRATE_USER_GROUPS"; then
+    migration_summary="enabled (missing account-pool groups will be copied)"
+  else
+    migration_summary="disabled (account-pool groups stay separate)"
+  fi
   frontend_url="$(frontend_url_hint)"
   manual_admin_env=""
   if [[ -n "$ADMIN_TOKEN" ]]; then
@@ -1855,11 +1881,12 @@ Sidecar:       ${sidecar_summary}
 GoPay:         ${gopay_summary}
 Lifecycle:     ${lifecycle_summary}
 Registration:  ${registration_summary}
+Group migration: ${migration_summary}
 WARP:          ${warp_summary}
 Admin token:   ${ADMIN_TOKEN:-<empty>}
 
 Manual run:
-  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}
+  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}
 
 Useful service commands:
   systemctl status ${SERVICE_NAME}.service
@@ -1871,6 +1898,7 @@ EOF
 }
 
 main() {
+  normalize_migrate_user_groups
   ensure_project_files
   ensure_absolute_paths
   log "Codex skills compatibility: full official skills/plugins/Browser Use support requires the official Codex account path; custom providers are best-effort."

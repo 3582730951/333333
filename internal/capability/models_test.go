@@ -108,6 +108,114 @@ func TestBuildModelsResponsePreservesOfficialRawModelMetadata(t *testing.T) {
 	}
 }
 
+func TestBuildCodexModelsResponseUsesNativeEnvelopeAndConservativeWindow(t *testing.T) {
+	raw := `{
+		"slug":"gpt-pool",
+		"display_name":"GPT Pool",
+		"description":"live metadata",
+		"default_reasoning_level":"medium",
+		"supported_reasoning_levels":[{"effort":"medium","description":"balanced"}],
+		"shell_type":"shell_command",
+		"visibility":"list",
+		"supported_in_api":true,
+		"priority":1,
+		"availability_nux":null,
+		"upgrade":null,
+		"base_instructions":"preserve live instructions",
+		"support_verbosity":true,
+		"default_verbosity":"low",
+		"apply_patch_tool_type":"freeform",
+		"truncation_policy":{"mode":"tokens","limit":10000},
+		"supports_parallel_tool_calls":true,
+		"context_window":372000,
+		"max_context_window":372000,
+		"auto_compact_token_limit":350000,
+		"effective_context_window_percent":95,
+		"experimental_supported_tools":[],
+		"prefer_websockets":true,
+		"use_responses_lite":true,
+		"minimal_client_version":"0.144.0",
+		"future_flag":"keep-me"
+	}`
+	caps := []storage.ModelCapability{
+		{AccountID: "large", ModelSlug: "gpt-pool", AvailabilityState: AvailabilityVerified, NativeContextWindow: 372000, NativeMaxContextWindow: 372000, EffectiveContextWindowPercent: 95, AutoCompactTokenLimit: 350000, Visibility: "list", RawModelJSON: raw, Source: "probe"},
+		{AccountID: "small", ModelSlug: "gpt-pool", AvailabilityState: AvailabilityVerified, NativeContextWindow: 272000, NativeMaxContextWindow: 272000, EffectiveContextWindowPercent: 90, AutoCompactTokenLimit: 250000, Visibility: "list", Source: "probe"},
+	}
+
+	body, etag, err := BuildCodexModelsResponse(caps)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if etag == "" {
+		t.Fatal("etag empty")
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, exists := root["object"]; exists {
+		t.Fatalf("Codex catalog retained OpenAI object envelope: %#v", root)
+	}
+	if _, exists := root["data"]; exists {
+		t.Fatalf("Codex catalog retained OpenAI data envelope: %#v", root)
+	}
+	models, ok := root["models"].([]interface{})
+	if !ok || len(models) != 1 {
+		t.Fatalf("models = %#v", root["models"])
+	}
+	model := models[0].(map[string]interface{})
+	if model["slug"] != "gpt-pool" || model["future_flag"] != "keep-me" || model["base_instructions"] != "preserve live instructions" {
+		t.Fatalf("live ModelInfo metadata was not preserved: %#v", model)
+	}
+	if model["context_window"] != float64(272000) || model["max_context_window"] != float64(272000) {
+		t.Fatalf("pool catalog advertised a window larger than a routable account: %#v", model)
+	}
+	if model["effective_context_window_percent"] != float64(90) {
+		t.Fatalf("effective window percent was not conservative: %#v", model)
+	}
+	if model["auto_compact_token_limit"] != float64(244800) {
+		t.Fatalf("auto compact limit = %#v, want 90%% of conservative context", model["auto_compact_token_limit"])
+	}
+	for _, required := range []string{
+		"slug", "display_name", "description", "supported_reasoning_levels", "shell_type",
+		"visibility", "supported_in_api", "priority", "availability_nux", "upgrade",
+		"base_instructions", "support_verbosity", "default_verbosity", "apply_patch_tool_type",
+		"truncation_policy", "supports_parallel_tool_calls", "context_window",
+		"max_context_window", "experimental_supported_tools", "minimal_client_version",
+	} {
+		if _, exists := model[required]; !exists {
+			t.Errorf("required Codex ModelInfo field %q missing: %#v", required, model)
+		}
+	}
+}
+
+func TestBuildCodexModelsResponseSynthesizesCompleteModelInfo(t *testing.T) {
+	body, _, err := BuildCodexModelsResponse([]storage.ModelCapability{{
+		AccountID: "runtime", ModelSlug: "gpt-runtime", AvailabilityState: AvailabilityVerified,
+		NativeContextWindow: 128000, NativeMaxContextWindow: 128000,
+		EffectiveContextWindowPercent: 95, Visibility: "list", Source: "codex_runtime_inference",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Models []map[string]interface{} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil || len(root.Models) != 1 {
+		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
+	}
+	model := root.Models[0]
+	if model["slug"] != "gpt-runtime" || model["display_name"] == "" || model["base_instructions"] == "" {
+		t.Fatalf("synthesized ModelInfo is incomplete: %#v", model)
+	}
+	if _, ok := model["truncation_policy"].(map[string]interface{}); !ok {
+		t.Fatalf("truncation_policy missing: %#v", model)
+	}
+	if model["auto_compact_token_limit"] != float64(115200) {
+		t.Fatalf("auto compact limit = %#v", model["auto_compact_token_limit"])
+	}
+}
+
 func TestBuildModelsResponseDoesNotForgeOfficialMetadataForCustomModels(t *testing.T) {
 	caps := []storage.ModelCapability{{
 		AccountID:                     "custom-1",

@@ -333,6 +333,52 @@ func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPBridgeStripsGenerateAfterClassifyingPrewarm(t *testing.T) {
+	var gotHeader http.Header
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_prewarm\",\"status\":\"completed\",\"output\":[]}}\n\n")
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+	client := NewClient(cfg)
+	original := []byte(`{"model":"gpt-5.6-sol","generate":false,"input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep prewarm context"}]}],"stream":true}`)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses",
+		Body:           testBody(original),
+		Account:        storage.Account{ID: "acc-http-prewarm"},
+		Token:          storage.AccountToken{AccessToken: "access-http-prewarm", RefreshToken: "refresh-http-prewarm"},
+		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(gotBody, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := payload["generate"]; present {
+		t.Fatalf("HTTPS bridge leaked WebSocket-only generate: %s", gotBody)
+	}
+	if !bytes.Contains(payload["input"], []byte("keep prewarm context")) {
+		t.Fatalf("HTTPS bridge lost prewarm input: %s", gotBody)
+	}
+	var turn map[string]interface{}
+	if err := json.Unmarshal([]byte(gotHeader.Get("X-Codex-Turn-Metadata")), &turn); err != nil {
+		t.Fatalf("turn metadata decode: %v header=%q", err, gotHeader.Get("X-Codex-Turn-Metadata"))
+	}
+	if turn["request_kind"] != "prewarm" {
+		t.Fatalf("generate:false classification was lost before HTTP strip: %+v", turn)
+	}
+}
+
 func TestStripCodexTopLevelTransportCorrelatorsPreservesContext(t *testing.T) {
 	original := []byte(`{"model":"gpt-5.6-sol","thread_id":"thread-downstream","session_id":"session-downstream","conversation_id":"conversation-downstream","instructions":"keep","previous_response_id":"resp_keep","tools":[{"schema":{"const":900719925474099312345}}],"input":[{"exact_id":900719925474099312345}]}`)
 	got := stripCodexTopLevelTransportCorrelators(original)

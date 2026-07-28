@@ -529,6 +529,24 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// native Anthropic /v1/models schema or its model picker / "auto" selection breaks;
 	// every other client keeps the OpenAI-shaped list. Detection keys off headers only
 	// Anthropic clients send (anthropic-version / anthropic-beta / x-api-key).
+	// The official Codex client identifies its catalog request with the client_version
+	// query key and expects {"models":[ModelInfo,...]}. Check this first because wrapper
+	// processes can retain Anthropic-family headers while invoking Codex.
+	if _, codexClient := r.URL.Query()["client_version"]; codexClient {
+		body, etag, err := capability.BuildCodexModelsResponse(caps)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", etag)
+		_, _ = w.Write(body)
+		return
+	}
 	if isAnthropicClient(r) {
 		body, etag, err := capability.BuildAnthropicModelsResponse(caps)
 		if err != nil {
@@ -924,7 +942,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		writeCodexReasoningEffortUnsupported(w, model, normalizeEffort(pol.ForceEffort))
 		return
 	}
-	if !isChat && !strictNativeCPA {
+	if !isChat && !strictNativeCPA && !isCompact {
 		raw = ensureEncryptedReasoningInclude(raw)
 	}
 

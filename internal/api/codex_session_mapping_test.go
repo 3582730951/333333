@@ -401,6 +401,81 @@ func TestCodexSessionMappingAdvancesWindowAfterBodyTriggeredCompaction(t *testin
 	}
 }
 
+func TestCodexSessionMappingDoesNotAdvanceWindowAfterCompactContextFailure(t *testing.T) {
+	var mu sync.Mutex
+	var windows []string
+	var paths []string
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		mu.Lock()
+		windows = append(windows, r.Header.Get("X-Codex-Window-Id"))
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		switch call {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp-compact-failure-root","object":"response","model":"gpt","status":"completed","output":[]}`)
+		case 2:
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.failed\n"+
+				`data: {"type":"response.failed","response":{"id":"resp-compact-failure","status":"failed","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"too many tokens to compact"}}}`+"\n\n")
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"resp-compact-failure-next","object":"response","model":"gpt","status":"completed","output":[]}`)
+		default:
+			t.Fatalf("unexpected upstream call %d", call)
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	accountID := h.importAccount(t, "compact-failure-window", "upstream-compact-failure-window", "access-compact-failure-window")
+
+	post := func(path, body string) []byte {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "compact-failure-window-root")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("path=%s status=%d body=%s", path, resp.StatusCode, result)
+		}
+		return result
+	}
+	post("/v1/responses", `{"model":"gpt","input":"before compact"}`)
+	failed := post("/v1/responses/compact", `{"model":"gpt","instructions":"compact","input":[{"role":"user","content":"full history"}],"tools":[],"parallel_tool_calls":false}`)
+	if !bytes.Contains(failed, []byte(`"code":"context_length_exceeded"`)) {
+		t.Fatalf("compact failure signal changed: %s", failed)
+	}
+	post("/v1/responses", `{"model":"gpt","previous_response_id":"resp-compact-failure-root","input":"after failed compact"}`)
+
+	mu.Lock()
+	gotWindows := append([]string(nil), windows...)
+	gotPaths := append([]string(nil), paths...)
+	mu.Unlock()
+	if len(gotWindows) != 3 || !strings.HasSuffix(gotWindows[0], ":0") || gotWindows[1] != gotWindows[0] || gotWindows[2] != gotWindows[0] {
+		t.Fatalf("failed compact advanced window generation: %v", gotWindows)
+	}
+	if len(gotPaths) != 3 || gotPaths[1] != "/backend-api/codex/responses/compact" || calls.Load() != 3 {
+		t.Fatalf("compact failure retried or used wrong route: calls=%d paths=%v", calls.Load(), gotPaths)
+	}
+	account, err := h.store.GetAccount(context.Background(), accountID)
+	if err != nil || account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+		t.Fatalf("compact request error changed account health: %+v err=%v", account, err)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), accountID)
+	if err != nil || binding.CooldownUntil != 0 || binding.RecheckPending {
+		t.Fatalf("compact request error changed egress binding: %+v err=%v", binding, err)
+	}
+}
+
 func TestCodexSessionMappingCommitsConcurrentAnonymousRootsWithUniqueResponses(t *testing.T) {
 	var calls atomic.Int32
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

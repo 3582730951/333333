@@ -941,6 +941,230 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
 }
 
+// BuildCodexModelsResponse renders the native model catalog consumed by the
+// official Codex client when it calls GET /v1/models?client_version=.... Unlike
+// the OpenAI compatibility endpoint, Codex deserializes the whole response as
+// {"models":[ModelInfo,...]}; returning {"object":"list","data":[...]} makes
+// the refresh fail and leaves the client on stale or fallback context limits.
+//
+// A request can be scheduled to any routable account that advertises the selected
+// slug, so window metadata is the minimum supported by those accounts. This keeps
+// client-side automatic compaction ahead of the smallest real upstream window.
+func BuildCodexModelsResponse(capabilities []storage.ModelCapability) ([]byte, string, error) {
+	best := advertisedCapabilitiesBySlug(capabilities)
+	keys := make([]string, 0, len(best))
+	for key := range best {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	models := make([]interface{}, 0, len(keys))
+	for priority, key := range keys {
+		cap := best[key]
+		item := codexModelInfoItem(cap, capabilities, priority+1)
+		models = append(models, item)
+	}
+	resp := map[string]interface{}{"models": models}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(raw)
+	return raw, `W/"` + hex.EncodeToString(sum[:])[:24] + `"`, nil
+}
+
+// advertisedCapabilitiesBySlug preserves the existing public catalog policy:
+// each provider contributes the coherent model set of its richest routable
+// account, and duplicate slugs retain the metadata row with the largest maximum.
+func advertisedCapabilitiesBySlug(capabilities []storage.ModelCapability) map[string]storage.ModelCapability {
+	buckets := map[string][]storage.ModelCapability{}
+	order := make([]string, 0)
+	for _, c := range capabilities {
+		if !capabilityIsVerified(c) {
+			continue
+		}
+		key := providerKeyForSource(c.Source)
+		if _, ok := buckets[key]; !ok {
+			order = append(order, key)
+		}
+		buckets[key] = append(buckets[key], c)
+	}
+	best := map[string]storage.ModelCapability{}
+	for _, key := range order {
+		for _, cap := range richestAccountCaps(buckets[key]) {
+			current, exists := best[cap.ModelSlug]
+			if !exists || cap.NativeMaxContextWindow > current.NativeMaxContextWindow {
+				best[cap.ModelSlug] = cap
+			}
+		}
+	}
+	return best
+}
+
+func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage.ModelCapability, priority int) map[string]interface{} {
+	item := rawOfficialModelItem(selected)
+	if len(item) == 0 {
+		// Runtime inference can verify a model before that account has completed a
+		// fresh /models probe. Reuse another routable account's official metadata
+		// for the same slug when available.
+		for _, candidate := range capabilities {
+			if !capabilityIsVerified(candidate) || !strings.EqualFold(candidate.ModelSlug, selected.ModelSlug) {
+				continue
+			}
+			if raw := rawOfficialModelItem(candidate); len(raw) != 0 {
+				item = raw
+				break
+			}
+		}
+	}
+	if item == nil {
+		item = map[string]interface{}{}
+	}
+
+	window, maxWindow, percent, autoCompact := conservativeCodexLimits(selected.ModelSlug, capabilities)
+	if window == 0 {
+		window = firstPositive(selected.NativeContextWindow, selected.NativeMaxContextWindow)
+	}
+	if maxWindow == 0 {
+		maxWindow = firstPositive(selected.NativeMaxContextWindow, window)
+	}
+	if maxWindow > 0 && (window == 0 || window > maxWindow) {
+		window = maxWindow
+	}
+	if percent == 0 {
+		percent = 95
+	}
+	if window > 0 {
+		derivedLimit := (window * 9) / 10
+		if autoCompact == 0 || autoCompact > derivedLimit {
+			autoCompact = derivedLimit
+		}
+	}
+
+	static, knownStatic := codexStaticModelForSlug(selected.ModelSlug)
+	setModelInfoDefault(item, "slug", selected.ModelSlug)
+	// A raw endpoint may use id rather than slug. The route's canonical persisted
+	// slug always wins so Codex can match the returned metadata to its request.
+	item["slug"] = selected.ModelSlug
+	setModelInfoDefault(item, "display_name", selected.ModelSlug)
+	setModelInfoDefault(item, "description", selected.ModelSlug+" coding model")
+	setModelInfoDefault(item, "default_reasoning_level", "medium")
+	if _, ok := item["supported_reasoning_levels"]; !ok {
+		levels := []string{"low", "medium", "high"}
+		if knownStatic && len(static.reasoningLevels) > 0 {
+			levels = static.reasoningLevels
+		}
+		presets := make([]interface{}, 0, len(levels))
+		for _, level := range levels {
+			presets = append(presets, map[string]interface{}{
+				"effort": level, "description": codexReasoningDescription(level),
+			})
+		}
+		item["supported_reasoning_levels"] = presets
+	}
+	setModelInfoDefault(item, "shell_type", "shell_command")
+	visibility := strings.TrimSpace(selected.Visibility)
+	if visibility == "" {
+		visibility = "list"
+	}
+	setModelInfoDefault(item, "visibility", visibility)
+	setModelInfoDefault(item, "supported_in_api", true)
+	setModelInfoDefault(item, "priority", priority)
+	setModelInfoDefault(item, "availability_nux", nil)
+	setModelInfoDefault(item, "upgrade", nil)
+	setModelInfoDefault(item, "base_instructions", "You are Codex, a coding agent. Work with the user in the current workspace until the task is complete.")
+	setModelInfoDefault(item, "support_verbosity", true)
+	setModelInfoDefault(item, "default_verbosity", "low")
+	setModelInfoDefault(item, "apply_patch_tool_type", "freeform")
+	setModelInfoDefault(item, "truncation_policy", map[string]interface{}{"mode": "tokens", "limit": 10000})
+	setModelInfoDefault(item, "supports_parallel_tool_calls", true)
+	setModelInfoDefault(item, "experimental_supported_tools", []interface{}{})
+	setModelInfoDefault(item, "input_modalities", []interface{}{"text", "image"})
+	item["context_window"] = window
+	item["max_context_window"] = maxWindow
+	item["auto_compact_token_limit"] = autoCompact
+	item["effective_context_window_percent"] = percent
+	if knownStatic {
+		setModelInfoDefault(item, "minimal_client_version", static.minimumClientVersion)
+		setModelInfoDefault(item, "prefer_websockets", static.preferWebSocket)
+		setModelInfoDefault(item, "use_responses_lite", static.responsesLite)
+	} else {
+		setModelInfoDefault(item, "minimal_client_version", "0.0.1")
+		setModelInfoDefault(item, "prefer_websockets", false)
+		setModelInfoDefault(item, "use_responses_lite", false)
+	}
+	return item
+}
+
+func conservativeCodexLimits(slug string, capabilities []storage.ModelCapability) (window, maxWindow, percent, autoCompact int64) {
+	for _, cap := range capabilities {
+		if !capabilityIsVerified(cap) || !strings.EqualFold(strings.TrimSpace(cap.ModelSlug), strings.TrimSpace(slug)) {
+			continue
+		}
+		candidateWindow := firstPositive(cap.NativeContextWindow, cap.NativeMaxContextWindow)
+		candidateMax := firstPositive(cap.NativeMaxContextWindow, candidateWindow)
+		window = minPositive(window, candidateWindow)
+		maxWindow = minPositive(maxWindow, candidateMax)
+		candidatePercent := cap.EffectiveContextWindowPercent
+		if candidatePercent == 0 {
+			candidatePercent = 95
+		}
+		percent = minPositive(percent, candidatePercent)
+		if cap.AutoCompactTokenLimit > 0 {
+			autoCompact = minPositive(autoCompact, cap.AutoCompactTokenLimit)
+		}
+	}
+	return window, maxWindow, percent, autoCompact
+}
+
+func firstPositive(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func minPositive(current, candidate int64) int64 {
+	if candidate <= 0 {
+		return current
+	}
+	if current <= 0 || candidate < current {
+		return candidate
+	}
+	return current
+}
+
+func setModelInfoDefault(item map[string]interface{}, key string, value interface{}) {
+	current, exists := item[key]
+	if !exists || current == nil || (isEmptyString(current) && value != nil) {
+		item[key] = value
+	}
+}
+
+func isEmptyString(value interface{}) bool {
+	text, ok := value.(string)
+	return ok && strings.TrimSpace(text) == ""
+}
+
+func codexReasoningDescription(level string) string {
+	switch level {
+	case "low":
+		return "Fast responses with lighter reasoning"
+	case "medium":
+		return "Balances speed and reasoning depth"
+	case "high":
+		return "Greater reasoning depth for complex problems"
+	case "xhigh":
+		return "Extra high reasoning depth for complex problems"
+	case "max", "ultra":
+		return "Maximum reasoning depth for the hardest problems"
+	default:
+		return level
+	}
+}
+
 // BuildAnthropicModelsResponse renders the pool's Claude capabilities in Anthropic's
 // native GET /v1/models schema — {data:[{type:"model",id,display_name,created_at}],
 // has_more:false,first_id,last_id}. Anthropic clients (Claude Code) enumerate models

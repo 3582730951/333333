@@ -183,6 +183,14 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 			patches = append(patches, bodysource.JSONFieldPatch{Name: "client_metadata", Value: clientMetadata})
 		}
 	}
+	// `generate` is a WebSocket frame control, not an HTTP Responses parameter.
+	// Metadata above intentionally observes it first so generate:false retains its
+	// prewarm request_kind even when this request is being bridged to HTTPS.
+	if !spec.CodexResponsesWebSocket {
+		if _, present := meta.Fields["generate"]; present {
+			patches = append(patches, bodysource.JSONFieldPatch{Name: "generate", Delete: true})
+		}
+	}
 	for _, name := range []string{"thread_id", "session_id", "conversation_id", "window_id", "parent_thread_id", "forked_from_thread_id", "turn_metadata", "turn_state"} {
 		if _, present := meta.Fields[name]; present {
 			patches = append(patches, bodysource.JSONFieldPatch{Name: name, Delete: true})

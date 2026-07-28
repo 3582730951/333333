@@ -170,3 +170,31 @@ func TestBackfillUserGroups(t *testing.T) {
 		t.Error("api_key.user_group_id not set after backfill")
 	}
 }
+
+func TestLegacyUserGroupMigrationCanBeDisabled(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	if err := s.CreateGroup(ctx, Group{Name: "do-not-copy", PromptMode: "prepend"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_POOL_MIGRATE_USER_GROUPS", "0")
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetUserGroupByName(ctx, "do-not-copy"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("legacy account-pool group was copied while migration was disabled")
+	}
+
+	t.Setenv("CODEX_POOL_MIGRATE_USER_GROUPS", "1")
+	if err := s.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.GetUserGroupByName(ctx, "do-not-copy"); err != nil {
+		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("legacy account-pool group was not copied when migration was enabled")
+	}
+}

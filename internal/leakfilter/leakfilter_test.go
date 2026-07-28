@@ -202,6 +202,77 @@ func TestRetryableCodexFailureFrameAcceptsResponseError(t *testing.T) {
 	}
 }
 
+func TestParseCodexFailureFrameRecognizesStructuredContextLengthExceeded(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame string
+		want  int
+	}{
+		{
+			name: "standard_nested_response_failed",
+			frame: "event: response.failed\n" +
+				`data: {"type":"response.failed","response":{"id":"resp_full","status":"failed","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"too many tokens"}}}` + "\n\n",
+			want: http.StatusBadRequest,
+		},
+		{
+			name:  "top_level_error",
+			frame: "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too many tokens\"}}\n\n",
+			want:  http.StatusBadRequest,
+		},
+		{
+			name:  "top_level_response_error_explicit_413",
+			frame: "event: response.error\ndata: {\"type\":\"response.error\",\"status_code\":413,\"error\":{\"code\":\"context_length_exceeded\"}}\n\n",
+			want:  http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:  "structured_error_overrides_retryable_status",
+			frame: "event: response.failed\ndata: {\"type\":\"response.failed\",\"status\":503,\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"server overloaded\"}}}\n\n",
+			want:  http.StatusServiceUnavailable,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			failure, ok := ParseCodexFailureFrame([]byte(tc.frame))
+			if !ok || failure.StatusCode != tc.want || failure.RequestError != ResponsesRequestErrorContextLengthExceeded {
+				t.Fatalf("failure=%+v ok=%v", failure, ok)
+			}
+			if failure.ContextError != ResponsesContextErrorNone || failure.BuiltinRetryable {
+				t.Fatalf("request size error entered account/context recovery: %+v", failure)
+			}
+			if retryable, ok := ParseRetryableCodexFailureFrame([]byte(tc.frame)); ok {
+				t.Fatalf("request size error became retryable: %+v", retryable)
+			}
+		})
+	}
+}
+
+func TestParseCodexFailureFrameContextLengthCodeMustBeExactAndStructured(t *testing.T) {
+	frames := []string{
+		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"context_length_exceeded\"}}}\n\n",
+		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded_later\"}}}\n\n",
+		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_error\"}}}\n\n",
+		"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+	}
+	for _, frame := range frames {
+		failure, ok := ParseCodexFailureFrame([]byte(frame))
+		if !ok {
+			t.Fatalf("terminal frame was not parsed: %s", frame)
+		}
+		if failure.RequestError != ResponsesRequestErrorNone || failure.StatusCode != 0 {
+			t.Fatalf("unstructured/inexact code matched: %+v frame=%s", failure, frame)
+		}
+	}
+}
+
+func TestSSEFilterPreservesContextLengthExceededForCodexClient(t *testing.T) {
+	frame := "event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"status":"failed","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"too many tokens"}}}` + "\n\n"
+	got := runSSE(t, "codex", frame, 2)
+	if !strings.Contains(got, `"code":"context_length_exceeded"`) || !strings.Contains(got, "event: response.failed") {
+		t.Fatalf("Codex context signal was changed: %q", got)
+	}
+}
+
 func TestSSEFilterDoesNotDropAssistantModelSwitchText(t *testing.T) {
 	stream := "event: response.output_text.delta\n" +
 		`data: {"type":"response.output_text.delta","delta":"You can switch to another model manually."}` + "\n\n" +

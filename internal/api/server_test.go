@@ -940,15 +940,18 @@ func TestGatewayPreservesResponsesAttachmentsWhenVirtual2MEnabled(t *testing.T) 
 }
 
 func TestGatewayCompactUnary(t *testing.T) {
+	var upstreamBody []byte
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/backend-api/codex/responses/compact" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
+		upstreamBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"compact-1","output_text":"summary"}`))
 	})
 	h.importAccount(t, "a", "upstream-a", "access-a")
-	resp, err := http.Post(h.pool.URL+"/v1/responses/compact", "application/json", strings.NewReader(`{"model":"gpt","input":[{"role":"user","content":"old"}]}`))
+	requestBody := `{"model":"gpt","instructions":"compact base","input":[{"type":"message","role":"user","content":"old"},{"type":"compaction_trigger","opaque":{"n":900719925474099312345}}],"tools":[],"parallel_tool_calls":false,"reasoning":{"effort":"medium"},"prompt_cache_key":"compact-cache","text":{"verbosity":"low"},"future_compact_field":{"keep":true}}`
+	resp, err := http.Post(h.pool.URL+"/v1/responses/compact", "application/json", strings.NewReader(requestBody))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,6 +959,34 @@ func TestGatewayCompactUnary(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var want, got map[string]interface{}
+	if err = json.Unmarshal([]byte(requestBody), &want); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(upstreamBody, &got); err != nil {
+		t.Fatalf("decode upstream compact body: %v body=%s", err, upstreamBody)
+	}
+	cacheKey, ok := got["prompt_cache_key"].(string)
+	if !ok || len(cacheKey) != len("cp_")+24 || !strings.HasPrefix(cacheKey, "cp_") {
+		t.Fatalf("compact prompt_cache_key was not account-namespaced: %q body=%s", cacheKey, upstreamBody)
+	}
+	for _, ch := range cacheKey[len("cp_"):] {
+		if !strings.ContainsRune("0123456789abcdef", ch) {
+			t.Fatalf("compact prompt_cache_key has invalid format: %q", cacheKey)
+		}
+	}
+	// Conversation isolation intentionally rewrites this routing hint per account;
+	// compare the canonical compact payload independently of that transport metadata.
+	delete(want, "prompt_cache_key")
+	delete(got, "prompt_cache_key")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical compact body changed:\nwant %s\n got %s", requestBody, upstreamBody)
+	}
+	for _, forbidden := range []string{"store", "client_metadata", "include", "generate", "stream"} {
+		if _, present := got[forbidden]; present {
+			t.Fatalf("compact body gained normal-turn field %q: %s", forbidden, upstreamBody)
+		}
 	}
 }
 
@@ -1627,6 +1658,92 @@ func TestGatewayFallsBackToHTTPSSEWhenGatedModelWebSocketMissingScope(t *testing
 	}
 	if binding.CooldownUntil != 0 || binding.RecheckPending {
 		t.Fatalf("websocket permission fallback must not bench account: %+v", binding)
+	}
+}
+
+func TestDownstreamResponsesWebSocketHandshakeFallbackStripsGenerate(t *testing.T) {
+	type capturedFallback struct {
+		body         []byte
+		turnMetadata string
+	}
+	var wsHits atomic.Int32
+	var httpHits atomic.Int32
+	captured := make(chan capturedFallback, 1)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/backend-api/codex/responses":
+			wsHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"Missing scopes: api.responses.write","type":"invalid_request_error"}}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/codex/responses":
+			httpHits.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			captured <- capturedFallback{body: body, turnMetadata: r.Header.Get("X-Codex-Turn-Metadata")}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: response.completed\n"+
+				`data: {"type":"response.completed","response":{"id":"resp_ws_https_prewarm","model":"gpt-5.5","status":"completed","output":[]}}`+
+				"\n\ndata: [DONE]\n\n")
+		default:
+			t.Fatalf("unexpected upstream request %s %s", r.Method, r.URL.Path)
+		}
+	})
+	h.importAccount(t, "downstream-ws-generate-fallback", "acct-downstream-ws-generate-fallback", "access-downstream-ws-generate-fallback")
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			t.Fatalf("downstream handshake: %v status=%d body=%s", err, response.StatusCode, body)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	request := `{"type":"response.create","model":"gpt-5.5","generate":false,"input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"preserve fallback prewarm context"}]}],"stream":true}`
+	if err = conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		_, event, readErr := conn.ReadMessage()
+		if readErr != nil {
+			t.Fatalf("read HTTPS fallback event: %v", readErr)
+		}
+		if bytes.Contains(event, []byte(`"type":"response.completed"`)) {
+			break
+		}
+		if bytes.Contains(event, []byte(`"type":"error"`)) || bytes.Contains(event, []byte(`"type":"response.failed"`)) {
+			t.Fatalf("HTTPS fallback returned terminal error: %s", event)
+		}
+	}
+
+	var fallback capturedFallback
+	select {
+	case fallback = <-captured:
+	case <-time.After(time.Second):
+		t.Fatal("HTTPS fallback request was not captured")
+	}
+	var payload map[string]json.RawMessage
+	if err = json.Unmarshal(fallback.body, &payload); err != nil {
+		t.Fatalf("decode HTTPS fallback body: %v body=%s", err, fallback.body)
+	}
+	if _, present := payload["generate"]; present {
+		t.Fatalf("HTTPS fallback leaked WebSocket-only generate: %s", fallback.body)
+	}
+	if !bytes.Contains(payload["input"], []byte("preserve fallback prewarm context")) {
+		t.Fatalf("HTTPS fallback lost prewarm context: %s", fallback.body)
+	}
+	var turnMetadata map[string]interface{}
+	if err = json.Unmarshal([]byte(fallback.turnMetadata), &turnMetadata); err != nil {
+		t.Fatalf("decode fallback turn metadata: %v header=%q", err, fallback.turnMetadata)
+	}
+	if turnMetadata["request_kind"] != "prewarm" {
+		t.Fatalf("generate:false classification was lost before HTTPS fallback: %+v", turnMetadata)
+	}
+	if wsHits.Load() != 1 || httpHits.Load() != 1 {
+		t.Fatalf("fallback attempts ws=%d http=%d, want 1/1", wsHits.Load(), httpHits.Load())
 	}
 }
 
@@ -2523,6 +2640,69 @@ func TestModelsProbeAdvertisesNativeWindowsOnly(t *testing.T) {
 	}
 	if resp.Header.Get("ETag") == "" {
 		t.Fatalf("missing etag")
+	}
+}
+
+func TestModelsClientVersionReturnsCodexCatalogBeforeAnthropicNegotiation(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	})
+	accountID := h.importAccount(t, "codex-catalog", "upstream-catalog", "access-catalog")
+	setTestCapability(t, h, accountID, "gpt-catalog", 128000)
+
+	req, _ := http.NewRequest(http.MethodGet, h.pool.URL+"/v1/models?client_version=0.145.0", nil)
+	// client_version is authoritative even if a wrapper happens to retain an
+	// Anthropic-family header or user agent.
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, raw)
+	}
+	var catalog struct {
+		Models []map[string]interface{} `json:"models"`
+		Data   []interface{}            `json:"data"`
+		Object string                   `json:"object"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1 || catalog.Models[0]["slug"] != "gpt-catalog" || catalog.Data != nil || catalog.Object != "" {
+		t.Fatalf("expected native Codex catalog, got %s", raw)
+	}
+	if catalog.Models[0]["context_window"] != float64(128000) || catalog.Models[0]["auto_compact_token_limit"] != float64(115200) {
+		t.Fatalf("unsafe Codex context metadata: %#v", catalog.Models[0])
+	}
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		t.Fatal("Codex catalog ETag missing")
+	}
+
+	req, _ = http.NewRequest(http.MethodGet, h.pool.URL+"/v1/models?client_version", nil)
+	req.Header.Set("If-None-Match", etag)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotModified {
+		t.Fatalf("If-None-Match status=%d, want 304", resp.StatusCode)
+	}
+
+	resp, err = http.Get(h.pool.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var openAI map[string]interface{}
+	_ = json.Unmarshal(raw, &openAI)
+	if openAI["object"] != "list" || openAI["data"] == nil || openAI["models"] != nil {
+		t.Fatalf("ordinary model endpoint changed shape: %s", raw)
 	}
 }
 
@@ -4333,6 +4513,53 @@ func TestCodexStreamingEarlyFailedFrameRetriesBeforeWrite(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "ok-from-b") || strings.Contains(string(body), "response.failed") {
 		t.Fatalf("downstream saw wrong stream after retry: %s", body)
+	}
+}
+
+func TestCodexStreamingContextLengthExceededIsPassedThroughWithoutFailover(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.failed\n"+
+			`data: {"type":"response.failed","response":{"id":"resp_too_large","status":"failed","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"too many tokens"}}}`+"\n\n")
+	})
+	accountA := h.importAccount(t, "context-large-a", "upstream-context-large-a", "access-context-large-a")
+	accountB := h.importAccount(t, "context-large-b", "upstream-context-large-b", "access-context-large-b")
+	reqBody := `{"model":"gpt","stream":true,"prompt_cache_key":"context-too-large","input":[{"role":"user","content":"oversized"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"code":"context_length_exceeded"`)) || !bytes.Contains(body, []byte("event: response.failed")) {
+		t.Fatalf("native context signal changed: status=%d body=%s", resp.StatusCode, body)
+	}
+	if calls.Load() != 1 || len(h.requests()) != 1 || h.requests()[0].Auth != "Bearer access-context-large-a" {
+		t.Fatalf("request-size error retried or rotated: calls=%d requests=%+v", calls.Load(), h.requests())
+	}
+	for _, accountID := range []string{accountA, accountB} {
+		account, getErr := h.store.GetAccount(context.Background(), accountID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if account.Status != "active" || account.QuarantineUntil != 0 || account.QuarantineReason != "" {
+			t.Fatalf("request-size error changed account %s health: %+v", accountID, account)
+		}
+		binding, bindingErr := h.store.GetEgressBinding(context.Background(), accountID)
+		if bindingErr != nil {
+			t.Fatal(bindingErr)
+		}
+		if binding.CooldownUntil != 0 || binding.RecheckPending {
+			t.Fatalf("request-size error cooled account %s: %+v", accountID, binding)
+		}
 	}
 }
 

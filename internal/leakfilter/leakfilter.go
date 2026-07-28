@@ -320,10 +320,21 @@ type CodexFailureFrame struct {
 	EventType        string
 	StatusCode       int
 	ContextError     ResponsesContextErrorKind
+	RequestError     ResponsesRequestErrorKind
 	BuiltinRetryable bool
 	Header           http.Header
 	Body             []byte
 }
+
+// ResponsesRequestErrorKind identifies request-scoped failures that must remain
+// visible to the Codex client but must not be treated as account-local context loss,
+// quota pressure, or an account health failure.
+type ResponsesRequestErrorKind string
+
+const (
+	ResponsesRequestErrorNone                  ResponsesRequestErrorKind = ""
+	ResponsesRequestErrorContextLengthExceeded ResponsesRequestErrorKind = "context_length_exceeded"
+)
 
 // ResponsesContextErrorKind identifies the precise upstream 400s that mean a
 // Responses request lost account-local context. This includes a transport rejecting
@@ -352,6 +363,8 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		Type       string                     `json:"type"`
 		Status     json.RawMessage            `json:"status"`
 		StatusCode json.RawMessage            `json:"status_code"`
+		Error      json.RawMessage            `json:"error"`
+		Response   json.RawMessage            `json:"response"`
 		Headers    map[string]json.RawMessage `json:"headers"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
@@ -371,12 +384,42 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 	if status == 0 {
 		status = jsonInt(envelope.Status)
 	}
-	contextError := DetectResponsesContextError(status, data)
+	if status < 100 || status > 599 {
+		status = 0
+	}
+	topLevelCode := structuredErrorCode(envelope.Error)
+	nestedCode := structuredResponseErrorCode(envelope.Response)
+	requestCode := topLevelCode
+	if kind == "response.failed" {
+		requestCode = nestedCode
+		if requestCode == "" {
+			requestCode = topLevelCode
+		}
+	} else if requestCode == "" {
+		requestCode = nestedCode
+	}
+	requestError := ResponsesRequestErrorNone
+	if requestCode == string(ResponsesRequestErrorContextLengthExceeded) {
+		requestError = ResponsesRequestErrorContextLengthExceeded
+		if status == 0 {
+			status = http.StatusBadRequest
+		}
+	}
+	contextError := ResponsesContextErrorNone
+	if requestError == ResponsesRequestErrorNone {
+		contextError = DetectResponsesContextError(status, data)
+	}
 	statusRetryable := status == http.StatusUnauthorized || status == http.StatusForbidden ||
 		status == http.StatusRequestTimeout || status == http.StatusTooManyRequests ||
 		status == http.StatusServiceUnavailable || status >= 500
 	signatureRetryable := containsAnyFold(lower, codexFailedLeakSignatures)
 	builtinRetryable := statusRetryable || signatureRetryable || contextError != ResponsesContextErrorNone
+	if requestError != ResponsesRequestErrorNone {
+		// Request size is deterministic for this payload. Rotating or cooling down an
+		// account cannot repair it, and would hide the native signal Codex uses to
+		// report/coordinate compaction.
+		builtinRetryable = false
+	}
 	if status == 0 && builtinRetryable {
 		if containsAnyFold(lower, []string{"server_is_overloaded", "slow_down", "at capacity", "try a different model"}) {
 			status = http.StatusServiceUnavailable
@@ -395,10 +438,41 @@ func ParseCodexFailureFrame(frame []byte) (CodexFailureFrame, bool) {
 		EventType:        kind,
 		StatusCode:       status,
 		ContextError:     contextError,
+		RequestError:     requestError,
 		BuiltinRetryable: builtinRetryable,
 		Header:           header,
 		Body:             append([]byte(nil), data...),
 	}, true
+}
+
+func structuredResponseErrorCode(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var response struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return ""
+	}
+	return structuredErrorCode(response.Error)
+}
+
+func structuredErrorCode(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var object struct {
+		Code json.RawMessage `json:"code"`
+	}
+	if err := json.Unmarshal(raw, &object); err != nil || len(object.Code) == 0 {
+		return ""
+	}
+	var code string
+	if err := json.Unmarshal(object.Code, &code); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(code)
 }
 
 // ParseRetryableCodexFailureFrame applies the built-in retry policy to a parsed

@@ -2456,7 +2456,27 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 	if err := s.backfillUsageCacheDiagnostics(ctx); err != nil {
 		return err
 	}
-	return s.backfillUserGroups(ctx)
+	if legacyUserGroupMigrationEnabled() {
+		return s.backfillUserGroups(ctx)
+	}
+	return nil
+}
+
+// legacyUserGroupMigrationEnabled controls the compatibility backfill that
+// copies account-pool groups into the user-facing routing layer. Keep the
+// historical behavior when the variable is absent, while allowing installers
+// to disable the backfill so deleted user groups stay deleted across restarts.
+func legacyUserGroupMigrationEnabled() bool {
+	raw, ok := os.LookupEnv("CODEX_POOL_MIGRATE_USER_GROUPS")
+	if !ok || strings.TrimSpace(raw) == "" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Store) migrateAccountRateLimits(ctx context.Context) error {

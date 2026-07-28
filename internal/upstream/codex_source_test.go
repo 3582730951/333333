@@ -124,6 +124,67 @@ func TestCodexSourceNormalizationMatchesLegacyBytes(t *testing.T) {
 	}
 }
 
+func TestCodexSourceHTTPStripsGenerateAfterClassifyingPrewarm(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		websocket bool
+		wantField bool
+	}{
+		{name: "HTTP bridge strips frame control", websocket: false, wantField: false},
+		{name: "WebSocket retains frame control", websocket: true, wantField: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"model":"gpt-5.6-sol","generate":false,"stream":true,"input":[{"type":"additional_tools","role":"developer","tools":[]},{"role":"user","content":"keep","exact":900719925474099312345}]}`)
+			source := bodysource.Bytes(raw)
+			meta, err := bodysource.ScanJSON(context.Background(), source, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := Request{
+				DownstreamPath:          "/v1/responses",
+				Body:                    source,
+				BodyMeta:                &meta,
+				Account:                 storage.Account{ID: "source-generate"},
+				Token:                   storage.AccountToken{AccessToken: "oauth-access", RefreshToken: "oauth-refresh"},
+				CodexResponsesWebSocket: tc.websocket,
+				CodexIdentity: &CodexIdentitySnapshot{
+					InstallationID: "installation-fixed", SessionID: "session-fixed", ThreadID: "thread-fixed", WindowGeneration: 0,
+				},
+			}
+			client := NewClient(config.Default())
+			normalized, err := normalizeCodexSource(client, &spec, whamBaseURL, false)
+			if err != nil || !normalized {
+				t.Fatalf("normalize=%v err=%v", normalized, err)
+			}
+			got, err := bodysource.ReadAll(spec.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]json.RawMessage
+			if err = json.Unmarshal(got, &payload); err != nil {
+				t.Fatal(err)
+			}
+			_, present := payload["generate"]
+			if present != tc.wantField {
+				t.Fatalf("generate present=%v want=%v body=%s", present, tc.wantField, got)
+			}
+			if !bytes.Contains(got, []byte(`900719925474099312345`)) {
+				t.Fatalf("large context integer changed: %s", got)
+			}
+			if spec.codexMetadata == nil {
+				t.Fatal("Codex metadata missing")
+			}
+			var turn map[string]interface{}
+			if err = json.Unmarshal([]byte(spec.codexMetadata.turnMetadata), &turn); err != nil {
+				t.Fatal(err)
+			}
+			if turn["request_kind"] != "prewarm" {
+				t.Fatalf("request_kind=%v metadata=%s", turn["request_kind"], spec.codexMetadata.turnMetadata)
+			}
+		})
+	}
+}
+
 func legacyCodexNormalizedBody(client *Client, spec Request, upstreamBaseURL string, compact bool) ([]byte, error) {
 	raw, err := bodysource.ReadAll(spec.Body)
 	if err != nil {
@@ -146,6 +207,9 @@ func legacyCodexNormalizedBody(client *Client, spec Request, upstreamBaseURL str
 		if !compact {
 			raw = applyCodexClientMetadataWithFields(raw, fields, metadata, spec.CodexResponsesWebSocket)
 		}
+	}
+	if !spec.CodexResponsesWebSocket {
+		raw = stripCodexResponsesHTTPGenerateWithFields(raw, fields)
 	}
 	return stripCodexTopLevelTransportCorrelatorsWithFields(raw, fields), nil
 }
