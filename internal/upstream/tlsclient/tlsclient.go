@@ -16,6 +16,8 @@ package tlsclient
 import (
 	"container/list"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	stdhttp "net/http"
 	"net/http/cookiejar"
@@ -259,6 +261,12 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("tls transport returned a nil response")
+	}
+	if resp.Body == nil {
+		return nil, fmt.Errorf("tls transport returned a nil response body (status %d)", resp.StatusCode)
 	}
 	f.storeCookies(r.CookieJarKey, r.URL, toStdHeader(resp.Header))
 	return &Response{

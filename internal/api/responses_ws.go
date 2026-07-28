@@ -25,6 +25,7 @@ import (
 
 type forceCodexResponsesWebSocketKey struct{}
 type codexResponsesWebSocketSessionKey struct{}
+type codexResponsesWebSocketHTTPSFallbackTurnKey struct{}
 
 const (
 	responsesWebSocketHeartbeatInterval = 30 * time.Second
@@ -216,6 +217,11 @@ func codexResponsesWebSocketSession(ctx context.Context) *upstream.CodexResponse
 	return session
 }
 
+func codexResponsesWebSocketUsesHTTPSFallback(ctx context.Context) bool {
+	fallback, _ := ctx.Value(codexResponsesWebSocketHTTPSFallbackTurnKey{}).(bool)
+	return forceCodexResponsesWebSocket(ctx) && fallback
+}
+
 func isResponsesWebSocketUpgrade(r *http.Request) bool {
 	return r.Method == http.MethodGet &&
 		strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
@@ -302,7 +308,13 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			turnBaseCtx = contextWithUsageEventID(turnBaseCtx, newRequestID())
 			turnBaseCtx = contextWithBodySource(turnBaseCtx, source)
 			turnBaseCtx = contextWithBodyMeta(turnBaseCtx, meta)
+			// Snapshot the transport at turn admission. If this turn itself discovers
+			// a broken upstream WebSocket, it must retain CPA/Goal persistence through
+			// its recovery. Only turns admitted after MarkHTTPSFallback use the
+			// stateless HTTP-rebuild path.
+			httpsFallbackAtStart := session.UseHTTPSFallback()
 			turnCtx := context.WithValue(turnBaseCtx, forceCodexResponsesWebSocketKey{}, true)
+			turnCtx = context.WithValue(turnCtx, codexResponsesWebSocketHTTPSFallbackTurnKey{}, httpsFallbackAtStart)
 			req := r.Clone(turnCtx)
 			req.Method = http.MethodPost
 			req.Body = body
@@ -327,12 +339,22 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 				defer supervisor.Recover("responses-websocket-heartbeat")
 				heartbeatErr = keepResponsesWebSocketAlive(turnBaseCtx, downstream, responsesWebSocketHeartbeatInterval)
 			}()
-			s.handleGatewayPost(writer, req)
-			writerErr := writer.Close()
+			turnPanicked := s.handleGatewayWebSocketTurn(writer, req)
+			var writerErr error
+			if turnPanicked {
+				writer.closeBuffers()
+				writer.closed = true
+				writerErr = writeWebSocketError(downstream, http.StatusInternalServerError, "internal server error")
+			} else {
+				writerErr = writer.Close()
+			}
 			cancelTurn()
 			heartbeatErr := <-heartbeatDone
 			_ = body.Close()
 			_ = source.Close()
+			if turnPanicked {
+				return
+			}
 			if heartbeatErr != nil {
 				return
 			}
@@ -345,6 +367,23 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
+}
+
+// handleGatewayWebSocketTurn keeps a panic in one post-upgrade turn from unwinding
+// through ServeHTTP as a misleading "GET /v1/responses" failure. Normal transport
+// faults are returned as protocol errors before reaching this boundary; this is the
+// final containment layer for an unforeseen handler bug and records the per-turn id.
+func (s *Server) handleGatewayWebSocketTurn(w *responsesWebSocketWriter, r *http.Request) (panicked bool) {
+	defer func() {
+		if value := recover(); value != nil {
+			panicked = true
+			requestID := requestIDFromContext(r.Context())
+			log.Printf("[PANIC] responses websocket turn request_id=%s panic=%v", requestID, value)
+			supervisor.LogPanic("responses-websocket-turn", fmt.Sprintf("request_id=%s panic=%v", requestID, value))
+		}
+	}()
+	s.handleGatewayPost(w, r)
+	return false
 }
 
 func responsesWebSocketRequestToSource(ctx context.Context, source bodysource.BodySource, meta bodysource.BodyMeta, hmacKey []byte) (string, bodysource.BodySource, bodysource.BodyMeta, error) {

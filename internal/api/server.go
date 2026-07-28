@@ -68,10 +68,14 @@ type Dependencies struct {
 }
 
 type Server struct {
-	cfg        config.Config
-	store      *storage.Store
-	scheduler  *scheduler.Scheduler
-	upstream   *upstream.Client
+	cfg       config.Config
+	store     *storage.Store
+	scheduler *scheduler.Scheduler
+	upstream  *upstream.Client
+	// upstreamDo is the single Codex/Responses call boundary. Production binds it
+	// to upstream.Client.Do during construction; focused fault-injection tests replace
+	// it to verify that a broken transport contract cannot panic an HTTP/WS request.
+	upstreamDo func(context.Context, upstream.Request) (*upstream.Response, error)
 	planner    *virtual.Planner
 	gopay      *gopay.Manager
 	paymentMgr *payment.Manager
@@ -231,6 +235,7 @@ func NewServer(dep Dependencies) *Server {
 	// identity fields to the upstream client at boot, so admin settings survive a
 	// restart (the request-time getters already overlay the rest live).
 	if s.upstream != nil {
+		s.upstreamDo = s.upstream.Do
 		s.upstream.UpdateConfig(s.effectiveUpstreamConfig(context.Background()))
 	}
 	if s.scheduler != nil {
@@ -766,12 +771,51 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// to see cannot arise. Chat completions carry their history in `messages` and never
 	// hold server-side state, so they are unaffected.
 	if !isChat && s.codexStatelessPassthrough(r.Context()) && serverSideStateWithMeta(path, r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)) {
-		raw = degradedResponsesReplay(raw)
-		if r.Header.Get("X-Codex-Turn-State") != "" {
+		if codexResponsesWebSocketUsesHTTPSFallback(r.Context()) {
+			// response.append carries only the current delta. After its persistent
+			// upstream WebSocket has failed, simply deleting previous_response_id
+			// would silently discard the earlier turns (and can orphan tool outputs).
+			// Rebuild the durable goal/journal into one self-contained HTTP request,
+			// then keep all later turns on the stateless HTTPS bridge.
+			contextError := leakfilter.ResponsesContextErrorPreviousResponseNotFound
+			retry, mode, recovered := s.recoverResponsesContext(r.Context(), raw, r.Header, contextError)
+			unpaired := false
+			if recovered && mode == "rebuilt" {
+				unpaired = responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone)
+			} else if recovered {
+				unpaired = responsesHasUnpairedToolOutput(raw, contextError)
+			}
+			if !recovered || unpaired {
+				code := "codex_context_epoch_retired"
+				if unpaired {
+					code = codexMappingErrorCode(errCodexToolContextUnrecoverable)
+				}
+				s.auditCodexMappingFailure(r.Context(), code)
+				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
+				return
+			}
+			raw = retry.Raw
 			r = r.Clone(r.Context())
-			r.Header.Del("X-Codex-Turn-State")
+			r.Header = retry.Header
+			w.Header().Set("X-MiCliProxy-Context-Status", mode)
+			w.Header().Set("X-MiCliProxy-Codex-Passthrough", "https-fallback-"+mode)
+			if mode == "rebuilt" {
+				atomic.AddUint64(&s.contextRebuilt, 1)
+			} else {
+				atomic.AddUint64(&s.contextDegraded, 1)
+			}
+			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+				Action: "codex_context_migrated", State: "recovered", Reason: "websocket_https_fallback",
+				Detail: "stateless_http_replay",
+			})
+		} else {
+			raw = degradedResponsesReplay(raw)
+			if r.Header.Get("X-Codex-Turn-State") != "" {
+				r = r.Clone(r.Context())
+				r.Header.Del("X-Codex-Turn-State")
+			}
+			w.Header().Set("X-MiCliProxy-Codex-Passthrough", "stateless")
 		}
-		w.Header().Set("X-MiCliProxy-Codex-Passthrough", "stateless")
 	}
 	// Native Codex context is owned by the upstream Responses session during normal
 	// operation. Resolve exact downstream aliases first; only a missing bound account
@@ -1516,6 +1560,26 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 	withCodexUsageContext()
 	var webSocketFallbackAuditOnce sync.Once
+	errWebSocketFallbackContextRecovery := errors.New("websocket continuation requires durable HTTPS recovery")
+	webSocketFallbackRequiresContextRecovery := func() bool {
+		if !strictNativeCPA || mapping == nil || !responsesRecoveryEligible(body, hdr) {
+			return false
+		}
+		mapping.mu.Lock()
+		defer mapping.mu.Unlock()
+		return mapping.binding != nil
+	}
+	webSocketFallbackContextResult := func() codexAttemptResult {
+		_ = s.settleBillingHold(r.Context(), holdID, "websocket_fallback_context_recovering")
+		return codexAttemptResult{
+			Outcome:              outcomeContextRecovery,
+			RecoveryContextError: leakfilter.ResponsesContextErrorPreviousResponseNotFound,
+			RecoveryReason:       "websocket_https_fallback",
+			RecoveryStatus:       http.StatusConflict,
+			RecoveryHeader:       http.Header{"Content-Type": []string{"application/json"}},
+			RecoveryBody:         []byte(`{"error":{"type":"codex_context_unavailable","message":"The upstream conversation transport changed."}}`),
+		}
+	}
 	fallbackToHTTPS := func(reason string) (*upstream.Response, storage.EgressProfile, error) {
 		codexUseWebSocket = false
 		if webSocketSession != nil {
@@ -1529,6 +1593,13 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 				Detail: "same_account_same_egress_https_sse_bridge",
 			})
 		})
+		// A response id created on the retired WebSocket is not a portable HTTP
+		// parameter. Rotate through the durable checkpoint before issuing any HTTPS
+		// request, rather than deliberately eliciting a 400 and reacting afterward.
+		if webSocketFallbackRequiresContextRecovery() {
+			s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "https_fallback_context_recovery", 0)
+			return nil, lease.Egress, errWebSocketFallbackContextRecovery
+		}
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "https_fallback_attempted", 0)
 		fallbackRequest := requestForToken(token)
 		fallbackRequest.CodexResponsesWebSocket = false
@@ -1547,6 +1618,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	if err != nil && attemptedWebSocket {
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "websocket_transport_error", 0)
 		resp, finalEgress, err = fallbackToHTTPS("transport_error")
+		if errors.Is(err, errWebSocketFallbackContextRecovery) {
+			return webSocketFallbackContextResult()
+		}
 	}
 	if err != nil {
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "transport_error", 0)
@@ -1565,6 +1639,9 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		originalEgress := finalEgress
 		_ = resp.Body.Close()
 		fallbackResponse, fallbackEgress, fallbackErr := fallbackToHTTPS("handshake_http_status")
+		if errors.Is(fallbackErr, errWebSocketFallbackContextRecovery) {
+			return webSocketFallbackContextResult()
+		}
 		if fallbackErr != nil {
 			log.Printf("codex websocket HTTPS fallback %s: %v", lease.Account.ID, fallbackErr)
 			resp = &upstream.Response{
@@ -2070,6 +2147,9 @@ codexSuccess:
 					s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "websocket_stream_probe_error", 0)
 					_ = resp.Body.Close()
 					fallbackResponse, fallbackEgress, fallbackErr := fallbackToHTTPS("stream_probe_error")
+					if errors.Is(fallbackErr, errWebSocketFallbackContextRecovery) {
+						return webSocketFallbackContextResult()
+					}
 					if fallbackErr == nil {
 						resp, finalEgress = fallbackResponse, fallbackEgress
 						if resp.StatusCode < http.StatusBadRequest {
@@ -2555,7 +2635,7 @@ codexSuccess:
 						for authAttempt := 0; authAttempt < 2; authAttempt++ {
 							continuationReq := requestForTokenWithIdentity(continuationToken, continuationBody, hdr.Clone(), codexIdentity)
 							continuationReq.Egress = finalEgress
-							continuationResp, continuationErr := s.upstream.Do(cctx, continuationReq)
+							continuationResp, continuationErr := s.doCodexUpstream(cctx, continuationReq)
 							if continuationErr != nil {
 								return nil, continuationErr
 							}
@@ -2816,7 +2896,11 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 // this state is used exclusively to migrate a tree whose bound account or upstream
 // previous_response_id became unavailable.
 func (s *Server) persistCodexGoalContinuity(ctx context.Context, r *http.Request, requestBody, responseBody []byte) {
-	if !s.codexSessionMappingEnabled(ctx) || !s.goalContinuityEnabled(ctx) {
+	// A downstream WebSocket that has switched permanently to HTTPS rebuilds each
+	// response.append as a self-contained turn and intentionally disables native
+	// session mapping. It still needs the encrypted Goal chain advanced so the next
+	// append can resolve the just-completed HTTP response id without losing history.
+	if (!s.codexSessionMappingEnabled(ctx) && !codexResponsesWebSocketUsesHTTPSFallback(ctx)) || !s.goalContinuityEnabled(ctx) {
 		return
 	}
 	if _, err := s.persistGoalContinuity(ctx, r, "codex", requestBody, responseBody); err != nil {
@@ -2847,8 +2931,30 @@ func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routin
 	upsert(routing.ResponseAffinityKey(responseID))
 }
 
+var errInvalidUpstreamResponse = errors.New("upstream transport returned an invalid response")
+
+func (s *Server) doCodexUpstream(ctx context.Context, req upstream.Request) (*upstream.Response, error) {
+	if s == nil || s.upstreamDo == nil {
+		return nil, fmt.Errorf("%w: client is unavailable", errInvalidUpstreamResponse)
+	}
+	resp, err := s.upstreamDo(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("%w: nil response", errInvalidUpstreamResponse)
+	}
+	if resp.Body == nil {
+		return nil, fmt.Errorf("%w: nil body (status %d)", errInvalidUpstreamResponse, resp.StatusCode)
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	return resp, nil
+}
+
 func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease scheduler.Lease, strict bool) (*upstream.Response, storage.EgressProfile, error) {
-	resp, err := s.upstream.Do(ctx, req)
+	resp, err := s.doCodexUpstream(ctx, req)
 	if err != nil {
 		if !strict {
 			return s.doCodexStandbyEgressRetries(ctx, req, lease, nil, nil, err)
@@ -2925,7 +3031,7 @@ func (s *Server) doCodexStandbyEgressRetries(ctx context.Context, req upstream.R
 		retryReq := req
 		retryReq.Egress = standby
 		retryReq.CookieJarKey = req.Account.ID + ":" + standby.ID
-		retryResp, err := s.upstream.Do(ctx, retryReq)
+		retryResp, err := s.doCodexUpstream(ctx, retryReq)
 		if err != nil {
 			lastErr = err
 			continue

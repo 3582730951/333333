@@ -30,6 +30,8 @@ import (
 
 const drainAndCloseBodyLimit = 8 << 20
 
+var errInvalidResponseContract = errors.New("upstream transport returned an invalid response")
+
 // Kept as a variable for deterministic focused transport tests. Production uses
 // the required ten-second maximum recovery window.
 var sidecarPreHeaderRecoveryWindow = 10 * time.Second
@@ -430,17 +432,30 @@ type idleCancelBody struct {
 }
 
 func (b *idleCancelBody) Read(p []byte) (int, error) {
+	if b == nil || b.guard == nil {
+		return 0, fmt.Errorf("%w: response body guard is nil", errInvalidResponseContract)
+	}
 	if b.guard.timer != nil {
 		b.guard.timer.Reset(b.guard.idle)
+	}
+	if b.ReadCloser == nil {
+		b.guard.Fail()
+		return 0, fmt.Errorf("%w: response body is nil", errInvalidResponseContract)
 	}
 	return b.ReadCloser.Read(p)
 }
 
 func (b *idleCancelBody) Close() error {
+	if b == nil || b.guard == nil {
+		return fmt.Errorf("%w: response body guard is nil", errInvalidResponseContract)
+	}
 	if b.guard.timer != nil {
 		b.guard.timer.Stop()
 	}
-	err := b.ReadCloser.Close()
+	var err error
+	if b.ReadCloser != nil {
+		err = b.ReadCloser.Close()
+	}
 	b.guard.cancel()
 	return err
 }
@@ -469,7 +484,10 @@ func (c *Client) SidecarAdaptiveStatuses() []SidecarAdaptiveStatus {
 	return c.sidecars.statuses()
 }
 
-func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
+func (c *Client) Do(ctx context.Context, req Request) (resp *Response, err error) {
+	defer func() {
+		resp, err = enforceResponseContract(resp, err)
+	}()
 	if req.Provider == "claude" {
 		if !req.PassThrough {
 			if err := req.loadBody(); err != nil {
@@ -566,6 +584,22 @@ codexNormalized:
 	default:
 		return c.doHTTP(ctx, req)
 	}
+}
+
+func enforceResponseContract(resp *Response, err error) (*Response, error) {
+	if err != nil {
+		return resp, err
+	}
+	if resp == nil {
+		return nil, fmt.Errorf("%w: nil response", errInvalidResponseContract)
+	}
+	if resp.Body == nil {
+		return nil, fmt.Errorf("%w: nil response body (status %d)", errInvalidResponseContract, resp.StatusCode)
+	}
+	if resp.Header == nil {
+		resp.Header = make(http.Header)
+	}
+	return resp, nil
 }
 
 func (c *Client) doHTTP(ctx context.Context, spec Request) (*Response, error) {

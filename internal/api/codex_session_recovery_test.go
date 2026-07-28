@@ -166,6 +166,77 @@ func TestCodexSessionMappingRepairsUltraPreviousResponseNotFoundInPlace(t *testi
 	}
 }
 
+func TestCodexSessionMappingRepairsUnsupportedPreviousResponseIDInPlace(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		call := len(bodies)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch call {
+		case 1:
+			w.Header().Set("X-Codex-Turn-State", "unsupported-root-state")
+			_, _ = io.WriteString(w, `{"id":"resp-unsupported-root","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"durable root context"}]}]}`)
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"{\"detail\":\"Unsupported parameter: previous_response_id\"}","type":"upstream_error"},"status":400,"type":"error"}`)
+		case 3:
+			if strings.Contains(string(raw), "previous_response_id") || r.Header.Get("X-Codex-Turn-State") != "" ||
+				!strings.Contains(string(raw), "start durable unsupported task") ||
+				!strings.Contains(string(raw), "continue after transport fallback") {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"invalid unsupported-parameter rebuild"}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"id":"resp-unsupported-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}`)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "unsupported-origin", "upstream-unsupported-origin", "access-unsupported-origin")
+
+	post := func(body, state string) (int, http.Header, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Thread-Id", "unsupported-root")
+		req.Header.Set("Session-Id", "unsupported-root")
+		if state != "" {
+			req.Header.Set("X-Codex-Turn-State", state)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		payload, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Clone(), string(payload)
+	}
+
+	if status, _, body := post(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"start durable unsupported task"}]}`, ""); status != http.StatusOK || !strings.Contains(body, "resp-unsupported-root") {
+		t.Fatalf("root status=%d body=%s", status, body)
+	}
+	status, headers, body := post(`{"model":"gpt-5.6-sol","previous_response_id":"resp-unsupported-root","input":[{"role":"user","content":"continue after transport fallback"}]}`, "unsupported-root-state")
+	if status != http.StatusOK || !strings.Contains(body, "resp-unsupported-recovered") ||
+		headers.Get("X-MiCliProxy-Context-Status") != "rebuilt" ||
+		strings.Contains(body, "Unsupported parameter") {
+		t.Fatalf("unsupported-parameter recovery status=%d context=%q body=%s", status, headers.Get("X-MiCliProxy-Context-Status"), body)
+	}
+	mu.Lock()
+	got := append([]string(nil), bodies...)
+	mu.Unlock()
+	if len(got) != 3 || strings.Contains(got[2], "previous_response_id") {
+		t.Fatalf("expected one fresh-root repair, calls=%d payloads=%v", len(got), got)
+	}
+}
+
 func TestCodexSessionMappingRepairsStreamedPreviousResponseNotFound(t *testing.T) {
 	var mu sync.Mutex
 	var bodies []string

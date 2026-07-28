@@ -427,6 +427,38 @@ func TestResponsesContextErrorRecognizesPreviousResponseNotFound(t *testing.T) {
 	}
 }
 
+func TestResponsesContextErrorRecognizesUnsupportedPreviousResponseID(t *testing.T) {
+	inner := `{"detail":"Unsupported parameter:\nprevious_response_id"}`
+	wrapped, _ := json.Marshal(map[string]interface{}{
+		"error":  map[string]interface{}{"type": "upstream_error", "message": inner},
+		"status": 400,
+		"type":   "error",
+	})
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "direct_detail", body: []byte(inner)},
+		{name: "message_wrapped_detail", body: wrapped},
+		{name: "quoted_parameter", body: []byte(`{"error":{"message":"Unsupported parameter: 'previous_response_id'."}}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := DetectResponsesContextError(http.StatusBadRequest, tc.body); got != ResponsesContextErrorPreviousResponseNotFound {
+				t.Fatalf("kind = %q, body=%s", got, tc.body)
+			}
+		})
+	}
+	for _, body := range [][]byte{
+		[]byte(`{"detail":"Unsupported parameter: max_output_tokens"}`),
+		[]byte(`{"detail":"Unsupported parameter: previous_response_id_extra"}`),
+		[]byte(`{"detail":"Unsupported parameter: previous_response_id for this model"}`),
+	} {
+		if got := DetectResponsesContextError(http.StatusBadRequest, body); got != ResponsesContextErrorNone {
+			t.Fatalf("unrelated unsupported parameter matched as %q: %s", got, body)
+		}
+	}
+}
+
 func TestResponsesContextErrorRejectsInvalidPreviousResponseErrors(t *testing.T) {
 	for _, body := range [][]byte{
 		[]byte(`{"error":{"type":"invalid_request_error","message":"previous_response_not_found"}}`),

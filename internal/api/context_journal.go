@@ -413,8 +413,9 @@ func toolOutputText(v interface{}) string {
 }
 
 // responsesContextError recognizes the precise upstream 400s that mean account-local
-// Responses context is unavailable: either previous_response_id itself is gone, or a
-// tool output references a call that disappeared with that context.
+// Responses context is unavailable: previous_response_id is gone or rejected after a
+// transport fallback, or a tool output references a call that disappeared with that
+// context.
 func responsesContextError(status int, body []byte) leakfilter.ResponsesContextErrorKind {
 	return leakfilter.DetectResponsesContextError(status, body)
 }

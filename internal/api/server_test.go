@@ -24,6 +24,7 @@ import (
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
 	"codex-account-pool/internal/virtual"
 	"github.com/gorilla/websocket"
@@ -1692,6 +1693,148 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 	}
 }
 
+func TestResponsesEndpointGETUpgradeMatrix(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("method-matrix request reached upstream")
+	})
+	for _, tc := range []struct {
+		name       string
+		connection string
+		upgrade    string
+	}{
+		{name: "plain_get"},
+		{name: "connection_only", connection: "Upgrade"},
+		{name: "upgrade_only", upgrade: "websocket"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, h.pool.URL+"/v1/responses", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.connection != "" {
+				req.Header.Set("Connection", tc.connection)
+			}
+			if tc.upgrade != "" {
+				req.Header.Set("Upgrade", tc.upgrade)
+			}
+			resp, err := h.pool.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusMethodNotAllowed {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+			}
+		})
+	}
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			response.Body.Close()
+		}
+		t.Fatal(err)
+	}
+	if err = conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "empty_frame", payload: ""},
+		{name: "processed_before_session", payload: `{"type":"response.processed","response_id":"resp_none"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				if response != nil && response.Body != nil {
+					response.Body.Close()
+				}
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err = conn.WriteMessage(websocket.TextMessage, []byte(tc.payload)); err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read protocol error: %v", err)
+			}
+			if !bytes.Contains(raw, []byte(`"type":"error"`)) {
+				t.Fatalf("protocol error frame=%s", raw)
+			}
+		})
+	}
+}
+
+func TestDownstreamResponsesWebSocketRejectsInvalidUpstreamResponseContract(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("fault-injected request reached network upstream")
+	})
+	h.importAccount(t, "invalid-upstream-contract", "acct-invalid-upstream-contract", "access-invalid-upstream-contract")
+
+	panicCounts := func() map[string]int64 {
+		counts := map[string]int64{}
+		for _, state := range supervisor.ModuleStates() {
+			counts[state.Name] = state.PanicCount
+		}
+		return counts
+	}
+	for _, tc := range []struct {
+		name string
+		do   func(context.Context, upstream.Request) (*upstream.Response, error)
+	}{
+		{
+			name: "nil_response",
+			do: func(context.Context, upstream.Request) (*upstream.Response, error) {
+				return nil, nil
+			},
+		},
+		{
+			name: "nil_body",
+			do: func(context.Context, upstream.Request) (*upstream.Response, error) {
+				return &upstream.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}}, nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h.app.upstreamDo = tc.do
+			before := panicCounts()
+			wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+			conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				if response != nil && response.Body != nil {
+					response.Body.Close()
+				}
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"contract fault","stream":true}`)); err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("invalid response contract closed websocket instead of returning an error: %v", err)
+			}
+			if !bytes.Contains(raw, []byte(`"type":"error"`)) {
+				t.Fatalf("invalid response contract frame=%s", raw)
+			}
+			after := panicCounts()
+			for _, module := range []string{"http-request", "responses-websocket-turn"} {
+				if after[module] != before[module] {
+					t.Fatalf("%s panic count changed from %d to %d", module, before[module], after[module])
+				}
+			}
+		})
+	}
+}
+
 func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T) {
 	var webSocketAttempts atomic.Int32
 	var httpAttempts atomic.Int32
@@ -1705,26 +1848,67 @@ func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T
 				t.Errorf("upstream upgrade: %v", err)
 				return
 			}
-			_, _, _ = conn.ReadMessage()
-			_ = conn.Close() // protocol ends before any response event
+			defer conn.Close()
+			_, root, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("read upstream root: %v", err)
+				return
+			}
+			if bytes.Contains(root, []byte(`"previous_response_id"`)) {
+				t.Errorf("fresh upstream root carried previous_response_id: %s", root)
+				return
+			}
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_ws_1","object":"response","model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`))
+			for {
+				_, continuation, readErr := conn.ReadMessage()
+				if readErr != nil {
+					t.Errorf("read upstream continuation: %v", readErr)
+					return
+				}
+				if bytes.Contains(continuation, []byte(`"type":"response.processed"`)) {
+					continue
+				}
+				if !bytes.Contains(continuation, []byte(`"previous_response_id":"resp_ws_1"`)) {
+					t.Errorf("stateful continuation lost WebSocket response id: %s", continuation)
+				}
+				// Reproduce the diagnostic chain: the persistent upstream socket dies
+				// after accepting a stateful append but before its first response event.
+				return
+			}
 		case http.MethodPost:
 			attempt := httpAttempts.Add(1)
 			body, _ := io.ReadAll(r.Body)
-			if attempt == 1 && (!bytes.Contains(body, []byte(`"name":"tool_search"`)) || !bytes.Contains(body, []byte("SKILL.md"))) {
+			if bytes.Contains(body, []byte(`"previous_response_id"`)) || r.Header.Get("X-Codex-Turn-State") != "" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"{\"detail\":\"Unsupported parameter: previous_response_id\"}","type":"upstream_error"},"status":400,"type":"error"}`)
+				return
+			}
+			if !bytes.Contains(body, []byte(`"name":"tool_search"`)) || !bytes.Contains(body, []byte("SKILL.md")) {
 				t.Errorf("HTTPS bridge lost Codex skills/tool payload: %s", body)
 			}
+			servedTurn := attempt + 1
+			for turn := int32(1); turn <= servedTurn; turn++ {
+				if !bytes.Contains(body, []byte(fmt.Sprintf("turn %d", turn))) {
+					t.Errorf("HTTPS turn %d was not rebuilt with turn %d: %s", servedTurn, turn, body)
+				}
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_https_%d\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n", attempt)
+			_, _ = fmt.Fprintf(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_https_%d\",\"object\":\"response\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\ndata: [DONE]\n\n", servedTurn)
 		default:
 			t.Fatalf("unexpected upstream method %s", r.Method)
 		}
 	})
+	enableCodexSessionMappingForTest(h)
 	h.importAccount(t, "downstream-ws-https-bridge", "upstream-ws-https-bridge", "access-ws-https-bridge")
 
 	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
 	dialer := *websocket.DefaultDialer
 	dialer.EnableCompression = true
-	conn, handshake, err := dialer.Dial(wsURL, nil)
+	downstreamHeader := http.Header{}
+	downstreamHeader.Set("Thread-Id", "client-ws-https-fallback")
+	downstreamHeader.Set("Session-Id", "client-ws-https-fallback")
+	conn, handshake, err := dialer.Dial(wsURL, downstreamHeader)
 	if err != nil {
 		if handshake != nil && handshake.Body != nil {
 			body, _ := io.ReadAll(handshake.Body)
@@ -1754,25 +1938,34 @@ func TestDownstreamResponsesWebSocketBridgesPersistentHTTPSFallback(t *testing.T
 				}
 				return
 			}
+			if bytes.Contains(raw, []byte(`"type":"response.failed"`)) || bytes.Contains(raw, []byte(`"type":"error"`)) {
+				t.Fatalf("terminal error while waiting for %s: %s", wantID, raw)
+			}
 		}
 	}
-	for turn := 1; turn <= 2; turn++ {
-		if turn == 2 {
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.processed","response_id":"resp_https_1"}`)); err != nil {
+	responseIDs := []string{"resp_ws_1", "resp_https_2", "resp_https_3", "resp_https_4"}
+	for turn := 1; turn <= 4; turn++ {
+		if turn > 1 {
+			processed := fmt.Sprintf(`{"type":"response.processed","response_id":%q}`, responseIDs[turn-2])
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(processed)); err != nil {
 				t.Fatal(err)
 			}
 		}
-		request := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.5","input":[{"role":"developer","content":"Use the repository SKILL.md instructions."},{"role":"user","content":"turn %d"}],"tools":[{"type":"function","name":"tool_search","description":"Find an installed skill","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"stream":true}`, turn)
+		requestType := "response.create"
+		if turn > 1 {
+			requestType = "response.append"
+		}
+		request := fmt.Sprintf(`{"type":%q,"model":"gpt-5.5","input":[{"role":"developer","content":"Use the repository SKILL.md instructions."},{"role":"user","content":"turn %d"}],"tools":[{"type":"function","name":"tool_search","description":"Find an installed skill","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}],"stream":true}`, requestType, turn)
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 			t.Fatal(err)
 		}
-		readCompleted(fmt.Sprintf("resp_https_%d", turn))
+		readCompleted(responseIDs[turn-1])
 	}
 	if got := webSocketAttempts.Load(); got != 1 {
 		t.Fatalf("known-broken upstream WebSocket was retried %d times", got)
 	}
-	if got := httpAttempts.Load(); got != 2 {
-		t.Fatalf("HTTPS bridge attempts=%d, want one per downstream turn", got)
+	if got := httpAttempts.Load(); got != 3 {
+		t.Fatalf("HTTPS bridge attempts=%d, want one rebuilt request for turns 2 through 4", got)
 	}
 }
 

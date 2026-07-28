@@ -326,8 +326,11 @@ type CodexFailureFrame struct {
 }
 
 // ResponsesContextErrorKind identifies the precise upstream 400s that mean a
-// Responses request lost account-local context. These errors are recoverable by
-// rebuilding or degrading the request and must not affect account health.
+// Responses request lost account-local context. This includes a transport rejecting
+// previous_response_id after a WebSocket-to-HTTPS fallback: the pointer is no longer
+// usable on that transport even though the response itself may still exist on the
+// retired connection. These errors are recoverable by rebuilding or degrading the
+// request and must not affect account health.
 type ResponsesContextErrorKind string
 
 const (
@@ -455,6 +458,12 @@ func responsesContextErrorInStructuredError(raw []byte, depth int, remaining *in
 
 	messages := structuredErrorMessages(root)
 	for _, message := range messages {
+		if isUnsupportedPreviousResponseIDMessage(message) {
+			// Treat the exact schema rejection as unavailable continuation state.
+			// The durable recovery path will remove the connection-scoped pointer
+			// before retrying; unrelated unsupported parameters remain ordinary 400s.
+			return ResponsesContextErrorPreviousResponseNotFound
+		}
 		if isMissingPairedToolOutputMessage(message) {
 			return ResponsesContextErrorOrphanedToolOutput
 		}
@@ -515,15 +524,31 @@ func structuredErrorMessages(root map[string]interface{}) []string {
 		}
 	}
 	appendMessage(root["message"])
+	appendMessage(root["detail"])
 	if detail, ok := root["error"].(map[string]interface{}); ok {
 		appendMessage(detail["message"])
+		appendMessage(detail["detail"])
 	}
 	if response, ok := root["response"].(map[string]interface{}); ok {
 		if detail, ok := response["error"].(map[string]interface{}); ok {
 			appendMessage(detail["message"])
+			appendMessage(detail["detail"])
 		}
 	}
 	return messages
+}
+
+func isUnsupportedPreviousResponseIDMessage(message string) bool {
+	// Fields collapses the newline emitted by one observed backend wrapper:
+	// "Unsupported parameter:\nprevious_response_id".
+	normalized := strings.ToLower(strings.Join(strings.Fields(message), " "))
+	const prefix = "unsupported parameter:"
+	if !strings.HasPrefix(normalized, prefix) {
+		return false
+	}
+	parameter := strings.TrimSpace(strings.TrimPrefix(normalized, prefix))
+	parameter = strings.Trim(parameter, " \t\r\n\"'`.")
+	return parameter == "previous_response_id"
 }
 
 func isMissingPairedToolOutputMessage(message string) bool {
