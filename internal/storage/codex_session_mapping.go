@@ -174,6 +174,18 @@ type CodexUpstreamAttempt struct {
 	ExpiresAt  int64
 }
 
+// CodexEgressRecentOutcome is a bounded-window, exit-attributable quality
+// aggregate used by fresh Codex routing. Attempts are classified outcomes (a
+// completed model terminal or an explicit network/edge failure), not raw starts.
+// Account quota/auth/context responses and downstream cancellation therefore do
+// not silently become egress failures. Successes are completed model terminals on
+// the real exit that produced the terminal.
+type CodexEgressRecentOutcome struct {
+	EgressID  string
+	Attempts  int64
+	Successes int64
+}
+
 type codexSessionIdentityPayload struct {
 	InstallationID     string `json:"installation_id,omitempty"`
 	DeviceOSHint       string `json:"device_os_hint,omitempty"`
@@ -964,6 +976,34 @@ func (s *Store) InsertCodexUpstreamAttempt(ctx context.Context, attempt CodexUps
 	_, err := s.db.ExecContext(ctx, `INSERT INTO codex_upstream_attempt(tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at)
 VALUES(?,?,?,?,?,?,?,?)`, attempt.TreeID, attempt.AccountID, attempt.EgressID, attempt.Epoch, attempt.State, attempt.StatusCode, attempt.CreatedAt, attempt.ExpiresAt)
 	return err
+}
+
+// ListRecentCodexEgressOutcomes aggregates raw recent observations. Daily rows
+// are intentionally excluded: routing needs a short moving window, while daily
+// aggregation exists for diagnostics and long-term retention.
+func (s *Store) ListRecentCodexEgressOutcomes(ctx context.Context, since int64) (map[string]CodexEgressRecentOutcome, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT egress_id,
+COUNT(*),
+SUM(CASE WHEN state='terminal_success' THEN 1 ELSE 0 END)
+FROM codex_upstream_attempt
+WHERE created_at>=? AND expires_at>? AND state IN ('egress_failure','terminal_success')
+GROUP BY egress_id`, since, Now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]CodexEgressRecentOutcome)
+	for rows.Next() {
+		var item CodexEgressRecentOutcome
+		if err := rows.Scan(&item.EgressID, &item.Attempts, &item.Successes); err != nil {
+			return nil, err
+		}
+		item.EgressID = strings.TrimSpace(item.EgressID)
+		if item.EgressID != "" {
+			out[item.EgressID] = item
+		}
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ListCodexUpstreamAttemptDiagnostics(ctx context.Context) ([]CodexUpstreamAttemptDiagnostic, error) {

@@ -37,6 +37,57 @@ func seedDownstreamKey(t *testing.T, h *testHarness, plain, hint string) {
 	}
 }
 
+func TestChatCompletionsExplicitAntigravityRejectedAtDispatch(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"wrong_codex_dispatch","status":"completed","output_text":"wrong route"}`)
+	})
+	accountID := h.importAccount(t, "chat-antigravity-dispatch", "upstream-chat-antigravity", "access-chat-antigravity")
+	setTestCapability(t, h, accountID, "gemini-3.2-pro", 128000)
+	const key = "cap_antigravity_chat_dispatch"
+	seedDownstreamKey(t, h, key, "antigravity")
+
+	tests := []struct {
+		name   string
+		header map[string]string
+	}{
+		{name: "explicit header", header: map[string]string{"X-Pool-Provider": "antigravity"}},
+		{name: "downstream key policy", header: map[string]string{"Authorization": "Bearer " + key}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gemini-3.2-pro","messages":[{"role":"user","content":"hello"}]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			for key, value := range tc.header {
+				req.Header.Set(key, value)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			errObj := decodeErrorBody(t, resp.Body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status=%d error=%#v", resp.StatusCode, errObj)
+			}
+			if errObj["type"] != "capability_unavailable" || errObj["current_route"] != "antigravity" || errObj["required_tier"] != "native_antigravity_messages" {
+				t.Fatalf("protocol capability error=%#v", errObj)
+			}
+			if message, _ := errObj["message"].(string); !strings.Contains(message, "Chat Completions") {
+				t.Fatalf("unclear protocol message=%#v", errObj)
+			}
+			if hint, _ := errObj["fix_hint"].(string); !strings.Contains(hint, "/v1/messages") {
+				t.Fatalf("missing native Messages fix hint=%#v", errObj)
+			}
+		})
+	}
+	if requests := h.requests(); len(requests) != 0 {
+		t.Fatalf("explicit antigravity Chat request reached Codex upstream: %+v", requests)
+	}
+}
+
 func TestCustomResponsesHostedToolIsOmittedWithDiagnostic(t *testing.T) {
 	h := newHarness(t, deepseekMock(t))
 	accountID := setupDeepSeek(t, h, []string{"deepseek-chat"}, false)

@@ -777,9 +777,12 @@ WHERE id=? AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session
 }
 
 type goalReplaySegment struct {
-	HistoryKey string      `json:"history_key"`
-	Input      interface{} `json:"input"`
-	Output     interface{} `json:"output"`
+	HistoryKey               string        `json:"history_key"`
+	Input                    interface{}   `json:"input"`
+	Output                   interface{}   `json:"output"`
+	ReplacementHistory       []interface{} `json:"replacement_history,omitempty"`
+	ReplaceInput             bool          `json:"replace_input,omitempty"`
+	CodexCompactionEvaluated bool          `json:"codex_compaction_evaluated,omitempty"`
 }
 
 func appendGoalItems(dst []interface{}, raw interface{}) []interface{} {
@@ -853,7 +856,7 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 		return nil, session, err
 	}
 	var root map[string]interface{}
-	if err := json.Unmarshal([]byte(checkpoint.Payload), &root); err != nil {
+	if err := decodeGoalReplayJSON(checkpoint.Payload, &root); err != nil {
 		return nil, session, fmt.Errorf("invalid goal checkpoint: %w", err)
 	}
 	historyKey := goalHistoryKey(session.Protocol)
@@ -865,18 +868,13 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 	}
 	for _, segment := range compacted {
 		var turn goalReplaySegment
-		if err := json.Unmarshal([]byte(segment.Payload), &turn); err != nil {
+		if err := decodeGoalReplayJSON(segment.Payload, &turn); err != nil {
 			return nil, session, fmt.Errorf("invalid compacted goal segment: %w", err)
 		}
 		if turn.HistoryKey != "" && turn.HistoryKey != historyKey {
 			return nil, session, fmt.Errorf("goal segment protocol history mismatch: %s", turn.HistoryKey)
 		}
-		items = appendGoalItems(items, turn.Input)
-		if historyKey == "messages" {
-			items = append(items, claudeAssistantMessages(turn.Output)...)
-		} else {
-			items = appendGoalItems(items, turn.Output)
-		}
+		items = appendGoalReplayTurn(items, turn, historyKey)
 	}
 	segments, err := s.listGoalSegmentsAfter(ctx, session.ID, checkpoint.ThroughSegmentSequence)
 	if err != nil {
@@ -884,18 +882,13 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 	}
 	for _, segment := range segments {
 		var turn goalReplaySegment
-		if err := json.Unmarshal([]byte(segment.Payload), &turn); err != nil {
+		if err := decodeGoalReplayJSON(segment.Payload, &turn); err != nil {
 			return nil, session, fmt.Errorf("invalid goal segment: %w", err)
 		}
 		if turn.HistoryKey != "" && turn.HistoryKey != historyKey {
 			return nil, session, fmt.Errorf("goal segment protocol history mismatch: %s", turn.HistoryKey)
 		}
-		items = appendGoalItems(items, turn.Input)
-		if historyKey == "messages" {
-			items = append(items, claudeAssistantMessages(turn.Output)...)
-		} else {
-			items = appendGoalItems(items, turn.Output)
-		}
+		items = appendGoalReplayTurn(items, turn, historyKey)
 	}
 	root[historyKey] = items
 	if historyKey == "messages" {
@@ -907,6 +900,12 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 	delete(root, "turn_state")
 	body, err := json.Marshal(root)
 	return body, session, err
+}
+
+func decodeGoalReplayJSON(raw string, dst interface{}) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	return decoder.Decode(dst)
 }
 
 func (s *Store) GetGoalSession(ctx context.Context, id string) (GoalSession, error) {

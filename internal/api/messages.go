@@ -192,11 +192,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// provider validation. This lets the same Anthropic Messages endpoint serve Claude
 	// Code through either a custom Chat provider or the pool's native Codex/Responses
 	// accounts instead of restricting every request to Claude/Kiro up front.
+	providerHint := effectiveGatewayProviderHint(r, pol)
 	var selectedCustom storage.CustomProvider
 	var selectedCustomOK bool
-	if strings.HasPrefix(pol.ProviderHint, "custom:") {
-		selectedCustom, selectedCustomOK = s.customProviderByID(r.Context(), strings.TrimPrefix(pol.ProviderHint, "custom:"))
-	} else {
+	if strings.HasPrefix(providerHint, "custom:") {
+		selectedCustom, selectedCustomOK = s.customProviderByID(r.Context(), strings.TrimPrefix(providerHint, "custom:"))
+	} else if providerHint == "auto" {
 		selectedCustom, selectedCustomOK = s.customProviderForModel(r.Context(), model)
 	}
 	if selectedCustomOK {
@@ -219,7 +220,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		s.handleMessagesViaCustom(w, r, raw, model, pol.Group, prov)
 		return
 	}
-	if pol.ProviderHint == "codex" || isCodexMessagesModel(model) {
+	if providerHint == "codex" || (providerHint == "auto" && isCodexMessagesModel(model)) {
 		s.handleMessagesViaCodex(w, r, raw, model)
 		return
 	}
@@ -237,14 +238,18 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		model = requestedModel.BaseModel
 	}
 	r = r.WithContext(withRequestedClaudeModel(r.Context(), requestedModel))
-	allowedProviders, routeMode, err := s.resolveClaudeProviders(r.Context(), r, pol)
+	allowedProviders, routeMode, err := s.resolveClaudeMessageProviders(r.Context(), r, pol)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	affinity := namespaceClaudeAffinity(s.claudeSelectionAffinity(r.Context(), r, raw, raw, pol.Group, pol.KeyHash, requestedModel.RequestedModel), routeMode, requestedModel.ContextMode)
 	existingAffinity, affinityBindingErr := s.store.GetAffinityBinding(r.Context(), affinity.Hash)
-	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != ""
+	// Provider stickiness is valid only for the model that established it. An
+	// explicit provider hint fixes the provider, not the old model: when Claude Code
+	// changes /model on the same session, the scheduler must re-check the new exact
+	// capability and may bind another account of that provider.
+	affinityEstablished := affinity.Hash != "" && affinityBindingErr == nil && existingAffinity.Provider != "" && existingAffinity.Model != "" && existingAffinity.EgressID != "" && claudeRouteModelsEquivalent(existingAffinity.Model, model)
 	// Once an auto-routed Claude session is bound to Kiro, preserve Kiro's
 	// immutable-session guarantee. A later request must fail visibly if that exact
 	// account is unavailable instead of switching identities behind Claude Code.

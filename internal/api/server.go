@@ -492,38 +492,32 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	group := s.cfg.DefaultGroup
+	userGroupID := ""
 	if plain := downstreamBearer(r); plain != "" {
-		if key, found, _ := s.store.LookupAPIKey(r.Context(), hashAPIKey(plain)); found && strings.TrimSpace(key.GroupName) != "" {
-			group = strings.TrimSpace(key.GroupName)
+		if key, found, _ := s.store.LookupAPIKey(r.Context(), hashAPIKey(plain)); found {
+			if strings.TrimSpace(key.GroupName) != "" {
+				group = strings.TrimSpace(key.GroupName)
+			}
+			userGroupID = strings.TrimSpace(key.UserGroupID)
 		}
 	}
-	caps, err := s.store.ListRoutableCapabilities(r.Context(), group)
+	scopes, err := s.modelsRoutableCapabilityScopes(r.Context(), group, userGroupID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if hint, ok := s.modelsProviderHint(r); !ok {
-		writeError(w, http.StatusBadRequest, errors.New("provider hint must be auto, codex, claude, or kiro"))
+		writeError(w, http.StatusBadRequest, errors.New("provider hint must be auto, codex, claude, kiro, antigravity, or custom:<id>"))
 		return
 	} else if hint != "auto" {
-		accounts, listErr := s.store.ListAccounts(r.Context())
-		if listErr != nil {
-			writeError(w, http.StatusInternalServerError, listErr)
+		providers, providerErr := s.modelsAccountProviders(r.Context())
+		if providerErr != nil {
+			writeError(w, http.StatusInternalServerError, providerErr)
 			return
 		}
-		allowed := map[string]bool{}
-		for _, account := range accounts {
-			if strings.EqualFold(strings.TrimSpace(account.Provider), hint) {
-				allowed[account.ID] = true
-			}
+		for i := range scopes {
+			scopes[i] = filterModelsCapabilitiesByProvider(scopes[i], providers, hint)
 		}
-		filtered := caps[:0]
-		for _, c := range caps {
-			if allowed[c.AccountID] {
-				filtered = append(filtered, c)
-			}
-		}
-		caps = filtered
 	}
 	// Content-negotiate by client family: an Anthropic client (Claude Code) needs the
 	// native Anthropic /v1/models schema or its model picker / "auto" selection breaks;
@@ -533,7 +527,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	// query key and expects {"models":[ModelInfo,...]}. Check this first because wrapper
 	// processes can retain Anthropic-family headers while invoking Codex.
 	if _, codexClient := r.URL.Query()["client_version"]; codexClient {
-		body, etag, err := capability.BuildCodexModelsResponse(caps)
+		body, etag, err := capability.BuildCodexModelsResponseForScopes(scopes)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -548,7 +542,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isAnthropicClient(r) {
-		body, etag, err := capability.BuildAnthropicModelsResponse(caps)
+		body, etag, err := capability.BuildAnthropicModelsResponseForScopes(scopes)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -566,7 +560,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if group, err := s.store.GetGroup(r.Context(), cfg.DefaultGroup); err == nil {
 		cfg.Virtual2MEnabled = cfg.Virtual2MEnabled && group.Virtual2MEnabled
 	}
-	body, etag, err := capability.BuildModelsResponse(caps, cfg)
+	body, etag, err := capability.BuildModelsResponseForScopes(scopes, cfg)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -580,17 +574,115 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
+// modelsRoutableCapabilities mirrors the two-layer request router for model
+// discovery. Account-pool targets contribute their own inventory, while a model
+// provider target keeps the API key's base group and narrows that inventory to
+// the selected provider. The union is built before a request-level provider hint
+// is applied, so a hint can only reduce the user group's visible route surface.
+func (s *Server) modelsRoutableCapabilities(ctx context.Context, baseGroup, userGroupID string) ([]storage.ModelCapability, error) {
+	scopes, err := s.modelsRoutableCapabilityScopes(ctx, baseGroup, userGroupID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]storage.ModelCapability, 0)
+	seen := make(map[string]struct{})
+	for _, caps := range scopes {
+		for _, c := range caps {
+			key := c.AccountID + "\x00" + c.ModelSlug
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+func (s *Server) modelsRoutableCapabilityScopes(ctx context.Context, baseGroup, userGroupID string) ([][]storage.ModelCapability, error) {
+	if strings.TrimSpace(userGroupID) == "" {
+		caps, err := s.store.ListRoutableCapabilities(ctx, baseGroup)
+		return [][]storage.ModelCapability{caps}, err
+	}
+	group, found, err := s.store.GetUserGroup(ctx, userGroupID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("user group %s not found", userGroupID)
+	}
+	// Legacy user groups created before target rows were mandatory retain the
+	// router's base-group fallback instead of presenting an empty catalog.
+	if len(group.Targets) == 0 {
+		caps, listErr := s.store.ListRoutableCapabilities(ctx, baseGroup)
+		return [][]storage.ModelCapability{caps}, listErr
+	}
+
+	var baseCaps []storage.ModelCapability
+	baseLoaded := false
+	var providers map[string]string
+	scopes := make([][]storage.ModelCapability, 0, len(group.Targets))
+
+	for _, target := range group.Targets {
+		routeGroup, routeProvider, routeErr := targetRefToRoute(target)
+		if routeErr != nil {
+			return nil, routeErr
+		}
+		if routeGroup != "" {
+			caps, listErr := s.store.ListRoutableCapabilities(ctx, routeGroup)
+			if listErr != nil {
+				return nil, listErr
+			}
+			scopes = append(scopes, caps)
+			continue
+		}
+		if routeProvider == "" {
+			continue
+		}
+		if !baseLoaded {
+			baseCaps, err = s.store.ListRoutableCapabilities(ctx, baseGroup)
+			if err != nil {
+				return nil, err
+			}
+			baseLoaded = true
+		}
+		if providers == nil {
+			providers, err = s.modelsAccountProviders(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		scopes = append(scopes, filterModelsCapabilitiesByProvider(baseCaps, providers, routeProvider))
+	}
+	return scopes, nil
+}
+
+func (s *Server) modelsAccountProviders(ctx context.Context) (map[string]string, error) {
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.store.ResolveAccountProviders(ctx, accounts)
+}
+
+func filterModelsCapabilitiesByProvider(caps []storage.ModelCapability, providers map[string]string, provider string) []storage.ModelCapability {
+	provider = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(provider)), "custom:")
+	filtered := make([]storage.ModelCapability, 0, len(caps))
+	for _, c := range caps {
+		if strings.EqualFold(strings.TrimSpace(providers[c.AccountID]), provider) {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
 func (s *Server) modelsProviderHint(r *http.Request) (string, bool) {
 	if raw := strings.TrimSpace(r.Header.Get("X-Pool-Provider")); raw != "" {
 		return normalizeProviderHint(raw)
 	}
 	if plain := downstreamBearer(r); plain != "" {
 		if key, found, _ := s.store.LookupAPIKey(r.Context(), hashAPIKey(plain)); found {
-			hint := normalizeProviderHintLoose(key.ProviderHint)
-			if hint == "auto" || hint == "codex" || hint == "claude" || hint == "kiro" {
-				return hint, true
-			}
-			return "", false
+			return normalizeProviderHint(key.ProviderHint)
 		}
 	}
 	return "auto", true
@@ -708,6 +800,21 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			pol.ProviderHint = routeProvider
 			userGroupProvider = routeProvider
 		}
+	}
+
+	// Antigravity currently implements the native Anthropic Messages contract,
+	// not the OpenAI Chat Completions wire protocol.  Reject an explicit route at
+	// this dispatch boundary for every model family (notably gemini-*); otherwise a
+	// non-Claude slug falls through to the Codex adapter and produces a misleading
+	// account/model error after using the wrong protocol.
+	if isChat && (userGroupProvider == "antigravity" || effectiveGatewayProviderHint(r, pol) == "antigravity") {
+		s.writeCapabilityUnavailable(w, http.StatusBadRequest,
+			"provider antigravity does not expose the OpenAI Chat Completions protocol",
+			[]string{"openai_chat_completions", "model:" + model},
+			"native_antigravity_messages",
+			"antigravity",
+			"Send this model through POST /v1/messages, or select a provider route that advertises /v1/chat/completions.")
+		return
 	}
 
 	// OpenAI-compatible requests targeting a Claude model are transparently
@@ -2402,6 +2509,7 @@ codexSuccess:
 						log.Printf("[CODEX-SESSION-MAPPING] chat stream terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
 					}
 				} else {
+					s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, finalEgress, "terminal_success", http.StatusOK)
 					s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, finalEgress, model)
 				}
 				if s.goalContinuityEnabled(r.Context()) {
@@ -2449,6 +2557,7 @@ codexSuccess:
 			} else {
 				// Compatibility mode retains only the old affinity metadata; no Codex
 				// goal/checkpoint/journal write is permitted.
+				s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, committedEgress, "terminal_success", http.StatusOK)
 				s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, committedEgress, model)
 			}
 			// A mapping-alias conflict must not discard the encrypted recovery
@@ -2893,7 +3002,14 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 		Status string `json:"status"`
 	}
 	_ = json.Unmarshal(responseBody, &response)
-	if response.Status != "" && !strings.EqualFold(response.Status, "completed") {
+	// RemoteCompactionV2 is committed by the official client only after a real
+	// completed terminal. The legacy /responses/compact unary endpoint also sets
+	// compact=true, but its successful full JSON response may omit status entirely.
+	// Identify V2 by its normal Responses route plus the terminal input trigger so
+	// legacy compaction retains its existing compatibility behavior.
+	remoteCompactionV2 := codexRemoteCompactionV2Request(r, requestBody)
+	if (remoteCompactionV2 && !strings.EqualFold(strings.TrimSpace(response.Status), "completed")) ||
+		(!remoteCompactionV2 && response.Status != "" && !strings.EqualFold(response.Status, "completed")) {
 		return
 	}
 	if mapping := codexSessionMappingFromContext(ctx); mapping != nil && mapping.enabled {
@@ -2904,9 +3020,26 @@ func (s *Server) persistCodexStateBindings(ctx context.Context, r *http.Request,
 	} else {
 		// Compatibility mode retains ordinary affinity metadata only. Codex never
 		// writes goal/checkpoint/journal bodies unless CPA-v2 is active.
+		s.recordCodexUpstreamAttempt(ctx, mapping, lease, egress, "terminal_success", http.StatusOK)
 		s.persistCodexBindingAliases(ctx, affinity, response.ID, response.Model, lease, egress, requestedModel)
 	}
 	s.persistCodexGoalContinuity(ctx, r, requestBody, responseBody)
+}
+
+func codexRemoteCompactionV2Request(r *http.Request, requestBody []byte) bool {
+	if r != nil && r.URL != nil && strings.Contains(strings.ToLower(r.URL.Path), "/responses/compact") {
+		return false
+	}
+	request, err := decodeContextJSONMap(requestBody)
+	if err != nil {
+		return false
+	}
+	input, ok := request["input"].([]interface{})
+	if !ok || len(input) == 0 {
+		return false
+	}
+	last, ok := input[len(input)-1].(map[string]interface{})
+	return ok && strings.EqualFold(strings.TrimSpace(streamString(last["type"])), "compaction_trigger")
 }
 
 // persistCodexGoalContinuity writes an encrypted, incremental replay checkpoint
@@ -2972,8 +3105,17 @@ func (s *Server) doCodexUpstream(ctx context.Context, req upstream.Request) (*up
 }
 
 func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease scheduler.Lease, strict bool) (*upstream.Response, storage.EgressProfile, error) {
+	mapping := codexSessionMappingFromContext(ctx)
+	// This canonical start is emitted at the actual transport boundary, so every
+	// auth/version/native/HTTPS retry and every selected real exit is observable.
+	// It is diagnostic-only: routing quality below uses explicit terminal success
+	// or egress_failure rows and never treats an unfinished start as a failure.
+	s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "transport_attempted", 0)
 	resp, err := s.doCodexUpstream(ctx, req)
 	if err != nil {
+		if ctx.Err() == nil {
+			s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", 0)
+		}
 		if !strict {
 			return s.doCodexStandbyEgressRetries(ctx, req, lease, nil, nil, err)
 		}
@@ -2984,6 +3126,9 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 	}
 	body, err := upstream.DrainAndClose(resp.Body)
 	if err != nil {
+		if ctx.Err() == nil {
+			s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", resp.StatusCode)
+		}
 		return nil, req.Egress, err
 	}
 	detection := cf.Detect(resp.StatusCode, resp.Header, body)
@@ -2995,12 +3140,21 @@ func (s *Server) doWithCFRetry(ctx context.Context, req upstream.Request, lease 
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp, req.Egress, nil
 	}
+	egressFailureRecorded := false
 	if detection.Matched && cf.Recordable(detection) {
+		s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", resp.StatusCode)
+		egressFailureRecorded = true
 		s.handleCFEvent(ctx, req.Account, req.Egress, resp.StatusCode, detection)
 	}
 	if strict {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp, req.Egress, nil
+	}
+	// Reaching standby retry is itself the classification boundary for an
+	// ordinary 5xx. Record the real exit exactly once; account/quota 4xx responses
+	// returned above remain unclassified and never depress outlet quality.
+	if !egressFailureRecorded {
+		s.recordCodexUpstreamAttempt(ctx, mapping, lease, req.Egress, "egress_failure", resp.StatusCode)
 	}
 	return s.doCodexStandbyEgressRetries(ctx, req, lease, resp, body, nil)
 }
@@ -3049,8 +3203,13 @@ func (s *Server) doCodexStandbyEgressRetries(ctx context.Context, req upstream.R
 		retryReq := req
 		retryReq.Egress = standby
 		retryReq.CookieJarKey = req.Account.ID + ":" + standby.ID
+		mapping := codexSessionMappingFromContext(ctx)
+		s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "transport_attempted", 0)
 		retryResp, err := s.doCodexUpstream(ctx, retryReq)
 		if err != nil {
+			if ctx.Err() == nil {
+				s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", 0)
+			}
 			lastErr = err
 			continue
 		}
@@ -3059,17 +3218,26 @@ func (s *Server) doCodexStandbyEgressRetries(ctx context.Context, req upstream.R
 		}
 		retryBody, drainErr := upstream.DrainAndClose(retryResp.Body)
 		if drainErr != nil {
+			if ctx.Err() == nil {
+				s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", retryResp.StatusCode)
+			}
 			lastErr = drainErr
 			continue
 		}
 		lastResp, lastBody, lastEgress, lastErr = retryResp, retryBody, standby, nil
 		detection := cf.Detect(retryResp.StatusCode, retryResp.Header, retryBody)
-		if detection.Matched && cf.Recordable(detection) {
+		egressFailureRecorded := false
+		if detection.Matched && !cf.EdgeOnly(detection) && cf.Recordable(detection) {
+			s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", retryResp.StatusCode)
+			egressFailureRecorded = true
 			s.handleCFEvent(ctx, req.Account, standby, retryResp.StatusCode, detection)
 		}
 		if (!detection.Matched || cf.EdgeOnly(detection)) && retryResp.StatusCode < http.StatusInternalServerError {
 			retryResp.Body = io.NopCloser(bytes.NewReader(retryBody))
 			return retryResp, standby, nil
+		}
+		if !egressFailureRecorded && !(detection.Matched && cf.EdgeOnly(detection)) {
+			s.recordCodexUpstreamAttempt(ctx, mapping, lease, standby, "egress_failure", retryResp.StatusCode)
 		}
 	}
 	if lastResp != nil {
@@ -3170,6 +3338,9 @@ func (s *Server) handleCFEvent(ctx context.Context, account storage.Account, egr
 		return
 	}
 	_ = (cf.StormBreaker{Store: s.store}).Record(ctx, account.ID, egress.ID, status, detection)
+	// StormBreaker may synchronously trip the shared egress profile. Publish that
+	// health/cooldown mutation before another fresh request reads the 30s cache.
+	s.scheduler.InvalidateEgressCache()
 	if s.warp == nil || !s.warp.Enabled() {
 		return
 	}
@@ -3200,6 +3371,8 @@ func (s *Server) recoverWarpExit(ctx context.Context, account storage.Account, e
 	if s.warp != nil {
 		if err := s.warp.ReregisterExit(ctx, egress.ID); err != nil {
 			log.Printf("warp: reregister exit %s failed: %v", egress.ID, err)
+		} else {
+			s.scheduler.InvalidateEgressCache()
 		}
 	}
 }

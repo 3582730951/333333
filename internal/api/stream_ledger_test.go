@@ -51,6 +51,59 @@ func TestCodexStreamLedgerKeepsDeltaFallbackForMinimalTerminal(t *testing.T) {
 	}
 }
 
+func TestCodexStreamLedgerPreservesCompactionAndCompletedUsage(t *testing.T) {
+	recorder := newCodexStreamLedgerRecorder()
+	defer recorder.Close()
+	frames := []string{
+		`event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"type":"compaction","id":"cmp_usage","encrypted_content":"opaque-usage-exact"}}
+
+`,
+		`event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_compaction_usage","model":"gpt-5.6-sol","status":"completed","output":[{"type":"compaction","id":"cmp_usage","encrypted_content":"opaque-usage-exact"}],"usage":{"input_tokens":272001,"output_tokens":37,"total_tokens":272038,"input_tokens_details":{"cached_tokens":123456}}}}
+
+`,
+	}
+	for _, frame := range frames {
+		if _, err := recorder.Write([]byte(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !recorder.completedSuccessfully() {
+		t.Fatal("completed compaction terminal was not recognized")
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(string(recorder.ResponseJSON())))
+	decoder.UseNumber()
+	var response map[string]interface{}
+	if err := decoder.Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	output, _ := response["output"].([]interface{})
+	if len(output) != 1 {
+		t.Fatalf("compaction output=%#v", response["output"])
+	}
+	compaction, _ := output[0].(map[string]interface{})
+	if compaction["type"] != "compaction" || compaction["id"] != "cmp_usage" || compaction["encrypted_content"] != "opaque-usage-exact" {
+		t.Fatalf("compaction changed: %#v", compaction)
+	}
+	usage, _ := response["usage"].(map[string]interface{})
+	details, _ := usage["input_tokens_details"].(map[string]interface{})
+	for field, want := range map[string]string{
+		"input_tokens":  "272001",
+		"output_tokens": "37",
+		"total_tokens":  "272038",
+	} {
+		got, _ := usage[field].(json.Number)
+		if got.String() != want {
+			t.Fatalf("usage.%s=%q want=%q response=%s", field, got.String(), want, recorder.ResponseJSON())
+		}
+	}
+	if got, _ := details["cached_tokens"].(json.Number); got.String() != "123456" {
+		t.Fatalf("cached_tokens=%q response=%s", got.String(), recorder.ResponseJSON())
+	}
+}
+
 func TestCodexStreamLedgerSpoolsAndPreservesLargeDeltaFrame(t *testing.T) {
 	delta := strings.Repeat("large-\\\"-delta-\U0001f642-", 128<<10)
 	payload, err := json.Marshal(map[string]interface{}{"type": "response.output_text.delta", "delta": delta})

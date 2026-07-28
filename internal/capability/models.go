@@ -621,6 +621,7 @@ type codexStaticModel struct {
 	slug                  string
 	window                int64
 	maxWindow             int64
+	autoCompactTokenLimit int64
 	minimumClientVersion  string
 	requiresCurrentClient bool
 	preferWebSocket       bool
@@ -634,9 +635,9 @@ type codexStaticModel struct {
 // listed (the hidden codex-auto-review preset is omitted). Ordered most-capable
 // first. The live probe — when it works — is authoritative and supersedes this.
 var codexStaticModels = []codexStaticModel{
-	{slug: "gpt-5.6-sol", window: 372000, maxWindow: 372000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-terra", window: 372000, maxWindow: 372000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-luna", window: 372000, maxWindow: 372000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
+	{slug: "gpt-5.6-sol", window: 372000, maxWindow: 372000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-terra", window: 372000, maxWindow: 372000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-luna", window: 372000, maxWindow: 372000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
 	{slug: "gpt-5.5", window: 272000, maxWindow: 272000, minimumClientVersion: "0.124.0", requiresCurrentClient: true, preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4", window: 272000, maxWindow: 1000000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4-mini", window: 272000, maxWindow: 272000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
@@ -667,6 +668,18 @@ func CodexMinimumClientVersion(slug string) string {
 		return ""
 	}
 	return m.minimumClientVersion
+}
+
+// CodexClientContextOverrides returns the explicit full-window and automatic
+// compaction settings that the generated official-client config should install.
+// They are independent Codex settings: the full window controls the hard context
+// cap, while the smaller threshold starts compaction before that cap is reached.
+func CodexClientContextOverrides(slug string) (contextWindow, autoCompactTokenLimit int64, ok bool) {
+	m, found := codexStaticModelForSlug(slug)
+	if !found || m.window <= 0 || m.autoCompactTokenLimit <= 0 {
+		return 0, 0, false
+	}
+	return m.window, m.autoCompactTokenLimit, true
 }
 
 // CodexPrefersWebSocket mirrors model_info.prefer_websockets from the official
@@ -715,6 +728,7 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 			NativeContextWindow:           m.window,
 			NativeMaxContextWindow:        m.maxWindow,
 			EffectiveContextWindowPercent: 95,
+			AutoCompactTokenLimit:         m.autoCompactTokenLimit,
 			AvailabilityState:             AvailabilityUnverified,
 			Context1MState:                Context1MUnknown,
 			Visibility:                    "list",
@@ -843,8 +857,9 @@ func richestAccountCaps(capabilities []storage.ModelCapability) []storage.ModelC
 }
 
 // providerKeyForSource maps a capability's Source tag to a provider bucket key:
-// "claude" for the Anthropic sets, "custom:<id>" for a custom OpenAI-compatible
-// provider (tagged "custom:<id>" by the probe), and "codex" otherwise.
+// "claude" for the Anthropic sets, "antigravity" for the native Antigravity
+// probe, "custom:<id>" for a custom OpenAI-compatible provider (tagged
+// "custom:<id>" by the probe), and "codex" otherwise.
 func providerKeyForSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	switch {
@@ -854,9 +869,59 @@ func providerKeyForSource(source string) string {
 		return "claude"
 	case strings.HasPrefix(s, "kiro"):
 		return "kiro"
+	case strings.HasPrefix(s, "antigravity"):
+		return "antigravity"
 	default:
 		return "codex"
 	}
+}
+
+// scopedCatalogCapabilities preserves the coherent richest-account policy inside
+// each independently routable target, then unions those target catalogs. The
+// synthetic account id is internal to catalog construction: it makes the existing
+// response builders treat the selected sets from multiple targets as one provider
+// catalog without exposing or mutating a stored account identity.
+func scopedCatalogCapabilities(scopes [][]storage.ModelCapability) []storage.ModelCapability {
+	selected := make([]storage.ModelCapability, 0)
+	for _, scope := range scopes {
+		buckets := map[string][]storage.ModelCapability{}
+		order := make([]string, 0)
+		for _, c := range scope {
+			if !capabilityIsVerified(c) {
+				continue
+			}
+			key := providerKeyForSource(c.Source)
+			if _, exists := buckets[key]; !exists {
+				order = append(order, key)
+			}
+			buckets[key] = append(buckets[key], c)
+		}
+		for _, key := range order {
+			for _, c := range richestAccountCaps(buckets[key]) {
+				c.AccountID = "\x00scoped-catalog\x00" + key
+				selected = append(selected, c)
+			}
+		}
+	}
+	return selected
+}
+
+// BuildModelsResponseForScopes advertises the union of independently routable
+// user-group target catalogs while retaining richest-account coherence per target.
+func BuildModelsResponseForScopes(scopes [][]storage.ModelCapability, cfg config.Config) ([]byte, string, error) {
+	return BuildModelsResponse(scopedCatalogCapabilities(scopes), cfg)
+}
+
+// BuildCodexModelsResponseForScopes is the native Codex schema counterpart of
+// BuildModelsResponseForScopes.
+func BuildCodexModelsResponseForScopes(scopes [][]storage.ModelCapability) ([]byte, string, error) {
+	return BuildCodexModelsResponse(scopedCatalogCapabilities(scopes))
+}
+
+// BuildAnthropicModelsResponseForScopes is the native Anthropic schema
+// counterpart of BuildModelsResponseForScopes.
+func BuildAnthropicModelsResponseForScopes(scopes [][]storage.ModelCapability) ([]byte, string, error) {
+	return BuildAnthropicModelsResponse(scopedCatalogCapabilities(scopes))
 }
 
 func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Config) ([]byte, string, error) {
@@ -1034,6 +1099,17 @@ func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage
 	if percent == 0 {
 		percent = 95
 	}
+	static, knownStatic := codexStaticModelForSlug(selected.ModelSlug)
+	// Current 5.6 clients deliberately use a 372K full window with a separate
+	// 272K compaction trigger. Codex clamps config.model_context_window to the
+	// ModelInfo maximum, so both live and synthesized ModelInfo must expose the
+	// same full-window contract. This changes only the three context-limit fields;
+	// every live reasoning/tool/instruction/future field above remains intact.
+	if knownStatic && static.autoCompactTokenLimit > 0 {
+		window = static.window
+		maxWindow = static.maxWindow
+		autoCompact = static.autoCompactTokenLimit
+	}
 	if window > 0 {
 		derivedLimit := (window * 9) / 10
 		if autoCompact == 0 || autoCompact > derivedLimit {
@@ -1041,7 +1117,6 @@ func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage
 		}
 	}
 
-	static, knownStatic := codexStaticModelForSlug(selected.ModelSlug)
 	setModelInfoDefault(item, "slug", selected.ModelSlug)
 	// A raw endpoint may use id rather than slug. The route's canonical persisted
 	// slug always wins so Codex can match the returned metadata to its request.
@@ -1165,26 +1240,32 @@ func codexReasoningDescription(level string) string {
 	}
 }
 
-// BuildAnthropicModelsResponse renders the pool's Claude capabilities in Anthropic's
+// BuildAnthropicModelsResponse renders the pool's native Messages capabilities in Anthropic's
 // native GET /v1/models schema — {data:[{type:"model",id,display_name,created_at}],
 // has_more:false,first_id,last_id}. Anthropic clients (Claude Code) enumerate models
 // from THIS shape and disable their model picker / "auto" selection when handed the
-// OpenAI-shaped list BuildModelsResponse returns. Only verified claude-* models are
-// listed; unverified static discovery hints never leak into the public catalog.
+// OpenAI-shaped list BuildModelsResponse returns. Verified Claude, Kiro, and
+// Antigravity models are listed; unverified static discovery hints never leak.
 func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byte, string, error) {
 	claudeCaps := make([]storage.ModelCapability, 0, len(capabilities))
 	kiroCaps := make([]storage.ModelCapability, 0, len(capabilities))
+	antigravityCaps := make([]storage.ModelCapability, 0, len(capabilities))
 	for _, c := range capabilities {
 		switch providerKeyForSource(c.Source) {
 		case "claude":
 			claudeCaps = append(claudeCaps, c)
 		case "kiro":
 			kiroCaps = append(kiroCaps, c)
+		case "antigravity":
+			antigravityCaps = append(antigravityCaps, c)
 		}
 	}
 	merged := append([]storage.ModelCapability(nil), richestAccountCaps(kiroCaps)...)
 	if len(claudeCaps) > 0 {
 		merged = append(merged, richestAccountCaps(claudeCaps)...)
+	}
+	if len(antigravityCaps) > 0 {
+		merged = append(merged, richestAccountCaps(antigravityCaps)...)
 	}
 	seen := make(map[string]bool, len(merged))
 	data := make([]interface{}, 0, len(merged))

@@ -290,7 +290,7 @@ func claudeAllowedProviders(r *http.Request, pol downstreamPolicy) ([]string, er
 	case "antigravity":
 		return []string{"antigravity"}, nil
 	default:
-		return nil, errors.New("Claude-family inference provider must be auto, claude, or kiro")
+		return nil, errors.New("Claude-family inference provider must be auto, claude, kiro, or antigravity")
 	}
 }
 

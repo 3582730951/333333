@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -110,5 +112,53 @@ func TestAdminEgressPoolDeleteCannotDeleteSameIDEgressProfile(t *testing.T) {
 	}
 	if _, err := h.store.GetEgressProfile(context.Background(), "shared-resource-id"); err != nil {
 		t.Fatalf("egress pool path deleted same-id profile: %v", err)
+	}
+}
+
+func TestAdminEgressProfileMutationInvalidatesSchedulerCache(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	ctx := context.Background()
+	upsertTestEgressProfile(t, h, "cache-primary")
+	upsertTestEgressProfile(t, h, "cache-standby")
+	account := storage.Account{ID: "cache-publish-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	group, err := h.store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"cache-primary", "cache-standby"}
+	if err := h.store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := h.app.scheduler.Select(ctx, scheduler.Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Egress.ID != "cache-primary" {
+		first.Release()
+		t.Fatalf("initial egress=%q, want cache-primary", first.Egress.ID)
+	}
+	first.Release()
+
+	cooldownUntil := storage.Now() + 3600
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/egress-profiles", `{
+		"id":"cache-primary","name":"cache-primary","type":"direct",
+		"stream_capable":true,"health":"cooldown","cooldown_until":`+strconv.FormatInt(cooldownUntil, 10)+`,
+		"max_concurrency":10,"detect_region":false
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("update cached profile = %d: %s", code, raw)
+	}
+
+	second, err := h.app.scheduler.Select(ctx, scheduler.Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Egress.ID != "cache-standby" {
+		t.Fatalf("profile mutation remained cached: egress=%q", second.Egress.ID)
 	}
 }

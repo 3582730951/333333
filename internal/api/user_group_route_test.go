@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -143,6 +144,133 @@ func TestDispatchUserGroupRouteCandidatesFallsBackBeforeCommitAcrossEntrypoints(
 				t.Fatalf("fallback binding=%+v found=%v err=%v, want %+v", binding, found, err, attempts[1])
 			}
 		})
+	}
+}
+
+func TestClaudeMessagesUserGroupFallsThroughCodexTierToExactAntigravityModel(t *testing.T) {
+	const (
+		groupID          = "ug_messages_exact_antigravity"
+		codexGroup       = "route-codex-only"
+		antigravityGroup = "route-antigravity-capable"
+		antigravityID    = "route-antigravity-account"
+		plainKey         = "sk-user-group-exact-antigravity"
+	)
+	observedModels := make(chan string, 4)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var request struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatalf("decode Antigravity request: %v body=%s", err, body)
+		}
+		observedModels <- request.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"response": {
+				"candidates": [{"content":{"role":"model","parts":[{"text":"routed"}]},"finishReason":"STOP"}],
+				"usageMetadata": {"promptTokenCount":4,"candidatesTokenCount":2}
+			}
+		}`)
+	})
+	for _, name := range []string{codexGroup, antigravityGroup} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	codexID := h.importAccount(t, "route-codex-only", "route-codex-upstream", "route-codex-access")
+	codex, err := h.store.GetAccount(t.Context(), codexID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexToken, err := h.store.GetToken(t.Context(), codexID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex.GroupName = codexGroup
+	if err := h.store.UpsertAccount(t.Context(), codex, codexToken); err != nil {
+		t.Fatal(err)
+	}
+
+	antigravity := storage.Account{ID: antigravityID, Label: antigravityID, GroupName: antigravityGroup, Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccountWithAntigravityCredentials(t.Context(), antigravity, storage.AccountToken{}, storage.AntigravityCredentials{
+		ProjectID: "project", AccessToken: "access", ExpiresAt: time.Now().Add(2 * time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	models := []string{"claude-opus-4-6-thinking", "gemini-3-flash"}
+	capabilities := make([]storage.ModelCapability, 0, len(models))
+	for _, model := range models {
+		capabilities = append(capabilities, storage.ModelCapability{
+			AccountID: antigravityID, ModelSlug: model, AvailabilityState: "verified", Source: "antigravity_model_probe",
+		})
+	}
+	if err := h.store.UpsertCapabilities(t.Context(), capabilities); err != nil {
+		t.Fatal(err)
+	}
+
+	codexTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: codexGroup}
+	antigravityTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: antigravityGroup}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{codexTarget, antigravityTarget}, []storage.ModelRoutingRule{{
+		Model: "*", Tiers: [][]storage.TargetRef{{codexTarget}, {antigravityTarget}},
+	}})
+	if err := h.store.UpsertAPIKey(t.Context(), storage.APIKey{
+		KeyHash: hashAPIKey(plainKey), KeyType: "downstream", Label: "exact Antigravity route",
+		GroupName: codexGroup, UserGroupID: groupID, ProviderHint: "auto", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	for index, model := range models {
+		body := []byte(`{"model":"` + model + `","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+		sessionID := fmt.Sprintf("exact-antigravity-%d", index)
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+plainKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		affinity := routing.ExtractClaudeAffinityKey(req, body)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		responseBody, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Pool-Resolved-Provider") != "antigravity" {
+			t.Fatalf("model=%s status=%d provider=%q body=%s", model, resp.StatusCode, resp.Header.Get("X-Pool-Resolved-Provider"), responseBody)
+		}
+		if observed := <-observedModels; observed != model {
+			t.Fatalf("model=%s reached Antigravity as %q", model, observed)
+		}
+		binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+		if err != nil || !found || binding.Target != antigravityTarget {
+			t.Fatalf("model=%s binding=%+v found=%v err=%v, want %+v", model, binding, found, err, antigravityTarget)
+		}
+	}
+
+	before := len(h.requests())
+	unknownBody := []byte(`{"model":"gemini-unverified","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+	unknownReq, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(unknownBody))
+	unknownReq.Header.Set("Authorization", "Bearer "+plainKey)
+	unknownReq.Header.Set("Content-Type", "application/json")
+	unknownReq.Header.Set("anthropic-version", "2023-06-01")
+	unknownReq.Header.Set("X-Claude-Code-Session-Id", "exact-antigravity-unknown")
+	unknownResp, err := http.DefaultClient.Do(unknownReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, unknownResp.Body)
+	_ = unknownResp.Body.Close()
+	if unknownResp.StatusCode == http.StatusOK || len(h.requests()) != before {
+		t.Fatalf("unknown model status=%d upstream calls=%d->%d", unknownResp.StatusCode, before, len(h.requests()))
 	}
 }
 

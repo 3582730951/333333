@@ -36,6 +36,272 @@ func TestIncrementalGoalRequestStoresOnlyDurableHistorySuffix(t *testing.T) {
 	}
 }
 
+func TestIncrementalGoalRequestRecognizesPostCompactLiteSnapshot(t *testing.T) {
+	durable := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"old_tool"}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"retained task"}]},{"type":"compaction","encrypted_content":"opaque"}]}`)
+	current := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"new_tool","format":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"new base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"retained task"}]},{"type":"compaction","id":"new-id","encrypted_content":"opaque"},{"type":"message","role":"user","content":[{"type":"input_text","text":"current turn"}]}]}`)
+	trimmed, replace := incrementalGoalRequestWithMode(current, durable)
+	if !replace || string(trimmed) != string(current) {
+		t.Fatalf("post-compact snapshot replace=%v body=%s", replace, trimmed)
+	}
+
+	durableRoot, err := decodeContextJSONMap(durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentRoot, err := decodeContextJSONMap(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergeCodexGoalReplayInput(durableRoot["input"], currentRoot["input"])
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(encoded)
+	for _, marker := range []string{"new_tool", "new base", "retained task", "opaque", "current turn"} {
+		if strings.Count(text, marker) != 1 {
+			t.Fatalf("marker %q count=%d input=%s", marker, strings.Count(text, marker), text)
+		}
+	}
+	if strings.Contains(text, "old_tool") || strings.Contains(text, "old base") || !strings.Contains(text, "900719925474099312345") {
+		t.Fatalf("Lite prefix was not replaced exactly: %s", text)
+	}
+}
+
+func TestCodexRemoteCompactionPersistenceUsesDurableLogicalInput(t *testing.T) {
+	durable := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"durable real task"}]},{"type":"reasoning","encrypted_content":"old reasoning"}]}`)
+	incremental := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp-before-compact","input":[{"type":"compaction_trigger"}]}`)
+	response := []byte(`{"id":"resp-compact","status":"completed","output":[{"type":"message","role":"assistant","content":"ignored"},{"type":"compaction","encrypted_content":"opaque-v2"}]}`)
+	replacement, ok := codexRemoteCompactionReplacement(durable, incremental, response, false)
+	if !ok || len(replacement) != 2 {
+		t.Fatalf("replacement=%+v ok=%v", replacement, ok)
+	}
+	encoded, _ := json.Marshal(replacement)
+	if !strings.Contains(string(encoded), "durable real task") || !strings.Contains(string(encoded), "opaque-v2") || strings.Contains(string(encoded), "old reasoning") || strings.Contains(string(encoded), "base") {
+		t.Fatalf("logical compact replacement=%s", encoded)
+	}
+
+	fullWithPrevious := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp-before-compact","input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"base"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"durable real task"}]},{"type":"reasoning","encrypted_content":"old reasoning"},{"type":"compaction_trigger"}]}`)
+	replacement, ok = codexRemoteCompactionReplacement(durable, fullWithPrevious, response, false)
+	if !ok {
+		t.Fatal("full input with previous_response_id was not recognized as RemoteCompactionV2")
+	}
+	encoded, _ = json.Marshal(replacement)
+	if strings.Count(string(encoded), "durable real task") != 1 || strings.Count(string(encoded), "opaque-v2") != 1 {
+		t.Fatalf("full logical input was prefixed with durable history twice: %s", encoded)
+	}
+
+	for _, invalid := range [][]byte{
+		[]byte(`{"id":"resp-partial","output":[{"type":"compaction","encrypted_content":"must-not-install"}]}`),
+		[]byte(`{"id":"resp-failed","status":"failed","output":[{"type":"compaction","encrypted_content":"must-not-install"}]}`),
+	} {
+		if replacement, accepted := codexRemoteCompactionReplacement(durable, incremental, invalid, false); accepted || replacement != nil {
+			t.Fatalf("non-completed compaction installed replacement=%+v accepted=%v response=%s", replacement, accepted, invalid)
+		}
+	}
+}
+
+func TestPersistGoalContinuityFullRootRemoteCompactionRetainsLogicalUsers(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+	ctx := context.Background()
+
+	request := func(body []byte) *http.Request {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("thread-id", "compact-full-root-thread")
+		return req
+	}
+
+	firstBody := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"apply_patch"}]},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"current base instructions"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"durable real task"}]}
+		]
+	}`)
+	firstResponse := []byte(`{
+		"id":"resp-before-full-root-compact",
+		"status":"completed",
+		"output":[
+			{"type":"reasoning","encrypted_content":"old reasoning"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"old answer"}]}
+		]
+	}`)
+	firstCtx := withGoalOriginalBody(ctx, firstBody)
+	goal, err := h.app.persistGoalContinuity(firstCtx, request(firstBody), "codex", firstBody, firstResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	durable, _, err := h.store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullRoot, err := decodeContextJSONMap(durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullRoot["input"] = append(appendItems(nil, fullRoot["input"]), map[string]interface{}{"type": "compaction_trigger"})
+	delete(fullRoot, "previous_response_id")
+	fullRootBody, err := json.Marshal(fullRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compactResponse := []byte(`{
+		"id":"resp-full-root-compact",
+		"status":"completed",
+		"output":[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ignored side output"}]},
+			{"type":"compaction","encrypted_content":"opaque-full-root"}
+		]
+	}`)
+	compactCtx := withGoalOriginalBody(ctx, fullRootBody)
+	goal, err = h.app.persistGoalContinuity(compactCtx, request(fullRootBody), "codex", fullRootBody, compactResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replay, _, err := h.store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(replay)
+	for _, retained := range []string{"apply_patch", "current base instructions", "durable real task", "opaque-full-root"} {
+		if strings.Count(text, retained) != 1 {
+			t.Fatalf("retained marker %q count=%d replay=%s", retained, strings.Count(text, retained), text)
+		}
+	}
+	for _, compacted := range []string{"old reasoning", "old answer", "ignored side output", "compaction_trigger"} {
+		if strings.Contains(text, compacted) {
+			t.Fatalf("compacted marker %q remained in replay=%s", compacted, text)
+		}
+	}
+}
+
+func TestPersistGoalContinuityRejectedRemoteCompactionKeepsDurableHistory(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		response string
+	}{
+		{
+			name:     "missing status",
+			response: `{"id":"resp-statusless","output":[{"type":"compaction","encrypted_content":"must-not-install"}]}`,
+		},
+		{
+			name:     "failed status",
+			response: `{"id":"resp-failed","status":"failed","output":[{"type":"compaction","encrypted_content":"must-not-install"}]}`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+			h.app.cfg.GoalContinuityEnabled = true
+			ctx := context.Background()
+			threadID := "rejected-compact-" + strings.ReplaceAll(testCase.name, " ", "-")
+			request := func(body []byte) *http.Request {
+				t.Helper()
+				req, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("thread-id", threadID)
+				return req
+			}
+
+			firstBody := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"history must survive"}]}]}`)
+			firstResponse := []byte(`{"id":"resp-before-rejected-compact","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer must survive"}]}]}`)
+			firstCtx := withGoalOriginalBody(ctx, firstBody)
+			goal, err := h.app.persistGoalContinuity(firstCtx, request(firstBody), "codex", firstBody, firstResponse)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			trigger := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp-before-rejected-compact","input":[{"type":"compaction_trigger"}]}`)
+			triggerCtx := withGoalOriginalBody(ctx, trigger)
+			goal, err = h.app.persistGoalContinuity(triggerCtx, request(trigger), "codex", trigger, []byte(testCase.response))
+			if err != nil {
+				t.Fatal(err)
+			}
+			replay, _, err := h.store.BuildGoalReplay(ctx, goal.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(replay)
+			for _, marker := range []string{"history must survive", "answer must survive"} {
+				if strings.Count(text, marker) != 1 {
+					t.Fatalf("rejected compaction changed %q count=%d replay=%s", marker, strings.Count(text, marker), text)
+				}
+			}
+		})
+	}
+}
+
+func TestGoalReplayRestoresCurrentLiteToolAndReasoningContract(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	ctx := context.Background()
+	_, err := h.store.CommitGoalTurn(ctx, storage.GoalTurn{
+		Protocol:          "codex",
+		DownstreamKeyHash: "lite-key",
+		WorkspaceHash:     "lite-workspace",
+		InitialGoalHash:   "lite-initial",
+		ResponseID:        "resp-lite-before-migration",
+		CheckpointPayload: `{"model":"gpt-5.6-sol","instructions":"stale top instructions","tools":[{"type":"custom","name":"stale_top_tool"}],"service_tier":"stale-tier","input":[]}`,
+		SegmentPayload: `{
+			"history_key":"input",
+			"input":[
+				{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"old_tool"}]},
+				{"type":"message","role":"developer","content":[{"type":"input_text","text":"old base"}]},
+				{"type":"message","role":"user","content":[{"type":"input_text","text":"durable task"}]}
+			],
+			"output":[{"type":"custom_tool_call","call_id":"call-lite","name":"apply_patch","input":"{}"}]
+		}`,
+		ExpiresAt:       storage.Now() + 3600,
+		StorageMaxBytes: 8 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := []byte(`{
+		"model":"gpt-5.6-sol",
+		"previous_response_id":"resp-lite-before-migration",
+		"reasoning":{"effort":"max","context":"all_turns"},
+		"parallel_tool_calls":false,
+		"tool_choice":"auto",
+		"text":{"verbosity":"high"},
+		"future_current_field":{"keep":true},
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"apply_patch","format":{"const":900719925474099312345}}]},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"current base"}]},
+			{"type":"custom_tool_call_output","call_id":"call-lite","output":"tool completed"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue now"}]}
+		]
+	}`)
+	req, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(current)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay := h.app.goalReplayBody(ctx, req, "codex", current)
+	if replay.Kind != goalResumeFound {
+		t.Fatalf("replay=%+v", replay)
+	}
+	text := string(replay.Body)
+	for _, marker := range []string{"apply_patch", "900719925474099312345", "current base", "durable task", "call-lite", "tool completed", "continue now", `"effort":"max"`, `"context":"all_turns"`, `"future_current_field":{"keep":true}`} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("missing %q in replay=%s", marker, text)
+		}
+	}
+	if strings.Contains(text, "stale_top_tool") || strings.Contains(text, "stale top instructions") || strings.Contains(text, "stale-tier") || strings.Contains(text, "old_tool") || strings.Contains(text, "old base") || strings.Contains(text, "previous_response_id") {
+		t.Fatalf("stale or account-local context leaked: %s", text)
+	}
+	if strings.Index(text, `"type":"additional_tools"`) > strings.Index(text, "durable task") || strings.Index(text, `"type":"custom_tool_call"`) > strings.Index(text, `"type":"custom_tool_call_output"`) {
+		t.Fatalf("Lite prefix or tool pair order is invalid: %s", text)
+	}
+}
+
 // skipLegacyCodexGoalReplay marks tests for the v1 Codex goal/checkpoint engine.
 // CPA-v2 deliberately keeps Codex context only in the original upstream session;
 // equivalent mapping/EOF/tool-result coverage lives in codex_session_mapping_test.go.

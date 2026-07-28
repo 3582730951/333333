@@ -91,6 +91,12 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 	if tierErr != nil {
 		return userGroupRoutePlan{}, tierErr
 	}
+	// Auto mode keeps every configured target and lets exact account capability
+	// checks decide executability. An explicit header/key hint fixes only provider
+	// targets; account-pool targets remain because they may contain that provider.
+	if hint := effectiveGatewayProviderHint(r, pol); hint != "" && hint != "auto" {
+		tiers = userGroupTiersForProvider(tiers, hint)
+	}
 	if len(tiers) == 0 {
 		return userGroupRoutePlan{}, fmt.Errorf("user group %s has no target compatible with model %q", group.ID, model)
 	}
@@ -203,6 +209,15 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			candidateContext = withUserGroupFallbackProbe(candidateContext)
 		}
 		candidate := r.Clone(candidateContext)
+		// An account_pool_group keeps the caller's explicit provider hint and lets
+		// that pool choose any capable account for it. A model_provider target is
+		// itself the explicit provider decision, so it must override a conflicting
+		// request header rather than silently executing another provider while the
+		// user-group binding records this target.
+		if target.Kind == storage.TargetKindModelProvider {
+			_, providerHint, _ := targetRefToRoute(target)
+			candidate.Header.Set("X-Pool-Provider", providerHint)
+		}
 		candidate.Body = io.NopCloser(bytes.NewReader(originalRaw))
 		candidate.ContentLength = int64(len(originalRaw))
 		dispatch(attempt, candidate)
@@ -548,11 +563,10 @@ func userGroupTargetSupportsModel(ctx context.Context, store *storage.Store, tar
 		return true
 	}
 	switch target.ID {
-	case "codex":
-		return isCodexMessagesModel(model)
-	case "claude":
-		return isClaudeModel(model)
-	case "kiro", "antigravity":
+	case "codex", "claude", "kiro", "antigravity":
+		// Model names do not prove provider capability. Runtime-verified exact
+		// account capabilities are authoritative, so auto routing must not discard
+		// a built-in target before its scheduler gets to evaluate the model.
 		return true
 	}
 	provider, ok, err := store.GetCustomProvider(ctx, target.ID)
@@ -603,6 +617,28 @@ func compatibleUserGroupTiers(ctx context.Context, store *storage.Store, group s
 		}
 	}
 	return out, nil
+}
+
+func userGroupTiersForProvider(tiers [][]storage.TargetRef, provider string) [][]storage.TargetRef {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	filtered := make([][]storage.TargetRef, 0, len(tiers))
+	for _, tier := range tiers {
+		eligible := make([]storage.TargetRef, 0, len(tier))
+		for _, target := range tier {
+			if target.Kind == storage.TargetKindAccountPoolGroup {
+				eligible = append(eligible, target)
+				continue
+			}
+			_, routeProvider, err := targetRefToRoute(target)
+			if err == nil && strings.EqualFold(routeProvider, provider) {
+				eligible = append(eligible, target)
+			}
+		}
+		if len(eligible) > 0 {
+			filtered = append(filtered, eligible)
+		}
+	}
+	return filtered
 }
 
 func orderUserGroupTiers(tiers [][]storage.TargetRef, seed string) []storage.TargetRef {

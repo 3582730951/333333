@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,106 @@ import (
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
+
+func TestClaudeMessagesAutoRoutesExactGroupModelsToAntigravity(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	observedModels := make(chan string, 4)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct {
+			Model string `json:"model"`
+		}
+		if err := json.Unmarshal(body, &envelope); err != nil {
+			t.Fatalf("decode Antigravity envelope: %v body=%s", err, body)
+		}
+		observedModels <- envelope.Model
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"response": {
+				"candidates": [{"content":{"role":"model","parts":[{"text":"routed"}]},"finishReason":"STOP"}],
+				"usageMetadata": {"promptTokenCount":4,"candidatesTokenCount":2}
+			}
+		}`)
+	})
+	ctx := context.Background()
+	unsupported := storage.Account{ID: "claude-unsupported-in-mixed-group", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, unsupported, storage.AccountToken{OpenAIAPIKey: "sk-ant-unsupported"}); err != nil {
+		t.Fatal(err)
+	}
+	account := storage.Account{ID: "antigravity-auto-route", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	if err := h.store.UpsertAccount(ctx, account, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertAntigravityCredentials(ctx, storage.AntigravityCredentials{
+		AccountID: account.ID, ProjectID: "project", AccessToken: "access",
+		ExpiresAt: time.Now().Add(2 * time.Hour).Unix(), BaseURL: h.upstream.URL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	models := []string{"claude-opus-4-6-thinking", "gemini-3-flash"}
+	caps := make([]storage.ModelCapability, 0, len(models)*2)
+	for _, model := range models {
+		caps = append(caps, storage.ModelCapability{
+			AccountID: account.ID, ModelSlug: model, AvailabilityState: "verified",
+			Source: "antigravity_model_probe",
+		}, storage.ModelCapability{
+			AccountID: unsupported.ID, ModelSlug: model, AvailabilityState: "unsupported",
+			Source: "claude_runtime_rejected",
+		})
+	}
+	if err := h.store.UpsertCapabilities(ctx, caps); err != nil {
+		t.Fatal(err)
+	}
+
+	const sessionID = "mixed-group-model-switch"
+	for _, model := range models {
+		body := []byte(`{"model":"` + model + `","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		affinity := routing.ExtractClaudeAffinityKey(req, body)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Pool-Resolved-Provider") != "antigravity" {
+			t.Fatalf("model=%s status=%d provider=%q body=%s", model, resp.StatusCode, resp.Header.Get("X-Pool-Resolved-Provider"), raw)
+		}
+		if observed := <-observedModels; observed != model {
+			t.Fatalf("model=%s reached Antigravity as %q", model, observed)
+		}
+		binding, err := h.store.GetAffinityBinding(ctx, affinity.Hash)
+		if err != nil || binding.AccountID != account.ID || binding.Provider != "antigravity" || binding.Model != model {
+			t.Fatalf("model=%s exact affinity binding=%+v err=%v", model, binding, err)
+		}
+	}
+
+	before := upstreamCalls.Load()
+	unknownBody := `{"model":"gemini-unverified","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`
+	unknownReq, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(unknownBody))
+	unknownReq.Header.Set("Content-Type", "application/json")
+	unknownReq.Header.Set("anthropic-version", "2023-06-01")
+	unknownReq.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	unknownResp, err := http.DefaultClient.Do(unknownReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, unknownResp.Body)
+	_ = unknownResp.Body.Close()
+	if unknownResp.StatusCode == http.StatusOK || upstreamCalls.Load() != before {
+		t.Fatalf("unknown Antigravity model status=%d calls=%d->%d", unknownResp.StatusCode, before, upstreamCalls.Load())
+	}
+}
 
 func TestAntigravityGeminiHandlerRecordsAttributedCacheUsage(t *testing.T) {
 	const (

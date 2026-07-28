@@ -662,7 +662,13 @@ func goalWorkingState(body []byte) string {
 	return string(encoded)
 }
 
-func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []byte) (string, string, string, bool, error) {
+type goalSegmentSemantics struct {
+	ReplacementHistory       []interface{}
+	ReplaceInput             bool
+	CodexCompactionEvaluated bool
+}
+
+func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []byte, semantics ...goalSegmentSemantics) (string, string, string, bool, error) {
 	request, err := decodeContextJSONMap(requestBody)
 	if err != nil {
 		return "", "", "", false, err
@@ -704,7 +710,22 @@ func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []by
 	if err != nil {
 		return "", "", "", false, err
 	}
-	segment, err := json.Marshal(map[string]interface{}{"history_key": historyKey, "input": history, "output": output})
+	segmentFields := map[string]interface{}{"history_key": historyKey, "input": history, "output": output}
+	if len(semantics) > 0 {
+		if len(semantics[0].ReplacementHistory) > 0 {
+			segmentFields["replacement_history"] = semantics[0].ReplacementHistory
+		}
+		if semantics[0].ReplaceInput {
+			segmentFields["replace_input"] = true
+		}
+		if semantics[0].CodexCompactionEvaluated {
+			// New Codex segments record that the response terminal was evaluated by
+			// the strict RemoteCompactionV2 gate. Storage may use its trigger-only
+			// compatibility inference solely for older segments that lack this bit.
+			segmentFields["codex_compaction_evaluated"] = true
+		}
+	}
+	segment, err := json.Marshal(segmentFields)
 	if err != nil {
 		return "", "", "", false, err
 	}
@@ -716,10 +737,18 @@ func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []by
 // array on every turn; persisting that full array as every segment creates O(n^2)
 // storage. Any mismatch keeps the original body, preferring duplication over loss.
 func incrementalGoalRequest(currentBody, durableReplay []byte) []byte {
+	trimmed, _ := incrementalGoalRequestWithMode(currentBody, durableReplay)
+	return trimmed
+}
+
+// incrementalGoalRequestWithMode distinguishes an ordinary delta from the full
+// replacement snapshot Codex emits after remote compaction. The latter must replace
+// the durable input instead of being appended to it.
+func incrementalGoalRequestWithMode(currentBody, durableReplay []byte) ([]byte, bool) {
 	current, currentErr := decodeContextJSONMap(currentBody)
 	durable, durableErr := decodeContextJSONMap(durableReplay)
 	if currentErr != nil || durableErr != nil {
-		return currentBody
+		return currentBody, false
 	}
 	historyKey := "input"
 	if _, ok := current["messages"]; ok {
@@ -728,19 +757,177 @@ func incrementalGoalRequest(currentBody, durableReplay []byte) []byte {
 	currentHistory, currentOK := current[historyKey].([]interface{})
 	durableHistory, durableOK := durable[historyKey].([]interface{})
 	if !currentOK || !durableOK || len(durableHistory) == 0 || len(durableHistory) > len(currentHistory) {
-		return currentBody
+		return currentBody, goalFullInputReplacesDurable(currentHistory, durableHistory)
 	}
 	for index := range durableHistory {
 		if !reflect.DeepEqual(durableHistory[index], currentHistory[index]) {
-			return currentBody
+			return currentBody, goalFullInputReplacesDurable(currentHistory, durableHistory)
 		}
 	}
 	current[historyKey] = append([]interface{}(nil), currentHistory[len(durableHistory):]...)
 	encoded, err := json.Marshal(current)
 	if err != nil {
-		return currentBody
+		return currentBody, false
 	}
-	return encoded
+	return encoded, false
+}
+
+func goalFullInputReplacesDurable(current, durable []interface{}) bool {
+	if goalInputSnapshotReplacesDurable(current, durable) {
+		return true
+	}
+	currentPrefix, currentHistory := splitLeadingCodexLiteReplayPrefix(current)
+	_, durableHistory := removeCodexLiteReplayPrefixes(durable)
+	return len(currentPrefix) > 0 && goalHistoryPrefixEqual(durableHistory, currentHistory)
+}
+
+func goalInputSnapshotReplacesDurable(current, durable []interface{}) bool {
+	signature, ok := latestGoalCompactionSignature(durable)
+	if !ok {
+		return false
+	}
+	for _, raw := range current {
+		if currentSignature, currentOK := goalCompactionSignature(raw); currentOK && currentSignature == signature {
+			return true
+		}
+	}
+	return false
+}
+
+func latestGoalCompactionSignature(items []interface{}) (string, bool) {
+	for index := len(items) - 1; index >= 0; index-- {
+		if signature, ok := goalCompactionSignature(items[index]); ok {
+			return signature, true
+		}
+	}
+	return "", false
+}
+
+func goalCompactionSignature(raw interface{}) (string, bool) {
+	item, ok := raw.(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	kind := strings.ToLower(strings.TrimSpace(streamString(item["type"])))
+	if kind != "compaction" && kind != "compaction_summary" {
+		return "", false
+	}
+	encrypted, ok := item["encrypted_content"].(string)
+	if !ok {
+		return "", false
+	}
+	return "compaction\x00" + encrypted, true
+}
+
+func mergeCodexGoalReplayInput(durableRaw, currentRaw interface{}) []interface{} {
+	durablePrefix, durableHistory := removeCodexLiteReplayPrefixes(appendItems(nil, durableRaw))
+	currentPrefix, currentHistory := splitLeadingCodexLiteReplayPrefix(appendItems(nil, currentRaw))
+	prefix := currentPrefix
+	if len(prefix) == 0 {
+		prefix = durablePrefix
+	}
+
+	mergedHistory := append([]interface{}(nil), durableHistory...)
+	switch {
+	case goalInputSnapshotReplacesDurable(currentHistory, durableHistory):
+		// A post-compaction full request already contains the official replacement
+		// history. Appending it would duplicate the retained messages and opaque
+		// compaction item.
+		mergedHistory = append([]interface{}(nil), currentHistory...)
+	case goalHistoryPrefixEqual(durableHistory, currentHistory):
+		mergedHistory = append(mergedHistory, currentHistory[len(durableHistory):]...)
+	default:
+		mergedHistory = append(mergedHistory, currentHistory...)
+	}
+	return append(append([]interface{}(nil), prefix...), mergedHistory...)
+}
+
+func goalHistoryPrefixEqual(prefix, items []interface{}) bool {
+	if len(prefix) == 0 || len(prefix) > len(items) {
+		return false
+	}
+	for index := range prefix {
+		if !reflect.DeepEqual(prefix[index], items[index]) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitLeadingCodexLiteReplayPrefix(items []interface{}) ([]interface{}, []interface{}) {
+	if len(items) == 0 || !codexGoalLiteAdditionalTools(items[0]) {
+		return nil, items
+	}
+	end := 1
+	for end < len(items) && codexGoalDeveloperMessage(items[end]) {
+		end++
+	}
+	return append([]interface{}(nil), items[:end]...), append([]interface{}(nil), items[end:]...)
+}
+
+func removeCodexLiteReplayPrefixes(items []interface{}) ([]interface{}, []interface{}) {
+	var latestPrefix []interface{}
+	history := make([]interface{}, 0, len(items))
+	for index := 0; index < len(items); {
+		if !codexGoalLiteAdditionalTools(items[index]) {
+			history = append(history, items[index])
+			index++
+			continue
+		}
+		end := index + 1
+		for end < len(items) && codexGoalDeveloperMessage(items[end]) {
+			end++
+		}
+		latestPrefix = append([]interface{}(nil), items[index:end]...)
+		index = end
+	}
+	return latestPrefix, history
+}
+
+func codexGoalLiteAdditionalTools(raw interface{}) bool {
+	item, ok := raw.(map[string]interface{})
+	if !ok || streamString(item["type"]) != "additional_tools" || streamString(item["role"]) != "developer" {
+		return false
+	}
+	_, ok = item["tools"].([]interface{})
+	return ok
+}
+
+func codexGoalDeveloperMessage(raw interface{}) bool {
+	item, ok := raw.(map[string]interface{})
+	return ok && streamString(item["type"]) == "message" && streamString(item["role"]) == "developer"
+}
+
+func codexRemoteCompactionReplacement(durableReplay, incrementalBody, responseBody []byte, replaceInput bool) ([]interface{}, bool) {
+	request, err := decodeContextJSONMap(incrementalBody)
+	if err != nil {
+		return nil, false
+	}
+	response, err := decodeContextJSONMap(responseBody)
+	if err != nil {
+		return nil, false
+	}
+	// RemoteCompactionV2 installs a replacement only after the official client has
+	// observed response.completed. Treating a status-less or partial response as a
+	// boundary could erase the only durable copy of the pre-compaction history.
+	if !strings.EqualFold(strings.TrimSpace(streamString(response["status"])), "completed") {
+		return nil, false
+	}
+	logicalInput := appendItems(nil, request["input"])
+	previousResponseID := strings.TrimSpace(streamString(request["previous_response_id"]))
+	if previousResponseID != "" && !replaceInput && len(durableReplay) > 0 {
+		if durable, decodeErr := decodeContextJSONMap(durableReplay); decodeErr == nil {
+			durableInput := appendItems(nil, durable["input"])
+			// A transport fallback can carry previous_response_id together with a
+			// self-contained full input. Only WebSocket deltas need the durable prefix;
+			// prepending it to an already complete logical request duplicates every
+			// retained message at the compaction boundary.
+			if !goalHistoryPrefixEqual(durableInput, logicalInput) {
+				logicalInput = append(durableInput, logicalInput...)
+			}
+		}
+	}
+	return storage.CodexRemoteCompactionV2Replacement(logicalInput, response["output"])
 }
 
 // goalResponseFromSSE retains a protocol stream as encrypted structured segment data
@@ -931,12 +1118,26 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		return storage.GoalSession{}, nil
 	}
 	segmentRequestBody := goalOriginalBody(ctx, requestBody)
+	// Keep the model-visible request before removing an already durable prefix.
+	// HTTP Responses sends the complete prompt without previous_response_id, while
+	// WebSocket reuse sends only a delta with previous_response_id. Persistence may
+	// trim either form, but RemoteCompactionV2 must derive its replacement from the
+	// complete logical prompt that preceded compaction_trigger.
+	logicalRequestBody := segmentRequestBody
+	var durableReplay []byte
+	replaceInput := false
 	if resolved, resolveErr := s.store.ResolveGoalAliasSets(ctx, resolutionSets); resolveErr == nil {
 		if replay, _, replayErr := s.store.BuildGoalReplay(ctx, resolved.Session.ID); replayErr == nil {
-			segmentRequestBody = incrementalGoalRequest(segmentRequestBody, replay)
+			durableReplay = replay
+			segmentRequestBody, replaceInput = incrementalGoalRequestWithMode(segmentRequestBody, replay)
 		}
 	}
-	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody)
+	semantics := goalSegmentSemantics{ReplaceInput: replaceInput}
+	if strings.EqualFold(strings.TrimSpace(protocol), "codex") {
+		semantics.CodexCompactionEvaluated = true
+		semantics.ReplacementHistory, _ = codexRemoteCompactionReplacement(durableReplay, logicalRequestBody, responseBody, replaceInput)
+	}
+	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody, semantics)
 	if err != nil {
 		return storage.GoalSession{}, err
 	}
@@ -1053,20 +1254,40 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 	if err != nil {
 		return goalResumeResult{Kind: goalResumeUnidentified, Reason: err.Error()}
 	}
-	keys := []string{"model", "instructions", "tools", "reasoning", "stream", "include"}
-	if protocol == "claude" || protocol == "kiro" {
-		keys = []string{"model", "system", "tools", "max_tokens", "temperature", "top_p", "thinking", "stream", "metadata"}
-	}
-	for _, key := range keys {
-		if value, ok := cur[key]; ok {
-			replayed[key] = value
-		}
-	}
 	historyKey := "input"
 	if protocol == "claude" || protocol == "kiro" {
 		historyKey = "messages"
+		for _, key := range []string{"model", "system", "tools", "max_tokens", "temperature", "top_p", "thinking", "stream", "metadata"} {
+			if value, ok := cur[key]; ok {
+				replayed[key] = value
+			}
+		}
+		replayed[historyKey] = appendItems(replayed[historyKey], cur[historyKey])
+	} else {
+		// The current request is authoritative for every current-turn setting,
+		// including future fields. Keeping only a historical whitelist silently
+		// dropped tool_choice, parallel_tool_calls, reasoning.context, text and
+		// Responses Lite metadata during an account migration. Start from a fresh
+		// envelope so fields intentionally omitted now cannot leak from an old
+		// checkpoint.
+		mergedInput := mergeCodexGoalReplayInput(replayed[historyKey], cur[historyKey])
+		currentEnvelope := make(map[string]interface{}, len(cur)+1)
+		for key, value := range cur {
+			switch key {
+			case "input", "messages", "previous_response_id", "turn_state":
+				continue
+			default:
+				currentEnvelope[key] = value
+			}
+		}
+		if _, ok := currentEnvelope["model"]; !ok {
+			// Every official request includes model. Retaining it only as a malformed
+			// request fallback is safer than emitting a model-less fresh root.
+			currentEnvelope["model"] = replayed["model"]
+		}
+		currentEnvelope[historyKey] = mergedInput
+		replayed = currentEnvelope
 	}
-	replayed[historyKey] = appendItems(replayed[historyKey], cur[historyKey])
 	if historyKey == "messages" {
 		delete(replayed, "input")
 	} else {

@@ -2,9 +2,13 @@ package scheduler
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"log"
 	"math"
 	"strings"
+	"sync"
+	"time"
 
 	"codex-account-pool/internal/storage"
 )
@@ -94,6 +98,17 @@ func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (
 	if route.Group == "" {
 		route.Group = s.Config().DefaultGroup
 	}
+	// Match Select's dynamic account-pool outlet resolution. Provider-level
+	// ordering supplied by the caller still wins; otherwise every pressure view
+	// must see the same current group outlets as a fresh lease.
+	if len(route.PreferredEgressIDs) == 0 {
+		group, groupErr := s.store.GetGroup(ctx, route.Group)
+		if groupErr == nil {
+			route.PreferredEgressIDs = append([]string(nil), group.EgressIDs...)
+		} else if !errors.Is(groupErr, sql.ErrNoRows) {
+			return ProviderPressureSnapshot{}, groupErr
+		}
+	}
 	out := ProviderPressureSnapshot{Group: route.Group, Provider: route.Provider, Model: route.Model}
 
 	selection, err := s.accountsSnapshot(ctx, route.Group)
@@ -137,6 +152,16 @@ func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (
 
 	now := storage.Now()
 	egCache := make(map[string]storage.EgressProfile)
+	requestEgress := make(map[string]storage.EgressProfile)
+	var egressCacheMutex *sync.RWMutex
+	var egressOutcomes map[string]storage.CodexEgressRecentOutcome
+	s.egressCacheMutex.Lock()
+	if time.Since(s.egressCacheTime) > s.egressCacheTTL {
+		s.egressCache = sync.Map{}
+		s.egressCacheTime = time.Now()
+	}
+	egressCacheMutex = &s.egressCacheMutex
+	s.egressCacheMutex.Unlock()
 	cfg := s.Config()
 	for _, awe := range accountsWithEgress {
 		account, binding := awe.Account, awe.Binding
@@ -161,7 +186,40 @@ func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (
 		if binding.RecheckPending && !account.IgnoreRateLimitControls {
 			continue
 		}
+		binding = routeEgressBinding(binding, account.ID, route.PreferredEgressIDs)
 
+		inflight, tokens := s.currentLoad(account.ID)
+		if accountProvider == "codex" {
+			if egressOutcomes == nil {
+				egressOutcomes = s.recentCodexEgressOutcomes(ctx)
+			}
+			// Fresh Codex routing treats every healthy outlet as active capacity.
+			// A full primary therefore leaves the account immediately available
+			// when a standby has room, exactly as Select does.
+			_, _, _, capacityBlocked, available := s.selectFreshEgressWithCache(
+				ctx, binding, now, account.IgnoreRateLimitControls,
+				&requestEgress, egressCacheMutex, egressOutcomes,
+			)
+			if !available {
+				if capacityBlocked {
+					out.EligibleAccounts++
+					out.SaturatedAccounts++
+					out.InFlight += inflight
+				}
+				continue
+			}
+			out.EligibleAccounts++
+			out.InFlight += inflight
+			if tokenBudgetLimited(cfg.AccountTokenBudget, route.Compaction, inflight, tokens, route.EstimatedTokens) {
+				out.SaturatedAccounts++
+				continue
+			}
+			out.AvailableAccounts++
+			continue
+		}
+
+		// Other providers retain ordered primary/standby semantics. Their
+		// standbys become active only when the primary is unhealthy/cooling.
 		egress, ok := s.selectEgress(ctx, binding, now, egCache, account.IgnoreRateLimitControls)
 		if !ok {
 			continue
@@ -172,12 +230,11 @@ func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (
 		}
 
 		out.EligibleAccounts++
-		inflight, tokens := s.currentLoad(account.ID)
 		out.InFlight += inflight
-		egressLoad := s.currentEgressLoad(egress.ID)
+		egressLoad, sidecarLoad := s.currentEgressLoads(egress)
 		egressSaturated := concurrencyLimited(egress.MaxConcurrency, egressLoad)
-		if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" {
-			egressSaturated = egressSaturated || concurrencyLimited(egress.TransportSidecarMaxConcurrency, s.currentEgressLoad(sidecarID))
+		if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
+			egressSaturated = egressSaturated || concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad)
 		}
 		if egressSaturated || tokenBudgetLimited(cfg.AccountTokenBudget, route.Compaction, inflight, tokens, route.EstimatedTokens) {
 			out.SaturatedAccounts++
@@ -207,6 +264,9 @@ func (s *Scheduler) pressureModelEligible(ctx context.Context, account storage.A
 		return ok
 	case "codex":
 		_, _, ok := resolveCodexRouteModel(route, capabilitiesByAccount[account.ID])
+		return ok
+	case "antigravity":
+		_, ok := resolveAntigravityRouteModel(route, capabilitiesByAccount[account.ID])
 		return ok
 	default:
 		return capable == nil || capable[account.ID]

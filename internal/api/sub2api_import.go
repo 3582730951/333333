@@ -177,6 +177,12 @@ func accountTokenFromParsed(parsed authparse.ParsedAuth, refreshToken string) st
 
 func (s *Server) importSub2APIProxies(ctx context.Context, proxies []authparse.Sub2APIProxy, result *authDocumentImportResult) map[string]string {
 	resolved := make(map[string]string, len(proxies))
+	profilesChanged := false
+	defer func() {
+		if profilesChanged {
+			s.scheduler.InvalidateEgressCache()
+		}
+	}()
 	existing, err := s.store.ListEgressProfiles(ctx)
 	if err != nil {
 		for _, proxy := range proxies {
@@ -217,6 +223,7 @@ func (s *Server) importSub2APIProxies(ctx context.Context, proxies []authparse.S
 					result.Errors = append(result.Errors, authDocumentError{Kind: "proxy", Name: proxy.Name, ProxyKey: safeSub2APIProxyKey(key), Message: err.Error()})
 					continue
 				}
+				profilesChanged = true
 				byID[existingID] = existingProfile
 			}
 			resolved[key] = existingID
@@ -233,6 +240,7 @@ func (s *Server) importSub2APIProxies(ctx context.Context, proxies []authparse.S
 			result.Errors = append(result.Errors, authDocumentError{Kind: "proxy", Name: proxy.Name, ProxyKey: safeSub2APIProxyKey(key), Message: err.Error()})
 			continue
 		}
+		profilesChanged = true
 		resolved[key] = profile.ID
 		byWire[wireKey] = profile.ID
 		byID[profile.ID] = profile

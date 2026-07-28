@@ -28,6 +28,30 @@ func testStore(t *testing.T) *storage.Store {
 	return store
 }
 
+func insertCodexEgressOutcomeSamples(t *testing.T, store *storage.Store, egressID string, attempts, successes int) {
+	t.Helper()
+	if successes < 0 || successes > attempts {
+		t.Fatalf("invalid outcome sample attempts=%d successes=%d", attempts, successes)
+	}
+	now := storage.Now()
+	for index := 0; index < attempts-successes; index++ {
+		if err := store.InsertCodexUpstreamAttempt(context.Background(), storage.CodexUpstreamAttempt{
+			TreeID: "scheduler-outcome-" + egressID, AccountID: "scheduler-outcome-account", EgressID: egressID,
+			State: "egress_failure", CreatedAt: now - 1, ExpiresAt: now + 3600,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index := 0; index < successes; index++ {
+		if err := store.InsertCodexUpstreamAttempt(context.Background(), storage.CodexUpstreamAttempt{
+			TreeID: "scheduler-outcome-" + egressID, AccountID: "scheduler-outcome-account", EgressID: egressID,
+			State: "terminal_success", CreatedAt: now - 1, ExpiresAt: now + 3600,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestAdaptiveZeroLimitsDoNotReject(t *testing.T) {
 	if concurrencyLimited(0, 10_000) {
 		t.Fatal("max_concurrency=0 must not impose a static limit")
@@ -146,6 +170,413 @@ func TestSelectDynamicallyInheritsOrderedGroupEgressWithoutRewritingAccount(t *t
 	defer lease.Release()
 	if lease.Egress.ID != "group-standby" {
 		t.Fatalf("updated group order was not inherited dynamically: %+v", lease.Egress)
+	}
+}
+
+func TestFreshSelectionUsesStandbyWhenPrimaryIsFull(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "multi-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"egress-a", "egress-b"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"egress-a", "egress-b"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	primary, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Release()
+	if primary.Egress.ID != "egress-a" {
+		t.Fatalf("first fresh lease egress=%q, want ordered tie-break egress-a", primary.Egress.ID)
+	}
+	standby, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatalf("full primary removed an account with standby capacity: %v", err)
+	}
+	defer standby.Release()
+	if standby.Account.ID != account.ID || standby.Egress.ID != "egress-b" {
+		t.Fatalf("standby lease account=%q egress=%q, want %q on egress-b", standby.Account.ID, standby.Egress.ID, account.ID)
+	}
+	if standby.Binding.PrimaryEgressID != "egress-b" || standby.Binding.StandbyEgressIDs != "egress-a" || standby.Binding.CookieJarKey != account.ID+":egress-b" {
+		t.Fatalf("selected standby was not rotated into lease binding: %+v", standby.Binding)
+	}
+}
+
+func TestInvalidateEgressCachePublishesCooldownImmediately(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "egress-cache-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"cached-primary", "cached-standby"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080",
+			Health: "healthy", MaxConcurrency: 4,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"cached-primary", "cached-standby"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	first, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Egress.ID != "cached-primary" {
+		first.Release()
+		t.Fatalf("initial egress=%q, want cached-primary", first.Egress.ID)
+	}
+	first.Release()
+	if _, cached := s.egressCache.Load("cached-primary"); !cached {
+		t.Fatal("selection did not populate the process egress cache")
+	}
+
+	if err := store.SetEgressCooldown(ctx, "cached-primary", storage.Now()+3600, "test-ray"); err != nil {
+		t.Fatal(err)
+	}
+	s.InvalidateEgressCache()
+	if _, cached := s.egressCache.Load("cached-primary"); cached {
+		t.Fatal("egress cache still contains the pre-cooldown profile")
+	}
+	second, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Egress.ID != "cached-standby" {
+		t.Fatalf("post-invalidation egress=%q, want cached-standby", second.Egress.ID)
+	}
+}
+
+func TestFreshStandbyRotatesStoredBindingWithoutPreferredEgresses(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "stored-standby-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"stored-primary", "stored-standby"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertEgressBinding(ctx, storage.AccountEgressBinding{
+		AccountID: account.ID, PrimaryEgressID: "stored-primary", StandbyEgressIDs: "stored-standby", CookieJarKey: account.ID + ":stored-primary",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	primary, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Release()
+	standby, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer standby.Release()
+	if standby.Egress.ID != "stored-standby" || standby.Binding.PrimaryEgressID != "stored-standby" || standby.Binding.StandbyEgressIDs != "stored-primary" || standby.Binding.CookieJarKey != account.ID+":stored-standby" {
+		t.Fatalf("stored standby lease was not rotated and re-namespaced: egress=%s binding=%+v", standby.Egress.ID, standby.Binding)
+	}
+}
+
+func TestFreshSelectionBalancesAbsoluteInflightAcrossUnequalLimits(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "unequal-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range []storage.EgressProfile{
+		{ID: "egress-us-huge", Type: "http_proxy", Endpoint: "http://us.example:8080", Health: "healthy", MaxConcurrency: 999999999999},
+		{ID: "egress-jp-16", Type: "http_proxy", Endpoint: "http://jp.example:8080", Health: "healthy", MaxConcurrency: 16},
+	} {
+		if err := store.UpsertEgressProfile(ctx, profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"egress-us-huge", "egress-jp-16"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	leases := make([]Lease, 0, 20)
+	counts := map[string]int{}
+	defer func() {
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+	for range 20 {
+		lease, selectErr := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+		if selectErr != nil {
+			t.Fatal(selectErr)
+		}
+		leases = append(leases, lease)
+		counts[lease.Egress.ID]++
+	}
+	if counts["egress-us-huge"] != 10 || counts["egress-jp-16"] != 10 {
+		t.Fatalf("unequal hard limits skewed fresh traffic: counts=%v", counts)
+	}
+}
+
+func TestCodexFreshSelectionWeightsConcurrentLoadBySuccessProbability(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "weighted-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range []storage.EgressProfile{
+		{ID: "egress-p90-huge", Type: "http_proxy", Endpoint: "http://p90.example:8080", Health: "healthy", MaxConcurrency: 999999999999},
+		{ID: "egress-p70", Type: "http_proxy", Endpoint: "http://p70.example:8080", Health: "healthy", MaxConcurrency: 160},
+	} {
+		if err := store.UpsertEgressProfile(ctx, profile); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"egress-p90-huge", "egress-p70"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	// With the bounded prior these observations produce posterior buckets 90
+	// and 70 exactly.  The configured limit of the first outlet is deliberately
+	// enormous: it is a ceiling, not a routing weight.
+	insertCodexEgressOutcomeSamples(t, store, "egress-p90-huge", 100, 90)
+	insertCodexEgressOutcomeSamples(t, store, "egress-p70", 100, 68)
+	if high, low := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 100, Successes: 90}), codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 100, Successes: 68}); high != 90 || low != 70 {
+		t.Fatalf("posterior buckets high=%d low=%d, want 90/70", high, low)
+	}
+
+	s := New(store, config.Default())
+	leases := make([]Lease, 0, 160)
+	counts := map[string]int{}
+	defer func() {
+		for _, lease := range leases {
+			lease.Release()
+		}
+	}()
+	for range 160 {
+		lease, selectErr := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+		if selectErr != nil {
+			t.Fatal(selectErr)
+		}
+		leases = append(leases, lease)
+		counts[lease.Egress.ID]++
+	}
+	if high, low := counts["egress-p90-huge"], counts["egress-p70"]; high < 89 || high > 91 || low < 69 || low > 71 {
+		t.Fatalf("weighted 90/70 routing was monopolized: counts=%v", counts)
+	}
+}
+
+func TestCodexFreshSelectionDoesNotForceKnownFailingColdEgress(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "outcome-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"mature-egress", "exploring-egress"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 32,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"mature-egress", "exploring-egress"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	insertCodexEgressOutcomeSamples(t, store, "mature-egress", 100, 100)
+	insertCodexEgressOutcomeSamples(t, store, "exploring-egress", 19, 0)
+
+	s := New(store, config.Default())
+	mature, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mature.Release()
+	if mature.Egress.ID != "mature-egress" {
+		t.Fatalf("nineteen observed failures overrode mature success: %s", mature.Egress.ID)
+	}
+}
+
+func TestCodexFreshSelectionExploresUnobservedEgressAtComparableQuality(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "bounded-exploration-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"mature-egress", "unobserved-egress"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 32,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"mature-egress", "unobserved-egress"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	insertCodexEgressOutcomeSamples(t, store, "mature-egress", 100, 90)
+
+	s := New(store, config.Default())
+	first, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	if first.Egress.ID != "mature-egress" {
+		t.Fatalf("equal posterior did not preserve configured tie-break: %s", first.Egress.ID)
+	}
+	second, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Egress.ID != "unobserved-egress" {
+		t.Fatalf("unobserved outlet was not explored under comparable quality: %s", second.Egress.ID)
+	}
+}
+
+func TestCodexEgressSuccessBucketsIgnoreSubPercentNoise(t *testing.T) {
+	a := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 1000, Successes: 850})
+	b := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 1000, Successes: 851})
+	if a != b {
+		t.Fatalf("one-sample noise crossed a one-percent routing bucket: %d != %d", a, b)
+	}
+	if noSamples, nineteen := codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{}), codexEgressSuccessBucket(storage.CodexEgressRecentOutcome{Attempts: 19}); noSamples <= nineteen || noSamples > 100 || nineteen >= 50 {
+		t.Fatalf("exploration ranks no-sample=%d nineteen-sample=%d", noSamples, nineteen)
+	}
+}
+
+func TestNonCodexFreshSelectionIgnoresCodexOutcomeStats(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "claude-outcome-account", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"claude-primary", "claude-standby"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 32,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"claude-primary", "claude-standby"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	// If Codex-only samples leaked across providers, the unsampled standby would
+	// receive exploration priority over the ordered Claude primary.
+	insertCodexEgressOutcomeSamples(t, store, "claude-primary", 100, 90)
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Egress.ID != "claude-primary" {
+		lease.Release()
+		t.Fatalf("Codex outcome samples changed non-Codex routing: %s", lease.Egress.ID)
+	}
+	defer lease.Release()
+	second, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Egress.ID != "claude-primary" {
+		t.Fatalf("Codex fresh balancing changed Claude primary/standby semantics: %s", second.Egress.ID)
+	}
+}
+
+func TestRequiredAccountAndEgressIgnoreFreshOutletReordering(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "required-egress-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"committed-egress", "fresh-egress"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The committed outlet is deliberately absent from the current fresh pool.
+	group.EgressIDs = []string{"fresh-egress"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	lease, err := s.Select(ctx, Route{
+		Group: "cyber", Provider: "codex",
+		RequiredAccountID: account.ID, RequiredEgressID: "committed-egress",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != account.ID || lease.Egress.ID != "committed-egress" {
+		t.Fatalf("required mapping moved: account=%q egress=%q", lease.Account.ID, lease.Egress.ID)
 	}
 }
 
@@ -656,6 +1087,139 @@ func TestClaudeAliasRequiresVerifiedCapabilityAndRejectionsStayModelScoped(t *te
 		ModelSlug: "gpt-5.6-sol", AvailabilityState: capability.AvailabilityUnsupported, Source: "codex_runtime_rejected",
 	}}); ok || resolved != "" {
 		t.Fatalf("rejected Codex model was retried as %q", resolved)
+	}
+}
+
+func TestAntigravityRouteRequiresExactVerifiedAccountCapability(t *testing.T) {
+	route := Route{Model: "claude-opus-4-6-thinking"}
+	verified := []storage.ModelCapability{{
+		ModelSlug: route.Model, AvailabilityState: capability.AvailabilityVerified,
+		Context1MState: capability.Context1MUnknown, Source: "antigravity_model_probe",
+	}}
+	if resolved, ok := resolveAntigravityRouteModel(route, verified); !ok || resolved != route.Model {
+		t.Fatalf("verified Antigravity model resolved=%q ok=%v", resolved, ok)
+	}
+	if resolved, ok := resolveAntigravityRouteModel(Route{Model: "gemini-unknown"}, verified); ok || resolved != "" {
+		t.Fatalf("unknown Antigravity model resolved=%q ok=%v", resolved, ok)
+	}
+	unverified := append([]storage.ModelCapability(nil), verified...)
+	unverified[0].AvailabilityState = capability.AvailabilityUnverified
+	if resolved, ok := resolveAntigravityRouteModel(route, unverified); ok || resolved != "" {
+		t.Fatalf("unverified Antigravity model resolved=%q ok=%v", resolved, ok)
+	}
+	if resolved, ok := resolveAntigravityRouteModel(Route{Model: route.Model, ContextMode: "1m"}, verified); ok || resolved != "" {
+		t.Fatalf("1m routed without account evidence: resolved=%q ok=%v", resolved, ok)
+	}
+	verified[0].Context1MState = capability.Context1MSupported
+	if resolved, ok := resolveAntigravityRouteModel(Route{Model: route.Model, ContextMode: "1m"}, verified); !ok || resolved != route.Model {
+		t.Fatalf("verified Antigravity 1m model resolved=%q ok=%v", resolved, ok)
+	}
+}
+
+func TestAntigravityCapabilityAppliesToFreshRequiredAndPressurePaths(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "antigravity-capability", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	const model = "gemini-3-flash"
+	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{{
+		AccountID: account.ID, ModelSlug: model, AvailabilityState: capability.AvailabilityVerified,
+		Source: "antigravity_model_probe",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	s := New(store, config.Default())
+	route := Route{Group: "cyber", AllowedProviders: []string{"claude", "kiro", "antigravity"}, Model: model}
+	lease, err := s.Select(ctx, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Account.ID != account.ID || lease.ResolvedModel != model {
+		lease.Release()
+		t.Fatalf("fresh Antigravity lease=%+v", lease)
+	}
+	lease.Release()
+
+	required := route
+	required.RequiredAccountID = account.ID
+	lease, err = s.Select(ctx, required)
+	if err != nil {
+		t.Fatalf("required verified Antigravity route: %v", err)
+	}
+	lease.Release()
+
+	unknown := route
+	unknown.Model = "gemini-unverified"
+	if _, err = s.Select(ctx, unknown); err == nil {
+		t.Fatal("fresh Antigravity route accepted an unknown model")
+	}
+	unknown.RequiredAccountID = account.ID
+	if _, err = s.Select(ctx, unknown); !errors.Is(err, ErrBoundAccountUnavailable) {
+		t.Fatalf("required Antigravity route accepted unknown model: %v", err)
+	}
+	if count, countErr := s.EligibleCandidateCount(ctx, route); countErr != nil || count != 1 {
+		t.Fatalf("verified Antigravity pressure eligibility count=%d err=%v", count, countErr)
+	}
+	if count, countErr := s.EligibleCandidateCount(ctx, Route{Group: "cyber", Provider: "antigravity", Model: "gemini-unverified"}); countErr != nil || count != 0 {
+		t.Fatalf("unknown Antigravity pressure eligibility count=%d err=%v", count, countErr)
+	}
+}
+
+func TestVerifiedModelGateRejectsMixedProviderBootstrapAndWrongAffinity(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	claude := storage.Account{ID: "mixed-unprobed-claude", GroupName: "cyber", Provider: "claude", Status: "active"}
+	antigravity := storage.Account{ID: "mixed-verified-antigravity", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+	for _, account := range []storage.Account{claude, antigravity} {
+		if err := store.UpsertAccount(ctx, account, storage.AccountToken{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedUnverifiedKiroAccount(t, store, storage.Account{ID: "mixed-unprobed-kiro", GroupName: "cyber", PlanType: "KIRO PRO"})
+	const model = "gemini-3-flash"
+	if err := store.UpsertCapabilities(ctx, []storage.ModelCapability{{
+		AccountID: antigravity.ID, ModelSlug: model, AvailabilityState: capability.AvailabilityVerified,
+		Source: "antigravity_model_probe",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	affinity := routing.AffinityFromKey("mixed-provider-wrong-model-binding", "test")
+	if err := store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		RouteKeyHash: affinity.Hash, RouteKey: affinity.Key, Source: affinity.Source,
+		AccountID: claude.ID, Provider: "claude", Model: "claude-opus-4-8", EgressID: storage.DefaultDirectEgressID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	route := Route{
+		Group: "cyber", AllowedProviders: []string{"claude", "kiro", "antigravity"},
+		Model: model, Affinity: affinity,
+	}
+	lease, err := s.Select(ctx, route)
+	if err != nil {
+		t.Fatalf("verified mixed-provider route: %v", err)
+	}
+	if lease.Account.ID != antigravity.ID || lease.ResolvedModel != model {
+		lease.Release()
+		t.Fatalf("wrong-model Claude affinity captured route: %+v", lease)
+	}
+	lease.Release()
+	bound, err := store.GetAffinityBinding(ctx, affinity.Hash)
+	if err != nil || bound.AccountID != antigravity.ID || bound.Model != model {
+		t.Fatalf("wrong-model affinity was not rebound to verified provider: %+v err=%v", bound, err)
+	}
+
+	unknown := route
+	unknown.Affinity = routing.AffinityKey{}
+	unknown.Model = "gemini-unverified"
+	if _, err = s.Select(ctx, unknown); err == nil {
+		t.Fatal("mixed provider auto route bootstrapped an unverified model")
+	}
+	if count, countErr := s.EligibleCandidateCount(ctx, unknown); countErr != nil || count != 0 {
+		t.Fatalf("unknown mixed-provider pressure eligibility count=%d err=%v", count, countErr)
 	}
 }
 

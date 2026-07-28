@@ -27,6 +27,13 @@ var ErrNoAccount = errors.New("no active account available")
 var ErrStrictUnavailable = errors.New("strict sticky account unavailable")
 var ErrBoundAccountUnavailable = errors.New("bound account unavailable")
 
+const (
+	codexEgressOutcomeWindow   = 30 * time.Minute
+	codexEgressOutcomeCacheTTL = 5 * time.Second
+	codexEgressPriorAttempts   = int64(10)
+	codexEgressPriorSuccesses  = int64(9)
+)
+
 type Scheduler struct {
 	store           *storage.Store
 	cfg             atomic.Value // stores config.Config
@@ -74,6 +81,15 @@ type Scheduler struct {
 	egressCacheTime  time.Time
 	egressCacheTTL   time.Duration
 	egressCacheMutex sync.RWMutex
+
+	// Recent Codex transport outcomes change independently from account/egress
+	// configuration, so they use a short immutable snapshot cache of their own.
+	// A refresh failure publishes an empty snapshot for one TTL and degrades to
+	// healthy least-inflight routing rather than blocking admission.
+	egressOutcomeMu        sync.RWMutex
+	egressOutcomeRefreshMu sync.Mutex
+	egressOutcomeAt        time.Time
+	egressOutcomes         map[string]storage.CodexEgressRecentOutcome
 
 	// providerCache caches provider inference results (from token shape) per account.
 	// Provider is set explicitly on import for new accounts, so the cache is only hit
@@ -186,6 +202,24 @@ func (s *Scheduler) InvalidateAccountCache() {
 	s.accountCacheMutex.Unlock()
 	s.affinityCache.clear()
 	s.candidateIndexes.Store(map[string]*routeCandidateIndex{})
+	s.NotifyStateChanged()
+}
+
+// InvalidateEgressCache publishes profile/cooldown/health mutations immediately.
+// The normal 30-second cache amortizes hot-path profile reads, but a persisted
+// breaker trip or operator repair must not keep routing with the previous endpoint
+// or health state until that TTL elapses.
+func (s *Scheduler) InvalidateEgressCache() {
+	s.egressCacheMutex.Lock()
+	s.egressCache = sync.Map{}
+	s.egressCacheTime = time.Now()
+	s.egressCacheMutex.Unlock()
+	// accountSelectionSnapshot embeds the stored primary profile for sticky and
+	// required-account fast paths. Drop that one-second snapshot as part of the
+	// same publication so every route observes the mutation immediately.
+	s.accountCacheMutex.Lock()
+	s.selectionCache = nil
+	s.accountCacheMutex.Unlock()
 	s.NotifyStateChanged()
 }
 
@@ -575,11 +609,16 @@ func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
 				lease, reason, ok := s.tryLeaseAccountDetailed(ctx, bound.AccountID, route, nil)
 				if ok {
 					lease.RouteEpoch = bound.Epoch
-					if bound.Provider == "" || bound.Model == "" || bound.EgressID == "" {
+					resolvedModel := firstRouteValue(lease.ResolvedModel, route.Model)
+					// A normal affinity binds the conversation, not one forever-fixed
+					// model. If the same capable account serves a later /model choice,
+					// publish that exact model so subsequent immutable decisions never
+					// resurrect the previous model.
+					if bound.Provider == "" || bound.Model == "" || bound.EgressID == "" || !strings.EqualFold(strings.TrimSpace(bound.Model), strings.TrimSpace(resolvedModel)) {
 						if stored, upsertErr := s.upsertAffinityResult(ctx, storage.AffinityBinding{
 							RouteKeyHash: bound.RouteKeyHash, RouteKey: bound.RouteKey, Source: bound.Source,
 							AccountID: bound.AccountID, Provider: s.providerOfAccount(ctx, lease.Account),
-							Model: firstRouteValue(lease.ResolvedModel, route.Model), EgressID: lease.Egress.ID,
+							Model: resolvedModel, EgressID: lease.Egress.ID,
 						}); upsertErr == nil {
 							lease.RouteEpoch = stored.Epoch
 						}
@@ -1294,10 +1333,34 @@ func resolveClaudeRouteModel(route Route, caps []storage.ModelCapability) (strin
 	// bootstrap and turn the inference response into runtime evidence. Static hints
 	// must not turn absence into an unsupported verdict. Aliases and 1M still require
 	// an explicit candidate capability.
-	if !capabilityCatalogAuthoritative(caps) && !context1M && canonical != "" {
+	if !capabilityCatalogAuthoritative(caps) && !context1M && canonical != "" && strings.HasPrefix(strings.ToLower(requested), "claude-") {
 		return requested, true, true
 	}
 	return "", false, false
+}
+
+// resolveAntigravityRouteModel is intentionally exact and fail-closed. The
+// Antigravity model catalogue is live account-scoped evidence, so a model may be
+// routed only to an account whose probe verified that exact slug. Unlike the
+// Claude/Kiro bootstrap paths, absence is never permission to guess. A 1M request
+// additionally requires explicit account-scoped 1M support.
+func resolveAntigravityRouteModel(route Route, caps []storage.ModelCapability) (string, bool) {
+	parsed, err := capability.ParseRequestedClaudeModel(route.Model)
+	if err != nil {
+		return "", false
+	}
+	requested := strings.TrimSpace(parsed.BaseModel)
+	context1M := strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") || parsed.ContextMode == "1m"
+	for _, c := range caps {
+		if !strings.EqualFold(strings.TrimSpace(c.ModelSlug), requested) || c.AvailabilityState != capability.AvailabilityVerified {
+			continue
+		}
+		if context1M && c.Context1MState != capability.Context1MSupported {
+			return "", false
+		}
+		return strings.TrimSpace(c.ModelSlug), true
+	}
+	return "", false
 }
 
 func resolveCodexRouteModel(route Route, caps []storage.ModelCapability) (string, bool, bool) {
@@ -1469,7 +1532,7 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		if !ok {
 			return Lease{}, leaseBlockModelUnsupported, false
 		}
-	} else if (accountProvider == "claude" || accountProvider == "codex") && capabilityRouteModel(candidateRoute.Model) {
+	} else if (accountProvider == "claude" || accountProvider == "codex" || accountProvider == "antigravity") && capabilityRouteModel(candidateRoute.Model) {
 		caps, err := s.store.ListCapabilities(ctx, account.ID)
 		if err != nil {
 			return Lease{}, leaseBlockModelUnsupported, false
@@ -1482,8 +1545,10 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 		var ok bool
 		if accountProvider == "claude" {
 			resolvedModel, _, ok = resolveClaudeRouteModel(candidateRoute, caps)
-		} else {
+		} else if accountProvider == "codex" {
 			resolvedModel, _, ok = resolveCodexRouteModel(candidateRoute, caps)
+		} else {
+			resolvedModel, ok = resolveAntigravityRouteModel(candidateRoute, caps)
 		}
 		if !ok {
 			return Lease{}, leaseBlockModelUnsupported, false
@@ -1496,7 +1561,18 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 			return Lease{}, leaseBlockRateLimitCooldown, false
 		}
 	}
-	binding := routeEgressBinding(snapshot.Binding, accountID, route.PreferredEgressIDs)
+	binding := snapshot.Binding
+	if route.RequiredEgressID == "" {
+		binding = routeEgressBinding(binding, accountID, route.PreferredEgressIDs)
+	} else {
+		// A required account+egress pair is persisted server-side session identity.
+		// Group/provider outlet reorderings apply only to fresh work and must not
+		// move an established CPA session to a different network path.
+		binding.AccountID = accountID
+		binding.PrimaryEgressID = strings.TrimSpace(route.RequiredEgressID)
+		binding.StandbyEgressIDs = ""
+		binding.CookieJarKey = accountID + ":" + binding.PrimaryEgressID
+	}
 	if binding.PrimaryEgressID == "" {
 		return Lease{}, leaseBlockEgressUnavailable, false
 	}
@@ -1508,9 +1584,6 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	var egress storage.EgressProfile
 	var ok bool
 	if route.RequiredEgressID != "" {
-		if !bindingContainsEgress(binding, route.RequiredEgressID) {
-			return Lease{}, leaseBlockEgressUnavailable, false
-		}
 		egress, err = s.egressProfile(ctx, route.RequiredEgressID, egressCache)
 		ok = err == nil && EgressHealthy(egress, now) && (account.IgnoreRateLimitControls || binding.CooldownUntil <= now)
 	} else {
@@ -1530,8 +1603,8 @@ func (s *Scheduler) tryLeaseAccountDetailed(ctx context.Context, accountID strin
 	if !ok {
 		return Lease{}, leaseBlockEgressUnavailable, false
 	}
-	if len(route.PreferredEgressIDs) > 0 {
-		binding.CookieJarKey = accountID + ":" + egress.ID
+	if route.RequiredEgressID == "" {
+		binding = selectedEgressBinding(binding, accountID, egress.ID)
 	}
 	coordinated, reason, coordinateErr := s.acquireCoordinatedLease(ctx, accountID, egress, cfg.AccountTokenBudget, route)
 	if coordinateErr != nil {
@@ -1632,6 +1705,17 @@ func routeEgressBinding(binding storage.AccountEgressBinding, accountID string, 
 		binding.CookieJarKey = binding.AccountID + ":" + clean[0]
 	}
 	return binding
+}
+
+func selectedEgressBinding(binding storage.AccountEgressBinding, accountID, selectedID string) storage.AccountEgressBinding {
+	selectedID = strings.TrimSpace(selectedID)
+	if selectedID == "" {
+		return binding
+	}
+	ordered := make([]string, 0, 2+len(binding.StandbyIDs()))
+	ordered = append(ordered, selectedID, binding.PrimaryEgressID)
+	ordered = append(ordered, binding.StandbyIDs()...)
+	return routeEgressBinding(binding, accountID, ordered)
 }
 
 func (s *Scheduler) currentLoad(accountID string) (int, int64) {
@@ -2203,6 +2287,142 @@ func (s *Scheduler) selectEgressWithCache(ctx context.Context, binding storage.A
 		}
 	}
 	return storage.EgressProfile{}, false
+}
+
+// selectFreshEgressWithCache applies weighted least-request routing to healthy
+// Codex outlets. Recent posterior success probability is the weight, while
+// MaxConcurrency remains only a hard admission ceiling. Thus a 91% outlet receives
+// somewhat more work than a 90% outlet instead of monopolizing the pool until it
+// fills, and an arbitrarily large configured limit cannot manufacture priority.
+// A saturated primary therefore cannot hide a standby that still has capacity.
+func (s *Scheduler) selectFreshEgressWithCache(ctx context.Context, binding storage.AccountEgressBinding, now int64, ignoreBindingCooldown bool, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex, outcomes map[string]storage.CodexEgressRecentOutcome) (storage.EgressProfile, int, int, bool, bool) {
+	ids := append([]string{binding.PrimaryEgressID}, binding.StandbyIDs()...)
+	var selected storage.EgressProfile
+	selectedEgressLoad := 0
+	selectedSidecarLoad := 0
+	selectedSuccessBucket := 0
+	selectedPressure := 0
+	found := false
+	capacityBlocked := false
+	for index, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || (index == 0 && !ignoreBindingCooldown && binding.CooldownUntil > now) {
+			continue
+		}
+		egress, ok := s.egressProfileWithCache(ctx, id, now, reqCache, procCache)
+		if !ok || !EgressHealthy(egress, now) {
+			continue
+		}
+		egress, ok = s.applyBoundSidecarWithCache(ctx, binding, egress, now, reqCache, procCache)
+		if !ok {
+			continue
+		}
+		egressLoad, sidecarLoad := s.currentEgressLoads(egress)
+		if concurrencyLimited(egress.MaxConcurrency, egressLoad) {
+			capacityBlocked = true
+			continue
+		}
+		if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
+			if concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad) {
+				capacityBlocked = true
+				continue
+			}
+		}
+		successBucket := 0
+		if outcomes != nil {
+			successBucket = codexEgressSuccessBucket(outcomes[egress.ID])
+		}
+		if successBucket < 1 {
+			successBucket = 1
+		}
+		pressure := egressLoad + sidecarLoad + 1
+		lowerWeightedPressure := found && int64(pressure)*int64(selectedSuccessBucket) < int64(selectedPressure)*int64(successBucket)
+		equalWeightedPressure := found && int64(pressure)*int64(selectedSuccessBucket) == int64(selectedPressure)*int64(successBucket)
+		if !found || lowerWeightedPressure ||
+			(equalWeightedPressure && egressLoad < selectedEgressLoad) ||
+			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad < selectedSidecarLoad) ||
+			(equalWeightedPressure && egressLoad == selectedEgressLoad && sidecarLoad == selectedSidecarLoad && egress.LatencyMillis < selected.LatencyMillis) {
+			selected = egress
+			selectedEgressLoad = egressLoad
+			selectedSidecarLoad = sidecarLoad
+			selectedSuccessBucket = successBucket
+			selectedPressure = pressure
+			found = true
+		}
+	}
+	return selected, selectedEgressLoad, selectedSidecarLoad, capacityBlocked, found
+}
+
+// codexEgressSuccessBucket returns a deterministic routing rank. A bounded 90%
+// Beta prior lets a genuinely unobserved outlet share traffic with an ordinary
+// healthy outlet, while real failures immediately lower its rank. In particular,
+// an outlet with nineteen observed failures no longer outranks a mature 100%
+// outlet merely because it has not crossed an arbitrary sample-count threshold.
+// The posterior mean is rounded to one percentage point so sub-percent noise
+// cannot defeat load balance.
+func codexEgressSuccessBucket(outcome storage.CodexEgressRecentOutcome) int {
+	attempts := outcome.Attempts
+	if attempts < 0 {
+		attempts = 0
+	}
+	successes := outcome.Successes
+	if successes < 0 {
+		successes = 0
+	}
+	if successes > attempts {
+		successes = attempts
+	}
+	numerator := (successes + codexEgressPriorSuccesses) * 100
+	denominator := attempts + codexEgressPriorAttempts
+	bucket := int((numerator + denominator/2) / denominator)
+	if bucket > 100 {
+		return 100
+	}
+	return bucket
+}
+
+func (s *Scheduler) recentCodexEgressOutcomes(ctx context.Context) map[string]storage.CodexEgressRecentOutcome {
+	now := time.Now()
+	s.egressOutcomeMu.RLock()
+	rows := s.egressOutcomes
+	at := s.egressOutcomeAt
+	s.egressOutcomeMu.RUnlock()
+	if rows != nil && now.Sub(at) < codexEgressOutcomeCacheTTL {
+		return rows
+	}
+
+	s.egressOutcomeRefreshMu.Lock()
+	defer s.egressOutcomeRefreshMu.Unlock()
+	now = time.Now()
+	s.egressOutcomeMu.RLock()
+	rows = s.egressOutcomes
+	at = s.egressOutcomeAt
+	s.egressOutcomeMu.RUnlock()
+	if rows != nil && now.Sub(at) < codexEgressOutcomeCacheTTL {
+		return rows
+	}
+
+	refreshed, err := s.store.ListRecentCodexEgressOutcomes(ctx, now.Add(-codexEgressOutcomeWindow).Unix())
+	if err != nil {
+		log.Printf("[SCHEDULER] recent Codex egress outcome refresh failed: %v", err)
+		refreshed = map[string]storage.CodexEgressRecentOutcome{}
+	}
+	s.egressOutcomeMu.Lock()
+	s.egressOutcomes = refreshed
+	s.egressOutcomeAt = now
+	s.egressOutcomeMu.Unlock()
+	return refreshed
+}
+
+func (s *Scheduler) currentEgressLoads(egress storage.EgressProfile) (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	egressLoad := s.egressInflight[egress.ID]
+	sidecarLoad := 0
+	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" && sidecarID != egress.ID {
+		sidecarLoad = s.egressInflight[sidecarID]
+	}
+	return egressLoad, sidecarLoad
 }
 
 func (s *Scheduler) applyBoundSidecarWithCache(ctx context.Context, binding storage.AccountEgressBinding, egress storage.EgressProfile, now int64, reqCache *map[string]storage.EgressProfile, procCache *sync.RWMutex) (storage.EgressProfile, bool) {

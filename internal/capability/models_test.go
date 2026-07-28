@@ -570,12 +570,86 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 		bySlug[c.ModelSlug] = c
 	}
 	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
-		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 {
+		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 || got.AutoCompactTokenLimit != 272000 {
 			t.Fatalf("current model %s missing or wrong window: %+v", slug, got)
 		}
 	}
 	if _, stale := bySlug["gpt-5.3-codex"]; stale {
 		t.Fatalf("removed gpt-5.3-codex must not remain in static catalog: %v", bySlug)
+	}
+}
+
+func TestBuildCodexModelsResponseAppliesIndependent56ContextLimits(t *testing.T) {
+	raw := `{
+		"slug":"gpt-5.6-sol",
+		"context_window":272000,
+		"max_context_window":272000,
+		"auto_compact_token_limit":244800,
+		"supported_reasoning_levels":[{"effort":"ultra","description":"maximum reasoning"}],
+		"experimental_supported_tools":["future_tool"],
+		"future_capability":{"preserve":true}
+	}`
+	body, _, err := BuildCodexModelsResponse([]storage.ModelCapability{{
+		AccountID: "live", ModelSlug: "gpt-5.6-sol", AvailabilityState: AvailabilityVerified,
+		NativeContextWindow: 272000, NativeMaxContextWindow: 272000,
+		EffectiveContextWindowPercent: 95, AutoCompactTokenLimit: 244800,
+		Visibility: "list", RawModelJSON: raw, Source: "probe",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Models []map[string]interface{} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil || len(root.Models) != 1 {
+		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
+	}
+	model := root.Models[0]
+	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
+		t.Fatalf("5.6 full context contract missing: %#v", model)
+	}
+	if model["auto_compact_token_limit"] != float64(272000) {
+		t.Fatalf("5.6 auto-compaction trigger = %#v, want 272000", model["auto_compact_token_limit"])
+	}
+	levels, _ := model["supported_reasoning_levels"].([]interface{})
+	tools, _ := model["experimental_supported_tools"].([]interface{})
+	future, _ := model["future_capability"].(map[string]interface{})
+	if len(levels) != 1 || levels[0].(map[string]interface{})["effort"] != "ultra" || len(tools) != 1 || tools[0] != "future_tool" || future["preserve"] != true {
+		t.Fatalf("reasoning/tool/future metadata was changed: %#v", model)
+	}
+}
+
+func TestBuildCodexModelsResponseSynthesizes56ContextLimitsFromStaticMetadata(t *testing.T) {
+	var selected storage.ModelCapability
+	for _, candidate := range StaticCodexModels("static") {
+		if candidate.ModelSlug == "gpt-5.6-terra" {
+			selected = candidate
+			break
+		}
+	}
+	if selected.ModelSlug == "" {
+		t.Fatal("gpt-5.6-terra missing from static metadata")
+	}
+	// Static rows are fail-closed until the account/model is verified. Simulate
+	// that verification while retaining the no-RawModelJSON synthesized path.
+	selected.AvailabilityState = AvailabilityVerified
+	body, _, err := BuildCodexModelsResponse([]storage.ModelCapability{selected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Models []map[string]interface{} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil || len(root.Models) != 1 {
+		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
+	}
+	model := root.Models[0]
+	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) || model["auto_compact_token_limit"] != float64(272000) {
+		t.Fatalf("synthesized 5.6 limits are not 372K/272K: %#v", model)
+	}
+	levels, _ := model["supported_reasoning_levels"].([]interface{})
+	if len(levels) != 6 || levels[5].(map[string]interface{})["effort"] != "ultra" || model["supports_parallel_tool_calls"] != true {
+		t.Fatalf("synthesized reasoning/tool capabilities were reduced: %#v", model)
 	}
 }
 

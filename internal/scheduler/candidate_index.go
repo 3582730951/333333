@@ -144,6 +144,13 @@ func (s *Scheduler) buildCandidateIndex(ctx context.Context, selection *accountS
 				index.staticCounters.ModelUnsupported++
 				continue
 			}
+		} else if provider == "antigravity" && capabilityRouteModel(candidateRoute.Model) {
+			var ok bool
+			resolvedModel, ok = resolveAntigravityRouteModel(candidateRoute, capabilitiesByAccount[account.ID])
+			if !ok {
+				index.staticCounters.ModelUnsupported++
+				continue
+			}
 		} else if capable != nil && !capable[account.ID] {
 			index.staticCounters.ModelUnsupported++
 			continue
@@ -162,6 +169,7 @@ type candidateEvaluationContext struct {
 	requestEgress    map[string]storage.EgressProfile
 	egressCacheTime  time.Time
 	egressCacheMutex *sync.RWMutex
+	egressOutcomes   map[string]storage.CodexEgressRecentOutcome
 }
 
 func (s *Scheduler) newCandidateEvaluationContext(ctx context.Context, route Route, selection *accountSelectionSnapshot) candidateEvaluationContext {
@@ -201,41 +209,62 @@ func (s *Scheduler) evaluateIndexedCandidate(indexed indexedCandidate, evaluatio
 		counters.RecheckPending++
 		return candidate{}, false
 	}
-	egress, ok := s.selectEgressWithCache(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
-	if !ok {
-		if s.egressTemporarilyUnavailable(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls) {
-			counters.EgressCooldown++
-		} else {
-			counters.EgressUnavailable++
+	var egress storage.EgressProfile
+	var egressLoad, sidecarLoad int
+	var ok bool
+	if indexed.provider == "codex" {
+		if evaluation.egressOutcomes == nil {
+			evaluation.egressOutcomes = s.recentCodexEgressOutcomes(evaluation.ctx)
 		}
-		return candidate{}, false
-	}
-	egress, ok = s.applyBoundSidecarWithCache(evaluation.ctx, binding, egress, evaluation.now, &evaluation.requestEgress, evaluation.egressCacheMutex)
-	if !ok {
-		counters.EgressUnavailable++
-		return candidate{}, false
+		var capacityBlocked bool
+		egress, egressLoad, sidecarLoad, capacityBlocked, ok = s.selectFreshEgressWithCache(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls, &evaluation.requestEgress, evaluation.egressCacheMutex, evaluation.egressOutcomes)
+		if !ok {
+			if capacityBlocked {
+				counters.Concurrency++
+			} else if s.egressTemporarilyUnavailable(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls) {
+				counters.EgressCooldown++
+			} else {
+				counters.EgressUnavailable++
+			}
+			return candidate{}, false
+		}
+		// Codex fresh work may start on any pool outlet.  Rotate only the lease's
+		// retry order and cookie namespace; the stored account binding remains
+		// untouched and an existing CPA RequiredEgressID never reaches this path.
+		binding = selectedEgressBinding(binding, account.ID, egress.ID)
+	} else {
+		// Other providers retain their established ordered primary/standby
+		// semantics.  Codex transport observations and fresh-pool balancing must
+		// not silently turn a Claude/Kiro/custom standby into an active outlet.
+		egress, ok = s.selectEgressWithCache(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls, &evaluation.requestEgress, evaluation.egressCacheMutex, &evaluation.egressCacheTime)
+		if !ok {
+			if s.egressTemporarilyUnavailable(evaluation.ctx, binding, evaluation.now, account.IgnoreRateLimitControls) {
+				counters.EgressCooldown++
+			} else {
+				counters.EgressUnavailable++
+			}
+			return candidate{}, false
+		}
+		egress, ok = s.applyBoundSidecarWithCache(evaluation.ctx, binding, egress, evaluation.now, &evaluation.requestEgress, evaluation.egressCacheMutex)
+		if !ok {
+			counters.EgressUnavailable++
+			return candidate{}, false
+		}
+		egressLoad, sidecarLoad = s.currentEgressLoads(egress)
+		if concurrencyLimited(egress.MaxConcurrency, egressLoad) ||
+			(strings.TrimSpace(egress.TransportSidecarID) != "" && concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad)) {
+			counters.Concurrency++
+			return candidate{}, false
+		}
+		if len(evaluation.route.PreferredEgressIDs) > 0 {
+			binding.CookieJarKey = account.ID + ":" + egress.ID
+		}
 	}
 	if evaluation.route.Exclude[account.ID] {
 		counters.Excluded++
 		return candidate{}, false
 	}
 	inflight, tokens := s.currentLoad(account.ID)
-	egressLoad := s.currentEgressLoad(egress.ID)
-	if concurrencyLimited(egress.MaxConcurrency, egressLoad) {
-		counters.Concurrency++
-		return candidate{}, false
-	}
-	sidecarLoad := 0
-	if sidecarID := strings.TrimSpace(egress.TransportSidecarID); sidecarID != "" {
-		sidecarLoad = s.currentEgressLoad(sidecarID)
-		if concurrencyLimited(egress.TransportSidecarMaxConcurrency, sidecarLoad) {
-			counters.Concurrency++
-			return candidate{}, false
-		}
-	}
-	if len(evaluation.route.PreferredEgressIDs) > 0 {
-		binding.CookieJarKey = account.ID + ":" + egress.ID
-	}
 	if tokenBudgetLimited(evaluation.cfg.AccountTokenBudget, evaluation.route.Compaction, inflight, tokens, evaluation.route.EstimatedTokens) {
 		counters.TokenBudget++
 		return candidate{}, false

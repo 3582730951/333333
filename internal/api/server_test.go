@@ -988,6 +988,37 @@ func TestGatewayCompactUnary(t *testing.T) {
 			t.Fatalf("compact body gained normal-turn field %q: %s", forbidden, upstreamBody)
 		}
 	}
+	// Legacy /responses/compact success responses can omit status. Even when the
+	// canonical payload happens to end in a compaction_trigger item, it is not the
+	// normal-/responses RemoteCompactionV2 stream and must still commit bindings.
+	if _, err = h.store.GetAffinityBinding(context.Background(), routing.ResponseAffinityKey("compact-1").Hash); err != nil {
+		t.Fatalf("status-less legacy compact response did not commit its response binding: %v", err)
+	}
+}
+
+func TestCodexRemoteCompactionV2RequestRequiresNormalResponsesTerminalTrigger(t *testing.T) {
+	trigger := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":"task"},{"type":"compaction_trigger"}]}`)
+	for _, testCase := range []struct {
+		name string
+		path string
+		body []byte
+		want bool
+	}{
+		{name: "remote v2", path: "/v1/responses", body: trigger, want: true},
+		{name: "legacy compact endpoint", path: "/v1/responses/compact", body: trigger, want: false},
+		{name: "legacy top level flag", path: "/v1/responses", body: []byte(`{"model":"gpt","compaction_trigger":true,"input":"task"}`), want: false},
+		{name: "trigger is not terminal", path: "/v1/responses", body: []byte(`{"model":"gpt","input":[{"type":"compaction_trigger"},{"type":"message","role":"user","content":"later"}]}`), want: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, testCase.path, bytes.NewReader(testCase.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := codexRemoteCompactionV2Request(req, testCase.body); got != testCase.want {
+				t.Fatalf("codexRemoteCompactionV2Request()=%v want=%v body=%s", got, testCase.want, testCase.body)
+			}
+		})
+	}
 }
 
 func TestGatewayCompactSkipsLocalTokenBudget(t *testing.T) {

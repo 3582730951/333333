@@ -35,10 +35,9 @@ func noAccountHTTPStatus(err error) (int, int) {
 
 // describeNoAccount turns the scheduler's opaque "no active account available" into
 // an actionable 503 message. The overwhelmingly common cause of "I have GPT accounts
-// in the pool but the API key says there is no candidate" is a GROUP MISMATCH:
-// /v1/models is group-blind (it advertises the whole pool's catalog), so the model
-// list looks correct while the key actually routes to a group that holds none of
-// those accounts. This re-derives the high-signal facts — how many usable accounts
+// in the pool but the API key says there is no candidate" is either a group mismatch
+// or a provider/model capability filter that disagrees with the group-scoped model
+// catalogue. This re-derives the high-signal facts — how many usable accounts
 // the routed group has (by provider), and which OTHER groups DO have active accounts
 // — so the operator can immediately see and fix the misroute. Best-effort and
 // read-only; for a strict-sticky failure or any non-ErrNoAccount error (incl. DB
@@ -57,7 +56,7 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 	}
 	tokensByID, _ := s.store.ListTokensByAccountIDs(ctx, accountIDs)
 	allowedProviders, normalizedModel, counters := noAccountRouteDiagnostics(provider, model, err)
-	type gcount struct{ active, parked, codex, claude, kiro, custom int }
+	type gcount struct{ active, parked, codex, claude, kiro, antigravity, custom int }
 	byGroup := map[string]*gcount{}
 	now := storage.Now()
 	for _, a := range all {
@@ -79,6 +78,8 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 			g.codex++
 		case "kiro":
 			g.kiro++
+		case "antigravity":
+			g.antigravity++
 		default:
 			g.custom++
 		}
@@ -100,22 +101,24 @@ func (s *Server) describeNoAccount(ctx context.Context, group, provider, model s
 	case cur.active == 0:
 		fmt.Fprintf(&b, "Group %q has %d account(s) but all are quarantined or disabled. ", group, cur.parked)
 	default:
-		fmt.Fprintf(&b, "Group %q: %d active (codex=%d claude=%d kiro=%d custom=%d), %d quarantined/disabled. ", group, cur.active, cur.codex, cur.claude, cur.kiro, cur.custom, cur.parked)
+		fmt.Fprintf(&b, "Group %q: %d active (codex=%d claude=%d kiro=%d antigravity=%d custom=%d), %d quarantined/disabled. ", group, cur.active, cur.codex, cur.claude, cur.kiro, cur.antigravity, cur.custom, cur.parked)
 		if len(allowedProviders) == 1 && allowedProviders[0] == "codex" && cur.codex == 0 {
 			b.WriteString("None of the active accounts are Codex/GPT accounts. ")
 		} else if len(allowedProviders) == 1 && allowedProviders[0] == "claude" && cur.claude == 0 {
 			b.WriteString("None of the active accounts are Claude accounts. ")
 		} else if len(allowedProviders) == 1 && allowedProviders[0] == "kiro" && cur.kiro == 0 {
 			b.WriteString("None of the active accounts are Kiro accounts. ")
+		} else if len(allowedProviders) == 1 && allowedProviders[0] == "antigravity" && cur.antigravity == 0 {
+			b.WriteString("None of the active accounts are Antigravity accounts. ")
 		}
 	}
 	modelFiltered := counters.ModelUnsupported > 0
 	if modelFiltered {
-		kiroCount := 0
+		claudeCount, kiroCount, antigravityCount := 0, 0, 0
 		if cur != nil {
-			kiroCount = cur.kiro
+			claudeCount, kiroCount, antigravityCount = cur.claude, cur.kiro, cur.antigravity
 		}
-		fmt.Fprintf(&b, "Routing rejected normalized model %q for %d in-group Kiro account(s); model_unsupported=%d. ", normalizedModel, kiroCount, counters.ModelUnsupported)
+		fmt.Fprintf(&b, "Routing rejected normalized model %q for in-group provider candidates (claude=%d kiro=%d antigravity=%d); model_unsupported=%d. ", normalizedModel, claudeCount, kiroCount, antigravityCount, counters.ModelUnsupported)
 	} else {
 		// Where ARE the usable accounts? The smoking gun for a genuine group mismatch.
 		var others []string

@@ -62,6 +62,113 @@ func TestSetupScriptBashSyntaxAndContents(t *testing.T) {
 	}
 }
 
+func TestSetupScriptWritesIndependent56ContextAndCompactionLimits(t *testing.T) {
+	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.6-sol", "ultra", "never", "danger-full-access")
+	for _, want := range []string{
+		"model_context_window = 372000",
+		"model_auto_compact_token_limit = 272000",
+		`model_reasoning_effort = "ultra"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("5.6 setup script missing %q\n---\n%s", want, script)
+		}
+	}
+	legacy := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "xhigh", "never", "danger-full-access")
+	for _, forbidden := range []string{"model_context_window = 372000", "model_auto_compact_token_limit = 272000"} {
+		if strings.Contains(legacy, forbidden) {
+			t.Fatalf("non-5.6 setup script received 5.6 override %q", forbidden)
+		}
+	}
+}
+
+func TestSetupScriptInstallsUnique56ContextKeys(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	home := t.TempDir()
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := "model_context_window = 111000\nmodel_auto_compact_token_limit = 100000\n[features]\nmulti_agent = true\n"
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(t.TempDir(), "setup.sh")
+	if err := os.WriteFile(scriptPath, []byte(buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.6-sol", "ultra", "never", "danger-full-access")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"POOL_CLIENT=codex",
+		"POOL_INSTALL_RTK=0",
+		"POOL_CODEX_WEBSOCKETS=0",
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("5.6 setup failed: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(codexDir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(data)
+	for _, line := range []string{"model_context_window = 372000", "model_auto_compact_token_limit = 272000"} {
+		if strings.Count(config, line) != 1 {
+			t.Fatalf("installed config must contain exactly one %q\n---\n%s", line, config)
+		}
+	}
+	for _, stale := range []string{"model_context_window = 111000", "model_auto_compact_token_limit = 100000"} {
+		if strings.Contains(config, stale) {
+			t.Fatalf("installed config retained stale key %q\n---\n%s", stale, config)
+		}
+	}
+	if !strings.Contains(config, "multi_agent = true") || !strings.Contains(config, `model_reasoning_effort = "ultra"`) {
+		t.Fatalf("setup reduced existing features or reasoning effort\n---\n%s", config)
+	}
+}
+
+func TestSetupScriptPreservesNon56ContextKeys(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	home := t.TempDir()
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := "model_context_window = 256000\nmodel_auto_compact_token_limit = 220000\n[features]\nmulti_agent = true\n"
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(t.TempDir(), "setup.sh")
+	if err := os.WriteFile(scriptPath, []byte(buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "xhigh", "never", "danger-full-access")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"POOL_CLIENT=codex",
+		"POOL_INSTALL_RTK=0",
+		"POOL_CODEX_WEBSOCKETS=0",
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("non-5.6 setup failed: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(codexDir, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(data)
+	for _, preserved := range []string{"model_context_window = 256000", "model_auto_compact_token_limit = 220000", "multi_agent = true"} {
+		if strings.Count(config, preserved) != 1 {
+			t.Fatalf("non-5.6 setup did not preserve %q exactly once\n---\n%s", preserved, config)
+		}
+	}
+}
+
 func TestSetupScriptCodexBranchIsIsolatedFromClaudeGateway(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "", "", "")
 

@@ -50,3 +50,44 @@ func TestExplicitKiroAndGroupsAreIndependent(t *testing.T) {
 		t.Fatalf("explicit Kiro route = %v mode=%q err=%v", providers, mode, err)
 	}
 }
+
+func TestClaudeNativeMessagesAutoUsesGroupCapabilityProviderUnion(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	request := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	providers, mode, err := h.app.resolveClaudeMessageProviders(ctx, request, downstreamPolicy{Group: "cyber", ProviderHint: "auto"})
+	if err != nil || mode != "auto" {
+		t.Fatalf("native auto route providers=%v mode=%q err=%v", providers, mode, err)
+	}
+	want := []string{"claude", "kiro", "antigravity"}
+	if len(providers) != len(want) {
+		t.Fatalf("native auto providers=%v, want %v", providers, want)
+	}
+	for index := range want {
+		if providers[index] != want[index] {
+			t.Fatalf("native auto providers=%v, want %v", providers, want)
+		}
+	}
+
+	request.Header.Set("X-Pool-Provider", "antigravity")
+	providers, mode, err = h.app.resolveClaudeMessageProviders(ctx, request, downstreamPolicy{Group: "cyber", ProviderHint: "auto"})
+	if err != nil || mode != "antigravity" || len(providers) != 1 || providers[0] != "antigravity" {
+		t.Fatalf("explicit native Antigravity providers=%v mode=%q err=%v", providers, mode, err)
+	}
+	if _, _, err = h.app.resolveClaudeProviders(ctx, request, downstreamPolicy{Group: "cyber", ProviderHint: "auto"}); err == nil {
+		t.Fatal("OpenAI Chat Claude bridge accepted Antigravity without a response bridge")
+	}
+}
+
+func TestClaudeRouteModelsEquivalentForAffinity(t *testing.T) {
+	if !claudeRouteModelsEquivalent("claude-opus-4.6", "claude-opus-4-6") {
+		t.Fatal("equivalent Kiro Claude spellings split affinity")
+	}
+	if !claudeRouteModelsEquivalent("gemini-3-flash", "GEMINI-3-FLASH") {
+		t.Fatal("exact non-Kiro model spelling split affinity")
+	}
+	if claudeRouteModelsEquivalent("claude-opus-4-6", "gemini-3-flash") {
+		t.Fatal("different requested models reused immutable Kiro affinity")
+	}
+}

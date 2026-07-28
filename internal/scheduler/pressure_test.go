@@ -133,3 +133,84 @@ func TestEligibleCandidateCountHonorsExclusionsAndPersistentCooldowns(t *testing
 		t.Fatalf("eligible candidates=%d, want only codex-c", count)
 	}
 }
+
+func TestCodexPressureUsesStandbyCapacityWhenPrimaryIsFull(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	const model = "gpt-pressure-multi-egress"
+	seedPressureCodexAccount(t, store, "codex-multi-egress", "cyber", model)
+	for _, id := range []string{"pressure-primary", "pressure-standby"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080",
+			Health: "healthy", MaxConcurrency: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"pressure-primary", "pressure-standby"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	primary, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex", Model: model})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Release()
+	if primary.Egress.ID != "pressure-primary" {
+		t.Fatalf("initial egress=%q, want pressure-primary", primary.Egress.ID)
+	}
+
+	snapshot, err := s.ProviderPressureSnapshot(ctx, "cyber", "codex", model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.EligibleAccounts != 1 || snapshot.AvailableAccounts != 1 || snapshot.SaturatedAccounts != 0 || snapshot.InFlight != 1 {
+		t.Fatalf("standby capacity was hidden from Codex pressure: %+v", snapshot)
+	}
+}
+
+func TestNonCodexPressureKeepsOrderedPrimarySemantics(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "claude-pressure-egress", GroupName: "cyber", Provider: "claude", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, storage.AccountToken{AccessToken: "claude-token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"claude-pressure-primary", "claude-pressure-standby"} {
+		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080",
+			Health: "healthy", MaxConcurrency: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"claude-pressure-primary", "claude-pressure-standby"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	primary, err := s.Select(ctx, Route{Group: "cyber", Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Release()
+
+	snapshot, err := s.ProviderPressureSnapshot(ctx, "cyber", "claude", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.EligibleAccounts != 1 || snapshot.AvailableAccounts != 0 || snapshot.SaturatedAccounts != 1 {
+		t.Fatalf("non-Codex pressure activated a healthy standby: %+v", snapshot)
+	}
+}

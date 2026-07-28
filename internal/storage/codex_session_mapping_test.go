@@ -364,6 +364,54 @@ func TestCodexUpstreamAttemptDiagnosticsRedactTreeID(t *testing.T) {
 	}
 }
 
+func TestListRecentCodexEgressOutcomesCountsOnlyExitAttributableResults(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := Now()
+	insert := func(egress, state string, createdAt int64) {
+		t.Helper()
+		if err := store.InsertCodexUpstreamAttempt(ctx, CodexUpstreamAttempt{
+			TreeID: "recent-outcome-tree", AccountID: "account-a", EgressID: egress,
+			State: state, CreatedAt: createdAt, ExpiresAt: now + 3600,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, state := range []string{"transport_attempted", "transport_attempted", "transport_attempted", "egress_failure", "terminal_success", "terminal_success", "response_headers", "attempted"} {
+		insert("egress-a", state, now-60)
+	}
+	insert("egress-a", "egress_failure", now-3600)
+	// A raw start with no classified exit result can be an account/quota response,
+	// client cancellation, or an in-flight request. It is observable in diagnostics
+	// but must not be inferred as a network-exit failure.
+	insert("egress-b", "transport_attempted", now-30)
+
+	rows, err := store.ListRecentCodexEgressOutcomes(ctx, now-1800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rows["egress-a"]; got.Attempts != 3 || got.Successes != 2 {
+		t.Fatalf("egress-a recent outcome=%+v, want attempts=3 successes=2", got)
+	}
+	if _, ok := rows["egress-b"]; ok {
+		t.Fatalf("unclassified raw transport start became an egress failure: %+v", rows["egress-b"])
+	}
+}
+
+func TestRecentCodexEgressOutcomeIndexUsesAdditiveMigration(t *testing.T) {
+	if strings.Contains(codexSessionMappingSchemaSQL, "idx_codex_upstream_attempt_recent_egress") {
+		t.Fatal("additive index changed immutable PostgreSQL base schema checksum")
+	}
+	store := newTestStore(t)
+	var count int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_codex_upstream_attempt_recent_egress'`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("recent outcome migration index count=%d, want 1", count)
+	}
+}
+
 func TestCleanupCodexUpstreamAttemptsAggregatesExactlyOnceAndKeepsSevenDayDetail(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

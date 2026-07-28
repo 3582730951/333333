@@ -157,3 +157,38 @@ func TestUpsertAccountIgnoresGroupRuntimePoolForNewBindings(t *testing.T) {
 		t.Fatalf("primary egress = %q, want default direct egress despite legacy group runtime policy", binding.PrimaryEgressID)
 	}
 }
+
+func TestListActiveAccountsWithEgressPreservesStoredBinding(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	account := Account{ID: "stored-binding-account", GroupName: "cyber", Provider: "codex", Status: "active"}
+	if err := store.UpsertAccount(ctx, account, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"stored-egress", "group-egress"} {
+		if err := store.UpsertEgressProfile(ctx, EgressProfile{
+			ID: id, Type: "http_proxy", Endpoint: "http://" + id + ".example:8080", Health: "healthy", MaxConcurrency: 4,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.UpsertEgressBinding(ctx, AccountEgressBinding{AccountID: account.ID, PrimaryEgressID: "stored-egress"}); err != nil {
+		t.Fatal(err)
+	}
+	group, err := store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.EgressIDs = []string{"group-egress", "stored-egress"}
+	if err := store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := store.ListActiveAccountsWithEgress(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Binding.PrimaryEgressID != "stored-egress" || rows[0].Egress.ID != "stored-egress" {
+		t.Fatalf("stored binding was overwritten by group order: %+v", rows)
+	}
+}

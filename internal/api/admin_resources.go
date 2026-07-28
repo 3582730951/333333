@@ -255,6 +255,7 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		s.scheduler.InvalidateEgressCache()
 		writeJSON(w, http.StatusOK, profile)
 	default:
 		methodNotAllowed(w)
@@ -537,6 +538,7 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 			}
 			return
 		}
+		s.scheduler.InvalidateEgressCache()
 		writeJSON(w, http.StatusOK, map[string]interface{}{"id": parts[0], "deleted": true})
 		return
 	}
@@ -563,6 +565,7 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.scheduler.InvalidateEgressCache()
 		writeJSON(w, http.StatusOK, map[string]interface{}{"egress_id": id, "health": "healthy"})
 	case "detect-region":
 		// Probe the geo endpoint THROUGH this egress; persist the discovered exit
@@ -585,6 +588,7 @@ func (s *Server) adminEgressProfileAction(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.scheduler.InvalidateEgressCache()
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"egress_id": id, "region": profile.Region, "exit_ip": profile.ExitIP,
 			"city": pr.City, "latency_ms": pr.LatencyMS,
@@ -840,6 +844,9 @@ func (s *Server) adminEgressImport(w http.ResponseWriter, r *http.Request) {
 		if err := s.store.UpsertEgressProfile(r.Context(), p); err == nil {
 			created = append(created, p)
 		}
+	}
+	if len(created) > 0 {
+		s.scheduler.InvalidateEgressCache()
 	}
 	errStrs := make([]string, 0, len(parseErrs))
 	for _, e := range parseErrs {

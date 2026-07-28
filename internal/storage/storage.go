@@ -2306,6 +2306,13 @@ ON CONFLICT(account_id) DO NOTHING`,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_codex_reauth_jobs_account_status ON account_codex_reauth_jobs(account_id, status, created_at)`,
+		// Keep additive indexes out of codexSessionMappingSchemaSQL: that schema is
+		// part of PostgreSQL's immutable 20260727_base_v1 checksum.  Putting a new
+		// index there makes every existing PostgreSQL installation fail startup with
+		// a checksum mismatch.  state leads because the moving-window query uses a
+		// small IN set, followed by the time range and all remaining referenced
+		// columns so both SQLite and PostgreSQL can answer it from the index.
+		`CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_recent_egress ON codex_upstream_attempt(state, created_at, expires_at, egress_id)`,
 		`CREATE TABLE IF NOT EXISTS codex_reset_credit_consumptions(
   account_id TEXT NOT NULL,
   seven_day_reset_at INTEGER NOT NULL,
@@ -4241,10 +4248,6 @@ type AccountWithEgress struct {
 // their bindings and primary egress profiles in a single query. Used by the scheduler's
 // optimized selectFresh path to collapse N+1 DB round-trips into one.
 func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) ([]AccountWithEgress, error) {
-	var inheritedEgressIDs []string
-	if configuredGroup, err := s.GetGroup(ctx, group); err == nil && len(configuredGroup.EgressIDs) > 0 {
-		inheritedEgressIDs = append([]string(nil), configuredGroup.EgressIDs...)
-	}
 	rows, err := s.rdb.QueryContext(ctx, `
 		SELECT a.id, a.label, a.group_name, a.upstream_account_id, a.chatgpt_user_id,
 		       a.email, a.plan_type, a.provider, a.status, a.is_fedramp, a.ignore_rate_limit_controls, a.quarantine_until,
@@ -4311,20 +4314,6 @@ func (s *Store) ListActiveAccountsWithEgress(ctx context.Context, group string) 
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
-	}
-	if len(inheritedEgressIDs) > 0 {
-		primary := inheritedEgressIDs[0]
-		primaryProfile, profileErr := s.GetEgressProfile(ctx, primary)
-		if profileErr != nil {
-			primaryProfile = EgressProfile{}
-		}
-		standby := strings.Join(inheritedEgressIDs[1:], ",")
-		for i := range out {
-			out[i].Binding.PrimaryEgressID = primary
-			out[i].Binding.StandbyEgressIDs = standby
-			out[i].Binding.CookieJarKey = out[i].Account.ID + ":" + primary
-			out[i].Egress = primaryProfile
-		}
 	}
 	return out, nil
 }

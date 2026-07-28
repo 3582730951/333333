@@ -24,7 +24,7 @@ func TestCodexConfigScript(t *testing.T) {
 		KeyHash:    hashAPIKey(plain),
 		Label:      "codex",
 		GroupName:  "cyber",
-		ForceModel: "gpt-5.4",
+		ForceModel: "gpt-5.6-sol",
 		Enabled:    true,
 	}); err != nil {
 		t.Fatal(err)
@@ -49,7 +49,9 @@ func TestCodexConfigScript(t *testing.T) {
 		`POOL_CODEX_WEBSOCKETS`,
 		"experimental_bearer_token",
 		`API_KEY='` + plain + `'`,
-		`MODEL='gpt-5.4'`,
+		`MODEL='gpt-5.6-sol'`,
+		`model_context_window = 372000`,
+		`model_auto_compact_token_limit = 272000`,
 		"/v1\"", // base_url ends with /v1
 	} {
 		if !strings.Contains(s, want) {
@@ -108,5 +110,25 @@ func TestDescribeNoAccountPassThrough(t *testing.T) {
 	}
 	if got := h.app.describeNoAccount(context.Background(), "cyber", "", "", scheduler.ErrStrictUnavailable); !errors.Is(got, scheduler.ErrStrictUnavailable) {
 		t.Fatalf("strict-unavailable must pass through, got %v", got)
+	}
+}
+
+func TestDescribeNoAccountReportsAntigravityCapabilityCandidates(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	if err := h.store.UpsertAccount(ctx, storage.Account{
+		ID: "antigravity-diagnostic", GroupName: "cyber", Provider: "antigravity", Status: "active",
+	}, storage.AccountToken{}); err != nil {
+		t.Fatal(err)
+	}
+	err := &scheduler.NoAccountError{
+		Group: "cyber", AllowedProviders: []string{"claude", "kiro", "antigravity"}, Model: "gemini-unverified",
+		Counters: scheduler.NoAccountCounters{ModelUnsupported: 1},
+	}
+	message := h.app.describeNoAccount(ctx, "cyber", "claude,kiro,antigravity", "gemini-unverified", err).Error()
+	for _, want := range []string{"antigravity=1", "model_unsupported=1", "gemini-unverified"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("diagnostic missing %q: %s", want, message)
+		}
 	}
 }

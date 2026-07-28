@@ -230,6 +230,70 @@ func TestResponsesWebSocketWriterStreamsLargeSSEFrameThroughSpool(t *testing.T) 
 	}
 }
 
+func TestResponsesWebSocketWriterPreservesCompactionAndCompletedUsage(t *testing.T) {
+	opaque := strings.Repeat("opaque-compaction-", 20<<10)
+	largeUsage := json.Number("900719925474099312345")
+	payload, err := json.Marshal(map[string]interface{}{
+		"type": "response.completed",
+		"response": map[string]interface{}{
+			"id": "resp_compaction_usage_ws", "status": "completed",
+			"output": []interface{}{map[string]interface{}{
+				"type": "compaction", "id": "cmp_ws", "encrypted_content": opaque,
+			}},
+			"usage": map[string]interface{}{
+				"input_tokens": largeUsage, "output_tokens": json.Number("41"), "total_tokens": largeUsage,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &streamingRecordingWebSocketWriter{recordingWebSocketWriter: recordingWebSocketWriter{notify: make(chan struct{}, 1)}}
+	conn := newResponsesWebSocketConn(recorder)
+	budget := bodysource.NewBudget(64<<10, 8<<20)
+	writer := newResponsesWebSocketWriter(context.Background(), conn, nil, bodysource.CaptureOptions{
+		MaxBytes: 4 << 20, MemoryThreshold: 64 << 10, TempDir: t.TempDir(), Budget: budget,
+	}, []byte("secret"))
+	writer.Header().Set("Content-Type", "text/event-stream")
+	wire := append(append([]byte("event: response.completed\ndata: "), payload...), []byte("\n\n")...)
+	for len(wire) > 0 {
+		size := 8191
+		if size > len(wire) {
+			size = len(wire)
+		}
+		if _, err = writer.Write(wire[:size]); err != nil {
+			t.Fatal(err)
+		}
+		wire = wire[size:]
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := recorder.lastMessage()
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("completed compaction payload changed: got=%d want=%d", len(got), len(payload))
+	}
+	decoder := json.NewDecoder(bytes.NewReader(got))
+	decoder.UseNumber()
+	var event map[string]interface{}
+	if err = decoder.Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	response, _ := event["response"].(map[string]interface{})
+	usage, _ := response["usage"].(map[string]interface{})
+	if input, _ := usage["input_tokens"].(json.Number); input.String() != largeUsage.String() {
+		t.Fatalf("large usage changed: got=%q want=%q", input.String(), largeUsage.String())
+	}
+	output, _ := response["output"].([]interface{})
+	compaction, _ := output[0].(map[string]interface{})
+	if compaction["type"] != "compaction" || compaction["id"] != "cmp_ws" || compaction["encrypted_content"] != opaque {
+		t.Fatalf("websocket compaction changed: %#v", compaction)
+	}
+	if snapshot := budget.Snapshot(); snapshot.MemoryUsed != 0 || snapshot.SpoolUsed != 0 {
+		t.Fatalf("websocket compaction buffers leaked: %+v", snapshot)
+	}
+}
+
 func TestResponsesWebSocketHeartbeatEmitsProtocolProgress(t *testing.T) {
 	recorder := &recordingWebSocketWriter{notify: make(chan struct{}, 1)}
 	conn := newResponsesWebSocketConn(recorder)

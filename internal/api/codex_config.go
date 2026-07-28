@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"codex-account-pool/internal/capability"
 )
 
 // handleCodexConfigScript serves GET /file/{apikey} (the key may also arrive as
@@ -208,6 +210,11 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 		return "'" + strings.ReplaceAll(v, "'", "'\"'\"'") + "'"
 	}
 	var extra strings.Builder
+	contextWindow, compactLimit, manageContextLimits := capability.CodexClientContextOverrides(model)
+	if manageContextLimits {
+		fmt.Fprintf(&extra, "model_context_window = %d\n", contextWindow)
+		fmt.Fprintf(&extra, "model_auto_compact_token_limit = %d\n", compactLimit)
+	}
 	if e := clean(effort); e != "" {
 		fmt.Fprintf(&extra, "model_reasoning_effort = \"%s\"\n", e)
 	}
@@ -216,6 +223,10 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 	}
 	if sb := clean(sandbox); sb != "" {
 		fmt.Fprintf(&extra, "sandbox_mode = \"%s\"\n", sb)
+	}
+	managedRootKeys := "model|model_provider|model_reasoning_effort|approval_policy|sandbox_mode"
+	if manageContextLimits {
+		managedRootKeys += "|model_context_window|model_auto_compact_token_limit"
 	}
 	strictDefault := "1"
 	if !scriptOptions.StrictLinuxDefault {
@@ -439,7 +450,7 @@ configure_codex() {
 
   local TMP="$CONFIG.tmp.$$"
   if [ -f "$CONFIG" ]; then
-    awk -v provider="$PROVIDER_ID" '
+    awk -v provider="$PROVIDER_ID" -v managed_root_keys=%s '
       BEGIN { section=""; skip=0 }
       /^\[/ {
         section=$0
@@ -447,7 +458,7 @@ configure_codex() {
         if ($0 == "[model_providers." provider "]") { skip=1; next }
       }
       skip { next }
-      section == "" && $0 ~ /^(model|model_provider|model_reasoning_effort|approval_policy|sandbox_mode)[[:space:]]*=/ { next }
+      section == "" && $0 ~ ("^(" managed_root_keys ")[[:space:]]*=") { next }
       { print }
     ' "$CONFIG" > "$TMP"
   else
@@ -568,7 +579,7 @@ main() {
 }
 
 main "$@"
-`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), runtimeDefault, extra.String(), keyLine, runtimeDefault, strictDefault, disableNonessentialEnv)
+`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), runtimeDefault, shellQuote(managedRootKeys), extra.String(), keyLine, runtimeDefault, strictDefault, disableNonessentialEnv)
 }
 
 func renderClaudeDisableNonessentialEnvExports(enabled bool, indent string) string {
