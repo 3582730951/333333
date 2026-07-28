@@ -259,7 +259,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			_ = writeWebSocketError(downstream, http.StatusBadRequest, "unexpected non-text websocket message")
 			return
 		}
-		source, meta, err := captureJSONRequestBody(baseCtx, message, s.cfg, s.bodyBudget, s.identitySecretCached)
+		source, meta, err := captureJSONRequestBody(baseCtx, message, s.cfg, s.requestBodyBudget, s.identitySecretCached)
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, bodysource.ErrBodyTooLarge) {
@@ -324,7 +324,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			req.Header.Set("Content-Type", "application/json")
 			writer := newResponsesWebSocketWriter(baseCtx, downstream, state.observeMeta, bodysource.CaptureOptions{
 				MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
-				MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.bodyBudget, TempFileNamePrefix: "codex-pool-ws-response-*",
+				MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-ws-response-*",
 			}, s.identitySecretCached)
 			downstream.resetIdleClock()
 			heartbeatDone := make(chan error, 1)

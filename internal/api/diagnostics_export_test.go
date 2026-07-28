@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 )
 
@@ -83,6 +84,10 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := h.store.SettleBillingHold(ctx, holdID, "failed_upstream"); err != nil {
 		t.Fatal(err)
 	}
+	h.app.recordRouteAttempt("req-diagnostic", 2, "account_pool_group:cyber", "fair", "upstream_503", "account_pool_group:standby")
+	h.app.recordProviderAttempt("req-diagnostic", account.ID, "antigravity", "inference", http.StatusServiceUnavailable, "transient_resource_exhausted", "sha256:0123456789abcdef", "2")
+	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageDiskReserve, Cause: bodysource.ErrDiskReserve})
+	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageLocalCapacity, Cause: bodysource.ErrSpoolBudget})
 
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/logs", "")
 	if code != http.StatusOK {
@@ -92,6 +97,9 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	required := []string{
 		"manifest.json",
 		"diagnostic_summary.json",
+		"runtime_storage.json",
+		"route_attempts.csv",
+		"provider_attempts.csv",
 		"account_map.csv",
 		"account_auth_metadata.csv",
 		"account_model_capabilities.csv",
@@ -181,6 +189,46 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv", "account_auth_metadata.csv"} {
 		if !strings.Contains(files[name], "ACC-0001") {
 			t.Fatalf("%s should use stable account code ACC-0001:\n%s", name, files[name])
+		}
+	}
+
+	var runtimeStorage struct {
+		Budget struct {
+			MemoryLimit           int64 `json:"memory_limit"`
+			RequestMemoryMinimum  int64 `json:"request_memory_minimum"`
+			ResponseMemoryMinimum int64 `json:"response_memory_minimum"`
+		} `json:"budget"`
+		Filesystem struct {
+			FilesystemTotalBytes     int64 `json:"filesystem_total_bytes"`
+			FilesystemAvailableBytes int64 `json:"filesystem_available_bytes"`
+			MinimumFreeBytes         int64 `json:"minimum_free_bytes"`
+			GlobalLimitBytes         int64 `json:"global_limit_bytes"`
+		} `json:"filesystem"`
+		Rejections map[string]int64 `json:"rejection_counts"`
+	}
+	if err := json.Unmarshal([]byte(files["runtime_storage.json"]), &runtimeStorage); err != nil {
+		t.Fatalf("runtime_storage.json: %v\n%s", err, files["runtime_storage.json"])
+	}
+	if runtimeStorage.Budget.MemoryLimit <= 0 || runtimeStorage.Budget.RequestMemoryMinimum <= 0 || runtimeStorage.Budget.ResponseMemoryMinimum <= 0 {
+		t.Fatalf("runtime_storage split budget missing: %+v", runtimeStorage.Budget)
+	}
+	if runtimeStorage.Filesystem.FilesystemTotalBytes <= 0 || runtimeStorage.Filesystem.FilesystemAvailableBytes <= 0 || runtimeStorage.Filesystem.GlobalLimitBytes <= 0 {
+		t.Fatalf("runtime_storage filesystem/reserver missing: %+v", runtimeStorage.Filesystem)
+	}
+	if runtimeStorage.Rejections["request_body_storage_exhausted"] != 1 || runtimeStorage.Rejections["local_spool_capacity"] != 1 {
+		t.Fatalf("runtime_storage rejection counts: %+v", runtimeStorage.Rejections)
+	}
+
+	routeCSV := files["route_attempts.csv"]
+	for _, want := range []string{"request_id,tier,target,selection_type,status_class,fallback_target,created_at", "req-diagnostic", "account_pool_group:cyber", "upstream_503", "account_pool_group:standby"} {
+		if !strings.Contains(routeCSV, want) {
+			t.Fatalf("route_attempts.csv missing %q:\n%s", want, routeCSV)
+		}
+	}
+	providerCSV := files["provider_attempts.csv"]
+	for _, want := range []string{"request_id,account_code,provider,phase,status,error_class,body_hash,retry_after,created_at", "req-diagnostic", "ACC-0001", "antigravity", "transient_resource_exhausted", "sha256:0123456789abcdef"} {
+		if !strings.Contains(providerCSV, want) {
+			t.Fatalf("provider_attempts.csv missing %q:\n%s", want, providerCSV)
 		}
 	}
 	usageCSV := files["usage_records.csv"]
@@ -415,6 +463,20 @@ func TestDiagnosticsExportDeduplicatesAffinityAliasesAndOmitsExpiredRows(t *test
 	}
 	if manifest.Rows["affinity_bindings.csv"] != 2 {
 		t.Fatalf("manifest affinity rows=%d", manifest.Rows["affinity_bindings.csv"])
+	}
+}
+
+func TestDiagnosticRuntimeRecordersRemainBoundedAndOrdered(t *testing.T) {
+	s := &Server{}
+	for i := 0; i < diagnosticRuntimeRecordLimit+3; i++ {
+		s.recordRouteAttempt("req-"+strconv.Itoa(i), i%3, "account_pool_group:pool", "fair", "success", "")
+	}
+	rows := s.diagnosticRouteAttempts()
+	if len(rows) != diagnosticRuntimeRecordLimit {
+		t.Fatalf("route attempt ring size=%d want=%d", len(rows), diagnosticRuntimeRecordLimit)
+	}
+	if rows[0].RequestID != "req-3" || rows[len(rows)-1].RequestID != "req-"+strconv.Itoa(diagnosticRuntimeRecordLimit+2) {
+		t.Fatalf("route attempt ring order first=%q last=%q", rows[0].RequestID, rows[len(rows)-1].RequestID)
 	}
 }
 

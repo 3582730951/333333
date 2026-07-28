@@ -253,6 +253,51 @@ func TestAntigravityHandlerRetriesBeforeCommitAndExcludesAccount(t *testing.T) {
 	}
 }
 
+func TestAntigravityRetriesAreBoundedAndPermanent4xxIsPreserved(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantCalls   int32
+		wantOutcome attemptOutcome
+		wantStatus  int
+		wantExclude bool
+	}{
+		{name: "transient bounded", status: http.StatusServiceUnavailable, body: `{"error":{"message":"temporarily unavailable"}}`, wantCalls: 4, wantOutcome: outcomeRetry, wantStatus: http.StatusOK, wantExclude: true},
+		{name: "permanent preserved", status: http.StatusBadRequest, body: `{"error":{"message":"invalid exact model input"}}`, wantCalls: 1, wantOutcome: outcomeDone, wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			})
+			account := storage.Account{ID: "antigravity-classifier", GroupName: "cyber", Provider: "antigravity", Status: "active"}
+			if err := h.store.UpsertAccount(context.Background(), account, storage.AccountToken{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.store.UpsertAntigravityCredentials(context.Background(), storage.AntigravityCredentials{
+				AccountID: account.ID, ProjectID: "project", AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).Unix(), BaseURL: h.upstream.URL,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			raw := []byte(`{"model":"gemini-exact","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+			w := httptest.NewRecorder()
+			exclude := map[string]bool{}
+			got := h.app.antigravityMessagesWithLease(w, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(raw)), raw, "gemini-exact", scheduler.Lease{Account: account}, exclude)
+			if got != tt.wantOutcome || calls.Load() != tt.wantCalls || w.Code != tt.wantStatus || exclude[account.ID] != tt.wantExclude {
+				t.Fatalf("outcome=%v calls=%d status=%d exclude=%v body=%s", got, calls.Load(), w.Code, exclude, w.Body.String())
+			}
+			if tt.status == http.StatusBadRequest && w.Body.String() != tt.body {
+				t.Fatalf("permanent body=%s want=%s", w.Body.String(), tt.body)
+			}
+		})
+	}
+}
+
 func TestAntigravitySafetyStopIsHiddenWithoutAccountSwitch(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

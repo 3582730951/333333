@@ -2,13 +2,56 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestDeploymentHandlerReadinessAndInflight(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	h := newDeploymentHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() { close(entered) })
+		<-release
+		_, _ = io.WriteString(w, "done")
+	}), "release-test", "/tmp/worker-test.sock")
+	h.ready.Store(true)
+
+	normalDone := make(chan struct{})
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		close(normalDone)
+	}()
+	<-entered
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("ready status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var status map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status["release_id"] != "release-test" || status["deployment_state"] != "ready" || status["inflight"] != float64(1) {
+		t.Fatalf("unexpected readiness: %#v", status)
+	}
+	close(release)
+	<-normalDone
+	h.ready.Store(false)
+	h.draining.Store(true)
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"draining"`) {
+		t.Fatalf("draining readiness = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
 
 func TestIsLoopbackBindHost(t *testing.T) {
 	cases := map[string]bool{

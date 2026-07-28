@@ -75,14 +75,18 @@ type Server struct {
 	// upstreamDo is the single Codex/Responses call boundary. Production binds it
 	// to upstream.Client.Do during construction; focused fault-injection tests replace
 	// it to verify that a broken transport contract cannot panic an HTTP/WS request.
-	upstreamDo func(context.Context, upstream.Request) (*upstream.Response, error)
-	planner    *virtual.Planner
-	gopay      *gopay.Manager
-	paymentMgr *payment.Manager
-	warp       *warp.Manager
-	solver     *cfsolve.Client
-	mux        *http.ServeMux
-	bodyBudget *bodysource.Budget
+	upstreamDo         func(context.Context, upstream.Request) (*upstream.Response, error)
+	planner            *virtual.Planner
+	gopay              *gopay.Manager
+	paymentMgr         *payment.Manager
+	warp               *warp.Manager
+	solver             *cfsolve.Client
+	mux                *http.ServeMux
+	bodyBudget         *bodysource.Budget
+	requestBodyBudget  *bodysource.Budget
+	responseBodyBudget *bodysource.Budget
+	bodyDiskReserver   *bodysource.DiskReserver
+	diagnostics        diagnosticRuntime
 	// oauth holds in-flight web-login (paste-back) PKCE sessions for the
 	// /admin/oauth/* import flow. In-memory + TTL'd; see oauth.go.
 	oauth *oauthStore
@@ -169,6 +173,12 @@ type Server struct {
 }
 
 func NewServer(dep Dependencies) *Server {
+	requestBodyBudget, responseBodyBudget := bodysource.NewSplitBudget(
+		dep.Config.EffectiveBodyMemoryBudgetBytes(), dep.Config.BodySpoolMaxBytes, .25,
+	)
+	bodyDiskReserver := bodysource.NewDiskReserver(dep.Config.BodySpoolDir, dep.Config.BodyDiskReserveBytes, dep.Config.BodySpoolMaxBytes)
+	requestBodyBudget.SetDiskReserver(bodyDiskReserver)
+	responseBodyBudget.SetDiskReserver(bodyDiskReserver)
 	s := &Server{
 		cfg:        dep.Config,
 		store:      dep.Store,
@@ -180,9 +190,10 @@ func NewServer(dep Dependencies) *Server {
 		warp:       dep.Warp,
 		solver:     dep.Solver,
 		mux:        http.NewServeMux(),
-		bodyBudget: bodysource.NewBudget(dep.Config.EffectiveBodyMemoryBudgetBytes(), dep.Config.BodySpoolMaxBytes),
-		oauth:      newOAuthStore(oauthSessionTTL),
-		login:      newLoginThrottle(),
+		bodyBudget: requestBodyBudget, requestBodyBudget: requestBodyBudget, responseBodyBudget: responseBodyBudget,
+		bodyDiskReserver: bodyDiskReserver,
+		oauth:            newOAuthStore(oauthSessionTTL),
+		login:            newLoginThrottle(),
 		clientErrors: newClientErrorLimiter(
 			clientErrorLogLimit,
 			clientErrorLogWindow,

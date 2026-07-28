@@ -277,7 +277,9 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
   ```
   默认安装和 `--full` 都会要求仓库包含 `gopay/plus`（含 `orchestrator.py`、`plus_gopay_links/payment_server.py`、`requirements.txt`）。当前 GoPay 功能默认关闭，但如果启用该能力，安装脚本会把 GoPay bundle 部署到 `/var/lib/codex-pool/gopay/plus` 并使用独立 venv。
 - Docker：`docker build -t codex-pool-server .`
-- systemd：`deploy/systemd/codex-pool.service`
+- systemd：`deploy/systemd/codex-pool.socket` 持有公开端口，`codex-pool-handoff.service`
+  常驻转发到 release worker；更新时只短暂挂起**新请求**，已建立的 HTTP/SSE/WebSocket
+  继续由旧 worker 排空，不再重启公开 listener。`codex-pool.service` 仅保留为兼容入口。
 - TLS reverse proxy：`deploy/nginx/codex-pool.conf` 或 `deploy/caddy/Caddyfile`
 
 ### 上游中转特征防护：直连 vs sidecar 出口（重要）

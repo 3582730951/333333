@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -69,13 +70,15 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 	// --- 2. Forward to upstream ---
 	stream := isStreamRequest(raw)
 	req := upstream.AntigravityRequest{
-		AccessToken: token,
-		ProjectID:   creds.ProjectID,
-		Model:       resolvedModel,
-		BaseURL:     creds.BaseURL,
-		UserAgent:   creds.UserAgent,
-		Body:        raw,
-		Stream:      stream,
+		AccountID:       lease.Account.ID,
+		AccessToken:     token,
+		ProjectID:       creds.ProjectID,
+		Model:           resolvedModel,
+		BaseURL:         creds.BaseURL,
+		UserAgent:       creds.UserAgent,
+		Body:            raw,
+		Stream:          stream,
+		MaxOutputTokens: s.antigravityCatalogMaxOutputTokens(ctx, lease.Account.ID, resolvedModel),
 	}
 	doRequest := func() (*upstream.Response, storage.EgressProfile, error) {
 		resp, finalEgress, requestErr := s.doAntigravityWithEgressRetry(ctx, req, lease)
@@ -118,8 +121,13 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errorBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		failure := upstream.ClassifyAntigravityFailure(resp.StatusCode, resp.Header, errorBody, nil)
+		if !failure.Failover {
+			writeAntigravityUpstreamError(w, resp.StatusCode, resp.Header, errorBody)
+			return outcomeDone
+		}
 		_ = s.onUpstreamError(ctx, lease.Account, resp.StatusCode, resp.Header, errorBody)
-		log.Printf("[ANTIGRAVITY] upstream status account=%s model=%s status=%d; retrying another account", lease.Account.ID, req.Model, resp.StatusCode)
+		log.Printf("[ANTIGRAVITY] upstream status account=%s model=%s status=%d class=%s; retrying another account", lease.Account.ID, req.Model, resp.StatusCode, failure.Class)
 		return retry()
 	}
 
@@ -135,7 +143,20 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		prefix, probeErr := upstream.ProbeAntigravitySSE(reader)
 		if probeErr != nil {
 			_ = activityBody.Close()
-			log.Printf("[ANTIGRAVITY] early stream failure account=%s model=%s: %v", lease.Account.ID, req.Model, probeErr)
+			failure := upstream.ClassifyAntigravityFailure(0, nil, nil, probeErr)
+			probeHashBody := raw
+			if embedded, ok := upstream.AsAntigravityUpstreamError(probeErr); ok {
+				probeHashBody = embedded.Body
+			}
+			s.recordProviderAttempt(requestIDFromContext(ctx), lease.Account.ID, "antigravity", "sse_probe", failure.Status, string(failure.Class), antigravityBodyHash(probeHashBody), "")
+			if embedded, ok := upstream.AsAntigravityUpstreamError(probeErr); ok && !failure.Failover {
+				writeAntigravityUpstreamError(w, embedded.StatusCode, nil, embedded.Body)
+				return outcomeDone
+			}
+			if embedded, ok := upstream.AsAntigravityUpstreamError(probeErr); ok {
+				_ = s.onUpstreamError(ctx, lease.Account, embedded.StatusCode, nil, embedded.Body)
+			}
+			log.Printf("[ANTIGRAVITY] early stream failure account=%s model=%s class=%s: %v", lease.Account.ID, req.Model, failure.Class, probeErr)
 			return retry()
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -183,27 +204,15 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 // failures and upstream 5xx responses are outlet-retryable; auth, quota, safety,
 // and request validation remain account/model decisions.
 func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.AntigravityRequest, lease scheduler.Lease) (*upstream.Response, storage.EgressProfile, error) {
-	send := func(egress storage.EgressProfile) (*upstream.Response, error) {
+	send := func(egress storage.EgressProfile, wireReq upstream.AntigravityRequest) (*upstream.Response, error) {
 		cookieJarKey := lease.Binding.CookieJarKey
 		if strings.TrimSpace(egress.ID) != "" {
 			cookieJarKey = lease.Account.ID + ":" + egress.ID
 		}
-		return s.upstream.DoAntigravity(ctx, egress, cookieJarKey, req)
+		return s.upstream.DoAntigravity(ctx, egress, cookieJarKey, wireReq)
 	}
 
-	resp, requestErr := send(lease.Egress)
-	if upstream.IsAntigravityConversionError(requestErr) {
-		return nil, lease.Egress, requestErr
-	}
-	if requestErr == nil && (resp.StatusCode < http.StatusInternalServerError || resp.StatusCode > 599) {
-		return resp, lease.Egress, nil
-	}
-
-	lastResp, lastEgress, lastErr := resp, lease.Egress, requestErr
-	var lastBody []byte
-	if resp != nil {
-		lastBody, lastErr = upstream.DrainAndClose(resp.Body)
-	}
+	egresses := []storage.EgressProfile{lease.Egress}
 	for _, standbyID := range lease.Binding.StandbyIDs() {
 		standbyID = strings.TrimSpace(standbyID)
 		if standbyID == "" || standbyID == lease.Egress.ID {
@@ -217,22 +226,72 @@ func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.
 		if err != nil {
 			continue
 		}
-		retryResp, err := send(standby)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if retryResp.StatusCode < http.StatusInternalServerError || retryResp.StatusCode > 599 {
-			return retryResp, standby, nil
-		}
-		retryBody, drainErr := upstream.DrainAndClose(retryResp.Body)
-		if drainErr != nil {
-			lastErr = drainErr
-			continue
-		}
-		lastResp, lastBody, lastEgress, lastErr = retryResp, retryBody, standby, nil
+		egresses = append(egresses, standby)
 	}
-	if lastResp != nil {
+
+	type attemptTarget struct {
+		egress storage.EgressProfile
+		base   string
+	}
+	targets := make([]attemptTarget, 0, len(egresses)*2)
+	for _, egress := range egresses {
+		for _, base := range upstream.AntigravityEndpointBases(req.BaseURL) {
+			targets = append(targets, attemptTarget{egress: egress, base: base})
+		}
+	}
+	if len(targets) == 0 {
+		targets = append(targets, attemptTarget{egress: lease.Egress, base: req.BaseURL})
+	}
+	const maxRetries = 3
+	var lastResp *upstream.Response
+	var lastBody []byte
+	var lastErr error
+	lastEgress := lease.Egress
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		target := targets[attempt%len(targets)]
+		attemptReq := req
+		attemptReq.BaseURL = target.base
+		resp, requestErr := send(target.egress, attemptReq)
+		if upstream.IsAntigravityConversionError(requestErr) {
+			return nil, target.egress, requestErr
+		}
+		failure := upstream.ClassifyAntigravityFailure(0, nil, nil, requestErr)
+		var body []byte
+		if requestErr == nil && resp != nil {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				s.recordProviderAttempt(requestIDFromContext(ctx), lease.Account.ID, "antigravity", "inference", resp.StatusCode, string(upstream.AntigravityFailureNone), antigravityBodyHash(req.Body), resp.Header.Get("Retry-After"))
+				return resp, target.egress, nil
+			}
+			body, requestErr = upstream.DrainAndClose(resp.Body)
+			if requestErr == nil {
+				failure = upstream.ClassifyAntigravityFailure(resp.StatusCode, resp.Header, body, nil)
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+			}
+		}
+		status := 0
+		retryAfter := ""
+		if resp != nil {
+			status = resp.StatusCode
+			retryAfter = resp.Header.Get("Retry-After")
+		}
+		hashBody := req.Body
+		if len(body) > 0 {
+			hashBody = body
+		}
+		s.recordProviderAttempt(requestIDFromContext(ctx), lease.Account.ID, "antigravity", "inference", status, string(failure.Class), antigravityBodyHash(hashBody), retryAfter)
+		lastResp, lastBody, lastEgress, lastErr = resp, body, target.egress, requestErr
+		if requestErr != nil || resp == nil {
+			if !failure.Retryable {
+				break
+			}
+			continue
+		}
+		if !failure.Retryable {
+			return resp, target.egress, nil
+		}
+		_ = resp.Body.Close()
+	}
+	if lastResp != nil && lastErr == nil {
 		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
 		return lastResp, lastEgress, nil
 	}
@@ -272,6 +331,50 @@ func resolvedAntigravityModel(requested string, lease scheduler.Lease) string {
 		return rm
 	}
 	return strings.TrimSpace(requested)
+}
+
+func (s *Server) antigravityCatalogMaxOutputTokens(ctx context.Context, accountID, exactModel string) int64 {
+	caps, err := s.store.ListCapabilities(ctx, accountID)
+	if err != nil {
+		return 0
+	}
+	exactModel = strings.TrimSpace(exactModel)
+	for _, cap := range caps {
+		if strings.TrimSpace(cap.ModelSlug) != exactModel || strings.TrimSpace(cap.RawModelJSON) == "" {
+			continue
+		}
+		var model struct {
+			MaxOutputTokens int64 `json:"maxOutputTokens"`
+		}
+		if json.Unmarshal([]byte(cap.RawModelJSON), &model) == nil && model.MaxOutputTokens > 0 {
+			return model.MaxOutputTokens
+		}
+	}
+	return 0
+}
+
+func writeAntigravityUpstreamError(w http.ResponseWriter, status int, header http.Header, body []byte) {
+	if status < 400 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	if contentType := header.Get("Content-Type"); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	if retryAfter := header.Get("Retry-After"); retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	w.WriteHeader(status)
+	if len(body) == 0 {
+		body = []byte(`{"error":{"message":"` + http.StatusText(status) + `"}}`)
+	}
+	_, _ = w.Write(body)
+}
+
+func antigravityBodyHash(body []byte) string {
+	digest := sha256.Sum256(body)
+	return fmt.Sprintf("%x", digest[:])
 }
 
 // recordAntigravityUsage writes a lightweight usage row for billing/analytics.

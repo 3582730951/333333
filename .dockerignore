@@ -5,6 +5,18 @@
 .codex
 .build
 
+# Local regression/reference trees and captured diagnostics are not build inputs.
+# Some contain nested repositories large enough to stall the legacy Docker context
+# packer before the Dockerfile is evaluated.
+/other
+/other_cpa
+/other_new_gpt_register
+/example_zip
+/capture
+/newtest
+/pngs
+/pngs_s
+
 node_modules
 web-spa/node_modules
 web-spa/dist
@@ -31,3 +43,8 @@ capture/out*
 pngs
 pngs_s
 screenshot*.png
+
+# Host-side release and trace artifacts.
+/codex-pool-server
+/account-pool-importer-*.exe
+/rollout-*.jsonl

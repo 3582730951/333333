@@ -25,6 +25,22 @@ type AffinityKey struct {
 	Source string `json:"source"`
 }
 
+// IsTrueConversationAffinity reports whether persisting a target/account choice
+// is safe. Stable-prefix and coarse request fingerprints intentionally return
+// false: they improve cache locality but must take a fresh fair-pool decision on
+// every request.
+func IsTrueConversationAffinity(key AffinityKey) bool {
+	switch strings.ToLower(strings.TrimSpace(key.Source)) {
+	case CodexRootThreadAffinitySource,
+		"x-codex-parent-thread-id", "thread_id", "conversation_id",
+		"x-codex-window-id", "previous_response_id", "x-codex-turn-metadata",
+		"x-claude-code-session-id", "claude_item_id", "claude_resource":
+		return strings.TrimSpace(key.Hash) != ""
+	default:
+		return false
+	}
+}
+
 type PromptPrefixFingerprint struct {
 	Hash        string `json:"hash"`
 	Source      string `json:"source"`

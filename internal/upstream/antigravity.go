@@ -44,7 +44,8 @@ import (
 )
 
 const (
-	antigravityProdBaseURL  = "https://daily-cloudcode-pa.googleapis.com"
+	antigravityDailyBaseURL = "https://daily-cloudcode-pa.googleapis.com"
+	antigravityProdBaseURL  = "https://cloudcode-pa.googleapis.com"
 	antigravityStreamPath   = "/v1internal:streamGenerateContent?alt=sse"
 	antigravityGeneratePath = "/v1internal:generateContent"
 	antigravityDefaultUA    = "antigravity/hub/2.2.1 darwin/arm64"
@@ -117,7 +118,7 @@ func fetchAntigravityModels(ctx context.Context, accessToken, projectID, baseURL
 	if custom := strings.TrimRight(strings.TrimSpace(baseURL), "/"); custom != "" {
 		bases = append(bases, custom)
 	} else {
-		bases = append(bases, antigravityProdBaseURL, "https://cloudcode-pa.googleapis.com")
+		bases = append(bases, antigravityDailyBaseURL, antigravityProdBaseURL)
 	}
 	payload := map[string]string{}
 	if projectID = strings.TrimSpace(projectID); projectID != "" {
@@ -250,6 +251,7 @@ func refreshAntigravityToken(ctx context.Context, refreshToken string, cfg *conf
 
 // AntigravityRequest is the pool-side representation of a single Antigravity inference call.
 type AntigravityRequest struct {
+	AccountID   string // account-scoped salt for stable session isolation
 	AccessToken string
 	ProjectID   string
 	Model       string // Gemini or Claude model slug
@@ -257,6 +259,9 @@ type AntigravityRequest struct {
 	UserAgent   string // empty → default UA
 	Body        []byte // Anthropic-format request JSON
 	Stream      bool
+	// MaxOutputTokens is the account catalog's exact-model output ceiling. Zero
+	// means the catalog did not publish a limit.
+	MaxOutputTokens int64
 }
 
 // AntigravityConversionError identifies a downstream request that cannot be
@@ -279,6 +284,91 @@ func IsAntigravityConversionError(err error) bool {
 	return errors.As(err, &target)
 }
 
+type AntigravityFailureClass string
+
+const (
+	AntigravityFailureNone      AntigravityFailureClass = "none"
+	AntigravityFailureAuth      AntigravityFailureClass = "auth"
+	AntigravityFailureRateLimit AntigravityFailureClass = "rate_limit"
+	AntigravityFailureCapacity  AntigravityFailureClass = "capacity"
+	AntigravityFailureTransient AntigravityFailureClass = "transient"
+	AntigravityFailurePermanent AntigravityFailureClass = "permanent_4xx"
+)
+
+// AntigravityFailure describes the provider decision without mutating account
+// capability state. Retryable is a bounded same-account wire retry; Failover is
+// an account-level retry after those attempts are exhausted.
+type AntigravityFailure struct {
+	Class     AntigravityFailureClass
+	Status    int
+	Retryable bool
+	Failover  bool
+}
+
+// AntigravityUpstreamError preserves an error embedded in an HTTP-200 SSE event
+// so it enters the same classifier as ordinary HTTP failures.
+type AntigravityUpstreamError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *AntigravityUpstreamError) Error() string {
+	if e == nil {
+		return "antigravity upstream error"
+	}
+	return fmt.Sprintf("antigravity upstream error (status %d)", e.StatusCode)
+}
+
+func AsAntigravityUpstreamError(err error) (*AntigravityUpstreamError, bool) {
+	var target *AntigravityUpstreamError
+	if !errors.As(err, &target) {
+		return nil, false
+	}
+	return target, true
+}
+
+// ClassifyAntigravityFailure is shared by HTTP and SSE failures. Permanent
+// request/model 4xx responses are not retried or converted into capability loss.
+func ClassifyAntigravityFailure(status int, header http.Header, body []byte, requestErr error) AntigravityFailure {
+	if embedded, ok := AsAntigravityUpstreamError(requestErr); ok {
+		status = embedded.StatusCode
+		body = embedded.Body
+		requestErr = nil
+	}
+	if requestErr != nil || status == 0 {
+		return AntigravityFailure{Class: AntigravityFailureTransient, Status: status, Retryable: true, Failover: true}
+	}
+	if status >= 200 && status < 300 {
+		return AntigravityFailure{Class: AntigravityFailureNone, Status: status}
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		return AntigravityFailure{Class: AntigravityFailureAuth, Status: status, Failover: true}
+	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooEarly:
+		return AntigravityFailure{Class: AntigravityFailureTransient, Status: status, Retryable: true, Failover: true}
+	case http.StatusTooManyRequests:
+		lower := strings.ToLower(string(body))
+		soft := header.Get("Retry-After") != "" || strings.Contains(lower, "resource_exhausted") ||
+			strings.Contains(lower, "resource exhausted") || strings.Contains(lower, "no capacity") ||
+			strings.Contains(lower, "no_capacity") || strings.Contains(lower, "temporar") ||
+			strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests")
+		return AntigravityFailure{Class: AntigravityFailureRateLimit, Status: status, Retryable: soft, Failover: true}
+	}
+	if status >= 500 && status <= 599 {
+		class := AntigravityFailureTransient
+		lower := strings.ToLower(string(body))
+		if strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "resource exhausted") ||
+			strings.Contains(lower, "no capacity") || strings.Contains(lower, "no_capacity") {
+			class = AntigravityFailureCapacity
+		}
+		return AntigravityFailure{Class: class, Status: status, Retryable: true, Failover: true}
+	}
+	if status >= 400 && status <= 499 {
+		return AntigravityFailure{Class: AntigravityFailurePermanent, Status: status}
+	}
+	return AntigravityFailure{Class: AntigravityFailureTransient, Status: status, Retryable: true, Failover: true}
+}
+
 // AntigravityIsClaudeModel reports whether the model uses Claude semantics. Both
 // Claude and Gemini are sent through Antigravity's v1internal endpoint; the flag is
 // used only for model-family policy and cache behavior.
@@ -286,14 +376,20 @@ func AntigravityIsClaudeModel(model string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude")
 }
 
-func buildAntigravityRequest(req AntigravityRequest) (string, http.Header, []byte, error) {
-	base := strings.TrimRight(antigravityProdBaseURL, "/")
-	if u := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"); u != "" {
-		base = u
+// AntigravityEndpointBases returns the native endpoint order. Account-specific
+// custom endpoints are deliberately never combined with the public endpoints.
+func AntigravityEndpointBases(baseURL string) []string {
+	if custom := strings.TrimRight(strings.TrimSpace(baseURL), "/"); custom != "" {
+		return []string{custom}
 	}
+	return []string{antigravityDailyBaseURL, antigravityProdBaseURL}
+}
+
+func buildAntigravityRequest(req AntigravityRequest) (string, http.Header, []byte, error) {
+	base := AntigravityEndpointBases(req.BaseURL)[0]
 
 	// Convert Anthropic request body → Antigravity wire format.
-	agBody, err := anthropicToAntigravity(req.Body, req.Model, req.ProjectID)
+	agBody, err := anthropicToAntigravityForAccount(req.Body, req.Model, req.ProjectID, req.AccountID, req.MaxOutputTokens)
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -319,33 +415,101 @@ func buildAntigravityRequest(req AntigravityRequest) (string, http.Header, []byt
 // DoAntigravity sends a request through the scheduler-selected egress while
 // retaining Antigravity's HTTP/1.1-only wire profile.
 func (c *Client) DoAntigravity(ctx context.Context, egress storage.EgressProfile, cookieJarKey string, req AntigravityRequest) (*Response, error) {
-	target, headers, body, err := buildAntigravityRequest(req)
-	if err != nil {
-		return nil, err
+	bases := AntigravityEndpointBases(req.BaseURL)
+	var lastResp *Response
+	var lastBody []byte
+	var lastErr error
+	for index, base := range bases {
+		wireReq := req
+		wireReq.BaseURL = base
+		target, headers, body, err := buildAntigravityRequest(wireReq)
+		if err != nil {
+			return nil, err
+		}
+		resp, requestErr := c.DoRawHTTP1(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey)
+		if requestErr != nil {
+			lastErr = requestErr
+			if index+1 < len(bases) {
+				continue
+			}
+			return nil, requestErr
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp, nil
+		}
+		responseBody, readErr := DrainAndClose(resp.Body)
+		if readErr != nil {
+			lastErr = readErr
+			if index+1 < len(bases) {
+				continue
+			}
+			return nil, readErr
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+		lastResp, lastBody = resp, responseBody
+		failure := ClassifyAntigravityFailure(resp.StatusCode, resp.Header, responseBody, nil)
+		if !failure.Retryable || index+1 == len(bases) {
+			return resp, nil
+		}
 	}
-	return c.DoRawHTTP1(ctx, egress, http.MethodPost, target, headers, body, cookieJarKey)
+	if lastResp != nil {
+		lastResp.Body = io.NopCloser(bytes.NewReader(lastBody))
+		return lastResp, nil
+	}
+	return nil, lastErr
 }
 
 // DoAntigravity remains available to standalone adapter callers and focused
 // conversion tests. Production API traffic uses Client.DoAntigravity above.
 func DoAntigravity(ctx context.Context, req AntigravityRequest) (*http.Response, error) {
-	target, headers, body, err := buildAntigravityRequest(req)
-	if err != nil {
-		return nil, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header = headers
-
 	client := &http.Client{Transport: antigravityTransport, Timeout: 5 * time.Minute}
-	return client.Do(httpReq)
+	bases := AntigravityEndpointBases(req.BaseURL)
+	var lastErr error
+	for index, base := range bases {
+		wireReq := req
+		wireReq.BaseURL = base
+		target, headers, body, err := buildAntigravityRequest(wireReq)
+		if err != nil {
+			return nil, err
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header = headers
+		resp, requestErr := client.Do(httpReq)
+		if requestErr != nil {
+			lastErr = requestErr
+			if index+1 < len(bases) {
+				continue
+			}
+			return nil, requestErr
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp, nil
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+		failure := ClassifyAntigravityFailure(resp.StatusCode, resp.Header, responseBody, nil)
+		if !failure.Retryable || index+1 == len(bases) {
+			return resp, nil
+		}
+	}
+	return nil, lastErr
 }
 
 // anthropicToAntigravity converts an Anthropic /v1/messages JSON body to the
 // Antigravity wire format: outer Antigravity envelope wrapping a Gemini inner request.
 func anthropicToAntigravity(body []byte, model, projectID string) ([]byte, error) {
+	return anthropicToAntigravityForAccount(body, model, projectID, "", 0)
+}
+
+func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID string, maxOutputTokens int64) ([]byte, error) {
 	if !json.Valid(body) {
 		return nil, antigravityConversionError("request body is not valid JSON")
 	}
@@ -370,13 +534,19 @@ func anthropicToAntigravity(body []byte, model, projectID string) ([]byte, error
 	if projectID != "" {
 		out, _ = sjson.SetBytes(out, "project", projectID)
 	}
-	out, _ = sjson.SetBytes(out, "requestId", "agent-"+strings.ReplaceAll(uuid.NewString(), "-", ""))
+	out, _ = sjson.SetBytes(out, "requestId", uuid.NewString())
 	out, _ = sjson.SetRawBytes(out, "request.contents", contentsJSON)
-	out, _ = sjson.SetBytes(out, "request.sessionId", antigravityStableSessionID(body))
+	out, _ = sjson.SetBytes(out, "request.sessionId", antigravityStableSessionID(body, accountID))
 
 	// 3. Forward generationConfig fields.
-	if mt := gjson.GetBytes(body, "max_tokens"); isClaudeModel && mt.Exists() {
-		out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", mt.Int())
+	if mt := gjson.GetBytes(body, "max_tokens"); mt.Exists() {
+		requested := mt.Int()
+		if maxOutputTokens > 0 && (requested <= 0 || requested > maxOutputTokens) {
+			requested = maxOutputTokens
+		}
+		if requested > 0 {
+			out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", requested)
+		}
 	}
 	if temp := gjson.GetBytes(body, "temperature"); temp.Exists() {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.temperature", temp.Float())
@@ -505,7 +675,6 @@ func anthropicToAntigravity(body []byte, model, projectID string) ([]byte, error
 		// The real client overrides AUTO/ANY/NONE at the final transport boundary.
 		out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
 	}
-	out, _ = sjson.SetBytes(out, "request.safetySettings", antigravityDefaultSafetySettings())
 	if gjson.GetBytes(body, "context_management").Exists() {
 		return nil, antigravityConversionError("context_management is not supported by the Antigravity protocol")
 	}
@@ -838,19 +1007,11 @@ func normalizeAntigravityClaudeSignature(raw string) (string, bool) {
 	}
 }
 
-func antigravityDefaultSafetySettings() []map[string]string {
-	return []map[string]string{
-		{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-		{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-		{"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-		{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-		{"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
-	}
-}
-
 // antigravityStableSessionID derives a stable session ID from the first user message
-// text — matching the CLIProxyAPI generateStableSessionID implementation.
-func antigravityStableSessionID(body []byte) string {
+// text. The account salt prevents two physical accounts from sharing provider
+// state while preserving stability for retries and later turns on one account.
+func antigravityStableSessionID(body []byte, accountID string) string {
+	seed := strings.TrimSpace(accountID)
 	msgs := gjson.GetBytes(body, "messages")
 	if msgs.IsArray() {
 		for _, m := range msgs.Array() {
@@ -869,14 +1030,16 @@ func antigravityStableSessionID(body []byte) string {
 					}
 				}
 				if text != "" {
-					h := sha256.Sum256([]byte(text))
+					h := sha256.Sum256([]byte(seed + "\x00" + text))
 					n := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF
 					return fmt.Sprintf("-%d", n)
 				}
 			}
 		}
 	}
-	return fmt.Sprintf("-%d", time.Now().UnixNano()&0x7FFFFFFFFFFFFFFF)
+	h := sha256.Sum256(append([]byte(seed+"\x00"), body...))
+	n := int64(binary.BigEndian.Uint64(h[:8])) & 0x7FFFFFFFFFFFFFFF
+	return fmt.Sprintf("-%d", n)
 }
 
 // AntigravityChunk is a parsed Gemini streaming response chunk translated to
@@ -926,14 +1089,14 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 		return nil, fmt.Errorf("antigravity response chunk is not valid JSON")
 	}
 	r := gjson.ParseBytes(payload)
-	if r.Get("error").Exists() {
-		return nil, fmt.Errorf("antigravity response contains an upstream error")
+	if embedded := r.Get("error"); embedded.Exists() {
+		return nil, newAntigravityEmbeddedError(embedded)
 	}
 	if wrapped := r.Get("response"); wrapped.Exists() {
 		r = wrapped
 	}
-	if r.Get("error").Exists() {
-		return nil, fmt.Errorf("antigravity response contains an upstream error")
+	if embedded := r.Get("error"); embedded.Exists() {
+		return nil, newAntigravityEmbeddedError(embedded)
 	}
 	chunk := &AntigravityChunk{}
 
@@ -1020,6 +1183,31 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 		}
 	}
 	return chunk, nil
+}
+
+func newAntigravityEmbeddedError(node gjson.Result) error {
+	status := int(node.Get("code").Int())
+	if status < 100 || status > 599 {
+		switch strings.ToUpper(strings.TrimSpace(node.Get("status").String())) {
+		case "UNAUTHENTICATED":
+			status = http.StatusUnauthorized
+		case "RESOURCE_EXHAUSTED":
+			status = http.StatusTooManyRequests
+		case "INVALID_ARGUMENT":
+			status = http.StatusBadRequest
+		case "PERMISSION_DENIED":
+			status = http.StatusForbidden
+		case "UNAVAILABLE":
+			status = http.StatusServiceUnavailable
+		default:
+			status = http.StatusBadGateway
+		}
+	}
+	body := []byte(node.Raw)
+	if len(body) == 0 {
+		body = []byte(`{"error":{"message":"upstream error"}}`)
+	}
+	return &AntigravityUpstreamError{StatusCode: status, Body: body}
 }
 
 func firstNonEmptyString(values ...string) string {

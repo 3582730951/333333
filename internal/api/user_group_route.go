@@ -14,6 +14,7 @@ import (
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -25,6 +26,11 @@ type userGroupRoutePlan struct {
 	AffinityKey  string
 	BindingModel string
 	Candidates   []storage.TargetRef
+	Tiers        [][]storage.TargetRef
+	Affinity     routing.AffinityKey
+	Persist      bool
+	Bound        bool
+	BoundTarget  storage.TargetRef
 }
 
 func withUserGroupRouteOverride(ctx context.Context, target storage.TargetRef) context.Context {
@@ -65,10 +71,11 @@ func resolveUserGroupRoute(ctx context.Context, store *storage.Store, pol downst
 		return pol.Group, pol.ProviderHint, nil
 	}
 	selected := plan.Candidates[0]
-	if err := commitUserGroupRouteBinding(ctx, store, plan, selected); err != nil {
+	actual, err := claimUserGroupRouteBinding(ctx, store, plan, selected)
+	if err != nil {
 		return "", "", err
 	}
-	return targetRefToRoute(selected)
+	return targetRefToRoute(actual)
 }
 
 // resolveUserGroupRouteCandidates returns every compatible target in retry order.
@@ -110,22 +117,29 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 		affinityKey = fnvHashString(string(raw))
 		seed = pol.UserGroupID + ":request:" + affinityKey
 	}
-	ordered := orderUserGroupTiers(tiers, seed)
+	orderedTiers := orderUserGroupTierSlices(tiers, seed)
+	ordered := flattenUserGroupTiers(orderedTiers)
 	plan := userGroupRoutePlan{
 		UserGroupID: group.ID,
 		AffinityKey: affinityKeyObj.Hash,
 		Candidates:  ordered,
+		Tiers:       orderedTiers,
+		Affinity:    affinityKeyObj,
+		Persist:     routing.IsTrueConversationAffinity(affinityKeyObj),
 	}
 
 	// A root/session binding is shared by the main CLI and its child agents. Only
 	// create a model-scoped exception when that target cannot serve the child model.
-	if affinityKeyObj.Hash != "" {
+	if plan.Persist {
 		base, found, bindingErr := store.GetUserGroupTargetBinding(ctx, group.ID, affinityKeyObj.Hash, "")
 		if bindingErr != nil {
 			return userGroupRoutePlan{}, bindingErr
 		}
 		if found && userGroupTargetsContain(ordered, base.Target) {
-			plan.Candidates = prioritizeUserGroupTarget(ordered, base.Target)
+			plan.Bound = true
+			plan.BoundTarget = base.Target
+			plan.Tiers = prioritizeUserGroupTargetInTiers(orderedTiers, base.Target)
+			plan.Candidates = flattenUserGroupTiers(plan.Tiers)
 			return plan, nil
 		}
 		if found {
@@ -135,7 +149,10 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 				return userGroupRoutePlan{}, exceptionErr
 			}
 			if exceptionFound && userGroupTargetsContain(ordered, exception.Target) {
-				plan.Candidates = prioritizeUserGroupTarget(ordered, exception.Target)
+				plan.Bound = true
+				plan.BoundTarget = exception.Target
+				plan.Tiers = prioritizeUserGroupTargetInTiers(orderedTiers, exception.Target)
+				plan.Candidates = flattenUserGroupTiers(plan.Tiers)
 			}
 		}
 	}
@@ -143,15 +160,24 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 }
 
 func commitUserGroupRouteBinding(ctx context.Context, store *storage.Store, plan userGroupRoutePlan, selected storage.TargetRef) error {
-	if plan.UserGroupID == "" || plan.AffinityKey == "" {
-		return nil
+	_, err := claimUserGroupRouteBinding(ctx, store, plan, selected)
+	return err
+}
+
+func claimUserGroupRouteBinding(ctx context.Context, store *storage.Store, plan userGroupRoutePlan, selected storage.TargetRef) (storage.TargetRef, error) {
+	if plan.UserGroupID == "" || plan.AffinityKey == "" || !plan.Persist {
+		return selected, nil
 	}
-	return store.UpsertUserGroupTargetBinding(ctx, storage.UserGroupTargetBinding{
+	actual, _, err := store.ClaimUserGroupTargetBinding(ctx, storage.UserGroupTargetBinding{
 		UserGroupID: plan.UserGroupID,
 		AffinityKey: plan.AffinityKey,
 		Model:       plan.BindingModel,
 		Target:      selected,
 	})
+	if err != nil {
+		return storage.TargetRef{}, err
+	}
+	return actual.Target, nil
 }
 
 func userGroupTargetsContain(targets []storage.TargetRef, target storage.TargetRef) bool {
@@ -177,6 +203,28 @@ func prioritizeUserGroupTarget(targets []storage.TargetRef, target storage.Targe
 	return ordered
 }
 
+func prioritizeUserGroupTargetInTiers(tiers [][]storage.TargetRef, target storage.TargetRef) [][]storage.TargetRef {
+	out := make([][]storage.TargetRef, 0, len(tiers))
+	for _, tier := range tiers {
+		copyTier := append([]storage.TargetRef(nil), tier...)
+		if userGroupTargetsContain(copyTier, target) {
+			copyTier = prioritizeUserGroupTarget(copyTier, target)
+		}
+		out = append(out, copyTier)
+	}
+	// A persisted conversation target outranks ordinary tier order while it remains
+	// compatible. Move the containing tier to the front without merging tiers.
+	for i := range out {
+		if userGroupTargetsContain(out[i], target) && i > 0 {
+			selected := out[i]
+			copy(out[1:i+1], out[0:i])
+			out[0] = selected
+			break
+		}
+	}
+	return out
+}
+
 // dispatchUserGroupRouteCandidates runs an entrypoint once per ordered target and
 // discards only pre-commit, target-scoped failures. A successful stream is passed
 // through on its first flush/write; after that point another target is never tried.
@@ -198,14 +246,68 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 
 	replaySafe := !routing.HasServerSideState(r.URL.Path, r, resolvedRaw)
 	streamRequest := isStreamRequest(resolvedRaw)
-	for index, target := range plan.Candidates {
+	units := buildUserGroupDispatchUnits(plan)
+	allowBindingMigration := false
+	for index := 0; index < len(units); index++ {
+		unit := units[index]
+		target := unit.Targets[0]
+		moreUnits := index+1 < len(units)
+		// A grouped unit retains a speculative probe until we know the downstream
+		// handler consumed its scheduler context. Test/extension dispatchers that do
+		// not select an account fall back to the remaining targets one by one.
+		speculative := replaySafe && (moreUnits || len(unit.Targets) > 1)
 		attempt := newUserGroupAttemptWriter(r.Context(), w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"), bodysource.CaptureOptions{
 			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
-			MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.bodyBudget, TempFileNamePrefix: "codex-pool-route-response-*",
-		})
+			MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-route-response-*",
+		}, speculative)
 		candidateContext := withUserGroupRouteOverride(r.Context(), target)
-		moreTargets := index+1 < len(plan.Candidates)
-		if replaySafe && moreTargets {
+		var choiceState *scheduler.RouteChoiceState
+		if replaySafe && userGroupTargetsAreAccountPools(unit.Targets) {
+			choices := make([]scheduler.RouteChoice, 0, len(unit.Targets))
+			for _, choiceTarget := range unit.Targets {
+				choices = append(choices, scheduler.RouteChoice{
+					ChoiceKey: userGroupTargetChoiceKey(choiceTarget),
+					Route:     scheduler.Route{Group: choiceTarget.ID},
+				})
+			}
+			var claim scheduler.RouteChoiceClaim
+			switch {
+			case plan.Persist && !plan.Bound:
+				claim = func(ctx context.Context, proposed string) (string, error) {
+					proposedTarget, found := userGroupTargetForChoiceKey(unit.Targets, proposed)
+					if !found {
+						return "", fmt.Errorf("unknown proposed user-group target %q", proposed)
+					}
+					actual, _, err := s.store.ClaimUserGroupTargetBinding(ctx, storage.UserGroupTargetBinding{
+						UserGroupID: plan.UserGroupID, AffinityKey: plan.AffinityKey,
+						Model: plan.BindingModel, Target: proposedTarget,
+					})
+					return userGroupTargetChoiceKey(actual.Target), err
+				}
+			case plan.Persist && plan.Bound && userGroupTargetsContain(unit.Targets, plan.BoundTarget):
+				claim = func(context.Context, string) (string, error) {
+					return userGroupTargetChoiceKey(plan.BoundTarget), nil
+				}
+			case plan.Persist && plan.Bound && allowBindingMigration:
+				expected := plan.BoundTarget
+				claim = func(ctx context.Context, proposed string) (string, error) {
+					proposedTarget, found := userGroupTargetForChoiceKey(unit.Targets, proposed)
+					if !found {
+						return "", fmt.Errorf("unknown migration target %q", proposed)
+					}
+					actual, swapped, err := s.store.CompareAndSwapUserGroupTargetBinding(ctx, expected, storage.UserGroupTargetBinding{
+						UserGroupID: plan.UserGroupID, AffinityKey: plan.AffinityKey,
+						Model: plan.BindingModel, Target: proposedTarget,
+					})
+					if err == nil && swapped {
+						plan.BoundTarget = actual.Target
+					}
+					return userGroupTargetChoiceKey(actual.Target), err
+				}
+			}
+			candidateContext, choiceState = scheduler.WithRouteChoices(candidateContext, choices, claim)
+		}
+		if replaySafe && (moreUnits || len(unit.Targets) > 1) {
 			candidateContext = withUserGroupFallbackProbe(candidateContext)
 		}
 		candidate := r.Clone(candidateContext)
@@ -218,12 +320,44 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			_, providerHint, _ := targetRefToRoute(target)
 			candidate.Header.Set("X-Pool-Provider", providerHint)
 		}
-		candidate.Body = io.NopCloser(bytes.NewReader(originalRaw))
+		candidate.Body, candidate.GetBody = replayUserGroupRequestBody(r.Context(), originalRaw)
 		candidate.ContentLength = int64(len(originalRaw))
 		dispatch(attempt, candidate)
+		if candidate.Body != nil {
+			_ = candidate.Body.Close()
+		}
 
+		if choiceState != nil && choiceState.Used() {
+			if selected, found := userGroupTargetForChoiceKey(unit.Targets, choiceState.SelectedChoice()); found {
+				target = selected
+				if plan.Persist && !plan.Bound {
+					plan.Bound = true
+					plan.BoundTarget = selected
+					if claimed, claimedFound := userGroupTargetForChoiceKey(unit.Targets, choiceState.ClaimedChoice()); claimedFound {
+						plan.BoundTarget = claimed
+					}
+				}
+			}
+		}
 		status := attempt.Status()
 		if status < http.StatusBadRequest {
+			// Scheduler-backed pool migrations CAS before releasing the winning lease.
+			// Provider targets have no lease boundary, so migrate only after the
+			// replacement produced a successful response. A concurrent CAS winner is
+			// retained, while this response ID is still aliased to the target that
+			// actually produced it below.
+			if plan.Persist && plan.Bound && allowBindingMigration && target != plan.BoundTarget {
+				actual, _, migrationErr := s.store.CompareAndSwapUserGroupTargetBinding(r.Context(), plan.BoundTarget, storage.UserGroupTargetBinding{
+					UserGroupID: plan.UserGroupID, AffinityKey: plan.AffinityKey,
+					Model: plan.BindingModel, Target: target,
+				})
+				if migrationErr != nil {
+					log.Printf("[USER-GROUP-ROUTE] binding migration failed request_id=%s user_group=%s target_kind=%s target_id=%s model=%s: %v",
+						requestIDFromContext(r.Context()), plan.UserGroupID, target.Kind, target.ID, plan.BindingModel, migrationErr)
+				} else {
+					plan.BoundTarget = actual.Target
+				}
+			}
 			if bindingErr := commitUserGroupRouteBinding(r.Context(), s.store, plan, target); bindingErr != nil {
 				log.Printf("[USER-GROUP-ROUTE] binding persistence failed request_id=%s user_group=%s target_kind=%s target_id=%s model=%s: %v",
 					requestIDFromContext(r.Context()), plan.UserGroupID, target.Kind, target.ID, plan.BindingModel, bindingErr)
@@ -233,45 +367,226 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			// cannot rendezvous onto a different pool/provider on its next turn.
 			if responseID := attempt.CompletedResponseID(); responseID != "" {
 				aliasPlan := plan
-				aliasPlan.AffinityKey = routing.ResponseAffinityKey(responseID).Hash
+				aliasPlan.Affinity = routing.ResponseAffinityKey(responseID)
+				aliasPlan.AffinityKey = aliasPlan.Affinity.Hash
 				aliasPlan.BindingModel = ""
+				aliasPlan.Persist = true
+				aliasPlan.Bound = false
 				if bindingErr := commitUserGroupRouteBinding(r.Context(), s.store, aliasPlan, target); bindingErr != nil {
 					log.Printf("[USER-GROUP-ROUTE] response binding persistence failed request_id=%s user_group=%s target_kind=%s target_id=%s: %v",
 						requestIDFromContext(r.Context()), plan.UserGroupID, target.Kind, target.ID, bindingErr)
 				}
 			}
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, "success", "")
 			attempt.Commit()
 			return true
 		}
 		if attempt.Committed() {
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), "")
 			_ = attempt.Close()
 			return true
 		}
-		if !moreTargets || !replaySafe || !attempt.RetryableFailure() {
+		retryable := attempt.RetryableFailure()
+		// Preserve the legacy extension surface: when dispatch did not invoke the
+		// scheduler, expand a grouped unit into its remaining individual targets.
+		if retryable && replaySafe && choiceState != nil && !choiceState.Used() && len(unit.Targets) > 1 {
+			extras := make([]userGroupDispatchUnit, 0, len(unit.Targets)-1)
+			for _, fallback := range unit.Targets[1:] {
+				extras = append(extras, userGroupDispatchUnit{Tier: unit.Tier, Targets: []storage.TargetRef{fallback}, SelectionType: "single"})
+			}
+			units = append(units[:index+1], append(extras, units[index+1:]...)...)
+		}
+		moreUnits = index+1 < len(units)
+		fallbackName := ""
+		if moreUnits && retryable && replaySafe {
+			fallbackName = userGroupTargetDiagnosticName(units[index+1].Targets[0])
+		}
+		s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), fallbackName)
+		if !moreUnits || !replaySafe || !retryable {
 			attempt.Commit()
 			return true
+		}
+		if plan.Bound && userGroupTargetsContain(unit.Targets, plan.BoundTarget) && attempt.PermanentTargetFailure() {
+			allowBindingMigration = true
 		}
 		_ = attempt.Close()
 	}
 	return false
 }
 
-type userGroupAttemptWriter struct {
-	downstream http.ResponseWriter
-	header     http.Header
-	status     int
-	body       *bodysource.SpoolBuffer
-	bodyErr    error
-	committed  bool
-	stream     bool
-	responses  *responsesRouteAliasTracker
+type userGroupDispatchUnit struct {
+	Tier          int
+	Targets       []storage.TargetRef
+	SelectionType string
 }
 
-func newUserGroupAttemptWriter(ctx context.Context, downstream http.ResponseWriter, stream, trackResponses bool, options bodysource.CaptureOptions) *userGroupAttemptWriter {
+func buildUserGroupDispatchUnits(plan userGroupRoutePlan) []userGroupDispatchUnit {
+	tiers := plan.Tiers
+	if len(tiers) == 0 && len(plan.Candidates) > 0 {
+		tiers = [][]storage.TargetRef{plan.Candidates}
+	}
+	units := make([]userGroupDispatchUnit, 0, len(plan.Candidates))
+	for tierIndex, tier := range tiers {
+		remaining := append([]storage.TargetRef(nil), tier...)
+		if plan.Bound && userGroupTargetsContain(remaining, plan.BoundTarget) {
+			units = append(units, userGroupDispatchUnit{Tier: tierIndex, Targets: []storage.TargetRef{plan.BoundTarget}, SelectionType: "bound"})
+			filtered := remaining[:0]
+			for _, target := range remaining {
+				if target != plan.BoundTarget {
+					filtered = append(filtered, target)
+				}
+			}
+			remaining = filtered
+		}
+		poolTargets := make([]storage.TargetRef, 0, len(remaining))
+		for _, target := range remaining {
+			if target.Kind == storage.TargetKindAccountPoolGroup {
+				poolTargets = append(poolTargets, target)
+			}
+		}
+		poolsEmitted := false
+		for _, target := range remaining {
+			if target.Kind == storage.TargetKindAccountPoolGroup {
+				if poolsEmitted {
+					continue
+				}
+				selectionType := "pool"
+				if len(poolTargets) > 1 {
+					selectionType = "across"
+				}
+				units = append(units, userGroupDispatchUnit{Tier: tierIndex, Targets: poolTargets, SelectionType: selectionType})
+				poolsEmitted = true
+				continue
+			}
+			units = append(units, userGroupDispatchUnit{Tier: tierIndex, Targets: []storage.TargetRef{target}, SelectionType: "provider"})
+		}
+	}
+	return units
+}
+
+func userGroupTargetsAreAccountPools(targets []storage.TargetRef) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	for _, target := range targets {
+		if target.Kind != storage.TargetKindAccountPoolGroup {
+			return false
+		}
+	}
+	return true
+}
+
+func userGroupTargetChoiceKey(target storage.TargetRef) string {
+	return target.Kind + "\x00" + target.ID
+}
+
+func userGroupTargetForChoiceKey(targets []storage.TargetRef, key string) (storage.TargetRef, bool) {
+	for _, target := range targets {
+		if userGroupTargetChoiceKey(target) == key {
+			return target, true
+		}
+	}
+	return storage.TargetRef{}, false
+}
+
+func userGroupTargetDiagnosticName(target storage.TargetRef) string {
+	return target.Kind + ":" + target.ID
+}
+
+func userGroupRouteStatusClass(attempt *userGroupAttemptWriter) string {
+	status := attempt.Status()
+	if attempt.bodyErr != nil {
+		return "local_response_storage"
+	}
+	if attempt.probeClass != "" {
+		return attempt.probeClass
+	}
+	probe := attempt.probeBytes()
+	switch {
+	case bytes.Contains(probe, []byte("no available account")), bytes.Contains(probe, []byte("no_account")):
+		return "no_account"
+	case bytes.Contains(probe, []byte("rate_limit_cooldown")), bytes.Contains(probe, []byte("quota_cooldown")), bytes.Contains(probe, []byte("quota exhausted")):
+		return "quota_cooldown"
+	case bytes.Contains(probe, []byte("egress_saturated")), bytes.Contains(probe, []byte("egress unavailable")), bytes.Contains(probe, []byte("outlet capacity")):
+		return "egress_saturated"
+	case bytes.Contains(probe, []byte("transport_error")), bytes.Contains(probe, []byte("connection reset")), bytes.Contains(probe, []byte("connection refused")):
+		return "transport"
+	}
+	switch {
+	case status < http.StatusBadRequest:
+		return "success"
+	case status == http.StatusTooManyRequests:
+		return "upstream_429"
+	case status >= http.StatusInternalServerError:
+		return "upstream_5xx"
+	case status >= http.StatusBadRequest && status < http.StatusInternalServerError:
+		return "permanent_4xx"
+	default:
+		return "unknown"
+	}
+}
+
+func (w *userGroupAttemptWriter) probeBytes() []byte {
+	if w != nil && w.probe {
+		return bytes.ToLower(append([]byte(nil), w.probeBody...))
+	}
+	if w == nil || w.body == nil || w.bodyErr != nil {
+		return nil
+	}
+	r, err := w.body.Open()
+	if err != nil {
+		return nil
+	}
+	defer r.Close()
+	payload, err := io.ReadAll(io.LimitReader(r, 64<<10))
+	if err != nil {
+		return nil
+	}
+	return bytes.ToLower(payload)
+}
+
+func replayUserGroupRequestBody(ctx context.Context, original []byte) (io.ReadCloser, func() (io.ReadCloser, error)) {
+	if source := bodySourceFromContext(ctx); source != nil && source.Size() == int64(len(original)) {
+		if body, err := source.Open(); err == nil {
+			return body, source.Open
+		}
+	}
+	getBody := func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(original)), nil
+	}
+	body, _ := getBody()
+	return body, getBody
+}
+
+type userGroupAttemptWriter struct {
+	downstream     http.ResponseWriter
+	header         http.Header
+	status         int
+	body           *bodysource.SpoolBuffer
+	bodyErr        error
+	probeBody      []byte
+	probeReserved  int64
+	probeTail      []byte
+	probeRetryable bool
+	probePermanent bool
+	probeClass     string
+	ctx            context.Context
+	options        bodysource.CaptureOptions
+	speculative    bool
+	probe          bool
+	probeTruncated bool
+	committed      bool
+	stream         bool
+	responses      *responsesRouteAliasTracker
+}
+
+func newUserGroupAttemptWriter(ctx context.Context, downstream http.ResponseWriter, stream, trackResponses bool, options bodysource.CaptureOptions, speculative ...bool) *userGroupAttemptWriter {
 	header := make(http.Header, len(downstream.Header()))
 	copyUserGroupHeaders(header, downstream.Header())
-	body, err := bodysource.NewSpoolBuffer(ctx, options)
-	w := &userGroupAttemptWriter{downstream: downstream, header: header, stream: stream, body: body, bodyErr: err}
+	w := &userGroupAttemptWriter{downstream: downstream, header: header, stream: stream, ctx: ctx, options: options}
+	if len(speculative) > 0 {
+		w.speculative = speculative[0]
+	}
 	if stream && trackResponses {
 		w.responses = &responsesRouteAliasTracker{}
 	}
@@ -308,6 +623,16 @@ func (w *userGroupAttemptWriter) writeBuffered(payload []byte) (int, error) {
 	if w.bodyErr != nil {
 		return 0, w.bodyErr
 	}
+	if w.speculative && w.Status() >= http.StatusBadRequest {
+		return w.writeProbe(payload)
+	}
+	if w.body == nil {
+		options := w.options
+		w.body, w.bodyErr = bodysource.NewSpoolBuffer(w.ctx, options)
+		if w.bodyErr != nil {
+			return 0, w.bodyErr
+		}
+	}
 	n, err := w.body.Write(payload)
 	if err != nil {
 		w.bodyErr = err
@@ -316,6 +641,81 @@ func (w *userGroupAttemptWriter) writeBuffered(payload []byte) (int, error) {
 		w.header.Set("Content-Type", "application/json")
 	}
 	return n, err
+}
+
+func (w *userGroupAttemptWriter) writeProbe(payload []byte) (int, error) {
+	w.probe = true
+	w.observeProbeMarkers(payload)
+	remaining := int64(64<<10) - int64(len(w.probeBody))
+	if remaining <= 0 {
+		w.probeTruncated = true
+		return len(payload), nil
+	}
+	accepted := payload
+	if int64(len(accepted)) > remaining {
+		accepted = accepted[:remaining]
+		w.probeTruncated = true
+	}
+	if len(accepted) > 0 {
+		if w.options.Budget != nil && !w.options.Budget.ReserveMemory(int64(len(accepted))) {
+			// Status and the streaming marker classifier remain sufficient for
+			// fallback; a saturated response budget never spills this probe to disk.
+			w.probeTruncated = true
+			return len(payload), nil
+		}
+		w.probeReserved += int64(len(accepted))
+		w.probeBody = append(w.probeBody, accepted...)
+	}
+	return len(payload), nil
+}
+
+func (w *userGroupAttemptWriter) observeProbeMarkers(payload []byte) {
+	markers := []struct {
+		value     []byte
+		class     string
+		permanent bool
+	}{
+		{[]byte("no available account"), "no_account", true},
+		{[]byte("no_account"), "no_account", true},
+		{[]byte("capability_unavailable"), "no_account", true},
+		{[]byte("claude_context_1m_unavailable"), "no_account", true},
+		{[]byte("model_fallback_required"), "no_account", true},
+		{[]byte("model_not_found"), "no_account", true},
+		{[]byte("model_unsupported"), "no_account", true},
+		{[]byte("bound_account_unavailable"), "no_account", true},
+		{[]byte("rate_limit_cooldown"), "quota_cooldown", false},
+		{[]byte("quota_cooldown"), "quota_cooldown", false},
+		{[]byte("quota exhausted"), "quota_cooldown", false},
+		{[]byte("egress_saturated"), "egress_saturated", false},
+		{[]byte("egress unavailable"), "egress_saturated", false},
+		{[]byte("transport_error"), "transport", false},
+		{[]byte("temporarily unavailable"), "upstream_5xx", false},
+	}
+	maxMarker := 1
+	for _, marker := range markers {
+		if len(marker.value) > maxMarker {
+			maxMarker = len(marker.value)
+		}
+	}
+	for len(payload) > 0 {
+		n := min(len(payload), 4096)
+		window := make([]byte, 0, len(w.probeTail)+n)
+		window = append(window, w.probeTail...)
+		window = append(window, payload[:n]...)
+		window = bytes.ToLower(window)
+		for _, marker := range markers {
+			if bytes.Contains(window, marker.value) {
+				w.probeRetryable = true
+				w.probePermanent = w.probePermanent || marker.permanent
+				if w.probeClass == "" {
+					w.probeClass = marker.class
+				}
+			}
+		}
+		keep := min(maxMarker-1, len(window))
+		w.probeTail = append(w.probeTail[:0], window[len(window)-keep:]...)
+		payload = payload[n:]
+	}
 }
 
 func (w *userGroupAttemptWriter) Flush() {
@@ -341,11 +741,14 @@ func (w *userGroupAttemptWriter) Status() int {
 func (w *userGroupAttemptWriter) Committed() bool { return w.committed }
 
 func (w *userGroupAttemptWriter) RetryableFailure() bool {
-	if w.body == nil || w.bodyErr != nil {
-		return false
-	}
 	if retryableUserGroupTargetStatus(w.Status()) {
 		return true
+	}
+	if w.probe {
+		return w.probeRetryable
+	}
+	if w.body == nil || w.bodyErr != nil {
+		return false
 	}
 	r, err := w.body.Open()
 	if err != nil {
@@ -353,6 +756,44 @@ func (w *userGroupAttemptWriter) RetryableFailure() bool {
 	}
 	defer r.Close()
 	return retryableUserGroupTargetFailure(w.Status(), r)
+}
+
+// PermanentTargetFailure is deliberately narrower than RetryableFailure. Quota,
+// transient 5xx and outlet saturation may use another target for this replayable
+// request, but they do not rewrite a durable conversation target. Only evidence
+// that the target cannot execute this route permits compare-and-swap migration.
+func (w *userGroupAttemptWriter) PermanentTargetFailure() bool {
+	if w.Status() == http.StatusNotFound {
+		return true
+	}
+	if w.probe {
+		return w.probePermanent
+	}
+	if w.body == nil || w.bodyErr != nil {
+		return false
+	}
+	r, err := w.body.Open()
+	if err != nil {
+		return false
+	}
+	defer r.Close()
+	payload, err := io.ReadAll(io.LimitReader(r, 64<<10))
+	if err != nil {
+		return false
+	}
+	payload = bytes.ToLower(payload)
+	for _, marker := range [][]byte{
+		[]byte("no available account"),
+		[]byte("capability_unavailable"),
+		[]byte("model_not_found"),
+		[]byte("model_unsupported"),
+		[]byte("bound_account_unavailable"),
+	} {
+		if bytes.Contains(payload, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *userGroupAttemptWriter) CompletedResponseID() string {
@@ -396,11 +837,18 @@ func (w *userGroupAttemptWriter) Commit() {
 			w.header.Set("Content-Type", "application/json")
 		}
 	}
+	if w.probeTruncated {
+		w.header.Set("X-Pool-Error-Probe-Truncated", "1")
+	}
 	w.commitHeaders()
 	if w.bodyErr != nil {
 		_, _ = io.WriteString(w.downstream, `{"error":{"type":"resource_exhausted","message":"response buffer exhausted"}}`)
 	} else if body != nil {
 		_, _ = io.Copy(w.downstream, body)
+	} else if w.probe && len(w.probeBody) > 0 {
+		_, _ = w.downstream.Write(w.probeBody)
+	} else if w.probe {
+		_, _ = io.WriteString(w.downstream, `{"error":{"type":"target_unavailable","message":"target failure response probe unavailable"}}`)
 	}
 	if body != nil {
 		_ = body.Close()
@@ -409,6 +857,14 @@ func (w *userGroupAttemptWriter) Commit() {
 }
 
 func (w *userGroupAttemptWriter) Close() error {
+	if w.probe {
+		if w.probeReserved > 0 && w.options.Budget != nil {
+			w.options.Budget.ReleaseMemory(w.probeReserved)
+		}
+		w.probeReserved = 0
+		w.probeBody = nil
+		w.probeTail = nil
+	}
 	if w.body == nil {
 		return nil
 	}
@@ -642,13 +1098,25 @@ func userGroupTiersForProvider(tiers [][]storage.TargetRef, provider string) [][
 }
 
 func orderUserGroupTiers(tiers [][]storage.TargetRef, seed string) []storage.TargetRef {
-	ordered := make([]storage.TargetRef, 0)
+	return flattenUserGroupTiers(orderUserGroupTierSlices(tiers, seed))
+}
+
+func orderUserGroupTierSlices(tiers [][]storage.TargetRef, seed string) [][]storage.TargetRef {
+	ordered := make([][]storage.TargetRef, 0, len(tiers))
 	for tierIndex, tier := range tiers {
 		copyTier := append([]storage.TargetRef(nil), tier...)
 		sort.SliceStable(copyTier, func(i, j int) bool {
 			return userGroupRendezvousRank(seed, tierIndex, copyTier[i]) > userGroupRendezvousRank(seed, tierIndex, copyTier[j])
 		})
-		ordered = append(ordered, copyTier...)
+		ordered = append(ordered, copyTier)
+	}
+	return ordered
+}
+
+func flattenUserGroupTiers(tiers [][]storage.TargetRef) []storage.TargetRef {
+	ordered := make([]storage.TargetRef, 0)
+	for _, tier := range tiers {
+		ordered = append(ordered, tier...)
 	}
 	return ordered
 }

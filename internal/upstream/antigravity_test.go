@@ -14,6 +14,7 @@ import (
 
 	"codex-account-pool/internal/config"
 
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
 
@@ -115,6 +116,60 @@ func TestAnthropicToAntigravityPreservesStructuredMessages(t *testing.T) {
 	}
 	if session := gjson.GetBytes(out, "request.sessionId").String(); session == "" || !strings.HasPrefix(session, "-") {
 		t.Fatalf("generated session id = %q", session)
+	}
+}
+
+func TestAntigravityFinalWireIdentitySafetyAndCatalogLimit(t *testing.T) {
+	body := []byte(`{"max_tokens":4096,"messages":[{"role":"user","content":"same conversation"}]}`)
+	one, err := anthropicToAntigravityForAccount(body, "gemini-3.1-pro", "project", "account-a", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := anthropicToAntigravityForAccount(body, "gemini-3.1-pro", "project", "account-a", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := anthropicToAntigravityForAccount(body, "gemini-3.1-pro", "project", "account-b", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requestID := gjson.GetBytes(one, "requestId").String(); requestID == "" {
+		t.Fatal("missing requestId")
+	} else if _, parseErr := uuid.Parse(requestID); parseErr != nil {
+		t.Fatalf("requestId %q is not a standard UUID: %v", requestID, parseErr)
+	}
+	if gjson.GetBytes(one, "request.safetySettings").Exists() {
+		t.Fatalf("final wire retained safetySettings: %s", one)
+	}
+	if got := gjson.GetBytes(one, "request.generationConfig.maxOutputTokens").Int(); got != 1024 {
+		t.Fatalf("maxOutputTokens=%d want catalog cap 1024", got)
+	}
+	session := gjson.GetBytes(one, "request.sessionId").String()
+	if session == "" || session != gjson.GetBytes(two, "request.sessionId").String() {
+		t.Fatalf("account session is not stable: %q / %q", session, gjson.GetBytes(two, "request.sessionId").String())
+	}
+	if session == gjson.GetBytes(other, "request.sessionId").String() {
+		t.Fatalf("sessions were shared across accounts: %q", session)
+	}
+}
+
+func TestAntigravityEndpointOrderAndFailureClassifier(t *testing.T) {
+	bases := AntigravityEndpointBases("")
+	if len(bases) != 2 || bases[0] != antigravityDailyBaseURL || bases[1] != antigravityProdBaseURL {
+		t.Fatalf("default bases=%v", bases)
+	}
+	if custom := AntigravityEndpointBases("https://custom.test/"); len(custom) != 1 || custom[0] != "https://custom.test" {
+		t.Fatalf("custom bases=%v", custom)
+	}
+	if got := ClassifyAntigravityFailure(429, http.Header{"Retry-After": {"1"}}, nil, nil); !got.Retryable || !got.Failover || got.Class != AntigravityFailureRateLimit {
+		t.Fatalf("soft 429=%+v", got)
+	}
+	if got := ClassifyAntigravityFailure(400, nil, []byte(`{"error":"bad request"}`), nil); got.Retryable || got.Failover || got.Class != AntigravityFailurePermanent {
+		t.Fatalf("permanent 400=%+v", got)
+	}
+	err := newAntigravityEmbeddedError(gjson.Parse(`{"code":503,"status":"UNAVAILABLE","message":"capacity"}`))
+	if got := ClassifyAntigravityFailure(200, nil, nil, err); !got.Retryable || got.Status != 503 || got.Class != AntigravityFailureTransient {
+		t.Fatalf("embedded SSE classifier=%+v", got)
 	}
 }
 

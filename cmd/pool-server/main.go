@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,8 +38,21 @@ func main() {
 
 func run() int {
 	var configPath string
+	var unixSocket string
+	var releaseID string
+	var selfTest bool
 	flag.StringVar(&configPath, "config", "", "path to JSON configuration file")
+	flag.StringVar(&unixSocket, "unix-socket", "", "serve on a private Unix socket instead of the configured TCP address")
+	flag.StringVar(&releaseID, "release-id", strings.TrimSpace(os.Getenv("CODEX_POOL_RELEASE_ID")), "deployed release identifier exposed by /readyz")
+	flag.BoolVar(&selfTest, "self-test", false, "verify that the worker binary can start")
 	flag.Parse()
+	if selfTest {
+		fmt.Println("codex-pool-server self-test ok")
+		return 0
+	}
+	if releaseID == "" {
+		releaseID = "development"
+	}
 
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -193,9 +208,10 @@ func run() int {
 		}
 	})
 
+	deployment := newDeploymentHandler(app, releaseID, unixSocket)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           app,
+		Handler:           deployment,
 		ReadHeaderTimeout: 15 * time.Second,
 		// Bound slow request-body uploads without imposing a WriteTimeout on SSE or
 		// WebSocket responses. Individual upstream calls still use their own context.
@@ -203,7 +219,8 @@ func run() int {
 	}
 
 	serveErr := make(chan error, 1)
-	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServer(httpServer) })
+	deployment.ready.Store(true)
+	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServerOn(httpServer, unixSocket) })
 	// Historical usage diagnostics affect reports, not request correctness. Run their
 	// potentially large JSON backfill only after the listener is accepting health
 	// checks; synchronous execution here previously made an active systemd service look
@@ -233,6 +250,8 @@ func run() int {
 			log.Printf("http server: %v", err)
 		}
 	}
+	deployment.ready.Store(false)
+	deployment.draining.Store(true)
 	cancelBackground()
 
 	// Graceful drain: stop accepting new connections and let in-flight requests (the
@@ -253,6 +272,60 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// deploymentHandler provides the worker-local deployment contract used by the
+// stable handoff process. It deliberately lives outside the API router so readiness
+// remains available while normal admission middleware is saturated.
+type deploymentHandler struct {
+	next       http.Handler
+	releaseID  string
+	workerAddr string
+	startedAt  time.Time
+	ready      atomic.Bool
+	draining   atomic.Bool
+	inflight   atomic.Int64
+}
+
+func newDeploymentHandler(next http.Handler, releaseID, workerAddr string) *deploymentHandler {
+	return &deploymentHandler{next: next, releaseID: releaseID, workerAddr: workerAddr, startedAt: time.Now().UTC()}
+}
+
+func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/readyz" {
+		h.serveReady(w)
+		return
+	}
+	h.inflight.Add(1)
+	defer h.inflight.Add(-1)
+	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
+	h.next.ServeHTTP(w, r)
+}
+
+func (h *deploymentHandler) serveReady(w http.ResponseWriter) {
+	ready := h.ready.Load() && !h.draining.Load()
+	state := "ready"
+	status := http.StatusOK
+	if h.draining.Load() {
+		state = "draining"
+		status = http.StatusServiceUnavailable
+	} else if !ready {
+		state = "starting"
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":               ready,
+		"ready":            ready,
+		"release_id":       h.releaseID,
+		"deployment_state": state,
+		"inflight":         h.inflight.Load(),
+		"started_at":       h.startedAt.Format(time.RFC3339Nano),
+		"worker_socket":    h.workerAddr,
+	})
 }
 
 func startCPUProfile() func() {
@@ -311,6 +384,28 @@ func startHeapProfileSignal(ctx context.Context) {
 }
 
 func serveHTTPServer(httpServer *http.Server) error {
+	return serveHTTPServerOn(httpServer, "")
+}
+
+func serveHTTPServerOn(httpServer *http.Server, unixSocket string) error {
+	if strings.TrimSpace(unixSocket) != "" {
+		if err := os.Remove(unixSocket); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale worker socket: %w", err)
+		}
+		ln, err := net.Listen("unix", unixSocket)
+		if err != nil {
+			return fmt.Errorf("listen on worker socket %s: %w", unixSocket, err)
+		}
+		defer func() {
+			_ = ln.Close()
+			_ = os.Remove(unixSocket)
+		}()
+		if err := os.Chmod(unixSocket, 0660); err != nil {
+			return fmt.Errorf("chmod worker socket %s: %w", unixSocket, err)
+		}
+		log.Printf("codex pool worker listening on unix://%s", unixSocket)
+		return cleanServeError(httpServer.Serve(ln))
+	}
 	// Prefer a socket passed by systemd (socket activation): the .socket unit owns
 	// the listening fd, so `systemctl restart` keeps the socket open across the swap
 	// and new connections queue in the kernel backlog instead of being refused during

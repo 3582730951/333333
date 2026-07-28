@@ -18,7 +18,8 @@
 #   2. Clears the Go build cache + .build so the binary is recompiled from scratch.
 #   3. Runs scripts/install.sh (rebuilds the binary incl. the embedded UI, reinstalls
 #      the sidecar + gopay, preserves the existing config/admin_token, restarts the
-#      systemd services). install.sh NEVER writes the DB, so accounts survive.
+#      systemd units and atomically switches a ready worker behind the stable handoff).
+#      install.sh NEVER writes the DB, so accounts survive.
 #   4. Verifies the account count did not drop, prints the public access URL.
 #
 # Zero-config external HTTP: with no flags the service binds 0.0.0.0:<port> (keeps
@@ -44,6 +45,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
 SERVICE_NAME="${SERVICE_NAME:-codex-pool}"
+HANDOFF_SERVICE_NAME="${HANDOFF_SERVICE_NAME:-${SERVICE_NAME}-handoff}"
 DATA_DIR="${DATA_DIR:-/var/lib/codex-pool}"
 CONFIG_FILE="${CONFIG_FILE:-/etc/codex-pool/config.json}"
 BACKUP=""
@@ -345,7 +347,7 @@ print_summary() {
     echo "  池内账号 Accounts:  数据库文件已原样保留（未安装 sqlite3，跳过计数校验）"
   fi
   if command -v systemctl >/dev/null 2>&1; then
-    echo "  服务状态 Service:   $(systemctl is-active "${SERVICE_NAME}.service" 2>/dev/null || echo unknown) (${SERVICE_NAME}.service)"
+    echo "  服务状态 Service:   $(systemctl is-active "${HANDOFF_SERVICE_NAME}.service" 2>/dev/null || echo unknown) (${HANDOFF_SERVICE_NAME}.service)"
   fi
   listen="$(discover_listen_from_systemd || true)"
   [[ -z "$listen" ]] && listen="${LISTEN_ADDR:-}"
@@ -362,7 +364,7 @@ print_summary() {
     esac
   fi
   echo
-  echo "  日志 logs: journalctl -u ${SERVICE_NAME}.service -f"
+  echo "  日志 logs: journalctl -u ${HANDOFF_SERVICE_NAME}.service -f"
 }
 
 main() {

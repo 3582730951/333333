@@ -3312,26 +3312,128 @@ func (s *Store) GetUserGroupTargetBinding(ctx context.Context, userGroupID, affi
 }
 
 func (s *Store) UpsertUserGroupTargetBinding(ctx context.Context, binding UserGroupTargetBinding) error {
-	target, err := NormalizeTargetRef(binding.Target)
+	target, binding, err := normalizeUserGroupTargetBinding(binding)
 	if err != nil {
 		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO user_group_target_bindings(user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?)
+ON CONFLICT(user_group_id, affinity_key, model) DO UPDATE SET target_kind=excluded.target_kind, target_id=excluded.target_id, updated_at=excluded.updated_at`,
+		binding.UserGroupID, binding.AffinityKey, binding.Model, target.Kind, target.ID, binding.CreatedAt, binding.UpdatedAt)
+	return err
+}
+
+// ClaimUserGroupTargetBinding atomically publishes the first target selected for
+// a conversation. Concurrent first turns all observe the same winner: exactly one
+// insert succeeds and every loser receives the already-committed binding instead
+// of overwriting it with its speculative choice.
+func (s *Store) ClaimUserGroupTargetBinding(ctx context.Context, binding UserGroupTargetBinding) (UserGroupTargetBinding, bool, error) {
+	target, binding, err := normalizeUserGroupTargetBinding(binding)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `INSERT INTO user_group_target_bindings(user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at)
+VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_group_id, affinity_key, model) DO NOTHING`,
+		binding.UserGroupID, binding.AffinityKey, binding.Model, target.Kind, target.ID, binding.CreatedAt, binding.UpdatedAt)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	actual, err := scanUserGroupTargetBinding(ctx, tx, binding.UserGroupID, binding.AffinityKey, binding.Model)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	return actual, rows == 1, nil
+}
+
+// CompareAndSwapUserGroupTargetBinding migrates a replayable conversation only
+// while the binding still names expected. A concurrent migration winner is never
+// overwritten; callers receive the current binding and can follow it.
+func (s *Store) CompareAndSwapUserGroupTargetBinding(ctx context.Context, expected TargetRef, replacement UserGroupTargetBinding) (UserGroupTargetBinding, bool, error) {
+	expected, err := NormalizeTargetRef(expected)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	target, replacement, err := normalizeUserGroupTargetBinding(replacement)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `UPDATE user_group_target_bindings
+SET target_kind=?, target_id=?, updated_at=?
+WHERE user_group_id=? AND affinity_key=? AND model=? AND target_kind=? AND target_id=?`,
+		target.Kind, target.ID, replacement.UpdatedAt,
+		replacement.UserGroupID, replacement.AffinityKey, replacement.Model, expected.Kind, expected.ID)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	actual, err := scanUserGroupTargetBinding(ctx, tx, replacement.UserGroupID, replacement.AffinityKey, replacement.Model)
+	if err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return UserGroupTargetBinding{}, false, err
+	}
+	return actual, rows == 1, nil
+}
+
+type userGroupTargetBindingQuerier interface {
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+func scanUserGroupTargetBinding(ctx context.Context, q userGroupTargetBindingQuerier, userGroupID, affinityKey, model string) (UserGroupTargetBinding, error) {
+	var binding UserGroupTargetBinding
+	var kind, targetID string
+	err := q.QueryRowContext(ctx, `SELECT user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at
+FROM user_group_target_bindings WHERE user_group_id=? AND affinity_key=? AND model=?`, userGroupID, affinityKey, model).Scan(
+		&binding.UserGroupID, &binding.AffinityKey, &binding.Model, &kind, &targetID, &binding.CreatedAt, &binding.UpdatedAt)
+	if err != nil {
+		return UserGroupTargetBinding{}, err
+	}
+	binding.Target, err = NormalizeTargetRef(TargetRef{Kind: kind, ID: targetID})
+	if err != nil {
+		return UserGroupTargetBinding{}, err
+	}
+	return binding, nil
+}
+
+func normalizeUserGroupTargetBinding(binding UserGroupTargetBinding) (TargetRef, UserGroupTargetBinding, error) {
+	target, err := NormalizeTargetRef(binding.Target)
+	if err != nil {
+		return TargetRef{}, UserGroupTargetBinding{}, err
 	}
 	binding.UserGroupID = strings.TrimSpace(binding.UserGroupID)
 	binding.AffinityKey = strings.TrimSpace(binding.AffinityKey)
 	binding.Model = strings.TrimSpace(binding.Model)
 	if binding.UserGroupID == "" || binding.AffinityKey == "" {
-		return errors.New("user group target binding requires group and affinity key")
+		return TargetRef{}, UserGroupTargetBinding{}, errors.New("user group target binding requires group and affinity key")
 	}
 	now := Now()
 	if binding.CreatedAt == 0 {
 		binding.CreatedAt = now
 	}
 	binding.UpdatedAt = now
-	_, err = s.db.ExecContext(ctx, `INSERT INTO user_group_target_bindings(user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at)
-VALUES(?,?,?,?,?,?,?)
-ON CONFLICT(user_group_id, affinity_key, model) DO UPDATE SET target_kind=excluded.target_kind, target_id=excluded.target_id, updated_at=excluded.updated_at`,
-		binding.UserGroupID, binding.AffinityKey, binding.Model, target.Kind, target.ID, binding.CreatedAt, binding.UpdatedAt)
-	return err
+	binding.Target = target
+	return target, binding, nil
 }
 
 func (s *Store) UpsertUserGroupTarget(ctx context.Context, t UserGroupTarget) error {

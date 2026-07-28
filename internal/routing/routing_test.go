@@ -9,6 +9,19 @@ import (
 	"testing"
 )
 
+func TestIsTrueConversationAffinityExcludesFairnessOnlyFingerprints(t *testing.T) {
+	for _, source := range []string{CodexRootThreadAffinitySource, "thread_id", "previous_response_id", "x-claude-code-session-id"} {
+		if !IsTrueConversationAffinity(AffinityFromKey("conversation", source)) {
+			t.Fatalf("source %q should persist a conversation binding", source)
+		}
+	}
+	for _, source := range []string{"cache_prefix_hash", "stable_messages_hash", "downstream_api_project_model", "prompt_cache_key", ""} {
+		if IsTrueConversationAffinity(AffinityFromKey("fairness-only", source)) {
+			t.Fatalf("source %q should take a fresh fair decision", source)
+		}
+	}
+}
+
 func TestHasServerSideState(t *testing.T) {
 	mk := func(body string, hdr map[string]string) (*http.Request, []byte) {
 		req, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(""))

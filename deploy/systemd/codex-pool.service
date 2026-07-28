@@ -1,33 +1,14 @@
 [Unit]
-Description=Codex Account Pool Server
-After=network-online.target
-Wants=network-online.target
+Description=Codex Pool compatibility service (public listener is codex-pool-handoff.service)
+Requires=codex-pool-handoff.service
+After=codex-pool-handoff.service
 
 [Service]
-Type=simple
-User=codex-pool
-Group=codex-pool
-WorkingDirectory=/var/lib/codex-pool
+Type=oneshot
 Environment=CODEX_POOL_DATABASE=/var/lib/codex-pool/pool.sqlite3
-# 1-core/1-GB VPS memory backstop (Go honors these env vars natively — no code change).
-# Uncomment to cap the Go heap so a request burst triggers GC instead of an OOM kill.
-# GOMEMLIMIT is a SOFT limit; pair it with a lower GOGC so collection ramps up earlier.
-# Leave commented on 2c/2g+ hosts, where an artificial cap only adds GC pressure.
-#Environment=GOMEMLIMIT=700MiB
-#Environment=GOGC=50
-ExecStart=/usr/local/bin/codex-pool-server --config /etc/codex-pool/config.json
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/codex-pool
-# Memory accounting lets `systemctl status` / `systemd-cgtop` report real RSS; the
-# (commented) ceilings are an OS-enforced hard stop complementing GOMEMLIMIT above.
-MemoryAccounting=true
-#MemoryHigh=850M
-#MemoryMax=950M
+Environment=CODEX_POOL_LISTEN_ADDR=0.0.0.0:8787
+ExecStart=/bin/true
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -170,6 +170,121 @@ func TestLocalLeaseCoordinatorConcurrentLimit(t *testing.T) {
 	}
 }
 
+func TestLocalLeaseCoordinatorAcrossUsesTargetCapacityAndGlobalRoundRobin(t *testing.T) {
+	coordinator := newLocalLeaseCoordinator()
+	makeCandidates := func(left, right int) []LeaseCandidateRequest {
+		candidates := make([]LeaseCandidateRequest, 0, left+right)
+		for index := range left {
+			id := fmt.Sprintf("left-%d", index)
+			candidates = append(candidates, LeaseCandidateRequest{ChoiceKey: "left", Request: LeaseRequest{AccountID: id, Resources: []LeaseResource{{ID: "egress-" + id}}}})
+		}
+		for index := range right {
+			id := fmt.Sprintf("right-%d", index)
+			candidates = append(candidates, LeaseCandidateRequest{ChoiceKey: "right", Request: LeaseRequest{AccountID: id, Resources: []LeaseResource{{ID: "egress-" + id}}}})
+		}
+		return candidates
+	}
+
+	assertHeldDistribution := func(name string, candidates []LeaseCandidateRequest, acquisitions, wantLeft, wantRight int) {
+		t.Helper()
+		counts := map[string]int{}
+		leases := make([]CoordinatedLease, 0, acquisitions)
+		for range acquisitions {
+			selected, reason, err := coordinator.TryAcquireAcross(context.Background(), candidates)
+			if err != nil || selected.Lease == nil || reason != leaseBlockNone {
+				t.Fatalf("%s acquire lease=%v reason=%s err=%v", name, selected.Lease, reason, err)
+			}
+			counts[selected.ChoiceKey]++
+			leases = append(leases, selected.Lease)
+		}
+		if counts["left"] != wantLeft || counts["right"] != wantRight {
+			t.Fatalf("%s distribution=%v want left=%d right=%d", name, counts, wantLeft, wantRight)
+		}
+		for _, lease := range leases {
+			if err := lease.Release(context.Background()); err != nil {
+				t.Fatalf("%s release: %v", name, err)
+			}
+		}
+	}
+
+	assertHeldDistribution("equal", makeCandidates(2, 2), 1000, 500, 500)
+	assertHeldDistribution("five-to-two-first-wave", makeCandidates(5, 2), 7, 5, 2)
+}
+
+func TestLocalLeaseCoordinatorAcrossBarrierConcurrentFairness(t *testing.T) {
+	coordinator := newLocalLeaseCoordinator()
+	candidates := []LeaseCandidateRequest{
+		{ChoiceKey: "left", Request: LeaseRequest{AccountID: "left-0", Resources: []LeaseResource{{ID: "left-egress"}}}},
+		{ChoiceKey: "left", Request: LeaseRequest{AccountID: "left-1", Resources: []LeaseResource{{ID: "left-egress"}}}},
+		{ChoiceKey: "right", Request: LeaseRequest{AccountID: "right-0", Resources: []LeaseResource{{ID: "right-egress"}}}},
+		{ChoiceKey: "right", Request: LeaseRequest{AccountID: "right-1", Resources: []LeaseResource{{ID: "right-egress"}}}},
+	}
+	const requests = 1000
+	start := make(chan struct{})
+	results := make(chan CoordinatedLeaseSelection, requests)
+	errs := make(chan error, requests)
+	var wait sync.WaitGroup
+	for range requests {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			selection, reason, err := coordinator.TryAcquireAcross(context.Background(), candidates)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if selection.Lease == nil || reason != leaseBlockNone {
+				errs <- fmt.Errorf("selection=%+v reason=%s", selection, reason)
+				return
+			}
+			results <- selection
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	leases := make([]CoordinatedLease, 0, requests)
+	for selection := range results {
+		counts[selection.ChoiceKey]++
+		leases = append(leases, selection.Lease)
+	}
+	if delta := counts["left"] - counts["right"]; delta < -1 || delta > 1 {
+		t.Fatalf("barrier-concurrent distribution=%v delta=%d", counts, delta)
+	}
+	for _, lease := range leases {
+		if err := lease.Release(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestLocalLeaseCoordinatorAcrossFallsBackFromBlockedTarget(t *testing.T) {
+	coordinator := newLocalLeaseCoordinator()
+	blockedResource := "blocked-egress"
+	held, reason, err := coordinator.TryAcquire(context.Background(), LeaseRequest{
+		AccountID: "occupant", Resources: []LeaseResource{{ID: blockedResource, Limit: 1}},
+	})
+	if err != nil || held == nil || reason != leaseBlockNone {
+		t.Fatalf("seed lease=%v reason=%s err=%v", held, reason, err)
+	}
+	defer held.Release(context.Background())
+
+	selected, reason, err := coordinator.TryAcquireAcross(context.Background(), []LeaseCandidateRequest{
+		{ChoiceKey: "blocked", Request: LeaseRequest{AccountID: "blocked-account", Resources: []LeaseResource{{ID: blockedResource, Limit: 1}}}},
+		{ChoiceKey: "healthy", Request: LeaseRequest{AccountID: "healthy-account", Resources: []LeaseResource{{ID: "healthy-egress", Limit: 1}}}},
+	})
+	if err != nil || selected.Lease == nil || reason != leaseBlockNone || selected.ChoiceKey != "healthy" {
+		t.Fatalf("fallback selection=%+v reason=%s err=%v", selected, reason, err)
+	}
+	_ = selected.Lease.Release(context.Background())
+}
+
 func TestRedisLeaseCoordinatorAtomicAcrossNodes(t *testing.T) {
 	rawURL := strings.TrimSpace(os.Getenv("TEST_REDIS_URL"))
 	if rawURL == "" {
@@ -207,6 +322,67 @@ func TestRedisLeaseCoordinatorAtomicAcrossNodes(t *testing.T) {
 	if err = second.Release(context.Background()); err != nil {
 		t.Fatalf("release second: %v", err)
 	}
+}
+
+func TestRedisLeaseCoordinatorAcrossNodesIsGloballyFair(t *testing.T) {
+	rawURL := strings.TrimSpace(os.Getenv("TEST_REDIS_URL"))
+	if rawURL == "" {
+		t.Skip("TEST_REDIS_URL is not configured")
+	}
+	firstCoordinator, err := newRedisLeaseCoordinator(rawURL, "across-fair-node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstCoordinator.Close()
+	secondCoordinator, err := newRedisLeaseCoordinator(rawURL, "across-fair-node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondCoordinator.Close()
+
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	candidates := make([]LeaseCandidateRequest, 0, 4)
+	for _, choice := range []string{"left", "right"} {
+		for index := range 2 {
+			id := fmt.Sprintf("redis-across-%s-%s-%d", suffix, choice, index)
+			candidates = append(candidates, LeaseCandidateRequest{
+				ChoiceKey: choice,
+				Request:   LeaseRequest{AccountID: id, Resources: []LeaseResource{{ID: "egress-" + id, Limit: 1000}}, TTL: time.Minute},
+			})
+		}
+	}
+
+	counts := map[string]int{}
+	leases := make([]CoordinatedLease, 0, 1000)
+	for index := range 1000 {
+		coordinator := firstCoordinator
+		if index%2 != 0 {
+			coordinator = secondCoordinator
+		}
+		selected, reason, acquireErr := coordinator.TryAcquireAcross(context.Background(), candidates)
+		if acquireErr != nil || selected.Lease == nil || reason != leaseBlockNone {
+			t.Fatalf("acquire %d selection=%+v reason=%s err=%v", index, selected, reason, acquireErr)
+		}
+		counts[selected.ChoiceKey]++
+		leases = append(leases, selected.Lease)
+	}
+	left, right := float64(counts["left"]), float64(counts["right"])
+	jain := (left + right) * (left + right) / (2 * (left*left + right*right))
+	if jain < 0.99 || absInt(counts["left"]-counts["right"]) > 1 {
+		t.Fatalf("distribution=%v Jain=%f", counts, jain)
+	}
+	for _, lease := range leases {
+		if releaseErr := lease.Release(context.Background()); releaseErr != nil {
+			t.Fatal(releaseErr)
+		}
+	}
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func TestRedisLeaseCoordinatorFailsClosedAfterEpochLoss(t *testing.T) {

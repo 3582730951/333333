@@ -1,0 +1,265 @@
+package scheduler
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/routing"
+	"codex-account-pool/internal/storage"
+)
+
+// RouteChoice is one same-tier routing target. ChoiceKey is opaque to the
+// scheduler and is returned unchanged with the physical-account lease.
+type RouteChoice struct {
+	ChoiceKey string
+	Route     Route
+}
+
+// RoutedLease identifies both the actual account lease and the target whose
+// route admitted it. Lease is embedded for source-compatible Account/Egress use.
+type RoutedLease struct {
+	Lease
+	ChoiceKey string
+}
+
+type acrossEvaluatedCandidate struct {
+	choiceKey string
+	route     Route
+	candidate candidate
+	pending   int
+}
+
+// SelectAcross evaluates every exact-capability account in the supplied tier,
+// merges duplicate physical account IDs, and lets the coordinator choose+lease
+// in one atomic operation. Callers preserve strict tier priority by invoking it
+// once per tier rather than combining fallback tiers.
+func (s *Scheduler) SelectAcross(ctx context.Context, choices []RouteChoice) (RoutedLease, error) {
+	started := time.Now()
+	defer s.observeRouteSelection(started)
+	if len(choices) == 0 {
+		return RoutedLease{}, ErrNoAccount
+	}
+	if err := s.admission.Wait(ctx); err != nil {
+		return RoutedLease{}, err
+	}
+
+	normalized := make([]RouteChoice, 0, len(choices))
+	seenChoices := make(map[string]struct{}, len(choices))
+	for index, choice := range choices {
+		choice.ChoiceKey = strings.TrimSpace(choice.ChoiceKey)
+		if choice.ChoiceKey == "" {
+			choice.ChoiceKey = fmt.Sprintf("choice:%d", index)
+		}
+		if _, duplicate := seenChoices[choice.ChoiceKey]; duplicate {
+			return RoutedLease{}, fmt.Errorf("duplicate route choice key %q", choice.ChoiceKey)
+		}
+		seenChoices[choice.ChoiceKey] = struct{}{}
+		if err := s.normalizeAcrossRoute(ctx, &choice.Route); err != nil {
+			return RoutedLease{}, err
+		}
+		normalized = append(normalized, choice)
+	}
+
+	// A real conversation reuses its already-established physical account. Prefix
+	// and coarse affinities deliberately bypass this path and remain freshly fair.
+	trueAffinity := routing.AffinityKey{}
+	for _, choice := range normalized {
+		if routing.IsTrueConversationAffinity(choice.Route.Affinity) {
+			trueAffinity = choice.Route.Affinity
+			break
+		}
+	}
+	if trueAffinity.Hash != "" {
+		if bound, err := s.affinitySnapshot(ctx, trueAffinity.Hash); err == nil {
+			account, accountErr := s.store.GetAccount(ctx, bound.AccountID)
+			if accountErr == nil {
+				provider := s.providerOfAccount(ctx, account)
+				for _, choice := range normalized {
+					if choice.Route.Group != account.GroupName || !routeAllowsProvider(choice.Route, provider) {
+						continue
+					}
+					lease, selectErr := s.Select(ctx, choice.Route)
+					if selectErr == nil {
+						return RoutedLease{Lease: lease, ChoiceKey: choice.ChoiceKey}, nil
+					}
+					if choice.Route.ServerSideState || choice.Route.ImmutableAffinity {
+						return RoutedLease{}, selectErr
+					}
+				}
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return RoutedLease{}, err
+		}
+	}
+
+	evaluated, counters, err := s.evaluateAcrossCandidates(ctx, normalized)
+	if err != nil {
+		return RoutedLease{}, err
+	}
+	if len(evaluated) == 0 {
+		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters}
+	}
+
+	requests := make([]LeaseCandidateRequest, 0, len(evaluated))
+	lookup := make(map[string]acrossEvaluatedCandidate, len(evaluated))
+	cfg := s.Config()
+	for _, item := range evaluated {
+		key := item.choiceKey + "\x00" + item.candidate.account.ID
+		if _, duplicate := lookup[key]; duplicate {
+			continue
+		}
+		lookup[key] = item
+		requests = append(requests, LeaseCandidateRequest{
+			ChoiceKey: item.choiceKey, Request: leaseRequestForCandidate(item.candidate, item.route, cfg),
+			AccountScore: item.candidate.score, Pending: item.pending,
+		})
+	}
+	if len(requests) == 0 {
+		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters}
+	}
+
+	selection, reason, acquireErr := s.acquireAcross(ctx, requests)
+	if acquireErr != nil {
+		return RoutedLease{}, acquireErr
+	}
+	if selection.Lease == nil {
+		if reason == leaseBlockTokenBudget {
+			counters.TokenBudget++
+		} else if reason == leaseBlockCoordinator {
+			counters.Coordinator++
+		} else {
+			counters.Concurrency++
+		}
+		return RoutedLease{}, &NoAccountError{Group: acrossGroups(normalized), Model: normalized[0].Route.Model, Counters: counters}
+	}
+	item, found := lookup[selection.ChoiceKey+"\x00"+selection.AccountID]
+	if !found {
+		_ = selection.Lease.Release(context.Background())
+		return RoutedLease{}, fmt.Errorf("coordinator selected unknown route/account pair %q/%q", selection.ChoiceKey, selection.AccountID)
+	}
+	lease := s.activateCoordinatedCandidate(item.candidate, item.route, selection.Lease)
+	if trueAffinity.Hash != "" {
+		stored, bindErr := s.upsertAffinityResult(ctx, storage.AffinityBinding{
+			RouteKeyHash: trueAffinity.Hash, RouteKey: trueAffinity.Key, Source: trueAffinity.Source,
+			AccountID: lease.Account.ID, Provider: s.providerOfAccount(ctx, lease.Account),
+			Model: firstRouteValue(lease.ResolvedModel, item.route.Model), EgressID: lease.Egress.ID,
+		})
+		if bindErr == nil {
+			lease.RouteEpoch = stored.Epoch
+		}
+	}
+	return RoutedLease{Lease: lease, ChoiceKey: selection.ChoiceKey}, nil
+}
+
+func (s *Scheduler) normalizeAcrossRoute(ctx context.Context, route *Route) error {
+	if route.Group == "" {
+		route.Group = s.Config().DefaultGroup
+	}
+	if len(route.PreferredEgressIDs) == 0 {
+		group, err := s.store.GetGroup(ctx, route.Group)
+		if err == nil {
+			route.PreferredEgressIDs = append([]string(nil), group.EgressIDs...)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Scheduler) evaluateAcrossCandidates(ctx context.Context, choices []RouteChoice) ([]acrossEvaluatedCandidate, NoAccountCounters, error) {
+	all := make([]acrossEvaluatedCandidate, 0)
+	counters := NoAccountCounters{}
+	// Stable ordering keeps coordinator inputs reproducible; fairness comes from
+	// the coordinator's single global round-robin, not map iteration.
+	sort.SliceStable(choices, func(i, j int) bool { return choices[i].ChoiceKey < choices[j].ChoiceKey })
+	for _, choice := range choices {
+		selection, err := s.accountsSnapshot(ctx, choice.Route.Group)
+		if err != nil {
+			return nil, counters, err
+		}
+		index, err := s.candidateIndexSnapshot(ctx, selection, choice.Route)
+		if err != nil {
+			return nil, counters, err
+		}
+		addNoAccountCounters(&counters, index.staticCounters)
+		evaluation := s.newCandidateEvaluationContext(ctx, choice.Route, selection)
+		pending := s.queuedForRoute(choice.Route)
+		for _, indexed := range index.candidates {
+			candidateCounters := NoAccountCounters{}
+			item, ok := s.evaluateIndexedCandidate(indexed, &evaluation, &candidateCounters)
+			addNoAccountCounters(&counters, candidateCounters)
+			if !ok {
+				continue
+			}
+			all = append(all, acrossEvaluatedCandidate{choiceKey: choice.ChoiceKey, route: choice.Route, candidate: item, pending: pending})
+		}
+	}
+	return all, counters, nil
+}
+
+func addNoAccountCounters(dst *NoAccountCounters, src NoAccountCounters) {
+	dst.Inactive += src.Inactive
+	dst.Quarantined += src.Quarantined
+	dst.Excluded += src.Excluded
+	dst.ProviderMismatch += src.ProviderMismatch
+	dst.ModelUnsupported += src.ModelUnsupported
+	dst.RateLimitCooldown += src.RateLimitCooldown
+	dst.RecheckPending += src.RecheckPending
+	dst.EgressUnavailable += src.EgressUnavailable
+	dst.EgressCooldown += src.EgressCooldown
+	dst.Concurrency += src.Concurrency
+	dst.TokenBudget += src.TokenBudget
+	dst.Coordinator += src.Coordinator
+}
+
+func acrossGroups(choices []RouteChoice) string {
+	groups := make([]string, 0, len(choices))
+	seen := map[string]struct{}{}
+	for _, choice := range choices {
+		if _, ok := seen[choice.Route.Group]; ok {
+			continue
+		}
+		seen[choice.Route.Group] = struct{}{}
+		groups = append(groups, choice.Route.Group)
+	}
+	sort.Strings(groups)
+	return strings.Join(groups, ",")
+}
+
+func leaseRequestForCandidate(item candidate, route Route, cfg config.Config) LeaseRequest {
+	resources := []LeaseResource{{ID: item.egress.ID, Limit: item.egress.MaxConcurrency}}
+	if sidecarID := strings.TrimSpace(item.egress.TransportSidecarID); sidecarID != "" && sidecarID != item.egress.ID {
+		resources = append(resources, LeaseResource{ID: sidecarID, Limit: item.egress.TransportSidecarMaxConcurrency})
+	}
+	ttl := 2 * cfg.RequestTimeout()
+	if ttl < 2*time.Minute {
+		ttl = 2 * time.Minute
+	}
+	return LeaseRequest{AccountID: item.account.ID, EstimatedTokens: route.EstimatedTokens, TokenBudget: cfg.AccountTokenBudget, Compaction: route.Compaction, Resources: resources, TTL: ttl}
+}
+
+func (s *Scheduler) acquireAcross(ctx context.Context, requests []LeaseCandidateRequest) (CoordinatedLeaseSelection, leaseBlockReason, error) {
+	if coordinator, ok := s.coordinator.(MultiLeaseCoordinator); ok {
+		return coordinator.TryAcquireAcross(ctx, requests)
+	}
+	// Compatibility for injected legacy coordinators: serialize the best-effort
+	// scan so one process cannot make two non-atomic fresh choices concurrently.
+	s.acrossMu.Lock()
+	defer s.acrossMu.Unlock()
+	for _, request := range requests {
+		lease, reason, err := s.coordinator.TryAcquire(ctx, request.Request)
+		if err != nil {
+			return CoordinatedLeaseSelection{}, reason, err
+		}
+		if lease != nil {
+			return CoordinatedLeaseSelection{Lease: lease, ChoiceKey: request.ChoiceKey, AccountID: request.Request.AccountID}, leaseBlockNone, nil
+		}
+	}
+	return CoordinatedLeaseSelection{}, leaseBlockConcurrency, nil
+}

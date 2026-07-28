@@ -1,0 +1,10 @@
+[Unit]
+Description=Codex Pool public activation socket
+
+[Socket]
+ListenStream=0.0.0.0:8787
+Service=codex-pool-handoff.service
+Backlog=4096
+
+[Install]
+WantedBy=sockets.target

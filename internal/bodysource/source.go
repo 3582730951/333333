@@ -105,18 +105,19 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 func (r *chunkReader) Close() error { return nil }
 
 type fileSource struct {
-	path     string
-	size     int64
-	remove   bool
-	budget   *Budget
-	reserved int64
-	once     sync.Once
-	mu       sync.RWMutex
-	closed   bool
-	err      error
-	viewOnce sync.Once
-	view     []byte
-	viewErr  error
+	path            string
+	size            int64
+	remove          bool
+	budget          *Budget
+	reserved        int64
+	diskReservation *DiskReservation
+	once            sync.Once
+	mu              sync.RWMutex
+	closed          bool
+	err             error
+	viewOnce        sync.Once
+	view            []byte
+	viewErr         error
 }
 
 func (s *fileSource) Size() int64 { return s.size }
@@ -162,6 +163,10 @@ func (s *fileSource) Close() error {
 		if s.budget != nil {
 			s.budget.releaseSpool(s.reserved)
 			s.budget.recordClose()
+		}
+		if s.diskReservation != nil {
+			s.diskReservation.Release()
+			s.diskReservation = nil
 		}
 	})
 	return s.err

@@ -1,0 +1,25 @@
+[Unit]
+Description=Codex Pool worker release %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-pool
+Group=codex-pool
+WorkingDirectory=/var/lib/codex-pool
+Environment=CODEX_POOL_DATABASE=/var/lib/codex-pool/pool.sqlite3
+Environment=CODEX_POOL_RELEASE_ID=%i
+ExecStart=/usr/local/lib/codex-pool/releases/%i/codex-pool-server --config /etc/codex-pool/config.json --release-id %i --unix-socket /var/lib/codex-pool/run/worker-%i.sock
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/codex-pool
+MemoryAccounting=true
+
+[Install]
+WantedBy=multi-user.target

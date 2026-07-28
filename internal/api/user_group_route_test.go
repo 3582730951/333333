@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +64,34 @@ func TestUserGroupAttemptWriterSpoolsAndCommitsWithoutChangingBody(t *testing.T)
 	}
 }
 
+func TestUserGroupStablePrefixDoesNotCreateDurableTargetBinding(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "fair-prefix-secondary"}); err != nil {
+		t.Fatal(err)
+	}
+	createRouteTestGroup(t, h, "ug_fair_prefix", []storage.TargetRef{
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"},
+		{Kind: storage.TargetKindAccountPoolGroup, ID: "fair-prefix-secondary"},
+	}, nil)
+	longPrefix := strings.Repeat("shared-context-", 400)
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"system","content":"` + longPrefix + `"},{"role":"user","content":"new turn"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer stable-prefix-key")
+	plan, err := resolveUserGroupRouteCandidates(req.Context(), h.store, downstreamPolicy{UserGroupID: "ug_fair_prefix"}, req, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.AffinityKey == "" || plan.Persist {
+		t.Fatalf("stable-prefix plan affinity=%+v persist=%v", plan.Affinity, plan.Persist)
+	}
+	if _, _, err := resolveUserGroupRoute(req.Context(), h.store, downstreamPolicy{UserGroupID: "ug_fair_prefix"}, req, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := h.store.GetUserGroupTargetBinding(t.Context(), "ug_fair_prefix", plan.AffinityKey, ""); err != nil || found {
+		t.Fatalf("stable prefix durable binding found=%v err=%v", found, err)
+	}
+}
+
 func TestUserGroupAttemptWriterFindsRetryMarkerAcrossSpoolChunks(t *testing.T) {
 	w := newUserGroupAttemptWriter(context.Background(), httptest.NewRecorder(), false, false, bodysource.CaptureOptions{
 		MaxBytes: 1 << 20, MemoryThreshold: 1, TempDir: t.TempDir(), Budget: bodysource.NewBudget(1, 1<<20),
@@ -78,6 +107,60 @@ func TestUserGroupAttemptWriterFindsRetryMarkerAcrossSpoolChunks(t *testing.T) {
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUserGroupSpeculativeProbeFallsBackWhenResponseMemoryIsSaturated(t *testing.T) {
+	dir := t.TempDir()
+	budget := bodysource.NewBudget(1, 1<<20)
+	if !budget.ReserveMemory(1) {
+		t.Fatal("failed to saturate response memory fixture")
+	}
+	w := newUserGroupAttemptWriter(context.Background(), httptest.NewRecorder(), false, false, bodysource.CaptureOptions{
+		MaxBytes: 1 << 20, MemoryThreshold: 64 << 10, TempDir: dir, Budget: budget,
+	}, true)
+	w.WriteHeader(http.StatusBadRequest)
+	for _, chunk := range []string{"NO AVAILABLE ", "ACCOUNT"} {
+		if _, err := io.WriteString(w, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !w.RetryableFailure() || !w.PermanentTargetFailure() || userGroupRouteStatusClass(w) != "no_account" {
+		t.Fatalf("saturated probe classification retryable=%v permanent=%v class=%q", w.RetryableFailure(), w.PermanentTargetFailure(), userGroupRouteStatusClass(w))
+	}
+	if w.body != nil || len(w.probeBody) != 0 || !w.probeTruncated {
+		t.Fatalf("saturated probe touched general spool: body=%v retained=%d truncated=%v", w.body, len(w.probeBody), w.probeTruncated)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	budget.ReleaseMemory(1)
+	if snapshot := budget.Snapshot(); snapshot.MemoryUsed != 0 || snapshot.SpoolUsed != 0 {
+		t.Fatalf("probe budget leaked: %+v", snapshot)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("speculative probe created spool files: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestUserGroupSpeculativeProbeMemoryAdmissionIsReleased(t *testing.T) {
+	budget := bodysource.NewBudget(64<<10, 1<<20)
+	w := newUserGroupAttemptWriter(context.Background(), httptest.NewRecorder(), false, false, bodysource.CaptureOptions{
+		MaxBytes: 1 << 20, MemoryThreshold: 64 << 10, TempDir: t.TempDir(), Budget: budget,
+	}, true)
+	w.WriteHeader(http.StatusServiceUnavailable)
+	payload := []byte(`{"error":{"message":"temporarily unavailable"}}`)
+	if _, err := w.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := budget.Snapshot(); snapshot.MemoryUsed != int64(len(payload)) || snapshot.SpoolUsed != 0 {
+		t.Fatalf("probe admission mismatch: %+v", snapshot)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := budget.Snapshot(); snapshot.MemoryUsed != 0 || snapshot.SpoolUsed != 0 {
+		t.Fatalf("probe close leaked admission: %+v", snapshot)
 	}
 }
 
@@ -379,6 +462,60 @@ func TestUserGroupHTTPHandlerFallsBackAcrossModelProviders(t *testing.T) {
 	}
 }
 
+func TestUserGroupPermanentProviderFailureMigratesExistingBinding(t *testing.T) {
+	const (
+		groupID = "ug_provider_binding_migration"
+		model   = "provider-binding-migration-model"
+		thread  = "provider-binding-migration-root"
+	)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	primary := storage.TargetRef{Kind: storage.TargetKindModelProvider, ID: "migration-primary"}
+	secondary := storage.TargetRef{Kind: storage.TargetKindModelProvider, ID: "migration-secondary"}
+	for _, provider := range []storage.CustomProvider{
+		{ID: primary.ID, Name: "Migration primary", BaseURL: "https://primary.example/v1", UpstreamProtocol: storage.CustomProviderProtocolResponses, Enabled: true, Models: []string{model}},
+		{ID: secondary.ID, Name: "Migration secondary", BaseURL: "https://secondary.example/v1", UpstreamProtocol: storage.CustomProviderProtocolResponses, Enabled: true, Models: []string{model}},
+	} {
+		if err := h.store.UpsertCustomProvider(t.Context(), provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{primary, secondary}, []storage.ModelRoutingRule{{
+		Model: model, Tiers: [][]storage.TargetRef{{primary}, {secondary}},
+	}})
+
+	raw := []byte(`{"model":"` + model + `","input":"migrate"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Thread-Id", thread)
+	affinity := routing.ExtractAffinityKey(req, raw)
+	if err := h.store.UpsertUserGroupTargetBinding(t.Context(), storage.UserGroupTargetBinding{
+		UserGroupID: groupID, AffinityKey: affinity.Hash, Target: primary,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	attempts := make([]storage.TargetRef, 0, 2)
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{UserGroupID: groupID}, func(w http.ResponseWriter, candidate *http.Request) {
+		target, ok := userGroupRouteOverride(candidate.Context())
+		if !ok {
+			t.Fatal("candidate request missing route override")
+		}
+		attempts = append(attempts, target)
+		if target == primary {
+			writePoolCodeError(w, http.StatusNotFound, "model_not_found", "bound target permanently unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"id": "resp_migrated", "status": "completed"})
+	})
+	if !handled || recorder.Code != http.StatusOK || len(attempts) != 2 || attempts[0] != primary || attempts[1] != secondary {
+		t.Fatalf("handled=%v status=%d attempts=%+v body=%s", handled, recorder.Code, attempts, recorder.Body.String())
+	}
+	binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+	if err != nil || !found || binding.Target != secondary {
+		t.Fatalf("migrated binding=%+v found=%v err=%v, want %+v", binding, found, err, secondary)
+	}
+}
+
 func TestUserGroupExhaustedPlusFallsThroughToAuthorizedPro(t *testing.T) {
 	const (
 		plusGroup = "route-plus-exhausted"
@@ -468,6 +605,78 @@ func TestUserGroupExhaustedPlusFallsThroughToAuthorizedPro(t *testing.T) {
 	requests := h.requests()
 	if len(requests) != 1 || requests[0].AccountID != "upstream-pro" {
 		t.Fatalf("upstream requests=%+v, want one Pro request", requests)
+	}
+}
+
+func TestUserGroupSameTierSelectAcrossSkipsEmptyPool(t *testing.T) {
+	const (
+		emptyGroup   = "same-tier-empty"
+		healthyGroup = "same-tier-healthy"
+		groupID      = "ug_same_tier_across"
+		model        = "gpt-5.6-sol"
+		plainKey     = "sk-same-tier-across"
+	)
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp_same_tier","status":"completed","output":[]}}`+"\n\n"+
+			"data: [DONE]\n\n")
+	})
+	for _, group := range []string{emptyGroup, healthyGroup} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: group}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	accountID := h.importAccount(t, "same-tier", "upstream-same-tier", "access-same-tier")
+	account, err := h.store.GetAccount(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := h.store.GetToken(t.Context(), accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.GroupName = healthyGroup
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	setTestCapability(t, h, accountID, model, 272000)
+	emptyTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: emptyGroup}
+	healthyTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: healthyGroup}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{emptyTarget, healthyTarget}, []storage.ModelRoutingRule{{
+		Model: model, Tiers: [][]storage.TargetRef{{emptyTarget, healthyTarget}},
+	}})
+	if err := h.store.UpsertAPIKey(t.Context(), storage.APIKey{
+		KeyHash: hashAPIKey(plainKey), KeyType: "downstream", Label: "same-tier across",
+		GroupName: emptyGroup, UserGroupID: groupID, ProviderHint: "auto", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	body := []byte(`{"model":"` + model + `","input":"route fairly","stream":true}`)
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+plainKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "same-tier-across-root")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(responseBody, []byte("resp_same_tier")) {
+		t.Fatalf("same-tier response status=%d body=%s", resp.StatusCode, responseBody)
+	}
+	if requests := h.requests(); len(requests) != 1 || requests[0].AccountID != "upstream-same-tier" {
+		t.Fatalf("same-tier upstream attempts=%+v", requests)
+	}
+	affinityReq := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	affinityReq.Header.Set("Thread-Id", "same-tier-across-root")
+	affinity := routing.ExtractAffinityKey(affinityReq, body)
+	binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+	if err != nil || !found || binding.Target != healthyTarget {
+		t.Fatalf("same-tier binding=%+v found=%v err=%v", binding, found, err)
 	}
 }
 

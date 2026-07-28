@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/accountprovider"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
 )
@@ -161,6 +162,9 @@ func diagnosticFileOrder() []string {
 	return []string{
 		"manifest.json",
 		"diagnostic_summary.json",
+		"runtime_storage.json",
+		"route_attempts.csv",
+		"provider_attempts.csv",
 		"account_map.csv",
 		"account_auth_metadata.csv",
 		"account_model_capabilities.csv",
@@ -367,9 +371,16 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	addCSV("account_lifecycle_status.csv", []string{"account_code", "validity_status", "subscription_tier", "subscription_expires_at", "last_health_check_at", "last_token_refresh_at", "health_check_fail_count", "summary_json", "created_at", "updated_at"}, lifecycleStatusRows(lifecycleStatuses, codebook))
 	addCSV("codex_reauth_config.csv", []string{"account_code", "login_email_present", "password_configured", "otp_url_configured", "target_workspace_id", "auto_enabled", "last_status", "last_error", "created_at", "updated_at"}, codexReauthConfigRows(reauthConfigs, codebook))
 	addCSV("codex_reauth_jobs.csv", []string{"id", "account_code", "status", "reason", "last_error", "created_at", "updated_at", "started_at", "finished_at"}, codexReauthJobRows(reauthJobs, codebook))
+	routeAttempts := s.diagnosticRouteAttempts()
+	providerAttempts := s.diagnosticProviderAttempts()
+	addCSV("route_attempts.csv", []string{"request_id", "tier", "target", "selection_type", "status_class", "fallback_target", "created_at"}, routeAttemptRows(routeAttempts))
+	addCSV("provider_attempts.csv", []string{"request_id", "account_code", "provider", "phase", "status", "error_class", "body_hash", "retry_after", "created_at"}, providerAttemptRows(providerAttempts, codebook))
 	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "ignore_rate_limit_controls", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "sidecar_egress_id", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
 	addCSV("egress_snapshot.csv", []string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
 	if err := addJSON("diagnostic_summary.json", summary); err != nil {
+		return err
+	}
+	if err := addJSON("runtime_storage.json", s.runtimeStorageDiagnostics()); err != nil {
 		return err
 	}
 	for name, stat := range stats {
@@ -478,6 +489,16 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		reauthJobTimes = append(reauthJobTimes, row.CreatedAt)
 	}
 	addRange("codex_reauth_jobs.csv", reauthJobTimes)
+	routeAttemptTimes := make([]int64, 0, len(routeAttempts))
+	for _, row := range routeAttempts {
+		routeAttemptTimes = append(routeAttemptTimes, row.CreatedAt)
+	}
+	addRange("route_attempts.csv", routeAttemptTimes)
+	providerAttemptTimes := make([]int64, 0, len(providerAttempts))
+	for _, row := range providerAttempts {
+		providerAttemptTimes = append(providerAttemptTimes, row.CreatedAt)
+	}
+	addRange("provider_attempts.csv", providerAttemptTimes)
 	egressTimes := make([]int64, 0, len(egressProfiles))
 	for _, row := range egressProfiles {
 		egressTimes = append(egressTimes, row.CreatedAt)
@@ -1017,6 +1038,8 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, nil)
 	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, nil)
 	addCSV("codex_upstream_attempts_daily.csv", []string{"day_start", "account_code", "egress_id", "state", "status_code", "attempt_count", "first_created_at", "last_created_at"}, nil)
+	addCSV("route_attempts.csv", []string{"request_id", "tier", "target", "selection_type", "status_class", "fallback_target", "created_at"}, nil)
+	addCSV("provider_attempts.csv", []string{"request_id", "account_code", "provider", "phase", "status", "error_class", "body_hash", "retry_after", "created_at"}, nil)
 	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, nil)
 	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, nil)
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
@@ -1033,6 +1056,12 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("accounts_snapshot.csv", []string{"account_code", "group_name", "declared_provider", "effective_provider", "status", "plan_type", "is_fedramp", "ignore_rate_limit_controls", "quarantine_until", "quarantine_reason", "created_at", "updated_at", "primary_egress_id", "standby_egress_ids", "sidecar_egress_id", "cooldown_until", "recheck_pending"}, accountSnapshotRows(accounts, tokensByID, bindings, codebook))
 	addCSV("egress_snapshot.csv", []string{"egress_id", "name", "type", "region", "exit_ip", "stream_capable", "health", "latency_millis", "cf_score", "last_cf_ray", "cooldown_until", "max_concurrency", "created_at", "updated_at", "bound_account_codes"}, egressSnapshotRows(egressProfiles, bindings, codebook))
 	if err := addJSON("diagnostic_summary.json", diagnosticSummary(accounts, tokensByID, auditRows, holds, bindings, rateLimits)); err != nil {
+		return nil, err
+	}
+	if err := addJSON("runtime_storage.json", map[string]interface{}{
+		"budget": bodysource.BudgetSnapshot{}, "filesystem": bodysource.DiskReserverSnapshot{},
+		"rejection_counts": map[string]int64{},
+	}); err != nil {
 		return nil, err
 	}
 	rowCounts["manifest.json"] = 1

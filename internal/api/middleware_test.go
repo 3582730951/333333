@@ -13,8 +13,45 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/supervisor"
 )
+
+func TestWriteBodyStorageErrorClassifiesDiskAndProcessCapacity(t *testing.T) {
+	tests := []struct {
+		name       string
+		class      bodysource.BodyStorageClass
+		cause      error
+		status     int
+		code       string
+		retryAfter string
+	}{
+		{name: "filesystem reserve", class: bodysource.BodyStorageDiskReserve, cause: bodysource.ErrDiskReserve, status: http.StatusInsufficientStorage, code: "request_body_storage_exhausted"},
+		{name: "process capacity", class: bodysource.BodyStorageLocalCapacity, cause: bodysource.ErrSpoolBudget, status: http.StatusServiceUnavailable, code: "local_spool_capacity", retryAfter: "1"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			recorder.Header().Set(requestIDHeader, "req-storage-test")
+			handled := writeBodyStorageError(recorder, &bodysource.BodyStorageError{Class: test.class, Op: "capture", Cause: test.cause})
+			if !handled || recorder.Code != test.status || recorder.Header().Get("Retry-After") != test.retryAfter {
+				t.Fatalf("handled=%v status=%d retry-after=%q body=%s", handled, recorder.Code, recorder.Header().Get("Retry-After"), recorder.Body.String())
+			}
+			var envelope struct {
+				Error struct {
+					Code      string `json:"code"`
+					RequestID string `json:"request_id"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Error.Code != test.code || envelope.Error.RequestID != "req-storage-test" {
+				t.Fatalf("error payload=%+v", envelope.Error)
+			}
+		})
+	}
+}
 
 func TestServeHTTPAddsAndPreservesRequestID(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

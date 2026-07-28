@@ -1,4 +1,4 @@
-FROM golang:1.26-bookworm AS build
+FROM golang:1.24.1-bookworm AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -6,6 +6,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 go test ./... && \
     CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/codex-pool-server ./cmd/pool-server && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/codex-pool-handoff ./cmd/pool-handoff && \
     mkdir -p /out/gateway-bin && \
     for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do \
       os="${target%/*}"; arch="${target#*/}"; ext=""; \
@@ -15,15 +16,21 @@ RUN CGO_ENABLED=1 go test ./... && \
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates sqlite3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl sqlite3 && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --home /var/lib/codex-pool --create-home --shell /usr/sbin/nologin codex-pool
 
-COPY --from=build /out/codex-pool-server /usr/local/bin/codex-pool-server
+RUN mkdir -p /usr/local/lib/codex-pool/releases/docker /var/lib/codex-pool/run && \
+    chown -R codex-pool:codex-pool /var/lib/codex-pool
+COPY --from=build /out/codex-pool-server /usr/local/lib/codex-pool/releases/docker/codex-pool-server
+COPY --from=build /out/codex-pool-handoff /usr/local/bin/codex-pool-handoff
 COPY --from=build /out/gateway-bin /usr/local/lib/codex-pool/bin
 COPY config.example.json /etc/codex-pool/config.json
+COPY deploy/docker-entrypoint.sh /usr/local/bin/codex-pool-entrypoint
+RUN chmod 0755 /usr/local/bin/codex-pool-entrypoint
 
 USER codex-pool
 WORKDIR /var/lib/codex-pool
 EXPOSE 8787
-ENTRYPOINT ["/usr/local/bin/codex-pool-server"]
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 CMD curl --noproxy '*' -fsS http://127.0.0.1:8787/readyz >/dev/null || exit 1
+ENTRYPOINT ["/usr/local/bin/codex-pool-entrypoint"]
 CMD ["--config", "/etc/codex-pool/config.json"]

@@ -1,0 +1,142 @@
+package scheduler
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+)
+
+// RouteChoiceClaim atomically resolves a speculative target choice. It returns
+// the choice key every concurrent caller must follow. User-group routing uses it
+// to implement claim-if-absent conversation bindings without teaching the
+// scheduler about user-group storage tables.
+type RouteChoiceClaim func(context.Context, string) (string, error)
+
+type routeChoiceContextKey struct{}
+type routeChoiceBypassKey struct{}
+
+// RouteChoiceState exposes the target actually leased by the most recent Select
+// call. A handler may retry account selection several times; each retry updates
+// SelectedChoice while preserving one atomic cross-target decision per call.
+type RouteChoiceState struct {
+	mu        sync.Mutex
+	templates []RouteChoice
+	claim     RouteChoiceClaim
+	selected  string
+	claimed   string
+	claimDone bool
+	used      bool
+}
+
+// WithRouteChoices makes ordinary Scheduler.Select calls evaluate the supplied
+// same-tier targets through SelectAcross. Handler code continues to construct the
+// authoritative Route (model, provider, affinity, exclusions and token estimate);
+// each template contributes only its target group and optional explicit fields.
+func WithRouteChoices(ctx context.Context, choices []RouteChoice, claim RouteChoiceClaim) (context.Context, *RouteChoiceState) {
+	state := &RouteChoiceState{templates: append([]RouteChoice(nil), choices...), claim: claim}
+	return context.WithValue(ctx, routeChoiceContextKey{}, state), state
+}
+
+func (s *RouteChoiceState) SelectedChoice() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.selected
+}
+
+func (s *RouteChoiceState) Used() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.used
+}
+
+// ClaimedChoice is the durable first-selection winner. SelectedChoice may differ
+// after a request-local retry moves replayable work away from a failed account or
+// temporarily saturated target.
+func (s *RouteChoiceState) ClaimedChoice() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claimed
+}
+
+func (s *Scheduler) selectFromRouteChoiceContext(ctx context.Context, route Route) (Lease, bool, error) {
+	if bypass, _ := ctx.Value(routeChoiceBypassKey{}).(bool); bypass {
+		return Lease{}, false, nil
+	}
+	state, _ := ctx.Value(routeChoiceContextKey{}).(*RouteChoiceState)
+	if state == nil || len(state.templates) == 0 {
+		return Lease{}, false, nil
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.used = true
+	bypassCtx := context.WithValue(ctx, routeChoiceBypassKey{}, true)
+	choices := make([]RouteChoice, 0, len(state.templates))
+	for _, template := range state.templates {
+		merged := route
+		if group := strings.TrimSpace(template.Route.Group); group != "" {
+			merged.Group = group
+			// Outlet order belongs to the target group. Do not copy an order resolved
+			// for the dispatch placeholder into every cross-target candidate.
+			merged.PreferredEgressIDs = nil
+		}
+		if provider := strings.TrimSpace(template.Route.Provider); provider != "" {
+			merged.Provider = provider
+			merged.AllowedProviders = nil
+		}
+		if len(template.Route.AllowedProviders) > 0 {
+			merged.Provider = ""
+			merged.AllowedProviders = append([]string(nil), template.Route.AllowedProviders...)
+		}
+		choices = append(choices, RouteChoice{ChoiceKey: template.ChoiceKey, Route: merged})
+	}
+	routed, err := s.SelectAcross(bypassCtx, choices)
+	if err != nil {
+		return Lease{}, true, err
+	}
+	selected := routed.ChoiceKey
+	if state.claim != nil && !state.claimDone {
+		winner, claimErr := state.claim(bypassCtx, selected)
+		winner = strings.TrimSpace(winner)
+		if claimErr != nil || winner == "" {
+			routed.Release()
+			if claimErr != nil {
+				return Lease{}, true, claimErr
+			}
+			return Lease{}, true, fmt.Errorf("route choice claim returned an empty winner")
+		}
+		if winner != selected {
+			routed.Release()
+			var winningRoute *Route
+			for i := range choices {
+				if choices[i].ChoiceKey == winner {
+					winningRoute = &choices[i].Route
+					break
+				}
+			}
+			if winningRoute == nil {
+				return Lease{}, true, fmt.Errorf("route choice claim selected unavailable winner %q", winner)
+			}
+			lease, selectErr := s.Select(bypassCtx, *winningRoute)
+			if selectErr != nil {
+				return Lease{}, true, selectErr
+			}
+			routed = RoutedLease{Lease: lease, ChoiceKey: winner}
+			selected = winner
+		}
+		state.claimDone = true
+		state.claimed = selected
+	}
+	state.selected = selected
+	return routed.Lease, true, nil
+}

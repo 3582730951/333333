@@ -147,17 +147,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				requestBody = bodysource.Bytes(raw)
 			}
 		} else if requestNeedsBodyMeta(r) {
-			requestBody, bodyMeta, err = captureJSONRequestBody(r.Context(), r.Body, s.cfg, s.bodyBudget, s.identitySecretCached, r.ContentLength)
+			requestBody, bodyMeta, err = captureJSONRequestBody(r.Context(), r.Body, s.cfg, s.requestBodyBudget, s.identitySecretCached, r.ContentLength)
 		} else {
-			requestBody, err = captureRequestBody(r.Context(), r.Body, s.cfg, s.bodyBudget, r.ContentLength)
+			requestBody, err = captureRequestBody(r.Context(), r.Body, s.cfg, s.requestBodyBudget, r.ContentLength)
 		}
 		_ = r.Body.Close()
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, bodysource.ErrBodyTooLarge) {
 				status = http.StatusRequestEntityTooLarge
-			} else if errors.Is(err, bodysource.ErrSpoolBudget) || errors.Is(err, bodysource.ErrDiskReserve) {
-				writeResourceExhausted(rec, err.Error())
+			} else if writeBodyStorageError(rec, err) {
+				s.recordBodyStorageRejection(err)
 				return
 			}
 			writeError(rec, status, err)
@@ -207,6 +207,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	s.mux.ServeHTTP(rec, r)
+}
+
+func writeBodyStorageError(w http.ResponseWriter, err error) bool {
+	var storageErr *bodysource.BodyStorageError
+	if !errors.As(err, &storageErr) {
+		if errors.Is(err, bodysource.ErrDiskReserve) {
+			storageErr = &bodysource.BodyStorageError{Class: bodysource.BodyStorageDiskReserve, Cause: err}
+		} else if errors.Is(err, bodysource.ErrSpoolBudget) {
+			storageErr = &bodysource.BodyStorageError{Class: bodysource.BodyStorageLocalCapacity, Cause: err}
+		} else {
+			return false
+		}
+	}
+	status := http.StatusServiceUnavailable
+	code := "local_spool_capacity"
+	if storageErr.Class == bodysource.BodyStorageDiskReserve {
+		status = http.StatusInsufficientStorage
+		code = "request_body_storage_exhausted"
+	} else {
+		w.Header().Set("Retry-After", "1")
+	}
+	errorBody := map[string]interface{}{
+		"message": storageErr.Error(), "type": "codex_pool_error", "code": code,
+	}
+	if requestID := strings.TrimSpace(w.Header().Get(requestIDHeader)); requestID != "" {
+		errorBody["request_id"] = requestID
+	}
+	writeJSON(w, status, map[string]interface{}{"error": errorBody})
+	return true
 }
 
 func captureRequestBody(ctx context.Context, src io.Reader, cfg config.Config, budget *bodysource.Budget, expectedBytes ...int64) (bodysource.BodySource, error) {

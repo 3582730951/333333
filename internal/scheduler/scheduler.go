@@ -38,6 +38,7 @@ type Scheduler struct {
 	store           *storage.Store
 	cfg             atomic.Value // stores config.Config
 	mu              sync.Mutex
+	acrossMu        sync.Mutex
 	inflight        map[string]int
 	inflightTokens  map[string]int64
 	egressInflight  map[string]int
@@ -518,6 +519,9 @@ func (s *Scheduler) Metrics() SchedulerMetrics {
 }
 
 func (s *Scheduler) Select(ctx context.Context, route Route) (Lease, error) {
+	if lease, handled, err := s.selectFromRouteChoiceContext(ctx, route); handled {
+		return lease, err
+	}
 	started := time.Now()
 	defer s.observeRouteSelection(started)
 	if err := s.admission.Wait(ctx); err != nil {
@@ -2560,18 +2564,24 @@ func (s *Scheduler) shortestCooldownBatch(ctx context.Context, group, provider, 
 // tryLeaseAccount does for data we already have.
 func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidate, route Route) (Lease, leaseBlockReason, bool) {
 	cfg := s.Config()
-	account := c.account
-	egress := c.egress
-	accountID := account.ID
-	estimatedTokens := route.EstimatedTokens
-	coordinated, reason, coordinateErr := s.acquireCoordinatedLease(ctx, accountID, egress, cfg.AccountTokenBudget, route)
+	coordinated, reason, coordinateErr := s.acquireCoordinatedLease(ctx, c.account.ID, c.egress, cfg.AccountTokenBudget, route)
 	if coordinateErr != nil {
-		log.Printf("[SCHEDULER] lease coordinator acquire failed account=%s egress=%s: %v", accountID, egress.ID, coordinateErr)
+		log.Printf("[SCHEDULER] lease coordinator acquire failed account=%s egress=%s: %v", c.account.ID, c.egress.ID, coordinateErr)
 		return Lease{}, leaseBlockCoordinator, false
 	}
 	if coordinated == nil {
 		return Lease{}, reason, false
 	}
+	return s.activateCoordinatedCandidate(c, route, coordinated), leaseBlockNone, true
+}
+
+// activateCoordinatedCandidate publishes a coordinator-owned grant to the
+// process-local load snapshot and returns its idempotent release wrapper.
+func (s *Scheduler) activateCoordinatedCandidate(c candidate, route Route, coordinated CoordinatedLease) Lease {
+	account := c.account
+	egress := c.egress
+	accountID := account.ID
+	estimatedTokens := route.EstimatedTokens
 	s.mu.Lock()
 	s.inflight[accountID]++
 	incrementEgressInflight(s.egressInflight, egress)
@@ -2609,5 +2619,5 @@ func (s *Scheduler) tryLeaseAccountFromCandidate(ctx context.Context, c candidat
 	// candidate, so the lease is built without a second DB read while holding s.mu —
 	// keeping the hot critical section to map ops only (the previous GetEgressBinding
 	// here serialized every lease grant and release behind a SQLite round-trip).
-	return Lease{Account: account, Binding: c.binding, Egress: egress, ResolvedModel: c.resolvedModel, FencingToken: coordinated.FencingToken(), release: release}, leaseBlockNone, true
+	return Lease{Account: account, Binding: c.binding, Egress: egress, ResolvedModel: c.resolvedModel, FencingToken: coordinated.FencingToken(), release: release}
 }
