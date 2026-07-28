@@ -46,7 +46,7 @@ SKIP_OS_PACKAGES="${SKIP_OS_PACKAGES:-0}"
 SIDECAR_ADDR="${SIDECAR_ADDR:-127.0.0.1:8790}"
 GOPAY_SOURCE_DIR="${GOPAY_SOURCE_DIR:-${PROJECT_ROOT}/gopay/plus}"
 # HEALTH_TIMEOUT bounds the post-restart /healthz wait before auto-rollback.
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 # Set by install_sidecar: 1 when the sidecar source changed (or first install), 0 when
 # unchanged — lets the restart block skip a needless sidecar restart that would sever
 # in-flight upstream streams.
@@ -188,7 +188,7 @@ Environment overrides:
   GOPAY_SOURCE_DIR, GOPAY_INSTALL_DIR, GOPAY_VENV,
   LIFECYCLE_REGISTER_SOURCE, LIFECYCLE_REGISTER_INSTALL, LIFECYCLE_REGISTER_VENV, LIFECYCLE_REGISTER_ADDR,
   LIFECYCLE_PAYMENT_SOURCE, LIFECYCLE_PAYMENT_INSTALL, LIFECYCLE_PAYMENT_VENV, LIFECYCLE_PAYMENT_ADDR,
-  INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN,
+  INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
   REGISTRAR_SOURCE, REGISTRAR_INSTALL
@@ -1028,17 +1028,20 @@ systemd_running() {
 
 wait_for_service_health() {
   local url="$1" max="$2" phase="$3"
-  local started="$SECONDS" deadline=$((SECONDS + max)) next_report=$((SECONDS + 10)) state
+  local started="$SECONDS" deadline=$((SECONDS + max)) next_report=$((SECONDS + 10)) state curl_error
 
   while (( SECONDS < deadline )); do
-    if curl -fsS --connect-timeout 1 --max-time 2 "$url" >/dev/null 2>&1; then
+    # A host-level HTTP(S)_PROXY must never intercept a loopback health probe.
+    # Capture curl's reason so an active-but-pre-listener process is distinguishable
+    # from an HTTP error instead of reporting only a generic timeout.
+    if curl_error="$(curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 --output /dev/null "$url" 2>&1)"; then
       return 0
     fi
     if (( SECONDS >= next_report )); then
       state="$(run_root systemctl show "${SERVICE_NAME}.service" \
         --property=ActiveState --property=SubState --property=Result --property=NRestarts \
         2>/dev/null | tr '\n' ' ' || true)"
-      warn "Still waiting for ${phase} health ($((SECONDS - started))s/${max}s): ${state:-service state unavailable}"
+      warn "Still waiting for ${phase} health ($((SECONDS - started))s/${max}s): ${state:-service state unavailable} curl=${curl_error:-unknown failure}"
       next_report=$((next_report + 10))
     fi
     sleep 1
@@ -1048,11 +1051,15 @@ wait_for_service_health() {
 
 print_service_start_diagnostics() {
   local since="${1:-}"
+  local invocation_id=""
   warn "${SERVICE_NAME}.service failed its health gate; startup diagnostics follow."
   run_root systemctl --no-pager --full status "${SERVICE_NAME}.service" >&2 || true
   if command -v journalctl >/dev/null 2>&1; then
     warn "Complete service journal from this restart:"
-    if [[ -n "$since" ]]; then
+    invocation_id="$(run_root systemctl show "${SERVICE_NAME}.service" --property=InvocationID --value 2>/dev/null || true)"
+    if [[ -n "$invocation_id" ]]; then
+      run_root journalctl "_SYSTEMD_INVOCATION_ID=${invocation_id}" -n 120 --no-pager -l >&2 || true
+    elif [[ -n "$since" ]]; then
       run_root journalctl -u "${SERVICE_NAME}.service" --since "$since" -n 120 --no-pager -l >&2 || true
     else
       run_root journalctl -u "${SERVICE_NAME}.service" -n 120 --no-pager -l >&2 || true
@@ -1072,7 +1079,7 @@ health_check_or_rollback() {
   systemd_running || return 0
   command -v curl >/dev/null 2>&1 || { warn "curl missing; skipping health gate"; return 0; }
 
-  local port host url max="$HEALTH_TIMEOUT"
+  local port host url rollback_since max="$HEALTH_TIMEOUT"
   [[ "$max" =~ ^[1-9][0-9]*$ ]] || die "HEALTH_TIMEOUT must be a positive integer: ${max}"
   port="$(listen_port "$LISTEN_ADDR")"
   if [[ ! "$port" =~ ^[0-9]+$ ]]; then
@@ -1098,10 +1105,12 @@ health_check_or_rollback() {
     # Pause the socket so even a previous (non-socket-activation) binary can bind the
     # port directly during rollback.
     run_root systemctl stop "${SERVICE_NAME}.socket" 2>/dev/null || true
+    rollback_since="$(date '+%Y-%m-%d %H:%M:%S')"
     run_root systemctl restart "${SERVICE_NAME}.service" || true
     if wait_for_service_health "$url" "$max" "rolled-back version"; then
       die "新版本启动失败，已自动回滚到上一版本并恢复服务（socket 已暂停、直接绑定端口）。失败日志已在回滚前输出。"
     fi
+    print_service_start_diagnostics "$rollback_since"
     die "新版本启动失败，且回滚后仍不健康！请立即人工介入：journalctl -u ${SERVICE_NAME}.service -n 200（数据库已由 update.sh 预先备份）"
   fi
   die "新版本未通过健康检查，且无可回滚的旧二进制（首次安装？）。排查：journalctl -u ${SERVICE_NAME}.service -n 100"
@@ -1371,7 +1380,10 @@ EOF
       # sidecar. NOTE: with one instance, a long drain means new requests QUEUE on the
       # socket (not refused) until the new process is up — tune CODEX_POOL_SHUTDOWN_DRAIN_SECONDS.
       log "Restarting ${SERVICE_NAME}.service"
-      restart_since="$(date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')"
+      # journalctl on older systemd releases rejects ISO-8601 timestamps with a
+      # colonized UTC offset. InvocationID is preferred for diagnostics; this local
+      # format remains a compatible fallback.
+      restart_since="$(date '+%Y-%m-%d %H:%M:%S')"
       run_root systemctl restart "${SERVICE_NAME}.service" || true
       health_check_or_rollback "$restart_since"
       run_root systemctl --no-pager --full status "${SERVICE_NAME}.service" || true

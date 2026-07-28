@@ -55,3 +55,44 @@ func TestInitMigratesLegacyAffinityBindingExpiryBeforeCreatingIndex(t *testing.T
 		t.Fatalf("second init should remain idempotent: %v", err)
 	}
 }
+
+func TestInitAddsBillingHoldColumnBeforeRecoveryIndex(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "legacy-usage.sqlite3"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Base usage schema from before billing holds and usage diagnostics existed.
+	// schemaSQL runs before migrate(), so the recovery index must stay in the
+	// ordered migration list after ALTER TABLE adds billing_hold_id.
+	if _, err := store.DB().ExecContext(ctx, `CREATE TABLE usage_records(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  route_key_hash TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  raw_usage_json TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+)`); err != nil {
+		t.Fatalf("create legacy usage table: %v", err)
+	}
+
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("migrate legacy usage store: %v", err)
+	}
+	var columnCount, indexCount int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('usage_records') WHERE name='billing_hold_id'`).Scan(&columnCount); err != nil {
+		t.Fatalf("inspect billing_hold_id: %v", err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_records_billing_hold'`).Scan(&indexCount); err != nil {
+		t.Fatalf("inspect billing recovery index: %v", err)
+	}
+	if columnCount != 1 || indexCount != 1 {
+		t.Fatalf("billing_hold_id columns=%d indexes=%d, want 1/1", columnCount, indexCount)
+	}
+}

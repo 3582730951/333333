@@ -407,6 +407,27 @@ CREATE TABLE goal_segment(id TEXT PRIMARY KEY,goal_id TEXT NOT NULL,sequence INT
 	}
 }
 
+func TestGoalV2StorageAccountingMigrationIsMarked(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, err := store.DB().ExecContext(ctx, `UPDATE settings SET value='1' WHERE key=?`, goalContinuityV2MigrationMarker); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO goal_session(id,protocol,expires_at,created_at,updated_at,storage_bytes) VALUES('post-marker','codex',?,?,?,123)`, Now()+3600, Now(), Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrateGoalContinuityV2(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var stored int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id='post-marker'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 123 {
+		t.Fatalf("marked migration recalculated storage_bytes=%d, want 123", stored)
+	}
+}
+
 func TestGoalCleanupNeverEvictsExpiredLiveRun(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()

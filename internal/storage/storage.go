@@ -2173,6 +2173,10 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE goal_segment ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_event_id ON usage_records(usage_event_id) WHERE usage_event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
+		// Startup billing recovery resolves historical holds through this column.
+		// Without the partial index, every missing hold repeatedly scans the full
+		// usage history and can keep a large install pre-listener for minutes.
+		`CREATE INDEX IF NOT EXISTS idx_usage_records_billing_hold ON usage_records(billing_hold_id) WHERE billing_hold_id <> ''`,
 		// Per-account usage rollups (the admin account list's UsageSummaryByAccountIDs)
 		// filter `account_id IN (...) AND created_at >= ?`. Without an account_id-leading
 		// index SQLite scans the whole usage_records history per page load; this composite
@@ -2451,9 +2455,6 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if err := s.backfillUsageCacheDiagnostics(ctx); err != nil {
 		return err
 	}
 	if legacyUserGroupMigrationEnabled() {
@@ -7678,18 +7679,55 @@ func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
 	return 0
 }
 
+const usageCacheDiagnosticsMigrationMarker = "usage_cache_diagnostics_v3_backfilled"
+
+// RunDeferredMigrations performs reporting-only historical repairs after the HTTP
+// listener is available. Schema and billing-integrity migrations remain synchronous;
+// this potentially large JSON backfill must not hold a socket-activated service in
+// the pre-listener state long enough for the install health gate to roll it back.
+func (s *Store) RunDeferredMigrations(ctx context.Context) error {
+	if s == nil || s.driver == "postgres" {
+		return nil
+	}
+	var completed int
+	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, usageCacheDiagnosticsMigrationMarker).Scan(&completed); err != nil {
+		return err
+	}
+	if completed > 0 {
+		return nil
+	}
+	if err := s.backfillUsageCacheDiagnostics(ctx); err != nil {
+		return err
+	}
+	now := Now()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, usageCacheDiagnosticsMigrationMarker, "1", now)
+	return err
+}
+
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
+	const batchSize = 500
+	type creditBackfill struct {
+		id    int64
+		value float64
+	}
+
+	// Parse only payloads that can contain the legacy credit field. The previous
+	// query decoded every Kiro usage row on every startup, including rows that could
+	// never be updated.
 	var afterID int64
 	for {
-		rows, err := s.rdb.QueryContext(ctx, `SELECT id,raw_usage_json FROM usage_records WHERE usage_provider='kiro' AND kiro_credits_present=0 AND id>? ORDER BY id LIMIT 500`, afterID)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rows, err := s.rdb.QueryContext(ctx, `
+SELECT id,raw_usage_json FROM usage_records
+WHERE usage_provider='kiro' AND kiro_credits_present=0 AND id>?
+  AND raw_usage_json LIKE '%"kiro_credits"%'
+ORDER BY id LIMIT ?`, afterID, batchSize)
 		if err != nil {
 			return err
 		}
-		type creditBackfill struct {
-			id    int64
-			value float64
-		}
-		var updates []creditBackfill
+		updates := make([]creditBackfill, 0, batchSize)
 		scanned := 0
 		for rows.Next() {
 			var id int64
@@ -7715,30 +7753,55 @@ func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
 				updates = append(updates, creditBackfill{id: id, value: value})
 			}
 		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
 		if err = rows.Close(); err != nil {
 			return err
 		}
-		for _, update := range updates {
-			if _, err = s.db.ExecContext(ctx, `UPDATE usage_records SET kiro_credits=?,kiro_credits_present=1 WHERE id=? AND kiro_credits_present=0`, update.value, update.id); err != nil {
+		if len(updates) > 0 {
+			if err = func() error {
+				tx, txErr := s.db.BeginTx(ctx, nil)
+				if txErr != nil {
+					return txErr
+				}
+				defer tx.Rollback()
+				for _, update := range updates {
+					if _, txErr = tx.ExecContext(ctx, `UPDATE usage_records SET kiro_credits=?,kiro_credits_present=1 WHERE id=? AND kiro_credits_present=0`, update.value, update.id); txErr != nil {
+						return txErr
+					}
+				}
+				return tx.Commit()
+			}(); err != nil {
 				return err
 			}
 		}
-		if scanned < 500 {
+		if scanned < batchSize {
 			break
 		}
 	}
-	// Older Kiro converters used the wire spelling as the persisted model while
-	// newer responses use the canonical dotted version. Keep one reporting key.
-	if _, err := s.db.ExecContext(ctx, `UPDATE usage_records SET model='claude-opus-4.8' WHERE usage_provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
-		return err
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE affinity_bindings SET model='claude-opus-4.8' WHERE provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
-		return err
-	}
-	// A historical meteringEvent containing only credits was previously treated as
-	// authoritative zero-token usage. Preserve the original raw payload for audit,
-	// but mark the derived row unreported rather than fabricating token values.
-	if _, err := s.db.ExecContext(ctx, `
+
+	// Apply the fixed-shape repairs in one transaction so a large history incurs one
+	// commit rather than a separate durable write per statement.
+	if err := func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		// Older Kiro converters used the wire spelling as the persisted model while
+		// newer responses use the canonical dotted version. Keep one reporting key.
+		if _, err = tx.ExecContext(ctx, `UPDATE usage_records SET model='claude-opus-4.8' WHERE usage_provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE affinity_bindings SET model='claude-opus-4.8' WHERE provider='kiro' AND lower(trim(model))='claude-opus-4-8'`); err != nil {
+			return err
+		}
+		// A historical meteringEvent containing only credits was previously treated as
+		// authoritative zero-token usage. Preserve the original raw payload for audit,
+		// but mark the derived row unreported rather than fabricating token values.
+		if _, err = tx.ExecContext(ctx, `
 UPDATE usage_records
 SET usage_source='unreported', cache_capability=CASE WHEN cache_capability='' OR cache_capability='unknown' THEN 'unreported' ELSE cache_capability END,
     cache_miss_tokens=0, cache_total_input_tokens=0
@@ -7746,52 +7809,84 @@ WHERE usage_provider='kiro' AND usage_source='upstream'
   AND prompt_tokens=0 AND completion_tokens=0 AND total_tokens=0
   AND cached_tokens=0 AND cache_read_tokens=0 AND cache_creation_tokens=0
   AND cache_read_present=0 AND cache_creation_present=0`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}(); err != nil {
 		return err
 	}
-	rows, err := s.rdb.QueryContext(ctx, `
-SELECT id, model, usage_provider, usage_source, cache_read_present, cache_creation_present, prompt_tokens, cached_tokens,
-       CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END,
-       cache_creation_tokens, raw_usage_json
-FROM usage_records
-WHERE cache_total_input_tokens = 0
-  AND (prompt_tokens > 0 OR cached_tokens > 0 OR cache_read_tokens > 0 OR cache_creation_tokens > 0
-       OR raw_usage_json LIKE '%cache_read_input_tokens%' OR raw_usage_json LIKE '%cache_creation_input_tokens%' OR raw_usage_json LIKE '%estimated%')`)
-	if err != nil {
-		return err
-	}
+
 	type row struct {
 		id                                int64
 		model, provider, source, raw      string
 		cacheReadPresent, createPresent   int
 		prompt, cached, cacheRead, create int64
 	}
-	var items []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.id, &r.model, &r.provider, &r.source, &r.cacheReadPresent, &r.createPresent, &r.prompt, &r.cached, &r.cacheRead, &r.create, &r.raw); err != nil {
-			rows.Close()
+	afterID = 0
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		items = append(items, r)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, r := range items {
-		diag := finalizeUsageDiagnostics(r.model, r.prompt, r.cached, r.cacheRead, r.create, json.RawMessage(r.raw), UsageDiagnostics{
-			UsageProvider: r.provider, UsageSource: r.source,
-			CacheReadPresent: r.cacheReadPresent != 0, CacheCreationPresent: r.createPresent != 0,
-		})
-		if _, err := s.db.ExecContext(ctx, `
+		rows, err := s.rdb.QueryContext(ctx, `
+SELECT id, model, usage_provider, usage_source, cache_read_present, cache_creation_present, prompt_tokens, cached_tokens,
+       CASE WHEN cache_read_tokens > 0 THEN cache_read_tokens ELSE cached_tokens END,
+       cache_creation_tokens, raw_usage_json
+FROM usage_records
+WHERE id > ? AND cache_total_input_tokens = 0
+  AND (prompt_tokens > 0 OR cached_tokens > 0 OR cache_read_tokens > 0 OR cache_creation_tokens > 0
+       OR raw_usage_json LIKE '%cache_read_input_tokens%' OR raw_usage_json LIKE '%cache_creation_input_tokens%' OR raw_usage_json LIKE '%estimated%')
+ORDER BY id LIMIT ?`, afterID, batchSize)
+		if err != nil {
+			return err
+		}
+		items := make([]row, 0, batchSize)
+		scanned := 0
+		for rows.Next() {
+			var r row
+			if err = rows.Scan(&r.id, &r.model, &r.provider, &r.source, &r.cacheReadPresent, &r.createPresent, &r.prompt, &r.cached, &r.cacheRead, &r.create, &r.raw); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			afterID = r.id
+			scanned++
+			items = append(items, r)
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		if len(items) > 0 {
+			if err = func() error {
+				tx, txErr := s.db.BeginTx(ctx, nil)
+				if txErr != nil {
+					return txErr
+				}
+				defer tx.Rollback()
+				for _, r := range items {
+					diag := finalizeUsageDiagnostics(r.model, r.prompt, r.cached, r.cacheRead, r.create, json.RawMessage(r.raw), UsageDiagnostics{
+						UsageProvider: r.provider, UsageSource: r.source,
+						CacheReadPresent: r.cacheReadPresent != 0, CacheCreationPresent: r.createPresent != 0,
+					})
+					if _, txErr = tx.ExecContext(ctx, `
 UPDATE usage_records
 SET usage_provider = ?, usage_source = ?, cache_read_present = ?, cache_creation_present = ?, estimated = ?, cache_miss_tokens = ?, cache_total_input_tokens = ?,
     cache_creation_5m_tokens = ?, cache_creation_1h_tokens = ?
 WHERE id = ?`,
-			diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens,
-			diag.CacheCreation5mTokens, diag.CacheCreation1hTokens, r.id); err != nil {
-			return err
+						diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), boolInt(diag.Estimated), diag.CacheMissTokens, diag.CacheTotalInputTokens,
+						diag.CacheCreation5mTokens, diag.CacheCreation1hTokens, r.id); txErr != nil {
+						return txErr
+					}
+				}
+				return tx.Commit()
+			}(); err != nil {
+				return err
+			}
+		}
+		if scanned < batchSize {
+			break
 		}
 	}
 	return nil
@@ -7807,23 +7902,7 @@ WHERE id = ?`,
 //
 // Runs inside its own transaction; skips rows that already exist (ON CONFLICT DO NOTHING).
 func (s *Store) backfillUserGroups(ctx context.Context) error {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT `+userGroupCols+` FROM user_groups`)
-	if err != nil {
-		return err
-	}
 	existing := map[string]bool{}
-	for rows.Next() {
-		var g UserGroup
-		if _, scanErr := scanUserGroup(rows.Scan); scanErr == nil {
-			_ = g
-		}
-		// collect names already present
-		var id, name string
-		_ = rows.Scan(&id, &name)
-	}
-	rows.Close()
-
-	// Re-query to get names only (simpler scan).
 	nameRows, err := s.rdb.QueryContext(ctx, `SELECT name FROM user_groups`)
 	if err != nil {
 		return err

@@ -249,6 +249,43 @@ VALUES
 	}
 }
 
+func TestDeferredUsageDiagnosticsMigrationRunsOnce(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO usage_records(account_id, route_key_hash, model, prompt_tokens, completion_tokens, total_tokens, raw_usage_json, created_at)
+VALUES('deferred-before', 'before', 'gpt-test', 25, 1, 26, '{"input_tokens":25,"output_tokens":1}', ?)`, Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RunDeferredMigrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var total, markerCount int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT cache_total_input_tokens FROM usage_records WHERE account_id='deferred-before'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, usageCacheDiagnosticsMigrationMarker).Scan(&markerCount); err != nil {
+		t.Fatal(err)
+	}
+	if total != 25 || markerCount != 1 {
+		t.Fatalf("deferred migration total=%d markers=%d, want 25/1", total, markerCount)
+	}
+
+	// Once marked, subsequent starts do constant work instead of rescanning history.
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO usage_records(account_id, route_key_hash, model, prompt_tokens, completion_tokens, total_tokens, raw_usage_json, created_at)
+VALUES('deferred-after', 'after', 'gpt-test', 30, 1, 31, '{"input_tokens":30,"output_tokens":1}', ?)`, Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RunDeferredMigrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT cache_total_input_tokens FROM usage_records WHERE account_id='deferred-after'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Fatalf("completed one-time migration rescanned new row: total=%d", total)
+	}
+}
+
 func TestAccountPoolSummaryCountsDashboardFields(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

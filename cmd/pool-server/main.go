@@ -60,6 +60,8 @@ func run() int {
 	startHeapProfileSignal(ctx)
 	stopCPUProfile := startCPUProfile()
 	defer stopCPUProfile()
+	storageInitStarted := time.Now()
+	log.Printf("startup: initializing storage")
 	store, err := storage.OpenWithConfig(cfg)
 	if err != nil {
 		log.Printf("open storage: %v", err)
@@ -71,6 +73,7 @@ func run() int {
 		log.Printf("init storage: %v", err)
 		return 1
 	}
+	log.Printf("startup: storage initialized in %s", time.Since(storageInitStarted).Round(time.Millisecond))
 	// Encrypt account secrets (tokens, session cookies) at rest with a key derived from
 	// the deployment identity secret, so a leaked DB file / backup does not hand over
 	// every account. Reads transparently decrypt; legacy plaintext rows are upgraded
@@ -201,6 +204,20 @@ func run() int {
 
 	serveErr := make(chan error, 1)
 	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServer(httpServer) })
+	// Historical usage diagnostics affect reports, not request correctness. Run their
+	// potentially large JSON backfill only after the listener is accepting health
+	// checks; synchronous execution here previously made an active systemd service look
+	// dead long enough for install.sh to roll back both the new and previous binaries.
+	supervisor.Go(ctx, "storage-deferred-migrations", func(ctx context.Context) {
+		started := time.Now()
+		if err := store.RunDeferredMigrations(ctx); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("deferred storage migrations: %v", err)
+			}
+			return
+		}
+		log.Printf("startup: deferred storage migrations completed in %s", time.Since(started).Round(time.Millisecond))
+	})
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)

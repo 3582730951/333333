@@ -299,7 +299,16 @@ type GoalMetrics struct {
 	PersistenceDegraded       int64 `json:"persistence_degraded"`
 }
 
+const goalContinuityV2MigrationMarker = "goal_continuity_v2_storage_accounted"
+
 func (s *Store) migrateGoalContinuityV2(ctx context.Context) error {
+	var completed int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, goalContinuityV2MigrationMarker).Scan(&completed); err != nil {
+		return err
+	}
+	if completed > 0 {
+		return nil
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -325,6 +334,10 @@ COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_checkpoint WHERE goal_
 COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_segment WHERE goal_id=goal_session.id),0)+
 COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_payload_chunk WHERE goal_id=goal_session.id),0)`)
 	if err != nil {
+		return err
+	}
+	now := Now()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, goalContinuityV2MigrationMarker, "1", now); err != nil {
 		return err
 	}
 	return tx.Commit()
