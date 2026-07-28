@@ -680,6 +680,9 @@ func anthropicToAntigravityForAccount(body []byte, model, projectID, accountID s
 	// the local context/compaction pipeline and omitted from the final provider wire.
 	// Rejecting it here caused Claude Code's automatic context management to fail with a
 	// local 422 even though no unsupported field would have reached Antigravity.
+	// Note: context_management is already omitted because we rebuild the envelope from scratch.
+
+	// Check for unsupported fields that would reach the wire.
 	if gjson.GetBytes(body, "mcp_servers").Exists() {
 		return nil, antigravityConversionError("mcp_servers are not supported by the Antigravity protocol")
 	}

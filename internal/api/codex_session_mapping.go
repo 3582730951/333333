@@ -619,6 +619,21 @@ func stripCodexRetiredEpochTurnMetadata(raw string) (string, bool) {
 }
 
 func codexSessionNamespace(pol downstreamPolicy, r *http.Request) string {
+	// Check for X-Session-ID header for explicit session isolation
+	// This allows multiple CLI instances with the same API key to maintain separate contexts
+	if sessionID := strings.TrimSpace(r.Header.Get("X-Session-ID")); sessionID != "" {
+		keyPart := strings.TrimSpace(pol.KeyHash)
+		if keyPart == "" {
+			if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
+				keyPart = hashAPIKey(token)
+			}
+		}
+		if keyPart != "" {
+			return "key:" + keyPart + ":session:" + sessionID
+		}
+		return "session:" + sessionID
+	}
+
 	if strings.TrimSpace(pol.KeyHash) != "" {
 		return "key:" + strings.TrimSpace(pol.KeyHash)
 	}

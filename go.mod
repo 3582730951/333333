@@ -1,6 +1,6 @@
 module codex-account-pool
 
-go 1.24.1
+go 1.23
 
 require (
 	github.com/bogdanfinn/fhttp v0.6.8
