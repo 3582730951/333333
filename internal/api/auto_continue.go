@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/streamrewrite"
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
@@ -39,6 +40,16 @@ type reissueFunc func(ctx context.Context, continuationBody []byte) (io.ReadClos
 // errAutoContinueUnavailable means no lossless continuation request could be built.
 // Callers must synthesize a protocol failure terminal rather than silently EOF.
 var errAutoContinueUnavailable = errors.New("lossless auto-continue context unavailable")
+
+func appendBoundedStreamText(base, extra string, maxBytes int64) (string, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultStreamAccumulatorMaxBytes
+	}
+	if int64(len(extra)) > maxBytes-int64(len(base)) {
+		return "", bodysource.ErrBodyTooLarge
+	}
+	return base + extra, nil
+}
 
 func (s *Server) autoContinueEnabled(ctx context.Context, decision *upstreamErrorRuleDecision) bool {
 	if s.flagEnabled(ctx, "stream_auto_continue_enabled", s.cfg.StreamAutoContinueEnabled) {
@@ -73,35 +84,7 @@ func (s *Server) autoContinueMaxAttempts(ctx context.Context) int {
 // forEachSSEFrame reads src and invokes fn for each complete LF- or CRLF-delimited
 // SSE frame, then once more for any unterminated trailing bytes.
 func forEachSSEFrame(src io.Reader, fn func(frame []byte) error) error {
-	buf := make([]byte, 0, 32768)
-	tmp := make([]byte, 32768)
-	for {
-		n, readErr := src.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			for {
-				boundary, separatorLen := sseFrameBoundary(buf)
-				if boundary < 0 {
-					break
-				}
-				frameEnd := boundary + separatorLen
-				frame := append([]byte(nil), buf[:frameEnd]...)
-				buf = buf[frameEnd:]
-				if err := fn(frame); err != nil {
-					return err
-				}
-			}
-		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				if len(buf) > 0 {
-					return fn(buf)
-				}
-				return nil
-			}
-			return readErr
-		}
-	}
+	return forEachSSEFrameWithOptions(context.Background(), src, bodysource.CaptureOptions{}, fn)
 }
 
 func writeSSEEvent(w io.Writer, event string, payload map[string]interface{}) error {
@@ -147,6 +130,26 @@ func newScrubbingFrameWriter(dst io.Writer, leak bool, words *streamrewrite.Matc
 }
 
 func (s *scrubbingFrameWriter) Write(p []byte) (int, error) {
+	originalLen := len(p)
+	if len(s.buf) == 0 {
+		for {
+			boundary, separatorLen := sseFrameBoundary(p)
+			if boundary < 0 {
+				break
+			}
+			frameEnd := boundary + separatorLen
+			if err := s.relay(p[:frameEnd]); err != nil {
+				return 0, err
+			}
+			p = p[frameEnd:]
+		}
+		if len(p) == 0 {
+			return originalLen, nil
+		}
+	}
+	if int64(len(p)) > defaultStreamAccumulatorMaxBytes-int64(len(s.buf)) {
+		return 0, bodysource.ErrBodyTooLarge
+	}
 	s.buf = append(s.buf, p...)
 	for {
 		boundary, separatorLen := sseFrameBoundary(s.buf)
@@ -154,26 +157,35 @@ func (s *scrubbingFrameWriter) Write(p []byte) (int, error) {
 			break
 		}
 		frameEnd := boundary + separatorLen
-		frame := append([]byte(nil), s.buf[:frameEnd]...)
-		s.buf = s.buf[frameEnd:]
-		out := frame
-		if s.leak {
-			out = leakfilter.NewSSEFilter(s.provider, s.words).ProcessFrameForRelay(out)
-		} else {
-			if s.provider == "codex" {
-				out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
-			}
-			if s.words != nil && !s.words.Empty() {
-				out = s.words.ReplaceAll(out)
-			}
+		frame := s.buf[:frameEnd]
+		if err := s.relay(frame); err != nil {
+			return 0, err
 		}
-		if len(out) > 0 {
-			if _, err := s.dst.Write(out); err != nil {
-				return 0, err
-			}
+		s.buf = s.buf[frameEnd:]
+		if len(s.buf) == 0 {
+			s.buf = nil
 		}
 	}
-	return len(p), nil
+	return originalLen, nil
+}
+
+func (s *scrubbingFrameWriter) relay(frame []byte) error {
+	out := frame
+	if s.leak {
+		out = leakfilter.NewSSEFilter(s.provider, s.words).ProcessFrameForRelay(out)
+	} else {
+		if s.provider == "codex" {
+			out, _ = leakfilter.NeutralizeResponsesContextErrorSSEFrame(out)
+		}
+		if s.words != nil && !s.words.Empty() {
+			out = s.words.ReplaceAll(out)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	_, err := s.dst.Write(out)
+	return err
 }
 
 func (s *scrubbingFrameWriter) Flush() {
@@ -238,7 +250,10 @@ func (s *Server) maybeAutoContinueCodex(ctx context.Context, w io.Writer, origin
 // or transforms the stream — it only records.
 type claudeStreamTap struct {
 	buf            []byte
-	text           strings.Builder
+	ctx            context.Context
+	options        bodysource.CaptureOptions
+	text           *streamAccumulator
+	err            error
 	blocksOpened   int
 	openBlockIndex int
 	openBlock      bool
@@ -246,7 +261,21 @@ type claudeStreamTap struct {
 	terminalError  bool
 }
 
+func newClaudeStreamTap(ctx context.Context, options bodysource.CaptureOptions) *claudeStreamTap {
+	return &claudeStreamTap{ctx: ctx, options: options}
+}
+
+func (t *claudeStreamTap) ensureText() *streamAccumulator {
+	if t.text == nil {
+		t.text = newStreamAccumulator(t.ctx, t.options, "codex-pool-claude-partial-text-*")
+	}
+	return t.text
+}
+
 func (t *claudeStreamTap) Write(p []byte) (int, error) {
+	if t.err != nil {
+		return 0, t.err
+	}
 	t.buf = append(t.buf, p...)
 	for {
 		boundary, separatorLen := sseFrameBoundary(t.buf)
@@ -255,6 +284,9 @@ func (t *claudeStreamTap) Write(p []byte) (int, error) {
 		}
 		frameEnd := boundary + separatorLen
 		t.observe(t.buf[:frameEnd])
+		if t.err != nil {
+			return 0, t.err
+		}
 		t.buf = t.buf[frameEnd:]
 	}
 	if len(t.buf) > streamLedgerMaxPartialFrame {
@@ -284,7 +316,7 @@ func (t *claudeStreamTap) observe(frame []byte) {
 	case "content_block_delta":
 		if delta, ok := ev["delta"].(map[string]interface{}); ok {
 			if s := streamString(delta["text"]); s != "" {
-				t.text.WriteString(s)
+				t.err = t.ensureText().WriteString(s)
 			}
 		}
 	case "content_block_stop":
@@ -301,7 +333,23 @@ func (t *claudeStreamTap) observe(frame []byte) {
 
 func (t *claudeStreamTap) reachedTerminal() bool       { return t.messageStopped || t.terminalError }
 func (t *claudeStreamTap) completedSuccessfully() bool { return t.messageStopped && !t.terminalError }
-func (t *claudeStreamTap) partialText() string         { return t.text.String() }
+func (t *claudeStreamTap) partialText() string {
+	if t.text == nil {
+		return ""
+	}
+	value, err := t.text.String()
+	if err != nil {
+		t.err = err
+		return ""
+	}
+	return value
+}
+func (t *claudeStreamTap) Close() error {
+	if t.text == nil {
+		return nil
+	}
+	return t.text.Close()
+}
 
 func jsonIntValue(v interface{}) int {
 	switch n := v.(type) {
@@ -344,14 +392,18 @@ func buildClaudeContinueBody(originalBody []byte, partialText, continueText stri
 // content-block index by priorBlocks, and relays the continuation's message_delta /
 // message_stop as the true terminal. It returns the continuation's own tap so a caller can
 // decide whether a further continuation is needed and with what accumulated text.
-func stitchClaudeContinuation(w io.Writer, src io.Reader, priorBlocks, priorOpenIndex int, priorOpen bool) (*claudeStreamTap, error) {
+func stitchClaudeContinuation(w io.Writer, src io.Reader, priorBlocks, priorOpenIndex int, priorOpen bool, options ...bodysource.CaptureOptions) (*claudeStreamTap, error) {
 	if priorOpen {
 		if err := writeSSEEvent(w, "content_block_stop", map[string]interface{}{"index": priorOpenIndex}); err != nil {
 			return nil, err
 		}
 		flushWriter(w)
 	}
-	tap := &claudeStreamTap{}
+	var captureOptions bodysource.CaptureOptions
+	if len(options) > 0 {
+		captureOptions = options[0]
+	}
+	tap := newClaudeStreamTap(context.Background(), captureOptions)
 	err := forEachSSEFrame(src, func(frame []byte) error {
 		eventType, data := sseFrameEventData(frame)
 		if len(data) == 0 {
@@ -367,6 +419,9 @@ func stitchClaudeContinuation(w io.Writer, src io.Reader, priorBlocks, priorOpen
 		}
 		// Record raw continuation state for a possible further round.
 		tap.observe(frame)
+		if tap.err != nil {
+			return tap.err
+		}
 		switch typ {
 		case "message_start":
 			// The downstream already has message_start from the first stream; a second
@@ -434,7 +489,14 @@ func buildCodexContinueBody(resolvedBody []byte, partialItems []interface{}, con
 // everything the client saw). It returns whether the continuation reached its terminal and
 // the continuation's own recorder for a possible further round.
 func stitchCodexContinuation(w io.Writer, src io.Reader, priorItems []interface{}, priorText string, priorItemCount int) (*codexStreamLedgerRecorder, error) {
-	rec := newCodexStreamLedgerRecorder()
+	return stitchCodexContinuationWithRecorder(w, src, priorItems, priorText, priorItemCount, newCodexStreamLedgerRecorder())
+}
+
+func stitchCodexContinuationWithRecorder(w io.Writer, src io.Reader, priorItems []interface{}, priorText string, priorItemCount int, rec *codexStreamLedgerRecorder, limits ...int64) (*codexStreamLedgerRecorder, error) {
+	maxBytes := defaultStreamAccumulatorMaxBytes
+	if len(limits) > 0 && limits[0] > 0 {
+		maxBytes = limits[0]
+	}
 	err := forEachSSEFrame(src, func(frame []byte) error {
 		eventType, data := sseFrameEventData(frame)
 		if len(data) == 0 {
@@ -473,7 +535,11 @@ func stitchCodexContinuation(w io.Writer, src io.Reader, priorItems []interface{
 		case "response.completed", "response.incomplete", "response.failed":
 			if resp, ok := ev["response"].(map[string]interface{}); ok {
 				resp["output"] = append(append([]interface{}{}, priorItems...), asSlice(resp["output"])...)
-				if t := priorText + responsesRootOutputText(resp); strings.TrimSpace(t) != "" {
+				t, appendErr := appendBoundedStreamText(priorText, responsesRootOutputText(resp), maxBytes)
+				if appendErr != nil {
+					return appendErr
+				}
+				if strings.TrimSpace(t) != "" {
 					resp["output_text"] = t
 				}
 			}
@@ -528,22 +594,35 @@ func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBo
 	}
 	maxAttempts := s.autoContinueMaxAttempts(ctx)
 	continueText := s.autoContinueText(ctx)
+	maxBytes := s.cfg.MaxBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultStreamAccumulatorMaxBytes
+	}
 	priorBlocks := first.blocksOpened
 	priorOpen := first.openBlock
 	priorOpenIndex := first.openBlockIndex
 	accumulated := first.partialText()
+	if first.err != nil {
+		return nil, first.err
+	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		body, ok := buildClaudeContinueBody(originalBody, accumulated, continueText)
 		if !ok {
 			break
 		}
+		if int64(len(body)) > maxBytes {
+			return nil, bodysource.ErrBodyTooLarge
+		}
 		stream, err := reissue(ctx, body)
 		if err != nil || stream == nil {
 			break
 		}
-		tap, stitchErr := stitchClaudeContinuation(w, io.TeeReader(stream, capture), priorBlocks, priorOpenIndex, priorOpen)
+		tap, stitchErr := stitchClaudeContinuation(w, io.TeeReader(stream, capture), priorBlocks, priorOpenIndex, priorOpen, first.options)
 		_ = stream.Close()
 		if stitchErr != nil {
+			if tap == nil {
+				return nil, stitchErr
+			}
 			// stitchClaudeContinuation closes the prior block before it starts the
 			// continuation. If the new upstream stream then stalls or breaks, terminate
 			// using the new block's offset index here. Returning nil,nil means the
@@ -562,7 +641,17 @@ func (s *Server) autoContinueClaude(ctx context.Context, w io.Writer, originalBo
 		priorBlocks += tap.blocksOpened
 		priorOpen = tap.openBlock
 		priorOpenIndex = newOpenIndex
-		accumulated += tap.partialText()
+		var appendErr error
+		accumulated, appendErr = appendBoundedStreamText(accumulated, tap.partialText(), maxBytes)
+		if tap.err != nil {
+			_ = tap.Close()
+			return nil, tap.err
+		}
+		if appendErr != nil {
+			_ = tap.Close()
+			return nil, appendErr
+		}
+		_ = tap.Close()
 	}
 	if err := closeClaudeStreamGracefully(w, priorOpen, priorOpenIndex); err != nil {
 		return nil, err
@@ -604,6 +693,10 @@ func closeClaudeStreamGracefully(w io.Writer, open bool, openIndex int) error {
 func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBody []byte, first *codexStreamLedgerRecorder, reissue reissueFunc) (*codexStreamLedgerRecorder, error) {
 	maxAttempts := s.autoContinueMaxAttempts(ctx)
 	continueText := s.autoContinueText(ctx)
+	maxBytes := s.cfg.MaxBodyBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultStreamAccumulatorMaxBytes
+	}
 	priorItems := first.partialItems()
 	priorText := first.partialText()
 	priorCount := first.partialItemCount()
@@ -613,19 +706,28 @@ func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBod
 		if !ok {
 			break
 		}
+		if int64(len(body)) > maxBytes {
+			return nil, bodysource.ErrBodyTooLarge
+		}
 		stream, err := reissue(ctx, body)
 		if err != nil || stream == nil {
 			break
 		}
-		rec, stitchErr := stitchCodexContinuation(w, stream, priorItems, priorText, priorCount)
+		rec, stitchErr := stitchCodexContinuationWithRecorder(w, stream, priorItems, priorText, priorCount, s.newCodexStreamLedgerRecorder(ctx), maxBytes)
 		_ = stream.Close()
 		if stitchErr != nil {
+			_ = rec.Close()
 			return nil, stitchErr
 		}
 		if rec.reachedTerminal() {
 			return rec, nil
 		}
-		priorText += rec.partialText()
+		var appendErr error
+		priorText, appendErr = appendBoundedStreamText(priorText, rec.partialText(), maxBytes)
+		if appendErr != nil {
+			_ = rec.Close()
+			return nil, appendErr
+		}
 		priorItems = append(priorItems, rec.partialItems()...)
 		priorCount += rec.partialItemCount()
 		recID, recModel, _ := rec.metadata()
@@ -635,6 +737,7 @@ func (s *Server) autoContinueCodex(ctx context.Context, w io.Writer, resolvedBod
 		if recModel != "" {
 			model = recModel
 		}
+		_ = rec.Close()
 	}
 	if err := closeCodexStreamGracefully(w, priorItems, priorText, id, model); err != nil {
 		return nil, err

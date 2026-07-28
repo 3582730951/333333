@@ -101,6 +101,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		"codex_session_mappings.csv",
 		"codex_instruction_snapshots.csv",
 		"codex_upstream_attempts.csv",
+		"codex_upstream_attempts_daily.csv",
 		"codex_group_policy_revisions.csv",
 		"sidecar_status.csv",
 		"settings.csv",
@@ -125,6 +126,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 
 	var manifest struct {
 		Format             string                 `json:"format"`
+		SnapshotID         string                 `json:"snapshot_id"`
 		Files              []string               `json:"files"`
 		Rows               map[string]int         `json:"row_counts"`
 		CurrentAccounts    int                    `json:"current_account_count"`
@@ -135,8 +137,8 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
 		t.Fatalf("manifest json: %v\n%s", err, files["manifest.json"])
 	}
-	if manifest.Format != "codex-pool-diagnostics-v2" {
-		t.Fatalf("manifest format = %q, want codex-pool-diagnostics-v2", manifest.Format)
+	if manifest.Format != "codex-pool-diagnostics-v2" || !strings.HasPrefix(manifest.SnapshotID, "diag_") {
+		t.Fatalf("manifest format/snapshot = %q/%q", manifest.Format, manifest.SnapshotID)
 	}
 	if manifest.CurrentAccounts != 1 || manifest.HistoricalAccounts != 1 || manifest.Build == nil || manifest.TableTimeRanges["usage_records.csv"] == nil {
 		t.Fatalf("manifest account/build/range metadata = %+v", manifest)
@@ -144,6 +146,16 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	for _, name := range required {
 		if _, ok := manifest.Rows[name]; !ok {
 			t.Fatalf("manifest missing row count for %s: %+v", name, manifest.Rows)
+		}
+		if !strings.HasSuffix(name, ".csv") {
+			continue
+		}
+		rows, csvErr := csv.NewReader(strings.NewReader(files[name])).ReadAll()
+		if csvErr != nil {
+			t.Fatalf("parse %s: %v", name, csvErr)
+		}
+		if actual := len(rows) - 1; actual != manifest.Rows[name] {
+			t.Fatalf("manifest row count drift for %s: manifest=%d actual=%d", name, manifest.Rows[name], actual)
 		}
 	}
 
@@ -199,10 +211,17 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := json.Unmarshal([]byte(files["diagnostic_summary.json"]), &summary); err != nil {
 		t.Fatalf("diagnostic_summary.json: %v\n%s", err, files["diagnostic_summary.json"])
 	}
-	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa"} {
+	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "usage_journal"} {
 		if _, ok := summary[key]; !ok {
 			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
 		}
+	}
+	journalJSON, err := json.Marshal(summary["usage_journal"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(journalJSON, []byte("usage-journal")) || bytes.Contains(journalJSON, []byte(h.store.Path())) {
+		t.Fatalf("usage journal diagnostics leaked a local path: %s", journalJSON)
 	}
 }
 
@@ -341,6 +360,61 @@ func TestDiagnosticsExportStreamsLargeUsageTableInBoundedWrites(t *testing.T) {
 	}
 	if w.maxWrite >= 1<<20 {
 		t.Fatalf("export buffered an oversized archive chunk: max write=%d", w.maxWrite)
+	}
+}
+
+func TestDiagnosticsExportDeduplicatesAffinityAliasesAndOmitsExpiredRows(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	for _, id := range []string{"affinity-export-a", "affinity-export-b"} {
+		if err := h.store.UpsertAccount(ctx, storage.Account{ID: id, GroupName: "cyber", Provider: "codex", Status: "active"}, storage.AccountToken{AccessToken: "token-" + id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := storage.Now()
+	if _, err := h.store.DB().ExecContext(ctx, `INSERT INTO affinity_bindings(route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,0)`, "overlap-hash", "legacy", "previous_response_id", "affinity-export-a", "codex", "gpt-5", "direct", 1, now-10, now-10); err != nil {
+		t.Fatal(err)
+	}
+	for _, binding := range []storage.AffinityBinding{
+		{RouteKeyHash: "overlap-hash", RouteKey: "current", Source: "previous_response_id", AccountID: "affinity-export-b", Provider: "codex", Model: "gpt-5", EgressID: "direct", Epoch: 2},
+		{RouteKeyHash: "active-hash", RouteKey: "active", Source: "prompt_cache_key", AccountID: "affinity-export-a", Provider: "codex", Model: "gpt-5", EgressID: "direct"},
+		{RouteKeyHash: "expired-hash", RouteKey: "expired", Source: "previous_response_id", AccountID: "affinity-export-a", Provider: "codex", Model: "gpt-5", EgressID: "direct"},
+	} {
+		if err := h.store.UpsertAffinityBinding(ctx, binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := h.store.DB().ExecContext(ctx, `UPDATE affinity_aliases SET expires_at=? WHERE route_key_hash='expired-hash'`, now-1); err != nil {
+		t.Fatal(err)
+	}
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/logs", "")
+	if code != http.StatusOK {
+		t.Fatalf("diagnostics export = %d: %s", code, raw)
+	}
+	files := readZipFiles(t, raw)
+	rows, err := csv.NewReader(strings.NewReader(files["affinity_bindings.csv"])).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("affinity CSV rows=%d, want header plus two bindings: %v", len(rows), rows)
+	}
+	seen := map[string]int{}
+	for _, row := range rows[1:] {
+		seen[row[0]]++
+	}
+	if seen["overlap-hash"] != 1 || seen["active-hash"] != 1 || seen["expired-hash"] != 0 {
+		t.Fatalf("affinity hashes=%v", seen)
+	}
+	var manifest struct {
+		Rows map[string]int `json:"row_counts"`
+	}
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Rows["affinity_bindings.csv"] != 2 {
+		t.Fatalf("manifest affinity rows=%d", manifest.Rows["affinity_bindings.csv"])
 	}
 }
 

@@ -2,6 +2,7 @@ package kiro
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"github.com/google/uuid"
 )
@@ -178,6 +180,12 @@ func webSearchSummary(data *WebSearchData) string {
 type ResponseProcessor struct {
 	names      map[string]string
 	data       ResponseData
+	ctx        context.Context
+	options    bodysource.CaptureOptions
+	text       *responseAccumulator
+	thinking   *responseAccumulator
+	toolInput  *responseAccumulator
+	err        error
 	activeTool ToolCall
 	toolActive bool
 	tagParser  thinkingTagParser
@@ -185,19 +193,109 @@ type ResponseProcessor struct {
 }
 
 func NewResponseProcessor(names map[string]string) *ResponseProcessor {
-	return &ResponseProcessor{names: names, losses: map[string]struct{}{}}
+	return NewResponseProcessorWithOptions(context.Background(), names, bodysource.CaptureOptions{})
+}
+
+func NewResponseProcessorWithOptions(ctx context.Context, names map[string]string, options bodysource.CaptureOptions) *ResponseProcessor {
+	if options.MaxBytes <= 0 {
+		options.MaxBytes = 1 << 30
+		options.MemoryThreshold = 8 << 20
+	}
+	return &ResponseProcessor{names: names, ctx: ctx, options: options, losses: map[string]struct{}{}}
 }
 
 func (p *ResponseProcessor) Data() ResponseData {
 	out := p.data
+	if p.text != nil {
+		if value, err := p.text.String(); err == nil {
+			out.Text += value
+		} else {
+			p.err = err
+		}
+	}
+	if p.thinking != nil {
+		if value, err := p.thinking.String(); err == nil {
+			out.Thinking += value
+		} else {
+			p.err = err
+		}
+	}
 	if p.toolActive {
-		out.Tools = append(append([]ToolCall(nil), out.Tools...), p.activeTool)
+		tool := p.activeTool
+		if p.toolInput != nil {
+			if value, err := p.toolInput.String(); err == nil {
+				tool.Input = value
+			} else {
+				p.err = err
+			}
+		}
+		out.Tools = append(append([]ToolCall(nil), out.Tools...), tool)
 	}
 	out.CompatibilityLosses = sortedStringSet(p.losses)
 	return out
 }
 
+func (p *ResponseProcessor) Model() string          { return p.data.Model }
+func (p *ResponseProcessor) Metering() KiroMetering { return p.data.Metering }
+
+func (p *ResponseProcessor) Close() error {
+	return errors.Join(p.text.Close(), p.thinking.Close(), p.toolInput.Close())
+}
+
+type responseAccumulator struct {
+	buffer *bodysource.SpoolBuffer
+	err    error
+}
+
+func newResponseAccumulator(ctx context.Context, options bodysource.CaptureOptions, prefix string) *responseAccumulator {
+	options.TempFileNamePrefix = prefix
+	buffer, err := bodysource.NewSpoolBuffer(ctx, options)
+	return &responseAccumulator{buffer: buffer, err: err}
+}
+
+func (a *responseAccumulator) WriteString(value string) error {
+	if a == nil {
+		return nil
+	}
+	if a.err != nil {
+		return a.err
+	}
+	_, a.err = io.WriteString(a.buffer, value)
+	return a.err
+}
+
+func (a *responseAccumulator) String() (string, error) {
+	if a == nil {
+		return "", nil
+	}
+	if a.err != nil {
+		return "", a.err
+	}
+	if view, ok := bodysource.ByteView(a.buffer); ok {
+		return string(view), nil
+	}
+	raw, err := bodysource.ReadAll(a.buffer)
+	return string(raw), err
+}
+
+func (a *responseAccumulator) Close() error {
+	if a == nil || a.buffer == nil {
+		return nil
+	}
+	return a.buffer.Close()
+}
+
+func (p *ResponseProcessor) accumulator(target **responseAccumulator, prefix string) *responseAccumulator {
+	if *target == nil {
+		*target = newResponseAccumulator(p.ctx, p.options, prefix)
+	}
+	return *target
+}
+
 func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
 	messageType := frame.HeaderString(":message-type")
 	if messageType == "error" || messageType == "exception" {
 		if messageType == "exception" && frame.HeaderString(":exception-type") == "ContentLengthExceededException" {
@@ -224,7 +322,10 @@ func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
 		}
 		var deltas []ResponseDelta
 		if thinking != "" {
-			p.data.Thinking += thinking
+			if err := p.accumulator(&p.thinking, "codex-pool-kiro-thinking-*").WriteString(thinking); err != nil {
+				p.err = err
+				return nil, err
+			}
 			deltas = append(deltas, ResponseDelta{Kind: "thinking", Text: thinking})
 		}
 		if content != "" {
@@ -233,7 +334,9 @@ func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
 				p.losses[LossThinkingTagFallback] = struct{}{}
 			}
 			for _, delta := range parsed {
-				p.appendTextDelta(delta)
+				if err := p.appendTextDelta(delta); err != nil {
+					return nil, err
+				}
 				deltas = append(deltas, delta)
 			}
 		}
@@ -263,12 +366,15 @@ func (p *ResponseProcessor) ProcessFrame(frame Frame) ([]ResponseDelta, error) {
 	}
 }
 
-func (p *ResponseProcessor) appendTextDelta(delta ResponseDelta) {
+func (p *ResponseProcessor) appendTextDelta(delta ResponseDelta) error {
+	var err error
 	if delta.Kind == "thinking" {
-		p.data.Thinking += delta.Text
+		err = p.accumulator(&p.thinking, "codex-pool-kiro-thinking-*").WriteString(delta.Text)
 	} else if delta.Kind == "text" {
-		p.data.Text += delta.Text
+		err = p.accumulator(&p.text, "codex-pool-kiro-text-*").WriteString(delta.Text)
 	}
+	p.err = err
+	return err
 }
 
 func (p *ResponseProcessor) syncMeteringFields() {
@@ -307,6 +413,8 @@ func (p *ResponseProcessor) processToolUseEvent(fields map[string]json.RawMessag
 			id = newSyntheticToolID()
 		}
 		p.activeTool = ToolCall{ID: id, Name: name}
+		_ = p.toolInput.Close()
+		p.toolInput = nil
 		p.toolActive = true
 	} else if p.toolActive && p.activeTool.Name == "" && name != "" {
 		p.activeTool.Name = name
@@ -321,9 +429,12 @@ func (p *ResponseProcessor) processToolUseEvent(fields map[string]json.RawMessag
 			return nil, fmt.Errorf("%w: tool_use_id=%s: %v", ErrInvalidToolInput, p.activeTool.ID, err)
 		}
 		if replace {
-			p.activeTool.Input = input
-		} else {
-			p.activeTool.Input += input
+			_ = p.toolInput.Close()
+			p.toolInput = nil
+		}
+		if err = p.accumulator(&p.toolInput, "codex-pool-kiro-tool-input-*").WriteString(input); err != nil {
+			p.err = err
+			return nil, err
 		}
 	}
 
@@ -341,6 +452,14 @@ func (p *ResponseProcessor) processToolUseEvent(fields map[string]json.RawMessag
 
 func (p *ResponseProcessor) finishActiveTool() (ResponseDelta, error) {
 	tool := p.activeTool
+	if p.toolInput != nil {
+		input, err := p.toolInput.String()
+		if err != nil {
+			p.err = err
+			return ResponseDelta{}, err
+		}
+		tool.Input = input
+	}
 	input, err := normalizeToolInput(tool.Input)
 	if err != nil {
 		return ResponseDelta{}, fmt.Errorf("%w: tool_use_id=%s: %v", ErrInvalidToolInput, tool.ID, err)
@@ -349,6 +468,8 @@ func (p *ResponseProcessor) finishActiveTool() (ResponseDelta, error) {
 	p.data.Tools = append(p.data.Tools, tool)
 	p.activeTool = ToolCall{}
 	p.toolActive = false
+	_ = p.toolInput.Close()
+	p.toolInput = nil
 	return ResponseDelta{Kind: "tool", ToolID: tool.ID, ToolName: tool.Name, ToolInput: tool.Input, NewTool: true}, nil
 }
 
@@ -403,7 +524,9 @@ func (p *ResponseProcessor) Finish() ([]ResponseDelta, error) {
 		p.losses[LossThinkingTagFallback] = struct{}{}
 	}
 	for _, delta := range parsed {
-		p.appendTextDelta(delta)
+		if err := p.appendTextDelta(delta); err != nil {
+			return deltas, err
+		}
 		deltas = append(deltas, delta)
 	}
 	if p.toolActive {
@@ -432,8 +555,13 @@ func (p *ResponseProcessor) Finish() ([]ResponseDelta, error) {
 }
 
 func DecodeResponse(r io.Reader, names map[string]string) (ResponseData, error) {
+	return DecodeResponseWithOptions(context.Background(), r, names, bodysource.CaptureOptions{})
+}
+
+func DecodeResponseWithOptions(ctx context.Context, r io.Reader, names map[string]string, options bodysource.CaptureOptions) (ResponseData, error) {
 	decoder := NewDecoder()
-	processor := NewResponseProcessor(names)
+	processor := NewResponseProcessorWithOptions(ctx, names, options)
+	defer processor.Close()
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := r.Read(buf)
@@ -469,6 +597,7 @@ func DecodeResponse(r io.Reader, names map[string]string) (ResponseData, error) 
 // tool inputs are validated at stream completion.
 func applyFrame(out *ResponseData, frame Frame, names map[string]string, tools map[string]int) error {
 	processor := NewResponseProcessor(names)
+	defer processor.Close()
 	processor.data = *out
 	// applyFrame predates the stateful processor and has no production callers.
 	// Preserve state through a private sentinel for package-local compatibility;

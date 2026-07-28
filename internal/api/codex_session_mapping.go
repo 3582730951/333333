@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/leakfilter"
@@ -33,6 +34,7 @@ import (
 
 type codexSessionMappingContextKey struct{}
 type codexStrictCPAContextKey struct{}
+type codexDownstreamIdentityContextKey struct{}
 
 type codexSessionGate struct {
 	semaphore chan struct{}
@@ -47,6 +49,11 @@ type codexDownstreamIdentity struct {
 	ForkedFromID string
 	ResponseID   string
 	TurnState    string
+}
+
+type codexDownstreamIdentityContext struct {
+	body     []byte
+	identity codexDownstreamIdentity
 }
 
 func (i codexDownstreamIdentity) stateful() bool {
@@ -173,9 +180,13 @@ func codexStrictCPAFromContext(ctx context.Context) bool {
 }
 
 func (s *Server) codexSessionMappingEnabled(ctx context.Context) bool {
-	// Mapping is the identity boundary: downstream session/thread ids are lookup
-	// aliases only, while the upstream sees locally generated UUIDv7 values. When
-	// mapping is enabled it therefore takes precedence over legacy stateless mode.
+	// HTTP stateless mode intentionally wins over mapping. It is the stable default:
+	// previous_response_id never reaches an account that may differ from the one that
+	// created it. A downstream WebSocket remains one pinned connection, so stateless
+	// mode is disabled there and mapping may still protect its native identity.
+	if s.codexStatelessPassthrough(ctx) {
+		return false
+	}
 	return s.flagEnabled(ctx, "codex_session_mapping_enabled", s.cfg.CodexSessionMappingEnabled)
 }
 
@@ -189,9 +200,6 @@ func (s *Server) codexStatelessPassthrough(ctx context.Context) bool {
 	// This also keeps codexSessionMappingEnabled at its configured value for the WS path,
 	// matching its pre-passthrough behavior exactly.
 	if forceCodexResponsesWebSocket(ctx) {
-		return false
-	}
-	if s.flagEnabled(ctx, "codex_session_mapping_enabled", s.cfg.CodexSessionMappingEnabled) {
 		return false
 	}
 	return s.flagEnabled(ctx, "codex_stateless_passthrough", s.cfg.CodexStatelessPassthrough)
@@ -219,60 +227,88 @@ func codexHeaderValue(h http.Header, key string) string {
 	return ""
 }
 
-func codexJSONMap(raw []byte) map[string]interface{} {
-	var root map[string]interface{}
-	if json.Unmarshal(raw, &root) != nil {
-		return nil
-	}
-	return root
-}
-
-func codexMapStringAPI(root map[string]interface{}, key string) string {
-	if root == nil {
-		return ""
-	}
-	value, _ := root[key].(string)
-	return strings.TrimSpace(value)
-}
-
-func codexTurnMapAPI(root map[string]interface{}, metadata map[string]interface{}, headers http.Header) map[string]interface{} {
-	for _, candidate := range []string{
-		codexMapStringAPI(metadata, "x-codex-turn-metadata"),
-		codexHeaderValue(headers, "x-codex-turn-metadata"),
-	} {
-		if candidate == "" {
-			continue
-		}
-		var turn map[string]interface{}
-		if json.Unmarshal([]byte(candidate), &turn) == nil {
-			return turn
-		}
-	}
-	if raw, ok := root["turn_metadata"].(map[string]interface{}); ok {
-		return raw
-	}
-	return nil
-}
-
 // codexDownstreamSessionIdentity reads only true client correlators. Model name,
 // prompt-cache key, request body prefix and API key are intentionally excluded: none
 // is a session identity and using them would merge independent CLI conversations.
 func codexDownstreamSessionIdentity(headers http.Header, body []byte) codexDownstreamIdentity {
-	root := codexJSONMap(body)
-	metadata, _ := root["client_metadata"].(map[string]interface{})
-	turn := codexTurnMapAPI(root, metadata, headers)
+	return codexDownstreamSessionIdentityWithMeta(headers, body, nil)
+}
+
+func codexDownstreamSessionIdentityWithMeta(headers http.Header, body []byte, meta *bodysource.BodyMeta) codexDownstreamIdentity {
+	metaUsable := meta != nil && meta.Size == int64(len(body))
+	hasMetadata := !metaUsable || meta.Fields["client_metadata"].Length > 0
+	hasTurnObject := !metaUsable || meta.Fields["turn_metadata"].Length > 0
+	metaString := func(key string) string {
+		if !metaUsable {
+			return ""
+		}
+		switch key {
+		case "thread_id":
+			return strings.TrimSpace(meta.ThreadID)
+		case "session_id":
+			return strings.TrimSpace(meta.SessionID)
+		case "conversation_id":
+			return strings.TrimSpace(meta.ConversationID)
+		case "previous_response_id":
+			return strings.TrimSpace(meta.PreviousResponseID)
+		}
+		var value string
+		if raw := meta.Scalars[key]; len(raw) > 0 && json.Unmarshal(raw, &value) == nil {
+			return strings.TrimSpace(value)
+		}
+		return ""
+	}
+	jsonString := func(path string) string {
+		value := gjson.GetBytes(body, path)
+		if value.Type != gjson.String {
+			return ""
+		}
+		return strings.TrimSpace(value.String())
+	}
+	rootString := func(key string) string {
+		if metaUsable {
+			return metaString(key)
+		}
+		return jsonString(key)
+	}
+	metadataString := func(key string) string {
+		if !hasMetadata {
+			return ""
+		}
+		return jsonString("client_metadata." + key)
+	}
+	embeddedTurn := ""
+	for _, candidate := range []string{metadataString("x-codex-turn-metadata"), codexHeaderValue(headers, "x-codex-turn-metadata")} {
+		if candidate != "" && gjson.Parse(candidate).IsObject() {
+			embeddedTurn = candidate
+			break
+		}
+	}
+	turnString := func(key string) string {
+		if embeddedTurn != "" {
+			value := gjson.Get(embeddedTurn, key)
+			if value.Type == gjson.String {
+				return strings.TrimSpace(value.String())
+			}
+			return ""
+		}
+		if !hasTurnObject {
+			return ""
+		}
+		return jsonString("turn_metadata." + key)
+	}
 	value := func(header string, bodyKeys ...string) string {
 		if v := codexHeaderValue(headers, header); v != "" {
 			return v
 		}
 		for _, key := range bodyKeys {
-			if v := codexMapStringAPI(metadata, key); v != "" {
+			if v := metadataString(key); v != "" {
 				return v
 			}
-			if v := codexMapStringAPI(root, key); v != "" {
+			if v := rootString(key); v != "" {
 				return v
 			}
-			if v := codexMapStringAPI(turn, key); v != "" {
+			if v := turnString(key); v != "" {
 				return v
 			}
 		}
@@ -288,19 +324,19 @@ func codexDownstreamSessionIdentity(headers http.Header, body []byte) codexDowns
 	sessionID := value("session-id", "session_id")
 	parentID := value("x-codex-parent-thread-id", "x-codex-parent-thread-id", "parent_thread_id")
 	forkedFrom := value("x-codex-forked-from-thread-id", "forked_from_thread_id")
-	responseID := codexMapStringAPI(root, "previous_response_id")
+	responseID := rootString("previous_response_id")
 	turnState := firstNonEmpty(
 		codexHeaderValue(headers, "x-codex-turn-state"),
-		codexMapStringAPI(metadata, "x-codex-turn-state"),
-		codexMapStringAPI(root, "turn_state"),
-		codexMapStringAPI(turn, "x-codex-turn-state"),
-		codexMapStringAPI(turn, "turn_state"),
+		metadataString("x-codex-turn-state"),
+		rootString("turn_state"),
+		turnString("x-codex-turn-state"),
+		turnString("turn_state"),
 	)
 
 	// A client may carry only a window id. Its prefix is the real thread id; the
 	// ordinal is not a root identity and must never be used to create a new branch.
 	if threadID == "" {
-		if window := firstNonEmpty(codexHeaderValue(headers, "x-codex-window-id"), codexMapStringAPI(metadata, "x-codex-window-id")); window != "" {
+		if window := firstNonEmpty(codexHeaderValue(headers, "x-codex-window-id"), metadataString("x-codex-window-id")); window != "" {
 			if idx := strings.LastIndex(window, ":"); idx > 0 {
 				threadID = strings.TrimSpace(window[:idx])
 			}
@@ -327,6 +363,21 @@ func codexDownstreamSessionIdentity(headers http.Header, body []byte) codexDowns
 		ResponseID:   strings.TrimSpace(responseID),
 		TurnState:    strings.TrimSpace(turnState),
 	}
+}
+
+func withCodexDownstreamIdentity(ctx context.Context, body []byte, identity codexDownstreamIdentity) context.Context {
+	return context.WithValue(ctx, codexDownstreamIdentityContextKey{}, codexDownstreamIdentityContext{body: body, identity: identity})
+}
+
+func codexDownstreamSessionIdentityForRequest(r *http.Request, body []byte) codexDownstreamIdentity {
+	if r != nil {
+		if cached, ok := r.Context().Value(codexDownstreamIdentityContextKey{}).(codexDownstreamIdentityContext); ok &&
+			len(cached.body) == len(body) && (len(body) == 0 || &cached.body[0] == &body[0]) {
+			return cached.identity
+		}
+		return codexDownstreamSessionIdentity(r.Header, body)
+	}
+	return codexDownstreamSessionIdentity(nil, body)
 }
 
 // codexRetiredEpochFreshRootRequest removes only the account-local state pointers
@@ -583,7 +634,7 @@ func codexSessionGateKey(pol downstreamPolicy, r *http.Request, body []byte) str
 	if r == nil {
 		return ""
 	}
-	id := codexDownstreamSessionIdentity(r.Header, body)
+	id := codexDownstreamSessionIdentityForRequest(r, body)
 	kind, value := "branch", id.ThreadID
 	if value == "" {
 		kind, value = "root", id.RootID
@@ -685,7 +736,7 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 		return mapping, nil
 	}
 	mapping.namespace = codexSessionNamespace(pol, r)
-	mapping.identity = codexDownstreamSessionIdentity(r.Header, body)
+	mapping.identity = codexDownstreamSessionIdentityForRequest(r, body)
 	id := mapping.identity
 	lookupBranchOrRoot := func(value string) (*storage.CodexSessionBinding, error) {
 		if value == "" {
@@ -1300,11 +1351,16 @@ func (s *Server) emitCodexNativeContinuationFailure(ctx context.Context, w io.Wr
 // codexSessionMappingStats contains aggregate-only operational data. None of the
 // HMAC aliases, internal UUIDs, response ids, or request content is exposed.
 func (s *Server) codexSessionMappingStats(ctx context.Context) map[string]interface{} {
+	stateless := s.codexStatelessPassthrough(ctx)
+	return s.codexSessionMappingStatsConfigured(ctx, s.store, !stateless && s.codexSessionMappingEnabled(ctx), stateless, s.codexCPAStrict(ctx), int(s.codexSessionMappingRetention(ctx).Hours()/24))
+}
+
+func (s *Server) codexSessionMappingStatsConfigured(ctx context.Context, metricsStore *storage.Store, enabled, stateless, strict bool, retentionDays int) map[string]interface{} {
 	stats := map[string]interface{}{
-		"enabled":                        s.codexSessionMappingEnabled(ctx),
-		"stateless_passthrough":          s.codexStatelessPassthrough(ctx),
-		"strict_cpa":                     s.codexCPAStrict(ctx),
-		"retention_days":                 int(s.codexSessionMappingRetention(ctx).Hours() / 24),
+		"enabled":                        enabled,
+		"stateless_passthrough":          stateless,
+		"strict_cpa":                     strict,
+		"retention_days":                 retentionDays,
 		"bindings_created":               atomic.LoadUint64(&s.codexMappingBindingsCreated),
 		"epoch_rotations":                atomic.LoadUint64(&s.codexMappingEpochRotations),
 		"fresh_roots_after_context_loss": atomic.LoadUint64(&s.codexMappingFreshRoots),
@@ -1313,10 +1369,10 @@ func (s *Server) codexSessionMappingStats(ctx context.Context) map[string]interf
 		"native_continues":               atomic.LoadUint64(&s.codexNativeContinues),
 		"eof_compensations":              atomic.LoadUint64(&s.codexEOFCompensations),
 	}
-	if s.store == nil {
+	if metricsStore == nil {
 		return stats
 	}
-	if active, retired, err := s.store.CodexSessionMappingMetrics(ctx); err == nil {
+	if active, retired, err := metricsStore.CodexSessionMappingMetrics(ctx); err == nil {
 		stats["active"] = active
 		stats["retired"] = retired
 	}
@@ -1324,16 +1380,7 @@ func (s *Server) codexSessionMappingStats(ctx context.Context) map[string]interf
 }
 
 func responseTurnState(header http.Header, body []byte) string {
-	root := codexJSONMap(body)
-	metadata, _ := root["client_metadata"].(map[string]interface{})
-	turn := codexTurnMapAPI(root, metadata, header)
-	return firstNonEmpty(
-		codexHeaderValue(header, "x-codex-turn-state"),
-		codexMapStringAPI(root, "turn_state"),
-		codexMapStringAPI(metadata, "x-codex-turn-state"),
-		codexMapStringAPI(turn, "x-codex-turn-state"),
-		codexMapStringAPI(turn, "turn_state"),
-	)
+	return codexDownstreamSessionIdentity(header, body).TurnState
 }
 
 // commitCodexSessionMapping is the terminal-only counterpart of identitySnapshot.
@@ -1503,7 +1550,7 @@ func (s *Server) auditCodexMappingFailure(ctx context.Context, code string) {
 	default:
 		atomic.AddUint64(&s.codexMappingUnidentified, 1)
 	}
-	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "codex_session_mapping_" + strings.TrimPrefix(code, "codex_session_mapping_"), State: "visible_error", Reason: code, Detail: "no_raw_identifiers"})
+	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: code, State: "visible_error", Reason: code, Detail: "no_raw_identifiers"})
 }
 
 func (s *Server) codexMappingContextHeader(w http.ResponseWriter) {

@@ -21,12 +21,16 @@ func (s *Server) maybePrewarmClaudeCache(ctx context.Context, mode string, req u
 	if !strings.Contains(path, "/v1/messages") || strings.Contains(path, "count_tokens") || req.PassThrough {
 		return false
 	}
-	body, ok := claudeCachePrewarmBody(req.Body)
+	raw, err := req.ReadBody()
+	if err != nil {
+		return false
+	}
+	body, ok := claudeCachePrewarmBody(raw)
 	if !ok {
 		return false
 	}
 	warmReq := req
-	warmReq.Body = body
+	warmReq.SetBodyBytes(body)
 	warmReq.Headers = req.Headers.Clone()
 	run := func(runCtx context.Context) {
 		resp, err := s.upstream.Do(runCtx, warmReq)

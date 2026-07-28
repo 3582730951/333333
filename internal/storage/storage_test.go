@@ -44,6 +44,99 @@ func TestInitCreatesCyberGroupAndDirectEgress(t *testing.T) {
 	}
 }
 
+func TestCodexHTTPStatelessMigrationUpdatesOnlyLegacyStableProfileOnce(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	const marker = "codex_http_stateless_v1_migrated"
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM settings WHERE key=?`, marker); err != nil {
+		t.Fatal(err)
+	}
+	store.InvalidateSettingsCache()
+	if err := store.SetSettings(ctx, map[string]string{
+		"codex_session_mapping_enabled": "true",
+		"codex_stateless_passthrough":   "false",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrateCodexHTTPStateless(ctx, Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := store.GetSetting(ctx, "codex_stateless_passthrough"); err != nil || !ok || got != "true" {
+		t.Fatalf("migrated stateless setting=%q present=%v err=%v", got, ok, err)
+	}
+	if got, ok, err := store.GetSetting(ctx, "codex_session_mapping_enabled"); err != nil || !ok || got != "true" {
+		t.Fatalf("mapping setting=%q present=%v err=%v", got, ok, err)
+	}
+
+	// A later explicit operator choice must not be overwritten on every restart.
+	if err := store.SetSetting(ctx, "codex_stateless_passthrough", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrateCodexHTTPStateless(ctx, Now()+1); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := store.GetSetting(ctx, "codex_stateless_passthrough"); err != nil || got != "false" {
+		t.Fatalf("post-migration operator setting=%q err=%v", got, err)
+	}
+}
+
+func TestCodexNativeCacheMigrationRevertsOnlyAutoForcedStateless(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for _, marker := range []string{"codex_http_stateless_v1_migrated", "codex_native_cache_default_v2_migrated"} {
+		if _, err := store.DB().ExecContext(ctx, `DELETE FROM settings WHERE key=?`, marker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.InvalidateSettingsCache()
+	if err := store.SetSettings(ctx, map[string]string{"codex_session_mapping_enabled": "true", "codex_stateless_passthrough": "false"}); err != nil {
+		t.Fatal(err)
+	}
+	now := Now() + 10
+	if err := store.migrateCodexHTTPStateless(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrateCodexNativeCacheDefault(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := store.GetSetting(ctx, "codex_stateless_passthrough"); err != nil || got != "false" {
+		t.Fatalf("auto-forced stateless value was not repaired: value=%q err=%v", got, err)
+	}
+	if err := store.SetSetting(ctx, "codex_stateless_passthrough", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrateCodexNativeCacheDefault(ctx, now+1); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := store.GetSetting(ctx, "codex_stateless_passthrough"); err != nil || got != "true" {
+		t.Fatalf("explicit post-migration operator choice changed: value=%q err=%v", got, err)
+	}
+}
+
+func TestCodexNativeCacheMigrationPreservesExplicitStateless(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for _, marker := range []string{"codex_http_stateless_v1_migrated", "codex_native_cache_default_v2_migrated"} {
+		if _, err := store.DB().ExecContext(ctx, `DELETE FROM settings WHERE key=?`, marker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.InvalidateSettingsCache()
+	if err := store.SetSettings(ctx, map[string]string{"codex_session_mapping_enabled": "true", "codex_stateless_passthrough": "true"}); err != nil {
+		t.Fatal(err)
+	}
+	now := Now() + 20
+	if err := store.migrateCodexHTTPStateless(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrateCodexNativeCacheDefault(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := store.GetSetting(ctx, "codex_stateless_passthrough"); err != nil || got != "true" {
+		t.Fatalf("explicit stateless choice changed: value=%q err=%v", got, err)
+	}
+}
+
 func TestAccountImportCreatesEgressBinding(t *testing.T) {
 	store := newTestStore(t)
 	err := store.UpsertAccount(context.Background(), Account{

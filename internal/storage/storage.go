@@ -18,6 +18,7 @@ import (
 	"codex-account-pool/internal/secretbox"
 	"codex-account-pool/internal/supervisor"
 
+	"github.com/google/uuid"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -32,6 +33,8 @@ var (
 )
 
 type Store struct {
+	path   string
+	driver string
 	// db is the single-connection WRITE pool. SQLite permits only one writer at a
 	// time, so funneling every write through one connection means our own
 	// concurrency never collides into SQLITE_BUSY. Init() sets WAL/synchronous on it.
@@ -41,7 +44,7 @@ type Store struct {
 	// the latest committed snapshot, so the per-request account-selection / token /
 	// group SELECTs no longer serialize behind the writer. For an in-memory test DB
 	// it is the same handle as db (see Open).
-	rdb *sql.DB
+	rdb ReadQuerier
 	// tokenKey, when set (32 bytes), enables transparent AES-256-GCM encryption of the
 	// secret columns in account_auth_tokens (access/refresh/id token, upstream api key,
 	// and Agent Identity runtime/private/task credentials),
@@ -66,6 +69,14 @@ type Store struct {
 	apiKeyUsed       sync.Map // key hash -> last persisted minute
 	rateLimitGen     atomic.Uint64
 	affinityGen      atomic.Uint64
+}
+
+// ReadQuerier is the common read surface implemented by sql.DB, sql.Conn, and
+// sql.Tx. Diagnostic exports use it to bind an ordinary Store view to one
+// repeatable snapshot without duplicating the store's row decoding logic.
+type ReadQuerier interface {
+	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
 type Group struct {
@@ -926,7 +937,7 @@ func Open(path string) (*Store, error) {
 		r.SetMaxIdleConns(n)
 		rdb = r
 	}
-	return &Store{db: db, rdb: rdb}, nil
+	return &Store{path: path, driver: "sqlite", db: db, rdb: rdb}, nil
 }
 
 // readPoolSize uses a 2/4/8 memory tier and remains overridable via
@@ -991,8 +1002,8 @@ func OpenInMemory() (*Store, error) {
 }
 
 func (s *Store) Close() error {
-	if s.rdb != nil && s.rdb != s.db {
-		_ = s.rdb.Close()
+	if rdb, ok := s.rdb.(*sql.DB); ok && rdb != s.db {
+		_ = rdb.Close()
 	}
 	return s.db.Close()
 }
@@ -1001,11 +1012,31 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
+
+func (s *Store) InMemory() bool {
+	return s == nil || strings.Contains(s.path, "mode=memory") || s.path == ":memory:"
+}
+
+// ReadDB exposes the WAL read pool for read-only streaming operations such as
+// diagnostics. Callers must never execute mutations through this handle.
+func (s *Store) ReadDB() ReadQuerier {
+	return s.rdb
+}
+
 func Now() int64 {
 	return time.Now().Unix()
 }
 
 func (s *Store) Init(ctx context.Context) error {
+	if s.driver == "postgres" {
+		return s.initPostgres(ctx)
+	}
 	if _, err := s.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA cache_size=-16384; PRAGMA mmap_size=67108864; PRAGMA temp_store=MEMORY;`); err != nil {
 		return err
 	}
@@ -1032,6 +1063,17 @@ func (s *Store) Init(ctx context.Context) error {
 	if err := s.migrate(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateGoalContinuityV2(ctx); err != nil {
+		return err
+	}
+	if err := s.repairLegacyUsageEvents(ctx); err != nil {
+		return err
+	}
+	// New previous_response_id aliases live in affinity_aliases. Legacy rows remain
+	// readable for one compatibility window and are then removed in small batches.
+	if _, err := s.db.ExecContext(ctx, `UPDATE affinity_bindings SET expires_at=updated_at+? WHERE source='previous_response_id' AND expires_at=0`, int64((7*24*time.Hour)/time.Second)); err != nil {
+		return err
+	}
 	if err := s.migrateAccountRateLimits(ctx); err != nil {
 		return err
 	}
@@ -1043,6 +1085,12 @@ func (s *Store) Init(ctx context.Context) error {
 		return err
 	}
 	if err := s.migrateContextJournalTTL(ctx, now); err != nil {
+		return err
+	}
+	if err := s.migrateCodexHTTPStateless(ctx, now); err != nil {
+		return err
+	}
+	if err := s.migrateCodexNativeCacheDefault(ctx, now); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `
@@ -1092,6 +1140,61 @@ ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, CustomProviderProtocolChat
 	return nil
 }
 
+func (s *Store) repairLegacyUsageEvents(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events(event_id, hold_id, account_id, route_key_hash, route_epoch, estimated_tokens, usage_state, terminal_status, usage_recorded_at, settled_at, created_at, updated_at)
+SELECT 'legacy_hold:'||h.id, h.id, h.account_id, h.route_key_hash,
+ COALESCE((SELECT MAX(route_epoch) FROM usage_records u WHERE u.billing_hold_id=h.id),0), h.estimated_tokens,
+ CASE WHEN EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id=h.id AND u.estimated=0) THEN 'real'
+      WHEN EXISTS(SELECT 1 FROM usage_records u WHERE u.billing_hold_id=h.id) THEN 'estimated' ELSE 'pending' END,
+ CASE WHEN h.status='held' THEN '' ELSE h.status END, h.usage_recorded_at,
+ CASE WHEN h.status='held' THEN 0 ELSE h.updated_at END, h.created_at, h.updated_at
+FROM billing_holds h WHERE NOT EXISTS(SELECT 1 FROM usage_events e WHERE e.hold_id=h.id)`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_events(event_id, account_id, route_key_hash, route_epoch, usage_state, usage_recorded_at, created_at, updated_at)
+SELECT usage_event_id, account_id, route_key_hash, route_epoch, CASE WHEN estimated=0 THEN 'real' ELSE 'estimated' END, created_at, created_at, created_at
+FROM usage_records WHERE usage_event_id<>''`); err != nil {
+		return err
+	}
+	// These terminal states represent a failed/retried attempt, not missing billing.
+	// The example diagnostic snapshot had 46 such false pending rows at its manifest
+	// boundary (49 by the later CSV boundary); retain true usage rows when present.
+	if _, err = tx.ExecContext(ctx, `UPDATE billing_holds SET usage_expected=0
+WHERE usage_recorded_at=0 AND status IN ('mapped_session_risk_rotating','stream_mapped_session_risk_rotating','stream_probe_failed','stream_interrupted_compensated')`); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM billing_holds
+WHERE usage_recorded_at=0 AND estimated_tokens>0 AND status IN ('settled','settled_streaming','success_body_rule') ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	var holdIDs []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		holdIDs = append(holdIDs, id)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, holdID := range holdIDs {
+		if err = s.recoverEstimatedUsageForHold(ctx, tx, holdID, Now()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *Store) migrateContextJournalTTL(ctx context.Context, now int64) error {
 	const marker = "context_journal_ttl_1h_migrated"
 	var migrated int
@@ -1115,6 +1218,90 @@ func (s *Store) migrateContextJournalTTL(ctx context.Context, now int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// migrateCodexHTTPStateless updates the one previously shipped stable-profile
+// combination that enabled strict HTTP continuation. New HTTP requests then discard
+// account-local response state before routing, while WebSocket connections may keep
+// using mapping. The marker preserves any operator choice made after this upgrade.
+func (s *Store) migrateCodexHTTPStateless(ctx context.Context, now int64) error {
+	const marker = "codex_http_stateless_v1_migrated"
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var migrated int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, marker).Scan(&migrated); err != nil {
+		return err
+	}
+	if migrated > 0 {
+		return nil
+	}
+	var mapping, stateless string
+	if err := tx.QueryRowContext(ctx, `SELECT
+COALESCE((SELECT lower(trim(value)) FROM settings WHERE key='codex_session_mapping_enabled'),''),
+COALESCE((SELECT lower(trim(value)) FROM settings WHERE key='codex_stateless_passthrough'),'')`).Scan(&mapping, &stateless); err != nil {
+		return err
+	}
+	markerValue := "observed"
+	if mapping == "true" && stateless == "false" {
+		if _, err := tx.ExecContext(ctx, `UPDATE settings SET value='true',updated_at=? WHERE key='codex_stateless_passthrough'`, now); err != nil {
+			return err
+		}
+		markerValue = "forced"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)`, marker, markerValue, now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.InvalidateSettingsCache()
+	return nil
+}
+
+// migrateCodexNativeCacheDefault repairs only the stateless value that the v1
+// migration itself forced. Explicit operator choices remain untouched. Older v1
+// builds stored marker value "1", so matching updated_at values identify their
+// atomic auto-update without guessing from the boolean alone.
+func (s *Store) migrateCodexNativeCacheDefault(ctx context.Context, now int64) error {
+	const marker = "codex_native_cache_default_v2_migrated"
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var migrated int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, marker).Scan(&migrated); err != nil {
+		return err
+	}
+	if migrated > 0 {
+		return nil
+	}
+	var v1Value, stateless string
+	var v1Updated, statelessUpdated int64
+	if err := tx.QueryRowContext(ctx, `SELECT
+COALESCE((SELECT lower(trim(value)) FROM settings WHERE key='codex_http_stateless_v1_migrated'),''),
+COALESCE((SELECT updated_at FROM settings WHERE key='codex_http_stateless_v1_migrated'),0),
+COALESCE((SELECT lower(trim(value)) FROM settings WHERE key='codex_stateless_passthrough'),''),
+COALESCE((SELECT updated_at FROM settings WHERE key='codex_stateless_passthrough'),0)`).Scan(&v1Value, &v1Updated, &stateless, &statelessUpdated); err != nil {
+		return err
+	}
+	autoForced := v1Value == "forced" || v1Value == "1" && v1Updated > 0 && v1Updated == statelessUpdated
+	if autoForced && stateless == "true" {
+		if _, err := tx.ExecContext(ctx, `UPDATE settings SET value='false',updated_at=? WHERE key='codex_stateless_passthrough'`, now); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)`, marker, "1", now); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.InvalidateSettingsCache()
+	return nil
 }
 
 const schemaSQL = `
@@ -1304,6 +1491,22 @@ CREATE TABLE IF NOT EXISTS affinity_bindings(
 	expires_at INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS affinity_aliases(
+  route_key_hash TEXT PRIMARY KEY,
+  route_key TEXT NOT NULL,
+  source TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  provider TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  egress_id TEXT NOT NULL DEFAULT '',
+  epoch INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_affinity_aliases_expiry ON affinity_aliases(expires_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_affinity_aliases_account ON affinity_aliases(account_id, updated_at);
 CREATE TABLE IF NOT EXISTS egress_profiles(
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -1411,6 +1614,22 @@ CREATE TABLE IF NOT EXISTS billing_holds(
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_billing_holds_status_updated ON billing_holds(status, updated_at);
+CREATE TABLE IF NOT EXISTS usage_events(
+  event_id TEXT PRIMARY KEY,
+  hold_id TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  route_key_hash TEXT NOT NULL DEFAULT '',
+  route_epoch INTEGER NOT NULL DEFAULT 0,
+  estimated_tokens INTEGER NOT NULL DEFAULT 0,
+  usage_state TEXT NOT NULL DEFAULT 'pending',
+  terminal_status TEXT NOT NULL DEFAULT '',
+  usage_recorded_at INTEGER NOT NULL DEFAULT 0,
+  settled_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_hold_id ON usage_events(hold_id) WHERE hold_id <> '';
+CREATE INDEX IF NOT EXISTS idx_usage_events_state_updated ON usage_events(usage_state, updated_at);
 CREATE TABLE IF NOT EXISTS usage_records(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   usage_event_id TEXT NOT NULL DEFAULT '',
@@ -1949,6 +2168,9 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE usage_records ADD COLUMN model_override_source TEXT NOT NULL DEFAULT 'none'`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_expected INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE billing_holds ADD COLUMN usage_recorded_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE goal_session ADD COLUMN storage_bytes INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE goal_checkpoint ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE goal_segment ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_records_event_id ON usage_records(usage_event_id) WHERE usage_event_id <> ''`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_records_created_model ON usage_records(created_at, model)`,
 		// Per-account usage rollups (the admin account list's UsageSummaryByAccountIDs)
@@ -4158,6 +4380,7 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 		`DELETE FROM account_codex_reauth_config WHERE account_id = ?`,
 		`DELETE FROM account_rate_limits WHERE account_id = ?`,
 		`DELETE FROM account_model_capabilities WHERE account_id = ?`,
+		`DELETE FROM affinity_aliases WHERE account_id = ?`,
 		`DELETE FROM affinity_bindings WHERE account_id = ?`,
 		`DELETE FROM account_egress_bindings WHERE account_id = ?`,
 		`DELETE FROM account_session_cookies WHERE account_id = ?`,
@@ -6133,20 +6356,37 @@ func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding,
 }
 
 func (s *Store) GetAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
-	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at, expires_at FROM affinity_bindings WHERE route_key_hash = ? AND (expires_at = 0 OR expires_at > ?)`, routeKeyHash, Now())
+	now := Now()
+	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at FROM (
+SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at,0 AS source_rank FROM affinity_aliases WHERE route_key_hash=? AND expires_at>?
+UNION ALL
+SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at,1 AS source_rank FROM affinity_bindings WHERE route_key_hash=? AND (expires_at=0 OR expires_at>?)
+) ORDER BY source_rank LIMIT 1`, routeKeyHash, now, routeKeyHash, now)
 	var b AffinityBinding
 	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt)
 	return b, err
 }
 
 func (s *Store) UpsertAffinityBinding(ctx context.Context, b AffinityBinding) error {
+	_, err := s.UpsertAffinityBindingResult(ctx, b)
+	return err
+}
+
+func (s *Store) UpsertAffinityBindingResult(ctx context.Context, b AffinityBinding) (AffinityBinding, error) {
 	now := Now()
 	if b.CreatedAt == 0 {
 		b.CreatedAt = now
 	}
 	b.UpdatedAt = now
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO affinity_bindings(route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at, expires_at)
+	table := "affinity_bindings"
+	if b.Source == "previous_response_id" {
+		table = "affinity_aliases"
+		if b.ExpiresAt <= now {
+			b.ExpiresAt = now + int64((7*24*time.Hour)/time.Second)
+		}
+	}
+	row := s.db.QueryRowContext(ctx, `
+INSERT INTO `+table+`(route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at, expires_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(route_key_hash) DO UPDATE SET
  account_id = excluded.account_id,
@@ -6154,15 +6394,51 @@ ON CONFLICT(route_key_hash) DO UPDATE SET
  route_key = excluded.route_key,
  provider = excluded.provider,
  model = excluded.model,
- egress_id = excluded.egress_id,
+	 egress_id = excluded.egress_id,
 	expires_at = excluded.expires_at,
- epoch = affinity_bindings.epoch + 1,
- updated_at = excluded.updated_at`,
+	 epoch = `+table+`.epoch + CASE WHEN `+table+`.account_id<>excluded.account_id OR `+table+`.provider<>excluded.provider OR `+table+`.model<>excluded.model OR `+table+`.egress_id<>excluded.egress_id THEN 1 ELSE 0 END,
+	 updated_at = excluded.updated_at
+RETURNING route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at`,
 		b.RouteKeyHash, b.RouteKey, b.Source, b.AccountID, b.Provider, b.Model, b.EgressID, b.Epoch, b.CreatedAt, b.UpdatedAt, b.ExpiresAt)
+	var stored AffinityBinding
+	err := row.Scan(&stored.RouteKeyHash, &stored.RouteKey, &stored.Source, &stored.AccountID, &stored.Provider, &stored.Model, &stored.EgressID, &stored.Epoch, &stored.CreatedAt, &stored.UpdatedAt, &stored.ExpiresAt)
 	if err == nil {
 		s.affinityGen.Add(1)
 	}
-	return err
+	return stored, err
+}
+
+// CleanupAffinityAliases removes expired v2 aliases and legacy previous-response
+// rows in bounded batches. It returns the total deleted rows.
+func (s *Store) CleanupAffinityAliases(ctx context.Context, batch int) (int64, error) {
+	if batch <= 0 {
+		batch = 256
+	}
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var deleted int64
+	for _, statement := range []string{
+		`DELETE FROM affinity_aliases WHERE rowid IN (SELECT rowid FROM affinity_aliases WHERE expires_at<=? ORDER BY expires_at LIMIT ?)`,
+		`DELETE FROM affinity_bindings WHERE rowid IN (SELECT rowid FROM affinity_bindings WHERE source='previous_response_id' AND expires_at>0 AND expires_at<=? ORDER BY expires_at LIMIT ?)`,
+	} {
+		result, execErr := tx.ExecContext(ctx, statement, now, batch)
+		if execErr != nil {
+			return 0, execErr
+		}
+		rows, _ := result.RowsAffected()
+		deleted += rows
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	if deleted > 0 {
+		s.affinityGen.Add(1)
+	}
+	return deleted, nil
 }
 
 func (s *Store) AffinityGeneration() uint64 { return s.affinityGen.Load() }
@@ -6984,13 +7260,14 @@ type UsageRecordWrite struct {
 }
 
 type BillingHoldWrite struct {
-	ID, RouteKeyHash, AccountID, Status string
-	EstimatedTokens, CreatedAt          int64
-	Create, IfHeld                      bool
+	ID, EventID, RouteKeyHash, AccountID, Status string
+	EstimatedTokens, RouteEpoch, CreatedAt       int64
+	Create, IfHeld                               bool
 }
 
 type sqlExecContext interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
 func (s *Store) InsertUsageRecordWithDiagnostics(ctx context.Context, accountID, routeKeyHash, apiKeyHash, userID, model string, prompt, completion, total, cached, cacheRead, cacheCreation int64, raw json.RawMessage, diag UsageDiagnostics) error {
@@ -7011,6 +7288,15 @@ func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWri
 	}
 	defer tx.Rollback()
 	persistedKeyMinutes := make(map[string]int64, len(apiKeyUsed))
+	// A batch can contain the hold create, usage and settlement for one request.
+	// Create shells first so usage can mark the hold, then settle after usage merge.
+	for _, hold := range holds {
+		if hold.Create {
+			if err := s.applyBillingHoldCreate(ctx, tx, hold); err != nil {
+				return err
+			}
+		}
+	}
 	for _, write := range writes {
 		if err := s.insertUsageRecord(ctx, tx, write); err != nil {
 			return err
@@ -7027,26 +7313,10 @@ func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWri
 		persistedKeyMinutes[keyHash] = minute
 	}
 	for _, hold := range holds {
-		now := hold.CreatedAt
-		if now == 0 {
-			now = Now()
-		}
-		if hold.Create {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, usage_expected, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', 1, ?, ?) ON CONFLICT(id) DO NOTHING`, hold.ID, hold.RouteKeyHash, hold.AccountID, hold.EstimatedTokens, now, now); err != nil {
+		if !hold.Create {
+			if err := s.applyBillingHoldSettlement(ctx, tx, hold); err != nil {
 				return err
 			}
-			continue
-		}
-		status := hold.Status
-		if status == "" {
-			status = "settled"
-		}
-		query := `UPDATE billing_holds SET status = ?, updated_at = ?, usage_expected = CASE WHEN usage_recorded_at > 0 THEN 1 WHEN ? LIKE 'failed%%' OR ? IN ('abandoned','context_recovery_retry','responses_context_error_terminal') THEN 0 ELSE usage_expected END WHERE id = ?`
-		if hold.IfHeld {
-			query += ` AND status = 'held'`
-		}
-		if _, err := tx.ExecContext(ctx, query, status, now, status, status, hold.ID); err != nil {
-			return err
 		}
 	}
 	for _, row := range audits {
@@ -7070,11 +7340,121 @@ func (s *Store) BatchWriteTelemetry(ctx context.Context, writes []UsageRecordWri
 	return nil
 }
 
+func (s *Store) applyBillingHoldCreate(ctx context.Context, tx *sql.Tx, hold BillingHoldWrite) error {
+	now := hold.CreatedAt
+	if now == 0 {
+		now = Now()
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, usage_expected, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', 1, ?, ?) ON CONFLICT(id) DO NOTHING`, hold.ID, hold.RouteKeyHash, hold.AccountID, hold.EstimatedTokens, now, now); err != nil {
+		return err
+	}
+	eventID := strings.TrimSpace(hold.EventID)
+	if eventID == "" {
+		eventID = "usage_" + hold.ID
+	}
+	// A journal replay may contain a historical duplicate hold ID from the old
+	// timestamp-based generator. Treat either unique-key conflict as an idempotent
+	// shell replay so one poison record cannot block every later metering event.
+	_, err := tx.ExecContext(ctx, `INSERT INTO usage_events(event_id, hold_id, account_id, route_key_hash, route_epoch, estimated_tokens, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+		eventID, hold.ID, hold.AccountID, hold.RouteKeyHash, hold.RouteEpoch, hold.EstimatedTokens, now, now)
+	return err
+}
+
+func billingStatusExpectsUsage(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "held", "settled", "settled_streaming", "success_body_rule":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) applyBillingHoldSettlement(ctx context.Context, tx *sql.Tx, hold BillingHoldWrite) error {
+	now := hold.CreatedAt
+	if now == 0 {
+		now = Now()
+	}
+	status := strings.TrimSpace(hold.Status)
+	if status == "" {
+		status = "settled"
+	}
+	expectsUsage := billingStatusExpectsUsage(status)
+	query := `UPDATE billing_holds SET status=?, updated_at=?, usage_expected=CASE WHEN usage_recorded_at>0 THEN 1 ELSE ? END WHERE id=?`
+	args := []interface{}{status, now, boolInt(expectsUsage), hold.ID}
+	if hold.IfHeld {
+		query += ` AND status='held'`
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed == 0 {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE usage_events SET terminal_status=?, settled_at=?, updated_at=MAX(updated_at,?) WHERE hold_id=?`, status, now, now, hold.ID); err != nil {
+		return err
+	}
+	if !expectsUsage {
+		return nil
+	}
+	return s.recoverEstimatedUsageForHold(ctx, tx, hold.ID, now)
+}
+
+func (s *Store) recoverEstimatedUsageForHold(ctx context.Context, tx *sql.Tx, holdID string, now int64) error {
+	var eventID, accountID, routeKeyHash string
+	var estimatedTokens, routeEpoch, usageRecordedAt int64
+	err := tx.QueryRowContext(ctx, `SELECT e.event_id, h.account_id, h.route_key_hash, h.estimated_tokens, e.route_epoch, h.usage_recorded_at
+FROM billing_holds h JOIN usage_events e ON e.hold_id=h.id WHERE h.id=?`, holdID).Scan(&eventID, &accountID, &routeKeyHash, &estimatedTokens, &routeEpoch, &usageRecordedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil || usageRecordedAt > 0 {
+		return err
+	}
+	if estimatedTokens <= 0 {
+		_, err = tx.ExecContext(ctx, `UPDATE billing_holds SET usage_expected=0 WHERE id=?`, holdID)
+		return err
+	}
+	write := UsageRecordWrite{AccountID: accountID, RouteKeyHash: routeKeyHash, Model: "unknown", Prompt: estimatedTokens, Total: estimatedTokens,
+		Raw: json.RawMessage(`{"estimated":true,"recovered_from_hold":true}`), Diagnostics: UsageDiagnostics{
+			UsageEventID: eventID, UsageSource: "hold_recovery", Estimated: true, BillingHoldID: holdID, RouteEpoch: routeEpoch,
+		}}
+	if err = s.insertUsageRecord(ctx, tx, write); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE usage_events SET updated_at=MAX(updated_at,?) WHERE event_id=?`, now, eventID)
+	return err
+}
+
 func (s *Store) insertUsageRecord(ctx context.Context, exec sqlExecContext, write UsageRecordWrite) error {
 	accountID, routeKeyHash, apiKeyHash, userID, model := write.AccountID, write.RouteKeyHash, write.APIKeyHash, write.UserID, write.Model
 	prompt, completion, total, cached := write.Prompt, write.Completion, write.Total, write.Cached
 	cacheRead, cacheCreation, raw, diag := write.CacheRead, write.CacheCreation, write.Raw, write.Diagnostics
+	if diag.BillingHoldID != "" {
+		var eventID string
+		err := exec.QueryRowContext(ctx, `SELECT event_id FROM usage_events WHERE hold_id=?`, diag.BillingHoldID).Scan(&eventID)
+		if err == nil {
+			diag.UsageEventID = eventID
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if diag.UsageEventID == "" && diag.BillingHoldID != "" {
+		diag.UsageEventID = "usage_" + diag.BillingHoldID
+	}
 	diag = finalizeUsageDiagnostics(model, prompt, cached, cacheRead, cacheCreation, raw, diag)
+	now := Now()
+	if diag.UsageEventID != "" {
+		if _, err := exec.ExecContext(ctx, `INSERT INTO usage_events(event_id, hold_id, account_id, route_key_hash, route_epoch, estimated_tokens, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(event_id) DO UPDATE SET hold_id=CASE WHEN excluded.hold_id<>'' THEN excluded.hold_id ELSE usage_events.hold_id END,
+ account_id=CASE WHEN excluded.account_id<>'' THEN excluded.account_id ELSE usage_events.account_id END,
+ route_key_hash=CASE WHEN excluded.route_key_hash<>'' THEN excluded.route_key_hash ELSE usage_events.route_key_hash END,
+ route_epoch=CASE WHEN excluded.route_epoch>0 THEN excluded.route_epoch ELSE usage_events.route_epoch END,
+ updated_at=MAX(usage_events.updated_at,excluded.updated_at)`, diag.UsageEventID, diag.BillingHoldID, accountID, routeKeyHash, diag.RouteEpoch, total, now, now); err != nil {
+			return err
+		}
+	}
 	_, err := exec.ExecContext(ctx, `INSERT INTO usage_records(
 usage_event_id, account_id, route_key_hash, api_key_hash, user_id, model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_read_tokens, cache_creation_tokens,
 usage_provider, usage_source, cache_read_present, cache_creation_present, compatibility_losses_json, cache_capability,
@@ -7087,12 +7467,24 @@ latest_user_cache_control, latest_user_auto_context_cache_control, latest_user_t
 raw_usage_json, created_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(usage_event_id) WHERE usage_event_id <> '' DO UPDATE SET
- account_id=excluded.account_id, route_key_hash=excluded.route_key_hash, api_key_hash=excluded.api_key_hash, user_id=excluded.user_id,
- model=excluded.model, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens,
- cached_tokens=excluded.cached_tokens, cache_read_tokens=excluded.cache_read_tokens, cache_creation_tokens=excluded.cache_creation_tokens,
- usage_provider=excluded.usage_provider, usage_source=excluded.usage_source, estimated=excluded.estimated, kiro_credits=excluded.kiro_credits,
- kiro_credits_present=excluded.kiro_credits_present, billing_hold_id=excluded.billing_hold_id, requested_model=excluded.requested_model,
- resolved_model=excluded.resolved_model, model_override_source=excluded.model_override_source, raw_usage_json=excluded.raw_usage_json
+	 account_id=excluded.account_id, route_key_hash=excluded.route_key_hash, api_key_hash=excluded.api_key_hash, user_id=excluded.user_id,
+	 model=excluded.model, prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens, total_tokens=excluded.total_tokens,
+	 cached_tokens=excluded.cached_tokens, cache_read_tokens=excluded.cache_read_tokens, cache_creation_tokens=excluded.cache_creation_tokens,
+	 usage_provider=excluded.usage_provider, usage_source=excluded.usage_source, cache_read_present=excluded.cache_read_present,
+	 cache_creation_present=excluded.cache_creation_present, compatibility_losses_json=excluded.compatibility_losses_json, cache_capability=excluded.cache_capability,
+	 estimated=excluded.estimated, cache_miss_tokens=excluded.cache_miss_tokens, cache_total_input_tokens=excluded.cache_total_input_tokens,
+	 cache_creation_5m_tokens=excluded.cache_creation_5m_tokens, cache_creation_1h_tokens=excluded.cache_creation_1h_tokens,
+	 affinity_source=excluded.affinity_source, prompt_cache_key_present=excluded.prompt_cache_key_present, prompt_cache_key_source=excluded.prompt_cache_key_source,
+	 stable_prefix_source=excluded.stable_prefix_source, stable_prefix_reason=excluded.stable_prefix_reason, stable_prefix_bytes=excluded.stable_prefix_bytes,
+	 retention_effective=excluded.retention_effective, retention_source=excluded.retention_source, claude_cache_ttl=excluded.claude_cache_ttl,
+	 cache_control_injected=excluded.cache_control_injected, cache_breakpoint_count=excluded.cache_breakpoint_count, cache_breakpoints_json=excluded.cache_breakpoints_json,
+	 unwritten_tail_tokens=excluded.unwritten_tail_tokens, max_possible_cache_read_tokens=excluded.max_possible_cache_read_tokens,
+	 cache_hit_after_prewarm=excluded.cache_hit_after_prewarm, singleflight_waited_requests=excluded.singleflight_waited_requests,
+	 diagnostics_miss_reason=excluded.diagnostics_miss_reason, latest_user_cache_control=excluded.latest_user_cache_control,
+	 latest_user_auto_context_cache_control=excluded.latest_user_auto_context_cache_control, latest_user_tail_cache_control=excluded.latest_user_tail_cache_control,
+	 latest_user_tool_result_cache_control=excluded.latest_user_tool_result_cache_control, route_epoch=excluded.route_epoch, kiro_credits=excluded.kiro_credits,
+	 kiro_credits_present=excluded.kiro_credits_present, billing_hold_id=excluded.billing_hold_id, requested_model=excluded.requested_model,
+	 resolved_model=excluded.resolved_model, model_override_source=excluded.model_override_source, raw_usage_json=excluded.raw_usage_json
 WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		diag.UsageEventID, accountID, routeKeyHash, apiKeyHash, userID, model, prompt, completion, total, cached, cacheRead, cacheCreation,
 		diag.UsageProvider, diag.UsageSource, boolInt(diag.CacheReadPresent), boolInt(diag.CacheCreationPresent), diag.CompatibilityLossesJSON, diag.CacheCapability,
@@ -7103,9 +7495,23 @@ WHERE usage_records.estimated > 0 AND excluded.estimated = 0`,
 		boolInt(diag.LatestUserCacheControl),
 		boolInt(diag.LatestUserAutoContextCacheControl), boolInt(diag.LatestUserTailCacheControl), boolInt(diag.LatestUserToolResultCacheControl), diag.RouteEpoch,
 		diag.KiroCredits, boolInt(diag.KiroCreditsPresent), diag.BillingHoldID, diag.RequestedModel, diag.ResolvedModel, firstNonEmptyStorage(diag.ModelOverrideSource, "none"),
-		string(raw), Now())
-	if err == nil && diag.BillingHoldID != "" {
-		_, err = exec.ExecContext(ctx, `UPDATE billing_holds SET usage_recorded_at = ?, usage_expected = 1 WHERE id = ?`, Now(), diag.BillingHoldID)
+		string(raw), now)
+	if err != nil {
+		return err
+	}
+	if diag.UsageEventID != "" {
+		state := "real"
+		if diag.Estimated {
+			state = "estimated"
+		}
+		if _, err = exec.ExecContext(ctx, `UPDATE usage_events SET usage_state=CASE WHEN usage_state='real' OR ?='real' THEN 'real' ELSE 'estimated' END,
+ usage_recorded_at=CASE WHEN usage_recorded_at>0 THEN usage_recorded_at ELSE ? END, route_epoch=CASE WHEN ?>0 THEN ? ELSE route_epoch END,
+ updated_at=MAX(updated_at,?) WHERE event_id=?`, state, now, diag.RouteEpoch, diag.RouteEpoch, now, diag.UsageEventID); err != nil {
+			return err
+		}
+	}
+	if diag.BillingHoldID != "" {
+		_, err = exec.ExecContext(ctx, `UPDATE billing_holds SET usage_recorded_at=CASE WHEN usage_recorded_at>0 THEN usage_recorded_at ELSE ? END, usage_expected=1 WHERE id=?`, now, diag.BillingHoldID)
 	}
 	return err
 }
@@ -7253,14 +7659,51 @@ func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
 }
 
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {
+	var afterID int64
 	for {
-		res, err := s.db.ExecContext(ctx, `UPDATE usage_records SET kiro_credits=CAST(json_extract(raw_usage_json,'$.kiro_credits') AS REAL), kiro_credits_present=1
-WHERE id IN (SELECT id FROM usage_records WHERE usage_provider='kiro' AND kiro_credits_present=0 AND json_valid(raw_usage_json) AND json_type(raw_usage_json,'$.kiro_credits') IN ('integer','real') LIMIT 500)`)
+		rows, err := s.rdb.QueryContext(ctx, `SELECT id,raw_usage_json FROM usage_records WHERE usage_provider='kiro' AND kiro_credits_present=0 AND id>? ORDER BY id LIMIT 500`, afterID)
 		if err != nil {
 			return err
 		}
-		n, _ := res.RowsAffected()
-		if n < 500 {
+		type creditBackfill struct {
+			id    int64
+			value float64
+		}
+		var updates []creditBackfill
+		scanned := 0
+		for rows.Next() {
+			var id int64
+			var raw string
+			if err = rows.Scan(&id, &raw); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			afterID = id
+			scanned++
+			decoder := json.NewDecoder(strings.NewReader(raw))
+			decoder.UseNumber()
+			var payload map[string]interface{}
+			if decoder.Decode(&payload) != nil {
+				continue
+			}
+			switch value := payload["kiro_credits"].(type) {
+			case json.Number:
+				if parsed, parseErr := value.Float64(); parseErr == nil {
+					updates = append(updates, creditBackfill{id: id, value: parsed})
+				}
+			case float64:
+				updates = append(updates, creditBackfill{id: id, value: value})
+			}
+		}
+		if err = rows.Close(); err != nil {
+			return err
+		}
+		for _, update := range updates {
+			if _, err = s.db.ExecContext(ctx, `UPDATE usage_records SET kiro_credits=?,kiro_credits_present=1 WHERE id=? AND kiro_credits_present=0`, update.value, update.id); err != nil {
+				return err
+			}
+		}
+		if scanned < 500 {
 			break
 		}
 	}
@@ -8811,9 +9254,8 @@ func (s *Store) UpdateCodexResetCreditConsumptionStatus(ctx context.Context, acc
 
 func (s *Store) CreateBillingHold(ctx context.Context, routeKeyHash, accountID string, estimatedTokens int64) (string, error) {
 	now := Now()
-	id := fmt.Sprintf("hold_%d_%s", time.Now().UnixNano(), accountID)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO billing_holds(id, route_key_hash, account_id, estimated_tokens, status, usage_expected, created_at, updated_at) VALUES(?, ?, ?, ?, 'held', 1, ?, ?)`,
-		id, routeKeyHash, accountID, estimatedTokens, now, now)
+	id := "hold_" + uuid.NewString()
+	err := s.BatchWriteTelemetry(ctx, nil, nil, []BillingHoldWrite{{ID: id, EventID: "usage_" + id, RouteKeyHash: routeKeyHash, AccountID: accountID, EstimatedTokens: estimatedTokens, CreatedAt: now, Create: true}}, nil)
 	return id, err
 }
 
@@ -8830,8 +9272,7 @@ func (s *Store) SettleBillingHold(ctx context.Context, id, status string) error 
 	// keeps request values but drops cancellation so the terminal status always lands.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ?`, status, Now(), id)
-	return err
+	return s.BatchWriteTelemetry(ctx, nil, nil, []BillingHoldWrite{{ID: id, Status: status, CreatedAt: Now()}}, nil)
 }
 
 // SettleBillingHoldIfHeld settles a hold ONLY while it is still in the 'held' state.
@@ -8849,8 +9290,7 @@ func (s *Store) SettleBillingHoldIfHeld(ctx context.Context, id, status string) 
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = ?, updated_at = ? WHERE id = ? AND status = 'held'`, status, Now(), id)
-	return err
+	return s.BatchWriteTelemetry(ctx, nil, nil, []BillingHoldWrite{{ID: id, Status: status, CreatedAt: Now(), IfHeld: true}}, nil)
 }
 
 func (s *Store) ExpireStaleBillingHolds(ctx context.Context, olderThan time.Duration) (int64, error) {
@@ -8858,8 +9298,21 @@ func (s *Store) ExpireStaleBillingHolds(ctx context.Context, olderThan time.Dura
 		olderThan = time.Hour
 	}
 	cutoff := Now() - int64(olderThan/time.Second)
-	res, err := s.db.ExecContext(ctx, `UPDATE billing_holds SET status = 'expired_unsettled', updated_at = ? WHERE status = 'held' AND created_at < ?`, Now(), cutoff)
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE billing_holds SET status='expired_unsettled', usage_expected=0, updated_at=? WHERE status='held' AND created_at<?`, now, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE usage_events SET terminal_status='expired_unsettled', settled_at=?, updated_at=MAX(updated_at,?)
+WHERE hold_id IN (SELECT id FROM billing_holds WHERE status='expired_unsettled' AND updated_at=?)`, now, now, now); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +21,56 @@ func TestLoadMigratesLegacyClaudeOAuthTokenURL(t *testing.T) {
 	}
 	if cfg.ClaudeOAuthTokenURL != DefaultClaudeOAuthTokenURL {
 		t.Fatalf("ClaudeOAuthTokenURL = %q, want %q", cfg.ClaudeOAuthTokenURL, DefaultClaudeOAuthTokenURL)
+	}
+}
+
+func TestBodyResourceDefaults(t *testing.T) {
+	cfg := Default()
+	if cfg.MaxBodyBytes != 1<<30 || cfg.BodyMemoryThresholdBytes != 8<<20 || cfg.BodySpoolMaxBytes != 32<<30 || cfg.BodyDiskReserveBytes != 10<<30 {
+		t.Fatalf("body defaults: max=%d threshold=%d spool=%d reserve=%d", cfg.MaxBodyBytes, cfg.BodyMemoryThresholdBytes, cfg.BodySpoolMaxBytes, cfg.BodyDiskReserveBytes)
+	}
+	if got := cfg.EffectiveBodyMemoryBudgetBytes(); got < 8<<20 || got > 256<<20 {
+		t.Fatalf("automatic body memory budget=%d", got)
+	}
+	if !cfg.UsageJournalEnabled || cfg.UsageJournalSegmentBytes != 8<<20 {
+		t.Fatalf("usage journal defaults: enabled=%v segment=%d", cfg.UsageJournalEnabled, cfg.UsageJournalSegmentBytes)
+	}
+	if !cfg.BodyV2Enabled || !cfg.SchedulerIndexEnabled {
+		t.Fatalf("phase defaults: body_v2=%v scheduler_index=%v", cfg.BodyV2Enabled, cfg.SchedulerIndexEnabled)
+	}
+	cfg.BodyMemoryBudgetBytes = 17 << 20
+	if got := cfg.EffectiveBodyMemoryBudgetBytes(); got != 17<<20 {
+		t.Fatalf("explicit body memory budget=%d", got)
+	}
+}
+
+func TestPhaseRollbackEnvironmentOverrides(t *testing.T) {
+	t.Setenv("CODEX_POOL_BODY_V2_ENABLED", "false")
+	t.Setenv("CODEX_POOL_SCHEDULER_INDEX_ENABLED", "false")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BodyV2Enabled || cfg.SchedulerIndexEnabled {
+		t.Fatalf("rollback flags ignored: body_v2=%v scheduler_index=%v", cfg.BodyV2Enabled, cfg.SchedulerIndexEnabled)
+	}
+}
+
+func TestPostgresRequiresRedisAndSensitiveEnvironmentOverrides(t *testing.T) {
+	t.Setenv("CODEX_POOL_STORAGE_DRIVER", "postgres")
+	t.Setenv("CODEX_POOL_POSTGRES_DSN", "postgres://db.example/pool")
+	t.Setenv("CODEX_POOL_REDIS_URL", "")
+	if _, err := Load(""); err == nil || !strings.Contains(err.Error(), "requires redis_url") {
+		t.Fatalf("missing Redis validation err=%v", err)
+	}
+	t.Setenv("CODEX_POOL_REDIS_URL", "redis://cache.example/0")
+	t.Setenv("CODEX_POOL_NODE_ID", "node east/1")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StorageDriver != "postgres" || cfg.PostgresDSN != "postgres://db.example/pool" || cfg.RedisURL != "redis://cache.example/0" || cfg.NodeID != "node_east_1" {
+		t.Fatalf("cluster config=%+v", cfg)
 	}
 }
 
@@ -160,6 +211,9 @@ func TestExampleConfigKeepsOptimizedCacheDefaults(t *testing.T) {
 
 	wants := map[string]interface{}{
 		"conversation_isolation":                true,
+		"codex_session_mapping_enabled":         true,
+		"codex_cpa_strict":                      true,
+		"codex_stateless_passthrough":           false,
 		"codex_prefer_sidecar_ja3_over_ws":      true,
 		"codex_prompt_cache_retention":          "",
 		"claude_cache_control_inject":           true,

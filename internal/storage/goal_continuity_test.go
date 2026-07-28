@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -254,6 +255,158 @@ func TestGoalCompactionRunsInResumableChunksWithoutLosingTurns(t *testing.T) {
 	}
 }
 
+func TestGoalV2UsesBoundedEncryptedChunksAndAdvancesCheckpointWithoutRewriting(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.SetTokenEncryptionKey(bytes.Repeat([]byte{7}, 32))
+	largeInput := strings.Repeat("chunk-data-", 20<<10)
+	first := goalTurnForTest("chunk-root", "chunk-r1", largeInput, "out-one")
+	first.StorageMaxBytes = 16 << 20
+	goal, err := store.CommitGoalTurn(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct{ response, input, output string }{{"chunk-r2", "turn-two", "out-two"}, {"chunk-r3", "turn-three", "out-three"}} {
+		turn := goalTurnForTest("chunk-root", item.response, item.input, item.output)
+		turn.StorageMaxBytes = 16 << 20
+		if _, err = store.CommitGoalTurn(ctx, turn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var chunks, maxPlainChunk, legacyPayloadBytes int64
+	if err = store.DB().QueryRow(`SELECT COUNT(*),COALESCE(MAX(payload_bytes),0) FROM goal_payload_chunk WHERE goal_id=?`, goal.ID).Scan(&chunks, &maxPlainChunk); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRow(`SELECT (SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_checkpoint WHERE goal_id=?)+(SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_segment WHERE goal_id=?)`, goal.ID, goal.ID).Scan(&legacyPayloadBytes); err != nil {
+		t.Fatal(err)
+	}
+	if chunks < 5 || maxPlainChunk > goalPayloadChunkSize || legacyPayloadBytes != 0 {
+		t.Fatalf("chunks=%d max_plain=%d legacy_bytes=%d", chunks, maxPlainChunk, legacyPayloadBytes)
+	}
+	before, err := store.GetGoalSession(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type chunkRecord struct {
+		index     int
+		encrypted string
+	}
+	rows, err := store.DB().Query(`SELECT chunk_index,encrypted_payload FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence=1 ORDER BY chunk_index`, goal.ID, goalChunkSegment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var immutable []chunkRecord
+	for rows.Next() {
+		var item chunkRecord
+		if err = rows.Scan(&item.index, &item.encrypted); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		immutable = append(immutable, item)
+	}
+	if err = rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.CompactGoalSegmentsWithRatio(ctx, goal.ID, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.GetGoalSession(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkpoints, segments int
+	if err = store.DB().QueryRow(`SELECT (SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id=?),(SELECT COUNT(*) FROM goal_segment WHERE goal_id=?)`, goal.ID, goal.ID).Scan(&checkpoints, &segments); err != nil {
+		t.Fatal(err)
+	}
+	if before.StorageBytes != after.StorageBytes || checkpoints != 1 || segments != 2 {
+		t.Fatalf("storage before=%d after=%d checkpoints=%d segments=%d", before.StorageBytes, after.StorageBytes, checkpoints, segments)
+	}
+	for _, item := range immutable {
+		var encrypted string
+		if err = store.DB().QueryRow(`SELECT encrypted_payload FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence=1 AND chunk_index=?`, goal.ID, goalChunkSegment, item.index).Scan(&encrypted); err != nil || encrypted != item.encrypted {
+			t.Fatalf("checkpoint rewrote immutable chunk index=%d err=%v", item.index, err)
+		}
+	}
+	body, _, err := store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil || !strings.Contains(string(body), largeInput) || !strings.Contains(string(body), "turn-two") || !strings.Contains(string(body), "turn-three") {
+		t.Fatalf("chunked replay lost history len=%d err=%v", len(body), err)
+	}
+}
+
+func TestGoalV2MigratesLegacyCheckpointIncrementally(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "goal-v1.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.SetTokenEncryptionKey(bytes.Repeat([]byte{8}, 32))
+	if _, err = store.DB().ExecContext(ctx, `
+CREATE TABLE goal_session(id TEXT PRIMARY KEY,protocol TEXT NOT NULL,parent_goal_id TEXT NOT NULL DEFAULT '',branch_hash TEXT NOT NULL DEFAULT '',downstream_key_hash TEXT NOT NULL DEFAULT '',workspace_hash TEXT NOT NULL DEFAULT '',initial_goal_hash TEXT NOT NULL DEFAULT '',last_response_hash TEXT NOT NULL DEFAULT '',state TEXT NOT NULL DEFAULT 'ready',current_checkpoint_id TEXT NOT NULL DEFAULT '',encrypted_working_state TEXT NOT NULL DEFAULT '',expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE goal_checkpoint(id TEXT PRIMARY KEY,goal_id TEXT NOT NULL,sequence INTEGER NOT NULL,through_segment_sequence INTEGER NOT NULL DEFAULT 0,payload_hash TEXT NOT NULL,payload_bytes INTEGER NOT NULL,encrypted_payload TEXT NOT NULL,created_at INTEGER NOT NULL,UNIQUE(goal_id,sequence));
+CREATE TABLE goal_segment(id TEXT PRIMARY KEY,goal_id TEXT NOT NULL,sequence INTEGER NOT NULL,payload_hash TEXT NOT NULL,payload_bytes INTEGER NOT NULL,encrypted_payload TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'committed',created_at INTEGER NOT NULL,UNIQUE(goal_id,sequence));`); err != nil {
+		t.Fatal(err)
+	}
+	now := Now()
+	base := `{"model":"gpt-test","input":[]}`
+	segments := []string{
+		`{"history_key":"input","input":[{"role":"user","content":"legacy-one"}],"output":[{"type":"message","content":[{"type":"output_text","text":"legacy-out-one"}]}]}`,
+		`{"history_key":"input","input":[{"role":"user","content":"legacy-two"}],"output":[{"type":"message","content":[{"type":"output_text","text":"legacy-out-two"}]}]}`,
+	}
+	if _, err = store.DB().ExecContext(ctx, `INSERT INTO goal_session(id,protocol,current_checkpoint_id,encrypted_working_state,expires_at,created_at,updated_at) VALUES('legacy-goal','codex','legacy-cp',?,?,?,?)`, store.sealToken(`{"legacy":true}`), now+86400, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB().ExecContext(ctx, `INSERT INTO goal_checkpoint(id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES('legacy-cp','legacy-goal',1,0,?,?,?,?)`, hashGoalPayload(base), len(base), store.sealToken(base), now); err != nil {
+		t.Fatal(err)
+	}
+	for i, payload := range segments {
+		if _, err = store.DB().ExecContext(ctx, `INSERT INTO goal_segment(id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,state,created_at) VALUES(?,?,?,?,?,?,'committed',?)`, "legacy-segment-"+string(rune('1'+i)), "legacy-goal", i+1, hashGoalPayload(payload), len(payload), store.sealToken(payload), now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := store.BuildGoalReplay(ctx, "legacy-goal")
+	if err != nil || !strings.Contains(string(before), "legacy-one") || !strings.Contains(string(before), "legacy-two") {
+		t.Fatalf("legacy replay before migration=%s err=%v", before, err)
+	}
+	if err = store.CompactGoalSegmentsWithRatio(ctx, "legacy-goal", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := store.BuildGoalReplay(ctx, "legacy-goal")
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("legacy replay changed during migration\nbefore=%s\nafter=%s\nerr=%v", before, after, err)
+	}
+	var format, checkpoints, chunks int
+	var stored, actual int64
+	if err = store.DB().QueryRow(`SELECT format_version FROM goal_checkpoint WHERE id=(SELECT current_checkpoint_id FROM goal_session WHERE id='legacy-goal')`).Scan(&format); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id='legacy-goal'`).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRow(`SELECT COUNT(*) FROM goal_payload_chunk WHERE goal_id='legacy-goal'`).Scan(&chunks); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRow(`SELECT storage_bytes FROM goal_session WHERE id='legacy-goal'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB().QueryRow(`SELECT COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_checkpoint WHERE goal_id='legacy-goal'),0)+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_segment WHERE goal_id='legacy-goal'),0)+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_payload_chunk WHERE goal_id='legacy-goal'),0)`).Scan(&actual); err != nil {
+		t.Fatal(err)
+	}
+	if format != 2 || checkpoints != 1 || chunks == 0 || stored != actual {
+		t.Fatalf("format=%d checkpoints=%d chunks=%d storage=%d actual=%d", format, checkpoints, chunks, stored, actual)
+	}
+}
+
 func TestGoalCleanupNeverEvictsExpiredLiveRun(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()
@@ -292,14 +445,11 @@ func TestGoalCleanupNeverEvictsExpiredLiveRun(t *testing.T) {
 
 func goalEncryptedPayloadBytes(t *testing.T, store *Store) int64 {
 	t.Helper()
-	var checkpoints, segments int64
-	if err := store.DB().QueryRow(`SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_checkpoint`).Scan(&checkpoints); err != nil {
+	var stored int64
+	if err := store.DB().QueryRow(`SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.DB().QueryRow(`SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_segment`).Scan(&segments); err != nil {
-		t.Fatal(err)
-	}
-	return checkpoints + segments
+	return stored
 }
 
 func TestGoalStorageBudgetReclaimsLeastRecentlyUsedInactiveGoal(t *testing.T) {

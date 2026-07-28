@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	fhttp "github.com/bogdanfinn/fhttp"
 	"github.com/bogdanfinn/tls-client/profiles"
 )
@@ -98,31 +99,43 @@ func TestClientForPoolsByKey(t *testing.T) {
 		t.Fatalf("clientFor: %v", err)
 	}
 	if c1 != c1again {
-		t.Fatalf("same (profile,proxy,jar) key returned distinct clients; keep-alive pool is not reused")
+		t.Fatalf("same transport key returned distinct clients; keep-alive pool is not reused")
 	}
 	c2, err := f.clientFor(Request{Profile: ProfileChrome, ProxyURL: "", CookieJarKey: "acct-2"})
 	if err != nil {
 		t.Fatalf("clientFor: %v", err)
 	}
-	if c1 == c2 {
-		t.Fatalf("different cookie-jar keys must not share a client (cross-account cookie bleed)")
+	if c1 != c2 {
+		t.Fatalf("cookie-jar keys fragmented the transport client pool")
 	}
 }
 
-func TestJarForLockedReusesKeyedJar(t *testing.T) {
+func TestCookieJarReusesOnlyKeyedState(t *testing.T) {
 	f := New()
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	a := f.jarForLocked("k")
-	b := f.jarForLocked("k")
+	a := f.cookieJar("k")
+	b := f.cookieJar("k")
 	if a != b {
 		t.Fatalf("keyed jar not reused across calls")
 	}
-	// empty key => always a fresh, unshared jar
-	e1 := f.jarForLocked("")
-	e2 := f.jarForLocked("")
-	if e1 == e2 {
-		t.Fatalf("empty-key jars must be fresh each call (no accidental shared state)")
+	if f.cookieJar("") != nil {
+		t.Fatalf("empty key unexpectedly retained cookie state")
+	}
+}
+
+func TestCookieJarCapacityDoesNotEvictOnHit(t *testing.T) {
+	f := New()
+	f.cookieJarMax = 2
+	a := f.cookieJar("a")
+	f.cookieJar("b")
+	if got := f.cookieJar("a"); got != a {
+		t.Fatalf("jar hit returned a replacement")
+	}
+	if len(f.jars) != 2 || f.jars["a"] == nil || f.jars["b"] == nil {
+		t.Fatalf("jar hit evicted fresh state: keys=%v", f.jars)
+	}
+	f.cookieJar("c")
+	if len(f.jars) != 2 || f.jars["a"] == nil || f.jars["c"] == nil || f.jars["b"] != nil {
+		t.Fatalf("capacity eviction did not remove the LRU key: keys=%v", f.jars)
 	}
 }
 
@@ -154,7 +167,7 @@ func TestDoRoundTrip(t *testing.T) {
 		URL:         srv.URL,
 		Header:      hdr,
 		HeaderOrder: []string{"Content-Type", "X-Amz-Target"},
-		Body:        []byte(`{"ping":true}`),
+		Body:        bodysource.Bytes([]byte(`{"ping":true}`)),
 		Timeout:     10 * time.Second,
 	})
 	if err != nil {

@@ -165,7 +165,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 	}
 	// Persist session-sticky affinity binding for this account.
 	if affinity.Hash != "" {
-		_ = s.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
+		_ = s.scheduler.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
 			RouteKeyHash: affinity.Hash,
 			RouteKey:     affinity.Key,
 			Source:       "antigravity",

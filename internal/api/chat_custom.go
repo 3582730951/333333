@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
@@ -261,7 +262,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	scrub := cloak.ScrubSensitive(body, s.cfg.SensitiveWordsFor(provider.ID))
 	body = scrub.Body
 	scrubber := scrub.Scrubber
-	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, virtual.EstimateTokensJSON(body))
 	// Backstop for THIS attempt's failure paths (several rule branches below return
 	// without settling). On success the hold is handed to the caller via cc.holdID, which
 	// settles it after streaming — so disarm the backstop before that hand-off.
@@ -284,7 +285,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			TransportProfile: provider.TransportProfile,
 			DownstreamPath:   upstreamPath,
 			Headers:          r.Header.Clone(),
-			Body:             body,
+			Body:             bodysource.Bytes(body),
 			Account:          lease.Account,
 			Token:            token,
 			Egress:           lease.Egress,
@@ -1064,6 +1065,7 @@ func (s *Server) settleValidatedStreamUsage(r *http.Request, cc customCall, usca
 func customUsageContext(ctx context.Context, cc customCall) context.Context {
 	diagnostics := usageDiagnosticsFromCtx(ctx)
 	diagnostics.UsageProvider = strings.TrimSpace(cc.provider)
+	diagnostics.RouteEpoch = cc.lease.RouteEpoch
 	ctx = withUsageDiagnostics(ctx, diagnostics)
 	return withBillingHold(ctx, cc.holdID)
 }

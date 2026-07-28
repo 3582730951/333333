@@ -5,6 +5,7 @@ import json
 import pathlib
 import resource
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -36,6 +37,76 @@ async def read_chunked_body(reader):
 
 
 class AsyncSidecarIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_v2_request_body_spools_and_uploads_from_file(self):
+        sidecar = load_sidecar()
+        sidecar.IMPERSONATE = "chrome"
+        payload = b"large-context-" * (192 << 10)
+        arrived = asyncio.Event()
+        release = asyncio.Event()
+        received = {}
+
+        with tempfile.TemporaryDirectory() as spool_dir:
+            sidecar.SPOOL_DIR = spool_dir
+            sidecar.SPOOL_RESERVE_BYTES = 0
+            sidecar.SPOOL_MAX_BYTES = 16 << 20
+            sidecar.MAX_BODY_BYTES = 16 << 20
+
+            async def upstream(reader, writer):
+                head = await reader.readuntil(b"\r\n\r\n")
+                headers = {}
+                for line in head.decode("latin1").split("\r\n")[1:]:
+                    if ":" in line:
+                        key, value = line.split(":", 1)
+                        headers[key.lower()] = value.strip()
+                size = int(headers["content-length"])
+                received["body"] = await reader.readexactly(size)
+                arrived.set()
+                await release.wait()
+                writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            upstream_server = await asyncio.start_server(upstream, "127.0.0.1", 0)
+            upstream_port = upstream_server.sockets[0].getsockname()[1]
+            sidecar_server = await asyncio.start_server(sidecar.client, "127.0.0.1", 0)
+            sidecar_port = sidecar_server.sockets[0].getsockname()[1]
+            meta = base64.b64encode(json.dumps({
+                "method": "POST",
+                "url": f"http://127.0.0.1:{upstream_port}/upload",
+                "headers": {"content-type": ["application/json"]},
+                "cookie_jar_key": "spooled-upload",
+            }).encode()).decode()
+
+            async def request():
+                reader, writer = await asyncio.open_connection("127.0.0.1", sidecar_port)
+                writer.write(f"POST /proxy HTTP/1.1\r\nx-sidecar-meta: {meta}\r\ncontent-length: {len(payload)}\r\n\r\n".encode())
+                writer.write(payload)
+                await writer.drain()
+                head = await reader.readuntil(b"\r\n\r\n")
+                self.assertIn(b"x-sidecar-upstream-status: 200", head.lower())
+                body, trailers = await read_chunked_body(reader)
+                writer.close()
+                await writer.wait_closed()
+                return body, trailers
+
+            task = asyncio.create_task(request())
+            await asyncio.wait_for(arrived.wait(), timeout=10)
+            self.assertEqual(sidecar._spool_bytes, len(payload))
+            self.assertEqual(len(list(pathlib.Path(spool_dir).iterdir())), 1)
+            release.set()
+            body, trailers = await task
+            self.assertEqual(body, b"ok")
+            self.assertEqual(trailers, {})
+            self.assertEqual(received["body"], payload)
+            self.assertEqual(sidecar._spool_bytes, 0)
+            self.assertEqual(list(pathlib.Path(spool_dir).iterdir()), [])
+
+            sidecar_server.close()
+            upstream_server.close()
+            await sidecar_server.wait_closed()
+            await upstream_server.wait_closed()
+
     async def test_two_hundred_streams_reach_upstream(self):
         sidecar = load_sidecar()
         sidecar.IMPERSONATE = "chrome"

@@ -180,6 +180,64 @@ func TestCodexSessionMappingResolvesAfterStoreRestart(t *testing.T) {
 	}
 }
 
+func TestCodexSessionMappingSharedTurnStateUsesResponseToDisambiguate(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	const namespace = "key:shared-turn-state"
+	commit := func(id, tree, response, thread string) CodexSessionBinding {
+		t.Helper()
+		binding, err := store.CommitCodexSessionBinding(ctx, CodexSessionCommit{
+			Namespace: namespace,
+			Binding: CodexSessionBinding{
+				ID: id, TreeID: tree, AccountID: "account-a", EgressID: "direct", State: "active",
+				RootSessionID: "root-shared-state", ThreadID: thread,
+			},
+			Aliases: []CodexSessionAlias{
+				{Type: "response", Value: response},
+				{Type: "turn_state", Value: "shared-sibling-state"},
+			},
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		if err != nil {
+			t.Fatalf("commit %s: %v", id, err)
+		}
+		return binding
+	}
+	a := commit("binding-sibling-a", "tree-sibling-a", "resp-sibling-a", "thread-sibling-a")
+	b := commit("binding-sibling-b", "tree-sibling-b", "resp-sibling-b", "thread-sibling-b")
+
+	for _, tc := range []struct {
+		name    string
+		aliases []CodexSessionAlias
+		binding CodexSessionBinding
+	}{
+		{name: "response_a_first", aliases: []CodexSessionAlias{{Type: "response", Value: "resp-sibling-a"}, {Type: "turn_state", Value: "shared-sibling-state"}}, binding: a},
+		{name: "state_b_first", aliases: []CodexSessionAlias{{Type: "turn_state", Value: "shared-sibling-state"}, {Type: "response", Value: "resp-sibling-b"}}, binding: b},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved, err := store.ResolveCodexSessionAliases(ctx, namespace, tc.aliases)
+			if err != nil || resolved.ID != tc.binding.ID {
+				t.Fatalf("resolved=%+v err=%v want=%s", resolved, err, tc.binding.ID)
+			}
+		})
+	}
+	if _, err := store.ResolveCodexSessionAliases(ctx, namespace, []CodexSessionAlias{{Type: "turn_state", Value: "shared-sibling-state"}}); !errors.Is(err, ErrCodexSessionMappingAmbiguous) {
+		t.Fatalf("shared turn state alone err=%v, want ambiguity", err)
+	}
+	_, err := store.CommitCodexSessionBinding(ctx, CodexSessionCommit{
+		Namespace: namespace,
+		Binding: CodexSessionBinding{
+			ID: "binding-response-conflict", TreeID: "tree-response-conflict", AccountID: "account-a", EgressID: "direct", State: "active",
+			RootSessionID: "root-response-conflict", ThreadID: "root-response-conflict",
+		},
+		Aliases:   []CodexSessionAlias{{Type: "response", Value: "resp-sibling-a"}},
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if !errors.Is(err, ErrCodexSessionMappingAmbiguous) {
+		t.Fatalf("response alias conflict err=%v, want ambiguity", err)
+	}
+}
+
 func TestCodexInstructionSnapshotIsEncryptedStableAndTreeCAS(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -303,5 +361,52 @@ func TestCodexUpstreamAttemptDiagnosticsRedactTreeID(t *testing.T) {
 	row := rows[0]
 	if row.TreeHMACPrefix == "" || strings.Contains(row.TreeHMACPrefix, "tree-real") || row.AccountID != "account-a" || row.EgressID != "egress-real" || row.Epoch != 3 || row.StatusCode != 200 {
 		t.Fatalf("redacted attempt diagnostic=%+v", row)
+	}
+}
+
+func TestCleanupCodexUpstreamAttemptsAggregatesExactlyOnceAndKeepsSevenDayDetail(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := Now()
+	day := now - now%86400
+	insert := func(tree, account, state string, status int, createdAt, expiresAt int64) {
+		t.Helper()
+		if _, err := store.DB().ExecContext(ctx, `INSERT INTO codex_upstream_attempt(
+tree_id,account_id,egress_id,epoch,state,status_code,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?)`,
+			tree, account, "egress-a", 2, state, status, createdAt, expiresAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("expired-a", "account-a", "response_headers", 429, day-10, now-1)
+	insert("expired-b", "account-a", "response_headers", 429, day-5, now-1)
+	insert("live-without-binding", "account-a", "request_sent", 0, now-60, now+3600)
+
+	if _, err := store.CleanupCodexSessionMappings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListCodexUpstreamAttemptDailyDiagnostics(ctx)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("daily rows=%+v err=%v", rows, err)
+	}
+	if rows[0].AttemptCount != 2 || rows[0].AccountID != "account-a" || rows[0].StatusCode != 429 || rows[0].DayStart != day-86400 {
+		t.Fatalf("daily row=%+v", rows[0])
+	}
+	var dailyExpiry int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT expires_at FROM codex_upstream_attempt_daily`).Scan(&dailyExpiry); err != nil {
+		t.Fatal(err)
+	}
+	if want := day - 86400 + int64((30*24*time.Hour)/time.Second); dailyExpiry != want {
+		t.Fatalf("daily expiry=%d want event-day+30d=%d", dailyExpiry, want)
+	}
+	var detail int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM codex_upstream_attempt`).Scan(&detail); err != nil || detail != 1 {
+		t.Fatalf("retained detail=%d err=%v", detail, err)
+	}
+	if _, err := store.CleanupCodexSessionMappings(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = store.ListCodexUpstreamAttemptDailyDiagnostics(ctx)
+	if err != nil || len(rows) != 1 || rows[0].AttemptCount != 2 {
+		t.Fatalf("second cleanup duplicated aggregate: rows=%+v err=%v", rows, err)
 	}
 }

@@ -655,10 +655,11 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 			"reasoning": map[string]interface{}{"effort": effort, "context": "all_turns"},
 			"text":      map[string]interface{}{"verbosity": "low"}, "store": false, "stream": true,
 		}
-		spec.Body, _ = json.Marshal(payload)
+		raw, _ := json.Marshal(payload)
+		spec.SetBodyBytes(raw)
 		spec.DownstreamPath = "/v1/responses"
 		spec.CodexClientVersion = s.codexClientVersionForModel(combo.Model)
-		spec.CodexResponsesWebSocket = s.codexResponsesWebSocketForModel(combo.Model, false, false, spec.Body)
+		spec.CodexResponsesWebSocket = s.codexResponsesWebSocketForModel(combo.Model, false, false, raw)
 		if strings.EqualFold(lease.Egress.Type, "curl_cffi_sidecar") && s.flagEnabled(ctx, "codex_prefer_sidecar_ja3_over_ws", s.cfg.CodexPreferSidecarJA3OverWS) {
 			spec.CodexResponsesWebSocket = false
 		}
@@ -681,7 +682,7 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 		if oauth {
 			billingVersion = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		}
-		spec.Body = cloak.VirtualizeClaudeCode(raw, id, s.cfg.SensitiveWordsFor("claude"), oauth, billingVersion).Body
+		spec.SetBodyBytes(cloak.VirtualizeClaudeCode(raw, id, s.cfg.SensitiveWordsFor("claude"), oauth, billingVersion).Body)
 		spec.OSHint = osHint
 		spec.DownstreamPath = "/v1/messages"
 	default:
@@ -696,7 +697,8 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 				"input":             []interface{}{map[string]interface{}{"role": "developer", "content": commonInstruction}, map[string]interface{}{"role": "user", "content": probe.Prompt}},
 				"max_output_tokens": 32, "stream": false,
 			}
-			spec.Body, _ = json.Marshal(payload)
+			raw, _ := json.Marshal(payload)
+			spec.SetBodyBytes(raw)
 			spec.DownstreamPath = "/responses"
 		} else {
 			payload := map[string]interface{}{
@@ -704,7 +706,8 @@ func (s *Server) modelQualityUpstreamRequest(ctx context.Context, combo modelQua
 				"messages":   []interface{}{map[string]interface{}{"role": "system", "content": commonInstruction}, map[string]interface{}{"role": "user", "content": probe.Prompt}},
 				"max_tokens": 32, "temperature": 0, "stream": false,
 			}
-			spec.Body, _ = json.Marshal(payload)
+			raw, _ := json.Marshal(payload)
+			spec.SetBodyBytes(raw)
 			spec.DownstreamPath = "/chat/completions"
 		}
 	}

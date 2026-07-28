@@ -31,7 +31,7 @@ func (s *Server) persistClaudeItemAliases(ctx context.Context, requestBody, resp
 			continue
 		}
 		seen[key.Hash] = true
-		_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		_ = s.scheduler.UpsertAffinityBinding(ctx, storage.AffinityBinding{
 			RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source,
 			AccountID: lease.Account.ID, Provider: "claude", Model: model, EgressID: lease.Egress.ID,
 		})

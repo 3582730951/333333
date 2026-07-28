@@ -43,6 +43,20 @@ func TestAdaptiveZeroLimitsDoNotReject(t *testing.T) {
 	}
 }
 
+func TestSelectRecordsRouteLatencyMetrics(t *testing.T) {
+	store := testStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s := New(store, config.Default())
+	if _, err := s.Select(ctx, Route{Group: "cyber", Provider: "codex"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled selection error=%v", err)
+	}
+	metrics := s.Metrics()
+	if metrics.RouteSelects != 1 || metrics.RouteNanos <= 0 || metrics.RouteAvgNanos != metrics.RouteNanos || metrics.RouteMaxNanos != metrics.RouteNanos {
+		t.Fatalf("route latency metrics=%+v", metrics)
+	}
+}
+
 func TestSelectComposesAccountSidecarOverRealProxyEgress(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()

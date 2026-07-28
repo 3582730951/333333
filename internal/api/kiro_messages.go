@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
@@ -70,7 +71,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
 		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
 		setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, storage.KiroRuntimeCapability{})
+		s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, *data, storage.KiroRuntimeCapability{})
 		displayModel := downstreamKiroModel(r.Context(), data.Model)
 		goalResponse := kirowire.AnthropicJSON(*data, displayModel, id)
 		s.persistKiroGoalContinuity(r.Context(), r, raw, goalResponse)
@@ -89,6 +90,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	}
 	if isStreamRequest(raw) {
 		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
+		releaseFlight()
 		// Stop the keepalive synchronously before any emitter write. The emitter writes
 		// straight to w, bypassing schedulerWaitState's mutex, so a trailing keepalive
 		// tick must be guaranteed gone before the first real frame (success or error).
@@ -108,7 +110,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		}, resolvedModel, id)
 		emitter.displayModel = downstreamKiroModel(r.Context(), resolvedModel)
 		emitter.estimatedInputTokens = converted.EstimatedInputTokens
-		data, streamErr := streamKiroResponse(response.Body, converted.ToolNameMap, emitter)
+		data, streamErr := streamKiroResponseWithContext(r.Context(), response.Body, converted.ToolNameMap, emitter, s.responseBodyCaptureOptions(r.Context()))
 		finalizeKiroUsage(&data, converted)
 		data.Model = firstNonEmpty(data.Model, resolvedModel)
 		if data.UsageSource == "" {
@@ -122,7 +124,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 			if emitter.started {
 				capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
 				setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-				s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+				s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
 				emitter.fail(kiroErrorCode(streamErr), streamErr)
 				s.markGoalStreamRetryable(r.Context(), r, "kiro", raw, "upstream_stream_error")
 			} else {
@@ -133,12 +135,12 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 		capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
 		emitter.finish(data)
 		setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+		s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
 		s.persistKiroGoalContinuity(r.Context(), r, raw, kirowire.AnthropicJSON(data, downstreamKiroModel(r.Context(), data.Model), id))
 		return outcomeDone
 	}
 
-	data, endpointHash, outcome := s.doKiroAttempt(w, r, &converted, lease)
+	data, endpointHash, outcome := s.doKiroAttemptOnResponse(w, r, &converted, lease, releaseFlight)
 	if data == nil {
 		return outcome
 	}
@@ -149,7 +151,7 @@ func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, r
 	data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
 	capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, *data)
 	setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-	s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, capabilityState)
+	s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, *data, capabilityState)
 	goalResponse := kirowire.AnthropicJSON(*data, downstreamKiroModel(r.Context(), data.Model), id)
 	s.persistKiroGoalContinuity(r.Context(), r, raw, goalResponse)
 	w.Header().Set("Content-Type", "application/json")
@@ -219,7 +221,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 		data.ToolDescriptionHashes = converted.ToolDescriptionHashes
 		data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
 		setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, storage.KiroRuntimeCapability{})
+		s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, *data, storage.KiroRuntimeCapability{})
 		displayModel := downstreamKiroModel(r.Context(), data.Model)
 		if isStreamRequest(anthBody) {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -237,6 +239,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 	}
 	if isStreamRequest(anthBody) {
 		response, endpointHash, outcome := s.openKiroAttempt(w, r, &converted, lease)
+		releaseFlight()
 		// Stop the keepalive synchronously before startChat can spawn the SSE-writing
 		// goroutine, so no keepalive comment can interleave with a real frame on w.
 		stopKeepalive()
@@ -268,7 +271,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 		emitter := newKiroAnthropicEmitter(writer, startChat, resolvedModel, id)
 		emitter.displayModel = downstreamKiroModel(r.Context(), resolvedModel)
 		emitter.estimatedInputTokens = converted.EstimatedInputTokens
-		data, streamErr := streamKiroResponse(response.Body, converted.ToolNameMap, emitter)
+		data, streamErr := streamKiroResponseWithContext(r.Context(), response.Body, converted.ToolNameMap, emitter, s.responseBodyCaptureOptions(r.Context()))
 		finalizeKiroUsage(&data, converted)
 		data.Model = firstNonEmpty(data.Model, resolvedModel)
 		if data.UsageSource == "" {
@@ -282,7 +285,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 			if emitter.started {
 				capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, data)
 				setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-				s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+				s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
 				emitter.fail(kiroErrorCode(streamErr), streamErr)
 				_ = writer.Close()
 				<-convertedDone
@@ -299,11 +302,11 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 			<-convertedDone
 		}
 		setKiroTrailers(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-		s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, data, capabilityState)
+		s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, data, capabilityState)
 		return outcomeDone
 	}
 
-	data, endpointHash, outcome := s.doKiroAttempt(w, r, &converted, lease)
+	data, endpointHash, outcome := s.doKiroAttemptOnResponse(w, r, &converted, lease, releaseFlight)
 	if data == nil {
 		return outcome
 	}
@@ -314,7 +317,7 @@ func (s *Server) kiroChatWithLease(w http.ResponseWriter, r *http.Request, anthB
 	data.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, data.CompatibilityLosses)
 	capabilityState := s.observeKiroResponse(r.Context(), lease.Account.ID, endpointHash, converted, *data)
 	setKiroHeaders(w, data.Model, data.CompatibilityLosses, data.UsageSource)
-	s.recordKiroUsage(r, lease.Account.ID, affinity, data.Model, *data, capabilityState)
+	s.recordKiroUsage(r, lease.Account.ID, affinity, lease.RouteEpoch, data.Model, *data, capabilityState)
 	displayModel := downstreamKiroModel(r.Context(), data.Model)
 	body, err := prompt.AnthropicToChatCompletion(kirowire.AnthropicJSON(*data, displayModel, id), displayModel)
 	if err != nil {
@@ -421,10 +424,18 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 }
 
 func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted *kirowire.Conversion, lease scheduler.Lease) (*kirowire.ResponseData, string, attemptOutcome) {
+	return s.doKiroAttemptOnResponse(w, r, converted, lease, nil)
+}
+
+func (s *Server) doKiroAttemptOnResponse(w http.ResponseWriter, r *http.Request, converted *kirowire.Conversion, lease scheduler.Lease, onResponse func()) (*kirowire.ResponseData, string, attemptOutcome) {
 	for attempt := 0; attempt < 2; attempt++ {
 		response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
 		if response == nil {
 			return nil, endpointHash, outcome
+		}
+		if onResponse != nil {
+			onResponse()
+			onResponse = nil
 		}
 		var data kirowire.ResponseData
 		var err error
@@ -435,7 +446,7 @@ func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted
 				data, err = kirowire.DecodeWebSearchResponse(raw, *converted.WebSearch, converted.EstimatedInputTokens)
 			}
 		} else {
-			data, err = kirowire.DecodeResponse(response.Body, converted.ToolNameMap)
+			data, err = kirowire.DecodeResponseWithOptions(r.Context(), response.Body, converted.ToolNameMap, s.responseBodyCaptureOptions(r.Context()))
 		}
 		response.Body.Close()
 		if err != nil {
@@ -573,7 +584,7 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	send := func(accessToken string, requestBody []byte) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
 		headers.Set("authorization", "Bearer "+accessToken)
-		return s.upstream.DoRaw(r.Context(), lease.Egress, http.MethodPost, target, headers, requestBody, lease.Binding.CookieJarKey)
+		return s.upstream.DoRawSource(r.Context(), lease.Egress, http.MethodPost, target, headers, bodysource.Bytes(requestBody), lease.Binding.CookieJarKey)
 	}
 	response, err := send(bearer, body)
 	if err != nil {
@@ -714,9 +725,18 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 	return response, endpointHash, outcomeDone
 }
 
-func streamKiroResponse(reader io.Reader, names map[string]string, emitter *kiroAnthropicEmitter) (kirowire.ResponseData, error) {
+func streamKiroResponse(reader io.Reader, names map[string]string, emitter *kiroAnthropicEmitter, captureOptions ...bodysource.CaptureOptions) (kirowire.ResponseData, error) {
+	return streamKiroResponseWithContext(context.Background(), reader, names, emitter, captureOptions...)
+}
+
+func streamKiroResponseWithContext(ctx context.Context, reader io.Reader, names map[string]string, emitter *kiroAnthropicEmitter, captureOptions ...bodysource.CaptureOptions) (kirowire.ResponseData, error) {
 	decoder := kirowire.NewDecoder()
-	processor := kirowire.NewResponseProcessor(names)
+	var options bodysource.CaptureOptions
+	if len(captureOptions) > 0 {
+		options = captureOptions[0]
+	}
+	processor := kirowire.NewResponseProcessorWithOptions(ctx, names, options)
+	defer processor.Close()
 	buffer := make([]byte, 32*1024)
 	for {
 		n, readErr := reader.Read(buffer)
@@ -730,12 +750,11 @@ func streamKiroResponse(reader io.Reader, names map[string]string, emitter *kiro
 				if err != nil {
 					return processor.Data(), err
 				}
-				state := processor.Data()
-				if state.Model != "" {
-					emitter.model = state.Model
+				if model := processor.Model(); model != "" {
+					emitter.model = model
 				}
 				for _, delta := range deltas {
-					emitter.delta(delta, state.Metering)
+					emitter.delta(delta, processor.Metering())
 				}
 			}
 		}
@@ -751,7 +770,7 @@ func streamKiroResponse(reader io.Reader, names map[string]string, emitter *kiro
 	}
 	deltas, err := processor.Finish()
 	for _, delta := range deltas {
-		emitter.delta(delta, processor.Data().Metering)
+		emitter.delta(delta, processor.Metering())
 	}
 	return processor.Data(), err
 }
@@ -1112,13 +1131,13 @@ func (s *Server) persistKiroResolvedBinding(ctx context.Context, affinity routin
 	if err != nil && !storage.NotFound(err) {
 		return
 	}
-	_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+	_ = s.scheduler.UpsertAffinityBinding(ctx, storage.AffinityBinding{
 		RouteKeyHash: affinity.Hash, RouteKey: affinity.Key, Source: affinity.Source,
 		AccountID: lease.Account.ID, Provider: "kiro", Model: model, EgressID: lease.Egress.ID,
 	})
 }
 
-func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity routing.AffinityKey, model string, data kirowire.ResponseData, capabilityState storage.KiroRuntimeCapability) {
+func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity routing.AffinityKey, routeEpoch int64, model string, data kirowire.ResponseData, capabilityState storage.KiroRuntimeCapability) {
 	rawUsage := map[string]any{
 		"input_tokens": data.InputTokens, "output_tokens": data.OutputTokens,
 		"usage_source":           data.UsageSource,
@@ -1164,7 +1183,7 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 	breakpointsJSON, _ := json.Marshal(data.CachePointBreakpoints)
 	keyHash, userID := downstreamFromCtx(r.Context())
 	diagnostics := storage.UsageDiagnostics{
-		UsageEventID:            requestIDFromContext(r.Context()),
+		UsageEventID:            firstNonEmpty(usageEventIDFromContext(r.Context()), requestIDFromContext(r.Context())),
 		UsageProvider:           "kiro",
 		UsageSource:             data.UsageSource,
 		CacheReadPresent:        data.Metering.CacheReadTokens.Present,
@@ -1177,6 +1196,7 @@ func (s *Server) recordKiroUsage(r *http.Request, accountID string, affinity rou
 		CacheMissTokens:         data.InputTokens,
 		CacheTotalInputTokens:   data.Metering.TotalInputTokens.Value,
 		AffinitySource:          affinity.Source,
+		RouteEpoch:              routeEpoch,
 		CacheControlInjected:    data.CachePointCount > 0,
 		CacheBreakpointCount:    data.CachePointCount,
 		CacheBreakpointsJSON:    string(breakpointsJSON),

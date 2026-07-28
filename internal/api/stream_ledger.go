@@ -1,25 +1,44 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf16"
+	"unicode/utf8"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/leakfilter"
 )
 
-const streamLedgerMaxPartialFrame = 256 * 1024
+const (
+	streamLedgerMaxPartialFrame = 256 * 1024
+	streamLedgerDefaultMaxBytes = int64(1 << 30)
+)
 
 type codexStreamLedgerRecorder struct {
-	mu        sync.Mutex
-	buf       []byte
-	id        string
-	model     string
-	text      strings.Builder
-	completed map[string]interface{}
-	terminal  string
-	turnState string
+	mu               sync.Mutex
+	ctx              context.Context
+	options          bodysource.CaptureOptions
+	frame            *bodysource.SpoolBuffer
+	lineNonCR        bool
+	pendingErr       error
+	id               string
+	model            string
+	text             *streamLedgerText
+	completed        map[string]interface{}
+	terminal         string
+	terminalPayload  *bodysource.SpoolBuffer
+	terminalResponse bodysource.BodySource
+	terminalMeta     bodysource.BodyMeta
+	turnState        string
 	// contextError is captured from the raw terminal SSE frame before any
 	// downstream filtering. Strict CPA uses it only to retire a confirmed lost
 	// previous_response epoch; ordinary missing tool output remains visible but
@@ -29,15 +48,42 @@ type codexStreamLedgerRecorder struct {
 	// It drives late mapped-session retirement after output has already committed,
 	// while the downstream receives only a neutral protocol terminal.
 	failure *leakfilter.CodexFailureFrame
-	added   []interface{}
-	done    []interface{}
+	added   *streamLedgerItems
+	done    *streamLedgerItems
 	// rateLimits holds the most recent codex.rate_limits frame's windows (workstream B:
 	// real-time Codex quota captured before leakfilter drops the frame).
 	rateLimits codexStreamRateLimits
 }
 
 func newCodexStreamLedgerRecorder() *codexStreamLedgerRecorder {
-	return &codexStreamLedgerRecorder{}
+	return newCodexStreamLedgerRecorderWithOptions(context.Background(), bodysource.CaptureOptions{MaxBytes: streamLedgerDefaultMaxBytes, MemoryThreshold: 8 << 20})
+
+}
+
+func newCodexStreamLedgerRecorderWithOptions(ctx context.Context, options bodysource.CaptureOptions) *codexStreamLedgerRecorder {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if options.MaxBytes <= 0 {
+		options.MaxBytes = streamLedgerDefaultMaxBytes
+	}
+	if options.MemoryThreshold < 0 {
+		options.MemoryThreshold = 0
+	}
+	options.TempFileNamePrefix = "codex-pool-stream-ledger-*"
+	return &codexStreamLedgerRecorder{
+		ctx: ctx, options: options,
+		text:  newStreamLedgerText(ctx, options),
+		added: newStreamLedgerItems(ctx, options, "codex-pool-stream-added-*"),
+		done:  newStreamLedgerItems(ctx, options, "codex-pool-stream-done-*"),
+	}
+}
+
+func (s *Server) newCodexStreamLedgerRecorder(ctx context.Context) *codexStreamLedgerRecorder {
+	return newCodexStreamLedgerRecorderWithOptions(ctx, bodysource.CaptureOptions{
+		MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
+		MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.bodyBudget,
+	})
 }
 
 func codexSSEToResponseJSON(raw []byte) []byte {
@@ -45,26 +91,44 @@ func codexSSEToResponseJSON(raw []byte) []byte {
 		return nil
 	}
 	rec := newCodexStreamLedgerRecorder()
+	defer rec.Close()
 	_, _ = rec.Write(raw)
+	rec.finish()
 	return rec.ResponseJSON()
 }
 
 func (r *codexStreamLedgerRecorder) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.buf = append(r.buf, p...)
-	for {
-		boundary, separatorLen := sseFrameBoundary(r.buf)
-		if boundary < 0 {
-			break
-		}
-		frameEnd := boundary + separatorLen
-		frame := r.buf[:frameEnd]
-		r.observeFrame(frame)
-		r.buf = r.buf[frameEnd:]
+	if r.pendingErr != nil {
+		return 0, r.pendingErr
 	}
-	if len(r.buf) > streamLedgerMaxPartialFrame {
-		r.buf = r.buf[len(r.buf)-streamLedgerMaxPartialFrame:]
+	start := 0
+	for index, value := range p {
+		if value != '\n' {
+			if value != '\r' {
+				r.lineNonCR = true
+			}
+			continue
+		}
+		boundary := !r.lineNonCR
+		r.lineNonCR = false
+		if !boundary {
+			continue
+		}
+		if err := r.writeFrameBytesLocked(p[start : index+1]); err != nil {
+			r.pendingErr = err
+			return start, err
+		}
+		start = index + 1
+		if err := r.flushFrameLocked(); err != nil {
+			r.pendingErr = err
+			return start, err
+		}
+	}
+	if err := r.writeFrameBytesLocked(p[start:]); err != nil {
+		r.pendingErr = err
+		return start, err
 	}
 	return len(p), nil
 }
@@ -74,12 +138,151 @@ func (r *codexStreamLedgerRecorder) Write(p []byte) (int, error) {
 func (r *codexStreamLedgerRecorder) finish() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(bytes.TrimSpace(r.buf)) == 0 {
-		r.buf = nil
+	if r.pendingErr != nil || r.frame == nil || r.frame.Size() == 0 {
 		return
 	}
-	r.observeFrame(r.buf)
-	r.buf = nil
+	if err := r.flushFrameLocked(); err != nil {
+		r.pendingErr = err
+	}
+}
+
+func (r *codexStreamLedgerRecorder) writeFrameBytesLocked(payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	if r.frame == nil {
+		options := r.options
+		options.TempFileNamePrefix = "codex-pool-stream-frame-*"
+		frame, err := bodysource.NewSpoolBuffer(r.ctx, options)
+		if err != nil {
+			return err
+		}
+		r.frame = frame
+	}
+	_, err := r.frame.Write(payload)
+	return err
+}
+
+func (r *codexStreamLedgerRecorder) flushFrameLocked() error {
+	frame := r.frame
+	r.frame = nil
+	if frame == nil || frame.Size() == 0 {
+		if frame != nil {
+			_ = frame.Close()
+		}
+		return nil
+	}
+	defer frame.Close()
+	if frame.Size() <= streamLedgerMaxPartialFrame {
+		raw, err := bodysource.ReadAll(frame)
+		if err != nil {
+			return err
+		}
+		r.observeFrame(raw)
+		return r.pendingErr
+	}
+	payload, hasData, err := extractSSEDataSource(r.ctx, frame, r.options)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		return nil
+	}
+	retained := false
+	defer func() {
+		if !retained {
+			_ = payload.Close()
+		}
+	}()
+	if !hasData || payload.Size() == 0 {
+		return nil
+	}
+	meta, err := bodysource.ScanJSON(r.ctx, payload, nil)
+	if err != nil {
+		return err
+	}
+	retained, err = r.observeLargeEventLocked(payload, meta)
+	return err
+}
+
+func (r *codexStreamLedgerRecorder) observeLargeEventLocked(payload *bodysource.SpoolBuffer, meta bodysource.BodyMeta) (bool, error) {
+	typ := strings.TrimSpace(meta.Type)
+	switch typ {
+	case "response.created":
+		r.id = firstNonEmpty(strings.TrimSpace(meta.ResponseID), r.id)
+		r.model = firstNonEmpty(strings.TrimSpace(meta.ResponseModel), r.model)
+	case "response.output_text.delta":
+		span, ok := meta.Fields["delta"]
+		if !ok || meta.Kinds["delta"] != '"' {
+			return false, nil
+		}
+		value, err := bodysource.Slice(payload, span.Offset, span.Length)
+		if err != nil {
+			return false, err
+		}
+		return false, r.text.AppendJSONString(value)
+	case "response.output_item.added", "response.output_item.done":
+		span, ok := meta.Fields["item"]
+		if !ok {
+			return false, nil
+		}
+		item, err := bodysource.Slice(payload, span.Offset, span.Length)
+		if err != nil {
+			return false, err
+		}
+		if typ == "response.output_item.done" {
+			return false, r.done.AppendSource(item)
+		}
+		return false, r.added.AppendSource(item)
+	case "response.completed", "response.incomplete", "response.failed", "response.error", "error":
+		r.terminal = typ
+		if r.terminalPayload != nil {
+			_ = r.terminalPayload.Close()
+		}
+		r.terminalPayload = payload
+		r.terminalResponse = nil
+		r.terminalMeta = bodysource.BodyMeta{}
+		if span, ok := meta.Fields["response"]; ok && meta.Kinds["response"] == '{' {
+			response, err := bodysource.Slice(payload, span.Offset, span.Length)
+			if err != nil {
+				return false, err
+			}
+			responseMeta, err := bodysource.ScanJSON(r.ctx, response, nil)
+			if err != nil {
+				return false, err
+			}
+			r.terminalResponse, r.terminalMeta = response, responseMeta
+			r.id = firstNonEmpty(strings.TrimSpace(responseMeta.ID), r.id)
+			r.model = firstNonEmpty(strings.TrimSpace(responseMeta.Model), r.model)
+			if streamLedgerCanonicalOutput(response, responseMeta) {
+				r.text.Reset()
+				r.added.Reset()
+				r.done.Reset()
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func streamLedgerCanonicalOutput(response bodysource.BodySource, meta bodysource.BodyMeta) bool {
+	span, ok := meta.Fields["output"]
+	if !ok || meta.Kinds["output"] != '[' || span.Length <= 2 {
+		return false
+	}
+	view, err := bodysource.Slice(response, span.Offset, min64(span.Length, 64))
+	if err != nil {
+		return false
+	}
+	raw, err := bodysource.ReadAll(view)
+	return err == nil && len(bytes.TrimSpace(raw)) > 2
+}
+
+func min64(left, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
@@ -87,7 +290,20 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 	defer r.mu.Unlock()
 	var root map[string]interface{}
 	if r.completed != nil {
-		root = cloneJSONMap(r.completed)
+		root = make(map[string]interface{}, len(r.completed)+4)
+		for key, value := range r.completed {
+			root[key] = value
+		}
+	} else if r.terminalResponse != nil {
+		raw, err := bodysource.ReadAll(r.terminalResponse)
+		if err != nil || json.Unmarshal(raw, &root) != nil {
+			return nil
+		}
+	} else if r.terminalPayload != nil {
+		raw, err := bodysource.ReadAll(r.terminalPayload)
+		if err != nil || json.Unmarshal(raw, &root) != nil {
+			return nil
+		}
 	} else {
 		root = map[string]interface{}{}
 	}
@@ -107,7 +323,7 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 	if _, ok := root["status"]; !ok {
 		root["status"] = "completed"
 	}
-	text := r.text.String()
+	text := r.currentTextLocked()
 	if !hasNonEmptyArray(root["output"]) {
 		if output := r.outputItems(text); len(output) > 0 {
 			root["output"] = output
@@ -120,7 +336,7 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 	}
 	status := strings.ToLower(streamString(root["status"]))
 	if !hasNonEmptyArray(root["output"]) && strings.TrimSpace(streamString(root["output_text"])) == "" &&
-		status != "failed" && status != "incomplete" && r.id == "" && r.completed == nil {
+		status != "failed" && status != "incomplete" && r.id == "" && r.completed == nil && r.terminalResponse == nil && r.terminalPayload == nil {
 		return nil
 	}
 	out, err := json.Marshal(root)
@@ -136,7 +352,7 @@ func (r *codexStreamLedgerRecorder) ResponseJSON() []byte {
 func (r *codexStreamLedgerRecorder) reachedTerminal() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.completed != nil
+	return r.terminal != "" || r.completed != nil
 }
 
 // completedSuccessfully distinguishes a real response.completed from every failure
@@ -180,7 +396,7 @@ func (r *codexStreamLedgerRecorder) responseTurnState() string {
 func (r *codexStreamLedgerRecorder) partialText() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.text.String()
+	return r.currentTextLocked()
 }
 
 // partialItems reconstructs the assistant output items produced so far (the same shape
@@ -190,7 +406,7 @@ func (r *codexStreamLedgerRecorder) partialText() string {
 func (r *codexStreamLedgerRecorder) partialItems() []interface{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.outputItems(r.text.String())
+	return r.outputItems(r.currentTextLocked())
 }
 
 // partialItemCount is the number of output items the stream opened, used to offset the
@@ -198,10 +414,10 @@ func (r *codexStreamLedgerRecorder) partialItems() []interface{} {
 func (r *codexStreamLedgerRecorder) partialItemCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if n := len(r.done); n > len(r.added) {
+	if n := r.done.Count(); n > r.added.Count() {
 		return n
 	}
-	return len(r.added)
+	return r.added.Count()
 }
 
 // metadata returns a consistent copy of the fields consumed after streaming. The
@@ -250,20 +466,26 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 		}
 	case "response.output_text.delta":
 		if delta := streamString(ev["delta"]); delta != "" {
-			r.text.WriteString(delta)
+			if err := r.text.WriteString(delta); err != nil {
+				r.pendingErr = err
+			}
 		}
 	case "response.output_item.added":
-		if item := cloneJSONValue(ev["item"]); item != nil {
-			r.added = append(r.added, item)
+		if item := ev["item"]; item != nil {
+			if err := r.added.Append(item); err != nil {
+				r.pendingErr = err
+			}
 		}
 	case "response.output_item.done":
-		if item := cloneJSONValue(ev["item"]); item != nil {
-			r.done = append(r.done, item)
+		if item := ev["item"]; item != nil {
+			if err := r.done.Append(item); err != nil {
+				r.pendingErr = err
+			}
 		}
 	case "response.completed", "response.incomplete", "response.failed", "response.error", "error":
 		r.terminal = typ
 		if resp, ok := ev["response"].(map[string]interface{}); ok {
-			r.completed = cloneJSONMap(resp)
+			r.completed = resp
 			if id := strings.TrimSpace(streamString(resp["id"])); id != "" {
 				r.id = id
 			}
@@ -274,7 +496,7 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 			// A terminal event without a response object is still a real protocol
 			// terminal. Treat it as such so EOF compensation does not append a second,
 			// misleading "stream closed before response.completed" failure.
-			r.completed = cloneJSONMap(ev)
+			r.completed = ev
 			switch typ {
 			case "response.completed":
 				r.completed["status"] = "completed"
@@ -283,6 +505,13 @@ func (r *codexStreamLedgerRecorder) observeFrame(frame []byte) {
 			default:
 				r.completed["status"] = "failed"
 			}
+		}
+		if hasNonEmptyArray(r.completed["output"]) {
+			r.added.Reset()
+			r.done.Reset()
+		}
+		if completedResponseText(r.completed) != "" {
+			r.text.Reset()
 		}
 	case "codex.rate_limits":
 		if rl, ok := parseCodexRateLimitsEvent(ev); ok {
@@ -305,10 +534,18 @@ func codexSSEHeaderValue(event map[string]interface{}, name string) string {
 
 func (r *codexStreamLedgerRecorder) outputItems(text string) []interface{} {
 	var items []interface{}
-	if len(r.done) > 0 {
-		items = cloneJSONArray(r.done)
-	} else if len(r.added) > 0 {
-		items = cloneJSONArray(r.added)
+	if r.completed != nil && hasNonEmptyArray(r.completed["output"]) {
+		items = cloneJSONArray(asSlice(r.completed["output"]))
+	} else if r.terminalResponse != nil {
+		raw, err := bodysource.ReadAll(r.terminalResponse)
+		var response map[string]interface{}
+		if err == nil && json.Unmarshal(raw, &response) == nil && hasNonEmptyArray(response["output"]) {
+			items = cloneJSONArray(asSlice(response["output"]))
+		}
+	} else if r.done.Count() > 0 {
+		items = r.done.Values()
+	} else if r.added.Count() > 0 {
+		items = r.added.Values()
 	}
 	if strings.TrimSpace(text) != "" {
 		for _, rawItem := range items {
@@ -344,6 +581,357 @@ func (r *codexStreamLedgerRecorder) outputItems(text string) []interface{} {
 		items[insertAt] = message
 	}
 	return items
+}
+
+func (r *codexStreamLedgerRecorder) currentTextLocked() string {
+	if text := completedResponseText(r.completed); text != "" {
+		return text
+	}
+	if r.terminalResponse != nil {
+		raw, err := bodysource.ReadAll(r.terminalResponse)
+		var response map[string]interface{}
+		if err == nil && json.Unmarshal(raw, &response) == nil {
+			if text := completedResponseText(response); text != "" {
+				return text
+			}
+		}
+	}
+	return r.text.String()
+}
+
+func (r *codexStreamLedgerRecorder) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var closeErr error
+	if r.frame != nil {
+		closeErr = errors.Join(closeErr, r.frame.Close())
+		r.frame = nil
+	}
+	if r.terminalPayload != nil {
+		closeErr = errors.Join(closeErr, r.terminalPayload.Close())
+		r.terminalPayload, r.terminalResponse = nil, nil
+	}
+	closeErr = errors.Join(closeErr, r.text.Close(), r.added.Close(), r.done.Close())
+	return closeErr
+}
+
+type streamLedgerText struct {
+	ctx     context.Context
+	options bodysource.CaptureOptions
+	buffer  *bodysource.SpoolBuffer
+}
+
+func newStreamLedgerText(ctx context.Context, options bodysource.CaptureOptions) *streamLedgerText {
+	return &streamLedgerText{ctx: ctx, options: options}
+}
+
+func (t *streamLedgerText) ensure() error {
+	if t.buffer != nil {
+		return nil
+	}
+	options := t.options
+	options.TempFileNamePrefix = "codex-pool-stream-text-*"
+	buffer, err := bodysource.NewSpoolBuffer(t.ctx, options)
+	if err != nil {
+		return err
+	}
+	t.buffer = buffer
+	return nil
+}
+
+func (t *streamLedgerText) WriteString(value string) error {
+	if value == "" {
+		return nil
+	}
+	if err := t.ensure(); err != nil {
+		return err
+	}
+	_, err := io.WriteString(t.buffer, value)
+	return err
+}
+
+func (t *streamLedgerText) AppendJSONString(source bodysource.BodySource) error {
+	if err := t.ensure(); err != nil {
+		return err
+	}
+	return decodeJSONStringSource(source, t.buffer)
+}
+
+func (t *streamLedgerText) Len() int {
+	if t == nil || t.buffer == nil {
+		return 0
+	}
+	size := t.buffer.Size()
+	if size > int64(^uint(0)>>1) {
+		return int(^uint(0) >> 1)
+	}
+	return int(size)
+}
+
+func (t *streamLedgerText) String() string {
+	if t == nil || t.buffer == nil || t.buffer.Size() == 0 {
+		return ""
+	}
+	raw, err := bodysource.ReadAll(t.buffer)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func (t *streamLedgerText) Reset() {
+	if t == nil || t.buffer == nil {
+		return
+	}
+	_ = t.buffer.Close()
+	t.buffer = nil
+}
+
+func (t *streamLedgerText) Close() error {
+	if t == nil || t.buffer == nil {
+		return nil
+	}
+	err := t.buffer.Close()
+	t.buffer = nil
+	return err
+}
+
+type streamLedgerItems struct {
+	ctx     context.Context
+	options bodysource.CaptureOptions
+	prefix  string
+	buffer  *bodysource.SpoolBuffer
+	count   int
+}
+
+func newStreamLedgerItems(ctx context.Context, options bodysource.CaptureOptions, prefix string) *streamLedgerItems {
+	return &streamLedgerItems{ctx: ctx, options: options, prefix: prefix}
+}
+
+func (i *streamLedgerItems) ensure() error {
+	if i.buffer != nil {
+		return nil
+	}
+	options := i.options
+	options.TempFileNamePrefix = i.prefix
+	buffer, err := bodysource.NewSpoolBuffer(i.ctx, options)
+	if err != nil {
+		return err
+	}
+	i.buffer = buffer
+	return nil
+}
+
+func (i *streamLedgerItems) Append(value interface{}) error {
+	if err := i.ensure(); err != nil {
+		return err
+	}
+	if err := json.NewEncoder(i.buffer).Encode(value); err != nil {
+		return err
+	}
+	i.count++
+	return nil
+}
+
+func (i *streamLedgerItems) AppendSource(source bodysource.BodySource) error {
+	if err := i.ensure(); err != nil {
+		return err
+	}
+	reader, err := source.Open()
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.CopyBuffer(i.buffer, reader, make([]byte, bodysource.DefaultChunkSize))
+	closeErr := reader.Close()
+	if copyErr != nil || closeErr != nil {
+		return errors.Join(copyErr, closeErr)
+	}
+	if _, err = i.buffer.Write([]byte{'\n'}); err != nil {
+		return err
+	}
+	i.count++
+	return nil
+}
+
+func (i *streamLedgerItems) Count() int {
+	if i == nil {
+		return 0
+	}
+	return i.count
+}
+
+func (i *streamLedgerItems) Values() []interface{} {
+	if i == nil || i.buffer == nil || i.count == 0 {
+		return nil
+	}
+	reader, err := i.buffer.Open()
+	if err != nil {
+		return nil
+	}
+	defer reader.Close()
+	decoder := json.NewDecoder(reader)
+	values := make([]interface{}, 0, i.count)
+	for {
+		var value interface{}
+		if err = decoder.Decode(&value); errors.Is(err, io.EOF) {
+			return values
+		} else if err != nil {
+			return nil
+		}
+		values = append(values, value)
+	}
+}
+
+func (i *streamLedgerItems) Reset() {
+	if i == nil {
+		return
+	}
+	if i.buffer != nil {
+		_ = i.buffer.Close()
+	}
+	i.buffer, i.count = nil, 0
+}
+
+func (i *streamLedgerItems) Close() error {
+	if i == nil || i.buffer == nil {
+		return nil
+	}
+	err := i.buffer.Close()
+	i.buffer, i.count = nil, 0
+	return err
+}
+
+func decodeJSONStringSource(source bodysource.BodySource, dst io.Writer) error {
+	reader, err := source.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	buffered := bufio.NewReaderSize(reader, bodysource.DefaultChunkSize)
+	writer := bufio.NewWriterSize(dst, bodysource.DefaultChunkSize)
+	defer writer.Flush()
+	first, err := readJSONNonSpace(buffered)
+	if err != nil {
+		return err
+	}
+	if first != '"' {
+		return fmt.Errorf("stream delta is not a JSON string")
+	}
+	for {
+		value, readErr := buffered.ReadByte()
+		if readErr != nil {
+			return readErr
+		}
+		switch value {
+		case '"':
+			for {
+				tail, tailErr := buffered.ReadByte()
+				if errors.Is(tailErr, io.EOF) {
+					return writer.Flush()
+				}
+				if tailErr != nil {
+					return tailErr
+				}
+				if !isJSONSpace(tail) {
+					return fmt.Errorf("unexpected data after JSON string")
+				}
+			}
+		case '\\':
+			escaped, escapeErr := buffered.ReadByte()
+			if escapeErr != nil {
+				return escapeErr
+			}
+			switch escaped {
+			case '"', '\\', '/':
+				err = writer.WriteByte(escaped)
+			case 'b':
+				err = writer.WriteByte('\b')
+			case 'f':
+				err = writer.WriteByte('\f')
+			case 'n':
+				err = writer.WriteByte('\n')
+			case 'r':
+				err = writer.WriteByte('\r')
+			case 't':
+				err = writer.WriteByte('\t')
+			case 'u':
+				code, codeErr := readJSONHexRune(buffered)
+				if codeErr != nil {
+					return codeErr
+				}
+				r := rune(code)
+				if utf16.IsSurrogate(r) {
+					marker := make([]byte, 2)
+					if _, codeErr = io.ReadFull(buffered, marker); codeErr != nil || marker[0] != '\\' || marker[1] != 'u' {
+						return fmt.Errorf("invalid JSON surrogate pair")
+					}
+					low, lowErr := readJSONHexRune(buffered)
+					if lowErr != nil {
+						return lowErr
+					}
+					r = utf16.DecodeRune(r, rune(low))
+					if r == utf8.RuneError {
+						return fmt.Errorf("invalid JSON surrogate pair")
+					}
+				}
+				_, err = writer.WriteRune(r)
+			default:
+				return fmt.Errorf("invalid JSON string escape")
+			}
+			if err != nil {
+				return err
+			}
+		default:
+			if value < 0x20 {
+				return fmt.Errorf("invalid control byte in JSON string")
+			}
+			if err = writer.WriteByte(value); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func readJSONNonSpace(reader *bufio.Reader) (byte, error) {
+	for {
+		value, err := reader.ReadByte()
+		if err != nil || !isJSONSpace(value) {
+			return value, err
+		}
+	}
+}
+
+func isJSONSpace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n'
+}
+
+func readJSONHexRune(reader *bufio.Reader) (uint16, error) {
+	var raw [4]byte
+	if _, err := io.ReadFull(reader, raw[:]); err != nil {
+		return 0, err
+	}
+	value, err := strconv.ParseUint(string(raw[:]), 16, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid JSON unicode escape: %w", err)
+	}
+	return uint16(value), nil
+}
+
+func completedResponseText(response map[string]interface{}) string {
+	if response == nil {
+		return ""
+	}
+	if text := streamString(response["output_text"]); text != "" {
+		return text
+	}
+	var text strings.Builder
+	for _, rawItem := range asSlice(response["output"]) {
+		item, _ := rawItem.(map[string]interface{})
+		if streamString(item["type"]) == "message" {
+			text.WriteString(responsesOutputItemText(item))
+		}
+	}
+	return text.String()
 }
 
 func sseFrameEventData(frame []byte) (string, []byte) {

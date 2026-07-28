@@ -222,6 +222,8 @@ func configFields() []configField {
 			Help: "开=请求 Anthropic cache diagnostics beta 并记录 miss 原因。", boot: func(c config.Config) interface{} { return c.ClaudeCacheDiagnosticsEnabled }},
 		{Key: "claude_cache_singleflight_enabled", Label: "Claude 缓存 Singleflight", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=同前缀并发请求等待首个写缓存请求开始返回，减少并发冷启动 miss。", boot: func(c config.Config) interface{} { return c.ClaudeCacheSingleflightEnabled }},
+		{Key: "codex_cache_singleflight_enabled", Label: "Codex 缓存 Singleflight", Category: catBehavior, Type: fieldBool, Effect: effectHot,
+			Help: "开(默认)=同账号、模型和 prompt_cache_key 的并发冷请求等待 leader 返回响应头；超时后独立执行。", boot: func(c config.Config) interface{} { return c.CodexCacheSingleflightEnabled }},
 		{Key: "claude_cache_lossless_block_split", Label: "Claude 无损块拆分", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=仅在拼接后逐字节一致时拆分巨型 text block，便于标记稳定上下文。", boot: func(c config.Config) interface{} { return c.ClaudeCacheLosslessBlockSplit }},
 		{Key: "claude_cch_signing", Label: "Claude CCH 签名（已弃用）", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
@@ -305,6 +307,10 @@ func configFields() []configField {
 			Help: "同账号已有在途请求时允许叠加的估算输入 token 上限；0=关闭。", boot: func(c config.Config) interface{} { return int(c.AccountTokenBudget) }},
 		{Key: "resource_headroom_percent", Label: "资源安全余量", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "CPU、内存或 FD 达到安全线时暂停新准入；最小 10%。", boot: func(c config.Config) interface{} { return c.ResourceHeadroomPercent }},
+		{Key: "scheduler_index_enabled", Label: "调度索引 v2", Category: catLimits, Type: fieldBool, Effect: effectScheduler,
+			Help: "开(默认)=不可变候选索引与 power-of-two；关=逐请求全候选扫描兼容路径。", boot: func(c config.Config) interface{} { return c.SchedulerIndexEnabled }},
+		{Key: "body_v2_enabled", Label: "请求体 v2", Category: catLimits, Type: fieldBool, Effect: effectRestart,
+			Help: "开(默认)=有界内存、自动 spool 与可重放 BodySource；关=旧版整块内存读取，需重启。", boot: func(c config.Config) interface{} { return c.BodyV2Enabled }},
 		{Key: "context_journal_ttl_seconds", Label: "上下文日志 TTL", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "加密 Responses 重建日志保留秒数，默认 3600 秒（1 小时）。命中(续写/恢复)会滑动续期，活跃长任务可无限恢复。", boot: func(c config.Config) interface{} { return c.ContextJournalTTLSeconds }},
 		{Key: "context_journal_max_rows", Label: "上下文日志最大行数", Category: catLimits, Type: fieldInt, Effect: effectHot,
@@ -330,13 +336,13 @@ func configFields() []configField {
 		{Key: "goal_compression_concurrency", Label: "目标压缩并发", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "全局可同时执行的目标压缩作业数，默认 1。", boot: func(c config.Config) interface{} { return c.GoalCompressionConcurrency }},
 		{Key: "codex_session_mapping_enabled", Label: "Codex 会话映射", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=下游 session/thread 仅作为加密查询别名，上游始终使用本地生成的 UUIDv7；主 CLI 会话遇到风控类错误时轮换为新的上游映射，并用目标检查点恢复任务。开启时优先于无状态直通。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
+			Help: "用于固定连接 WebSocket 和显式兼容模式的加密 UUIDv7 映射。HTTP 无状态直通开启时优先，不会建立或使用上游 continuation 映射。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingEnabled }},
 		{Key: "codex_session_mapping_retention_days", Label: "Codex 映射保留天数", Category: catLimits, Type: fieldInt, Effect: effectHot,
 			Help: "Codex 会话映射的滑动保留期，默认 7 天；仅保留 HMAC 别名和加密身份元数据。", boot: func(c config.Config) interface{} { return c.CodexSessionMappingRetentionDays }},
 		{Key: "codex_cpa_strict", Label: "Codex 严格 CPA", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "开(默认)=previous_response_id 与工具输出只原样交给同一上游会话；找不到映射时显式失败，不降级重放。管理员配置的上游错误规则仍会执行。", boot: func(c config.Config) interface{} { return c.CodexCPAStrict }},
+			Help: "默认开启：previous_response_id 与工具输出只交给原上游会话；额度耗尽时使用持久化 Goal 在健康账号重建，不改变原生缓存语义。", boot: func(c config.Config) interface{} { return c.CodexCPAStrict }},
 		{Key: "codex_stateless_passthrough", Label: "Codex 无状态直通", Category: catLimits, Type: fieldBool, Effect: effectHot,
-			Help: "仅在关闭 Codex 会话映射时生效：剥掉 previous_response_id / x-codex-turn-state，并以自包含请求转发。会话映射开启时始终优先，以保证上游不接触下游 session_id。", boot: func(c config.Config) interface{} { return c.CodexStatelessPassthrough }},
+			Help: "显式兼容模式，默认关闭：HTTP 请求剥掉 previous_response_id / x-codex-turn-state，允许任意账号接管，但会放弃原生 continuation 与对应缓存收益；固定连接 WebSocket 不受影响。", boot: func(c config.Config) interface{} { return c.CodexStatelessPassthrough }},
 		{Key: "strict_sticky_max_cooldown_seconds", Label: "严格 Sticky 冷却阈值", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
 			Help: "严格绑定账号冷却超过该秒数时允许换号；0=永不因长冷却换号。", boot: func(c config.Config) interface{} { return c.StrictStickyMaxCooldownSeconds }},
 		{Key: "cooldown_wait_max_seconds", Label: "短冷却等待秒数", Category: catLimits, Type: fieldInt, Effect: effectScheduler,
@@ -534,6 +540,7 @@ func (s *Server) effectiveSchedulerConfig(ctx context.Context) config.Config {
 	c.StatefulStickyWaitSeconds = s.settingInt(ctx, "stateful_sticky_wait_seconds", c.StatefulStickyWaitSeconds)
 	c.AccountTokenBudget = s.settingInt64(ctx, "account_token_budget", c.AccountTokenBudget)
 	c.ResourceHeadroomPercent = s.settingInt(ctx, "resource_headroom_percent", c.ResourceHeadroomPercent)
+	c.SchedulerIndexEnabled = s.flagEnabled(ctx, "scheduler_index_enabled", c.SchedulerIndexEnabled)
 	c.StrictStickyMaxCooldownSeconds = s.settingInt(ctx, "strict_sticky_max_cooldown_seconds", c.StrictStickyMaxCooldownSeconds)
 	c.CooldownWaitMaxSeconds = s.settingInt(ctx, "cooldown_wait_max_seconds", c.CooldownWaitMaxSeconds)
 	c.SchedulerHeartbeatSeconds = s.settingInt(ctx, "scheduler_heartbeat_seconds", c.SchedulerHeartbeatSeconds)

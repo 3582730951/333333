@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"bytes"
 	"context"
 	"net/http"
 	"net/http/cookiejar"
@@ -9,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream/tlsclient"
 )
@@ -17,7 +17,13 @@ import (
 // idle-timeout behavior. It is used by native adapters such as Kiro whose endpoint
 // and wire protocol are neither Codex nor Anthropic HTTP.
 func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
-	return c.doRaw(ctx, egress, method, rawURL, headers, body, cookieJarKey, false)
+	return c.DoRawSource(ctx, egress, method, rawURL, headers, bodysource.Bytes(body), cookieJarKey)
+}
+
+// DoRawSource is the replayable-body counterpart to DoRaw. The source is borrowed for
+// the duration of the call and remains owned by the caller.
+func (c *Client) DoRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string) (*Response, error) {
+	return c.doRawSource(ctx, egress, method, rawURL, headers, body, cookieJarKey, false)
 }
 
 // DoRawHTTP1 is the HTTP/1.1-only counterpart to DoRaw. It is used by native
@@ -26,10 +32,15 @@ func (c *Client) DoRaw(ctx context.Context, egress storage.EgressProfile, method
 // underlying chain proxy (and therefore exit IP) while using the Go HTTP/1.1
 // transport directly.
 func (c *Client) DoRawHTTP1(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
-	return c.doRaw(ctx, http1TransparentEgress(egress), method, rawURL, headers, body, cookieJarKey, true)
+	return c.DoRawHTTP1Source(ctx, egress, method, rawURL, headers, bodysource.Bytes(body), cookieJarKey)
 }
 
-func (c *Client) doRaw(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string, forceHTTP1 bool) (*Response, error) {
+// DoRawHTTP1Source is the replayable-body counterpart to DoRawHTTP1.
+func (c *Client) DoRawHTTP1Source(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string) (*Response, error) {
+	return c.doRawSource(ctx, http1TransparentEgress(egress), method, rawURL, headers, body, cookieJarKey, true)
+}
+
+func (c *Client) doRawSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string, forceHTTP1 bool) (*Response, error) {
 	if strings.EqualFold(strings.TrimSpace(egress.Type), "curl_cffi_sidecar") {
 		// In-process fingerprint engine: route native-adapter egress (Kiro's aws-sdk-js
 		// calls, Codex/WHAM reset-credit/quota/registration calls) through tls-client with
@@ -38,12 +49,12 @@ func (c *Client) doRaw(ctx context.Context, egress storage.EgressProfile, method
 		// the right fingerprint without changing this provider-neutral signature. The
 		// sidecar stays the fallback whenever the engine is left on "sidecar".
 		if c.inProcessFingerprint() {
-			return c.doRawInProcess(ctx, egress, method, rawURL, headers, body, cookieJarKey, rawProfileForHeaders(headers), nil)
+			return c.doRawInProcessSource(ctx, egress, method, rawURL, headers, body, cookieJarKey, rawProfileForHeaders(headers), nil)
 		}
-		return c.DoViaSidecar(ctx, egress, method, rawURL, headers, body, cookieJarKey)
+		return c.DoViaSidecarSource(ctx, egress, method, rawURL, headers, body, cookieJarKey)
 	}
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
-	req, err := http.NewRequestWithContext(ctx, method, rawURL, bytes.NewReader(body))
+	req, err := newReplayableHTTPRequest(ctx, method, rawURL, Request{Body: body})
 	if err != nil {
 		guard.Fail()
 		return nil, err
@@ -143,6 +154,12 @@ func proxyTypeForURL(raw string) string {
 // stdlib transport's fingerprint would be flagged. cookieJarKey scopes the sidecar's
 // server-side cookie store so a multi-call flow shares cookies under one key.
 func (c *Client) DoViaSidecar(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey string) (*Response, error) {
+	return c.DoViaSidecarSource(ctx, egress, method, rawURL, headers, bodysource.Bytes(body), cookieJarKey)
+}
+
+// DoViaSidecarSource streams a replayable source to sidecar v2 without base64 or
+// intermediate []byte copies. The source remains owned by the caller.
+func (c *Client) DoViaSidecarSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey string) (*Response, error) {
 	built := http.Header{}
 	for k, vs := range headers {
 		for _, v := range vs {

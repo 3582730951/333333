@@ -33,7 +33,7 @@ func TestAgentIdentityAuthorizationIsSignedForHTTPAndWebSocket(t *testing.T) {
 	client := NewClient(config.Default())
 	token := upstreamAgentToken(t)
 	spec := Request{
-		Method: http.MethodPost, DownstreamPath: "/v1/responses", Body: []byte(`{"model":"gpt-5.5","input":"hi"}`),
+		Method: http.MethodPost, DownstreamPath: "/v1/responses", Body: testBody([]byte(`{"model":"gpt-5.5","input":"hi"}`)),
 		Account: storage.Account{ID: "agent-account", UpstreamAccountID: "workspace-upstream"}, Token: token,
 	}
 	headers := http.Header{}

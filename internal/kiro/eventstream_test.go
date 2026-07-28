@@ -2,11 +2,16 @@ package kiro
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"hash/crc32"
+	"os"
 	"strings"
 	"testing"
+
+	"codex-account-pool/internal/bodysource"
 )
 
 func testFrame(headers map[string]string, payload []byte) []byte {
@@ -146,6 +151,52 @@ func TestResponseProcessorBuffersToolUntilStopAndEmitsCompleteJSON(t *testing.T)
 	}
 	if _, err := processor.Finish(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResponseProcessorSpoolsLargeAccumulatedOutputAndCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	processor := NewResponseProcessorWithOptions(context.Background(), nil, bodysource.CaptureOptions{
+		MaxBytes: 1 << 20, MemoryThreshold: 32, TempDir: dir,
+	})
+	delta := strings.Repeat("kiro-output-", 4096)
+	for index := 0; index < 8; index++ {
+		payload, _ := json.Marshal(map[string]interface{}{"content": delta})
+		if _, err := processor.ProcessFrame(Frame{
+			Headers: map[string]Header{":message-type": {Value: "event"}, ":event-type": {Value: "assistantResponseEvent"}},
+			Payload: payload,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if processor.text == nil || !processor.text.buffer.Spilled() {
+		t.Fatal("Kiro accumulated output did not spill")
+	}
+	if _, err := processor.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	data := processor.Data()
+	if len(data.Text) != len(delta)*8 || !strings.HasSuffix(data.Text, delta) {
+		t.Fatalf("Kiro output changed: got=%d want=%d", len(data.Text), len(delta)*8)
+	}
+	if err := processor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("Kiro spool cleanup entries=%v err=%v", entries, err)
+	}
+}
+
+func TestResponseProcessorRejectsAccumulatedOutputBeyondLimit(t *testing.T) {
+	processor := NewResponseProcessorWithOptions(context.Background(), nil, bodysource.CaptureOptions{MaxBytes: 64, MemoryThreshold: 8, TempDir: t.TempDir()})
+	defer processor.Close()
+	payload, _ := json.Marshal(map[string]interface{}{"content": strings.Repeat("x", 65)})
+	_, err := processor.ProcessFrame(Frame{
+		Headers: map[string]Header{":message-type": {Value: "event"}, ":event-type": {Value: "assistantResponseEvent"}},
+		Payload: payload,
+	})
+	if !errors.Is(err, bodysource.ErrBodyTooLarge) {
+		t.Fatalf("limit error=%v", err)
 	}
 }
 

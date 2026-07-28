@@ -1138,7 +1138,7 @@ func systemConfigTemplates() []map[string]interface{} {
 		{
 			"id":          "optimal-stable-models-v1",
 			"name":        "全模型稳定推荐配置",
-			"description": "启用会话隔离、Codex UUIDv7 映射、严格 CPA、长任务连续性、流式保活与停滞续接、故障转移和泄漏擦除；同时保留 Kiro 原生高质量与缓存配置。",
+			"description": "Codex HTTP 使用无状态完整上下文转发以支持任意健康账号无感切换；WebSocket 保留固定连接内的原生状态，并启用会话隔离、流式保活、故障转移和 Kiro 原生高质量缓存配置。",
 			"section":     "config",
 			"values":      optimalStableModelsTemplateValues(),
 		},

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,11 +29,23 @@ func testGatewayDirectConcurrentStreams(t *testing.T, count int, timeout time.Du
 	t.Helper()
 	var arrived atomic.Int64
 	allArrived := make(chan struct{})
+	capacityArrived := make(chan struct{})
 	release := make(chan struct{})
-	var once sync.Once
+	var allOnce, capacityOnce, releaseOnce sync.Once
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer releaseOnce.Do(func() { close(release) })
+	capacity := count
+	if capacity > 512 {
+		capacity = 512
+	}
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		if arrived.Add(1) == int64(count) {
-			once.Do(func() { close(allArrived) })
+		n := arrived.Add(1)
+		if n == int64(capacity) {
+			capacityOnce.Do(func() { close(capacityArrived) })
+		}
+		if n == int64(count) {
+			allOnce.Do(func() { close(allArrived) })
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -50,7 +64,7 @@ func testGatewayDirectConcurrentStreams(t *testing.T, count int, timeout time.Du
 		go func(i int) {
 			defer wg.Done()
 			body := fmt.Sprintf(`{"model":"gpt","stream":true,"input":"load-%d"}`, i)
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			resp, err := client.Do(req)
 			if err != nil {
@@ -69,15 +83,43 @@ func testGatewayDirectConcurrentStreams(t *testing.T, count int, timeout time.Du
 		}(i)
 	}
 	select {
+	case <-capacityArrived:
+	case <-time.After(timeout):
+		releaseOnce.Do(func() { close(release) })
+		writeConcurrentGoroutineProfile()
+		t.Fatalf("only %d/%d concurrent streams reached upstream within %s; early errors=%v", arrived.Load(), capacity, timeout, drainConcurrentErrors(errs, 10))
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
 	case <-allArrived:
 	case <-time.After(timeout):
-		close(release)
-		t.Fatalf("only %d/%d streams reached upstream within %s", arrived.Load(), count, timeout)
+		writeConcurrentGoroutineProfile()
+		t.Fatalf("only %d/%d queued streams reached upstream within %s after capacity released; early errors=%v", arrived.Load(), count, timeout, drainConcurrentErrors(errs, 10))
 	}
-	close(release)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
 		t.Error(err)
 	}
+}
+
+func writeConcurrentGoroutineProfile() {
+	if profile := pprof.Lookup("goroutine"); profile != nil {
+		_ = profile.WriteTo(os.Stderr, 1)
+	}
+}
+
+func drainConcurrentErrors(errs <-chan error, limit int) []error {
+	out := make([]error, 0, limit)
+	for len(out) < limit {
+		select {
+		case err := <-errs:
+			if err != nil {
+				out = append(out, err)
+			}
+		default:
+			return out
+		}
+	}
+	return out
 }

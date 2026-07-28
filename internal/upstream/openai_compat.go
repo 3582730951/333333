@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -61,7 +60,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 	}
 	method := firstNonEmpty(spec.Method, http.MethodPost)
-	stream := bodyStreamTrue(spec.Body)
+	stream := requestStreamTrue(spec)
 
 	built := http.Header{}
 	switch spec.TransportProfile {
@@ -90,7 +89,7 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
-	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(spec.Body))
+	req, err := newReplayableHTTPRequest(ctx, method, target, spec)
 	if err != nil {
 		guard.Fail()
 		return nil, err
@@ -157,7 +156,7 @@ func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
 			dst.Set("Anthropic-Beta", beta)
 		}
 	}
-	if len(spec.Body) > 0 {
+	if requestBodySize(spec) > 0 {
 		dst.Set("Content-Type", "application/json")
 	}
 	if stream {

@@ -15,8 +15,11 @@ import (
 
 func (s *Server) currentUsageCompleteness(ctx context.Context, snapshotAt int64) (storage.UsageCompleteness, error) {
 	flushCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	timedOut := s.flushTelemetry(flushCtx)
+	timedOut, flushErr := s.flushTelemetry(flushCtx)
 	cancel()
+	if flushErr != nil {
+		return storage.UsageCompleteness{}, flushErr
+	}
 	meta, err := s.store.UsageCompleteness(ctx, snapshotAt)
 	meta.TelemetryFlushTimedOut = timedOut
 	if timedOut {

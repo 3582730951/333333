@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -148,10 +149,8 @@ func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.streamDiagnosticsExport(r.Context(), w); err != nil {
-		// All database reads and manifest construction happen before headers are
-		// committed. A later error means the client receives a truncated ZIP, which
-		// is preferable to retaining the entire export in memory just to rewrite an
-		// HTTP status after streaming has begun.
+		// The complete ZIP is generated on disk before headers are committed, so a
+		// database, CSV, snapshot, or archive failure remains a normal JSON error.
 		if w.Header().Get("Content-Type") == "" {
 			writeError(w, http.StatusInternalServerError, err)
 		}
@@ -171,6 +170,7 @@ func diagnosticFileOrder() []string {
 		"codex_session_mappings.csv",
 		"codex_instruction_snapshots.csv",
 		"codex_upstream_attempts.csv",
+		"codex_upstream_attempts_daily.csv",
 		"codex_group_policy_revisions.csv",
 		"sidecar_status.csv",
 		"settings.csv",
@@ -196,97 +196,138 @@ type diagnosticExportStat struct {
 }
 
 func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWriter) error {
-	accounts, err := s.store.ListAccounts(ctx)
+	snapshot, err := s.store.BeginDiagnosticSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	bindings, err := s.store.ListEgressBindings(ctx)
+	snapshotOpen := true
+	defer func() {
+		if snapshotOpen {
+			_ = snapshot.Close()
+		}
+	}()
+	snapshotStore, err := snapshot.Store(s.store)
 	if err != nil {
 		return err
 	}
-	egressProfiles, err := s.store.ListEgressProfiles(ctx)
+	temp, err := os.CreateTemp(s.cfg.BodySpoolDir, "codex-pool-diagnostics-*.zip")
 	if err != nil {
 		return err
 	}
-	groups, err := s.store.ListGroups(ctx)
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+	}()
+	if err = s.writeDiagnosticsExport(ctx, temp, snapshot.ID(), snapshotStore); err != nil {
+		return err
+	}
+	if err = temp.Sync(); err != nil {
+		return err
+	}
+	if err = snapshot.Close(); err != nil {
+		return err
+	}
+	snapshotOpen = false
+	if _, err = temp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="codex-pool-diagnostics-v2.zip"`)
+	// Hide File.WriteTo and ResponseWriter.ReadFrom so archive delivery stays in
+	// small bounded writes even when the compressed ZIP is much smaller than its
+	// source tables.
+	_, err = io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{temp}, make([]byte, 4<<10))
+	return err
+}
+
+func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snapshotID string, snapshotStore *storage.Store) error {
+	generatedAt := time.Now().Unix()
+	snapshotNow := storage.Now()
+	accounts, err := snapshotStore.ListAccounts(ctx)
 	if err != nil {
 		return err
 	}
-	tokensByID, err := s.store.ListTokensByAccountIDs(ctx, accountIDsForDiagnostics(accounts))
+	bindings, err := snapshotStore.ListEgressBindings(ctx)
 	if err != nil {
 		return err
 	}
-	capabilities, err := s.store.ListCapabilities(ctx, "")
+	egressProfiles, err := snapshotStore.ListEgressProfiles(ctx)
 	if err != nil {
 		return err
 	}
-	kiroCapabilities, err := s.store.ListKiroRuntimeCapabilities(ctx, "")
+	groups, err := snapshotStore.ListGroups(ctx)
 	if err != nil {
 		return err
 	}
-	rateLimits, err := s.store.ListAccountRateLimits(ctx)
+	tokensByID, err := snapshotStore.ListTokensByAccountIDs(ctx, accountIDsForDiagnostics(accounts))
 	if err != nil {
 		return err
 	}
-	affinityBindings, err := listDiagnosticAffinityBindings(ctx, s.store.DB())
+	capabilities, err := snapshotStore.ListCapabilities(ctx, "")
 	if err != nil {
 		return err
 	}
-	codexMappings, err := s.store.ListCodexSessionMappingDiagnostics(ctx)
+	kiroCapabilities, err := snapshotStore.ListKiroRuntimeCapabilities(ctx, "")
 	if err != nil {
 		return err
 	}
-	codexInstructionSnapshots, err := s.store.ListCodexInstructionSnapshotDiagnostics(ctx)
+	rateLimits, err := snapshotStore.ListAccountRateLimits(ctx)
 	if err != nil {
 		return err
 	}
-	codexUpstreamAttempts, err := s.store.ListCodexUpstreamAttemptDiagnostics(ctx)
+	codexMappings, err := snapshotStore.ListCodexSessionMappingDiagnostics(ctx)
 	if err != nil {
 		return err
 	}
-	settings, err := listDiagnosticSettings(ctx, s.store.DB())
+	codexInstructionSnapshots, err := snapshotStore.ListCodexInstructionSnapshotDiagnostics(ctx)
 	if err != nil {
 		return err
 	}
-	customProviders, err := s.store.ListCustomProviders(ctx)
+	settings, err := listDiagnosticSettings(ctx, snapshotStore.ReadDB())
 	if err != nil {
 		return err
 	}
-	upstreamRules, err := s.store.ListUpstreamErrorRules(ctx)
+	customProviders, err := snapshotStore.ListCustomProviders(ctx)
 	if err != nil {
 		return err
 	}
-	resetConsumptions, err := listDiagnosticCodexResetCreditConsumptions(ctx, s.store.DB())
+	upstreamRules, err := snapshotStore.ListUpstreamErrorRules(ctx)
 	if err != nil {
 		return err
 	}
-	lifecycleStatuses, err := listDiagnosticLifecycleStatuses(ctx, s.store.DB())
+	resetConsumptions, err := listDiagnosticCodexResetCreditConsumptions(ctx, snapshotStore.ReadDB())
 	if err != nil {
 		return err
 	}
-	reauthConfigs, err := listDiagnosticCodexReauthConfigs(ctx, s.store.DB())
+	lifecycleStatuses, err := listDiagnosticLifecycleStatuses(ctx, snapshotStore.ReadDB())
 	if err != nil {
 		return err
 	}
-	reauthJobs, err := listDiagnosticCodexReauthJobs(ctx, s.store.DB())
+	reauthConfigs, err := listDiagnosticCodexReauthConfigs(ctx, snapshotStore.ReadDB())
 	if err != nil {
 		return err
 	}
-	codebook, err := buildStreamingDiagnosticCodebook(ctx, s.store.DB(), accounts, bindings)
+	reauthJobs, err := listDiagnosticCodexReauthJobs(ctx, snapshotStore.ReadDB())
+	if err != nil {
+		return err
+	}
+	codebook, err := buildStreamingDiagnosticCodebook(ctx, snapshotStore.ReadDB(), accounts, bindings)
 	if err != nil {
 		return err
 	}
 	summary := diagnosticSummary(accounts, tokensByID, nil, nil, bindings, rateLimits)
-	codexCPA := s.codexSessionMappingStats(ctx)
+	summary["usage_journal"] = s.usageJournalMetrics()
+	codexCPA := s.codexSessionMappingStatsFromSnapshot(ctx, snapshotStore, settings)
 	codexCPA["instruction_policy_groups"] = len(groups)
 	summary["codex_cpa"] = codexCPA
-	if err := applyDiagnosticAuditSummary(ctx, s.store.DB(), summary); err != nil {
+	if err := applyDiagnosticAuditSummary(ctx, snapshotStore.ReadDB(), summary); err != nil {
 		return err
 	}
-	if err := applyDiagnosticBillingHoldSummary(ctx, s.store.DB(), summary); err != nil {
+	if err := applyDiagnosticBillingHoldSummary(ctx, snapshotStore.ReadDB(), summary); err != nil {
 		return err
 	}
-	stats, err := diagnosticLargeTableStats(ctx, s.store.DB())
+	stats, err := diagnosticLargeTableStats(ctx, snapshotStore.ReadDB(), snapshotNow)
 	if err != nil {
 		return err
 	}
@@ -311,10 +352,8 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
 	addCSV("account_rate_limits.csv", []string{"account_code", "provider", "model", "limiter_type", "source", "used_percent", "limit_tokens", "remaining_tokens", "limit_requests", "remaining_requests", "reset_at", "status", "raw_json", "updated_at"}, accountRateLimitRows(rateLimits, codebook))
-	addCSV("affinity_bindings.csv", []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}, affinityBindingRows(affinityBindings, codebook))
 	addCSV("codex_session_mappings.csv", []string{"tree_hmac_prefix", "namespace_hmac_prefix", "account_code", "egress_id", "epoch", "state", "instruction_snapshot_present", "created_at", "updated_at", "expires_at"}, codexSessionMappingDiagnosticRows(codexMappings, codebook))
 	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, codexInstructionSnapshotDiagnosticRows(codexInstructionSnapshots))
-	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, codexUpstreamAttemptDiagnosticRows(codexUpstreamAttempts, codebook))
 	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, codexGroupPolicyRevisionRows(groups, s))
 	sidecarAdaptive := []upstream.SidecarAdaptiveStatus(nil)
 	if s.upstream != nil {
@@ -382,11 +421,6 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		rateTimes = append(rateTimes, row.UpdatedAt)
 	}
 	addRange("account_rate_limits.csv", rateTimes)
-	affinityTimes := make([]int64, 0, len(affinityBindings))
-	for _, row := range affinityBindings {
-		affinityTimes = append(affinityTimes, row.CreatedAt)
-	}
-	addRange("affinity_bindings.csv", affinityTimes)
 	codexMappingTimes := make([]int64, 0, len(codexMappings))
 	for _, row := range codexMappings {
 		codexMappingTimes = append(codexMappingTimes, row.CreatedAt)
@@ -397,11 +431,6 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		codexSnapshotTimes = append(codexSnapshotTimes, row.CreatedAt)
 	}
 	addRange("codex_instruction_snapshots.csv", codexSnapshotTimes)
-	codexAttemptTimes := make([]int64, 0, len(codexUpstreamAttempts))
-	for _, row := range codexUpstreamAttempts {
-		codexAttemptTimes = append(codexAttemptTimes, row.CreatedAt)
-	}
-	addRange("codex_upstream_attempts.csv", codexAttemptTimes)
 	groupPolicyTimes := make([]int64, 0, len(groups))
 	for _, row := range groups {
 		groupPolicyTimes = append(groupPolicyTimes, row.UpdatedAt)
@@ -455,7 +484,7 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 	}
 	addRange("egress_snapshot.csv", egressTimes)
 	manifest := map[string]interface{}{
-		"generated_at": time.Now().Unix(), "format": "codex-pool-diagnostics-v2",
+		"generated_at": generatedAt, "snapshot_id": snapshotID, "format": "codex-pool-diagnostics-v2",
 		"account_count": len(accounts), "current_account_count": len(accounts),
 		"historical_reference_account_count": len(codebook.byID),
 		"files":                              diagnosticFileOrder(), "row_counts": rowCounts,
@@ -467,19 +496,24 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		return err
 	}
 
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="codex-pool-diagnostics-v2.zip"`)
-	zw := zip.NewWriter(w)
+	zw := zip.NewWriter(dst)
 	for _, name := range diagnosticFileOrder() {
+		var written int64
 		switch name {
 		case "audit_log.csv":
-			err = streamDiagnosticAuditCSV(ctx, s.store.DB(), zw, codebook)
+			written, err = streamDiagnosticAuditCSV(ctx, snapshotStore.ReadDB(), zw, codebook)
 		case "cf_events.csv":
-			err = streamDiagnosticCFCSV(ctx, s.store.DB(), zw, codebook)
+			written, err = streamDiagnosticCFCSV(ctx, snapshotStore.ReadDB(), zw, codebook)
 		case "usage_records.csv":
-			err = streamDiagnosticUsageCSV(ctx, s.store.DB(), zw, codebook)
+			written, err = streamDiagnosticUsageCSV(ctx, snapshotStore.ReadDB(), zw, codebook)
 		case "billing_holds.csv":
-			err = streamDiagnosticBillingHoldsCSV(ctx, s.store.DB(), zw, codebook)
+			written, err = streamDiagnosticBillingHoldsCSV(ctx, snapshotStore.ReadDB(), zw, codebook)
+		case "affinity_bindings.csv":
+			written, err = streamDiagnosticAffinityCSV(ctx, snapshotStore.ReadDB(), zw, codebook, snapshotNow)
+		case "codex_upstream_attempts.csv":
+			written, err = streamDiagnosticCodexUpstreamAttemptsCSV(ctx, snapshotStore.ReadDB(), zw, codebook, snapshotStore, snapshotNow)
+		case "codex_upstream_attempts_daily.csv":
+			written, err = streamDiagnosticCodexUpstreamAttemptsDailyCSV(ctx, snapshotStore.ReadDB(), zw, codebook, snapshotNow)
 		default:
 			content, ok := small[name]
 			if !ok {
@@ -495,17 +529,58 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 			_ = zw.Close()
 			return err
 		}
+		if stat, streamed := stats[name]; streamed && written != stat.Rows {
+			_ = zw.Close()
+			return fmt.Errorf("diagnostic snapshot row count changed for %s: wrote %d expected %d", name, written, stat.Rows)
+		}
 	}
 	return zw.Close()
 }
 
-func buildStreamingDiagnosticCodebook(ctx context.Context, db *sql.DB, accounts []storage.Account, bindings []storage.AccountEgressBinding) (diagnosticCodebook, error) {
+func (s *Server) codexSessionMappingStatsFromSnapshot(ctx context.Context, snapshotStore *storage.Store, settings []diagnosticSetting) map[string]interface{} {
+	values := make(map[string]string, len(settings))
+	for _, setting := range settings {
+		values[setting.Key] = strings.TrimSpace(setting.Value)
+	}
+	boolValue := func(key string, fallback bool) bool {
+		value, ok := values[key]
+		if !ok || value == "" {
+			return fallback
+		}
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fallback
+		}
+		return parsed
+	}
+	intValue := func(key string, fallback int) int {
+		value, ok := values[key]
+		if !ok || value == "" {
+			return fallback
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return fallback
+		}
+		return parsed
+	}
+	stateless := boolValue("codex_stateless_passthrough", s.cfg.CodexStatelessPassthrough)
+	enabled := !stateless && boolValue("codex_session_mapping_enabled", s.cfg.CodexSessionMappingEnabled)
+	strict := boolValue("codex_cpa_strict", s.cfg.CodexCPAStrict)
+	retentionDays := intValue("codex_session_mapping_retention_days", s.cfg.CodexSessionMappingRetentionDays)
+	return s.codexSessionMappingStatsConfigured(ctx, snapshotStore, enabled, stateless, strict, retentionDays)
+}
+
+func buildStreamingDiagnosticCodebook(ctx context.Context, db storage.ReadQuerier, accounts []storage.Account, bindings []storage.AccountEgressBinding) (diagnosticCodebook, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT account_id, MAX(account_label) FROM audit_log WHERE account_id <> '' GROUP BY account_id
 UNION SELECT account_id, '' FROM cf_events WHERE account_id <> ''
 UNION SELECT account_id, '' FROM usage_records WHERE account_id <> ''
 UNION SELECT account_id, '' FROM billing_holds WHERE account_id <> ''
-UNION SELECT account_id, '' FROM affinity_bindings WHERE account_id <> ''`)
+UNION SELECT account_id, '' FROM affinity_bindings WHERE account_id <> ''
+UNION SELECT account_id, '' FROM affinity_aliases WHERE account_id <> ''
+UNION SELECT account_id, '' FROM codex_upstream_attempt WHERE account_id <> ''
+UNION SELECT account_id, '' FROM codex_upstream_attempt_daily WHERE account_id <> ''`)
 	if err != nil {
 		return diagnosticCodebook{}, err
 	}
@@ -524,7 +599,7 @@ UNION SELECT account_id, '' FROM affinity_bindings WHERE account_id <> ''`)
 	return buildDiagnosticCodebook(accounts, historical, nil, nil, nil, bindings), nil
 }
 
-func applyDiagnosticAuditSummary(ctx context.Context, db *sql.DB, summary map[string]interface{}) error {
+func applyDiagnosticAuditSummary(ctx context.Context, db storage.ReadQuerier, summary map[string]interface{}) error {
 	cutoff := storage.Now() - 24*60*60
 	lifetime, _ := summary["lifetime"].(diagnosticEventWindow)
 	last24h, _ := summary["last_24h"].(diagnosticEventWindow)
@@ -641,7 +716,7 @@ GROUP BY category`, cutoff, cutoff)
 	return nil
 }
 
-func applyDiagnosticBillingHoldSummary(ctx context.Context, db *sql.DB, summary map[string]interface{}) error {
+func applyDiagnosticBillingHoldSummary(ctx context.Context, db storage.ReadQuerier, summary map[string]interface{}) error {
 	now := storage.Now()
 	rows, err := db.QueryContext(ctx, `SELECT status, COUNT(*),
 SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END),
@@ -695,15 +770,28 @@ FROM billing_holds GROUP BY status`, now-24*60*60, now-60*60, now-60*60, now-60*
 	return nil
 }
 
-func diagnosticLargeTableStats(ctx context.Context, db *sql.DB) (map[string]diagnosticExportStat, error) {
-	tables := map[string]string{
-		"audit_log.csv": "audit_log", "cf_events.csv": "cf_events",
-		"usage_records.csv": "usage_records", "billing_holds.csv": "billing_holds",
+func diagnosticLargeTableStats(ctx context.Context, db storage.ReadQuerier, snapshotNow int64) (map[string]diagnosticExportStat, error) {
+	queries := map[string]struct {
+		sql  string
+		args []interface{}
+	}{
+		"audit_log.csv":     {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM audit_log`},
+		"cf_events.csv":     {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM cf_events`},
+		"usage_records.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM usage_records`},
+		"billing_holds.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM billing_holds`},
+		"affinity_bindings.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM (
+SELECT created_at FROM affinity_aliases WHERE expires_at>?
+UNION ALL
+SELECT b.created_at FROM affinity_bindings b WHERE (b.expires_at=0 OR b.expires_at>?)
+AND NOT EXISTS (SELECT 1 FROM affinity_aliases a WHERE a.route_key_hash=b.route_key_hash AND a.expires_at>?)
+)`, args: []interface{}{snapshotNow, snapshotNow, snapshotNow}},
+		"codex_upstream_attempts.csv":       {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM codex_upstream_attempt WHERE expires_at>?`, args: []interface{}{snapshotNow}},
+		"codex_upstream_attempts_daily.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(first_created_at),0), COALESCE(MAX(last_created_at),0) FROM codex_upstream_attempt_daily WHERE expires_at>?`, args: []interface{}{snapshotNow}},
 	}
 	out := map[string]diagnosticExportStat{}
-	for file, table := range tables {
+	for file, query := range queries {
 		var stat diagnosticExportStat
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM `+table).Scan(&stat.Rows, &stat.Min, &stat.Max); err != nil {
+		if err := db.QueryRowContext(ctx, query.sql, query.args...).Scan(&stat.Rows, &stat.Min, &stat.Max); err != nil {
 			return nil, err
 		}
 		out[file] = stat
@@ -711,100 +799,191 @@ func diagnosticLargeTableStats(ctx context.Context, db *sql.DB) (map[string]diag
 	return out, nil
 }
 
-func streamDiagnosticCSV(zw *zip.Writer, name string, header []string, writeRows func(*csv.Writer) error) error {
+func streamDiagnosticCSV(zw *zip.Writer, name string, header []string, writeRows func(*csv.Writer) (int64, error)) (int64, error) {
 	writer, err := zw.Create(name)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	cw := csv.NewWriter(writer)
 	if err := cw.Write(header); err != nil {
-		return err
+		return 0, err
 	}
-	if err := writeRows(cw); err != nil {
-		return err
+	rows, err := writeRows(cw)
+	if err != nil {
+		return rows, err
 	}
 	cw.Flush()
-	return cw.Error()
+	return rows, cw.Error()
 }
 
-func streamDiagnosticAuditCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
-	return streamDiagnosticCSV(zw, "audit_log.csv", []string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, func(cw *csv.Writer) error {
+func streamDiagnosticAuditCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
+	return streamDiagnosticCSV(zw, "audit_log.csv", []string{"id", "created_at", "account_code", "action", "state", "reason", "detail"}, func(cw *csv.Writer) (int64, error) {
 		rows, err := db.QueryContext(ctx, `SELECT id, account_id, account_label, action, state, reason, detail, created_at FROM audit_log ORDER BY id`)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer rows.Close()
+		var written int64
 		for rows.Next() {
 			var row storage.AuditLogRow
 			if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.Action, &row.State, &row.Reason, &row.Detail, &row.CreatedAt); err != nil {
-				return err
+				return written, err
 			}
 			if err := cw.Write(auditLogRows([]storage.AuditLogRow{row}, codebook)[0]); err != nil {
-				return err
+				return written, err
 			}
+			written++
 		}
-		return rows.Err()
+		return written, rows.Err()
 	})
 }
 
-func streamDiagnosticCFCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
-	return streamDiagnosticCSV(zw, "cf_events.csv", []string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, func(cw *csv.Writer) error {
+func streamDiagnosticCFCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
+	return streamDiagnosticCSV(zw, "cf_events.csv", []string{"id", "created_at", "account_code", "egress_id", "status", "cf_ray", "category", "message"}, func(cw *csv.Writer) (int64, error) {
 		rows, err := db.QueryContext(ctx, `SELECT id, account_id, egress_id, status, cf_ray, category, message, created_at FROM cf_events ORDER BY id`)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer rows.Close()
+		var written int64
 		for rows.Next() {
 			var row storage.CFEvent
 			if err := rows.Scan(&row.ID, &row.AccountID, &row.EgressID, &row.Status, &row.CFRay, &row.Category, &row.Message, &row.CreatedAt); err != nil {
-				return err
+				return written, err
 			}
 			if err := cw.Write(cfEventRows([]storage.CFEvent{row}, codebook)[0]); err != nil {
-				return err
+				return written, err
 			}
+			written++
 		}
-		return rows.Err()
+		return written, rows.Err()
 	})
 }
 
-func streamDiagnosticUsageCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
+func streamDiagnosticUsageCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
 	header := []string{"id", "created_at", "account_code", "route_key_hash", "api_key_hash", "user_id", "model", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_read_tokens", "cache_creation_tokens", "usage_provider", "usage_source", "cache_read_present", "cache_creation_present", "compatibility_losses_json", "cache_capability", "estimated", "cache_miss_tokens", "cache_total_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "affinity_source", "route_class", "prompt_cache_key_present", "prompt_cache_key_source", "stable_prefix_source", "stable_prefix_reason", "stable_prefix_bytes", "retention_effective", "retention_source", "claude_cache_ttl", "cache_control_injected", "cache_breakpoint_count", "cache_breakpoints_json", "unwritten_tail_tokens", "max_possible_cache_read_tokens", "cache_hit_after_prewarm", "singleflight_waited_requests", "diagnostics_miss_reason", "latest_user_cache_control", "latest_user_auto_context_cache_control", "latest_user_tail_cache_control", "latest_user_tool_result_cache_control", "route_epoch", "raw_usage_json", "kiro_credits", "kiro_credits_present", "billing_hold_id", "requested_model", "resolved_model", "model_override_source"}
-	return streamDiagnosticCSV(zw, "usage_records.csv", header, func(cw *csv.Writer) error {
+	return streamDiagnosticCSV(zw, "usage_records.csv", header, func(cw *csv.Writer) (int64, error) {
 		rows, err := db.QueryContext(ctx, diagnosticUsageRecordSelectSQL()+` ORDER BY id`)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer rows.Close()
+		var written int64
 		for rows.Next() {
 			var row diagnosticUsageRecord
 			if err := scanDiagnosticUsageRecord(rows, &row); err != nil {
-				return err
+				return written, err
 			}
 			if err := cw.Write(usageRecordRows([]diagnosticUsageRecord{row}, codebook)[0]); err != nil {
-				return err
+				return written, err
 			}
+			written++
 		}
-		return rows.Err()
+		return written, rows.Err()
 	})
 }
 
-func streamDiagnosticBillingHoldsCSV(ctx context.Context, db *sql.DB, zw *zip.Writer, codebook diagnosticCodebook) error {
-	return streamDiagnosticCSV(zw, "billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status", "usage_expected", "usage_recorded_at"}, func(cw *csv.Writer) error {
+func streamDiagnosticBillingHoldsCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
+	return streamDiagnosticCSV(zw, "billing_holds.csv", []string{"id", "created_at", "updated_at", "account_code", "route_key_hash", "estimated_tokens", "status", "usage_expected", "usage_recorded_at"}, func(cw *csv.Writer) (int64, error) {
 		rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, usage_expected, usage_recorded_at, created_at, updated_at FROM billing_holds ORDER BY created_at, id`)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		defer rows.Close()
+		var written int64
 		for rows.Next() {
 			var row diagnosticBillingHold
 			if err := rows.Scan(&row.ID, &row.RouteKeyHash, &row.AccountID, &row.EstimatedTokens, &row.Status, &row.UsageExpected, &row.UsageRecordedAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
-				return err
+				return written, err
 			}
 			if err := cw.Write(billingHoldRows([]diagnosticBillingHold{row}, codebook)[0]); err != nil {
-				return err
+				return written, err
 			}
+			written++
 		}
-		return rows.Err()
+		return written, rows.Err()
+	})
+}
+
+func streamDiagnosticAffinityCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook, snapshotNow int64) (int64, error) {
+	header := []string{"route_key_hash", "route_key", "source", "account_code", "provider", "model", "egress_id", "epoch", "created_at", "updated_at"}
+	return streamDiagnosticCSV(zw, "affinity_bindings.csv", header, func(cw *csv.Writer) (int64, error) {
+		rows, err := db.QueryContext(ctx, `SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at FROM (
+	SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at FROM affinity_aliases WHERE expires_at>?
+	UNION ALL
+	SELECT b.route_key_hash,b.route_key,b.source,b.account_id,b.provider,b.model,b.egress_id,b.epoch,b.created_at,b.updated_at FROM affinity_bindings b
+	WHERE (b.expires_at=0 OR b.expires_at>?) AND NOT EXISTS (
+		SELECT 1 FROM affinity_aliases a WHERE a.route_key_hash=b.route_key_hash AND a.expires_at>?
+	)
+	) ORDER BY updated_at,route_key_hash`, snapshotNow, snapshotNow, snapshotNow)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		var written int64
+		for rows.Next() {
+			var row storage.AffinityBinding
+			if err = rows.Scan(&row.RouteKeyHash, &row.RouteKey, &row.Source, &row.AccountID, &row.Provider, &row.Model, &row.EgressID, &row.Epoch, &row.CreatedAt, &row.UpdatedAt); err != nil {
+				return written, err
+			}
+			if err = cw.Write(affinityBindingRows([]storage.AffinityBinding{row}, codebook)[0]); err != nil {
+				return written, err
+			}
+			written++
+		}
+		return written, rows.Err()
+	})
+}
+
+func streamDiagnosticCodexUpstreamAttemptsCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook, store *storage.Store, snapshotNow int64) (int64, error) {
+	header := []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}
+	return streamDiagnosticCSV(zw, "codex_upstream_attempts.csv", header, func(cw *csv.Writer) (int64, error) {
+		rows, err := db.QueryContext(ctx, `SELECT tree_id,account_id,egress_id,epoch,state,status_code,created_at FROM codex_upstream_attempt WHERE expires_at>? ORDER BY created_at,id`, snapshotNow)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		var written int64
+		for rows.Next() {
+			var treeID string
+			var row storage.CodexUpstreamAttemptDiagnostic
+			if err = rows.Scan(&treeID, &row.AccountID, &row.EgressID, &row.Epoch, &row.State, &row.StatusCode, &row.CreatedAt); err != nil {
+				return written, err
+			}
+			row.TreeHMACPrefix = store.CodexDiagnosticTreePrefix(treeID)
+			if err = cw.Write(codexUpstreamAttemptDiagnosticRows([]storage.CodexUpstreamAttemptDiagnostic{row}, codebook)[0]); err != nil {
+				return written, err
+			}
+			written++
+		}
+		return written, rows.Err()
+	})
+}
+
+func streamDiagnosticCodexUpstreamAttemptsDailyCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook, snapshotNow int64) (int64, error) {
+	header := []string{"day_start", "account_code", "egress_id", "state", "status_code", "attempt_count", "first_created_at", "last_created_at"}
+	return streamDiagnosticCSV(zw, "codex_upstream_attempts_daily.csv", header, func(cw *csv.Writer) (int64, error) {
+		rows, err := db.QueryContext(ctx, `SELECT day_start,account_id,egress_id,state,status_code,attempt_count,first_created_at,last_created_at
+FROM codex_upstream_attempt_daily WHERE expires_at>? ORDER BY day_start,account_id,egress_id,state,status_code`, snapshotNow)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		var written int64
+		for rows.Next() {
+			var row storage.CodexUpstreamAttemptDailyDiagnostic
+			if err = rows.Scan(&row.DayStart, &row.AccountID, &row.EgressID, &row.State, &row.StatusCode, &row.AttemptCount, &row.FirstCreatedAt, &row.LastCreatedAt); err != nil {
+				return written, err
+			}
+			if err = cw.Write([]string{
+				strconv.FormatInt(row.DayStart, 10), codebook.code(row.AccountID), row.EgressID, row.State,
+				strconv.Itoa(row.StatusCode), strconv.FormatInt(row.AttemptCount, 10), strconv.FormatInt(row.FirstCreatedAt, 10), strconv.FormatInt(row.LastCreatedAt, 10),
+			}); err != nil {
+				return written, err
+			}
+			written++
+		}
+		return written, rows.Err()
 	})
 }
 
@@ -837,6 +1016,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_session_mappings.csv", []string{"tree_hmac_prefix", "namespace_hmac_prefix", "account_code", "egress_id", "epoch", "state", "instruction_snapshot_present", "created_at", "updated_at", "expires_at"}, nil)
 	addCSV("codex_instruction_snapshots.csv", []string{"tree_hmac_prefix", "revision_hmac_prefix", "created_at", "updated_at", "expires_at"}, nil)
 	addCSV("codex_upstream_attempts.csv", []string{"tree_hmac_prefix", "account_code", "egress_id", "epoch", "state", "status_code", "created_at"}, nil)
+	addCSV("codex_upstream_attempts_daily.csv", []string{"day_start", "account_code", "egress_id", "state", "status_code", "attempt_count", "first_created_at", "last_created_at"}, nil)
 	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, nil)
 	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, nil)
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
@@ -945,7 +1125,7 @@ func diagnosticTableTimeRanges(accounts []storage.Account, auditRows []storage.A
 	}
 }
 
-func listDiagnosticAuditRows(ctx context.Context, db *sql.DB) ([]storage.AuditLogRow, error) {
+func listDiagnosticAuditRows(ctx context.Context, db storage.ReadQuerier) ([]storage.AuditLogRow, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, account_id, account_label, action, state, reason, detail, created_at FROM audit_log ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -962,7 +1142,7 @@ func listDiagnosticAuditRows(ctx context.Context, db *sql.DB) ([]storage.AuditLo
 	return out, rows.Err()
 }
 
-func listDiagnosticCFEvents(ctx context.Context, db *sql.DB) ([]storage.CFEvent, error) {
+func listDiagnosticCFEvents(ctx context.Context, db storage.ReadQuerier) ([]storage.CFEvent, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, account_id, egress_id, status, cf_ray, category, message, created_at FROM cf_events ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -979,7 +1159,7 @@ func listDiagnosticCFEvents(ctx context.Context, db *sql.DB) ([]storage.CFEvent,
 	return out, rows.Err()
 }
 
-func listDiagnosticUsageRecords(ctx context.Context, db *sql.DB) ([]diagnosticUsageRecord, error) {
+func listDiagnosticUsageRecords(ctx context.Context, db storage.ReadQuerier) ([]diagnosticUsageRecord, error) {
 	rows, err := db.QueryContext(ctx, diagnosticUsageRecordSelectSQL()+` ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -1022,7 +1202,7 @@ func scanDiagnosticUsageRecord(rows usageRecordScanner, r *diagnosticUsageRecord
 		&r.RawUsageJSON, &r.CreatedAt, &r.KiroCredits, &r.KiroCreditsPresent, &r.BillingHoldID, &r.RequestedModel, &r.ResolvedModel, &r.ModelOverrideSource)
 }
 
-func listDiagnosticBillingHolds(ctx context.Context, db *sql.DB) ([]diagnosticBillingHold, error) {
+func listDiagnosticBillingHolds(ctx context.Context, db storage.ReadQuerier) ([]diagnosticBillingHold, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, route_key_hash, account_id, estimated_tokens, status, usage_expected, usage_recorded_at, created_at, updated_at FROM billing_holds ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -1039,8 +1219,16 @@ func listDiagnosticBillingHolds(ctx context.Context, db *sql.DB) ([]diagnosticBi
 	return out, rows.Err()
 }
 
-func listDiagnosticAffinityBindings(ctx context.Context, db *sql.DB) ([]storage.AffinityBinding, error) {
-	rows, err := db.QueryContext(ctx, `SELECT route_key_hash, route_key, source, account_id, provider, model, egress_id, epoch, created_at, updated_at FROM affinity_bindings ORDER BY updated_at ASC, route_key_hash ASC`)
+func listDiagnosticAffinityBindings(ctx context.Context, db storage.ReadQuerier) ([]storage.AffinityBinding, error) {
+	now := storage.Now()
+	rows, err := db.QueryContext(ctx, `SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at FROM (
+	SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at FROM affinity_aliases WHERE expires_at>?
+	UNION ALL
+	SELECT b.route_key_hash,b.route_key,b.source,b.account_id,b.provider,b.model,b.egress_id,b.epoch,b.created_at,b.updated_at FROM affinity_bindings b
+	WHERE (b.expires_at=0 OR b.expires_at>?) AND NOT EXISTS (
+		SELECT 1 FROM affinity_aliases a WHERE a.route_key_hash=b.route_key_hash AND a.expires_at>?
+	)
+	) ORDER BY updated_at ASC,route_key_hash ASC`, now, now, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1056,7 +1244,7 @@ func listDiagnosticAffinityBindings(ctx context.Context, db *sql.DB) ([]storage.
 	return out, rows.Err()
 }
 
-func listDiagnosticSettings(ctx context.Context, db *sql.DB) ([]diagnosticSetting, error) {
+func listDiagnosticSettings(ctx context.Context, db storage.ReadQuerier) ([]diagnosticSetting, error) {
 	rows, err := db.QueryContext(ctx, `SELECT key, value, updated_at FROM settings ORDER BY key ASC`)
 	if err != nil {
 		return nil, err
@@ -1073,7 +1261,7 @@ func listDiagnosticSettings(ctx context.Context, db *sql.DB) ([]diagnosticSettin
 	return out, rows.Err()
 }
 
-func listDiagnosticCodexResetCreditConsumptions(ctx context.Context, db *sql.DB) ([]storage.CodexResetCreditConsumption, error) {
+func listDiagnosticCodexResetCreditConsumptions(ctx context.Context, db storage.ReadQuerier) ([]storage.CodexResetCreditConsumption, error) {
 	rows, err := db.QueryContext(ctx, `SELECT account_id, seven_day_reset_at, redeem_request_id, status, created_at, updated_at FROM codex_reset_credit_consumptions ORDER BY updated_at ASC, account_id ASC`)
 	if err != nil {
 		return nil, err
@@ -1090,7 +1278,7 @@ func listDiagnosticCodexResetCreditConsumptions(ctx context.Context, db *sql.DB)
 	return out, rows.Err()
 }
 
-func listDiagnosticLifecycleStatuses(ctx context.Context, db *sql.DB) ([]diagnosticLifecycleStatus, error) {
+func listDiagnosticLifecycleStatuses(ctx context.Context, db storage.ReadQuerier) ([]diagnosticLifecycleStatus, error) {
 	rows, err := db.QueryContext(ctx, `SELECT account_id, validity_status, subscription_tier, subscription_expires_at, last_health_check_at, last_token_refresh_at, health_check_fail_count, summary_json, created_at, updated_at FROM account_lifecycle_status ORDER BY account_id ASC`)
 	if err != nil {
 		return nil, err
@@ -1107,7 +1295,7 @@ func listDiagnosticLifecycleStatuses(ctx context.Context, db *sql.DB) ([]diagnos
 	return out, rows.Err()
 }
 
-func listDiagnosticCodexReauthConfigs(ctx context.Context, db *sql.DB) ([]storage.AccountCodexReauthConfig, error) {
+func listDiagnosticCodexReauthConfigs(ctx context.Context, db storage.ReadQuerier) ([]storage.AccountCodexReauthConfig, error) {
 	rows, err := db.QueryContext(ctx, `SELECT account_id, login_email, encrypted_password, encrypted_otp_url, target_workspace_id, auto_enabled, last_status, last_error, created_at, updated_at FROM account_codex_reauth_config ORDER BY account_id ASC`)
 	if err != nil {
 		return nil, err
@@ -1129,7 +1317,7 @@ func listDiagnosticCodexReauthConfigs(ctx context.Context, db *sql.DB) ([]storag
 	return out, rows.Err()
 }
 
-func listDiagnosticCodexReauthJobs(ctx context.Context, db *sql.DB) ([]storage.AccountCodexReauthJob, error) {
+func listDiagnosticCodexReauthJobs(ctx context.Context, db storage.ReadQuerier) ([]storage.AccountCodexReauthJob, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, account_id, status, reason, last_error, created_at, updated_at, started_at, finished_at FROM account_codex_reauth_jobs ORDER BY created_at ASC, id ASC`)
 	if err != nil {
 		return nil, err
@@ -1503,7 +1691,7 @@ func settingRows(rows []diagnosticSetting) [][]string {
 
 func sensitiveDiagnosticKey(key string) bool {
 	lower := strings.ToLower(key)
-	for _, sig := range []string{"token", "secret", "password", "cookie", "admin", "api_key", "apikey", "proxy", "private_key"} {
+	for _, sig := range []string{"token", "secret", "password", "cookie", "admin", "api_key", "apikey", "proxy", "private_key", "dsn", "redis_url", "database_url"} {
 		if strings.Contains(lower, sig) {
 			return true
 		}

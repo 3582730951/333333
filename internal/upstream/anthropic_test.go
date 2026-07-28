@@ -106,7 +106,7 @@ func TestClaudePassthroughPreservesContentTypeAndBeta(t *testing.T) {
 		Account:  storage.Account{ID: "acc-skill"},
 		Token:    storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Headers:  in,
-		Body:     []byte("------abc123XYZ\r\n"),
+		Body:     testBody([]byte("------abc123XYZ\r\n")),
 	}, id, false)
 
 	if got := h.Get("Content-Type"); got != "multipart/form-data; boundary=----abc123XYZ" {
@@ -202,7 +202,7 @@ func TestClaudeMessagesFinalSanitizerBeforeSidecar(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           body,
+		Body:           testBody(body),
 		Account:        storage.Account{ID: "acc-final-sanitize"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -260,7 +260,7 @@ func TestClaudeMessagesFinalSanitizerNormalizesThinkingSampling(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           body,
+		Body:           testBody(body),
 		Account:        storage.Account{ID: "acc-thinking-sampling"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -298,7 +298,7 @@ func TestClaudeMessagesFinalSanitizerStripsHistoryProvenance(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           body,
+		Body:           testBody(body),
 		Account:        storage.Account{ID: "acc-history-sanitize"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -344,7 +344,7 @@ func TestClaudeMessagesFinalSanitizerNormalizesCacheControlTTL(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           body,
+		Body:           testBody(body),
 		Account:        storage.Account{ID: "acc-cache-ttl"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -381,16 +381,17 @@ func TestNormalizeClaudeMessagesSpecPreservesLargeToolInputInteger(t *testing.T)
 	spec := client.normalizeClaudeMessagesSpec(Request{
 		Provider: "claude",
 		Headers:  headers,
-		Body:     body,
+		Body:     testBody(body),
 		Account:  storage.Account{ID: "acc-large-integer"},
 		Token:    storage.AccountToken{AccessToken: "sk-ant-oat-test"},
 	})
 
-	if !bytes.Contains(spec.Body, []byte(largeInteger)) {
-		t.Fatalf("large integer text changed during normalization: %s", spec.Body)
+	normalized := requestBody(spec)
+	if !bytes.Contains(normalized, []byte(largeInteger)) {
+		t.Fatalf("large integer text changed during normalization: %s", normalized)
 	}
 	var root map[string]interface{}
-	if err := decodeClaudeJSONObject(spec.Body, &root); err != nil {
+	if err := decodeClaudeJSONObject(normalized, &root); err != nil {
 		t.Fatalf("decode normalized body: %v", err)
 	}
 	content := root["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})

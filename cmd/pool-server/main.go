@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"syscall"
@@ -56,15 +57,18 @@ func run() int {
 
 	ctx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
-	store, err := storage.Open(cfg.DatabasePath)
+	startHeapProfileSignal(ctx)
+	stopCPUProfile := startCPUProfile()
+	defer stopCPUProfile()
+	store, err := storage.OpenWithConfig(cfg)
 	if err != nil {
-		log.Printf("open sqlite: %v", err)
+		log.Printf("open storage: %v", err)
 		return 1
 	}
 	defer store.Close()
 
 	if err := store.Init(ctx); err != nil {
-		log.Printf("init sqlite: %v", err)
+		log.Printf("init storage: %v", err)
 		return 1
 	}
 	// Encrypt account secrets (tokens, session cookies) at rest with a key derived from
@@ -113,10 +117,15 @@ func run() int {
 	}
 	solver := cfsolve.NewClient(cfg)
 
+	leaseCoordinator, err := scheduler.NewLeaseCoordinator(cfg)
+	if err != nil {
+		log.Printf("init lease coordinator: %v", err)
+		return 1
+	}
 	app := api.NewServer(api.Dependencies{
 		Config:     cfg,
 		Store:      store,
-		Scheduler:  scheduler.New(store, cfg),
+		Scheduler:  scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
 		Upstream:   up,
 		Planner:    virtual.NewPlanner(store, cfg),
 		Gopay:      gopayMgr,
@@ -227,6 +236,61 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+func startCPUProfile() func() {
+	path := strings.TrimSpace(os.Getenv("CODEX_POOL_CPU_PROFILE"))
+	if path == "" {
+		return func() {}
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		log.Printf("create CPU profile %s: %v", path, err)
+		return func() {}
+	}
+	if err = pprof.StartCPUProfile(file); err != nil {
+		_ = file.Close()
+		log.Printf("start CPU profile %s: %v", path, err)
+		return func() {}
+	}
+	return func() {
+		pprof.StopCPUProfile()
+		if err := file.Close(); err != nil {
+			log.Printf("close CPU profile %s: %v", path, err)
+		}
+	}
+}
+
+// startHeapProfileSignal writes an explicit, operator-requested heap snapshot on
+// SIGUSR1. It is disabled unless CODEX_POOL_HEAP_PROFILE names a destination, so
+// production does not expose a debug HTTP endpoint or write diagnostic data by default.
+func startHeapProfileSignal(ctx context.Context) {
+	path := strings.TrimSpace(os.Getenv("CODEX_POOL_HEAP_PROFILE"))
+	if path == "" {
+		return
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGUSR1)
+	supervisor.Go(ctx, "heap-profile-signal", func(ctx context.Context) {
+		defer signal.Stop(signals)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-signals:
+				file, err := os.Create(path)
+				if err == nil {
+					err = pprof.WriteHeapProfile(file)
+					err = errors.Join(err, file.Close())
+				}
+				if err != nil {
+					log.Printf("write heap profile %s: %v", path, err)
+				} else {
+					log.Printf("heap profile written to %s", path)
+				}
+			}
+		}
+	})
 }
 
 func serveHTTPServer(httpServer *http.Server) error {

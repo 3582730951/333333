@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS codex_upstream_attempt(
 );
 CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_expiry ON codex_upstream_attempt(expires_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_tree ON codex_upstream_attempt(tree_id, created_at);
+CREATE TABLE IF NOT EXISTS codex_upstream_attempt_daily(
+  day_start INTEGER NOT NULL,
+  account_id TEXT NOT NULL,
+  egress_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  status_code INTEGER NOT NULL DEFAULT 0,
+  attempt_count INTEGER NOT NULL,
+  first_created_at INTEGER NOT NULL,
+  last_created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(day_start, account_id, egress_id, state, status_code)
+);
+CREATE INDEX IF NOT EXISTS idx_codex_upstream_attempt_daily_expiry ON codex_upstream_attempt_daily(expires_at, day_start);
 `
 
 var (
@@ -367,36 +381,66 @@ WHERE a.alias_hash=? AND a.expires_at>? AND b.expires_at>? ORDER BY b.updated_at
 	return out, nil
 }
 
-// ResolveCodexSessionAliases resolves a set of exact aliases.  Multiple aliases
-// must converge on one binding; any disagreement is an ambiguity, never a heuristic
-// opportunity to merge conversations.
+// ResolveCodexSessionAliases resolves a set of exact aliases. Response ids remain
+// globally unique within a namespace. Codex turn-state tokens are different: recent
+// clients can reuse one token across sibling branches, so a unique response id may
+// disambiguate a shared turn state but a shared turn state alone remains ambiguous.
 func (s *Store) ResolveCodexSessionAliases(ctx context.Context, namespace string, aliases []CodexSessionAlias) (CodexSessionBinding, error) {
 	aliases = normalizedCodexSessionAliases(aliases)
 	if len(aliases) == 0 {
 		return CodexSessionBinding{}, ErrCodexSessionMappingNotFound
 	}
 	var chosen *CodexSessionBinding
-	for _, alias := range aliases {
-		rows, err := s.FindCodexSessionAlias(ctx, namespace, alias)
-		if errors.Is(err, ErrCodexSessionMappingNotFound) {
-			// Stateful aliases are a set, not hints. Accepting an unknown
-			// turn-state beside a known previous_response_id would graft context
-			// from two sessions together.
-			return CodexSessionBinding{}, ErrCodexSessionMappingNotFound
-		}
-		if err != nil {
-			return CodexSessionBinding{}, err
-		}
-		if len(rows) != 1 {
-			return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
-		}
-		if chosen == nil {
-			copy := rows[0]
-			chosen = &copy
-			continue
-		}
-		if chosen.ID != rows[0].ID {
-			return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
+	// Resolve strict aliases before shared turn-state tokens so disambiguation does
+	// not depend on the caller's JSON/header field order.
+	for pass := 0; pass < 2; pass++ {
+		for _, alias := range aliases {
+			turnState := alias.Type == "turn_state"
+			if turnState != (pass == 1) {
+				continue
+			}
+			rows, err := s.FindCodexSessionAlias(ctx, namespace, alias)
+			if errors.Is(err, ErrCodexSessionMappingNotFound) {
+				// Stateful aliases are a set, not hints. Accepting an unknown
+				// turn-state beside a known previous_response_id would graft context
+				// from two sessions together.
+				return CodexSessionBinding{}, ErrCodexSessionMappingNotFound
+			}
+			if err != nil {
+				return CodexSessionBinding{}, err
+			}
+			if !turnState {
+				if len(rows) != 1 {
+					return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
+				}
+				if chosen == nil {
+					copy := rows[0]
+					chosen = &copy
+					continue
+				}
+				if chosen.ID != rows[0].ID {
+					return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
+				}
+				continue
+			}
+			if chosen == nil {
+				if len(rows) != 1 {
+					return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
+				}
+				copy := rows[0]
+				chosen = &copy
+				continue
+			}
+			matched := false
+			for _, row := range rows {
+				if row.ID == chosen.ID {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
+			}
 		}
 	}
 	if chosen == nil {
@@ -603,7 +647,7 @@ WHERE a.alias_hash=? AND a.expires_at>? AND b.expires_at>? AND b.state='active'`
 			owners = append(owners, owner)
 		}
 		rows.Close()
-		if len(owners) > 1 || (len(owners) == 1 && owners[0] != binding.ID) {
+		if alias.Type != "turn_state" && (len(owners) > 1 || (len(owners) == 1 && owners[0] != binding.ID)) {
 			return CodexSessionBinding{}, ErrCodexSessionMappingAmbiguous
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO codex_session_alias(alias_hash,alias_type,binding_id,created_at,updated_at,expires_at)
@@ -718,19 +762,51 @@ WHERE tree_id=? AND state='active'`, now, treeID)
 // CleanupCodexSessionMappings removes only expired metadata and their HMAC aliases.
 // It is safe to invoke opportunistically; no prompt or response content is involved.
 func (s *Store) CleanupCodexSessionMappings(ctx context.Context) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM codex_session_binding WHERE expires_at<=?`, Now())
+	if _, err := s.CleanupAffinityAliases(ctx, 256); err != nil {
+		return 0, err
+	}
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	// Aggregate and delete expired detail in one transaction. A failed cleanup can
+	// therefore be retried without incrementing a daily bucket twice.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO codex_upstream_attempt_daily(
+day_start,account_id,egress_id,state,status_code,attempt_count,first_created_at,last_created_at,updated_at,expires_at)
+SELECT created_at-(created_at%86400),account_id,egress_id,state,status_code,COUNT(*),MIN(created_at),MAX(created_at),?,
+       created_at-(created_at%86400)+?
+FROM codex_upstream_attempt WHERE expires_at<=?
+GROUP BY created_at-(created_at%86400),account_id,egress_id,state,status_code
+ON CONFLICT(day_start,account_id,egress_id,state,status_code) DO UPDATE SET
+attempt_count=codex_upstream_attempt_daily.attempt_count+excluded.attempt_count,
+first_created_at=MIN(codex_upstream_attempt_daily.first_created_at,excluded.first_created_at),
+last_created_at=MAX(codex_upstream_attempt_daily.last_created_at,excluded.last_created_at),
+updated_at=excluded.updated_at,
+expires_at=MAX(codex_upstream_attempt_daily.expires_at,excluded.expires_at)`,
+		now, int64((30*24*time.Hour)/time.Second), now); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_upstream_attempt WHERE expires_at<=?`, now); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_upstream_attempt_daily WHERE expires_at<=?`, now); err != nil {
+		return 0, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM codex_session_binding WHERE expires_at<=?`, now)
 	if err != nil {
 		return 0, err
 	}
 	// SQLite foreign keys may be disabled in an externally-opened legacy DB.  Keep
 	// aliases tidy even there without relying solely on ON DELETE CASCADE.
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM codex_session_alias WHERE expires_at<=? OR binding_id NOT IN (SELECT id FROM codex_session_binding)`, Now()); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_session_alias WHERE expires_at<=? OR binding_id NOT IN (SELECT id FROM codex_session_binding)`, now); err != nil {
 		return 0, err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM codex_instruction_snapshot WHERE expires_at<=? OR tree_id NOT IN (SELECT DISTINCT tree_id FROM codex_session_binding)`, Now()); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_instruction_snapshot WHERE expires_at<=? OR tree_id NOT IN (SELECT DISTINCT tree_id FROM codex_session_binding)`, now); err != nil {
 		return 0, err
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM codex_upstream_attempt WHERE expires_at<=? OR tree_id NOT IN (SELECT DISTINCT tree_id FROM codex_session_binding)`, Now()); err != nil {
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	n, _ := result.RowsAffected()
@@ -794,6 +870,17 @@ type CodexUpstreamAttemptDiagnostic struct {
 	CreatedAt      int64
 }
 
+type CodexUpstreamAttemptDailyDiagnostic struct {
+	DayStart       int64
+	AccountID      string
+	EgressID       string
+	State          string
+	StatusCode     int
+	AttemptCount   int64
+	FirstCreatedAt int64
+	LastCreatedAt  int64
+}
+
 func (s *Store) codexDiagnosticPrefix(domain, value string) string {
 	mac := hmac.New(sha256.New, s.codexSessionMappingKey())
 	_, _ = mac.Write([]byte("codex-safe-diagnostic/v1\x00"))
@@ -801,6 +888,12 @@ func (s *Store) codexDiagnosticPrefix(domain, value string) string {
 	_, _ = mac.Write([]byte("\x00"))
 	_, _ = mac.Write([]byte(value))
 	return hex.EncodeToString(mac.Sum(nil))[:16]
+}
+
+// CodexDiagnosticTreePrefix exposes only the domain-separated, truncated HMAC
+// used by support bundles; the raw tree identifier is never returned.
+func (s *Store) CodexDiagnosticTreePrefix(treeID string) string {
+	return s.codexDiagnosticPrefix("tree", treeID)
 }
 
 func (s *Store) ListCodexSessionMappingDiagnostics(ctx context.Context) ([]CodexSessionMappingDiagnostic, error) {
@@ -888,6 +981,24 @@ FROM codex_upstream_attempt WHERE expires_at>? ORDER BY created_at,id`, Now())
 			return nil, err
 		}
 		row.TreeHMACPrefix = s.codexDiagnosticPrefix("tree", treeID)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListCodexUpstreamAttemptDailyDiagnostics(ctx context.Context) ([]CodexUpstreamAttemptDailyDiagnostic, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT day_start,account_id,egress_id,state,status_code,attempt_count,first_created_at,last_created_at
+FROM codex_upstream_attempt_daily WHERE expires_at>? ORDER BY day_start,account_id,egress_id,state,status_code`, Now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CodexUpstreamAttemptDailyDiagnostic{}
+	for rows.Next() {
+		var row CodexUpstreamAttemptDailyDiagnostic
+		if err := rows.Scan(&row.DayStart, &row.AccountID, &row.EgressID, &row.State, &row.StatusCode, &row.AttemptCount, &row.FirstCreatedAt, &row.LastCreatedAt); err != nil {
+			return nil, err
+		}
 		out = append(out, row)
 	}
 	return out, rows.Err()

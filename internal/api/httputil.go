@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/prompt"
@@ -30,6 +31,21 @@ const adminJSONBodyLimit = 1 << 20
 
 func readLimited(r io.Reader, max int64) ([]byte, error) {
 	return readLimitedWithMessage(r, max, "request body too large")
+}
+
+func requestBodyBytes(r *http.Request, max int64) ([]byte, error) {
+	if source := bodySourceFromContext(r.Context()); source != nil {
+		if max <= 0 {
+			max = config.DefaultMaxBodyBytes
+		}
+		if source.Size() > max {
+			return nil, errors.New("request body too large")
+		}
+		if view, ok := bodysource.ByteView(source); ok {
+			return view, nil
+		}
+	}
+	return readLimited(r.Body, max)
 }
 
 func readLimitedWithMessage(r io.Reader, max int64, limitMessage string) ([]byte, error) {
@@ -215,6 +231,16 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]interface{}{
 		"error": errorBody,
 	})
+}
+
+func writeResourceExhausted(w http.ResponseWriter, message string) {
+	if strings.TrimSpace(message) == "" {
+		message = "resource capacity exhausted"
+	}
+	w.Header().Set("Retry-After", "1")
+	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{"error": map[string]interface{}{
+		"message": message, "type": "resource_exhausted", "code": "resource_exhausted",
+	}})
 }
 
 func methodNotAllowed(w http.ResponseWriter) {
@@ -472,16 +498,22 @@ func codexSelectionAffinity(r *http.Request, raw []byte, base routing.AffinityKe
 	return routing.AffinityFromKey(strings.Join([]string{"cache_prefix", strings.TrimSpace(group), model, prefixHash}, ":"), "cache_prefix_hash")
 }
 
-func codexRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, promptCacheKeySource, retentionEffective, retentionSource string) storage.UsageDiagnostics {
-	fp := routing.StablePromptPrefixFingerprint(body)
+func codexRequestUsageDiagnostics(body []byte, meta *bodysource.BodyMeta, affinity routing.AffinityKey, promptCacheKeySource, retentionEffective, retentionSource string) storage.UsageDiagnostics {
+	stableSource, stableReason, stableBytes := "", "", 0
+	if meta != nil && meta.Size == int64(len(body)) && len(body) > 256<<10 && meta.StablePrefixHMAC != "" {
+		stableSource, stableReason, stableBytes = "body_meta_hmac", "bounded_large_body", int(meta.StablePrefixBytes)
+	} else {
+		fp := routing.StablePromptPrefixFingerprint(body)
+		stableSource, stableReason, stableBytes = fp.Source, fp.Reason, fp.PrefixBytes
+	}
 	return storage.UsageDiagnostics{
 		UsageProvider:         "codex",
 		AffinitySource:        affinity.Source,
-		PromptCacheKeyPresent: routing.PromptCacheKey(body) != "",
+		PromptCacheKeyPresent: promptCacheKeyWithMeta(body, meta) != "",
 		PromptCacheKeySource:  promptCacheKeySource,
-		StablePrefixSource:    fp.Source,
-		StablePrefixReason:    fp.Reason,
-		StablePrefixBytes:     fp.PrefixBytes,
+		StablePrefixSource:    stableSource,
+		StablePrefixReason:    stableReason,
+		StablePrefixBytes:     stableBytes,
 		RetentionEffective:    retentionEffective,
 		RetentionSource:       retentionSource,
 	}

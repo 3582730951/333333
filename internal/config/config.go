@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 const (
 	DefaultListenAddr               = "127.0.0.1:8787"
 	DefaultDatabasePath             = "codex-pool.sqlite3"
+	DefaultStorageDriver            = "sqlite"
 	DefaultUpstreamBaseURL          = "https://chatgpt.com/backend-api/codex"
 	DefaultOpenAIAPIUpstreamBaseURL = "https://api.openai.com/v1"
 	DefaultGroupName                = "cyber"
@@ -24,19 +26,21 @@ const (
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
-	// AdmissionWait: when every provider/model-matching account is momentarily at its
-	// concurrency cap or over its per-account token budget, a request waits this long
-	// for an in-flight slot to free (retrying selection each time a lease releases)
-	// before the pool reports saturation. This is backpressure/queueing, never a model
-	// or context downgrade — the request still lands on a full-quality account. 0 disables.
-	DefaultAdmissionWaitMillis = 2500
+	// AdmissionWaitMillis is retained for config compatibility. Admission now waits
+	// until downstream cancellation or the request-wide 600-second deadline.
+	DefaultAdmissionWaitMillis = 600000
 	// Cooldown→health-recheck loop: how often to probe benched accounts, and how long
 	// to re-bench one whose probe still fails before the next attempt.
 	DefaultAccountRecheckIntervalSeconds  = 20
 	DefaultAccountRecheckBackoffSeconds   = 120
 	DefaultRequestTimeoutSec              = 600
 	DefaultShutdownDrainSec               = 30
-	DefaultMaxBodyBytes                   = 256 << 20
+	DefaultMaxBodyBytes                   = 1 << 30
+	DefaultBodyMemoryThresholdBytes       = 8 << 20
+	DefaultBodyMemoryBudgetMaxBytes       = 256 << 20
+	DefaultBodySpoolMaxBytes              = 32 << 30
+	DefaultBodyDiskReserveBytes           = 10 << 30
+	DefaultUsageJournalSegmentBytes       = 8 << 20
 	DefaultStreamFailoverHoldMemoryBytes  = 8 << 20
 	DefaultStreamFailoverHoldDiskBytes    = 0
 	DefaultVirtualWindow                  = 2_000_000
@@ -146,6 +150,10 @@ func DefaultClaudeGatewayBlockedHostPatterns() []string {
 type Config struct {
 	ListenAddr                     string `json:"listen_addr"`
 	DatabasePath                   string `json:"database_path"`
+	StorageDriver                  string `json:"storage_driver"`
+	PostgresDSN                    string `json:"postgres_dsn,omitempty"`
+	RedisURL                       string `json:"redis_url,omitempty"`
+	NodeID                         string `json:"node_id"`
 	UpstreamBaseURL                string `json:"upstream_base_url"`
 	OpenAIAPIUpstreamBaseURL       string `json:"openai_api_upstream_base_url"`
 	OAuthTokenURL                  string `json:"oauth_token_url"`
@@ -156,15 +164,30 @@ type Config struct {
 	VirtualContextLedgerTTLSeconds int64  `json:"-"`
 	StickyWaitMillis               int    `json:"sticky_wait_millis"`
 	// AdmissionWaitMillis bounds the per-account concurrency/token-budget backpressure
-	// wait (see DefaultAdmissionWaitMillis). Unset (0) adopts the default; a negative
-	// value disables the wait (legacy fail-fast).
-	AdmissionWaitMillis      int   `json:"admission_wait_millis"`
-	RequestTimeoutSeconds    int   `json:"request_timeout_seconds"`
-	ShutdownDrainSeconds     int   `json:"shutdown_drain_seconds"`
-	MaxBodyBytes             int64 `json:"max_body_bytes"`
-	AccountTokenBudget       int64 `json:"account_token_budget"`
-	ResourceHeadroomPercent  int   `json:"resource_headroom_percent"`
-	ContextJournalTTLSeconds int   `json:"context_journal_ttl_seconds"`
+	// wait. It is retained for one-version config compatibility; the scheduler now
+	// uses the cancellation-aware request deadline instead of a shorter queue timer.
+	AdmissionWaitMillis   int   `json:"admission_wait_millis"`
+	RequestTimeoutSeconds int   `json:"request_timeout_seconds"`
+	ShutdownDrainSeconds  int   `json:"shutdown_drain_seconds"`
+	MaxBodyBytes          int64 `json:"max_body_bytes"`
+	// BodyV2Enabled switches the bounded replayable body pipeline. Disable for one
+	// release to roll back to the legacy in-memory reader without changing protocols.
+	BodyV2Enabled            bool  `json:"body_v2_enabled"`
+	BodyMemoryThresholdBytes int64 `json:"body_memory_threshold_bytes"`
+	// BodyMemoryBudgetBytes is process-wide. Zero selects min(256 MiB, 12.5% of the cgroup/system memory limit).
+	BodyMemoryBudgetBytes    int64  `json:"body_memory_budget_bytes"`
+	BodySpoolMaxBytes        int64  `json:"body_spool_max_bytes"`
+	BodyDiskReserveBytes     int64  `json:"body_disk_reserve_bytes"`
+	BodySpoolDir             string `json:"body_spool_dir"`
+	UsageJournalEnabled      bool   `json:"usage_journal_enabled"`
+	UsageJournalDir          string `json:"usage_journal_dir"`
+	UsageJournalSegmentBytes int64  `json:"usage_journal_segment_bytes"`
+	AccountTokenBudget       int64  `json:"account_token_budget"`
+	// SchedulerIndexEnabled selects the immutable candidate index/power-of-two path.
+	// Disabling it retains the full-scan compatibility path for one release.
+	SchedulerIndexEnabled    bool `json:"scheduler_index_enabled"`
+	ResourceHeadroomPercent  int  `json:"resource_headroom_percent"`
+	ContextJournalTTLSeconds int  `json:"context_journal_ttl_seconds"`
 	// ContextJournalMaxRows / ContextJournalMaxMB bound the encrypted replay journal on
 	// low-config VPS hosts. When either is exceeded the disk guard evicts the rows with
 	// the lowest expires_at first — which, thanks to sliding TTL, are the least-recently
@@ -193,13 +216,12 @@ type Config struct {
 	CodexSessionMappingRetentionDays int  `json:"codex_session_mapping_retention_days"`
 	CodexCPAStrict                   bool `json:"codex_cpa_strict"`
 	// CodexStatelessPassthrough makes native Codex /v1/responses fully self-contained
-	// (CPA-style). When on (default) the durable session-mapping / goal-continuity /
-	// context-journal engine is bypassed and every turn strips previous_response_id +
-	// x-codex-turn-state, so ANY account can serve ANY turn and seamless failover is
-	// always lossless. This trades the previous_response_id server-side cache discount
-	// (more input tokens per turn) for stability: the "bound_account_unavailable" 409 and
-	// upstream "previous_response_not_found" 400 become structurally impossible. Set to
-	// false to restore the strict native session-mapping engine.
+	// (CPA-style). When explicitly enabled, the durable session-mapping /
+	// goal-continuity / context-journal engine is bypassed and every turn strips
+	// previous_response_id + x-codex-turn-state, so any account can serve any turn.
+	// It is off by default because it trades away native continuation and its
+	// server-side cache semantics; strict mapping plus durable Goal replay is the
+	// lossless default recovery path.
 	CodexStatelessPassthrough bool   `json:"codex_stateless_passthrough"`
 	AdminToken                string `json:"admin_token"`
 	// TrustedProxyCIDRs controls when forwarding headers may affect client IP,
@@ -435,6 +457,9 @@ type Config struct {
 	// ClaudeCacheSingleflightEnabled makes concurrent requests with the same cache
 	// prefix wait behind the first writer to reduce parallel cold misses.
 	ClaudeCacheSingleflightEnabled bool `json:"claude_cache_singleflight_enabled"`
+	// CodexCacheSingleflightEnabled coordinates concurrent cold writes for the same
+	// account, model and prompt_cache_key until the leader returns response headers.
+	CodexCacheSingleflightEnabled bool `json:"codex_cache_singleflight_enabled"`
 	// ClaudeCacheLosslessBlockSplit enables byte-preserving text-block splitting in
 	// max-hit mode when the split can be round-tripped exactly.
 	ClaudeCacheLosslessBlockSplit bool `json:"claude_cache_lossless_block_split"`
@@ -813,6 +838,7 @@ func Default() Config {
 	return Config{
 		ListenAddr:                       DefaultListenAddr,
 		DatabasePath:                     DefaultDatabasePath,
+		StorageDriver:                    DefaultStorageDriver,
 		UpstreamBaseURL:                  DefaultUpstreamBaseURL,
 		OpenAIAPIUpstreamBaseURL:         DefaultOpenAIAPIUpstreamBaseURL,
 		ClientVersion:                    DefaultClientVersion,
@@ -825,7 +851,14 @@ func Default() Config {
 		RequestTimeoutSeconds:            DefaultRequestTimeoutSec,
 		ShutdownDrainSeconds:             DefaultShutdownDrainSec,
 		MaxBodyBytes:                     DefaultMaxBodyBytes,
+		BodyV2Enabled:                    true,
+		BodyMemoryThresholdBytes:         DefaultBodyMemoryThresholdBytes,
+		BodySpoolMaxBytes:                DefaultBodySpoolMaxBytes,
+		BodyDiskReserveBytes:             DefaultBodyDiskReserveBytes,
+		UsageJournalEnabled:              true,
+		UsageJournalSegmentBytes:         DefaultUsageJournalSegmentBytes,
 		AccountTokenBudget:               DefaultAccountTokenBudget,
+		SchedulerIndexEnabled:            true,
 		ResourceHeadroomPercent:          10,
 		ContextJournalTTLSeconds:         3600,
 		ContextJournalMaxRows:            50000,
@@ -842,7 +875,7 @@ func Default() Config {
 		CodexSessionMappingEnabled:       true,
 		CodexSessionMappingRetentionDays: 7,
 		CodexCPAStrict:                   true,
-		CodexStatelessPassthrough:        true,
+		CodexStatelessPassthrough:        false,
 		TrustedProxyCIDRs:                []string{"127.0.0.0/8", "::1/128"},
 		SidecarTimeoutSeconds:            120,
 		EgressFingerprintEngine:          "inprocess",
@@ -870,7 +903,8 @@ func Default() Config {
 		ClaudeCacheLatestTailWrite:        true,
 		ClaudeCachePrewarmMode:            "off",
 		ClaudeCacheDiagnosticsEnabled:     false,
-		ClaudeCacheSingleflightEnabled:    false,
+		ClaudeCacheSingleflightEnabled:    true,
+		CodexCacheSingleflightEnabled:     true,
 		ClaudeCacheLosslessBlockSplit:     false,
 		ClaudeCacheTTL:                    "1h",
 		ClaudeCCHSigning:                  false,
@@ -966,7 +1000,27 @@ func Load(path string) (Config, error) {
 	}
 	cfg.applyEnv()
 	cfg.normalize()
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+func (c Config) Validate() error {
+	switch strings.ToLower(strings.TrimSpace(c.StorageDriver)) {
+	case "", "sqlite":
+		return nil
+	case "postgres":
+		if strings.TrimSpace(c.PostgresDSN) == "" {
+			return errors.New("storage_driver=postgres requires postgres_dsn or CODEX_POOL_POSTGRES_DSN")
+		}
+		if strings.TrimSpace(c.RedisURL) == "" {
+			return errors.New("storage_driver=postgres requires redis_url or CODEX_POOL_REDIS_URL")
+		}
+		return nil
+	default:
+		return errors.New("storage_driver must be sqlite or postgres")
+	}
 }
 
 func (c *Config) StickyWait() time.Duration {
@@ -981,9 +1035,8 @@ func (c Config) SchedulerHeartbeat() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// AdmissionWait is the bounded backpressure window a request spends waiting for a
-// per-account concurrency / token-budget slot to free before the pool reports
-// saturation. 0 disables the wait (legacy fail-fast selection).
+// AdmissionWait is retained for callers reading the compatibility setting. The
+// scheduler itself waits on the request context so capacity never causes fail-fast.
 func (c *Config) AdmissionWait() time.Duration {
 	if c.AdmissionWaitMillis <= 0 {
 		return 0
@@ -993,6 +1046,52 @@ func (c *Config) AdmissionWait() time.Duration {
 
 func (c *Config) RequestTimeout() time.Duration {
 	return time.Duration(c.RequestTimeoutSeconds) * time.Second
+}
+
+func (c Config) EffectiveBodyMemoryBudgetBytes() int64 {
+	if c.BodyMemoryBudgetBytes > 0 {
+		return c.BodyMemoryBudgetBytes
+	}
+	limit := detectedMemoryLimitBytes()
+	if limit <= 0 {
+		return DefaultBodyMemoryBudgetMaxBytes
+	}
+	budget := limit / 8
+	if budget > DefaultBodyMemoryBudgetMaxBytes {
+		return DefaultBodyMemoryBudgetMaxBytes
+	}
+	if budget < DefaultBodyMemoryThresholdBytes {
+		return DefaultBodyMemoryThresholdBytes
+	}
+	return budget
+}
+
+func detectedMemoryLimitBytes() int64 {
+	for _, path := range []string{"/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		value := strings.TrimSpace(string(raw))
+		if value == "" || value == "max" {
+			continue
+		}
+		if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed > 0 && parsed < 1<<62 {
+			return parsed
+		}
+	}
+	raw, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "MemTotal:" {
+			kb, _ := strconv.ParseInt(fields[1], 10, 64)
+			return kb << 10
+		}
+	}
+	return 0
 }
 
 func (c *Config) StatefulStickyWait() time.Duration {
@@ -1134,6 +1233,44 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("CODEX_POOL_DATABASE"); v != "" {
 		c.DatabasePath = v
+	}
+	if v := os.Getenv("CODEX_POOL_STORAGE_DRIVER"); v != "" {
+		c.StorageDriver = v
+	}
+	if v := os.Getenv("CODEX_POOL_POSTGRES_DSN"); v != "" {
+		c.PostgresDSN = v
+	}
+	if v := os.Getenv("CODEX_POOL_REDIS_URL"); v != "" {
+		c.RedisURL = v
+	}
+	if v := os.Getenv("CODEX_POOL_NODE_ID"); v != "" {
+		c.NodeID = v
+	}
+	if v := os.Getenv("CODEX_POOL_BODY_SPOOL_DIR"); v != "" {
+		c.BodySpoolDir = v
+	}
+	if v := os.Getenv("CODEX_POOL_BODY_V2_ENABLED"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.BodyV2Enabled = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_USAGE_JOURNAL_DIR"); v != "" {
+		c.UsageJournalDir = v
+	}
+	if v := os.Getenv("CODEX_POOL_USAGE_JOURNAL_ENABLED"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.UsageJournalEnabled = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_SCHEDULER_INDEX_ENABLED"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			c.SchedulerIndexEnabled = parsed
+		}
+	}
+	if v := os.Getenv("CODEX_POOL_BODY_MEMORY_BUDGET_BYTES"); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.BodyMemoryBudgetBytes = parsed
+		}
 	}
 	if v := os.Getenv("CODEX_POOL_UPSTREAM_BASE_URL"); v != "" {
 		c.UpstreamBaseURL = v
@@ -1323,6 +1460,13 @@ func (c *Config) normalize() {
 	if c.DatabasePath == "" {
 		c.DatabasePath = DefaultDatabasePath
 	}
+	c.StorageDriver = strings.ToLower(strings.TrimSpace(c.StorageDriver))
+	if c.StorageDriver == "" {
+		c.StorageDriver = DefaultStorageDriver
+	}
+	c.PostgresDSN = strings.TrimSpace(c.PostgresDSN)
+	c.RedisURL = strings.TrimSpace(c.RedisURL)
+	c.NodeID = normalizeNodeID(c.NodeID)
 	if c.UpstreamBaseURL == "" {
 		c.UpstreamBaseURL = DefaultUpstreamBaseURL
 	}
@@ -1361,6 +1505,21 @@ func (c *Config) normalize() {
 	}
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = DefaultMaxBodyBytes
+	}
+	if c.BodyMemoryThresholdBytes <= 0 {
+		c.BodyMemoryThresholdBytes = DefaultBodyMemoryThresholdBytes
+	}
+	if c.BodyMemoryBudgetBytes < 0 {
+		c.BodyMemoryBudgetBytes = 0
+	}
+	if c.BodySpoolMaxBytes <= 0 {
+		c.BodySpoolMaxBytes = DefaultBodySpoolMaxBytes
+	}
+	if c.BodyDiskReserveBytes < 0 {
+		c.BodyDiskReserveBytes = DefaultBodyDiskReserveBytes
+	}
+	if c.UsageJournalSegmentBytes <= 0 {
+		c.UsageJournalSegmentBytes = DefaultUsageJournalSegmentBytes
 	}
 	if c.AccountTokenBudget < 0 {
 		c.AccountTokenBudget = 0
@@ -1618,6 +1777,33 @@ func (c *Config) normalize() {
 	default:
 		c.GatewayReliabilityGuardMode = "lenient"
 	}
+}
+
+func normalizeNodeID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value, _ = os.Hostname()
+	}
+	if value == "" {
+		value = "node-local"
+	}
+	var out strings.Builder
+	out.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			out.WriteRune(r)
+		default:
+			out.WriteByte('_')
+		}
+		if out.Len() >= 128 {
+			break
+		}
+	}
+	if out.Len() == 0 {
+		return "node-local"
+	}
+	return out.String()
 }
 
 func sameURL(a, b string) bool {

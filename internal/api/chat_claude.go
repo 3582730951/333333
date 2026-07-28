@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/identity"
@@ -187,7 +188,7 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 			Provider:       "claude",
 			DownstreamPath: "/v1/messages",
 			Headers:        r.Header.Clone(),
-			Body:           result.Body,
+			Body:           bodysource.Bytes(result.Body),
 			Account:        lease.Account,
 			Token:          t,
 			Egress:         lease.Egress,
@@ -197,11 +198,12 @@ func (s *Server) handleChatViaClaude(w http.ResponseWriter, r *http.Request, raw
 	}
 	usageDiag := claudeRequestUsageDiagnostics(result.Body, affinity, claudeTTL, cacheInject)
 	usageDiag.CachePrewarmAttempted = s.maybePrewarmClaudeCache(r.Context(), s.claudeCachePrewarmMode(r.Context()), requestForToken(token))
-	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), result.Body, affinity)
+	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, result.Body, affinity)
 	if waitedForFlight {
 		usageDiag.SingleflightWaitedRequests = 1
 	}
-	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(result.Body))
+	usageDiag.RouteEpoch = lease.RouteEpoch
+	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, virtual.EstimateTokensJSON(result.Body))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()

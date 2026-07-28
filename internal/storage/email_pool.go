@@ -49,16 +49,18 @@ func (s *Store) BulkInsertEmailAccounts(ctx context.Context, accounts []EmailAcc
 		if accounts[i].UpdatedAt == 0 {
 			accounts[i].UpdatedAt = now
 		}
-		_, err := s.db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO email_pool(id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		result, err := s.db.ExecContext(ctx,
+			`INSERT INTO email_pool(id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
 			accounts[i].ID, accounts[i].Email, accounts[i].Password, accounts[i].ClientID, accounts[i].RefreshToken,
 			accounts[i].Status, accounts[i].GroupName, accounts[i].ErrorMessage, accounts[i].LastUsedAt,
 			accounts[i].CreatedAt, accounts[i].UpdatedAt)
 		if err != nil {
 			return inserted, err
 		}
-		inserted++
+		if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
+			inserted += int(affected)
+		}
 	}
 	return inserted, nil
 }

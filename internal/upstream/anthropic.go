@@ -65,7 +65,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	if spec.PassThrough {
 		stream = strings.Contains(strings.ToLower(spec.Headers.Get("Accept")), "text/event-stream")
 	} else {
-		stream = bodyStreamTrue(spec.Body)
+		stream = bodyStreamTrue(requestBody(spec))
 	}
 
 	// === THINKING INJECTION: Apply thinking configuration before forwarding ===
@@ -74,7 +74,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 	// 2. Thinking is enabled in config
 	// 3. Path is a messages endpoint (not files/skills/agents)
 	if !spec.PassThrough && !spec.MinimalProbe && c.cfg.ThinkingEnabled && strings.Contains(path, "/v1/messages") {
-		spec.Body = c.applyThinkingConfig(spec.Body, "claude", spec.Model, spec.Account)
+		setRequestBody(&spec, c.applyThinkingConfig(requestBody(spec), "claude", spec.Model, spec.Account))
 	}
 	if !spec.PassThrough && !spec.MinimalProbe && strings.Contains(path, "/v1/messages") {
 		spec = c.normalizeClaudeMessagesSpec(spec)
@@ -124,7 +124,7 @@ func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) 
 		return c.postViaSidecar(ctx, claudeSpec, target, built, timeout, ja3, false)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, bytes.NewReader(spec.Body))
+	req, err := newReplayableHTTPRequest(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -243,8 +243,8 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 	claudeVer := c.cfgSnapshot().ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
-	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, spec.Body, id))
-	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, spec.Body)))
+	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, requestBody(spec), id))
+	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, requestBody(spec))))
 	dst.Set("Accept", "application/json")
 	if stream {
 		// Uncompressed so the downstream SSE scanner can read it line-by-line.
@@ -282,7 +282,7 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	// and rewriting it to application/json corrupts the upload.
 	if ct := strings.TrimSpace(spec.Headers.Get("Content-Type")); ct != "" {
 		dst.Set("Content-Type", ct)
-	} else if len(spec.Body) > 0 {
+	} else if requestBodySize(spec) > 0 {
 		dst.Set("Content-Type", "application/json")
 	}
 	if acc := strings.TrimSpace(spec.Headers.Get("Accept")); acc != "" {
@@ -347,7 +347,7 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
 	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, nil, id))
-	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, spec.Body)))
+	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, nil)))
 }
 
 // claudeEntrypoint projects the real downstream launch mode while discarding
@@ -465,7 +465,7 @@ const claudeBillingHeaderPrefix = "x-anthropic-billing-header:"
 
 func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
 	var root map[string]interface{}
-	if decodeClaudeJSONObject(spec.Body, &root) != nil {
+	if decodeClaudeJSONObject(requestBody(spec), &root) != nil {
 		return spec
 	}
 
@@ -493,13 +493,13 @@ func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
 		changed = true
 	}
 
-	body := spec.Body
+	body := requestBody(spec)
 	if changed {
 		if marshaled, err := json.Marshal(root); err == nil {
 			body = marshaled
 		}
 	}
-	spec.Body = body
+	setRequestBody(&spec, body)
 	return spec
 }
 
@@ -540,7 +540,7 @@ func (c *Client) normalizeClaudeMessagesMetadata(root map[string]interface{}, sp
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
 	userID := id.UserID
 	if claudeCode {
-		sessionID := claudeSessionID(spec.Headers, spec.Body, id)
+		sessionID := claudeSessionID(spec.Headers, requestBody(spec), id)
 		userID = fmt.Sprintf(`{"device_id":%q,"account_uuid":%q,"session_id":%q}`, id.UserID, "", sessionID)
 	}
 	changed := !hasMetadata || metadata["user_id"] != userID || len(metadata) != 1

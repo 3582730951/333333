@@ -1,6 +1,9 @@
 package upstream
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestJarLRUReusesSameJar(t *testing.T) {
 	l := newJarLRU(8)
@@ -44,5 +47,17 @@ func TestJarLRUEvictsLeastRecentlyUsed(t *testing.T) {
 func TestJarLRUDefaultMax(t *testing.T) {
 	if l := newJarLRU(0); l.max != defaultJarLRUMax {
 		t.Fatalf("expected default max %d, got %d", defaultJarLRUMax, l.max)
+	}
+}
+
+func TestJarLRUExpiresIdleJar(t *testing.T) {
+	l := newJarLRU(8)
+	now := time.Unix(100, 0)
+	l.now = func() time.Time { return now }
+	l.ttl = time.Hour
+	first := l.getOrCreate("key")
+	now = now.Add(time.Hour)
+	if next := l.getOrCreate("key"); next == first {
+		t.Fatal("expired jar was reused")
 	}
 }

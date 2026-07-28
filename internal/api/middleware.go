@@ -2,7 +2,6 @@ package api
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,12 +13,13 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"codex-account-pool/internal/admission"
+	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/supervisor"
 )
 
@@ -125,62 +125,62 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
 	if s.scheduler != nil {
 		reserveBytes := int64(256 << 10)
-		if r.ContentLength > 0 {
-			reserveBytes += 5 * r.ContentLength
-		}
 		release, reserveErr := s.scheduler.Reserve(r.Context(), reserveBytes)
 		if reserveErr != nil {
-			status := http.StatusServiceUnavailable
 			if errors.Is(reserveErr, admission.ErrCapacity) {
-				status = http.StatusTooManyRequests
-				rec.Header().Set("Retry-After", "1")
+				writeResourceExhausted(rec, reserveErr.Error())
+			} else {
+				writeError(rec, http.StatusServiceUnavailable, reserveErr)
 			}
-			writeError(rec, status, reserveErr)
 			return
 		}
 		defer release()
 	}
-	if r.Body != nil && s.cfg.MaxBodyBytes > 0 {
-		// Enforce one process-wide request budget before route-specific decoders add
-		// their usually smaller limits. This also covers multipart/resource handlers
-		// that do not call readLimited directly.
-		r.Body = http.MaxBytesReader(rec, r.Body, s.cfg.MaxBodyBytes)
-	}
-	if r.Body != nil && r.ContentLength < 0 && s.scheduler != nil {
-		body, cleanup, err := spoolUnknownBody(r.Context(), r.Body, s.scheduler.Reserve)
+	var requestBody bodysource.BodySource
+	var bodyMeta bodysource.BodyMeta
+	if r.Body != nil && r.Body != http.NoBody {
+		var err error
+		if !s.cfg.BodyV2Enabled {
+			var raw []byte
+			raw, err = readLimited(r.Body, s.cfg.MaxBodyBytes)
+			if err == nil {
+				requestBody = bodysource.Bytes(raw)
+			}
+		} else if requestNeedsBodyMeta(r) {
+			requestBody, bodyMeta, err = captureJSONRequestBody(r.Context(), r.Body, s.cfg, s.bodyBudget, s.identitySecretCached, r.ContentLength)
+		} else {
+			requestBody, err = captureRequestBody(r.Context(), r.Body, s.cfg, s.bodyBudget, r.ContentLength)
+		}
+		_ = r.Body.Close()
 		if err != nil {
 			status := http.StatusBadRequest
-			if errors.Is(err, admission.ErrCapacity) {
-				status = http.StatusTooManyRequests
-				rec.Header().Set("Retry-After", "1")
+			if errors.Is(err, bodysource.ErrBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			} else if errors.Is(err, bodysource.ErrSpoolBudget) || errors.Is(err, bodysource.ErrDiskReserve) {
+				writeResourceExhausted(rec, err.Error())
+				return
 			}
 			writeError(rec, status, err)
 			return
 		}
-		defer cleanup()
-		r.Body = body
-	}
-	if r.Body != nil && r.ContentLength > (1<<20) {
-		tmp, err := os.CreateTemp("", "micliproxy-body-*")
+		defer requestBody.Close()
+		body, err := requestBody.Open()
 		if err != nil {
-			writeError(rec, http.StatusServiceUnavailable, err)
-			return
-		}
-		defer os.Remove(tmp.Name())
-		if _, err = io.Copy(tmp, r.Body); err != nil {
-			tmp.Close()
-			writeError(rec, http.StatusBadRequest, err)
-			return
-		}
-		if _, err = tmp.Seek(0, io.SeekStart); err != nil {
-			tmp.Close()
 			writeError(rec, http.StatusInternalServerError, err)
 			return
 		}
-		r.Body = tmp
-		defer tmp.Close()
+		defer body.Close()
+		r.Body = body
+		r.GetBody = requestBody.Open
+		r.ContentLength = requestBody.Size()
 	}
 	ctx := contextWithRequestID(r.Context(), requestID)
+	if requestBody != nil {
+		ctx = contextWithBodySource(ctx, requestBody)
+	}
+	if bodyMeta.Size > 0 {
+		ctx = contextWithBodyMeta(ctx, bodyMeta)
+	}
 	ctx = contextWithUsageEventID(ctx, newRequestID())
 	ctx = contextWithRuntimeSettingsCache(ctx)
 	r = r.WithContext(ctx)
@@ -209,73 +209,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(rec, r)
 }
 
-// spoolUnknownBody grows the admission reservation as a chunked request is read.
-// The first MiB stays in memory; larger bodies spill to disk before routing begins,
-// allowing a clean 429 if the next chunk would consume the protected headroom.
-func spoolUnknownBody(ctx context.Context, src io.ReadCloser, reserve func(context.Context, int64) (func(), error)) (io.ReadCloser, func(), error) {
-	defer src.Close()
-	const memoryLimit = 1 << 20
-	var memory bytes.Buffer
-	var file *os.File
-	releases := make([]func(), 0, 8)
-	cleanup := func() {
-		for _, release := range releases {
-			release()
-		}
-		if file != nil {
-			name := file.Name()
-			_ = file.Close()
-			_ = os.Remove(name)
-		}
+func captureRequestBody(ctx context.Context, src io.Reader, cfg config.Config, budget *bodysource.Budget, expectedBytes ...int64) (bodysource.BodySource, error) {
+	return bodysource.Capture(ctx, src, bodysource.CaptureOptions{MaxBytes: cfg.MaxBodyBytes, MemoryThreshold: cfg.BodyMemoryThresholdBytes, ExpectedBytes: positiveExpectedBytes(expectedBytes), TempDir: cfg.BodySpoolDir, MinDiskFreeBytes: cfg.BodyDiskReserveBytes, Budget: budget})
+}
+
+func captureJSONRequestBody(ctx context.Context, src io.Reader, cfg config.Config, budget *bodysource.Budget, hmacKey []byte, expectedBytes ...int64) (bodysource.BodySource, bodysource.BodyMeta, error) {
+	return bodysource.CaptureJSON(ctx, src, bodysource.CaptureOptions{MaxBytes: cfg.MaxBodyBytes, MemoryThreshold: cfg.BodyMemoryThresholdBytes, ExpectedBytes: positiveExpectedBytes(expectedBytes), TempDir: cfg.BodySpoolDir, MinDiskFreeBytes: cfg.BodyDiskReserveBytes, Budget: budget}, hmacKey)
+}
+
+func positiveExpectedBytes(values []int64) int64 {
+	if len(values) > 0 && values[0] > 0 {
+		return values[0]
 	}
-	buf := make([]byte, 64<<10)
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			release, reserveErr := reserve(ctx, 5*int64(n))
-			if reserveErr != nil {
-				cleanup()
-				return nil, func() {}, reserveErr
-			}
-			releases = append(releases, release)
-			if file == nil && memory.Len()+n > memoryLimit {
-				file, reserveErr = os.CreateTemp("", "micliproxy-body-*")
-				if reserveErr != nil {
-					cleanup()
-					return nil, func() {}, reserveErr
-				}
-				if _, reserveErr = file.Write(memory.Bytes()); reserveErr != nil {
-					cleanup()
-					return nil, func() {}, reserveErr
-				}
-				memory.Reset()
-			}
-			if file != nil {
-				_, err = file.Write(buf[:n])
-			} else {
-				_, err = memory.Write(buf[:n])
-			}
-			if err != nil {
-				cleanup()
-				return nil, func() {}, err
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			cleanup()
-			return nil, func() {}, err
-		}
+	return 0
+}
+
+func requestNeedsBodyMeta(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/messages", "/v1/messages/count_tokens":
+		return true
+	default:
+		return false
 	}
-	if file != nil {
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			cleanup()
-			return nil, func() {}, err
-		}
-		return file, cleanup, nil
-	}
-	return io.NopCloser(bytes.NewReader(memory.Bytes())), cleanup, nil
+}
+
+type bodySourceContextKey struct{}
+
+func contextWithBodySource(ctx context.Context, source bodysource.BodySource) context.Context {
+	return context.WithValue(ctx, bodySourceContextKey{}, source)
+}
+
+func bodySourceFromContext(ctx context.Context) bodysource.BodySource {
+	source, _ := ctx.Value(bodySourceContextKey{}).(bodysource.BodySource)
+	return source
+}
+
+type bodyMetaContextKey struct{}
+
+func contextWithBodyMeta(ctx context.Context, meta bodysource.BodyMeta) context.Context {
+	return context.WithValue(ctx, bodyMetaContextKey{}, meta)
+}
+
+func bodyMetaFromContext(ctx context.Context) (bodysource.BodyMeta, bool) {
+	meta, ok := ctx.Value(bodyMetaContextKey{}).(bodysource.BodyMeta)
+	return meta, ok
 }
 
 func setSecurityHeaders(w http.ResponseWriter, r *http.Request) {

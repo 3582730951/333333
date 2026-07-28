@@ -204,10 +204,12 @@ func (s *Server) runProviderAPIKeyInferenceProbe(ctx context.Context, account st
 	req := upstream.Request{Method: http.MethodPost, Provider: provider, Account: account, Token: token, Egress: egress, CookieJarKey: account.ID + ":" + egress.ID, MinimalProbe: true}
 	if provider == "claude" {
 		req.DownstreamPath = "/v1/messages"
-		req.Body, _ = json.Marshal(map[string]interface{}{"model": model, "max_tokens": 8, "messages": []interface{}{map[string]interface{}{"role": "user", "content": "Reply exactly OK"}}})
+		body, _ := json.Marshal(map[string]interface{}{"model": model, "max_tokens": 8, "messages": []interface{}{map[string]interface{}{"role": "user", "content": "Reply exactly OK"}}})
+		req.SetBodyBytes(body)
 	} else {
 		req.DownstreamPath = "/v1/responses"
-		req.Body, _ = json.Marshal(map[string]interface{}{"model": model, "input": "Reply exactly OK", "max_output_tokens": 8, "stream": false})
+		body, _ := json.Marshal(map[string]interface{}{"model": model, "input": "Reply exactly OK", "max_output_tokens": 8, "stream": false})
+		req.SetBodyBytes(body)
 	}
 	resp, err := s.upstream.Do(ctx, req)
 	if err != nil {

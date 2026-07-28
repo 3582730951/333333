@@ -2,10 +2,12 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/supervisor"
@@ -57,10 +59,18 @@ func (s *Server) handleMessagesViaCodex(w http.ResponseWriter, r *http.Request, 
 	inner.RequestURI = ""
 	inner.Body = io.NopCloser(bytes.NewReader(converted.Body))
 	inner.ContentLength = int64(len(converted.Body))
+	convertedSource := bodysource.Bytes(converted.Body)
+	defer convertedSource.Close()
+	inner = inner.WithContext(contextWithBodyMeta(contextWithBodySource(inner.Context(), convertedSource), bodysource.BodyMeta{}))
+	inner.GetBody = convertedSource.Open
 	inner.Header.Set("Content-Type", "application/json")
 	inner.Header.Del("Content-Length")
 
-	bridge := newCodexMessagesResponseWriter(w, isStreamRequest(raw), model, converted.ToolNames, converted.InheritModelTools)
+	bridge, err := newCodexMessagesResponseWriter(r.Context(), w, isStreamRequest(raw), model, converted.ToolNames, converted.InheritModelTools, s.responseBodyCaptureOptions(r.Context()))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	s.handleGatewayPost(bridge, inner)
 	bridge.finish()
 }
@@ -76,6 +86,7 @@ const (
 // Anthropic SSE converter in real time. A non-streaming Claude request still uses the
 // streaming Codex backend and is aggregated into one Messages JSON response.
 type codexMessagesResponseWriter struct {
+	ctx               context.Context
 	downstream        http.ResponseWriter
 	header            http.Header
 	status            int
@@ -84,13 +95,19 @@ type codexMessagesResponseWriter struct {
 	toolNames         map[string]string
 	inheritModelTools map[string]bool
 	mode              codexMessagesResponseMode
-	buffer            bytes.Buffer
+	buffer            *bodysource.SpoolBuffer
+	options           bodysource.CaptureOptions
 	pipeWriter        *io.PipeWriter
 	pipeDone          chan struct{}
 }
 
-func newCodexMessagesResponseWriter(downstream http.ResponseWriter, stream bool, model string, toolNames map[string]string, inheritModelTools map[string]bool) *codexMessagesResponseWriter {
+func newCodexMessagesResponseWriter(ctx context.Context, downstream http.ResponseWriter, stream bool, model string, toolNames map[string]string, inheritModelTools map[string]bool, options bodysource.CaptureOptions) (*codexMessagesResponseWriter, error) {
+	buffer, err := bodysource.NewSpoolBuffer(ctx, options)
+	if err != nil {
+		return nil, err
+	}
 	return &codexMessagesResponseWriter{
+		ctx:               ctx,
 		downstream:        downstream,
 		header:            make(http.Header),
 		streamRequested:   stream,
@@ -98,7 +115,9 @@ func newCodexMessagesResponseWriter(downstream http.ResponseWriter, stream bool,
 		toolNames:         toolNames,
 		inheritModelTools: inheritModelTools,
 		mode:              codexMessagesResponseBuffered,
-	}
+		buffer:            buffer,
+		options:           options,
+	}, nil
 }
 
 func (w *codexMessagesResponseWriter) Header() http.Header { return w.header }
@@ -124,7 +143,7 @@ func (w *codexMessagesResponseWriter) WriteHeader(status int) {
 			defer supervisor.Recover("messages-codex-sse")
 			defer close(w.pipeDone)
 			defer reader.Close()
-			responsesStreamToAnthropicSSE(w.downstream, reader, w.model, w.toolNames, w.inheritModelTools, streamrewrite.New(nil))
+			responsesStreamToAnthropicSSEWithOptions(w.ctx, w.downstream, reader, w.model, w.toolNames, w.inheritModelTools, streamrewrite.New(nil), w.options)
 		}()
 	}
 }
@@ -148,6 +167,7 @@ func (w *codexMessagesResponseWriter) Flush() {
 }
 
 func (w *codexMessagesResponseWriter) finish() {
+	defer w.buffer.Close()
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
@@ -167,12 +187,16 @@ func (w *codexMessagesResponseWriter) finish() {
 
 	copyBridgeHeaders(w.downstream.Header(), w.header)
 	w.downstream.Header().Del("Content-Length")
-	if w.status < 200 || w.status >= 300 {
-		w.downstream.WriteHeader(w.status)
-		_, _ = w.downstream.Write(w.buffer.Bytes())
+	responsesBody, err := responseSpoolBytes(w.buffer)
+	if err != nil {
+		writeError(w.downstream, http.StatusBadGateway, err)
 		return
 	}
-	responsesBody := w.buffer.Bytes()
+	if w.status < 200 || w.status >= 300 {
+		w.downstream.WriteHeader(w.status)
+		_, _ = w.downstream.Write(responsesBody)
+		return
+	}
 	if strings.Contains(strings.ToLower(w.header.Get("Content-Type")), "text/event-stream") {
 		responsesBody = codexSSEToResponseJSON(responsesBody)
 		if len(responsesBody) == 0 {

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 )
@@ -22,6 +24,58 @@ func createRouteTestGroup(t *testing.T, h *testHarness, id string, targets []sto
 		ModelRouting: rules,
 	}); err != nil {
 		t.Fatalf("create user group %s: %v", id, err)
+	}
+}
+
+func TestUserGroupAttemptWriterSpoolsAndCommitsWithoutChangingBody(t *testing.T) {
+	dir := t.TempDir()
+	budget := bodysource.NewBudget(64, 2<<20)
+	recorder := httptest.NewRecorder()
+	w := newUserGroupAttemptWriter(context.Background(), recorder, false, false, bodysource.CaptureOptions{
+		MaxBytes: 2 << 20, MemoryThreshold: 64, TempDir: dir, Budget: budget,
+	})
+	payload := []byte(`{"id":"resp_spooled","status":"completed","output_text":"` + strings.Repeat("large-output-", 64<<10) + `"}`)
+	w.WriteHeader(http.StatusOK)
+	for offset := 0; offset < len(payload); {
+		end := offset + 4093
+		if end > len(payload) {
+			end = len(payload)
+		}
+		if _, err := w.Write(payload[offset:end]); err != nil {
+			t.Fatal(err)
+		}
+		offset = end
+	}
+	if !w.body.Spilled() {
+		t.Fatal("large candidate response stayed in memory")
+	}
+	if got := w.CompletedResponseID(); got != "resp_spooled" {
+		t.Fatalf("completed response id=%q", got)
+	}
+	w.Commit()
+	if !bytes.Equal(recorder.Body.Bytes(), payload) {
+		t.Fatalf("committed body changed: got=%d want=%d", recorder.Body.Len(), len(payload))
+	}
+	if snapshot := budget.Snapshot(); snapshot.MemoryUsed != 0 || snapshot.SpoolUsed != 0 {
+		t.Fatalf("candidate response budget leaked: %+v", snapshot)
+	}
+}
+
+func TestUserGroupAttemptWriterFindsRetryMarkerAcrossSpoolChunks(t *testing.T) {
+	w := newUserGroupAttemptWriter(context.Background(), httptest.NewRecorder(), false, false, bodysource.CaptureOptions{
+		MaxBytes: 1 << 20, MemoryThreshold: 1, TempDir: t.TempDir(), Budget: bodysource.NewBudget(1, 1<<20),
+	})
+	w.WriteHeader(http.StatusBadRequest)
+	for _, chunk := range []string{strings.Repeat("x", 32<<10) + "CAPABILITY_", "UNAVAILABLE"} {
+		if _, err := io.WriteString(w, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !w.RetryableFailure() {
+		t.Fatal("split retry marker was not detected")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -114,7 +114,7 @@ func TestClaudeRoutesThroughSidecarWithClaudeHeaders(t *testing.T) {
 		Method:         http.MethodPost,
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           []byte(`{"model":"claude-3-5-sonnet","stream":true}`),
+		Body:           testBody([]byte(`{"model":"claude-3-5-sonnet","stream":true}`)),
 		Account:        storage.Account{ID: "acc-claude"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -178,7 +178,7 @@ func TestClaudeForceDirectBypassesSidecar(t *testing.T) {
 		Method:         http.MethodPost,
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           []byte(`{"model":"claude-3-5-sonnet"}`),
+		Body:           testBody([]byte(`{"model":"claude-3-5-sonnet"}`)),
 		Account:        storage.Account{ID: "acc-claude"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -223,7 +223,7 @@ func TestClaudeForceDirectKeepsWrappedBaseProxy(t *testing.T) {
 	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{
 		Method: http.MethodPost, Provider: "claude", DownstreamPath: "/v1/messages",
-		Body: []byte(`{"model":"claude-sonnet-4-6"}`), Account: storage.Account{ID: "acc-claude-proxy"},
+		Body: testBody([]byte(`{"model":"claude-sonnet-4-6"}`)), Account: storage.Account{ID: "acc-claude-proxy"},
 		Token: storage.AccountToken{AccessToken: "sk-ant-oat-test"}, Egress: wrapped,
 	})
 	if err != nil {
@@ -255,7 +255,7 @@ func TestClaudeAccountSidecarWrapperChainsThroughSelectedProxy(t *testing.T) {
 		Method:         http.MethodPost,
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`),
+		Body:           testBody([]byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`)),
 		Account:        storage.Account{ID: "acc-claude-wrapped"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-test"},
 		Egress:         wrapped,
@@ -291,7 +291,7 @@ func TestClaudeCLIVersionOverrideAppliesToHeaders(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-claude"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -332,7 +332,7 @@ func TestClaudeSidecarDefaultsToChromeJA3(t *testing.T) {
 		resp, err := client.Do(nilContext(t), Request{
 			Provider:       "claude",
 			DownstreamPath: "/v1/messages",
-			Body:           []byte(`{"stream":true}`),
+			Body:           testBody([]byte(`{"stream":true}`)),
 			Account:        storage.Account{ID: "acc-claude"},
 			Token:          tok,
 			Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -364,7 +364,7 @@ func TestClaudeJA3OptInReplaysRealClaudeJA3(t *testing.T) {
 		resp, err := client.Do(nilContext(t), Request{
 			Provider:       "claude",
 			DownstreamPath: "/v1/messages",
-			Body:           []byte(`{"stream":true}`),
+			Body:           testBody([]byte(`{"stream":true}`)),
 			Account:        storage.Account{ID: "acc-claude"},
 			Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 			Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -395,7 +395,7 @@ func TestClaudeJA3DisableKeepsChrome(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-claude"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -430,7 +430,7 @@ func TestClaudeSidecarSuppressesBrowserDefaultHeaders(t *testing.T) {
 		resp, err := client.Do(nilContext(t), Request{
 			Provider:       "claude",
 			DownstreamPath: "/v1/messages",
-			Body:           []byte(`{"stream":true}`),
+			Body:           testBody([]byte(`{"stream":true}`)),
 			Account:        storage.Account{ID: "acc-claude"},
 			Token:          tok,
 			Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -468,7 +468,7 @@ func TestCodexOAuthSidecarKeepsBrowserDefaultHeaders(t *testing.T) {
 	resp, err := client.Do(nilContext(t), Request{
 		Provider:       "codex",
 		DownstreamPath: "/responses",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-codex"},
 		Token:          storage.AccountToken{AccessToken: "eyJhb.codex.oauth"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},

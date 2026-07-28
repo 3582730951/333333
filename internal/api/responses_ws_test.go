@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
 	"github.com/gorilla/websocket"
 )
@@ -39,6 +42,26 @@ func (w *recordingWebSocketWriter) lastMessage() []byte {
 		return nil
 	}
 	return append([]byte(nil), w.messages[len(w.messages)-1]...)
+}
+
+type streamingRecordingWebSocketWriter struct {
+	recordingWebSocketWriter
+}
+
+func (w *streamingRecordingWebSocketWriter) NextWriter(messageType int) (io.WriteCloser, error) {
+	return &recordingMessage{messageType: messageType, owner: w}, nil
+}
+
+type recordingMessage struct {
+	messageType int
+	owner       *streamingRecordingWebSocketWriter
+	body        bytes.Buffer
+}
+
+func (w *recordingMessage) Write(payload []byte) (int, error) { return w.body.Write(payload) }
+
+func (w *recordingMessage) Close() error {
+	return w.owner.WriteMessage(w.messageType, w.body.Bytes())
 }
 
 func TestResponsesWebSocketRequestConversionPreservesContextBytes(t *testing.T) {
@@ -111,6 +134,99 @@ func TestResponsesWebSocketAppendCompletesPreviousResponseID(t *testing.T) {
 	unchanged, err := state.completeAppend(explicit)
 	if err != nil || !bytes.Equal(unchanged, explicit) {
 		t.Fatalf("explicit client context changed: err=%v body=%s", err, unchanged)
+	}
+}
+
+func TestResponsesWebSocketSourceConversionSpoolsAndPreservesUnknownToolOutput(t *testing.T) {
+	toolOutput := strings.Repeat("x", 2<<20)
+	raw := `{"type":"response.append","model":"gpt-5.6-sol","input":[{"type":"custom_tool_call_output","call_id":"historical_unknown_tool_id","output":"` + toolOutput + `"}]}`
+	budget := bodysource.NewBudget(64<<10, 8<<20)
+	source, meta, err := bodysource.CaptureJSON(context.Background(), strings.NewReader(raw), bodysource.CaptureOptions{
+		MaxBytes: 4 << 20, MemoryThreshold: 64 << 10, TempDir: t.TempDir(), Budget: budget,
+	}, []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kind, source, meta, err := responsesWebSocketRequestToSource(context.Background(), source, meta, []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if kind != "response.append" || !meta.ClientToolResult || meta.Type != "" || !meta.Stream {
+		t.Fatalf("kind=%q meta=%+v", kind, meta)
+	}
+	body, err := bodysource.ReadAll(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]json.RawMessage
+	if err = json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["type"]; exists || string(root["stream"]) != "true" || !bytes.Equal(root["input"], json.RawMessage(`[{"type":"custom_tool_call_output","call_id":"historical_unknown_tool_id","output":"`+toolOutput+`"}]`)) {
+		t.Fatal("source conversion changed the tool result or omitted the stream default")
+	}
+	if snapshot := budget.Snapshot(); snapshot.SpoolUsed == 0 {
+		t.Fatalf("large websocket message did not spill: %+v", snapshot)
+	}
+}
+
+func TestResponsesWebSocketAppendSourceAddsOnlyPreviousResponseID(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"type":"function_call_output","call_id":"unknown_old_call","output":"done"}]}`)
+	source := bodysource.Bytes(raw)
+	meta, err := bodysource.ScanJSON(context.Background(), source, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &responsesWebSocketState{}
+	state.observeMeta(bodysource.BodyMeta{Type: "response.completed", ResponseID: "resp_previous"})
+	source, meta, err = state.completeAppendSource(context.Background(), source, meta, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	body, err := bodysource.ReadAll(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.PreviousResponseID != "resp_previous" || routing.JSONStringField(body, "previous_response_id") != "resp_previous" || !bytes.Contains(body, []byte(`"call_id":"unknown_old_call"`)) {
+		t.Fatalf("append source=%s meta=%+v", body, meta)
+	}
+}
+
+func TestResponsesWebSocketWriterStreamsLargeSSEFrameThroughSpool(t *testing.T) {
+	output := strings.Repeat("z", 2<<20)
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp_spooled","status":"completed"},"output":"` + output + `"}`)
+	recorder := &streamingRecordingWebSocketWriter{recordingWebSocketWriter: recordingWebSocketWriter{notify: make(chan struct{}, 1)}}
+	conn := newResponsesWebSocketConn(recorder)
+	var observed bodysource.BodyMeta
+	budget := bodysource.NewBudget(64<<10, 8<<20)
+	writer := newResponsesWebSocketWriter(context.Background(), conn, func(meta bodysource.BodyMeta) { observed = meta }, bodysource.CaptureOptions{
+		MaxBytes: 4 << 20, MemoryThreshold: 64 << 10, TempDir: t.TempDir(), Budget: budget,
+	}, []byte("secret"))
+	writer.Header().Set("Content-Type", "text/event-stream")
+	wire := append(append([]byte("event: response.completed\r\ndata: "), payload...), []byte("\r\n\r\n")...)
+	for len(wire) > 0 {
+		size := 7919
+		if size > len(wire) {
+			size = len(wire)
+		}
+		if _, err := writer.Write(wire[:size]); err != nil {
+			t.Fatal(err)
+		}
+		wire = wire[size:]
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := recorder.lastMessage(); !bytes.Equal(got, payload) {
+		t.Fatalf("streamed websocket payload differs: got=%d want=%d", len(got), len(payload))
+	}
+	if observed.Type != "response.completed" || observed.ResponseID != "resp_spooled" {
+		t.Fatalf("observed=%+v", observed)
+	}
+	if snapshot := budget.Snapshot(); snapshot.MemoryUsed != 0 || snapshot.SpoolUsed != 0 {
+		t.Fatalf("websocket response buffers leaked: %+v", snapshot)
 	}
 }
 

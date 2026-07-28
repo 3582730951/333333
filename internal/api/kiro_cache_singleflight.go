@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"strings"
+	"time"
 
 	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/routing"
@@ -36,28 +37,34 @@ func (s *Server) enterKiroCacheSingleflight(ctx context.Context, raw []byte, aff
 	}
 	key := lease.Account.ID + "\x00" + endpointHash + "\x00" + model + "\x00" + prefix
 	waited := false
-	for {
-		s.kiroCacheFlightsMu.Lock()
-		if existing := s.kiroCacheFlights[key]; existing != nil {
-			s.kiroCacheFlightsMu.Unlock()
-			waited = true
-			select {
-			case <-existing:
-				continue
-			case <-ctx.Done():
-				return func() {}, waited
-			}
-		}
-		done := make(chan struct{})
-		s.kiroCacheFlights[key] = done
+	s.kiroCacheFlightsMu.Lock()
+	if existing := s.kiroCacheFlights[key]; existing != nil {
 		s.kiroCacheFlightsMu.Unlock()
-		return func() {
-			s.kiroCacheFlightsMu.Lock()
-			if current := s.kiroCacheFlights[key]; current == done {
-				delete(s.kiroCacheFlights, key)
-				close(done)
-			}
-			s.kiroCacheFlightsMu.Unlock()
-		}, waited
+		waited = true
+		timer := time.NewTimer(cacheSingleflightMaxWait)
+		defer timer.Stop()
+		select {
+		case <-existing:
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		return func() {}, waited
 	}
+	if len(s.kiroCacheFlights) >= cacheSingleflightMaxFlights {
+		s.kiroCacheFlightsMu.Unlock()
+		return func() {}, false
+	}
+	done := make(chan struct{})
+	s.kiroCacheFlights[key] = done
+	s.kiroCacheFlightsMu.Unlock()
+	release := func() {
+		s.kiroCacheFlightsMu.Lock()
+		if current := s.kiroCacheFlights[key]; current == done {
+			delete(s.kiroCacheFlights, key)
+			close(done)
+		}
+		s.kiroCacheFlightsMu.Unlock()
+	}
+	time.AfterFunc(cacheSingleflightMaxWait, release)
+	return release, waited
 }

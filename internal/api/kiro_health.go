@@ -205,7 +205,7 @@ func (s *Server) runKiroInferenceHealthProbe(r *http.Request, account storage.Ac
 	capabilityState := s.observeKiroResponse(ctx, account.ID, observedEndpointHash, converted, data)
 	// Empty route hash + a diagnostic affinity source records metering without
 	// creating a scheduler/session binding.
-	s.recordKiroUsage(probeRequest, account.ID, routing.AffinityKey{Source: "kiro_health_probe"}, data.Model, data, capabilityState)
+	s.recordKiroUsage(probeRequest, account.ID, routing.AffinityKey{Source: "kiro_health_probe"}, 0, data.Model, data, capabilityState)
 	result.Alive = true
 	result.State = string(ban.Alive)
 	result.Data = &data

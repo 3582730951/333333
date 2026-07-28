@@ -31,7 +31,7 @@ func TestClaudeSessionIDFallsBackToConversationAnchor(t *testing.T) {
 			Account:  storage.Account{ID: "acc-1"},
 			Token:    storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 			Headers:  http.Header{}, // no X-Claude-Code-Session-Id
-			Body:     []byte(body),
+			Body:     testBody([]byte(body)),
 		}
 		h := http.Header{}
 		c.applyClaudeHeaders(h, spec, id, true)
@@ -225,7 +225,7 @@ func TestCodexMappedDeviceUsesSnapshotOSProfile(t *testing.T) {
 	}
 	spec := Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"tool output says Platform: linux"}`),
+		Body:           testBody([]byte(`{"model":"gpt-5.6-sol","stream":true,"input":"tool output says Platform: linux"}`)),
 		Account:        account,
 		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
 		Egress:         egress,
@@ -457,7 +457,7 @@ func TestCodexSidecarDefaultsToChromeJA3(t *testing.T) {
 	client := NewClient(sidecarEngineConfig())
 	resp, err := client.Do(nilContext(t), Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-cdx"},
 		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -496,7 +496,7 @@ func TestCodexSidecarAliasResolvesToChrome(t *testing.T) {
 	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-cdx"},
 		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -524,7 +524,7 @@ func TestCodexSidecarRawJA3IsSanitized(t *testing.T) {
 	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-cdx"},
 		Token:          storage.AccountToken{AccessToken: "oauth-access-token"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -552,7 +552,7 @@ func TestCodexSidecarAPIKeyOmitsJA3(t *testing.T) {
 	client := NewClient(cfg)
 	resp, err := client.Do(nilContext(t), Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"stream":true}`),
+		Body:           testBody([]byte(`{"stream":true}`)),
 		Account:        storage.Account{ID: "acc-cdx-api"},
 		Token:          storage.AccountToken{AuthMethod: "api_key", OpenAIAPIKey: "sk-openai-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},

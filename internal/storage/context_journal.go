@@ -57,7 +57,9 @@ func (s *Store) CleanupContextJournal(ctx context.Context) (int64, error) {
 // ClearContextJournal atomically removes every encrypted replay context. SQLite
 // compaction is intentionally performed by the API after this transaction commits.
 func (s *Store) ClearContextJournal(ctx context.Context) (int64, error) {
-	_, _ = s.db.ExecContext(ctx, `PRAGMA secure_delete=OFF`)
+	if s.driver != "postgres" {
+		_, _ = s.db.ExecContext(ctx, `PRAGMA secure_delete=OFF`)
+	}
 	var total int64
 	for {
 		r, err := s.db.ExecContext(ctx, `DELETE FROM context_journal WHERE rowid IN (SELECT rowid FROM context_journal LIMIT 8)`)
@@ -69,8 +71,10 @@ func (s *Store) ClearContextJournal(ctx context.Context) (int64, error) {
 		if n == 0 {
 			return total, nil
 		}
-		if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			return total, err
+		if s.driver != "postgres" {
+			if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+				return total, err
+			}
 		}
 	}
 }

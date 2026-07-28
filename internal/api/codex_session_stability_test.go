@@ -588,9 +588,9 @@ func TestCodexMappedStreamingRiskSwitchesBeforeCommitAndAcceptsTerminalTail(t *t
 	}
 }
 
-func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(t *testing.T) {
-	const downstreamID = "client-websocket-risk-root"
-	const callID = "call-websocket-risk-pair"
+func TestCodexMappedDownstreamWebSocketQuotaRotatesAccountAndRestoresToolContext(t *testing.T) {
+	const downstreamID = "client-websocket-quota-root"
+	const callID = "call-websocket-quota-pair"
 	type capture struct {
 		auth    string
 		session string
@@ -626,24 +626,24 @@ func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(
 			mu.Unlock()
 
 			switch auth {
-			case "Bearer access-websocket-risk-a":
+			case "Bearer access-websocket-quota-a":
 				if !strings.Contains(got.body, "previous_response_id") {
-					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-risk-root","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"type":"custom_tool_call","id":"ctc-websocket-risk","call_id":"`+callID+`","name":"apply_patch","input":"{}"}]}}`))
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-quota-root","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"type":"custom_tool_call","id":"ctc-websocket-quota","call_id":"`+callID+`","name":"apply_patch","input":"{}"}]}}`))
 					continue
 				}
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.error","status_code":503,"error":{"type":"server_error","code":"session_risk","message":"session blocked by risk control"}}`))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status_code":429,"error":{"type":"usage_limit_reached","code":"usage_limit_reached","message":"usage limit reached","resets_at":1785583257}}`))
 				return
-			case "Bearer access-websocket-risk-b":
+			case "Bearer access-websocket-quota-b":
 				callIndex := strings.Index(got.body, `"type":"custom_tool_call"`)
 				outputIndex := strings.Index(got.body, `"type":"custom_tool_call_output"`)
 				valid := !strings.Contains(got.body, "previous_response_id") &&
 					callIndex >= 0 && outputIndex > callIndex &&
 					strings.Count(got.body, callID) == 2 &&
-					strings.Contains(got.body, "websocket-risk-result")
+					strings.Contains(got.body, "websocket-quota-result")
 				mu.Lock()
 				recoveredPayloadValid = valid
 				mu.Unlock()
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-risk-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}}`))
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-websocket-quota-recovered","object":"response","model":"gpt-5.6-sol","status":"completed","output":[]}}`))
 				return
 			default:
 				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status_code":401,"error":{"message":"unexpected account"}}`))
@@ -652,7 +652,7 @@ func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(
 		}
 	})
 	enableCodexSessionMappingForTest(h)
-	h.importAccount(t, "websocket-risk-a", "upstream-websocket-risk-a", "access-websocket-risk-a")
+	h.importAccount(t, "websocket-quota-a", "upstream-websocket-quota-a", "access-websocket-quota-a")
 
 	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
 	downstreamHeader := http.Header{}
@@ -683,11 +683,15 @@ func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(
 		for eventCount := 0; eventCount < 8; eventCount++ {
 			_, event, err := conn.ReadMessage()
 			if err != nil {
-				t.Fatalf("read downstream websocket terminal %q: %v; events=%s", responseID, err, received.String())
+				mu.Lock()
+				snapshot := append([]capture(nil), calls...)
+				valid := recoveredPayloadValid
+				mu.Unlock()
+				t.Fatalf("read downstream websocket terminal %q: %v; events=%s upstream_calls=%+v recovered_payload_valid=%v", responseID, err, received.String(), snapshot, valid)
 			}
 			received.Write(event)
-			if bytes.Contains(event, []byte("session_risk")) || bytes.Contains(event, []byte(`"type":"response.error"`)) {
-				t.Fatalf("upstream risk frame leaked downstream: %s", event)
+			if bytes.Contains(event, []byte("usage_limit_reached")) || bytes.Contains(event, []byte(`"status_code":429`)) || bytes.Contains(event, []byte(`"type":"response.failed"`)) {
+				t.Fatalf("upstream quota frame leaked downstream: %s", event)
 			}
 			if bytes.Contains(event, []byte(`"type":"response.completed"`)) {
 				if !bytes.Contains(event, []byte(responseID)) {
@@ -700,9 +704,9 @@ func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(
 		return ""
 	}
 
-	waitForCompleted(`{"type":"response.create","model":"gpt-5.6-sol","session_id":"`+downstreamID+`","thread_id":"`+downstreamID+`","input":"create websocket tool call"}`, "resp-websocket-risk-root")
-	h.importAccount(t, "websocket-risk-b", "upstream-websocket-risk-b", "access-websocket-risk-b")
-	waitForCompleted(`{"type":"response.append","model":"gpt-5.6-sol","input":[{"type":"custom_tool_call_output","call_id":"`+callID+`","output":"websocket-risk-result"}]}`, "resp-websocket-risk-recovered")
+	waitForCompleted(`{"type":"response.create","model":"gpt-5.6-sol","session_id":"`+downstreamID+`","thread_id":"`+downstreamID+`","input":"create websocket tool call"}`, "resp-websocket-quota-root")
+	h.importAccount(t, "websocket-quota-b", "upstream-websocket-quota-b", "access-websocket-quota-b")
+	waitForCompleted(`{"type":"response.append","model":"gpt-5.6-sol","input":[{"type":"custom_tool_call_output","call_id":"`+callID+`","output":"websocket-quota-result"}]}`, "resp-websocket-quota-recovered")
 
 	mu.Lock()
 	gotCalls := append([]capture(nil), calls...)
@@ -712,10 +716,10 @@ func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(
 	}
 	validRecovery := recoveredPayloadValid
 	mu.Unlock()
-	if len(gotCalls) != 3 || gotCalls[0].auth != "Bearer access-websocket-risk-a" || gotCalls[1].auth != gotCalls[0].auth || gotCalls[2].auth != "Bearer access-websocket-risk-b" {
+	if len(gotCalls) != 3 || gotCalls[0].auth != "Bearer access-websocket-quota-a" || gotCalls[1].auth != gotCalls[0].auth || gotCalls[2].auth != "Bearer access-websocket-quota-b" {
 		t.Fatalf("websocket account lifecycle=%+v", gotCalls)
 	}
-	if gotConnections["Bearer access-websocket-risk-a"] != 1 || gotConnections["Bearer access-websocket-risk-b"] != 1 {
+	if gotConnections["Bearer access-websocket-quota-a"] != 1 || gotConnections["Bearer access-websocket-quota-b"] != 1 {
 		t.Fatalf("websocket connection lifecycle=%v", gotConnections)
 	}
 	if !validRecovery {
@@ -730,10 +734,86 @@ func TestCodexMappedDownstreamWebSocketRiskRotatesAccountAndRestoresToolContext(
 			t.Fatalf("downstream websocket session leaked upstream: %+v", call)
 		}
 	}
-	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-risk-root"})
-	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-risk-recovered"})
+	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-quota-root"})
+	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-quota-recovered"})
 	if oldErr != nil || len(oldRows) != 1 || oldRows[0].State != "retired" || newErr != nil || len(newRows) != 1 || newRows[0].State != "active" || newRows[0].RootSessionID != gotCalls[2].session {
 		t.Fatalf("websocket rotation state old=%+v old_err=%v new=%+v new_err=%v", oldRows, oldErr, newRows, newErr)
+	}
+}
+
+func TestDownstreamWebSocketPersistsGoalAfterMappingCommitConflict(t *testing.T) {
+	const downstreamID = "client-websocket-mapping-conflict"
+	const responseID = "resp-websocket-mapping-conflict"
+	const callID = "call-websocket-mapping-conflict"
+	var h *testHarness
+	var conflictErr error
+	upgrader := websocket.Upgrader{}
+	h = newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream websocket upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("read upstream websocket request: %v", err)
+			return
+		}
+		_, conflictErr = h.store.CommitCodexSessionBinding(context.Background(), storage.CodexSessionCommit{
+			Namespace: "unauthenticated",
+			Binding: storage.CodexSessionBinding{
+				ID: "competing-binding", TreeID: "competing-tree", AccountID: "competing-account", EgressID: storage.DefaultDirectEgressID,
+				State: "active", RootSessionID: "competing-session", ThreadID: "competing-session",
+			},
+			Aliases:   []storage.CodexSessionAlias{{Type: "response", Value: responseID}},
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		payload := `{"type":"response.completed","response":{"id":"` + responseID + `","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"type":"custom_tool_call","id":"ctc-websocket-mapping-conflict","call_id":"` + callID + `","name":"apply_patch","input":"{}"}]}}`
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+			t.Errorf("write upstream websocket response: %v", err)
+		}
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "websocket-mapping-conflict", "upstream-websocket-mapping-conflict", "access-websocket-mapping-conflict")
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	header := http.Header{}
+	header.Set("Session-Id", downstreamID)
+	header.Set("Thread-Id", downstreamID)
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, header)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			t.Fatalf("downstream websocket dial: %v body=%s", err, body)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","session_id":"`+downstreamID+`","thread_id":"`+downstreamID+`","input":"create tool call"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, terminal, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read downstream websocket terminal: %v", err)
+	}
+	if conflictErr != nil || !bytes.Contains(terminal, []byte(`"type":"response.completed"`)) || !bytes.Contains(terminal, []byte(responseID)) {
+		t.Fatalf("upstream success was not delivered conflict_setup_err=%v terminal=%s", conflictErr, terminal)
+	}
+	goals, err := h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 1 {
+		t.Fatalf("goal sessions=%+v err=%v", goals, err)
+	}
+	replay, _, err := h.store.BuildGoalReplay(context.Background(), goals[0].ID)
+	if err != nil || !bytes.Contains(replay, []byte(`"type":"custom_tool_call"`)) || !bytes.Contains(replay, []byte(callID)) {
+		t.Fatalf("mapping conflict discarded tool checkpoint replay=%s err=%v", replay, err)
+	}
+	var commitFailures int
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE action='codex_session_mapping_commit_failed' AND reason='codex_session_mapping_ambiguous'`).Scan(&commitFailures); err != nil || commitFailures != 1 {
+		t.Fatalf("mapping failure audit count=%d err=%v", commitFailures, err)
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/agentidentity"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
@@ -182,7 +183,10 @@ type Request struct {
 	TransportProfile string
 	DownstreamPath   string
 	Headers          http.Header
-	Body             []byte
+	Body             bodysource.BodySource
+	BodyMeta         *bodysource.BodyMeta
+	bodyBytes        []byte
+	bodyLoaded       bool
 	Account          storage.Account
 	Token            storage.AccountToken
 	Egress           storage.EgressProfile
@@ -241,6 +245,88 @@ type Response struct {
 	// been committed, so callers must inspect it only after consuming Body.
 	Trailer http.Header
 	Body    io.ReadCloser
+}
+
+func (r *Request) loadBody() error {
+	if r.bodyLoaded {
+		return nil
+	}
+	if r.Body == nil {
+		r.Body = bodysource.Empty()
+		r.bodyLoaded = true
+		return nil
+	}
+	body, err := bodysource.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	r.bodyBytes, r.bodyLoaded = body, true
+	return nil
+}
+
+func requestBody(r Request) []byte {
+	if r.bodyLoaded {
+		return r.bodyBytes
+	}
+	body, _ := bodysource.ReadAll(r.Body)
+	return body
+}
+
+func requestStreamTrue(r Request) bool {
+	if r.BodyMeta != nil && r.BodyMeta.StreamPresent {
+		return r.BodyMeta.Stream
+	}
+	return bodyStreamTrue(requestBody(r))
+}
+
+func setRequestBody(r *Request, body []byte) {
+	r.Body = bodysource.Bytes(body)
+	r.BodyMeta = nil
+	r.bodyBytes, r.bodyLoaded = body, true
+}
+
+// ReadBody materializes the body for protocol transformations that cannot stream it.
+func (r Request) ReadBody() ([]byte, error) {
+	if r.bodyLoaded {
+		return r.bodyBytes, nil
+	}
+	return bodysource.ReadAll(r.Body)
+}
+
+// SetBodyBytes replaces the replayable body after a protocol transformation.
+func (r *Request) SetBodyBytes(body []byte) { setRequestBody(r, body) }
+
+func requestBodySize(r Request) int64 {
+	if r.Body == nil {
+		return 0
+	}
+	return r.Body.Size()
+}
+
+func openRequestBody(r Request) (io.ReadCloser, error) {
+	if r.Body == nil || r.Body.Size() == 0 {
+		return nil, nil
+	}
+	return r.Body.Open()
+}
+
+func newReplayableHTTPRequest(ctx context.Context, method, target string, r Request) (*http.Request, error) {
+	body, err := openRequestBody(r)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		if body != nil {
+			_ = body.Close()
+		}
+		return nil, err
+	}
+	if r.Body != nil {
+		req.ContentLength = r.Body.Size()
+		req.GetBody = r.Body.Open
+	}
+	return req, nil
 }
 
 // SidecarStreamFailure is a structured post-header failure. It contains no
@@ -385,6 +471,11 @@ func (c *Client) SidecarAdaptiveStatuses() []SidecarAdaptiveStatus {
 
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if req.Provider == "claude" {
+		if !req.PassThrough {
+			if err := req.loadBody(); err != nil {
+				return nil, err
+			}
+		}
 		return c.doClaude(ctx, req)
 	}
 	if req.Provider == "antigravity" {
@@ -409,11 +500,21 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		isCompact := strings.Contains(strings.ToLower(req.DownstreamPath), "/responses/compact")
 		usesAPIKey := AccountUsesAPIKey(req.Token)
 		codexBaseURL := c.codexBaseURL(req)
-		responsesLite := !usesAPIKey && CodexRequestUsesResponsesLite(req.Body)
+		if req.BodyMeta != nil {
+			if normalized, err := normalizeCodexSource(c, &req, codexBaseURL, isCompact); err != nil {
+				return nil, err
+			} else if normalized {
+				goto codexNormalized
+			}
+		}
+		if err := req.loadBody(); err != nil {
+			return nil, err
+		}
+		responsesLite := !usesAPIKey && CodexRequestUsesResponsesLite(req.bodyBytes)
 		if isCompact && responsesLite {
-			req.Body = normalizeCodexResponsesLiteCompactBody(req.Body)
+			setRequestBody(&req, normalizeCodexResponsesLiteCompactBody(req.bodyBytes))
 		} else if !isCompact {
-			req.Body = normalizeCodexResponsesBody(req.Body, codexBaseURL, responsesLite)
+			setRequestBody(&req, normalizeCodexResponsesBody(req.bodyBytes, codexBaseURL, responsesLite))
 		}
 		// Parse the top-level object ONCE here. The remaining normalizations each probe
 		// only one or two top-level fields, so they share this single scan instead of
@@ -425,36 +526,37 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		// passthrough each function had on malformed JSON. Mutations are still applied
 		// with targeted sjson edits on the live req.Body, never a map re-marshal.
 		var codexFields map[string]json.RawMessage
-		_ = json.Unmarshal(req.Body, &codexFields)
+		_ = json.Unmarshal(req.bodyBytes, &codexFields)
 		// `ultra` is a client-side Codex capability: the official client enables
 		// automatic delegation locally, but serializes `max` on every Responses wire
 		// path (including /responses/compact). Keep the downstream/config value intact
 		// until this final upstream boundary, then mirror that wire contract.
-		req.Body = normalizeCodexReasoningEffortForWireWithFields(req.Body, codexFields)
+		setRequestBody(&req, normalizeCodexReasoningEffortForWireWithFields(req.bodyBytes, codexFields))
 		// Current codex-rs has no prompt_cache_retention request field on either
 		// HTTP or Responses-over-WebSocket. Keep prompt_cache_key (the supported
 		// cache-affinity control), but strip this obsolete extension consistently.
-		req.Body = stripCodexResponsesPromptCacheRetentionWithFields(req.Body, codexFields)
+		setRequestBody(&req, stripCodexResponsesPromptCacheRetentionWithFields(req.bodyBytes, codexFields))
 		if !usesAPIKey {
 			// The ChatGPT Codex/WHAM contract does not accept the public Responses API's
 			// max_output_tokens field. Claude Code always sends Anthropic max_tokens;
 			// the Messages -> Chat -> Responses bridge preserves it until this transport
 			// boundary, where an OAuth account must mirror the official Codex client and
 			// omit the unsupported field. API-key Responses endpoints keep the limit.
-			req.Body = stripCodexResponsesMaxOutputTokensWithFields(req.Body, codexFields)
+			setRequestBody(&req, stripCodexResponsesMaxOutputTokensWithFields(req.bodyBytes, codexFields))
 			metadata := c.newCodexRequestMetadataWithResponsesLite(req, responsesLite)
 			req.codexMetadata = &metadata
 			// ApiCompactionInput projects the same identity through headers; only
 			// normal Responses turns serialize client_metadata in the request body.
 			if !isCompact {
-				req.Body = applyCodexClientMetadataWithFields(req.Body, codexFields, metadata, req.CodexResponsesWebSocket)
+				setRequestBody(&req, applyCodexClientMetadataWithFields(req.bodyBytes, codexFields, metadata, req.CodexResponsesWebSocket))
 			}
 		}
 		// Downstream Codex WebSocket clients may include transport correlators at
 		// the request root. They are useful for routing/identity derivation above,
 		// but are not valid upstream Responses parameters.
-		req.Body = stripCodexTopLevelTransportCorrelatorsWithFields(req.Body, codexFields)
+		setRequestBody(&req, stripCodexTopLevelTransportCorrelatorsWithFields(req.bodyBytes, codexFields))
 	}
+codexNormalized:
 	if req.CodexResponsesWebSocket {
 		return c.doCodexResponsesWebSocket(ctx, req)
 	}
@@ -476,7 +578,7 @@ func (c *Client) doHTTP(ctx context.Context, spec Request) (*Response, error) {
 	// long-but-progressing stream, and releases the context on the body's Close — never
 	// on this function's return (see requestGuard).
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
-	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(spec.Body))
+	req, err := newReplayableHTTPRequest(ctx, method, target, spec)
 	if err != nil {
 		guard.Fail()
 		return nil, err
@@ -488,7 +590,7 @@ func (c *Client) doHTTP(ctx context.Context, spec Request) (*Response, error) {
 		guard.Fail()
 		return nil, err
 	}
-	if req.Header.Get("Content-Type") == "" && len(spec.Body) > 0 {
+	if req.Header.Get("Content-Type") == "" && requestBodySize(spec) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	client, err := c.httpClientForEgress(spec)
@@ -572,8 +674,9 @@ func (c *Client) transportForEgressMode(egress storage.EgressProfile, forceHTTP1
 		ForceAttemptHTTP2:     !forceHTTP1,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		MaxIdleConns:          128,
+		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   64,
+		MaxConnsPerHost:       512,
 		IdleConnTimeout:       90 * time.Second,
 		// Larger socket buffers than the 4KiB stdlib default: this proxy moves very large
 		// request bodies (multi-MB 1M-context turns) and long SSE streams, so 64KiB read/
@@ -907,7 +1010,7 @@ func waitForSidecarRetry(ctx context.Context, until time.Time) bool {
 // delivery-ambiguous: the upstream may already have accepted a stateful turn.
 func (c *Client) postViaSidecarOnce(ctx context.Context, spec Request, encodedMeta string, timeout time.Duration, lease *sidecarAdaptiveLease) (*Response, bool, error) {
 	ctx, guard := newRequestGuard(ctx, timeout)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(spec.Egress.Endpoint, "/")+"/proxy", bytes.NewReader(spec.Body))
+	req, err := newReplayableHTTPRequest(ctx, http.MethodPost, strings.TrimRight(spec.Egress.Endpoint, "/")+"/proxy", spec)
 	if err != nil {
 		guard.Fail()
 		return nil, false, err
@@ -1002,7 +1105,7 @@ func (c *Client) postDirectThroughSidecarChain(ctx context.Context, spec Request
 		return nil, errors.New("sidecar direct bypass requires the selected chain proxy")
 	}
 	ctx, guard := newRequestGuard(ctx, timeout)
-	req, err := http.NewRequestWithContext(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, bytes.NewReader(spec.Body))
+	req, err := newReplayableHTTPRequest(ctx, firstNonEmpty(spec.Method, http.MethodPost), target, spec)
 	if err != nil {
 		guard.Fail()
 		return nil, err
@@ -1075,11 +1178,11 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	// which made every Codex SIDECAR request reach chatgpt.com with no content type and
 	// get rejected with 400 {"detail":"Unsupported content type"}. Setting it in this
 	// shared builder fixes all transports (the WS path overwrites it afterward).
-	if len(spec.Body) > 0 && dst.Get("Content-Type") == "" {
+	if requestBodySize(spec) > 0 && dst.Get("Content-Type") == "" {
 		dst.Set("Content-Type", "application/json")
 	}
 	if dst.Get("Accept") == "" {
-		if strings.EqualFold(firstNonEmpty(spec.Method, http.MethodPost), http.MethodGet) || (usesAPIKey && !bodyStreamTrue(spec.Body)) {
+		if strings.EqualFold(firstNonEmpty(spec.Method, http.MethodPost), http.MethodGet) || (usesAPIKey && !requestStreamTrue(spec)) {
 			dst.Set("Accept", "application/json")
 		} else {
 			dst.Set("Accept", "text/event-stream")

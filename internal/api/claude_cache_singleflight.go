@@ -6,27 +6,41 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/routing"
 )
 
-func (s *Server) enterClaudeCacheSingleflight(ctx context.Context, enabled bool, body []byte, affinity routing.AffinityKey) (func(), bool) {
+const (
+	cacheSingleflightMaxFlights = 4096
+	cacheSingleflightMaxWait    = 30 * time.Second
+)
+
+func (s *Server) enterClaudeCacheSingleflight(ctx context.Context, enabled bool, accountID, model string, body []byte, affinity routing.AffinityKey) (func(), bool) {
 	if !enabled {
 		return func() {}, false
 	}
-	key := claudeCacheSingleflightKey(body, affinity)
+	key := claudeCacheSingleflightKey(accountID, model, body, affinity)
 	if key == "" {
 		return func() {}, false
 	}
 	s.claudeCacheFlightsMu.Lock()
 	if done, ok := s.claudeCacheFlights[key]; ok {
 		s.claudeCacheFlightsMu.Unlock()
+		timer := time.NewTimer(cacheSingleflightMaxWait)
+		defer timer.Stop()
 		select {
 		case <-done:
+			return func() {}, true
+		case <-timer.C:
 			return func() {}, true
 		case <-ctx.Done():
 			return func() {}, true
 		}
+	}
+	if len(s.claudeCacheFlights) >= cacheSingleflightMaxFlights {
+		s.claudeCacheFlightsMu.Unlock()
+		return func() {}, false
 	}
 	done := make(chan struct{})
 	s.claudeCacheFlights[key] = done
@@ -39,15 +53,16 @@ func (s *Server) enterClaudeCacheSingleflight(ctx context.Context, enabled bool,
 		}
 		s.claudeCacheFlightsMu.Unlock()
 	}
+	time.AfterFunc(cacheSingleflightMaxWait, release)
 	return release, false
 }
 
-func claudeCacheSingleflightKey(body []byte, affinity routing.AffinityKey) string {
+func claudeCacheSingleflightKey(accountID, model string, body []byte, affinity routing.AffinityKey) string {
 	prefixHash := routing.AnthropicStablePromptPrefixHash(body)
 	if prefixHash == "" {
 		prefixHash = claudeCacheSingleflightBodyHash(body)
 	}
-	parts := []string{"claude-cache", strings.TrimSpace(affinity.Source), strings.TrimSpace(affinity.Hash), prefixHash}
+	parts := []string{"claude-cache", strings.TrimSpace(accountID), strings.TrimSpace(model), strings.TrimSpace(affinity.Source), strings.TrimSpace(affinity.Hash), prefixHash}
 	return strings.Join(parts, ":")
 }
 

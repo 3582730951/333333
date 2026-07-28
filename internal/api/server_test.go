@@ -113,6 +113,7 @@ func newHarness(t *testing.T, upstreamHandler http.HandlerFunc) *testHarness {
 	pool := httptest.NewServer(app)
 	t.Cleanup(func() {
 		pool.Close()
+		app.FlushWrites()
 		up.Close()
 		_ = store.Close()
 	})
@@ -1654,10 +1655,88 @@ func TestGatewayAcceptsDownstreamResponsesWebSocket(t *testing.T) {
 	}
 }
 
+func TestDownstreamResponsesWebSocketUsesDistinctUsageEventPerTurn(t *testing.T) {
+	var upstreamTurns atomic.Int32
+	upgrader := websocket.Upgrader{}
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upstream upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+		for upstreamTurns.Load() < 2 {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				t.Errorf("read upstream request: %v", err)
+				return
+			}
+			turn := upstreamTurns.Add(1)
+			responseID := fmt.Sprintf("resp-ws-usage-%d", turn)
+			payload := fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"model":"gpt-5.5","status":"completed","output":[],"usage":{"input_tokens":%d,"output_tokens":1,"total_tokens":%d}}}`, responseID, turn, turn+1)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+				t.Errorf("write upstream response: %v", err)
+				return
+			}
+		}
+	})
+	accountID := h.importAccount(t, "downstream-ws-usage", "acct-downstream-ws-usage", "access-downstream-ws-usage")
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			t.Fatalf("downstream dial: %v status=%d body=%s", err, response.StatusCode, body)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for turn := 1; turn <= 2; turn++ {
+		request := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.5","input":"turn %d","stream":true}`, turn)
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+			t.Fatalf("write downstream turn %d: %v", turn, err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			_, event, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read downstream turn %d: %v", turn, err)
+			}
+			if bytes.Contains(event, []byte(`"type":"response.completed"`)) {
+				break
+			}
+		}
+	}
+	var rows, usageEvents, holds, totalTokens int
+	deadline := time.Now().Add(3 * time.Second)
+	for rows < 2 && time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if timedOut, flushErr := h.app.flushTelemetry(ctx); flushErr != nil {
+			cancel()
+			t.Fatal(flushErr)
+		} else if timedOut {
+			cancel()
+			t.Fatal("timed out flushing usage writes")
+		}
+		err := h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*),COUNT(DISTINCT usage_event_id),COUNT(DISTINCT billing_hold_id),COALESCE(SUM(total_tokens),0) FROM usage_records WHERE account_id=?`, accountID).Scan(&rows, &usageEvents, &holds, &totalTokens)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows < 2 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if rows != 2 || usageEvents != 2 || holds != 2 || totalTokens != 5 {
+		t.Fatalf("multi-turn websocket usage rows=%d events=%d holds=%d total=%d", rows, usageEvents, holds, totalTokens)
+	}
+}
+
 func TestDownstreamResponsesWebSocketNeverLeaksRepeatedOrphanedToolOutput(t *testing.T) {
-	skipLegacyCodexContextReplay(t)
-	const callID = "call_GQqnpD0cS3uxvXlgWBSD974z"
-	var attempts int32
+	var attempts atomic.Int32
 	upgrader := websocket.Upgrader{}
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -1670,33 +1749,11 @@ func TestDownstreamResponsesWebSocketNeverLeaksRepeatedOrphanedToolOutput(t *tes
 			t.Errorf("read upstream WS request: %v", err)
 			return
 		}
-		atomic.AddInt32(&attempts, 1)
-		inner := `{"type":"error","error":{"type":"invalid_request_error","message":"No tool call found for custom tool call output with call_id ` + callID + `.","param":"input"},"status":400}`
-		payload, _ := json.Marshal(map[string]interface{}{
-			"type":        "error",
-			"status_code": 400,
-			"error": map[string]interface{}{
-				"type": "upstream_error", "message": inner,
-			},
-		})
-		_ = conn.WriteMessage(websocket.TextMessage, payload)
+		attempts.Add(1)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp-after-orphan","object":"response","model":"gpt-5.5","status":"completed","output":[]}}`))
 	})
-	accountID := h.importAccount(t, "downstream-ws-repeat", "acct-downstream-ws-repeat", "access-downstream-ws-repeat")
-	if err := h.store.SetSetting(context.Background(), "leak_scrub", "false"); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.store.SetSetting(context.Background(), "seamless_failover", "false"); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.store.SetSetting(context.Background(), "failover_max_attempts", "1"); err != nil {
-		t.Fatal(err)
-	}
-	body := `{"model":"gpt-5.5","previous_response_id":"resp_missing","stream":true,"input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"keep"}]}`
-	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
-	key := routing.ExtractAffinityKey(keyReq, []byte(body))
-	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountID}); err != nil {
-		t.Fatal(err)
-	}
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "downstream-ws-orphan", "acct-downstream-ws-orphan", "access-downstream-ws-orphan")
 
 	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
 	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
@@ -1709,25 +1766,81 @@ func TestDownstreamResponsesWebSocketNeverLeaksRepeatedOrphanedToolOutput(t *tes
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	request := `{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_missing","input":[{"type":"custom_tool_call_output","call_id":"` + callID + `","output":"keep"}],"stream":true}`
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
-		t.Fatal(err)
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, terminal, err := conn.ReadMessage()
-	if err != nil {
-		t.Fatalf("read safe downstream terminal error: %v", err)
-	}
-	if got := atomic.LoadInt32(&attempts); got != 2 {
-		t.Fatalf("upstream attempts=%d, want exactly 2", got)
-	}
-	for _, leak := range []string{"No tool call found", callID, "invalid_request_error"} {
-		if strings.Contains(string(terminal), leak) {
-			t.Fatalf("downstream WebSocket leaked %q: %s", leak, terminal)
+	for index, outputType := range []string{"function_call_output", "custom_tool_call_output", "local_shell_call_output", "mcp_tool_call_output", "tool_search_output"} {
+		callID := fmt.Sprintf("call_unknown_history_%d", index)
+		request := `{"type":"response.create","model":"gpt-5.5","previous_response_id":"resp_missing","input":[{"type":"` + outputType + `","call_id":"` + callID + `","output":"keep"}],"stream":true}`
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, terminal, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read safe downstream terminal for %s: %v", outputType, err)
+		}
+		if got := attempts.Load(); got != 0 {
+			t.Fatalf("unknown historical %s id reached upstream %d times", outputType, got)
+		}
+		for _, leak := range []string{"No tool call found", callID, "invalid_request_error"} {
+			if strings.Contains(string(terminal), leak) {
+				t.Fatalf("downstream WebSocket leaked %q for %s: %s", leak, outputType, terminal)
+			}
+		}
+		if !strings.Contains(string(terminal), `"type":"response.failed"`) || !strings.Contains(string(terminal), `"code":"codex_tool_context_unrecoverable"`) {
+			t.Fatalf("downstream WebSocket did not receive a stable safe error for %s: %s", outputType, terminal)
 		}
 	}
-	if !strings.Contains(string(terminal), `"status":503`) || !strings.Contains(string(terminal), "server_error") {
-		t.Fatalf("downstream WebSocket did not receive a stable safe error: %s", terminal)
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"start a clean turn","stream":true}`)); err != nil {
+		t.Fatalf("websocket was not reusable after orphan rejection: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, completed, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read clean turn after orphan rejection: %v", err)
+	}
+	if attempts.Load() != 1 || !bytes.Contains(completed, []byte(`"type":"response.completed"`)) || !bytes.Contains(completed, []byte("resp-after-orphan")) {
+		t.Fatalf("clean turn did not continue attempts=%d event=%s", attempts.Load(), completed)
+	}
+}
+
+func TestDownstreamResponsesWebSocketTurnStopsAtRequestDeadline(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		t.Error("quota-blocked turn reached upstream")
+	})
+	accountID := h.importAccount(t, "downstream-ws-deadline", "acct-downstream-ws-deadline", "access-downstream-ws-deadline")
+	h.app.cfg.RequestTimeoutSeconds = 1
+	now := storage.Now()
+	if err := h.store.UpsertAccountRateLimit(context.Background(), storage.AccountRateLimit{AccountID: accountID, Provider: "codex", LimiterType: "5h_polled", UsedPercent: 100, Status: "rejected", ResetAt: now + 3600, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	wsURL := "ws" + strings.TrimPrefix(h.pool.URL, "http") + "/v1/responses"
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if response != nil && response.Body != nil {
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			t.Fatalf("downstream dial: %v status=%d body=%s", err, response.StatusCode, body)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.5","input":"wait for capacity","stream":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, terminal, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("request deadline did not produce a terminal event: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 800*time.Millisecond || elapsed > 2500*time.Millisecond {
+		t.Fatalf("turn deadline elapsed=%s event=%s", elapsed, terminal)
+	}
+	if upstreamCalls.Load() != 0 || (!bytes.Contains(terminal, []byte(`"type":"error"`)) && !bytes.Contains(terminal, []byte(`"type":"response.failed"`))) {
+		t.Fatalf("deadline outcome calls=%d event=%s", upstreamCalls.Load(), terminal)
 	}
 }
 
@@ -2161,7 +2274,7 @@ func TestStrictStickyDoesNotCrossAccount(t *testing.T) {
 // two failures this mode was built to remove. It is the exact scenario as
 // TestStrictStickyDoesNotCrossAccount — a continuation carrying previous_response_id (and
 // an x-codex-turn-state header) whose bound account has become unavailable — but under
-// the DEFAULT stateless passthrough it must NOT surface bound_account_unavailable (409),
+// explicitly enabled stateless passthrough it must NOT surface bound_account_unavailable (409),
 // and must strip previous_response_id so the upstream can never answer
 // previous_response_not_found (400). The self-contained turn simply fails over to a
 // healthy account and succeeds.
@@ -2178,7 +2291,11 @@ func TestCodexStatelessPassthroughSurvivesDeadBoundAccount(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"resp_fresh","object":"response","status":"completed","output":[]}`)
 	})
-	// Do NOT disable stateless passthrough: this asserts the shipped default.
+	// Both flags were enabled by older deployments. Stateless HTTP must win while
+	// mapping remains available to a pinned downstream WebSocket.
+	h.app.cfg.CodexSessionMappingEnabled = true
+	h.app.cfg.CodexCPAStrict = true
+	h.app.cfg.CodexStatelessPassthrough = true
 	dead := h.importAccount(t, "dead", "upstream-dead", "access-dead")
 	h.importAccount(t, "healthy", "upstream-healthy", "access-healthy")
 
@@ -2222,6 +2339,60 @@ func TestCodexStatelessPassthroughSurvivesDeadBoundAccount(t *testing.T) {
 		}
 		if upstreamTurnStates[i] != "" {
 			t.Fatalf("upstream attempt %d leaked X-Codex-Turn-State=%q", i, upstreamTurnStates[i])
+		}
+	}
+}
+
+func TestCodexStatelessContinuationFailsOverOn429(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("Authorization") == "Bearer access-a" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"code":"rate_limit_exceeded","message":"usage limit reached"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_from_b","object":"response","status":"completed","output":[]}`)
+	})
+	h.app.cfg.CodexSessionMappingEnabled = true
+	h.app.cfg.CodexCPAStrict = true
+	h.app.cfg.CodexStatelessPassthrough = true
+	accountA := h.importAccount(t, "a", "upstream-a", "access-a")
+	h.importAccount(t, "b", "upstream-b", "access-b")
+
+	reqBody := `{"model":"gpt","previous_response_id":"resp_from_a","prompt_cache_key":"stateless-429","input":[{"type":"custom_tool_call_output","call_id":"call_from_a","output":"keep this tool result"}]}`
+	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
+	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codex-Turn-State", "state-from-a")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("resp_from_b")) || bytes.Contains(body, []byte("usage limit")) {
+		t.Fatalf("stateless failover status=%d body=%s", resp.StatusCode, body)
+	}
+	requests := h.requests()
+	if len(requests) != 2 || requests[0].Auth != "Bearer access-a" || requests[1].Auth != "Bearer access-b" {
+		t.Fatalf("upstream route=%+v", requests)
+	}
+	for i, request := range requests {
+		var root map[string]interface{}
+		if err := json.Unmarshal([]byte(request.Body), &root); err != nil {
+			t.Fatalf("attempt %d body: %v", i, err)
+		}
+		if _, exists := root["previous_response_id"]; exists || request.TurnState != "" {
+			t.Fatalf("attempt %d leaked account-local state: turn_state=%q body=%s", i, request.TurnState, request.Body)
+		}
+		input, _ := root["input"].([]interface{})
+		item, _ := input[0].(map[string]interface{})
+		if item["role"] != "user" || !strings.Contains(request.Body, "keep this tool result") {
+			t.Fatalf("attempt %d did not preserve orphaned tool result as context: %s", i, request.Body)
 		}
 	}
 }

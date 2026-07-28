@@ -4,17 +4,55 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 	"github.com/gorilla/websocket"
 )
+
+type guardedWebSocketSource struct {
+	body          []byte
+	mu            sync.Mutex
+	maxReadBuffer int
+	opens         int
+}
+
+func (s *guardedWebSocketSource) Size() int64 { return int64(len(s.body)) }
+
+func (s *guardedWebSocketSource) Open() (io.ReadCloser, error) {
+	s.mu.Lock()
+	s.opens++
+	s.mu.Unlock()
+	return io.NopCloser(&guardedWebSocketReader{source: s, reader: bytes.NewReader(s.body)}), nil
+}
+
+func (s *guardedWebSocketSource) Close() error { return nil }
+
+type guardedWebSocketReader struct {
+	source *guardedWebSocketSource
+	reader *bytes.Reader
+}
+
+func (r *guardedWebSocketReader) Read(payload []byte) (int, error) {
+	r.source.mu.Lock()
+	if len(payload) > r.source.maxReadBuffer {
+		r.source.maxReadBuffer = len(payload)
+	}
+	r.source.mu.Unlock()
+	if len(payload) > bodysource.DefaultChunkSize {
+		return 0, errors.New("request body was materialized instead of streamed")
+	}
+	return r.reader.Read(payload)
+}
 
 func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	var gotPath, gotMethod string
@@ -58,7 +96,7 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 			"x-codex-beta-features":                 []string{"network_proxy,remote_compaction_v2,network_proxy"},
 			"x-responsesapi-include-timing-metrics": []string{"true"},
 		},
-		Body:                    []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}},{"type":"namespace","name":"calendar","tools":[{"type":"function","name":"create"}]},{"type":"custom","name":"freeform","format":{"type":"text"}},{"type":"tool_search","execution":"client"},{"type":"future_tool","future":{"x":1}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep WS context"}]},{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"future_wire_field":{"n":900719925474099312345},"prompt_cache_retention":"24h"}`),
+		Body:                    testBody([]byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_keep","skills":[{"id":"repo-review","future":{"n":900719925474099312345}}],"plugins":{"mcp":{"server":"workspace-skills"},"future":"keep"},"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}},{"type":"namespace","name":"calendar","tools":[{"type":"function","name":"create"}]},{"type":"custom","name":"freeform","format":{"type":"text"}},{"type":"local_shell","name":"shell"},{"type":"mcp","server_label":"workspace-skills"},{"type":"tool_search","execution":"client"},{"type":"future_tool","future":{"x":1}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep WS context"}]},{"role":"user","content":"hi","exact_id":900719925474099312345}],"stream":true,"future_wire_field":{"n":900719925474099312345},"prompt_cache_retention":"24h"}`)),
 		Account:                 storage.Account{ID: "acc-ws", UpstreamAccountID: "workspace-should-not-leak"},
 		Token:                   storage.AccountToken{AccessToken: "access-ws"},
 		Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -136,6 +174,12 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 	if _, preserved := gotPayload["future_wire_field"]; !preserved {
 		t.Fatalf("unknown future WS field was dropped: %+v", gotPayload)
 	}
+	if _, preserved := gotPayload["skills"]; !preserved {
+		t.Fatalf("skill metadata was dropped over WS: %+v", gotPayload)
+	}
+	if _, preserved := gotPayload["plugins"]; !preserved {
+		t.Fatalf("plugin metadata was dropped over WS: %+v", gotPayload)
+	}
 	metadata, _ := gotPayload["client_metadata"].(map[string]interface{})
 	if metadata["x-codex-installation-id"] != virtualIdentity.MachineID ||
 		metadata["session_id"] != gotHeaders.Get("session-id") ||
@@ -161,8 +205,68 @@ func TestCodexResponsesWebSocketBridge(t *testing.T) {
 		t.Fatalf("Responses Lite input envelope malformed: %+v", gotPayload)
 	}
 	additional := items[0].(map[string]interface{})["tools"].([]interface{})
-	if len(additional) != 5 {
+	if len(additional) != 7 {
 		t.Fatalf("stable/future Responses tools were not transparent over WS: %+v", additional)
+	}
+}
+
+func TestCodexResponsesWebSocketStreamsBodySourceWithoutMaterializing(t *testing.T) {
+	largeInput := strings.Repeat("x", 2<<20)
+	raw := []byte(`{"model":"gpt-5.5","instructions":"keep","input":"` + largeInput + `","stream":true}`)
+	meta, err := bodysource.ScanJSON(context.Background(), bodysource.Bytes(raw), []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &guardedWebSocketSource{body: raw}
+	received := make(chan []byte, 1)
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, upgradeErr := upgrader.Upgrade(w, r, nil)
+		if upgradeErr != nil {
+			return
+		}
+		defer conn.Close()
+		messageType, body, readErr := conn.ReadMessage()
+		if readErr != nil || messageType != websocket.TextMessage {
+			return
+		}
+		received <- body
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_streamed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`))
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
+	client := NewClient(cfg)
+	resp, err := client.Do(context.Background(), Request{
+		DownstreamPath: "/v1/responses", Body: source, BodyMeta: &meta,
+		Account: storage.Account{ID: "acc-source-ws"}, Token: storage.AccountToken{AccessToken: "access-ws"},
+		Egress: storage.EgressProfile{Type: "direct", Health: "healthy"}, CodexResponsesWebSocket: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	var payload map[string]json.RawMessage
+	if err = json.Unmarshal(<-received, &payload); err != nil {
+		t.Fatal(err)
+	}
+	var input string
+	if err = json.Unmarshal(payload["input"], &input); err != nil || input != largeInput {
+		t.Fatalf("large input changed: len=%d err=%v", len(input), err)
+	}
+	if string(payload["type"]) != `"response.create"` || string(payload["stream"]) != "true" || string(payload["tools"]) != "[]" || string(payload["tool_choice"]) != `"auto"` || string(payload["parallel_tool_calls"]) != "false" || string(payload["include"]) != "[]" {
+		t.Fatalf("source websocket defaults missing: %s", payload)
+	}
+	var clientMetadata map[string]json.RawMessage
+	if err = json.Unmarshal(payload["client_metadata"], &clientMetadata); err != nil || len(clientMetadata[codexWSRequestStartMetadata]) == 0 {
+		t.Fatalf("source websocket metadata missing: %s err=%v", payload["client_metadata"], err)
+	}
+	source.mu.Lock()
+	defer source.mu.Unlock()
+	if source.maxReadBuffer > bodysource.DefaultChunkSize || source.opens < 1 {
+		t.Fatalf("body source was not replayed in bounded chunks: opens=%d max_read=%d", source.opens, source.maxReadBuffer)
 	}
 }
 
@@ -202,7 +306,7 @@ func TestCodexWebSocketClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T
 	client := NewClient(config.Default())
 	spec := Request{
 		DownstreamPath:          "/v1/responses",
-		Body:                    []byte(`{"model":"gpt-5.6-sol","instructions":"classic client","tools":[{"type":"web_search"}],"input":"search"}`),
+		Body:                    testBody([]byte(`{"model":"gpt-5.6-sol","instructions":"classic client","tools":[{"type":"web_search"}],"input":"search"}`)),
 		Account:                 storage.Account{ID: "acc-classic-hosted-ws"},
 		Token:                   storage.AccountToken{AccessToken: "oauth-access", RefreshToken: "oauth-refresh"},
 		CodexResponsesWebSocket: true,
@@ -255,7 +359,7 @@ func TestCodexResponsesWebSocketTerminalErrorFrameClosesCleanly(t *testing.T) {
 			client := NewClient(cfg)
 			resp, err := client.Do(context.Background(), Request{
 				DownstreamPath:          "/v1/responses",
-				Body:                    []byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"low"},"input":"hi"}`),
+				Body:                    testBody([]byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"low"},"input":"hi"}`)),
 				Account:                 storage.Account{ID: "acc-ws-error", UpstreamAccountID: "workspace"},
 				Token:                   storage.AccountToken{AccessToken: "access"},
 				Egress:                  storage.EgressProfile{Type: "direct", Health: "healthy"},

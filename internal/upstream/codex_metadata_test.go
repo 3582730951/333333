@@ -84,7 +84,7 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 			"x-client-request-id": []string{"real-thread"},
 			"x-codex-window-id":   []string{"real-thread:7"},
 		},
-		Body:    body,
+		Body:    testBody(body),
 		Account: storage.Account{ID: "acc-http", UpstreamAccountID: "workspace"},
 		Token:   storage.AccountToken{AccessToken: "access-http"},
 		Egress:  storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -160,7 +160,7 @@ func TestCodexMappedSnapshotDoesNotDeriveUnresolvedForkRelationship(t *testing.T
 	client := NewClient(config.Default())
 	metadata := client.newCodexRequestMetadata(Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"model":"gpt-5.6-sol","input":"fork","client_metadata":{"x-codex-turn-metadata":"{\"forked_from_thread_id\":\"downstream-unmapped-fork\",\"thread_id\":\"downstream-thread\"}"}}`),
+		Body:           testBody([]byte(`{"model":"gpt-5.6-sol","input":"fork","client_metadata":{"x-codex-turn-metadata":"{\"forked_from_thread_id\":\"downstream-unmapped-fork\",\"thread_id\":\"downstream-thread\"}"}}`)),
 		Account:        storage.Account{ID: "acc-mapped"},
 		Egress:         storage.EgressProfile{ID: "direct", Type: "direct", Health: "healthy"},
 		CodexIdentity: &CodexIdentitySnapshot{
@@ -202,7 +202,7 @@ func TestCodexHTTPClassicHostedToolDoesNotOptIntoResponsesLite(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.6-sol","instructions":"classic client","store":false,"stream":true,"tools":[{"type":"web_search"}],"input":"search"}`)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",
-		Body:           body,
+		Body:           testBody(body),
 		Account:        storage.Account{ID: "acc-classic-hosted", UpstreamAccountID: "workspace"},
 		Token:          storage.AccountToken{AccessToken: "oauth-access", RefreshToken: "oauth-refresh"},
 		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -237,7 +237,7 @@ func TestCodexHTTPAPIKeyPreservesMaxOutputTokens(t *testing.T) {
 	client := NewClient(cfg)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",
-		Body:           []byte(`{"model":"gpt-5.6-sol","instructions":"API request","store":false,"stream":true,"max_output_tokens":64000,"input":"hi"}`),
+		Body:           testBody([]byte(`{"model":"gpt-5.6-sol","instructions":"API request","store":false,"stream":true,"max_output_tokens":64000,"input":"hi"}`)),
 		Account:        storage.Account{ID: "acc-api-key"},
 		Token:          storage.AccountToken{AccessToken: "sk-api-key", OpenAIAPIKey: "sk-api-key"},
 		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -261,7 +261,7 @@ func TestCodexPrewarmOmitsTurnIDAndStartTimestamp(t *testing.T) {
 	metadata := client.newCodexRequestMetadata(Request{
 		DownstreamPath: "/v1/responses",
 		Headers:        http.Header{"x-client-request-id": []string{"019f4a5e-85d5-7ff2-b047-d392ac030c3d"}},
-		Body:           []byte(`{"model":"gpt-5.6-sol","generate":false,"input":[{"type":"additional_tools","role":"developer","tools":[]}]}`),
+		Body:           testBody([]byte(`{"model":"gpt-5.6-sol","generate":false,"input":[{"type":"additional_tools","role":"developer","tools":[]}]}`)),
 		Account:        storage.Account{ID: "acc-prewarm"},
 	})
 	if metadata.sessionID != metadata.threadID || !looksLikeUUIDv7(metadata.threadID) {
@@ -364,7 +364,7 @@ func TestCodexCompactFingerprintKeepsMetadataOutOfBody(t *testing.T) {
 	original := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"additional_tools","role":"developer","tools":[]}],"parallel_tool_calls":false,"reasoning":{"context":"all_turns"}}`)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses/compact",
-		Body:           original,
+		Body:           testBody(original),
 		Account:        storage.Account{ID: "acc-compact"},
 		Token:          storage.AccountToken{AccessToken: "access-compact"},
 		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},
@@ -400,7 +400,7 @@ func TestCodexClassicCompactDoesNotOptIntoResponsesLite(t *testing.T) {
 	original := []byte(`{"model":"gpt-5.6-sol","input":[],"instructions":"classic compact","tools":[{"type":"web_search"}]}`)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses/compact",
-		Body:           original,
+		Body:           testBody(original),
 		Account:        storage.Account{ID: "acc-classic-compact"},
 		Token:          storage.AccountToken{AccessToken: "access-classic-compact"},
 		Egress:         storage.EgressProfile{Type: "direct", Health: "healthy"},

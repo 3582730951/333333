@@ -77,19 +77,31 @@ func (p ProviderPressureSnapshot) ShouldSpillToKiro() bool {
 // one of them.
 func (s *Scheduler) ProviderPressureSnapshot(ctx context.Context, group, provider, model string) (ProviderPressureSnapshot, error) {
 	route := Route{Group: strings.TrimSpace(group), Provider: strings.TrimSpace(provider), Model: strings.TrimSpace(model)}
+	return s.providerPressureSnapshot(ctx, route)
+}
+
+// EligibleCandidateCount evaluates one full route without acquiring a lease. It
+// applies the same persistent provider/model/quota/recheck/egress checks as fresh
+// selection, honors the caller's per-attempt exclusion set, and still counts
+// concurrency/token-saturated accounts because those can become available while
+// the request waits in FIFO order.
+func (s *Scheduler) EligibleCandidateCount(ctx context.Context, route Route) (int, error) {
+	snapshot, err := s.providerPressureSnapshot(ctx, route)
+	return snapshot.EligibleAccounts, err
+}
+
+func (s *Scheduler) providerPressureSnapshot(ctx context.Context, route Route) (ProviderPressureSnapshot, error) {
 	if route.Group == "" {
 		route.Group = s.Config().DefaultGroup
 	}
 	out := ProviderPressureSnapshot{Group: route.Group, Provider: route.Provider, Model: route.Model}
 
-	accountsWithEgress, err := s.accountsSnapshot(ctx, route.Group)
+	selection, err := s.accountsSnapshot(ctx, route.Group)
 	if err != nil {
 		return out, err
 	}
-	accountIDs := make([]string, 0, len(accountsWithEgress))
-	for _, awe := range accountsWithEgress {
-		accountIDs = append(accountIDs, awe.Account.ID)
-	}
+	accountsWithEgress := selection.rows
+	accountIDs := selection.accountIDs
 
 	capabilitiesByAccount := map[string][]storage.ModelCapability{}
 	if capabilityRouteModel(route.Model) {
@@ -108,7 +120,7 @@ func (s *Scheduler) ProviderPressureSnapshot(ctx context.Context, group, provide
 		}
 	}
 
-	rateLimitsByAccount, rateLimitsErr := s.rateLimitsSnapshot(ctx, route.Group, accountIDs)
+	rateLimitsByAccount, rateLimitsErr := s.rateLimitsForSelection(ctx, selection)
 	if rateLimitsErr != nil {
 		// Keep Select's historical fail-open behavior when diagnostics storage is
 		// unavailable; this view must never make auto routing more restrictive.
@@ -128,6 +140,9 @@ func (s *Scheduler) ProviderPressureSnapshot(ctx context.Context, group, provide
 	cfg := s.Config()
 	for _, awe := range accountsWithEgress {
 		account, binding := awe.Account, awe.Binding
+		if route.Exclude[account.ID] {
+			continue
+		}
 		if account.Status != "active" || (account.QuarantineUntil > now && !account.IgnoreRateLimitControls) {
 			continue
 		}

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream/tlsclient"
@@ -77,11 +78,42 @@ func (s *CodexResponsesWebSocketSession) ForwardProcessed(raw []byte) error {
 	return s.conn.WriteMessage(websocket.TextMessage, raw)
 }
 
+// ForwardProcessedSource relays a potentially large acknowledgement without
+// materializing the complete WebSocket message.
+func (s *CodexResponsesWebSocketSession) ForwardProcessedSource(source bodysource.BodySource) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closed {
+		return errors.New("codex websocket session is closed")
+	}
+	if s.conn == nil {
+		return errors.New("codex websocket session is not connected")
+	}
+	return writeWebSocketTextSource(s.conn, source)
+}
+
+func writeWebSocketTextSource(conn *websocket.Conn, source bodysource.BodySource) error {
+	if source == nil {
+		return errors.New("nil websocket body source")
+	}
+	reader, err := source.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	writer, err := conn.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.CopyBuffer(writer, reader, make([]byte, bodysource.DefaultChunkSize))
+	return errors.Join(copyErr, writer.Close())
+}
+
 func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*Response, error) {
 	if spec.CodexWebSocketSession != nil {
 		return spec.CodexWebSocketSession.do(ctx, c, spec)
 	}
-	target, headers, payload, err := c.prepareCodexResponsesWebSocket(spec)
+	target, headers, payload, err := c.prepareCodexResponsesWebSocketSource(spec)
 	if err != nil {
 		return nil, err
 	}
@@ -102,8 +134,7 @@ func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
-	payload = stampCodexWebSocketRequestStart(payload)
-	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+	if err := writeWebSocketTextSource(conn, payload); err != nil {
 		_ = conn.Close()
 		guard.Fail()
 		return nil, err
@@ -126,6 +157,28 @@ func (c *Client) doCodexResponsesWebSocket(ctx context.Context, spec Request) (*
 	return &Response{StatusCode: http.StatusOK, Header: header, Body: guard.Wrap(pr)}, nil
 }
 
+func (c *Client) prepareCodexResponsesWebSocketSource(spec Request) (string, http.Header, bodysource.BodySource, error) {
+	if spec.BodyMeta == nil || spec.Body == nil {
+		target, headers, payload, err := c.prepareCodexResponsesWebSocket(spec)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		return target, headers, bodysource.Bytes(stampCodexWebSocketRequestStart(payload)), nil
+	}
+	target := ComputeCodexResponsesWebSocketURL(c.codexBaseURL(spec), spec.DownstreamPath)
+	headers := http.Header{}
+	if err := c.applyCodexHeaders(headers, spec); err != nil {
+		return "", nil, nil, err
+	}
+	metadata := spec.codexMetadata
+	if metadata == nil {
+		generated := c.newCodexRequestMetadata(spec)
+		metadata = &generated
+	}
+	applyCodexWebSocketHeaders(headers, *metadata)
+	return target, headers, spec.Body, nil
+}
+
 func (c *Client) prepareCodexResponsesWebSocket(spec Request) (string, http.Header, []byte, error) {
 	target := ComputeCodexResponsesWebSocketURL(c.codexBaseURL(spec), spec.DownstreamPath)
 	headers := http.Header{}
@@ -139,7 +192,7 @@ func (c *Client) prepareCodexResponsesWebSocket(spec Request) (string, http.Head
 	}
 	ids := *metadata
 	applyCodexWebSocketHeaders(headers, ids)
-	payload, err := buildCodexWebSocketCreatePayload(spec.Body, ids)
+	payload, err := buildCodexWebSocketCreatePayload(requestBody(spec), ids)
 	if err != nil {
 		return "", nil, nil, err
 	}
@@ -153,7 +206,7 @@ func (c *Client) prepareCodexResponsesWebSocket(spec Request) (string, http.Head
 
 func (s *CodexResponsesWebSocketSession) do(ctx context.Context, c *Client, spec Request) (*Response, error) {
 	s.requestMu.Lock()
-	target, headers, payload, err := c.prepareCodexResponsesWebSocket(spec)
+	target, headers, payload, err := c.prepareCodexResponsesWebSocketSource(spec)
 	if err != nil {
 		s.requestMu.Unlock()
 		return nil, err
@@ -168,8 +221,7 @@ func (s *CodexResponsesWebSocketSession) do(ctx context.Context, c *Client, spec
 		guard.Fail()
 		return nil, err
 	}
-	payload = stampCodexWebSocketRequestStart(payload)
-	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+	if err := writeWebSocketTextSource(conn, payload); err != nil {
 		s.invalidate(conn)
 		s.requestMu.Unlock()
 		guard.Fail()

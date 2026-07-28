@@ -229,7 +229,7 @@ func TestSidecarStructuredPreHeaderFailureRecoversOnlyThroughBoundProxy(t *testi
 	}
 	response, err := client.postViaSidecar(context.Background(), Request{
 		Method: http.MethodPost,
-		Body:   []byte(`{"input":"safe"}`),
+		Body:   testBody([]byte(`{"input":"safe"}`)),
 		Egress: egress,
 	}, "http://upstream.invalid/v1/responses", http.Header{"Content-Type": []string{"application/json"}}, time.Second, "", false)
 	if err != nil {

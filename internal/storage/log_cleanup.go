@@ -144,6 +144,9 @@ func (s *Store) CheckpointLogStorage(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return errors.New("store is not initialized")
 	}
+	if s.driver == "postgres" {
+		return nil
+	}
 	var busy, logFrames, checkpointed int
 	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
 		return err
@@ -159,6 +162,9 @@ func (s *Store) CheckpointLogStorage(ctx context.Context) error {
 // weekly maintenance window. VACUUM is intentionally separate from row deletion:
 // callers can report a successful clear even if an active reader delays compaction.
 func (s *Store) ReclaimLogStorage(ctx context.Context) error {
+	if s != nil && s.driver == "postgres" {
+		return nil
+	}
 	if err := s.CheckpointLogStorage(ctx); err != nil {
 		return err
 	}

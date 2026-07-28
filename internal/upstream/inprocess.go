@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream/tlsclient"
 )
@@ -82,6 +83,10 @@ func inProcessNamedProfile(ja3 string) string {
 // ProfileNode / ProfileRustls / ProfileChrome; headerOrder, when non-nil, pins the wire
 // order of the request headers to match the native client (e.g. aws-sdk-js).
 func (c *Client) doRawInProcess(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body []byte, cookieJarKey, profileName string, headerOrder []string) (*Response, error) {
+	return c.doRawInProcessSource(ctx, egress, method, rawURL, headers, bodysource.Bytes(body), cookieJarKey, profileName, headerOrder)
+}
+
+func (c *Client) doRawInProcessSource(ctx context.Context, egress storage.EgressProfile, method, rawURL string, headers http.Header, body bodysource.BodySource, cookieJarKey, profileName string, headerOrder []string) (*Response, error) {
 	built := headers.Clone()
 	built.Del("Accept-Encoding")
 

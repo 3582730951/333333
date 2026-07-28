@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
@@ -28,6 +31,10 @@ const (
 
 type webSocketMessageWriter interface {
 	WriteMessage(messageType int, data []byte) error
+}
+
+type webSocketNextWriter interface {
+	NextWriter(messageType int) (io.WriteCloser, error)
 }
 
 // responsesWebSocketConn serializes downstream writes and tracks application-level
@@ -58,6 +65,15 @@ func (s *responsesWebSocketState) observe(payload []byte) {
 	}
 }
 
+func (s *responsesWebSocketState) observeMeta(meta bodysource.BodyMeta) {
+	if meta.Type != "response.completed" || strings.TrimSpace(meta.ResponseID) == "" {
+		return
+	}
+	s.mu.Lock()
+	s.previousResponseID = strings.TrimSpace(meta.ResponseID)
+	s.mu.Unlock()
+}
+
 func (s *responsesWebSocketState) completeAppend(body []byte) ([]byte, error) {
 	if routing.JSONStringField(body, "previous_response_id") != "" {
 		return body, nil
@@ -71,6 +87,32 @@ func (s *responsesWebSocketState) completeAppend(body []byte) ([]byte, error) {
 	return sjson.SetBytes(body, "previous_response_id", previous)
 }
 
+func (s *responsesWebSocketState) completeAppendSource(ctx context.Context, source bodysource.BodySource, meta bodysource.BodyMeta, hmacKey []byte) (bodysource.BodySource, bodysource.BodyMeta, error) {
+	if meta.PreviousResponseID != "" {
+		return source, meta, nil
+	}
+	s.mu.Lock()
+	previous := s.previousResponseID
+	s.mu.Unlock()
+	if previous == "" {
+		return source, meta, nil
+	}
+	value, err := json.Marshal(previous)
+	if err != nil {
+		return nil, bodysource.BodyMeta{}, err
+	}
+	patched, err := bodysource.PatchTopLevel(source, meta, []bodysource.JSONFieldPatch{{Name: "previous_response_id", Value: value}})
+	if err != nil {
+		return source, meta, err
+	}
+	patchedMeta, err := bodysource.ScanJSON(ctx, patched, hmacKey)
+	if err != nil {
+		_ = patched.Close()
+		return patched, bodysource.BodyMeta{}, err
+	}
+	return patched, patchedMeta, nil
+}
+
 func newResponsesWebSocketConn(dst webSocketMessageWriter) *responsesWebSocketConn {
 	return &responsesWebSocketConn{dst: dst, lastWrite: time.Now()}
 }
@@ -80,6 +122,44 @@ func (c *responsesWebSocketConn) WriteMessage(messageType int, data []byte) erro
 	defer c.mu.Unlock()
 	if err := c.dst.WriteMessage(messageType, data); err != nil {
 		return err
+	}
+	if messageType == websocket.TextMessage {
+		c.lastWrite = time.Now()
+	}
+	return nil
+}
+
+func (c *responsesWebSocketConn) WriteSourceMessage(messageType int, source bodysource.BodySource) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if source == nil {
+		return errors.New("nil websocket message source")
+	}
+	if dst, ok := c.dst.(webSocketNextWriter); ok {
+		reader, err := source.Open()
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+		writer, err := dst.NextWriter(messageType)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.CopyBuffer(writer, reader, make([]byte, bodysource.DefaultChunkSize))
+		if err = errors.Join(copyErr, writer.Close()); err != nil {
+			return err
+		}
+	} else {
+		if source.Size() > 1<<20 {
+			return errors.New("websocket writer does not support streaming messages")
+		}
+		raw, err := bodysource.ReadAll(source)
+		if err != nil {
+			return err
+		}
+		if err = c.dst.WriteMessage(messageType, raw); err != nil {
+			return err
+		}
 	}
 	if messageType == websocket.TextMessage {
 		c.lastWrite = time.Now()
@@ -154,7 +234,7 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 	baseCtx := context.WithValue(r.Context(), codexResponsesWebSocketSessionKey{}, session)
 
 	for {
-		messageType, raw, err := conn.ReadMessage()
+		messageType, message, err := conn.NextReader()
 		if err != nil {
 			return
 		}
@@ -162,39 +242,67 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 			_ = writeWebSocketError(downstream, http.StatusBadRequest, "unexpected non-text websocket message")
 			return
 		}
-		kind, body, err := responsesWebSocketRequestToBody(raw)
+		source, meta, err := captureJSONRequestBody(baseCtx, message, s.cfg, s.bodyBudget, s.identitySecretCached)
 		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, bodysource.ErrBodyTooLarge) {
+				status = http.StatusRequestEntityTooLarge
+			} else if errors.Is(err, bodysource.ErrSpoolBudget) || errors.Is(err, bodysource.ErrDiskReserve) {
+				status = http.StatusServiceUnavailable
+			}
+			_ = writeWebSocketError(downstream, status, err.Error())
+			return
+		}
+		kind, source, meta, err := responsesWebSocketRequestToSource(baseCtx, source, meta, s.identitySecretCached)
+		if err != nil {
+			_ = source.Close()
 			_ = writeWebSocketError(downstream, http.StatusBadRequest, err.Error())
 			return
 		}
 		switch kind {
 		case "response.processed":
-			if err := session.ForwardProcessed(raw); err != nil {
+			err = session.ForwardProcessedSource(source)
+			_ = source.Close()
+			if err != nil {
 				_ = writeWebSocketError(downstream, http.StatusBadGateway, err.Error())
 				return
 			}
 			continue
 		case "response.create", "response.append":
 			if kind == "response.append" {
-				body, err = state.completeAppend(body)
+				source, meta, err = state.completeAppendSource(baseCtx, source, meta, s.identitySecretCached)
 				if err != nil {
+					_ = source.Close()
 					_ = writeWebSocketError(downstream, http.StatusBadRequest, err.Error())
 					return
 				}
 			}
+			body, openErr := source.Open()
+			if openErr != nil {
+				_ = source.Close()
+				_ = writeWebSocketError(downstream, http.StatusInternalServerError, openErr.Error())
+				return
+			}
 			turnBaseCtx, cancelTurn := context.WithCancel(baseCtx)
 			// One downstream WebSocket can carry many inference turns. Give each
-			// turn its own usage event while every retry/bridge inside that turn
-			// continues to share the same idempotency key.
+			// turn its own request and usage events while every retry/bridge inside
+			// that turn continues to share the same idempotency keys.
 			turnBaseCtx = contextWithRequestID(turnBaseCtx, newRequestID())
+			turnBaseCtx = contextWithUsageEventID(turnBaseCtx, newRequestID())
+			turnBaseCtx = contextWithBodySource(turnBaseCtx, source)
+			turnBaseCtx = contextWithBodyMeta(turnBaseCtx, meta)
 			turnCtx := context.WithValue(turnBaseCtx, forceCodexResponsesWebSocketKey{}, true)
 			req := r.Clone(turnCtx)
 			req.Method = http.MethodPost
-			req.Body = io.NopCloser(bytes.NewReader(body))
-			req.ContentLength = int64(len(body))
+			req.Body = body
+			req.GetBody = source.Open
+			req.ContentLength = source.Size()
 			req.Header = r.Header.Clone()
 			req.Header.Set("Content-Type", "application/json")
-			writer := newResponsesWebSocketWriter(downstream, state.observe)
+			writer := newResponsesWebSocketWriter(baseCtx, downstream, state.observeMeta, bodysource.CaptureOptions{
+				MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
+				MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.bodyBudget, TempFileNamePrefix: "codex-pool-ws-response-*",
+			}, s.identitySecretCached)
 			downstream.resetIdleClock()
 			heartbeatDone := make(chan error, 1)
 			go func() {
@@ -209,19 +317,47 @@ func (s *Server) handleGatewayWebSocket(w http.ResponseWriter, r *http.Request) 
 				heartbeatErr = keepResponsesWebSocketAlive(turnBaseCtx, downstream, responsesWebSocketHeartbeatInterval)
 			}()
 			s.handleGatewayPost(writer, req)
+			writerErr := writer.Close()
 			cancelTurn()
 			heartbeatErr := <-heartbeatDone
+			_ = body.Close()
+			_ = source.Close()
 			if heartbeatErr != nil {
 				return
 			}
-			if err := writer.Close(); err != nil {
+			if writerErr != nil {
 				return
 			}
 		default:
+			_ = source.Close()
 			_ = writeWebSocketError(downstream, http.StatusBadRequest, fmt.Sprintf("unsupported websocket request type %q", kind))
 			return
 		}
 	}
+}
+
+func responsesWebSocketRequestToSource(ctx context.Context, source bodysource.BodySource, meta bodysource.BodyMeta, hmacKey []byte) (string, bodysource.BodySource, bodysource.BodyMeta, error) {
+	kind := strings.TrimSpace(meta.Type)
+	if kind == "" {
+		return "", source, meta, fmt.Errorf("missing websocket request type")
+	}
+	if kind != "response.create" && kind != "response.append" {
+		return kind, source, meta, nil
+	}
+	fields := []bodysource.JSONFieldPatch{{Name: "type", Delete: true}}
+	if !meta.StreamPresent {
+		fields = append(fields, bodysource.JSONFieldPatch{Name: "stream", Value: []byte("true")})
+	}
+	patched, err := bodysource.PatchTopLevel(source, meta, fields)
+	if err != nil {
+		return "", source, meta, err
+	}
+	patchedMeta, err := bodysource.ScanJSON(ctx, patched, hmacKey)
+	if err != nil {
+		_ = patched.Close()
+		return "", patched, bodysource.BodyMeta{}, err
+	}
+	return kind, patched, patchedMeta, nil
 }
 
 func responsesWebSocketRequestToBody(raw []byte) (string, []byte, error) {
@@ -254,19 +390,32 @@ func responsesWebSocketRequestToBody(raw []byte) (string, []byte, error) {
 }
 
 type responsesWebSocketWriter struct {
+	ctx        context.Context
 	conn       webSocketMessageWriter
 	header     http.Header
 	status     int
-	sseBuffer  []byte
-	bodyBuffer []byte
-	onEvent    func([]byte)
+	frame      *bodysource.SpoolBuffer
+	body       *bodysource.SpoolBuffer
+	lineNonCR  bool
+	options    bodysource.CaptureOptions
+	hmacKey    []byte
+	onEvent    func(bodysource.BodyMeta)
+	closed     bool
+	pendingErr error
 }
 
-func newResponsesWebSocketWriter(conn webSocketMessageWriter, onEvent func([]byte)) *responsesWebSocketWriter {
+func newResponsesWebSocketWriter(ctx context.Context, conn webSocketMessageWriter, onEvent func(bodysource.BodyMeta), options bodysource.CaptureOptions, hmacKey []byte) *responsesWebSocketWriter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if options.MaxBytes <= 0 {
+		options.MaxBytes = 1 << 30
+	}
+	if options.MemoryThreshold <= 0 {
+		options.MemoryThreshold = 8 << 20
+	}
 	return &responsesWebSocketWriter{
-		conn:    conn,
-		header:  http.Header{},
-		onEvent: onEvent,
+		ctx: ctx, conn: conn, header: http.Header{}, onEvent: onEvent, options: options, hmacKey: hmacKey,
 	}
 }
 
@@ -281,16 +430,50 @@ func (w *responsesWebSocketWriter) WriteHeader(status int) {
 }
 
 func (w *responsesWebSocketWriter) Write(p []byte) (int, error) {
+	if w.closed {
+		return 0, bodysource.ErrClosed
+	}
+	if w.pendingErr != nil {
+		return 0, w.pendingErr
+	}
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
 	if w.status >= 400 || !isEventStream(w.header) {
-		w.bodyBuffer = append(w.bodyBuffer, p...)
-		return len(p), nil
+		if w.body == nil {
+			w.body, w.pendingErr = w.newBuffer("codex-pool-ws-error-*")
+			if w.pendingErr != nil {
+				return 0, w.pendingErr
+			}
+		}
+		return w.body.Write(p)
 	}
-	w.sseBuffer = append(w.sseBuffer, p...)
-	if err := w.flushSSEBlocks(false); err != nil {
-		return 0, err
+	start := 0
+	for index, value := range p {
+		if value != '\n' {
+			if value != '\r' {
+				w.lineNonCR = true
+			}
+			continue
+		}
+		boundary := !w.lineNonCR
+		w.lineNonCR = false
+		if !boundary {
+			continue
+		}
+		if err := w.writeFrameBytes(p[start : index+1]); err != nil {
+			w.pendingErr = err
+			return start, err
+		}
+		start = index + 1
+		if err := w.flushFrame(); err != nil {
+			w.pendingErr = err
+			return start, err
+		}
+	}
+	if err := w.writeFrameBytes(p[start:]); err != nil {
+		w.pendingErr = err
+		return start, err
 	}
 	return len(p), nil
 }
@@ -298,41 +481,202 @@ func (w *responsesWebSocketWriter) Write(p []byte) (int, error) {
 func (w *responsesWebSocketWriter) Flush() {}
 
 func (w *responsesWebSocketWriter) Close() error {
-	if w.status >= 400 || (!isEventStream(w.header) && len(w.bodyBuffer) > 0) {
-		return writeWebSocketError(w.conn, w.status, strings.TrimSpace(string(w.bodyBuffer)))
+	if w.closed {
+		return w.pendingErr
 	}
-	return w.flushSSEBlocks(true)
-}
-
-func (w *responsesWebSocketWriter) flushSSEBlocks(final bool) error {
-	for {
-		boundary, separatorLen := sseFrameBoundary(w.sseBuffer)
-		if boundary < 0 {
-			break
-		}
-		block := append([]byte(nil), w.sseBuffer[:boundary]...)
-		w.sseBuffer = w.sseBuffer[boundary+separatorLen:]
-		if err := w.writeSSEBlock(block); err != nil {
+	w.closed = true
+	if w.pendingErr != nil {
+		w.closeBuffers()
+		return w.pendingErr
+	}
+	if w.status >= 400 || !isEventStream(w.header) {
+		err := writeWebSocketErrorSource(w.conn, w.status, w.body)
+		w.closeBuffers()
+		return err
+	}
+	if w.frame != nil && w.frame.Size() > 0 {
+		if err := w.flushFrame(); err != nil {
+			w.closeBuffers()
 			return err
 		}
 	}
-	if final && len(bytes.TrimSpace(w.sseBuffer)) > 0 {
-		block := append([]byte(nil), w.sseBuffer...)
-		w.sseBuffer = nil
-		return w.writeSSEBlock(block)
-	}
+	w.closeBuffers()
 	return nil
 }
 
-func (w *responsesWebSocketWriter) writeSSEBlock(block []byte) error {
-	payload := sseDataPayload(block)
-	if payload == "" || payload == "[DONE]" {
+func (w *responsesWebSocketWriter) newBuffer(prefix string) (*bodysource.SpoolBuffer, error) {
+	options := w.options
+	options.TempFileNamePrefix = prefix
+	return bodysource.NewSpoolBuffer(w.ctx, options)
+}
+
+func (w *responsesWebSocketWriter) writeFrameBytes(payload []byte) error {
+	if len(payload) == 0 {
 		return nil
 	}
-	if w.onEvent != nil {
-		w.onEvent([]byte(payload))
+	if w.frame == nil {
+		var err error
+		w.frame, err = w.newBuffer("codex-pool-ws-sse-frame-*")
+		if err != nil {
+			return err
+		}
 	}
-	return w.conn.WriteMessage(websocket.TextMessage, []byte(payload))
+	_, err := w.frame.Write(payload)
+	return err
+}
+
+func (w *responsesWebSocketWriter) flushFrame() error {
+	frame := w.frame
+	w.frame = nil
+	if frame == nil || frame.Size() == 0 {
+		if frame != nil {
+			_ = frame.Close()
+		}
+		return nil
+	}
+	defer frame.Close()
+	payload, hasData, err := extractSSEDataSource(w.ctx, frame, w.options)
+	if err != nil {
+		return err
+	}
+	if payload == nil {
+		return nil
+	}
+	defer payload.Close()
+	if !hasData || payload.Size() == 0 {
+		return nil
+	}
+	if payload.Size() <= 64 {
+		raw, readErr := bodysource.ReadAll(payload)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.TrimSpace(string(raw)) == "[DONE]" {
+			return nil
+		}
+	}
+	meta, scanErr := bodysource.ScanJSON(w.ctx, payload, w.hmacKey)
+	if w.onEvent != nil {
+		if scanErr == nil {
+			w.onEvent(meta)
+		}
+	}
+	return writeWebSocketSourceMessage(w.conn, websocket.TextMessage, payload)
+}
+
+func (w *responsesWebSocketWriter) closeBuffers() {
+	if w.frame != nil {
+		_ = w.frame.Close()
+		w.frame = nil
+	}
+	if w.body != nil {
+		_ = w.body.Close()
+		w.body = nil
+	}
+}
+
+func extractSSEDataSource(ctx context.Context, frame bodysource.BodySource, options bodysource.CaptureOptions) (*bodysource.SpoolBuffer, bool, error) {
+	reader, err := frame.Open()
+	if err != nil {
+		return nil, false, err
+	}
+	defer reader.Close()
+	options.TempFileNamePrefix = "codex-pool-ws-sse-data-*"
+	payload, err := bodysource.NewSpoolBuffer(ctx, options)
+	if err != nil {
+		return nil, false, err
+	}
+	buffered := bufio.NewReaderSize(reader, bodysource.DefaultChunkSize)
+	hasData := false
+	for {
+		fragment, readErr := buffered.ReadSlice('\n')
+		firstFragment := true
+		active := false
+		for {
+			part := fragment
+			if firstFragment {
+				active = len(part) >= len("data:") && bytes.Equal(part[:len("data:")], []byte("data:"))
+				if active {
+					if hasData {
+						if _, err = payload.Write([]byte{'\n'}); err != nil {
+							_ = payload.Close()
+							return nil, false, err
+						}
+					}
+					hasData = true
+					part = part[len("data:"):]
+					if len(part) > 0 && part[0] == ' ' {
+						part = part[1:]
+					}
+				}
+				firstFragment = false
+			}
+			if active {
+				if readErr != bufio.ErrBufferFull {
+					part = bytes.TrimSuffix(part, []byte{'\n'})
+					part = bytes.TrimSuffix(part, []byte{'\r'})
+				}
+				if len(part) > 0 {
+					if _, err = payload.Write(part); err != nil {
+						_ = payload.Close()
+						return nil, false, err
+					}
+				}
+			}
+			if readErr != bufio.ErrBufferFull {
+				break
+			}
+			fragment, readErr = buffered.ReadSlice('\n')
+		}
+		if readErr == io.EOF {
+			return payload, hasData, nil
+		}
+		if readErr != nil {
+			_ = payload.Close()
+			return nil, false, readErr
+		}
+	}
+}
+
+func writeWebSocketSourceMessage(conn webSocketMessageWriter, messageType int, source bodysource.BodySource) error {
+	if streaming, ok := conn.(interface {
+		WriteSourceMessage(int, bodysource.BodySource) error
+	}); ok {
+		return streaming.WriteSourceMessage(messageType, source)
+	}
+	if source.Size() > 1<<20 {
+		return errors.New("websocket writer does not support streaming messages")
+	}
+	raw, err := bodysource.ReadAll(source)
+	if err != nil {
+		return err
+	}
+	return conn.WriteMessage(messageType, raw)
+}
+
+func writeWebSocketErrorSource(conn webSocketMessageWriter, status int, source bodysource.BodySource) error {
+	const maxErrorMessageBytes = 64 << 10
+	message := ""
+	if source != nil && source.Size() > 0 {
+		reader, err := source.Open()
+		if err != nil {
+			return err
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(reader, maxErrorMessageBytes+1))
+		_ = reader.Close()
+		if readErr != nil {
+			return readErr
+		}
+		truncated := len(raw) > maxErrorMessageBytes
+		if truncated {
+			raw = raw[:maxErrorMessageBytes]
+		}
+		message = strings.TrimSpace(string(raw))
+		if truncated {
+			message += "…"
+		}
+	}
+	return writeWebSocketError(conn, status, message)
 }
 
 func sseDataPayload(block []byte) string {

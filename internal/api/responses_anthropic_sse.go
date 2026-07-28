@@ -1,8 +1,8 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
 )
@@ -21,7 +22,7 @@ type responsesAnthropicToolStream struct {
 	name       string
 	namespace  string
 	kind       prompt.ResponsesToolKind
-	arguments  strings.Builder
+	arguments  *streamAccumulator
 	started    bool
 	closed     bool
 }
@@ -29,7 +30,7 @@ type responsesAnthropicToolStream struct {
 type responsesAnthropicReasoningStream struct {
 	blockIndex int
 	item       map[string]interface{}
-	text       strings.Builder
+	text       *streamAccumulator
 	started    bool
 	closed     bool
 }
@@ -39,6 +40,10 @@ type responsesAnthropicReasoningStream struct {
 // encrypted reasoning, parallel tool identity, complete tool arguments, cache usage,
 // incomplete status, and upstream error events.
 func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, requestedModel string, toolNames map[string]string, inheritModelTools map[string]bool, scrubber *streamrewrite.Matcher) map[string]interface{} {
+	return responsesStreamToAnthropicSSEWithOptions(context.Background(), w, body, requestedModel, toolNames, inheritModelTools, scrubber, bodysource.CaptureOptions{})
+}
+
+func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.ResponseWriter, body io.Reader, requestedModel string, toolNames map[string]string, inheritModelTools map[string]bool, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions) map[string]interface{} {
 	flusher, _ := w.(http.Flusher)
 	emit := func(event string, payload map[string]interface{}) {
 		payload["type"] = event
@@ -67,6 +72,15 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 	reasoningByKey := map[string]*responsesAnthropicReasoningStream{}
 	reasoning := make([]*responsesAnthropicReasoningStream, 0, 2)
 	bridgePlan := prompt.NewResponsesToolBridgePlan()
+	var accumulationErr error
+	defer func() {
+		for _, state := range tools {
+			_ = state.arguments.Close()
+		}
+		for _, state := range reasoning {
+			_ = state.text.Close()
+		}
+	}()
 
 	ensureStarted := func() {
 		if started {
@@ -157,7 +171,11 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			return
 		}
 		startTool(state)
-		arguments := state.arguments.String()
+		arguments, err := state.arguments.String()
+		if err != nil {
+			accumulationErr = err
+			return
+		}
 		if arguments == "" {
 			arguments = fallback
 		}
@@ -180,6 +198,7 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			id:        streamString(firstNonEmptyInterface(mapValue(item, "call_id"), mapValue(item, "id"))),
 			name:      streamString(mapValue(item, "name")),
 			namespace: streamString(mapValue(item, "namespace")),
+			arguments: newStreamAccumulator(ctx, options, "codex-pool-responses-tool-args-*"),
 		}
 		if kind == prompt.ResponsesToolSearch {
 			state.name = "tool_search"
@@ -214,7 +233,10 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		if state := reasoningByKey[key]; state != nil {
 			return state
 		}
-		state := &responsesAnthropicReasoningStream{blockIndex: nextBlock, item: item}
+		state := &responsesAnthropicReasoningStream{
+			blockIndex: nextBlock, item: item,
+			text: newStreamAccumulator(ctx, options, "codex-pool-responses-reasoning-*"),
+		}
 		nextBlock++
 		reasoningByKey[key] = state
 		if itemID := streamString(mapValue(item, "id")); itemID != "" {
@@ -265,7 +287,11 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			return
 		}
 		startReasoning(state)
-		seen := state.text.String()
+		seen, err := state.text.String()
+		if err != nil {
+			accumulationErr = err
+			return
+		}
 		if visible != "" {
 			missing := visible
 			if strings.HasPrefix(visible, seen) {
@@ -277,7 +303,6 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 				emit("content_block_delta", map[string]interface{}{
 					"index": state.blockIndex, "delta": map[string]interface{}{"type": "thinking_delta", "thinking": scrubber.ReplaceString(missing)},
 				})
-				state.text.WriteString(missing)
 			}
 		}
 		if signature != "" {
@@ -305,10 +330,16 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		}
 		for _, state := range reasoning {
 			finishReasoning(state, state.item)
+			if accumulationErr != nil {
+				return
+			}
 		}
 		closeText()
 		for _, state := range tools {
 			flushToolArguments(state, "")
+			if accumulationErr != nil {
+				return
+			}
 		}
 		ensureStarted()
 		stopReason := "end_turn"
@@ -383,7 +414,7 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			}
 		case "response.function_call_arguments.delta":
 			if state := lookupTool(event); state != nil {
-				state.arguments.WriteString(streamString(event["delta"]))
+				accumulationErr = state.arguments.WriteString(streamString(event["delta"]))
 			}
 		case "response.function_call_arguments.done":
 			state := lookupTool(event)
@@ -391,7 +422,7 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			flushToolArguments(state, fallback)
 		case "response.custom_tool_call_input.delta":
 			if state := lookupTool(event); state != nil && state.kind == prompt.ResponsesToolCustom {
-				state.arguments.WriteString(streamString(event["delta"]))
+				accumulationErr = state.arguments.WriteString(streamString(event["delta"]))
 			}
 		case "response.custom_tool_call_input.done":
 			state := lookupTool(event)
@@ -402,7 +433,10 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 			delta := streamString(event["delta"])
 			if delta != "" {
 				startReasoning(state)
-				state.text.WriteString(delta)
+				if err := state.text.WriteString(delta); err != nil {
+					accumulationErr = err
+					return
+				}
 				emit("content_block_delta", map[string]interface{}{
 					"index": state.blockIndex, "delta": map[string]interface{}{"type": "thinking_delta", "thinking": scrubber.ReplaceString(delta)},
 				})
@@ -456,23 +490,11 @@ func responsesStreamToAnthropicSSE(w http.ResponseWriter, body io.Reader, reques
 		}
 	}
 
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var frame bytes.Buffer
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.TrimRight(line, "\r") == "" {
-			process(frame.Bytes())
-			frame.Reset()
-			continue
-		}
-		frame.WriteString(line)
-		frame.WriteByte('\n')
-	}
-	if frame.Len() > 0 {
-		process(frame.Bytes())
-	}
-	if !terminal {
+	streamErr := forEachSSEFrameWithOptions(ctx, body, options, func(frame []byte) error {
+		process(frame)
+		return accumulationErr
+	})
+	if streamErr != nil || accumulationErr != nil || !terminal {
 		emit("error", map[string]interface{}{"error": map[string]interface{}{
 			"type": "api_error", "code": "server_error", "message": publicRetryMessage,
 		}})

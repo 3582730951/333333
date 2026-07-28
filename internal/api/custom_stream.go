@@ -2,12 +2,14 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
@@ -321,6 +323,10 @@ func usageMap(c chatChunk) map[string]interface{} {
 // chatStreamToResponsesSSE rewrites a Chat Completions SSE stream into a Responses API
 // SSE stream (response.created → per-item added/delta/done → response.completed).
 func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, plans ...*prompt.ResponsesToolBridgePlan) map[string]interface{} {
+	return chatStreamToResponsesSSEWithOptions(context.Background(), w, body, model, scrubber, bodysource.CaptureOptions{}, plans...)
+}
+
+func chatStreamToResponsesSSEWithOptions(ctx context.Context, w http.ResponseWriter, body io.Reader, model string, scrubber *streamrewrite.Matcher, options bodysource.CaptureOptions, plans ...*prompt.ResponsesToolBridgePlan) map[string]interface{} {
 	plan := prompt.NewResponsesToolBridgePlan()
 	if len(plans) > 0 && plans[0] != nil {
 		plan = plans[0]
@@ -343,7 +349,8 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	created := false
 	msgOpened := false
 	msgOutputIndex := -1
-	var textBuf strings.Builder
+	textBuf := newStreamAccumulator(ctx, options, "codex-pool-chat-response-text-*")
+	defer textBuf.Close()
 	nextOutputIndex := 0
 
 	type toolAcc struct {
@@ -353,12 +360,13 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 		name        string
 		identity    prompt.ResponsesToolIdentity
 		opened      bool
-		args        strings.Builder
+		args        *streamAccumulator
 	}
 	tools := map[int]*toolAcc{}
 	var toolOrder []int
 	var usage map[string]interface{}
 	sawDone := false
+	var accumulationErr error
 
 	ensureCreated := func(id string) {
 		if created {
@@ -436,6 +444,7 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	}
 
 	sc := newChatSSEScanner(body)
+scanLoop:
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if strings.HasPrefix(line, "data:") && strings.TrimSpace(line[len("data:"):]) == "[DONE]" {
@@ -477,7 +486,9 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 			if choice.Delta.Content != nil && *choice.Delta.Content != "" {
 				ensureMsgOpen()
 				txt := scrubber.ReplaceString(*choice.Delta.Content)
-				textBuf.WriteString(txt)
+				if accumulationErr = textBuf.WriteString(txt); accumulationErr != nil {
+					break scanLoop
+				}
 				emit(map[string]interface{}{
 					"type": "response.output_text.delta", "item_id": msgItemID,
 					"output_index": msgOutputIndex, "content_index": 0, "delta": txt,
@@ -486,7 +497,8 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 			for _, tc := range choice.Delta.ToolCalls {
 				acc := tools[tc.Index]
 				if acc == nil {
-					acc = &toolAcc{outputIndex: nextOutputIndex}
+					acc = &toolAcc{outputIndex: nextOutputIndex, args: newStreamAccumulator(ctx, options, "codex-pool-chat-tool-args-*")}
+					defer acc.args.Close()
 					nextOutputIndex++
 					tools[tc.Index] = acc
 					toolOrder = append(toolOrder, tc.Index)
@@ -505,7 +517,9 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 				}
 				if tc.Function.Arguments != "" {
 					arg := scrubber.ReplaceString(tc.Function.Arguments)
-					acc.args.WriteString(arg)
+					if accumulationErr = acc.args.WriteString(arg); accumulationErr != nil {
+						break scanLoop
+					}
 					if acc.identity.Kind == prompt.ResponsesToolFunction {
 						openTool(acc)
 						emit(map[string]interface{}{
@@ -517,7 +531,7 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 			}
 		}
 	}
-	if sc.Err() != nil || !sawDone {
+	if sc.Err() != nil || accumulationErr != nil || !sawDone {
 		ensureCreated("")
 		emit(map[string]interface{}{
 			"type": "response.failed",
@@ -538,7 +552,17 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	}
 	ordered := make([]interface{}, nextOutputIndex)
 	if msgOpened {
-		finalText := textBuf.String()
+		finalText, err := textBuf.String()
+		if err != nil {
+			emit(map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id": respID, "object": "response", "status": "failed", "model": model,
+					"error": map[string]interface{}{"type": "server_error", "code": "server_error", "message": publicRetryMessage},
+				},
+			})
+			return usage
+		}
 		emit(map[string]interface{}{
 			"type": "response.output_text.done", "item_id": msgItemID,
 			"output_index": msgOutputIndex, "content_index": 0, "text": finalText,
@@ -555,7 +579,17 @@ func chatStreamToResponsesSSE(w http.ResponseWriter, body io.Reader, model strin
 	for _, idx := range toolOrder {
 		acc := tools[idx]
 		openTool(acc)
-		args := acc.args.String()
+		args, err := acc.args.String()
+		if err != nil {
+			emit(map[string]interface{}{
+				"type": "response.failed",
+				"response": map[string]interface{}{
+					"id": respID, "object": "response", "status": "failed", "model": model,
+					"error": map[string]interface{}{"type": "server_error", "code": "server_error", "message": publicRetryMessage},
+				},
+			})
+			return usage
+		}
 		var completed map[string]interface{}
 		switch acc.identity.Kind {
 		case prompt.ResponsesToolCustom:

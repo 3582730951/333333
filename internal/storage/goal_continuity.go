@@ -7,10 +7,12 @@ package storage
 // token encryption in exactly the same way as context_journal.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,6 +20,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"codex-account-pool/internal/secretbox"
 )
 
 const goalContinuitySchemaSQL = `
@@ -33,6 +37,7 @@ CREATE TABLE IF NOT EXISTS goal_session(
  state TEXT NOT NULL DEFAULT 'ready',
  current_checkpoint_id TEXT NOT NULL DEFAULT '',
  encrypted_working_state TEXT NOT NULL DEFAULT '',
+	storage_bytes INTEGER NOT NULL DEFAULT 0,
  expires_at INTEGER NOT NULL,
  created_at INTEGER NOT NULL,
  updated_at INTEGER NOT NULL
@@ -55,6 +60,7 @@ CREATE TABLE IF NOT EXISTS goal_checkpoint(
  payload_hash TEXT NOT NULL,
  payload_bytes INTEGER NOT NULL,
  encrypted_payload TEXT NOT NULL,
+	format_version INTEGER NOT NULL DEFAULT 2,
  created_at INTEGER NOT NULL,
  FOREIGN KEY(goal_id) REFERENCES goal_session(id) ON DELETE CASCADE,
  UNIQUE(goal_id, sequence)
@@ -67,12 +73,26 @@ CREATE TABLE IF NOT EXISTS goal_segment(
  payload_hash TEXT NOT NULL,
  payload_bytes INTEGER NOT NULL,
  encrypted_payload TEXT NOT NULL,
+	format_version INTEGER NOT NULL DEFAULT 2,
  state TEXT NOT NULL DEFAULT 'committed',
  created_at INTEGER NOT NULL,
  FOREIGN KEY(goal_id) REFERENCES goal_session(id) ON DELETE CASCADE,
  UNIQUE(goal_id, sequence)
 );
 CREATE INDEX IF NOT EXISTS idx_goal_segment_goal ON goal_segment(goal_id, sequence);
+CREATE TABLE IF NOT EXISTS goal_payload_chunk(
+ goal_id TEXT NOT NULL,
+ payload_kind TEXT NOT NULL,
+ segment_sequence INTEGER NOT NULL DEFAULT 0,
+ chunk_index INTEGER NOT NULL,
+ payload_hash TEXT NOT NULL,
+ payload_bytes INTEGER NOT NULL,
+ encrypted_payload TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY(goal_id, payload_kind, segment_sequence, chunk_index),
+ FOREIGN KEY(goal_id) REFERENCES goal_session(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_goal_payload_chunk_history ON goal_payload_chunk(goal_id, payload_kind, segment_sequence, chunk_index);
 CREATE TABLE IF NOT EXISTS goal_run(
  id TEXT PRIMARY KEY,
  goal_id TEXT NOT NULL,
@@ -116,6 +136,7 @@ type GoalSession struct {
 	State             string `json:"state"`
 	CurrentCheckpoint string `json:"current_checkpoint_id,omitempty"`
 	WorkingState      string `json:"-"`
+	StorageBytes      int64  `json:"storage_bytes"`
 	ExpiresAt         int64  `json:"expires_at"`
 	CreatedAt         int64  `json:"created_at"`
 	UpdatedAt         int64  `json:"updated_at"`
@@ -129,18 +150,87 @@ type GoalCheckpoint struct {
 	PayloadHash            string `json:"payload_hash"`
 	PayloadBytes           int64  `json:"payload_bytes"`
 	Payload                string `json:"-"`
+	FormatVersion          int64  `json:"format_version"`
 	CreatedAt              int64  `json:"created_at"`
 }
 
 type GoalSegment struct {
-	ID           string `json:"id"`
-	GoalID       string `json:"goal_id"`
-	Sequence     int64  `json:"sequence"`
-	PayloadHash  string `json:"payload_hash"`
-	PayloadBytes int64  `json:"payload_bytes"`
-	Payload      string `json:"-"`
-	State        string `json:"state"`
-	CreatedAt    int64  `json:"created_at"`
+	ID            string `json:"id"`
+	GoalID        string `json:"goal_id"`
+	Sequence      int64  `json:"sequence"`
+	PayloadHash   string `json:"payload_hash"`
+	PayloadBytes  int64  `json:"payload_bytes"`
+	Payload       string `json:"-"`
+	FormatVersion int64  `json:"format_version"`
+	State         string `json:"state"`
+	CreatedAt     int64  `json:"created_at"`
+}
+
+const (
+	goalPayloadFormatV2  = int64(2)
+	goalPayloadChunkSize = 64 << 10
+	goalChunkCheckpoint  = "checkpoint"
+	goalChunkSegment     = "segment"
+)
+
+func (s *Store) estimateGoalChunkStorage(payload string) int64 {
+	var stored int64
+	for offset := 0; offset < len(payload); {
+		end := offset + goalPayloadChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		plainBytes := end - offset
+		if len(s.tokenKey) == 32 {
+			stored += int64(len(secretbox.Prefix) + base64.StdEncoding.EncodedLen(plainBytes+12+16))
+		} else {
+			stored += int64(plainBytes)
+		}
+		offset = end
+	}
+	return stored
+}
+
+func (s *Store) insertGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind string, segmentSequence, createdAt int64, payload string) (int64, error) {
+	var stored int64
+	for offset, index := 0, 0; offset < len(payload); index++ {
+		end := offset + goalPayloadChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		part := payload[offset:end]
+		encrypted := s.sealToken(part)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+			goalID, kind, segmentSequence, index, hashGoalPayload(part), len(part), encrypted, createdAt); err != nil {
+			return stored, err
+		}
+		stored += int64(len(encrypted))
+		offset = end
+	}
+	return stored, nil
+}
+
+func (s *Store) readGoalChunks(ctx context.Context, goalID, kind string, segmentSequence int64) (string, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT encrypted_payload FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence=? ORDER BY chunk_index`, goalID, kind, segmentSequence)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var payload bytes.Buffer
+	for rows.Next() {
+		var encrypted string
+		if err = rows.Scan(&encrypted); err != nil {
+			return "", err
+		}
+		payload.WriteString(s.openToken(encrypted))
+	}
+	if err = rows.Err(); err != nil {
+		return "", err
+	}
+	if payload.Len() == 0 {
+		return "", ErrGoalNotFound
+	}
+	return payload.String(), nil
 }
 
 type GoalRun struct {
@@ -209,6 +299,37 @@ type GoalMetrics struct {
 	PersistenceDegraded       int64 `json:"persistence_degraded"`
 }
 
+func (s *Store) migrateGoalContinuityV2(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS goal_payload_chunk(
+goal_id TEXT NOT NULL,payload_kind TEXT NOT NULL,segment_sequence INTEGER NOT NULL DEFAULT 0,chunk_index INTEGER NOT NULL,
+payload_hash TEXT NOT NULL,payload_bytes INTEGER NOT NULL,encrypted_payload TEXT NOT NULL,created_at INTEGER NOT NULL,
+PRIMARY KEY(goal_id,payload_kind,segment_sequence,chunk_index),FOREIGN KEY(goal_id) REFERENCES goal_session(id) ON DELETE CASCADE)`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_goal_payload_chunk_history ON goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index)`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE goal_checkpoint SET format_version=1 WHERE format_version<=0`); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE goal_segment SET format_version=1 WHERE format_version<=0`); err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE goal_session SET storage_bytes=
+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_checkpoint WHERE goal_id=goal_session.id),0)+
+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_segment WHERE goal_id=goal_session.id),0)+
+COALESCE((SELECT SUM(LENGTH(encrypted_payload)) FROM goal_payload_chunk WHERE goal_id=goal_session.id),0)`)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func hashGoalValue(kind, value string) string {
 	s := sha256.Sum256([]byte(strings.TrimSpace(kind) + "\x00" + strings.TrimSpace(value)))
 	return hex.EncodeToString(s[:])
@@ -262,7 +383,7 @@ func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []
 	args = append(args, Now())
 	query := `SELECT DISTINCT s.id, s.protocol, s.parent_goal_id, s.branch_hash,
  s.downstream_key_hash, s.workspace_hash, s.initial_goal_hash, s.last_response_hash,
- s.state, s.current_checkpoint_id, s.encrypted_working_state, s.expires_at, s.created_at, s.updated_at
+	 s.state, s.current_checkpoint_id, s.encrypted_working_state, s.storage_bytes, s.expires_at, s.created_at, s.updated_at
  FROM goal_alias a JOIN goal_session s ON s.id=a.goal_id
  WHERE a.alias_hash IN (` + strings.Join(marks, ",") + `) AND s.expires_at>?`
 	rows, err := q.QueryContext(ctx, query, args...)
@@ -276,7 +397,7 @@ func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []
 		var encrypted string
 		if err := rows.Scan(&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash,
 			&item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash,
-			&item.State, &item.CurrentCheckpoint, &encrypted, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&item.State, &item.CurrentCheckpoint, &encrypted, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return GoalResolution{}, err
 		}
 		item.WorkingState = s.openToken(encrypted)
@@ -342,7 +463,7 @@ func (s *Store) ResolveFallbackGoal(ctx context.Context, downstreamKeyHash, work
 	}
 	rows, err := s.rdb.QueryContext(ctx, `SELECT id, protocol, parent_goal_id, branch_hash,
  downstream_key_hash, workspace_hash, initial_goal_hash, last_response_hash, state,
- current_checkpoint_id, encrypted_working_state, expires_at, created_at, updated_at
+	 current_checkpoint_id, encrypted_working_state, storage_bytes, expires_at, created_at, updated_at
  FROM goal_session WHERE downstream_key_hash=? AND workspace_hash=? AND initial_goal_hash=? AND expires_at>?`,
 		downstreamKeyHash, workspaceHash, initialGoalHash, Now())
 	if err != nil {
@@ -355,7 +476,7 @@ func (s *Store) ResolveFallbackGoal(ctx context.Context, downstreamKeyHash, work
 		var encrypted string
 		if err := rows.Scan(&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash,
 			&item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash,
-			&item.State, &item.CurrentCheckpoint, &encrypted, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&item.State, &item.CurrentCheckpoint, &encrypted, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return GoalResolution{}, err
 		}
 		item.WorkingState = s.openToken(encrypted)
@@ -432,25 +553,22 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		return GoalSession{}, resolveErr
 	}
 	var session GoalSession
-	var nextSegment, nextCheckpoint int64
+	var nextSegment int64
 	created := errors.Is(resolveErr, ErrGoalNotFound)
+	segmentEstimatedBytes := s.estimateGoalChunkStorage(turn.SegmentPayload)
+	var checkpointEstimatedBytes int64
+	if created {
+		checkpointEstimatedBytes = s.estimateGoalChunkStorage(turn.CheckpointPayload)
+	}
 	if turn.StorageMaxBytes > 0 {
-		var checkpointUsed, segmentUsed int64
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_checkpoint`).Scan(&checkpointUsed); err != nil {
+		var used int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used); err != nil {
 			return GoalSession{}, err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_segment`).Scan(&segmentUsed); err != nil {
-			return GoalSession{}, err
-		}
-		estimate := int64(len(s.sealToken(turn.SegmentPayload)))
+		estimate := segmentEstimatedBytes
 		if created {
-			estimate += int64(len(s.sealToken(turn.CheckpointPayload)))
+			estimate += checkpointEstimatedBytes
 		}
-		// Existing turns append one segment only; charging their base checkpoint a
-		// second time would prematurely reject long jobs even though the chain is
-		// incremental.  Encryption overhead is checked conservatively by the next
-		// write/cleanup pass without evicting active work.
-		used := checkpointUsed + segmentUsed
 		if used+estimate > turn.StorageMaxBytes {
 			protectedGoalID := ""
 			if !created {
@@ -482,19 +600,24 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		// The checkpoint/segment tables intentionally have foreign keys to a goal.
 		// Insert the session shell first, then fill current_checkpoint_id in the
 		// final upsert below; the entire sequence remains one transaction.
-		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_session(id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			session.ID, session.Protocol, session.ParentGoalID, session.BranchHash, session.DownstreamKeyHash, session.WorkspaceHash, session.InitialGoalHash, "", session.State, "", s.sealToken(turn.WorkingState), session.ExpiresAt, session.CreatedAt, session.UpdatedAt); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_session(id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			session.ID, session.Protocol, session.ParentGoalID, session.BranchHash, session.DownstreamKeyHash, session.WorkspaceHash, session.InitialGoalHash, "", session.State, "", s.sealToken(turn.WorkingState), 0, session.ExpiresAt, session.CreatedAt, session.UpdatedAt); err != nil {
 			return GoalSession{}, err
 		}
 		checkpoint := GoalCheckpoint{ID: newGoalID("gcp"), GoalID: session.ID, Sequence: 1, Payload: turn.CheckpointPayload, CreatedAt: now}
 		checkpoint.PayloadHash, checkpoint.PayloadBytes = hashGoalPayload(checkpoint.Payload), int64(len(checkpoint.Payload))
-		checkpointEncrypted := s.sealToken(checkpoint.Payload)
-		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_checkpoint(id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES(?,?,?,?,?,?,?,?)`,
-			checkpoint.ID, checkpoint.GoalID, checkpoint.Sequence, 0, checkpoint.PayloadHash, checkpoint.PayloadBytes, checkpointEncrypted, checkpoint.CreatedAt); err != nil {
+		checkpoint.FormatVersion = goalPayloadFormatV2
+		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_checkpoint(id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,format_version,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			checkpoint.ID, checkpoint.GoalID, checkpoint.Sequence, 0, checkpoint.PayloadHash, checkpoint.PayloadBytes, "", checkpoint.FormatVersion, checkpoint.CreatedAt); err != nil {
 			return GoalSession{}, err
 		}
+		checkpointStoredBytes, insertErr := s.insertGoalChunks(ctx, tx, session.ID, goalChunkCheckpoint, 0, now, turn.CheckpointPayload)
+		if insertErr != nil {
+			return GoalSession{}, insertErr
+		}
+		session.StorageBytes += checkpointStoredBytes
 		session.CurrentCheckpoint = checkpoint.ID
-		nextSegment, nextCheckpoint = 1, 2
+		nextSegment = 1
 	} else {
 		session = resolution.Session
 		if strings.TrimSpace(session.Protocol) != turn.Protocol {
@@ -503,10 +626,6 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM goal_segment WHERE goal_id=?`, session.ID).Scan(&nextSegment); err != nil {
 			return GoalSession{}, err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM goal_checkpoint WHERE goal_id=?`, session.ID).Scan(&nextCheckpoint); err != nil {
-			return GoalSession{}, err
-		}
-		_ = nextCheckpoint // retained for the post-commit compaction call.
 		if strings.TrimSpace(turn.ParentGoalID) != "" {
 			session.ParentGoalID = strings.TrimSpace(turn.ParentGoalID)
 		}
@@ -526,12 +645,17 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		session.UpdatedAt = now
 	}
 
-	segment := GoalSegment{ID: newGoalID("gseg"), GoalID: session.ID, Sequence: nextSegment, Payload: turn.SegmentPayload, State: "committed", CreatedAt: now}
+	segment := GoalSegment{ID: newGoalID("gseg"), GoalID: session.ID, Sequence: nextSegment, Payload: turn.SegmentPayload, FormatVersion: goalPayloadFormatV2, State: "committed", CreatedAt: now}
 	segment.PayloadHash, segment.PayloadBytes = hashGoalPayload(segment.Payload), int64(len(segment.Payload))
-	if _, err := tx.ExecContext(ctx, `INSERT INTO goal_segment(id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,state,created_at) VALUES(?,?,?,?,?,?,?,?)`,
-		segment.ID, segment.GoalID, segment.Sequence, segment.PayloadHash, segment.PayloadBytes, s.sealToken(segment.Payload), segment.State, segment.CreatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO goal_segment(id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,format_version,state,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		segment.ID, segment.GoalID, segment.Sequence, segment.PayloadHash, segment.PayloadBytes, "", segment.FormatVersion, segment.State, segment.CreatedAt); err != nil {
 		return GoalSession{}, err
 	}
+	segmentStoredBytes, err := s.insertGoalChunks(ctx, tx, session.ID, goalChunkSegment, segment.Sequence, now, turn.SegmentPayload)
+	if err != nil {
+		return GoalSession{}, err
+	}
+	session.StorageBytes += segmentStoredBytes
 	if turn.AwaitingTool {
 		session.State = "awaiting_tool_result"
 	} else {
@@ -541,10 +665,10 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		session.LastResponseHash = hashGoalValue("response_id", turn.ResponseID)
 	}
 	working := s.sealToken(turn.WorkingState)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO goal_session(id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,expires_at,created_at,updated_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(id) DO UPDATE SET parent_goal_id=excluded.parent_goal_id, branch_hash=excluded.branch_hash, downstream_key_hash=excluded.downstream_key_hash, workspace_hash=excluded.workspace_hash, initial_goal_hash=excluded.initial_goal_hash, last_response_hash=excluded.last_response_hash, state=excluded.state, current_checkpoint_id=excluded.current_checkpoint_id, encrypted_working_state=excluded.encrypted_working_state, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
-		session.ID, session.Protocol, session.ParentGoalID, session.BranchHash, session.DownstreamKeyHash, session.WorkspaceHash, session.InitialGoalHash, session.LastResponseHash, session.State, session.CurrentCheckpoint, working, session.ExpiresAt, session.CreatedAt, session.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO goal_session(id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at)
+	VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(id) DO UPDATE SET parent_goal_id=excluded.parent_goal_id, branch_hash=excluded.branch_hash, downstream_key_hash=excluded.downstream_key_hash, workspace_hash=excluded.workspace_hash, initial_goal_hash=excluded.initial_goal_hash, last_response_hash=excluded.last_response_hash, state=excluded.state, current_checkpoint_id=excluded.current_checkpoint_id, encrypted_working_state=excluded.encrypted_working_state, storage_bytes=excluded.storage_bytes, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
+		session.ID, session.Protocol, session.ParentGoalID, session.BranchHash, session.DownstreamKeyHash, session.WorkspaceHash, session.InitialGoalHash, session.LastResponseHash, session.State, session.CurrentCheckpoint, working, session.StorageBytes, session.ExpiresAt, session.CreatedAt, session.UpdatedAt); err != nil {
 		return GoalSession{}, err
 	}
 	for _, alias := range aliases {
@@ -587,9 +711,7 @@ func (s *Store) reclaimGoalStorageBudget(ctx context.Context, tx *sql.Tx, protec
 	if bytesNeeded <= 0 {
 		return 0, 0, nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT s.id,
- COALESCE((SELECT SUM(LENGTH(c.encrypted_payload)) FROM goal_checkpoint c WHERE c.goal_id=s.id),0) +
- COALESCE((SELECT SUM(LENGTH(g.encrypted_payload)) FROM goal_segment g WHERE g.goal_id=s.id),0) AS payload_bytes
+	rows, err := tx.QueryContext(ctx, `SELECT s.id,s.storage_bytes
 FROM goal_session s
 WHERE (?='' OR s.id<>?)
   AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
@@ -724,6 +846,25 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 	historyKey := goalHistoryKey(session.Protocol)
 	items := make([]interface{}, 0)
 	items = appendGoalItems(items, root[historyKey])
+	compacted, err := s.listGoalCompactedSegments(ctx, session.ID, checkpoint.ThroughSegmentSequence)
+	if err != nil {
+		return nil, session, err
+	}
+	for _, segment := range compacted {
+		var turn goalReplaySegment
+		if err := json.Unmarshal([]byte(segment.Payload), &turn); err != nil {
+			return nil, session, fmt.Errorf("invalid compacted goal segment: %w", err)
+		}
+		if turn.HistoryKey != "" && turn.HistoryKey != historyKey {
+			return nil, session, fmt.Errorf("goal segment protocol history mismatch: %s", turn.HistoryKey)
+		}
+		items = appendGoalItems(items, turn.Input)
+		if historyKey == "messages" {
+			items = append(items, claudeAssistantMessages(turn.Output)...)
+		} else {
+			items = appendGoalItems(items, turn.Output)
+		}
+	}
 	segments, err := s.listGoalSegmentsAfter(ctx, session.ID, checkpoint.ThroughSegmentSequence)
 	if err != nil {
 		return nil, session, err
@@ -758,8 +899,8 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 func (s *Store) GetGoalSession(ctx context.Context, id string) (GoalSession, error) {
 	var item GoalSession
 	var encrypted string
-	err := s.rdb.QueryRowContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,expires_at,created_at,updated_at FROM goal_session WHERE id=? AND expires_at>?`, id, Now()).Scan(
-		&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash, &item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash, &item.State, &item.CurrentCheckpoint, &encrypted, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt)
+	err := s.rdb.QueryRowContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at FROM goal_session WHERE id=? AND expires_at>?`, id, Now()).Scan(
+		&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash, &item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash, &item.State, &item.CurrentCheckpoint, &encrypted, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return GoalSession{}, ErrGoalNotFound
@@ -773,35 +914,93 @@ func (s *Store) GetGoalSession(ctx context.Context, id string) (GoalSession, err
 func (s *Store) getGoalCheckpoint(ctx context.Context, id string) (GoalCheckpoint, error) {
 	var item GoalCheckpoint
 	var encrypted string
-	err := s.rdb.QueryRowContext(ctx, `SELECT id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,created_at FROM goal_checkpoint WHERE id=?`, id).Scan(
-		&item.ID, &item.GoalID, &item.Sequence, &item.ThroughSegmentSequence, &item.PayloadHash, &item.PayloadBytes, &encrypted, &item.CreatedAt)
+	err := s.rdb.QueryRowContext(ctx, `SELECT id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,format_version,created_at FROM goal_checkpoint WHERE id=?`, id).Scan(
+		&item.ID, &item.GoalID, &item.Sequence, &item.ThroughSegmentSequence, &item.PayloadHash, &item.PayloadBytes, &encrypted, &item.FormatVersion, &item.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return GoalCheckpoint{}, ErrGoalNotFound
 		}
 		return GoalCheckpoint{}, err
 	}
-	item.Payload = s.openToken(encrypted)
+	if item.FormatVersion >= goalPayloadFormatV2 {
+		item.Payload, err = s.readGoalChunks(ctx, item.GoalID, goalChunkCheckpoint, 0)
+	} else {
+		item.Payload = s.openToken(encrypted)
+	}
 	return item, nil
 }
 
 func (s *Store) listGoalSegmentsAfter(ctx context.Context, goalID string, after int64) ([]GoalSegment, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,state,created_at FROM goal_segment WHERE goal_id=? AND sequence>? ORDER BY sequence ASC`, goalID, after)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,format_version,state,created_at FROM goal_segment WHERE goal_id=? AND sequence>? ORDER BY sequence ASC`, goalID, after)
+	if err != nil {
+		return nil, err
+	}
+	var out []GoalSegment
+	var encryptedPayloads []string
+	for rows.Next() {
+		var item GoalSegment
+		var encrypted string
+		if err := rows.Scan(&item.ID, &item.GoalID, &item.Sequence, &item.PayloadHash, &item.PayloadBytes, &encrypted, &item.FormatVersion, &item.State, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+		encryptedPayloads = append(encryptedPayloads, encrypted)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if out[i].FormatVersion >= goalPayloadFormatV2 {
+			out[i].Payload, err = s.readGoalChunks(ctx, out[i].GoalID, goalChunkSegment, out[i].Sequence)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			out[i].Payload = s.openToken(encryptedPayloads[i])
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) listGoalCompactedSegments(ctx context.Context, goalID string, through int64) ([]GoalSegment, error) {
+	if through <= 0 {
+		return nil, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT segment_sequence,encrypted_payload FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence>0 AND segment_sequence<=? ORDER BY segment_sequence,chunk_index`, goalID, goalChunkSegment, through)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []GoalSegment
+	out := make([]GoalSegment, 0)
+	var sequence int64
+	var payload bytes.Buffer
+	flush := func() {
+		if sequence > 0 {
+			out = append(out, GoalSegment{GoalID: goalID, Sequence: sequence, Payload: payload.String(), FormatVersion: goalPayloadFormatV2, State: "compacted"})
+		}
+		payload.Reset()
+	}
 	for rows.Next() {
-		var item GoalSegment
+		var current int64
 		var encrypted string
-		if err := rows.Scan(&item.ID, &item.GoalID, &item.Sequence, &item.PayloadHash, &item.PayloadBytes, &encrypted, &item.State, &item.CreatedAt); err != nil {
+		if err = rows.Scan(&current, &encrypted); err != nil {
 			return nil, err
 		}
-		item.Payload = s.openToken(encrypted)
-		out = append(out, item)
+		if sequence != 0 && current != sequence {
+			flush()
+		}
+		sequence = current
+		payload.WriteString(s.openToken(encrypted))
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	flush()
+	return out, nil
 }
 
 // NeedsGoalCompaction is a metadata-only threshold check used by the asynchronous
@@ -844,31 +1043,29 @@ func (s *Store) CompactGoalSegmentsWithRatio(ctx context.Context, goalID string,
 	if chunkRatio <= 0 || chunkRatio > 1 {
 		chunkRatio = 1
 	}
-	session, err := s.GetGoalSession(ctx, goalID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	checkpoint, err := s.getGoalCheckpoint(ctx, session.CurrentCheckpoint)
-	if err != nil {
+	defer tx.Rollback()
+	var checkpoint GoalCheckpoint
+	var encryptedCheckpoint string
+	if err = tx.QueryRowContext(ctx, `SELECT c.id,c.goal_id,c.sequence,c.through_segment_sequence,c.payload_hash,c.payload_bytes,c.encrypted_payload,c.format_version,c.created_at
+FROM goal_session s JOIN goal_checkpoint c ON c.id=s.current_checkpoint_id WHERE s.id=? AND s.expires_at>?`, goalID, Now()).Scan(
+		&checkpoint.ID, &checkpoint.GoalID, &checkpoint.Sequence, &checkpoint.ThroughSegmentSequence, &checkpoint.PayloadHash, &checkpoint.PayloadBytes, &encryptedCheckpoint, &checkpoint.FormatVersion, &checkpoint.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrGoalNotFound
+		}
 		return err
 	}
-	segments, err := s.listGoalSegmentsAfter(ctx, goalID, checkpoint.ThroughSegmentSequence)
-	if err != nil || len(segments) <= maxStages {
+	var segmentCount int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_segment WHERE goal_id=? AND sequence>?`, goalID, checkpoint.ThroughSegmentSequence).Scan(&segmentCount); err != nil {
 		return err
 	}
-	_ = s.InsertAuditLog(ctx, AuditLogRow{Action: "goal_compaction_started", State: "compacting", Reason: "segment_threshold", Detail: fmt.Sprintf("goal=%s segments=%d", goalID, len(segments))})
-	var root map[string]interface{}
-	if err := json.Unmarshal([]byte(checkpoint.Payload), &root); err != nil {
-		return err
+	if segmentCount <= maxStages {
+		return nil
 	}
-	historyKey := goalHistoryKey(session.Protocol)
-	items := make([]interface{}, 0)
-	items = appendGoalItems(items, root[historyKey])
-	var through int64 = checkpoint.ThroughSegmentSequence
-	// Keep at most maxStages recent tail segments. A ratio below 1 bounds how much
-	// of an oversized backlog one checkpoint transaction absorbs, making repeated
-	// invocations resumable and predictable under the foreground budget.
-	required := len(segments) - maxStages
+	required := segmentCount - maxStages
 	chunk := int(float64(maxStages)*chunkRatio + 0.999999)
 	if chunk < 1 {
 		chunk = 1
@@ -876,53 +1073,84 @@ func (s *Store) CompactGoalSegmentsWithRatio(ctx context.Context, goalID string,
 	if required < chunk {
 		chunk = required
 	}
-	for _, segment := range segments[:chunk] {
-		var turn goalReplaySegment
-		if err := json.Unmarshal([]byte(segment.Payload), &turn); err != nil {
+	type compactSegment struct {
+		id, encrypted    string
+		sequence, format int64
+		createdAt        int64
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,sequence,encrypted_payload,format_version,created_at FROM goal_segment WHERE goal_id=? AND sequence>? ORDER BY sequence LIMIT ?`, goalID, checkpoint.ThroughSegmentSequence, chunk)
+	if err != nil {
+		return err
+	}
+	selected := make([]compactSegment, 0, chunk)
+	for rows.Next() {
+		var segment compactSegment
+		if err = rows.Scan(&segment.id, &segment.sequence, &segment.encrypted, &segment.format, &segment.createdAt); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		if turn.HistoryKey != "" && turn.HistoryKey != historyKey {
-			return fmt.Errorf("goal segment protocol history mismatch: %s", turn.HistoryKey)
-		}
-		items = appendGoalItems(items, turn.Input)
-		if historyKey == "messages" {
-			items = append(items, claudeAssistantMessages(turn.Output)...)
-		} else {
-			items = appendGoalItems(items, turn.Output)
-		}
-		through = segment.Sequence
+		selected = append(selected, segment)
 	}
-	root[historyKey] = items
-	if historyKey == "messages" {
-		delete(root, "input")
-	} else {
-		delete(root, "messages")
-	}
-	payload, err := json.Marshal(root)
-	if err != nil {
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if len(selected) == 0 {
+		return nil
 	}
 	now := Now()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	var addedStorage, removedStorage int64
+	if checkpoint.FormatVersion < goalPayloadFormatV2 {
+		checkpoint.Payload = s.openToken(encryptedCheckpoint)
+		stored, insertErr := s.insertGoalChunks(ctx, tx, goalID, goalChunkCheckpoint, 0, now, checkpoint.Payload)
+		if insertErr != nil {
+			return insertErr
+		}
+		addedStorage += stored
 	}
-	defer tx.Rollback()
+	for _, segment := range selected {
+		if segment.format >= goalPayloadFormatV2 {
+			continue
+		}
+		stored, insertErr := s.insertGoalChunks(ctx, tx, goalID, goalChunkSegment, segment.sequence, segment.createdAt, s.openToken(segment.encrypted))
+		if insertErr != nil {
+			return insertErr
+		}
+		addedStorage += stored
+	}
+	through := selected[len(selected)-1].sequence
 	var next int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM goal_checkpoint WHERE goal_id=?`, goalID).Scan(&next); err != nil {
 		return err
 	}
-	checkpoint = GoalCheckpoint{ID: newGoalID("gcp"), GoalID: goalID, Sequence: next, ThroughSegmentSequence: through, Payload: string(payload), PayloadHash: hashGoalPayload(string(payload)), PayloadBytes: int64(len(payload)), CreatedAt: now}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO goal_checkpoint(id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES(?,?,?,?,?,?,?,?)`, checkpoint.ID, checkpoint.GoalID, checkpoint.Sequence, checkpoint.ThroughSegmentSequence, checkpoint.PayloadHash, checkpoint.PayloadBytes, s.sealToken(checkpoint.Payload), checkpoint.CreatedAt); err != nil {
+	newCheckpointID := newGoalID("gcp")
+	if _, err = tx.ExecContext(ctx, `INSERT INTO goal_checkpoint(id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,format_version,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		newCheckpointID, goalID, next, through, checkpoint.PayloadHash, checkpoint.PayloadBytes, "", goalPayloadFormatV2, now); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM goal_segment WHERE goal_id=? AND sequence<=?`, goalID, through); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(LENGTH(encrypted_payload)),0) FROM goal_checkpoint WHERE goal_id=?`, goalID).Scan(&removedStorage); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE goal_session SET current_checkpoint_id=?, updated_at=? WHERE id=?`, checkpoint.ID, now, goalID); err != nil {
+	for _, segment := range selected {
+		removedStorage += int64(len(segment.encrypted))
+	}
+	updated, err := tx.ExecContext(ctx, `UPDATE goal_session SET current_checkpoint_id=?,storage_bytes=MAX(0,storage_bytes+?),updated_at=? WHERE id=? AND current_checkpoint_id=?`, newCheckpointID, addedStorage-removedStorage, now, goalID, checkpoint.ID)
+	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`, "goal_compaction_completed", "ready", "incremental_checkpoint", fmt.Sprintf("goal=%s checkpoint=%s through_segment=%d chunk=%d", goalID, checkpoint.ID, through, chunk), now); err != nil {
+	if changed, _ := updated.RowsAffected(); changed != 1 {
+		return ErrGoalInProgress
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM goal_segment WHERE goal_id=? AND sequence<=?`, goalID, through); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM goal_checkpoint WHERE goal_id=? AND id<>?`, goalID, newCheckpointID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`, "goal_compaction_completed", "ready", "incremental_checkpoint_v2", fmt.Sprintf("goal=%s checkpoint=%s through_segment=%d chunk=%d", goalID, newCheckpointID, through, len(selected)), now); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1081,7 +1309,7 @@ func (s *Store) ListGoalSessions(ctx context.Context, limit int) ([]GoalSession,
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,expires_at,created_at,updated_at FROM goal_session ORDER BY updated_at DESC LIMIT ?`, limit)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,storage_bytes,expires_at,created_at,updated_at FROM goal_session ORDER BY updated_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1089,7 +1317,7 @@ func (s *Store) ListGoalSessions(ctx context.Context, limit int) ([]GoalSession,
 	var out []GoalSession
 	for rows.Next() {
 		var item GoalSession
-		if err := rows.Scan(&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash, &item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash, &item.State, &item.CurrentCheckpoint, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash, &item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash, &item.State, &item.CurrentCheckpoint, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -1103,9 +1331,10 @@ func (s *Store) GetGoalDetail(ctx context.Context, goalID string) (GoalDetail, e
 		return GoalDetail{}, err
 	}
 	detail := GoalDetail{Session: session}
-	if err := s.rdb.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id=?), (SELECT COUNT(*) FROM goal_segment WHERE goal_id=?), (SELECT COALESCE(SUM(payload_bytes),0) FROM goal_checkpoint WHERE goal_id=?) + (SELECT COALESCE(SUM(payload_bytes),0) FROM goal_segment WHERE goal_id=?)`, goalID, goalID, goalID, goalID).Scan(&detail.CheckpointCount, &detail.SegmentCount, &detail.PayloadBytes); err != nil {
+	if err := s.rdb.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id=?), (SELECT COUNT(*) FROM goal_segment WHERE goal_id=?)`, goalID, goalID).Scan(&detail.CheckpointCount, &detail.SegmentCount); err != nil {
 		return GoalDetail{}, err
 	}
+	detail.PayloadBytes = session.StorageBytes
 	var run GoalRun
 	err = s.rdb.QueryRowContext(ctx, `SELECT id,goal_id,state,lease_expires_at,heartbeat_at,checkpoint_id,failure_code,created_at,updated_at FROM goal_run WHERE goal_id=? ORDER BY updated_at DESC LIMIT 1`, goalID).Scan(&run.ID, &run.GoalID, &run.State, &run.LeaseExpiresAt, &run.HeartbeatAt, &run.CheckpointID, &run.FailureCode, &run.CreatedAt, &run.UpdatedAt)
 	if err == nil {
@@ -1121,7 +1350,7 @@ func (s *Store) GoalContinuityMetrics(ctx context.Context) (GoalMetrics, error) 
 	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_session`).Scan(&metrics.Sessions); err != nil {
 		return GoalMetrics{}, err
 	}
-	if err := s.rdb.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(payload_bytes),0) FROM goal_checkpoint) + (SELECT COALESCE(SUM(payload_bytes),0) FROM goal_segment)`).Scan(&metrics.StorageBytes); err != nil {
+	if err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&metrics.StorageBytes); err != nil {
 		return GoalMetrics{}, err
 	}
 	rows, err := s.rdb.QueryContext(ctx, `SELECT action,COUNT(*) FROM audit_log WHERE action IN ('goal_resume_recovered','goal_resume_ambiguous','goal_stream_terminal_synthesized','goal_persistence_degraded') GROUP BY action`)

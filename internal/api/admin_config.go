@@ -511,7 +511,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			probeBillingVer = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		}
 		result := cloak.VirtualizeClaudeCode(base, id, s.cfg.SensitiveWordsFor("claude"), probeOAuth, probeBillingVer)
-		req.Body = result.Body
+		req.SetBodyBytes(result.Body)
 		req.OSHint = osHint
 	} else if upstream.IsCustomProvider(provider) {
 		// Custom OpenAI-compatible provider: a minimal non-streaming chat completion.
@@ -525,10 +525,10 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		req.BaseURL = prov.BaseURL
 		if prov.UpstreamProtocol == storage.CustomProviderProtocolResponses {
 			req.DownstreamPath = "/responses"
-			req.Body = []byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`)
+			req.SetBodyBytes([]byte(`{"model":"` + model + `","input":[{"role":"user","content":"ping"}],"max_output_tokens":1,"stream":false}`))
 		} else {
 			req.DownstreamPath = "/chat/completions"
-			req.Body = []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`)
+			req.SetBodyBytes([]byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`))
 		}
 	} else {
 		// The Codex /responses backend (WHAM) is STREAMING-ONLY and hard-validates the
@@ -559,7 +559,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		// UA + version headers; it is "" (no-op) for models that don't gate on version.
 		req.CodexClientVersion = s.codexClientVersionForModel(model)
 		req.DownstreamPath = "/v1/responses"
-		req.Body = codexLivenessProbeBody(model)
+		req.SetBodyBytes(codexLivenessProbeBody(model))
 	}
 	if provider == "claude" {
 		var perr error
@@ -629,7 +629,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		model = "gpt-5.5"
 		res.Model = model
 		req.CodexClientVersion = s.codexClientVersionForModel(model)
-		req.Body = codexLivenessProbeBody(model)
+		req.SetBodyBytes(codexLivenessProbeBody(model))
 		retryResp, retryErr := s.upstream.Do(ctx, req)
 		if retryErr != nil {
 			res.Err = retryErr

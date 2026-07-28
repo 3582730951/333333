@@ -75,13 +75,20 @@ type codexRequestMetadata struct {
 type codexWebSocketIDs = codexRequestMetadata
 
 func (c *Client) newCodexRequestMetadata(spec Request) codexRequestMetadata {
-	responsesLite := !AccountUsesAPIKey(spec.Token) && CodexRequestUsesResponsesLite(spec.Body)
+	responsesLite := false
+	if !AccountUsesAPIKey(spec.Token) {
+		if lite, _, supported, err := codexRequestUsesResponsesLiteSource(spec); err == nil && supported {
+			responsesLite = lite
+		} else {
+			responsesLite = CodexRequestUsesResponsesLite(requestBody(spec))
+		}
+	}
 	return c.newCodexRequestMetadataWithResponsesLite(spec, responsesLite)
 }
 
 func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, responsesLite bool) codexRequestMetadata {
 	if snapshot := spec.CodexIdentity; snapshot != nil && strings.TrimSpace(snapshot.SessionID) != "" && strings.TrimSpace(snapshot.ThreadID) != "" {
-		bodyMetadata := codexBodyClientMetadata(spec.Body)
+		bodyMetadata := requestCodexBodyClientMetadata(spec)
 		incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
 		requestKind := codexRequestKind(spec, incomingTurn)
 		startedAt := int64(0)
@@ -114,7 +121,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 		return metadata
 	}
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
-	bodyMetadata := codexBodyClientMetadata(spec.Body)
+	bodyMetadata := requestCodexBodyClientMetadata(spec)
 	incomingTurn := codexIncomingTurnMetadata(spec, bodyMetadata)
 
 	rawWindowID := firstNonEmpty(
@@ -127,12 +134,12 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 		getHeaderFold(spec.Headers, "x-client-request-id"),
 		codexMetadataString(bodyMetadata, "thread_id"),
 		codexMapString(incomingTurn, "thread_id"),
-		codexBodyString(spec.Body, "thread_id"),
-		codexBodyString(spec.Body, "session_id"),
-		codexBodyString(spec.Body, "conversation_id"),
+		requestCodexBodyString(spec, "thread_id"),
+		requestCodexBodyString(spec, "session_id"),
+		requestCodexBodyString(spec, "conversation_id"),
 		threadIDFromWindowID(rawWindowID),
-		codexBodyString(spec.Body, "prompt_cache_key"),
-		codexBodyString(spec.Body, "previous_response_id"),
+		requestCodexBodyString(spec, "prompt_cache_key"),
+		requestCodexBodyString(spec, "previous_response_id"),
 		codexRunCorrelator(spec.Headers),
 		id.SessionID,
 	)
@@ -443,7 +450,7 @@ func codexRequestKind(spec Request, incoming map[string]interface{}) string {
 	if strings.Contains(strings.ToLower(spec.DownstreamPath), "compact") {
 		return "compaction"
 	}
-	if generate, ok := codexBodyBool(spec.Body, "generate"); ok && !generate {
+	if generate, ok := requestCodexBodyBool(spec, "generate"); ok && !generate {
 		return "prewarm"
 	}
 	switch kind := strings.ToLower(codexMapString(incoming, "request_kind")); kind {
@@ -452,6 +459,63 @@ func codexRequestKind(spec Request, incoming map[string]interface{}) string {
 	default:
 		return "turn"
 	}
+}
+
+func requestCodexBodyClientMetadata(spec Request) map[string]interface{} {
+	if spec.BodyMeta != nil {
+		span, present := spec.BodyMeta.Fields["client_metadata"]
+		if !present {
+			return nil
+		}
+		if raw, ok, err := requestSpan(spec.Body, span, maxCodexPatchFieldBytes); err == nil && ok {
+			var metadata map[string]interface{}
+			if json.Unmarshal(raw, &metadata) == nil {
+				return metadata
+			}
+		}
+	}
+	return codexBodyClientMetadata(requestBody(spec))
+}
+
+func requestCodexBodyString(spec Request, key string) string {
+	if spec.BodyMeta != nil {
+		switch key {
+		case "model":
+			return spec.BodyMeta.Model
+		case "prompt_cache_key":
+			return spec.BodyMeta.PromptCacheKey
+		case "previous_response_id":
+			return spec.BodyMeta.PreviousResponseID
+		case "conversation_id":
+			return spec.BodyMeta.ConversationID
+		case "session_id":
+			return spec.BodyMeta.SessionID
+		case "thread_id":
+			return spec.BodyMeta.ThreadID
+		}
+		if raw, present := spec.BodyMeta.Scalars[key]; present {
+			var value string
+			if json.Unmarshal(raw, &value) == nil {
+				return strings.TrimSpace(value)
+			}
+		}
+		return ""
+	}
+	return codexBodyString(requestBody(spec), key)
+}
+
+func requestCodexBodyBool(spec Request, key string) (bool, bool) {
+	if spec.BodyMeta != nil {
+		switch spec.BodyMeta.Kinds[key] {
+		case 't':
+			return true, true
+		case 'f':
+			return false, true
+		default:
+			return false, false
+		}
+	}
+	return codexBodyBool(requestBody(spec), key)
 }
 
 func codexBodyClientMetadata(body []byte) map[string]interface{} {

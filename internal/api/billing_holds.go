@@ -2,18 +2,26 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
+
+	"github.com/google/uuid"
 )
 
-func (s *Server) createBillingHold(routeKeyHash, accountID string, estimatedTokens int64) string {
+func (s *Server) createBillingHold(ctx context.Context, routeKeyHash, accountID string, routeEpoch, estimatedTokens int64) string {
 	now := storage.Now()
-	id := fmt.Sprintf("hold_%d_%s", time.Now().UnixNano(), accountID)
-	s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, RouteKeyHash: routeKeyHash, AccountID: accountID, EstimatedTokens: estimatedTokens, CreatedAt: now, Create: true})
+	id := "hold_" + uuid.NewString()
+	eventID := usageEventIDFromContext(ctx)
+	if eventID == "" {
+		eventID = requestIDFromContext(ctx)
+	}
+	if eventID == "" {
+		eventID = "usage_" + id
+	}
+	s.enqueueBillingHold(storage.BillingHoldWrite{ID: id, EventID: eventID, RouteKeyHash: routeKeyHash, AccountID: accountID, EstimatedTokens: estimatedTokens, RouteEpoch: routeEpoch, CreatedAt: now, Create: true})
 	s.billingEstimates.Store(id, estimatedTokens)
 	return id
 }

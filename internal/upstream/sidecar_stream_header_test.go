@@ -119,7 +119,7 @@ func TestCodexSidecarResponsesStripsPromptCacheRetention(t *testing.T) {
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",
 		Headers:        http.Header{"Originator": []string{"codex_cli_rs"}},
-		Body:           []byte(`{"model":"gpt-5.5","input":"hi","prompt_cache_retention":"24h"}`),
+		Body:           testBody([]byte(`{"model":"gpt-5.5","input":"hi","prompt_cache_retention":"24h"}`)),
 		Account:        storage.Account{ID: "acc-sidecar", UpstreamAccountID: "acct-sidecar"},
 		Token:          storage.AccountToken{AccessToken: "access-sidecar"},
 		Egress:         storage.EgressProfile{ID: "sidecar", Type: "curl_cffi_sidecar", Endpoint: sidecar.URL, Health: "healthy"},
@@ -151,7 +151,7 @@ func TestCodexHTTPResponsesStripsPromptCacheRetention(t *testing.T) {
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",
 		Headers:        http.Header{"Originator": []string{"codex_cli_rs"}},
-		Body:           []byte(`{"model":"gpt-5.4","input":"hi","prompt_cache_retention":"24h"}`),
+		Body:           testBody([]byte(`{"model":"gpt-5.4","input":"hi","prompt_cache_retention":"24h"}`)),
 		Account:        storage.Account{ID: "acc-http", UpstreamAccountID: "acct-http"},
 		Token:          storage.AccountToken{AccessToken: "access-http"},
 		Egress:         storage.EgressProfile{ID: "direct", Type: "direct", Health: "healthy"},

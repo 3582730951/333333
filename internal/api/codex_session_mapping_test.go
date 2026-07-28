@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -397,6 +398,65 @@ func TestCodexSessionMappingAdvancesWindowAfterBodyTriggeredCompaction(t *testin
 	mu.Unlock()
 	if len(got) != 3 || !strings.HasSuffix(got[0], ":0") || got[1] != got[0] || !strings.HasSuffix(got[2], ":1") || strings.TrimSuffix(got[2], ":1") != strings.TrimSuffix(got[0], ":0") {
 		t.Fatalf("compaction window lifecycle=%v", got)
+	}
+}
+
+func TestCodexSessionMappingCommitsConcurrentAnonymousRootsWithUniqueResponses(t *testing.T) {
+	var calls atomic.Int32
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `event: response.completed
+data: {"type":"response.completed","response":{"id":"resp-concurrent-`+strconv.Itoa(int(call))+`","object":"response","model":"gpt","status":"completed","output":[]}}
+
+data: [DONE]
+
+`)
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "concurrent-roots", "upstream-concurrent-roots", "access-concurrent-roots")
+
+	const requests = 32
+	errs := make(chan error, requests)
+	var group sync.WaitGroup
+	for index := 0; index < requests; index++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt","stream":true,"prompt_cache_key":"concurrent-`+strconv.Itoa(index)+`","input":"hello"}`))
+			if err != nil {
+				errs <- err
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				errs <- err
+				return
+			}
+			_, readErr := io.Copy(io.Discard, resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil {
+				errs <- readErr
+			} else if closeErr != nil {
+				errs <- closeErr
+			} else if resp.StatusCode != http.StatusOK {
+				errs <- errors.New(resp.Status)
+			}
+		}(index)
+	}
+	group.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	active, retired, err := h.app.store.CodexSessionMappingMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != requests || retired != 0 {
+		t.Fatalf("mapping counts active=%d retired=%d want_active=%d", active, retired, requests)
 	}
 }
 

@@ -3,43 +3,48 @@ package api
 import (
 	"context"
 	"errors"
-	"io"
 	"strings"
-	"sync/atomic"
 	"testing"
 
-	"codex-account-pool/internal/admission"
+	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/config"
 )
 
-func TestSpoolUnknownBodyReservesProgressivelyAndSpills(t *testing.T) {
+func TestCaptureRequestBodySpillsAndReplays(t *testing.T) {
 	payload := strings.Repeat("x", (1<<20)+17)
-	var reserved atomic.Int64
-	body, cleanup, err := spoolUnknownBody(context.Background(), io.NopCloser(strings.NewReader(payload)), func(_ context.Context, n int64) (func(), error) {
-		reserved.Add(n)
-		return func() { reserved.Add(-n) }, nil
-	})
+	cfg := config.Default()
+	cfg.MaxBodyBytes = 2 << 20
+	cfg.BodyMemoryThresholdBytes = 1 << 20
+	cfg.BodyDiskReserveBytes = 0
+	cfg.BodySpoolDir = t.TempDir()
+	budget := bodysource.NewBudget(2<<20, 2<<20)
+	body, err := captureRequestBody(context.Background(), strings.NewReader(payload), cfg, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := io.ReadAll(body)
+	raw, err := bodysource.ReadAll(body)
 	if err != nil || string(raw) != payload {
 		t.Fatalf("spooled body mismatch: len=%d err=%v", len(raw), err)
 	}
-	if reserved.Load() != 5*int64(len(payload)) {
-		t.Fatalf("reservation=%d", reserved.Load())
+	if got := budget.Snapshot().SpoolUsed; got != int64(len(payload)) {
+		t.Fatalf("spool reservation=%d", got)
 	}
-	cleanup()
-	if reserved.Load() != 0 {
-		t.Fatalf("reservation leaked: %d", reserved.Load())
+	if err := body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.Snapshot().SpoolUsed; got != 0 {
+		t.Fatalf("reservation leaked: %d", got)
 	}
 }
 
-func TestSpoolUnknownBodyStopsAtCapacity(t *testing.T) {
-	_, cleanup, err := spoolUnknownBody(context.Background(), io.NopCloser(strings.NewReader(strings.Repeat("x", 128<<10))), func(_ context.Context, _ int64) (func(), error) {
-		return nil, admission.ErrCapacity
-	})
-	cleanup()
-	if !errors.Is(err, admission.ErrCapacity) {
+func TestCaptureRequestBodyStopsAtSpoolCapacity(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxBodyBytes = 1 << 20
+	cfg.BodyMemoryThresholdBytes = 1
+	cfg.BodyDiskReserveBytes = 0
+	cfg.BodySpoolDir = t.TempDir()
+	_, err := captureRequestBody(context.Background(), strings.NewReader(strings.Repeat("x", 128<<10)), cfg, bodysource.NewBudget(1, 64<<10))
+	if !errors.Is(err, bodysource.ErrSpoolBudget) {
 		t.Fatalf("err=%v", err)
 	}
 }

@@ -204,6 +204,13 @@ func TestSetupScriptCodexAutomationWritesOnlyCodexConfig(t *testing.T) {
 	existing := `[mcp_servers.keep]
 command = "keep-mcp"
 
+[plugins.keep]
+path = "/opt/codex/plugins/keep"
+skill = "repo-review"
+
+[features]
+multi_agent = true
+
 [model_providers.other]
 name = "Other"
 base_url = "https://other.example/v1"
@@ -233,7 +240,7 @@ base_url = "https://other.example/v1"
 			t.Fatalf("codex config missing %q\n---\n%s", want, config)
 		}
 	}
-	for _, want := range []string{`[mcp_servers.keep]`, `command = "keep-mcp"`, `[model_providers.other]`} {
+	for _, want := range []string{`[mcp_servers.keep]`, `command = "keep-mcp"`, `[plugins.keep]`, `skill = "repo-review"`, `[features]`, `multi_agent = true`, `[model_providers.other]`} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("codex config merge dropped existing %q\n---\n%s", want, config)
 		}

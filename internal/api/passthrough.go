@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
@@ -48,14 +49,17 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	body := bodySourceFromContext(r.Context())
 	var raw []byte
-	if r.Body != nil {
+	if body == nil && r.Body != nil {
 		b, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
 		if err != nil {
 			writeError(w, http.StatusRequestEntityTooLarge, err)
 			return
 		}
 		raw = b
+		body = bodysource.Bytes(raw)
+		defer body.Close()
 	}
 
 	// Authenticate + resolve the routing group (honors RequireDownstreamKey). The
@@ -128,7 +132,7 @@ func (s *Server) handleAnthropicPassthrough(w http.ResponseWriter, r *http.Reque
 			PassThrough:    true,
 			DownstreamPath: pathWithQuery(r.URL.Path, r.URL.RawQuery),
 			Headers:        r.Header.Clone(),
-			Body:           raw,
+			Body:           body,
 			Account:        lease.Account,
 			Token:          t,
 			Egress:         lease.Egress,
@@ -261,7 +265,7 @@ func (s *Server) persistClaudeResourceBinding(ctx context.Context, affinity rout
 	if affinity.Hash == "" {
 		return
 	}
-	_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+	_ = s.scheduler.UpsertAffinityBinding(ctx, storage.AffinityBinding{
 		RouteKeyHash: affinity.Hash, RouteKey: affinity.Key, Source: affinity.Source,
 		AccountID: lease.Account.ID, Provider: "claude", Model: "resource:" + kind, EgressID: lease.Egress.ID,
 	})

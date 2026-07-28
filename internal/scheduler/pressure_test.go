@@ -112,3 +112,24 @@ func TestProviderPressureSnapshotIncludesRouteQueue(t *testing.T) {
 		t.Fatalf("queued pressure must admit Kiro to the fair pool: %+v", snapshot)
 	}
 }
+
+func TestEligibleCandidateCountHonorsExclusionsAndPersistentCooldowns(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	const group, model = "gpt-group", "gpt-pressure-test"
+	seedPressureCodexAccount(t, store, "codex-a", group, model)
+	seedPressureCodexAccount(t, store, "codex-b", group, model)
+	seedPressureCodexAccount(t, store, "codex-c", group, model)
+	if err := store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{AccountID: "codex-b", Provider: "codex", LimiterType: "5h_polled", UsedPercent: 100, Status: "rejected", ResetAt: storage.Now() + 3600, UpdatedAt: storage.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(store, config.Default())
+	count, err := s.EligibleCandidateCount(ctx, Route{Group: group, Provider: "codex", Model: model, Exclude: map[string]bool{"codex-a": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("eligible candidates=%d, want only codex-c", count)
+	}
+}

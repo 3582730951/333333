@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/sysmetrics"
 )
@@ -31,17 +32,23 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 	dataDir := filepath.Dir(s.cfg.DatabasePath)
 	payload := struct {
 		sysmetrics.Metrics
-		Admission         interface{}              `json:"admission"`
-		ContextRebuilt    uint64                   `json:"context_rebuilt"`
-		ContextDegraded   uint64                   `json:"context_degraded"`
-		CodexSessionMap   map[string]interface{}   `json:"codex_session_mapping"`
-		Sidecar           interface{}              `json:"sidecar,omitempty"`
-		DiskGuard         DiskGuardSnapshot        `json:"disk_guard"`
-		SupervisorEvents  []supervisor.Event       `json:"supervisor_events"`
-		SupervisorModules []supervisor.ModuleState `json:"supervisor_modules"`
+		Admission         interface{}               `json:"admission"`
+		Scheduler         interface{}               `json:"scheduler"`
+		BodyStorage       bodysource.BudgetSnapshot `json:"body_storage"`
+		UsageJournal      map[string]interface{}    `json:"usage_journal"`
+		ContextRebuilt    uint64                    `json:"context_rebuilt"`
+		ContextDegraded   uint64                    `json:"context_degraded"`
+		CodexSessionMap   map[string]interface{}    `json:"codex_session_mapping"`
+		Sidecar           interface{}               `json:"sidecar,omitempty"`
+		DiskGuard         DiskGuardSnapshot         `json:"disk_guard"`
+		SupervisorEvents  []supervisor.Event        `json:"supervisor_events"`
+		SupervisorModules []supervisor.ModuleState  `json:"supervisor_modules"`
 	}{
 		Metrics:        sysmetrics.Collect(dataDir),
 		Admission:      s.scheduler.AdmissionSnapshot(),
+		Scheduler:      s.scheduler.Metrics(),
+		BodyStorage:    s.bodyBudgetSnapshot(),
+		UsageJournal:   s.usageJournalMetrics(),
 		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
 		CodexSessionMap:   s.codexSessionMappingStats(r.Context()),
 		Sidecar:           s.sidecarMetrics(r.Context()),
@@ -50,6 +57,13 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
 		SupervisorModules: supervisor.ModuleStates(),
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) bodyBudgetSnapshot() bodysource.BudgetSnapshot {
+	if s == nil || s.bodyBudget == nil {
+		return bodysource.BudgetSnapshot{}
+	}
+	return s.bodyBudget.Snapshot()
 }
 
 func (s *Server) sidecarMetrics(parent context.Context) interface{} {

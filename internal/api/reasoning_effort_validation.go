@@ -1,27 +1,23 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"codex-account-pool/internal/capability"
+	"github.com/tidwall/gjson"
 )
 
 // requestedResponsesReasoningEffort reads only the small reasoning leaf. It is
 // deliberately used before scheduling so an impossible local Codex setting cannot
 // acquire an account lease, mutate tool/session state, or reach an upstream.
 func requestedResponsesReasoningEffort(raw []byte) string {
-	var probe struct {
-		Reasoning struct {
-			Effort string `json:"effort"`
-		} `json:"reasoning"`
-	}
-	if json.Unmarshal(raw, &probe) != nil {
+	effort := gjson.GetBytes(raw, "reasoning.effort")
+	if effort.Type != gjson.String {
 		return ""
 	}
-	return normalizeEffort(probe.Reasoning.Effort)
+	return normalizeEffort(effort.String())
 }
 
 func unsupportedCodexReasoningEffort(model, effort string) bool {

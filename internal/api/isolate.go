@@ -145,6 +145,10 @@ func (s *Server) claudeCacheSingleflightEnabled(ctx context.Context) bool {
 	return s.flagEnabled(ctx, "claude_cache_singleflight_enabled", s.cfg.ClaudeCacheSingleflightEnabled)
 }
 
+func (s *Server) codexCacheSingleflightEnabled(ctx context.Context) bool {
+	return s.flagEnabled(ctx, "codex_cache_singleflight_enabled", s.cfg.CodexCacheSingleflightEnabled)
+}
+
 // leakScrubEnabled reports whether pool-internal upstream signals (quota/limit
 // headers, rate-limit SSE frames, limit/quota/overload error bodies, model-switch
 // suggestions) are hidden from the downstream client.

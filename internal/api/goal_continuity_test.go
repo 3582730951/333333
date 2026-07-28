@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
+	"codex-account-pool/internal/supervisor"
 )
 
 func TestIncrementalGoalRequestStoresOnlyDurableHistorySuffix(t *testing.T) {
@@ -587,6 +589,86 @@ func TestGoalContinuitySchedulesBoundedCheckpointCompaction(t *testing.T) {
 	body, _, err := h.store.BuildGoalReplay(context.Background(), resolved.Session.ID)
 	if err != nil || !strings.Contains(string(body), "one") || !strings.Contains(string(body), "two") || !strings.Contains(string(body), "three") {
 		t.Fatalf("scheduled compaction replay=%s err=%v", body, err)
+	}
+}
+
+func TestGoalCompactionWorkerRequeuesChunksFairly(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	commitGoal := func(alias string) storage.GoalSession {
+		t.Helper()
+		var goal storage.GoalSession
+		for turn := 1; turn <= 4; turn++ {
+			goal, err = store.CommitGoalTurn(ctx, storage.GoalTurn{
+				Protocol: "codex", Aliases: []storage.GoalAlias{{Type: "codex_root_thread", Value: alias}}, ResponseID: fmt.Sprintf("%s-response-%d", alias, turn),
+				CheckpointPayload: `{"model":"gpt-test","input":[]}`, SegmentPayload: fmt.Sprintf(`{"history_key":"input","input":"%s-input-%d","output":"%s-output-%d"}`, alias, turn, alias, turn),
+				ExpiresAt: storage.Now() + 86400, StorageMaxBytes: 8 << 20,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return goal
+	}
+	first, second := commitGoal("fair-first"), commitGoal("fair-second")
+	cfg := config.Default()
+	cfg.GoalCompressionMaxStages = 1
+	cfg.GoalCompressionChunkRatio = 1
+	s := &Server{cfg: cfg, store: store}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	queue := make(chan string, 8)
+	s.goalCompactionCtx, s.goalCompactionCancel = workerCtx, cancel
+	s.goalCompactionQueue = queue
+	s.goalCompactionQueued = map[string]bool{first.ID: true, second.ID: true}
+	queue <- first.ID
+	queue <- second.ID
+	s.asyncWG.Add(1)
+	go func() {
+		defer supervisor.Recover("goal-compaction-fairness-test")
+		defer s.asyncWG.Done()
+		s.goalCompactionWorker(workerCtx, queue)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		firstNeeded, firstErr := store.NeedsGoalCompaction(ctx, first.ID, 1)
+		secondNeeded, secondErr := store.NeedsGoalCompaction(ctx, second.ID, 1)
+		if firstErr != nil || secondErr != nil {
+			cancel()
+			t.Fatalf("compaction state errors: %v %v", firstErr, secondErr)
+		}
+		if !firstNeeded && !secondNeeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("fair compaction queue did not drain")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	s.asyncWG.Wait()
+	rows, err := store.DB().Query(`SELECT detail FROM audit_log WHERE action='goal_compaction_completed' ORDER BY id LIMIT 2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var order []string
+	for rows.Next() {
+		var detail string
+		if err = rows.Scan(&detail); err != nil {
+			t.Fatal(err)
+		}
+		order = append(order, detail)
+	}
+	if len(order) != 2 || !strings.Contains(order[0], first.ID) || !strings.Contains(order[1], second.ID) {
+		t.Fatalf("compaction queue was not FIFO-fair: %v", order)
 	}
 }
 

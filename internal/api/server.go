@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +20,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cfsolve"
@@ -41,6 +45,7 @@ import (
 	"codex-account-pool/internal/upstream"
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
+	"codex-account-pool/internal/usagejournal"
 	"codex-account-pool/internal/virtual"
 	"codex-account-pool/internal/warp"
 	"codex-account-pool/internal/web"
@@ -73,6 +78,7 @@ type Server struct {
 	warp       *warp.Manager
 	solver     *cfsolve.Client
 	mux        *http.ServeMux
+	bodyBudget *bodysource.Budget
 	// oauth holds in-flight web-login (paste-back) PKCE sessions for the
 	// /admin/oauth/* import flow. In-memory + TTL'd; see oauth.go.
 	oauth *oauthStore
@@ -104,6 +110,12 @@ type Server struct {
 	// 1-writer pool); see asyncwrite.go. FlushWrites drains it on shutdown.
 	asyncWrites           chan func()
 	usageWrites           chan telemetryWrite
+	usageJournal          *usagejournal.Journal
+	usageJournalStop      chan struct{}
+	usageJournalWake      chan struct{}
+	usageJournalCommitMu  sync.Mutex
+	usageEnqueueMu        sync.Mutex
+	usageJournalAcked     atomic.Uint64
 	usagePending          sync.WaitGroup
 	asyncWG               sync.WaitGroup
 	asyncMu               sync.RWMutex
@@ -117,6 +129,8 @@ type Server struct {
 
 	claudeCacheFlightsMu sync.Mutex
 	claudeCacheFlights   map[string]chan struct{}
+	codexCacheFlightsMu  sync.Mutex
+	codexCacheFlights    map[string]chan struct{}
 	claudeCacheDiagMu    sync.Mutex
 	claudeCacheDiagPrev  map[string]string
 	kiroCacheFlightsMu   sync.Mutex
@@ -131,7 +145,11 @@ type Server struct {
 	qualityMu            sync.Mutex
 	qualityRunning       bool
 	goalCompactionMu     sync.Mutex
-	goalCompactionActive int
+	goalCompactionQueued map[string]bool
+	goalCompactionQueue  chan string
+	goalCompactionCtx    context.Context
+	goalCompactionCancel context.CancelFunc
+	goalCompactionTimers sync.WaitGroup
 	contextRebuilt       uint64
 	contextDegraded      uint64
 	// Codex CPA-v2 aggregate-only observability. Values intentionally carry no
@@ -158,6 +176,7 @@ func NewServer(dep Dependencies) *Server {
 		warp:       dep.Warp,
 		solver:     dep.Solver,
 		mux:        http.NewServeMux(),
+		bodyBudget: bodysource.NewBudget(dep.Config.EffectiveBodyMemoryBudgetBytes(), dep.Config.BodySpoolMaxBytes),
 		oauth:      newOAuthStore(oauthSessionTTL),
 		login:      newLoginThrottle(),
 		clientErrors: newClientErrorLimiter(
@@ -178,6 +197,7 @@ func NewServer(dep Dependencies) *Server {
 		claudeRefresh:       newClaudeRefreshGates(),
 		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
 		claudeCacheFlights:  map[string]chan struct{}{},
+		codexCacheFlights:   map[string]chan struct{}{},
 		claudeCacheDiagPrev: map[string]string{},
 		kiroCacheFlights:    map[string]chan struct{}{},
 		codexSessionGates:   map[string]*codexSessionGate{},
@@ -186,7 +206,27 @@ func NewServer(dep Dependencies) *Server {
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
 	s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
+	if dep.Config.UsageJournalEnabled && dep.Store != nil && !dep.Store.InMemory() {
+		journalDir, err := usageJournalDirectory(dep.Config, dep.Store.Path())
+		if err != nil {
+			panic(fmt.Sprintf("usage journal path: %v", err))
+		}
+		s.usageJournal, err = usagejournal.Open(journalDir, dep.Config.UsageJournalSegmentBytes)
+		if err != nil {
+			panic(fmt.Sprintf("open usage journal: %v", err))
+		}
+		s.usageJournalStop = make(chan struct{})
+		s.usageJournalWake = make(chan struct{}, 1)
+		if err = s.replayUsageJournal(context.Background()); err != nil {
+			_ = s.usageJournal.Close()
+			panic(fmt.Sprintf("replay usage journal: %v", err))
+		}
+		if snapshot, snapshotErr := s.usageJournal.Snapshot(); snapshotErr == nil {
+			s.usageJournalAcked.Store(snapshot.AckedSequence)
+		}
+	}
 	s.startAsyncWriter()
+	s.startGoalCompactionWorkers()
 	// Apply any persisted runtime overrides for the upstream-consumed fingerprint /
 	// identity fields to the upstream client at boot, so admin settings survive a
 	// restart (the request-time getters already overlay the rest live).
@@ -198,6 +238,36 @@ func NewServer(dep Dependencies) *Server {
 	}
 	s.routes()
 	return s
+}
+
+func usageJournalDirectory(cfg config.Config, databasePath string) (string, error) {
+	if configured := strings.TrimSpace(cfg.UsageJournalDir); configured != "" {
+		return filepath.Clean(configured), nil
+	}
+	lowerPath := strings.ToLower(strings.TrimSpace(databasePath))
+	if strings.HasPrefix(lowerPath, "postgres://") || strings.HasPrefix(lowerPath, "postgresql://") {
+		base, err := os.UserCacheDir()
+		if err != nil || strings.TrimSpace(base) == "" {
+			base = os.TempDir()
+		}
+		nodeHash := sha256.Sum256([]byte(strings.TrimSpace(cfg.NodeID)))
+		return filepath.Join(base, "codex-account-pool", "usage-journal", fmt.Sprintf("node-%x", nodeHash[:8])), nil
+	}
+	raw := strings.TrimSpace(strings.SplitN(databasePath, "?", 2)[0])
+	if strings.HasPrefix(raw, "file:") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return "", err
+		}
+		raw = parsed.Path
+		if raw == "" {
+			raw = parsed.Opaque
+		}
+	}
+	if raw == "" || raw == ":memory:" {
+		return "", errors.New("file-backed database path is required")
+	}
+	return filepath.Join(filepath.Dir(raw), "."+filepath.Base(raw)+".usage-journal"), nil
 }
 
 func (s *Server) routes() {
@@ -401,6 +471,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler != nil {
 		body["scheduler"] = s.scheduler.Metrics()
 	}
+	body["body_storage"] = s.bodyBudgetSnapshot()
+	body["usage_journal"] = s.usageJournalMetrics()
 	body["codex_session_mapping"] = s.codexSessionMappingStats(r.Context())
 	writeJSON(w, http.StatusOK, body)
 }
@@ -510,14 +582,25 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	raw, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
+	if timeout := s.cfg.RequestTimeout(); timeout > 0 {
+		if deadline, ok := r.Context().Deadline(); !ok || time.Until(deadline) > timeout {
+			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+	}
+	raw, err := requestBodyBytes(r, s.cfg.MaxBodyBytes)
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, err)
 		return
 	}
-	originalRaw := append([]byte(nil), raw...)
-	r = r.WithContext(withSchedulerWait(r.Context(), w, isStreamRequest(raw), "openai"))
-	requestedModel := routing.Model(raw)
+	originalRaw := raw
+	var capturedMeta *bodysource.BodyMeta
+	if meta, ok := bodyMetaFromContext(r.Context()); ok && meta.Size == int64(len(raw)) {
+		capturedMeta = &meta
+	}
+	r = r.WithContext(withSchedulerWait(r.Context(), w, streamRequestWithMeta(raw, capturedMeta), "openai"))
+	requestedModel := modelWithMeta(raw, capturedMeta)
 	// Authenticate the downstream api key (if any) and resolve its routing group +
 	// forced model/effort policy. The forced model is applied to the body BEFORE
 	// affinity/capability routing so the request lands on an account that has the
@@ -537,7 +620,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// recovery journal.  Native CPA remains the steady-state fast path; these values
 	// are consulted only if its bound account disappears or the upstream confirms
 	// that a previous_response_id has been lost.
-	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "codex")))
+	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliasesWithMeta(r, raw, "codex", capturedMeta)))
 	r = r.WithContext(withGoalOriginalBody(r.Context(), raw))
 	// This is populated only after provider routing below confirms the request is
 	// headed to native Codex. Claude and custom providers keep their own continuity
@@ -556,7 +639,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		raw = setForcedModel(raw, pol.ForceModel)
 	}
 	requestPolicy := requestUserGroupPolicy(r.Context())
-	if prompt.ShouldRewrite(requestPolicy.SystemPrompt, routing.IsCompaction(r.URL.Path, raw), requestPolicy.SystemPromptApplyToCompaction) {
+	if prompt.ShouldRewrite(requestPolicy.SystemPrompt, compactionRequestWithMeta(r.URL.Path, raw, bodyMetaForView(capturedMeta, originalRaw, raw)), requestPolicy.SystemPromptApplyToCompaction) {
 		if r.URL.Path == "/v1/chat/completions" {
 			raw, _, err = prompt.InjectChatSystemPrompt(raw, requestPolicy.SystemPrompt)
 		} else {
@@ -567,7 +650,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	resolvedPolicyModel := routing.Model(raw)
+	resolvedPolicyModel := modelWithMeta(raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 	r = r.WithContext(withModelDiagnostics(r.Context(), requestedModel, resolvedPolicyModel, pol.ModelOverrideSource))
 	w.Header().Set("X-Pool-Requested-Model", requestedModel)
 	w.Header().Set("X-Pool-Resolved-Model", resolvedPolicyModel)
@@ -581,12 +664,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// trigger carried in a Responses body. The same classification drives routing,
 	// request shaping, and the CPA window-generation increment after terminal
 	// success, so the three cannot disagree.
-	isCompact := routing.IsCompaction(path, raw)
+	isCompact := compactionRequestWithMeta(path, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 	affinityGroup := pol.Group
 	if affinityGroup == "" {
 		affinityGroup = s.cfg.DefaultGroup
 	}
-	model := routing.Model(raw)
+	model := modelWithMeta(raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 	userGroupProvider := ""
 	if pol.UserGroupID != "" {
 		routeGroup, routeProvider, routeErr := resolveUserGroupRoute(r.Context(), s.store, pol, r, raw)
@@ -650,7 +733,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// `ultra` is a Codex CLI semantic, not a generic Responses wire value. Sol and
 	// Terra may use it (the upstream boundary serializes max); Luna and unknown
 	// models must be rejected before CPA mapping, scheduling, or tool/session work.
-	if effort := requestedResponsesReasoningEffort(raw); unsupportedCodexReasoningEffort(model, effort) {
+	if effort := responsesReasoningEffortWithMeta(raw, bodyMetaForView(capturedMeta, originalRaw, raw)); unsupportedCodexReasoningEffort(model, effort) {
 		writeCodexReasoningEffortUnsupported(w, model, effort)
 		return
 	}
@@ -660,14 +743,14 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// native Codex CPA mapping because Kiro has no compatible
 	// previous_response_id/session state.
 	kiroRaw := raw
-	if !routing.HasServerSideState(path, r, raw) {
+	if !serverSideStateWithMeta(path, r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)) {
 		kiroRaw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
 			return
 		}
 	}
-	if s.tryServeAutoKiroGPT(w, r, kiroRaw, model, affinityGroup, isChat, isCompact, pol) {
+	if s.tryServeAutoKiroGPT(w, r, kiroRaw, bodyMetaForView(capturedMeta, originalRaw, kiroRaw), model, affinityGroup, isChat, isCompact, pol) {
 		return
 	}
 	// CPA-style stateless passthrough (default). Make every native Codex turn
@@ -682,7 +765,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// below, the session-mapping engine reports disabled, and the 409/400 the client used
 	// to see cannot arise. Chat completions carry their history in `messages` and never
 	// hold server-side state, so they are unaffected.
-	if !isChat && s.codexStatelessPassthrough(r.Context()) && routing.HasServerSideState(path, r, raw) {
+	if !isChat && s.codexStatelessPassthrough(r.Context()) && serverSideStateWithMeta(path, r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)) {
 		raw = degradedResponsesReplay(raw)
 		if r.Header.Get("X-Codex-Turn-State") != "" {
 			r = r.Clone(r.Context())
@@ -694,6 +777,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// operation. Resolve exact downstream aliases first; only a missing bound account
 	// or confirmed upstream context loss activates the encrypted durable replay path.
 	if s.codexSessionMappingEnabled(r.Context()) {
+		var identityMeta *bodysource.BodyMeta
+		identityMeta = bodyMetaForView(capturedMeta, originalRaw, raw)
+		downstreamIdentity := codexDownstreamSessionIdentityWithMeta(r.Header, raw, identityMeta)
+		r = r.WithContext(withCodexDownstreamIdentity(r.Context(), raw, downstreamIdentity))
 		s.codexMappingContextHeader(w)
 		releaseSessionGate, gateErr := s.acquireCodexSessionGate(r.Context(), codexSessionGateKey(pol, r, raw))
 		if gateErr != nil {
@@ -734,7 +821,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[CODEX-SESSION-MAPPING] retired context migration request_id=%s: %v", requestIDFromContext(r.Context()), recoveryErr)
 			}
 			if mappingErr != nil {
-				retiredIdentity := codexDownstreamSessionIdentity(r.Header, raw)
+				retiredIdentity := codexDownstreamSessionIdentityForRequest(r, raw)
 				if resetBody, resetHeader, reset := codexRetiredEpochFreshRootRequest(raw, r.Header); reset {
 					raw = resetBody
 					r = r.Clone(r.Context())
@@ -754,10 +841,13 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if mappingErr != nil {
 			code := codexMappingErrorCode(mappingErr)
+			if code == "codex_session_mapping_unidentified" && bodyHasClientToolResult(raw) {
+				code = "codex_tool_context_unrecoverable"
+			}
 			// An unidentified first request without a real session identity is valid:
 			// it receives a one-shot identity and is bound only after success. Every
 			// stateful request, ambiguity, and retired epoch is explicit downstream.
-			if codexDownstreamSessionIdentity(r.Header, raw).stateful() || code != "codex_session_mapping_unidentified" {
+			if codexDownstreamSessionIdentityForRequest(r, raw).stateful() || code != "codex_session_mapping_unidentified" {
 				s.auditCodexMappingFailure(r.Context(), code)
 				s.writeCodexSessionMappingError(w, isStreamRequest(raw), code)
 				return
@@ -817,7 +907,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		raw = setResponsesInstructions(raw, instructionPlan.Instructions)
 	}
 
-	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), affinityGroup)
+	affinity := codexSelectionAffinity(r, raw, affinityWithMeta(r, raw, bodyMetaForView(capturedMeta, originalRaw, raw)), affinityGroup)
 	currentHeader := r.Header.Clone()
 	// movable: the request carries its full input and so can be re-sent to a fresh
 	// account losslessly. This is the failover gate. It is broader than !strict: a
@@ -827,7 +917,7 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// genuine server-side-state turns (previous_response_id / x-codex-turn-state) are
 	// non-movable in the normal failover loop. A separate, one-shot durable replay
 	// handles a disappeared binding or a confirmed upstream context loss.
-	movable := !routing.HasServerSideState(path, r, raw)
+	movable := !serverSideStateWithMeta(path, r, raw, bodyMetaForView(capturedMeta, originalRaw, raw))
 	if s.codexSessionMappingEnabled(r.Context()) && !movable && (codexMapping == nil || codexMapping.binding == nil) {
 		// resolveCodexSessionMapping should have caught this already; keep a strict
 		// defensive boundary in case a middleware supplied an unusual body shape.
@@ -847,21 +937,13 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// rather than leak it. Genuine stateful turns (previous_response_id /
 	// x-codex-turn-state) stay on their native session here; only the dedicated
 	// durable-replay recovery below may replace a lost state epoch.
-	attempts := 1
-	if s.flagEnabled(r.Context(), "seamless_failover", s.cfg.SeamlessFailover) && movable {
-		if attempts = s.settingInt(r.Context(), "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
-			attempts = 1
-		}
-	}
-	if movable && attempts < 2 {
-		attempts = 2
-	}
 	// Accounts this request has already tried and failed on. Passed to the scheduler
 	// each attempt so a just-failed account is never re-selected within the same
 	// request — not even via its sticky binding (the conversation rebinds to the
 	// fresh account instead). codexAttempt adds the leased account here before it
 	// returns outcomeRetry.
 	exclude := map[string]bool{}
+	attempts := s.codexFailoverAttempts(r.Context(), movable, pol.Group, model, exclude)
 	current := codexRetryRequest{Raw: raw, Header: currentHeader}
 	modelCapabilityRejected := false
 	attemptsRemaining := attempts
@@ -870,19 +952,28 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		attemptsRemaining--
 		headerReq := r.Clone(r.Context())
 		headerReq.Header = current.Header
-		currentStrict := routing.IsStrictSticky(path, headerReq, current.Raw)
-		currentMovable := !routing.HasServerSideState(path, headerReq, current.Raw)
-		currentModel := routing.Model(current.Raw)
+		attemptSource, attemptMeta := codexBodySourceForAttempt(r.Context(), originalRaw, current.Raw)
+		currentStrict := strictStickyWithMeta(path, headerReq, current.Raw, attemptMeta)
+		currentMovable := !serverSideStateWithMeta(path, headerReq, current.Raw, attemptMeta)
+		currentModel := modelWithMeta(current.Raw, attemptMeta)
 		if currentModel == "" {
 			currentModel = model
 		}
-		currentAffinity := codexSelectionAffinity(headerReq, current.Raw, routing.ExtractAffinityKey(headerReq, current.Raw), affinityGroup)
+		currentAffinity := codexSelectionAffinity(headerReq, current.Raw, affinityWithMeta(headerReq, current.Raw, attemptMeta), affinityGroup)
 		if currentAffinity.Hash == "" {
 			currentAffinity = affinity
 		}
-		result := s.codexAttempt(w, r, current.Raw, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, instructionPlan, attemptsRemaining > 0, exclude)
+		result := s.codexAttempt(w, r, current.Raw, attemptSource, attemptMeta, current.Header, current.Prepared, isChat && !current.Prepared, isCompact, currentAffinity, currentStrict, currentMovable, currentModel, pol.Group, pol.ForceEffort, instructionPlan, attemptsRemaining > 0, exclude)
 		if result.Outcome == outcomeModelRetry {
 			modelCapabilityRejected = true
+		}
+		if result.Outcome == outcomeRetry && result.WaitForCapacity && attemptsRemaining == 0 {
+			// Distinct-account retries are bounded, but quota recovery is an
+			// admission wait rather than another eager upstream retry. Give the
+			// scheduler one more pass so it can select another healthy account or
+			// remain in its cancellation-aware FIFO until a cooled account has
+			// passed recheck.
+			attemptsRemaining = 1
 		}
 		if result.Outcome == outcomeContextRecovery {
 			// A strict CPA turn normally stays on its original account.  When that
@@ -930,10 +1021,12 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 						Action: "codex_context_migrated", State: "recovered", Reason: firstNonEmpty(result.RecoveryReason, "upstream_context_unavailable"),
 						Detail: "durable_replay_new_epoch",
 					})
-					// The recovered turn is now self-contained. Give its fresh root a
-					// full attempt even when the original stateful route had a one-shot
-					// retry budget.
-					attemptsRemaining = 1
+					// The recovered turn is now self-contained. Give it the ordinary
+					// failover budget rather than a single no-retry attempt: the first
+					// replacement account may be exhausted too while a later one is
+					// healthy. The exclusion set still prevents revisiting any account
+					// already failed by this downstream turn.
+					attemptsRemaining = s.codexFailoverAttempts(r.Context(), true, pol.Group, routing.Model(current.Raw), exclude)
 					continue
 				}
 			}
@@ -957,6 +1050,33 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	writePoolCodeError(w, http.StatusBadGateway, "retry_exhausted", "upstream retry limit exhausted")
 }
 
+func (s *Server) codexFailoverAttempts(ctx context.Context, movable bool, group, model string, exclude map[string]bool) int {
+	attempts := 1
+	if s.flagEnabled(ctx, "seamless_failover", s.cfg.SeamlessFailover) && movable {
+		if attempts = s.settingInt(ctx, "failover_max_attempts", s.cfg.FailoverMaxAttempts); attempts < 1 {
+			attempts = 1
+		}
+	}
+	if !movable {
+		return attempts
+	}
+	candidates, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{Group: group, Provider: "codex", Model: model, Exclude: exclude})
+	if err == nil {
+		if candidates == 0 {
+			return 1
+		}
+		if attempts > candidates {
+			attempts = candidates
+		}
+		// A self-contained request gets one replacement when the pool actually has
+		// one, even if an older deployment saved failover_max_attempts=1.
+		if candidates > 1 && attempts < 2 {
+			attempts = 2
+		}
+	}
+	return attempts
+}
+
 type attemptOutcome int
 
 const (
@@ -973,8 +1093,9 @@ type codexRetryRequest struct {
 }
 
 type codexAttemptResult struct {
-	Outcome attemptOutcome
-	Retry   codexRetryRequest
+	Outcome         attemptOutcome
+	WaitForCapacity bool
+	Retry           codexRetryRequest
 	// Recovery* is populated only with outcomeContextRecovery. The outer gateway
 	// owns the mapping epoch transition so it can recompile instruction policy and
 	// install the fresh mapping before issuing the replay.
@@ -1003,13 +1124,30 @@ func shouldInjectCodexHostedWebSearch(model string, token storage.AccountToken, 
 //
 // exclude carries the accounts this request already failed on; the leased account is
 // added to it before any outcomeRetry so the next attempt selects a different one.
-func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort string, instructionPlan *CodexInstructionPlan, allowRetry bool, exclude map[string]bool) codexAttemptResult {
+func codexBodySourceForAttempt(ctx context.Context, original, current []byte) (bodysource.BodySource, *bodysource.BodyMeta) {
+	source := bodySourceFromContext(ctx)
+	meta, ok := bodyMetaFromContext(ctx)
+	if source == nil || !ok || meta.Size != source.Size() || !sameBodyBytes(original, current) || int64(len(current)) != source.Size() {
+		return nil, nil
+	}
+	return source, &meta
+}
+
+func sameBodyBytes(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	return len(left) == 0 || &left[0] == &right[0] || bytes.Equal(left, right)
+}
+
+func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte, replaySource bodysource.BodySource, replayMeta *bodysource.BodyMeta, baseHeader http.Header, prepared bool, isChat, isCompact bool, affinity routing.AffinityKey, strict, movable bool, model, routeGroup, forceEffort string, instructionPlan *CodexInstructionPlan, allowRetry bool, exclude map[string]bool) codexAttemptResult {
 	path := r.URL.Path
+	sourceRaw := raw
 	includeChatStreamUsage := isChat && chatStreamUsageRequested(raw)
 	// Decode the "stream" flag once for this attempt: isStreamRequest full-parses
 	// the (potentially multi-MB) body, and it was previously called up to 7× on the
 	// same unchanged `raw` within this function. `raw` is a stable parameter here.
-	streamReq := isStreamRequest(raw)
+	streamReq := streamRequestWithMeta(raw, replayMeta)
 	route := scheduler.Route{
 		Group:             routeGroup,
 		Provider:          "codex",
@@ -1019,8 +1157,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		ImmutableAffinity: !movable,
 		Movable:           movable,
 		Model:             model,
-		EstimatedTokens:   virtual.EstimateTokensJSON(raw),
-		Compaction:        routing.IsCompaction(path, raw),
+		EstimatedTokens:   estimatedTokensWithMeta(raw, replayMeta),
+		Compaction:        compactionRequestWithMeta(path, raw, replayMeta),
 		Exclude:           exclude,
 		OnWait:            schedulerWaitCallback(r.Context()),
 	}
@@ -1074,6 +1212,17 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		}
 		return codexAttemptResult{Outcome: outcomeRetry}
 	}
+	retryAfterCapacity := func() codexAttemptResult {
+		// A persisted quota cooldown is itself the exclusion. Keeping the account
+		// in the request-local exclusion set would make it permanently invisible
+		// after recheck succeeds, so let the scheduler observe its transient state
+		// and queue until it is genuinely eligible again.
+		if exclude != nil {
+			delete(exclude, lease.Account.ID)
+		}
+		s.scheduler.InvalidateAccountCache()
+		return codexAttemptResult{Outcome: outcomeRetry, WaitForCapacity: true}
+	}
 	token, err := s.store.GetToken(r.Context(), lease.Account.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1096,10 +1245,10 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	body := raw
 	strictNativeCPA := codexStrictCPAFromContext(r.Context()) && !isChat
 	promptCacheKeySource := "none"
-	if routing.PromptCacheKey(body) != "" {
+	if promptCacheKeyWithMeta(body, replayMeta) != "" {
 		promptCacheKeySource = "downstream"
 	}
-	retentionEffective := routing.JSONStringField(body, "prompt_cache_retention")
+	retentionEffective := topLevelStringWithMeta(body, replayMeta, "prompt_cache_retention")
 	retentionSource := "unsupported_current_codex"
 	if retentionEffective != "" {
 		retentionSource = "downstream_unsupported"
@@ -1175,7 +1324,8 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			promptCacheKeySource = "official_codex_stable_prefix"
 		}
 	}
-	if !prepared && !strictNativeCPA && routing.PromptCacheKey(body) == "" {
+	currentMeta := bodyMetaForView(replayMeta, sourceRaw, body)
+	if !prepared && !strictNativeCPA && promptCacheKeyWithMeta(body, currentMeta) == "" {
 		if prefixHash := automaticPromptCachePrefixHash(body); prefixHash != "" {
 			updated := ensureResponsesPromptCacheKey(body, automaticPromptCacheKey(model, prefixHash))
 			if routing.PromptCacheKey(updated) != "" {
@@ -1184,13 +1334,18 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			}
 		}
 	}
-	logicalUsageDiag := codexRequestUsageDiagnostics(body, affinity, promptCacheKeySource, retentionEffective, retentionSource)
+	var usageMeta *bodysource.BodyMeta
+	if replayMeta != nil && len(body) == len(sourceRaw) && (len(body) == 0 || &body[0] == &sourceRaw[0]) {
+		usageMeta = replayMeta
+	}
+	logicalUsageDiag := codexRequestUsageDiagnostics(body, usageMeta, affinity, promptCacheKeySource, retentionEffective, retentionSource)
 
 	// Resolve the persistent identity only after the exact account and egress are
 	// selected. A transport/auth retry below reuses this snapshot and therefore the
 	// same turn_id; a separately issued native EOF continue allocates its own turn.
+	osHint := s.osHint(raw, lease.Egress)
 	mapping := codexSessionMappingFromContext(r.Context())
-	codexIdentity, identityErr := mapping.identitySnapshot(s.identitySecret(), lease, s.osHint(raw, lease.Egress))
+	codexIdentity, identityErr := mapping.identitySnapshot(s.identitySecret(), lease, osHint)
 	if identityErr != nil {
 		writePoolCodeError(w, http.StatusConflict, codexMappingErrorCode(identityErr), "Codex session identity is no longer available")
 		return codexAttemptResult{Outcome: outcomeDone}
@@ -1205,7 +1360,6 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	// / risk-flagged session on one account can never contaminate another account
 	// that later serves the same conversation. Also resolves the (optionally
 	// OS-hinted) identity used to build the upstream headers.
-	osHint := s.osHint(raw, lease.Egress)
 	hdr := baseHeader.Clone()
 	if s.isolationEnabled(r.Context()) && !codexStrictCPAFromContext(r.Context()) {
 		id := identity.ForOS(s.identitySecret(), lease.Account.ID, osHint)
@@ -1225,7 +1379,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	}
 
 	codexClientVersion := s.codexClientVersionForModel(model)
-	codexUseWebSocket := forceCodexResponsesWebSocket(r.Context()) || s.codexResponsesWebSocketForModel(model, isChat, isCompact, body)
+	codexUseWebSocket := forceCodexResponsesWebSocket(r.Context()) || !isChat && !isCompact && streamReq && capability.CodexPrefersWebSocket(model)
 	// A preferred Responses WebSocket opened for an ordinary HTTP request is a
 	// one-shot upstream connection. Some Codex backend response ids are scoped to
 	// that connection, so a later HTTP continuation would necessarily open a new
@@ -1256,7 +1410,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			Method:                  http.MethodPost,
 			DownstreamPath:          pathWithQuery(path, r.URL.RawQuery),
 			Headers:                 requestHeaders,
-			Body:                    requestBody,
+			Body:                    bodysource.Bytes(requestBody),
 			Account:                 lease.Account,
 			Token:                   t,
 			Egress:                  lease.Egress,
@@ -1268,8 +1422,16 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 			CodexIdentity:           requestIdentity,
 		}
 	}
+	forwardSource, forwardMeta := bodysource.BodySource(nil), (*bodysource.BodyMeta)(nil)
+	if replaySource != nil && sameBodyBytes(body, sourceRaw) {
+		forwardSource, forwardMeta = replaySource, replayMeta
+	}
 	requestForToken := func(t storage.AccountToken) upstream.Request {
-		return requestForTokenWithIdentity(t, body, hdr, codexIdentity)
+		req := requestForTokenWithIdentity(t, body, hdr, codexIdentity)
+		if forwardSource != nil {
+			req.Body, req.BodyMeta = forwardSource, forwardMeta
+		}
+		return req
 	}
 	// Explicit administrator rules are a downstream policy overlay, including on
 	// strict CPA turns.  Strict CPA still guarantees that the request sent upstream
@@ -1310,7 +1472,13 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		return codexAttemptResult{}, false
 	}
 
-	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	logicalUsageDiag.RouteEpoch = lease.RouteEpoch
+	releaseCacheFlight, waitedForCacheFlight := s.enterCodexCacheSingleflight(r.Context(), s.codexCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, body, affinity)
+	if waitedForCacheFlight {
+		logicalUsageDiag.SingleflightWaitedRequests = 1
+	}
+	defer releaseCacheFlight()
+	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, estimatedTokensWithMeta(body, forwardMeta))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
@@ -1323,6 +1491,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 	withCodexUsageContext()
 	s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "attempted", 0)
 	resp, finalEgress, err := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
+	releaseCacheFlight()
 	if err != nil {
 		s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, lease.Egress, "transport_error", 0)
 		_ = s.settleBillingHold(r.Context(), holdID, "failed_before_response")
@@ -1515,7 +1684,7 @@ codexResponse:
 		}
 		if codexClientVersion == "" && codexRequiresNewerVersion(errorBody) {
 			codexClientVersion = s.cfg.ClientVersion
-			if !isChat && !isCompact && isStreamRequest(body) {
+			if !isChat && !isCompact && streamRequestWithMeta(body, forwardMeta) {
 				codexUseWebSocket = true
 			}
 			withCodexUsageContext()
@@ -1609,7 +1778,7 @@ codexResponse:
 			decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
 		hasFailoverCandidate := false
 		if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() && codexMappedSessionRiskError(resp.StatusCode, errorBody) {
-			hasFailoverCandidate = s.hasCodexFailoverCandidate(r.Context(), routeGroup, lease.Account.ID)
+			hasFailoverCandidate = s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
 		}
 		if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() &&
 			codexMappedSessionRotationRequired(resp.StatusCode, resp.Header, errorBody, movable, hasFailoverCandidate) {
@@ -1662,9 +1831,15 @@ codexResponse:
 				return result
 			}
 		}
-		canFailover := allowRetry && movable
-		if canFailover && retryableForFailover(v, resp.StatusCode) {
-			if v.State == ban.PermissionDenied && !s.hasCodexFailoverCandidate(r.Context(), routeGroup, lease.Account.ID) {
+		if movable && retryableForFailover(v, resp.StatusCode) {
+			if v.State == ban.RateLimited || resp.StatusCode == http.StatusTooManyRequests {
+				return retryAfterCapacity()
+			}
+			if !allowRetry {
+				s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
+				return codexAttemptResult{Outcome: outcomeDone}
+			}
+			if v.State == ban.PermissionDenied && !s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID) {
 				s.writeFilteredError(r.Context(), w, "codex", resp.StatusCode, resp.Header, errorBody, codexScrubber)
 				return codexAttemptResult{Outcome: outcomeDone}
 			}
@@ -1676,7 +1851,7 @@ codexResponse:
 	}
 codexSuccess:
 	s.verifyAccountModel(r.Context(), lease.Account, model, "")
-	normalizeCodexStreamContentType(resp.Header, isStreamRequest(body))
+	normalizeCodexStreamContentType(resp.Header, streamRequestWithMeta(body, forwardMeta))
 	resetHeaderExhaustion := false
 	if !codexResetRetried && !upstream.AccountUsesAPIKey(token) && !isAgentIdentityToken(token) && exhaustedCooldown(resp.Header, storage.Now()) > 0 {
 		resetHeaderExhaustion = s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, nil, "success_header_exhaustion")
@@ -1685,11 +1860,6 @@ codexSuccess:
 		s.guardRateLimitForAccount(r.Context(), lease.Account, resp.Header)
 	}
 	s.captureQuota(r.Context(), lease.Account.ID, "codex", model, resp.Header)
-
-	// Diagnostic logging for usage tracking
-	log.Printf("[CODEX-PATH] account=%s, egress=%s, path=%s, isChat=%v, reqStream=%v, respStream=%v, status=%d, ct=%q",
-		lease.Account.ID, finalEgress.Type, r.URL.Path, isChat, streamReq,
-		isEventStream(resp.Header), resp.StatusCode, resp.Header.Get("Content-Type"))
 
 	if isChat && !streamReq {
 		responseBody, err := s.readUpstreamResponseBody(resp.Body)
@@ -1747,9 +1917,12 @@ codexSuccess:
 			}
 			s.benchOnLimitForAccount(r.Context(), lease.Account, 200, resp.Header, responseBody)
 			_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
-			// Rate limit in 200 body — treat like a 429 for failover purposes.
-			if allowRetry && movable {
-				return retry()
+			// Rate limit in a 200 body is admission pressure, just like a 429. A
+			// movable request may switch immediately when another account is
+			// healthy; otherwise it waits for quota recovery instead of leaking a
+			// synthetic 503 merely because the distinct-account retry budget ended.
+			if movable {
+				return retryAfterCapacity()
 			}
 			if !strictNativeCPA && s.leakScrubEnabled(r.Context()) {
 				if nb, changed := leakfilter.NeutralizeResponsesJSON(responseBody); changed {
@@ -1770,7 +1943,7 @@ codexSuccess:
 		if relTurn.Active && s.reliabilityRepairEnabled(r.Context()) {
 			if findings := s.reliabilityFindings(r.Context(), responseBody, relTurn); len(findings) > 0 {
 				repairReq := requestForToken(token)
-				repairReq.Body = appendDeveloperTurn(body, s.reliabilityEnvelopeRole(r.Context()), reliability.RepairInstruction(findings))
+				repairReq.SetBodyBytes(appendDeveloperTurn(body, s.reliabilityEnvelopeRole(r.Context()), reliability.RepairInstruction(findings)))
 				if r2, _, e2 := s.doWithCFRetry(r.Context(), repairReq, lease, mappingTransportStrict); e2 == nil && r2 != nil {
 					if r2.StatusCode < 400 {
 						if b2, e := s.readUpstreamResponseBody(r2.Body); e == nil && len(b2) > 0 {
@@ -1975,7 +2148,7 @@ codexSuccess:
 						decision.Match.DownstreamAction == upstreamrules.DownstreamActionFailover
 					hasFailoverCandidate := false
 					if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() && codexMappedSessionRiskError(failureStatus, failureBody) {
-						hasFailoverCandidate = s.hasCodexFailoverCandidate(r.Context(), routeGroup, lease.Account.ID)
+						hasFailoverCandidate = s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
 					}
 					if rotationAllowed && strictNativeCPA && mapping != nil && mapping.mainCLI() &&
 						codexMappedSessionRotationRequired(failureStatus, failureHeader, failureBody, movable, hasFailoverCandidate) {
@@ -2021,10 +2194,11 @@ codexSuccess:
 							_ = retryResp.Body.Close()
 						}
 					}
+					failureVerdict := ban.Classify(false, failureStatus, failureHeader, failureBody)
 					if ruleMatched {
-						s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
+						failureVerdict = s.applyRuleAccountAction(r.Context(), lease.Account, failureStatus, failureHeader, failureBody, decision)
 					} else {
-						s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
+						failureVerdict = s.onUpstreamError(r.Context(), lease.Account, failureStatus, failureHeader, failureBody)
 					}
 					_ = s.settleBillingHold(r.Context(), holdID, "stream_retryable_error_retry")
 					if ruleMatched {
@@ -2034,6 +2208,9 @@ codexSuccess:
 						}
 					}
 					_ = resp.Body.Close()
+					if movable && failureVerdict.State == ban.RateLimited {
+						return retryAfterCapacity()
+					}
 					if allowRetry && movable {
 						return retry()
 					}
@@ -2052,19 +2229,27 @@ codexSuccess:
 			w.Header().Set("Cache-Control", "no-cache")
 			w.WriteHeader(resp.StatusCode)
 			uscan := usage.NewStreamScanner("codex")
-			nativeRecorder := newCodexStreamLedgerRecorder()
+			nativeRecorder := s.newCodexStreamLedgerRecorder(r.Context())
+			defer nativeRecorder.Close()
 			responsesStreamToChatSSE(w, io.TeeReader(streamBody, io.MultiWriter(uscan, nativeRecorder)), model, includeChatStreamUsage, codexScrubber)
 			if nativeRecorder.completedSuccessfully() {
 				responseID, responseModel, _ := nativeRecorder.metadata()
-				responseJSON := nativeRecorder.ResponseJSON()
 				if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
-					if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, finalEgress, responseID, firstNonEmpty(nativeRecorder.responseTurnState(), responseTurnState(resp.Header, nativeRecorder.ResponseJSON())), isCompact); err != nil {
+					turnState := nativeRecorder.responseTurnState()
+					var responseJSON []byte
+					if turnState == "" {
+						responseJSON = nativeRecorder.ResponseJSON()
+						turnState = responseTurnState(resp.Header, responseJSON)
+					}
+					if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, finalEgress, responseID, turnState, isCompact); err != nil {
 						log.Printf("[CODEX-SESSION-MAPPING] chat stream terminal commit request_id=%s: %v", requestIDFromContext(r.Context()), err)
 					}
 				} else {
 					s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, finalEgress, model)
 				}
-				s.persistCodexGoalContinuity(r.Context(), r, body, responseJSON)
+				if s.goalContinuityEnabled(r.Context()) {
+					s.persistCodexGoalContinuity(r.Context(), r, body, nativeRecorder.ResponseJSON())
+				}
 			}
 			if parsed, ok := uscan.Parsed(); ok {
 				s.recordParsedUsage(r.Context(), lease.Account.ID, affinity.Hash, parsed)
@@ -2072,7 +2257,8 @@ codexSuccess:
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
 			return codexAttemptResult{Outcome: outcomeDone}
 		}
-		streamRecorder := newCodexStreamLedgerRecorder()
+		streamRecorder := s.newCodexStreamLedgerRecorder(r.Context())
+		defer streamRecorder.Close()
 		recordingStream := io.TeeReader(streamBody, streamRecorder)
 		s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -2093,19 +2279,29 @@ codexSuccess:
 				return nil
 			}
 			responseID, responseModel, _ := recorder.metadata()
-			responseJSON := recorder.ResponseJSON()
+			var mappingErr error
 			if mapping := codexSessionMappingFromContext(r.Context()); mapping != nil && mapping.enabled {
-				if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, committedEgress, responseID, firstNonEmpty(recorder.responseTurnState(), responseTurnState(upstreamHeader, recorder.ResponseJSON())), isCompact); err != nil {
+				turnState := recorder.responseTurnState()
+				if turnState == "" {
+					turnState = responseTurnState(upstreamHeader, recorder.ResponseJSON())
+				}
+				if err := s.commitCodexSessionMapping(r.Context(), mapping, lease, committedEgress, responseID, turnState, isCompact); err != nil {
 					_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{Action: "codex_session_mapping_commit_failed", State: "retryable", Reason: codexMappingErrorCode(err), Detail: "stream_terminal_metadata_only"})
-					return err
+					mappingErr = err
 				}
 			} else {
 				// Compatibility mode retains only the old affinity metadata; no Codex
 				// goal/checkpoint/journal write is permitted.
 				s.persistCodexBindingAliases(r.Context(), affinity, responseID, responseModel, lease, committedEgress, model)
 			}
-			s.persistCodexGoalContinuity(r.Context(), r, body, responseJSON)
-			return nil
+			// A mapping-alias conflict must not discard the encrypted recovery
+			// checkpoint. In particular, downstream Responses WebSockets reach this
+			// native stream path, and losing a completed tool call here makes a later
+			// quota failover impossible to rebuild safely on another account.
+			if s.goalContinuityEnabled(r.Context()) {
+				s.persistCodexGoalContinuity(r.Context(), r, body, recorder.ResponseJSON())
+			}
+			return mappingErr
 		}
 		commitWriter := newTerminalCommitWriter(w, func() error {
 			return commitStreamMapping(streamRecorder, resp.Header, finalEgress)
@@ -2195,7 +2391,10 @@ codexSuccess:
 					continuationFailed = true
 					_ = s.emitCodexNativeContinuationFailure(r.Context(), w, responseID, responseModel, "native_continue_build_failed")
 				} else {
-					turnState := firstNonEmpty(streamRecorder.responseTurnState(), responseTurnState(resp.Header, streamRecorder.ResponseJSON()))
+					turnState := streamRecorder.responseTurnState()
+					if turnState == "" {
+						turnState = responseTurnState(resp.Header, streamRecorder.ResponseJSON())
+					}
 					continuationHeaders := hdr.Clone()
 					if turnState != "" {
 						continuationHeaders.Set("X-Codex-Turn-State", turnState)
@@ -2226,7 +2425,8 @@ codexSuccess:
 						}
 					} else {
 						s.recordCodexUpstreamAttempt(r.Context(), mapping, lease, continuationEgress, "native_continue_headers", continuationResp.StatusCode)
-						continuationRecorder := newCodexStreamLedgerRecorder()
+						continuationRecorder := s.newCodexStreamLedgerRecorder(r.Context())
+						defer continuationRecorder.Close()
 						continuationWriter := newTerminalCommitWriter(w, func() error {
 							return commitStreamMapping(continuationRecorder, continuationResp.Header, continuationEgress)
 						})
@@ -2331,6 +2531,9 @@ codexSuccess:
 					}
 					scrubbedWriter := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), codexScrubber, "codex")
 					continuationRecorder, continueErr := s.maybeAutoContinueCodex(r.Context(), scrubbedWriter, body, streamRecorder, reissue)
+					if continuationRecorder != nil && continuationRecorder != streamRecorder {
+						defer continuationRecorder.Close()
+					}
 					if continueErr != nil {
 						compatContinuationFailed = true
 						log.Printf("[AUTO-CONTINUE] codex stateless request_id=%s: %v", requestIDFromContext(r.Context()), continueErr)
@@ -2475,8 +2678,8 @@ codexSuccess:
 		_ = s.settleBillingHold(r.Context(), holdID, "rate_limited_in_200_body")
 		// Honor failover here too: a soft rate-limit in a 200 body is the same condition
 		// as a 429, so a movable request should fail over rather than surface it.
-		if allowRetry && movable {
-			return retry()
+		if movable {
+			return retryAfterCapacity()
 		}
 		if s.leakScrubEnabled(r.Context()) {
 			if nb, changed := leakfilter.NeutralizeResponsesJSON(responseBody); changed {
@@ -2576,7 +2779,7 @@ func (s *Server) persistCodexBindingAliases(ctx context.Context, affinity routin
 		if key.Hash == "" {
 			return
 		}
-		_ = s.store.UpsertAffinityBinding(ctx, storage.AffinityBinding{
+		_ = s.scheduler.UpsertAffinityBinding(ctx, storage.AffinityBinding{
 			RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source,
 			AccountID: lease.Account.ID, Provider: "codex", Model: model, EgressID: egressID,
 		})
@@ -2945,39 +3148,19 @@ func (s *Server) recordUsage(ctx context.Context, accountID, routeHash string, b
 		CacheRead: parsed.CacheReadTokens, CacheCreation: parsed.CacheCreationTokens, Raw: parsed.RawUsage, Diagnostics: diag})
 }
 
-func (s *Server) hasCodexFailoverCandidate(ctx context.Context, groupName string, excludeAccountIDs ...string) bool {
+func (s *Server) hasCodexFailoverCandidate(ctx context.Context, groupName, model string, excludeAccountIDs ...string) bool {
 	excluded := map[string]bool{}
 	for _, accountID := range excludeAccountIDs {
 		if accountID != "" {
 			excluded[accountID] = true
 		}
 	}
-	if groupName == "" {
-		groupName = s.cfg.DefaultGroup
-	}
-	accounts, err := s.store.ListActiveAccountsByGroup(ctx, groupName)
-	if err != nil {
-		return false
-	}
-	now := storage.Now()
-	candidateIDs := make([]string, 0, len(accounts))
-	for _, account := range accounts {
-		if excluded[account.ID] || account.QuarantineUntil > now {
-			continue
-		}
-		candidateIDs = append(candidateIDs, account.ID)
-	}
-	tokens, err := s.store.ListTokensByAccountIDs(ctx, candidateIDs)
-	if err != nil {
-		return false
-	}
-	for _, accountID := range candidateIDs {
-		token, ok := tokens[accountID]
-		if ok && scheduler.ProviderFromToken(token) == "codex" {
-			return true
-		}
-	}
-	return false
+	// This check runs only after an upstream failure. Imports, rechecks and quota
+	// updates may have occurred since the request's first lease, so force the same
+	// fresh snapshot Select would use on its stale-cache retry path.
+	s.scheduler.InvalidateAccountCache()
+	count, err := s.scheduler.EligibleCandidateCount(ctx, scheduler.Route{Group: groupName, Provider: "codex", Model: model, Exclude: excluded})
+	return err == nil && count > 0
 }
 
 // recordParsedUsage stores an already-parsed usage figure (the streaming path, where

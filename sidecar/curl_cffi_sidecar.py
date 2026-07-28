@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Async streaming curl_cffi sidecar. Wire-compatible with the legacy /proxy API."""
-import asyncio, base64, hashlib, inspect, json, os, resource, signal, sys, tempfile, time
+import asyncio, base64, hashlib, inspect, json, os, resource, shutil, signal, sys, tempfile, time
 from collections import OrderedDict
 from typing import Any
+from curl_cffi.const import CurlOpt
 from curl_cffi.requests import AsyncSession
 
 COOKIE_DIR=os.getenv("CODEX_POOL_SIDECAR_COOKIE_DIR",os.path.join(tempfile.gettempdir(),"codex-pool-sidecar-cookies"))
@@ -12,7 +13,12 @@ MAX_BUCKETS=int(os.getenv("CODEX_POOL_SIDECAR_POOL_MAX_KEYS","4096")); SESSION_T
 MAX_CLIENTS=int(os.getenv("CODEX_POOL_SIDECAR_MAX_CLIENTS","512"))
 ACCEPT_ENCODING=os.getenv("CODEX_POOL_SIDECAR_ACCEPT_ENCODING","gzip, deflate")
 COOKIE_FLUSH=float(os.getenv("CODEX_POOL_SIDECAR_COOKIE_FLUSH_SECONDS","0.25"))
-_sessions:OrderedDict[tuple,tuple[AsyncSession,float]]=OrderedDict();_session_active:dict[tuple,int]={};_cookies:dict[str,dict[str,str]]={};_dirty:set[str]=set();_inflight=0;_handles=0;_stopping=False
+SPOOL_DIR=os.getenv("CODEX_POOL_SIDECAR_SPOOL_DIR",tempfile.gettempdir())
+MAX_BODY_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_MAX_BODY_BYTES",str(1<<30)))
+LEGACY_BODY_MAX_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_LEGACY_BODY_MAX_BYTES",str(64<<20)))
+SPOOL_MAX_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_SPOOL_MAX_BYTES",str(32<<30)))
+SPOOL_RESERVE_BYTES=int(os.getenv("CODEX_POOL_SIDECAR_SPOOL_RESERVE_BYTES",str(10<<30)))
+_sessions:OrderedDict[tuple,tuple[AsyncSession,float]]=OrderedDict();_session_active:dict[tuple,int]={};_cookies:dict[str,dict[str,str]]={};_dirty:set[str]=set();_inflight=0;_handles=0;_spool_bytes=0;_stopping=False
 
 def safe_key(v:str)->str:return hashlib.sha256(v.encode()).hexdigest()
 def cookie_path(k:str)->str:return os.path.join(COOKIE_DIR,safe_key(k)+".json")
@@ -47,11 +53,51 @@ async def session_for(key:tuple)->AsyncSession:
   old,_=_sessions.pop(victim);_session_active.pop(victim,None);await old.close()
  return s
 
+class SidecarBodyError(Exception):
+ def __init__(self,code:str,status:int,retryable:bool,message:str):super().__init__(message);self.code=code;self.status=status;self.retryable=retryable
+
+class SpoolBody:
+ def __init__(self,file,size:int):self.file=file;self.path=file.name;self.size=size;self.closed=False
+ def rewind(self):self.file.flush();self.file.seek(0)
+ def close(self):
+  global _spool_bytes
+  if self.closed:return
+  self.closed=True
+  try:self.file.close()
+  finally:
+   try:os.remove(self.path)
+   except FileNotFoundError:pass
+   _spool_bytes=max(0,_spool_bytes-self.size)
+
+async def spool_request_body(reader:asyncio.StreamReader,size:int)->SpoolBody:
+ global _spool_bytes
+ if size>MAX_BODY_BYTES:raise SidecarBodyError("sidecar_body_too_large",413,False,f"request body exceeds {MAX_BODY_BYTES} bytes")
+ if size>SPOOL_MAX_BYTES-_spool_bytes:raise SidecarBodyError("sidecar_spool_exhausted",503,True,"sidecar spool budget exhausted")
+ os.makedirs(SPOOL_DIR,mode=0o700,exist_ok=True)
+ if shutil.disk_usage(SPOOL_DIR).free-size<SPOOL_RESERVE_BYTES:raise SidecarBodyError("sidecar_disk_reserve",503,True,"sidecar spool disk reserve reached")
+ file=tempfile.NamedTemporaryFile(mode="w+b",prefix="codex-pool-sidecar-body-",dir=SPOOL_DIR,delete=False)
+ _spool_bytes+=size
+ body=SpoolBody(file,size)
+ try:
+  remaining=size
+  while remaining:
+   chunk=await reader.readexactly(min(64<<10,remaining));file.write(chunk);remaining-=len(chunk)
+  body.rewind();return body
+ except Exception:
+  body.close();raise
+
 async def read_request(reader:asyncio.StreamReader):
  head=await reader.readuntil(b"\r\n\r\n");lines=head.decode("latin1").split("\r\n");method,path,_=lines[0].split(" ",2);headers={}
  for line in lines[1:]:
   if ":" in line:k,v=line.split(":",1);headers[k.lower()]=v.strip()
- n=int(headers.get("content-length","0"));body=await reader.readexactly(n) if n else b"";return method,path,headers,body
+ try:n=int(headers.get("content-length","0"))
+ except ValueError:raise SidecarBodyError("sidecar_invalid_content_length",400,False,"invalid content-length")
+ if n<0:raise SidecarBodyError("sidecar_invalid_content_length",400,False,"negative content-length")
+ if path=="/proxy" and headers.get("x-sidecar-meta") and n:body=await spool_request_body(reader,n)
+ else:
+  if n>LEGACY_BODY_MAX_BYTES:raise SidecarBodyError("sidecar_legacy_body_too_large",413,False,f"legacy sidecar body exceeds {LEGACY_BODY_MAX_BYTES} bytes")
+  body=await reader.readexactly(n) if n else b""
+ return method,path,headers,body
 async def send(writer,status:int,headers:dict[str,str],body:bytes=b""):
  reason={200:"OK",400:"Bad Request",404:"Not Found",502:"Bad Gateway",503:"Service Unavailable"}.get(status,"OK");headers=dict(headers);headers.setdefault("content-length",str(len(body)));headers["connection"]="close"
  writer.write((f"HTTP/1.1 {status} {reason}\r\n"+"".join(f"{k}: {v}\r\n" for k,v in headers.items())+"\r\n").encode("latin1")+body);await writer.drain()
@@ -66,7 +112,7 @@ def structured_error(code:str,phase:str,retryable:bool,message:str)->bytes:
  return json.dumps({"error":{"code":code,"phase":phase,"retryable":retryable,"message":message}},separators=(",",":"),ensure_ascii=False).encode()
 def metrics():
  rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
- return {"ok":True,"inflight":_inflight,"curl_handles":_handles,"session_buckets":len(_sessions),"rss_bytes":rss*(1024 if sys.platform!="darwin" else 1),"impersonate":IMPERSONATE,"draining":_stopping}
+ return {"ok":True,"inflight":_inflight,"curl_handles":_handles,"session_buckets":len(_sessions),"rss_bytes":rss*(1024 if sys.platform!="darwin" else 1),"spool_bytes":_spool_bytes,"spool_limit_bytes":SPOOL_MAX_BYTES,"impersonate":IMPERSONATE,"draining":_stopping}
 
 # A transport error after curl has begun a request is delivery-ambiguous: the
 # upstream may already have accepted a stateful Responses turn. Only the narrow
@@ -74,11 +120,17 @@ def metrics():
 class SidecarPreflightError(Exception): pass
 class SidecarDeliveryUnknownError(Exception): pass
 
-async def proxy(writer,payload:dict[str,Any],body:bytes):
+async def proxy(writer,payload:dict[str,Any],body:Any):
  global _handles
+ upload_session=None;key=None
  try:
   method=str(payload.get("method") or "POST").upper();url=str(payload["url"]);jar=str(payload.get("cookie_jar_key") or "default");proxy_url=str(payload.get("proxy") or "").strip();ja3=str(payload.get("ja3") or "").strip();akamai=str(payload.get("akamai") or "").strip()
-  key=(proxy_url,ja3,akamai,jar);session=await session_for(key);kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":body or None,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
+  if isinstance(body,SpoolBody):
+   body.rewind();options={CurlOpt.POST:0,CurlOpt.UPLOAD:1,CurlOpt.CUSTOMREQUEST:method.encode(),CurlOpt.INFILESIZE_LARGE:body.size,CurlOpt.READDATA:body.file,CurlOpt.UPLOAD_BUFFERSIZE:64<<10}
+   upload_session=AsyncSession(impersonate=IMPERSONATE,max_clients=1,curl_options=options);session=upload_session;request_data=None
+  else:
+   key=(proxy_url,ja3,akamai,jar);session=await session_for(key);request_data=body or None
+  kwargs={"headers":clean_headers(payload.get("headers") or {}),"data":request_data,"cookies":load_cookies(jar),"timeout":TIMEOUT,"accept_encoding":ACCEPT_ENCODING}
   if proxy_url:kwargs["proxy"]=proxy_url
   # default_headers gates curl-impersonate's INJECTION of the browser's own header set
   # (sec-ch-ua*, sec-fetch-*, accept-language, upgrade-insecure-requests, …) ON TOP of the
@@ -93,8 +145,9 @@ async def proxy(writer,payload:dict[str,Any],body:bytes):
   if akamai:kwargs["akamai"]=akamai
   if payload.get("allow_redirects") is False:kwargs["allow_redirects"]=False
  except Exception as e:
+  if upload_session is not None:await upload_session.close()
   raise SidecarPreflightError(str(e)) from e
- _session_active[key]=_session_active.get(key,0)+1
+ if key is not None:_session_active[key]=_session_active.get(key,0)+1
  _handles+=1;started=False
  try:
   async with session.stream(method,url,**kwargs) as resp:
@@ -117,10 +170,14 @@ async def proxy(writer,payload:dict[str,Any],body:bytes):
    except Exception:pass
    return
   raise SidecarDeliveryUnknownError(str(e)) from e
- finally:_handles-=1;_session_active[key]=max(0,_session_active.get(key,1)-1)
+ finally:
+  _handles-=1
+  if key is not None:_session_active[key]=max(0,_session_active.get(key,1)-1)
+  if upload_session is not None:await upload_session.close()
 
 async def client(reader,writer):
  global _inflight
+ raw=None
  try:
   method,path,h,raw=await read_request(reader)
   if method=="GET" and path in {"/healthz","/metrics"}:await send(writer,200,{"content-type":"application/json"},json.dumps(metrics()).encode());return
@@ -132,6 +189,8 @@ async def client(reader,writer):
   if h.get("x-sidecar-meta"):p=json.loads(base64.b64decode(h["x-sidecar-meta"]));body=raw
   else:p=json.loads(raw);body=base64.b64decode(str(p.get("body_b64") or ""))
   await proxy(writer,p,body)
+ except SidecarBodyError as e:
+  if not writer.is_closing():await send(writer,e.status,{"content-type":"application/json","retry-after":"1" if e.retryable else "0","x-sidecar-error-code":e.code,"x-sidecar-error-phase":"preflight","x-sidecar-error-retryable":"true" if e.retryable else "false"},structured_error(e.code,"preflight",e.retryable,str(e)))
  except SidecarPreflightError as e:
   # This is the only pre-header error certified not to have reached the upstream.
   # The v2 retryability header is an explicit contract with the Go relay.
@@ -144,6 +203,7 @@ async def client(reader,writer):
   if not writer.is_closing():await send(writer,502,{"content-type":"application/json","x-sidecar-error-code":"sidecar_request_error","x-sidecar-error-phase":"request","x-sidecar-error-retryable":"false"},structured_error("sidecar_request_error","request",False,str(e)))
  finally:
   if 'path' in locals() and path=="/proxy":_inflight=max(0,_inflight-1)
+  if isinstance(raw,SpoolBody):raw.close()
   writer.close();await writer.wait_closed()
 
 async def main(addr:str):

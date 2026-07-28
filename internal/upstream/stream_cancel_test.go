@@ -170,7 +170,7 @@ func doDirectClaudeStream(t *testing.T, baseURL string, cfg config.Config) *Resp
 		Method:         http.MethodPost,
 		Provider:       "claude",
 		DownstreamPath: "/v1/messages",
-		Body:           []byte(`{"model":"claude-3-5-sonnet","stream":true}`),
+		Body:           testBody([]byte(`{"model":"claude-3-5-sonnet","stream":true}`)),
 		Account:        storage.Account{ID: "acc-claude"},
 		Token:          storage.AccountToken{AccessToken: "sk-ant-oat-xyz"},
 		Egress:         storage.EgressProfile{ID: "eg1", Type: "direct", Health: "healthy"},

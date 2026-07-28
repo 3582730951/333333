@@ -14,13 +14,17 @@
 package tlsclient
 
 import (
-	"bytes"
+	"container/list"
 	"context"
 	"io"
 	stdhttp "net/http"
+	"net/http/cookiejar"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
@@ -83,7 +87,7 @@ type Request struct {
 	URL          string
 	Header       stdhttp.Header
 	HeaderOrder  []string
-	Body         []byte
+	Body         bodysource.BodySource
 	Profile      string        // "" or ProfileChrome => Chrome_120; ProfileNode/ProfileRustls => stub
 	JA3Override  string        // explicit named profile key from profiles.MappedTLSClients ("chrome_120" etc.)
 	ProxyURL     string        // optional chain proxy (http(s)/socks5(h))
@@ -98,22 +102,36 @@ type Response struct {
 	Body       io.ReadCloser
 }
 
-// Factory pools tls-client HttpClients (and their cookie jars) keyed by
-// (resolvedProfile, proxy, cookieJarKey) so repeated requests reuse warm TCP/TLS/HTTP2
-// connections instead of handshaking every time — the in-process analogue of the
-// sidecar's session pool.
+// Factory pools transport clients independently from request-scoped cookie state.
 type Factory struct {
 	mu             sync.Mutex
 	clients        map[string]tls_client.HttpClient
-	jars           map[string]tls_client.CookieJar
+	jars           map[string]*list.Element
+	jarLRU         *list.List
+	cookieJarMax   int
+	cookieJarTTL   time.Duration
 	defaultTimeout time.Duration
+}
+
+const (
+	defaultCookieJarMax = 131072
+	defaultCookieJarTTL = 24 * time.Hour
+)
+
+type cookieJarEntry struct {
+	key      string
+	jar      *cookiejar.Jar
+	lastUsed time.Time
 }
 
 // New returns a Factory with a sane default request timeout.
 func New() *Factory {
 	return &Factory{
 		clients:        map[string]tls_client.HttpClient{},
-		jars:           map[string]tls_client.CookieJar{},
+		jars:           map[string]*list.Element{},
+		jarLRU:         list.New(),
+		cookieJarMax:   defaultCookieJarMax,
+		cookieJarTTL:   defaultCookieJarTTL,
 		defaultTimeout: 120 * time.Second,
 	}
 }
@@ -159,22 +177,9 @@ func ResolveProfile(profileName, ja3Override string) profiles.ClientProfile {
 	}
 }
 
-func (f *Factory) jarForLocked(key string) tls_client.CookieJar {
-	if key == "" {
-		return tls_client.NewCookieJar()
-	}
-	if j := f.jars[key]; j != nil {
-		return j
-	}
-	j := tls_client.NewCookieJar()
-	f.jars[key] = j
-	return j
-}
-
-// cacheKey returns the factory cache key for a request.  The JA3Override participates
-// in the key so that an explicit named-profile override gets its own pooled client.
+// cacheKey intentionally excludes CookieJarKey so account/session state cannot fragment connections.
 func cacheKey(r Request) string {
-	return r.Profile + "\x00" + r.JA3Override + "\x00" + r.ProxyURL + "\x00" + r.CookieJarKey
+	return r.Profile + "\x00" + r.JA3Override + "\x00" + r.ProxyURL
 }
 
 func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
@@ -194,7 +199,6 @@ func (f *Factory) clientFor(r Request) (tls_client.HttpClient, error) {
 	}
 	opts := []tls_client.HttpClientOption{
 		tls_client.WithClientProfile(ResolveProfile(r.Profile, r.JA3Override)),
-		tls_client.WithCookieJar(f.jarForLocked(r.CookieJarKey)),
 		tls_client.WithTimeoutSeconds(secs),
 		// The pool owns failover/retry semantics; the transport must not silently follow
 		// redirects (an upstream 3xx is a signal we surface, not chase).
@@ -222,13 +226,26 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 	if method == "" {
 		method = fhttp.MethodPost
 	}
-	var body io.Reader
-	if len(r.Body) > 0 {
-		body = bytes.NewReader(r.Body)
+	var body io.ReadCloser
+	if r.Body != nil && r.Body.Size() > 0 {
+		body, err = r.Body.Open()
+		if err != nil {
+			return nil, err
+		}
 	}
 	req, err := fhttp.NewRequestWithContext(ctx, method, r.URL, body)
 	if err != nil {
+		if body != nil {
+			_ = body.Close()
+		}
 		return nil, err
+	}
+	if body != nil {
+		defer body.Close()
+	}
+	if r.Body != nil {
+		req.ContentLength = r.Body.Size()
+		req.GetBody = r.Body.Open
 	}
 	for k, vs := range r.Header {
 		for _, v := range vs {
@@ -238,15 +255,73 @@ func (f *Factory) Do(ctx context.Context, r Request) (*Response, error) {
 	if order := r.HeaderOrder; len(order) > 0 {
 		req.Header[fhttp.HeaderOrderKey] = lowered(order)
 	}
+	f.applyCookies(r.CookieJarKey, r.URL, req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
+	f.storeCookies(r.CookieJarKey, r.URL, toStdHeader(resp.Header))
 	return &Response{
 		StatusCode: resp.StatusCode,
 		Header:     toStdHeader(resp.Header),
 		Body:       resp.Body,
 	}, nil
+}
+
+func (f *Factory) cookieJar(key string) *cookiejar.Jar {
+	if key == "" {
+		return nil
+	}
+	now := time.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for back := f.jarLRU.Back(); back != nil; back = f.jarLRU.Back() {
+		entry := back.Value.(*cookieJarEntry)
+		if f.cookieJarTTL <= 0 || now.Sub(entry.lastUsed) < f.cookieJarTTL {
+			break
+		}
+		f.jarLRU.Remove(back)
+		delete(f.jars, entry.key)
+	}
+	if element := f.jars[key]; element != nil {
+		entry := element.Value.(*cookieJarEntry)
+		entry.lastUsed = now
+		f.jarLRU.MoveToFront(element)
+		return entry.jar
+	}
+	jar, _ := cookiejar.New(nil)
+	element := f.jarLRU.PushFront(&cookieJarEntry{key: key, jar: jar, lastUsed: now})
+	f.jars[key] = element
+	if f.cookieJarMax > 0 && f.jarLRU.Len() > f.cookieJarMax {
+		back := f.jarLRU.Back()
+		f.jarLRU.Remove(back)
+		delete(f.jars, back.Value.(*cookieJarEntry).key)
+	}
+	return jar
+}
+
+func (f *Factory) applyCookies(key, rawURL string, header fhttp.Header) {
+	jar := f.cookieJar(key)
+	u, err := url.Parse(rawURL)
+	if jar == nil || err != nil || header.Get("Cookie") != "" {
+		return
+	}
+	values := make([]string, 0, 4)
+	for _, cookie := range jar.Cookies(u) {
+		values = append(values, cookie.Name+"="+cookie.Value)
+	}
+	if len(values) > 0 {
+		header.Set("Cookie", strings.Join(values, "; "))
+	}
+}
+
+func (f *Factory) storeCookies(key, rawURL string, header stdhttp.Header) {
+	jar := f.cookieJar(key)
+	u, err := url.Parse(rawURL)
+	if jar == nil || err != nil {
+		return
+	}
+	jar.SetCookies(u, (&stdhttp.Response{Header: header}).Cookies())
 }
 
 // TLSDialerFor returns the TLS dialer function from a pooled client matching the

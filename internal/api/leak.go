@@ -407,8 +407,6 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 		err = leakfilter.NewSSEFilter(provider, words).Copy(sw, body)
 	}
 	if parsed, ok := scanner.Parsed(); ok {
-		log.Printf("[STREAM-USAGE] provider=%s, account=%s, model=%s, prompt=%d, completion=%d, total=%d, cached=%d",
-			provider, accountID, parsed.Model, parsed.PromptTokens, parsed.CompletionTokens, parsed.TotalTokens, parsed.CachedTokens)
 		s.recordParsedUsage(ctx, accountID, routeHash, parsed)
 	} else {
 		log.Printf("[STREAM-USAGE] provider=%s, account=%s: NO USAGE EXTRACTED", provider, accountID)

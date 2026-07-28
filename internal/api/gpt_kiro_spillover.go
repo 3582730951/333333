@@ -7,11 +7,10 @@ import (
 	"net/http"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/prompt"
-	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
-	"codex-account-pool/internal/virtual"
 )
 
 // autoKiroGPTBridge is the request-side representation Kiro needs. Kiro speaks
@@ -38,7 +37,7 @@ const autoKiroGPTFallbackModel = "gpt-5.6-sol"
 // owns the normal route. It does not make Kiro a priority provider: a selected
 // Codex lease is immediately released and the native Codex path below performs the
 // actual request. A Kiro winner is served here through the compatibility bridge.
-func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw []byte, model, group string, isChat, isCompact bool, pol downstreamPolicy) bool {
+func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw []byte, meta *bodysource.BodyMeta, model, group string, isChat, isCompact bool, pol downstreamPolicy) bool {
 	kiroModel, eligible := autoKiroGPTModelForCodex(model)
 	if s.scheduler == nil || effectiveGatewayProviderHint(r, pol) != "auto" || !eligible {
 		return false
@@ -47,7 +46,7 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 	// state. A previous_response_id / turn-state must stay on its account-bound
 	// Codex route. Compaction and WebSocket requests are likewise handled by the
 	// native Codex path only.
-	if isCompact || (!isChat && r.URL.Path != "/v1/responses") || routing.HasServerSideState(r.URL.Path, r, raw) {
+	if isCompact || (!isChat && r.URL.Path != "/v1/responses") || serverSideStateWithMeta(r.URL.Path, r, raw, meta) {
 		return false
 	}
 
@@ -63,14 +62,7 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 		return false
 	}
 
-	bridge, ok := buildAutoKiroGPTBridge(raw, isChat, kiroModel)
-	if !ok {
-		// The native Codex path remains lossless for any request shape that cannot
-		// be represented through Kiro's Chat/Anthropic compatibility bridge.
-		return false
-	}
-
-	affinity := codexSelectionAffinity(r, raw, routing.ExtractAffinityKey(r, raw), group)
+	affinity := codexSelectionAffinity(r, raw, affinityWithMeta(r, raw, meta), group)
 	kiroCfg := s.effectiveKiroConfig(r.Context())
 
 	// Fair scheduling is only for the first unbound request. Once an affinity
@@ -95,7 +87,7 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 		KiroDefaultRegion:     kiroCfg.KiroDefaultAPIRegion,
 		Model:                 model,
 		KiroFallbackModel:     kiroModel,
-		EstimatedTokens:       virtual.EstimateTokensJSON(raw),
+		EstimatedTokens:       estimatedTokensWithMeta(raw, meta),
 	}
 
 	// Select normally queues a request when every matching account is temporarily
@@ -117,6 +109,17 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 		lease.Release()
 		return false
 	}
+	// Conversion can allocate in proportion to the full request. Defer it until a
+	// Kiro account actually wins: under Codex-only pressure, eagerly building the
+	// bridge for every admitted candidate retained several extra million-token body
+	// copies and could exhaust the gateway before the fair scheduler chose Codex.
+	bridge, ok := buildAutoKiroGPTBridge(raw, isChat, kiroModel)
+	if !ok {
+		lease.Release()
+		// The native Codex path remains lossless for any request shape that cannot
+		// be represented through Kiro's Chat/Anthropic compatibility bridge.
+		return false
+	}
 	resolvedKiroModel := firstNonEmpty(lease.ResolvedModel, kiroModel)
 	if !strings.EqualFold(strings.TrimSpace(model), resolvedKiroModel) {
 		w.Header().Set("X-Pool-Kiro-Fallback-From", strings.TrimSpace(model))
@@ -129,7 +132,12 @@ func (s *Server) tryServeAutoKiroGPT(w http.ResponseWriter, r *http.Request, raw
 	// Preserve the request-side Responses bridge diagnostics in the Kiro usage row
 	// and surface the same losses to the downstream Responses client.
 	r = withResponsesCompatibilityLosses(r, bridge.responses.CompatibilityLosses)
-	writer := newKiroResponsesBridgeWriter(w, isStreamRequest(raw), resolvedKiroModel, bridge.responses.Plan, bridge.responses.CompatibilityLosses)
+	writer, err := newKiroResponsesBridgeWriter(r.Context(), w, isStreamRequest(raw), resolvedKiroModel, bridge.responses.Plan, bridge.responses.CompatibilityLosses, s.responseBodyCaptureOptions(r.Context()))
+	if err != nil {
+		lease.Release()
+		writeError(w, http.StatusInternalServerError, err)
+		return true
+	}
 	s.kiroChatWithLease(writer, r, bridge.anthropicBody, resolvedKiroModel, affinity, lease, false, nil)
 	writer.finish()
 	return true

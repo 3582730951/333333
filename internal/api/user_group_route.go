@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/storage"
 )
@@ -181,10 +182,11 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 
 	replaySafe := !routing.HasServerSideState(r.URL.Path, r, resolvedRaw)
 	streamRequest := isStreamRequest(resolvedRaw)
-	var last *userGroupAttemptWriter
 	for index, target := range plan.Candidates {
-		attempt := newUserGroupAttemptWriter(w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"))
-		last = attempt
+		attempt := newUserGroupAttemptWriter(r.Context(), w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"), bodysource.CaptureOptions{
+			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
+			MinDiskFreeBytes: s.cfg.BodyDiskReserveBytes, Budget: s.bodyBudget, TempFileNamePrefix: "codex-pool-route-response-*",
+		})
 		candidate := r.Clone(withUserGroupRouteOverride(r.Context(), target))
 		candidate.Body = io.NopCloser(bytes.NewReader(originalRaw))
 		candidate.ContentLength = int64(len(originalRaw))
@@ -212,17 +214,15 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			return true
 		}
 		if attempt.Committed() {
+			_ = attempt.Close()
 			return true
 		}
 		moreTargets := index+1 < len(plan.Candidates)
-		if !moreTargets || !replaySafe || !retryableUserGroupTargetFailure(status, attempt.Body()) {
+		if !moreTargets || !replaySafe || !attempt.RetryableFailure() {
 			attempt.Commit()
 			return true
 		}
-	}
-	if last != nil {
-		last.Commit()
-		return true
+		_ = attempt.Close()
 	}
 	return false
 }
@@ -231,17 +231,19 @@ type userGroupAttemptWriter struct {
 	downstream http.ResponseWriter
 	header     http.Header
 	status     int
-	body       bytes.Buffer
+	body       *bodysource.SpoolBuffer
+	bodyErr    error
 	committed  bool
 	stream     bool
 	responses  *responsesRouteAliasTracker
 }
 
-func newUserGroupAttemptWriter(downstream http.ResponseWriter, stream bool, trackResponses ...bool) *userGroupAttemptWriter {
+func newUserGroupAttemptWriter(ctx context.Context, downstream http.ResponseWriter, stream, trackResponses bool, options bodysource.CaptureOptions) *userGroupAttemptWriter {
 	header := make(http.Header, len(downstream.Header()))
 	copyUserGroupHeaders(header, downstream.Header())
-	w := &userGroupAttemptWriter{downstream: downstream, header: header, stream: stream}
-	if stream && len(trackResponses) > 0 && trackResponses[0] {
+	body, err := bodysource.NewSpoolBuffer(ctx, options)
+	w := &userGroupAttemptWriter{downstream: downstream, header: header, stream: stream, body: body, bodyErr: err}
+	if stream && trackResponses {
 		w.responses = &responsesRouteAliasTracker{}
 	}
 	return w
@@ -261,16 +263,30 @@ func (w *userGroupAttemptWriter) Write(payload []byte) (int, error) {
 		w.status = http.StatusOK
 	}
 	if w.status >= http.StatusBadRequest {
-		return w.body.Write(payload)
+		return w.writeBuffered(payload)
 	}
 	if !w.stream {
-		return w.body.Write(payload)
+		return w.writeBuffered(payload)
 	}
 	if w.responses != nil {
 		_, _ = w.responses.Write(payload)
 	}
 	w.commitHeaders()
 	return w.downstream.Write(payload)
+}
+
+func (w *userGroupAttemptWriter) writeBuffered(payload []byte) (int, error) {
+	if w.bodyErr != nil {
+		return 0, w.bodyErr
+	}
+	n, err := w.body.Write(payload)
+	if err != nil {
+		w.bodyErr = err
+		w.status = http.StatusServiceUnavailable
+		w.header.Set("Retry-After", "1")
+		w.header.Set("Content-Type", "application/json")
+	}
+	return n, err
 }
 
 func (w *userGroupAttemptWriter) Flush() {
@@ -293,25 +309,44 @@ func (w *userGroupAttemptWriter) Status() int {
 	return w.status
 }
 
-func (w *userGroupAttemptWriter) Body() []byte    { return w.body.Bytes() }
 func (w *userGroupAttemptWriter) Committed() bool { return w.committed }
+
+func (w *userGroupAttemptWriter) RetryableFailure() bool {
+	if w.body == nil || w.bodyErr != nil {
+		return false
+	}
+	if retryableUserGroupTargetStatus(w.Status()) {
+		return true
+	}
+	r, err := w.body.Open()
+	if err != nil {
+		return false
+	}
+	defer r.Close()
+	return retryableUserGroupTargetFailure(w.Status(), r)
+}
 
 func (w *userGroupAttemptWriter) CompletedResponseID() string {
 	if w.responses != nil {
 		w.responses.Finish()
 		return w.responses.CompletedResponseID()
 	}
-	if w.Status() >= http.StatusBadRequest || w.body.Len() == 0 {
+	if w.Status() >= http.StatusBadRequest || w.body == nil || w.body.Size() == 0 || w.bodyErr != nil {
 		return ""
 	}
-	var response struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
-	if json.Unmarshal(w.body.Bytes(), &response) != nil || (response.Status != "" && !strings.EqualFold(response.Status, "completed")) {
+	meta, err := bodysource.ScanJSON(context.Background(), w.body, nil)
+	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(response.ID)
+	var id, status string
+	if json.Unmarshal(meta.Scalars["id"], &id) != nil || id == "" {
+		return ""
+	}
+	_ = json.Unmarshal(meta.Scalars["status"], &status)
+	if status != "" && !strings.EqualFold(status, "completed") {
+		return ""
+	}
+	return strings.TrimSpace(id)
 }
 
 func (w *userGroupAttemptWriter) Commit() {
@@ -321,10 +356,36 @@ func (w *userGroupAttemptWriter) Commit() {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
-	w.commitHeaders()
-	if w.body.Len() > 0 {
-		_, _ = w.downstream.Write(w.body.Bytes())
+	var body io.ReadCloser
+	if w.body != nil && w.body.Size() > 0 && w.bodyErr == nil {
+		var err error
+		body, err = w.body.Open()
+		if err != nil {
+			w.bodyErr = err
+			w.status = http.StatusServiceUnavailable
+			w.header.Set("Retry-After", "1")
+			w.header.Set("Content-Type", "application/json")
+		}
 	}
+	w.commitHeaders()
+	if w.bodyErr != nil {
+		_, _ = io.WriteString(w.downstream, `{"error":{"type":"resource_exhausted","message":"response buffer exhausted"}}`)
+	} else if body != nil {
+		_, _ = io.Copy(w.downstream, body)
+	}
+	if body != nil {
+		_ = body.Close()
+	}
+	_ = w.Close()
+}
+
+func (w *userGroupAttemptWriter) Close() error {
+	if w.body == nil {
+		return nil
+	}
+	err := w.body.Close()
+	w.body = nil
+	return err
 }
 
 func (w *userGroupAttemptWriter) commitHeaders() {
@@ -410,18 +471,21 @@ func (t *responsesRouteAliasTracker) CompletedResponseID() string {
 	return strings.TrimSpace(t.completedID)
 }
 
-func retryableUserGroupTargetFailure(status int, body []byte) bool {
+func retryableUserGroupTargetStatus(status int) bool {
 	switch status {
 	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
 		http.StatusRequestTimeout, http.StatusConflict, http.StatusTooEarly,
 		http.StatusTooManyRequests:
 		return true
 	}
-	if status >= http.StatusInternalServerError {
+	return status >= http.StatusInternalServerError
+}
+
+func retryableUserGroupTargetFailure(status int, body io.Reader) bool {
+	if retryableUserGroupTargetStatus(status) {
 		return true
 	}
-	lower := bytes.ToLower(body)
-	for _, marker := range [][]byte{
+	markers := [][]byte{
 		[]byte("capability_unavailable"),
 		[]byte("claude_context_1m_unavailable"),
 		[]byte("model_fallback_required"),
@@ -429,12 +493,34 @@ func retryableUserGroupTargetFailure(status int, body []byte) bool {
 		[]byte("bound_account_unavailable"),
 		[]byte("no available account"),
 		[]byte("temporarily unavailable"),
-	} {
-		if bytes.Contains(lower, marker) {
-			return true
+	}
+	maxMarker := 0
+	for _, marker := range markers {
+		if len(marker) > maxMarker {
+			maxMarker = len(marker)
 		}
 	}
-	return false
+	window := make([]byte, (32<<10)+maxMarker)
+	tail := 0
+	for {
+		n, err := body.Read(window[tail:])
+		end := tail + n
+		for i := tail; i < end; i++ {
+			if window[i] >= 'A' && window[i] <= 'Z' {
+				window[i] += 'a' - 'A'
+			}
+		}
+		for _, marker := range markers {
+			if bytes.Contains(window[:end], marker) {
+				return true
+			}
+		}
+		if err != nil {
+			return false
+		}
+		tail = min(maxMarker-1, end)
+		copy(window[:tail], window[end-tail:end])
+	}
 }
 
 func userGroupRuleMatchesModel(ruleModel, model string) bool {

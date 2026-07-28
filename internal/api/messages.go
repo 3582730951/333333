@@ -12,6 +12,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/ban"
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cf"
 	"codex-account-pool/internal/cloak"
@@ -71,12 +72,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	raw, err := readLimited(r.Body, s.cfg.MaxBodyBytes)
+	raw, err := requestBodyBytes(r, s.cfg.MaxBodyBytes)
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, err)
 		return
 	}
-	originalRaw := append([]byte(nil), raw...)
+	originalRaw := raw
 	path := r.URL.Path
 	clientRequestedModel := routing.Model(raw)
 
@@ -452,7 +453,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 			Provider:       "claude",
 			DownstreamPath: path,
 			Headers:        r.Header.Clone(),
-			Body:           body,
+			Body:           bodysource.Bytes(body),
 			Account:        lease.Account,
 			Token:          t,
 			Egress:         lease.Egress,
@@ -526,11 +527,12 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	}
 	usageDiag := claudeRequestUsageDiagnostics(body, affinity, claudeTTL, nativeCacheInject)
 	usageDiag.CachePrewarmAttempted = s.maybePrewarmClaudeCache(r.Context(), s.claudeCachePrewarmMode(r.Context()), requestForToken(token))
-	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), body, affinity)
+	releaseFlight, waitedForFlight := s.enterClaudeCacheSingleflight(r.Context(), s.claudeCacheSingleflightEnabled(r.Context()), lease.Account.ID, resolvedModel, body, affinity)
 	if waitedForFlight {
 		usageDiag.SingleflightWaitedRequests = 1
 	}
-	holdID := s.createBillingHold(affinity.Hash, lease.Account.ID, virtual.EstimateTokensJSON(body))
+	usageDiag.RouteEpoch = lease.RouteEpoch
+	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, virtual.EstimateTokensJSON(body))
 	// Backstop: guarantee this attempt's hold reaches a terminal status no matter which
 	// branch returns (including a cancelled/streaming disconnect). Only fires while the
 	// hold is still 'held', so an explicit settle below always wins.
@@ -675,10 +677,24 @@ claudeSuccess:
 		}
 		streamBody := io.MultiReader(bytes.NewReader(prefix), resp.Body)
 		aliasCapture := &claudeAliasCapture{}
-		streamBody = io.TeeReader(streamBody, aliasCapture)
+		captureWriter := io.Writer(aliasCapture)
+		var goalCapture *bodysource.SpoolBuffer
+		if s.goalContinuityEnabled(r.Context()) {
+			goalCapture, err = bodysource.NewSpoolBuffer(r.Context(), s.responseBodyCaptureOptions(r.Context()))
+			if err != nil {
+				_ = resp.Body.Close()
+				_ = s.settleBillingHold(r.Context(), holdID, "response_spool_exhausted")
+				writeResourceExhausted(w, err.Error())
+				return outcomeDone
+			}
+			defer goalCapture.Close()
+			captureWriter = io.MultiWriter(aliasCapture, goalCapture)
+		}
+		streamBody = io.TeeReader(streamBody, captureWriter)
 		// Tap the stream to detect a truncated response (no message_stop) and capture the
 		// partial answer, so auto-continue can re-issue and stitch when enabled.
-		continueTap := &claudeStreamTap{}
+		continueTap := newClaudeStreamTap(r.Context(), s.responseBodyCaptureOptions(r.Context()))
+		defer continueTap.Close()
 		streamBody = io.TeeReader(streamBody, continueTap)
 		if !refreshHeartbeat.Committed() {
 			s.writeUpstreamHeaders(r.Context(), w.Header(), resp.Header)
@@ -711,11 +727,21 @@ claudeSuccess:
 		} else {
 			s.persistClaudeItemAliases(r.Context(), raw, aliasCapture.Bytes(), lease, model)
 			if continueTap.completedSuccessfully() {
-				if response := goalResponseFromSSE(aliasCapture.Bytes()); len(response) > 0 {
-					if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
-						log.Printf("[GOAL-CONTINUITY] claude stream persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
-						s.auditGoalPersistenceDegraded(r.Context(), "claude_stream_terminal", persistErr)
+				var goalFrames []byte
+				var captureErr error
+				if goalCapture != nil {
+					goalFrames, captureErr = responseSpoolBytes(goalCapture)
+				}
+				if captureErr == nil {
+					if response := goalResponseFromSSE(goalFrames); len(response) > 0 {
+						if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
+							log.Printf("[GOAL-CONTINUITY] claude stream persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+							s.auditGoalPersistenceDegraded(r.Context(), "claude_stream_terminal", persistErr)
+						}
 					}
+				} else {
+					log.Printf("[GOAL-CONTINUITY] claude stream capture unavailable request_id=%s: %v", requestIDFromContext(r.Context()), captureErr)
+					s.auditGoalPersistenceDegraded(r.Context(), "claude_stream_capture", captureErr)
 				}
 			}
 			_ = s.settleBillingHold(r.Context(), holdID, "settled_streaming")
@@ -727,11 +753,25 @@ claudeSuccess:
 				// message_stop is a closed upstream stream; v2 retries it once with the
 				// same account and full self-contained history before emitting an error.
 				if s.goalContinuityEnabled(r.Context()) || s.autoContinueEnabled(r.Context(), autoContinueDecisionFromFilter(rfForAC)) {
-					var continuationCapture bytes.Buffer
 					sw := newScrubbingFrameWriter(w, s.leakScrubEnabled(r.Context()), result.Scrubber, "claude")
+					continuationAliases := &claudeAliasCapture{}
+					continuationWriter := io.Writer(continuationAliases)
+					var continuationGoalCapture *bodysource.SpoolBuffer
+					if goalCapture != nil {
+						continuationGoalCapture, err = bodysource.NewSpoolBuffer(r.Context(), s.responseBodyCaptureOptions(r.Context()))
+						if err != nil {
+							log.Printf("[GOAL-CONTINUITY] claude continuation spool unavailable request_id=%s: %v", requestIDFromContext(r.Context()), err)
+							_ = closeClaudeStreamGracefully(sw, continueTap.openBlock, continueTap.openBlockIndex)
+							s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "continuation_spool_unavailable")
+							sw.Flush()
+							return outcomeDone
+						}
+						defer continuationGoalCapture.Close()
+						continuationWriter = io.MultiWriter(continuationAliases, continuationGoalCapture)
+					}
 					reissue := func(cctx context.Context, cbody []byte) (io.ReadCloser, error) {
 						creq := requestForToken(token)
-						creq.Body = cbody
+						creq.SetBodyBytes(cbody)
 						cresp, cerr := s.upstream.Do(cctx, creq)
 						if cerr != nil {
 							return nil, cerr
@@ -748,18 +788,27 @@ claudeSuccess:
 						}
 						return newSemanticSSERelayReadCloser(cctx, cresp.Body, rfForAC, "claude", s.streamStallRecoveryInterval(cctx), heartbeatEvery), nil
 					}
-					continuation, acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue, &continuationCapture)
+					continuation, acErr := s.autoContinueClaude(r.Context(), sw, body, continueTap, reissue, continuationWriter)
+					if continuation != nil {
+						defer continuation.Close()
+					}
 					if acErr != nil {
 						log.Printf("[AUTO-CONTINUE] claude request_id=%s: %v", requestIDFromContext(r.Context()), acErr)
 						_ = closeClaudeStreamGracefully(sw, continueTap.openBlock, continueTap.openBlockIndex)
 						s.markGoalStreamRetryable(r.Context(), r, "claude", raw, "continuation_unavailable")
 					} else if continuation != nil && continuation.completedSuccessfully() {
-						mergedFrames := append(append([]byte(nil), aliasCapture.Bytes()...), continuationCapture.Bytes()...)
-						s.persistClaudeItemAliases(r.Context(), raw, mergedFrames, lease, model)
-						if response := goalResponseFromSSE(mergedFrames); len(response) > 0 {
-							if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
-								log.Printf("[GOAL-CONTINUITY] claude continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
-								s.auditGoalPersistenceDegraded(r.Context(), "claude_continuation_terminal", persistErr)
+						s.persistClaudeItemAliases(r.Context(), raw, continuationAliases.Bytes(), lease, model)
+						if goalCapture != nil && continuationGoalCapture != nil {
+							firstFrames, firstErr := responseSpoolBytes(goalCapture)
+							continuationFrames, continuationErr := responseSpoolBytes(continuationGoalCapture)
+							if captureErr := errors.Join(firstErr, continuationErr); captureErr != nil {
+								log.Printf("[GOAL-CONTINUITY] claude continuation capture unavailable request_id=%s: %v", requestIDFromContext(r.Context()), captureErr)
+								s.auditGoalPersistenceDegraded(r.Context(), "claude_continuation_capture", captureErr)
+							} else if response := goalResponseFromSSEParts(firstFrames, continuationFrames); len(response) > 0 {
+								if _, persistErr := s.persistGoalContinuity(r.Context(), r, "claude", raw, response); persistErr != nil {
+									log.Printf("[GOAL-CONTINUITY] claude continuation persistence degraded request_id=%s: %v", requestIDFromContext(r.Context()), persistErr)
+									s.auditGoalPersistenceDegraded(r.Context(), "claude_continuation_terminal", persistErr)
+								}
 							}
 						}
 					} else {

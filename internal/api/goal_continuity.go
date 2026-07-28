@@ -7,6 +7,7 @@ package api
 // cache prefix, account affinity, or API-key alone.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,8 +20,10 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
+	"github.com/tidwall/gjson"
 )
 
 type goalResumeKind string
@@ -60,7 +63,7 @@ func goalIdentityAliases(ctx context.Context) []storage.GoalAlias {
 }
 
 func withGoalOriginalBody(ctx context.Context, body []byte) context.Context {
-	return context.WithValue(ctx, goalOriginalBodyKey{}, append([]byte(nil), body...))
+	return context.WithValue(ctx, goalOriginalBodyKey{}, body)
 }
 
 func goalOriginalBody(ctx context.Context, fallback []byte) []byte {
@@ -123,13 +126,57 @@ func (s *Server) goalCompressionConcurrency(ctx context.Context) int {
 	return limit
 }
 
-const goalCompactionForegroundBudget = 540 * time.Second
+const (
+	goalCompactionForegroundBudget = 540 * time.Second
+	goalCompactionQueueDepth       = 4096
+)
 
-// scheduleGoalCompaction starts a bounded, lease-protected local checkpoint job after
-// a terminal turn.  It never blocks the client response and never runs two jobs for
-// the same active goal; a saturated global limit leaves the committed segment chain
-// intact for a later resume/turn to pick up.
+func (s *Server) startGoalCompactionWorkers() {
+	if s == nil || s.store == nil {
+		return
+	}
+	workers := s.goalCompressionConcurrency(context.Background())
+	if workers > 32 {
+		workers = 32
+	}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	s.goalCompactionMu.Lock()
+	s.goalCompactionCtx = workerCtx
+	s.goalCompactionCancel = cancel
+	s.goalCompactionQueue = make(chan string, goalCompactionQueueDepth)
+	s.goalCompactionQueued = make(map[string]bool)
+	queue := s.goalCompactionQueue
+	s.goalCompactionMu.Unlock()
+	for i := 0; i < workers; i++ {
+		s.asyncWG.Add(1)
+		supervisor.GoOnce("goal-compaction-worker", func() {
+			defer s.asyncWG.Done()
+			s.goalCompactionWorker(workerCtx, queue)
+		})
+	}
+}
+
+func (s *Server) stopGoalCompactionWorkers() {
+	s.goalCompactionMu.Lock()
+	cancel := s.goalCompactionCancel
+	s.goalCompactionCancel = nil
+	s.goalCompactionCtx = nil
+	s.goalCompactionQueued = nil
+	s.goalCompactionMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	s.goalCompactionTimers.Wait()
+}
+
+// scheduleGoalCompaction enqueues one deduplicated goal. Each dequeue compacts at
+// most one chunk and requeues unfinished work at the FIFO tail, so a large history
+// cannot monopolize the worker while other goals are waiting.
 func (s *Server) scheduleGoalCompaction(ctx context.Context, goalID string) {
+	goalID = strings.TrimSpace(goalID)
+	if goalID == "" || s.store == nil {
+		return
+	}
 	stages := s.goalCompressionStages(ctx)
 	if stages <= 0 {
 		return
@@ -142,84 +189,100 @@ func (s *Server) scheduleGoalCompaction(ctx context.Context, goalID string) {
 	if err != nil || !needed {
 		return
 	}
-	limit := s.goalCompressionConcurrency(ctx)
 	s.goalCompactionMu.Lock()
-	if s.goalCompactionActive >= limit {
+	workerCtx, queue := s.goalCompactionCtx, s.goalCompactionQueue
+	if workerCtx == nil || workerCtx.Err() != nil || s.goalCompactionQueued[goalID] {
 		s.goalCompactionMu.Unlock()
-		_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_pending", State: "retryable", Reason: "global_concurrency", Detail: "goal=" + goalID})
 		return
 	}
-	s.goalCompactionActive++
+	s.goalCompactionQueued[goalID] = true
 	s.goalCompactionMu.Unlock()
-	ratio := s.goalCompressionChunkRatio(ctx)
-	supervisor.GoOnce("goal-compaction", func() {
-		defer func() {
-			s.goalCompactionMu.Lock()
-			s.goalCompactionActive--
-			s.goalCompactionMu.Unlock()
-		}()
-		jobCtx, cancel := context.WithTimeout(context.Background(), goalCompactionForegroundBudget)
-		defer cancel()
-		var finish func(string, string)
-		for {
-			var leaseErr error
-			finish, leaseErr = s.beginGoalRunWithResult(jobCtx, goalID, "compacting")
-			if leaseErr == nil {
-				break
-			}
-			if !errors.Is(leaseErr, storage.ErrGoalInProgress) {
-				_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_failed", State: "retryable", Reason: "lease", Detail: "goal=" + goalID})
-				return
-			}
-			select {
-			case <-jobCtx.Done():
-				_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_pending", State: "retryable", Reason: "lease_wait_budget", Detail: "goal=" + goalID})
-				return
-			case <-time.After(25 * time.Millisecond):
-			}
-		}
-		finishState, finishCode := "completed", ""
-		defer func() { finish(finishState, finishCode) }()
-		if err := s.store.SetGoalCompactionState(jobCtx, goalID, "compacting"); err != nil {
-			finishState, finishCode = "retryable", "goal_compaction_failed"
-			_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_failed", State: "retryable", Reason: "state", Detail: "goal=" + goalID})
+	select {
+	case queue <- goalID:
+	case <-workerCtx.Done():
+		s.finishGoalCompactionQueueItem(goalID)
+	default:
+		s.finishGoalCompactionQueueItem(goalID)
+		_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_pending", State: "retryable", Reason: "queue_full", Detail: "goal=" + goalID})
+	}
+}
+
+func (s *Server) finishGoalCompactionQueueItem(goalID string) {
+	s.goalCompactionMu.Lock()
+	if s.goalCompactionQueued != nil {
+		delete(s.goalCompactionQueued, goalID)
+	}
+	s.goalCompactionMu.Unlock()
+}
+
+func (s *Server) goalCompactionWorker(ctx context.Context, queue <-chan string) {
+	for {
+		select {
+		case <-ctx.Done():
 			return
-		}
-		completed := false
-		defer func() {
-			if completed {
-				_ = s.store.SetGoalCompactionState(context.Background(), goalID, "ready")
-			} else {
-				_ = s.store.SetGoalCompactionState(context.Background(), goalID, "retryable")
-				finishState = "retryable"
-				if finishCode == "" {
-					finishCode = "goal_compaction_pending"
-				}
-			}
-		}()
-		for {
-			if err := jobCtx.Err(); err != nil {
-				finishCode = "goal_compaction_pending"
-				_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_pending", State: "retryable", Reason: "foreground_budget", Detail: "goal=" + goalID})
-				return
-			}
-			needed, err := s.store.NeedsGoalCompaction(jobCtx, goalID, stages)
-			if err != nil {
-				finishCode = "goal_compaction_failed"
-				_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_failed", State: "retryable", Reason: "threshold", Detail: "goal=" + goalID})
-				return
-			}
-			if !needed {
-				completed = true
-				return
-			}
-			if err := s.store.CompactGoalSegmentsWithRatio(jobCtx, goalID, stages, ratio); err != nil {
-				finishCode = "goal_compaction_failed"
-				_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_failed", State: "retryable", Reason: "checkpoint", Detail: "goal=" + goalID})
-				return
+		case goalID := <-queue:
+			requeue, delay := s.compactOneGoalChunk(ctx, goalID)
+			s.finishGoalCompactionQueueItem(goalID)
+			if requeue && ctx.Err() == nil {
+				s.requeueGoalCompaction(ctx, goalID, delay)
 			}
 		}
+	}
+}
+
+func (s *Server) requeueGoalCompaction(ctx context.Context, goalID string, delay time.Duration) {
+	s.goalCompactionMu.Lock()
+	if s.goalCompactionCtx != ctx || ctx.Err() != nil {
+		s.goalCompactionMu.Unlock()
+		return
+	}
+	s.goalCompactionTimers.Add(1)
+	s.goalCompactionMu.Unlock()
+	supervisor.GoOnce("goal-compaction-requeue", func() {
+		defer s.goalCompactionTimers.Done()
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
+		s.scheduleGoalCompaction(ctx, goalID)
 	})
+}
+
+func (s *Server) compactOneGoalChunk(parent context.Context, goalID string) (bool, time.Duration) {
+	jobCtx, cancel := context.WithTimeout(parent, goalCompactionForegroundBudget)
+	defer cancel()
+	finish, err := s.beginGoalRunWithResult(jobCtx, goalID, "compacting")
+	if err != nil {
+		if errors.Is(err, storage.ErrGoalInProgress) {
+			return true, 25 * time.Millisecond
+		}
+		_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_failed", State: "retryable", Reason: "lease", Detail: "goal=" + goalID})
+		return true, time.Second
+	}
+	finishState, finishCode := "completed", ""
+	defer func() { finish(finishState, finishCode) }()
+	if err = s.store.SetGoalCompactionState(jobCtx, goalID, "compacting"); err != nil {
+		finishState, finishCode = "retryable", "goal_compaction_failed"
+		return true, time.Second
+	}
+	stages := s.goalCompressionStages(jobCtx)
+	if err = s.store.CompactGoalSegmentsWithRatio(jobCtx, goalID, stages, s.goalCompressionChunkRatio(jobCtx)); err != nil {
+		finishState, finishCode = "retryable", "goal_compaction_failed"
+		_ = s.store.SetGoalCompactionState(context.Background(), goalID, "retryable")
+		_ = s.store.InsertAuditLog(context.Background(), storage.AuditLogRow{Action: "goal_compaction_failed", State: "retryable", Reason: "checkpoint", Detail: "goal=" + goalID})
+		return true, time.Second
+	}
+	_ = s.store.SetGoalCompactionState(context.Background(), goalID, "ready")
+	needed, err := s.store.NeedsGoalCompaction(jobCtx, goalID, stages)
+	if err != nil {
+		return true, time.Second
+	}
+	return needed, 0
 }
 
 func (s *Server) goalLeaseDuration(ctx context.Context) time.Duration {
@@ -306,6 +369,10 @@ func (s *Server) beginGoalRunWithResult(ctx context.Context, goalID, phase strin
 // goalAliases implements the documented identity order.  Values live only for the
 // duration of this request and are converted to hashes inside storage.
 func goalAliases(r *http.Request, body []byte, protocol string) []storage.GoalAlias {
+	return goalAliasesWithMeta(r, body, protocol, nil)
+}
+
+func goalAliasesWithMeta(r *http.Request, body []byte, protocol string, meta *bodysource.BodyMeta) []storage.GoalAlias {
 	aliases := make([]storage.GoalAlias, 0, 10)
 	add := func(kind, value string) {
 		value = strings.TrimSpace(value)
@@ -329,17 +396,37 @@ func goalAliases(r *http.Request, body []byte, protocol string) []storage.GoalAl
 		add("claude_code_session", r.Header.Get("x-claude-code-session-id"))
 		add("codex_turn_state", r.Header.Get("x-codex-turn-state"))
 	}
-	add("response_id", jsonStringField(body, "previous_response_id"))
+	field := func(key string) string {
+		if meta == nil || meta.Size != int64(len(body)) {
+			return jsonStringField(body, key)
+		}
+		switch key {
+		case "previous_response_id":
+			return strings.TrimSpace(meta.PreviousResponseID)
+		case "conversation_id":
+			return strings.TrimSpace(meta.ConversationID)
+		case "session_id":
+			return strings.TrimSpace(meta.SessionID)
+		case "thread_id":
+			return strings.TrimSpace(meta.ThreadID)
+		}
+		var value string
+		if raw := meta.Scalars[key]; len(raw) > 0 && json.Unmarshal(raw, &value) == nil {
+			return strings.TrimSpace(value)
+		}
+		return ""
+	}
+	add("response_id", field("previous_response_id"))
 	// Some Codex transports put the same state token in a JSON field.  Hashing it
 	// under the same kind preserves compatibility without writing the opaque token.
-	add("codex_turn_state", jsonStringField(body, "turn_state"))
+	add("codex_turn_state", field("turn_state"))
 	if protocol == "claude" {
-		add("claude_session", jsonStringField(body, "session_id"))
+		add("claude_session", field("session_id"))
 	}
 	// These are real client conversation identifiers, not cache-derived correlators.
-	add("conversation_id", jsonStringField(body, "conversation_id"))
-	add("thread_id", jsonStringField(body, "thread_id"))
-	add("session_id", jsonStringField(body, "session_id"))
+	add("conversation_id", field("conversation_id"))
+	add("thread_id", field("thread_id"))
+	add("session_id", field("session_id"))
 	return aliases
 }
 
@@ -445,22 +532,19 @@ func goalPersistentAliases(aliases []storage.GoalAlias) []storage.GoalAlias {
 }
 
 func jsonStringField(raw []byte, key string) string {
-	var root map[string]interface{}
-	if json.Unmarshal(raw, &root) != nil {
+	value := gjson.GetBytes(raw, key)
+	if value.Type != gjson.String {
 		return ""
 	}
-	value, _ := root[key].(string)
-	return strings.TrimSpace(value)
+	return strings.TrimSpace(value.String())
 }
 
 func nestedJSONStringField(raw []byte, parent, key string) string {
-	var root map[string]interface{}
-	if json.Unmarshal(raw, &root) != nil {
+	value := gjson.GetBytes(raw, parent+"."+key)
+	if value.Type != gjson.String {
 		return ""
 	}
-	child, _ := root[parent].(map[string]interface{})
-	value, _ := child[key].(string)
-	return strings.TrimSpace(value)
+	return strings.TrimSpace(value.String())
 }
 
 func goalWorkspaceFingerprint(r *http.Request, body []byte) string {
@@ -522,10 +606,15 @@ func goalInitialFingerprint(body []byte) string {
 }
 
 func bodyHasClientToolResult(body []byte) bool {
-	lower := strings.ToLower(string(body))
-	return strings.Contains(lower, `"function_call_output"`) || strings.Contains(lower, `"local_shell_call_output"`) ||
-		strings.Contains(lower, `"mcp_tool_call_output"`) || strings.Contains(lower, `"custom_tool_call_output"`) ||
-		strings.Contains(lower, `"tool_search_output"`) || strings.Contains(lower, `"tool_result"`) || strings.Contains(lower, `"tool_use_result"`)
+	for _, marker := range [][]byte{
+		[]byte(`"function_call_output"`), []byte(`"local_shell_call_output"`), []byte(`"mcp_tool_call_output"`),
+		[]byte(`"custom_tool_call_output"`), []byte(`"tool_search_output"`), []byte(`"tool_result"`), []byte(`"tool_use_result"`),
+	} {
+		if bytes.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func outputAwaitingTool(response map[string]interface{}) bool {
@@ -655,35 +744,41 @@ func incrementalGoalRequest(currentBody, durableReplay []byte) []byte {
 }
 
 // goalResponseFromSSE retains a protocol stream as encrypted structured segment data
-// without pretending its provider-specific events are Responses output.  Only a small
-// capture is used by the Claude path; unknown content and attachments remain verbatim
-// JSON event payloads instead of being flattened to text.
+// without pretending its provider-specific events are Responses output.
 func goalResponseFromSSE(raw []byte) []byte {
+	return goalResponseFromSSEParts(raw)
+}
+
+// goalResponseFromSSEParts parses independently captured initial and continuation
+// streams without concatenating their potentially large raw byte ranges in memory.
+func goalResponseFromSSEParts(parts ...[]byte) []byte {
 	frames := make([]interface{}, 0)
 	messageID := ""
-	for _, frame := range strings.Split(string(raw), "\n\n") {
-		var dataLines []string
-		for _, line := range strings.Split(frame, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "data:") {
-				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+	for _, raw := range parts {
+		for _, frame := range bytes.Split(raw, []byte("\n\n")) {
+			var dataLines [][]byte
+			for _, line := range bytes.Split(frame, []byte("\n")) {
+				line = bytes.TrimSpace(line)
+				if bytes.HasPrefix(line, []byte("data:")) {
+					dataLines = append(dataLines, bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:"))))
+				}
 			}
-		}
-		if len(dataLines) == 0 {
-			continue
-		}
-		var event map[string]interface{}
-		if json.Unmarshal([]byte(strings.Join(dataLines, "\n")), &event) != nil {
-			continue
-		}
-		if message, ok := event["message"].(map[string]interface{}); ok {
-			if id, _ := message["id"].(string); strings.TrimSpace(id) != "" {
-				// A stitched continuation has a new upstream message id; bind the
-				// durable alias to the final completed response, not the truncated one.
-				messageID = id
+			if len(dataLines) == 0 {
+				continue
 			}
+			var event map[string]interface{}
+			if json.Unmarshal(bytes.Join(dataLines, []byte("\n")), &event) != nil {
+				continue
+			}
+			if message, ok := event["message"].(map[string]interface{}); ok {
+				if id, _ := message["id"].(string); strings.TrimSpace(id) != "" {
+					// A stitched continuation has a new upstream message id; bind the
+					// durable alias to the final completed response, not the truncated one.
+					messageID = id
+				}
+			}
+			frames = append(frames, event)
 		}
-		frames = append(frames, event)
 	}
 	if len(frames) == 0 {
 		return nil
@@ -781,7 +876,10 @@ func mergedCodexContinuationResponse(first, continuation *codexStreamLedgerRecor
 		continuationOutput = continuation.partialItems()
 	}
 	response["output"] = append(output, continuationOutput...)
-	text := first.partialText() + firstNonEmpty(streamString(response["output_text"]), continuation.partialText())
+	text, appendErr := appendBoundedStreamText(first.partialText(), firstNonEmpty(streamString(response["output_text"]), continuation.partialText()), defaultStreamAccumulatorMaxBytes)
+	if appendErr != nil {
+		return nil
+	}
 	if strings.TrimSpace(text) != "" {
 		response["output_text"] = text
 	}
