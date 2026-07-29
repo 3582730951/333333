@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -35,8 +36,12 @@ func handleStartBackground(configPath string) int {
 		return 1
 	}
 	if gatewayTCPReachable(cfg.ListenAddr) {
-		fmt.Println("✓ Gateway already running:", cfg.ListenAddr)
-		return 0
+		if managedGatewayOwnsListener(configPath, cfg.ListenAddr) {
+			fmt.Println("✓ Gateway already running:", cfg.ListenAddr)
+			return 0
+		}
+		fmt.Printf("Gateway listen address %s is occupied by an unmanaged process; refusing to reuse it\n", cfg.ListenAddr)
+		return 1
 	}
 
 	dir := filepath.Dir(configPath)
@@ -165,6 +170,30 @@ func gatewayTCPReachable(addr string) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+func managedGatewayOwnsListener(configPath, addr string) bool {
+	pid, ok := readGatewayPID(configPath)
+	if !ok || !processAlive(pid) {
+		return false
+	}
+	if runtime.GOOS == "linux" && !processLooksLikeGateway(pid) {
+		return false
+	}
+
+	// When the platform exposes listener ownership, require the pidfile process
+	// to own this exact socket. On platforms without /proc/lsof/fuser, the live
+	// managed pidfile plus the successful TCP probe remains the portable check.
+	listeners := listenerPIDs(addr)
+	if len(listeners) == 0 {
+		return true
+	}
+	for _, listenerPID := range listeners {
+		if listenerPID == pid {
+			return true
+		}
+	}
+	return false
 }
 
 func listenerPIDs(addr string) []int {

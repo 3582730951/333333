@@ -483,7 +483,6 @@ func buildCodexWebSocketCreatePayload(body []byte, ids codexWebSocketIDs) ([]byt
 		value interface{}
 	}{
 		{"tool_choice", "auto"},
-		{"parallel_tool_calls", false},
 		{"store", false},
 		{"include", []interface{}{}},
 	} {
@@ -494,6 +493,21 @@ func buildCodexWebSocketCreatePayload(body []byte, ids codexWebSocketIDs) ([]byt
 	if ids.responsesLite {
 		if err := set("parallel_tool_calls", false); err != nil {
 			return nil, err
+		}
+	} else {
+		toolsEmpty, toolsKnown := codexRawToolsEmpty(fields["tools"])
+		if toolsKnown && toolsEmpty {
+			if _, present := fields["parallel_tool_calls"]; present {
+				var err error
+				payload, err = sjson.DeleteBytes(payload, "parallel_tool_calls")
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else if _, present := fields["parallel_tool_calls"]; !present {
+			if err := set("parallel_tool_calls", false); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return applyCodexClientMetadata(payload, ids, true), nil

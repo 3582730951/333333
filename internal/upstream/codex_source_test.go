@@ -185,6 +185,58 @@ func TestCodexSourceHTTPStripsGenerateAfterClassifyingPrewarm(t *testing.T) {
 	}
 }
 
+func TestCodexSourceClassicParallelToolCallsRequireTools(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		tools       string
+		wantPresent bool
+		wantValue   bool
+	}{
+		{name: "tools missing"},
+		{name: "tools null", tools: `,"tools":null`},
+		{name: "tools empty", tools: `,"tools":[]`},
+		{name: "Claude Code tool present", tools: `,"tools":[{"type":"function","name":"Bash","parameters":{"type":"object"}}]`, wantPresent: true, wantValue: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"model":"gpt-5.5","instructions":"keep","store":false,"parallel_tool_calls":true` + tc.tools + `,"input":[{"role":"user","content":"keep","exact":900719925474099312345}]}`)
+			source := bodysource.Bytes(raw)
+			meta, err := bodysource.ScanJSON(context.Background(), source, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := Request{
+				DownstreamPath: "/v1/responses",
+				Body:           source,
+				BodyMeta:       &meta,
+				Account:        storage.Account{ID: "source-parallel"},
+				Token:          storage.AccountToken{AccessToken: "sk-api-key"},
+			}
+			normalized, err := normalizeCodexSource(NewClient(config.Default()), &spec, "https://api.openai.com/v1", false)
+			if err != nil || !normalized {
+				t.Fatalf("normalize=%v err=%v", normalized, err)
+			}
+			got, err := bodysource.ReadAll(spec.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]json.RawMessage
+			if err = json.Unmarshal(got, &payload); err != nil {
+				t.Fatal(err)
+			}
+			value, present := payload["parallel_tool_calls"]
+			if present != tc.wantPresent {
+				t.Fatalf("parallel_tool_calls present=%v, want %v: %s", present, tc.wantPresent, got)
+			}
+			if present && string(value) != "true" {
+				t.Fatalf("parallel_tool_calls=%s, want true: %s", value, got)
+			}
+			if !bytes.Contains(got, []byte(`900719925474099312345`)) {
+				t.Fatalf("large context integer changed: %s", got)
+			}
+		})
+	}
+}
+
 func legacyCodexNormalizedBody(client *Client, spec Request, upstreamBaseURL string, compact bool) ([]byte, error) {
 	raw, err := bodysource.ReadAll(spec.Body)
 	if err != nil {

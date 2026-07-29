@@ -256,8 +256,11 @@ func TestCodexResponsesWebSocketStreamsBodySourceWithoutMaterializing(t *testing
 	if err = json.Unmarshal(payload["input"], &input); err != nil || input != largeInput {
 		t.Fatalf("large input changed: len=%d err=%v", len(input), err)
 	}
-	if string(payload["type"]) != `"response.create"` || string(payload["stream"]) != "true" || string(payload["tools"]) != "[]" || string(payload["tool_choice"]) != `"auto"` || string(payload["parallel_tool_calls"]) != "false" || string(payload["include"]) != "[]" {
+	if string(payload["type"]) != `"response.create"` || string(payload["stream"]) != "true" || string(payload["tools"]) != "[]" || string(payload["tool_choice"]) != `"auto"` || string(payload["include"]) != "[]" {
 		t.Fatalf("source websocket defaults missing: %s", payload)
+	}
+	if _, present := payload["parallel_tool_calls"]; present {
+		t.Fatalf("source websocket leaked orphan parallel_tool_calls: %s", payload["parallel_tool_calls"])
 	}
 	var clientMetadata map[string]json.RawMessage
 	if err = json.Unmarshal(payload["client_metadata"], &clientMetadata); err != nil || len(clientMetadata[codexWSRequestStartMetadata]) == 0 {
@@ -299,6 +302,24 @@ func TestCodexWebSocketClassicResponsesStillDefaultsTools(t *testing.T) {
 	tools, present := root["tools"].([]interface{})
 	if !present || len(tools) != 0 {
 		t.Fatalf("classic Responses must retain the tools:[] default: %+v", root)
+	}
+	if _, present := root["parallel_tool_calls"]; present {
+		t.Fatalf("classic no-tool frame must omit parallel_tool_calls: %+v", root)
+	}
+}
+
+func TestCodexWebSocketClassicPreservesParallelToolCallsWithTools(t *testing.T) {
+	payload, err := buildCodexWebSocketCreatePayload([]byte(`{"model":"gpt-5.5","tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}],"parallel_tool_calls":true,"input":"hi"}`), codexWebSocketIDs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(payload, &root); err != nil {
+		t.Fatal(err)
+	}
+	tools, _ := root["tools"].([]interface{})
+	if len(tools) != 1 || root["parallel_tool_calls"] != true {
+		t.Fatalf("classic tool frame lost tools/parallel capability: %+v", root)
 	}
 }
 

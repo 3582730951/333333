@@ -91,6 +91,187 @@ func TestAnthropicRequestToResponsesNativeClaudeCodeShape(t *testing.T) {
 	}
 }
 
+func TestAnthropicRequestToResponsesPreservesClaudeCodeToolMatrix(t *testing.T) {
+	names := []string{
+		"Read", "Bash", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
+		"WebFetch", "WebSearch", "AskUserQuestion", "Agent", "Skill",
+		"mcp__workspace__lookup",
+	}
+	tools := make([]interface{}, 0, len(names))
+	for index, name := range names {
+		tools = append(tools, map[string]interface{}{
+			"name":        name,
+			"description": "Claude Code tool " + name,
+			"input_schema": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"sentinel": map[string]interface{}{"type": "integer", "const": json.Number("900719925474099312345")},
+					"index":    map[string]interface{}{"type": "integer", "const": index},
+				},
+				"required": []interface{}{"sentinel"},
+			},
+		})
+	}
+	raw, err := json.Marshal(map[string]interface{}{
+		"model":    "gpt-5.6-sol",
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "use installed tools and skills"}},
+		"tools":    tools,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	converted, err := AnthropicRequestToResponses(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	gotTools, _ := root["tools"].([]interface{})
+	if len(gotTools) != len(names) {
+		t.Fatalf("Claude Code tool count=%d want=%d: %s", len(gotTools), len(names), converted.Body)
+	}
+	for index, name := range names {
+		tool := gotTools[index].(map[string]interface{})
+		if tool["name"] != name || tool["type"] != "function" {
+			t.Fatalf("tool[%d] identity changed: %v", index, tool)
+		}
+		parameters := tool["parameters"].(map[string]interface{})
+		properties := parameters["properties"].(map[string]interface{})
+		if properties["sentinel"] == nil {
+			t.Fatalf("tool[%d] schema precision changed: %v", index, parameters)
+		}
+	}
+	if !strings.Contains(string(converted.Body), "900719925474099312345") {
+		t.Fatalf("tool schema integer was rounded: %s", converted.Body)
+	}
+	if root["parallel_tool_calls"] != true {
+		t.Fatalf("parallel Claude Code tools were disabled: %s", converted.Body)
+	}
+}
+
+func TestAnthropicRequestToResponsesMapsTypedWebSearchChoice(t *testing.T) {
+	raw := []byte(`{
+	  "model":"gpt-5.6-sol",
+	  "messages":[{"role":"user","content":"search"}],
+	  "tools":[
+	    {"type":"web_search_20260318","name":"browser_search","allowed_domains":["example.com"],"blocked_domains":["blocked.example"],"max_uses":4,"allowed_callers":["direct"],"response_inclusion":"full","user_location":{"type":"approximate","city":"Beijing","country":"CN"}},
+	    {"name":"web_search","description":"local function","input_schema":{"type":"object","properties":{}}}
+	  ],
+	  "tool_choice":{"type":"tool","name":"browser_search"}
+	}`)
+	converted, err := AnthropicRequestToResponses(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := mustUnmarshal(t, converted.Body)
+	tools := root["tools"].([]interface{})
+	web := tools[0].(map[string]interface{})
+	if web["type"] != "web_search" || web["blocked_domains"] != nil {
+		t.Fatalf("typed web search mapping invalid: %v", web)
+	}
+	for _, unsupported := range []string{"max_uses", "blocked_domains", "allowed_callers", "response_inclusion"} {
+		if _, leaked := web[unsupported]; leaked {
+			t.Fatalf("Claude-only web search field %q leaked to strict Codex: %v", unsupported, web)
+		}
+	}
+	filters := web["filters"].(map[string]interface{})
+	if filters["allowed_domains"].([]interface{})[0] != "example.com" {
+		t.Fatalf("web search domains missing: %v", web)
+	}
+	if root["tool_choice"].(map[string]interface{})["type"] != "web_search" {
+		t.Fatalf("typed web search choice was mislabeled as a function: %s", converted.Body)
+	}
+
+	raw = []byte(`{
+	  "model":"gpt-5.6-sol",
+	  "messages":[{"role":"user","content":"search"}],
+	  "tools":[
+	    {"type":"web_search_20250305","name":"browser_search"},
+	    {"name":"web_search","input_schema":{"type":"object","properties":{}}}
+	  ],
+	  "tool_choice":{"type":"tool","name":"web_search"}
+	}`)
+	converted, err = AnthropicRequestToResponses(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	choice := mustUnmarshal(t, converted.Body)["tool_choice"].(map[string]interface{})
+	if choice["type"] != "function" || choice["name"] != "web_search" {
+		t.Fatalf("same-named local function choice changed: %s", converted.Body)
+	}
+}
+
+func TestResponsesToAnthropicResponseWebSearchRoundTrip(t *testing.T) {
+	responses := []byte(`{
+	  "id":"resp_web","model":"gpt-5.6-sol","status":"completed",
+	  "output":[
+	    {"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"open_page"}},
+	    {"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","query":"current weather"},"results":[{"title":"Forecast","url":"https://example.com/weather","page_age":"today","encrypted_content":"opaque-search-state"}]},
+	    {"type":"message","content":[{"type":"output_text","text":"It is sunny."}]}
+	  ],
+	  "usage":{"input_tokens":5,"output_tokens":3}
+	}`)
+	anthropic, err := ResponsesToAnthropicResponse(responses, "gpt-5.6-sol", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := mustUnmarshal(t, anthropic)
+	content := message["content"].([]interface{})
+	if len(content) != 3 ||
+		content[0].(map[string]interface{})["type"] != "server_tool_use" ||
+		content[1].(map[string]interface{})["type"] != "web_search_tool_result" ||
+		content[2].(map[string]interface{})["type"] != "text" {
+		t.Fatalf("web search response blocks missing or misordered: %s", anthropic)
+	}
+	serverUse := content[0].(map[string]interface{})
+	wantToolUseID := ResponsesWebSearchToolUseID("ws_123")
+	if serverUse["id"] != wantToolUseID || serverUse["input"].(map[string]interface{})["query"] != "current weather" {
+		t.Fatalf("web search server_tool_use damaged: %v", serverUse)
+	}
+	result := content[1].(map[string]interface{})
+	results := result["content"].([]interface{})
+	if result["tool_use_id"] != wantToolUseID || len(results) != 1 ||
+		results[0].(map[string]interface{})["url"] != "https://example.com/weather" ||
+		results[0].(map[string]interface{})["encrypted_content"] != "opaque-search-state" {
+		t.Fatalf("web search result damaged: %v", result)
+	}
+	if message["stop_reason"] != "end_turn" {
+		t.Fatalf("server web search incorrectly requested a client tool result: %s", anthropic)
+	}
+	serverUsage := message["usage"].(map[string]interface{})["server_tool_use"].(map[string]interface{})
+	if serverUsage["web_search_requests"] != float64(1) {
+		t.Fatalf("web search server usage missing: %s", anthropic)
+	}
+
+	nextRaw, err := json.Marshal(map[string]interface{}{
+		"model": "gpt-5.6-sol",
+		"tools": []interface{}{
+			map[string]interface{}{"type": "web_search_20260209", "name": "web_search"},
+		},
+		"messages": []interface{}{
+			map[string]interface{}{"role": "assistant", "content": content},
+			map[string]interface{}{"role": "user", "content": "continue"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := AnthropicRequestToResponses(nextRaw)
+	if err != nil {
+		t.Fatalf("replay of Claude web search blocks failed: %v", err)
+	}
+	input := mustUnmarshal(t, next.Body)["input"].([]interface{})
+	if len(input) < 3 || input[0].(map[string]interface{})["type"] != "web_search_call" {
+		t.Fatalf("web search history was not replayed to Responses: %v", input)
+	}
+	if input[0].(map[string]interface{})["id"] != "ws_123" {
+		t.Fatalf("web search replay did not recover Codex ID: %v", input[0])
+	}
+	action := input[0].(map[string]interface{})["action"].(map[string]interface{})
+	if action["query"] != "current weather" {
+		t.Fatalf("web search replay lost query: %v", input[0])
+	}
+}
+
 func TestAnthropicRequestToResponsesMakesBuiltInAgentInheritCodexModel(t *testing.T) {
 	in := []byte(`{
 	  "model":"gpt-5.6-sol",

@@ -145,6 +145,73 @@ func TestNormalizeCodexResponsesBody(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodexClassicParallelToolCallsRequireTools(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		wantPresent  bool
+		wantParallel bool
+		byteExact    bool
+	}{
+		{
+			name: "missing tools drops orphan option",
+			body: `{"model":"gpt-5.5","instructions":"keep","store":false,"parallel_tool_calls":true,"input":"hi"}`,
+		},
+		{
+			name: "null tools drops orphan option",
+			body: `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":null,"parallel_tool_calls":false,"input":"hi"}`,
+		},
+		{
+			name: "empty tools drops orphan option",
+			body: `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[],"parallel_tool_calls":true,"input":"hi"}`,
+		},
+		{
+			name:         "function tool preserves parallel true",
+			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}],"parallel_tool_calls":true,"input":"hi"}`,
+			wantPresent:  true,
+			wantParallel: true,
+			byteExact:    true,
+		},
+		{
+			name:         "official tool preserves explicit false",
+			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":[{"type":"web_search"}],"parallel_tool_calls":false,"input":"hi"}`,
+			wantPresent:  true,
+			wantParallel: false,
+			byteExact:    true,
+		},
+		{
+			name:         "unknown future tools shape passes through",
+			body:         `{"model":"gpt-5.5","instructions":"keep","store":false,"tools":{"future":true},"parallel_tool_calls":true,"input":"hi"}`,
+			wantPresent:  true,
+			wantParallel: true,
+			byteExact:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := []byte(tt.body)
+			got := normalizeCodexResponsesBody(raw, whamBaseURL, false)
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(got, &payload); err != nil {
+				t.Fatal(err)
+			}
+			parallel, present := payload["parallel_tool_calls"]
+			if present != tt.wantPresent {
+				t.Fatalf("parallel_tool_calls present=%v, want %v: %s", present, tt.wantPresent, got)
+			}
+			if present {
+				var value bool
+				if err := json.Unmarshal(parallel, &value); err != nil || value != tt.wantParallel {
+					t.Fatalf("parallel_tool_calls=%s err=%v, want %v", parallel, err, tt.wantParallel)
+				}
+			}
+			if tt.byteExact && !bytes.Equal(got, raw) {
+				t.Fatalf("valid tool request changed:\nwant %s\n got %s", raw, got)
+			}
+		})
+	}
+}
+
 func TestNormalizeCodexResponsesLitePreservesReasoningFields(t *testing.T) {
 	input := []byte(`{"model":"gpt-5.6-sol","store":false,"parallel_tool_calls":false,"reasoning":{"effort":"xhigh","summary":"auto","context":"current_turn"},"input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"user","content":[{"type":"input_text","text":"keep exact context"}]}]}`)
 	got := normalizeCodexResponsesBody(input, whamBaseURL, true)

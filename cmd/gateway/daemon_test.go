@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -58,6 +60,62 @@ func TestListenerPIDsFindsProcessWithoutPIDFile(t *testing.T) {
 		}
 	}
 	t.Fatalf("listenerPIDs(%q) = %v, want current pid %d", ln.Addr().String(), pids, os.Getpid())
+}
+
+func TestStartBackgroundRejectsReachableUnmanagedListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	cfg := DefaultConfig()
+	cfg.ListenAddr = ln.Addr().String()
+	cfg.DownstreamKey = "cap_test"
+	cfg.MITM.CACert = filepath.Join(dir, "ca.pem")
+	cfg.MITM.CAKey = filepath.Join(dir, "ca-key.pem")
+	if err := SaveConfig(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := handleStartBackground(configPath); code == 0 {
+		t.Fatal("foreign listener was incorrectly accepted as an existing gateway")
+	}
+	if _, err := os.Stat(gatewayPIDPath(configPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign listener unexpectedly created pidfile: %v", err)
+	}
+}
+
+func TestStartBackgroundAcceptsManagedPIDThatOwnsListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	cfg := DefaultConfig()
+	cfg.ListenAddr = ln.Addr().String()
+	cfg.DownstreamKey = "cap_test"
+	cfg.MITM.CACert = filepath.Join(dir, "ca.pem")
+	cfg.MITM.CAKey = filepath.Join(dir, "ca-key.pem")
+	if err := SaveConfig(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		gatewayPIDPath(configPath),
+		[]byte(strconv.Itoa(os.Getpid())+"\n"),
+		gatewayConfigFileMode,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := handleStartBackground(configPath); code != 0 {
+		t.Fatalf("managed listener returned code %d", code)
+	}
 }
 
 func TestGatewayWindowsDownloadBinaryBuilds(t *testing.T) {

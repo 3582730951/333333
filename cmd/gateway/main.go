@@ -242,9 +242,9 @@ func main() {
 	case "run-claude":
 		os.Exit(handleRunClaude(defaultConfigPath))
 	case "trust-ca":
-		handleTrustCA(defaultConfigPath)
+		os.Exit(handleTrustCA(defaultConfigPath))
 	case "install-wrapper":
-		handleInstallWrapper()
+		handleInstallWrapper(defaultConfigPath)
 	case "uninstall":
 		handleUninstall()
 	case "quick-install":
@@ -478,32 +478,51 @@ func yesNo(ok bool) string {
 	return "no"
 }
 
-func handleTrustCA(configPath string) {
+func handleTrustCA(configPath string) int {
 	printCommands := flag.Bool("print-commands", false, "Print manual commands")
 	flag.CommandLine.Parse(os.Args[2:])
 
+	return performTrustCA(configPath, *printCommands, TrustCA)
+}
+
+func performTrustCA(configPath string, printCommands bool, trust func(string) error) int {
 	cfg, err := LoadConfig(configPath)
 	if err != nil {
-		log.Fatalf("Load config failed: %v", err)
+		fmt.Printf("Load config failed: %v\n", err)
+		return 1
 	}
 
-	if *printCommands {
+	if printCommands {
 		PrintTrustInstructions(cfg.MITM.CACert)
-		return
+		return 0
 	}
 
 	// 尝试自动信任
 	fmt.Println("尝试自动信任 CA...")
-	if err := TrustCA(cfg.MITM.CACert); err != nil {
+	if trust == nil {
+		fmt.Println("❌ 自动信任失败: trust implementation is nil")
+		return 1
+	}
+	if err := trust(cfg.MITM.CACert); err != nil {
 		fmt.Printf("❌ 自动信任失败: %v\n", err)
 		PrintTrustInstructions(cfg.MITM.CACert)
+		return 1
 	} else {
 		fmt.Println("✓ CA 已信任")
 	}
+	return 0
 }
 
-func handleInstallWrapper() {
-	if err := InstallWrapper(); err != nil {
+func installWrapperFromConfig(configPath string) error {
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	return InstallWrapper(cfg.ListenAddr)
+}
+
+func handleInstallWrapper(configPath string) {
+	if err := installWrapperFromConfig(configPath); err != nil {
 		log.Fatalf("Install wrapper failed: %v", err)
 	}
 	fmt.Println("✓ Wrapper installed. Now run: gateway start-background")
@@ -565,7 +584,7 @@ func handleQuickInstall(configPath string) {
 
 	// 3. 安装包装器
 	fmt.Println("\n[3/4] 安装 claude 命令包装器...")
-	if err := InstallWrapper(); err != nil {
+	if err := InstallWrapper(cfg.ListenAddr); err != nil {
 		log.Fatalf("Install wrapper failed: %v", err)
 	}
 	fmt.Println("  ✓ 包装器已安装")

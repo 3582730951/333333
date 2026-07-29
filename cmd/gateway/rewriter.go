@@ -4,158 +4,314 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 )
 
-// rewriteBody 改写请求体中的本地指纹
+const (
+	claudeAgentSDKIdentityLine = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+	claudeCodeIdentityLine     = "You are Claude Code, Anthropic's official CLI for Claude."
+)
+
+var officialEnvBlockRE = regexp.MustCompile(`(?s)<env>.*?</env>`)
+
+// rewriteBody only rewrites fields that are part of the gateway identity
+// contract. In particular, it deliberately does not run substitutions over the
+// complete request: messages, Skill instructions, tool input/result payloads,
+// paths and encrypted/opaque strings are model or client state and must remain
+// byte-for-byte equivalent after JSON decoding.
 func rewriteBody(body []byte, identity *CachedIdentity) ([]byte, error) {
-	// P0: 精确 JSON 路径替换 (metadata.user_id)
-	body, err := rewriteMetadataUserID(body, identity)
+	if identity == nil || identity.Virtual == nil {
+		return body, nil
+	}
+
+	root, err := decodeRawJSONObject(body)
 	if err != nil {
-		// 如果不是 JSON 或没有 metadata，继续（可能是其他格式）
+		// Let the upstream endpoint produce its normal JSON error. The gateway
+		// must not turn a malformed client request into an identity failure.
+		return body, nil
 	}
 
-	// P1: 文本流式替换（环境变量、主机名、用户名）
-	body = rewriteTextPatterns(body, identity)
+	metadataChanged, err := rewriteRawMetadataUserID(root, identity)
+	if err != nil {
+		return nil, err
+	}
+	systemChanged, err := rewriteRawOfficialSystem(root, identity)
+	if err != nil {
+		return nil, err
+	}
+	if !metadataChanged && !systemChanged {
+		return body, nil
+	}
 
-	// P2: <env> 块替换
-	body = rewriteEnvBlock(body, identity)
-
-	return body, nil
+	return marshalRawJSON(root)
 }
 
-// rewriteMetadataUserID 改写 metadata.user_id
+// rewriteMetadataUserID rewrites only metadata.user_id. It is kept separate for
+// focused callers/tests, while using RawMessage so unrelated numbers and opaque
+// values never make a float64 round trip.
 func rewriteMetadataUserID(body []byte, identity *CachedIdentity) ([]byte, error) {
-	var root map[string]interface{}
-	if err := json.Unmarshal(body, &root); err != nil {
+	if identity == nil || identity.Virtual == nil {
+		return body, nil
+	}
+	root, err := decodeRawJSONObject(body)
+	if err != nil {
 		return body, err
 	}
+	changed, err := rewriteRawMetadataUserID(root, identity)
+	if err != nil || !changed {
+		return body, err
+	}
+	return marshalRawJSON(root)
+}
 
-	// 替换 metadata.user_id
-	if md, ok := root["metadata"].(map[string]interface{}); ok {
-		if _, hasUserID := md["user_id"]; hasUserID {
-			// Claude: user_id 是 JSON 字符串
-			md["user_id"] = fmt.Sprintf(`{"device_id":"%s","account_uuid":"","session_id":"%s"}`,
-				identity.Virtual.UserID, identity.Virtual.SessionID)
+func decodeRawJSONObject(body []byte) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+
+	var root map[string]json.RawMessage
+	if err := decoder.Decode(&root); err != nil {
+		return nil, err
+	}
+	if root == nil {
+		return nil, fmt.Errorf("request body is not a JSON object")
+	}
+
+	// Reject a second JSON value while permitting trailing whitespace.
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("request body contains multiple JSON values")
 		}
+		return nil, err
 	}
+	return root, nil
+}
 
-	// 替换 session_id (Codex)
-	if _, hasSession := root["session_id"]; hasSession {
-		root["session_id"] = identity.Virtual.SessionID
-	}
-	if _, hasThread := root["parent_thread_id"]; hasThread {
-		root["parent_thread_id"] = identity.Virtual.SessionID
-	}
-
+func marshalRawJSON(value interface{}) ([]byte, error) {
 	var out bytes.Buffer
-	enc := json.NewEncoder(&out)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(root); err != nil {
-		return body, err
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
 	}
-	return bytes.TrimSpace(out.Bytes()), nil
+	return bytes.TrimSuffix(out.Bytes(), []byte{'\n'}), nil
 }
 
-// rewriteTextPatterns 使用 Aho-Corasick 风格的多模式匹配替换文本
-func rewriteTextPatterns(body []byte, identity *CachedIdentity) []byte {
-	replacements := []struct {
-		pattern string
-		repl    string
+func rewriteRawMetadataUserID(root map[string]json.RawMessage, identity *CachedIdentity) (bool, error) {
+	rawMetadata, ok := root["metadata"]
+	if !ok {
+		return false, nil
+	}
+
+	var metadata map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(rawMetadata))
+	decoder.UseNumber()
+	if err := decoder.Decode(&metadata); err != nil || metadata == nil {
+		// metadata is an extensible API field. Preserve unknown future shapes.
+		return false, nil
+	}
+	if _, ok := metadata["user_id"]; !ok {
+		return false, nil
+	}
+
+	virtualUserID, err := marshalRawJSON(struct {
+		DeviceID    string `json:"device_id"`
+		AccountUUID string `json:"account_uuid"`
+		SessionID   string `json:"session_id"`
 	}{
-		{identity.Local.Username, identity.Virtual.Username},
-		{identity.Local.Hostname, identity.Virtual.Hostname},
-		{identity.Local.HomeDir, identity.Virtual.HomeDir},
+		DeviceID:    identity.Virtual.UserID,
+		AccountUUID: "",
+		SessionID:   identity.Virtual.SessionID,
+	})
+	if err != nil {
+		return false, err
 	}
-	for i, localDNS := range identity.Local.DNSServers {
-		virtualDNS := ""
-		if i < len(identity.Virtual.DNSServers) {
-			virtualDNS = identity.Virtual.DNSServers[i]
-		} else if len(identity.Virtual.DNSServers) > 0 {
-			virtualDNS = identity.Virtual.DNSServers[len(identity.Virtual.DNSServers)-1]
-		}
-		replacements = append(replacements, struct {
-			pattern string
-			repl    string
-		}{localDNS, virtualDNS})
+	encodedUserID, err := marshalRawJSON(string(virtualUserID))
+	if err != nil {
+		return false, err
 	}
+	metadata["user_id"] = encodedUserID
 
-	result := body
-	for _, r := range replacements {
-		if r.pattern == "" || r.repl == "" {
-			continue
-		}
-		result = bytes.ReplaceAll(result, []byte(r.pattern), []byte(r.repl))
+	rewrittenMetadata, err := marshalRawJSON(metadata)
+	if err != nil {
+		return false, err
 	}
-
-	return result
+	root["metadata"] = rewrittenMetadata
+	return true, nil
 }
 
-// rewriteEnvBlock 改写 <env> 块
-func rewriteEnvBlock(body []byte, identity *CachedIdentity) []byte {
-	// 匹配 <env>...</env>
-	envRe := regexp.MustCompile(`(?s)<env>(.*?)</env>`)
+// rewriteRawOfficialSystem changes environment descriptors only when the
+// request has an explicit official Claude Code/Agent SDK identity system block.
+// Merely containing "<env>" is not sufficient: users, Skills and tool payloads
+// are allowed to discuss or emit that syntax.
+func rewriteRawOfficialSystem(root map[string]json.RawMessage, identity *CachedIdentity) (bool, error) {
+	rawSystem, ok := root["system"]
+	if !ok {
+		return false, nil
+	}
 
-	return envRe.ReplaceAllFunc(body, func(match []byte) []byte {
-		content := string(match)
+	trimmed := bytes.TrimSpace(rawSystem)
+	if len(trimmed) == 0 {
+		return false, nil
+	}
 
-		// 替换关键行
-		content = replaceMarkerValue(content, "Platform:", identity.Virtual.OSName)
-		content = replaceMarkerValue(content, "OS Version:", identity.Virtual.OSRelease)
-		content = replaceMarkerValue(content, "Terminal:", identity.Virtual.Terminal)
-		content = replaceMarkerValue(content, "Hostname:", identity.Virtual.Hostname)
-		content = replaceMarkerValue(content, "Architecture:", identity.Virtual.Arch)
+	switch trimmed[0] {
+	case '"':
+		var text string
+		if err := json.Unmarshal(rawSystem, &text); err != nil {
+			return false, nil
+		}
+		if !isOfficialIdentitySystemText(text) {
+			return false, nil
+		}
+		rewritten := rewriteEnvBlock([]byte(text), identity)
+		if bytes.Equal(rewritten, []byte(text)) {
+			return false, nil
+		}
+		encoded, err := marshalRawJSON(string(rewritten))
+		if err != nil {
+			return false, err
+		}
+		root["system"] = encoded
+		return true, nil
 
-		// 环境变量引用
-		content = strings.ReplaceAll(content, identity.Local.HomeDir, identity.Virtual.HomeDir)
-		content = strings.ReplaceAll(content, identity.Local.Username, identity.Virtual.Username)
-		for i, localDNS := range identity.Local.DNSServers {
-			if localDNS == "" || len(identity.Virtual.DNSServers) == 0 {
+	case '[':
+		var blocks []json.RawMessage
+		decoder := json.NewDecoder(bytes.NewReader(rawSystem))
+		decoder.UseNumber()
+		if err := decoder.Decode(&blocks); err != nil {
+			return false, nil
+		}
+
+		type parsedTextBlock struct {
+			index  int
+			fields map[string]json.RawMessage
+			text   string
+		}
+		textBlocks := make([]parsedTextBlock, 0, len(blocks))
+		official := false
+		for i, rawBlock := range blocks {
+			var fields map[string]json.RawMessage
+			decoder := json.NewDecoder(bytes.NewReader(rawBlock))
+			decoder.UseNumber()
+			if err := decoder.Decode(&fields); err != nil || fields == nil {
 				continue
 			}
-			virtualDNS := identity.Virtual.DNSServers[0]
-			if i < len(identity.Virtual.DNSServers) {
-				virtualDNS = identity.Virtual.DNSServers[i]
+			var blockType string
+			if rawType, exists := fields["type"]; exists {
+				if err := json.Unmarshal(rawType, &blockType); err != nil || blockType != "text" {
+					continue
+				}
+			} else {
+				// Anthropic system blocks are explicitly typed. Do not infer a
+				// future/third-party object with a text member to be identity.
+				continue
 			}
-			content = strings.ReplaceAll(content, localDNS, virtualDNS)
+			var text string
+			if err := json.Unmarshal(fields["text"], &text); err != nil {
+				continue
+			}
+			if isOfficialIdentitySystemText(text) {
+				official = true
+			}
+			textBlocks = append(textBlocks, parsedTextBlock{index: i, fields: fields, text: text})
+		}
+		if !official {
+			return false, nil
 		}
 
+		changed := false
+		for _, block := range textBlocks {
+			rewritten := rewriteEnvBlock([]byte(block.text), identity)
+			if bytes.Equal(rewritten, []byte(block.text)) {
+				continue
+			}
+			encodedText, err := marshalRawJSON(string(rewritten))
+			if err != nil {
+				return false, err
+			}
+			block.fields["text"] = encodedText
+			rewrittenBlock, err := marshalRawJSON(block.fields)
+			if err != nil {
+				return false, err
+			}
+			blocks[block.index] = rewrittenBlock
+			changed = true
+		}
+		if !changed {
+			return false, nil
+		}
+
+		rewrittenSystem, err := marshalRawJSON(blocks)
+		if err != nil {
+			return false, err
+		}
+		root["system"] = rewrittenSystem
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func isOfficialIdentitySystemText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	return strings.HasPrefix(trimmed, claudeAgentSDKIdentityLine) ||
+		strings.HasPrefix(trimmed, claudeCodeIdentityLine)
+}
+
+// rewriteEnvBlock rewrites only explicit descriptor lines inside <env> blocks.
+// Working directories, home paths, usernames, DNS values and free text are
+// intentionally untouched because they can be consumed verbatim by tools.
+func rewriteEnvBlock(body []byte, identity *CachedIdentity) []byte {
+	if identity == nil || identity.Virtual == nil {
+		return body
+	}
+	return officialEnvBlockRE.ReplaceAllFunc(body, func(match []byte) []byte {
+		content := string(match)
+		content = replaceEnvMarkerValue(content, "Platform:", identity.Virtual.OSName)
+		content = replaceEnvMarkerValue(content, "OS Version:", identity.Virtual.OSRelease)
+		content = replaceEnvMarkerValue(content, "Terminal:", identity.Virtual.Terminal)
+		content = replaceEnvMarkerValue(content, "Hostname:", identity.Virtual.Hostname)
+		content = replaceEnvMarkerValue(content, "Architecture:", identity.Virtual.Arch)
 		return []byte(content)
 	})
 }
 
-// replaceMarkerValue 替换标记后的值（如 "Platform: darwin" → "Platform: Mac OS"）
-func replaceMarkerValue(s, marker, value string) string {
+// replaceEnvMarkerValue changes a marker only when it begins a line (allowing
+// indentation). This avoids rewriting prose that happens to contain the same
+// words.
+func replaceEnvMarkerValue(text, marker, value string) string {
 	if value == "" {
-		return s
+		return text
 	}
 
-	idx := strings.Index(s, marker)
-	if idx < 0 {
-		return s
-	}
-
-	// 找到标记后的值起始位置
-	valStart := idx + len(marker)
-	for valStart < len(s) && (s[valStart] == ' ' || s[valStart] == '\t') {
-		valStart++
-	}
-
-	// 找到行尾
-	end := valStart
-	for end < len(s) && s[end] != '\n' && s[end] != '\r' {
-		if s[end] == '\\' && end+1 < len(s) && (s[end+1] == 'n' || s[end+1] == 'r') {
-			break
+	lines := strings.SplitAfter(text, "\n")
+	for i, line := range lines {
+		lineEnding := ""
+		content := line
+		if strings.HasSuffix(content, "\n") {
+			lineEnding = "\n"
+			content = strings.TrimSuffix(content, "\n")
 		}
-		end++
-	}
+		if strings.HasSuffix(content, "\r") {
+			lineEnding = "\r" + lineEnding
+			content = strings.TrimSuffix(content, "\r")
+		}
 
-	// 提取行尾（\n 或 \r\n）
-	rest := ""
-	if end < len(s) {
-		rest = s[end:]
+		leading := len(content) - len(strings.TrimLeft(content, " \t"))
+		if !strings.HasPrefix(content[leading:], marker) {
+			continue
+		}
+		valueStart := leading + len(marker)
+		if valueStart < len(content) && content[valueStart] != ' ' && content[valueStart] != '\t' {
+			continue
+		}
+		for valueStart < len(content) && (content[valueStart] == ' ' || content[valueStart] == '\t') {
+			valueStart++
+		}
+		lines[i] = content[:valueStart] + value + lineEnding
 	}
-
-	return s[:valStart] + value + rest
+	return strings.Join(lines, "")
 }

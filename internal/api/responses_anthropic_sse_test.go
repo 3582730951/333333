@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/streamrewrite"
 )
 
@@ -53,6 +54,247 @@ func TestResponsesStreamToAnthropicSSEPreservesReasoningAndParallelTools(t *test
 		if !strings.Contains(got, want) {
 			t.Fatalf("native Anthropic SSE missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestResponsesStreamToAnthropicSSESerializesParallelToolLifecycle(t *testing.T) {
+	stream := "event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","arguments":""}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"custom_tool_call","input":""}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":2,"item":{"type":"tool_search_call","arguments":{}}}` + "\n\n" +
+		"event: response.custom_tool_call_input.delta\n" +
+		`data: {"type":"response.custom_tool_call_input.delta","output_index":1,"delta":"patch"}` + "\n\n" +
+		"event: response.custom_tool_call_input.done\n" +
+		`data: {"type":"response.custom_tool_call_input.done","output_index":1,"input":"patch"}` + "\n\n" +
+		"event: response.custom_tool_call_input.done\n" +
+		`data: {"type":"response.custom_tool_call_input.done","output_index":1,"input":"patch"}` + "\n\n" +
+		"event: response.function_call_arguments.delta\n" +
+		`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"path\":\"partial\"}"}` + "\n\n" +
+		"event: response.function_call_arguments.done\n" +
+		`data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"a.go\"}"}` + "\n\n" +
+		"event: response.function_call_arguments.done\n" +
+		`data: {"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"path\":\"a.go\"}"}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_read","call_id":"call_read","name":"wire_read","arguments":"{\"path\":\"a.go\"}"}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_read","call_id":"call_read","name":"wire_read","arguments":"{\"path\":\"a.go\"}"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_parallel","status":"completed","usage":{"input_tokens":3,"output_tokens":3},"output":[{"type":"function_call","output_index":0,"id":"fc_read","call_id":"call_read","name":"wire_read","arguments":"{\"path\":\"a.go\"}"},{"type":"custom_tool_call","output_index":1,"id":"ctc_patch","call_id":"call_patch","name":"apply_patch","input":"patch"},{"type":"tool_search_call","output_index":2,"id":"tsc_search","call_id":"call_search","arguments":{"limit":900719925474099312345}},{"type":"function_call","output_index":3,"id":"fc_write","call_id":"call_write","name":"wire_write","arguments":"{\"path\":\"b.go\",\"content\":\"ok\"}"}]}}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	responsesStreamToAnthropicSSE(
+		recorder,
+		strings.NewReader(stream),
+		"gpt-5.6-sol",
+		map[string]string{"wire_read": "Read", "wire_write": "Write"},
+		nil,
+		streamrewrite.New(nil),
+	)
+	got := recorder.Body.String()
+
+	openIndex := -1
+	nextIndex := 0
+	starts := make([]string, 0, 4)
+	ids := make([]string, 0, 4)
+	stops := 0
+	for _, frame := range strings.Split(got, "\n\n") {
+		var data string
+		for _, line := range strings.Split(frame, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+				break
+			}
+		}
+		if data == "" {
+			continue
+		}
+		var event struct {
+			Type  string `json:"type"`
+			Index int    `json:"index"`
+			Block struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"content_block"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatalf("decode Anthropic SSE frame: %v\n%s", err, data)
+		}
+		switch event.Type {
+		case "content_block_start":
+			if openIndex >= 0 {
+				t.Fatalf("content block %d started while block %d was open:\n%s", event.Index, openIndex, got)
+			}
+			if event.Index != nextIndex {
+				t.Fatalf("content block index = %d, want unique sequential index %d:\n%s", event.Index, nextIndex, got)
+			}
+			openIndex = event.Index
+			nextIndex++
+			if event.Block.Type == "tool_use" {
+				starts = append(starts, event.Block.Name)
+				ids = append(ids, event.Block.ID)
+			}
+		case "content_block_delta":
+			if openIndex != event.Index {
+				t.Fatalf("delta for block %d while block %d was open:\n%s", event.Index, openIndex, got)
+			}
+		case "content_block_stop":
+			if openIndex != event.Index {
+				t.Fatalf("stop for block %d while block %d was open:\n%s", event.Index, openIndex, got)
+			}
+			openIndex = -1
+			stops++
+		}
+	}
+	if openIndex >= 0 {
+		t.Fatalf("content block %d remained open:\n%s", openIndex, got)
+	}
+	if strings.Join(starts, ",") != "Read,apply_patch,tool_search,Write" {
+		t.Fatalf("tool start order = %v, want registration order", starts)
+	}
+	if strings.Join(ids, ",") != "call_read,call_patch,call_search,call_write" {
+		t.Fatalf("tool IDs = %v, want each call exactly once", ids)
+	}
+	if stops != 4 {
+		t.Fatalf("content block stops = %d, want 4 (duplicate done events must be idempotent):\n%s", stops, got)
+	}
+	for _, want := range []string{
+		`"partial_json":"{\"path\":\"a.go\"}"`,
+		`"partial_json":"{\"input\":\"patch\"}"`,
+		`"partial_json":"{\"limit\":900719925474099312345}"`,
+		`"partial_json":"{\"path\":\"b.go\",\"content\":\"ok\"}"`,
+		`"stop_reason":"tool_use"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("serialized parallel tools missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `\"path\":\"partial\"`) || strings.Contains(got, `"name":""`) || strings.Contains(got, `"id":""`) {
+		t.Fatalf("incomplete arguments or pre-hydration tool identity leaked:\n%s", got)
+	}
+}
+
+func TestResponsesStreamToAnthropicSSEPreservesServerWebSearch(t *testing.T) {
+	stream := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_web","model":"gpt-5.6-sol"}}` + "\n\n" +
+		"event: response.output_item.added\n" +
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_123","status":"in_progress"}}` + "\n\n" +
+		"event: response.web_search_call.searching\n" +
+		`data: {"type":"response.web_search_call.searching","item_id":"ws_123","output_index":0}` + "\n\n" +
+		"event: response.web_search_call.completed\n" +
+		`data: {"type":"response.web_search_call.completed","item_id":"ws_123","output_index":0}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","query":"current weather"},"results":[{"title":"Forecast","url":"https://example.com/weather","page_age":"today","encrypted_content":"opaque-search-state"}]}}` + "\n\n" +
+		"event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","query":"current weather"}}}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","output_index":1,"delta":"It is sunny."}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_web","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":5,"output_tokens":3}}}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	responsesStreamToAnthropicSSE(recorder, strings.NewReader(stream), "gpt-5.6-sol", nil, nil, streamrewrite.New(nil))
+	got := recorder.Body.String()
+	toolUseID := prompt.ResponsesWebSearchToolUseID("ws_123")
+	for _, want := range []string{
+		`"type":"server_tool_use"`,
+		`"id":"` + toolUseID + `"`,
+		`"name":"web_search"`,
+		`"partial_json":"{\"query\":\"current weather\"}"`,
+		`"type":"web_search_tool_result"`,
+		`"tool_use_id":"` + toolUseID + `"`,
+		`"url":"https://example.com/weather"`,
+		`"encrypted_content":"opaque-search-state"`,
+		`"server_tool_use":{"web_search_requests":1}`,
+		`"stop_reason":"end_turn"`,
+		`"text":"It is sunny."`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("web search SSE missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, `"type":"server_tool_use"`) != 1 ||
+		strings.Count(got, `"type":"web_search_tool_result"`) != 1 {
+		t.Fatalf("duplicate web search events were not idempotent:\n%s", got)
+	}
+	if useAt, resultAt, textAt := strings.Index(got, `"type":"server_tool_use"`), strings.Index(got, `"type":"web_search_tool_result"`), strings.Index(got, `"text":"It is sunny."`); useAt < 0 || resultAt < useAt || textAt < resultAt {
+		t.Fatalf("web search use/result/text ordering is invalid:\n%s", got)
+	}
+	assertAnthropicSSEBlockLifecycle(t, got)
+}
+
+func TestResponsesStreamToAnthropicSSEHydratesTerminalWebSearchWithClientTool(t *testing.T) {
+	stream := "event: response.output_item.done\n" +
+		`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_read","call_id":"call_read","name":"Read","arguments":"{\"file_path\":\"a.go\"}"}}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp_terminal_web","status":"completed","usage":{"input_tokens":3,"output_tokens":2},"output":[{"type":"web_search_call","output_index":0,"id":"ws_terminal","status":"completed","action":{"type":"search","query":"release notes"}},{"type":"function_call","output_index":1,"id":"fc_read","call_id":"call_read","name":"Read","arguments":"{\"file_path\":\"a.go\"}"}]}}` + "\n\n"
+
+	recorder := httptest.NewRecorder()
+	responsesStreamToAnthropicSSE(recorder, strings.NewReader(stream), "gpt-5.6-sol", nil, nil, streamrewrite.New(nil))
+	got := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"server_tool_use"`,
+		`"partial_json":"{\"query\":\"release notes\"}"`,
+		`"type":"web_search_tool_result"`,
+		`"type":"tool_use"`,
+		`"name":"Read"`,
+		`"partial_json":"{\"file_path\":\"a.go\"}"`,
+		`"stop_reason":"tool_use"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("terminal web/client tool bridge missing %q:\n%s", want, got)
+		}
+	}
+	assertAnthropicSSEBlockLifecycle(t, got)
+}
+
+func assertAnthropicSSEBlockLifecycle(t *testing.T, stream string) {
+	t.Helper()
+	openIndex := -1
+	nextIndex := 0
+	for _, frame := range strings.Split(stream, "\n\n") {
+		var data string
+		for _, line := range strings.Split(frame, "\n") {
+			if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+				break
+			}
+		}
+		if data == "" {
+			continue
+		}
+		var event struct {
+			Type  string `json:"type"`
+			Index int    `json:"index"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			t.Fatalf("decode Anthropic SSE frame: %v\n%s", err, data)
+		}
+		switch event.Type {
+		case "content_block_start":
+			if openIndex >= 0 {
+				t.Fatalf("content block %d started while %d remained open:\n%s", event.Index, openIndex, stream)
+			}
+			if event.Index != nextIndex {
+				t.Fatalf("content block index=%d want=%d:\n%s", event.Index, nextIndex, stream)
+			}
+			openIndex = event.Index
+			nextIndex++
+		case "content_block_delta":
+			if event.Index != openIndex {
+				t.Fatalf("delta index=%d while open=%d:\n%s", event.Index, openIndex, stream)
+			}
+		case "content_block_stop":
+			if event.Index != openIndex {
+				t.Fatalf("stop index=%d while open=%d:\n%s", event.Index, openIndex, stream)
+			}
+			openIndex = -1
+		}
+	}
+	if openIndex >= 0 {
+		t.Fatalf("content block %d remained open:\n%s", openIndex, stream)
 	}
 }
 

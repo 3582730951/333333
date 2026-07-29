@@ -95,6 +95,97 @@ func TestMessagesRoutesGPTToBuiltInCodexNonStreaming(t *testing.T) {
 	}
 }
 
+func TestMessagesCodexNoToolsOmitsOrphanParallelToolCalls(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamStream := "event: response.created\n" +
+			`data: {"type":"response.created","response":{"id":"resp_no_tools","model":"gpt-5.5"}}` + "\n\n" +
+			"event: response.output_text.delta\n" +
+			`data: {"type":"response.output_text.delta","delta":"ok"}` + "\n\n" +
+			"event: response.completed\n" +
+			`data: {"type":"response.completed","response":{"id":"resp_no_tools","model":"gpt-5.5","status":"completed","usage":{"input_tokens":2,"output_tokens":1}}}` + "\n\n"
+		raw := serveCodexResponsesFixture(t, w, r, upstreamStream)
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode strict no-tool request: %v\n%s", err, raw)
+		}
+		if _, present := body["parallel_tool_calls"]; present {
+			t.Fatalf("orphan parallel_tool_calls would be rejected by Codex: %s", raw)
+		}
+	})
+	h.importAccount(t, "messages-codex-no-tools", "upstream-messages-codex-no-tools", "access-messages-codex-no-tools")
+
+	resp, err := http.Post(h.pool.URL+"/v1/messages", "application/json", strings.NewReader(
+		`{"model":"gpt-5.5","stream":false,"messages":[{"role":"user","content":"reply without tools"}]}`,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"text":"ok"`) {
+		t.Fatalf("strict no-tool bridge status=%d body=%s", resp.StatusCode, raw)
+	}
+}
+
+func TestMessagesCodexLongContextPreservesContentAndEffort(t *testing.T) {
+	const (
+		startMarker = "CTX-BEGIN-8F4B71"
+		midMarker   = "CTX-MIDDLE-31D9A2"
+		endMarker   = "CTX-END-C2E5F0"
+	)
+	longContext := startMarker +
+		strings.Repeat(" stable-context-a", 24*1024) +
+		midMarker +
+		strings.Repeat(" stable-context-b", 24*1024) +
+		endMarker
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamStream := "event: response.created\n" +
+			`data: {"type":"response.created","response":{"id":"resp_long_context","model":"gpt-5.6-sol"}}` + "\n\n" +
+			"event: response.output_text.delta\n" +
+			`data: {"type":"response.output_text.delta","delta":"long context ok"}` + "\n\n" +
+			"event: response.completed\n" +
+			`data: {"type":"response.completed","response":{"id":"resp_long_context","model":"gpt-5.6-sol","status":"completed","usage":{"input_tokens":210000,"output_tokens":3}}}` + "\n\n"
+		raw := serveCodexResponsesFixture(t, w, r, upstreamStream)
+		for _, marker := range []string{startMarker, midMarker, endMarker} {
+			if !strings.Contains(string(raw), marker) {
+				t.Fatalf("long context marker %q was truncated; upstream bytes=%d", marker, len(raw))
+			}
+		}
+		var body map[string]interface{}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("decode long-context request: %v", err)
+		}
+		reasoning, _ := body["reasoning"].(map[string]interface{})
+		if reasoning["effort"] != "xhigh" {
+			t.Fatalf("long-context reasoning effort changed: %s", raw[:min(len(raw), 2048)])
+		}
+	})
+	h.importAccount(t, "messages-codex-long", "upstream-messages-codex-long", "access-messages-codex-long")
+
+	requestBody, err := json.Marshal(map[string]interface{}{
+		"model":         "gpt-5.6-sol",
+		"stream":        false,
+		"max_tokens":    64000,
+		"output_config": map[string]interface{}{"effort": "xhigh"},
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": longContext},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(h.pool.URL+"/v1/messages", "application/json", strings.NewReader(string(requestBody)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"text":"long context ok"`) {
+		t.Fatalf("long-context bridge status=%d body=%s", resp.StatusCode, raw)
+	}
+}
+
 func TestMessagesCodexBuiltInAgentInheritsParentModel(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		upstreamStream := "event: response.created\n" +

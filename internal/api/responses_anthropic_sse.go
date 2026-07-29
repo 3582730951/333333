@@ -24,7 +24,9 @@ type responsesAnthropicToolStream struct {
 	kind       prompt.ResponsesToolKind
 	arguments  *streamAccumulator
 	started    bool
+	ready      bool
 	closed     bool
+	fallback   string
 }
 
 type responsesAnthropicReasoningStream struct {
@@ -33,6 +35,15 @@ type responsesAnthropicReasoningStream struct {
 	text       *streamAccumulator
 	started    bool
 	closed     bool
+}
+
+type responsesAnthropicWebSearchStream struct {
+	id          string
+	outputIndex string
+	query       string
+	results     []interface{}
+	ready       bool
+	closed      bool
 }
 
 // responsesStreamToAnthropicSSE is the native Codex Responses -> Claude Messages
@@ -71,6 +82,10 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 	tools := make([]*responsesAnthropicToolStream, 0, 4)
 	reasoningByKey := map[string]*responsesAnthropicReasoningStream{}
 	reasoning := make([]*responsesAnthropicReasoningStream, 0, 2)
+	webSearchByKey := map[string]*responsesAnthropicWebSearchStream{}
+	webSearches := make([]*responsesAnthropicWebSearchStream, 0, 2)
+	webSearchRequests := 0
+	nextToolToFlush := 0
 	bridgePlan := prompt.NewResponsesToolBridgePlan()
 	var accumulationErr error
 	defer func() {
@@ -122,28 +137,66 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		return textBlock
 	}
 
-	toolKey := func(event, item map[string]interface{}) string {
-		for _, value := range []interface{}{event["item_id"], mapValue(item, "id"), event["call_id"], mapValue(item, "call_id")} {
+	lookupToolItem := func(event, item map[string]interface{}) *responsesAnthropicToolStream {
+		hasIdentity := false
+		for _, value := range []interface{}{
+			mapValue(event, "item_id"), mapValue(item, "id"),
+			mapValue(event, "call_id"), mapValue(item, "call_id"),
+		} {
 			if text := streamString(value); text != "" {
-				return "id:" + text
+				hasIdentity = true
+				if state := toolsByKey["id:"+text]; state != nil {
+					return state
+				}
 			}
 		}
-		if value, ok := jsonNumberString(event["output_index"]); ok {
-			return "output:" + value
+		for _, value := range []interface{}{mapValue(event, "output_index"), mapValue(item, "output_index")} {
+			if index, ok := jsonNumberString(value); ok {
+				hasIdentity = true
+				if state := toolsByKey["output:"+index]; state != nil {
+					return state
+				}
+			}
 		}
-		return "output:0"
-	}
-	lookupTool := func(event map[string]interface{}) *responsesAnthropicToolStream {
-		if key := toolKey(event, nil); toolsByKey[key] != nil {
-			return toolsByKey[key]
-		}
-		if value, ok := jsonNumberString(event["output_index"]); ok {
-			return toolsByKey["output:"+value]
-		}
-		if len(tools) == 1 {
+		if !hasIdentity && len(tools) == 1 {
 			return tools[0]
 		}
 		return nil
+	}
+	lookupTool := func(event map[string]interface{}) *responsesAnthropicToolStream {
+		return lookupToolItem(event, nil)
+	}
+	hydrateTool := func(state *responsesAnthropicToolStream, event, item map[string]interface{}, kind prompt.ResponsesToolKind) {
+		if state == nil {
+			return
+		}
+		state.kind = kind
+		itemID := streamString(firstNonEmptyInterface(mapValue(item, "id"), mapValue(event, "item_id")))
+		callID := streamString(firstNonEmptyInterface(mapValue(item, "call_id"), mapValue(event, "call_id")))
+		if itemID != "" {
+			state.itemID = itemID
+			toolsByKey["id:"+itemID] = state
+		}
+		if callID != "" {
+			state.id = callID
+			toolsByKey["id:"+callID] = state
+		} else if state.id == "" && itemID != "" {
+			state.id = itemID
+		}
+		if name := streamString(mapValue(item, "name")); name != "" {
+			state.name = name
+		}
+		if namespace := streamString(mapValue(item, "namespace")); namespace != "" {
+			state.namespace = namespace
+		}
+		if kind == prompt.ResponsesToolSearch {
+			state.name = "tool_search"
+		}
+		for _, value := range []interface{}{mapValue(event, "output_index"), mapValue(item, "output_index")} {
+			if index, ok := jsonNumberString(value); ok {
+				toolsByKey["output:"+index] = state
+			}
+		}
 	}
 	startTool := func(state *responsesAnthropicToolStream) {
 		if state == nil || state.started {
@@ -151,6 +204,10 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		}
 		closeText()
 		ensureStarted()
+		if state.blockIndex < 0 {
+			state.blockIndex = nextBlock
+			nextBlock++
+		}
 		state.started = true
 		hasTools = true
 		name := state.name
@@ -171,13 +228,14 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			return
 		}
 		startTool(state)
-		arguments, err := state.arguments.String()
-		if err != nil {
-			accumulationErr = err
-			return
-		}
+		arguments := fallback
 		if arguments == "" {
-			arguments = fallback
+			var err error
+			arguments, err = state.arguments.String()
+			if err != nil {
+				accumulationErr = err
+				return
+			}
 		}
 		if state.kind == prompt.ResponsesToolCustom {
 			encoded, _ := json.Marshal(map[string]interface{}{"input": arguments})
@@ -192,28 +250,60 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		emit("content_block_stop", map[string]interface{}{"index": state.blockIndex})
 		state.closed = true
 	}
+	var flushReadyTools func()
+	flushReadyTools = func() {
+		// A Responses reasoning item can span multiple frames. Keep every
+		// Anthropic content block strictly serial by waiting until all reasoning
+		// items observed so far have closed before opening a tool_use block.
+		for _, state := range reasoning {
+			if !state.closed {
+				return
+			}
+		}
+		for nextToolToFlush < len(tools) {
+			state := tools[nextToolToFlush]
+			if state.closed {
+				nextToolToFlush++
+				continue
+			}
+			if !state.ready {
+				return
+			}
+			// Some Codex streams only reveal the stable name/call ID on
+			// output_item.done or response.output. Emitting an empty Anthropic
+			// tool_use would make Claude Code unable to route the result.
+			if state.name == "" || state.id == "" {
+				return
+			}
+			flushToolArguments(state, state.fallback)
+			if accumulationErr != nil {
+				return
+			}
+			nextToolToFlush++
+		}
+	}
+	markToolReady := func(state *responsesAnthropicToolStream, fallback string) {
+		if state == nil || state.closed {
+			return
+		}
+		if fallback != "" {
+			state.fallback = fallback
+		}
+		state.ready = true
+		flushReadyTools()
+	}
 	registerTool := func(event, item map[string]interface{}, kind prompt.ResponsesToolKind) *responsesAnthropicToolStream {
+		if state := lookupToolItem(event, item); state != nil {
+			hydrateTool(state, event, item, kind)
+			return state
+		}
 		state := &responsesAnthropicToolStream{
-			blockIndex: nextBlock, itemID: streamString(mapValue(item, "id")), kind: kind,
-			id:        streamString(firstNonEmptyInterface(mapValue(item, "call_id"), mapValue(item, "id"))),
-			name:      streamString(mapValue(item, "name")),
-			namespace: streamString(mapValue(item, "namespace")),
-			arguments: newStreamAccumulator(ctx, options, "codex-pool-responses-tool-args-*"),
-		}
-		if kind == prompt.ResponsesToolSearch {
-			state.name = "tool_search"
-		}
-		nextBlock++
-		key := toolKey(event, item)
-		toolsByKey[key] = state
-		if state.itemID != "" {
-			toolsByKey["id:"+state.itemID] = state
-		}
-		if value, ok := jsonNumberString(event["output_index"]); ok {
-			toolsByKey["output:"+value] = state
+			blockIndex: -1,
+			kind:       kind,
+			arguments:  newStreamAccumulator(ctx, options, "codex-pool-responses-tool-args-*"),
 		}
 		tools = append(tools, state)
-		startTool(state)
+		hydrateTool(state, event, item, kind)
 		return state
 	}
 
@@ -234,10 +324,9 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			return state
 		}
 		state := &responsesAnthropicReasoningStream{
-			blockIndex: nextBlock, item: item,
+			blockIndex: -1, item: item,
 			text: newStreamAccumulator(ctx, options, "codex-pool-responses-reasoning-*"),
 		}
-		nextBlock++
 		reasoningByKey[key] = state
 		if itemID := streamString(mapValue(item, "id")); itemID != "" {
 			reasoningByKey["id:"+itemID] = state
@@ -248,12 +337,23 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		reasoning = append(reasoning, state)
 		return state
 	}
+	var flushReadyWebSearches func()
+	flushDeferredContent := func() {
+		if flushReadyWebSearches != nil {
+			flushReadyWebSearches()
+		}
+		flushReadyTools()
+	}
 	startReasoning := func(state *responsesAnthropicReasoningStream) {
 		if state == nil || state.started || state.closed {
 			return
 		}
 		closeText()
 		ensureStarted()
+		if state.blockIndex < 0 {
+			state.blockIndex = nextBlock
+			nextBlock++
+		}
 		state.started = true
 		emit("content_block_start", map[string]interface{}{
 			"index": state.blockIndex, "content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
@@ -270,11 +370,16 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		signature := prompt.EncodeOpenAIReasoningItem(state.item)
 		if !state.started && visible == "" && signature == "" {
 			state.closed = true
+			flushDeferredContent()
 			return
 		}
 		if !state.started && visible == "" && signature != "" {
 			closeText()
 			ensureStarted()
+			if state.blockIndex < 0 {
+				state.blockIndex = nextBlock
+				nextBlock++
+			}
 			state.started = true
 			emit("content_block_start", map[string]interface{}{
 				"index": state.blockIndex,
@@ -284,6 +389,7 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			})
 			emit("content_block_stop", map[string]interface{}{"index": state.blockIndex})
 			state.closed = true
+			flushDeferredContent()
 			return
 		}
 		startReasoning(state)
@@ -312,6 +418,202 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 		}
 		emit("content_block_stop", map[string]interface{}{"index": state.blockIndex})
 		state.closed = true
+		flushDeferredContent()
+	}
+
+	lookupWebSearch := func(event, item map[string]interface{}) *responsesAnthropicWebSearchStream {
+		hasIdentity := false
+		for _, value := range []interface{}{
+			mapValue(event, "item_id"), mapValue(item, "id"),
+			mapValue(event, "call_id"), mapValue(item, "call_id"),
+		} {
+			if id := streamString(value); id != "" {
+				hasIdentity = true
+				if state := webSearchByKey["id:"+id]; state != nil {
+					return state
+				}
+			}
+		}
+		for _, value := range []interface{}{mapValue(event, "output_index"), mapValue(item, "output_index")} {
+			if index, ok := jsonNumberString(value); ok {
+				hasIdentity = true
+				if state := webSearchByKey["output:"+index]; state != nil {
+					return state
+				}
+			}
+		}
+		if !hasIdentity && len(webSearches) == 1 {
+			return webSearches[0]
+		}
+		return nil
+	}
+	hydrateWebSearch := func(state *responsesAnthropicWebSearchStream, event, item map[string]interface{}) {
+		if state == nil {
+			return
+		}
+		for _, value := range []interface{}{
+			mapValue(item, "id"), mapValue(event, "item_id"),
+			mapValue(item, "call_id"), mapValue(event, "call_id"),
+		} {
+			if id := streamString(value); id != "" {
+				if state.id == "" {
+					state.id = id
+				}
+				webSearchByKey["id:"+id] = state
+			}
+		}
+		for _, value := range []interface{}{mapValue(event, "output_index"), mapValue(item, "output_index")} {
+			if index, ok := jsonNumberString(value); ok {
+				if state.outputIndex == "" {
+					state.outputIndex = index
+				}
+				webSearchByKey["output:"+index] = state
+			}
+		}
+		if query := prompt.ResponsesWebSearchQuery(item); query != "" {
+			state.query = query
+		}
+		if results := prompt.ResponsesWebSearchResults(item); len(results) > 0 {
+			state.results = results
+		}
+		if state.query != "" || len(state.results) > 0 {
+			state.ready = true
+		}
+	}
+	registerWebSearch := func(event, item map[string]interface{}) *responsesAnthropicWebSearchStream {
+		if state := lookupWebSearch(event, item); state != nil {
+			hydrateWebSearch(state, event, item)
+			return state
+		}
+		state := &responsesAnthropicWebSearchStream{}
+		webSearches = append(webSearches, state)
+		hydrateWebSearch(state, event, item)
+		return state
+	}
+	emitWebSearch := func(state *responsesAnthropicWebSearchStream) {
+		if state == nil || state.closed || !state.ready {
+			return
+		}
+		closeText()
+		ensureStarted()
+		id := state.id
+		if id == "" {
+			id = "ws_stream_" + state.outputIndex
+			if state.outputIndex == "" {
+				id = "ws_stream_" + strconv.Itoa(webSearchRequests+1)
+			}
+		}
+		toolUseID := prompt.ResponsesWebSearchToolUseID(id)
+		useIndex := nextBlock
+		nextBlock++
+		emit("content_block_start", map[string]interface{}{
+			"index": useIndex,
+			"content_block": map[string]interface{}{
+				"type": "server_tool_use", "id": toolUseID, "name": "web_search", "input": map[string]interface{}{},
+			},
+		})
+		if state.query != "" {
+			partial, _ := json.Marshal(map[string]interface{}{"query": state.query})
+			emit("content_block_delta", map[string]interface{}{
+				"index": useIndex,
+				"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": scrubber.ReplaceString(string(partial))},
+			})
+		}
+		emit("content_block_stop", map[string]interface{}{"index": useIndex})
+
+		resultIndex := nextBlock
+		nextBlock++
+		emit("content_block_start", map[string]interface{}{
+			"index": resultIndex,
+			"content_block": map[string]interface{}{
+				"type": "web_search_tool_result", "tool_use_id": toolUseID, "content": state.results,
+			},
+		})
+		emit("content_block_stop", map[string]interface{}{"index": resultIndex})
+		state.closed = true
+		webSearchRequests++
+	}
+	flushReadyWebSearches = func() {
+		for _, state := range reasoning {
+			if !state.closed {
+				return
+			}
+		}
+		for _, state := range webSearches {
+			emitWebSearch(state)
+		}
+	}
+
+	toolItemArguments := func(kind prompt.ResponsesToolKind, item map[string]interface{}) string {
+		var value interface{}
+		if kind == prompt.ResponsesToolCustom {
+			value = mapValue(item, "input")
+		} else {
+			value = mapValue(item, "arguments")
+		}
+		if text, ok := value.(string); ok {
+			return text
+		}
+		if value == nil {
+			return ""
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
+	hydrateTerminalTools := func(response map[string]interface{}) {
+		output, _ := mapValue(response, "output").([]interface{})
+		for index, rawItem := range output {
+			item, _ := rawItem.(map[string]interface{})
+			if item == nil {
+				continue
+			}
+			var kind prompt.ResponsesToolKind
+			switch streamString(mapValue(item, "type")) {
+			case "function_call":
+				kind = prompt.ResponsesToolFunction
+			case "custom_tool_call":
+				kind = prompt.ResponsesToolCustom
+			case "tool_search_call":
+				execution := strings.TrimSpace(streamString(mapValue(item, "execution")))
+				if execution != "" && !strings.EqualFold(execution, "client") {
+					continue
+				}
+				kind = prompt.ResponsesToolSearch
+			default:
+				continue
+			}
+			outputIndex := interface{}(index)
+			if _, ok := jsonNumberString(mapValue(item, "output_index")); ok {
+				outputIndex = mapValue(item, "output_index")
+			}
+			event := map[string]interface{}{"output_index": outputIndex}
+			state := lookupToolItem(event, item)
+			if state == nil {
+				state = registerTool(event, item, kind)
+			} else {
+				hydrateTool(state, event, item, kind)
+			}
+			markToolReady(state, toolItemArguments(kind, item))
+		}
+	}
+	hydrateTerminalWebSearches := func(response map[string]interface{}) {
+		output, _ := mapValue(response, "output").([]interface{})
+		for index, rawItem := range output {
+			item, _ := rawItem.(map[string]interface{})
+			if item == nil || streamString(mapValue(item, "type")) != "web_search_call" {
+				continue
+			}
+			outputIndex := interface{}(index)
+			if _, ok := jsonNumberString(mapValue(item, "output_index")); ok {
+				outputIndex = mapValue(item, "output_index")
+			}
+			state := registerWebSearch(map[string]interface{}{"output_index": outputIndex}, item)
+			hydrateWebSearch(state, nil, item)
+		}
+		flushReadyWebSearches()
 	}
 
 	emitTerminal := func(response map[string]interface{}, eventType string) {
@@ -327,6 +629,8 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 				return
 			}
 			usage = prompt.ResponsesUsageToAnthropic(response["usage"])
+			hydrateTerminalTools(response)
+			hydrateTerminalWebSearches(response)
 		}
 		for _, state := range reasoning {
 			finishReasoning(state, state.item)
@@ -335,11 +639,29 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			}
 		}
 		closeText()
+		flushReadyWebSearches()
+		for _, state := range webSearches {
+			if !state.ready {
+				state.closed = true
+			}
+		}
 		for _, state := range tools {
-			flushToolArguments(state, "")
+			if state.name == "" || state.id == "" {
+				// A terminal response that still cannot identify a pending call
+				// cannot produce a routable Claude tool_use. Skip only that
+				// unresolved placeholder so later complete calls still flow.
+				state.ready = true
+				state.closed = true
+				continue
+			}
+			markToolReady(state, "")
 			if accumulationErr != nil {
 				return
 			}
+		}
+		flushReadyTools()
+		if accumulationErr != nil {
+			return
 		}
 		ensureStarted()
 		stopReason := "end_turn"
@@ -351,6 +673,12 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			if reason == "" || reason == "max_output_tokens" || reason == "max_tokens" {
 				stopReason = "max_tokens"
 			}
+		}
+		if usage == nil {
+			usage = map[string]interface{}{"input_tokens": int64(0), "output_tokens": int64(0)}
+		}
+		if webSearchRequests > 0 {
+			usage["server_tool_use"] = map[string]interface{}{"web_search_requests": webSearchRequests}
 		}
 		messageUsage := map[string]interface{}{"output_tokens": int64(0)}
 		for key, value := range usage {
@@ -406,28 +734,41 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			case "custom_tool_call":
 				registerTool(event, item, prompt.ResponsesToolCustom)
 			case "tool_search_call":
-				if strings.EqualFold(streamString(mapValue(item, "execution")), "client") {
+				execution := strings.TrimSpace(streamString(mapValue(item, "execution")))
+				if execution == "" || strings.EqualFold(execution, "client") {
 					registerTool(event, item, prompt.ResponsesToolSearch)
 				}
+			case "web_search_call":
+				registerWebSearch(event, item)
 			case "reasoning":
 				getReasoning(event, item)
 			}
+		case "response.web_search_call.searching", "response.web_search_call.in_progress", "response.web_search_call.completed":
+			registerWebSearch(event, nil)
 		case "response.function_call_arguments.delta":
 			if state := lookupTool(event); state != nil {
 				accumulationErr = state.arguments.WriteString(streamString(event["delta"]))
 			}
 		case "response.function_call_arguments.done":
-			state := lookupTool(event)
+			item, _ := event["item"].(map[string]interface{})
+			state := lookupToolItem(event, item)
+			if state != nil {
+				hydrateTool(state, event, item, state.kind)
+			}
 			fallback := streamString(firstNonEmptyInterface(event["arguments"], mapValueFromNested(event, "item", "arguments")))
-			flushToolArguments(state, fallback)
+			markToolReady(state, fallback)
 		case "response.custom_tool_call_input.delta":
 			if state := lookupTool(event); state != nil && state.kind == prompt.ResponsesToolCustom {
 				accumulationErr = state.arguments.WriteString(streamString(event["delta"]))
 			}
 		case "response.custom_tool_call_input.done":
-			state := lookupTool(event)
+			item, _ := event["item"].(map[string]interface{})
+			state := lookupToolItem(event, item)
+			if state != nil {
+				hydrateTool(state, event, item, state.kind)
+			}
 			fallback := streamString(firstNonEmptyInterface(event["input"], mapValueFromNested(event, "item", "input")))
-			flushToolArguments(state, fallback)
+			markToolReady(state, fallback)
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.reasoning.delta":
 			state := getReasoning(event, nil)
 			delta := streamString(event["delta"])
@@ -447,27 +788,38 @@ func responsesStreamToAnthropicSSEWithOptions(ctx context.Context, w http.Respon
 			case "reasoning":
 				finishReasoning(getReasoning(event, item), item)
 			case "function_call":
-				state := lookupTool(event)
+				state := lookupToolItem(event, item)
 				if state == nil {
 					state = registerTool(event, item, prompt.ResponsesToolFunction)
+				} else {
+					hydrateTool(state, event, item, prompt.ResponsesToolFunction)
 				}
-				flushToolArguments(state, streamString(mapValue(item, "arguments")))
+				markToolReady(state, streamString(mapValue(item, "arguments")))
 			case "custom_tool_call":
-				state := lookupTool(event)
+				state := lookupToolItem(event, item)
 				if state == nil {
 					state = registerTool(event, item, prompt.ResponsesToolCustom)
+				} else {
+					hydrateTool(state, event, item, prompt.ResponsesToolCustom)
 				}
-				flushToolArguments(state, streamString(mapValue(item, "input")))
+				markToolReady(state, streamString(mapValue(item, "input")))
 			case "tool_search_call":
-				if !strings.EqualFold(streamString(mapValue(item, "execution")), "client") {
+				execution := strings.TrimSpace(streamString(mapValue(item, "execution")))
+				if execution != "" && !strings.EqualFold(execution, "client") {
 					break
 				}
-				state := lookupTool(event)
+				state := lookupToolItem(event, item)
 				if state == nil {
 					state = registerTool(event, item, prompt.ResponsesToolSearch)
+				} else {
+					hydrateTool(state, event, item, prompt.ResponsesToolSearch)
 				}
 				arguments, _ := json.Marshal(mapValue(item, "arguments"))
-				flushToolArguments(state, string(arguments))
+				markToolReady(state, string(arguments))
+			case "web_search_call":
+				state := registerWebSearch(event, item)
+				hydrateWebSearch(state, event, item)
+				flushReadyWebSearches()
 			case "message":
 				if !sawText {
 					if text := responsesOutputItemText(item); text != "" {

@@ -59,6 +59,13 @@ func codexStoreValue(upstreamBaseURL string) bool {
 //     skip_serializing_if). FORCE-TO-CORRECT-VALUE: unlike instructions, a downstream client
 //     that wrongly sends store:true must be corrected, not preserved.
 //
+//   - "parallel_tool_calls": classic Responses accepts this option only when at
+//     least one top-level tool is present. Claude Code legitimately sends the
+//     option alongside tools, so it is preserved there; when tools are absent,
+//     null, or an empty array the orphan option is removed to prevent the
+//     upstream 400. Responses Lite has a different wire contract and always
+//     serializes false because its tools live in an additional_tools input item.
+//
 //   - Responses Lite reasoning context: current GPT-5.6 models require
 //     reasoning.context="all_turns" whenever the Responses Lite header/metadata is
 //     present. codex-rs sets this in build_reasoning; omitting it makes the live
@@ -103,9 +110,10 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 	// struct decode correctly handles JSON escapes (e.g. "\n" → real newline) that a
 	// string scan cannot, and ignores all other keys.
 	var probe struct {
-		Instructions      *string `json:"instructions"`
-		Store             *bool   `json:"store"`
-		ParallelToolCalls *bool   `json:"parallel_tool_calls"`
+		Instructions      *string         `json:"instructions"`
+		Store             *bool           `json:"store"`
+		ParallelToolCalls json.RawMessage `json:"parallel_tool_calls"`
+		Tools             json.RawMessage `json:"tools"`
 		Reasoning         *struct {
 			Context string `json:"context"`
 		} `json:"reasoning"`
@@ -118,7 +126,13 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 
 	instructionsOK := responsesLite || (probe.Instructions != nil && strings.TrimSpace(*probe.Instructions) != "")
 	storeOK := probe.Store != nil && *probe.Store == wantStore
-	parallelOK := !responsesLite || (probe.ParallelToolCalls != nil && !*probe.ParallelToolCalls)
+	parallelOK := false
+	if responsesLite {
+		parallelOK = bytes.Equal(bytes.TrimSpace(probe.ParallelToolCalls), []byte("false"))
+	} else {
+		toolsEmpty, toolsKnown := codexRawToolsEmpty(probe.Tools)
+		parallelOK = len(probe.ParallelToolCalls) == 0 || !toolsKnown || !toolsEmpty
+	}
 	reasoningContextOK := !responsesLite || (probe.Reasoning != nil && probe.Reasoning.Context == "all_turns")
 	if instructionsOK && storeOK && parallelOK && reasoningContextOK {
 		// Already matches the real-client shape: forward byte-identical.
@@ -150,8 +164,16 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 		}
 	}
 	if !parallelOK {
-		if !set("parallel_tool_calls", false) {
-			return raw
+		if responsesLite {
+			if !set("parallel_tool_calls", false) {
+				return raw
+			}
+		} else {
+			var err error
+			out, err = sjson.DeleteBytes(out, "parallel_tool_calls")
+			if err != nil {
+				return raw
+			}
 		}
 	}
 	if !reasoningContextOK {
@@ -160,6 +182,25 @@ func normalizeCodexResponsesBody(raw []byte, upstreamBaseURL string, responsesLi
 		}
 	}
 	return out
+}
+
+// codexRawToolsEmpty reports whether a top-level Responses tools value is
+// definitely absent/null/a valid empty array. Unknown or malformed future shapes
+// are not treated as empty: preserving them lets the upstream validate the actual
+// tool payload instead of hiding a client error behind this compatibility guard.
+func codexRawToolsEmpty(raw json.RawMessage) (empty, known bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return true, true
+	}
+	if trimmed[0] != '[' {
+		return false, false
+	}
+	var tools []json.RawMessage
+	if err := json.Unmarshal(trimmed, &tools); err != nil {
+		return false, false
+	}
+	return len(tools) == 0, true
 }
 
 // normalizeCodexResponsesLiteCompactBody applies only the Lite fields shared by

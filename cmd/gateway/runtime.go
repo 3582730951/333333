@@ -187,7 +187,18 @@ func runCompatClaude(cfg Config, realClaude string, args []string) int {
 }
 
 func compatRuntimeEnv(base []string, cfg Config) []string {
-	env := append([]string(nil), base...)
+	// Claude Code accepts both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN and
+	// currently sends both headers when both variables are set. A key inherited
+	// from the host (or supplied by an apiKeyHelper) can therefore take
+	// precedence over the gateway token at the pool. Remove all inherited
+	// occurrences, then pin both supported credential forms to the same
+	// downstream key so neither client precedence nor helper behavior can select
+	// a stale official credential.
+	env := removeRuntimeEnvKey(base, "ANTHROPIC_API_KEY")
+	// Remove every inherited token occurrence before adding exactly one gateway
+	// token. This also handles unusual exec environments containing duplicate
+	// keys, where replacing only the first value could leave a later host token.
+	env = removeRuntimeEnvKey(env, "ANTHROPIC_AUTH_TOKEN")
 	set := func(key, value string) {
 		prefix := key + "="
 		for i, item := range env {
@@ -200,10 +211,23 @@ func compatRuntimeEnv(base []string, cfg Config) []string {
 	}
 	set("ANTHROPIC_BASE_URL", strings.TrimRight(strings.TrimSpace(cfg.PoolServerURL), "/"))
 	set("ANTHROPIC_AUTH_TOKEN", strings.TrimSpace(cfg.DownstreamKey))
+	set("ANTHROPIC_API_KEY", strings.TrimSpace(cfg.DownstreamKey))
 	set("CLAUDE_CODE_ENABLE_AUTO_MODE", "1")
 	set("POOL_CLIENT_RUNTIME", "compat")
 	set("POOL_STRICT_LINUX", "0")
 	return env
+}
+
+func removeRuntimeEnvKey(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		if item == key || strings.HasPrefix(item, prefix) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func checkStrictRuntimeSupport() error {
@@ -415,6 +439,10 @@ func buildBubblewrapArgs(cfg Config, identity *CachedIdentity, paths strictRunti
 		"--ro-bind", paths.Group, "/etc/group",
 		"--chdir", paths.RuntimeCWD,
 	)
+	// bwrap otherwise inherits the launcher environment. Remove the host
+	// credential first; strictRuntimeEnv then installs both supported credential
+	// forms with the same gateway key.
+	out = append(out, "--unsetenv", "ANTHROPIC_API_KEY")
 	for _, kv := range strictRuntimeEnv(cfg, identity) {
 		parts := strings.SplitN(kv, "=", 2)
 		value := ""
@@ -480,6 +508,7 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		"NO_PROXY=" + gatewayNoProxy(cfg, policy),
 		"ANTHROPIC_BASE_URL=" + poolServerBaseURL(cfg),
 		"ANTHROPIC_AUTH_TOKEN=" + cfg.DownstreamKey,
+		"ANTHROPIC_API_KEY=" + cfg.DownstreamKey,
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 	}
 	if policy.DisableNonessentialEnv {

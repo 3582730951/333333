@@ -48,6 +48,8 @@ func TestBuildBubblewrapArgsPreservesRuntimeCWD(t *testing.T) {
 		"165.254.109.23,165.254.109.23:8787,api.openai.com",
 		"\x00--setenv\x00ANTHROPIC_BASE_URL\x00http://165.254.109.23:8787\x00",
 		"\x00--setenv\x00ANTHROPIC_AUTH_TOKEN\x00cap_secret\x00",
+		"\x00--setenv\x00ANTHROPIC_API_KEY\x00cap_secret\x00",
+		"\x00--unsetenv\x00ANTHROPIC_API_KEY\x00",
 		"\x00--\x00/bin/claude\x00--version\x00",
 	} {
 		if !strings.Contains(joined, want) {
@@ -114,6 +116,9 @@ func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
 		"HOME=/home/real",
 		"ANTHROPIC_BASE_URL=https://api.anthropic.com",
 		"ANTHROPIC_AUTH_TOKEN=old",
+		"ANTHROPIC_AUTH_TOKEN=duplicate-old",
+		"ANTHROPIC_API_KEY=host-secret",
+		"ANTHROPIC_API_KEY=duplicate-host-secret",
 		"ANTHROPIC_MODEL=claude-opus-old",
 		"CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-old",
 	}, cfg)
@@ -130,11 +135,76 @@ func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
 			t.Fatalf("compat runtime env missing %q\n---\n%s", want, joined)
 		}
 	}
-	if strings.Contains(joined, "https://api.anthropic.com") || strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=old") {
+	if strings.Contains(joined, "https://api.anthropic.com") ||
+		strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=old") ||
+		strings.Count(joined, "\nANTHROPIC_AUTH_TOKEN=") != 1 ||
+		strings.Count(joined, "\nANTHROPIC_API_KEY=") != 1 ||
+		!strings.Contains(joined, "\nANTHROPIC_API_KEY=cap_secret\n") {
 		t.Fatalf("compat runtime env did not replace old Anthropic settings\n---\n%s", joined)
 	}
 	if !strings.Contains(joined, "ANTHROPIC_MODEL=claude-opus-old") || !strings.Contains(joined, "CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-old") {
 		t.Fatalf("compat runtime must preserve user-maintained model variables\n---\n%s", joined)
+	}
+}
+
+func TestCompatRuntimeEnvReplacesBareAnthropicAPIKeyWithoutMutatingInput(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PoolServerURL = "https://pool.example/"
+	cfg.DownstreamKey = "cap_secret"
+	base := []string{
+		"HOME=/home/real",
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_API_KEY=host-secret",
+		"KEEP=value",
+	}
+
+	env := compatRuntimeEnv(base, cfg)
+	joined := "\n" + strings.Join(env, "\n") + "\n"
+	if strings.Contains(joined, "\nANTHROPIC_API_KEY\n") ||
+		strings.Count(joined, "\nANTHROPIC_API_KEY=") != 1 ||
+		!strings.Contains(joined, "\nANTHROPIC_API_KEY=cap_secret\n") {
+		t.Fatalf("compat runtime did not replace ANTHROPIC_API_KEY\n---\n%s", joined)
+	}
+	if !strings.Contains(joined, "\nANTHROPIC_AUTH_TOKEN=cap_secret\n") ||
+		!strings.Contains(joined, "\nKEEP=value\n") {
+		t.Fatalf("compat runtime lost required environment\n---\n%s", joined)
+	}
+	if got := strings.Join(base, "\n"); !strings.Contains(got, "ANTHROPIC_API_KEY=host-secret") {
+		t.Fatalf("compat runtime mutated caller environment: %q", base)
+	}
+}
+
+func TestBubblewrapReplacesAnthropicAPIKeyWithGatewayKey(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ListenAddr = "127.0.0.1:8765"
+	cfg.PoolServerURL = "https://pool.example/"
+	cfg.DownstreamKey = "cap_secret"
+	id := &CachedIdentity{
+		Local: &LocalEnvironment{WorkDir: "/workspace/project"},
+		Virtual: &VirtualIdentity{
+			Username: "virtuser",
+			Hostname: "virt-host",
+			HomeDir:  "/home/virtuser",
+		},
+	}
+	paths := strictRuntimePaths{
+		VirtualHomeHost: "/tmp/runtime/home",
+		ResolvConf:      "/tmp/runtime/resolv.conf",
+		Passwd:          "/tmp/runtime/passwd",
+		Group:           "/tmp/runtime/group",
+		RuntimeCWD:      "/workspace/project",
+	}
+
+	args := buildBubblewrapArgs(cfg, id, paths, "/bin/claude", nil)
+	joined := "\x00" + strings.Join(args, "\x00") + "\x00"
+	if !strings.Contains(joined, "\x00--unsetenv\x00ANTHROPIC_API_KEY\x00") {
+		t.Fatalf("strict runtime does not unset host ANTHROPIC_API_KEY\nargs=%q", args)
+	}
+	if !strings.Contains(joined, "\x00--setenv\x00ANTHROPIC_API_KEY\x00cap_secret\x00") {
+		t.Fatalf("strict runtime does not install gateway API key\nargs=%q", args)
+	}
+	if !strings.Contains(joined, "\x00--setenv\x00ANTHROPIC_AUTH_TOKEN\x00cap_secret\x00") {
+		t.Fatalf("strict runtime does not install gateway auth token\nargs=%q", args)
 	}
 }
 

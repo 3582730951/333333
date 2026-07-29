@@ -45,17 +45,14 @@ func (s *Server) handleGatewayInstallScript(w http.ResponseWriter, r *http.Reque
 		apiKey = extractAPIKey(r)
 	}
 
-	// 获取当前 VPS 地址
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	baseURL := fmt.Sprintf("%s://%s", scheme, r.Host)
+	// Reuse the same trusted-proxy-aware origin validation as /file. Never place
+	// raw Host/query input inside the generated shell program.
+	baseURL := s.externalOrigin(r)
 
 	// 如果有 API Key，自动填充；否则提示输入
 	apiKeyLine := ""
 	if apiKey != "" {
-		apiKeyLine = fmt.Sprintf(`API_KEY="%s"`, apiKey)
+		apiKeyLine = "API_KEY=" + bashSingleQuote(apiKey)
 	} else {
 		apiKeyLine = `read -p "请输入下游 API Key (cap_xxx): " API_KEY
 if [ -z "$API_KEY" ]; then
@@ -87,26 +84,34 @@ fi
 
 # 下载网关二进制
 echo "[1/6] 下载网关..."
-GATEWAY_URL="%s/download/gateway?os=$OS&arch=$ARCH"
+GATEWAY_URL=%s/download/gateway?os=$OS\&arch=$ARCH
 curl -fsSL "$GATEWAY_URL" -o /tmp/gateway || {
   echo "❌ 下载失败，请检查网络或 VPS 地址"
   exit 1
 }
 chmod +x /tmp/gateway
 
-# 移动到系统目录
-echo "[2/6] 安装到 /usr/local/bin..."
-sudo mv /tmp/gateway /usr/local/bin/gateway || {
-  echo "⚠️  需要 sudo 权限，请手动执行："
-  echo "    sudo mv /tmp/gateway /usr/local/bin/gateway"
-  exit 1
-}
-GATEWAY_BIN="/usr/local/bin/gateway"
+# 安装到持久 PATH：root 直接安装，普通用户优先 sudo；没有 sudo 时安全
+# 回退到 ~/.local/bin，而不是把安装卡死在精简 VPS/容器。
+echo "[2/6] 安装 gateway..."
+if [ "$(id -u)" = "0" ]; then
+  install -m 0755 /tmp/gateway /usr/local/bin/gateway
+  GATEWAY_BIN="/usr/local/bin/gateway"
+elif command -v sudo >/dev/null 2>&1; then
+  sudo install -m 0755 /tmp/gateway /usr/local/bin/gateway
+  GATEWAY_BIN="/usr/local/bin/gateway"
+else
+  mkdir -p "$HOME/.local/bin"
+  install -m 0755 /tmp/gateway "$HOME/.local/bin/gateway"
+  GATEWAY_BIN="$HOME/.local/bin/gateway"
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+rm -f /tmp/gateway
 
 # 配置
 echo ""
 echo "[3/6] 配置网关..."
-POOL_URL="%s"
+POOL_URL=%s
 %s
 export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 
@@ -129,7 +134,7 @@ if ! "$GATEWAY_BIN" trust-ca; then
   echo "执行完成后，运行以下命令继续："
   echo "  $GATEWAY_BIN install-wrapper"
   echo "  $GATEWAY_BIN start-background"
-  exit 0
+  exit 1
 fi
 
 # 安装包装器
@@ -159,11 +164,15 @@ echo ""
 echo "查看状态: $GATEWAY_BIN status"
 echo "查看日志: tail -f ~/.claude-gateway/gateway.log"
 echo "PID 文件: ~/.claude-gateway/gateway.pid"
-`, baseURL, baseURL, apiKeyLine)
+`, bashSingleQuote(baseURL), bashSingleQuote(baseURL), apiKeyLine)
 
 	w.Header().Set("Content-Type", "text/x-shellscript")
 	w.Header().Set("Content-Disposition", "attachment; filename=install-gateway.sh")
 	w.Write([]byte(script))
+}
+
+func bashSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 // extractAPIKey 从请求头提取 API Key

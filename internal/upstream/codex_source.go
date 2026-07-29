@@ -107,6 +107,19 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 		if !present || kind != 'f' {
 			patches = append(patches, bodysource.JSONFieldPatch{Name: "parallel_tool_calls", Value: []byte("false")})
 		}
+	} else if !compact {
+		// The classic Responses backend rejects an orphan parallel_tool_calls
+		// option. Preserve it byte-for-byte when real tools are present so Claude
+		// Code Skills/MCP/built-in tools retain their parallel execution behavior.
+		if _, present := meta.Fields["parallel_tool_calls"]; present {
+			empty, known, err := codexSourceToolsEmpty(*spec)
+			if err != nil {
+				return false, err
+			}
+			if known && empty {
+				patches = append(patches, bodysource.JSONFieldPatch{Name: "parallel_tool_calls", Delete: true})
+			}
+		}
 	}
 	if spec.CodexResponsesWebSocket {
 		patches = append(patches,
@@ -122,7 +135,12 @@ func normalizeCodexSource(client *Client, spec *Request, upstreamBaseURL string,
 			patches = append(patches, bodysource.JSONFieldPatch{Name: "tool_choice", Value: []byte(`"auto"`)})
 		}
 		if !responsesLite {
-			if _, present := meta.Fields["parallel_tool_calls"]; !present {
+			empty, known, err := codexSourceToolsEmpty(*spec)
+			if err != nil {
+				return false, err
+			}
+			_, parallelPresent := meta.Fields["parallel_tool_calls"]
+			if (!known || !empty) && !parallelPresent {
 				patches = append(patches, bodysource.JSONFieldPatch{Name: "parallel_tool_calls", Value: []byte("false")})
 			}
 		}

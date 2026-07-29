@@ -487,6 +487,57 @@ func TestReadRewriteBodyRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+func TestRewriteRequestPreservesClaudeCodeToolAndOpaquePayloads(t *testing.T) {
+	identity := gatewayRewriteTestIdentity()
+	cache := NewIdentityCache("http://pool.invalid", "cap_secret", time.Hour, nil)
+	cache.cache["claude"] = identity
+
+	const huge = "9007199254740993123456789"
+	body := []byte(`{
+	  "metadata":{"user_id":"real"},
+	  "system":[
+	    {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+	    {"type":"text","text":"<env>\nPlatform: darwin\nWorking directory: /home/realuser/project\n</env>"}
+	  ],
+	  "tools":[{"name":"Skill","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}],
+	  "messages":[{"role":"assistant","content":[
+	    {"type":"tool_use","id":"toolu_1","name":"Skill","input":{"path":"/home/realuser/project/SKILL.md","offset":` + huge + `}},
+	    {"type":"thinking","encrypted_content":"enc::real-host::/home/realuser"}
+	  ]}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
+	proxy := &Proxy{cache: cache}
+
+	if err := proxy.rewriteRequest(req); err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ContentLength != int64(len(rewritten)) {
+		t.Fatalf("content length = %d, want %d", req.ContentLength, len(rewritten))
+	}
+	for _, want := range []string{
+		`"/home/realuser/project/SKILL.md"`,
+		`enc::real-host::/home/realuser`,
+		huge,
+	} {
+		if !bytes.Contains(rewritten, []byte(want)) {
+			t.Fatalf("rewritten request lost %q\n---\n%s", want, rewritten)
+		}
+	}
+	// The virtual session belongs only inside metadata.user_id. Top-level
+	// context IDs must never be synthesized by the gateway.
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(rewritten, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["session_id"]; exists {
+		t.Fatalf("gateway synthesized a top-level context id: %s", rewritten)
+	}
+}
+
 func TestGatewayTargetPolicyBlocksNonessentialTraffic(t *testing.T) {
 	poolURL := "https://pool.example:1455"
 	for _, host := range []string{
@@ -592,9 +643,9 @@ func TestGenerateWrapperRoutesClaudeThroughRunClaude(t *testing.T) {
 	script := string(data)
 	for _, want := range []string{
 		"CLAUDE_REAL_BIN=",
-		"HTTP_PROXY=http://127.0.0.1:8765",
-		"HTTPS_PROXY=http://127.0.0.1:8765",
-		"ALL_PROXY=http://127.0.0.1:8765",
+		`HTTP_PROXY="http://127.0.0.1:8765"`,
+		`HTTPS_PROXY="http://127.0.0.1:8765"`,
+		`ALL_PROXY="http://127.0.0.1:8765"`,
 		"NO_PROXY=localhost,127.0.0.1,api.openai.com,chatgpt.com,.chatgpt.com",
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",

@@ -534,8 +534,12 @@ configure_claude() {
   fi
   export POOL_CLIENT_RUNTIME="${POOL_CLIENT_RUNTIME:-%s}"
   export POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-%s}"
+  # Claude Code 2.1.x may send both supported credentials. Pin both to the
+  # bundled gateway key so an inherited official key or apiKeyHelper cannot win
+  # header precedence and make this valid install look unauthorized.
   export ANTHROPIC_BASE_URL="$ORIGIN"
   export ANTHROPIC_AUTH_TOKEN="$API_KEY"
+  export ANTHROPIC_API_KEY="$API_KEY"
   export CLAUDE_CODE_ENABLE_AUTO_MODE=1
 %s
 
@@ -546,7 +550,8 @@ configure_claude() {
   "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"
   "$GATEWAY_BIN" stop || true
   if ! "$GATEWAY_BIN" trust-ca; then
-    say "CA 自动信任失败；请按上方命令手动信任后继续使用 Claude Code"
+    say "CA 自动信任失败；安装尚未完成。请执行 $GATEWAY_BIN trust-ca --print-commands 后重跑本脚本"
+    exit 1
   fi
 
   if [ "$install_rtk" = "1" ]; then

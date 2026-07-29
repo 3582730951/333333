@@ -39,6 +39,7 @@ func AnthropicRequestToResponses(raw []byte) (AnthropicResponsesRequest, error) 
 	}
 
 	originalToWire, wireToOriginal := anthropicResponsesToolNameMaps(root["tools"])
+	webSearchToolNames := anthropicResponsesWebSearchToolNames(root["tools"])
 	input, err := anthropicMessagesToResponsesInput(root["messages"], originalToWire)
 	if err != nil {
 		return AnthropicResponsesRequest{}, err
@@ -62,7 +63,7 @@ func AnthropicRequestToResponses(raw []byte) (AnthropicResponsesRequest, error) 
 		// is aggregated back to one Messages JSON object by the response bridge.
 		"stream": true,
 	}
-	if choice := anthropicResponsesToolChoice(root["tool_choice"], originalToWire); choice != nil {
+	if choice := anthropicResponsesToolChoice(root["tool_choice"], originalToWire, webSearchToolNames); choice != nil {
 		out["tool_choice"] = choice
 	}
 	if key := anthropicResponsesSessionCacheKey(root["metadata"]); key != "" {
@@ -233,6 +234,27 @@ func anthropicMessagesToResponsesInput(value interface{}, names map[string]strin
 						"type": "function_call_output", "call_id": shortenCodexCallID(stringOr(block["tool_use_id"], "")),
 						"output": anthropicToolResultToResponsesOutput(block),
 					})
+				case "server_tool_use":
+					if stringOr(block["name"], "") != "web_search" {
+						return nil, fmt.Errorf("Anthropic server tool %q cannot be represented by Responses", stringOr(block["name"], ""))
+					}
+					flush()
+					action := map[string]interface{}{"type": "search"}
+					if searchInput, _ := block["input"].(map[string]interface{}); searchInput != nil {
+						if query := stringOr(searchInput["query"], ""); query != "" {
+							action["query"] = query
+						}
+					}
+					call := map[string]interface{}{"type": "web_search_call", "status": "completed", "action": action}
+					if id := stringOr(block["id"], ""); id != "" {
+						call["id"] = ResponsesWebSearchCallID(id)
+					}
+					input = append(input, call)
+				case "web_search_tool_result":
+					// A Codex web_search_call is a server-executed output item and
+					// has no separate client result input. The preceding
+					// server_tool_use block is replayed as that item; accepting this
+					// paired Claude block avoids rejecting the next Claude Code turn.
 				case "thinking", "redacted_thinking":
 					reasoning := openAIReasoningItemFromAnthropicBlock(block)
 					if reasoning == nil {
@@ -382,6 +404,10 @@ func anthropicResponsesTools(value interface{}, names map[string]string) ([]inte
 		}
 		typ := stringOr(tool["type"], "")
 		if strings.HasPrefix(typ, "web_search_") {
+			// Claude-only controls (max_uses, blocked_domains,
+			// allowed_callers, response_inclusion) are intentionally not copied:
+			// Codex's hosted web_search schema does not accept them. Forward only
+			// the two fields with an exact Responses equivalent.
 			web := map[string]interface{}{"type": "web_search"}
 			if domains, ok := tool["allowed_domains"].([]interface{}); ok && len(domains) > 0 {
 				web["filters"] = map[string]interface{}{"allowed_domains": domains}
@@ -416,6 +442,21 @@ func anthropicResponsesTools(value interface{}, names map[string]string) ([]inte
 		out = append(out, definition)
 	}
 	return out, inheritModelTools
+}
+
+func anthropicResponsesWebSearchToolNames(value interface{}) map[string]bool {
+	tools, _ := value.([]interface{})
+	names := make(map[string]bool)
+	for _, item := range tools {
+		tool, _ := item.(map[string]interface{})
+		if tool == nil || !strings.HasPrefix(stringOr(tool["type"], ""), "web_search_") {
+			continue
+		}
+		if name := stringOr(tool["name"], ""); name != "" {
+			names[name] = true
+		}
+	}
+	return names
 }
 
 // isClaudeCodeAgentToolSchema deliberately recognizes the built-in Agent tool
@@ -503,7 +544,7 @@ func cleanAnthropicResponsesSchema(value interface{}) interface{} {
 	return root
 }
 
-func anthropicResponsesToolChoice(value interface{}, names map[string]string) interface{} {
+func anthropicResponsesToolChoice(value interface{}, names map[string]string, webSearchToolNames map[string]bool) interface{} {
 	choice, _ := value.(map[string]interface{})
 	if choice == nil {
 		return "auto"
@@ -517,6 +558,9 @@ func anthropicResponsesToolChoice(value interface{}, names map[string]string) in
 		return "none"
 	case "tool":
 		name := stringOr(choice["name"], "")
+		if webSearchToolNames[name] {
+			return map[string]interface{}{"type": "web_search"}
+		}
 		if wire := names[name]; wire != "" {
 			name = wire
 		}
@@ -698,6 +742,7 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 	content := make([]interface{}, 0, 4)
 	hasTools := false
 	bridgePlan := NewResponsesToolBridgePlan()
+	webSearchSeen := make(map[string]bool)
 	output, _ := root["output"].([]interface{})
 	for _, rawItem := range output {
 		item, _ := rawItem.(map[string]interface{})
@@ -767,6 +812,26 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 				"input": responsesToolSearchArguments(item["arguments"]),
 			})
 			hasTools = true
+		case "web_search_call":
+			id := stringOr(firstPresent(item["id"], item["call_id"]), "")
+			if id == "" || webSearchSeen[id] {
+				continue
+			}
+			query := ResponsesWebSearchQuery(item)
+			results := ResponsesWebSearchResults(item)
+			if query == "" && len(results) == 0 {
+				continue
+			}
+			toolUseID := ResponsesWebSearchToolUseID(id)
+			input := map[string]interface{}{}
+			if query != "" {
+				input["query"] = query
+			}
+			content = append(content,
+				map[string]interface{}{"type": "server_tool_use", "id": toolUseID, "name": "web_search", "input": input},
+				map[string]interface{}{"type": "web_search_tool_result", "tool_use_id": toolUseID, "content": results},
+			)
+			webSearchSeen[id] = true
 		}
 	}
 	if len(content) == 0 {
@@ -780,12 +845,78 @@ func ResponsesToAnthropicResponse(raw []byte, requestedModel string, toolNames m
 		model = requestedModel
 	}
 	id := stringOr(root["id"], "msg_pool_codex")
+	responseUsage := responsesAnthropicUsage(root["usage"])
+	if len(webSearchSeen) > 0 {
+		responseUsage["server_tool_use"] = map[string]interface{}{"web_search_requests": len(webSearchSeen)}
+	}
 	response := map[string]interface{}{
 		"id": id, "type": "message", "role": "assistant", "model": model,
 		"content": content, "stop_reason": responsesAnthropicStopReason(root, hasTools), "stop_sequence": nil,
-		"usage": responsesAnthropicUsage(root["usage"]),
+		"usage": responseUsage,
 	}
 	return json.Marshal(response)
+}
+
+const responsesWebSearchToolUsePrefix = "srvtoolu_cdx_"
+
+// ResponsesWebSearchToolUseID wraps a Codex ws_* output ID in Anthropic's
+// server-tool namespace while keeping the original ID exactly recoverable when
+// Claude Code replays the assistant turn.
+func ResponsesWebSearchToolUseID(id string) string {
+	if id == "" {
+		return ""
+	}
+	return responsesWebSearchToolUsePrefix + base64.RawURLEncoding.EncodeToString([]byte(id))
+}
+
+// ResponsesWebSearchCallID reverses ResponsesWebSearchToolUseID. Foreign
+// Anthropic server-tool IDs pass through unchanged rather than being guessed.
+func ResponsesWebSearchCallID(id string) string {
+	if !strings.HasPrefix(id, responsesWebSearchToolUsePrefix) {
+		return id
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(id, responsesWebSearchToolUsePrefix))
+	if err != nil || len(raw) == 0 {
+		return id
+	}
+	return string(raw)
+}
+
+// ResponsesWebSearchQuery extracts the searchable query from a completed
+// Responses web_search_call item.
+func ResponsesWebSearchQuery(item map[string]interface{}) string {
+	action, _ := item["action"].(map[string]interface{})
+	input, _ := item["input"].(map[string]interface{})
+	return stringOr(firstPresent(mapGet(action, "query"), item["query"], mapGet(input, "query")), "")
+}
+
+// ResponsesWebSearchResults converts any included Responses search results to
+// Anthropic web_search_result blocks while preserving opaque encrypted content.
+func ResponsesWebSearchResults(item map[string]interface{}) []interface{} {
+	values, _ := item["results"].([]interface{})
+	results := make([]interface{}, 0, len(values))
+	for _, value := range values {
+		result, _ := value.(map[string]interface{})
+		if result == nil {
+			continue
+		}
+		url := stringOr(result["url"], "")
+		if url == "" {
+			continue
+		}
+		title := stringOr(result["title"], "")
+		if title == "" {
+			title = url
+		}
+		block := map[string]interface{}{
+			"type": "web_search_result", "title": title, "url": url, "page_age": result["page_age"],
+		}
+		if encrypted := stringOr(result["encrypted_content"], ""); encrypted != "" {
+			block["encrypted_content"] = encrypted
+		}
+		results = append(results, block)
+	}
+	return results
 }
 
 func responsesToolSearchArguments(value interface{}) map[string]interface{} {

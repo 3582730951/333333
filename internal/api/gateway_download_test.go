@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,6 +90,9 @@ func TestGatewayInstallScriptRestartsManagedGateway(t *testing.T) {
 		`gateway stop || true`,
 		`"$GATEWAY_BIN" stop`,
 		`"$GATEWAY_BIN" start-background`,
+		`if [ "$(id -u)" = "0" ]`,
+		`command -v sudo`,
+		`GATEWAY_BIN="$HOME/.local/bin/gateway"`,
 		"gateway.pid",
 		"gateway.log",
 	} {
@@ -98,5 +102,32 @@ func TestGatewayInstallScriptRestartsManagedGateway(t *testing.T) {
 	}
 	if strings.Contains(script, `$GATEWAY_BIN start &`) {
 		t.Fatalf("install-gateway script should not tell users to manually background start\n---\n%s", script)
+	}
+}
+
+func TestGatewayInstallScriptQuotesOriginAndKey(t *testing.T) {
+	app := &Server{}
+	req := httptest.NewRequest(http.MethodGet, "/install-gateway.sh?key=cap_a%27b%24%28touch%20BAD%29", nil)
+	req.Host = "pool.example"
+	req.Header.Set("X-Forwarded-Host", "attacker.example")
+	rec := httptest.NewRecorder()
+	app.handleGatewayInstallScript(rec, req)
+
+	script := rec.Body.String()
+	if !strings.Contains(script, `POOL_URL='http://pool.example'`) {
+		t.Fatalf("installer did not use validated request origin\n---\n%s", script)
+	}
+	if strings.Contains(script, "attacker.example") {
+		t.Fatalf("installer trusted unconfigured forwarded host\n---\n%s", script)
+	}
+	if !strings.Contains(script, `API_KEY='cap_a'"'"'b$(touch BAD)'`) {
+		t.Fatalf("installer did not shell-quote API key\n---\n%s", script)
+	}
+	p := filepath.Join(t.TempDir(), "install-gateway.sh")
+	if err := os.WriteFile(p, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("bash", "-n", p).CombinedOutput(); err != nil {
+		t.Fatalf("installer shell syntax: %v\n%s", err, out)
 	}
 }
