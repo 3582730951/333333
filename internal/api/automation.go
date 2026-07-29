@@ -11,7 +11,6 @@ import (
 
 	"codex-account-pool/internal/registration/pipeline"
 	"codex-account-pool/internal/registration/provider"
-	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 )
 
@@ -26,7 +25,6 @@ const (
 	PolicyTypeScheduled = "scheduled" // scheduled batch registration (persisted; execution TODO: needs cron)
 	PolicyTypeRefill    = "refill"    // auto-refill when the active pool drops below a threshold
 	PolicyTypeHealth    = "health"    // health-check automation (handled by the lifecycle subsystem)
-	PolicyTypePlus      = "plus"      // Plus upgrade automation (persisted; execution is Stage 7)
 
 	automationPoliciesKey = "automation_policies"
 	automationRefillCap   = 10 // max registrations a single refill tick may start
@@ -134,7 +132,7 @@ func (s *Server) automationSavePolicy(w http.ResponseWriter, r *http.Request) {
 
 func validAutomationPolicyType(policyType string) bool {
 	switch policyType {
-	case PolicyTypeScheduled, PolicyTypeRefill, PolicyTypeHealth, PolicyTypePlus:
+	case PolicyTypeScheduled, PolicyTypeRefill, PolicyTypeHealth:
 		return true
 	default:
 		return false
@@ -185,8 +183,8 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 	threshold := intFromConfig(cfg, "threshold", 10)
 	method := strings.ToLower(firstNonEmpty(
 		strFromConfig(cfg, "register_method", ""),
-		s.settingString(ctx, "default_register_method", firstNonEmpty(s.cfg.DefaultRegisterMethod, "node")),
-		"node",
+		s.settingString(ctx, "default_register_method", firstNonEmpty(s.cfg.DefaultRegisterMethod, "protocol_v2")),
+		"protocol_v2",
 	))
 	identityMode, identityConfigured := optionalStrFromConfig(cfg, "identity_mode")
 	identityMode = strings.ToLower(strings.TrimSpace(identityMode))
@@ -209,11 +207,21 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 		identityMode = "phone"
 	}
 	group := firstNonEmpty(strFromConfig(cfg, "group", ""), s.cfg.DefaultGroup, "default")
-	egressID := strFromConfig(cfg, "egress", "egress_direct")
+	egressID := firstNonEmpty(
+		strFromConfig(cfg, "egress_id", ""),
+		strFromConfig(cfg, "egress", ""),
+	)
+	registrationPoolID := firstNonEmpty(
+		strFromConfig(cfg, "registration_egress_pool_id", ""),
+		s.settingString(ctx, "registration_egress_pool_id", s.cfg.RegistrationEgressPoolID),
+	)
 	platform := strFromConfig(cfg, "platform", "chatgpt")
 
 	mgr, providerErr := provider.BuildManagerWithError(ctx, s.store, nil)
-	mailboxN, smsN, captchaN := len(mgr.Mailbox), len(mgr.SMS), len(mgr.Captcha)
+	mailboxN, smsN, captchaN := 0, 0, 0
+	if mgr != nil {
+		mailboxN, smsN, captchaN = len(mgr.Mailbox), len(mgr.SMS), len(mgr.Captcha)
+	}
 	emailOTPN := s.enabledProviderKeyCount(ctx, "email", "hotmail_otp")
 
 	accounts, accountErr := s.store.ListAccounts(ctx)
@@ -231,6 +239,8 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 	blockers := []string{}
 	if s.regHandler == nil {
 		blockers = append(blockers, "注册子系统未初始化")
+	} else if !s.regHandler.enabled {
+		blockers = append(blockers, "注册功能默认关闭；需显式启用 registration_enabled")
 	}
 	if policyErr != nil {
 		blockers = append(blockers, "automation_policies 读取失败: "+policyErr.Error())
@@ -264,9 +274,27 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 			blockers = append(blockers, fmt.Sprintf("分组 %q 不存在", group))
 		}
 	}
-	if egressID != "" && egressID != "egress_direct" {
+	if egressID != "" {
 		if _, err := s.store.GetEgressProfile(ctx, egressID); err != nil {
 			blockers = append(blockers, fmt.Sprintf("出口 %q 不存在", egressID))
+		}
+	}
+	methodReadiness := registrationMethodReadiness{Method: method}
+	if s.regHandler != nil && supportedRegistrationMethod(method) && identityErr == "" {
+		var readinessErr error
+		methodReadiness, readinessErr = s.regHandler.registrationMethodReadiness(ctx, pipeline.RegisterRequest{
+			Method:                   method,
+			IdentityMode:             identityMode,
+			EgressID:                 egressID,
+			RegistrationEgressPoolID: registrationPoolID,
+		})
+		if readinessErr != nil {
+			blockers = append(blockers, "注册引擎就绪检查失败")
+		} else {
+			blockers = append(blockers, methodReadiness.Blockers...)
+			if methodReadiness.Ready && !methodReadiness.CanaryReady {
+				blockers = append(blockers, "当前注册配置尚未通过单账号 canary")
+			}
 		}
 	}
 	notes := []string{}
@@ -292,16 +320,19 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 	return map[string]interface{}{
 		"refill": map[string]interface{}{
 			"enabled": refillEnabled, "target": target, "threshold": threshold,
-			"register_method": method, "identity_mode": identityMode, "group": group, "egress": egressID, "platform": platform,
+			"register_method": method, "identity_mode": identityMode, "group": group,
+			"egress": egressID, "registration_egress_pool_id": registrationPoolID, "platform": platform,
 		},
-		"providers":      map[string]int{"mailbox": mailboxN, "email_otp": emailOTPN, "sms": smsN, "captcha": captchaN},
-		"pool":           map[string]int{"active": active, "target": target, "deficit": deficit},
-		"ready":          policyErr == nil && providerErr == nil && s.regHandler != nil && refillEnabled && len(blockers) == 0,
-		"policy_error":   policyError,
-		"provider_error": providerError,
-		"pool_error":     poolError,
-		"blockers":       blockers,
-		"notes":          notes,
+		"registration_enabled": s.regHandler != nil && s.regHandler.enabled,
+		"method_readiness":     methodReadiness,
+		"providers":            map[string]int{"mailbox": mailboxN, "email_otp": emailOTPN, "sms": smsN, "captcha": captchaN},
+		"pool":                 map[string]int{"active": active, "target": target, "deficit": deficit},
+		"ready":                policyErr == nil && providerErr == nil && s.regHandler != nil && s.regHandler.enabled && refillEnabled && len(blockers) == 0,
+		"policy_error":         policyError,
+		"provider_error":       providerError,
+		"pool_error":           poolError,
+		"blockers":             blockers,
+		"notes":                notes,
 	}
 }
 
@@ -369,16 +400,6 @@ func (s *Server) runAutomationTick(ctx context.Context, last map[string]int64) {
 			s.autoRefill(ctx, rp)
 		}
 	}
-	if pp := m[PolicyTypePlus]; pp != nil && pp.Enabled {
-		interval := int64(intFromConfig(pp.Config, "interval", 86400))
-		if interval < 3600 {
-			interval = 3600 // floor: never upgrade more often than hourly
-		}
-		if now-last[PolicyTypePlus] >= interval {
-			last[PolicyTypePlus] = now
-			s.autoUpgradePlus(ctx, pp)
-		}
-	}
 }
 
 // autoRefill tops the active pool back up to `target` when it drops below `threshold`,
@@ -412,7 +433,7 @@ func (s *Server) autoRefill(ctx context.Context, p *Policy) {
 	}
 	req := pipeline.RegisterRequest{
 		Platform:                 strFromConfig(p.Config, "platform", "chatgpt"),
-		Method:                   strFromConfig(p.Config, "register_method", ""), // "" → StartJob applies the configured default ("node")
+		Method:                   strFromConfig(p.Config, "register_method", ""), // "" → StartJob applies the configured default ("protocol_v2")
 		IdentityMode:             strFromConfig(p.Config, "identity_mode", ""),
 		Count:                    need,
 		GroupName:                strFromConfig(p.Config, "group", ""),
@@ -425,60 +446,6 @@ func (s *Server) autoRefill(ctx context.Context, p *Policy) {
 		return
 	}
 	log.Printf("automation: auto-refill started job %s for %d accounts (active=%d threshold=%d)", jobID, need, active, threshold)
-}
-
-// autoUpgradePlus upgrades free accounts to Plus when enabled. Operator-opt-in (only fires
-// when the plus policy is enabled) and payment-manager-gated (no-op when no payment provider
-// is wired). Respects a daily_limit cap to avoid billing surprises.
-func (s *Server) autoUpgradePlus(ctx context.Context, p *Policy) {
-	if s.paymentMgr == nil {
-		return
-	}
-	providerName := strFromConfig(p.Config, "payment_provider", "gopay")
-	provider, err := s.paymentMgr.Get(providerName)
-	if err != nil {
-		log.Printf("automation: auto-upgrade-plus: %v", err)
-		return
-	}
-	dailyLimit := intFromConfig(p.Config, "daily_limit", 5)
-	if dailyLimit <= 0 {
-		return
-	}
-	accounts, err := s.store.ListAccounts(ctx)
-	if err != nil {
-		return
-	}
-	candidates := []*storage.Account{}
-	for i := range accounts {
-		a := &accounts[i]
-		if a.Status == "active" && (a.PlanType == "" || a.PlanType == "free") {
-			candidates = append(candidates, a)
-		}
-	}
-	if len(candidates) == 0 {
-		return
-	}
-	if len(candidates) > dailyLimit {
-		candidates = candidates[:dailyLimit]
-	}
-	egressID := strFromConfig(p.Config, "egress", "egress_direct")
-	proxyURL := ""
-	if egress, err := s.store.GetEgressProfile(ctx, egressID); err == nil {
-		// Best-effort proxy URL extraction for the payment flow (GoPay has its own egress
-		// setting so this is informational; PayPal might use it).
-		proxyURL = egress.Endpoint
-	}
-	succeeded := 0
-	for _, acc := range candidates {
-		if err := provider.Subscribe(ctx, acc, proxyURL); err != nil {
-			log.Printf("automation: upgrade %s to Plus failed: %v", acc.ID, err)
-			continue
-		}
-		// The payment provider already updated account.PlanType inside Subscribe.
-		log.Printf("automation: upgraded %s to Plus via %s", acc.ID, providerName)
-		succeeded++
-	}
-	log.Printf("automation: auto-upgrade-plus: %d/%d succeeded (provider=%s)", succeeded, len(candidates), providerName)
 }
 
 func intFromConfig(cfg map[string]interface{}, key string, def int) int {

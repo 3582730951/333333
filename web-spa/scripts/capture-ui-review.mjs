@@ -366,7 +366,6 @@ async function handleAPI(req) {
     config: { values: { require_downstream_key: true, web_search_enabled: true, claude_cache_ttl: '1h' } },
     registrar: { values: { default_register_method: 'protocol', registration_concurrency: 2 } },
     automation: { policy: { enabled: true, type: 'refill', config: { target: 8, threshold: 2 } } },
-    lifecycle: { defaults: {} },
     logging: { values: {} },
     memory: { values: {} },
   }));

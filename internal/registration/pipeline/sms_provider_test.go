@@ -10,8 +10,11 @@ import (
 )
 
 type pipelineSMSProvider struct {
-	name  string
-	calls []string
+	name          string
+	calls         []string
+	completed     int
+	cancelled     int
+	lastSettledID string
 }
 
 func (p *pipelineSMSProvider) Name() string { return p.name }
@@ -23,7 +26,16 @@ func (p *pipelineSMSProvider) GetNumber(ctx context.Context, country string) (st
 func (p *pipelineSMSProvider) WaitCode(ctx context.Context, orderID string, timeout time.Duration) (string, error) {
 	return "123456", nil
 }
-func (p *pipelineSMSProvider) CancelNumber(ctx context.Context, orderID string) error { return nil }
+func (p *pipelineSMSProvider) CancelNumber(ctx context.Context, orderID string) error {
+	p.cancelled++
+	p.lastSettledID = orderID
+	return nil
+}
+func (p *pipelineSMSProvider) CompleteNumber(ctx context.Context, orderID string) error {
+	p.completed++
+	p.lastSettledID = orderID
+	return nil
+}
 
 func TestAcquireSMSRespectsRequestedProvider(t *testing.T) {
 	hero := &pipelineSMSProvider{name: "herosms"}
@@ -53,5 +65,25 @@ func TestAcquireSMSUnknownRequestedProviderErrors(t *testing.T) {
 	_, _, _, err := p.acquireSMS(context.Background(), RegisterRequest{SMSProvider: "smsbower", Country: "BR"})
 	if err == nil || !errors.Is(err, provider.ErrNoProviderAvailable) {
 		t.Fatalf("err = %v, want ErrNoProviderAvailable", err)
+	}
+}
+
+func TestSettleSMSLeaseCompletesConsumedNumberExactlyOnce(t *testing.T) {
+	smsProvider := &pipelineSMSProvider{name: "herosms"}
+	p := NewPipeline(nil, nil, nil, nil)
+	p.settleSMSLease(context.Background(), RegisterRequest{}, smsProvider, "order-1", true)
+
+	if smsProvider.completed != 1 || smsProvider.cancelled != 0 || smsProvider.lastSettledID != "order-1" {
+		t.Fatalf("settlement = completed:%d cancelled:%d id:%q", smsProvider.completed, smsProvider.cancelled, smsProvider.lastSettledID)
+	}
+}
+
+func TestSettleSMSLeaseCancelsUnconsumedNumberExactlyOnce(t *testing.T) {
+	smsProvider := &pipelineSMSProvider{name: "herosms"}
+	p := NewPipeline(nil, nil, nil, nil)
+	p.settleSMSLease(context.Background(), RegisterRequest{}, smsProvider, "order-2", false)
+
+	if smsProvider.completed != 0 || smsProvider.cancelled != 1 || smsProvider.lastSettledID != "order-2" {
+		t.Fatalf("settlement = completed:%d cancelled:%d id:%q", smsProvider.completed, smsProvider.cancelled, smsProvider.lastSettledID)
 	}
 }

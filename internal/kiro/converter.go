@@ -134,6 +134,17 @@ type ConversionOptions struct {
 	// It is required to resolve family/auto aliases; concrete versions never use a
 	// different verified version as a substitute.
 	VerifiedModels []string
+	// CatalogPublicModel and CatalogUpstreamModel bind conversion to an exact,
+	// account-scoped live-catalog descriptor. The public ID controls compatibility
+	// policy while the exact upstream ID is written to every Kiro wire message.
+	CatalogPublicModel   string
+	CatalogUpstreamModel string
+	// Live-catalog limits override bundled fallbacks only when present.
+	MaxOutputTokens           int64
+	AdaptiveThinkingKnown     bool
+	AdaptiveThinkingSupported bool
+	EffortKnown               bool
+	MaxThinkingEffort         string
 	// Compaction marks a genuine Claude Code summarization request. It does not
 	// change the window by itself; the API layer must still prove account/model
 	// eligibility before passing a larger ContextWindow.
@@ -259,12 +270,29 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	if err := decodeUseNumber(raw, &req); err != nil {
 		return Conversion{}, err
 	}
-	canonical, ok := capability.ResolveKiroModel(req.Model, options.VerifiedModels)
-	if !ok {
-		if capability.KiroModelAlias(req.Model) {
-			return Conversion{}, fmt.Errorf("%w for alias %q", ErrVerifiedModelUnavailable, req.Model)
+	canonical := ""
+	wireModel := ""
+	if strings.TrimSpace(options.CatalogPublicModel) != "" && strings.TrimSpace(options.CatalogUpstreamModel) != "" {
+		if strings.EqualFold(strings.TrimSpace(options.CatalogPublicModel), "auto") {
+			canonical = "auto"
+		} else {
+			var ok bool
+			canonical, ok = capability.KiroCanonicalModel(options.CatalogPublicModel)
+			if !ok {
+				return Conversion{}, fmt.Errorf("%w %q", ErrUnsupportedModel, options.CatalogPublicModel)
+			}
 		}
-		return Conversion{}, fmt.Errorf("%w %q", ErrUnsupportedModel, req.Model)
+		wireModel = strings.TrimSpace(options.CatalogUpstreamModel)
+	} else {
+		var ok bool
+		canonical, ok = capability.ResolveKiroModel(req.Model, options.VerifiedModels)
+		if !ok {
+			if capability.KiroModelAlias(req.Model) {
+				return Conversion{}, fmt.Errorf("%w for alias %q", ErrVerifiedModelUnavailable, req.Model)
+			}
+			return Conversion{}, fmt.Errorf("%w %q", ErrUnsupportedModel, req.Model)
+		}
+		wireModel = canonical
 	}
 	if len(req.Messages) == 0 {
 		return Conversion{}, errors.New("messages required")
@@ -358,13 +386,13 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	messageHistoryIndexes := map[int]int{}
 	for i := 0; i < historyEnd; i++ {
 		spanStart := len(history)
-		converted, role, err := convertHistory(req.Messages[i], canonical, toolNames, uses, paired, losses)
+		converted, role, err := convertHistory(req.Messages[i], wireModel, toolNames, uses, paired, losses)
 		if err != nil {
 			return Conversion{}, err
 		}
 		if role == "assistant" && (len(history) == 0 || historyItemRole(history[len(history)-1]) == "assistant") {
 			history = append(history, map[string]any{
-				"userInputMessage": map[string]any{"content": assistantFirstPadding, "modelId": canonical, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}},
+				"userInputMessage": map[string]any{"content": assistantFirstPadding, "modelId": wireModel, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}},
 			})
 			losses.add(LossAssistantFirstPadded)
 		}
@@ -384,12 +412,12 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 
 	var current map[string]any
 	if lastIsUser {
-		current, err = convertUserMessage(req.Messages[len(req.Messages)-1], canonical, uses, losses)
+		current, err = convertUserMessage(req.Messages[len(req.Messages)-1], wireModel, uses, losses)
 		if err != nil {
 			return Conversion{}, err
 		}
 	} else {
-		current = map[string]any{"content": prefillContinuation, "modelId": canonical, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}
+		current = map[string]any{"content": prefillContinuation, "modelId": wireModel, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}
 	}
 	ctx, _ := current["userInputMessageContext"].(map[string]any)
 	if ctx == nil {
@@ -428,29 +456,38 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	// downstream model id verbatim and use the upstream default generation policy.
 	// Do not turn the global Claude max-quality invariant into a GPT 400.
 	isKiroGPT := capability.KiroSupportsGPTModel(canonical)
-	if options.ForceMaxQuality && !isKiroGPT {
+	isKiroAuto := strings.EqualFold(canonical, "auto")
+	if options.ForceMaxQuality && !isKiroGPT && !isKiroAuto {
 		if explicitlyDisabled {
 			losses.add(LossThinkingForcedAdaptive)
 		}
 		thinkingEnabled = true
 	}
-	if isKiroGPT {
+	if isKiroGPT || isKiroAuto {
 		thinkingEnabled = false
 	}
-	if thinkingEnabled && !capability.KiroSupportsAdaptiveThinking(canonical) {
+	adaptiveSupported := capability.KiroSupportsAdaptiveThinking(canonical)
+	if options.AdaptiveThinkingKnown {
+		adaptiveSupported = options.AdaptiveThinkingSupported
+	}
+	if thinkingEnabled && !adaptiveSupported {
 		return Conversion{}, fmt.Errorf("%w: model %s does not support adaptive thinking", ErrReasoningUnavailable, canonical)
 	}
 	thinkingEffort := ""
 	if req.OutputConfig != nil {
 		thinkingEffort = normalizeKiroThinkingEffort(req.OutputConfig.Effort)
 	}
-	if options.ForceMaxQuality && !isKiroGPT {
-		if thinkingEffort != "" && thinkingEffort != "max" {
+	if options.ForceMaxQuality && !isKiroGPT && !isKiroAuto {
+		maximumEffort := "max"
+		if options.EffortKnown {
+			maximumEffort = normalizeKiroThinkingEffort(options.MaxThinkingEffort)
+		}
+		if thinkingEffort != "" && thinkingEffort != maximumEffort {
 			losses.add(LossThinkingEffortForcedMax)
 		}
-		thinkingEffort = "max"
+		thinkingEffort = maximumEffort
 	}
-	if isKiroGPT {
+	if isKiroGPT || isKiroAuto {
 		thinkingEffort = ""
 	}
 	additionalFields := map[string]any{}
@@ -464,8 +501,11 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		}
 	}
 	maxOutputTokens := int64(0)
-	if options.ForceMaxQuality && !isKiroGPT {
-		maxOutputTokens = kiroMaxOutputTokens(canonical)
+	if options.ForceMaxQuality && !isKiroGPT && !isKiroAuto {
+		maxOutputTokens = options.MaxOutputTokens
+		if maxOutputTokens <= 0 {
+			maxOutputTokens = kiroMaxOutputTokens(canonical)
+		}
 		additionalFields["max_tokens"] = maxOutputTokens
 	}
 	if len(additionalFields) > 0 {
@@ -527,7 +567,7 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	return Conversion{
 		Body:                   body,
 		BodyWithoutCachePoints: bodyWithoutCachePoints,
-		Model:                  canonical,
+		Model:                  wireModel,
 		ToolNameMap:            toolNames,
 		ToolDescriptionHashes:  descriptionHashes,
 		EstimatedInputTokens:   estimatedInputTokens,
@@ -789,8 +829,11 @@ func normalizeKiroThinkingEffort(effort string) string {
 }
 
 func kiroMaxOutputTokens(model string) int64 {
-	if canonical, ok := capability.KiroCanonicalModel(model); ok && canonical == "claude-opus-4.8" {
-		return 128000
+	if canonical, ok := capability.KiroCanonicalModel(model); ok {
+		switch canonical {
+		case "claude-opus-5", "claude-opus-4.8", "claude-sonnet-5":
+			return 128000
+		}
 	}
 	return 64000
 }

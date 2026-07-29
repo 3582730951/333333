@@ -9,7 +9,7 @@ import (
 )
 
 // TestTokenEncryptionAtRest proves the secret is ciphertext on disk (a reader without
-// the key sees an enc:v1: blob) while a keyed reader transparently gets the plaintext.
+// the key sees a versioned ciphertext blob) while a keyed reader gets plaintext.
 func TestTokenEncryptionAtRest(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "enc.sqlite3")

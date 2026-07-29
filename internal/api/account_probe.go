@@ -100,77 +100,38 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		}
 		return caps, nil
 	case "kiro":
-		caps := capability.StaticKiroModels(account.ID)
 		cred, err := s.store.GetKiroCredentials(ctx, account.ID)
 		if err != nil {
 			return nil, err
 		}
 		cfg := s.effectiveKiroConfig(ctx)
-		endpointHash, err := kirowire.EndpointHash(cred.Endpoint, firstNonEmpty(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1"), cfg.KiroEndpointAllowlist)
+		region := firstNonEmpty(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1")
+		endpointHash, err := kirowire.EndpointHash(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
 		if err != nil {
 			return nil, err
 		}
-		models := make([]string, 0, len(caps))
-		for _, model := range caps {
-			models = append(models, model.ModelSlug)
+		capabilityKey, _ := kirowire.KiroCapabilityKey(endpointHash, region, cred.ProfileARN)
+		bearer, _, refreshedCred, prepareErr := s.kiro.Prepare(ctx, account, cred, token, egress, false)
+		if prepareErr != nil {
+			return s.existingOrStaticKiroModels(ctx, account.ID, capabilityKey, endpointHash, prepareErr)
+		}
+		capabilityKey, _ = kirowire.KiroCapabilityKey(endpointHash, region, refreshedCred.ProfileARN)
+		catalog, catalogErr := s.kiro.RefreshModelCatalog(ctx, account, refreshedCred, bearer, egress)
+		if catalogErr != nil {
+			return s.existingOrStaticKiroModels(ctx, account.ID, capabilityKey, endpointHash, catalogErr)
+		}
+		caps := kiroCatalogCapabilities(account.ID, catalog)
+		if len(caps) == 0 {
+			return s.existingOrStaticKiroModels(ctx, account.ID, capabilityKey, endpointHash, errors.New("empty Kiro catalog"))
+		}
+		models := make([]string, 0, len(catalog)*2)
+		for _, descriptor := range catalog {
+			models = append(models, descriptor.PublicID, descriptor.UpstreamID)
 		}
 		if err := s.store.EnsureKiroRuntimeModels(ctx, account.ID, endpointHash, models); err != nil {
 			return nil, err
 		}
-		verified, err := s.store.VerifiedKiroModels(ctx, account.ID, endpointHash, true)
-		if err != nil {
-			return nil, err
-		}
-		verifiedByCanonical := map[string]string{}
-		for _, model := range verified {
-			if canonical, ok := capability.KiroCanonicalModel(model); ok {
-				verifiedByCanonical[canonical] = model
-			}
-		}
-		existingByCanonical := map[string]storage.ModelCapability{}
-		if existing, listErr := s.store.ListCapabilities(ctx, account.ID); listErr == nil {
-			for _, current := range existing {
-				if canonical, ok := capability.KiroCanonicalModel(current.ModelSlug); ok {
-					existingByCanonical[canonical] = current
-				}
-			}
-		}
-		seen := map[string]bool{}
-		for i := range caps {
-			canonical, ok := capability.KiroCanonicalModel(caps[i].ModelSlug)
-			if !ok {
-				continue
-			}
-			seen[canonical] = true
-			if _, ok := verifiedByCanonical[canonical]; !ok {
-				continue
-			}
-			caps[i].AvailabilityState = capability.AvailabilityVerified
-			caps[i].Source = "kiro_runtime_inference"
-			if prior, ok := existingByCanonical[canonical]; ok {
-				caps[i].Context1MState = prior.Context1MState
-				caps[i].Context1MSource = prior.Context1MSource
-			}
-		}
-		for canonical, runtimeModel := range verifiedByCanonical {
-			if seen[canonical] {
-				continue
-			}
-			model := firstNonEmpty(runtimeModel, canonical)
-			window := capability.KiroContextWindow(model)
-			cap := storage.ModelCapability{
-				AccountID: account.ID, ModelSlug: model, AvailabilityState: capability.AvailabilityVerified,
-				Context1MState: capability.Context1MUnknown, NativeContextWindow: 200000,
-				NativeMaxContextWindow: window, EffectiveContextWindowPercent: 100,
-				Source: "kiro_runtime_inference", LastProbeAt: storage.Now(),
-			}
-			if prior, ok := existingByCanonical[canonical]; ok {
-				cap.Context1MState = prior.Context1MState
-				cap.Context1MSource = prior.Context1MSource
-			}
-			caps = append(caps, cap)
-		}
-		if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+		if err := s.store.ReplaceCapabilities(ctx, account.ID, caps); err != nil {
 			return nil, err
 		}
 		return caps, nil
@@ -266,6 +227,75 @@ func (s *Server) existingAntigravityModels(ctx context.Context, accountID string
 		return nil, err
 	}
 	return nil, probeErr
+}
+
+func kiroCatalogCapabilities(accountID string, catalog []storage.KiroModelDescriptor) []storage.ModelCapability {
+	now := storage.Now()
+	out := make([]storage.ModelCapability, 0, len(catalog))
+	for _, descriptor := range catalog {
+		if !descriptor.Complete || strings.TrimSpace(descriptor.PublicID) == "" {
+			continue
+		}
+		maximum := descriptor.MaxInputTokens
+		if maximum <= 0 {
+			maximum = capability.KiroContextWindow(descriptor.PublicID)
+		}
+		contextState := capability.Context1MUnsupported
+		contextSource := "kiro_live_catalog_max_input"
+		if maximum >= 1_000_000 {
+			contextState = capability.Context1MSupported
+		} else if descriptor.MaxInputTokens <= 0 {
+			contextState = capability.Context1MUnknown
+			contextSource = ""
+		}
+		out = append(out, storage.ModelCapability{
+			AccountID:                     accountID,
+			ModelSlug:                     descriptor.PublicID,
+			AvailabilityState:             capability.AvailabilityVerified,
+			Context1MState:                contextState,
+			Context1MSource:               contextSource,
+			NativeContextWindow:           capability.KiroEffectiveContextWindow(descriptor.PublicID, "", descriptor.MaxInputTokens),
+			NativeMaxContextWindow:        maximum,
+			EffectiveContextWindowPercent: 100,
+			RawModelJSONHash:              descriptor.RawJSONHash,
+			Source:                        "kiro_live_catalog",
+			LastProbeAt:                   now,
+		})
+	}
+	return out
+}
+
+func (s *Server) existingOrStaticKiroModels(ctx context.Context, accountID, capabilityKey, endpointHash string, probeErr error) ([]storage.ModelCapability, error) {
+	if catalog, err := s.store.ListKiroModelCatalog(ctx, accountID, capabilityKey); err == nil && len(catalog) > 0 {
+		caps := kiroCatalogCapabilities(accountID, catalog)
+		if len(caps) > 0 {
+			log.Printf("Kiro model catalog probe failed class=%T; retaining last-good catalog", probeErr)
+			if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+				return nil, err
+			}
+			return caps, nil
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	if existing, err := s.store.ListCapabilities(ctx, accountID); err == nil && len(existing) > 0 {
+		log.Printf("Kiro model catalog probe failed class=%T; retaining existing capabilities", probeErr)
+		return existing, nil
+	} else if err != nil {
+		return nil, err
+	}
+	caps := capability.StaticKiroModels(accountID)
+	models := make([]string, 0, len(caps))
+	for _, model := range caps {
+		models = append(models, model.ModelSlug)
+	}
+	if err := s.store.EnsureKiroRuntimeModels(ctx, accountID, endpointHash, models); err != nil {
+		return nil, err
+	}
+	if err := s.store.UpsertCapabilities(ctx, caps); err != nil {
+		return nil, err
+	}
+	return caps, nil
 }
 
 // upsertStaticCodexModels stores unverified discovery hints when the live ChatGPT
@@ -539,6 +569,7 @@ func (s *Server) StartBackground(ctx context.Context) {
 	s.startBillingHoldExpiryLoop(ctx)
 	s.startLogRetentionLoop(ctx)
 	s.startDiskGuard(ctx)
+	s.startDiagnosticJobLoop(ctx)
 	interval := time.Duration(s.cfg.ModelProbeIntervalHours) * time.Hour
 	if interval <= 0 {
 		return
@@ -567,6 +598,9 @@ func (s *Server) probeLoop(ctx context.Context, interval time.Duration) {
 // and the shared egress. Every blocking point selects on ctx.Done() so the sweep
 // never blocks shutdown.
 func (s *Server) probeAllAccounts(ctx context.Context) {
+	if s.diskGuardPausesBackground() {
+		return
+	}
 	accounts, err := s.store.ListAccounts(ctx)
 	if err != nil {
 		log.Printf("model probe sweep: list accounts: %v", err)

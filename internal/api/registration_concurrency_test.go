@@ -111,8 +111,8 @@ func TestProcessBatchRecordsWorkerPanicAsFailure(t *testing.T) {
 	).Scan(&status, &succeeded, &failed); err != nil {
 		t.Fatal(err)
 	}
-	if status != "completed" || succeeded != 0 || failed != 1 {
-		t.Fatalf("job status=%s succeeded=%d failed=%d, want completed 0 1", status, succeeded, failed)
+	if status != "failed" || succeeded != 0 || failed != 1 {
+		t.Fatalf("job status=%s succeeded=%d failed=%d, want failed 0 1", status, succeeded, failed)
 	}
 
 	var recordStatus, recordError string

@@ -4,25 +4,25 @@ ChatGPT phone-signup: hero-sms + yescaptcha + cliproxy US (指定代理).
 Ported from other_project's working patterns + other_gpt's GuJumpgate techniques.
 
 Providers (all from env, pool_server injects):
-  - Proxy: cliproxy US residential (sg2.cliproxy.io:3010, user zdvw1182255-region-US-sid-8ijY8peJ-t-15)
-  - SMS: hero-sms (hero-sms.com, api_key 810154d173c3c562B1ed124418c8f7B3)
-  - Captcha: yescaptcha (api.yescaptcha.com, key 63bd2418e3ba87a501e06efe45820c65646a8c79111595)
+  - Proxy: configured residential egress
+  - SMS: configured SMS provider
+  - Captcha: configured captcha provider
 
 Output: __CODEX_ACCOUNT__ {json} on stdout (imported by pool_server Go pipeline).
 """
 import json, os, random, re, sys, time, urllib.error, urllib.parse, urllib.request
 
-# ── Providers (from env or defaults matching user's specified credentials) ──
+# ── Providers (required through the isolated worker environment) ─────────────
 REALIP        = os.environ.get("CLIPROXY_REALIP", "")
-PROXY_USER    = os.environ.get("REG_PROXY_USER", "zdvw1182255-region-US-sid-8ijY8peJ-t-15")
-PROXY_PASS    = os.environ.get("REG_PROXY_PASS", "d6kfytmo")
-HEROSMS_KEY   = os.environ.get("HEROSMS_KEY", "810154d173c3c562B1ed124418c8f7B3")
-YCAPTCHA_KEY  = os.environ.get("Y_CAPTCHA_KEY", "63bd2418e3ba87a501e06efe45820c65646a8c79111595")
+PROXY_USER    = os.environ.get("REG_PROXY_USER", "")
+PROXY_PASS    = os.environ.get("REG_PROXY_PASS", "")
+HEROSMS_KEY   = os.environ.get("HEROSMS_KEY", "")
+YCAPTCHA_KEY  = os.environ.get("Y_CAPTCHA_KEY", "")
 YCAPTCHA_API  = "https://api.yescaptcha.com"
 HEROSMS       = "https://hero-sms.com/stubs/handler_api.php"
 CHROME        = os.environ.get("REG_CHROME", os.environ.get("CHROME_PATH", ""))
 HEADLESS      = os.environ.get("REG_HEADLESS", "1") != "0"
-EMAIL_BASE    = os.environ.get("HOTMAIL_BASE", "xnzsilq@hotmail.com")
+EMAIL_BASE    = os.environ.get("HOTMAIL_BASE", "")
 OTP_URL       = os.environ.get("REG_OTP_URL", "")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 

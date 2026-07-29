@@ -24,7 +24,6 @@ const adminPages = [
   // Registration
   { name: '06_registration', path: '/console/registration' },
   { name: '07_automation', path: '/console/automation' },
-  { name: '08_lifecycle', path: '/console/lifecycle' },
 
   // Monitoring
   { name: '09_usage', path: '/console/usage' },
@@ -37,7 +36,6 @@ const adminPages = [
   { name: '14_users', path: '/console/users' },
   { name: '15_thinking', path: '/console/thinking' },
   { name: '16_moderation', path: '/console/moderation' },
-  { name: '17_gopay', path: '/console/gopay' },
   { name: '18_settings', path: '/console/settings' },
 
   // User Portal

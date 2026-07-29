@@ -10,11 +10,11 @@ CLI flow) so the account gets a refresh_token and id_token — the web-session a
 alone expires in ~6h and cannot refresh. This mirrors the GuJumpgate browser OAuth flow.
 
 Env vars (all set by pool_server):
-  REG_PROXY_SERVER    e.g. http://152.32.235.240:3010  (or 43.230.8.144:3010)
-  REG_PROXY_USER      e.g. zdvw1182255-region-Rand-sid-XXXX
-  REG_PROXY_PASS      e.g. d6kfytmo
-  REG_EMAIL           e.g. xnzsilq+tag@hotmail.com
-  REG_OTP_URL         e.g. http://185.242.234.133:8000/get_email/TOKEN
+  REG_PROXY_SERVER    proxy URL supplied by the selected egress
+  REG_PROXY_USER      proxy username
+  REG_PROXY_PASS      proxy password
+  REG_EMAIL           registration email
+  REG_OTP_URL         authenticated OTP relay URL
   REG_CHROME          chrome binary path (default: CHROME_PATH env)
   REG_HEADLESS        0=headed, 1=headless (default headless)
 Output: __CODEX_ACCOUNT__ {json} on stdout, step logs to stderr.
@@ -33,13 +33,14 @@ import urllib.request
 
 PROXY_SERVER = os.environ.get("REG_PROXY_SERVER", "")
 PROXY_USER   = os.environ.get("REG_PROXY_USER", "")
-PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "d6kfytmo")
+PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "")
 EMAIL        = os.environ.get("REG_EMAIL", "")
 OTP_URL      = os.environ.get("REG_OTP_URL", "")
+OTP_TOKEN    = os.environ.get("REG_OTP_TOKEN", "")
 CHROME       = os.environ.get("REG_CHROME", os.environ.get("CHROME_PATH", ""))
 HEADLESS     = os.environ.get("REG_HEADLESS", "1") != "0"
 # hero-sms for the OAuth-stage add-phone step (only used if OpenAI demands a phone).
-HEROSMS_KEY  = os.environ.get("HEROSMS_KEY", os.environ.get("HEROSMS_API_KEY", "810154d173c3c562B1ed124418c8f7B3"))
+HEROSMS_KEY  = os.environ.get("HEROSMS_KEY", os.environ.get("HEROSMS_API_KEY", ""))
 SMS_COUNTRY  = os.environ.get("REG_SMS_COUNTRY", "PH")  # must match the proxy region
 
 # Sibling module: the correct GuJumpgate-ported add-phone handler.
@@ -146,10 +147,15 @@ def react_fill(page, selector, value):
 
 def fetch_otp(since_ts):
     """Poll for a NEW OTP code (received after since_ts)."""
+    if not OTP_TOKEN:
+        raise RuntimeError("authenticated OTP relay token is missing")
     deadline = time.time() + 150
     while time.time() < deadline:
         try:
-            req = urllib.request.Request(OTP_URL, headers={"User-Agent": UA})
+            req = urllib.request.Request(OTP_URL, headers={
+                "User-Agent": UA,
+                "Authorization": f"Bearer {OTP_TOKEN}",
+            })
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
         except Exception:

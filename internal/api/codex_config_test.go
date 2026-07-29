@@ -50,7 +50,7 @@ func TestCodexConfigScript(t *testing.T) {
 		"experimental_bearer_token",
 		`API_KEY='` + plain + `'`,
 		`MODEL='gpt-5.6-sol'`,
-		`model_context_window = 372000`,
+		`model_context_window = 272000`,
 		`model_auto_compact_token_limit = 272000`,
 		"/v1\"", // base_url ends with /v1
 	} {

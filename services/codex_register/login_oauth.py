@@ -36,7 +36,7 @@ import urllib.request
 
 PROXY_SERVER = os.environ.get("REG_PROXY_SERVER", "")
 PROXY_USER   = os.environ.get("REG_PROXY_USER", "")
-PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "d6kfytmo")
+PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "")
 EMAIL        = os.environ.get("REG_EMAIL", "")
 PASSWORD     = os.environ.get("REG_PASSWORD", "")
 OTP_URL      = os.environ.get("REG_OTP_URL", "")

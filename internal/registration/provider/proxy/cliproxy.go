@@ -55,7 +55,7 @@ func (c *Cliproxy) URL() string {
 
 // ParseSpec parses the operator-facing "host:port:username:password" cliproxy spec, e.g.
 //
-//	sg2.cliproxy.io:3010:zdvw1182255-region-US-sid-8ijY8peJ-t-15:d6kfytmo
+//	proxy.example:3010:account-region-US-sid-example-t-15:password
 //
 // The username already encodes region / sid / ttl; ParseSpec extracts the static account,
 // region and ttl so URL() can regenerate the sid. The literal sid in the spec is ignored

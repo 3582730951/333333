@@ -256,7 +256,7 @@ func TestAntigravityStreamWrapperThinkingToolAndTerminal(t *testing.T) {
 	stream := strings.Join([]string{
 		`data: {"response":{"candidates":[{"content":{"parts":[{"text":"plan","thought":true,"thoughtSignature":"sig"}]}}]}}`,
 		`data: {"response":{"candidates":[{"content":{"parts":[{"text":"answer"},{"functionCall":{"id":"call-1","name":"read_file","args":{"path":"/tmp/a"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3,"thoughtsTokenCount":1,"cachedContentTokenCount":4}}}`,
-	}, "\n") + "\n"
+	}, "\n\n") + "\n\n"
 	var out bytes.Buffer
 	in, output, cached, stop, err := AntigravityStreamToAnthropic(context.Background(), strings.NewReader(stream), &out, "claude-opus-4-8", "msg_test")
 	if err != nil {
@@ -279,8 +279,50 @@ func TestAntigravityTruncatedStreamStillTerminatesDownstream(t *testing.T) {
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("error = %v, want unexpected EOF", err)
 	}
-	if !strings.Contains(out.String(), "partial") || !strings.Contains(out.String(), "event: message_stop") {
-		t.Fatalf("truncated stream was not closed cleanly: %s", out.String())
+	if !strings.Contains(out.String(), "partial") || !strings.Contains(out.String(), "event: error") || strings.Contains(out.String(), "event: message_stop") {
+		t.Fatalf("truncated stream did not receive exactly one failure terminal: %s", out.String())
+	}
+}
+
+func TestAntigravityUsageFramesDoNotTerminateAndUsageIsMonotonic(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"response":{"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":1},"candidates":[{"finishReason":""}]}}`,
+		`data: {"response":{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2},"candidates":[{"content":{"parts":[{"text":"complete"}]},"finishReason":""}]}}`,
+		`data: {"response":{"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":3,"thoughtsTokenCount":2},"candidates":[{"finishReason":"STOP"}]}}`,
+	}, "\n\n") + "\n\n"
+	var out bytes.Buffer
+	input, output, _, stop, err := AntigravityStreamToAnthropic(context.Background(), strings.NewReader(stream), &out, "claude-opus-5", "msg_usage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input != 12 || output != 5 || stop != "end_turn" {
+		t.Fatalf("usage/stop = %d/%d/%q", input, output, stop)
+	}
+	if !strings.Contains(out.String(), `"text":"complete"`) || strings.Count(out.String(), "event: message_stop") != 1 {
+		t.Fatalf("stream terminated early or more than once: %s", out.String())
+	}
+}
+
+func TestAntigravitySSEDecoderSupportsCRLFAndMultilineData(t *testing.T) {
+	stream := "data: {\"response\":\r\n" +
+		"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"multi\"}]},\"finishReason\":\"STOP\"}]}}\r\n\r\n"
+	var out bytes.Buffer
+	_, _, _, _, err := AntigravityStreamToAnthropic(context.Background(), strings.NewReader(stream), &out, "claude-opus-5", "msg_multi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"text":"multi"`) || strings.Count(out.String(), "event: message_stop") != 1 {
+		t.Fatalf("multiline frame = %s", out.String())
+	}
+}
+
+func TestParseAntigravityUsageWithEmptyFinishIsNotTerminal(t *testing.T) {
+	chunk, err := parseAntigravityChunk([]byte(`{"usageMetadata":{"promptTokenCount":9},"candidates":[{"finishReason":""}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunk.IsLast || chunk.StopReason != "" || chunk.InputTokens != 9 {
+		t.Fatalf("chunk = %+v", chunk)
 	}
 }
 

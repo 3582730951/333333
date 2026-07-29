@@ -180,14 +180,14 @@ export function TaskDetailDrawer({
   const active = open ?? visible ?? !!task;
   const details = task && typeof task === 'object' ? [
     [t('workflow.task_id'), task.id],
-    [t('lifecycle.type'), task.task_type || task.method],
-    [t('lifecycle.platform'), task.platform],
-    [t('lifecycle.group'), task.group_name],
-    [t('lifecycle.egress'), task.egress_id || task.registration_egress_pool_id],
+    [t('workflow.type'), task.task_type || task.method],
+    [t('workflow.platform'), task.platform],
+    [t('workflow.group'), task.group_name],
+    [t('workflow.egress'), task.egress_id || task.registration_egress_pool_id],
     [t('workflow.target'), task.total ?? task.target_count],
     [t('workflow.success'), task.succeeded ?? task.success_count],
     [t('workflow.failed'), task.failed ?? task.failed_count],
-    [t('lifecycle.created_at'), fmtDateTime(task.created_at)],
+    [t('workflow.created_at'), fmtDateTime(task.created_at)],
     [t('common.updated_at'), fmtDateTime(task.updated_at)],
   ].filter(([, value]) => value !== undefined && value !== null && value !== '') : [];
 

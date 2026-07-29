@@ -31,7 +31,22 @@ func (s *Server) handleRegisterBatch(w http.ResponseWriter, r *http.Request) {
 		s.regHandler.HandleJobList(w, r)
 		return
 	}
+	if s.diskGuardPausesBackground() {
+		writePublicServiceUnavailable(w)
+		return
+	}
 	s.regHandler.HandleRegisterBatch(w, r)
+}
+
+func (s *Server) handleRegisterCanary(w http.ResponseWriter, r *http.Request) {
+	if !s.regReady(w, r) {
+		return
+	}
+	if r.Method == http.MethodPost && s.diskGuardPausesBackground() {
+		writePublicServiceUnavailable(w)
+		return
+	}
+	s.regHandler.HandleCanary(w, r)
 }
 
 func (s *Server) handleRegisterJobs(w http.ResponseWriter, r *http.Request) {

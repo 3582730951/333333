@@ -7,12 +7,12 @@ the protocol flow hits registration_disallowed — the real browser carries the 
 signals + solves challenges the API-only path can't reproduce).
 
 Config via env:
-  Y_CAPTCHA_KEY   yescaptcha API key (63bd2418e3ba87a501e06efe45820c65646a8c79…)
+  Y_CAPTCHA_KEY   captcha provider API key
   CLIPROXY_SPEC   host:port:user:pass  (user encodes -region-{REGION}-sid-{SID}-t-{TTL})
   HEROSMS_KEY     hero-sms.com api_key
   CHROME_PATH     path to the chrome binary
   REG_HEADLESS    0=headed, 1=headless (default)
-  HOTMAIL_BASE    base email for plus-addressing (default: xnzsilq@hotmail.com)
+  HOTMAIL_BASE    base email for plus-addressing
   HOTMAIL_OTP_URL OTP reader endpoint
   CLIPROXY_REALIP real IP of cliproxy gateway (bypasses fake-IP DNS issues)
 
@@ -24,13 +24,16 @@ logging.basicConfig(level=logging.INFO, format="[br-v2] %(message)s", stream=sys
 log = logging.info
 
 # ── Config from env ─────────────────────────────────────────────────────────
-YCAPTCHA_KEY     = os.environ.get("Y_CAPTCHA_KEY", "63bd2418e3ba87a501e06efe45820c65646a8c79111595")
+YCAPTCHA_KEY     = os.environ.get("Y_CAPTCHA_KEY", "")
 YCAPTCHA_API     = "https://api.yescaptcha.com"
 HEROSMS          = "https://hero-sms.com/stubs/handler_api.php"
-HEROSMS_KEY      = os.environ.get("HEROSMS_KEY", "810154d173c3c562B1ed124418c8f7B3")
-HOTMAIL_BASE     = os.environ.get("HOTMAIL_BASE", "xnzsilq@hotmail.com")
-HOTMAIL_OTP_URL  = os.environ.get("HOTMAIL_OTP_URL", "http://185.242.234.133:8000/get_email/1de6b84d7b6c46c981498e42da06f0d7")
-CLIPROXY_REALIP  = os.environ.get("CLIPROXY_REALIP", "43.230.8.144")
+HEROSMS_KEY      = os.environ.get("HEROSMS_KEY", "")
+HOTMAIL_BASE     = os.environ.get("HOTMAIL_BASE", "")
+HOTMAIL_OTP_URL  = os.environ.get("HOTMAIL_OTP_URL", "")
+CLIPROXY_REALIP  = os.environ.get("CLIPROXY_REALIP", "")
+CLIPROXY_PORT    = os.environ.get("CLIPROXY_PORT", "")
+CLIPROXY_ACCOUNT = os.environ.get("CLIPROXY_ACCOUNT", "")
+CLIPROXY_PASS    = os.environ.get("CLIPROXY_PASS", "")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 FIRST_NAMES = ["James","Robert","Michael","William","David","Mary","Sarah","Emma","Olivia","Sophia","Daniel","Andrew","Emily","Grace"]
 LAST_NAMES  = ["Smith","Johnson","Williams","Brown","Jones","Miller","Davis","Wilson","Anderson","Taylor","Moore","Martin","Clark","Walker"]
@@ -68,14 +71,16 @@ def hotmail_wait_otp(timeout_sec=150):
 
 # ── cliproxy proxy settings (socks5h + region-Rand + real IP) ─────────────
 def cliproxy_settings():
+    if not all((CLIPROXY_REALIP, CLIPROXY_PORT, CLIPROXY_ACCOUNT, CLIPROXY_PASS)):
+        raise RuntimeError("cliproxy configuration is incomplete")
     tag = secrets.token_hex(4)
-    user = f"zdvw1182255-region-Rand-sid-{tag}"
+    user = f"{CLIPROXY_ACCOUNT}-region-Rand-sid-{tag}"
     # Chromium/Playwright: auth must be passed via separate `username`/`password`
     # fields, NOT embedded in the proxy URL (Chrome rejects URL-embedded basic auth for proxies).
     proxy_cfg = {
-        "server": f"http://{CLIPROXY_REALIP}:3010",
+        "server": f"http://{CLIPROXY_REALIP}:{CLIPROXY_PORT}",
         "username": user,
-        "password": "d6kfytmo",
+        "password": CLIPROXY_PASS,
     }
     return proxy_cfg, tag
 

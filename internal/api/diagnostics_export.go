@@ -4,14 +4,19 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base32"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -132,6 +137,7 @@ type diagnosticCodebook struct {
 	byID         map[string]diagnosticAccountIdentity
 	replacements []diagnosticReplacement
 	replacer     *strings.Replacer
+	aliasKey     []byte
 }
 
 type diagnosticEventWindow struct {
@@ -141,23 +147,6 @@ type diagnosticEventWindow struct {
 	BillingHolds map[string]int         `json:"billing_hold_events_by_status"`
 }
 
-func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) {
-	if !s.adminAllowed(w, r) {
-		return
-	}
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w)
-		return
-	}
-	if err := s.streamDiagnosticsExport(r.Context(), w); err != nil {
-		// The complete ZIP is generated on disk before headers are committed, so a
-		// database, CSV, snapshot, or archive failure remains a normal JSON error.
-		if w.Header().Get("Content-Type") == "" {
-			writeError(w, http.StatusInternalServerError, err)
-		}
-	}
-}
-
 func diagnosticFileOrder() []string {
 	return []string{
 		"manifest.json",
@@ -165,7 +154,6 @@ func diagnosticFileOrder() []string {
 		"runtime_storage.json",
 		"route_attempts.csv",
 		"provider_attempts.csv",
-		"account_map.csv",
 		"account_auth_metadata.csv",
 		"account_model_capabilities.csv",
 		"kiro_runtime_capabilities.csv",
@@ -237,7 +225,7 @@ func (s *Server) streamDiagnosticsExport(ctx context.Context, w http.ResponseWri
 		return err
 	}
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="codex-pool-diagnostics-v2.zip"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="codex-pool-diagnostics-v3.zip"`)
 	// Hide File.WriteTo and ResponseWriter.ReadFrom so archive delivery stays in
 	// small bounded writes even when the compressed ZIP is much smaller than its
 	// source tables.
@@ -264,7 +252,10 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	if err != nil {
 		return err
 	}
-	tokensByID, err := snapshotStore.ListTokensByAccountIDs(ctx, accountIDsForDiagnostics(accounts))
+	// Credential metadata is selected with SQL CASE expressions only. Diagnostic
+	// generation never invokes the decryption path and never holds plaintext
+	// credentials in memory.
+	tokensByID, err := listDiagnosticTokenMetadata(ctx, snapshotStore.ReadDB())
 	if err != nil {
 		return err
 	}
@@ -316,7 +307,7 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	if err != nil {
 		return err
 	}
-	codebook, err := buildStreamingDiagnosticCodebook(ctx, snapshotStore.ReadDB(), accounts, bindings)
+	codebook, err := buildStreamingDiagnosticCodebook(ctx, snapshotStore.ReadDB(), accounts, bindings, s.cfg.RuntimeDiagnosticAliasKey)
 	if err != nil {
 		return err
 	}
@@ -339,7 +330,11 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	small := map[string]string{}
 	rowCounts := map[string]int64{}
 	addCSV := func(name string, header []string, rows [][]string) {
-		small[name] = csvString(header, rows)
+		safeRows := make([][]string, 0, len(rows))
+		for _, row := range rows {
+			safeRows = append(safeRows, codebook.safeCSVRow(row))
+		}
+		small[name] = csvString(header, safeRows)
 		rowCounts[name] = int64(len(rows))
 	}
 	addJSON := func(name string, value interface{}) error {
@@ -351,7 +346,6 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 		rowCounts[name] = 1
 		return nil
 	}
-	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
 	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "credential_mode", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroCapabilities, codebook))
@@ -410,7 +404,6 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	for _, row := range accounts {
 		accountTimes = append(accountTimes, row.CreatedAt)
 	}
-	addRange("account_map.csv", accountTimes)
 	addRange("accounts_snapshot.csv", accountTimes)
 	tokenTimes := make([]int64, 0, len(tokensByID))
 	for _, row := range tokensByID {
@@ -505,13 +498,13 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	}
 	addRange("egress_snapshot.csv", egressTimes)
 	manifest := map[string]interface{}{
-		"generated_at": generatedAt, "snapshot_id": snapshotID, "format": "codex-pool-diagnostics-v2",
+		"generated_at": generatedAt, "snapshot_id": snapshotID, "format": "codex-pool-diagnostics-v3",
 		"account_count": len(accounts), "current_account_count": len(accounts),
 		"historical_reference_account_count": len(codebook.byID),
 		"files":                              diagnosticFileOrder(), "row_counts": rowCounts,
 		"build": diagnosticBuildInfo(), "table_time_ranges": timeRanges,
-		"account_redaction":   "business files use account_code; account_map.csv preserves the complete local account id mapping; route/session hashes, user ids, exit IPs and correlation fields remain complete",
-		"account_code_format": "ACC-0001",
+		"account_redaction":   "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
+		"account_code_format": "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
 	}
 	if err := addJSON("manifest.json", manifest); err != nil {
 		return err
@@ -540,6 +533,7 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 			if !ok {
 				continue
 			}
+			content = codebook.sanitize(content)
 			var writer io.Writer
 			writer, err = zw.Create(name)
 			if err == nil {
@@ -592,7 +586,7 @@ func (s *Server) codexSessionMappingStatsFromSnapshot(ctx context.Context, snaps
 	return s.codexSessionMappingStatsConfigured(ctx, snapshotStore, enabled, stateless, strict, retentionDays)
 }
 
-func buildStreamingDiagnosticCodebook(ctx context.Context, db storage.ReadQuerier, accounts []storage.Account, bindings []storage.AccountEgressBinding) (diagnosticCodebook, error) {
+func buildStreamingDiagnosticCodebook(ctx context.Context, db storage.ReadQuerier, accounts []storage.Account, bindings []storage.AccountEgressBinding, aliasKey []byte) (diagnosticCodebook, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT account_id, MAX(account_label) FROM audit_log WHERE account_id <> '' GROUP BY account_id
 UNION SELECT account_id, '' FROM cf_events WHERE account_id <> ''
@@ -617,7 +611,7 @@ UNION SELECT account_id, '' FROM codex_upstream_attempt_daily WHERE account_id <
 	if err := rows.Err(); err != nil {
 		return diagnosticCodebook{}, err
 	}
-	return buildDiagnosticCodebook(accounts, historical, nil, nil, nil, bindings), nil
+	return buildDiagnosticCodebookWithKey(aliasKey, accounts, historical, nil, nil, nil, bindings), nil
 }
 
 func applyDiagnosticAuditSummary(ctx context.Context, db storage.ReadQuerier, summary map[string]interface{}) error {
@@ -850,7 +844,7 @@ func streamDiagnosticAuditCSV(ctx context.Context, db storage.ReadQuerier, zw *z
 			if err := rows.Scan(&row.ID, &row.AccountID, &row.AccountLabel, &row.Action, &row.State, &row.Reason, &row.Detail, &row.CreatedAt); err != nil {
 				return written, err
 			}
-			if err := cw.Write(auditLogRows([]storage.AuditLogRow{row}, codebook)[0]); err != nil {
+			if err := cw.Write(codebook.safeCSVRow(auditLogRows([]storage.AuditLogRow{row}, codebook)[0])); err != nil {
 				return written, err
 			}
 			written++
@@ -872,7 +866,7 @@ func streamDiagnosticCFCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.
 			if err := rows.Scan(&row.ID, &row.AccountID, &row.EgressID, &row.Status, &row.CFRay, &row.Category, &row.Message, &row.CreatedAt); err != nil {
 				return written, err
 			}
-			if err := cw.Write(cfEventRows([]storage.CFEvent{row}, codebook)[0]); err != nil {
+			if err := cw.Write(codebook.safeCSVRow(cfEventRows([]storage.CFEvent{row}, codebook)[0])); err != nil {
 				return written, err
 			}
 			written++
@@ -895,7 +889,7 @@ func streamDiagnosticUsageCSV(ctx context.Context, db storage.ReadQuerier, zw *z
 			if err := scanDiagnosticUsageRecord(rows, &row); err != nil {
 				return written, err
 			}
-			if err := cw.Write(usageRecordRows([]diagnosticUsageRecord{row}, codebook)[0]); err != nil {
+			if err := cw.Write(codebook.safeCSVRow(usageRecordRows([]diagnosticUsageRecord{row}, codebook)[0])); err != nil {
 				return written, err
 			}
 			written++
@@ -917,7 +911,7 @@ func streamDiagnosticBillingHoldsCSV(ctx context.Context, db storage.ReadQuerier
 			if err := rows.Scan(&row.ID, &row.RouteKeyHash, &row.AccountID, &row.EstimatedTokens, &row.Status, &row.UsageExpected, &row.UsageRecordedAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
 				return written, err
 			}
-			if err := cw.Write(billingHoldRows([]diagnosticBillingHold{row}, codebook)[0]); err != nil {
+			if err := cw.Write(codebook.safeCSVRow(billingHoldRows([]diagnosticBillingHold{row}, codebook)[0])); err != nil {
 				return written, err
 			}
 			written++
@@ -947,7 +941,7 @@ func streamDiagnosticAffinityCSV(ctx context.Context, db storage.ReadQuerier, zw
 			if err = rows.Scan(&row.RouteKeyHash, &row.RouteKey, &row.Source, &row.AccountID, &row.Provider, &row.Model, &row.EgressID, &row.Epoch, &row.CreatedAt, &row.UpdatedAt); err != nil {
 				return written, err
 			}
-			if err = cw.Write(affinityBindingRows([]storage.AffinityBinding{row}, codebook)[0]); err != nil {
+			if err = cw.Write(codebook.safeCSVRow(affinityBindingRows([]storage.AffinityBinding{row}, codebook)[0])); err != nil {
 				return written, err
 			}
 			written++
@@ -972,7 +966,7 @@ func streamDiagnosticCodexUpstreamAttemptsCSV(ctx context.Context, db storage.Re
 				return written, err
 			}
 			row.TreeHMACPrefix = store.CodexDiagnosticTreePrefix(treeID)
-			if err = cw.Write(codexUpstreamAttemptDiagnosticRows([]storage.CodexUpstreamAttemptDiagnostic{row}, codebook)[0]); err != nil {
+			if err = cw.Write(codebook.safeCSVRow(codexUpstreamAttemptDiagnosticRows([]storage.CodexUpstreamAttemptDiagnostic{row}, codebook)[0])); err != nil {
 				return written, err
 			}
 			written++
@@ -996,10 +990,10 @@ FROM codex_upstream_attempt_daily WHERE expires_at>? ORDER BY day_start,account_
 			if err = rows.Scan(&row.DayStart, &row.AccountID, &row.EgressID, &row.State, &row.StatusCode, &row.AttemptCount, &row.FirstCreatedAt, &row.LastCreatedAt); err != nil {
 				return written, err
 			}
-			if err = cw.Write([]string{
+			if err = cw.Write(codebook.safeCSVRow([]string{
 				strconv.FormatInt(row.DayStart, 10), codebook.code(row.AccountID), row.EgressID, row.State,
 				strconv.Itoa(row.StatusCode), strconv.FormatInt(row.AttemptCount, 10), strconv.FormatInt(row.FirstCreatedAt, 10), strconv.FormatInt(row.LastCreatedAt, 10),
-			}); err != nil {
+			})); err != nil {
 				return written, err
 			}
 			written++
@@ -1012,7 +1006,11 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	files := map[string]string{}
 	rowCounts := map[string]int{}
 	addCSV := func(name string, header []string, rows [][]string) {
-		files[name] = csvString(header, rows)
+		safeRows := make([][]string, 0, len(rows))
+		for _, row := range rows {
+			safeRows = append(safeRows, codebook.safeCSVRow(row))
+		}
+		files[name] = csvString(header, safeRows)
 		rowCounts[name] = len(rows)
 	}
 	addJSON := func(name string, value interface{}) error {
@@ -1025,7 +1023,6 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 		return nil
 	}
 
-	addCSV("account_map.csv", []string{"account_code", "account_id"}, accountMapRows(codebook))
 	addCSV("account_auth_metadata.csv", []string{"account_code", "declared_provider", "effective_provider", "auth_method", "credential_mode", "billing_mode", "credential_present", "expires_at", "last_refresh", "oauth_rate_limit_tier", "created_at", "updated_at"}, accountAuthMetadataRows(accounts, tokensByID, codebook))
 	addCSV("account_model_capabilities.csv", []string{"account_code", "model_slug", "availability_state", "context_1m_state", "context_1m_source", "native_context_window", "native_max_context_window", "source", "last_probe_at"}, modelCapabilityRows(capabilities, codebook))
 	addCSV("kiro_runtime_capabilities.csv", []string{"account_code", "endpoint_hash", "model", "model_state", "thinking_state", "cache_capability", "observations", "metering_events", "cache_reported_observations", "cache_hit_observations", "consecutive_unreported", "unknown_cache_schema_json", "updated_at", "cache_point_state", "cache_reuse_state", "cache_reuse_evidence", "cache_reuse_credit_reduction_percent", "cache_reuse_probed_at"}, kiroRuntimeCapabilityRows(kiroRuntimeCapabilities, codebook))
@@ -1067,7 +1064,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	rowCounts["manifest.json"] = 1
 	manifest := map[string]interface{}{
 		"generated_at":                       time.Now().Unix(),
-		"format":                             "codex-pool-diagnostics-v2",
+		"format":                             "codex-pool-diagnostics-v3",
 		"account_count":                      len(accounts),
 		"current_account_count":              len(accounts),
 		"historical_reference_account_count": len(codebook.byID),
@@ -1075,14 +1072,17 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 		"table_time_ranges":                  diagnosticTableTimeRanges(accounts, auditRows, cfRows, usageRows, holds),
 		"files":                              diagnosticFileOrder(),
 		"row_counts":                         rowCounts,
-		"account_redaction":                  "business files use account_code; account_map.csv contains only account_code and local account_id; email, label, and upstream identity columns are omitted",
-		"account_code_format":                "ACC-0001",
+		"account_redaction":                  "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
+		"account_code_format":                "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
 	}
 	rawManifest, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return nil, err
 	}
 	files["manifest.json"] = string(rawManifest) + "\n"
+	for name, content := range files {
+		files[name] = codebook.sanitize(content)
+	}
 	return files, nil
 }
 
@@ -1290,6 +1290,63 @@ func listDiagnosticSettings(ctx context.Context, db storage.ReadQuerier) ([]diag
 	return out, rows.Err()
 }
 
+func listDiagnosticTokenMetadata(ctx context.Context, db storage.ReadQuerier) (map[string]storage.AccountToken, error) {
+	rows, err := db.QueryContext(ctx, `
+SELECT account_id,auth_method,credential_mode,
+ CASE WHEN access_token<>'' THEN 1 ELSE 0 END,
+ CASE WHEN refresh_token<>'' THEN 1 ELSE 0 END,
+ CASE WHEN openai_api_key<>'' THEN 1 ELSE 0 END,
+ CASE WHEN id_token_raw<>'' THEN 1 ELSE 0 END,
+ CASE WHEN agent_runtime_id<>'' THEN 1 ELSE 0 END,
+ CASE WHEN agent_private_key<>'' THEN 1 ELSE 0 END,
+ CASE WHEN agent_task_id<>'' THEN 1 ELSE 0 END,
+ last_refresh,expires_at,oauth_rate_limit_tier,created_at,updated_at
+FROM account_auth_tokens`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]storage.AccountToken{}
+	for rows.Next() {
+		var (
+			token                                                 storage.AccountToken
+			access, refresh, apiKey, idToken, runtime, privateKey int
+			task                                                  int
+		)
+		if err := rows.Scan(
+			&token.AccountID, &token.AuthMethod, &token.CredentialMode,
+			&access, &refresh, &apiKey, &idToken, &runtime, &privateKey, &task,
+			&token.LastRefresh, &token.ExpiresAt, &token.OAuthRateLimitTier,
+			&token.CreatedAt, &token.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		if access != 0 {
+			token.AccessToken = "configured"
+		}
+		if refresh != 0 {
+			token.RefreshToken = "configured"
+		}
+		if apiKey != 0 {
+			token.OpenAIAPIKey = "configured"
+		}
+		if idToken != 0 {
+			token.IDTokenRaw = "configured"
+		}
+		if runtime != 0 {
+			token.AgentRuntimeID = "configured"
+		}
+		if privateKey != 0 {
+			token.AgentPrivateKey = "configured"
+		}
+		if task != 0 {
+			token.AgentTaskID = "configured"
+		}
+		out[token.AccountID] = token
+	}
+	return out, rows.Err()
+}
+
 func listDiagnosticCodexResetCreditConsumptions(ctx context.Context, db storage.ReadQuerier) ([]storage.CodexResetCreditConsumption, error) {
 	rows, err := db.QueryContext(ctx, `SELECT account_id, seven_day_reset_at, redeem_request_id, status, created_at, updated_at FROM codex_reset_credit_consumptions ORDER BY updated_at ASC, account_id ASC`)
 	if err != nil {
@@ -1325,7 +1382,13 @@ func listDiagnosticLifecycleStatuses(ctx context.Context, db storage.ReadQuerier
 }
 
 func listDiagnosticCodexReauthConfigs(ctx context.Context, db storage.ReadQuerier) ([]storage.AccountCodexReauthConfig, error) {
-	rows, err := db.QueryContext(ctx, `SELECT account_id, login_email, encrypted_password, encrypted_otp_url, target_workspace_id, auto_enabled, last_status, last_error, created_at, updated_at FROM account_codex_reauth_config ORDER BY account_id ASC`)
+	rows, err := db.QueryContext(ctx, `
+SELECT account_id,
+ CASE WHEN login_email<>'' THEN 1 ELSE 0 END,
+ CASE WHEN encrypted_password<>'' THEN 1 ELSE 0 END,
+ CASE WHEN encrypted_otp_url<>'' THEN 1 ELSE 0 END,
+ target_workspace_id,auto_enabled,last_status,last_error,created_at,updated_at
+FROM account_codex_reauth_config ORDER BY account_id ASC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1333,14 +1396,16 @@ func listDiagnosticCodexReauthConfigs(ctx context.Context, db storage.ReadQuerie
 	var out []storage.AccountCodexReauthConfig
 	for rows.Next() {
 		var cfg storage.AccountCodexReauthConfig
-		var auto int
-		var password, otp string
-		if err := rows.Scan(&cfg.AccountID, &cfg.LoginEmail, &password, &otp, &cfg.TargetWorkspaceID, &auto, &cfg.LastStatus, &cfg.LastError, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
+		var auto, loginEmail, password, otp int
+		if err := rows.Scan(&cfg.AccountID, &loginEmail, &password, &otp, &cfg.TargetWorkspaceID, &auto, &cfg.LastStatus, &cfg.LastError, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
 			return nil, err
 		}
 		cfg.AutoEnabled = auto != 0
-		cfg.PasswordConfigured = strings.TrimSpace(password) != ""
-		cfg.OTPURLConfigured = strings.TrimSpace(otp) != ""
+		if loginEmail != 0 {
+			cfg.LoginEmail = "configured"
+		}
+		cfg.PasswordConfigured = password != 0
+		cfg.OTPURLConfigured = otp != 0
 		out = append(out, cfg)
 	}
 	return out, rows.Err()
@@ -1364,6 +1429,15 @@ func listDiagnosticCodexReauthJobs(ctx context.Context, db storage.ReadQuerier) 
 }
 
 func buildDiagnosticCodebook(accounts []storage.Account, auditRows []storage.AuditLogRow, cfRows []storage.CFEvent, usageRows []diagnosticUsageRecord, holds []diagnosticBillingHold, bindings []storage.AccountEgressBinding) diagnosticCodebook {
+	return buildDiagnosticCodebookWithKey([]byte("diagnostic-test-alias-key-v3"), accounts, auditRows, cfRows, usageRows, holds, bindings)
+}
+
+func buildDiagnosticCodebookWithKey(aliasKey []byte, accounts []storage.Account, auditRows []storage.AuditLogRow, cfRows []storage.CFEvent, usageRows []diagnosticUsageRecord, holds []diagnosticBillingHold, bindings []storage.AccountEgressBinding) diagnosticCodebook {
+	if len(aliasKey) == 0 {
+		// Production startup always provisions an independent persistent alias key.
+		// This fallback is deterministic only for legacy in-memory test helpers.
+		aliasKey = []byte("diagnostic-test-alias-key-v3")
+	}
 	identities := map[string]diagnosticAccountIdentity{}
 	ensure := func(accountID string) diagnosticAccountIdentity {
 		accountID = strings.TrimSpace(accountID)
@@ -1418,9 +1492,9 @@ func buildDiagnosticCodebook(accounts []storage.Account, auditRows []storage.Aud
 	sort.Strings(ids)
 	seenNeedle := map[string]bool{}
 	replacements := []diagnosticReplacement{}
-	for i, id := range ids {
+	for _, id := range ids {
 		info := identities[id]
-		info.Code = fmt.Sprintf("ACC-%04d", i+1)
+		info.Code = diagnosticAlias(aliasKey, "ACC", "account", id)
 		identities[id] = info
 		for _, needle := range []string{info.AccountID, info.Email, info.Label, info.UpstreamAccountID, info.ChatGPTUserID} {
 			needle = strings.TrimSpace(needle)
@@ -1442,7 +1516,19 @@ func buildDiagnosticCodebook(accounts []storage.Account, auditRows []storage.Aud
 	if len(oldnew) > 0 {
 		replacer = strings.NewReplacer(oldnew...)
 	}
-	return diagnosticCodebook{byID: identities, replacements: replacements, replacer: replacer}
+	return diagnosticCodebook{byID: identities, replacements: replacements, replacer: replacer, aliasKey: append([]byte(nil), aliasKey...)}
+}
+
+var diagnosticBase32 = base32.StdEncoding.WithPadding(base32.NoPadding)
+
+func diagnosticAlias(aliasKey []byte, prefix, entityType, rawID string) string {
+	mac := hmac.New(sha256.New, aliasKey)
+	_, _ = mac.Write([]byte("codex-pool-diagnostic-alias-v3\x00"))
+	_, _ = mac.Write([]byte(strings.ToLower(strings.TrimSpace(entityType))))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(rawID))
+	sum := mac.Sum(nil)
+	return strings.ToUpper(strings.TrimSpace(prefix)) + "-" + diagnosticBase32.EncodeToString(sum[:16])
 }
 
 func (b diagnosticCodebook) code(accountID string) string {
@@ -1453,22 +1539,81 @@ func (b diagnosticCodebook) code(accountID string) string {
 }
 
 func (b diagnosticCodebook) sanitize(text string) string {
-	if b.replacer == nil {
-		return text
+	if b.replacer != nil {
+		text = b.replacer.Replace(text)
 	}
-	return b.replacer.Replace(text)
+	text = diagnosticPrivateKeyRE.ReplaceAllString(text, "[REDACTED-CREDENTIAL]")
+	text = diagnosticBearerRE.ReplaceAllString(text, "Bearer [REDACTED-CREDENTIAL]")
+	text = diagnosticJWTRE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "TOKEN", "credential", value)
+	})
+	text = diagnosticEmailRE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "EMAIL", "email", strings.ToLower(value))
+	})
+	text = diagnosticURLRE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "URL", "url", value)
+	})
+	text = diagnosticIPv4RE.ReplaceAllStringFunc(text, func(value string) string {
+		if net.ParseIP(value) == nil {
+			return value
+		}
+		return diagnosticAlias(b.aliasKey, "IP", "ip", value)
+	})
+	text = diagnosticIPv6RE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "IP", "ip", strings.ToLower(value))
+	})
+	text = diagnosticWindowsPathRE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "PATH", "path", value)
+	})
+	text = diagnosticUnixPathRE.ReplaceAllStringFunc(text, func(value string) string {
+		prefix := ""
+		path := value
+		if !strings.HasPrefix(value, "/") {
+			prefix, path = value[:1], value[1:]
+		}
+		return prefix + diagnosticAlias(b.aliasKey, "PATH", "path", path)
+	})
+	text = diagnosticHighEntropyRE.ReplaceAllStringFunc(text, func(value string) string {
+		upper := strings.ToUpper(value)
+		for _, prefix := range []string{"ACC-", "EMAIL-", "URL-", "IP-", "PATH-", "TOKEN-", "REQ-"} {
+			if strings.HasPrefix(upper, prefix) {
+				return value
+			}
+		}
+		return diagnosticAlias(b.aliasKey, "TOKEN", "unknown-string", value)
+	})
+	return text
 }
 
-func accountMapRows(codebook diagnosticCodebook) [][]string {
-	ids := make([]string, 0, len(codebook.byID))
-	for id := range codebook.byID {
-		ids = append(ids, id)
+var (
+	diagnosticPrivateKeyRE  = regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY-----.*?-----END[ A-Z0-9_-]{0,40}PRIVATE KEY-----`)
+	diagnosticBearerRE      = regexp.MustCompile(`(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}`)
+	diagnosticJWTRE         = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+	diagnosticEmailRE       = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	diagnosticURLRE         = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s,"'<>]+`)
+	diagnosticIPv4RE        = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
+	diagnosticWindowsPathRE = regexp.MustCompile(`(?i)\b[A-Z]:\\(?:[^\\\s,"'<>]+\\)*[^\\\s,"'<>]*`)
+	diagnosticUnixPathRE    = regexp.MustCompile(`(?:^|[\s="'(])(/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+:-]+)+)`)
+	diagnosticHighEntropyRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
+)
+
+func diagnosticSafeCSVCell(value string) string {
+	value = strings.NewReplacer("\r", " ", "\n", " ").Replace(value)
+	if value == "" {
+		return value
 	}
-	sort.Strings(ids)
-	out := make([][]string, 0, len(ids))
-	for _, id := range ids {
-		info := codebook.byID[id]
-		out = append(out, []string{info.Code, info.AccountID})
+	switch value[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + value
+	default:
+		return value
+	}
+}
+
+func (b diagnosticCodebook) safeCSVRow(row []string) []string {
+	out := make([]string, len(row))
+	for index, value := range row {
+		out[index] = diagnosticSafeCSVCell(b.sanitize(value))
 	}
 	return out
 }
@@ -2185,7 +2330,11 @@ func csvString(header []string, rows [][]string) string {
 	cw := csv.NewWriter(&buf)
 	_ = cw.Write(header)
 	for _, row := range rows {
-		_ = cw.Write(row)
+		safe := make([]string, len(row))
+		for index, value := range row {
+			safe[index] = diagnosticSafeCSVCell(value)
+		}
+		_ = cw.Write(safe)
 	}
 	cw.Flush()
 	return buf.String()

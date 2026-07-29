@@ -104,6 +104,29 @@ func TestRegisterProvidersAcceptsHotmailOTPEmailProvider(t *testing.T) {
 	}
 }
 
+func TestRegisterProvidersNeverReturnsConfiguredSecrets(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	const secret = "provider-api-key-must-not-leak"
+	code, body := grpReq(t, h, http.MethodPost, "/admin/register/providers", `{
+		"providers": [{"type":"sms","key":"herosms","display_name":"HeroSMS","enabled":true,
+			"config":{"api_key":"`+secret+`","service":"dr"}}]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("provider save status = %d: %s", code, body)
+	}
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/register/providers", "")
+	if code != http.StatusOK {
+		t.Fatalf("provider list status = %d: %s", code, raw)
+	}
+	if strings.Contains(string(raw), secret) {
+		t.Fatalf("provider list leaked configured secret: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"api_key_configured":true`) ||
+		!strings.Contains(string(raw), `"masked":"••••"`) {
+		t.Fatalf("provider list omitted safe credential metadata: %s", raw)
+	}
+}
+
 func TestRegisterProvidersReportsDefaultsReadErrors(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	if _, err := h.store.DB().ExecContext(context.Background(), `DROP TABLE settings`); err != nil {
@@ -114,11 +137,11 @@ func TestRegisterProvidersReportsDefaultsReadErrors(t *testing.T) {
 	h.store.InvalidateSettingsCache()
 
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/register/providers", "")
-	if code != http.StatusInternalServerError {
-		t.Fatalf("provider list with missing settings table = %d, want 500: %s", code, raw)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("provider list with missing settings table = %d, want 503: %s", code, raw)
 	}
-	if !strings.Contains(string(raw), "read registration default") {
-		t.Fatalf("provider list error = %s, want read registration default", raw)
+	if !strings.Contains(string(raw), `"code":"service_unavailable"`) || strings.Contains(string(raw), "settings") {
+		t.Fatalf("provider list error was not safely normalized: %s", raw)
 	}
 }
 
@@ -132,7 +155,7 @@ func TestRegisterProviderOptionsRejectsInvalidStoredConfig(t *testing.T) {
 	}
 
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/register/providers/options", "")
-	if code != http.StatusInternalServerError {
-		t.Fatalf("provider options with invalid config = %d, want 500: %s", code, raw)
+	if code != http.StatusServiceUnavailable || !strings.Contains(string(raw), `"code":"service_unavailable"`) {
+		t.Fatalf("provider options with invalid config = %d, want safe 503: %s", code, raw)
 	}
 }

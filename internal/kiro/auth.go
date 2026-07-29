@@ -26,15 +26,21 @@ var (
 )
 
 type Manager struct {
-	store    *storage.Store
-	upstream *upstream.Client
-	cfg      atomic.Value
-	mu       sync.Mutex
-	gates    map[string]*sync.Mutex
+	store          *storage.Store
+	upstream       *upstream.Client
+	cfg            atomic.Value
+	mu             sync.Mutex
+	gates          map[string]*sync.Mutex
+	catalogFlights map[string]*catalogFlight
 }
 
 func NewManager(store *storage.Store, up *upstream.Client, cfg config.Config) *Manager {
-	m := &Manager{store: store, upstream: up, gates: map[string]*sync.Mutex{}}
+	m := &Manager{
+		store:          store,
+		upstream:       up,
+		gates:          map[string]*sync.Mutex{},
+		catalogFlights: map[string]*catalogFlight{},
+	}
 	m.cfg.Store(cfg)
 	return m
 }

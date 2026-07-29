@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+
+	"codex-account-pool/internal/datadir"
 )
 
 const DiskReservationChunkBytes int64 = 8 << 20
@@ -83,6 +85,7 @@ type DiskReserver struct {
 	releases  int64
 	rejects   int64
 	lastError string
+	managed   bool
 }
 
 type DiskReserverSnapshot struct {
@@ -101,13 +104,14 @@ type DiskReserverSnapshot struct {
 }
 
 func NewDiskReserver(dir string, minimumFreeBytes, globalLimitBytes int64) *DiskReserver {
+	managed := dir != ""
 	if stringsTrimmed := filepath.Clean(dir); dir != "" && stringsTrimmed != "." {
 		dir = stringsTrimmed
 	}
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	return &DiskReserver{dir: dir, minFree: max64(minimumFreeBytes, 0), limit: max64(globalLimitBytes, 0)}
+	return &DiskReserver{dir: dir, minFree: max64(minimumFreeBytes, 0), limit: max64(globalLimitBytes, 0), managed: managed}
 }
 
 func (d *DiskReserver) Snapshot() DiskReserverSnapshot {
@@ -167,6 +171,11 @@ func (d *DiskReserver) reserveLocked(delta int64) error {
 	if d.limit > 0 {
 		if delta > d.limit || d.reserved > d.limit-delta {
 			return ErrSpoolBudget
+		}
+	}
+	if d.managed {
+		if err := datadir.RecoverDirectory(d.dir); err != nil {
+			return fmt.Errorf("prepare spool directory: %w", err)
 		}
 	}
 	_, available, err := diskFilesystemStats(d.dir)

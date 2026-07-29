@@ -113,7 +113,7 @@ func TestAdminEgressBindingConfiguresIndependentSidecarTransport(t *testing.T) {
 
 	// A normal proxy cannot be smuggled into the transport-only sidecar field.
 	code, raw = grpReq(t, h, http.MethodPost, "/admin/accounts/"+accountID+"/egress-binding", `{"primary_egress_id":"proxy_exit","sidecar_egress_id":"proxy_exit"}`)
-	if code != http.StatusBadRequest || !strings.Contains(string(raw), "curl_cffi_sidecar") {
+	if code != http.StatusBadRequest || !strings.Contains(string(raw), `"code":"invalid_request"`) {
 		t.Fatalf("non-sidecar transport accepted: status=%d body=%s", code, raw)
 	}
 

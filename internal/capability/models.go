@@ -78,7 +78,7 @@ func normalizeRequestedClaudeBase(model string) string {
 func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64 {
 	limit := KiroContextWindow(model)
 	requestLimit := int64(200000)
-	// GPT-5.6 is a native Kiro model family with a 372K standard context
+	// GPT-5.6 is a native Kiro model family with a 272K standard context
 	// window. This is not the paid Claude-only 1M extension, so a normal GPT
 	// request must retain the model's documented window rather than being
 	// artificially reduced to the generic 200K default.
@@ -127,9 +127,10 @@ var claudeStaticModels = []string{
 }
 
 var kiroStaticModels = []string{
+	"claude-opus-5",
 	"claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5",
 	"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5",
-	"claude-haiku-4.5", "claude-fable-5",
+	"claude-haiku-4.5",
 	// Kiro also exposes this GPT-5.6 family through generateAssistantResponse.
 	// Keep this list intentionally exact: an unknown GPT slug must not be routed
 	// to Kiro merely because it shares a prefix with a Codex model.
@@ -185,6 +186,10 @@ func KiroSupportsGPTModel(model string) bool {
 // they are sent without changing their version and become verified only after a
 // successful upstream response.
 func ResolveKiroModel(model string, verified []string) (string, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "auto" {
+		return "auto", true
+	}
 	if concrete, ok := KiroCanonicalModel(model); ok {
 		return concrete, true
 	}
@@ -213,6 +218,92 @@ func ResolveKiroModel(model string, verified []string) (string, bool) {
 	return best, best != ""
 }
 
+// ResolveKiroCatalogModel resolves a downstream model against one complete,
+// account-scoped live Kiro catalog. It returns the exact upstream ID rather than
+// synthesizing an ID from a family name. "auto" is an independent upstream model;
+// "default" selects only the catalog-designated default.
+func ResolveKiroCatalogModel(model string, catalog []storage.KiroModelDescriptor) (storage.KiroModelDescriptor, bool) {
+	requested := strings.ToLower(strings.TrimSpace(model))
+	if requested == "" {
+		return storage.KiroModelDescriptor{}, false
+	}
+	if requested == "default" {
+		for _, candidate := range catalog {
+			if candidate.Complete && candidate.Default {
+				return candidate, true
+			}
+		}
+		return storage.KiroModelDescriptor{}, false
+	}
+	if requested == "auto" {
+		for _, candidate := range catalog {
+			if !candidate.Complete {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(candidate.PublicID), "auto") ||
+				strings.EqualFold(strings.TrimSpace(candidate.UpstreamID), "auto") ||
+				stringSliceContainsFold(candidate.Aliases, "auto") {
+				return candidate, true
+			}
+		}
+		return storage.KiroModelDescriptor{}, false
+	}
+	if canonical, ok := KiroCanonicalModel(model); ok {
+		for _, candidate := range catalog {
+			if candidate.Complete && kiroDescriptorMatches(candidate, canonical) {
+				return candidate, true
+			}
+		}
+		return storage.KiroModelDescriptor{}, false
+	}
+	if !KiroModelAlias(model) {
+		return storage.KiroModelDescriptor{}, false
+	}
+	family := strings.TrimPrefix(requested, "claude-")
+	bestIndex, bestScore := -1, int64(-1)
+	for index, candidate := range catalog {
+		if !candidate.Complete {
+			continue
+		}
+		canonical := ""
+		for _, identifier := range append([]string{candidate.PublicID, candidate.UpstreamID}, candidate.Aliases...) {
+			if parsed, ok := KiroCanonicalModel(identifier); ok {
+				canonical = parsed
+				break
+			}
+		}
+		candidateFamily, score := kiroModelRank(canonical)
+		if candidateFamily != family {
+			continue
+		}
+		if score > bestScore || (score == bestScore && candidate.UpstreamID > catalog[bestIndex].UpstreamID) {
+			bestIndex, bestScore = index, score
+		}
+	}
+	if bestIndex < 0 {
+		return storage.KiroModelDescriptor{}, false
+	}
+	return catalog[bestIndex], true
+}
+
+func kiroDescriptorMatches(candidate storage.KiroModelDescriptor, canonical string) bool {
+	for _, identifier := range append([]string{candidate.PublicID, candidate.UpstreamID}, candidate.Aliases...) {
+		if parsed, ok := KiroCanonicalModel(identifier); ok && parsed == canonical {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSliceContainsFold(values []string, wanted string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), strings.TrimSpace(wanted)) {
+			return true
+		}
+	}
+	return false
+}
+
 func kiroModelRank(model string) (string, int64) {
 	match := kiroConcreteModelRE.FindStringSubmatch(model)
 	if match == nil {
@@ -231,7 +322,7 @@ func KiroSupportsAdaptiveThinking(model string) bool {
 	if !ok {
 		return false
 	}
-	for _, prefix := range []string{"claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-sonnet-4.6", "claude-sonnet-5"} {
+	for _, prefix := range []string{"claude-opus-5", "claude-opus-4.6", "claude-opus-4.7", "claude-opus-4.8", "claude-sonnet-4.6", "claude-sonnet-5"} {
 		if canonical == prefix {
 			return true
 		}
@@ -246,21 +337,18 @@ func KiroSupportsAdaptiveThinking(model string) bool {
 // models retain the 200k window. Unknown future versions use 200k until a live
 // capability proves otherwise.
 //
-// GPT-5.6 cap raised to 372K (2026-07-25): the official Codex static model
-// table records 372K for gpt-5.6-sol/terra/luna; 272K was a conservative
-// placeholder that under-served the actual upstream limit.
+// GPT-5.6 uses the 272K window documented by Kiro.
 func KiroContextWindow(model string) int64 {
 	canonical, ok := KiroCanonicalModel(model)
 	if !ok {
 		return 200000
 	}
 	if strings.HasPrefix(canonical, "gpt-") {
-		return 372000
+		return 272000
 	}
 	switch canonical {
 	case "claude-sonnet-5", "claude-sonnet-4.6",
-		"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6",
-		"claude-fable-5":
+		"claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6":
 		return 1000000
 	default:
 		return 200000
@@ -283,16 +371,12 @@ func KiroPlanAllowsBootstrap(plan, model string) bool {
 	return true
 }
 
-// KiroPlanAllows1M reports whether the observed subscription may attempt a
-// runtime-verified model in one-million-token mode. A model's technical maximum
-// is not entitlement evidence: an empty/unknown plan and KIRO FREE stay on the
-// standard window until a paid subscription is observed.
+// KiroPlanAllows1M is intentionally independent of a human-readable plan name.
+// Account-scoped live catalog evidence (Context1MState) is the entitlement gate;
+// this helper only checks the selected model's technical fallback limit.
 func KiroPlanAllows1M(plan, model string) bool {
-	if KiroContextWindow(model) < 1000000 {
-		return false
-	}
-	normalizedPlan := strings.ToUpper(strings.TrimSpace(plan))
-	return normalizedPlan != "" && !strings.Contains(normalizedPlan, "FREE")
+	_ = plan
+	return KiroContextWindow(model) >= 1000000
 }
 
 func minKiroNativeWindow(slug string, maximum int64) int64 {
@@ -308,7 +392,7 @@ func StaticKiroModels(accountID string) []storage.ModelCapability {
 	for _, slug := range kiroStaticModels {
 		window := int64(1000000)
 		if strings.HasPrefix(slug, "gpt-") {
-			window = 372000 // gpt-5.6-sol/terra/luna actual limit (was 272K, raised 2026-07-25)
+			window = 272000
 		} else if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
 			window = 200000
 		}
@@ -635,9 +719,9 @@ type codexStaticModel struct {
 // listed (the hidden codex-auto-review preset is omitted). Ordered most-capable
 // first. The live probe — when it works — is authoritative and supersedes this.
 var codexStaticModels = []codexStaticModel{
-	{slug: "gpt-5.6-sol", window: 372000, maxWindow: 372000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-terra", window: 372000, maxWindow: 372000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-luna", window: 372000, maxWindow: 372000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
+	{slug: "gpt-5.6-sol", window: 272000, maxWindow: 272000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-terra", window: 272000, maxWindow: 272000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-luna", window: 272000, maxWindow: 272000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
 	{slug: "gpt-5.5", window: 272000, maxWindow: 272000, minimumClientVersion: "0.124.0", requiresCurrentClient: true, preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4", window: 272000, maxWindow: 1000000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4-mini", window: 272000, maxWindow: 272000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
@@ -996,6 +1080,19 @@ func BuildModelsResponse(capabilities []storage.ModelCapability, cfg config.Conf
 			item["provider_window_mode"] = "custom_native"
 		}
 		data = append(data, item)
+		if cap.Context1MState == Context1MSupported && cap.NativeMaxContextWindow >= 1_000_000 &&
+			!strings.HasSuffix(strings.ToLower(strings.TrimSpace(cap.ModelSlug)), "[1m]") {
+			alias := make(map[string]interface{}, len(item))
+			for field, value := range item {
+				alias[field] = value
+			}
+			alias["id"] = cap.ModelSlug + "[1m]"
+			alias["context_window"] = int64(1_000_000)
+			alias["native_context_window"] = int64(1_000_000)
+			alias["native_max_context_window"] = int64(1_000_000)
+			alias["window_mode"] = "context_1m"
+			data = append(data, alias)
+		}
 	}
 	resp := map[string]interface{}{"object": "list", "data": data}
 	raw, err := json.Marshal(resp)
@@ -1060,6 +1157,14 @@ func advertisedCapabilitiesBySlug(capabilities []storage.ModelCapability) map[st
 			current, exists := best[cap.ModelSlug]
 			if !exists || cap.NativeMaxContextWindow > current.NativeMaxContextWindow {
 				best[cap.ModelSlug] = cap
+			}
+			if cap.Context1MState == Context1MSupported && cap.NativeMaxContextWindow >= 1_000_000 &&
+				!strings.HasSuffix(strings.ToLower(strings.TrimSpace(cap.ModelSlug)), "[1m]") {
+				alias := cap
+				alias.ModelSlug += "[1m]"
+				alias.NativeContextWindow = 1_000_000
+				alias.NativeMaxContextWindow = 1_000_000
+				best[alias.ModelSlug] = alias
 			}
 		}
 	}
@@ -1290,6 +1395,10 @@ func BuildAnthropicModelsResponse(capabilities []storage.ModelCapability) ([]byt
 			slug = ClaudeFacingKiroModelID(slug)
 		}
 		appendModel(slug)
+		if c.Context1MState == Context1MSupported && c.NativeMaxContextWindow >= 1_000_000 &&
+			!strings.HasSuffix(strings.ToLower(strings.TrimSpace(slug)), "[1m]") {
+			appendModel(slug + "[1m]")
+		}
 	}
 	resp := map[string]interface{}{"data": data, "has_more": false}
 	if len(data) > 0 {

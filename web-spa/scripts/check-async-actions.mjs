@@ -54,10 +54,6 @@ const actionFiles = [
     bannedStateNames: [],
   },
   {
-    file: 'src/pages/Lifecycle.tsx',
-    bannedStateNames: ['creating', 'setCreating'],
-  },
-  {
     file: 'src/pages/SettingsV2.tsx',
     bannedStateNames: ['saving', 'setSaving'],
   },

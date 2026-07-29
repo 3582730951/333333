@@ -75,6 +75,44 @@ func TestConvertAnthropicKiroGPTUsesPlainGenerationEnvelope(t *testing.T) {
 	}
 }
 
+func TestConvertAnthropicUsesExactLiveCatalogDescriptor(t *testing.T) {
+	raw := []byte(`{"model":"opus","messages":[{"role":"user","content":"hello"}]}`)
+	got, err := ConvertAnthropicRequestWithOptions(raw, "catalog-affinity", ConversionOptions{
+		ForceMaxQuality:           true,
+		ContextWindow:             1_000_000,
+		CatalogPublicModel:        "claude-opus-5",
+		CatalogUpstreamModel:      "amazon.kiro.claude-opus-5-v1",
+		MaxOutputTokens:           128_000,
+		AdaptiveThinkingKnown:     true,
+		AdaptiveThinkingSupported: true,
+		EffortKnown:               true,
+		MaxThinkingEffort:         "high",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "amazon.kiro.claude-opus-5-v1" || got.MaxOutputTokens != 128_000 || got.ThinkingEffort != "high" {
+		t.Fatalf("conversion=%+v", got)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(got.Body, &root); err != nil {
+		t.Fatal(err)
+	}
+	state := root["conversationState"].(map[string]any)
+	current := state["currentMessage"].(map[string]any)["userInputMessage"].(map[string]any)
+	if current["modelId"] != "amazon.kiro.claude-opus-5-v1" {
+		t.Fatalf("wire model=%v body=%s", current["modelId"], got.Body)
+	}
+	fields := root["additionalModelRequestFields"].(map[string]any)
+	if fields["max_tokens"] != float64(128_000) {
+		t.Fatalf("catalog output limit was not authoritative: %v", fields)
+	}
+	output := fields["output_config"].(map[string]any)
+	if output["effort"] != "high" {
+		t.Fatalf("catalog effort was not authoritative: %v", output)
+	}
+}
+
 func TestIsClaudeCodeCompactionRequestRequiresDedicatedSignature(t *testing.T) {
 	instruction := claudeCodeCompactionInstruction + ", preserving technical details."
 	tests := []struct {

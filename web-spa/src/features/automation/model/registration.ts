@@ -1,5 +1,4 @@
 import type { ApiError } from '../../../model/contracts';
-import type { LifecycleGroup, LifecycleProviderOptions } from './lifecycle';
 
 export type RegistrationIdentityMode = 'phone' | 'email';
 export type RegistrationCountryStrategy = 'auto' | 'manual';
@@ -42,10 +41,23 @@ export interface RegistrationPool {
   [key: string]: unknown;
 }
 
+export interface RegistrationGroup {
+  name: string;
+  [key: string]: unknown;
+}
+
+export type RegistrationProviderOption = string | { label: string; value: string; [key: string]: unknown };
+
+export interface RegistrationProviderOptions {
+  sms: RegistrationProviderOption[];
+  mailbox: RegistrationProviderOption[];
+  captcha: RegistrationProviderOption[];
+}
+
 export interface RegistrationOptions {
-  groups: LifecycleGroup[];
+  groups: RegistrationGroup[];
   pools: RegistrationPool[];
-  providers: LifecycleProviderOptions;
+  providers: RegistrationProviderOptions;
   error: ApiError | null;
 }
 
@@ -89,8 +101,8 @@ export interface RegistrationBlocker {
   detail?: string;
 }
 
-export function normalizeRegisterMethod(method: unknown, fallback = 'node'): string {
-  return String(method || fallback || 'node').trim().toLowerCase();
+export function normalizeRegisterMethod(method: unknown, fallback = 'protocol_v2'): string {
+  return String(method || fallback || 'protocol_v2').trim().toLowerCase();
 }
 
 export function lockedIdentityForMethod(method: unknown): RegistrationIdentityMode | '' {

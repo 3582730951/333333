@@ -14,6 +14,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -60,15 +61,10 @@ func cliproxySpecFromEndpoint(endpoint string) string {
 
 // herosmsKey reads the hero-sms api_key from provider_settings.
 func (p *Pipeline) herosmsKey(ctx context.Context) string {
-	var cfgJSON string
-	err := p.store.DB().QueryRowContext(ctx,
-		`SELECT config_json FROM provider_settings
-		 WHERE provider_type='sms' AND provider_key='herosms' AND enabled=1 LIMIT 1`).Scan(&cfgJSON)
+	cfg, err := p.providerConfig(ctx, "sms", "herosms")
 	if err != nil {
 		return ""
 	}
-	cfg := map[string]interface{}{}
-	_ = json.Unmarshal([]byte(cfgJSON), &cfg)
 	s, _ := cfg["api_key"].(string)
 	return strings.TrimSpace(s)
 }
@@ -93,15 +89,15 @@ func (p *Pipeline) browserRegisterOne(ctx context.Context, req RegisterRequest) 
 	cctx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, python, script)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(registrarBaseEnv(),
 		"CLIPROXY_SPEC="+spec,
 		"HEROSMS_KEY="+herokey,
 		"CHROME_PATH="+chrome,
 		"REG_HEADLESS="+headless,
 	)
-	out, err := cmd.Output() // stdout = the JSON result line; stderr = step logs
+	out, err := p.runRegistrarCommand(cctx, cmd)
 	if err != nil && len(out) == 0 {
-		return nil, fmt.Errorf("browser register: harness failed: %w", err)
+		return nil, errors.New("browser register: harness process failed")
 	}
 	// The harness prints exactly one JSON line on stdout.
 	line := strings.TrimSpace(string(out))
@@ -113,30 +109,14 @@ func (p *Pipeline) browserRegisterOne(ctx context.Context, req RegisterRequest) 
 		return nil, fmt.Errorf("browser register: unparseable harness output: %v", e)
 	}
 	if !res.Success || strings.TrimSpace(res.AccessToken) == "" {
-		return nil, fmt.Errorf("browser register failed: %s", firstNonEmpty(res.Error, "no access token"))
+		return nil, errors.New("browser register did not produce verified credentials")
 	}
 
-	account := &storage.Account{
-		ID:                generateAccountID(),
-		Label:             "browser-" + firstNonEmpty(res.Email, res.Phone),
-		GroupName:         req.GroupName,
+	return p.persistVerifiedRegistration(ctx, req, registrationCredential{
+		LabelPrefix:       "browser-",
+		Email:             res.Email,
 		UpstreamAccountID: res.AccountID,
 		ChatGPTUserID:     res.UserID,
-		Email:             res.Email,
-		PlanType:          firstNonEmpty(res.PlanType, "free"),
-		Provider:          "codex",
-		Status:            "active",
-		CreatedAt:         time.Now().Unix(),
-		UpdatedAt:         time.Now().Unix(),
-	}
-	token := &storage.AccountToken{
-		AccountID:   account.ID,
-		AccessToken: res.AccessToken,
-		CreatedAt:   time.Now().Unix(),
-		UpdatedAt:   time.Now().Unix(),
-	}
-	if err := p.store.UpsertAccount(ctx, *account, *token); err != nil {
-		return nil, fmt.Errorf("upsertAccount: %w", err)
-	}
-	return account, nil
+		AccessToken:       res.AccessToken,
+	})
 }

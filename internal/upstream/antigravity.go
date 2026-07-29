@@ -1075,16 +1075,20 @@ type AntigravityResponsePart struct {
 	FunctionCall     *AntigravityFunctionCall
 }
 
-// ParseAntigravitySSELine parses one "data:" SSE line from an Antigravity stream
-// into an AntigravityChunk. Returns (nil, nil) for non-data lines.
+// ParseAntigravitySSELine remains as a compatibility helper for a single-line
+// event. Streaming paths use antigravitySSEDecoder so CRLF, multi-line data
+// fields and arbitrary transport chunking are handled correctly.
 func ParseAntigravitySSELine(line string) (*AntigravityChunk, error) {
-	line = strings.TrimSpace(line)
+	line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 	if !strings.HasPrefix(line, "data:") {
 		return nil, nil
 	}
 	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-	if payload == "[DONE]" || payload == "" {
+	if payload == "[DONE]" {
 		return &AntigravityChunk{IsLast: true}, nil
+	}
+	if payload == "" {
+		return nil, nil
 	}
 	return parseAntigravityChunk([]byte(payload))
 }
@@ -1110,7 +1114,6 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 		chunk.InputTokens = usage.Get("promptTokenCount").Int()
 		chunk.OutputTokens = usage.Get("candidatesTokenCount").Int() + usage.Get("thoughtsTokenCount").Int()
 		chunk.CachedTokens = usage.Get("cachedContentTokenCount").Int()
-		chunk.IsLast = true // usage chunk is terminal
 	}
 	if usage := r.Get("cpaUsageMetadata"); usage.Exists() {
 		if chunk.InputTokens == 0 {
@@ -1138,13 +1141,14 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 		chunk.StopReason = "end_turn"
 		chunk.IsLast = true
 	case "":
-		if chunk.IsLast {
-			chunk.StopReason = "end_turn"
-		}
+		// Google explicitly uses an empty finishReason while generation is still
+		// in progress. Usage metadata in the same frame does not change that.
 	case "MAX_TOKENS":
 		chunk.StopReason = "max_tokens"
 		chunk.IsLast = true
-	case "SAFETY", "OTHER", "FINISH_REASON_UNSPECIFIED":
+	case "FINISH_REASON_UNSPECIFIED":
+		// Unspecified is not evidence that generation has stopped.
+	case "SAFETY", "OTHER":
 		chunk.StopReason = "end_turn"
 		chunk.IsLast = true
 		chunk.Blocked = strings.EqualFold(cand.Get("finishReason").String(), "SAFETY")
@@ -1188,6 +1192,81 @@ func parseAntigravityChunk(payload []byte) (*AntigravityChunk, error) {
 		}
 	}
 	return chunk, nil
+}
+
+const antigravityMaxSSEFrameBytes = 2 << 20
+
+type antigravitySSEDecoder struct {
+	reader *bufio.Reader
+}
+
+func newAntigravitySSEDecoder(reader io.Reader) *antigravitySSEDecoder {
+	if buffered, ok := reader.(*bufio.Reader); ok {
+		return &antigravitySSEDecoder{reader: buffered}
+	}
+	return &antigravitySSEDecoder{reader: bufio.NewReaderSize(reader, 64*1024)}
+}
+
+// Next returns one complete SSE event. data fields are joined with a newline as
+// required by the SSE standard. raw is a normalized replayable frame.
+func (d *antigravitySSEDecoder) Next() (data string, raw []byte, ok bool, err error) {
+	var dataLines []string
+	var frame bytes.Buffer
+	sawData := false
+	for {
+		line, readErr := readBoundedSSELine(d.reader, antigravityMaxSSEFrameBytes-frame.Len())
+		if len(line) > 0 || readErr == nil {
+			frame.Write(line)
+			frame.WriteByte('\n')
+		}
+		if frame.Len() > antigravityMaxSSEFrameBytes {
+			return "", nil, false, errors.New("antigravity SSE frame exceeds limit")
+		}
+		if len(line) == 0 {
+			if sawData {
+				return strings.Join(dataLines, "\n"), append([]byte(nil), frame.Bytes()...), true, nil
+			}
+			frame.Reset()
+		} else if line[0] != ':' {
+			field, value, hasColon := strings.Cut(string(line), ":")
+			if hasColon && strings.HasPrefix(value, " ") {
+				value = value[1:]
+			}
+			if field == "data" {
+				sawData = true
+				dataLines = append(dataLines, value)
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return "", nil, false, readErr
+			}
+			if sawData {
+				return strings.Join(dataLines, "\n"), append([]byte(nil), frame.Bytes()...), true, nil
+			}
+			return "", nil, false, io.EOF
+		}
+	}
+}
+
+func readBoundedSSELine(reader *bufio.Reader, remaining int) ([]byte, error) {
+	if remaining <= 0 {
+		return nil, errors.New("antigravity SSE frame exceeds limit")
+	}
+	line := make([]byte, 0, min(remaining, 4096))
+	for {
+		part, prefix, err := reader.ReadLine()
+		if len(line)+len(part) > remaining {
+			return nil, errors.New("antigravity SSE frame exceeds limit")
+		}
+		line = append(line, part...)
+		if err != nil {
+			return line, err
+		}
+		if !prefix {
+			return line, nil
+		}
+	}
 }
 
 func newAntigravityEmbeddedError(node gjson.Result) error {
@@ -1244,30 +1323,37 @@ func ProbeAntigravitySSE(reader *bufio.Reader) ([]byte, error) {
 		return nil, io.ErrUnexpectedEOF
 	}
 	var prefix bytes.Buffer
+	decoder := newAntigravitySSEDecoder(reader)
 	for prefix.Len() <= 512*1024 {
-		line, err := reader.ReadString('\n')
-		if len(line) > 0 {
-			prefix.WriteString(line)
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "data:") {
-				chunk, parseErr := ParseAntigravitySSELine(trimmed)
-				if parseErr != nil {
-					return nil, parseErr
-				}
-				if chunk != nil {
-					if len(chunk.Parts) == 0 && chunk.IsLast && !chunk.Blocked && chunk.InputTokens == 0 && chunk.OutputTokens == 0 {
-						return nil, io.ErrUnexpectedEOF
-					}
-					return append([]byte(nil), prefix.Bytes()...), nil
-				}
-			}
+		payload, raw, ok, err := decoder.Next()
+		if len(raw) > 0 {
+			prefix.Write(raw)
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil, io.ErrUnexpectedEOF
-			}
-			return nil, err
+			return nil, io.ErrUnexpectedEOF
 		}
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(payload) == "[DONE]" {
+			return nil, io.ErrUnexpectedEOF
+		}
+		chunk, parseErr := parseAntigravityChunk([]byte(payload))
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		if chunk == nil {
+			continue
+		}
+		// Usage-only frames are valid but do not commit downstream bytes. Keep
+		// probing so a pre-first-byte failure can still fail over accounts.
+		if len(chunk.Parts) == 0 && !chunk.IsLast && !chunk.Blocked {
+			continue
+		}
+		if len(chunk.Parts) == 0 && chunk.IsLast && !chunk.Blocked && chunk.InputTokens == 0 && chunk.OutputTokens == 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return append([]byte(nil), prefix.Bytes()...), nil
 	}
 	return nil, fmt.Errorf("antigravity stream did not produce a valid event within the probe limit")
 }
@@ -1277,9 +1363,8 @@ func ProbeAntigravitySSE(reader *bufio.Reader) ([]byte, error) {
 // The msgID is used as the Anthropic message id (msg_*) for the downstream response.
 func AntigravityStreamToAnthropic(ctx context.Context, body io.Reader, w io.Writer,
 	model, msgID string) (inputTok, outputTok, cachedTok int64, stopReason string, err error) {
-	stopReason = "end_turn"
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 256*1024), 2*1024*1024)
+	stopReason = ""
+	decoder := newAntigravitySSEDecoder(body)
 	writeEvent := func(event string, payload []byte) error {
 		_, writeErr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, payload)
 		return writeErr
@@ -1333,26 +1418,44 @@ func AntigravityStreamToAnthropic(ctx context.Context, body io.Reader, w io.Writ
 		hasContent = true
 		return nil
 	}
-	for scanner.Scan() {
+	for {
 		if ctx.Err() != nil {
 			return inputTok, outputTok, cachedTok, stopReason, ctx.Err()
 		}
-		line := scanner.Text()
-		chunk, parseErr := ParseAntigravitySSELine(line)
+		payload, _, ok, readErr := decoder.Next()
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			} else {
+				err = readErr
+			}
+			break
+		}
+		if !ok {
+			continue
+		}
+		var chunk *AntigravityChunk
+		var parseErr error
+		if strings.TrimSpace(payload) == "[DONE]" {
+			chunk = &AntigravityChunk{IsLast: true}
+		} else {
+			chunk, parseErr = parseAntigravityChunk([]byte(payload))
+		}
 		if parseErr != nil {
-			return inputTok, outputTok, cachedTok, stopReason, parseErr
+			err = parseErr
+			break
 		}
 		if chunk == nil {
 			continue
 		}
 		sawChunk = true
-		if chunk.InputTokens > 0 {
+		if chunk.InputTokens > inputTok {
 			inputTok = chunk.InputTokens
 		}
-		if chunk.OutputTokens > 0 {
+		if chunk.OutputTokens > outputTok {
 			outputTok = chunk.OutputTokens
 		}
-		if chunk.CachedTokens > 0 {
+		if chunk.CachedTokens > cachedTok {
 			cachedTok = chunk.CachedTokens
 		}
 		if chunk.StopReason != "" {
@@ -1440,19 +1543,35 @@ func AntigravityStreamToAnthropic(ctx context.Context, body io.Reader, w io.Writ
 			break
 		}
 	}
-	if scanErr := scanner.Err(); scanErr != nil {
-		err = scanErr
-	} else if !sawChunk || !sawTerminal {
+	if err == nil && (!sawChunk || !sawTerminal) {
 		err = io.ErrUnexpectedEOF
 	}
 
-	if !hasContent {
+	if err == nil && !hasContent {
 		if startErr := startBlock("text", map[string]interface{}{"type": "text", "text": ""}); startErr != nil {
 			return inputTok, outputTok, cachedTok, stopReason, startErr
 		}
 	}
 	if closeErr := closeBlock(); closeErr != nil {
 		return inputTok, outputTok, cachedTok, stopReason, closeErr
+	}
+	if err != nil {
+		failure, _ := json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":       "server_error",
+				"code":       "service_unavailable",
+				"message":    "The relay service is temporarily unavailable. Please retry.",
+				"request_id": "REQ-" + strings.ToUpper(strings.ReplaceAll(uuid.NewString(), "-", "")[:16]),
+			},
+		})
+		if writeErr := writeEvent("error", failure); writeErr != nil {
+			return inputTok, outputTok, cachedTok, stopReason, writeErr
+		}
+		return inputTok, outputTok, cachedTok, stopReason, err
+	}
+	if stopReason == "" {
+		stopReason = "end_turn"
 	}
 
 	usage := map[string]interface{}{"output_tokens": outputTok}

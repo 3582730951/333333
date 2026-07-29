@@ -154,7 +154,9 @@ func TestRegisterBatchRejectsNonRegistrationPool(t *testing.T) {
 
 func TestRegisterBatchDoesNotRequireRuntimePool(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	h.app.regHandler.enabled = true
 	regPool, _ := configureRegistrationEgressPools(t, h)
+	configureProtocolEmailProvider(t, h, "mail-token-runtime-independent")
 	ctx := context.Background()
 	if err := h.store.UpsertGroupEgressPolicy(ctx, storage.GroupEgressPolicy{
 		GroupName:          config.DefaultGroupName,
@@ -163,10 +165,19 @@ func TestRegisterBatchDoesNotRequireRuntimePool(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	readiness, err := h.app.regHandler.registrationMethodReadiness(ctx, pipeline.RegisterRequest{
+		Method: "protocol", IdentityMode: "email", RegistrationEgressPoolID: regPool,
+	})
+	if err != nil || !readiness.Ready {
+		t.Fatalf("registration readiness=%+v err=%v", readiness, err)
+	}
+	if err := h.store.RecordRegistrationCanary(ctx, "protocol", "passed", readiness.Fingerprint, "job-canary", "account-canary", ""); err != nil {
+		t.Fatal(err)
+	}
 
 	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1,"method":"protocol","identity_mode":"email"}`)
-	if code != http.StatusOK {
-		t.Fatalf("register batch with registration pool only = %d, want 200: %s", code, raw)
+	if code != http.StatusAccepted {
+		t.Fatalf("register batch with registration pool only = %d, want 202: %s", code, raw)
 	}
 }
 
@@ -181,8 +192,8 @@ func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 	if req.Platform != "chatgpt" {
 		t.Fatalf("platform = %q, want chatgpt", req.Platform)
 	}
-	if req.Method != "node" {
-		t.Fatalf("method = %q, want node", req.Method)
+	if req.Method != "protocol_v2" {
+		t.Fatalf("method = %q, want protocol_v2", req.Method)
 	}
 	if req.GroupName != config.DefaultGroupName {
 		t.Fatalf("group_name = %q, want %q", req.GroupName, config.DefaultGroupName)
@@ -196,8 +207,8 @@ func TestRegisterRequestNormalizationDefaults(t *testing.T) {
 	if req.EgressID != "" {
 		t.Fatalf("egress_id = %q, want empty until a worker selects a registration-pool member", req.EgressID)
 	}
-	if req.IdentityMode != "phone" {
-		t.Fatalf("identity_mode = %q, want phone", req.IdentityMode)
+	if req.IdentityMode != "email" {
+		t.Fatalf("identity_mode = %q, want email", req.IdentityMode)
 	}
 }
 
@@ -209,7 +220,7 @@ func TestRegisterRequestManualCountryFallbackAndValidation(t *testing.T) {
 	if err := h.store.SetSetting(ctx, "sms_platform_strategy", "manual"); err != nil {
 		t.Fatal(err)
 	}
-	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1}`)
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/register/batch", `{"count":1,"method":"protocol","identity_mode":"phone"}`)
 	if code != http.StatusBadRequest {
 		t.Fatalf("manual country missing status = %d, want 400: %s", code, raw)
 	}
@@ -220,7 +231,7 @@ func TestRegisterRequestManualCountryFallbackAndValidation(t *testing.T) {
 	if err := h.store.SetSetting(ctx, "sms_manual_country", "br"); err != nil {
 		t.Fatal(err)
 	}
-	req := pipeline.RegisterRequest{Count: 1}
+	req := pipeline.RegisterRequest{Count: 1, Method: "protocol", IdentityMode: "phone"}
 	if err := h.app.regHandler.normalizeRegisterRequest(ctx, &req); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +242,7 @@ func TestRegisterRequestManualCountryFallbackAndValidation(t *testing.T) {
 	if err := h.store.SetSetting(ctx, "sms_manual_country", "ZZZ"); err != nil {
 		t.Fatal(err)
 	}
-	req = pipeline.RegisterRequest{Count: 1}
+	req = pipeline.RegisterRequest{Count: 1, Method: "protocol", IdentityMode: "phone"}
 	if err := h.app.regHandler.normalizeRegisterRequest(ctx, &req); err == nil {
 		t.Fatal("normalizeRegisterRequest with invalid sms_manual_country succeeded, want error")
 	}

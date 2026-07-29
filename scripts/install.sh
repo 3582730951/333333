@@ -18,17 +18,15 @@ RUN_TESTS="${RUN_TESTS:-0}"
 INSTALL_SYSTEMD="${INSTALL_SYSTEMD:-auto}"
 START_SERVICE="${START_SERVICE:-1}"
 WITH_SIDECAR="${WITH_SIDECAR:-1}"
-WITH_GOPAY="${WITH_GOPAY:-1}"
 WITH_WARP="${WITH_WARP:-0}"
-WITH_LIFECYCLE="${WITH_LIFECYCLE:-1}"
 MIGRATE_USER_GROUPS="${MIGRATE_USER_GROUPS:-0}"
-# Node registration engine (other_new_gpt_register): installs Node.js + a headless
+# Node registration engine: installs Node.js + a headless
 # Chrome + Xvfb and the puppeteer-real-browser registrar so the pool can auto-register
 # accounts on a no-display cloud VPS. Default on; disable with --without-registration.
 WITH_REGISTRATION="${WITH_REGISTRATION:-1}"
-NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-18}"
-NODE_INSTALL_MAJOR="${NODE_INSTALL_MAJOR:-20}"
-REGISTRAR_SOURCE="${REGISTRAR_SOURCE:-${PROJECT_ROOT}/other_new_gpt_register}"
+NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-22}"
+NODE_INSTALL_MAJOR="${NODE_INSTALL_MAJOR:-22}"
+REGISTRAR_SOURCE="${REGISTRAR_SOURCE:-${PROJECT_ROOT}/workers/node-registrar}"
 REGISTRAR_INSTALL="${REGISTRAR_INSTALL:-${DATA_DIR%/}/registrar}"
 NODE_BIN="${NODE_BIN:-}"
 CHROME_BIN="${CHROME_BIN:-}"
@@ -41,12 +39,11 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PUBLIC_URL="${PUBLIC_URL:-}"
 INSTALL_GO="${INSTALL_GO:-auto}"
-GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.23.5}"
+GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.24.1}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/.build}"
 SKIP_OS_PACKAGES="${SKIP_OS_PACKAGES:-0}"
 SIDECAR_ADDR="${SIDECAR_ADDR:-127.0.0.1:8790}"
-GOPAY_SOURCE_DIR="${GOPAY_SOURCE_DIR:-${PROJECT_ROOT}/gopay/plus}"
 # HEALTH_TIMEOUT bounds private-worker and post-switch /readyz gates.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
@@ -110,31 +107,6 @@ else
   SIDECAR_COOKIE_DIR_EXPLICIT=0
   SIDECAR_COOKIE_DIR="${DATA_DIR%/}/sidecar-cookies"
 fi
-if [[ -n "${GOPAY_INSTALL_DIR:-}" ]]; then
-  GOPAY_INSTALL_DIR_EXPLICIT=1
-else
-  GOPAY_INSTALL_DIR_EXPLICIT=0
-  GOPAY_INSTALL_DIR="${DATA_DIR%/}/gopay/plus"
-fi
-if [[ -n "${GOPAY_VENV:-}" ]]; then
-  GOPAY_VENV_EXPLICIT=1
-else
-  GOPAY_VENV_EXPLICIT=0
-  GOPAY_VENV="${DATA_DIR%/}/gopay-venv"
-fi
-
-# Lifecycle management services (chatgpt_register + plus_payment)
-LIFECYCLE_REGISTER_SOURCE="${LIFECYCLE_REGISTER_SOURCE:-${PROJECT_ROOT}/services/chatgpt_register}"
-LIFECYCLE_REGISTER_INSTALL="${LIFECYCLE_REGISTER_INSTALL:-${DATA_DIR%/}/lifecycle/register}"
-LIFECYCLE_REGISTER_VENV="${LIFECYCLE_REGISTER_VENV:-${DATA_DIR%/}/lifecycle-register-venv}"
-LIFECYCLE_REGISTER_ADDR="${LIFECYCLE_REGISTER_ADDR:-127.0.0.1:8791}"
-LIFECYCLE_PAYMENT_SOURCE="${LIFECYCLE_PAYMENT_SOURCE:-${PROJECT_ROOT}/services/plus_payment}"
-LIFECYCLE_PAYMENT_INSTALL="${LIFECYCLE_PAYMENT_INSTALL:-${DATA_DIR%/}/lifecycle/payment}"
-LIFECYCLE_PAYMENT_VENV="${LIFECYCLE_PAYMENT_VENV:-${DATA_DIR%/}/lifecycle-payment-venv}"
-LIFECYCLE_PAYMENT_ADDR="${LIFECYCLE_PAYMENT_ADDR:-127.0.0.1:8792}"
-LIFECYCLE_REGISTER_CHANGED=1
-LIFECYCLE_PAYMENT_CHANGED=1
-
 log() {
   printf '==> %s\n' "$*"
 }
@@ -165,16 +137,12 @@ Options:
   --no-systemd              Do not install a systemd unit
   --no-start                Do not restart/start the systemd service
   --no-tests                Skip go test ./... (default, use RUN_TESTS=1 to enable)
-  --full                    Install all optional bundled Python components (default)
+  --full                    Install all supported optional components (default)
   --minimal                 Install only the Go gateway
   --with-sidecar            Install and manage the curl_cffi sidecar (default)
   --without-sidecar         Do not install the curl_cffi sidecar
-  --with-gopay              Install the bundled gopay/plus Python services (default)
-  --without-gopay           Do not install the bundled gopay/plus Python services
-  --with-lifecycle          Install lifecycle management services (chatgpt_register + plus_payment, default)
-  --without-lifecycle       Do not install lifecycle management services
   --with-registration       Install the Node auto-registration engine: Node.js + headless Chrome + Xvfb + the
-                            puppeteer-real-browser registrar (other_new_gpt_register). Default. Works on a
+                            repository-owned Playwright registrar. Default. Works on a
                             no-display cloud VPS (Chrome runs headed inside a per-process Xvfb).
   --without-registration    Do not install the Node auto-registration engine
   --migrate-user-groups     Copy missing account-pool groups to same-named user groups on service start
@@ -196,14 +164,11 @@ Options:
 Environment overrides:
   SERVICE_NAME, SERVICE_USER, SERVICE_GROUP, INSTALL_PREFIX, BIN_DIR, APP_DIR,
   CONFIG_DIR, CONFIG_FILE, DATA_DIR, DATABASE_PATH, SYSTEMD_DIR,
-  RUN_TESTS, INSTALL_SYSTEMD, START_SERVICE, WITH_SIDECAR, WITH_GOPAY, WITH_LIFECYCLE,
+  RUN_TESTS, INSTALL_SYSTEMD, START_SERVICE, WITH_SIDECAR,
   MIGRATE_USER_GROUPS,
   WITH_WARP, WARP_EXITS, WARP_BASE_PORT, WARP_ACCOUNTS_PER_EXIT, WARP_DIR, CF_SOLVER_URL,
   LISTEN_ADDR, ADMIN_TOKEN, PUBLIC_URL, OPEN_FIREWALL,
   SIDECAR_ADDR, SIDECAR_VENV, SIDECAR_INSTALL_DIR, SIDECAR_COOKIE_DIR,
-  GOPAY_SOURCE_DIR, GOPAY_INSTALL_DIR, GOPAY_VENV,
-  LIFECYCLE_REGISTER_SOURCE, LIFECYCLE_REGISTER_INSTALL, LIFECYCLE_REGISTER_VENV, LIFECYCLE_REGISTER_ADDR,
-  LIFECYCLE_PAYMENT_SOURCE, LIFECYCLE_PAYMENT_INSTALL, LIFECYCLE_PAYMENT_VENV, LIFECYCLE_PAYMENT_ADDR,
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
@@ -290,12 +255,6 @@ while [[ $# -gt 0 ]]; do
       if [[ "$SIDECAR_COOKIE_DIR_EXPLICIT" == "0" ]]; then
         SIDECAR_COOKIE_DIR="${DATA_DIR%/}/sidecar-cookies"
       fi
-      if [[ "$GOPAY_INSTALL_DIR_EXPLICIT" == "0" ]]; then
-        GOPAY_INSTALL_DIR="${DATA_DIR%/}/gopay/plus"
-      fi
-      if [[ "$GOPAY_VENV_EXPLICIT" == "0" ]]; then
-        GOPAY_VENV="${DATA_DIR%/}/gopay-venv"
-      fi
       shift 2
       ;;
     --data-dir=*)
@@ -308,12 +267,6 @@ while [[ $# -gt 0 ]]; do
       fi
       if [[ "$SIDECAR_COOKIE_DIR_EXPLICIT" == "0" ]]; then
         SIDECAR_COOKIE_DIR="${DATA_DIR%/}/sidecar-cookies"
-      fi
-      if [[ "$GOPAY_INSTALL_DIR_EXPLICIT" == "0" ]]; then
-        GOPAY_INSTALL_DIR="${DATA_DIR%/}/gopay/plus"
-      fi
-      if [[ "$GOPAY_VENV_EXPLICIT" == "0" ]]; then
-        GOPAY_VENV="${DATA_DIR%/}/gopay-venv"
       fi
       shift
       ;;
@@ -345,15 +298,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --full)
       WITH_SIDECAR=1
-      WITH_GOPAY=1
-      WITH_LIFECYCLE=1
       WITH_REGISTRATION=1
       shift
       ;;
     --minimal)
       WITH_SIDECAR=0
-      WITH_GOPAY=0
-      WITH_LIFECYCLE=0
       WITH_REGISTRATION=0
       shift
       ;;
@@ -363,22 +312,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --without-sidecar)
       WITH_SIDECAR=0
-      shift
-      ;;
-    --with-gopay)
-      WITH_GOPAY=1
-      shift
-      ;;
-    --without-gopay)
-      WITH_GOPAY=0
-      shift
-      ;;
-    --with-lifecycle)
-      WITH_LIFECYCLE=1
-      shift
-      ;;
-    --without-lifecycle)
-      WITH_LIFECYCLE=0
       shift
       ;;
     --with-registration)
@@ -591,8 +524,9 @@ config_string_value() {
 }
 
 render_runtime_config() {
-  local listen_json database_json admin_json sidecar_json gopay_dir_json gopay_python_json
+  local listen_json data_json database_json admin_json sidecar_json
   listen_json="$(json_escape "$LISTEN_ADDR")"
+  data_json="$(json_escape "${DATA_DIR%/}/data")"
   database_json="$(json_escape "$DATABASE_PATH")"
   admin_json="$(json_escape "$ADMIN_TOKEN")"
   if bool_enabled "$WITH_SIDECAR"; then
@@ -600,23 +534,18 @@ render_runtime_config() {
   else
     sidecar_json=""
   fi
-  if bool_enabled "$WITH_GOPAY"; then
-    gopay_dir_json="$(json_escape "$GOPAY_INSTALL_DIR")"
-    gopay_python_json="$(json_escape "${GOPAY_VENV}/bin/python")"
-  else
-    gopay_dir_json="$(json_escape "gopay/plus")"
-    gopay_python_json="$(json_escape "python3")"
-  fi
-
   awk \
     -v listen="$listen_json" \
+    -v data_dir="$data_json" \
     -v database="$database_json" \
     -v admin="$admin_json" \
-    -v sidecar="$sidecar_json" \
-    -v gopay_dir="$gopay_dir_json" \
-    -v gopay_python="$gopay_python_json" '
+    -v sidecar="$sidecar_json" '
       /^[[:space:]]*"listen_addr"[[:space:]]*:/ {
         print "  \"listen_addr\": \"" listen "\","
+        next
+      }
+      /^[[:space:]]*"data_dir"[[:space:]]*:/ {
+        print "  \"data_dir\": \"" data_dir "\","
         next
       }
       /^[[:space:]]*"database_path"[[:space:]]*:/ {
@@ -631,20 +560,12 @@ render_runtime_config() {
         print "  \"default_sidecar_endpoint\": \"" sidecar "\","
         next
       }
-      /^[[:space:]]*"gopay_dir"[[:space:]]*:/ {
-        print "  \"gopay_dir\": \"" gopay_dir "\","
-        next
-      }
-      /^[[:space:]]*"gopay_python"[[:space:]]*:/ {
-        print "  \"gopay_python\": \"" gopay_python "\","
-        next
-      }
       { print }
     ' config.example.json
 }
 
 python_runtime_enabled() {
-  bool_enabled "$WITH_SIDECAR" || bool_enabled "$WITH_GOPAY"
+  bool_enabled "$WITH_SIDECAR"
 }
 
 group_exists() {
@@ -885,11 +806,9 @@ ensure_project_files() {
     [[ -f sidecar/curl_cffi_sidecar.py ]] || die "sidecar/curl_cffi_sidecar.py not found"
     [[ -f sidecar/requirements.txt ]] || die "sidecar/requirements.txt not found"
   fi
-  if bool_enabled "$WITH_GOPAY"; then
-    [[ -d "$GOPAY_SOURCE_DIR" ]] || die "GoPay bundle not found: ${GOPAY_SOURCE_DIR}. Add gopay/plus or unset --with-gopay."
-    [[ -f "${GOPAY_SOURCE_DIR%/}/orchestrator.py" ]] || die "GoPay orchestrator.py not found in ${GOPAY_SOURCE_DIR}"
-    [[ -f "${GOPAY_SOURCE_DIR%/}/plus_gopay_links/payment_server.py" ]] || die "GoPay payment_server.py not found in ${GOPAY_SOURCE_DIR}/plus_gopay_links"
-    [[ -f "${GOPAY_SOURCE_DIR%/}/requirements.txt" ]] || die "GoPay requirements.txt not found in ${GOPAY_SOURCE_DIR}"
+  if bool_enabled "$WITH_REGISTRATION"; then
+    [[ -f "${REGISTRAR_SOURCE%/}/package.json" ]] || die "repository-owned Node registrar not found: ${REGISTRAR_SOURCE}"
+    [[ -f "${REGISTRAR_SOURCE%/}/package-lock.json" ]] || die "Node registrar lockfile not found: ${REGISTRAR_SOURCE}/package-lock.json"
   fi
   if bool_enabled "$WITH_WARP"; then
     [[ -f scripts/warp-exit.sh ]] || die "scripts/warp-exit.sh not found (required for --with-warp)"
@@ -910,12 +829,11 @@ ensure_absolute_paths() {
   require_absolute_path "SYSTEMD_DIR" "$SYSTEMD_DIR"
   require_absolute_path "GO_INSTALL_ROOT" "$GO_INSTALL_ROOT"
   require_absolute_path "BUILD_DIR" "$BUILD_DIR"
-  require_absolute_path "GOPAY_SOURCE_DIR" "$GOPAY_SOURCE_DIR"
   require_absolute_path "SIDECAR_INSTALL_DIR" "$SIDECAR_INSTALL_DIR"
   require_absolute_path "SIDECAR_VENV" "$SIDECAR_VENV"
   require_absolute_path "SIDECAR_COOKIE_DIR" "$SIDECAR_COOKIE_DIR"
-  require_absolute_path "GOPAY_INSTALL_DIR" "$GOPAY_INSTALL_DIR"
-  require_absolute_path "GOPAY_VENV" "$GOPAY_VENV"
+  require_absolute_path "REGISTRAR_SOURCE" "$REGISTRAR_SOURCE"
+  require_absolute_path "REGISTRAR_INSTALL" "$REGISTRAR_INSTALL"
 }
 
 ensure_system_deps() {
@@ -971,10 +889,29 @@ build_project() {
   done
 }
 
+ensure_persistent_key() {
+  local key_path="$1" tmp size
+  if run_root test -L "$key_path"; then
+    die "persistent key must not be a symlink: ${key_path}"
+  fi
+  if run_root test -e "$key_path"; then
+    size="$(run_root stat -c %s -- "$key_path" 2>/dev/null || true)"
+    [[ "$size" == "32" ]] || die "persistent key must contain exactly 32 bytes: ${key_path}"
+    run_root chown "$SERVICE_USER:$SERVICE_GROUP" "$key_path"
+    run_root chmod 0600 "$key_path"
+    return
+  fi
+  tmp="$(mktemp)"
+  (umask 077; dd if=/dev/urandom of="$tmp" bs=32 count=1 status=none)
+  run_root install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp" "$key_path"
+  rm -f "$tmp"
+}
+
 prepare_runtime_layout() {
-  local config_parent database_parent
+  local config_parent database_parent persistent_root
   config_parent="$(dirname "$CONFIG_FILE")"
   database_parent="$(dirname "$DATABASE_PATH")"
+  persistent_root="${DATA_DIR%/}/data"
 
   if ! group_exists "$SERVICE_GROUP"; then
     log "Creating group ${SERVICE_GROUP}"
@@ -991,15 +928,18 @@ prepare_runtime_layout() {
   run_root install -d -m 0755 "${APP_DIR}/releases"
   run_root install -d -m 0755 "${APP_DIR}/bin"
   run_root install -d -m 0755 "$CONFIG_DIR" "$config_parent"
-  run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR"
-  run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "${DATA_DIR}/run"
-  run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$database_parent"
+  run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR" "$persistent_root"
+  run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+    "${persistent_root}/spool" "${persistent_root}/journal" "${persistent_root}/diagnostics" \
+    "${persistent_root}/tmp" "${persistent_root}/tmp/browser" "${persistent_root}/run" \
+    "${persistent_root}/keys" "${DATA_DIR}/run"
+  ensure_persistent_key "${persistent_root}/keys/master.key"
+  ensure_persistent_key "${persistent_root}/keys/identity.key"
+  ensure_persistent_key "${persistent_root}/keys/diagnostic-alias.key"
+  run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$database_parent"
   if bool_enabled "$WITH_SIDECAR"; then
     run_root install -d -m 0755 "$SIDECAR_INSTALL_DIR"
-    run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$SIDECAR_COOKIE_DIR"
-  fi
-  if bool_enabled "$WITH_GOPAY"; then
-    run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$(dirname "$GOPAY_INSTALL_DIR")"
+    run_root install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$SIDECAR_COOKIE_DIR"
   fi
 }
 
@@ -1066,6 +1006,14 @@ EOF
     run_root install -m 0640 -o root -g "$SERVICE_GROUP" "$tmp" "$CONFIG_FILE"
     rm -f "$tmp"
   fi
+  if [[ -n "$ADMIN_TOKEN" ]]; then
+    tmp="$(mktemp)"
+    (umask 077; printf '%s\n' "$ADMIN_TOKEN" >"$tmp")
+    run_root install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp" "${DATA_DIR%/}/data/keys/admin.token"
+    rm -f "$tmp"
+  else
+    run_root rm -f -- "${DATA_DIR%/}/data/keys/admin.token"
+  fi
 }
 
 systemd_requested() {
@@ -1082,6 +1030,26 @@ systemd_requested() {
 
 systemd_running() {
   command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]
+}
+
+remove_legacy_auxiliary_units() {
+  local unit unit_path removed=0
+  for unit in "${SERVICE_NAME}-payment.service" "${SERVICE_NAME}-register.service"; do
+    unit_path="${SYSTEMD_DIR%/}/${unit}"
+    if command -v systemctl >/dev/null 2>&1; then
+      run_root systemctl stop "$unit" >/dev/null 2>&1 || true
+      run_root systemctl disable "$unit" >/dev/null 2>&1 || true
+    fi
+    if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+      log "Removing retired auxiliary unit ${unit}"
+      run_root rm -f -- "$unit_path"
+      removed=1
+    fi
+  done
+  if (( removed == 1 )) && systemd_running; then
+    run_root systemctl daemon-reload
+    run_root systemctl reset-failed >/dev/null 2>&1 || true
+  fi
 }
 
 acquire_deploy_lock() {
@@ -1451,11 +1419,6 @@ install_systemd_unit() {
     read_write_paths="$DATA_DIR $database_parent"
   fi
   extra_env=""
-  if bool_enabled "$WITH_GOPAY"; then
-    extra_env="${extra_env}
-Environment=\"CODEX_POOL_GOPAY_DIR=${GOPAY_INSTALL_DIR}\"
-Environment=\"CODEX_POOL_GOPAY_PYTHON=${GOPAY_VENV}/bin/python\""
-  fi
   if bool_enabled "$WITH_SIDECAR"; then
     extra_env="${extra_env}
 Environment=\"CODEX_POOL_DEFAULT_SIDECAR_ENDPOINT=http://${SIDECAR_ADDR}\""
@@ -1502,7 +1465,8 @@ Environment=\"CODEX_POOL_CF_SOLVER_URL=${CF_SOLVER_URL}\""
   admin_env=""
   if [[ -n "$ADMIN_TOKEN" ]]; then
     admin_env="
-Environment=\"CODEX_POOL_ADMIN_TOKEN=${ADMIN_TOKEN}\""
+LoadCredential=admin.token:${DATA_DIR%/}/data/keys/admin.token
+Environment=\"CODEX_POOL_ADMIN_TOKEN_FILE=%d/admin.token\""
   fi
 
   run_root install -d -m 0755 "$SYSTEMD_DIR"
@@ -1579,6 +1543,13 @@ Group=${SERVICE_GROUP}
 WorkingDirectory=${DATA_DIR}
 Environment="CODEX_POOL_DATABASE=${DATABASE_PATH}"
 Environment="CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS}"
+Environment="CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data"
+Environment="CODEX_POOL_MASTER_KEY_FILE=%d/master.key"
+Environment="CODEX_POOL_IDENTITY_KEY_FILE=%d/identity.key"
+Environment="CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE=%d/diagnostic-alias.key"
+LoadCredential=master.key:${DATA_DIR%/}/data/keys/master.key
+LoadCredential=identity.key:${DATA_DIR%/}/data/keys/identity.key
+LoadCredential=diagnostic-alias.key:${DATA_DIR%/}/data/keys/diagnostic-alias.key
 Environment="CODEX_POOL_RELEASE_ID=%i"${admin_env}${extra_env}
 ExecStart=${APP_DIR%/}/releases/%i/${APP_NAME} --config ${CONFIG_FILE} --release-id %i --unix-socket ${DATA_DIR%/}/run/worker-%i.sock
 Restart=on-failure
@@ -1655,79 +1626,6 @@ EOF
     rm -f "$tmp"
   fi
 
-  # Lifecycle management services (chatgpt_register + plus_payment)
-  if bool_enabled "$WITH_LIFECYCLE"; then
-    # Register service
-    if [[ -d "$LIFECYCLE_REGISTER_INSTALL" ]]; then
-      tmp="$(mktemp)"
-      local register_unit="${SYSTEMD_DIR%/}/${SERVICE_NAME}-register.service"
-      cat >"$tmp" <<EOF
-[Unit]
-Description=Codex Pool Lifecycle Register Service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_GROUP}
-WorkingDirectory=${LIFECYCLE_REGISTER_INSTALL}
-Environment="FLASK_HOST=127.0.0.1"
-Environment="FLASK_PORT=${LIFECYCLE_REGISTER_ADDR##*:}"
-ExecStart=${LIFECYCLE_REGISTER_VENV}/bin/python ${LIFECYCLE_REGISTER_INSTALL}/register_service.py
-Restart=always
-RestartSec=3
-TimeoutStopSec=30
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${DATA_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-      log "Installing systemd unit to ${register_unit}"
-      run_root install -m 0644 "$tmp" "$register_unit"
-      rm -f "$tmp"
-    fi
-
-    # Payment service
-    if [[ -d "$LIFECYCLE_PAYMENT_INSTALL" ]]; then
-      tmp="$(mktemp)"
-      local payment_unit="${SYSTEMD_DIR%/}/${SERVICE_NAME}-payment.service"
-      cat >"$tmp" <<EOF
-[Unit]
-Description=Codex Pool Lifecycle Payment Service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_GROUP}
-WorkingDirectory=${LIFECYCLE_PAYMENT_INSTALL}
-Environment="FLASK_HOST=127.0.0.1"
-Environment="FLASK_PORT=${LIFECYCLE_PAYMENT_ADDR##*:}"
-ExecStart=${LIFECYCLE_PAYMENT_VENV}/bin/python ${LIFECYCLE_PAYMENT_INSTALL}/payment_service.py
-Restart=always
-RestartSec=3
-TimeoutStopSec=30
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${DATA_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-      log "Installing systemd unit to ${payment_unit}"
-      run_root install -m 0644 "$tmp" "$payment_unit"
-      rm -f "$tmp"
-    fi
-  fi
-
   if systemd_running; then
     run_root systemctl daemon-reload
     run_root systemctl enable "${SERVICE_NAME}.socket" >/dev/null 2>&1 || true
@@ -1736,15 +1634,6 @@ EOF
     if bool_enabled "$WITH_SIDECAR"; then
       run_root systemctl enable "${SERVICE_NAME}-sidecar.service" >/dev/null 2>&1 || true
     fi
-    if bool_enabled "$WITH_LIFECYCLE"; then
-      if [[ -f "${SYSTEMD_DIR%/}/${SERVICE_NAME}-register.service" ]]; then
-        run_root systemctl enable "${SERVICE_NAME}-register.service" >/dev/null 2>&1 || true
-      fi
-      if [[ -f "${SYSTEMD_DIR%/}/${SERVICE_NAME}-payment.service" ]]; then
-        run_root systemctl enable "${SERVICE_NAME}-payment.service" >/dev/null 2>&1 || true
-      fi
-    fi
-
     if bool_enabled "$START_SERVICE"; then
       # Start and self-test the private A/B worker first. activate_staged_release then
       # atomically moves only new requests; the old worker remains alive until its
@@ -1766,27 +1655,6 @@ EOF
         fi
       fi
 
-      # Restart lifecycle services when their source changed (or not running)
-      if bool_enabled "$WITH_LIFECYCLE"; then
-        if [[ -f "${SYSTEMD_DIR%/}/${SERVICE_NAME}-register.service" ]]; then
-          if [[ "${LIFECYCLE_REGISTER_CHANGED:-1}" == "1" ]] || ! run_root systemctl is-active --quiet "${SERVICE_NAME}-register.service"; then
-            log "Restarting ${SERVICE_NAME}-register.service"
-            run_root systemctl restart "${SERVICE_NAME}-register.service" || true
-            run_root systemctl --no-pager --full status "${SERVICE_NAME}-register.service" || true
-          else
-            log "Register service unchanged; leaving ${SERVICE_NAME}-register.service running"
-          fi
-        fi
-        if [[ -f "${SYSTEMD_DIR%/}/${SERVICE_NAME}-payment.service" ]]; then
-          if [[ "${LIFECYCLE_PAYMENT_CHANGED:-1}" == "1" ]] || ! run_root systemctl is-active --quiet "${SERVICE_NAME}-payment.service"; then
-            log "Restarting ${SERVICE_NAME}-payment.service"
-            run_root systemctl restart "${SERVICE_NAME}-payment.service" || true
-            run_root systemctl --no-pager --full status "${SERVICE_NAME}-payment.service" || true
-          else
-            log "Payment service unchanged; leaving ${SERVICE_NAME}-payment.service running"
-          fi
-        fi
-      fi
     else
       atomic_symlink "$RELEASE_DIR" "${APP_DIR%/}/current"
       warn "Service installed but not started"
@@ -1855,101 +1723,7 @@ install_sidecar() {
   if [[ "$SIDECAR_VENV_EXPLICIT" == 0 ]]; then SIDECAR_VENV="${APP_DIR%/}/current/sidecar-venv"; fi
 }
 
-install_gopay() {
-  bool_enabled "$WITH_GOPAY" || return 0
-
-  local tmp
-  tmp="${GOPAY_INSTALL_DIR}.tmp"
-  log "Installing GoPay bundle to ${GOPAY_INSTALL_DIR}"
-  run_root rm -rf "$tmp"
-  run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp"
-  run_root cp -a "${GOPAY_SOURCE_DIR%/}/." "$tmp/"
-  run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$tmp"
-  run_root rm -rf "$GOPAY_INSTALL_DIR"
-  run_root mv "$tmp" "$GOPAY_INSTALL_DIR"
-
-  log "Preparing GoPay virtualenv at ${GOPAY_VENV}"
-  run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$GOPAY_VENV"
-  run_root python3 -m venv "$GOPAY_VENV"
-  run_root "${GOPAY_VENV}/bin/pip" install --upgrade pip
-  run_root "${GOPAY_VENV}/bin/pip" install -r "${GOPAY_INSTALL_DIR}/requirements.txt"
-  run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$GOPAY_INSTALL_DIR" "$GOPAY_VENV"
-}
-
-# install_lifecycle_services installs the lifecycle management Python services
-# (chatgpt_register + plus_payment) that support automated account registration
-# and Plus subscription management.
-install_lifecycle_services() {
-  bool_enabled "$WITH_LIFECYCLE" || return 0
-
-  # Install chatgpt_register service
-  if [[ -d "$LIFECYCLE_REGISTER_SOURCE" ]]; then
-    local tmp
-    tmp="${LIFECYCLE_REGISTER_INSTALL}.tmp"
-    log "Installing lifecycle register service to ${LIFECYCLE_REGISTER_INSTALL}"
-    run_root rm -rf "$tmp"
-    run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp"
-    run_root cp -a "${LIFECYCLE_REGISTER_SOURCE%/}/." "$tmp/"
-    run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$tmp"
-
-    # Check if source changed (for smart restart)
-    if [[ -d "$LIFECYCLE_REGISTER_INSTALL" ]]; then
-      local old_hash new_hash
-      old_hash=$(run_root find "$LIFECYCLE_REGISTER_INSTALL" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
-      new_hash=$(run_root find "$tmp" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
-      [[ "$old_hash" == "$new_hash" ]] && LIFECYCLE_REGISTER_CHANGED=0 || LIFECYCLE_REGISTER_CHANGED=1
-    else
-      LIFECYCLE_REGISTER_CHANGED=1
-    fi
-
-    run_root rm -rf "$LIFECYCLE_REGISTER_INSTALL"
-    run_root mv "$tmp" "$LIFECYCLE_REGISTER_INSTALL"
-
-    log "Preparing lifecycle register virtualenv at ${LIFECYCLE_REGISTER_VENV}"
-    run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$LIFECYCLE_REGISTER_VENV"
-    run_root python3 -m venv "$LIFECYCLE_REGISTER_VENV"
-    run_root "${LIFECYCLE_REGISTER_VENV}/bin/pip" install --upgrade pip setuptools wheel
-    run_root "${LIFECYCLE_REGISTER_VENV}/bin/pip" install -r "${LIFECYCLE_REGISTER_INSTALL}/requirements.txt"
-    run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$LIFECYCLE_REGISTER_INSTALL" "$LIFECYCLE_REGISTER_VENV"
-  else
-    warn "Lifecycle register source not found at ${LIFECYCLE_REGISTER_SOURCE}, skipping"
-  fi
-
-  # Install plus_payment service
-  if [[ -d "$LIFECYCLE_PAYMENT_SOURCE" ]]; then
-    local tmp
-    tmp="${LIFECYCLE_PAYMENT_INSTALL}.tmp"
-    log "Installing lifecycle payment service to ${LIFECYCLE_PAYMENT_INSTALL}"
-    run_root rm -rf "$tmp"
-    run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp"
-    run_root cp -a "${LIFECYCLE_PAYMENT_SOURCE%/}/." "$tmp/"
-    run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$tmp"
-
-    # Check if source changed (for smart restart)
-    if [[ -d "$LIFECYCLE_PAYMENT_INSTALL" ]]; then
-      local old_hash new_hash
-      old_hash=$(run_root find "$LIFECYCLE_PAYMENT_INSTALL" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
-      new_hash=$(run_root find "$tmp" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | awk '{print $1}')
-      [[ "$old_hash" == "$new_hash" ]] && LIFECYCLE_PAYMENT_CHANGED=0 || LIFECYCLE_PAYMENT_CHANGED=1
-    else
-      LIFECYCLE_PAYMENT_CHANGED=1
-    fi
-
-    run_root rm -rf "$LIFECYCLE_PAYMENT_INSTALL"
-    run_root mv "$tmp" "$LIFECYCLE_PAYMENT_INSTALL"
-
-    log "Preparing lifecycle payment virtualenv at ${LIFECYCLE_PAYMENT_VENV}"
-    run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$LIFECYCLE_PAYMENT_VENV"
-    run_root python3 -m venv "$LIFECYCLE_PAYMENT_VENV"
-    run_root "${LIFECYCLE_PAYMENT_VENV}/bin/pip" install --upgrade pip setuptools wheel
-    run_root "${LIFECYCLE_PAYMENT_VENV}/bin/pip" install -r "${LIFECYCLE_PAYMENT_INSTALL}/requirements.txt"
-    run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$LIFECYCLE_PAYMENT_INSTALL" "$LIFECYCLE_PAYMENT_VENV"
-  else
-    warn "Lifecycle payment source not found at ${LIFECYCLE_PAYMENT_SOURCE}, skipping"
-  fi
-}
-
-# ── Node auto-registration engine (other_new_gpt_register) ──────────────────────────
+# ── Repository-owned Node auto-registration engine ──────────────────────────────────
 # Installs Node.js + a Chrome/Chromium browser + Xvfb + the puppeteer-real-browser
 # registrar so the pool can auto-register accounts on a NO-DISPLAY cloud VPS. The Go
 # orchestrator (internal/registration/pipeline/registrar_node.go) launches the registrar
@@ -2234,21 +2008,11 @@ frontend_url_hint() {
 }
 
 print_summary() {
-  local sidecar_summary gopay_summary lifecycle_summary migration_summary warp_summary frontend_url manual_admin_env
+  local sidecar_summary migration_summary warp_summary frontend_url manual_admin_env admin_token_summary
   if bool_enabled "$WITH_SIDECAR"; then
     sidecar_summary="${SERVICE_NAME}-sidecar.service (${SIDECAR_ADDR})"
   else
     sidecar_summary="disabled"
-  fi
-  if bool_enabled "$WITH_GOPAY"; then
-    gopay_summary="${GOPAY_INSTALL_DIR}"
-  else
-    gopay_summary="disabled"
-  fi
-  if bool_enabled "$WITH_LIFECYCLE"; then
-    lifecycle_summary="${SERVICE_NAME}-register.service (${LIFECYCLE_REGISTER_ADDR}), ${SERVICE_NAME}-payment.service (${LIFECYCLE_PAYMENT_ADDR})"
-  else
-    lifecycle_summary="disabled"
   fi
   local registration_summary
   if bool_enabled "$WITH_REGISTRATION"; then
@@ -2268,8 +2032,10 @@ print_summary() {
   fi
   frontend_url="$(frontend_url_hint)"
   manual_admin_env=""
+  admin_token_summary="<empty>"
   if [[ -n "$ADMIN_TOKEN" ]]; then
-    manual_admin_env=" CODEX_POOL_ADMIN_TOKEN=${ADMIN_TOKEN}"
+    manual_admin_env=" CODEX_POOL_ADMIN_TOKEN_FILE=${DATA_DIR%/}/data/keys/admin.token"
+    admin_token_summary="<configured in ${DATA_DIR%/}/data/keys/admin.token>"
   fi
 
   cat <<EOF
@@ -2281,19 +2047,17 @@ Handoff:       ${BIN_DIR}/${HANDOFF_NAME}
 Release:       ${RELEASE_ID} (${RELEASE_DIR})
 Context clear: ${BIN_DIR}/codex-pool-clear-context
 Config:        ${CONFIG_FILE}
-Data:          ${DATA_DIR}
+Data:          ${DATA_DIR%/}/data
 Database:      ${DATABASE_PATH}
 Listen:        ${LISTEN_ADDR}
 Frontend:      ${frontend_url}
 Handoff svc:  ${HANDOFF_SERVICE_NAME}.service
 Compat svc:   ${SERVICE_NAME}.service
 Sidecar:       ${sidecar_summary}
-GoPay:         ${gopay_summary}
-Lifecycle:     ${lifecycle_summary}
 Registration:  ${registration_summary}
 Group migration: ${migration_summary}
 WARP:          ${warp_summary}
-Admin token:   ${ADMIN_TOKEN:-<empty>}
+Admin token:   ${admin_token_summary}
 
 Manual run:
   CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}
@@ -2305,8 +2069,6 @@ Useful service commands:
   ${BIN_DIR}/codex-pool-rollback
   journalctl -u ${HANDOFF_SERVICE_NAME}.service -f
   systemctl status ${SERVICE_NAME}-sidecar.service
-  systemctl status ${SERVICE_NAME}-register.service
-  systemctl status ${SERVICE_NAME}-payment.service
 EOF
 }
 
@@ -2315,6 +2077,7 @@ main() {
   ensure_project_files
   ensure_absolute_paths
   acquire_deploy_lock
+  remove_legacy_auxiliary_units
   trap deployment_exit_cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -2327,8 +2090,6 @@ main() {
   prepare_runtime_layout
   install_binary_and_config
   install_sidecar
-  install_gopay
-  install_lifecycle_services
   install_nodejs
   install_chrome
   install_node_registrar

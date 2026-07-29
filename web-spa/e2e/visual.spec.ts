@@ -48,18 +48,14 @@ function apiFixture(pathname: string, search: URLSearchParams): unknown {
     const value: Record<string, unknown> = {};
     if (sections.includes('automation')) value.automation = { policies: [], stats: null, readiness: { ready: false, blockers: ['尚未配置'] } };
     if (sections.includes('registrar')) value.registrar = {};
-    if (sections.includes('lifecycle')) value.lifecycle = { defaults: {} };
     if (sections.includes('logging')) value.logging = {};
     if (sections.includes('memory')) value.memory = {};
     return value;
   }
   if (pathname === '/admin/config') return [];
-  if (pathname === '/admin/lifecycle/tasks') return { tasks: [] };
-  if (pathname === '/admin/lifecycle/services') return { services: [] };
   if (pathname === '/admin/upstream-error-rules') return { rules: [] };
   if (pathname === '/admin/upstream-error-rules/model-options') return { families: [] };
   if (pathname === '/admin/model-quality') return { rows: [], summary: {} };
-  if (pathname === '/admin/gopay') return { supported: false, cards: [], orders: [] };
   if (pathname === '/auth/me') return null;
   if (pathname === '/user/profile') return { email: 'user@example.test', name: 'Portal User', role: 'user' };
   return [];
@@ -125,15 +121,6 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
     }
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/api-keys') {
       return route.fulfill({ json: { key: 'cap_e2e_new_secret' } });
-    }
-    if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/lifecycle/tasks') {
-      return route.fulfill({ json: { tasks: [{ id: 'job-e2e-1', task_type: 'register', platform: 'chatgpt', status: 'pending', target_count: 2, completed_count: 0, success_count: 0, failed_count: 0, created_at: 1_700_000_000 }] } });
-    }
-    if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/lifecycle/tasks') {
-      return route.fulfill({ json: { id: 'job-e2e-created' } });
-    }
-    if (state === 'interactive' && request.method() === 'DELETE' && url.pathname === '/admin/lifecycle/tasks/job-e2e-1') {
-      return route.fulfill({ json: { ok: true } });
     }
     if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/register/readiness') {
       return route.fulfill({ json: { ready: false, blockers: ['auto-refill 策略未启用'], providers: { sms: 1, mailbox: 1, email_otp: 1, captcha: 0 }, pool: { active: 3, target: 5, deficit: 2 } } });
@@ -354,10 +341,6 @@ test('access and audit pages switch locale without remounting', async ({ browser
   await expect(adminPage.getByRole('button', { name: 'Create key' })).toBeVisible();
   await adminPage.goto('/console/audit');
   await expect(adminPage.getByRole('heading', { name: 'Audit Log' })).toBeVisible();
-  await adminPage.goto('/console/lifecycle');
-  await expect(adminPage.getByRole('heading', { name: 'Lifecycle Jobs' })).toBeVisible();
-  await expect(adminPage.getByRole('button', { name: 'New job' })).toBeVisible();
-  await expect(adminPage.getByRole('columnheader', { name: 'Succeeded / Failed' })).toBeVisible();
   await adminPage.goto('/console/registration');
   await expect(adminPage.getByRole('heading', { name: 'Auto-Registration' })).toBeVisible();
   await expect(adminPage.getByRole('button', { name: 'Start' })).toBeVisible();
@@ -388,41 +371,17 @@ test('access and audit pages switch locale without remounting', async ({ browser
   await portalPage.close();
 });
 
-test('automation pages render without React console errors', async ({ page }) => {
+test('registration page renders without React console errors', async ({ page }) => {
   const consoleErrors: string[] = [];
   page.on('console', (message) => {
     if (message.type() === 'error') consoleErrors.push(message.text());
   });
   await mockBackend(page, 'admin', 'interactive');
-  await page.goto('/console/lifecycle');
-  await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
   await page.goto('/console/registration');
   await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
   await page.getByLabel('国家策略').selectOption('manual');
   await expect(page.getByLabel('指定国家')).toBeVisible();
   expect(consoleErrors).toEqual([]);
-});
-
-test('lifecycle create and cancel mutations remain usable', async ({ page }) => {
-  await mockBackend(page, 'admin', 'interactive');
-  await page.goto('/console/lifecycle');
-  await expect(page.locator('[data-page-ready="true"]')).toBeVisible();
-
-  await page.getByRole('button', { name: '新建任务' }).click();
-  const createDialog = page.getByRole('dialog', { name: '新建生命周期任务' });
-  const createRequest = page.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/lifecycle/tasks');
-  await createDialog.getByRole('button', { name: '创建', exact: true }).click();
-  const payload = (await createRequest).postDataJSON();
-  expect(payload).toMatchObject({ task_type: 'register', platform: 'chatgpt', target_count: 1, concurrency: 1 });
-  await expect(page.getByText('任务已创建', { exact: true })).toBeVisible();
-
-  await page.getByRole('button', { name: '任务操作' }).click();
-  await page.getByRole('menuitem', { name: '取消任务' }).click();
-  const confirmDialog = page.getByRole('alertdialog', { name: '取消该任务？' });
-  const cancelRequest = page.waitForRequest((request) => request.method() === 'DELETE' && new URL(request.url()).pathname === '/admin/lifecycle/tasks/job-e2e-1');
-  await confirmDialog.getByRole('button', { name: '取消任务' }).click();
-  await cancelRequest;
-  await expect(page.getByText('任务已取消', { exact: true })).toBeVisible();
 });
 
 test('registration saves manual country strategy before starting a job', async ({ page }) => {

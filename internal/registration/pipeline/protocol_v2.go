@@ -17,9 +17,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -153,7 +153,7 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 	script := firstEnv("services/codex_register/protocol_register.py", "CODEX_REG_PROTOCOL_SCRIPT")
 	proxyURL := p.proxyURLFromEgress(ctx, req.EgressID)
 	emailProvider := firstEnv("hotmail_otp", "CODEX_REG_EMAIL_PROVIDER")
-	baseEmail, otpURL, emailErr := p.getEmailForRegistration(ctx)
+	baseEmail, otpURL, otpToken, emailErr := p.getEmailForRegistration(ctx)
 	if emailErr != nil {
 		return nil, fmt.Errorf("protocol_v2: email: %w", emailErr)
 	}
@@ -161,7 +161,7 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, python, "-u", script)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(registrarBaseEnv(),
 		"REG_AUTO=1",
 		"REG_COUNT=1",
 		"REG_WORKERS=1",
@@ -170,10 +170,11 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 		"EMAIL_PROVIDER="+emailProvider,
 		"HOTMAIL_BASE_EMAIL="+baseEmail,
 		"HOTMAIL_OTP_URL="+otpURL,
+		"HOTMAIL_OTP_TOKEN="+otpToken,
 	)
-	out, err := cmd.Output()
+	out, err := p.runRegistrarCommand(cctx, cmd)
 	if err != nil && len(out) == 0 {
-		return nil, fmt.Errorf("protocol_v2: registrar failed: %w", err)
+		return nil, errors.New("protocol_v2: registrar process failed")
 	}
 
 	// Parse the "__CODEX_ACCOUNT__ {json}" marker line.
@@ -195,27 +196,13 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 		return nil, fmt.Errorf("protocol_v2: no account produced (OpenAI signup not completed — see registrar logs)")
 	}
 
-	account := &storage.Account{
-		ID:                generateAccountID(),
-		Label:             "protocol-" + acct.Email,
-		GroupName:         req.GroupName,
-		UpstreamAccountID: acct.AccountID,
+	return p.persistVerifiedRegistration(ctx, req, registrationCredential{
+		LabelPrefix:       "protocol-",
 		Email:             acct.Email,
-		Provider:          "codex",
-		Status:            "active",
-		CreatedAt:         time.Now().Unix(),
-		UpdatedAt:         time.Now().Unix(),
-	}
-	token := &storage.AccountToken{
-		AccountID:    account.ID,
-		AccessToken:  acct.AccessToken,
-		RefreshToken: acct.RefreshToken,
-		IDTokenRaw:   acct.IDToken,
-		CreatedAt:    time.Now().Unix(),
-		UpdatedAt:    time.Now().Unix(),
-	}
-	if err := p.store.UpsertAccount(ctx, *account, *token); err != nil {
-		return nil, fmt.Errorf("upsertAccount: %w", err)
-	}
-	return account, nil
+		UpstreamAccountID: acct.AccountID,
+		ChatGPTUserID:     acct.UserID,
+		AccessToken:       acct.AccessToken,
+		RefreshToken:      acct.RefreshToken,
+		IDToken:           acct.IDToken,
+	})
 }

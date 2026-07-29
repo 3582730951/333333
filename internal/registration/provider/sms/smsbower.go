@@ -425,6 +425,12 @@ func (p *SMSBowerProvider) CancelNumber(ctx context.Context, orderID string) err
 	return err
 }
 
+// CompleteNumber confirms the received code and completes the activation.
+func (p *SMSBowerProvider) CompleteNumber(ctx context.Context, orderID string) error {
+	_, err := p.rawRequest(ctx, "setStatus", map[string]string{"id": orderID, "status": "6"})
+	return err
+}
+
 // --- small helpers (local to avoid depending on herosms.go's splitN etc.) ---
 
 func truncate(s string, n int) string {

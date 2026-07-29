@@ -25,8 +25,6 @@ const expectedAdminRoutes = [
   '/providers',
   '/upstream-error-rules',
   '/registration',
-  '/lifecycle',
-  '/gopay',
   '/usage',
   '/quota',
   '/model-quality',

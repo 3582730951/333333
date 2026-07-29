@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync/atomic"
 	"time"
@@ -35,6 +36,8 @@ type telemetryWrite struct {
 // queue is live before any request is served. The drainer runs until FlushWrites closes
 // the channel during shutdown (after in-flight requests have drained), then exits.
 func (s *Server) startAsyncWriter() {
+	s.asyncWriteCtx, s.asyncWriteCancel = context.WithCancel(context.Background())
+	s.asyncFlushDone = make(chan struct{})
 	s.asyncWrites = make(chan func(), asyncWriteQueueDepth)
 	s.usageWrites = make(chan telemetryWrite, asyncWriteQueueDepth)
 	s.asyncWG.Add(1)
@@ -156,6 +159,18 @@ func (s *Server) startAsyncWriter() {
 }
 
 func (s *Server) persistTelemetryBatch(batch []telemetryWrite) error {
+	ctx, cancel := s.bgWriteContext()
+	defer cancel()
+	return s.persistTelemetryBatchContext(ctx, batch)
+}
+
+func (s *Server) persistTelemetryBatchDetached(batch []telemetryWrite) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return s.persistTelemetryBatchContext(ctx, batch)
+}
+
+func (s *Server) persistTelemetryBatchContext(ctx context.Context, batch []telemetryWrite) error {
 	usageBatch := make([]storage.UsageRecordWrite, 0, len(batch))
 	holds := make([]storage.BillingHoldWrite, 0, len(batch))
 	apiKeys := make(map[string]int64)
@@ -181,9 +196,7 @@ func (s *Server) persistTelemetryBatch(batch []telemetryWrite) error {
 	if len(usageBatch) == 0 && len(holds) == 0 && len(apiKeys) == 0 && len(audits) == 0 {
 		return nil
 	}
-	ctx, cancel := bgWriteContext()
 	directErr := s.store.BatchWriteTelemetry(ctx, usageBatch, apiKeys, holds, audits)
-	cancel()
 	if directErr != nil || len(journalSequences) == 0 {
 		return directErr
 	}
@@ -203,7 +216,7 @@ func (s *Server) persistTelemetryBatch(batch []telemetryWrite) error {
 		contiguous = journalSequences[index] == journalSequences[index-1]+1
 	}
 	if !contiguous {
-		return s.replayUsageJournalLocked(context.Background())
+		return s.replayUsageJournalLocked(ctx)
 	}
 	last := journalSequences[len(journalSequences)-1]
 	if err := s.usageJournal.Ack(last); err != nil {
@@ -335,10 +348,17 @@ func (s *Server) enqueueAudit(row storage.AuditLogRow) {
 }
 
 func (s *Server) enqueueTelemetry(write telemetryWrite) {
+	if s.usageDirectWrites.Load() && (write.usage != nil || write.hold != nil) {
+		if err := s.persistTelemetryBatch([]telemetryWrite{write}); err == nil {
+			return
+		} else {
+			log.Printf("[USAGE-ERROR] direct pressure-mode insert failed; retaining journal fallback: %v", err)
+		}
+	}
 	s.asyncMu.RLock()
 	if s.asyncClosed {
 		s.asyncMu.RUnlock()
-		if err := s.persistTelemetryBatch([]telemetryWrite{write}); err != nil {
+		if err := s.persistTelemetryBatchDetached([]telemetryWrite{write}); err != nil {
 			log.Printf("[USAGE-ERROR] inline insert after close: %v", err)
 		}
 		return
@@ -445,42 +465,85 @@ func (s *Server) enqueueWriteSized(approxBytes int, fn func()) {
 	}
 }
 
-// FlushWrites stops accepting new async writes and blocks until the queue has drained.
-// Call it during shutdown AFTER the HTTP server has drained in-flight requests (so no
-// further writes are enqueued) and BEFORE the store is closed. Idempotent.
-func (s *Server) FlushWrites() {
+// FlushWritesContext stops admission to async queues and drains them within the caller's
+// deadline. If the deadline expires, the current journal is synced and left replayable
+// rather than blocking process shutdown indefinitely.
+func (s *Server) FlushWritesContext(ctx context.Context) error {
+	if ctx == nil {
+		return context.Canceled
+	}
 	s.asyncMu.Lock()
-	if s.asyncClosed {
-		s.asyncMu.Unlock()
-		return
+	if s.asyncFlushDone == nil {
+		s.asyncFlushDone = make(chan struct{})
 	}
-	s.asyncClosed = true
-	if s.usageJournalStop != nil {
-		close(s.usageJournalStop)
-	}
-	close(s.asyncWrites)
-	close(s.usageWrites)
 	s.asyncMu.Unlock()
-	s.stopGoalCompactionWorkers()
-	s.asyncWG.Wait()
-	s.usagePending.Wait()
-	if s.usageJournal != nil {
-		if err := s.replayUsageJournal(context.Background()); err != nil {
-			log.Printf("[USAGE-JOURNAL] final replay failed; records remain durable: %v", err)
+	s.asyncFlushOnce.Do(func() {
+		s.asyncMu.Lock()
+		s.asyncClosed = true
+		if s.usageJournalStop != nil {
+			close(s.usageJournalStop)
 		}
-		if err := s.usageJournal.Close(); err != nil {
-			log.Printf("[USAGE-JOURNAL] close failed: %v", err)
+		if s.asyncWrites != nil {
+			close(s.asyncWrites)
 		}
-	}
-	if s.scheduler != nil {
-		s.scheduler.Close()
+		if s.usageWrites != nil {
+			close(s.usageWrites)
+		}
+		s.asyncMu.Unlock()
+		s.stopGoalCompactionWorkers()
+		go func() {
+			defer supervisor.Recover("bounded-async-flush")
+			s.asyncWG.Wait()
+			s.usagePending.Wait()
+			if s.usageJournal != nil {
+				if err := s.replayUsageJournal(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[USAGE-JOURNAL] final replay failed; records remain durable: %v", err)
+				}
+				if err := s.usageJournal.Close(); err != nil {
+					log.Printf("[USAGE-JOURNAL] close failed: %v", err)
+				}
+			}
+			if s.scheduler != nil {
+				s.scheduler.Close()
+			}
+			if s.asyncWriteCancel != nil {
+				s.asyncWriteCancel()
+			}
+			close(s.asyncFlushDone)
+		}()
+	})
+	select {
+	case <-s.asyncFlushDone:
+		return nil
+	case <-ctx.Done():
+		if s.asyncWriteCancel != nil {
+			s.asyncWriteCancel()
+		}
+		if s.usageJournal != nil {
+			_ = s.usageJournal.Sync()
+		}
+		return ctx.Err()
 	}
 }
 
-// bgWriteContext returns a detached context with a generous timeout for an async write;
-// the originating request's context is already gone by the time the drainer runs it.
-func bgWriteContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 30*time.Second)
+// FlushWrites preserves the test and embedding API while still imposing a finite
+// ceiling. Production supplies its own shorter shutdown deadline.
+func (s *Server) FlushWrites() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.FlushWritesContext(ctx); err != nil {
+		log.Printf("[SHUTDOWN] async flush incomplete; durable journal retained: %v", err)
+	}
+}
+
+// bgWriteContext detaches a write from its originating request but remains cancellable
+// by the bounded shutdown flush.
+func (s *Server) bgWriteContext() (context.Context, context.CancelFunc) {
+	base := s.asyncWriteCtx
+	if base == nil {
+		base = context.Background()
+	}
+	return context.WithTimeout(base, 30*time.Second)
 }
 
 // WaitForAsyncWrites blocks until every write enqueued before this call has been

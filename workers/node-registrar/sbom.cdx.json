@@ -1,0 +1,26 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:6c419cf5-b32a-4a30-8130-f25b49b1f45c",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "application",
+      "name": "@codex-pool/node-registrar",
+      "version": "1.0.0"
+    }
+  },
+  "components": [
+    {
+      "type": "library",
+      "name": "playwright",
+      "version": "1.62.0",
+      "purl": "pkg:npm/playwright@1.62.0"
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:npm/playwright@1.62.0"
+    }
+  ]
+}

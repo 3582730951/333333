@@ -1,14 +1,12 @@
 import { z } from 'zod';
 import { get, post } from '../../../api.js';
 import { createApiError, parseApiResponse } from '../../../api/contracts';
-import { lifecycleProviderOptionsSchema } from './lifecycle';
 import { normalizeRegisterMethod } from '../model/registration';
 import type {
   RegistrationCountry, RegistrationDashboard, RegistrationJob, RegistrationOptions,
-  RegistrationPool, RegistrationReadiness, RegistrationStartInput, RegistrationStrategyConfig,
-  RegistrationStrategyInput,
+  RegistrationGroup, RegistrationPool, RegistrationProviderOptions, RegistrationReadiness,
+  RegistrationStartInput, RegistrationStrategyConfig, RegistrationStrategyInput,
 } from '../model/registration';
-import type { LifecycleGroup, LifecycleProviderOptions } from '../model/lifecycle';
 
 const jobSchema = z.object({ id: z.string().optional(), status: z.string().optional() }).passthrough();
 export const registrationJobsResponseSchema = z.union([
@@ -30,6 +28,20 @@ const groupsResponseSchema = z.union([
   z.array(groupSchema),
   z.object({ groups: z.array(groupSchema).optional() }).passthrough().transform((value) => value.groups ?? []),
 ]);
+
+const providerOptionSchema = z.union([
+  z.string(),
+  z.object({ label: z.string(), value: z.string() }).passthrough(),
+]);
+export const registrationProviderOptionsSchema = z.object({
+  sms: z.array(providerOptionSchema).optional(),
+  mailbox: z.array(providerOptionSchema).optional(),
+  captcha: z.array(providerOptionSchema).optional(),
+}).passthrough().transform((value) => ({
+  sms: value.sms ?? [],
+  mailbox: value.mailbox ?? [],
+  captcha: value.captcha ?? [],
+}));
 
 const poolSchema = z.object({
   id: z.string(),
@@ -82,16 +94,16 @@ export async function fetchRegistrationDashboard(signal?: AbortSignal): Promise<
   };
 }
 
-async function fetchRegistrationGroups(signal?: AbortSignal): Promise<LifecycleGroup[]> {
-  return parseApiResponse(groupsResponseSchema, await get('/admin/groups', undefined, { signal })) as LifecycleGroup[];
+async function fetchRegistrationGroups(signal?: AbortSignal): Promise<RegistrationGroup[]> {
+  return parseApiResponse(groupsResponseSchema, await get('/admin/groups', undefined, { signal })) as RegistrationGroup[];
 }
 
 async function fetchRegistrationPools(signal?: AbortSignal): Promise<RegistrationPool[]> {
   return parseApiResponse(poolsResponseSchema, await get('/admin/egress-pools', undefined, { signal })) as RegistrationPool[];
 }
 
-async function fetchRegistrationProviders(signal?: AbortSignal): Promise<LifecycleProviderOptions> {
-  return parseApiResponse(lifecycleProviderOptionsSchema, await get('/admin/register/providers/options', undefined, { signal })) as LifecycleProviderOptions;
+async function fetchRegistrationProviders(signal?: AbortSignal): Promise<RegistrationProviderOptions> {
+  return parseApiResponse(registrationProviderOptionsSchema, await get('/admin/register/providers/options', undefined, { signal })) as RegistrationProviderOptions;
 }
 
 export async function fetchRegistrationOptions(signal?: AbortSignal): Promise<RegistrationOptions> {
@@ -119,7 +131,7 @@ export function adaptRegistrationStrategy(fields: Array<{ key: string; value: un
   return {
     strategy,
     manualCountry: strategy === 'manual' ? String(values.get('sms_manual_country') || '') : '',
-    defaultMethod: normalizeRegisterMethod(values.get('default_register_method'), 'node'),
+    defaultMethod: normalizeRegisterMethod(values.get('default_register_method'), 'protocol_v2'),
   };
 }
 

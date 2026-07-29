@@ -47,12 +47,12 @@
 
 ## Web 控制台 / 多用户门户
 
-商业化前端(零构建纯前端,打包进单个 Go 二进制;`internal/web/assets/` 多文件由 `embed` 直接服务):
+管理前端由固定版本的 Node 工具链构建，并作为确定性静态产物嵌入 Go 二进制：
 
 - **new-api 风格布局**:可折叠侧栏(用户端 / 管理端分组)+ 顶栏(主题切换、语言切换、用户菜单),**浅色 / 深色双主题** + **中文 / English 双语**(偏好持久化)。
 - **真多用户登录**:终端用户可**注册 / 登录 / 登出**(`/auth/register|login|logout|me`),首个注册用户自动成为管理员;PBKDF2(stdlib,无新依赖)口令 + `user_sessions` 会话(HttpOnly Cookie、SameSite=Lax、TLS 下 Secure)+ **双提交 CSRF** + 登录限流。旧的单一 `admin_token`(Bearer)仍然兼容(`/auth/me` 会以 `via=admin_token`/`open` 标识)。
 - **用户端**(`/user/*`,会话鉴权、按属主隔离):「我的密钥」自助创建/增删 `cap_` Key(明文仅显示一次)、「我的用量」(按用户归属的 token 用量 + 按模型汇总)、「模型广场」、「我的设置」(改昵称/改密码/主题/语言)。
-- **管理端**:概览、账号、供应商、出口、用量、隔离/会话、分组、密钥、**用户管理**(改角色/封禁/重置密码/删除,带自锁保护)、CF、审计、GoPay、租户/项目、设置(含**注册开关** `allow_registration`)。
+- **管理端**:概览、账号、供应商、出口、用量、隔离/会话、分组、密钥、**用户管理**(改角色/封禁/重置密码/删除,带自锁保护)、CF、审计、注册与设置。
 - **按用户用量归属**:下游 Key 绑定到创建它的用户,每条 `usage_records` 记录 `user_id`/`api_key_hash`,用户端只看自己的用量、管理端看全局。
 
 ## CF 防护（WARP 多出口阶梯）
@@ -263,7 +263,7 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
 
 ## 部署
 
-- 一键完整安装（Linux；默认安装 Go 网关、`curl_cffi` sidecar、GoPay bundle/venv；运行时是否启用由管理端配置决定）：
+- 一键完整安装（Linux；安装 Go 网关、前端产物、`curl_cffi` sidecar 及注册 worker）：
   ```bash
   sudo scripts/install.sh
   ```
@@ -275,7 +275,6 @@ curl -sS http://127.0.0.1:8787/admin/accounts/<account_id>/browser-repair \
   ```bash
   sudo scripts/install.sh --full
   ```
-  默认安装和 `--full` 都会要求仓库包含 `gopay/plus`（含 `orchestrator.py`、`plus_gopay_links/payment_server.py`、`requirements.txt`）。当前 GoPay 功能默认关闭，但如果启用该能力，安装脚本会把 GoPay bundle 部署到 `/var/lib/codex-pool/gopay/plus` 并使用独立 venv。
 - Docker：`docker build -t codex-pool-server .`
 - systemd：`deploy/systemd/codex-pool.socket` 持有公开端口，`codex-pool-handoff.service`
   常驻转发到 release worker；更新时只短暂挂起**新请求**，已建立的 HTTP/SSE/WebSocket
@@ -335,7 +334,7 @@ export DO_NOT_TRACK=1                               # 额外关会话质量问�
 把整个项目文件夹重新上传到 VPS 覆盖后，在项目目录里执行：
 
 ```bash
-sudo ./update.sh             # 清空编译缓存 + 全量重编译 + 重装(含内嵌UI/sidecar/gopay) + 重启
+sudo ./update.sh             # 清空编译缓存 + 全量重编译 + 重装(含内嵌 UI/sidecar) + 重启
 sudo ./update.sh --minimal   # 只更新 Go 网关
 sudo ./update.sh --no-tests  # 跳过 go test，加快更新
 sudo ./update.sh --open-firewall  # 顺便在 ufw/firewalld 放行监听端口

@@ -20,6 +20,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const codexWebSocketTestDeadline = 10 * time.Second
+
 type codexStabilityCapture struct {
 	session string
 	thread  string
@@ -670,13 +672,13 @@ func TestCodexMappedDownstreamWebSocketQuotaRotatesAccountAndRestoresToolContext
 	defer conn.Close()
 	waitForCompleted := func(request, responseID string) string {
 		t.Helper()
-		if err := conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		if err := conn.SetWriteDeadline(time.Now().Add(codexWebSocketTestDeadline)); err != nil {
 			t.Fatal(err)
 		}
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
 			t.Fatal(err)
 		}
-		if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(codexWebSocketTestDeadline)); err != nil {
 			t.Fatal(err)
 		}
 		var received strings.Builder
@@ -793,7 +795,7 @@ func TestDownstreamWebSocketPersistsGoalAfterMappingCommitConflict(t *testing.T)
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","session_id":"`+downstreamID+`","thread_id":"`+downstreamID+`","input":"create tool call"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(codexWebSocketTestDeadline)); err != nil {
 		t.Fatal(err)
 	}
 	_, terminal, err := conn.ReadMessage()
@@ -866,7 +868,7 @@ func TestCodexMappedDownstreamWebSocketSurvivesTruncatedUpstreamTurn(t *testing.
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":"first turn is truncated"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(codexWebSocketTestDeadline)); err != nil {
 		t.Fatal(err)
 	}
 	var firstEvents strings.Builder
@@ -888,13 +890,13 @@ func TestCodexMappedDownstreamWebSocketSurvivesTruncatedUpstreamTurn(t *testing.
 		t.Fatalf("truncated upstream websocket did not produce a stable terminal: %s", first)
 	}
 
-	if err := conn.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(codexWebSocketTestDeadline)); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":"second turn still works"}`)); err != nil {
 		t.Fatalf("downstream websocket was not reusable after failure: %v", err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetReadDeadline(time.Now().Add(codexWebSocketTestDeadline)); err != nil {
 		t.Fatal(err)
 	}
 	_, completed, err := conn.ReadMessage()

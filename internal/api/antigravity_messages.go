@@ -354,22 +354,7 @@ func (s *Server) antigravityCatalogMaxOutputTokens(ctx context.Context, accountI
 }
 
 func writeAntigravityUpstreamError(w http.ResponseWriter, status int, header http.Header, body []byte) {
-	if status < 400 || status > 599 {
-		status = http.StatusBadGateway
-	}
-	if contentType := header.Get("Content-Type"); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-	}
-	if retryAfter := header.Get("Retry-After"); retryAfter != "" {
-		w.Header().Set("Retry-After", retryAfter)
-	}
-	w.WriteHeader(status)
-	if len(body) == 0 {
-		body = []byte(`{"error":{"message":"` + http.StatusText(status) + `"}}`)
-	}
-	_, _ = w.Write(body)
+	writePublicServiceUnavailable(w)
 }
 
 func antigravityBodyHash(body []byte) string {

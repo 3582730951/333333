@@ -1434,6 +1434,27 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 	if err != nil {
 		return "", false, false
 	}
+	capabilityKey, _ := kirowire.KiroCapabilityKey(endpointHash, region, credentials.ProfileARN)
+	catalog, catalogErr := s.store.ListKiroModelCatalog(ctx, account.ID, capabilityKey)
+	if catalogErr != nil {
+		return "", false, false
+	}
+	if len(catalog) > 0 {
+		descriptor, found := capability.ResolveKiroCatalogModel(route.Model, catalog)
+		if !found {
+			return "", false, false
+		}
+		if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") && descriptor.MaxInputTokens < 1_000_000 {
+			return "", false, false
+		}
+		return strings.TrimSpace(descriptor.UpstreamID), false, true
+	}
+	// One-million-token entitlement is established only by an account-scoped,
+	// complete live catalog. Runtime inference and plan labels are deliberately
+	// insufficient because they do not prove the current region/governance scope.
+	if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") {
+		return "", false, false
+	}
 	// Claude-family Kiro inference is a mandatory-thinking path, so its runtime
 	// evidence must include a successful thinking request. Kiro's GPT-5.6 models
 	// use a distinct non-thinking envelope: use ordinary model verification for
@@ -1449,22 +1470,29 @@ func (s *Scheduler) resolveKiroRouteModel(ctx context.Context, account storage.A
 		return "", false, false
 	}
 	if capability.KiroModelAlias(route.Model) {
-		if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") && !capability.KiroPlanAllows1M(account.PlanType, resolved) {
+		normalizedAlias := strings.ToLower(strings.TrimSpace(route.Model))
+		if normalizedAlias == "default" {
 			return "", false, false
+		}
+		if normalizedAlias == "auto" {
+			foundAuto := false
+			for _, model := range verified {
+				if strings.EqualFold(strings.TrimSpace(model), "auto") {
+					foundAuto = true
+					break
+				}
+			}
+			if !foundAuto {
+				return "", false, false
+			}
 		}
 		return resolved, false, true
 	}
 	for _, model := range verified {
 		canonical, modelOK := capability.KiroCanonicalModel(model)
 		if modelOK && canonical == resolved {
-			if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") && !capability.KiroPlanAllows1M(account.PlanType, resolved) {
-				return "", false, false
-			}
 			return resolved, false, true
 		}
-	}
-	if strings.EqualFold(strings.TrimSpace(route.ContextMode), "1m") {
-		return "", false, false
 	}
 	// GPT models are deliberately exact and have already passed
 	// KiroSupportsGPTModel above. They do not support the Claude adaptive-thinking

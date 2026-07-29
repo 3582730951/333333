@@ -21,19 +21,18 @@ const policyPath = 'docs/CONSOLE_ASSET_POLICY.md';
 const requiredAssets = [
   'web-spa/src/assets/vendors/openai-blossom.svg',
   'web-spa/src/assets/vendors/anthropic.svg',
-  'web-spa/src/assets/vendors/paypal.svg',
 ];
 
 if (!exists(vendorLogoPath)) {
   problems.push('VendorLogo.jsx must exist.');
 } else {
   const source = read(vendorLogoPath);
-  for (const vendor of ['openai', 'chatgpt', 'codex', 'claude', 'anthropic', 'paypal', 'custom']) {
+  for (const vendor of ['openai', 'chatgpt', 'codex', 'claude', 'anthropic', 'custom']) {
     if (!source.includes(`'${vendor}'`) && !source.includes(`"${vendor}"`)) {
       problems.push(`VendorLogo.jsx must support ${vendor}.`);
     }
   }
-  for (const asset of ['openai-blossom.svg', 'anthropic.svg', 'paypal.svg']) {
+  for (const asset of ['openai-blossom.svg', 'anthropic.svg']) {
     if (!source.includes(asset)) {
       problems.push(`VendorLogo.jsx must import ${asset}.`);
     }
@@ -55,7 +54,6 @@ if (!exists(policyPath)) {
     'https://claude.com/',
     'Anthropic',
     'https://www.anthropic.com/',
-    'PayPal',
     'Vendor Logo Register',
   ]) {
     if (!policy.includes(required)) problems.push(`Console asset policy must include ${required}.`);

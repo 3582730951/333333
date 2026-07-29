@@ -60,7 +60,7 @@ func (s *Server) adminCacheHitsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	codebook := buildDiagnosticCodebook(accounts, nil, nil, usageRows, nil, nil)
+	codebook := buildDiagnosticCodebookWithKey(s.cfg.RuntimeDiagnosticAliasKey, accounts, nil, nil, usageRows, nil, nil)
 	version := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("version")))
 	if version == "" {
 		version = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -110,7 +110,6 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"by_route_account_model.csv",
 		"by_time_bucket.csv",
 		"route_map.csv",
-		"account_map.csv",
 	}
 	if !legacyV1 {
 		order = append(order, "by_provider.csv", "by_provider_model.csv", "telemetry_completeness.csv", "kiro_capabilities.csv", "usage_sources.csv")
@@ -128,7 +127,7 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"timezone":            win.Window.Timezone,
 		"utc_offset_seconds":  win.Window.UTCOffsetSeconds,
 		"files":               order,
-		"account_redaction":   "business files use account_code; account_map.csv contains only account_code and local account_id; email, label, and upstream identity columns are omitted",
+		"account_redaction":   "business files use stable type-separated HMAC aliases; raw account IDs and reverse maps are omitted",
 		"api_key_redaction":   "api key hashes are truncated to 12-character prefixes",
 		"hit_tokens_formula":  "cache_read_tokens",
 		"token_hit_rate":      "clamp(hit_tokens / cache_input_tokens)",
@@ -158,7 +157,6 @@ func buildCacheHitsZipFiles(report storage.CacheUsageReport, win adminUsageWindo
 		"by_route_account_model.csv": "",
 		"by_time_bucket.csv":         csvString(cacheBucketHeader(false), cacheBucketRows(report.ByTimeBucket, false)),
 		"route_map.csv":              "",
-		"account_map.csv":            csvString([]string{"account_code", "account_id"}, accountMapRows(codebook)),
 	}
 	if !legacyV1 {
 		files["summary.csv"] = csvString(cacheMetricHeaderV2("window_start", "window_until"), cacheSummaryRows(report.Summary, win, hasData, true))

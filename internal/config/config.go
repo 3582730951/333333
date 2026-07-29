@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -80,9 +81,9 @@ const (
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
 	// Reconfirmed 2026-07-10 from Claude Code 2.1.206 Docker capture.
 	DefaultClaudeNodeVersion = "v26.3.0"
-	// DefaultModelProbeIntervalHours re-probes each account's upstream model list
-	// twice a day so the advertised /v1/models union stays fresh.
-	DefaultModelProbeIntervalHours = 12
+	// DefaultModelProbeIntervalHours refreshes each account's last-good model
+	// catalog every six hours. The worker adds per-account jitter.
+	DefaultModelProbeIntervalHours = 6
 	// Model-quality monitoring is group×model (never per account). One compact
 	// primary probe runs per interval; confirmations are anomaly-only.
 	DefaultModelQualityIntervalMinutes   = 60
@@ -91,12 +92,7 @@ const (
 	DefaultModelQualityHistoryDays       = 30
 	// DefaultGeoProbeURL is the IP/geo echo used to auto-detect a proxy's exit
 	// region when none is configured. It returns JSON with ip/country/region/city.
-	DefaultGeoProbeURL = "https://ipapi.co/json/"
-	// GoPay auto-subscribe integration defaults (Part 4). The feature is OFF by
-	// default; these only take effect once an admin enables it.
-	DefaultGopayDir             = "gopay/plus"
-	DefaultGopayPython          = "python3"
-	DefaultGopayOrchestratorURL = "http://127.0.0.1:8800"
+	DefaultGeoProbeURL          = "https://ipapi.co/json/"
 	DefaultCodexReauthWorkerURL = "http://127.0.0.1:8802"
 
 	legacyClaudeOAuthTokenURL = "https://console.anthropic.com/v1/oauth/token"
@@ -149,6 +145,13 @@ func DefaultClaudeGatewayBlockedHostPatterns() []string {
 
 type Config struct {
 	ListenAddr                     string `json:"listen_addr"`
+	DataDir                        string `json:"data_dir"`
+	MasterKeyFile                  string `json:"master_key_file,omitempty"`
+	IdentityKeyFile                string `json:"identity_key_file,omitempty"`
+	DiagnosticAliasKeyFile         string `json:"diagnostic_alias_key_file,omitempty"`
+	DiagnosticsDir                 string `json:"diagnostics_dir,omitempty"`
+	RuntimeIdentityKey             []byte `json:"-"`
+	RuntimeDiagnosticAliasKey      []byte `json:"-"`
 	DatabasePath                   string `json:"database_path"`
 	StorageDriver                  string `json:"storage_driver"`
 	PostgresDSN                    string `json:"postgres_dsn,omitempty"`
@@ -597,9 +600,9 @@ type Config struct {
 	ClaudeGatewayStrictLinuxDefault     bool     `json:"claude_gateway_strict_linux_default"`
 	ClaudeGatewayVirtualDNSServers      []string `json:"claude_gateway_virtual_dns_servers"`
 	// DefaultRegisterMethod is the registration engine used when a trigger (admin batch
-	// or auto-refill) does not name a method. "node" = the transplanted
-	// puppeteer-real-browser registrar (other_new_gpt_register) orchestrated per-job.
-	// Runtime-overridable via the "default_register_method" setting. Default "node".
+	// or auto-refill) does not name a method. Runtime-overridable via the
+	// "default_register_method" setting. Default "protocol_v2"; every method remains
+	// gated by artifact/provider/egress readiness and a matching one-account canary.
 	DefaultRegisterMethod string `json:"default_register_method"`
 	// RegistrationEgressPoolID is the runtime-editable default pool used only for
 	// launching registration tasks when a request does not name an egress_id or
@@ -652,28 +655,6 @@ type Config struct {
 	// server itself uses per-account/job de-dupe. Default 1.
 	CodexReauthWorkerConcurrency int `json:"codex_reauth_worker_concurrency"`
 
-	// ── GoPay 自动订阅 (Part 4) ──
-	// GopayEnabled is the BOOT default for the bundled GoPay Plus auto-subscribe
-	// integration; default false (off). The live value is runtime-toggleable from
-	// the admin UI (settings key "gopay_enabled"). When enabled the manager can
-	// launch the bundled Python services (gopay/plus) as managed subprocesses and
-	// expose /admin/gopay/subscribe, which feeds each pooled account's stored
-	// session token into the proven Stripe→Midtrans→GoPay payment flow.
-	GopayEnabled bool `json:"gopay_enabled"`
-	// GopayDir is the path to the bundled gopay-plus project (holds orchestrator.py
-	// and plus_gopay_links/). Relative to the server's working directory.
-	GopayDir string `json:"gopay_dir"`
-	// GopayPython is the interpreter used to launch the bundled services.
-	GopayPython string `json:"gopay_python"`
-	// GopayAutoStart, when true, makes the server launch (and stop) the bundled
-	// gopay services as child processes on enable. When false the operator runs the
-	// orchestrator themselves and the server only talks to GopayOrchestratorURL.
-	GopayAutoStart bool `json:"gopay_auto_start"`
-	// GopayOrchestratorURL is the base URL of the gopay orchestrator HTTP API.
-	GopayOrchestratorURL string `json:"gopay_orchestrator_url"`
-	// GopayAuthToken is the bearer token the orchestrator requires on /subscribe;
-	// the manager also writes it into the generated gopay config.json.
-	GopayAuthToken string `json:"gopay_auth_token"`
 	// ── WARP CF fallback (multi-exit) ──
 	// WarpEnabled turns on the WARP fallback pool. When on, the server ensures a set
 	// of warp-* egress profiles exist (one per local wireproxy SOCKS5 exit) and the
@@ -730,18 +711,6 @@ type Config struct {
 	// up (default 3). Higher = more fallback resilience at the cost of more number purchases
 	// on a bad day.
 	SMSStatsTopN int `json:"sms_stats_top_n"`
-
-	// ── Email Registration (ChatGPT email OTP flow via Outlook/IMAP) ──
-	// EmailRegistrationEnabled enables the email-based ChatGPT registration service.
-	EmailRegistrationEnabled bool `json:"email_registration_enabled"`
-	// EmailRegistrationConcurrency caps parallel email registrations.
-	EmailRegistrationConcurrency int `json:"email_registration_concurrency"`
-	// EmailRegistrationTimeoutSeconds is the max time for one email registration.
-	EmailRegistrationTimeoutSeconds int `json:"email_registration_timeout_seconds"`
-	// EmailRegistrationGroup is the default group assigned to registered accounts.
-	EmailRegistrationGroup string `json:"email_registration_group"`
-	// EmailRegistrationEgressPoolID is the default egress pool for email registration.
-	EmailRegistrationEgressPoolID string `json:"email_registration_egress_pool_id"`
 
 	// ── CLIPProxy API whitelist mode + exit-region validation ──
 	// CliproxyAPIBase is the cliproxy white-api base URL (default https://api.cliproxy.io),
@@ -840,6 +809,7 @@ type ThinkingOverride struct {
 func Default() Config {
 	return Config{
 		ListenAddr:                       DefaultListenAddr,
+		DataDir:                          "data",
 		DatabasePath:                     DefaultDatabasePath,
 		StorageDriver:                    DefaultStorageDriver,
 		UpstreamBaseURL:                  DefaultUpstreamBaseURL,
@@ -942,7 +912,7 @@ func Default() Config {
 		ClaudeGatewayUnknownTargetPolicy:       "forward",
 		ClaudeGatewayDisableNonessentialEnv:    true,
 		ClaudeGatewayStrictLinuxDefault:        false,
-		DefaultRegisterMethod:                  "node",
+		DefaultRegisterMethod:                  "protocol_v2",
 		StrictStickyMaxCooldownSeconds:         DefaultStrictStickyMaxCooldownSeconds,
 		StatefulStickyWaitSeconds:              0,
 		CooldownWaitMaxSeconds:                 DefaultCooldownWaitMaxSeconds,
@@ -956,19 +926,10 @@ func Default() Config {
 		GeoProbeURL:                            DefaultGeoProbeURL,
 		CodexReauthWorkerURL:                   DefaultCodexReauthWorkerURL,
 		CodexReauthWorkerConcurrency:           1,
-		GopayDir:                               DefaultGopayDir,
-		GopayPython:                            DefaultGopayPython,
-		GopayOrchestratorURL:                   DefaultGopayOrchestratorURL,
 		WarpExitBasePort:                       40000,
 		WarpAccountsPerExit:                    3,
 		RegistrationConcurrency:                1,
 		RegistrationTimeout:                    300,
-		EmailRegistrationEnabled:               false,
-		EmailRegistrationConcurrency:           2,
-		EmailRegistrationTimeoutSeconds:        300,
-		EmailRegistrationGroup:                 "cyber",
-		EmailRegistrationEgressPoolID:          "",
-		GopayAutoStart:                         true,
 		CodexPreferSidecarJA3OverWS:            true,
 		SMSPlatformStrategy:                    "auto",
 		SMSPreferredCountries:                  "BR,CO,PL",
@@ -1001,7 +962,9 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
-	cfg.applyEnv()
+	if err := cfg.applyEnv(); err != nil {
+		return Config{}, err
+	}
 	cfg.normalize()
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -1230,9 +1193,21 @@ func looksLikeDotVersion(s string) bool {
 	return true
 }
 
-func (c *Config) applyEnv() {
+func (c *Config) applyEnv() error {
 	if v := os.Getenv("CODEX_POOL_LISTEN_ADDR"); v != "" {
 		c.ListenAddr = v
+	}
+	if v := os.Getenv("CODEX_POOL_DATA_DIR"); v != "" {
+		c.DataDir = v
+	}
+	if v := os.Getenv("CODEX_POOL_MASTER_KEY_FILE"); v != "" {
+		c.MasterKeyFile = v
+	}
+	if v := os.Getenv("CODEX_POOL_IDENTITY_KEY_FILE"); v != "" {
+		c.IdentityKeyFile = v
+	}
+	if v := os.Getenv("CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE"); v != "" {
+		c.DiagnosticAliasKeyFile = v
 	}
 	if v := os.Getenv("CODEX_POOL_DATABASE"); v != "" {
 		c.DatabasePath = v
@@ -1298,6 +1273,13 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("CODEX_POOL_ADMIN_TOKEN"); v != "" {
 		c.AdminToken = v
+	}
+	if path := strings.TrimSpace(os.Getenv("CODEX_POOL_ADMIN_TOKEN_FILE")); path != "" {
+		value, err := readSecretFile(path, 4096)
+		if err != nil {
+			return fmt.Errorf("load admin token credential: %w", err)
+		}
+		c.AdminToken = value
 	}
 	if v := os.Getenv("CODEX_POOL_TRUSTED_PROXY_CIDRS"); v != "" {
 		c.TrustedProxyCIDRs = strings.Split(v, ",")
@@ -1375,28 +1357,6 @@ func (c *Config) applyEnv() {
 			c.CodexReauthWorkerConcurrency = parsed
 		}
 	}
-	if v := os.Getenv("CODEX_POOL_GOPAY_ENABLED"); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			c.GopayEnabled = parsed
-		}
-	}
-	if v := os.Getenv("CODEX_POOL_GOPAY_DIR"); v != "" {
-		c.GopayDir = v
-	}
-	if v := os.Getenv("CODEX_POOL_GOPAY_PYTHON"); v != "" {
-		c.GopayPython = v
-	}
-	if v := os.Getenv("CODEX_POOL_GOPAY_AUTO_START"); v != "" {
-		if parsed, err := strconv.ParseBool(v); err == nil {
-			c.GopayAutoStart = parsed
-		}
-	}
-	if v := os.Getenv("CODEX_POOL_GOPAY_ORCHESTRATOR_URL"); v != "" {
-		c.GopayOrchestratorURL = v
-	}
-	if v := os.Getenv("CODEX_POOL_GOPAY_AUTH_TOKEN"); v != "" {
-		c.GopayAuthToken = v
-	}
 	if v := os.Getenv("CODEX_POOL_WARP_ENABLED"); v != "" {
 		if parsed, err := strconv.ParseBool(v); err == nil {
 			c.WarpEnabled = parsed
@@ -1454,11 +1414,43 @@ func (c *Config) applyEnv() {
 			c.GatewayReliabilityRepair = parsed
 		}
 	}
+	return nil
+}
+
+func readSecretFile(path string, maxBytes int64) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", errors.New("secret file must be a regular non-symlink file")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("secret file has unsafe permissions %04o", info.Mode().Perm())
+	}
+	if maxBytes <= 0 {
+		maxBytes = 4096
+	}
+	if info.Size() <= 0 || info.Size() > maxBytes {
+		return "", errors.New("secret file has invalid size")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(raw))
+	if value == "" {
+		return "", errors.New("secret file is empty")
+	}
+	return value, nil
 }
 
 func (c *Config) normalize() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = DefaultListenAddr
+	}
+	if strings.TrimSpace(c.DataDir) == "" {
+		c.DataDir = "data"
 	}
 	if c.DatabasePath == "" {
 		c.DatabasePath = DefaultDatabasePath
@@ -1714,15 +1706,6 @@ func (c *Config) normalize() {
 	if c.CodexReauthWorkerConcurrency <= 0 {
 		c.CodexReauthWorkerConcurrency = 1
 	}
-	if c.GopayDir == "" {
-		c.GopayDir = DefaultGopayDir
-	}
-	if c.GopayPython == "" {
-		c.GopayPython = DefaultGopayPython
-	}
-	if c.GopayOrchestratorURL == "" {
-		c.GopayOrchestratorURL = DefaultGopayOrchestratorURL
-	}
 	if c.WarpExitBasePort <= 0 {
 		c.WarpExitBasePort = 40000
 	}
@@ -1740,16 +1723,6 @@ func (c *Config) normalize() {
 	}
 	c.RegistrationEgressPoolID = strings.TrimSpace(c.RegistrationEgressPoolID)
 	// Email registration normalization
-	if c.EmailRegistrationConcurrency <= 0 {
-		c.EmailRegistrationConcurrency = 2
-	}
-	if c.EmailRegistrationTimeoutSeconds <= 0 {
-		c.EmailRegistrationTimeoutSeconds = 300
-	}
-	if strings.TrimSpace(c.EmailRegistrationGroup) == "" {
-		c.EmailRegistrationGroup = "cyber"
-	}
-	c.EmailRegistrationEgressPoolID = strings.TrimSpace(c.EmailRegistrationEgressPoolID)
 	if c.DefaultSMSProvider == "" {
 		c.DefaultSMSProvider = "smsbower"
 	}

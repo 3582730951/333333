@@ -14,14 +14,19 @@
 package tlsclient
 
 import (
+	"bufio"
 	"container/list"
 	"context"
+	stdtls "crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	stdhttp "net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +35,8 @@ import (
 	fhttp "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	utls "github.com/bogdanfinn/utls"
+	"golang.org/x/net/proxy"
 )
 
 // Profile names understood by ResolveProfile.
@@ -113,6 +120,7 @@ type Factory struct {
 	cookieJarMax   int
 	cookieJarTTL   time.Duration
 	defaultTimeout time.Duration
+	wsSessionCache utls.ClientSessionCache
 }
 
 const (
@@ -135,6 +143,7 @@ func New() *Factory {
 		cookieJarMax:   defaultCookieJarMax,
 		cookieJarTTL:   defaultCookieJarTTL,
 		defaultTimeout: 120 * time.Second,
+		wsSessionCache: utls.NewLRUClientSessionCache(128),
 	}
 }
 
@@ -332,15 +341,183 @@ func (f *Factory) storeCookies(key, rawURL string, header stdhttp.Header) {
 	jar.SetCookies(u, (&stdhttp.Response{Header: header}).Cookies())
 }
 
-// TLSDialerFor returns the TLS dialer function from a pooled client matching the
-// profile in r.  The dialer is used by the WebSocket transport (A4) to open a
-// fingerprinted TCP+TLS connection that gorilla/websocket then upgrades.
-func (f *Factory) TLSDialerFor(r Request) (tls_client.TLSDialerFunc, error) {
-	client, err := f.clientFor(r)
+// TLSDialerFunc opens a fingerprinted TLS connection suitable for a WebSocket
+// HTTP/1.1 upgrade. It deliberately lives in this package rather than exposing a
+// version-specific tls-client type.
+type TLSDialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// TLSDialerFor returns a TLS dialer matching the HTTP client's browser profile
+// and proxy route. tls-client v1.9 does not expose its internal TLS dialer, so
+// the small WebSocket-specific path is built directly with the same uTLS
+// profile. HTTP traffic still uses tls-client and retains its HTTP/2 fingerprint.
+func (f *Factory) TLSDialerFor(r Request) (TLSDialerFunc, error) {
+	profile := ResolveProfile(r.Profile, r.JA3Override)
+	proxyURL, err := parseDialProxy(r.ProxyURL)
 	if err != nil {
 		return nil, err
 	}
-	return client.GetTLSDialer(), nil
+	timeout := r.Timeout
+	if timeout <= 0 {
+		timeout = f.defaultTimeout
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.ContainsAny(addr, "\r\n") {
+			return nil, errors.New("invalid TLS target")
+		}
+		rawConn, err := dialRoute(ctx, network, addr, proxyURL, timeout)
+		if err != nil {
+			return nil, err
+		}
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			host = addr
+		}
+		tlsConfig := &utls.Config{
+			ClientSessionCache: f.wsSessionCache,
+			ServerName:         host,
+			OmitEmptyPsk:       true,
+			MinVersion:         utls.VersionTLS12,
+		}
+		conn := utls.UClient(rawConn, tlsConfig, profile.GetClientHelloId(), false, true)
+		if err = conn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}, nil
+}
+
+func parseDialProxy(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, errors.New("invalid proxy URL")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return u, nil
+	default:
+		return nil, errors.New("unsupported proxy scheme")
+	}
+}
+
+func dialRoute(ctx context.Context, network, addr string, proxyURL *url.URL, timeout time.Duration) (net.Conn, error) {
+	direct := &net.Dialer{Timeout: timeout}
+	if proxyURL == nil {
+		return direct.DialContext(ctx, network, addr)
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if proxyURL.User != nil {
+			password, _ := proxyURL.User.Password()
+			auth = &proxy.Auth{User: proxyURL.User.Username(), Password: password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, direct)
+		if err != nil {
+			return nil, err
+		}
+		if contextDialer, ok := dialer.(proxy.ContextDialer); ok {
+			return contextDialer.DialContext(ctx, network, addr)
+		}
+		return dialer.Dial(network, addr)
+	case "http", "https":
+		return dialHTTPConnect(ctx, network, addr, proxyURL, direct)
+	default:
+		return nil, errors.New("unsupported proxy scheme")
+	}
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func dialHTTPConnect(ctx context.Context, network, addr string, proxyURL *url.URL, direct *net.Dialer) (net.Conn, error) {
+	conn, err := direct.DialContext(ctx, network, proxyURL.Host)
+	if err != nil {
+		return nil, err
+	}
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = conn.Close()
+		}
+	}()
+
+	if strings.EqualFold(proxyURL.Scheme, "https") {
+		proxyHost := proxyURL.Hostname()
+		tlsConn := stdtls.Client(conn, &stdtls.Config{
+			MinVersion: stdtls.VersionTLS12,
+			ServerName: proxyHost,
+		})
+		if err = tlsConn.HandshakeContext(ctx); err != nil {
+			return nil, err
+		}
+		conn = tlsConn
+	}
+
+	authHeader := ""
+	if proxyURL.User != nil {
+		password, _ := proxyURL.User.Password()
+		encoded := base64.StdEncoding.EncodeToString([]byte(proxyURL.User.Username() + ":" + password))
+		authHeader = "Proxy-Authorization: Basic " + encoded + "\r\n"
+	}
+	if _, err = fmt.Fprintf(conn,
+		"CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n%s\r\n",
+		addr, addr, authHeader,
+	); err != nil {
+		return nil, err
+	}
+
+	reader := bufio.NewReaderSize(conn, 4096)
+	statusLine, total, err := readProxyLine(reader, 0)
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(statusLine)
+	if len(fields) < 2 {
+		return nil, errors.New("invalid proxy CONNECT response")
+	}
+	statusCode, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return nil, errors.New("invalid proxy CONNECT status")
+	}
+	for {
+		var line string
+		line, total, err = readProxyLine(reader, total)
+		if err != nil {
+			return nil, err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	if statusCode != stdhttp.StatusOK {
+		return nil, fmt.Errorf("proxy CONNECT failed with status %d", statusCode)
+	}
+	closeOnError = false
+	return &bufferedConn{Conn: conn, reader: reader}, nil
+}
+
+func readProxyLine(reader *bufio.Reader, total int) (string, int, error) {
+	const maxProxyHeaderBytes = 32 << 10
+	line, err := reader.ReadString('\n')
+	total += len(line)
+	if total > maxProxyHeaderBytes {
+		return "", total, errors.New("proxy CONNECT response headers too large")
+	}
+	if err != nil {
+		return "", total, err
+	}
+	return line, total, nil
 }
 
 // CloseIdle releases idle keep-alive connections across all pooled clients.

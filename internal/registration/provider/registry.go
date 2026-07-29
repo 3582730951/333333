@@ -32,14 +32,16 @@ func BuildManagerWithError(ctx context.Context, store *storage.Store, httpClient
 	}
 	// Wire historical success-rate queries from registration_records.
 	m.Stats = NewSMSStats(store.DB())
-	rows, err := store.DB().QueryContext(ctx, `SELECT provider_type, provider_key, config_json FROM provider_settings WHERE enabled=1 ORDER BY priority DESC`)
+	rows, err := store.DB().QueryContext(ctx, `
+SELECT provider_type,provider_key,config_json,auth_json
+FROM provider_settings WHERE enabled=1 ORDER BY priority DESC`)
 	if err != nil {
 		return m, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var ptype, pkey, cfgJSON string
-		if err := rows.Scan(&ptype, &pkey, &cfgJSON); err != nil {
+		var ptype, pkey, cfgJSON, authJSON string
+		if err := rows.Scan(&ptype, &pkey, &cfgJSON, &authJSON); err != nil {
 			return m, err
 		}
 		cfg := map[string]interface{}{}
@@ -47,6 +49,13 @@ func BuildManagerWithError(ctx context.Context, store *storage.Store, httpClient
 			if err := json.Unmarshal([]byte(cfgJSON), &cfg); err != nil {
 				return m, fmt.Errorf("provider_settings %s/%s has invalid config_json: %w", strings.TrimSpace(ptype), strings.TrimSpace(pkey), err)
 			}
+		}
+		secrets, err := store.OpenProviderAuthJSON(ptype, pkey, authJSON)
+		if err != nil {
+			return m, fmt.Errorf("provider_settings %s/%s credentials unavailable: %w", strings.TrimSpace(ptype), strings.TrimSpace(pkey), err)
+		}
+		for field, value := range secrets {
+			cfg[field] = value
 		}
 		switch strings.ToLower(strings.TrimSpace(ptype)) {
 		case "sms":

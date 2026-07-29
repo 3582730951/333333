@@ -52,7 +52,11 @@ type Store struct {
 	// disabled (plaintext, legacy behavior) — kept nil by tests/in-memory stores so
 	// they are unaffected. Set via SetTokenEncryptionKey from main using the resolved
 	// deployment identity secret.
-	tokenKey []byte
+	tokenKey     []byte
+	tokenKeys    [][]byte
+	cryptoStrict bool
+	cryptoErrMu  sync.Mutex
+	cryptoErr    error
 
 	// settings snapshot cache: a hot request reads ~15-20 distinct settings keys, each
 	// previously its own SELECT against the small WAL read pool. This caches the whole
@@ -616,7 +620,7 @@ type EgressProfile struct {
 	// Empty string = credential mode (backward compatible).
 	ProxyAuthMode string `json:"proxy_auth_mode,omitempty"`
 	// ProxyAPIKey is the cliproxy account API token used only in api_whitelist mode.
-	// It is stored encrypted at rest like other secrets (enc:v1: prefix).
+	// It is stored encrypted at rest like other versioned secrets.
 	ProxyAPIKey string `json:"proxy_api_key,omitempty"`
 	// IPMode describes the operator-facing address behavior, e.g.
 	// "static_residential", "dynamic_residential", or "datacenter". It is metadata used
@@ -2094,6 +2098,129 @@ WHERE availability_state = 'unverified'
   authoritative INTEGER NOT NULL DEFAULT 0,
   last_probe_at INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE TABLE IF NOT EXISTS kiro_model_catalog(
+  account_id TEXT NOT NULL,
+  capability_key TEXT NOT NULL,
+  upstream_id TEXT NOT NULL,
+  public_id TEXT NOT NULL,
+  aliases_json TEXT NOT NULL DEFAULT '[]',
+  region TEXT NOT NULL DEFAULT '',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  max_input_tokens INTEGER NOT NULL DEFAULT 0,
+  max_output_tokens INTEGER NOT NULL DEFAULT 0,
+  thinking_json TEXT NOT NULL DEFAULT '{}',
+  effort_json TEXT NOT NULL DEFAULT '{}',
+  source TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  observed_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  complete INTEGER NOT NULL DEFAULT 0,
+  raw_json_hash TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(account_id, capability_key, upstream_id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_kiro_catalog_public ON kiro_model_catalog(public_id,account_id,expires_at)`,
+		`CREATE TABLE IF NOT EXISTS kiro_probe_state(
+  account_id TEXT NOT NULL,
+  capability_key TEXT NOT NULL,
+  region TEXT NOT NULL DEFAULT '',
+  endpoint_hash TEXT NOT NULL DEFAULT '',
+  governance_key TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  last_success_at INTEGER NOT NULL DEFAULT 0,
+  last_error_at INTEGER NOT NULL DEFAULT 0,
+  last_error_class TEXT NOT NULL DEFAULT '',
+  expires_at INTEGER NOT NULL DEFAULT 0,
+  generation INTEGER NOT NULL DEFAULT 0,
+  page_count INTEGER NOT NULL DEFAULT 0,
+  complete INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(account_id, capability_key),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+)`,
+		`CREATE TABLE IF NOT EXISTS diagnostic_jobs(
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  format_version TEXT NOT NULL DEFAULT 'v3',
+  artifact_path TEXT NOT NULL DEFAULT '',
+  artifact_size INTEGER NOT NULL DEFAULT 0,
+  artifact_sha256 TEXT NOT NULL DEFAULT '',
+  error_code TEXT NOT NULL DEFAULT '',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  download_leases INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  started_at INTEGER NOT NULL DEFAULT 0,
+  completed_at INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL DEFAULT 0
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_diagnostic_jobs_status ON diagnostic_jobs(status,created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_diagnostic_jobs_expiry ON diagnostic_jobs(expires_at,status)`,
+		`CREATE TABLE IF NOT EXISTS diagnostic_events(
+  id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info',
+  entity_type TEXT NOT NULL DEFAULT '',
+  entity_alias TEXT NOT NULL DEFAULT '',
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  diagnostic_gap INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_diagnostic_events_created ON diagnostic_events(created_at)`,
+		`CREATE TABLE IF NOT EXISTS storage_resources(
+  id TEXT PRIMARY KEY,
+  resource_type TEXT NOT NULL,
+  path TEXT NOT NULL,
+  state TEXT NOT NULL,
+  owner_id TEXT NOT NULL DEFAULT '',
+  lease_expires_at INTEGER NOT NULL DEFAULT 0,
+  fencing_token INTEGER NOT NULL DEFAULT 0,
+  mount_id TEXT NOT NULL DEFAULT '',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  retention_class TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_storage_resources_gc ON storage_resources(state,retention_class,lease_expires_at,updated_at)`,
+		`CREATE TABLE IF NOT EXISTS maintenance_leases(
+  lease_name TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  fencing_token INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE TABLE IF NOT EXISTS registration_workflow_items(
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  state TEXT NOT NULL,
+  platform TEXT NOT NULL DEFAULT 'chatgpt',
+  remote_identity_alias TEXT NOT NULL DEFAULT '',
+  error_class TEXT NOT NULL DEFAULT '',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  retry_at INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_registration_workflow_items_job ON registration_workflow_items(job_id,state)`,
+		`CREATE TABLE IF NOT EXISTS registration_method_canaries(
+  method TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  readiness_fingerprint TEXT NOT NULL DEFAULT '',
+  job_id TEXT NOT NULL DEFAULT '',
+  account_id TEXT NOT NULL DEFAULT '',
+  error_class TEXT NOT NULL DEFAULT '',
+  last_success_at INTEGER NOT NULL DEFAULT 0,
+  last_failure_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+)`,
+		`CREATE TABLE IF NOT EXISTS key_metadata(
+  key_domain TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  rotated_at INTEGER NOT NULL DEFAULT 0
 )`,
 		`INSERT INTO account_model_catalog_status(account_id, authoritative, last_probe_at)
 SELECT account_id, 1, MAX(last_probe_at)
@@ -4812,41 +4939,115 @@ func publicKiroEndpoint(raw string) string {
 	return u.String()
 }
 
-// SetTokenEncryptionKey enables transparent at-rest encryption of secret columns using
-// a 32-byte key derived from the deployment secret (identity.ResolveSecret in main).
-// Call once after Open/Init and before serving. An empty secret leaves encryption off.
+// SetTokenEncryptionKey is the compatibility entry point used by tests and older
+// embedders. New deployments should call SetTokenMasterKey with a persistent key.
 func (s *Store) SetTokenEncryptionKey(secret []byte) {
 	if len(secret) == 0 {
 		return
 	}
-	s.tokenKey = secretbox.DeriveKey(secret)
+	_ = s.SetTokenMasterKey(secretbox.DeriveKey(secret))
 }
 
-// sealToken encrypts a secret for storage (no-op when encryption is disabled, and
-// best-effort: a Seal failure falls back to storing the value rather than losing it).
+// SetTokenMasterKey installs an exact 32-byte primary key plus any exact legacy
+// keys that remain available during a bounded rotation migration.
+func (s *Store) SetTokenMasterKey(primary []byte, legacy ...[]byte) error {
+	if len(primary) != 32 {
+		return errors.New("storage master key must contain exactly 32 bytes")
+	}
+	s.tokenKey = append([]byte(nil), primary...)
+	s.tokenKeys = [][]byte{s.tokenKey}
+	for _, key := range legacy {
+		if len(key) != 32 {
+			return errors.New("legacy storage key must contain exactly 32 bytes")
+		}
+		s.tokenKeys = append(s.tokenKeys, append([]byte(nil), key...))
+	}
+	s.cryptoStrict = false
+	s.cryptoErrMu.Lock()
+	s.cryptoErr = nil
+	s.cryptoErrMu.Unlock()
+	return nil
+}
+
+// EnableStrictEncryption rejects any later plaintext secret read. It is called
+// only after the startup migration and sentinel validation succeed.
+func (s *Store) EnableStrictEncryption() {
+	s.cryptoStrict = true
+}
+
+func (s *Store) recordCryptoError(err error) {
+	if err == nil {
+		return
+	}
+	s.cryptoErrMu.Lock()
+	if s.cryptoErr == nil {
+		s.cryptoErr = err
+	}
+	s.cryptoErrMu.Unlock()
+}
+
+func (s *Store) CryptoError() error {
+	s.cryptoErrMu.Lock()
+	defer s.cryptoErrMu.Unlock()
+	return s.cryptoErr
+}
+
+// sealToken never falls back to plaintext after a master key is installed.
 func (s *Store) sealToken(v string) string {
+	if v == "" || len(s.tokenKey) == 0 {
+		return v
+	}
 	out, err := secretbox.Seal(s.tokenKey, v)
 	if err != nil {
-		return v
+		s.recordCryptoError(err)
+		return ""
 	}
 	return out
 }
 
-// openToken decrypts a stored secret. Legacy plaintext passes through unchanged. A
-// decrypt failure (e.g. the operator rotated identity_secret) returns the raw stored
-// value rather than panicking — the account simply fails auth and can be re-imported.
+// openToken fails closed: ciphertext is never returned as an upstream credential.
 func (s *Store) openToken(v string) string {
-	out, err := secretbox.Open(s.tokenKey, v)
-	if err != nil {
+	if v == "" || len(s.tokenKey) == 0 {
 		return v
+	}
+	if s.cryptoStrict && !secretbox.IsSealed(v) {
+		s.recordCryptoError(errors.New("plaintext secret encountered after encryption migration"))
+		return ""
+	}
+	out, err := secretbox.OpenDomainWithKeys(s.tokenKeys, secretbox.DefaultDomain, v)
+	if err != nil {
+		s.recordCryptoError(err)
+		return ""
 	}
 	return out
 }
 
-// EncryptExistingTokens re-encrypts any plaintext rows in secret-bearing tables so an
-// existing pool is protected at rest, not just newly-written rows. Idempotent (skips
-// already-sealed values) and a no-op when encryption is disabled. Returns the number of
-// rows upgraded. Run once at startup after SetTokenEncryptionKey.
+func (s *Store) resealToken(v string) (string, error) {
+	if v == "" {
+		return "", nil
+	}
+	plain, err := secretbox.OpenDomainWithKeys(s.tokenKeys, secretbox.DefaultDomain, v)
+	if err != nil {
+		return "", err
+	}
+	return secretbox.Seal(s.tokenKey, plain)
+}
+
+func (s *Store) resealTokens(values ...string) ([]string, error) {
+	out := make([]string, len(values))
+	for i, value := range values {
+		sealed, err := s.resealToken(value)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = sealed
+	}
+	return out, nil
+}
+
+// EncryptExistingTokens re-encrypts plaintext and legacy-key rows in all core
+// credential tables. A value that cannot be decrypted aborts startup; it is never
+// copied forward or treated as a token.
 func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 	if len(s.tokenKey) == 0 {
 		return 0, nil
@@ -4865,7 +5066,7 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 			return 0, err
 		}
 		// Only rows with at least one non-empty, not-yet-sealed secret need an upgrade.
-		if anyPlaintextSecret(r.at, r.rt, r.ak, r.it, r.ar, r.ap, r.task) {
+		if anyNonCurrentSecret(s.tokenKey, r.at, r.rt, r.ak, r.it, r.ar, r.ap, r.task) {
 			pending = append(pending, r)
 		}
 	}
@@ -4874,8 +5075,12 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	for _, r := range pending {
+		sealed, sealErr := s.resealTokens(r.at, r.rt, r.ak, r.it, r.ar, r.ap, r.task)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt account credentials %s: %w", r.id, sealErr)
+		}
 		if _, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, agent_runtime_id = ?, agent_private_key = ?, agent_task_id = ? WHERE account_id = ?`,
-			s.sealToken(r.at), s.sealToken(r.rt), s.sealToken(r.ak), s.sealToken(r.it), s.sealToken(r.ar), s.sealToken(r.ap), s.sealToken(r.task), r.id); err != nil {
+			sealed[0], sealed[1], sealed[2], sealed[3], sealed[4], sealed[5], sealed[6], r.id); err != nil {
 			return n, err
 		}
 		n++
@@ -4892,7 +5097,7 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 			keyRows.Close()
 			return n, err
 		}
-		if anyPlaintextSecret(r.secret) {
+		if anyNonCurrentSecret(s.tokenKey, r.secret) {
 			keyPending = append(keyPending, r)
 		}
 	}
@@ -4901,7 +5106,11 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 		return n, err
 	}
 	for _, r := range keyPending {
-		if _, err := s.db.ExecContext(ctx, `UPDATE api_keys SET secret = ?, updated_at = ? WHERE key_hash = ?`, s.sealToken(r.secret), Now(), r.hash); err != nil {
+		sealed, sealErr := s.resealToken(r.secret)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt downstream key %s: %w", r.hash, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE api_keys SET secret = ?, updated_at = ? WHERE key_hash = ?`, sealed, Now(), r.hash); err != nil {
 			return n, err
 		}
 		n++
@@ -4918,7 +5127,7 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 			kiroRows.Close()
 			return n, err
 		}
-		if anyPlaintextSecret(r.secret, r.apiKey) {
+		if anyNonCurrentSecret(s.tokenKey, r.secret, r.apiKey) {
 			kiroPending = append(kiroPending, r)
 		}
 	}
@@ -4927,7 +5136,11 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 		return n, err
 	}
 	for _, r := range kiroPending {
-		if _, err := s.db.ExecContext(ctx, `UPDATE account_kiro_credentials SET client_secret=?, kiro_api_key=? WHERE account_id=?`, s.sealToken(r.secret), s.sealToken(r.apiKey), r.id); err != nil {
+		sealed, sealErr := s.resealTokens(r.secret, r.apiKey)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt Kiro credentials %s: %w", r.id, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_kiro_credentials SET client_secret=?, kiro_api_key=? WHERE account_id=?`, sealed[0], sealed[1], r.id); err != nil {
 			return n, err
 		}
 		n++
@@ -4944,7 +5157,7 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 			antigravityRows.Close()
 			return n, err
 		}
-		if anyPlaintextSecret(r.accessToken, r.refreshToken) {
+		if anyNonCurrentSecret(s.tokenKey, r.accessToken, r.refreshToken) {
 			antigravityPending = append(antigravityPending, r)
 		}
 	}
@@ -4953,16 +5166,126 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 		return n, err
 	}
 	for _, r := range antigravityPending {
-		if _, err := s.db.ExecContext(ctx, `UPDATE account_antigravity_credentials SET access_token=?, refresh_token=?, updated_at=? WHERE account_id=?`, s.sealToken(r.accessToken), s.sealToken(r.refreshToken), Now(), r.id); err != nil {
+		sealed, sealErr := s.resealTokens(r.accessToken, r.refreshToken)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt Antigravity credentials %s: %w", r.id, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_antigravity_credentials SET access_token=?, refresh_token=?, updated_at=? WHERE account_id=?`, sealed[0], sealed[1], Now(), r.id); err != nil {
 			return n, err
 		}
 		n++
 	}
+
+	sessionRows, err := s.rdb.QueryContext(ctx, `SELECT account_id, cookie FROM account_session_cookies WHERE cookie <> ''`)
+	if err != nil {
+		return n, err
+	}
+	var sessions []struct{ id, cookie string }
+	for sessionRows.Next() {
+		var row struct{ id, cookie string }
+		if err := sessionRows.Scan(&row.id, &row.cookie); err != nil {
+			sessionRows.Close()
+			return n, err
+		}
+		if anyNonCurrentSecret(s.tokenKey, row.cookie) {
+			sessions = append(sessions, row)
+		}
+	}
+	sessionRows.Close()
+	if err := sessionRows.Err(); err != nil {
+		return n, err
+	}
+	for _, row := range sessions {
+		sealed, sealErr := s.resealToken(row.cookie)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt session cookie %s: %w", row.id, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_session_cookies SET cookie=?,updated_at=? WHERE account_id=?`, sealed, Now(), row.id); err != nil {
+			return n, err
+		}
+		n++
+	}
+
+	injectedRows, err := s.rdb.QueryContext(ctx, `SELECT account_id,egress_id,upstream_host,cookie_header FROM account_injected_cookies WHERE cookie_header <> ''`)
+	if err != nil {
+		return n, err
+	}
+	type injectedRec struct{ accountID, egressID, host, cookie string }
+	var injected []injectedRec
+	for injectedRows.Next() {
+		var row injectedRec
+		if err := injectedRows.Scan(&row.accountID, &row.egressID, &row.host, &row.cookie); err != nil {
+			injectedRows.Close()
+			return n, err
+		}
+		if anyNonCurrentSecret(s.tokenKey, row.cookie) {
+			injected = append(injected, row)
+		}
+	}
+	injectedRows.Close()
+	if err := injectedRows.Err(); err != nil {
+		return n, err
+	}
+	for _, row := range injected {
+		sealed, sealErr := s.resealToken(row.cookie)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt injected cookie %s: %w", row.accountID, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_injected_cookies SET cookie_header=?,updated_at=? WHERE account_id=? AND egress_id=? AND upstream_host=?`, sealed, Now(), row.accountID, row.egressID, row.host); err != nil {
+			return n, err
+		}
+		n++
+	}
+
+	reauthRows, err := s.rdb.QueryContext(ctx, `SELECT account_id,encrypted_password,encrypted_otp_url FROM account_codex_reauth_config`)
+	if err != nil {
+		return n, err
+	}
+	type reauthRec struct{ id, password, otp string }
+	var reauth []reauthRec
+	for reauthRows.Next() {
+		var row reauthRec
+		if err := reauthRows.Scan(&row.id, &row.password, &row.otp); err != nil {
+			reauthRows.Close()
+			return n, err
+		}
+		if anyNonCurrentSecret(s.tokenKey, row.password, row.otp) {
+			reauth = append(reauth, row)
+		}
+	}
+	reauthRows.Close()
+	if err := reauthRows.Err(); err != nil {
+		return n, err
+	}
+	for _, row := range reauth {
+		sealed, sealErr := s.resealTokens(row.password, row.otp)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt reauth credentials %s: %w", row.id, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE account_codex_reauth_config SET encrypted_password=?,encrypted_otp_url=?,updated_at=? WHERE account_id=?`, sealed[0], sealed[1], Now(), row.id); err != nil {
+			return n, err
+		}
+		n++
+	}
+	providerRows, err := s.migrateProviderSecrets(ctx)
+	if err != nil {
+		return n, err
+	}
+	n += providerRows
 	return n, nil
 }
 
-// anyPlaintextSecret reports whether any field is a non-empty value that is not already
-// encrypted (so EncryptExistingTokens only touches rows that actually need upgrading).
+func anyNonCurrentSecret(key []byte, vals ...string) bool {
+	for _, v := range vals {
+		if v != "" && !secretbox.IsCurrent(key, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// anyPlaintextSecret is retained for callers/tests that only care whether a row
+// predates encryption.
 func anyPlaintextSecret(vals ...string) bool {
 	for _, v := range vals {
 		if v != "" && !secretbox.IsSealed(v) {
@@ -4970,6 +5293,64 @@ func anyPlaintextSecret(vals ...string) bool {
 		}
 	}
 	return false
+}
+
+const encryptionSentinelSetting = "_encryption_sentinel_v2"
+
+// ValidateEncryptionSentinel proves that the configured master key can decrypt
+// persistent state. A missing sentinel is created once; a wrong or missing key
+// fails startup rather than allowing ciphertext to reach an upstream.
+func (s *Store) ValidateEncryptionSentinel(ctx context.Context) error {
+	if len(s.tokenKey) != 32 {
+		return errors.New("persistent storage master key is not configured")
+	}
+	const marker = "codex-pool-encryption-sentinel"
+	var stored string
+	err := s.rdb.QueryRowContext(ctx, `SELECT value FROM settings WHERE key = ?`, encryptionSentinelSetting).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		sealed, sealErr := secretbox.SealDomain(s.tokenKey, "sentinel", marker)
+		if sealErr != nil {
+			return sealErr
+		}
+		_, err = s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, encryptionSentinelSetting, sealed, Now())
+		s.InvalidateSettingsCache()
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	plain, err := secretbox.OpenDomainWithKeys(s.tokenKeys, "sentinel", stored)
+	if err != nil {
+		return fmt.Errorf("decrypt encryption sentinel: %w", err)
+	}
+	if plain != marker {
+		return errors.New("encryption sentinel validation failed")
+	}
+	if !secretbox.IsCurrent(s.tokenKey, stored) {
+		sealed, sealErr := secretbox.SealDomain(s.tokenKey, "sentinel", marker)
+		if sealErr != nil {
+			return sealErr
+		}
+		if _, err = s.db.ExecContext(ctx, `UPDATE settings SET value=?,updated_at=? WHERE key=?`, sealed, Now(), encryptionSentinelSetting); err != nil {
+			return err
+		}
+		s.InvalidateSettingsCache()
+	}
+	return nil
+}
+
+// CheckWritable is the readiness DB probe. It performs a tiny transactional
+// write so read-only mounts and exhausted databases are not reported ready.
+func (s *Store) CheckWritable(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `UPDATE settings SET updated_at=updated_at WHERE key=?`, encryptionSentinelSetting); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SetSessionCookie stores the chatgpt.com session cookie used to (re)mint a
@@ -5002,7 +5383,7 @@ ON CONFLICT(account_id, egress_id, upstream_host) DO UPDATE SET
  user_agent = excluded.user_agent,
  exit_ip = excluded.exit_ip,
  updated_at = excluded.updated_at`,
-		c.AccountID, c.EgressID, c.UpstreamHost, c.CookieHeader, c.UserAgent, c.ExitIP, Now())
+		c.AccountID, c.EgressID, c.UpstreamHost, s.sealToken(c.CookieHeader), c.UserAgent, c.ExitIP, Now())
 	return err
 }
 
@@ -5019,6 +5400,7 @@ func (s *Store) ListInjectedCookies(ctx context.Context) ([]InjectedCookie, erro
 		if err := rows.Scan(&c.AccountID, &c.EgressID, &c.UpstreamHost, &c.CookieHeader, &c.UserAgent, &c.ExitIP, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
+		c.CookieHeader = s.openToken(c.CookieHeader)
 		out = append(out, c)
 	}
 	return out, rows.Err()

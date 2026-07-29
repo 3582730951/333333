@@ -115,14 +115,15 @@ func (r *responseRecorder) Unwrap() http.ResponseWriter {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	requestID := normalizeRequestID(r.Header.Get(requestIDHeader))
-	if requestID == "" {
-		requestID = newRequestID()
-	}
+	requestID := newRequestID()
 	w.Header().Set(requestIDHeader, requestID)
 	setSecurityHeaders(w, r)
 
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+	if s.rejectForStoragePressure(r) {
+		writePublicServiceUnavailable(rec)
+		return
+	}
 	if s.scheduler != nil {
 		reserveBytes := int64(256 << 10)
 		release, reserveErr := s.scheduler.Reserve(r.Context(), reserveBytes)
@@ -191,13 +192,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			supervisor.LogPanic("http-request", fmt.Sprintf("%s %s request_id=%s remote=%s panic=%v",
 				r.Method, r.URL.Path, requestID, r.RemoteAddr, v))
 			if !rec.wrote && !rec.hijacked {
-				writeJSON(rec, http.StatusInternalServerError, map[string]interface{}{
-					"error": map[string]interface{}{
-						"message":    "internal server error",
-						"type":       "codex_pool_panic",
-						"request_id": requestID,
-					},
-				})
+				writePublicServiceUnavailable(rec)
 			}
 			return
 		}
@@ -207,6 +202,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	s.mux.ServeHTTP(rec, r)
+}
+
+func (s *Server) rejectForStoragePressure(r *http.Request) bool {
+	if s == nil || r == nil || !isInferenceRequestPath(r.URL.Path) {
+		return false
+	}
+	if s.storageAdmissionBlocked.Load() {
+		return true
+	}
+	if !s.storageLargeRequestsPaused.Load() {
+		return false
+	}
+	// Chunked requests have no trustworthy upper bound, so treat them as large while
+	// the spool filesystem is critical. Known in-memory-sized requests may continue.
+	return r.ContentLength < 0 || r.ContentLength > s.cfg.BodyMemoryThresholdBytes
+}
+
+func isInferenceRequestPath(path string) bool {
+	switch path {
+	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions",
+		"/v1/messages", "/v1/messages/count_tokens":
+		return true
+	default:
+		return strings.HasPrefix(path, "/v1/agents/") ||
+			strings.HasPrefix(path, "/v1/environments/") ||
+			strings.HasPrefix(path, "/v1/sessions/")
+	}
 }
 
 func writeBodyStorageError(w http.ResponseWriter, err error) bool {
@@ -220,21 +242,7 @@ func writeBodyStorageError(w http.ResponseWriter, err error) bool {
 			return false
 		}
 	}
-	status := http.StatusServiceUnavailable
-	code := "local_spool_capacity"
-	if storageErr.Class == bodysource.BodyStorageDiskReserve {
-		status = http.StatusInsufficientStorage
-		code = "request_body_storage_exhausted"
-	} else {
-		w.Header().Set("Retry-After", "1")
-	}
-	errorBody := map[string]interface{}{
-		"message": storageErr.Error(), "type": "codex_pool_error", "code": code,
-	}
-	if requestID := strings.TrimSpace(w.Header().Get(requestIDHeader)); requestID != "" {
-		errorBody["request_id"] = requestID
-	}
-	writeJSON(w, status, map[string]interface{}{"error": errorBody})
+	writePublicServiceUnavailable(w)
 	return true
 }
 
@@ -343,9 +351,9 @@ func normalizeRequestID(value string) string {
 func newRequestID() string {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err == nil {
-		return "req_" + hex.EncodeToString(b[:])
+		return "REQ-" + strings.ToUpper(hex.EncodeToString(b[:]))
 	}
-	return fmt.Sprintf("req_%d", time.Now().UnixNano())
+	return fmt.Sprintf("REQ-%d", time.Now().UnixNano())
 }
 
 func (s *Server) handleClientError(w http.ResponseWriter, r *http.Request) {

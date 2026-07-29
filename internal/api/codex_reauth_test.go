@@ -104,7 +104,7 @@ func TestManualCodexOAuthCompleteUpdatesOriginalAccountAndRejectsWorkspaceMismat
 		t.Fatal(err)
 	}
 	code, body = codexReauthReq(t, h, http.MethodPost, "/admin/accounts/"+url.PathEscape(orig.ID)+"/codex-reauth/oauth/complete", `{"session_id":"`+start.SessionID+`","redirected":"http://localhost:1455/auth/callback?code=WRONG"}`)
-	if code != http.StatusConflict || !strings.Contains(body, "workspace") {
+	if code != http.StatusConflict || !strings.Contains(body, `"code":"conflict"`) || strings.Contains(body, "workspace-wrong") {
 		t.Fatalf("workspace mismatch status/body = %d %s", code, body)
 	}
 	oldTok, _ := h.store.GetToken(ctx, orig.ID)
@@ -245,7 +245,7 @@ func TestCodexReauthRunWorkerSuccessUpdatesOriginalAndWorkerFailureKeepsOldToken
 
 	// Second run fails; the successful token remains in place.
 	code, body = codexReauthReq(t, h, http.MethodPost, "/admin/accounts/"+url.PathEscape(acc.ID)+"/codex-reauth/run", `{}`)
-	if code != http.StatusBadGateway || !strings.Contains(body, "bad password") {
+	if code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"service_unavailable"`) || strings.Contains(body, "bad password") {
 		t.Fatalf("failed worker status/body = %d %s", code, body)
 	}
 	gotTok, _ = h.store.GetToken(ctx, acc.ID)
@@ -345,7 +345,7 @@ func TestCodexReauthRunWorkerWorkspaceMismatchReturnsConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, body := codexReauthReq(t, h, http.MethodPost, "/admin/accounts/"+url.PathEscape(acc.ID)+"/codex-reauth/run", `{}`)
-	if code != http.StatusConflict || !strings.Contains(body, "workspace") {
+	if code != http.StatusConflict || !strings.Contains(body, `"code":"conflict"`) || strings.Contains(body, "workspace-wrong") {
 		t.Fatalf("worker mismatch status/body = %d %s", code, body)
 	}
 	jobs, err := h.store.ListCodexReauthJobs(ctx, acc.ID, 10)

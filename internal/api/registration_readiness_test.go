@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"codex-account-pool/internal/config"
+	"codex-account-pool/internal/registration/pipeline"
 )
 
 // registration_readiness_test.go guards Phase ⑤'s observability deliverable: the
@@ -48,31 +49,37 @@ func blockersContain(m map[string]interface{}, sub string) bool {
 func TestRegistrationReadiness(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 
-	// Initially NOT ready: no refill policy and default node registration has no SMS provider.
+	// Initially NOT ready: registration is deliberately disabled and the default
+	// protocol_v2 method has neither a refill policy nor authenticated email OTP.
 	rd := getReadiness(t, h)
 	if rd["ready"] != false {
 		t.Fatalf("expected not-ready initially: %v", rd)
 	}
-	if !blockersContain(rd, "refill") || !blockersContain(rd, "SMS provider") {
-		t.Fatalf("expected refill + SMS blockers, got %v", rd["blockers"])
+	if !blockersContain(rd, "默认关闭") || !blockersContain(rd, "refill") || !blockersContain(rd, "hotmail_otp") {
+		t.Fatalf("expected disabled + refill + email OTP blockers, got %v", rd["blockers"])
 	}
 
-	// Enable the refill policy for the legacy protocol email path and configure mailbox.
+	// Enable one production method, its provider and a registration-only egress.
+	h.app.regHandler.enabled = true
+	registrationPoolID, _ := configureRegistrationEgressPools(t, h)
 	if code, body := grpReq(t, h, http.MethodPost, "/admin/automation/policies", `{"type":"refill","enabled":true,"config":{"target":5,"threshold":2,"register_method":"protocol","identity_mode":"email"}}`); code != http.StatusOK {
 		t.Fatalf("save refill policy = %d: %s", code, body)
 	}
-	if _, err := h.store.DB().ExecContext(context.Background(),
-		`INSERT INTO provider_settings(id, provider_type, provider_key, display_name, enabled, priority, config_json, auth_json, created_at, updated_at)
-		 VALUES('p1','mailbox','tempmail','TempMail',1,0,'{}','{}',0,0)`); err != nil {
-		t.Fatal(err)
+	configureProtocolEmailProvider(t, h, "readiness-mail-token")
+	methodReadiness, err := h.app.regHandler.registrationMethodReadiness(context.Background(), pipeline.RegisterRequest{
+		Method: "protocol", IdentityMode: "email", RegistrationEgressPoolID: registrationPoolID,
+	})
+	if err != nil || !methodReadiness.Ready {
+		t.Fatalf("method readiness=%+v err=%v", methodReadiness, err)
 	}
-	if _, err := h.store.DB().ExecContext(context.Background(),
-		`INSERT INTO provider_settings(id, provider_type, provider_key, display_name, enabled, priority, config_json, auth_json, created_at, updated_at)
-		 VALUES('email1','email','hotmail_otp','Hotmail OTP',1,0,'{"base_email":"ops@example.com","otp_url":"http://127.0.0.1/otp"}','{}',0,0)`); err != nil {
+	if err := h.store.RecordRegistrationCanary(
+		context.Background(), "protocol", "passed", methodReadiness.Fingerprint,
+		"job-readiness-canary", "account-readiness-canary", "",
+	); err != nil {
 		t.Fatal(err)
 	}
 
-	// Now ready, with the mailbox provider counted for protocol+email.
+	// Now ready, with a canary matching the current artifact/provider/egress fingerprint.
 	rd = getReadiness(t, h)
 	if rd["ready"] != true {
 		t.Fatalf("expected ready after refill+mailbox; blockers=%v", rd["blockers"])
@@ -80,9 +87,6 @@ func TestRegistrationReadiness(t *testing.T) {
 	prov, _ := rd["providers"].(map[string]interface{})
 	if mb, _ := prov["mailbox"].(float64); mb < 1 {
 		t.Fatalf("mailbox provider not counted: %v", prov)
-	}
-	if emailOTP, _ := prov["email_otp"].(float64); emailOTP < 1 {
-		t.Fatalf("email_otp provider not counted: %v", prov)
 	}
 }
 
@@ -162,11 +166,28 @@ func TestRegistrationReadinessReportsPoolReadErrors(t *testing.T) {
 
 func TestAutoRefillUsesRegistrationDefaultGroup(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	h.app.regHandler.enabled = true
 	regPool, _ := configureRegistrationEgressPools(t, h)
+	configureProtocolEmailProvider(t, h, "auto-refill-mail-token")
+	readiness, err := h.app.regHandler.registrationMethodReadiness(context.Background(), pipeline.RegisterRequest{
+		Method: "protocol", IdentityMode: "email", RegistrationEgressPoolID: regPool,
+	})
+	if err != nil || !readiness.Ready {
+		t.Fatalf("method readiness=%+v err=%v", readiness, err)
+	}
+	if err := h.store.RecordRegistrationCanary(
+		context.Background(), "protocol", "passed", readiness.Fingerprint,
+		"job-auto-refill-canary", "account-auto-refill-canary", "",
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	h.app.autoRefill(context.Background(), &Policy{
 		Enabled: true,
-		Config:  map[string]interface{}{"target": 1, "threshold": 1},
+		Config: map[string]interface{}{
+			"target": 1, "threshold": 1,
+			"register_method": "protocol", "identity_mode": "email",
+		},
 	})
 
 	var raw string
@@ -199,8 +220,8 @@ func TestAutomationPolicyReadErrorsAreVisible(t *testing.T) {
 	}
 
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/automation/policies", "")
-	if code != http.StatusInternalServerError {
-		t.Fatalf("automation policies with invalid JSON = %d, want 500: %s", code, raw)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("automation policies with invalid JSON = %d, want 503: %s", code, raw)
 	}
 
 	rd := getReadiness(t, h)
@@ -231,8 +252,8 @@ func TestSettingsCenterAutomationReportsStatsErrors(t *testing.T) {
 	}
 
 	code, raw := grpReq(t, h, http.MethodGet, "/admin/automation/stats", "")
-	if code != http.StatusInternalServerError {
-		t.Fatalf("automation stats with missing accounts = %d, want 500: %s", code, raw)
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("automation stats with missing accounts = %d, want 503: %s", code, raw)
 	}
 
 	status, body, rawBody := getSettingsCenter(t, h, "?section=automation")

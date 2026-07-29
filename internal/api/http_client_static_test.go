@@ -44,12 +44,9 @@ func TestSensitiveMutationSourcesUseBoundedJSONDecoder(t *testing.T) {
 	files := []string{
 		"admin_accounts.go",
 		"admin_config.go",
-		"admin_lifecycle.go",
 		"admin_resources.go",
 		"automation.go",
-		"gopay.go",
 		"keys.go",
-		"lifecycle.go",
 		"moderation.go",
 		"oauth.go",
 		"provider_testing.go",

@@ -12,15 +12,13 @@ Each successful run writes a ready-to-use ~/.codex/auth.json-style file (with a
 refresh_token, via the in-flow PKCE OAuth exchange) so you NEVER have to open
 `codex login` in a browser by hand.
 
-Credentials default to the ones you provided; override via env or flags.
-The email source (Hotmail base + OTP reader URL) is the one piece you must supply
-— registration already depends on it in your setup.
+Provider credentials and the email source are required via environment variables.
 
 Examples
 --------
   # 20 accounts, 5 in parallel, headless, rotating through cheap SMS countries
-  HOTMAIL_BASE=xnzsilq@hotmail.com \
-  REG_OTP_URL=http://185.242.234.133:8000/get_email/TOKEN \
+  HOTMAIL_BASE=operator@example.com \
+  REG_OTP_URL=https://otp-relay.example/one-time-token \
   python3 run_concurrent.py --count 20 --concurrency 5
 
   # pin a single country, headed (watch it), custom chrome
@@ -41,16 +39,16 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# ── credentials (your values as defaults; override via env) ──────────────────
-PROXY_HOST    = os.environ.get("CLIPROXY_HOST", "us2.cliproxy.io")
-PROXY_PORT    = os.environ.get("CLIPROXY_PORT", "3010")
-PROXY_ACCOUNT = os.environ.get("CLIPROXY_ACCOUNT", "zdvw1182255")
-PROXY_PASS    = os.environ.get("CLIPROXY_PASS", "d6kfytmo")
+# ── credentials (required via the worker's isolated environment) ─────────────
+PROXY_HOST    = os.environ.get("CLIPROXY_HOST", "")
+PROXY_PORT    = os.environ.get("CLIPROXY_PORT", "")
+PROXY_ACCOUNT = os.environ.get("CLIPROXY_ACCOUNT", "")
+PROXY_PASS    = os.environ.get("CLIPROXY_PASS", "")
 PROXY_TTL     = os.environ.get("CLIPROXY_TTL", "15")  # minutes; one sticky IP per account
-HEROSMS_KEY   = os.environ.get("HEROSMS_KEY", "810154d173c3c562B1ed124418c8f7B3")
-YESCAPTCHA_KEY = os.environ.get("YESCAPTCHA_KEY", "63bd2418e3ba87a501e06efe45820c65646a8c79111595")
-HOTMAIL_BASE  = os.environ.get("HOTMAIL_BASE", "")           # e.g. xnzsilq@hotmail.com
-REG_OTP_URL   = os.environ.get("REG_OTP_URL", "")            # e.g. http://host:8000/get_email/TOKEN
+HEROSMS_KEY   = os.environ.get("HEROSMS_KEY", "")
+YESCAPTCHA_KEY = os.environ.get("YESCAPTCHA_KEY", "")
+HOTMAIL_BASE  = os.environ.get("HOTMAIL_BASE", "")
+REG_OTP_URL   = os.environ.get("REG_OTP_URL", "")
 CHROME        = os.environ.get("REG_CHROME", os.environ.get("CHROME_PATH", ""))
 
 # Cheap-first SMS countries that work for OpenAI on hero-sms; proxy region matches each.
@@ -214,7 +212,7 @@ def main():
 
     if not HOTMAIL_BASE or not REG_OTP_URL:
         log("FATAL: set HOTMAIL_BASE and REG_OTP_URL (your Hotmail base + OTP reader URL).")
-        log("       e.g. HOTMAIL_BASE=xnzsilq@hotmail.com REG_OTP_URL=http://host:8000/get_email/TOKEN")
+        log("       supply an operator inbox and authenticated OTP relay URL")
         sys.exit(2)
 
     global REAL_IP

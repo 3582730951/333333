@@ -378,7 +378,7 @@ func TestLegacyAdminSettingsRejectsUnknownAndInvalidValues(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("unknown /admin/settings key status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "unknown settings key") || !strings.Contains(body, "not_a_legacy_setting") {
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "not_a_legacy_setting") {
 		t.Fatalf("unknown /admin/settings body = %q", body)
 	}
 
@@ -386,7 +386,7 @@ func TestLegacyAdminSettingsRejectsUnknownAndInvalidValues(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("invalid /admin/settings bool status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "expected boolean") {
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "expected boolean") {
 		t.Fatalf("invalid /admin/settings bool body = %q", body)
 	}
 
@@ -415,10 +415,10 @@ func TestAdminConfigRejectsOversizedAndMultiValueJSON(t *testing.T) {
 	})
 
 	status, body := patchConfigStatus(t, h, `{"require_downstream_key":true}`+strings.Repeat(" ", adminJSONBodyLimit))
-	if status != http.StatusBadRequest {
-		t.Fatalf("oversized /admin/config status = %d, want 400: %s", status, body)
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized /admin/config status = %d, want 413: %s", status, body)
 	}
-	if !strings.Contains(body, "request body too large") {
+	if !strings.Contains(body, `"code":"request_too_large"`) {
 		t.Fatalf("oversized /admin/config body = %q, want size error", body)
 	}
 
@@ -426,8 +426,8 @@ func TestAdminConfigRejectsOversizedAndMultiValueJSON(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("multi-value /admin/config status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "single JSON value") {
-		t.Fatalf("multi-value /admin/config body = %q, want single-value error", body)
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "single JSON value") {
+		t.Fatalf("multi-value /admin/config body was not safely normalized: %q", body)
 	}
 	row := findConfigRow(adminConfigRows(t, h), "require_downstream_key")
 	if row == nil || row["value"] != false || row["overridden"] != false {
@@ -441,10 +441,10 @@ func TestSettingsCenterRejectsOversizedJSON(t *testing.T) {
 	})
 
 	status, body := postSettingsCenter(t, h, `[{"section":"config","values":{"require_downstream_key":true}}]`+strings.Repeat(" ", adminJSONBodyLimit))
-	if status != http.StatusBadRequest {
-		t.Fatalf("oversized settings-center status = %d, want 400: %s", status, body)
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized settings-center status = %d, want 413: %s", status, body)
 	}
-	if !strings.Contains(body, "request body too large") {
+	if !strings.Contains(body, `"code":"request_too_large"`) {
 		t.Fatalf("oversized settings-center body = %q, want size error", body)
 	}
 	row := findConfigRow(adminConfigRows(t, h), "require_downstream_key")
@@ -462,16 +462,16 @@ func TestAdminConfigRejectsInvalidSchedulerFields(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("account_token_budget=-1 status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "must be zero") {
-		t.Fatalf("account_token_budget=-1 body = %q, want validation message", body)
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "account_token_budget") {
+		t.Fatalf("account_token_budget=-1 body was not safely normalized: %q", body)
 	}
 
 	status, body = patchConfigStatus(t, h, `{"cooldown_wait_max_seconds":-1}`)
 	if status != http.StatusBadRequest {
 		t.Fatalf("cooldown_wait_max_seconds=-1 status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "must be greater than or equal to 0") {
-		t.Fatalf("cooldown_wait_max_seconds=-1 body = %q, want validation message", body)
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "cooldown_wait_max_seconds") {
+		t.Fatalf("cooldown_wait_max_seconds=-1 body was not safely normalized: %q", body)
 	}
 }
 
@@ -484,7 +484,7 @@ func TestAdminConfigRejectsClaudeCacheRolloutModelScope(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("model-scoped claude cache rollout status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "unsupported rollout key") || !strings.Contains(body, "models") {
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "models") {
 		t.Fatalf("model-scoped claude cache rollout body = %q", body)
 	}
 }
@@ -516,7 +516,7 @@ func TestAdminConfigPatchRejectsUnknownAndRestartOnlyKeys(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("unknown /admin/config key status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, "unknown config key") || !strings.Contains(body, "not_a_runtime_key") {
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, "not_a_runtime_key") {
 		t.Fatalf("unknown /admin/config body = %q", body)
 	}
 
@@ -524,7 +524,7 @@ func TestAdminConfigPatchRejectsUnknownAndRestartOnlyKeys(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("restart-only /admin/config key status = %d, want 400: %s", status, body)
 	}
-	if !strings.Contains(body, `requires restart`) {
+	if !strings.Contains(body, `"code":"invalid_request"`) || strings.Contains(body, `requires restart`) {
 		t.Fatalf("restart-only /admin/config body = %q", body)
 	}
 
@@ -716,11 +716,11 @@ END`); err != nil {
 		{"section":"logging","values":{"verbose_logging":false}},
 		{"section":"memory","values":{"lifecycle_concurrency":4}}
 	]`)
-	if status != http.StatusInternalServerError {
-		t.Fatalf("settings-center write failure status = %d, want 500: %s", status, body)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("settings-center write failure status = %d, want 503: %s", status, body)
 	}
-	if !strings.Contains(body, "synthetic settings failure") {
-		t.Fatalf("settings-center write failure body = %q", body)
+	if !strings.Contains(body, `"code":"service_unavailable"`) || strings.Contains(body, "synthetic settings failure") {
+		t.Fatalf("settings-center write failure was not safely normalized: %q", body)
 	}
 
 	status, got, raw := getSettingsCenter(t, h, "?sections=logging,memory")

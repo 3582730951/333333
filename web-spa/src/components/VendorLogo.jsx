@@ -2,7 +2,6 @@ import React from 'react';
 import { IconGlobe } from './pool/icons.jsx';
 import openaiLogo from '../assets/vendors/openai-blossom.svg';
 import anthropicLogo from '../assets/vendors/anthropic.svg';
-import paypalLogo from '../assets/vendors/paypal.svg';
 import kiroLogo from '../assets/vendors/kiro.svg';
 
 const vendorMap = {
@@ -11,7 +10,6 @@ const vendorMap = {
   'codex': { label: 'OpenAI', asset: openaiLogo, tone: 'neutral' },
   'claude': { label: 'Claude', asset: anthropicLogo, tone: 'claude' },
   'anthropic': { label: 'Anthropic', asset: anthropicLogo, tone: 'claude' },
-  'paypal': { label: 'PayPal', asset: paypalLogo, tone: 'paypal' },
   'kiro': { label: 'Kiro', asset: kiroLogo, tone: 'kiro' },
 };
 

@@ -463,7 +463,10 @@ func (b *idleCancelBody) Close() error {
 func NewClient(cfg config.Config) *Client {
 	cfg.UpstreamBaseURL = NormalizeBaseURL(cfg.UpstreamBaseURL)
 	cfg.OpenAIAPIUpstreamBaseURL = NormalizeBaseURL(cfg.OpenAIAPIUpstreamBaseURL)
-	secret := identity.ResolveSecret([]byte(cfg.IdentitySecret))
+	secret := cfg.RuntimeIdentityKey
+	if len(secret) != 32 {
+		secret = identity.ResolveSecret([]byte(cfg.IdentitySecret))
+	}
 	return &Client{
 		cfg:            cfg,
 		identitySecret: secret,

@@ -154,7 +154,7 @@ func (s *Server) captureCodexStreamRateLimits(accountID string, rl codexStreamRa
 		s.scheduler.ApplyRateLimitSnapshot(snap)
 		snapCopy := snap
 		s.enqueueWrite(func() {
-			writeCtx, cancel := bgWriteContext()
+			writeCtx, cancel := s.bgWriteContext()
 			defer cancel()
 			_ = s.store.UpsertAccountRateLimit(writeCtx, snapCopy)
 		})

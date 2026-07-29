@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
 import { IconRefresh, IconPlay, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
@@ -20,9 +20,8 @@ import {
 } from '../features/automation/model/registration';
 import type {
   RegistrationBlocker, RegistrationCountryStrategy, RegistrationIdentityMode,
-  RegistrationJob, RegistrationStartInput,
+  RegistrationJob, RegistrationProviderOption, RegistrationStartInput,
 } from '../features/automation/model/registration';
-import type { LifecycleProviderOption } from '../features/automation/model/lifecycle';
 
 const { Button, Toast, Typography, Form, Card, Tag, Select } = PoolUI as any;
 const ErrorBanner = LoadErrorBanner as any;
@@ -54,11 +53,11 @@ function blockerText(blocker: RegistrationBlocker): string {
   return blocker.detail ? message.replace('{detail}', blocker.detail) : message;
 }
 
-function providerOptionValue(option: LifecycleProviderOption): string {
+function providerOptionValue(option: RegistrationProviderOption): string {
   return typeof option === 'string' ? option : option.value;
 }
 
-function providerOptionLabel(option: LifecycleProviderOption): string {
+function providerOptionLabel(option: RegistrationProviderOption): string {
   return typeof option === 'string' ? option : option.label;
 }
 

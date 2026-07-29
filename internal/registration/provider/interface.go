@@ -16,6 +16,14 @@ type SMSProvider interface {
 	Type() string
 }
 
+// SMSSettlementProvider is an optional provider capability for explicitly marking a
+// consumed activation complete. Providers whose check endpoint auto-completes an order
+// need not implement it. The pipeline invokes exactly one of CompleteNumber or
+// CancelNumber for each acquired order.
+type SMSSettlementProvider interface {
+	CompleteNumber(ctx context.Context, orderID string) error
+}
+
 // MailboxProvider creates email addresses and retrieves verification codes
 type MailboxProvider interface {
 	CreateEmail(ctx context.Context) (email, password, mailboxID string, err error)

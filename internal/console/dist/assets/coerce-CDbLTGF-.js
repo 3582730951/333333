@@ -1,1 +1,0 @@
-import{C as e,P as t}from"./api-CZeaz0bo.js";function n(n){return t(e,n)}export{n as t};

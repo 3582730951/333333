@@ -7,13 +7,53 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/storage"
 )
+
+func awaitLegacyDiagnosticExport(t *testing.T, h *testHarness) []byte {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	h.app.startDiagnosticJobLoop(ctx)
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/logs", "")
+	if code != http.StatusAccepted {
+		t.Fatalf("legacy diagnostics enqueue = %d: %s", code, raw)
+	}
+	var envelope struct {
+		Job storage.DiagnosticJob `json:"job"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil || envelope.Job.ID == "" {
+		t.Fatalf("decode diagnostics job: %v (%s)", err, raw)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		job, err := h.store.GetDiagnosticJob(context.Background(), envelope.Job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch job.Status {
+		case storage.DiagnosticJobReady:
+			artifact, err := os.ReadFile(job.ArtifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return artifact
+		case storage.DiagnosticJobFailed, storage.DiagnosticJobCancelled:
+			t.Fatalf("diagnostics job failed: %+v", job)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("diagnostics job did not finish")
+	return nil
+}
 
 func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
@@ -89,10 +129,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageDiskReserve, Cause: bodysource.ErrDiskReserve})
 	h.app.recordBodyStorageRejection(&bodysource.BodyStorageError{Class: bodysource.BodyStorageLocalCapacity, Cause: bodysource.ErrSpoolBudget})
 
-	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/logs", "")
-	if code != http.StatusOK {
-		t.Fatalf("diagnostics export = %d: %s", code, raw)
-	}
+	raw := awaitLegacyDiagnosticExport(t, h)
 	files := readZipFiles(t, raw)
 	required := []string{
 		"manifest.json",
@@ -100,7 +137,6 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		"runtime_storage.json",
 		"route_attempts.csv",
 		"provider_attempts.csv",
-		"account_map.csv",
 		"account_auth_metadata.csv",
 		"account_model_capabilities.csv",
 		"kiro_runtime_capabilities.csv",
@@ -145,7 +181,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
 		t.Fatalf("manifest json: %v\n%s", err, files["manifest.json"])
 	}
-	if manifest.Format != "codex-pool-diagnostics-v2" || !strings.HasPrefix(manifest.SnapshotID, "diag_") {
+	if manifest.Format != "codex-pool-diagnostics-v3" || !strings.HasPrefix(manifest.SnapshotID, "diag_") {
 		t.Fatalf("manifest format/snapshot = %q/%q", manifest.Format, manifest.SnapshotID)
 	}
 	if manifest.CurrentAccounts != 1 || manifest.HistoricalAccounts != 1 || manifest.Build == nil || manifest.TableTimeRanges["usage_records.csv"] == nil {
@@ -167,12 +203,16 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 
-	accountMap, err := csv.NewReader(strings.NewReader(files["account_map.csv"])).ReadAll()
+	accountRows, err := csv.NewReader(strings.NewReader(files["accounts_snapshot.csv"])).ReadAll()
 	if err != nil {
-		t.Fatalf("account_map.csv: %v", err)
+		t.Fatalf("accounts_snapshot.csv: %v", err)
 	}
-	if len(accountMap) != 2 || len(accountMap[0]) != 2 || accountMap[0][0] != "account_code" || accountMap[0][1] != "account_id" || accountMap[1][0] != "ACC-0001" || accountMap[1][1] != account.ID {
-		t.Fatalf("account_map.csv must contain only account_code and account_id: %v", accountMap)
+	if len(accountRows) != 2 || len(accountRows[1]) == 0 || !strings.HasPrefix(accountRows[1][0], "ACC-") {
+		t.Fatalf("accounts_snapshot.csv has no stable account alias: %v", accountRows)
+	}
+	accountAlias := accountRows[1][0]
+	if _, ok := files["account_map.csv"]; ok {
+		t.Fatal("diagnostics export contains a reversible account map")
 	}
 
 	for _, name := range required {
@@ -182,13 +222,13 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 				t.Fatalf("%s leaked %q:\n%s", name, forbidden, text)
 			}
 		}
-		if name != "account_map.csv" && strings.Contains(text, account.ID) {
+		if strings.Contains(text, account.ID) {
 			t.Fatalf("%s leaked raw account id %q:\n%s", name, account.ID, text)
 		}
 	}
 	for _, name := range []string{"audit_log.csv", "cf_events.csv", "usage_records.csv", "billing_holds.csv", "accounts_snapshot.csv", "egress_snapshot.csv", "account_auth_metadata.csv"} {
-		if !strings.Contains(files[name], "ACC-0001") {
-			t.Fatalf("%s should use stable account code ACC-0001:\n%s", name, files[name])
+		if !strings.Contains(files[name], accountAlias) {
+			t.Fatalf("%s should use stable account alias %s:\n%s", name, accountAlias, files[name])
 		}
 	}
 
@@ -229,7 +269,7 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 		}
 	}
 	providerCSV := files["provider_attempts.csv"]
-	for _, want := range []string{"request_id,account_code,provider,phase,status,error_class,body_hash,retry_after,created_at", "req-diagnostic", "ACC-0001", "antigravity", "transient_resource_exhausted", "sha256:0123456789abcdef"} {
+	for _, want := range []string{"request_id,account_code,provider,phase,status,error_class,body_hash,retry_after,created_at", "req-diagnostic", accountAlias, "antigravity", "transient_resource_exhausted", "sha256:0123456789abcdef"} {
 		if !strings.Contains(providerCSV, want) {
 			t.Fatalf("provider_attempts.csv missing %q:\n%s", want, providerCSV)
 		}
@@ -439,10 +479,7 @@ func TestDiagnosticsExportDeduplicatesAffinityAliasesAndOmitsExpiredRows(t *test
 		t.Fatal(err)
 	}
 
-	code, raw := grpReq(t, h, http.MethodGet, "/admin/export/logs", "")
-	if code != http.StatusOK {
-		t.Fatalf("diagnostics export = %d: %s", code, raw)
-	}
+	raw := awaitLegacyDiagnosticExport(t, h)
 	files := readZipFiles(t, raw)
 	rows, err := csv.NewReader(strings.NewReader(files["affinity_bindings.csv"])).ReadAll()
 	if err != nil {

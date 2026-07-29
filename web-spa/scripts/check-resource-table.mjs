@@ -4,8 +4,8 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const managedPages = ['Groups.jsx', 'Users.tsx', 'Egress.jsx', 'Providers.jsx', 'Audit.tsx', 'CFEvents.tsx', 'Quota.tsx', 'Gopay.jsx', 'Accounts.jsx'];
-const tableOnlyPages = ['Usage.tsx', 'System.tsx', 'Lifecycle.tsx', 'Registration.tsx'];
+const managedPages = ['Groups.jsx', 'Users.tsx', 'Egress.jsx', 'Providers.jsx', 'Audit.tsx', 'CFEvents.tsx', 'Quota.tsx', 'Accounts.jsx'];
+const tableOnlyPages = ['Usage.tsx', 'System.tsx', 'Registration.tsx'];
 const portalTableOnlyPages = ['PortalDashboard.tsx'];
 const managedComponents = ['DataPage.jsx', 'ApiKeysTable.tsx'];
 const highValueMobilePages = ['Accounts.jsx', 'Providers.jsx', 'Users.tsx'];

@@ -1,0 +1,16 @@
+{
+  "name": "@codex-pool/node-registrar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Repository-owned, one-shot Playwright registrar worker",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node --check index.js"
+  },
+  "dependencies": {
+    "playwright": "1.62.0"
+  }
+}

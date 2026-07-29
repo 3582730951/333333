@@ -374,8 +374,8 @@ func TestKiroGPTModelsAreExactAndKeepTheirNativeWindow(t *testing.T) {
 		if !ok || !KiroSupportsGPTModel(model) {
 			t.Fatalf("Kiro GPT model %q was not recognized", model)
 		}
-		if got := KiroEffectiveContextWindow(canonical, "", 0); got != 372000 {
-			t.Fatalf("%s standard window=%d, want 372000", canonical, got)
+		if got := KiroEffectiveContextWindow(canonical, "", 0); got != 272000 {
+			t.Fatalf("%s standard window=%d, want 272000", canonical, got)
 		}
 	}
 	for _, model := range []string{"gpt-5.6", "gpt-5.6-sol-preview", "gpt-5.5-sol", "gpt-4.1"} {
@@ -453,13 +453,13 @@ func TestStaticKiroSeparatesStandardAndTechnicalContextWindows(t *testing.T) {
 	for _, c := range StaticKiroModels("account") {
 		wantNative := int64(200000)
 		if KiroSupportsGPTModel(c.ModelSlug) {
-			wantNative = 372000
+			wantNative = 272000
 		}
 		if c.NativeContextWindow != wantNative {
 			t.Fatalf("%s standard window=%d, want %d", c.ModelSlug, c.NativeContextWindow, wantNative)
 		}
-		if KiroSupportsGPTModel(c.ModelSlug) && c.NativeMaxContextWindow != 372000 {
-			t.Fatalf("%s GPT maximum window=%d, want 372000", c.ModelSlug, c.NativeMaxContextWindow)
+		if KiroSupportsGPTModel(c.ModelSlug) && c.NativeMaxContextWindow != 272000 {
+			t.Fatalf("%s GPT maximum window=%d, want 272000", c.ModelSlug, c.NativeMaxContextWindow)
 		}
 		if KiroContextWindow(c.ModelSlug) == 1000000 && c.NativeMaxContextWindow != 1000000 {
 			t.Fatalf("%s technical window=%d, want 1000000", c.ModelSlug, c.NativeMaxContextWindow)
@@ -468,11 +468,11 @@ func TestStaticKiroSeparatesStandardAndTechnicalContextWindows(t *testing.T) {
 }
 
 func TestKiroAliasesUseOnlyVerifiedModels(t *testing.T) {
-	if _, ok := ResolveKiroModel("auto", nil); ok {
-		t.Fatal("auto resolved without a verified model")
+	if got, ok := ResolveKiroModel("auto", nil); !ok || got != "auto" {
+		t.Fatalf("auto was not preserved as an upstream model: (%q,%v)", got, ok)
 	}
 	verified := []string{"claude-sonnet-4.6", "claude-opus-4.7", "claude-opus-4.8"}
-	if got, ok := ResolveKiroModel("auto", verified); !ok || got != "claude-opus-4.8" {
+	if got, ok := ResolveKiroModel("auto", verified); !ok || got != "auto" {
 		t.Fatalf("auto=(%q,%v)", got, ok)
 	}
 	if got, ok := ResolveKiroModel("sonnet", verified); !ok || got != "claude-sonnet-4.6" {
@@ -500,15 +500,10 @@ func TestKiroFreePlanCannotBootstrapOpus(t *testing.T) {
 	}
 }
 
-func TestKiroPlanAllows1MRequiresKnownPaidPlanAndTechnicalWindow(t *testing.T) {
-	for _, plan := range []string{"", "KIRO FREE"} {
-		if KiroPlanAllows1M(plan, "claude-opus-4-8") {
-			t.Fatalf("plan %q unexpectedly received Kiro 1M entitlement", plan)
-		}
-	}
-	for _, plan := range []string{"KIRO PRO", "KIRO PRO+", "KIRO ENTERPRISE"} {
+func TestKiroPlanAllows1MUsesCatalogTechnicalWindowNotPlanName(t *testing.T) {
+	for _, plan := range []string{"", "KIRO FREE", "KIRO PRO", "KIRO PRO+", "KIRO ENTERPRISE"} {
 		if !KiroPlanAllows1M(plan, "claude-opus-4-8") {
-			t.Fatalf("known paid plan %q was rejected for Kiro 1M", plan)
+			t.Fatalf("catalog-supported model was rejected for plan %q", plan)
 		}
 	}
 	if KiroPlanAllows1M("KIRO PRO", "claude-haiku-4.5") {
@@ -570,7 +565,7 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 		bySlug[c.ModelSlug] = c
 	}
 	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
-		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 || got.AutoCompactTokenLimit != 272000 {
+		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 272000 || got.NativeMaxContextWindow != 272000 || got.AutoCompactTokenLimit != 272000 {
 			t.Fatalf("current model %s missing or wrong window: %+v", slug, got)
 		}
 	}
@@ -605,11 +600,11 @@ func TestBuildCodexModelsResponseAppliesIndependent56ContextLimits(t *testing.T)
 		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
 	}
 	model := root.Models[0]
-	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
+	if model["context_window"] != float64(272000) || model["max_context_window"] != float64(272000) {
 		t.Fatalf("5.6 full context contract missing: %#v", model)
 	}
-	if model["auto_compact_token_limit"] != float64(272000) {
-		t.Fatalf("5.6 auto-compaction trigger = %#v, want 272000", model["auto_compact_token_limit"])
+	if model["auto_compact_token_limit"] != float64(244800) {
+		t.Fatalf("5.6 auto-compaction trigger = %#v, want 244800", model["auto_compact_token_limit"])
 	}
 	levels, _ := model["supported_reasoning_levels"].([]interface{})
 	tools, _ := model["experimental_supported_tools"].([]interface{})
@@ -644,8 +639,8 @@ func TestBuildCodexModelsResponseSynthesizes56ContextLimitsFromStaticMetadata(t 
 		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
 	}
 	model := root.Models[0]
-	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) || model["auto_compact_token_limit"] != float64(272000) {
-		t.Fatalf("synthesized 5.6 limits are not 372K/272K: %#v", model)
+	if model["context_window"] != float64(272000) || model["max_context_window"] != float64(272000) || model["auto_compact_token_limit"] != float64(244800) {
+		t.Fatalf("synthesized 5.6 limits are not 272K: %#v", model)
 	}
 	levels, _ := model["supported_reasoning_levels"].([]interface{})
 	if len(levels) != 6 || levels[5].(map[string]interface{})["effort"] != "ultra" || model["supports_parallel_tool_calls"] != true {

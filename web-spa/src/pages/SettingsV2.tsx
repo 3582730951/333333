@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
 import { IconSave, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
@@ -9,12 +9,11 @@ import ConfigFormBase from '../components/ConfigForm';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import {
   useApplySettingsTemplateMutation, useAutomationSettingsData, useClearContextJournalMutation, useClearLogRecordsMutation, useConfigSettingsData,
-  useLifecycleSettingsData, useLoggingSettingsData, useMemorySettingsData,
-  useRegistrarSettingsData, useSaveRegistrarMutation, useSaveSettingsMutation,
+  useLoggingSettingsData, useMemorySettingsData, useRegistrarSettingsData, useSaveRegistrarMutation, useSaveSettingsMutation,
   useSharedSettingsOptions,
 } from '../features/settings/queries/settings';
 import type {
-  AutomationPolicy, AutomationSettings, ConfigField, LifecycleSettings, ProviderOptions, ProviderSetting, RegistrarSettings,
+  AutomationPolicy, AutomationSettings, ConfigField, ProviderSetting, RegistrarSettings,
   SettingsDiff, SettingsEgress, SettingsGroup, SettingsOption, SettingsSection, SettingsTemplate, SettingsValues,
   SharedSettingsOptions,
 } from '../features/settings/model/settings';
@@ -284,12 +283,6 @@ const POLICY_TYPES: PolicyDefinition[] = [
     { field: 'register_method', label: '注册引擎', type: 'select', options: [{ label: 'node', value: 'node' }, { label: 'protocol_v2', value: 'protocol_v2' }, { label: 'browser_v3', value: 'browser_v3' }], w: 160 },
     { field: 'platform', label: '平台', type: 'select', options: [{ label: 'ChatGPT', value: 'chatgpt' }], w: 140 },
     { field: 'group', label: '分组', type: 'group_select', ph: '默认' },
-    { field: 'egress', label: '出口', type: 'egress_select', ph: 'egress_direct' },
-  ]},
-  { type: 'plus', title: '自动升级 Plus', desc: '定期把免费账号升级到 Plus 订阅。', fields: [
-    { field: 'interval', label: '间隔(秒)', type: 'number', w: 150 },
-    { field: 'daily_limit', label: '每日上限', type: 'number' },
-    { field: 'payment_provider', label: '支付方式', type: 'select', options: [{ label: 'GoPay', value: 'gopay' }, { label: 'PayPal', value: 'paypal' }], w: 140 },
     { field: 'egress', label: '出口', type: 'egress_select', ph: 'egress_direct' },
   ]},
   { type: 'scheduled', title: '定时注册', desc: '按计划批量注册。', fields: [
@@ -601,7 +594,11 @@ function RegistrarTab() {
         type: 'email', key: 'hotmail_otp', display_name: 'Hotmail OTP',
         enabled: values.hotmail_otp_enabled === true,
         priority: Number(values.hotmail_otp_priority) || 0,
-        config: { base_email: values.hotmail_base_email || '', otp_url: values.hotmail_otp_url || '' },
+        config: {
+          base_email: values.hotmail_base_email || '',
+          otp_url: values.hotmail_otp_url || '',
+          auth_token: values.hotmail_otp_auth_token || '',
+        },
       });
       const r = await saveMutation.mutateAsync({ providers, values: out });
       setDiffs(r?.saved || [{ section: 'registrar', key: 'sms_providers', old_value: 'saved', new_value: 'saved' }]);
@@ -654,6 +651,7 @@ function RegistrarTab() {
   known.hotmail_otp_priority = hotmailOTP?.priority ?? 100;
   known.hotmail_base_email = hotmailOTP?.config?.base_email || '';
   known.hotmail_otp_url = hotmailOTP?.config?.otp_url || '';
+  known.hotmail_otp_auth_token = '';
   MAILBOX_PROVIDER_CARDS.forEach((card, index) => {
     const row = mailboxProviders.find((p) => p.key === card.key);
     const providerConfig = row?.config || {};
@@ -717,8 +715,12 @@ function RegistrarTab() {
         <Card title="Hotmail OTP Reader" className="pool-card" style={{ width: '100%' }} bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
           <Form.Switch field="hotmail_otp_enabled" label="启用" />
           <Form.InputNumber field="hotmail_otp_priority" label="优先级" style={{ width: 120 }} min={0} max={1000} />
-          <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }} placeholder="account@outlook.com" />
-          <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }} placeholder="https://otp.example.com/read" />
+          <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }}
+            placeholder={hotmailOTP?.config?.base_email_configured ? '已加密配置；留空保留' : 'account@outlook.com'} />
+          <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }}
+            placeholder={hotmailOTP?.config?.otp_url_configured ? '已加密配置；留空保留' : 'https://otp.example.com/read'} />
+          <Form.Input field="hotmail_otp_auth_token" label="OTP Relay Token" mode="password" style={{ width: 260 }}
+            placeholder={hotmailOTP?.config?.auth_token_configured ? '已加密配置；留空保留' : 'Bearer token'} />
         </Card>
         <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>邮箱提供商</Typography.Title>
         <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
@@ -752,73 +754,6 @@ function RegistrarTab() {
         <div style={{ width: '100%', marginTop: 8 }}>
           <Button htmlType="submit" theme="solid" icon={<IconSave />} loading={saving}>保存凭据</Button>
           <Button style={{ marginLeft: 8 }} onClick={load}>重新加载</Button>
-        </div>
-      </Form>
-    </SettingsTabShell>
-  );
-}
-
-// ── LifecycleTab ─────────────────────────────────────────────────────────────
-
-const EMPTY_LIFECYCLE_SETTINGS: LifecycleSettings = { defaults: {}, defaultsError: '' };
-
-function LifecycleTab({ groups, egresses, providerOpts }: { groups: SettingsGroup[]; egresses: SettingsEgress[]; providerOpts: ProviderOptions }) {
-  const [diffs, setDiffs] = useState<SettingsDiff[] | null>(null);
-
-  const {
-    data: lifecycleSettings = EMPTY_LIFECYCLE_SETTINGS,
-    loading,
-    error,
-    lastRefresh,
-    reload: load,
-  } = useLifecycleSettingsData();
-  const saveMutation = useSaveSettingsMutation();
-
-  const defaults = lifecycleSettings.defaults || {};
-  const defaultsError = lifecycleSettings.defaultsError || '';
-
-  const save = async (values: SettingsValues) => {
-    try {
-      const r = await saveMutation.mutateAsync([{ section: 'lifecycle', values: { defaults: values } }]);
-      setDiffs(r?.saved || []);
-      Toast.success('生命周期默认值已保存');
-    } catch (e) { showErrorToast(e); }
-  };
-  const saving = saveMutation.isPending;
-
-  const groupOptions = groups.map((g) => ({ label: g.name, value: g.name }));
-  const egressOptions = egresses
-    .filter((e) => e && e.id)
-    .map((e) => ({ label: `${e.name || e.id} (${e.type || 'direct'})`, value: e.id }));
-  const smsOptions = ensureCurrentOption(providerOpts?.sms, defaults.sms);
-  const mailboxOptions = ensureCurrentOption(providerOpts?.mailbox, defaults.mailbox);
-  const captchaOptions = ensureCurrentOption(providerOpts?.captcha, defaults.captcha);
-  const defaultGroupOptions = ensureCurrentOption(groupOptions, defaults.group);
-  const defaultEgressOptions = ensureCurrentOption(egressOptions, defaults.egress);
-
-  return (
-    <SettingsTabShell
-      loading={loading}
-      lastRefresh={lastRefresh}
-      error={error}
-      onRetry={load}
-      diffs={diffs}
-      onClearDiffs={() => setDiffs(null)}
-    >
-      {defaultsError && (
-        <Banner type="danger" closeIcon={null} style={{ marginBottom: 12 }}
-          title="生命周期默认值读取异常" description={defaultsError} />
-      )}
-      <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
-        description="设置生命周期任务（批量注册/升级 Plus）的默认值，创建新任务时自动填充。" />
-      <Form key={settingsFormKey('lifecycle', defaults)} onSubmit={save} initValues={defaults} labelPosition="top" style={{ display: 'flex', flexWrap: 'wrap', gap: '0 24px' }}>
-        <Form.Select field="sms" label="默认短信提供商" style={{ width: 220 }} optionList={[{ label: '未设置', value: '' }, ...smsOptions]} />
-        <Form.Select field="mailbox" label="默认邮箱提供商" style={{ width: 220 }} optionList={[{ label: '未设置', value: '' }, ...mailboxOptions]} />
-        <Form.Select field="captcha" label="默认验证码求解器" style={{ width: 220 }} optionList={[{ label: '未设置', value: '' }, ...captchaOptions]} />
-        <Form.Select field="group" label="默认分组" style={{ width: 220 }} optionList={[{ label: '默认', value: '' }, ...defaultGroupOptions]} />
-        <Form.Select field="egress" label="默认出口" style={{ width: 240 }} optionList={[{ label: '未设置', value: '' }, ...defaultEgressOptions]} />
-        <div style={{ width: '100%', marginTop: 8 }}>
-          <Button htmlType="submit" theme="solid" icon={<IconSave />} loading={saving}>保存默认值</Button>
         </div>
       </Form>
     </SettingsTabShell>
@@ -1015,7 +950,7 @@ function MemoryTab() {
 
 // ── SettingsV2 main ──────────────────────────────────────────────────────────
 
-const SETTINGS_TAB_KEYS = ['config', 'automation', 'registrar', 'lifecycle', 'logging', 'memory', 'thinking', 'moderation'] as const;
+const SETTINGS_TAB_KEYS = ['config', 'automation', 'registrar', 'logging', 'memory', 'thinking', 'moderation'] as const;
 type SettingsTabKey = typeof SETTINGS_TAB_KEYS[number];
 
 function isSettingsTabKey(tab: string | null): tab is SettingsTabKey {
@@ -1023,7 +958,7 @@ function isSettingsTabKey(tab: string | null): tab is SettingsTabKey {
 }
 
 function tabNeedsSharedOptions(tab: SettingsTabKey) {
-  return tab === 'automation' || tab === 'lifecycle';
+  return tab === 'automation';
 }
 
 const EMPTY_SHARED_OPTIONS: SharedSettingsOptions = { groups: [], egresses: [], providerOpts: { sms: [], mailbox: [], captcha: [] }, error: null };
@@ -1063,7 +998,6 @@ export default function SettingsV2() {
   const tabContent = (key: SettingsTabKey, node: ReactNode) => (mountedTabs.includes(key) ? node : null);
   const groups = sharedOptions.groups || [];
   const egresses = sharedOptions.egresses || [];
-  const providerOpts = sharedOptions.providerOpts || EMPTY_SHARED_OPTIONS.providerOpts;
 
   return (
     <div>
@@ -1080,9 +1014,6 @@ export default function SettingsV2() {
         </TabPane>
         <TabPane tab={t('settings.registrar_tab')} itemKey="registrar">
           {tabContent('registrar', <RegistrarTab />)}
-        </TabPane>
-        <TabPane tab={t('settings.lifecycle')} itemKey="lifecycle">
-          {tabContent('lifecycle', <LifecycleTab groups={groups} egresses={egresses} providerOpts={providerOpts} />)}
         </TabPane>
         <TabPane tab={t('settings.logging_tab')} itemKey="logging">
           {tabContent('logging', <LoggingTab />)}

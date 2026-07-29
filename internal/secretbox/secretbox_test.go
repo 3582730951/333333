@@ -33,11 +33,9 @@ func TestOpenLegacyPlaintextPassthrough(t *testing.T) {
 	}
 }
 
-func TestEncryptionDisabledPassthrough(t *testing.T) {
-	// nil/short key = disabled → Seal must not alter the value.
-	sealed, err := Seal(nil, "tok")
-	if err != nil || sealed != "tok" {
-		t.Fatalf("disabled Seal = %q,%v; want passthrough", sealed, err)
+func TestEncryptionWithoutKeyFailsClosed(t *testing.T) {
+	if sealed, err := Seal(nil, "tok"); err == nil || sealed != "" {
+		t.Fatalf("Seal without a key = %q,%v; want empty,error", sealed, err)
 	}
 }
 
@@ -54,5 +52,19 @@ func TestNonDeterministic(t *testing.T) {
 	b, _ := Seal(key, "same")
 	if a == b {
 		t.Fatal("two seals of the same plaintext should differ (random nonce)")
+	}
+}
+
+func TestDomainIsolation(t *testing.T) {
+	key := DeriveKey([]byte("k"))
+	sealed, err := SealDomain(key, "tokens", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDomain(key, "cookies", sealed); err == nil {
+		t.Fatal("ciphertext opened in a different domain")
+	}
+	if got, err := OpenDomain(key, "tokens", sealed); err != nil || got != "secret" {
+		t.Fatalf("same-domain open = %q,%v", got, err)
 	}
 }

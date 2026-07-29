@@ -269,7 +269,7 @@ func TestAntigravityHandlerRetriesBeforeCommitAndExcludesAccount(t *testing.T) {
 	}
 }
 
-func TestAntigravityRetriesAreBoundedAndPermanent4xxIsPreserved(t *testing.T) {
+func TestAntigravityRetriesAreBoundedAndUpstream4xxIsFirewalled(t *testing.T) {
 	tests := []struct {
 		name        string
 		status      int
@@ -280,7 +280,7 @@ func TestAntigravityRetriesAreBoundedAndPermanent4xxIsPreserved(t *testing.T) {
 		wantExclude bool
 	}{
 		{name: "transient bounded", status: http.StatusServiceUnavailable, body: `{"error":{"message":"temporarily unavailable"}}`, wantCalls: 4, wantOutcome: outcomeRetry, wantStatus: http.StatusOK, wantExclude: true},
-		{name: "permanent preserved", status: http.StatusBadRequest, body: `{"error":{"message":"invalid exact model input"}}`, wantCalls: 1, wantOutcome: outcomeDone, wantStatus: http.StatusBadRequest},
+		{name: "upstream client error hidden", status: http.StatusBadRequest, body: `{"error":{"message":"invalid exact model input"}}`, wantCalls: 1, wantOutcome: outcomeDone, wantStatus: http.StatusServiceUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -307,8 +307,8 @@ func TestAntigravityRetriesAreBoundedAndPermanent4xxIsPreserved(t *testing.T) {
 			if got != tt.wantOutcome || calls.Load() != tt.wantCalls || w.Code != tt.wantStatus || exclude[account.ID] != tt.wantExclude {
 				t.Fatalf("outcome=%v calls=%d status=%d exclude=%v body=%s", got, calls.Load(), w.Code, exclude, w.Body.String())
 			}
-			if tt.status == http.StatusBadRequest && w.Body.String() != tt.body {
-				t.Fatalf("permanent body=%s want=%s", w.Body.String(), tt.body)
+			if tt.status == http.StatusBadRequest && (strings.Contains(w.Body.String(), "invalid exact model input") || !strings.Contains(w.Body.String(), `"code":"service_unavailable"`)) {
+				t.Fatalf("upstream client error was not safely firewalled: %s", w.Body.String())
 			}
 		})
 	}

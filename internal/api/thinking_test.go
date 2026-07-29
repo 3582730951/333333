@@ -15,55 +15,49 @@ func TestThinkingAdminErrorsUseJSONEnvelope(t *testing.T) {
 	h.app.cfg.AdminToken = "secret"
 
 	tests := []struct {
-		name        string
-		method      string
-		path        string
-		body        string
-		token       string
-		wantStatus  int
-		wantMessage string
+		name       string
+		method     string
+		path       string
+		body       string
+		token      string
+		wantStatus int
 	}{
 		{
-			name:        "unauthorized",
-			method:      http.MethodGet,
-			path:        "/admin/thinking",
-			wantStatus:  http.StatusUnauthorized,
-			wantMessage: "admin token required",
+			name:       "unauthorized",
+			method:     http.MethodGet,
+			path:       "/admin/thinking",
+			wantStatus: http.StatusUnauthorized,
 		},
 		{
-			name:        "method not allowed",
-			method:      http.MethodPut,
-			path:        "/admin/thinking",
-			token:       "secret",
-			wantStatus:  http.StatusMethodNotAllowed,
-			wantMessage: "method not allowed",
+			name:       "method not allowed",
+			method:     http.MethodPut,
+			path:       "/admin/thinking",
+			token:      "secret",
+			wantStatus: http.StatusMethodNotAllowed,
 		},
 		{
-			name:        "invalid save json",
-			method:      http.MethodPost,
-			path:        "/admin/thinking",
-			body:        "{",
-			token:       "secret",
-			wantStatus:  http.StatusBadRequest,
-			wantMessage: "invalid JSON",
+			name:       "invalid save json",
+			method:     http.MethodPost,
+			path:       "/admin/thinking",
+			body:       "{",
+			token:      "secret",
+			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:        "oversized save json",
-			method:      http.MethodPost,
-			path:        "/admin/thinking",
-			body:        `{"enabled":true}` + strings.Repeat(" ", adminJSONBodyLimit),
-			token:       "secret",
-			wantStatus:  http.StatusBadRequest,
-			wantMessage: "request body too large",
+			name:       "oversized save json",
+			method:     http.MethodPost,
+			path:       "/admin/thinking",
+			body:       `{"enabled":true}` + strings.Repeat(" ", adminJSONBodyLimit),
+			token:      "secret",
+			wantStatus: http.StatusRequestEntityTooLarge,
 		},
 		{
-			name:        "preview missing provider model",
-			method:      http.MethodPost,
-			path:        "/admin/thinking/preview",
-			body:        "{}",
-			token:       "secret",
-			wantStatus:  http.StatusBadRequest,
-			wantMessage: "provider and model are required",
+			name:       "preview missing provider model",
+			method:     http.MethodPost,
+			path:       "/admin/thinking/preview",
+			body:       "{}",
+			token:      "secret",
+			wantStatus: http.StatusBadRequest,
 		},
 	}
 
@@ -76,7 +70,7 @@ func TestThinkingAdminErrorsUseJSONEnvelope(t *testing.T) {
 			if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 				t.Fatalf("content-type = %q, want application/json", ct)
 			}
-			assertErrorEnvelope(t, body, tc.wantMessage)
+			assertErrorEnvelope(t, body, tc.wantStatus)
 		})
 	}
 }
@@ -116,18 +110,24 @@ func thinkingAdminReq(t *testing.T, h *testHarness, method, path, body, token st
 	return resp, decoded
 }
 
-func assertErrorEnvelope(t *testing.T, body map[string]interface{}, wantMessage string) {
+func assertErrorEnvelope(t *testing.T, body map[string]interface{}, status int) {
 	t.Helper()
 
 	errBody, ok := body["error"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("missing JSON error envelope: %v", body)
 	}
-	if typ, _ := errBody["type"].(string); typ != "codex_pool_error" {
-		t.Fatalf("error.type = %q, want codex_pool_error", typ)
+	if typ, _ := errBody["type"].(string); typ != "invalid_request_error" {
+		t.Fatalf("error.type = %q, want invalid_request_error", typ)
 	}
-	msg, _ := errBody["message"].(string)
-	if !strings.Contains(msg, wantMessage) {
-		t.Fatalf("error.message = %q, want substring %q", msg, wantMessage)
+	wantMessage, wantCode := safeClientError(status)
+	if msg, _ := errBody["message"].(string); msg != wantMessage {
+		t.Fatalf("error.message = %q, want %q", msg, wantMessage)
+	}
+	if code, _ := errBody["code"].(string); code != wantCode {
+		t.Fatalf("error.code = %q, want %q", code, wantCode)
+	}
+	if requestID, _ := errBody["request_id"].(string); !strings.HasPrefix(requestID, "REQ-") {
+		t.Fatalf("error.request_id = %q", requestID)
 	}
 }

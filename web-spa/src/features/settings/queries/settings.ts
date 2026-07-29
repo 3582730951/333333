@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import {
-  applySettingsTemplate, clearContextJournal, clearLogRecords, fetchAdvancedSettings, fetchAIConfigSettings, fetchAutomationSettings, fetchConfigSettings, fetchLifecycleSettings,
+  applySettingsTemplate, clearContextJournal, clearLogRecords, fetchAdvancedSettings, fetchAIConfigSettings, fetchAutomationSettings, fetchConfigSettings,
   fetchLoggingSettings, fetchMemorySettings, fetchRegistrarSettings, fetchSharedSettingsOptions,
   saveAdvancedSettings, saveRegistrarSettings, saveSettingsPatches,
 } from '../api/settings';
@@ -39,10 +39,6 @@ export function useAutomationSettingsData() {
 
 export function useRegistrarSettingsData() {
   return useSettingsQuery('registrar', fetchRegistrarSettings);
-}
-
-export function useLifecycleSettingsData() {
-  return useSettingsQuery('lifecycle', fetchLifecycleSettings);
 }
 
 export function useLoggingSettingsData() {

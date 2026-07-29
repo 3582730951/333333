@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -109,29 +110,26 @@ func parseBrowserProxy(endpoint string) (serverURL, user, pass string, err error
 
 // getEmailForRegistration builds a plus-addressed Hotmail email from the
 // operator-configured base email and OTP reader URL (provider_settings).
-func (p *Pipeline) getEmailForRegistration(ctx context.Context) (email, otpURL string, err error) {
-	// Read hotmail_otp provider settings for the base email and OTP URL.
-	var cfgJSON string
-	err = p.store.DB().QueryRowContext(ctx,
-		`SELECT config_json FROM provider_settings
-		 WHERE provider_type='email' AND provider_key='hotmail_otp' AND enabled=1 LIMIT 1`).Scan(&cfgJSON)
+func (p *Pipeline) getEmailForRegistration(ctx context.Context) (email, otpURL, otpToken string, err error) {
+	cfg, configErr := p.providerConfig(ctx, "email", "hotmail_otp")
+	err = configErr
 	if err != nil {
 		// Fall back to env vars (for testing / non-DB setups).
 		base := os.Getenv("HOTMAIL_BASE_EMAIL")
 		otp := os.Getenv("HOTMAIL_OTP_URL")
-		if base == "" || otp == "" {
-			return "", "", fmt.Errorf("hotmail_otp email provider not configured (set HOTMAIL_BASE_EMAIL + HOTMAIL_OTP_URL)")
+		token := os.Getenv("HOTMAIL_OTP_TOKEN")
+		if base == "" || otp == "" || token == "" {
+			return "", "", "", fmt.Errorf("hotmail_otp email provider not configured")
 		}
-		return base, otp, nil
+		return base, otp, token, nil
 	}
-	cfg := map[string]interface{}{}
-	_ = json.Unmarshal([]byte(cfgJSON), &cfg)
 	base, _ := cfg["base_email"].(string)
 	otpURL, _ = cfg["otp_url"].(string)
-	if base == "" || otpURL == "" {
-		return "", "", fmt.Errorf("hotmail_otp config missing base_email or otp_url")
+	otpToken, _ = cfg["auth_token"].(string)
+	if base == "" || otpURL == "" || otpToken == "" {
+		return "", "", "", fmt.Errorf("hotmail_otp config missing required credentials")
 	}
-	return base, otpURL, nil
+	return base, otpURL, otpToken, nil
 }
 
 func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest) (*storage.Account, error) {
@@ -153,7 +151,7 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 	}
 
 	// Build plus-addressed email from the configured base
-	baseEmail, otpURL, err := p.getEmailForRegistration(ctx)
+	baseEmail, otpURL, otpToken, err := p.getEmailForRegistration(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("browser_v3: email: %w", err)
 	}
@@ -172,24 +170,25 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 	cctx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, python, "-u", script)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(registrarBaseEnv(),
 		"REG_PROXY_SERVER="+server,
 		"REG_PROXY_USER="+user,
 		"REG_PROXY_PASS="+pass,
 		"REG_EMAIL="+email,
 		"REG_OTP_URL="+otpURL,
+		"REG_OTP_TOKEN="+otpToken,
 		"REG_CHROME="+chrome,
 		"REG_HEADLESS="+headless,
 		// SMS country must match the proxy region so the IP and phone agree; reg_v3.py
 		// only draws a hero-sms number if OpenAI demands add-phone during OAuth.
 		"REG_SMS_COUNTRY="+country,
 	)
-	if hk := firstEnv("", "HEROSMS_KEY", "HEROSMS_API_KEY"); hk != "" {
+	if hk := p.herosmsKey(ctx); hk != "" {
 		cmd.Env = append(cmd.Env, "HEROSMS_KEY="+hk)
 	}
-	out, err := cmd.Output()
+	out, err := p.runRegistrarCommand(cctx, cmd)
 	if err != nil && len(out) == 0 {
-		return nil, fmt.Errorf("browser_v3: harness failed: %w", err)
+		return nil, errors.New("browser_v3: harness process failed")
 	}
 
 	// Parse the "__CODEX_ACCOUNT__ {json}" marker line.
@@ -203,32 +202,15 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 		}
 		var a codexAccountLine
 		if json.Unmarshal([]byte(line[i+len("__CODEX_ACCOUNT__ "):]), &a) == nil && strings.TrimSpace(a.AccessToken) != "" {
-			account := &storage.Account{
-				ID:                generateAccountID(),
-				Label:             "browser-" + a.Email,
-				GroupName:         req.GroupName,
+			return p.persistVerifiedRegistration(ctx, req, registrationCredential{
+				LabelPrefix:       "browser-",
+				Email:             a.Email,
 				UpstreamAccountID: a.AccountID,
 				ChatGPTUserID:     a.UserID,
-				Email:             a.Email,
-				PlanType:          firstNonEmpty(a.PlanType, "free"),
-				Provider:          "codex",
-				Status:            "active",
-				CreatedAt:         time.Now().Unix(),
-				UpdatedAt:         time.Now().Unix(),
-			}
-			token := &storage.AccountToken{
-				AccountID:    account.ID,
-				AccessToken:  a.AccessToken,
-				RefreshToken: a.RefreshToken,
-				IDTokenRaw:   a.IDToken,
-				LastRefresh:  storage.Now(),
-				CreatedAt:    time.Now().Unix(),
-				UpdatedAt:    time.Now().Unix(),
-			}
-			if err := p.store.UpsertAccount(ctx, *account, *token); err != nil {
-				return nil, fmt.Errorf("upsertAccount: %w", err)
-			}
-			return account, nil
+				AccessToken:       a.AccessToken,
+				RefreshToken:      a.RefreshToken,
+				IDToken:           a.IDToken,
+			})
 		}
 	}
 	return nil, fmt.Errorf("browser_v3: no account produced")

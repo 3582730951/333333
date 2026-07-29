@@ -188,12 +188,12 @@ func TestAuthRegisterRejectsOversizedJSON(t *testing.T) {
 	c := jarClient(t)
 
 	resp, body := doReq(t, c, http.MethodPost, h.pool.URL+"/auth/register", `{"email":"big@x.io","password":"hunter2hunter"}`+strings.Repeat(" ", adminJSONBodyLimit), nil)
-	if resp.StatusCode != http.StatusBadRequest {
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized register status=%d body=%v", resp.StatusCode, body)
 	}
 	errBody, _ := body["error"].(map[string]interface{})
-	if msg, _ := errBody["message"].(string); !strings.Contains(msg, "request body too large") {
-		t.Fatalf("oversized register error = %v, want size error", body)
+	if code, _ := errBody["code"].(string); code != "request_too_large" {
+		t.Fatalf("oversized register error = %v, want safe request_too_large", body)
 	}
 
 	resp, body = doReq(t, c, http.MethodPost, h.pool.URL+"/auth/register", `{"email":"admin@x.io","password":"hunter2hunter"}`, nil)

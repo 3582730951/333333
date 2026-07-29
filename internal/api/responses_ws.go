@@ -705,28 +705,7 @@ func writeWebSocketSourceMessage(conn webSocketMessageWriter, messageType int, s
 }
 
 func writeWebSocketErrorSource(conn webSocketMessageWriter, status int, source bodysource.BodySource) error {
-	const maxErrorMessageBytes = 64 << 10
-	message := ""
-	if source != nil && source.Size() > 0 {
-		reader, err := source.Open()
-		if err != nil {
-			return err
-		}
-		raw, readErr := io.ReadAll(io.LimitReader(reader, maxErrorMessageBytes+1))
-		_ = reader.Close()
-		if readErr != nil {
-			return readErr
-		}
-		truncated := len(raw) > maxErrorMessageBytes
-		if truncated {
-			raw = raw[:maxErrorMessageBytes]
-		}
-		message = strings.TrimSpace(string(raw))
-		if truncated {
-			message += "…"
-		}
-	}
-	return writeWebSocketError(conn, status, message)
+	return writeWebSocketError(conn, http.StatusServiceUnavailable, "")
 }
 
 func sseDataPayload(block []byte) string {
@@ -741,17 +720,21 @@ func sseDataPayload(block []byte) string {
 }
 
 func writeWebSocketError(conn webSocketMessageWriter, status int, message string) error {
-	if status == 0 {
-		status = http.StatusInternalServerError
-	}
-	if message == "" {
-		message = http.StatusText(status)
+	requestID := newRequestID()
+	if status < 400 || status >= 500 {
+		status = http.StatusServiceUnavailable
+		message = "The relay service is temporarily unavailable. Please retry."
+	} else {
+		message, _ = safeClientError(status)
 	}
 	payload := map[string]interface{}{
 		"type":   "error",
 		"status": status,
 		"error": map[string]interface{}{
-			"message": message,
+			"type":       map[bool]string{true: "server_error", false: "invalid_request_error"}[status == http.StatusServiceUnavailable],
+			"code":       map[bool]string{true: "service_unavailable", false: "invalid_request"}[status == http.StatusServiceUnavailable],
+			"message":    message,
+			"request_id": requestID,
 		},
 	}
 	raw, err := json.Marshal(payload)

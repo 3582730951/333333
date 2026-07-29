@@ -31,10 +31,12 @@ type Handler struct {
 	up         *upstream.Client
 	httpClient *http.Client
 	pipeline   *pipeline.Pipeline
+	cfg        *config.Config
 
 	defaultMethod string // registration engine when a trigger names none (boot default)
 	defaultGroup  string // account group when a trigger names none (boot default)
 	concurrency   int    // max parallel registrations per batch (boot default)
+	enabled       bool
 
 	mu         sync.Mutex
 	jobCancels map[string]context.CancelFunc // running job id → cancel
@@ -43,6 +45,9 @@ type Handler struct {
 const registrationBatchMaxCount = 100
 
 var errInvalidRegisterRequest = errors.New("invalid registration request")
+var errPaymentFeatureRemoved = errors.New("payment_feature_removed")
+var errRegistrationDisabled = errors.New("registration is disabled until readiness and canary checks pass")
+var errRegistrationNotReady = errors.New("registration method readiness checks failed")
 
 // NewHandler creates a registration handler. It builds the live provider Manager from the
 // provider_settings table and wires the pipeline with an egress-aware upstream client, so
@@ -51,7 +56,7 @@ var errInvalidRegisterRequest = errors.New("invalid registration request")
 func NewHandler(store *storage.Store, up *upstream.Client, defaultMethod string, concurrency int, cfg *config.Config) *Handler {
 	hc := &http.Client{Timeout: 60 * time.Second}
 	if strings.TrimSpace(defaultMethod) == "" {
-		defaultMethod = "node"
+		defaultMethod = "protocol_v2"
 	}
 	defaultGroup := config.DefaultGroupName
 	if cfg != nil && strings.TrimSpace(cfg.DefaultGroup) != "" {
@@ -60,7 +65,8 @@ func NewHandler(store *storage.Store, up *upstream.Client, defaultMethod string,
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	h := &Handler{store: store, up: up, httpClient: hc, defaultMethod: defaultMethod, defaultGroup: defaultGroup, concurrency: concurrency, jobCancels: map[string]context.CancelFunc{}}
+	enabled := cfg != nil && cfg.RegistrationEnabled
+	h := &Handler{store: store, up: up, httpClient: hc, pipeline: nil, cfg: cfg, defaultMethod: defaultMethod, defaultGroup: defaultGroup, concurrency: concurrency, enabled: enabled, jobCancels: map[string]context.CancelFunc{}}
 	mgr, err := provider.BuildManagerWithError(context.Background(), store, hc)
 	if err != nil {
 		log.Printf("[REGISTRATION] provider manager bootstrap failed: %v", err)
@@ -166,7 +172,7 @@ func (h *Handler) recentFailureRate(ctx context.Context) float64 {
 	var total, failed int
 	rows, err := h.store.DB().QueryContext(ctx,
 		`SELECT total, failed FROM registration_jobs
-		 WHERE total > 0 AND status IN ('completed','cancelled')
+		 WHERE total > 0 AND status IN ('completed','completed_with_review','failed','cancelled')
 		 ORDER BY created_at DESC LIMIT 10`)
 	if err != nil {
 		return 0
@@ -296,6 +302,9 @@ func registrationMethodRequiresEmailOTPProvider(method string) bool {
 }
 
 func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.RegisterRequest) error {
+	if req.UpgradeToPlus {
+		return errPaymentFeatureRemoved
+	}
 	req.Platform = strings.ToLower(strings.TrimSpace(req.Platform))
 	if req.Platform == "" {
 		req.Platform = "chatgpt"
@@ -306,7 +315,7 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 
 	req.Method = strings.ToLower(strings.TrimSpace(h.resolveMethod(ctx, req.Method)))
 	if req.Method == "" {
-		req.Method = "node"
+		req.Method = "protocol_v2"
 	}
 	if !supportedRegistrationMethod(req.Method) {
 		return invalidRegisterRequest("unsupported method %q", req.Method)
@@ -412,6 +421,34 @@ func invalidRegisterRequest(format string, args ...interface{}) error {
 	return fmt.Errorf("%w: %s", errInvalidRegisterRequest, fmt.Sprintf(format, args...))
 }
 
+func registrationErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, storage.ErrRegistrationIdentityExists):
+		return "duplicate_remote_identity"
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "provider"), strings.Contains(text, "mailbox"), strings.Contains(text, "sms"):
+		return "provider_unavailable"
+	case strings.Contains(text, "egress"), strings.Contains(text, "proxy"):
+		return "egress_unavailable"
+	case strings.Contains(text, "credential"), strings.Contains(text, "access token"), strings.Contains(text, "identity mismatch"):
+		return "credential_invalid"
+	case strings.Contains(text, "liveness"):
+		return "remote_liveness_failed"
+	case strings.Contains(text, "no account produced"), strings.Contains(text, "signup"):
+		return "registration_incomplete"
+	default:
+		return "internal_failure"
+	}
+}
+
 // ReloadProviders rebuilds the provider Manager from the current provider_settings and
 // re-wires the pipeline, so saving providers in the UI takes effect without a restart.
 func (h *Handler) ReloadProviders(ctx context.Context) error {
@@ -421,7 +458,7 @@ func (h *Handler) ReloadProviders(ctx context.Context) error {
 	}
 	// cfg is nil here — ReloadProviders is called after save, the pipeline already has
 	// its original cfg from NewHandler. We keep the same pipeline's httpClient/cfg.
-	h.pipeline = pipeline.NewPipeline(h.store, mgr, h.up, nil)
+	h.pipeline = pipeline.NewPipeline(h.store, mgr, h.up, h.cfg)
 	h.pipeline.LogEvent = h.logEventDetail
 	return nil
 }
@@ -442,16 +479,25 @@ func (h *Handler) HandleRegisterBatch(w http.ResponseWriter, r *http.Request) {
 	jobID, err := h.StartJob(r.Context(), req)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, errInvalidRegisterRequest) {
+		if errors.Is(err, errPaymentFeatureRemoved) {
+			status = http.StatusGone
+		} else if errors.Is(err, errRegistrationDisabled) {
+			status = http.StatusForbidden
+		} else if errors.Is(err, errRegistrationCanaryRequired) {
+			status = http.StatusConflict
+		} else if errors.Is(err, errRegistrationNotReady) {
+			status = http.StatusServiceUnavailable
+		} else if errors.Is(err, errInvalidRegisterRequest) {
 			status = http.StatusBadRequest
 		}
 		writeError(w, status, err)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
+	w.Header().Set("Location", "/admin/register/jobs/"+jobID)
+	writeJSON(w, http.StatusAccepted, map[string]string{
 		"job_id": jobID,
-		"status": "started",
+		"status": "queued",
 	})
 }
 
@@ -459,14 +505,47 @@ func (h *Handler) HandleRegisterBatch(w http.ResponseWriter, r *http.Request) {
 // cancelable context. Returns the job id. Shared by the HTTP handler and the automation
 // scheduler (auto-refill).
 func (h *Handler) StartJob(ctx context.Context, req pipeline.RegisterRequest) (string, error) {
+	if req.Canary {
+		return "", invalidRegisterRequest("canary jobs must use /admin/register/canary")
+	}
+	return h.startRegistrationJob(ctx, req, false)
+}
+
+func (h *Handler) StartCanary(ctx context.Context, req pipeline.RegisterRequest) (string, error) {
+	if req.Count != 0 && req.Count != 1 {
+		return "", invalidRegisterRequest("canary count must be exactly 1")
+	}
+	req.Count = 1
+	return h.startRegistrationJob(ctx, req, true)
+}
+
+func (h *Handler) startRegistrationJob(ctx context.Context, req pipeline.RegisterRequest, canary bool) (string, error) {
+	if req.UpgradeToPlus {
+		return "", errPaymentFeatureRemoved
+	}
 	if err := h.normalizeRegisterRequest(ctx, &req); err != nil {
 		return "", err
 	}
+	if !h.enabled {
+		return "", errRegistrationDisabled
+	}
+	req.Canary = canary
+	readiness, err := h.registrationMethodReadiness(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", errRegistrationNotReady, err)
+	}
+	if !readiness.Ready {
+		return "", errRegistrationNotReady
+	}
+	if !canary && !readiness.CanaryReady {
+		return "", errRegistrationCanaryRequired
+	}
+	req.ReadinessFingerprint = readiness.Fingerprint
 	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
 	configJSON, _ := json.Marshal(req)
 	if _, err := h.store.DB().ExecContext(ctx,
 		`INSERT INTO registration_jobs (id, platform, method, total, status, config_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
 		jobID, req.Platform, req.Method, req.Count, string(configJSON), time.Now().Unix(), time.Now().Unix()); err != nil {
 		return "", err
 	}
@@ -489,13 +568,13 @@ func (h *Handler) runProcessBatch(ctx context.Context, jobID string, req pipelin
 	h.processBatch(ctx, jobID, req)
 }
 
-func (h *Handler) failRegistrationJob(jobID, message string) {
+func (h *Handler) failRegistrationJob(jobID, _ string) {
 	bg := context.Background()
 	now := time.Now().Unix()
 	_, _ = h.store.DB().ExecContext(bg,
 		`UPDATE registration_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=?`,
-		message, now, now, jobID)
-	h.logEvent(bg, jobID, "error", message)
+		"registration_internal_failure", now, now, jobID)
+	h.logEvent(bg, jobID, "error", "Registration job failed (internal_failure)")
 }
 
 func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.RegisterRequest) {
@@ -520,6 +599,8 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 	succeeded := 0
 	failed := 0
 	cancelled := false
+	canaryAccountID := ""
+	canaryErrorClass := ""
 
 	// Bounded-concurrency worker pool. Each parallel registration is isolated by the
 	// orchestrator (unique egress IP, fingerprint, throwaway profile). DB writes and the
@@ -530,6 +611,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 	var mu sync.Mutex
 	cancelled = runBounded(ctx, req.Count, concurrency, func(i int) {
 		recordID := fmt.Sprintf("rec_%d_%d", time.Now().UnixNano(), i)
+		workflowItemID := fmt.Sprintf("rwi_%d_%d", time.Now().UnixNano(), i)
 		start := time.Now()
 		recordCreated := false
 		settled := false
@@ -539,7 +621,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 				if settled {
 					return
 				}
-				message := fmt.Sprintf("Registration %d panicked: %v", i+1, v)
+				message := fmt.Sprintf("Registration %d failed (internal_failure)", i+1)
 				duration := int(time.Since(start).Seconds())
 				mu.Lock()
 				defer mu.Unlock()
@@ -555,6 +637,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 						message, duration, recordID)
 				}
 				h.logEvent(bg, jobID, "error", message)
+				_ = h.store.UpdateRegistrationWorkflowItem(bg, workflowItemID, storage.RegistrationItemFailed, "internal_failure")
 				_, _ = h.store.DB().ExecContext(bg,
 					`UPDATE registration_jobs SET succeeded=?, failed=?, updated_at=? WHERE id=?`,
 					succeeded, failed, time.Now().Unix(), jobID)
@@ -563,8 +646,9 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		mu.Lock()
 		h.store.DB().ExecContext(bg,
 			`INSERT INTO registration_records (id, job_id, status, created_at)
-			 VALUES (?, ?, 'pending', ?)`,
+				 VALUES (?, ?, 'pending', ?)`,
 			recordID, jobID, time.Now().Unix())
+		_ = h.store.CreateRegistrationWorkflowItem(bg, workflowItemID, jobID, req.Method, req.Platform)
 		recordCreated = true
 		mu.Unlock()
 
@@ -581,6 +665,12 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 				workerReq.EgressID = egress.ID
 			}
 		}
+		workerReq.JobID = jobID
+		workerReq.RecordID = recordID
+		workerReq.WorkflowItemID = workflowItemID
+		if err == nil {
+			err = h.store.UpdateRegistrationWorkflowItem(ctx, workflowItemID, storage.RegistrationItemResourcesLeased, "")
+		}
 		var account *storage.Account
 		if err == nil {
 			account, err = h.pipeline.RegisterOne(ctx, workerReq)
@@ -594,16 +684,25 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		defer mu.Unlock()
 		if err != nil {
 			failed++
+			errorClass := registrationErrorClass(err)
+			if req.Canary {
+				canaryErrorClass = errorClass
+			}
+			message := fmt.Sprintf("Registration %d failed (%s)", i+1, errorClass)
 			h.store.DB().ExecContext(bg,
 				`UPDATE registration_records SET status='failed', error=?, duration_seconds=? WHERE id=?`,
-				err.Error(), duration, recordID)
-			h.logEvent(bg, jobID, "error", fmt.Sprintf("Registration %d failed: %v", i+1, err))
+				errorClass, duration, recordID)
+			_ = h.store.UpdateRegistrationWorkflowItem(bg, workflowItemID, storage.RegistrationItemFailed, errorClass)
+			h.logEvent(bg, jobID, "error", message)
 		} else {
 			succeeded++
+			if req.Canary {
+				canaryAccountID = account.ID
+			}
 			h.store.DB().ExecContext(bg,
 				`UPDATE registration_records SET status='success', account_id=?, sms_provider=?, sms_country=?, sms_cost=?, duration_seconds=? WHERE id=?`,
 				account.ID, req.SMSProvider, req.SMSCountry, req.SMSCost, duration, recordID)
-			h.logEvent(bg, jobID, "info", fmt.Sprintf("Registration %d succeeded: %s", i+1, account.ID))
+			h.logEvent(bg, jobID, "info", fmt.Sprintf("Registration %d succeeded", i+1))
 		}
 		h.store.DB().ExecContext(bg,
 			`UPDATE registration_jobs SET succeeded=?, failed=?, updated_at=? WHERE id=?`,
@@ -614,10 +713,27 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 	status := "completed"
 	if cancelled {
 		status = "cancelled"
+	} else if failed > 0 && succeeded > 0 {
+		status = "completed_with_review"
+	} else if failed > 0 {
+		status = "failed"
 	}
 	h.store.DB().ExecContext(bg,
 		`UPDATE registration_jobs SET status=?, completed_at=?, updated_at=? WHERE id=?`,
 		status, time.Now().Unix(), time.Now().Unix(), jobID)
+	if req.Canary {
+		canaryStatus := "failed"
+		if status == "completed" && succeeded == 1 && failed == 0 {
+			canaryStatus = "passed"
+		}
+		if cancelled {
+			canaryErrorClass = "cancelled"
+		}
+		_ = h.store.RecordRegistrationCanary(
+			bg, req.Method, canaryStatus, req.ReadinessFingerprint,
+			jobID, canaryAccountID, canaryErrorClass,
+		)
+	}
 
 	h.logEvent(bg, jobID, "info", fmt.Sprintf("Batch %s: %d succeeded, %d failed", status, succeeded, failed))
 
@@ -626,7 +742,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 	// low-RAM VPS is not asked to run parallel browsers — and surface it in the log so
 	// the operator sees why concurrency dropped. The operator can clear reg_degraded
 	// from the SettingsV2 "日志与降级" tab once the underlying issue is fixed.
-	if succeeded+failed > 0 {
+	if !req.Canary && succeeded+failed > 0 {
 		rate := float64(failed) / float64(succeeded+failed)
 		threshold := h.failureThreshold(bg)
 		if rate >= threshold {
@@ -748,7 +864,7 @@ func (h *Handler) HandleJobCancel(w http.ResponseWriter, r *http.Request, jobID 
 		cancel()
 	}
 	res, err := h.store.DB().ExecContext(r.Context(),
-		`UPDATE registration_jobs SET status='cancelled', completed_at=?, updated_at=? WHERE id=? AND status IN ('pending','running')`,
+		`UPDATE registration_jobs SET status='cancelled', completed_at=?, updated_at=? WHERE id=? AND status IN ('queued','pending','running')`,
 		time.Now().Unix(), time.Now().Unix(), jobID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1021,10 +1137,14 @@ func (h *Handler) writeRegistrationJobStatusError(w http.ResponseWriter, jobID s
 }
 
 func writeRegistrationSSEError(w io.Writer, err error) {
+	requestID := newRequestID()
+	log.Printf("[REGISTRATION-SSE] internal stream failure request_id=%s class=%T", requestID, err)
 	data, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{
-			"message": err.Error(),
-			"type":    "codex_pool_error",
+			"type":       "server_error",
+			"code":       "service_unavailable",
+			"message":    "The relay service is temporarily unavailable. Please retry.",
+			"request_id": requestID,
 		},
 	})
 	fmt.Fprintf(w, "event: error\ndata: %s\n\n", data)
@@ -1142,7 +1262,7 @@ func (h *Handler) saveDefaultsWithExecutor(ctx context.Context, exec sqlExecutor
 // response left the UI's data.providers / data.defaults undefined → nothing rendered).
 func (h *Handler) listProviders(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.store.DB().QueryContext(r.Context(),
-		`SELECT id, provider_type, provider_key, display_name, enabled, priority, config_json
+		`SELECT id, provider_type, provider_key, display_name, enabled, priority, config_json, auth_json
 		 FROM provider_settings ORDER BY provider_type, priority DESC`)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1152,9 +1272,9 @@ func (h *Handler) listProviders(w http.ResponseWriter, r *http.Request) {
 
 	providers := []map[string]interface{}{}
 	for rows.Next() {
-		var id, providerType, providerKey, displayName, configJSON string
+		var id, providerType, providerKey, displayName, configJSON, authJSON string
 		var enabled, priority int
-		if err := rows.Scan(&id, &providerType, &providerKey, &displayName, &enabled, &priority, &configJSON); err != nil {
+		if err := rows.Scan(&id, &providerType, &providerKey, &displayName, &enabled, &priority, &configJSON, &authJSON); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -1169,6 +1289,27 @@ func (h *Handler) listProviders(w http.ResponseWriter, r *http.Request) {
 		if config == nil {
 			config = map[string]interface{}{}
 		}
+		credentials := storage.ProviderAuthMetadata(authJSON)
+		for field, value := range config {
+			if !storage.IsProviderSecretField(field) {
+				continue
+			}
+			if strings.TrimSpace(cfgString(value)) != "" {
+				if _, exists := credentials[field]; !exists {
+					credentials[field] = map[string]interface{}{
+						"configured":  true,
+						"masked":      "••••",
+						"key_version": "legacy",
+						"key_id":      "",
+					}
+				}
+			}
+			delete(config, field)
+		}
+		for field := range credentials {
+			config[field] = ""
+			config[field+"_configured"] = true
+		}
 
 		providers = append(providers, map[string]interface{}{
 			"id":           id,
@@ -1178,6 +1319,7 @@ func (h *Handler) listProviders(w http.ResponseWriter, r *http.Request) {
 			"enabled":      enabled == 1,
 			"priority":     priority,
 			"config":       config,
+			"credentials":  credentials,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -1350,22 +1492,49 @@ func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWr
 	for k, v := range p.Config {
 		cfg[k] = v
 	}
-	var existingID, existingCfg string
+	var existingID, existingCfg, existingAuth string
 	err := exec.QueryRowContext(ctx,
-		`SELECT id, config_json FROM provider_settings WHERE provider_type=? AND provider_key=?`,
-		p.Type, p.Key).Scan(&existingID, &existingCfg)
+		`SELECT id, config_json, auth_json FROM provider_settings WHERE provider_type=? AND provider_key=?`,
+		p.Type, p.Key).Scan(&existingID, &existingCfg, &existingAuth)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	if cfgString(cfg["api_key"]) == "" && existingCfg != "" {
-		old := map[string]interface{}{}
-		if json.Unmarshal([]byte(existingCfg), &old) == nil {
-			if k := cfgString(old["api_key"]); k != "" {
-				cfg["api_key"] = k
+	publicConfig, incomingSecrets, err := storage.SplitProviderConfig(cfg)
+	if err != nil {
+		return "", err
+	}
+	existingSecrets := map[string]string{}
+	if existingID != "" {
+		existingSecrets, err = h.store.OpenProviderAuthJSON(p.Type, p.Key, existingAuth)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(existingCfg) != "" {
+			old := map[string]interface{}{}
+			if err := json.Unmarshal([]byte(existingCfg), &old); err != nil {
+				return "", err
+			}
+			_, legacySecrets, err := storage.SplitProviderConfig(old)
+			if err != nil {
+				return "", err
+			}
+			for field, value := range legacySecrets {
+				if strings.TrimSpace(value) != "" {
+					existingSecrets[field] = value
+				}
 			}
 		}
 	}
-	configJSON, err := json.Marshal(cfg)
+	for field, value := range incomingSecrets {
+		if strings.TrimSpace(value) != "" {
+			existingSecrets[field] = value
+		}
+	}
+	configJSON, err := json.Marshal(publicConfig)
+	if err != nil {
+		return "", err
+	}
+	authJSON, err := h.store.SealProviderAuthJSON(p.Type, p.Key, existingSecrets)
 	if err != nil {
 		return "", err
 	}
@@ -1380,8 +1549,8 @@ func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWr
 	now := time.Now().Unix()
 	if existingID != "" {
 		if _, err := exec.ExecContext(ctx,
-			`UPDATE provider_settings SET display_name=?, enabled=?, priority=?, config_json=?, updated_at=? WHERE id=?`,
-			display, enabled, p.Priority, string(configJSON), now, existingID); err != nil {
+			`UPDATE provider_settings SET display_name=?, enabled=?, priority=?, config_json=?, auth_json=?, updated_at=? WHERE id=?`,
+			display, enabled, p.Priority, string(configJSON), authJSON, now, existingID); err != nil {
 			return "", err
 		}
 		return existingID, nil
@@ -1389,8 +1558,8 @@ func (h *Handler) upsertProviderWithExecutor(ctx context.Context, exec sqlReadWr
 	id := fmt.Sprintf("prov_%d", time.Now().UnixNano())
 	if _, err := exec.ExecContext(ctx,
 		`INSERT INTO provider_settings (id, provider_type, provider_key, display_name, enabled, priority, config_json, auth_json, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, ?)`,
-		id, p.Type, p.Key, display, enabled, p.Priority, string(configJSON), now, now); err != nil {
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, p.Type, p.Key, display, enabled, p.Priority, string(configJSON), authJSON, now, now); err != nil {
 		return "", err
 	}
 	return id, nil

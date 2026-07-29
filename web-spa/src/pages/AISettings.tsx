@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';

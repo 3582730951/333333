@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
 import { IconRefresh, IconPlus, IconUser, IconKey, IconSetting, IconLineChartStroked } from '../components/pool/icons.jsx';
 import LoadErrorBannerBase from '../components/LoadErrorBanner.jsx';

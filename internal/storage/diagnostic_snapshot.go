@@ -7,18 +7,25 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 // DiagnosticSnapshot pins one read-only SQLite WAL snapshot. Writers continue to
 // commit while every query issued through Store() observes the same boundary.
 type DiagnosticSnapshot struct {
-	id     string
-	conn   *sql.Conn
-	tx     *sql.Tx
-	driver string
-	mu     sync.Mutex
+	id         string
+	conn       *sql.Conn
+	tx         *sql.Tx
+	driver     string
+	mu         sync.Mutex
+	backupDB   *sql.DB
+	backupPath string
 }
 
 func (s *Store) BeginDiagnosticSnapshot(ctx context.Context) (*DiagnosticSnapshot, error) {
@@ -47,26 +54,97 @@ func (s *Store) BeginDiagnosticSnapshot(ctx context.Context) (*DiagnosticSnapsho
 		}
 		return &DiagnosticSnapshot{id: newDiagnosticSnapshotID(), conn: conn, tx: tx, driver: s.driver}, nil
 	}
-	if _, err = conn.ExecContext(ctx, "PRAGMA query_only=ON"); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("make diagnostic SQLite connection read-only: %w", err)
+	_ = conn.Close()
+	return s.beginSQLiteDiagnosticBackup(ctx, pool)
+}
+
+func (s *Store) beginSQLiteDiagnosticBackup(ctx context.Context, pool *sql.DB) (*DiagnosticSnapshot, error) {
+	tempDir := os.TempDir()
+	databasePath := strings.SplitN(s.path, "?", 2)[0]
+	if databasePath != "" && databasePath != ":memory:" && !strings.Contains(databasePath, "mode=memory") {
+		if candidate := filepath.Dir(databasePath); candidate != "" {
+			tempDir = candidate
+		}
 	}
-	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	temp, err := os.CreateTemp(tempDir, ".diagnostic-snapshot-*.sqlite3")
 	if err != nil {
-		_, _ = conn.ExecContext(context.Background(), "PRAGMA query_only=OFF")
-		_ = conn.Close()
-		return nil, fmt.Errorf("begin diagnostic SQLite snapshot: %w", err)
+		return nil, fmt.Errorf("create diagnostic SQLite backup: %w", err)
 	}
-	// A deferred SQLite transaction chooses its WAL boundary on the first read.
-	// Force that read here so later writer commits cannot move the export boundary.
-	var schemaRows int64
-	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master").Scan(&schemaRows); err != nil {
-		_ = tx.Rollback()
-		_, _ = conn.ExecContext(context.Background(), "PRAGMA query_only=OFF")
-		_ = conn.Close()
-		return nil, fmt.Errorf("establish diagnostic SQLite snapshot: %w", err)
+	tempPath := temp.Name()
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return nil, err
 	}
-	return &DiagnosticSnapshot{id: newDiagnosticSnapshotID(), conn: conn, tx: tx, driver: s.driver}, nil
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+	destination, err := sql.Open("sqlite3", tempPath+"?_busy_timeout=5000&_foreign_keys=on")
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+	destination.SetMaxOpenConns(1)
+	sourceConn, err := pool.Conn(ctx)
+	if err != nil {
+		_ = destination.Close()
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+	defer sourceConn.Close()
+	destinationConn, err := destination.Conn(ctx)
+	if err != nil {
+		_ = destination.Close()
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+	backupErr := sourceConn.Raw(func(sourceDriver any) error {
+		sourceSQLite, ok := sourceDriver.(*sqlite3.SQLiteConn)
+		if !ok {
+			return errors.New("unexpected SQLite source driver")
+		}
+		return destinationConn.Raw(func(destinationDriver any) error {
+			destinationSQLite, ok := destinationDriver.(*sqlite3.SQLiteConn)
+			if !ok {
+				return errors.New("unexpected SQLite destination driver")
+			}
+			backup, err := destinationSQLite.Backup("main", sourceSQLite, "main")
+			if err != nil {
+				return err
+			}
+			defer backup.Finish()
+			for {
+				done, stepErr := backup.Step(256)
+				if stepErr != nil {
+					return stepErr
+				}
+				if done {
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Millisecond):
+				}
+			}
+		})
+	})
+	_ = destinationConn.Close()
+	if backupErr != nil {
+		_ = destination.Close()
+		_ = os.Remove(tempPath)
+		return nil, fmt.Errorf("backup diagnostic SQLite snapshot: %w", backupErr)
+	}
+	if _, err := destination.ExecContext(ctx, `PRAGMA query_only=ON`); err != nil {
+		_ = destination.Close()
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+	return &DiagnosticSnapshot{
+		id: newDiagnosticSnapshotID(), driver: s.driver,
+		backupDB: destination, backupPath: tempPath,
+	}, nil
 }
 
 func (s *DiagnosticSnapshot) ID() string {
@@ -79,11 +157,17 @@ func (s *DiagnosticSnapshot) ID() string {
 // Store returns a read-only view whose normal list methods are bound to the
 // snapshot transaction. The view does not own the source store or transaction.
 func (s *DiagnosticSnapshot) Store(source *Store) (*Store, error) {
-	if s == nil || source == nil || s.tx == nil {
+	if s == nil || source == nil {
 		return nil, errors.New("diagnostic snapshot is unavailable")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.backupDB != nil {
+		return &Store{
+			path: s.backupPath, driver: source.driver, db: s.backupDB, rdb: s.backupDB,
+			tokenKey: source.tokenKey, tokenKeys: source.tokenKeys, cryptoStrict: source.cryptoStrict,
+		}, nil
+	}
 	if s.tx == nil {
 		return nil, errors.New("diagnostic snapshot is closed")
 	}
@@ -96,6 +180,13 @@ func (s *DiagnosticSnapshot) Close() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.backupDB != nil {
+		closeErr := s.backupDB.Close()
+		s.backupDB = nil
+		removeErr := os.Remove(s.backupPath)
+		s.backupPath = ""
+		return errors.Join(closeErr, removeErr)
+	}
 	if s.tx == nil || s.conn == nil {
 		return nil
 	}

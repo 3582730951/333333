@@ -111,13 +111,19 @@ _EMAIL_PROVIDER_API = {
 }
 
 # hotmail_otp: Hotmail plus-addressing on a REAL inbox (OpenAI delivers to it, unlike
-# disposable domains). All kvmlqqi+{tag}@hotmail.com land in one inbox; an external reader
-# returns recent emails as JSON. (other_project's proven path — see docs/init.md.)
-HOTMAIL_BASE_EMAIL = os.environ.get("HOTMAIL_BASE_EMAIL", "kvmlqqi@hotmail.com")
+# disposable domains). An operator-provided plus-addressing inbox and authenticated reader
+# return recent emails as JSON.
+HOTMAIL_BASE_EMAIL = os.environ.get("HOTMAIL_BASE_EMAIL", "")
 HOTMAIL_OTP_URL = os.environ.get(
     "HOTMAIL_OTP_URL",
-    "http://185.242.234.133:8000/get_email/a89ae03149b94598a554614fa4d5e826",
+    "",
 )
+HOTMAIL_OTP_TOKEN = os.environ.get("HOTMAIL_OTP_TOKEN", "")
+
+def _hotmail_headers():
+    if not HOTMAIL_OTP_TOKEN:
+        raise RuntimeError("authenticated Hotmail OTP relay token is missing")
+    return {"Authorization": f"Bearer {HOTMAIL_OTP_TOKEN}"}
 
 if EMAIL_PROVIDER == "duckmail" and not DUCKMAIL_BEARER:
     print("⚠️ 警告: 使用 DuckMail 但未设置 DUCKMAIL_BEARER")
@@ -470,7 +476,7 @@ def _upload_token_json(filepath):
             UPLOAD_API_URL,
             multipart=mp,
             headers={"Authorization": f"Bearer {UPLOAD_API_TOKEN}"},
-            verify=False,
+            verify=True,
             timeout=30,
         )
 
@@ -605,7 +611,7 @@ class ChatGPTRegister:
 
     def _fetch_available_domain(self, session, api_base):
         """从 mail.tm / mail.gw 获取可用邮箱域名"""
-        res = session.get(f"{api_base}/domains", timeout=15, verify=False)
+        res = session.get(f"{api_base}/domains", timeout=15, verify=True)
         if res.status_code != 200:
             raise Exception(f"获取域名列表失败: {res.status_code}")
         data = res.json()
@@ -632,7 +638,13 @@ class ChatGPTRegister:
                 # 快照当前收件箱，后续只接受「之后」到达的新邮件，避免取到旧验证码
                 self._hotmail_seen = set()
                 try:
-                    r = std_requests.get(HOTMAIL_OTP_URL, timeout=12, proxies=None, verify=False)
+                    r = std_requests.get(
+                        HOTMAIL_OTP_URL,
+                        timeout=12,
+                        proxies=None,
+                        verify=True,
+                        headers=_hotmail_headers(),
+                    )
                     for m in (r.json().get("emails", []) if r.status_code == 200 else []):
                         self._hotmail_seen.add(str(m.get("时间", "")) + str(m.get("主题", "")))
                 except Exception:
@@ -646,7 +658,7 @@ class ChatGPTRegister:
                     f"{api_base}/v2/inbox/create",
                     timeout=15,
                     proxies=None,  # 邮箱 API 直连，不走住宅代理
-                    verify=False,
+                    verify=True,
                 )
                 if res.status_code not in [200, 201]:
                     raise Exception(f"创建收件箱失败: {res.status_code} - {res.text[:200]}")
@@ -682,7 +694,7 @@ class ChatGPTRegister:
                 json=payload,
                 headers=headers,
                 timeout=15,
-                verify=False,
+                verify=True,
             )
             if res.status_code not in [200, 201]:
                 raise Exception(f"创建邮箱失败: {res.status_code} - {res.text[:200]}")
@@ -692,7 +704,7 @@ class ChatGPTRegister:
                 f"{api_base}/token",
                 json={"address": email, "password": password},
                 timeout=15,
-                verify=False,
+                verify=True,
             )
             if token_res.status_code == 200:
                 mail_token = token_res.json().get("token")
@@ -710,7 +722,13 @@ class ChatGPTRegister:
 
             # hotmail_otp: 直连外部读信服务，只返回基线之后到达的「新」邮件
             if EMAIL_PROVIDER == "hotmail_otp":
-                res = std_requests.get(HOTMAIL_OTP_URL, timeout=15, proxies=None, verify=False)
+                res = std_requests.get(
+                    HOTMAIL_OTP_URL,
+                    timeout=15,
+                    proxies=None,
+                    verify=True,
+                    headers=_hotmail_headers(),
+                )
                 if res.status_code != 200:
                     return []
                 seen = getattr(self, "_hotmail_seen", set())
@@ -729,7 +747,7 @@ class ChatGPTRegister:
                     params={"token": mail_token},
                     timeout=15,
                     proxies=None,  # 邮箱 API 直连，不走住宅代理
-                    verify=False,
+                    verify=True,
                 )
                 if res.status_code == 200:
                     data = res.json()
@@ -744,7 +762,7 @@ class ChatGPTRegister:
                 f"{api_base}/messages",
                 headers=headers,
                 timeout=15,
-                verify=False,
+                verify=True,
             )
             if res.status_code == 200:
                 data = res.json()
@@ -771,7 +789,7 @@ class ChatGPTRegister:
                 f"{api_base}/messages/{msg_id}",
                 headers=headers,
                 timeout=15,
-                verify=False,
+                verify=True,
             )
             if res.status_code == 200:
                 return res.json()

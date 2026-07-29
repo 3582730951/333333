@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { del, get, post } from '../../../api.js';
 import { createApiError, parseApiResponse } from '../../../api/contracts';
 import type {
-  AdvancedSettings, AdvancedSettingsKind, AdvancedSettingsSaveInput, AutomationSettings, ConfigField, LifecycleSettings, ProviderOptions, ProviderSetting,
+  AdvancedSettings, AdvancedSettingsKind, AdvancedSettingsSaveInput, AutomationSettings, ConfigField, ProviderOptions, ProviderSetting,
   ContextJournalClearResponse, LogClearResponse, RegistrarSaveInput, RegistrarSettings, SettingsEgress, SettingsGroup, SettingsPatch,
   SettingsSaveResponse, SettingsSection, SettingsTemplate, SettingsValues, SharedSettingsOptions,
 } from '../model/settings';
@@ -150,16 +150,6 @@ export const registrarSectionSchema = z.object({
   registrar: valuesSchema.optional(),
 }).passthrough().transform((view) => view.registrar ?? {});
 
-export const lifecycleSectionSchema = z.object({
-  lifecycle: z.object({
-    defaults: valuesSchema.optional(),
-    defaults_error: z.string().optional(),
-  }).passthrough().optional(),
-}).passthrough().transform((view): LifecycleSettings => ({
-  defaults: view.lifecycle?.defaults ?? {},
-  defaultsError: view.lifecycle?.defaults_error ?? '',
-}));
-
 function runtimeSectionSchema(section: 'logging' | 'memory') {
   return z.object({ [section]: valuesSchema.optional() }).passthrough()
     .transform((view) => (view[section] ?? {}) as SettingsValues);
@@ -278,10 +268,6 @@ export async function fetchRegistrarSettings(signal?: AbortSignal): Promise<Regi
       providers: providersResult.status === 'rejected' ? '接码平台配置读取失败' : '',
     },
   };
-}
-
-export async function fetchLifecycleSettings(signal?: AbortSignal): Promise<LifecycleSettings> {
-  return parseApiResponse(lifecycleSectionSchema, await get(settingsCenterURL('lifecycle'), undefined, { signal }));
 }
 
 export async function fetchLoggingSettings(signal?: AbortSignal): Promise<SettingsValues> {

@@ -29,6 +29,8 @@ import (
 const upstreamErrorBodyLimit = 1 << 20
 const adminJSONBodyLimit = 1 << 20
 
+var errRequestBodyTooLarge = errors.New("request body too large")
+
 func readLimited(r io.Reader, max int64) ([]byte, error) {
 	return readLimitedWithMessage(r, max, "request body too large")
 }
@@ -39,7 +41,7 @@ func requestBodyBytes(r *http.Request, max int64) ([]byte, error) {
 			max = config.DefaultMaxBodyBytes
 		}
 		if source.Size() > max {
-			return nil, errors.New("request body too large")
+			return nil, errRequestBodyTooLarge
 		}
 		if view, ok := bodysource.ByteView(source); ok {
 			return view, nil
@@ -57,6 +59,9 @@ func readLimitedWithMessage(r io.Reader, max int64, limitMessage string) ([]byte
 		return nil, err
 	}
 	if int64(len(raw)) > max {
+		if limitMessage == errRequestBodyTooLarge.Error() {
+			return nil, errRequestBodyTooLarge
+		}
 		return nil, errors.New(limitMessage)
 	}
 	return raw, nil
@@ -215,32 +220,118 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 func writeRaw(w http.ResponseWriter, status int, headers http.Header, body []byte) {
+	if status >= http.StatusBadRequest {
+		writePublicServiceUnavailable(w)
+		return
+	}
 	copyDownstreamHeaders(w.Header(), headers)
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
-	errorBody := map[string]interface{}{
-		"message": err.Error(),
-		"type":    "codex_pool_error",
+	if errors.Is(err, errRequestBodyTooLarge) {
+		status = http.StatusRequestEntityTooLarge
 	}
-	if requestID := strings.TrimSpace(w.Header().Get(requestIDHeader)); requestID != "" {
-		errorBody["request_id"] = requestID
+	if status < 400 || status >= 500 {
+		writePublicServiceUnavailable(w)
+		return
 	}
+	message, code := safeClientError(status)
+	if public, ok := err.(*PublicError); ok {
+		if strings.TrimSpace(public.Message) != "" {
+			message = public.Message
+		}
+		if strings.TrimSpace(public.Code) != "" {
+			code = public.Code
+		}
+	}
+	resetPublicErrorHeaders(w)
 	writeJSON(w, status, map[string]interface{}{
-		"error": errorBody,
+		"error": map[string]interface{}{
+			"message":    message,
+			"type":       "invalid_request_error",
+			"code":       code,
+			"request_id": publicRequestID(w),
+		},
+	})
+}
+
+// PublicError is restricted to messages and codes that are safe to expose. Raw
+// upstream or persistence errors must never be wrapped in this type.
+type PublicError struct {
+	Code    string
+	Message string
+}
+
+func (e *PublicError) Error() string { return e.Message }
+
+func safeClientError(status int) (string, string) {
+	switch status {
+	case http.StatusBadRequest:
+		return "The request is invalid.", "invalid_request"
+	case http.StatusUnauthorized:
+		return "Invalid or missing credentials.", "invalid_api_key"
+	case http.StatusForbidden:
+		return "The request is not permitted.", "forbidden"
+	case http.StatusNotFound:
+		return "The requested resource was not found.", "not_found"
+	case http.StatusMethodNotAllowed:
+		return "The requested method is not supported.", "method_not_allowed"
+	case http.StatusConflict:
+		return "The request conflicts with the current resource state.", "conflict"
+	case http.StatusGone:
+		return "This feature has been removed.", "feature_removed"
+	case http.StatusRequestEntityTooLarge:
+		return "The request body is too large.", "request_too_large"
+	case http.StatusTooManyRequests:
+		return "The downstream tenant quota has been exceeded.", "rate_limit_exceeded"
+	default:
+		return "The request could not be accepted.", "invalid_request"
+	}
+}
+
+func publicRequestID(w http.ResponseWriter) string {
+	requestID := strings.TrimSpace(w.Header().Get(requestIDHeader))
+	if requestID == "" {
+		requestID = newRequestID()
+		w.Header().Set(requestIDHeader, requestID)
+	}
+	return requestID
+}
+
+func resetPublicErrorHeaders(w http.ResponseWriter) {
+	requestID := strings.TrimSpace(w.Header().Get(requestIDHeader))
+	retryAfter := strings.TrimSpace(w.Header().Get("Retry-After"))
+	for name := range w.Header() {
+		w.Header().Del(name)
+	}
+	if requestID != "" {
+		w.Header().Set(requestIDHeader, requestID)
+	}
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	w.Header().Set("Content-Type", "application/json")
+}
+
+func writePublicServiceUnavailable(w http.ResponseWriter) {
+	requestID := publicRequestID(w)
+	resetPublicErrorHeaders(w)
+	w.Header().Set(requestIDHeader, requestID)
+	w.Header().Set("Retry-After", "3")
+	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+		"error": map[string]interface{}{
+			"type":       "server_error",
+			"code":       "service_unavailable",
+			"message":    "The relay service is temporarily unavailable. Please retry.",
+			"request_id": requestID,
+		},
 	})
 }
 
 func writeResourceExhausted(w http.ResponseWriter, message string) {
-	if strings.TrimSpace(message) == "" {
-		message = "resource capacity exhausted"
-	}
-	w.Header().Set("Retry-After", "1")
-	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{"error": map[string]interface{}{
-		"message": message, "type": "resource_exhausted", "code": "resource_exhausted",
-	}})
+	writePublicServiceUnavailable(w)
 }
 
 func methodNotAllowed(w http.ResponseWriter) {

@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Button, Tag, Toast, Typography } from '../components/pool/index.jsx';
 import { IconPlay, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
 import { errMsg, get, post } from '../api.js';

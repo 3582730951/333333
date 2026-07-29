@@ -2,10 +2,24 @@
 set -eu
 
 run_dir=/var/lib/codex-pool/run
+secret_dir=/run/secrets
 release_id="${CODEX_POOL_RELEASE_ID:-docker}"
 worker_socket="${run_dir}/worker-${release_id}.sock"
 active_link="${run_dir}/active-worker.sock"
 worker=/usr/local/lib/codex-pool/releases/docker/codex-pool-server
+
+if [ -f "${secret_dir}/codex_pool_master_key" ] && [ -z "${CODEX_POOL_MASTER_KEY_FILE:-}" ]; then
+  export CODEX_POOL_MASTER_KEY_FILE="${secret_dir}/codex_pool_master_key"
+fi
+if [ -f "${secret_dir}/codex_pool_identity_key" ] && [ -z "${CODEX_POOL_IDENTITY_KEY_FILE:-}" ]; then
+  export CODEX_POOL_IDENTITY_KEY_FILE="${secret_dir}/codex_pool_identity_key"
+fi
+if [ -f "${secret_dir}/codex_pool_diagnostic_alias_key" ] && [ -z "${CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE:-}" ]; then
+  export CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE="${secret_dir}/codex_pool_diagnostic_alias_key"
+fi
+if [ -f "${secret_dir}/codex_pool_admin_token" ] && [ -z "${CODEX_POOL_ADMIN_TOKEN_FILE:-}" ]; then
+  export CODEX_POOL_ADMIN_TOKEN_FILE="${secret_dir}/codex_pool_admin_token"
+fi
 
 mkdir -p "$run_dir"
 rm -f "$worker_socket"

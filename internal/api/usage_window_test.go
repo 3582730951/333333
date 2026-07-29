@@ -552,10 +552,13 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 		t.Fatalf("response is not a zip: %v\n%s", err, raw)
 	}
 	files := readZipFiles(t, raw)
-	for _, name := range []string{"manifest.json", "summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "route_map.csv", "account_map.csv", "kiro_capabilities.csv", "usage_sources.csv"} {
+	for _, name := range []string{"manifest.json", "summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "route_map.csv", "kiro_capabilities.csv", "usage_sources.csv"} {
 		if _, ok := files[name]; !ok {
 			t.Fatalf("cache hit zip missing %s; has %v", name, zipFileNames(files))
 		}
+	}
+	if _, ok := files["account_map.csv"]; ok {
+		t.Fatal("cache hit zip must not contain a reversible account map")
 	}
 	if !strings.Contains(files["manifest.json"], "codex-pool-cache-hits-v2") || !strings.Contains(files["manifest.json"], "excluded from calculable hit-rate denominators") {
 		t.Fatalf("manifest format missing:\n%s", files["manifest.json"])
@@ -581,12 +584,8 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 		t.Fatalf("route_map.csv must expose the zip-level route codebook:\n%s", files["route_map.csv"])
 	}
 	for version, archiveFiles := range map[string]map[string]string{"v2": files, "v1": legacyFiles} {
-		accountMap, err := csv.NewReader(strings.NewReader(archiveFiles["account_map.csv"])).ReadAll()
-		if err != nil {
-			t.Fatalf("%s account_map.csv: %v", version, err)
-		}
-		if len(accountMap) != 2 || len(accountMap[0]) != 2 || accountMap[0][0] != "account_code" || accountMap[0][1] != "account_id" || accountMap[1][0] != "ACC-0001" || accountMap[1][1] != account.ID {
-			t.Fatalf("%s account_map.csv must contain only account_code and account_id: %v", version, accountMap)
+		if _, ok := archiveFiles["account_map.csv"]; ok {
+			t.Fatalf("%s export contains a reversible account map", version)
 		}
 		for name, text := range archiveFiles {
 			for _, forbidden := range []string{account.Email, account.Label, account.UpstreamAccountID, account.ChatGPTUserID, "access-cache-secret"} {
@@ -594,7 +593,7 @@ func TestAdminCacheHitsExportZip(t *testing.T) {
 					t.Fatalf("%s %s leaked %q:\n%s", version, name, forbidden, text)
 				}
 			}
-			if name != "account_map.csv" && strings.Contains(text, account.ID) {
+			if strings.Contains(text, account.ID) {
 				t.Fatalf("%s %s leaked raw account id %q:\n%s", version, name, account.ID, text)
 			}
 		}
@@ -756,7 +755,7 @@ func TestAdminCacheHitsExportEmptyZipHasHeaders(t *testing.T) {
 		t.Fatalf("empty cache hit export = %d: %s", code, raw)
 	}
 	files := readZipFiles(t, raw)
-	for _, name := range []string{"summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv", "account_map.csv"} {
+	for _, name := range []string{"summary.csv", "by_api_key.csv", "by_account_model.csv", "by_route.csv", "by_route_account_model.csv", "by_time_bucket.csv"} {
 		text := files[name]
 		if firstLine := strings.TrimSpace(strings.SplitN(text, "\n", 2)[0]); firstLine == "" {
 			t.Fatalf("%s should contain a CSV header, got %q", name, text)
@@ -764,6 +763,9 @@ func TestAdminCacheHitsExportEmptyZipHasHeaders(t *testing.T) {
 	}
 	if len(files) == 0 {
 		t.Fatal("empty export zip had no files")
+	}
+	if _, ok := files["account_map.csv"]; ok {
+		t.Fatal("empty export must not contain a reversible account map")
 	}
 	_ = io.EOF
 }

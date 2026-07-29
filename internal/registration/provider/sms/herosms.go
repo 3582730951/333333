@@ -148,11 +148,20 @@ func (p *HeroSMSProvider) WaitCode(ctx context.Context, orderID string, timeout 
 
 // CancelNumber cancels the order
 func (p *HeroSMSProvider) CancelNumber(ctx context.Context, orderID string) error {
+	return p.setStatus(ctx, orderID, "8")
+}
+
+// CompleteNumber marks a consumed activation complete (SMS-Activate status 6).
+func (p *HeroSMSProvider) CompleteNumber(ctx context.Context, orderID string) error {
+	return p.setStatus(ctx, orderID, "6")
+}
+
+func (p *HeroSMSProvider) setStatus(ctx context.Context, orderID, status string) error {
 	params := url.Values{}
 	params.Set("api_key", p.apiKey)
 	params.Set("action", "setStatus")
 	params.Set("id", orderID)
-	params.Set("status", "8") // 8 = cancel
+	params.Set("status", status)
 
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		heroSMSBase+"?"+params.Encode(), nil)
@@ -161,7 +170,14 @@ func (p *HeroSMSProvider) CancelNumber(ctx context.Context, orderID string) erro
 		return err
 	}
 	defer resp.Body.Close()
-	return nil
+	body := strings.TrimSpace(string(readSMSProviderBody(resp.Body)))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("herosms setStatus: HTTP %d", resp.StatusCode)
+	}
+	if strings.HasPrefix(body, "ACCESS_") {
+		return nil
+	}
+	return fmt.Errorf("herosms setStatus rejected")
 }
 
 // GetBalance returns the hero-sms account balance. hero-sms may return the bare
@@ -334,11 +350,20 @@ func (p *SMSActivateProvider) WaitCode(ctx context.Context, orderID string, time
 
 // CancelNumber cancels the order
 func (p *SMSActivateProvider) CancelNumber(ctx context.Context, orderID string) error {
+	return p.setStatus(ctx, orderID, "8")
+}
+
+// CompleteNumber marks a consumed activation complete (SMS-Activate status 6).
+func (p *SMSActivateProvider) CompleteNumber(ctx context.Context, orderID string) error {
+	return p.setStatus(ctx, orderID, "6")
+}
+
+func (p *SMSActivateProvider) setStatus(ctx context.Context, orderID, status string) error {
 	params := url.Values{}
 	params.Set("api_key", p.apiKey)
 	params.Set("action", "setStatus")
 	params.Set("id", orderID)
-	params.Set("status", "8")
+	params.Set("status", status)
 
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		"https://api.sms-activate.org/stubs/handler_api.php?"+params.Encode(), nil)
@@ -347,7 +372,14 @@ func (p *SMSActivateProvider) CancelNumber(ctx context.Context, orderID string) 
 		return err
 	}
 	defer resp.Body.Close()
-	return nil
+	body := strings.TrimSpace(string(readSMSProviderBody(resp.Body)))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("sms-activate setStatus: HTTP %d", resp.StatusCode)
+	}
+	if strings.HasPrefix(body, "ACCESS_") {
+		return nil
+	}
+	return fmt.Errorf("sms-activate setStatus rejected")
 }
 
 func splitN(s, sep string, n int) []string {

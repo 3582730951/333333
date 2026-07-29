@@ -25,8 +25,6 @@ const adminRoutes = [
   ['05-providers', '/providers'],
   ['06-registration', '/registration'],
   ['07-automation', '/settings-v2#automation'],
-  ['08-lifecycle', '/lifecycle'],
-  ['09-gopay', '/gopay'],
   ['10-usage', '/usage'],
   ['11-quota', '/quota'],
   ['12-system', '/system'],
@@ -200,9 +198,6 @@ function settingsCenterResponse(url) {
   if (sections.includes('registrar')) {
     return { registrar: { heroSmsService: 'dr', heroSmsCountry: 73, mailProvider: '1secmail', mailDomains: ['guerrillamail.com', 'sharklasers.com'], proxyHost: 'br.proxy.local', proxyPort: 3010 } };
   }
-  if (sections.includes('lifecycle')) {
-    return { lifecycle: { defaults: { sms: 'herosms', mailbox: 'cloudflare', captcha: 'yescaptcha', group: 'cyber', egress: 'direct' } } };
-  }
   if (sections.includes('logging')) {
     return { logging: { verbose_logging: true, failure_threshold: 0.6, log_retention_days: 14, degraded: false } };
   }
@@ -246,11 +241,6 @@ function mockPayload(url, role) {
     mailbox: [{ label: 'Cloudflare Mailbox', value: 'cloudflare' }],
     captcha: [{ label: 'YesCaptcha', value: 'yescaptcha' }],
   };
-  if (pathname === '/admin/lifecycle/tasks') return { tasks: [
-    { id: 'life_001', task_type: 'register', platform: 'chatgpt', group_name: 'cyber', egress_id: 'direct', status: 'running', target_count: 20, completed_count: 11, created_at: now - 1800 },
-    { id: 'life_000', task_type: 'health', platform: 'chatgpt', group_name: 'staging', egress_id: 'br-residential', status: 'completed', target_count: 50, completed_count: 50, created_at: now - 7200 },
-  ] };
-  if (pathname === '/admin/lifecycle/services') return { scheduler: { name: 'scheduler', status: 'running' }, sidecar: { name: 'sidecar', status: 'running' } };
   if (pathname === '/admin/quota') return { quota: accounts.map((account, i) => ({ account_id: account.id, label: account.label, provider: account.provider, used_percent: 45 + i * 18, secondary_7d_used_pct: 25 + i * 14, remaining_tokens: 1_200_000 - i * 200_000, status: i === 2 ? 'warning' : 'ok', reset_at: now + (i + 1) * 3600 })) };
   if (pathname === '/admin/cf-events') return { events: [
     { id: 'cf_1', created_at: now - 600, account_id: 'acct_prod_001', egress_id: 'direct', status: 403, category: 'challenge', cf_ray: '8abc-test', message: 'Managed challenge observed' },
@@ -259,10 +249,6 @@ function mockPayload(url, role) {
   if (pathname === '/admin/audit') return { rows: [
     { id: 'audit_1', created_at: now - 120, account_label: 'primary-prod', account_id: 'acct_prod_001', action: 'health-test', state: 'alive', reason: '', detail: 'latency=820ms' },
     { id: 'audit_2', created_at: now - 980, account_label: 'staging-worker', account_id: 'acct_stage_002', action: 'quarantine', state: 'rate_limited', reason: '429', detail: 'cooldown applied' },
-  ] };
-  if (pathname === '/admin/gopay') return { accounts: [
-    { id: 'pay_001', email: 'primary@example.com', account_id: 'acct_prod_001', status: 'active', plan: 'plus', amount: 20, created_at: now - 86400, expires_at: now + 86400 * 20 },
-    { id: 'pay_002', email: 'stage@example.com', account_id: 'acct_stage_002', status: 'pending', plan: 'team', amount: 30, created_at: now - 3600 },
   ] };
   if (pathname === '/admin/config') return settingFields();
   if (pathname === '/admin/thinking') return { mode: 'medium', budget: 4096, enabled: true };

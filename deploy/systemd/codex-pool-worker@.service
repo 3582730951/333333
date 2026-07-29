@@ -9,7 +9,14 @@ User=codex-pool
 Group=codex-pool
 WorkingDirectory=/var/lib/codex-pool
 Environment=CODEX_POOL_DATABASE=/var/lib/codex-pool/pool.sqlite3
+Environment=CODEX_POOL_DATA_DIR=/var/lib/codex-pool/data
+Environment=CODEX_POOL_MASTER_KEY_FILE=%d/master.key
+Environment=CODEX_POOL_IDENTITY_KEY_FILE=%d/identity.key
+Environment=CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE=%d/diagnostic-alias.key
 Environment=CODEX_POOL_RELEASE_ID=%i
+LoadCredential=master.key:/var/lib/codex-pool/data/keys/master.key
+LoadCredential=identity.key:/var/lib/codex-pool/data/keys/identity.key
+LoadCredential=diagnostic-alias.key:/var/lib/codex-pool/data/keys/diagnostic-alias.key
 ExecStart=/usr/local/lib/codex-pool/releases/%i/codex-pool-server --config /etc/codex-pool/config.json --release-id %i --unix-socket /var/lib/codex-pool/run/worker-%i.sock
 Restart=on-failure
 RestartSec=3

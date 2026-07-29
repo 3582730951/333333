@@ -15,12 +15,8 @@ import { accountsResponseSchema } from '../src/features/accounts/api/accounts';
 import { emailPoolResponseSchema } from '../src/features/accounts/api/emailPool';
 import { cfEventsResponseSchema, quotaResponseSchema } from '../src/features/observability/api/events';
 import {
-  lifecycleProviderOptionsSchema, lifecycleServicesResponseSchema, lifecycleTasksResponseSchema,
-} from '../src/features/automation/api/lifecycle';
-import { LIFECYCLE_REFETCH_INTERVAL, lifecycleQueryKeys } from '../src/features/automation/queries/lifecycle';
-import {
   adaptRegistrationStrategy, registrationCountriesSchema, registrationJobsResponseSchema,
-  registrationReadinessSchema,
+  registrationProviderOptionsSchema, registrationReadinessSchema,
 } from '../src/features/automation/api/registration';
 import {
   lockedIdentityForMethod, manualStartBlockers, methodUsesSMSCountry,
@@ -34,7 +30,7 @@ import {
 } from '../src/features/observability/api/usage';
 import { usageQueryKeys } from '../src/features/observability/queries/usage';
 import {
-  automationSectionSchema, configFieldsResponseSchema, lifecycleSectionSchema, providersResponseSchema,
+  automationSectionSchema, configFieldsResponseSchema, providersResponseSchema,
   moderationSettingsSchema, settingsProviderOptionsSchema, settingsSaveResponseSchema, settingsTemplateSchema,
   thinkingSettingsSchema,
 } from '../src/features/settings/api/settings';
@@ -117,14 +113,8 @@ describe('API contracts', () => {
       .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
   });
 
-  it('normalizes lifecycle envelopes and service maps', () => {
-    expect(parseApiResponse(lifecycleTasksResponseSchema, { tasks: [{ id: 'job-1', status: 'pending', future_field: 1 }] }))
-      .toEqual([{ id: 'job-1', status: 'pending', future_field: 1 }]);
-    expect(parseApiResponse(lifecycleServicesResponseSchema, { services: [] })).toEqual([]);
-    expect(parseApiResponse(lifecycleServicesResponseSchema, {
-      sms: { name: 'SMS', status: 'alive' }, mailbox: 'unreachable',
-    })).toEqual([{ name: 'SMS', status: 'alive' }, { name: 'unreachable', status: 'unreachable' }]);
-    expect(parseApiResponse(lifecycleProviderOptionsSchema, {
+  it('normalizes registration provider options', () => {
+    expect(parseApiResponse(registrationProviderOptionsSchema, {
       sms: ['sms-a'], mailbox: [{ label: 'Mailbox A', value: 'mail-a', future: true }],
     })).toEqual({ sms: ['sms-a'], mailbox: [{ label: 'Mailbox A', value: 'mail-a', future: true }], captcha: [] });
   });
@@ -235,8 +225,6 @@ describe('API contracts', () => {
       stats: { running: 2 }, readiness: { ready: false, blockers: ['provider missing'] },
       automationErrors: { policy: 'legacy row', stats: '' },
     });
-    expect(parseApiResponse(lifecycleSectionSchema, { lifecycle: { defaults: { sms: 'hero' }, defaults_error: '' } }))
-      .toEqual({ defaults: { sms: 'hero' }, defaultsError: '' });
     expect(parseApiResponse(providersResponseSchema, { providers: [{ type: 'sms', key: 'hero', priority: '90' }] }))
       .toEqual([{ type: 'sms', key: 'hero', priority: 90 }]);
     expect(parseApiResponse(settingsProviderOptionsSchema, { sms: ['hero'] })).toMatchObject({ sms: ['hero'], mailbox: [], captcha: [] });
@@ -290,10 +278,10 @@ describe('API contracts', () => {
 
 describe('routing, responsive actions, and forms', () => {
   it('keeps every management and portal screen in the visual route matrix', () => {
-    expect(adminVisualRoutes).toHaveLength(29);
+    expect(adminVisualRoutes).toHaveLength(26);
     expect(portalRoutes).toHaveLength(4);
     expect(new Set(adminRoutes.map((route) => route.path)).size).toBe(adminRoutes.length);
-    expect(settingsSections.map((section) => section.key)).toEqual(['config', 'automation', 'registrar', 'lifecycle', 'logging', 'memory', 'thinking', 'moderation']);
+    expect(settingsSections.map((section) => section.key)).toEqual(['config', 'automation', 'registrar', 'logging', 'memory', 'thinking', 'moderation']);
     expect(legacyRedirects.find((route) => route.path === '/thinking')?.to).toContain('?tab=thinking');
     expect(adminRoutes.filter((route) => route.path.startsWith('/settings/ai/')).map((route) => route.path)).toEqual([
       '/settings/ai/chatgpt', '/settings/ai/claude', '/settings/ai/kiro', '/settings/ai/antigravity', '/settings/ai/codex', '/settings/ai/claude-code',
@@ -357,11 +345,6 @@ describe('query invalidation', () => {
     expect(client.getQueryState(key)?.isInvalidated).toBe(true);
   });
 
-  it('keeps lifecycle polling visible-page scoped and domain keyed', () => {
-    expect(LIFECYCLE_REFETCH_INTERVAL).toBe(5_000);
-    expect(lifecycleQueryKeys.dashboard.slice(0, 2)).toEqual(['pool', 'lifecycle-dashboard']);
-  });
-
   it('uses separate registration keys for polling and reference data', () => {
     expect(REGISTRATION_REFETCH_INTERVAL).toBe(5_000);
     expect(registrationQueryKeys.dashboard).not.toEqual(registrationQueryKeys.countries);
@@ -387,7 +370,7 @@ describe('query invalidation', () => {
 
   it('keeps each settings section and shared option query independently addressable', () => {
     expect(settingsQueryKeys.section('config')).not.toEqual(settingsQueryKeys.section('memory'));
-    expect(settingsQueryKeys.sharedOptions).not.toEqual(settingsQueryKeys.section('lifecycle'));
+    expect(settingsQueryKeys.sharedOptions).not.toEqual(settingsQueryKeys.section('registrar'));
     expect(settingsQueryKeys.section('config').slice(0, 2)).toEqual(['pool', 'settings']);
     expect(settingsQueryKeys.advanced('thinking')).not.toEqual(settingsQueryKeys.advanced('moderation'));
   });

@@ -53,6 +53,69 @@ func requireModelUnsupported(t *testing.T, err error, want int) {
 	}
 }
 
+func seedKiroLiveCatalog(t *testing.T, store *storage.Store, accountID string, models []storage.KiroModelDescriptor) {
+	t.Helper()
+	endpointHash, err := kirowire.EndpointHash("", "us-east-1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilityKey, governanceKey := kirowire.KiroCapabilityKey(endpointHash, "us-east-1", "")
+	now := storage.Now()
+	for index := range models {
+		models[index].AccountID = accountID
+		models[index].CapabilityKey = capabilityKey
+		models[index].Complete = true
+		models[index].Generation = now
+		models[index].ObservedAt = now
+		models[index].ExpiresAt = now + 21600
+		models[index].Source = "kiro_live_catalog"
+	}
+	if err := store.ReplaceKiroModelCatalog(context.Background(), storage.KiroProbeState{
+		AccountID: accountID, CapabilityKey: capabilityKey, Region: "us-east-1",
+		EndpointHash: endpointHash, GovernanceKey: governanceKey, Source: "kiro_live_catalog",
+		Generation: now, ExpiresAt: now + 21600, PageCount: 1, Complete: true,
+	}, models); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKiroLiveCatalogControlsDefaultAliasesAndFirstOneMillionRequest(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	account := storage.Account{ID: "kiro-live", Label: "live", GroupName: "cyber", PlanType: "KIRO FREE"}
+	seedUnverifiedKiroAccount(t, store, account)
+	seedKiroLiveCatalog(t, store, account.ID, []storage.KiroModelDescriptor{
+		{UpstreamID: "claude-opus-4.8", PublicID: "claude-opus-4.8", MaxInputTokens: 1_000_000},
+		{UpstreamID: "claude-opus-5", PublicID: "claude-opus-5", MaxInputTokens: 1_000_000, MaxOutputTokens: 128_000},
+		{UpstreamID: "claude-sonnet-5", PublicID: "claude-sonnet-5", Default: true, MaxInputTokens: 1_000_000},
+		{UpstreamID: "auto", PublicID: "auto", MaxInputTokens: 1_000_000},
+	})
+	scheduler := New(store, config.Default())
+	for _, test := range []struct {
+		requested   string
+		contextMode string
+		want        string
+	}{
+		{requested: "default", want: "claude-sonnet-5"},
+		{requested: "opus", want: "claude-opus-5"},
+		{requested: "auto", want: "auto"},
+		{requested: "claude-opus-5", contextMode: "1m", want: "claude-opus-5"},
+	} {
+		resolved, bootstrap, ok := scheduler.resolveKiroRouteModel(ctx, account, Route{
+			Group: "cyber", Model: test.requested, ContextMode: test.contextMode,
+			KiroDefaultRegion: "us-east-1",
+		})
+		if !ok || bootstrap || resolved != test.want {
+			t.Fatalf("request=%q context=%q resolved=%q bootstrap=%t ok=%t", test.requested, test.contextMode, resolved, bootstrap, ok)
+		}
+	}
+	if _, _, ok := scheduler.resolveKiroRouteModel(ctx, account, Route{
+		Group: "cyber", Model: "claude-haiku-4-5", KiroDefaultRegion: "us-east-1",
+	}); ok {
+		t.Fatal("complete live catalog silently bootstrapped a missing model")
+	}
+}
+
 func TestAutoKiroOnlyConcreteModelBootstrapsThenBecomesVerified(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
@@ -175,7 +238,7 @@ func TestFairSchedulingBypassesStickyAffinityForAutoKiroGPT(t *testing.T) {
 	}
 }
 
-func TestKiroOneMillionRequiresRuntimeVerifiedOpus(t *testing.T) {
+func TestKiroOneMillionRequiresCompleteLiveCatalog(t *testing.T) {
 	store := testStore(t)
 	ctx := context.Background()
 	endpointHash := seedUnverifiedKiroAccount(t, store, storage.Account{ID: "kiro-1m", Label: "kiro", GroupName: "cyber", PlanType: "KIRO PRO"})
@@ -188,9 +251,16 @@ func TestKiroOneMillionRequiresRuntimeVerifiedOpus(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.InvalidateAccountCache()
+	if _, err := s.Select(ctx, route); !errors.Is(err, ErrNoAccount) {
+		t.Fatalf("runtime inference alone established Kiro 1M: %v", err)
+	}
+	seedKiroLiveCatalog(t, store, "kiro-1m", []storage.KiroModelDescriptor{{
+		UpstreamID: "claude-opus-4.8", PublicID: "claude-opus-4.8", MaxInputTokens: 1_000_000,
+	}})
+	s.InvalidateAccountCache()
 	lease, err := s.Select(ctx, route)
 	if err != nil {
-		t.Fatalf("runtime-verified Kiro Opus 1M did not route: %v", err)
+		t.Fatalf("catalog-verified Kiro Opus 1M did not route: %v", err)
 	}
 	if lease.ResolvedModel != "claude-opus-4.8" {
 		t.Fatalf("resolved model=%q", lease.ResolvedModel)

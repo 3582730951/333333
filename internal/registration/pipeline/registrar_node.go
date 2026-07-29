@@ -1,6 +1,5 @@
-// node registration: orchestrates the puppeteer-real-browser registrar
-// (other_new_gpt_register) as a per-job subprocess. pool_server owns the isolation and
-// lifecycle that the standalone Node tool lacks:
+// node registration orchestrates the repository-owned Playwright registrar as a
+// per-job subprocess. pool_server owns isolation, provider leases, and lifecycle:
 //
 //   - Per-browser IP uniqueness: each job leases the request's egress and rotates a
 //     fresh exit IP (cliproxy SID), passed to the worker via HTTPS_PROXY + the per-job
@@ -13,8 +12,9 @@
 //     is hard-deleted on teardown, plus browserClearChatGptSession — zero cross-session
 //     contamination.
 //
-// The registrar reads its config from CONFIG_FILE (src/config.js) and writes the result
-// token as codex-<email>-free.json into tokenOutputDir; we parse it and UpsertAccount.
+// The registrar reads its 0600 config from CONFIG_FILE and writes an OAuth result to the
+// exact resultPath. Provider credentials and order IDs stay in Go; the worker can only
+// retrieve the leased OTP through a loopback, per-job bearer-authenticated relay.
 package pipeline
 
 import (
@@ -34,18 +34,22 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/datadir"
 	"codex-account-pool/internal/registration/provider/proxy"
 	"codex-account-pool/internal/storage"
 )
 
 // nodeTokenFile is the shape other_new_gpt_register writes per successful registration.
 type nodeTokenFile struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	IDToken      string `json:"id_token"`
-	AccountID    string `json:"account_id"`
-	Email        string `json:"email"`
-	Type         string `json:"type"`
+	AccessToken       string `json:"access_token"`
+	RefreshToken      string `json:"refresh_token"`
+	IDToken           string `json:"id_token"`
+	AccountID         string `json:"account_id"`
+	Email             string `json:"email"`
+	Type              string `json:"type"`
+	AuthorizationCode string `json:"authorization_code"`
+	CodeVerifier      string `json:"code_verifier"`
+	RedirectURI       string `json:"redirect_uri"`
 }
 
 // nodeJob carries the per-job isolation parameters the orchestrator assigns.
@@ -54,6 +58,10 @@ type nodeJob struct {
 	ProfileDir      string // throwaway browser userDataDir (deleted on teardown)
 	TokenDir        string // where the worker writes codex-*-free.json
 	FingerprintSeed string // unique per job → fingerprint isolation
+	ResultPath      string
+	PhoneNumber     string
+	OTPRelayURL     string
+	OTPRelayToken   string
 
 	// CountryISO is the ISO-2 the registration's SMS number belongs to (e.g. "BR"). When set,
 	// the orchestrator pins the cliproxy exit region to it (region must match the phone
@@ -204,7 +212,28 @@ func buildNodeJobConfig(base map[string]interface{}, j nodeJob) map[string]inter
 	cfg["tokenOutputDirs"] = []string{j.TokenDir}
 	// Per-job fingerprint seed → fingerprint isolation across concurrent browsers.
 	cfg["fingerprintSeed"] = j.FingerprintSeed
+	cfg["resultPath"] = j.ResultPath
+	cfg["phoneNumber"] = j.PhoneNumber
+	cfg["otpRelayURL"] = j.OTPRelayURL
+	cfg["otpRelayToken"] = j.OTPRelayToken
 	return cfg
+}
+
+// sanitizeNodeWorkerConfig prevents legacy registrar/provider secrets from crossing
+// into the Node process. Provider access is exclusively through the authenticated OTP
+// relay; only bounded browser presentation settings are accepted from the admin blob.
+func sanitizeNodeWorkerConfig(raw map[string]interface{}) map[string]interface{} {
+	allowed := map[string]struct{}{
+		"browserExecutablePath": {}, "headless": {}, "locale": {}, "timezoneId": {},
+		"userAgent": {}, "viewportHeight": {}, "viewportWidth": {},
+	}
+	out := make(map[string]interface{}, len(allowed))
+	for key := range allowed {
+		if value, ok := raw[key]; ok {
+			out[key] = value
+		}
+	}
+	return out
 }
 
 func applyNodeSMSProviderConfig(cfg map[string]interface{}, providerName string, providerConfig map[string]interface{}) {
@@ -411,7 +440,7 @@ func rotateProxyUsernameSid(username string) string {
 
 func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*storage.Account, error) {
 	nodeBin := firstEnv("node", "CODEX_REG_NODE")
-	regDir := firstEnv("other_new_gpt_register", "CODEX_REG_NODE_DIR")
+	regDir := firstEnv("workers/node-registrar", "CODEX_REG_NODE_DIR")
 	entry := firstEnv("index.js", "CODEX_REG_NODE_ENTRY")
 	if abs, err := filepath.Abs(regDir); err == nil {
 		regDir = abs
@@ -419,7 +448,14 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 
 	// Per-job parent dir; each attempt gets a fresh profile inside it. Deleted on
 	// teardown → cookie/profile purge.
-	jobRoot, err := os.MkdirTemp("", "reg-node-*")
+	tempRoot := ""
+	if p != nil && p.cfg != nil && strings.TrimSpace(p.cfg.DataDir) != "" {
+		tempRoot = filepath.Join(p.cfg.DataDir, "tmp", "browser")
+		if err := datadir.RecoverDirectory(tempRoot); err != nil {
+			return nil, fmt.Errorf("node reg: browser temp directory unavailable: %w", err)
+		}
+	}
+	jobRoot, err := os.MkdirTemp(tempRoot, "reg-node-*")
 	if err != nil {
 		return nil, fmt.Errorf("node reg: temp dir: %w", err)
 	}
@@ -429,7 +465,7 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 	if !filepath.IsAbs(entryPath) {
 		entryPath = filepath.Join(regDir, entry)
 	}
-	baseConfig := p.nodeRegistrarBaseConfig(ctx, regDir)
+	baseConfig := sanitizeNodeWorkerConfig(p.nodeRegistrarBaseConfig(ctx, regDir))
 	maxAttempts := nodeRegMaxAttempts()
 
 	// Resolve the SMS country for THIS registration. Under "auto" the Manager already picked
@@ -446,20 +482,35 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 	// would be ideal, but the engine itself does getCountries+getTopCountries and will use
 	// heroSmsCountry from its own catalog resolution — so we only set it when we know it.
 	countryID := heroSmsCountryID(countryISO)
-	selectedSMSProvider, selectedSMSConfig := p.nodeSelectedSMSConfig(ctx, req.SMSProvider)
-
 	// Drive retries by spawning a FRESH node process per attempt (REG_ONE_SHOT=1), each
 	// doing exactly ONE browser launch. This sidesteps the puppeteer-real-browser relaunch
 	// flakiness (2nd+ connect() in a long-lived process fails to fetch the debug URL) and
 	// gives every attempt a clean profile + fingerprint + rotated exit IP.
 	var acct *nodeTokenFile
-	var lastTail string
-	var lastFullOutput string
 	for attempt := 1; attempt <= maxAttempts && ctx.Err() == nil; attempt++ {
+		cctx, cancel := context.WithTimeout(ctx, nodeRegAttemptTimeout())
+		smsProvider, phone, orderID, acquireErr := p.acquireSMS(cctx, req)
+		if acquireErr != nil {
+			cancel()
+			continue
+		}
+		relay, relayErr := startRegistrarOTPRelay(cctx, smsProvider, orderID, 3*time.Minute)
+		if relayErr != nil {
+			p.settleSMSLease(ctx, req, smsProvider, orderID, false)
+			cancel()
+			continue
+		}
+		cleanupAttempt := func() {
+			relay.Close()
+			p.settleSMSLease(ctx, req, smsProvider, orderID, relay.Consumed())
+			cancel()
+		}
+
 		profileDir := filepath.Join(jobRoot, fmt.Sprintf("profile-%d", attempt))
 		_ = os.MkdirAll(profileDir, 0o700)
 		_ = os.MkdirAll(tokenDir, 0o700)
-		_ = os.Remove(filepath.Join(jobRoot, "auth.json")) // clear any stale success marker
+		resultPath := filepath.Join(jobRoot, "auth.json")
+		_ = os.Remove(resultPath) // clear any stale success marker
 
 		// Per-attempt proxy: a FRESH exit IP for each browser launch. In credential mode
 		// proxyURLFromEgress already rotated the sid; buildNodeJobConfig pins the region to
@@ -495,10 +546,12 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 			ProfileDir:      profileDir,
 			TokenDir:        tokenDir,
 			FingerprintSeed: randomFingerprintSeed(),
+			ResultPath:      resultPath,
+			PhoneNumber:     phone,
+			OTPRelayURL:     relay.url,
+			OTPRelayToken:   relay.bearerToken,
 			CountryISO:      countryISO,
 			CountryID:       countryID,
-			SMSProvider:     selectedSMSProvider,
-			SMSConfig:       selectedSMSConfig,
 		}
 		cfg := buildNodeJobConfig(baseConfig, job)
 		// Fresh residential exit IP per attempt (credential mode only): rotate the cliproxy
@@ -511,13 +564,14 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 		cfgPath := filepath.Join(jobRoot, "job-config.json")
 		cfgRaw, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
+			cleanupAttempt()
 			return nil, fmt.Errorf("node reg: marshal config: %w", err)
 		}
 		if err := os.WriteFile(cfgPath, cfgRaw, 0o600); err != nil {
+			cleanupAttempt()
 			return nil, fmt.Errorf("node reg: write config: %w", err)
 		}
 
-		cctx, cancel := context.WithTimeout(ctx, nodeRegAttemptTimeout())
 		cmd := exec.CommandContext(cctx, nodeBin, entryPath)
 		// cwd = jobRoot so the registrar's cwd-relative success artifact (auth.json) lands
 		// where we read it; node resolves require('./src/...') by the script path.
@@ -534,7 +588,7 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 		// NOTE: deliberately NO HTTP(S)_PROXY env — the browser's egress proxy comes from
 		// the per-job CONFIG (proxyHost/...). Setting HTTP_PROXY here would also route node's
 		// fetch to Chrome's OWN debug port (127.0.0.1) through the proxy, breaking the launch.
-		cmd.Env = append(envWithout(os.Environ(), "DISPLAY", "REG_HEADLESS"),
+		cmd.Env = append(registrarBaseEnv(),
 			"CONFIG_FILE="+cfgPath,
 			"REG_FP_SEED="+job.FingerprintSeed,
 			"REG_ONE_SHOT=1",           // fresh process per attempt
@@ -551,63 +605,40 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 			"REG_PHONE_OCCUPIED_STATE_FILE="+filepath.Join(jobRoot, "reg-phone-occupied.json"),
 			// VPS 低配优化：根据系统内存限制 Node.js V8 老生代堆上限，避免 Chrome+Node 吃爆内存。
 			// Node 堆只占进程内存一小部分（Chrome 才是大头），但限制它能防失控重试内存堆积。
-			"NODE_OPTIONS="+nodeMemoryLimitOption(),
 		)
-		// Capture stdout and stderr with a cap so a runaway subprocess cannot fill
-		// the VPS memory. 1 MiB per stream is enough for the full registration log;
-		// the cap is configurable via the "reg_combined_output_cap" setting. We use a
-		// capped Writer so the subprocess can write freely and we keep only the last
-		// outputCap bytes, never the full (potentially multi-MB) stream.
-		outputCap := p.outputCap(ctx)
-		stdoutBuf := newCappedBuffer(int(outputCap))
-		stderrBuf := newCappedBuffer(int(outputCap))
-		cmd.Stdout = stdoutBuf
-		cmd.Stderr = stderrBuf
-		runErr := cmd.Run()
-		cancel()
-		out := stdoutBuf.String() + "\n" + stderrBuf.String()
-		lastTail = tailString(out, 600)
-		lastFullOutput = out
-		lastFullOutput = out
+		if nodeOptions := nodeMemoryLimitOption(); nodeOptions != "" {
+			cmd.Env = append(cmd.Env, "NODE_OPTIONS="+nodeOptions)
+		}
+		_, runErr := p.runRegistrarCommand(cctx, cmd)
 		if a, _ := readNodeRegistrationResult(jobRoot, tokenDir); a != nil {
 			acct = a
+			cleanupAttempt()
 			break
 		}
+		cleanupAttempt()
 		_ = runErr // this attempt produced no account → spawn a fresh one
 	}
 	if acct == nil {
-		// lastFullOutput carries the full capped subprocess output of the final attempt;
-		// it is intentionally kept for the registration handler's structured logging even
-		// though this code path returns an error. We surface a tail in the error here so the
-		// legacy one-line log keeps working, and the full output is logged separately.
-		_ = lastFullOutput
-		return nil, fmt.Errorf("node reg: no account produced after %d attempt(s). last worker tail: %s", maxAttempts, lastTail)
+		return nil, fmt.Errorf("node reg: no verified account produced after %d attempt(s)", maxAttempts)
+	}
+	if strings.TrimSpace(acct.AccessToken) == "" {
+		tokens, err := p.exchangeRegistrationOAuthCode(ctx, req, acct.AuthorizationCode, acct.CodeVerifier, acct.RedirectURI)
+		if err != nil {
+			return nil, err
+		}
+		acct.AccessToken = tokens.AccessToken
+		acct.RefreshToken = tokens.RefreshToken
+		acct.IDToken = tokens.IDToken
 	}
 
-	now := time.Now().Unix()
-	account := &storage.Account{
-		ID:                generateAccountID(),
-		Label:             "node-" + acct.Email,
-		GroupName:         req.GroupName,
-		UpstreamAccountID: acct.AccountID,
+	return p.persistVerifiedRegistration(ctx, req, registrationCredential{
+		LabelPrefix:       "node-",
 		Email:             acct.Email,
-		Provider:          "codex",
-		Status:            "active",
-		CreatedAt:         now,
-		UpdatedAt:         now,
-	}
-	token := &storage.AccountToken{
-		AccountID:    account.ID,
-		AccessToken:  acct.AccessToken,
-		RefreshToken: acct.RefreshToken,
-		IDTokenRaw:   acct.IDToken,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	if err := p.store.UpsertAccount(ctx, *account, *token); err != nil {
-		return nil, fmt.Errorf("node reg: upsertAccount: %w", err)
-	}
-	return account, nil
+		UpstreamAccountID: acct.AccountID,
+		AccessToken:       acct.AccessToken,
+		RefreshToken:      acct.RefreshToken,
+		IDToken:           acct.IDToken,
+	})
 }
 
 // readNodeRegistrationResult reads the credential the registrar produced on success
@@ -620,7 +651,7 @@ func readNodeRegistrationResult(jobRoot, tokenDir string) (*nodeTokenFile, error
 	authPath := filepath.Join(jobRoot, "auth.json")
 	if raw, err := os.ReadFile(authPath); err == nil {
 		var t nodeTokenFile
-		if json.Unmarshal(raw, &t) == nil && strings.TrimSpace(t.AccessToken) != "" {
+		if json.Unmarshal(raw, &t) == nil && validNodeRegistrationResult(t) {
 			return &t, nil
 		}
 	}
@@ -663,11 +694,20 @@ func readNewestNodeToken(dir string) (*nodeTokenFile, error) {
 			continue
 		}
 		var t nodeTokenFile
-		if json.Unmarshal(raw, &t) == nil && strings.TrimSpace(t.AccessToken) != "" {
+		if json.Unmarshal(raw, &t) == nil && validNodeRegistrationResult(t) {
 			return &t, nil
 		}
 	}
 	return nil, fmt.Errorf("token files present but none carried an access_token")
+}
+
+func validNodeRegistrationResult(result nodeTokenFile) bool {
+	if strings.TrimSpace(result.AccessToken) != "" {
+		return true
+	}
+	return strings.TrimSpace(result.AuthorizationCode) != "" &&
+		strings.TrimSpace(result.CodeVerifier) != "" &&
+		strings.TrimSpace(result.RedirectURI) == registrationOAuthRedirectURI
 }
 
 // nodeRegMaxAttempts bounds how many fresh one-shot worker processes a single
@@ -696,48 +736,22 @@ func nodeRegAttemptTimeout() time.Duration {
 	return 4 * time.Minute
 }
 
-func tailString(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) <= n {
-		return s
-	}
-	return "…" + s[len(s)-n:]
-}
-
-// envWithout returns a copy of env with the named variables removed (case-sensitive,
-// matching on the KEY before '='). Used to strip DISPLAY/REG_HEADLESS from the worker
-// so puppeteer-real-browser starts its own fresh Xvfb and runs Chrome headed.
-func envWithout(env []string, drop ...string) []string {
-	out := make([]string, 0, len(env))
-	for _, e := range env {
-		key := e
-		if i := strings.IndexByte(e, '='); i >= 0 {
-			key = e[:i]
-		}
-		skip := false
-		for _, d := range drop {
-			if key == d {
-				skip = true
-				break
-			}
-		}
-		if !skip {
-			out = append(out, e)
-		}
-	}
-	return out
-}
-
 // outputCap returns the subprocess stdout/stderr capture cap (bytes) from the
 // "reg_combined_output_cap" setting, defaulting to 1 MiB. Capping prevents a runaway
 // Node/Chrome subprocess from filling VPS memory with multi-MB logs.
 func (p *Pipeline) outputCap(ctx context.Context) int64 {
-	const def = 1 << 20
+	const (
+		def = 1 << 20
+		max = 4 << 20
+	)
 	if p == nil || p.store == nil {
 		return def
 	}
 	if v, ok, _ := p.store.GetSetting(ctx, "reg_combined_output_cap"); ok {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+			if n > max {
+				n = max
+			}
 			return int64(n)
 		}
 	}
@@ -786,4 +800,8 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 
 func (c *cappedBuffer) String() string {
 	return string(c.buf)
+}
+
+func (c *cappedBuffer) Bytes() []byte {
+	return append([]byte(nil), c.buf...)
 }

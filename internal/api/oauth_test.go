@@ -118,11 +118,10 @@ func TestOAuthCompleteValidationDoesNotConsumeSession(t *testing.T) {
 	tests := []struct {
 		name       string
 		redirected string
-		want       string
 	}{
-		{name: "unparseable paste", redirected: "This is not an OAuth callback", want: "解析"},
-		{name: "state mismatch", redirected: "http://localhost:51121/oauth-callback?code=ABC&state=WRONG", want: "state"},
-		{name: "authorization denied", redirected: "http://localhost:51121/oauth-callback?error=access_denied&error_description=User+cancelled&state=EXPECTED", want: "access_denied"},
+		{name: "unparseable paste", redirected: "This is not an OAuth callback"},
+		{name: "state mismatch", redirected: "http://localhost:51121/oauth-callback?code=ABC&state=WRONG"},
+		{name: "authorization denied", redirected: "http://localhost:51121/oauth-callback?error=access_denied&error_description=User+cancelled&state=EXPECTED"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,7 +132,8 @@ func TestOAuthCompleteValidationDoesNotConsumeSession(t *testing.T) {
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 			h.app.adminOAuthComplete(w, req)
-			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), tt.want) {
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"invalid_request"`) ||
+				strings.Contains(w.Body.String(), "WRONG") || strings.Contains(w.Body.String(), "access_denied") {
 				t.Fatalf("status/body = %d %s", w.Code, w.Body.String())
 			}
 			if _, ok := h.app.oauth.get(sessionID); !ok {

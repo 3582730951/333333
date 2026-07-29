@@ -181,6 +181,7 @@ func (s *Server) kiroCountTokensWithLease(w http.ResponseWriter, r *http.Request
 	setKiroHeaders(w, model, nil, kirowire.UsageSourceEstimated)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"input_tokens": count, "estimated": true, "usage_source": kirowire.UsageSourceEstimated,
+		"model": downstreamKiroModel(r.Context(), model),
 	})
 	return outcomeDone
 }
@@ -342,6 +343,12 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 	if err != nil {
 		return kirowire.Conversion{}, err
 	}
+	region := firstNonEmpty(credentials.APIRegion, kiroCfg.KiroDefaultAPIRegion, "us-east-1")
+	capabilityKey, _ := kirowire.KiroCapabilityKey(endpointHash, region, credentials.ProfileARN)
+	catalog, err := s.store.ListKiroModelCatalog(ctx, lease.Account.ID, capabilityKey)
+	if err != nil {
+		return kirowire.Conversion{}, err
+	}
 	// Claude-family Kiro calls require an adaptive-thinking observation before
 	// they are reusable. Kiro's exact GPT models deliberately use the ordinary
 	// (non-thinking) generation envelope, so their successful model observation
@@ -352,26 +359,27 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 		return kirowire.Conversion{}, err
 	}
 	capabilityModel, _ := capability.ResolveKiroModel(requestedKiroModel, verified)
+	var catalogModel storage.KiroModelDescriptor
+	catalogModelFound := false
+	for _, descriptor := range catalog {
+		if strings.EqualFold(strings.TrimSpace(descriptor.UpstreamID), strings.TrimSpace(requestedKiroModel)) {
+			catalogModel, catalogModelFound = descriptor, true
+			break
+		}
+	}
+	if !catalogModelFound {
+		catalogModel, catalogModelFound = capability.ResolveKiroCatalogModel(requestedKiroModel, catalog)
+	}
+	if catalogModelFound {
+		capabilityModel = catalogModel.PublicID
+		verified = append(verified, catalogModel.PublicID, catalogModel.UpstreamID)
+	}
 	requestedModel := requestedClaudeModelFromContext(ctx)
 	compaction := kirowire.IsClaudeCodeCompactionRequest(raw)
 	effectiveContextMode := requestedModel.ContextMode
-	if compaction && capability.KiroPlanAllows1M(lease.Account.PlanType, capabilityModel) {
-		// Kiro has no Anthropic beta header on the wire. For the dedicated Claude
-		// Code summarization call only, a paid + runtime-verified 1M-capable model
-		// may use its technical window so /compact cannot be blocked by the 200K
-		// preflight it is meant to recover from.
-		effectiveContextMode = "1m"
-	}
-	// For non-compaction Claude requests on PRO plans with a 1M-capable model,
-	// automatically upgrade to the 1M window so Claude Code users get the full
-	// context (claude-opus-4.8, claude-sonnet-4.6, etc.) without needing the
-	// [1m] model suffix. GPT models are excluded: they use their own documented
-	// window via KiroContextWindow and are not entitled to the Claude 1M beta.
-	// This never fires when the client already specified a contextMode — their
-	// explicit preference wins.
-	if effectiveContextMode == "" && !compaction && !capability.KiroSupportsGPTModel(capabilityModel) &&
-		capability.KiroPlanAllows1M(lease.Account.PlanType, capabilityModel) {
-		effectiveContextMode = "1m"
+	if strings.EqualFold(strings.TrimSpace(effectiveContextMode), "1m") &&
+		(!catalogModelFound || catalogModel.MaxInputTokens < 1_000_000) {
+		return kirowire.Conversion{}, fmt.Errorf("%w: 1m catalog capability unavailable", kirowire.ErrVerifiedModelUnavailable)
 	}
 	measuredWindow := int64(0)
 	if capabilityModel != "" {
@@ -403,14 +411,23 @@ func (s *Server) convertKiroRequest(ctx context.Context, raw []byte, affinity ro
 			Policy: "max_hit", LatestTailWrite: true, PreferRecentTurnRead: true,
 		})
 	}
+	adaptiveSupported, adaptiveKnown := kirowire.CatalogAdaptiveThinking(catalogModel)
+	maximumEffort, effortKnown := kirowire.CatalogMaximumEffort(catalogModel)
 	converted, err := kirowire.ConvertAnthropicRequestWithOptions(raw, affinity.Hash, kirowire.ConversionOptions{
-		DefaultThinking:   kiroCfg.KiroDefaultThinking,
-		ForceMaxQuality:   true,
-		EnableCachePoints: cachePointsEnabled,
-		ContextWindow:     contextWindow,
-		VerifiedModels:    verified,
-		Compaction:        compaction,
-		ContextMode:       effectiveContextMode,
+		DefaultThinking:           kiroCfg.KiroDefaultThinking,
+		ForceMaxQuality:           true,
+		EnableCachePoints:         cachePointsEnabled,
+		ContextWindow:             contextWindow,
+		VerifiedModels:            verified,
+		CatalogPublicModel:        catalogModel.PublicID,
+		CatalogUpstreamModel:      catalogModel.UpstreamID,
+		MaxOutputTokens:           catalogModel.MaxOutputTokens,
+		AdaptiveThinkingKnown:     adaptiveKnown,
+		AdaptiveThinkingSupported: adaptiveSupported,
+		EffortKnown:               effortKnown,
+		MaxThinkingEffort:         maximumEffort,
+		Compaction:                compaction,
+		ContextMode:               effectiveContextMode,
 	})
 	if err != nil {
 		var contextErr *kirowire.ContextLengthError

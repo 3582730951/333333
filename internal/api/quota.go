@@ -245,7 +245,7 @@ func (s *Server) captureQuota(ctx context.Context, accountID, provider, model st
 	}
 	s.scheduler.ApplyRateLimitSnapshot(snap)
 	s.enqueueWrite(func() {
-		writeCtx, cancel := bgWriteContext()
+		writeCtx, cancel := s.bgWriteContext()
 		defer cancel()
 		_ = s.store.UpsertAccountRateLimit(writeCtx, snap)
 	})

@@ -891,7 +891,7 @@ func TestKiroContentLengthRetryTrimsOldestTurnOnlyAfterReducedOutputFails(t *tes
 	}
 }
 
-func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
+func TestKiroCatalogOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 	var compactRequests int
 	var fullHistoryForwarded bool
 	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -928,9 +928,9 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 	h.app.scheduler.InvalidateAccountCache()
 
 	history := strings.Repeat("historic-context-", 65_000) + "tail-marker-before-compaction"
-	request := func(historyContent, system, finalInstruction, session string) (*http.Response, []byte) {
+	request := func(model, historyContent, system, finalInstruction, session string) (*http.Response, []byte) {
 		payload, _ := json.Marshal(map[string]any{
-			"model":  "claude-opus-4-8",
+			"model":  model,
 			"system": system,
 			"messages": []any{
 				map[string]any{"role": "user", "content": historyContent},
@@ -951,37 +951,51 @@ func TestKiroPaidOpusClaudeCodeCompactionUsesExtendedWindow(t *testing.T) {
 		return resp, body
 	}
 
-	// PRO accounts now get automatic 1M window for all non-compaction Claude requests,
-	// so a 276k-token ordinary request should succeed instead of being rejected.
-	ordinary, ordinaryBody := request(history, "You are Claude Code", "continue ordinary work", "ordinary-over-200k")
+	// Runtime success and a paid-looking plan string are not entitlement evidence.
+	// Until the complete account/region catalog says 1M, an oversized request fails
+	// locally without contacting the upstream.
+	ordinary, ordinaryBody := request("claude-opus-4-8", history, "You are Claude Code", "continue ordinary work", "ordinary-over-200k")
+	if ordinary.StatusCode != http.StatusBadRequest || !bytes.Contains(ordinaryBody, []byte(`"code":"context_length_exceeded"`)) {
+		t.Fatalf("request without live 1M catalog was accepted: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
+	}
+
+	capabilityKey, governanceKey := kirowire.KiroCapabilityKey(endpointHash, "us-east-1", "")
+	now := storage.Now()
+	if err := h.store.ReplaceKiroModelCatalog(context.Background(), storage.KiroProbeState{
+		AccountID: account.ID, CapabilityKey: capabilityKey, Region: "us-east-1",
+		EndpointHash: endpointHash, GovernanceKey: governanceKey, Source: "kiro_live_catalog",
+		Generation: now, ExpiresAt: now + 21600, PageCount: 1, Complete: true,
+	}, []storage.KiroModelDescriptor{{
+		AccountID: account.ID, CapabilityKey: capabilityKey,
+		UpstreamID: "claude-opus-4.8", PublicID: "claude-opus-4.8",
+		MaxInputTokens: 1_000_000, Complete: true, Source: "kiro_live_catalog",
+		Generation: now, ObservedAt: now, ExpiresAt: now + 21600,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	ordinary, ordinaryBody = request("claude-opus-4-8[1m]", history, "You are Claude Code", "continue ordinary work", "ordinary-over-200k-catalog")
 	if ordinary.StatusCode != http.StatusOK || ordinary.Header.Get("X-Pool-Kiro-Context-Window") != "1000000" || !bytes.Contains(ordinaryBody, []byte(`"type":"message"`)) {
-		t.Fatalf("PRO ordinary request over 200k should succeed with 1M auto-upgrade: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
+		t.Fatalf("catalog-backed ordinary request did not use 1M: status=%d headers=%v body=%s", ordinary.StatusCode, ordinary.Header, ordinaryBody)
 	}
 
 	compactSystem := "You are a helpful AI assistant tasked with summarizing conversations."
 	compactInstruction := "Your task is to create a detailed summary of the conversation so far, preserving every technical decision."
+	// Catalog evidence is authoritative regardless of marketing plan text.
 	if err := h.store.SetAccountPlanType(context.Background(), account.ID, "KIRO FREE"); err != nil {
 		t.Fatal(err)
 	}
 	h.app.scheduler.InvalidateAccountCache()
-	freeResponse, freeBody := request(history, compactSystem, compactInstruction, "compact-free")
-	if freeResponse.StatusCode != http.StatusBadRequest || !bytes.Contains(freeBody, []byte(`"code":"claude_context_1m_unavailable"`)) {
-		t.Fatalf("free Kiro compact bypassed entitlement: status=%d body=%s", freeResponse.StatusCode, freeBody)
+	freeResponse, freeBody := request("claude-opus-4-8[1m]", history, compactSystem, compactInstruction, "compact-free")
+	if freeResponse.StatusCode != http.StatusOK || !bytes.Contains(freeBody, []byte("compact summary")) {
+		t.Fatalf("catalog-backed compact status=%d body=%s", freeResponse.StatusCode, freeBody)
 	}
-
-	if err := h.store.SetAccountPlanType(context.Background(), account.ID, "KIRO PRO"); err != nil {
-		t.Fatal(err)
-	}
-	h.app.scheduler.InvalidateAccountCache()
-	compactResponse, compactBody := request(history, compactSystem, compactInstruction, "compact-paid")
-	if compactResponse.StatusCode != http.StatusOK || !bytes.Contains(compactBody, []byte("compact summary")) {
-		t.Fatalf("paid compact status=%d body=%s", compactResponse.StatusCode, compactBody)
-	}
-	if compactResponse.Header.Get("X-Pool-Kiro-Context-Window") != "1000000" || compactRequests != 1 || !fullHistoryForwarded {
-		t.Fatalf("compact did not use lossless extended window: headers=%v requests=%d full_history=%v", compactResponse.Header, compactRequests, fullHistoryForwarded)
+	if freeResponse.Header.Get("X-Pool-Kiro-Context-Window") != "1000000" || compactRequests != 1 || !fullHistoryForwarded {
+		t.Fatalf("compact did not use lossless extended window: headers=%v requests=%d full_history=%v", freeResponse.Header, compactRequests, fullHistoryForwarded)
 	}
 	overflowHistory := strings.Repeat("overflow-context-", 280_000)
-	overflowResponse, overflowBody := request(overflowHistory, compactSystem, compactInstruction+"\n\nREMINDER: Do NOT call any tools. Respond with plain text only.", "compact-over-1m")
+	overflowResponse, overflowBody := request("claude-opus-4-8[1m]", overflowHistory, compactSystem, compactInstruction+"\n\nREMINDER: Do NOT call any tools. Respond with plain text only.", "compact-over-1m")
 	var overflowEnvelope struct {
 		Type  string `json:"type"`
 		Error struct {

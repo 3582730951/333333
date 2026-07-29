@@ -50,10 +50,10 @@ func TestAPIKeyCreateRejectsOversizedJSON(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 
 	code, body := grpReq(t, h, http.MethodPost, "/admin/api-keys", `{"label":"too-big"}`+strings.Repeat(" ", adminJSONBodyLimit))
-	if code != http.StatusBadRequest {
-		t.Fatalf("oversized api-key create = %d, want 400: %s", code, body)
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized api-key create = %d, want 413: %s", code, body)
 	}
-	if !strings.Contains(string(body), "request body too large") {
+	if !strings.Contains(string(body), `"code":"request_too_large"`) {
 		t.Fatalf("oversized api-key create body = %s, want size error", body)
 	}
 

@@ -173,7 +173,7 @@ func TestImportedChatGPTWebSessionUsesRealBearerAndUpdatesOnReimport(t *testing.
 
 	olderAccess := externalSessionJWTForTest(t, "user-session", "workspace-session", now.Add(30*time.Minute).Unix())
 	code, raw = importExternalSessionForTest(t, h, "session-older", olderAccess, "")
-	if code != http.StatusBadRequest || !strings.Contains(string(raw), "older") {
+	if code != http.StatusBadRequest || !strings.Contains(string(raw), `"code":"invalid_request"`) {
 		t.Fatalf("older session reimport = %d: %s", code, raw)
 	}
 	token, err = h.store.GetToken(context.Background(), first.ID)

@@ -2,10 +2,14 @@ package pipeline
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"codex-account-pool/internal/registration/provider"
 	"codex-account-pool/internal/storage"
 )
 
@@ -67,17 +71,27 @@ func TestNodeRegisterOneOrchestration(t *testing.T) {
 	// write BOTH artifacts — a fallback codex-*-free.json into tokenOutputDir AND the
 	// preferred auth.json into cwd (which the orchestrator sets to the isolated job
 	// dir). The orchestrator must import auth.json (auth@…), not the token file.
+	header, _ := json.Marshal(map[string]interface{}{"alg": "none", "typ": "JWT"})
+	claims, _ := json.Marshal(map[string]interface{}{
+		"email": "auth@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/auth": map[string]interface{}{
+			"chatgpt_user_id":    "user-auth",
+			"chatgpt_account_id": "acc-auth",
+			"chatgpt_plan_type":  "free",
+		},
+	})
+	encode := base64.RawURLEncoding.EncodeToString
+	accessToken := encode(header) + "." + encode(claims) + "." + encode([]byte("sig"))
 	fake := `#!/usr/bin/env bash
 set -e
 DIR=$(python3 -c "import json,os;c=json.load(open(os.environ['CONFIG_FILE']));print(c['tokenOutputDir'])")
 PROF=$(python3 -c "import json,os;c=json.load(open(os.environ['CONFIG_FILE']));print(c['browserUserDataDir'])")
 SEED=$(python3 -c "import json,os;c=json.load(open(os.environ['CONFIG_FILE']));print(c['fingerprintSeed'])")
+RESULT=$(python3 -c "import json,os;c=json.load(open(os.environ['CONFIG_FILE']));print(c['resultPath'])")
 test -n "$DIR" && test -d "$PROF" && test -n "$SEED" || { echo "missing isolation fields" >&2; exit 3; }
-cat > "$DIR/codex-token@example.com-free.json" <<JSON
-{"access_token":"tok-access","refresh_token":"tok-refresh","id_token":"tok-id","account_id":"acc-tok","email":"token@example.com","type":"codex"}
-JSON
-cat > auth.json <<JSON
-{"access_token":"auth-access","refresh_token":"auth-refresh","id_token":"auth-id","account_id":"acc-auth","email":"auth@example.com","type":"codex"}
+cat > "$RESULT" <<JSON
+{"access_token":"` + accessToken + `","refresh_token":"auth-refresh","account_id":"acc-auth","email":"auth@example.com","type":"codex"}
 JSON
 echo "fake registrar ok seed=$SEED"
 `
@@ -91,8 +105,11 @@ echo "fake registrar ok seed=$SEED"
 	t.Setenv("CODEX_REG_NODE_ENTRY", scriptPath)
 	t.Setenv("CODEX_REG_NODE_DIR", regDir)
 
-	p := NewPipeline(store, nil, nil, nil)
-	acct, err := p.nodeRegisterOne(context.Background(), RegisterRequest{Method: "node", GroupName: "cyber"})
+	smsProvider := &pipelineSMSProvider{name: "herosms"}
+	p := NewPipeline(store, &provider.Manager{SMS: []provider.SMSProvider{smsProvider}}, nil, nil)
+	acct, err := p.nodeRegisterOne(context.Background(), RegisterRequest{
+		Method: "node", GroupName: "default", EgressID: storage.DefaultDirectEgressID,
+	})
 	if err != nil {
 		t.Fatalf("nodeRegisterOne: %v", err)
 	}
@@ -105,7 +122,10 @@ echo "fake registrar ok seed=$SEED"
 	if err != nil {
 		t.Fatalf("GetToken: %v", err)
 	}
-	if tok.AccessToken != "auth-access" || tok.RefreshToken != "auth-refresh" {
-		t.Fatalf("token = %+v, want auth-access/auth-refresh (from auth.json)", tok)
+	if tok.AccessToken != accessToken || tok.RefreshToken != "auth-refresh" {
+		t.Fatalf("token was not imported from the verified auth.json result")
+	}
+	if smsProvider.cancelled != 1 || smsProvider.completed != 0 {
+		t.Fatalf("unused OTP lease settlement = cancelled:%d completed:%d", smsProvider.cancelled, smsProvider.completed)
 	}
 }

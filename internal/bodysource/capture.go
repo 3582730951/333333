@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"codex-account-pool/internal/datadir"
 )
 
 const DefaultChunkSize = 64 << 10
@@ -513,6 +515,8 @@ func ensureDiskReserve(dir string, reserveBytes, incoming int64) error {
 	}
 	if dir == "" {
 		dir = os.TempDir()
+	} else if err := datadir.RecoverDirectory(dir); err != nil {
+		return fmt.Errorf("prepare spool directory: %w", err)
 	}
 	dir, err := filepath.Abs(dir)
 	if err != nil {

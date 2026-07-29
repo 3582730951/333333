@@ -242,7 +242,7 @@ func TestGatewayIdentityMissingDownstreamKeyUsesJSONError(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	assertErrorEnvelope(t, body, "missing downstream_key")
+	assertErrorEnvelope(t, body, http.StatusBadRequest)
 }
 
 func newGatewayIdentityTestServer(t *testing.T) *Server {

@@ -3,7 +3,7 @@
 #
 # The real, authoritative installer is scripts/install.sh. It:
 #   - builds the Go gateway WITH the embedded admin UI (-> codex-pool-server),
-#   - installs the curl_cffi sidecar, gopay, and the lifecycle services (register/payment),
+#   - installs the curl_cffi sidecar and registration workers,
 #   - writes the systemd units + activation socket and starts the service,
 #   - preserves an existing config + the accounts SQLite DB.
 #
@@ -51,7 +51,7 @@ done
 echo "================================"
 echo " Pool Server 安装 / Install"
 echo "================================"
-echo "==> 转交给规范安装器 scripts/install.sh（构建内嵌UI的二进制、安装 sidecar/gopay/生命周期服务、写入 systemd）"
+echo "==> 转交给规范安装器 scripts/install.sh（构建内嵌 UI 的二进制、安装 sidecar/注册 worker、写入 systemd）"
 echo "==> Codex skills 兼容提示：完整官方 skills/plugins/Browser Use 体验请使用官方 Codex 账号通道；第三方 API 通道为 best-effort。"
 echo
 

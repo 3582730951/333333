@@ -1832,20 +1832,6 @@
   overflow-wrap: anywhere;
 }
 
-.pool-gopay-fallback,
-.pool-gopay-panels {
-  display: grid;
-  gap: 14px;
-}
-
-.pool-gopay-panels {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
-.pool-gopay-panel {
-  min-width: 0;
-}
-
 @media (max-width: 1000px) {
   .pool-dashboard-command,
   .pool-grid.cols-3,
@@ -2009,8 +1995,7 @@
   }
 
   .pool-task-detail__grid,
-  .pool-kv-grid,
-  .pool-gopay-panels {
+  .pool-kv-grid {
     grid-template-columns: 1fr;
   }
 }

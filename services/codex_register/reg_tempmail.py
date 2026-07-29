@@ -14,10 +14,10 @@ import base64, hashlib, json, os, re, random, secrets, sys, time, urllib.parse, 
 
 PROXY_SERVER = os.environ.get("REG_PROXY_SERVER", "")
 PROXY_USER   = os.environ.get("REG_PROXY_USER", "")
-PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "d6kfytmo")
+PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "")
 CHROME       = os.environ.get("REG_CHROME", os.environ.get("CHROME_PATH", ""))
 HEADLESS     = os.environ.get("REG_HEADLESS", "1") != "0"
-HEROSMS_KEY  = os.environ.get("HEROSMS_API_KEY", "810154d173c3c562B1ed124418c8f7B3")
+HEROSMS_KEY  = os.environ.get("HEROSMS_API_KEY", "")
 SMS_COUNTRY  = os.environ.get("SMS_COUNTRY", "PH")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"

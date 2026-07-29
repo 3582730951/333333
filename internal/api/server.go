@@ -27,13 +27,10 @@ import (
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/console"
-	"codex-account-pool/internal/gopay"
 	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
-	"codex-account-pool/internal/payment"
 	"codex-account-pool/internal/prompt"
-	"codex-account-pool/internal/registration"
 	"codex-account-pool/internal/reliability"
 	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/routing"
@@ -41,7 +38,6 @@ import (
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/streamrewrite"
 	"codex-account-pool/internal/supervisor"
-	"codex-account-pool/internal/turbo_gpt_register"
 	"codex-account-pool/internal/upstream"
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 	"codex-account-pool/internal/usage"
@@ -57,10 +53,6 @@ type Dependencies struct {
 	Scheduler *scheduler.Scheduler
 	Upstream  *upstream.Client
 	Planner   *virtual.Planner
-	Gopay     *gopay.Manager
-	// PaymentMgr abstracts Plus upgrade payment providers (GoPay/PayPal) so automation
-	// and lifecycle are decoupled from the payment implementation.
-	PaymentMgr *payment.Manager
 	// Warp is the multi-exit WARP CF-fallback manager (nil = WARP disabled).
 	Warp *warp.Manager
 	// Solver is the cf_clearance solver client (nil/disabled = no solver rung).
@@ -77,8 +69,6 @@ type Server struct {
 	// it to verify that a broken transport contract cannot panic an HTTP/WS request.
 	upstreamDo         func(context.Context, upstream.Request) (*upstream.Response, error)
 	planner            *virtual.Planner
-	gopay              *gopay.Manager
-	paymentMgr         *payment.Manager
 	warp               *warp.Manager
 	solver             *cfsolve.Client
 	mux                *http.ServeMux
@@ -87,6 +77,7 @@ type Server struct {
 	responseBodyBudget *bodysource.Budget
 	bodyDiskReserver   *bodysource.DiskReserver
 	diagnostics        diagnosticRuntime
+	diagnosticJobsOnce sync.Once
 	// oauth holds in-flight web-login (paste-back) PKCE sessions for the
 	// /admin/oauth/* import flow. In-memory + TTL'd; see oauth.go.
 	oauth *oauthStore
@@ -105,13 +96,9 @@ type Server struct {
 	// when the gateway_reliability flag is on. See reliability.go.
 	relState *reliability.Store
 	// regHandler handles registration API requests
-	regHandler *Handler
-	// emailReg orchestrates email-based ChatGPT registration
-	emailReg         *registration.EmailRegOrchestrator
-	turboGPTRegister *turbo_gpt_register.Orchestrator
-	lifecycleHandler *LifecycleHandlers
-	claudeRefresh    *claudeRefreshGates
-	kiro             *kiro.Manager
+	regHandler    *Handler
+	claudeRefresh *claudeRefreshGates
+	kiro          *kiro.Manager
 	// asyncWrites carries fire-and-forget DB writes (usage rows, virtual-ledger rows)
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
@@ -128,6 +115,10 @@ type Server struct {
 	asyncWG               sync.WaitGroup
 	asyncMu               sync.RWMutex
 	asyncClosed           bool
+	asyncWriteCtx         context.Context
+	asyncWriteCancel      context.CancelFunc
+	asyncFlushOnce        sync.Once
+	asyncFlushDone        chan struct{}
 	asyncBytes            int64
 	billingEstimates      sync.Map
 	missingLimitAudit     sync.Map // account/provider -> last emitted unix hour
@@ -170,6 +161,9 @@ type Server struct {
 	codexNativeContinues        uint64
 	codexEOFCompensations       uint64
 	diskGuard                   atomic.Value // DiskGuardSnapshot
+	storageAdmissionBlocked     atomic.Bool
+	storageLargeRequestsPaused  atomic.Bool
+	usageDirectWrites           atomic.Bool
 }
 
 func NewServer(dep Dependencies) *Server {
@@ -189,8 +183,6 @@ func NewServer(dep Dependencies) *Server {
 		scheduler:  dep.Scheduler,
 		upstream:   dep.Upstream,
 		planner:    dep.Planner,
-		gopay:      dep.Gopay,
-		paymentMgr: dep.PaymentMgr,
 		warp:       dep.Warp,
 		solver:     dep.Solver,
 		mux:        http.NewServeMux(),
@@ -203,16 +195,8 @@ func NewServer(dep Dependencies) *Server {
 			clientErrorLogWindow,
 			clientErrorLogMaxClients,
 		),
-		relState:   reliability.NewStore(relStateTTL, relStateMax),
-		regHandler: NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
-		emailReg:   newEmailRegOrchestrator(dep.Store, &dep.Config),
-		turboGPTRegister: turbo_gpt_register.New(dep.Store, turbo_gpt_register.NodeExecutor{
-			NodePath: "node", ScriptPath: "services/turbo_gpt_register/index.js",
-		}, turbo_gpt_register.Options{
-			MaxConcurrent: dep.Config.RegistrationConcurrency,
-			PhaseTimeout:  time.Duration(dep.Config.RegistrationTimeout) * time.Second,
-		}),
-		lifecycleHandler:    newServerLifecycleHandlers(dep.Store),
+		relState:            reliability.NewStore(relStateTTL, relStateMax),
+		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		claudeRefresh:       newClaudeRefreshGates(),
 		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
 		claudeCacheFlights:  map[string]chan struct{}{},
@@ -224,7 +208,11 @@ func NewServer(dep Dependencies) *Server {
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
-	s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
+	if len(dep.Config.RuntimeIdentityKey) == 32 {
+		s.identitySecretCached = append([]byte(nil), dep.Config.RuntimeIdentityKey...)
+	} else {
+		s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
+	}
 	if dep.Config.UsageJournalEnabled && dep.Store != nil && !dep.Store.InMemory() {
 		journalDir, err := usageJournalDirectory(dep.Config, dep.Store.Path())
 		if err != nil {
@@ -368,9 +356,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/providers", s.adminProviders)
 
 	// Lifecycle management API routes
-	s.mux.HandleFunc("/admin/lifecycle/services", s.handleLifecycleServices)
-	s.mux.HandleFunc("/admin/lifecycle/tasks", s.handleLifecycleTasks)
-	s.mux.HandleFunc("/admin/lifecycle/tasks/", s.handleLifecycleTaskAction)
+	s.mux.HandleFunc("/admin/lifecycle/services", s.handleRemovedLifecycle)
+	s.mux.HandleFunc("/admin/lifecycle/tasks", s.handleRemovedLifecycle)
+	s.mux.HandleFunc("/admin/lifecycle/tasks/", s.handleRemovedLifecycle)
 
 	s.mux.HandleFunc("/admin/providers/", s.adminProviderAction)
 	s.mux.HandleFunc("/admin/moderation", s.adminModeration)
@@ -398,6 +386,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/egress-pools", s.adminEgressPools)
 	s.mux.HandleFunc("/admin/egress-pools/", s.adminEgressPoolAction)
 	s.mux.HandleFunc("/admin/export/logs", s.adminDiagnosticsExport)
+	s.mux.HandleFunc("/admin/diagnostics/jobs", s.adminDiagnosticJobs)
+	s.mux.HandleFunc("/admin/diagnostics/jobs/", s.adminDiagnosticJobAction)
 	s.mux.HandleFunc("/admin/logs", s.adminLogRecords)
 	s.mux.HandleFunc("/admin/context-journal", s.adminContextJournal)
 	s.mux.HandleFunc("/admin/goals", s.adminGoals)
@@ -417,13 +407,13 @@ func (s *Server) routes() {
 	// Thinking (deep reasoning) configuration APIs
 	s.mux.HandleFunc("/admin/thinking", s.handleThinkingConfig)
 	s.mux.HandleFunc("/admin/thinking/preview", s.handlePreviewThinking)
-	s.mux.HandleFunc("/admin/gopay", s.adminGopay)
-	s.mux.HandleFunc("/admin/gopay/subscribe", s.adminGopaySubscribe)
-	s.mux.HandleFunc("/admin/gopay/otp", s.adminGopayOTP)
+	s.mux.HandleFunc("/admin/gopay", s.handleRemovedPayment)
+	s.mux.HandleFunc("/admin/gopay/", s.handleRemovedPayment)
 	s.mux.HandleFunc("/admin/virtual-context/sweep", s.adminVirtualSweep)
 
 	// Registration API routes
 	s.mux.HandleFunc("/admin/register/batch", s.handleRegisterBatch)
+	s.mux.HandleFunc("/admin/register/canary", s.handleRegisterCanary)
 	s.mux.HandleFunc("/admin/register/jobs", s.handleRegisterJobs)
 	s.mux.HandleFunc("/admin/register/job/status", s.handleJobStatus)
 	s.mux.HandleFunc("/admin/register/job/events", s.handleJobEvents)
@@ -450,18 +440,10 @@ func (s *Server) routes() {
 	// Readiness self-check: reports whether "deploy → auto-fill the pool" is actually
 	// configured to run (refill policy, providers, pool deficit, blockers).
 	s.mux.HandleFunc("/admin/register/readiness", s.handleRegisterReadiness)
-	// Email-based registration (ChatGPT protocol registration via Outlook/IMAP OTP).
-	s.mux.HandleFunc("/admin/register/email/start", s.handleEmailRegStart)
-	s.mux.HandleFunc("/admin/register/email/jobs", s.handleEmailRegJobs)
-	s.mux.HandleFunc("/admin/register/email/job/status", s.handleEmailRegJobStatus)
-	s.mux.HandleFunc("/admin/register/email/job/events", s.handleEmailRegJobEvents)
-	s.mux.HandleFunc("/admin/register/email/job/events/sse", s.handleEmailRegJobEventsSSE)
-	s.mux.HandleFunc("/admin/register/email/job/", s.handleEmailRegJobAction)
-	s.mux.HandleFunc("/admin/register/email/config", s.handleEmailRegConfig)
-	// Turbo GPT phased browser registrar (durable jobs + encrypted OAuth results).
-	s.mux.HandleFunc("/admin/turbo-gpt-register/jobs", s.adminTurboGPTRegisterJobs)
-	s.mux.HandleFunc("/admin/turbo-gpt-register/jobs/", s.adminTurboGPTRegisterJobAction)
-	s.mux.HandleFunc("/admin/turbo-gpt-register/config", s.adminTurboGPTRegisterConfig)
+	// One-release compatibility tombstones for the two superseded registration
+	// orchestrators. All new work goes through /admin/register/batch.
+	s.mux.HandleFunc("/admin/register/email/", s.handleRemovedRegistration)
+	s.mux.HandleFunc("/admin/turbo-gpt-register/", s.handleRemovedRegistration)
 	// Email account pool management (Outlook/Hotmail accounts for registration).
 	s.mux.HandleFunc("/admin/email-pool/import", s.adminEmailPoolImport)
 	s.mux.HandleFunc("/admin/email-pool", s.adminEmailPool)

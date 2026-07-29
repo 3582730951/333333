@@ -383,8 +383,8 @@ func configFields() []configField {
 
 		// ── 注册 / 引擎 ───────────────────────────────────────────────────────
 		{Key: "default_register_method", Label: "默认注册引擎", Category: catReg, Type: fieldSelect, Effect: effectHot,
-			Options: []string{"node", "protocol_v2", "browser_v3", "protocol", "browser"},
-			Help:    "node=移植的 puppeteer-real-browser 注册机(每任务独立 IP/指纹/Cookie 清理)。触发注册未指定引擎时使用。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.DefaultRegisterMethod, "node") }},
+			Options: []string{"protocol_v2", "protocol", "node", "browser", "browser_v3"},
+			Help:    "触发注册未指定引擎时使用。引擎只有在制品、provider、注册出口就绪且当前配置的单账号 canary 成功后才可批量运行。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.DefaultRegisterMethod, "protocol_v2") }},
 		{Key: "registration_egress_pool_id", Label: "默认注册池", Category: catReg, Type: fieldString, Effect: effectHot,
 			Help: "注册任务发起阶段使用的默认注册代理池。注册成功的账号仍默认直连，账号详情页单独修改运行出口。", boot: func(c config.Config) interface{} { return c.RegistrationEgressPoolID }},
 		{Key: "registration_concurrency", Label: "注册并发上限", Category: catReg, Type: fieldInt, Effect: effectHot,

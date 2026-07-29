@@ -1,6 +1,6 @@
 import type { ApiError } from '../../../model/contracts';
 
-export type SettingsSection = 'config' | 'automation' | 'registrar' | 'lifecycle' | 'logging' | 'memory';
+export type SettingsSection = 'config' | 'automation' | 'registrar' | 'logging' | 'memory';
 export type SettingsValues = Record<string, unknown>;
 export type ConfigPlacement = 'ai_settings' | 'system_settings' | 'feature_page';
 export type AISettingsDomain = 'chatgpt' | 'claude' | 'kiro' | 'antigravity' | 'codex' | 'claude_code';
@@ -118,11 +118,6 @@ export interface RegistrarSettings {
   captchaProviders: ProviderSetting[];
   emailProviders: ProviderSetting[];
   registrarErrors: Record<string, string>;
-}
-
-export interface LifecycleSettings {
-  defaults: SettingsValues;
-  defaultsError: string;
 }
 
 export interface SettingsOption {

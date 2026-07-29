@@ -23,7 +23,6 @@ const adminPages = [
   { name: '05-providers', path: '/providers', wait: 1500 },
   { name: '06-registration', path: '/registration', wait: 2000 },
   { name: '07-automation', path: '/automation', wait: 2000 },
-  { name: '08-lifecycle', path: '/lifecycle', wait: 2000 },
   { name: '09-usage', path: '/usage', wait: 2000 },
   { name: '10-quota', path: '/quota', wait: 1500 },
   { name: '11-cf-events', path: '/cf-events', wait: 1500 },
@@ -32,7 +31,6 @@ const adminPages = [
   { name: '14-users', path: '/users', wait: 1500 },
   { name: '15-thinking', path: '/thinking', wait: 1000 },
   { name: '16-moderation', path: '/moderation', wait: 1000 },
-  { name: '17-gopay', path: '/gopay', wait: 1500 },
   { name: '18-settings', path: '/settings', wait: 2000 },
   { name: '19-system', path: '/system', wait: 2000 },
 ];

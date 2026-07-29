@@ -6,6 +6,7 @@ After=codex-pool-handoff.service
 [Service]
 Type=oneshot
 Environment=CODEX_POOL_DATABASE=/var/lib/codex-pool/pool.sqlite3
+Environment=CODEX_POOL_DATA_DIR=/var/lib/codex-pool/data
 Environment=CODEX_POOL_LISTEN_ADDR=0.0.0.0:8787
 ExecStart=/bin/true
 RemainAfterExit=yes

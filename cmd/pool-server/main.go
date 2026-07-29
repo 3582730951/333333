@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -21,10 +23,10 @@ import (
 	"codex-account-pool/internal/api"
 	"codex-account-pool/internal/cfsolve"
 	"codex-account-pool/internal/config"
-	"codex-account-pool/internal/gopay"
+	"codex-account-pool/internal/datadir"
 	"codex-account-pool/internal/identity"
-	"codex-account-pool/internal/payment"
 	"codex-account-pool/internal/scheduler"
+	"codex-account-pool/internal/secretbox"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
@@ -34,6 +36,13 @@ import (
 
 func main() {
 	os.Exit(run())
+}
+
+func loadRuntimeKey(path string, explicit bool) ([]byte, error) {
+	if explicit {
+		return datadir.LoadCredentialKey(path)
+	}
+	return datadir.LoadOrCreateKey(path)
 }
 
 func run() int {
@@ -57,6 +66,51 @@ func run() int {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Printf("load config: %v", err)
+		return 1
+	}
+	explicitJournal := strings.TrimSpace(cfg.UsageJournalDir)
+	explicitMasterKey := strings.TrimSpace(cfg.MasterKeyFile) != ""
+	explicitIdentityKey := strings.TrimSpace(cfg.IdentityKeyFile) != ""
+	explicitDiagnosticAliasKey := strings.TrimSpace(cfg.DiagnosticAliasKeyFile) != ""
+	layout, err := datadir.Prepare(cfg.DataDir, cfg.BodySpoolDir, explicitJournal)
+	if err != nil {
+		log.Printf("persistent data preflight: %v", err)
+		return 1
+	}
+	cfg.DataDir = layout.Root
+	cfg.BodySpoolDir = layout.Spool
+	cfg.DiagnosticsDir = layout.Diagnostics
+	if explicitJournal == "" {
+		cfg.UsageJournalDir = filepath.Join(layout.Journal, journalOwnerDirectory(cfg.NodeID, os.Getenv("CODEX_POOL_INSTANCE_ID")))
+		if err := datadir.EnsureDirectory(cfg.UsageJournalDir); err != nil {
+			log.Printf("usage journal preflight: %v", err)
+			return 1
+		}
+	} else {
+		cfg.UsageJournalDir = layout.Journal
+	}
+	if strings.TrimSpace(cfg.MasterKeyFile) == "" {
+		cfg.MasterKeyFile = filepath.Join(layout.Keys, "master.key")
+	}
+	if strings.TrimSpace(cfg.IdentityKeyFile) == "" {
+		cfg.IdentityKeyFile = filepath.Join(layout.Keys, "identity.key")
+	}
+	if strings.TrimSpace(cfg.DiagnosticAliasKeyFile) == "" {
+		cfg.DiagnosticAliasKeyFile = filepath.Join(layout.Keys, "diagnostic-alias.key")
+	}
+	masterKey, err := loadRuntimeKey(cfg.MasterKeyFile, explicitMasterKey)
+	if err != nil {
+		log.Printf("load storage master key: %v", err)
+		return 1
+	}
+	cfg.RuntimeIdentityKey, err = loadRuntimeKey(cfg.IdentityKeyFile, explicitIdentityKey)
+	if err != nil {
+		log.Printf("load stable identity key: %v", err)
+		return 1
+	}
+	cfg.RuntimeDiagnosticAliasKey, err = loadRuntimeKey(cfg.DiagnosticAliasKeyFile, explicitDiagnosticAliasKey)
+	if err != nil {
+		log.Printf("load diagnostic alias key: %v", err)
 		return 1
 	}
 	// Advisory only: surface fingerprint version-override combinations that risk looking
@@ -89,16 +143,40 @@ func run() int {
 		return 1
 	}
 	log.Printf("startup: storage initialized in %s", time.Since(storageInitStarted).Round(time.Millisecond))
-	// Encrypt account secrets (tokens, session cookies) at rest with a key derived from
-	// the deployment identity secret, so a leaked DB file / backup does not hand over
-	// every account. Reads transparently decrypt; legacy plaintext rows are upgraded
-	// once here. Set a unique identity_secret in production (an unset one falls back to
-	// a host-derived key — better than nothing, but rotating the host invalidates it).
-	store.SetTokenEncryptionKey(identity.ResolveSecret([]byte(cfg.IdentitySecret)))
+	paymentRemoval, err := store.RemovePaymentFeatureData(ctx)
+	if err != nil {
+		log.Printf("[SECURITY] remove legacy payment state: %v", err)
+		return 1
+	}
+	if paymentRemoval.CancelledTasks+paymentRemoval.ClearedPaymentRows+paymentRemoval.QuarantinedMocks+paymentRemoval.AccountsForReview > 0 {
+		log.Printf("[SECURITY] removed legacy payment state: cancelled_tasks=%d cleared_rows=%d quarantined_mocks=%d manual_review=%d",
+			paymentRemoval.CancelledTasks, paymentRemoval.ClearedPaymentRows, paymentRemoval.QuarantinedMocks, paymentRemoval.AccountsForReview)
+	}
+	// Keep the former host/config-derived key readable for exactly this migration
+	// window. Every value is then rewritten with the independent persistent master.
+	legacyStorageKey := secretbox.DeriveKey(identity.ResolveSecret([]byte(cfg.IdentitySecret)))
+	legacyKeys := [][]byte(nil)
+	if string(legacyStorageKey) != string(masterKey) {
+		legacyKeys = append(legacyKeys, legacyStorageKey)
+	}
+	if err := store.SetTokenMasterKey(masterKey, legacyKeys...); err != nil {
+		log.Printf("[SECURITY] configure storage encryption: %v", err)
+		return 1
+	}
+	if err := store.ValidateEncryptionSentinel(ctx); err != nil {
+		log.Printf("[SECURITY] encryption sentinel: %v", err)
+		return 1
+	}
 	if n, err := store.EncryptExistingTokens(ctx); err != nil {
 		log.Printf("[SECURITY] encrypt existing tokens at rest: %v", err)
+		return 1
 	} else if n > 0 {
 		log.Printf("[SECURITY] encrypted %d plaintext account token row(s) at rest", n)
+	}
+	store.EnableStrictEncryption()
+	if err := store.CryptoError(); err != nil {
+		log.Printf("[SECURITY] credential validation: %v", err)
+		return 1
 	}
 	if cfg.DefaultSidecarEndpoint != "" {
 		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
@@ -116,12 +194,6 @@ func run() int {
 		}
 	}
 
-	gopayMgr := gopay.NewManager(cfg, store)
-	// Payment manager abstracts Plus upgrade providers (GoPay/PayPal). Registers both;
-	// the automation scheduler picks via policy config.
-	paymentMgr := payment.NewManager()
-	paymentMgr.Register(payment.NewGopayProvider(gopayMgr, store))
-	paymentMgr.Register(payment.NewPaypalProvider(store, nil)) // settings loaded from automation policy config
 	up := upstream.NewClient(cfg)
 	// WARP CF-fallback manager. The prober wraps ProbeEgress so the manager can refresh
 	// an exit's IP after a re-registration without importing the upstream package.
@@ -141,15 +213,13 @@ func run() int {
 		return 1
 	}
 	app := api.NewServer(api.Dependencies{
-		Config:     cfg,
-		Store:      store,
-		Scheduler:  scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
-		Upstream:   up,
-		Planner:    virtual.NewPlanner(store, cfg),
-		Gopay:      gopayMgr,
-		PaymentMgr: paymentMgr,
-		Warp:       warpMgr,
-		Solver:     solver,
+		Config:    cfg,
+		Store:     store,
+		Scheduler: scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
+		Upstream:  up,
+		Planner:   virtual.NewPlanner(store, cfg),
+		Warp:      warpMgr,
+		Solver:    solver,
 	})
 
 	// Background model-capability probe sweep (periodic; honors
@@ -169,16 +239,6 @@ func run() int {
 	// Low-cost group×model intelligence/degradation monitor. It is opt-in and
 	// never iterates accounts; one normal scheduler sample is used per combination.
 	app.StartModelQualityMonitor(ctx)
-
-	// GoPay auto-subscribe (default off). If an operator previously enabled it and
-	// auto-start is on, bring the managed Python services up now; failure is logged
-	// but never blocks the relay.
-	if gopayMgr.Enabled(ctx) && cfg.GopayAutoStart {
-		if err := gopayMgr.Start(ctx); err != nil {
-			log.Printf("gopay: start skipped: %v", err)
-		}
-	}
-	defer gopayMgr.Stop()
 
 	// Background ledger purge: prevents unbounded virtual_context_ledger growth by
 	// periodically evicting rows older than the configured TTL (default 1 hour).
@@ -209,6 +269,27 @@ func run() int {
 	})
 
 	deployment := newDeploymentHandler(app, releaseID, unixSocket)
+	deployment.check = func(checkCtx context.Context) error {
+		if err := datadir.RecoverDirectory(cfg.BodySpoolDir); err != nil {
+			return err
+		}
+		if err := datadir.RecoverDirectory(cfg.UsageJournalDir); err != nil {
+			return err
+		}
+		if err := store.CryptoError(); err != nil {
+			return err
+		}
+		if err := store.ValidateEncryptionSentinel(checkCtx); err != nil {
+			return err
+		}
+		if err := store.CheckWritable(checkCtx); err != nil {
+			return err
+		}
+		if !app.StorageAdmissionReady() {
+			return errors.New("storage admission unavailable")
+		}
+		return nil
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           deployment,
@@ -256,8 +337,8 @@ func run() int {
 
 	// Graceful drain: stop accepting new connections and let in-flight requests (the
 	// long-lived SSE streams this relay serves) finish, up to the configured window.
-	// On timeout we log and return (not Fatalf) so the deferred store.Close /
-	// gopay.Stop still run for a clean exit; the unit's TimeoutStopSec is set well
+	// On timeout we log and return (not Fatalf) so deferred storage cleanup still
+	// runs for a clean exit; the unit's TimeoutStopSec is set well
 	// above this so systemd never SIGKILLs mid-drain.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownDrainTimeout())
 	defer cancel()
@@ -267,7 +348,11 @@ func run() int {
 	// In-flight requests have now drained, so no new async writes will be enqueued.
 	// Flush the deferred fire-and-forget DB writes (usage / virtual-ledger rows) before
 	// the deferred store.Close runs, so a clean shutdown loses no recorded usage.
-	app.FlushWrites()
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := app.FlushWritesContext(flushCtx); err != nil {
+		log.Printf("bounded write flush incomplete; durable journal retained: %v", err)
+	}
+	cancelFlush()
 	if serveFailure != nil {
 		return 1
 	}
@@ -285,6 +370,7 @@ type deploymentHandler struct {
 	ready      atomic.Bool
 	draining   atomic.Bool
 	inflight   atomic.Int64
+	check      func(context.Context) error
 }
 
 func newDeploymentHandler(next http.Handler, releaseID, workerAddr string) *deploymentHandler {
@@ -292,8 +378,14 @@ func newDeploymentHandler(next http.Handler, releaseID, workerAddr string) *depl
 }
 
 func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/livez" {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "release_id": h.releaseID})
+		return
+	}
 	if r.URL.Path == "/readyz" {
-		h.serveReady(w)
+		h.serveReady(w, r)
 		return
 	}
 	h.inflight.Add(1)
@@ -302,8 +394,15 @@ func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.next.ServeHTTP(w, r)
 }
 
-func (h *deploymentHandler) serveReady(w http.ResponseWriter) {
+func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 	ready := h.ready.Load() && !h.draining.Load()
+	var checkErr error
+	if ready && h.check != nil {
+		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		checkErr = h.check(checkCtx)
+		cancel()
+		ready = checkErr == nil
+	}
 	state := "ready"
 	status := http.StatusOK
 	if h.draining.Load() {
@@ -325,7 +424,16 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter) {
 		"inflight":         h.inflight.Load(),
 		"started_at":       h.startedAt.Format(time.RFC3339Nano),
 		"worker_socket":    h.workerAddr,
+		"checks":           map[string]bool{"storage": checkErr == nil},
 	})
+}
+
+func journalOwnerDirectory(nodeID, instanceID string) string {
+	if strings.TrimSpace(instanceID) == "" {
+		instanceID = "default"
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(nodeID) + "\x00" + strings.TrimSpace(instanceID)))
+	return fmt.Sprintf("owner-%x", sum[:12])
 }
 
 func startCPUProfile() func() {
