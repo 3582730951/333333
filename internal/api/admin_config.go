@@ -486,19 +486,17 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		CookieJarKey: binding.CookieJarKey,
 	}
 	if provider == "claude" {
-		// Probe liveness with a CLOAKED count_tokens call — the same shape the
-		// real Claude Code client uses, routed through the same path as live
-		// traffic. Two reasons this matters and the old bare /v1/messages ping
-		// did not work: (1) Anthropic silently rejects OAuth (sk-ant-oat) requests
-		// whose first system block is not the exact "You are Claude Code…" identity
-		// line (HTTP 400 for non-Haiku models, escalating to 429 under repeats), so
-		// the probe MUST carry the cloak just like messages.go does; (2) count_tokens
-		// consumes no generation quota and lives under a far higher rate limit, so a
-		// healthy account returns a clean 200 instead of tripping the generation
-		// limiter. cloak.Virtualize injects the identity system block + virtual
-		// user_id; osHint/identity are derived exactly as the live path does.
+		// Probe liveness with a count_tokens call carrying the same Claude Code
+		// identity system block as live traffic. count_tokens consumes no generation
+		// quota and has a higher rate limit than a synthetic message. Its schema is
+		// narrower than /v1/messages, though: current OAuth deployments reject the
+		// otherwise-valid messages metadata field with "Extra inputs are not
+		// permitted". Keep the identity/billing system blocks and strip only that
+		// unsupported top-level field, matching the reference client's native token
+		// counting path rather than turning a schema 400 into an auth failure.
 		req.Provider = "claude"
 		req.DownstreamPath = "/v1/messages/count_tokens"
+		req.MinimalProbe = true
 		base := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"ping"}]}`)
 		osHint := s.osHint(base, egress)
 		id := identity.ForOS(s.identitySecret(), account.ID, osHint)
@@ -511,7 +509,7 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 			probeBillingVer = s.cfg.ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 		}
 		result := cloak.VirtualizeClaudeCode(base, id, s.cfg.SensitiveWordsFor("claude"), probeOAuth, probeBillingVer)
-		req.SetBodyBytes(result.Body)
+		req.SetBodyBytes(claudeCountTokensProbeBody(result.Body))
 		req.OSHint = osHint
 	} else if upstream.IsCustomProvider(provider) {
 		// Custom OpenAI-compatible provider: a minimal non-streaming chat completion.
@@ -721,6 +719,22 @@ func (s *Server) probeModel(ctx context.Context, accountID, provider string) str
 
 func codexLivenessProbeBody(model string) []byte {
 	return []byte(`{"model":"` + model + `","instructions":"You are a coding agent.","store":false,"input":[{"role":"user","content":"ping"}],"stream":true}`)
+}
+
+func claudeCountTokensProbeBody(body []byte) []byte {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body
+	}
+	if _, present := root["metadata"]; !present {
+		return body
+	}
+	delete(root, "metadata")
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return normalized
 }
 
 func codexHealthProbeModelAllowed(model string) bool {

@@ -227,7 +227,7 @@ func configFields() []configField {
 		{Key: "claude_cache_lossless_block_split", Label: "Claude 无损块拆分", Category: catBehavior, Type: fieldBool, Effect: effectHot,
 			Help: "开=仅在拼接后逐字节一致时拆分巨型 text block，便于标记稳定上下文。", boot: func(c config.Config) interface{} { return c.ClaudeCacheLosslessBlockSplit }},
 		{Key: "claude_cch_signing", Label: "Claude CCH 签名（已弃用）", Category: catBehavior, Type: fieldBool, Effect: effectUpstream,
-			Help: "兼容旧配置；Claude Code 2.1.206 当前 wire 不含 cch，本设置不再改变请求。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
+			Help: "兼容旧配置；Claude Code 2.1.220 当前 wire 不含 cch，本设置不再改变请求。", boot: func(c config.Config) interface{} { return c.ClaudeCCHSigning }},
 		{Key: "claude_cache_ttl", Label: "Claude 缓存 TTL", Category: catBehavior, Type: fieldSelect, Effect: effectHot,
 			Options: []string{"", "1h"}, Help: "注入缓存的 TTL：空=标准(5m)，1h=长缓存。", boot: func(c config.Config) interface{} {
 				if strings.TrimSpace(c.ClaudeCacheTTL) == "1h" {

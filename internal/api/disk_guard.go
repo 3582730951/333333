@@ -342,6 +342,23 @@ func diskGuardLevel(freePercent float64, freeBytes uint64, previous string) stri
 	}
 }
 
+func bodySpoolMinimumFreeBytes(path string, configured int64) int64 {
+	reserve := int64(diskEmergencyFreeBytes)
+	if configured > reserve {
+		reserve = configured
+	}
+	var stat syscall.Statfs_t
+	if strings.TrimSpace(path) == "" || syscall.Statfs(path, &stat) != nil || stat.Blocks == 0 || stat.Bsize <= 0 {
+		return reserve
+	}
+	total := uint64(stat.Blocks) * uint64(stat.Bsize)
+	twoPercent := int64(total / 50)
+	if twoPercent > reserve {
+		reserve = twoPercent
+	}
+	return reserve
+}
+
 func diskLevelRank(level string) int {
 	switch level {
 	case "pressure":

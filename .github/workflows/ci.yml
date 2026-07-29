@@ -8,20 +8,101 @@ permissions:
   contents: read
 
 jobs:
+  repository-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.12
+          cache: true
+      - name: Reject tracked binaries, archives, databases, and large files
+        run: scripts/check-repository-hygiene.sh
+      - name: Install Gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.28.0
+      - name: Scan the current source tree
+        run: gitleaks dir --redact --no-banner --max-archive-depth=1 .
+      - name: Select the pushed or pull-request commit range
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ -n "$BASE_SHA" ]] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          elif [[ -n "$BEFORE_SHA" && ! "$BEFORE_SHA" =~ ^0+$ ]] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            range="${BEFORE_SHA}..${HEAD_SHA}"
+          elif git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+            base="$(git merge-base "origin/${DEFAULT_BRANCH}" "$HEAD_SHA")"
+            range="${base}..${HEAD_SHA}"
+          else
+            range="-1 ${HEAD_SHA}"
+          fi
+          echo "GITLEAKS_LOG_OPTS=$range" >> "$GITHUB_ENV"
+      - name: Scan newly introduced Git history
+        run: gitleaks git --redact --no-banner --max-archive-depth=1 --log-opts="$GITLEAKS_LOG_OPTS" .
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: 1.25.12
           cache: true
+      - name: Verify the pinned toolchain
+        run: go version | grep -F 'go1.25.12'
+      - name: Verify module files are deterministic
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
       - name: Unit and integration tests
         run: go test ./...
       - name: Race tests for stateful Kiro paths
         run: go test -race ./internal/kiro ./internal/storage ./internal/scheduler
       - name: Static analysis
         run: go vet ./...
+      - name: Build binaries for reachable-vulnerability analysis
+        run: |
+          go build -trimpath -o "$RUNNER_TEMP/codex-pool-server" ./cmd/pool-server
+          go build -trimpath -o "$RUNNER_TEMP/codex-pool-handoff" ./cmd/pool-handoff
+          go build -trimpath -o "$RUNNER_TEMP/codex-gateway" ./cmd/gateway
+      - name: Scan reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck -mode=binary "$RUNNER_TEMP/codex-pool-server"
+          govulncheck -mode=binary "$RUNNER_TEMP/codex-pool-handoff"
+          govulncheck -mode=binary "$RUNNER_TEMP/codex-gateway"
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web-spa/package-lock.json
+            workers/node-registrar/package-lock.json
+      - name: Install deterministic frontend dependencies
+        working-directory: web-spa
+        run: npm ci
+      - name: Install Chromium and browser system dependencies
+        working-directory: web-spa
+        run: npx playwright install --with-deps chromium
+      - name: Typecheck, test, visual smoke, and build
+        working-directory: web-spa
+        run: npm run verify
+      - name: Verify the embedded SPA artifact is current
+        run: git diff --exit-code -- internal/console/dist
+      - name: Audit production Node dependencies
+        run: |
+          npm --prefix web-spa audit --omit=dev --audit-level=high
+          npm --prefix workers/node-registrar audit --omit=dev --audit-level=high
 
   docker:
     runs-on: ubuntu-latest
@@ -29,3 +110,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build non-root production image
         run: docker build --tag codex-pool-server:ci .
+      - name: Generate image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: codex-pool-server:ci
+          format: spdx-json
+          output-file: codex-pool-server.spdx.json
+          artifact-name: codex-pool-server-sbom.spdx.json
+      - name: Scan the production image
+        uses: anchore/scan-action@v7
+        with:
+          image: codex-pool-server:ci
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: true

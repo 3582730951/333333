@@ -56,6 +56,42 @@ func TestPhaseRollbackEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestSystemdCredentialDirectoryFallback(t *testing.T) {
+	credentialDirectory := t.TempDir()
+	adminToken := "credential-admin-token-0123456789"
+	if err := os.WriteFile(filepath.Join(credentialDirectory, "admin.token"), []byte(adminToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentialDirectory)
+	t.Setenv("CODEX_POOL_MASTER_KEY_FILE", "")
+	t.Setenv("CODEX_POOL_IDENTITY_KEY_FILE", "")
+	t.Setenv("CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE", "")
+	t.Setenv("CODEX_POOL_ADMIN_TOKEN", "")
+	t.Setenv("CODEX_POOL_ADMIN_TOKEN_FILE", "")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MasterKeyFile != filepath.Join(credentialDirectory, "master.key") ||
+		cfg.IdentityKeyFile != filepath.Join(credentialDirectory, "identity.key") ||
+		cfg.DiagnosticAliasKeyFile != filepath.Join(credentialDirectory, "diagnostic-alias.key") {
+		t.Fatalf("credential paths were not derived from CREDENTIALS_DIRECTORY: %+v", cfg)
+	}
+	if cfg.AdminToken != adminToken {
+		t.Fatalf("AdminToken = %q, want credential file value", cfg.AdminToken)
+	}
+}
+
+func TestSystemdCredentialDirectoryAllowsMissingOptionalAdminToken(t *testing.T) {
+	t.Setenv("CREDENTIALS_DIRECTORY", t.TempDir())
+	t.Setenv("CODEX_POOL_ADMIN_TOKEN", "")
+	t.Setenv("CODEX_POOL_ADMIN_TOKEN_FILE", "")
+	if _, err := Load(""); err != nil {
+		t.Fatalf("missing optional admin.token must not fail config load: %v", err)
+	}
+}
+
 func TestPostgresRequiresRedisAndSensitiveEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CODEX_POOL_STORAGE_DRIVER", "postgres")
 	t.Setenv("CODEX_POOL_POSTGRES_DSN", "postgres://db.example/pool")

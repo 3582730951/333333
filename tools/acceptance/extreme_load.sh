@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-GO_BIN="${GO_BIN:-/tmp/codex-go1.24.1/go/bin/go}"
+GO_BIN="${GO_BIN:-/tmp/codex-go1.25.12/go/bin/go}"
 FIXTURE_COUNT="${FIXTURE_COUNT:-256}"
 TARGET_TOKENS="${TARGET_TOKENS:-1000000}"
 TARGET_RPS="${TARGET_RPS:-100}"

@@ -30,6 +30,220 @@ func createRouteTestGroup(t *testing.T, h *testHarness, id string, targets []sto
 	}
 }
 
+func setUserGroupCapacityTestIntervals(t *testing.T, timeout, poll, heartbeat, safetyRetry time.Duration) {
+	t.Helper()
+	oldTimeout := userGroupCapacityWaitTimeout
+	oldPoll := userGroupCapacityPollInterval
+	oldHeartbeat := userGroupCapacityHeartbeatInterval
+	oldSafetyRetry := userGroupCapacitySafetyRetryInterval
+	userGroupCapacityWaitTimeout = timeout
+	userGroupCapacityPollInterval = poll
+	userGroupCapacityHeartbeatInterval = heartbeat
+	userGroupCapacitySafetyRetryInterval = safetyRetry
+	t.Cleanup(func() {
+		userGroupCapacityWaitTimeout = oldTimeout
+		userGroupCapacityPollInterval = oldPoll
+		userGroupCapacityHeartbeatInterval = oldHeartbeat
+		userGroupCapacitySafetyRetryInterval = oldSafetyRetry
+	})
+}
+
+func TestUserGroupTargetFamilyPolicySkipsOnlySelectedAccountPool(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "family-policy-secondary"}); err != nil {
+		t.Fatal(err)
+	}
+	primary := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}
+	secondary := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "family-policy-secondary"}
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: "ug_family_policy", Name: "family-policy",
+		Targets:                 []storage.TargetRef{primary, secondary},
+		BlockClaudeTargetGroups: []string{primary.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pol := downstreamPolicy{UserGroupID: "ug_family_policy", Group: "cyber"}
+
+	claudeRaw := []byte(`{"model":"claude-opus-5","messages":[{"role":"user","content":"hello"}]}`)
+	claudePlan, err := resolveUserGroupRouteCandidates(t.Context(), h.store, pol, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), claudeRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claudePlan.Candidates) != 1 || claudePlan.Candidates[0] != secondary {
+		t.Fatalf("Claude candidates=%+v, want only secondary", claudePlan.Candidates)
+	}
+
+	gptRaw := []byte(`{"model":"gpt-5.6-sol","input":"hello"}`)
+	gptPlan, err := resolveUserGroupRouteCandidates(t.Context(), h.store, pol, httptest.NewRequest(http.MethodPost, "/v1/responses", nil), gptRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gptPlan.Candidates) != 2 || !userGroupTargetsContain(gptPlan.Candidates, primary) || !userGroupTargetsContain(gptPlan.Candidates, secondary) {
+		t.Fatalf("GPT candidates=%+v, want both account pools", gptPlan.Candidates)
+	}
+}
+
+func TestUserGroupPolicyTransfersStaleModelBindingToEligiblePool(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "policy-transfer-secondary"}); err != nil {
+		t.Fatal(err)
+	}
+	primary := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}
+	secondary := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "policy-transfer-secondary"}
+	const (
+		groupID = "ug_policy_transfer"
+		model   = "claude-opus-5"
+		thread  = "policy-transfer-root"
+	)
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: groupID, Name: "policy-transfer",
+		Targets:                 []storage.TargetRef{primary, secondary},
+		BlockClaudeTargetGroups: []string{primary.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"model":"` + model + `","messages":[{"role":"user","content":"continue"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("X-Claude-Code-Session-Id", thread)
+	affinity := routing.ExtractClaudeAffinityKey(req, raw)
+	for _, binding := range []storage.UserGroupTargetBinding{
+		{UserGroupID: groupID, AffinityKey: affinity.Hash, Target: primary},
+		{UserGroupID: groupID, AffinityKey: affinity.Hash, Model: model, Target: primary},
+	} {
+		if err := h.store.UpsertUserGroupTargetBinding(t.Context(), binding); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	var selected storage.TargetRef
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{
+		UserGroupID: groupID, Group: "cyber",
+	}, func(w http.ResponseWriter, candidate *http.Request) {
+		selected, _ = userGroupRouteOverride(candidate.Context())
+		writeJSON(w, http.StatusOK, map[string]string{"id": "msg_policy_transfer"})
+	})
+	if !handled || recorder.Code != http.StatusOK || selected != secondary {
+		t.Fatalf("handled=%v status=%d selected=%+v body=%s", handled, recorder.Code, selected, recorder.Body.String())
+	}
+	rootBinding, rootFound, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+	if err != nil || !rootFound || rootBinding.Target != primary {
+		t.Fatalf("root binding changed: %+v found=%v err=%v", rootBinding, rootFound, err)
+	}
+	modelBinding, modelFound, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, model)
+	if err != nil || !modelFound || modelBinding.Target != secondary {
+		t.Fatalf("model binding not transferred: %+v found=%v err=%v", modelBinding, modelFound, err)
+	}
+}
+
+func TestUserGroupCapacityWaitKeepsStreamAliveAndNewTargetTakesOver(t *testing.T) {
+	if userGroupCapacityWaitTimeout != 10*time.Minute {
+		t.Fatalf("production capacity wait=%s, want 10m", userGroupCapacityWaitTimeout)
+	}
+	setUserGroupCapacityTestIntervals(t, 300*time.Millisecond, 5*time.Millisecond, 5*time.Millisecond, time.Hour)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "capacity-takeover"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "capacity-final"}); err != nil {
+		t.Fatal(err)
+	}
+	blocked := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}
+	takeover := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "capacity-takeover"}
+	final := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "capacity-final"}
+	const groupID = "ug_capacity_takeover"
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: groupID, Name: "capacity-takeover",
+		Targets:                 []storage.TargetRef{blocked},
+		BlockClaudeTargetGroups: []string{blocked.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	updateDone := make(chan error, 2)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		updateDone <- h.store.ReplaceUserGroupDefinition(context.Background(), storage.UserGroup{
+			ID: groupID, Name: "capacity-takeover",
+			Targets:                 []storage.TargetRef{blocked, takeover},
+			BlockClaudeTargetGroups: []string{blocked.ID},
+		})
+		time.Sleep(30 * time.Millisecond)
+		updateDone <- h.store.ReplaceUserGroupDefinition(context.Background(), storage.UserGroup{
+			ID: groupID, Name: "capacity-takeover",
+			Targets:                 []storage.TargetRef{blocked, takeover, final},
+			BlockClaudeTargetGroups: []string{blocked.ID},
+		})
+	}()
+
+	raw := []byte(`{"model":"claude-opus-5","stream":true,"messages":[{"role":"user","content":"wait"}]}`)
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req = req.WithContext(withSchedulerWait(req.Context(), recorder, true, "anthropic"))
+	var selected storage.TargetRef
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{
+		UserGroupID: groupID, Group: "cyber",
+	}, func(w http.ResponseWriter, candidate *http.Request) {
+		selected, _ = userGroupRouteOverride(candidate.Context())
+		if selected == takeover {
+			if schedulerWaitTerminal(candidate.Context(), "candidate unavailable") {
+				t.Error("nested candidate terminated the outer waiting stream")
+				return
+			}
+			writePoolCodeError(w, http.StatusServiceUnavailable, "capability_unavailable", "candidate unavailable")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	})
+	for range 2 {
+		if err := <-updateDone; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !handled || selected != final {
+		t.Fatalf("handled=%v selected=%+v, want final takeover target", handled, selected)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: ping") || !strings.Contains(body, "event: message_stop") || strings.Contains(body, "event: error") {
+		t.Fatalf("capacity takeover stream=%q", body)
+	}
+}
+
+func TestUserGroupCapacityWaitTimesOutWithProtocolTerminal(t *testing.T) {
+	setUserGroupCapacityTestIntervals(t, 45*time.Millisecond, 5*time.Millisecond, 5*time.Millisecond, time.Hour)
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	blocked := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}
+	const groupID = "ug_capacity_timeout"
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: groupID, Name: "capacity-timeout",
+		Targets:              []storage.TargetRef{blocked},
+		BlockGPTTargetGroups: []string{blocked.ID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"wait"}`)
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req = req.WithContext(withSchedulerWait(req.Context(), recorder, true, "responses"))
+	attempts := 0
+	started := time.Now()
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{
+		UserGroupID: groupID, Group: "cyber",
+	}, func(http.ResponseWriter, *http.Request) {
+		attempts++
+	})
+	elapsed := time.Since(started)
+	if !handled || attempts != 0 || elapsed < 35*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("handled=%v attempts=%d elapsed=%s", handled, attempts, elapsed)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: response.in_progress") || !strings.Contains(body, "event: response.failed") || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("capacity timeout stream=%q", body)
+	}
+}
+
 func TestUserGroupAttemptWriterSpoolsAndCommitsWithoutChangingBody(t *testing.T) {
 	dir := t.TempDir()
 	budget := bodysource.NewBudget(64, 2<<20)
@@ -230,6 +444,37 @@ func TestDispatchUserGroupRouteCandidatesFallsBackBeforeCommitAcrossEntrypoints(
 	}
 }
 
+func TestDispatchUserGroupRoutePersistsTerminalBindingAfterClientCancellation(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	const groupID = "ug_cancelled_terminal_binding"
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{{
+		Kind: storage.TargetKindAccountPoolGroup,
+		ID:   "cyber",
+	}}, nil)
+
+	raw := []byte(`{"model":"gpt-5.6-sol","input":"terminal"}`)
+	base := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	base.Header.Set("Thread-Id", "cancelled-terminal-root")
+	ctx, cancel := context.WithCancel(base.Context())
+	req := base.WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	handled := h.app.dispatchUserGroupRouteCandidates(recorder, req, raw, raw, downstreamPolicy{UserGroupID: groupID}, func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"id": "resp_cancelled_terminal", "status": "completed"})
+		cancel()
+	})
+	if !handled || recorder.Code != http.StatusOK {
+		t.Fatalf("handled=%v status=%d body=%s", handled, recorder.Code, recorder.Body.String())
+	}
+
+	affinityRequest := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	affinityRequest.Header.Set("Thread-Id", "cancelled-terminal-root")
+	affinity := routing.ExtractAffinityKey(affinityRequest, raw)
+	binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+	if err != nil || !found || binding.Target.ID != "cyber" {
+		t.Fatalf("terminal binding=%+v found=%v err=%v", binding, found, err)
+	}
+}
+
 func TestClaudeMessagesUserGroupFallsThroughCodexTierToExactAntigravityModel(t *testing.T) {
 	const (
 		groupID          = "ug_messages_exact_antigravity"
@@ -354,6 +599,97 @@ func TestClaudeMessagesUserGroupFallsThroughCodexTierToExactAntigravityModel(t *
 	_ = unknownResp.Body.Close()
 	if unknownResp.StatusCode == http.StatusOK || len(h.requests()) != before {
 		t.Fatalf("unknown model status=%d upstream calls=%d->%d", unknownResp.StatusCode, before, len(h.requests()))
+	}
+}
+
+func TestClaudeMessagesUserGroupRoutesExactModelToClaudeAccountPool(t *testing.T) {
+	const (
+		groupID     = "ug_messages_exact_claude"
+		codexGroup  = "route-codex-before-claude"
+		claudeGroup = "route-native-claude"
+		claudeID    = "route-native-claude-account"
+		model       = "claude-sonnet-4-6"
+		plainKey    = "sk-user-group-exact-native-claude"
+	)
+	var upstreamCalls int
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls++
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("native Claude request path=%q", r.URL.Path)
+		}
+		if !strings.Contains(r.Header.Get("Authorization"), "native-claude-token") &&
+			!strings.Contains(r.Header.Get("X-Api-Key"), "native-claude-token") {
+			t.Fatalf("native Claude credential headers=%v", r.Header)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_native_group","type":"message","role":"assistant","model":"`+model+`","content":[{"type":"text","text":"native claude"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":2}}`)
+	})
+	for _, name := range []string{codexGroup, claudeGroup} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	codexID := h.importAccount(t, "route-codex-before-claude", "route-codex-before-claude-upstream", "route-codex-before-claude-token")
+	codex, err := h.store.GetAccount(t.Context(), codexID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexToken, err := h.store.GetToken(t.Context(), codexID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex.GroupName = codexGroup
+	if err := h.store.UpsertAccount(t.Context(), codex, codexToken); err != nil {
+		t.Fatal(err)
+	}
+
+	claude := storage.Account{ID: claudeID, Label: claudeID, GroupName: claudeGroup, Provider: "claude", Status: "active"}
+	if err := h.store.UpsertAccount(t.Context(), claude, storage.AccountToken{AccessToken: "native-claude-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertCapabilities(t.Context(), []storage.ModelCapability{{
+		AccountID: claudeID, ModelSlug: model, AvailabilityState: "verified", Source: "native_claude_catalog",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	codexTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: codexGroup}
+	claudeTarget := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: claudeGroup}
+	createRouteTestGroup(t, h, groupID, []storage.TargetRef{codexTarget, claudeTarget}, []storage.ModelRoutingRule{{
+		Model: model, Tiers: [][]storage.TargetRef{{codexTarget}, {claudeTarget}},
+	}})
+	if err := h.store.UpsertAPIKey(t.Context(), storage.APIKey{
+		KeyHash: hashAPIKey(plainKey), KeyType: "downstream", Label: "exact native Claude route",
+		GroupName: codexGroup, UserGroupID: groupID, ProviderHint: "auto", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	body := []byte(`{"model":"` + model + `","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+plainKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("X-Claude-Code-Session-Id", "native-claude-group-session")
+	affinity := routing.ExtractClaudeAffinityKey(req, body)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Pool-Resolved-Provider") != "claude" ||
+		!bytes.Contains(responseBody, []byte("native claude")) || upstreamCalls != 1 {
+		t.Fatalf("status=%d provider=%q calls=%d body=%s", resp.StatusCode, resp.Header.Get("X-Pool-Resolved-Provider"), upstreamCalls, responseBody)
+	}
+	binding, found, err := h.store.GetUserGroupTargetBinding(t.Context(), groupID, affinity.Hash, "")
+	if err != nil || !found || binding.Target != claudeTarget {
+		t.Fatalf("native Claude binding=%+v found=%v err=%v, want %+v", binding, found, err, claudeTarget)
 	}
 }
 

@@ -73,6 +73,24 @@ func TestRefreshAntigravityTokenRejectsMissingAccessToken(t *testing.T) {
 	}
 }
 
+func TestRefreshAntigravityTokenRedactsErrorBody(t *testing.T) {
+	cfg := &config.Config{AntigravityOAuthTokenURL: "https://oauth2.googleapis.com/token"}
+	const secretBody = `{"error":"invalid_grant","error_description":"credential SECRET-MATERIAL was revoked"}`
+	_, err := refreshAntigravityToken(context.Background(), "refresh-token", cfg,
+		func(context.Context, string, http.Header, []byte) (*Response, error) {
+			return &Response{
+				StatusCode: http.StatusBadRequest,
+				Body:       io.NopCloser(strings.NewReader(secretBody)),
+			}, nil
+		})
+	if err == nil || !strings.Contains(err.Error(), "status 400") {
+		t.Fatalf("refresh error = %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET-MATERIAL") || strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("refresh error leaked OAuth response body: %v", err)
+	}
+}
+
 func TestAnthropicToAntigravityPreservesStructuredMessages(t *testing.T) {
 	body := []byte(`{
 		"model":"claude-opus-4-8","max_tokens":4096,"stop_sequences":["END"],

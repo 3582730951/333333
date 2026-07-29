@@ -416,7 +416,7 @@ func (s *Server) claudeMessagesAttempt(w http.ResponseWriter, r *http.Request, r
 	// Virtualize the request to a consistent first-party Claude Code client and, in the
 	// SAME single JSON parse/marshal pass, stamp the x-anthropic-billing-header for
 	// native Claude Code/OAuth traffic (cc_version coherent with our UA and a fresh
-	// per-request three-hex suffix; current 2.1.206 emits no cch field).
+	// per-request three-hex suffix; current 2.1.220 emits no cch field).
 	// Folding the billing stamp in here avoids a second full unmarshal+marshal over what
 	// is often a very large Claude Code request body.
 	oauth := claudeIsOAuth(token)

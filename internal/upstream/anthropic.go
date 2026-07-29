@@ -20,10 +20,12 @@ import (
 
 // Official Claude Code anti-fingerprint constants (see cliproxyapi-reference).
 const (
-	claudeAnthropicVersion = "2023-06-01"
+	claudeAnthropicVersion  = "2023-06-01"
+	claudeAgentIDHeader     = "X-Claude-Code-Agent-Id"
+	claudeParentAgentHeader = "X-Claude-Code-Parent-Agent-Id"
 	// OAuth (Claude Pro/Max) carries the oauth beta; API keys must not.
-	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24"
-	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24"
+	claudeOAuthBetas             = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01,extended-cache-ttl-2025-04-11"
+	claudeAPIKeyBetas            = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24,fallback-credit-2026-06-01"
 	claudeCacheDiagnosticsBeta   = "cache-diagnosis-2026-04-07"
 	claudeCacheDiagnosticsHeader = "X-Codex-Claude-Cache-Diagnostics"
 )
@@ -221,7 +223,7 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 		}
 		dst.Set("Anthropic-Beta", mergeBetas(claudeOAuthBetas, spec.Headers, false))
 	}
-	// Claude Code 2.1.206 sends this in both API-key and third-party Bearer
+	// Claude Code 2.1.220 sends this in both API-key and third-party Bearer
 	// configurations (verified through ANTHROPIC_BASE_URL captures).
 	dst.Set("Anthropic-Dangerous-Direct-Browser-Access", "true")
 	if strings.TrimSpace(spec.Headers.Get(claudeCacheDiagnosticsHeader)) != "" {
@@ -239,11 +241,12 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 	// OS/device/session axes still provide fleet diversity. An explicit operator
 	// override wins globally. The claude-cli version (UA) and the @anthropic-ai/sdk
 	// "Stainless" package version are separate axes — the real client sends
-	// claude-cli/2.1.206 with X-Stainless-Package-Version: 0.94.0.
+	// claude-cli/2.1.220 with X-Stainless-Package-Version: 0.94.0.
 	claudeVer := c.cfgSnapshot().ClaudeCLIVersionOrDefault(id.ClaudeCLIVersion)
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
 	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, requestBody(spec), id))
+	forwardClaudeAgentContextHeaders(dst, spec.Headers)
 	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, requestBody(spec))))
 	dst.Set("Accept", "application/json")
 	if stream {
@@ -347,11 +350,38 @@ func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id
 	dst.Set("X-Stainless-Package-Version", c.cfgSnapshot().ClaudeStainlessVersionOrDefault(id.StainlessPackageVersion))
 	dst.Set("X-Stainless-Runtime-Version", c.cfgSnapshot().ClaudeNodeVersionOrDefault(id.NodeVersion))
 	dst.Set("X-Claude-Code-Session-Id", claudeSessionID(spec.Headers, nil, id))
+	forwardClaudeAgentContextHeaders(dst, spec.Headers)
 	dst.Set("User-Agent", id.ClaudeUserAgentVersionForEntrypoint(claudeVer, claudeEntrypoint(spec.Headers, nil)))
 }
 
+// forwardClaudeAgentContextHeaders preserves Claude Code 2.1.220's subagent
+// ancestry only when it was supplied by the downstream client. Values are
+// protocol metadata rather than identity fields: the relay does not invent them.
+// Keep the validation stricter than net/http's generic header validation so an
+// opaque value cannot smuggle control bytes or an unbounded payload upstream.
+func forwardClaudeAgentContextHeaders(dst, src http.Header) {
+	for _, name := range []string{claudeAgentIDHeader, claudeParentAgentHeader} {
+		if value := validClaudeAgentContextValue(src.Get(name)); value != "" {
+			dst.Set(name, value)
+		}
+	}
+}
+
+func validClaudeAgentContextValue(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || len(value) > 128 {
+		return ""
+	}
+	for _, r := range value {
+		if r < 0x20 || r > 0x7e {
+			return ""
+		}
+	}
+	return value
+}
+
 // claudeEntrypoint projects the real downstream launch mode while discarding
-// the downstream version. Claude 2.1.206 uses sdk-cli for `claude -p`/Agent SDK
+// the downstream version. Claude 2.1.220 uses sdk-cli for `claude -p`/Agent SDK
 // and cli for the interactive terminal.
 func claudeEntrypoint(headers http.Header, body []byte) string {
 	if strings.Contains(strings.ToLower(headers.Get("User-Agent")), "(external, sdk-cli)") ||
@@ -486,7 +516,7 @@ func (c *Client) normalizeClaudeMessagesSpec(spec Request) Request {
 	if sanitizeClaudeHistory(root) {
 		changed = true
 	}
-	if normalizeClaudeThinkingCompatibility(root) {
+	if normalizeClaudeThinkingCompatibility(root, claudeMessagesModel(root, spec.Model)) {
 		changed = true
 	}
 	if anthropicwire.NormalizeCacheControlTTL(root) {
@@ -523,7 +553,7 @@ func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
 }
 
 // normalizeClaudeMessagesMetadata preserves the exact current Claude Code
-// metadata surface while replacing downstream identity. Captured 2.1.206 sends
+// metadata surface while replacing downstream identity. Captured 2.1.220 sends
 // exactly metadata.user_id, whose value is a JSON string; its session_id is the
 // same UUID as X-Claude-Code-Session-Id. Generic API-key SDK traffic keeps a plain
 // opaque user id, while OAuth and native Claude Code requests use the JSON shape.
@@ -710,33 +740,88 @@ func stripClaudeToolUseProvenance(block map[string]interface{}) bool {
 	return changed
 }
 
-func normalizeClaudeThinkingCompatibility(root map[string]interface{}) bool {
+func claudeMessagesModel(root map[string]interface{}, fallback string) string {
+	if model, ok := root["model"].(string); ok && strings.TrimSpace(model) != "" {
+		return model
+	}
+	return fallback
+}
+
+func normalizeClaudeThinkingCompatibility(root map[string]interface{}, model string) bool {
 	changed := false
+	model = canonicalClaudeCompatibilityModel(model)
+	thinking, hasThinking := root["thinking"].(map[string]interface{})
+	thinkingType, _ := thinking["type"].(string)
+	thinkingType = strings.ToLower(strings.TrimSpace(thinkingType))
+
+	// Current adaptive-only models reject the legacy manual budget form. Preserve
+	// an optional display preference while converting the control plane to the
+	// current adaptive contract. Fable/Mythos cannot disable thinking at all, and
+	// Opus 5 cannot disable it at xhigh/max effort.
+	switch {
+	case claudeAdaptiveOnlyModel(model) && (thinkingType == "enabled" || thinkingType == "auto"):
+		thinking["type"] = "adaptive"
+		if _, ok := thinking["budget_tokens"]; ok {
+			delete(thinking, "budget_tokens")
+		}
+		changed = true
+		thinkingType = "adaptive"
+	case claudeAlwaysThinkingModel(model) && thinkingType == "disabled":
+		thinking["type"] = "adaptive"
+		delete(thinking, "budget_tokens")
+		changed = true
+		thinkingType = "adaptive"
+	case claudeOpus5Model(model) && thinkingType == "disabled" && claudeHighOnlyThinkingConflict(root):
+		thinking["type"] = "adaptive"
+		delete(thinking, "budget_tokens")
+		changed = true
+		thinkingType = "adaptive"
+	case claudeAdaptiveModel(model) && thinkingType == "auto":
+		thinking["type"] = "adaptive"
+		delete(thinking, "budget_tokens")
+		changed = true
+		thinkingType = "adaptive"
+	}
+
 	if toolChoice, ok := root["tool_choice"].(map[string]interface{}); ok {
 		switch typ, _ := toolChoice["type"].(string); typ {
 		case "any", "tool":
-			if _, ok := root["thinking"]; ok {
+			// Forced tool choice is incompatible only with legacy manual
+			// extended thinking. Adaptive thinking supports it and must remain
+			// attached on current Claude models.
+			if hasThinking && thinkingType == "enabled" {
 				delete(root, "thinking")
 				changed = true
-			}
-			if removeOutputConfigEffort(root) {
-				changed = true
+				if !claudeAdaptiveModel(model) && removeOutputConfigEffort(root) {
+					changed = true
+				}
 			}
 			return changed
 		}
 	}
 
-	thinking, ok := root["thinking"].(map[string]interface{})
-	if !ok {
+	// Fable/Opus/Sonnet 5 and the current Opus 4.7+ line reject non-default
+	// sampling values on every request. Omitting all three parameters is the
+	// stable wire representation of their defaults.
+	if claudeRejectsSamplingParameters(model) {
+		for _, key := range []string{"temperature", "top_p", "top_k"} {
+			if _, ok := root[key]; ok {
+				delete(root, key)
+				changed = true
+			}
+		}
 		return changed
 	}
-	switch typ, _ := thinking["type"].(string); typ {
+
+	if !hasThinking {
+		return changed
+	}
+	switch thinkingType {
 	case "enabled", "adaptive", "auto":
-		if !claudeNumericValueIsOne(root["temperature"]) {
-			root["temperature"] = 1.0
-			changed = true
-		}
-		for _, key := range []string{"top_p", "top_k"} {
+		// Older models also reject explicit sampling controls while thinking is
+		// active. Remove them instead of forcing temperature=1, which is still an
+		// explicit parameter and can be rejected by newer API revisions.
+		for _, key := range []string{"temperature", "top_p", "top_k"} {
 			if _, ok := root[key]; ok {
 				delete(root, key)
 				changed = true
@@ -746,16 +831,80 @@ func normalizeClaudeThinkingCompatibility(root map[string]interface{}) bool {
 	return changed
 }
 
-func claudeNumericValueIsOne(value interface{}) bool {
-	switch number := value.(type) {
-	case json.Number:
-		parsed, err := number.Float64()
-		return err == nil && parsed == 1
-	case float64:
-		return number == 1
+func canonicalClaudeCompatibilityModel(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if index := strings.IndexByte(model, '['); index >= 0 {
+		model = model[:index]
+	}
+	model = strings.TrimSuffix(model, "-thinking")
+	return strings.ReplaceAll(model, ".", "-")
+}
+
+func claudeCompatibilityModelIs(model, exact string) bool {
+	return model == exact || strings.HasPrefix(model, exact+"-20")
+}
+
+func claudeAdaptiveOnlyModel(model string) bool {
+	for _, exact := range []string{
+		"claude-fable-5",
+		"claude-mythos-5",
+		"claude-mythos-preview",
+		"claude-opus-5",
+		"claude-sonnet-5",
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+	} {
+		if claudeCompatibilityModelIs(model, exact) {
+			return true
+		}
+	}
+	return false
+}
+
+func claudeAdaptiveModel(model string) bool {
+	if claudeAdaptiveOnlyModel(model) {
+		return true
+	}
+	return claudeCompatibilityModelIs(model, "claude-opus-4-6") ||
+		claudeCompatibilityModelIs(model, "claude-sonnet-4-6")
+}
+
+func claudeAlwaysThinkingModel(model string) bool {
+	return claudeCompatibilityModelIs(model, "claude-fable-5") ||
+		claudeCompatibilityModelIs(model, "claude-mythos-5") ||
+		claudeCompatibilityModelIs(model, "claude-mythos-preview")
+}
+
+func claudeOpus5Model(model string) bool {
+	return claudeCompatibilityModelIs(model, "claude-opus-5")
+}
+
+func claudeHighOnlyThinkingConflict(root map[string]interface{}) bool {
+	output, _ := root["output_config"].(map[string]interface{})
+	effort, _ := output["effort"].(string)
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "xhigh", "max":
+		return true
 	default:
 		return false
 	}
+}
+
+func claudeRejectsSamplingParameters(model string) bool {
+	for _, exact := range []string{
+		"claude-fable-5",
+		"claude-mythos-5",
+		"claude-mythos-preview",
+		"claude-opus-5",
+		"claude-opus-4-8",
+		"claude-opus-4-7",
+		"claude-sonnet-5",
+	} {
+		if claudeCompatibilityModelIs(model, exact) {
+			return true
+		}
+	}
+	return false
 }
 
 func removeOutputConfigEffort(root map[string]interface{}) bool {

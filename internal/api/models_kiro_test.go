@@ -121,6 +121,10 @@ func TestAnthropicModelsEndpointAdvertisesClaudeFacingKiroModelID(t *testing.T) 
 	for i := range caps {
 		caps[i].AvailabilityState = capability.AvailabilityVerified
 		caps[i].Source = "kiro_runtime"
+		if canonical, ok := capability.KiroCanonicalModel(caps[i].ModelSlug); ok && canonical == "claude-opus-5" {
+			caps[i].Context1MState = capability.Context1MSupported
+			caps[i].Context1MSource = "kiro_live_catalog"
+		}
 	}
 	if err := h.store.UpsertCapabilities(context.Background(), caps); err != nil {
 		t.Fatal(err)
@@ -149,8 +153,47 @@ func TestAnthropicModelsEndpointAdvertisesClaudeFacingKiroModelID(t *testing.T) 
 	for _, model := range body.Data {
 		ids[model.ID] = true
 	}
-	if !ids["claude-opus-4-8"] || ids["claude-opus-4.8"] {
+	if !ids["claude-opus-4-8"] || ids["claude-opus-4.8"] ||
+		!ids["claude-opus-5"] || !ids["claude-opus-5[1m]"] {
 		t.Fatalf("unexpected Anthropic Kiro model catalog: %+v", ids)
+	}
+}
+
+func TestUserGroupModelCatalogFiltersOnlyTheBlockedAccountPoolScope(t *testing.T) {
+	group := storage.UserGroup{
+		BlockClaudeTargetGroups: []string{"pool-a"},
+		BlockGPTTargetGroups:    []string{"pool-b"},
+	}
+	caps := []storage.ModelCapability{
+		{ModelSlug: "claude-opus-5"},
+		{ModelSlug: "gpt-5.6-sol"},
+		{ModelSlug: "gemini-3.2-pro"},
+	}
+	models := func(values []storage.ModelCapability) map[string]bool {
+		out := make(map[string]bool, len(values))
+		for _, capability := range values {
+			out[capability.ModelSlug] = true
+		}
+		return out
+	}
+
+	poolA := models(filterUserGroupBlockedCapabilities(group, storage.TargetRef{
+		Kind: storage.TargetKindAccountPoolGroup, ID: "pool-a",
+	}, caps))
+	if poolA["claude-opus-5"] || !poolA["gpt-5.6-sol"] || !poolA["gemini-3.2-pro"] {
+		t.Fatalf("pool-a catalog filter=%v", poolA)
+	}
+	poolB := models(filterUserGroupBlockedCapabilities(group, storage.TargetRef{
+		Kind: storage.TargetKindAccountPoolGroup, ID: "pool-b",
+	}, caps))
+	if !poolB["claude-opus-5"] || poolB["gpt-5.6-sol"] || !poolB["gemini-3.2-pro"] {
+		t.Fatalf("pool-b catalog filter=%v", poolB)
+	}
+	provider := models(filterUserGroupBlockedCapabilities(group, storage.TargetRef{
+		Kind: storage.TargetKindModelProvider, ID: "claude",
+	}, caps))
+	if len(provider) != len(caps) {
+		t.Fatalf("provider target was incorrectly filtered: %v", provider)
 	}
 }
 

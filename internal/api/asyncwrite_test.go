@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -147,6 +148,39 @@ func TestUsageJournalReplaysCrashAndRemainsIdempotent(t *testing.T) {
 			t.Fatalf("iteration=%d journal metrics=%+v", iteration, metrics)
 		}
 		app.FlushWrites()
+	}
+}
+
+func TestDeferredRuntimeStartLeavesStandbyJournalAndWritersStopped(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "standby.sqlite3")
+	store, err := storage.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	journalDir := filepath.Join(t.TempDir(), "standby-journal")
+	cfg := config.Default()
+	cfg.UsageJournalEnabled = true
+	cfg.UsageJournalDir = journalDir
+	app := NewServer(Dependencies{Config: cfg, Store: store, DeferRuntimeStart: true})
+	if app.usageJournal != nil || app.asyncWrites != nil || app.usageWrites != nil || app.goalCompactionQueue != nil {
+		t.Fatal("standby construction started a journal or background writer")
+	}
+	if _, err := os.Stat(journalDir); !os.IsNotExist(err) {
+		t.Fatalf("standby journal path exists before activation: %v", err)
+	}
+	if err := app.StartRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	defer app.FlushWrites()
+	if app.usageJournal == nil || app.asyncWrites == nil || app.usageWrites == nil || app.goalCompactionQueue == nil {
+		t.Fatal("active runtime did not start all durable writers")
+	}
+	if info, err := os.Stat(journalDir); err != nil || !info.IsDir() {
+		t.Fatalf("active journal path = info:%v err:%v", info, err)
 	}
 }
 

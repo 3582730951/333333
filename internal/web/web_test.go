@@ -112,6 +112,28 @@ func TestEmbeddedAssetFilesRemainReadable(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAssetsContainNoPaymentFeatures(t *testing.T) {
+	matches, err := fs.Glob(assets, "assets/*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, match := range matches {
+		raw, err := fs.ReadFile(assets, match)
+		if err != nil {
+			t.Fatalf("read %s: %v", match, err)
+		}
+		lower := strings.ToLower(string(raw))
+		for _, forbidden := range []string{
+			"gopay", "paypal", "/admin/gopay", "plus-payment", "plus upgrade",
+			"plus 升级", "支付方式", "自动升级新注册账号",
+		} {
+			if strings.Contains(lower, strings.ToLower(forbidden)) {
+				t.Errorf("%s still contains removed payment feature marker %q", match, forbidden)
+			}
+		}
+	}
+}
+
 func request(t *testing.T, handler http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-GO_BIN="${GO_BIN:-/tmp/codex-go1.24.1/go/bin/go}"
-BUNDLE="$ROOT_DIR/example_zip/codex-pool-diagnostics-v2.zip"
-EXPECTED_SHA256="09b530cee7b04223e9bfc8b52b2307ef7daaeb8daa5f4d46b69015f1c66ea9bb"
+GO_BIN="${GO_BIN:-/tmp/codex-go1.25.12/go/bin/go}"
+BUNDLE="${DIAGNOSTIC_BUNDLE:-$ROOT_DIR/example_zip/codex-pool-diagnostics-v2.zip}"
+EXPECTED_SHA256="${DIAGNOSTIC_BUNDLE_SHA256:-09b530cee7b04223e9bfc8b52b2307ef7daaeb8daa5f4d46b69015f1c66ea9bb}"
 
 cd "$ROOT_DIR"
 test -f "$BUNDLE"

@@ -276,7 +276,7 @@ func TestBuildModelsResponseRichestAccount(t *testing.T) {
 }
 
 func TestParseClaudeModelsFillsWindows(t *testing.T) {
-	raw := []byte(`{"data":[{"id":"claude-opus-4-7"},{"id":"claude-sonnet-4-6"},{"id":"claude-unknown-9"}]}`)
+	raw := []byte(`{"data":[{"id":"claude-opus-5"},{"id":"claude-opus-4-7"},{"id":"claude-sonnet-4-6"},{"id":"claude-unknown-9"}]}`)
 	caps, err := ParseClaudeModels("acc1", raw, `W/"etag"`)
 	if err != nil {
 		t.Fatal(err)
@@ -288,6 +288,9 @@ func TestParseClaudeModelsFillsWindows(t *testing.T) {
 			t.Fatalf("source = %q", c.Source)
 		}
 	}
+	if win["claude-opus-5"] != 1000000 {
+		t.Fatalf("opus-5 window = %d", win["claude-opus-5"])
+	}
 	if win["claude-opus-4-7"] != 1000000 {
 		t.Fatalf("opus-4-7 window = %d", win["claude-opus-4-7"])
 	}
@@ -297,6 +300,38 @@ func TestParseClaudeModelsFillsWindows(t *testing.T) {
 	// Unknown models default to the standard 200k Claude window, not 0.
 	if win["claude-unknown-9"] != 200000 {
 		t.Fatalf("unknown model window = %d (want 200000 default)", win["claude-unknown-9"])
+	}
+}
+
+func TestClaudeOpus5UsesDefaultOneMillionWindowAcrossCredentialTypes(t *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		account storage.Account
+		token   storage.AccountToken
+	}{
+		{
+			name:    "api key",
+			account: storage.Account{Provider: "claude", PlanType: "api"},
+			token:   storage.AccountToken{AuthMethod: "api_key", AccessToken: "sk-ant-api"},
+		},
+		{
+			name:    "pro oauth",
+			account: storage.Account{Provider: "claude", PlanType: "Pro"},
+			token:   storage.AccountToken{AuthMethod: "oauth", AccessToken: "oauth"},
+		},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			caps, err := ParseClaudeModels("opus5", []byte(`{"data":[{"id":"claude-opus-5"}]}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			caps = ApplyClaudeAccountPolicy(caps, fixture.account, fixture.token)
+			got := caps[0]
+			if got.NativeContextWindow != 1000000 || got.NativeMaxContextWindow != 1000000 ||
+				got.Context1MState != Context1MSupported || got.Context1MSource != "model_default" {
+				t.Fatalf("Opus 5 default context was downgraded: %+v", got)
+			}
+		})
 	}
 }
 
@@ -344,14 +379,41 @@ func TestStaticClaudeModelsNonEmpty(t *testing.T) {
 		t.Fatal("static Claude model set must not be empty")
 	}
 	for _, c := range caps {
-		if c.AccountID != "acc2" || c.ModelSlug == "" || c.NativeContextWindow != 200000 || c.NativeMaxContextWindow == 0 || c.Source != "claude_static_unverified" || c.AvailabilityState != AvailabilityUnverified || c.Context1MState != Context1MUnknown {
+		wantNative := int64(200000)
+		if claudeDefault1M(c.ModelSlug) {
+			wantNative = 1000000
+		}
+		if c.AccountID != "acc2" || c.ModelSlug == "" || c.NativeContextWindow != wantNative || c.NativeMaxContextWindow == 0 || c.Source != "claude_static_unverified" || c.AvailabilityState != AvailabilityUnverified || c.Context1MState != Context1MUnknown {
 			t.Fatalf("malformed static capability: %+v", c)
 		}
+	}
+	if got := NormalizeClaudeModelAlias("opus"); got != "claude-opus-5" {
+		t.Fatalf("current Opus alias=%q, want claude-opus-5", got)
+	}
+	if got := NormalizeClaudeModelAlias("sonnet"); got != "claude-sonnet-5" {
+		t.Fatalf("current Sonnet alias=%q, want claude-sonnet-5", got)
+	}
+	if got := NormalizeClaudeModelAlias("fable"); got != "claude-fable-5" {
+		t.Fatalf("current Fable alias=%q, want claude-fable-5", got)
+	}
+	foundFable := false
+	for _, capability := range caps {
+		if capability.ModelSlug == "claude-fable-5" {
+			foundFable = true
+			if capability.NativeContextWindow != 1000000 || capability.NativeMaxContextWindow != 1000000 {
+				t.Fatalf("Fable 5 static context = %+v", capability)
+			}
+		}
+	}
+	if !foundFable {
+		t.Fatal("claude-fable-5 missing from current direct Claude discovery hints")
 	}
 }
 
 func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
 	cases := map[string]string{
+		"claude-opus-5":            "claude-opus-5",
+		"claude-opus-5-thinking":   "claude-opus-5",
 		"claude-opus-4-8":          "claude-opus-4.8",
 		"claude-opus-4.8":          "claude-opus-4.8",
 		"claude-opus-4-8-20260701": "claude-opus-4.8",
@@ -365,6 +427,9 @@ func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
 	}
 	if got, ok := KiroCanonicalModel("claude-opus-4-9-preview"); ok || got != "" {
 		t.Fatalf("unknown suffix was attracted to a known version: %q %v", got, ok)
+	}
+	if got, ok := KiroCanonicalModel("claude-opus-4-5"); !ok || got != "claude-opus-4.5" {
+		t.Fatalf("Opus 5 mapping attracted Opus 4.5: %q %v", got, ok)
 	}
 }
 
@@ -565,12 +630,28 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 		bySlug[c.ModelSlug] = c
 	}
 	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
-		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 272000 || got.NativeMaxContextWindow != 272000 || got.AutoCompactTokenLimit != 272000 {
+		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 || got.AutoCompactTokenLimit != 0 {
 			t.Fatalf("current model %s missing or wrong window: %+v", slug, got)
 		}
 	}
+	if got := NormalizeCodexModelAlias("gpt-5.6"); got != "gpt-5.6-sol" ||
+		!CodexSupportsReasoningEffort("gpt-5.6", "ultra") {
+		t.Fatalf("direct Codex alias is not feature-equivalent to Sol: %q", got)
+	}
 	if _, stale := bySlug["gpt-5.3-codex"]; stale {
 		t.Fatalf("removed gpt-5.3-codex must not remain in static catalog: %v", bySlug)
+	}
+}
+
+func TestCodexClientContextOverridesLeaveCompactionToClient(t *testing.T) {
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		window, compact, ok := CodexClientContextOverrides(slug)
+		if !ok {
+			t.Fatalf("%s missing generated-client context overrides", slug)
+		}
+		if window != 372000 || compact != 0 {
+			t.Fatalf("%s context overrides = (%d, %d), want (372000, unset)", slug, window, compact)
+		}
 	}
 }
 
@@ -600,11 +681,11 @@ func TestBuildCodexModelsResponseAppliesIndependent56ContextLimits(t *testing.T)
 		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
 	}
 	model := root.Models[0]
-	if model["context_window"] != float64(272000) || model["max_context_window"] != float64(272000) {
+	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
 		t.Fatalf("5.6 full context contract missing: %#v", model)
 	}
-	if model["auto_compact_token_limit"] != float64(244800) {
-		t.Fatalf("5.6 auto-compaction trigger = %#v, want 244800", model["auto_compact_token_limit"])
+	if _, exists := model["auto_compact_token_limit"]; exists {
+		t.Fatalf("5.6 auto-compaction trigger must be client-managed: %#v", model["auto_compact_token_limit"])
 	}
 	levels, _ := model["supported_reasoning_levels"].([]interface{})
 	tools, _ := model["experimental_supported_tools"].([]interface{})
@@ -639,8 +720,11 @@ func TestBuildCodexModelsResponseSynthesizes56ContextLimitsFromStaticMetadata(t 
 		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
 	}
 	model := root.Models[0]
-	if model["context_window"] != float64(272000) || model["max_context_window"] != float64(272000) || model["auto_compact_token_limit"] != float64(244800) {
-		t.Fatalf("synthesized 5.6 limits are not 272K: %#v", model)
+	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
+		t.Fatalf("synthesized 5.6 limits are not 372K: %#v", model)
+	}
+	if _, exists := model["auto_compact_token_limit"]; exists {
+		t.Fatalf("synthesized 5.6 auto-compaction trigger must be client-managed: %#v", model)
 	}
 	levels, _ := model["supported_reasoning_levels"].([]interface{})
 	if len(levels) != 6 || levels[5].(map[string]interface{})["effort"] != "ultra" || model["supports_parallel_tool_calls"] != true {

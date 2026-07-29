@@ -10,10 +10,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +32,7 @@ const (
 	diagnosticJobPollInterval  = time.Second
 	diagnosticJobQueueCapacity = 3 // one running + two queued
 	diagnosticArtifactMaxCount = 5
+	diagnosticDownloadLeaseTTL = 24 * time.Hour
 )
 
 var (
@@ -92,7 +95,12 @@ func (s *Server) adminDiagnosticJobAction(w http.ResponseWriter, r *http.Request
 		populateDiagnosticJobLinks(&job)
 		writeJSON(w, http.StatusOK, job)
 	case http.MethodDelete:
-		path, err := s.store.RequestDiagnosticJobCancellation(r.Context(), id)
+		mountID, err := s.diagnosticArtifactMountID()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		err = s.store.RequestDiagnosticJobCancellation(r.Context(), id, mountID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				writeError(w, http.StatusNotFound, &PublicError{Code: "not_found", Message: "Diagnostic job not found."})
@@ -101,9 +109,7 @@ func (s *Server) adminDiagnosticJobAction(w http.ResponseWriter, r *http.Request
 			}
 			return
 		}
-		if path != "" {
-			_ = s.removeDiagnosticArtifact(path)
-		}
+		s.cleanupEligibleDiagnosticArtifacts(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		methodNotAllowed(w)
@@ -151,7 +157,6 @@ func (s *Server) createDiagnosticJob(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", location)
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"job": job, "location": location,
-		"download": location + "/download",
 	})
 }
 
@@ -160,7 +165,21 @@ func (s *Server) downloadDiagnosticJob(w http.ResponseWriter, r *http.Request, i
 		methodNotAllowed(w)
 		return
 	}
-	job, err := s.store.AcquireDiagnosticDownloadLease(r.Context(), id)
+	mountID, err := s.diagnosticArtifactMountID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	leaseID := "diaglease_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	leaseOwner := strings.TrimSpace(s.cfg.NodeID)
+	if leaseOwner == "" {
+		leaseOwner = "local"
+	}
+	leaseOwner += ":" + strconv.Itoa(os.Getpid())
+	job, err := s.store.AcquireDiagnosticDownloadLease(
+		r.Context(), id, leaseID, leaseOwner, mountID,
+		storage.Now()+int64(diagnosticDownloadLeaseTTL/time.Second),
+	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, &PublicError{Code: "not_ready", Message: "Diagnostic artifact is not ready."})
@@ -172,7 +191,9 @@ func (s *Server) downloadDiagnosticJob(w http.ResponseWriter, r *http.Request, i
 	defer func() {
 		releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = s.store.ReleaseDiagnosticDownloadLease(releaseCtx, id)
+		if s.store.ReleaseDiagnosticDownloadLease(releaseCtx, id, leaseID, mountID) == nil {
+			s.cleanupEligibleDiagnosticArtifacts(releaseCtx)
+		}
 	}()
 	if !s.validDiagnosticArtifactPath(job.ArtifactPath) {
 		writeError(w, http.StatusInternalServerError, errors.New("invalid diagnostic artifact path"))
@@ -197,34 +218,42 @@ func (s *Server) downloadDiagnosticJob(w http.ResponseWriter, r *http.Request, i
 }
 
 func (s *Server) startDiagnosticJobLoop(ctx context.Context) {
-	s.diagnosticJobsOnce.Do(func() {
+	// These loops belong to the active worker lease, not the process lifetime.
+	// They must restart after an active -> standby -> active transition. A
+	// process-scoped sync.Once permanently stranded queued jobs after the first
+	// active context was cancelled.
+	supervisor.Go(ctx, "diagnostic-job-worker", func(ctx context.Context) {
 		if err := s.store.ResetInterruptedDiagnosticJobs(ctx); err != nil {
+			// Returning lets the supervisor retry with bounded backoff. In
+			// particular, a transient SQLite lock at activation must not disable
+			// diagnostics until the next process restart.
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("[DIAGNOSTICS] worker initialization failed; retrying: %v", err)
+			}
 			return
 		}
-		supervisor.Go(ctx, "diagnostic-job-worker", func(ctx context.Context) {
-			ticker := time.NewTicker(diagnosticJobPollInterval)
-			defer ticker.Stop()
-			for {
-				s.runNextDiagnosticJob(ctx)
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-				}
+		ticker := time.NewTicker(diagnosticJobPollInterval)
+		defer ticker.Stop()
+		for {
+			s.runNextDiagnosticJob(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
 			}
-		})
-		supervisor.Go(ctx, "diagnostic-artifact-expiry", func(ctx context.Context) {
-			ticker := time.NewTicker(time.Minute)
-			defer ticker.Stop()
-			for {
-				s.cleanupExpiredDiagnosticJobs(ctx)
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-				}
+		}
+	})
+	supervisor.Go(ctx, "diagnostic-artifact-expiry", func(ctx context.Context) {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			s.cleanupExpiredDiagnosticJobs(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
 			}
-		})
+		}
 	})
 }
 
@@ -251,7 +280,9 @@ func (s *Server) runNextDiagnosticJob(ctx context.Context) {
 			case <-pollDone:
 				return
 			case <-ticker.C:
-				requested, checkErr := s.store.DiagnosticJobCancelled(context.Background(), job.ID)
+				checkCtx, checkCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+				requested, checkErr := s.store.DiagnosticJobCancelled(checkCtx, job.ID)
+				checkCancel()
 				if checkErr == nil && requested {
 					cancel()
 					return
@@ -259,13 +290,10 @@ func (s *Server) runNextDiagnosticJob(ctx context.Context) {
 			}
 		}
 	}()
-	artifactPath, generateErr := s.generateDiagnosticArtifact(jobCtx, job.ID)
+	_, generateErr := s.generateDiagnosticArtifact(jobCtx, job.ID)
 	close(pollDone)
 	if generateErr == nil {
 		return
-	}
-	if artifactPath != "" {
-		_ = s.removeDiagnosticArtifact(artifactPath)
 	}
 	code := "internal"
 	switch {
@@ -278,11 +306,18 @@ func (s *Server) runNextDiagnosticJob(ctx context.Context) {
 	case errors.Is(generateErr, errDiagnosticCapacity):
 		code = "capacity_exceeded"
 	}
-	_ = s.store.FailDiagnosticJob(context.Background(), job.ID, code)
+	failCtx, failCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	_ = s.store.FailDiagnosticJob(failCtx, job.ID, code)
+	s.cleanupEligibleDiagnosticArtifacts(failCtx)
+	failCancel()
 }
 
 func (s *Server) generateDiagnosticArtifact(ctx context.Context, jobID string) (artifactPath string, err error) {
 	dir, err := s.diagnosticArtifactDirectory()
+	if err != nil {
+		return "", err
+	}
+	mountID, err := diagnosticMountID(dir)
 	if err != nil {
 		return "", err
 	}
@@ -299,17 +334,39 @@ func (s *Server) generateDiagnosticArtifact(ctx context.Context, jobID string) (
 	}
 	partialPath := filepath.Join(dir, "."+jobID+".partial")
 	finalPath := filepath.Join(dir, jobID+".zip")
-	file, err := os.OpenFile(partialPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	resource, err := s.store.CreateStorageResource(ctx, storage.StorageResource{
+		ID:             "diagres_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		ResourceType:   storage.StorageResourceTypeDiagnosticArtifact,
+		Path:           partialPath,
+		OwnerID:        jobID,
+		LeaseExpiresAt: storage.Now() + int64(diagnosticJobTimeout/time.Second),
+		FencingToken:   1,
+		MountID:        mountID,
+		RetentionClass: storage.StorageRetentionDiagnosticArtifact,
+	})
 	if err != nil {
 		return "", err
 	}
-	cleanupPartial := true
+	var file *os.File
 	defer func() {
-		_ = file.Close()
-		if cleanupPartial {
-			_ = os.Remove(partialPath)
+		if file != nil {
+			_ = file.Close()
+		}
+		if err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = s.store.MarkStorageResourceEligible(cleanupCtx, resource)
+			s.cleanupEligibleDiagnosticArtifacts(cleanupCtx)
+			cleanupCancel()
 		}
 	}()
+	file, err = os.OpenFile(partialPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if err = s.store.ActivateStorageResource(ctx, resource); err != nil {
+		return partialPath, err
+	}
+	resource.State = storage.StorageResourceActive
 
 	snapshot, err := s.store.BeginDiagnosticSnapshot(ctx)
 	if err != nil {
@@ -360,13 +417,13 @@ func (s *Server) generateDiagnosticArtifact(ctx context.Context, jobID string) (
 	if err := os.Rename(partialPath, finalPath); err != nil {
 		return partialPath, err
 	}
-	cleanupPartial = false
 	if err := fsyncDiagnosticDirectory(dir); err != nil {
-		_ = os.Remove(finalPath)
 		return finalPath, err
 	}
-	if err := s.store.CompleteDiagnosticJob(ctx, jobID, finalPath, digest, size, storage.Now()+int64(diagnosticArtifactTTL/time.Second)); err != nil {
-		_ = os.Remove(finalPath)
+	if err := s.store.CompleteDiagnosticJob(
+		ctx, jobID, resource.ID, finalPath, digest, size,
+		storage.Now()+int64(diagnosticArtifactTTL/time.Second),
+	); err != nil {
 		return finalPath, err
 	}
 	return finalPath, nil
@@ -503,13 +560,23 @@ func validateDiagnosticEntry(entry *zip.File) error {
 
 func diagnosticDLPMatch(value string) bool {
 	if diagnosticPrivateKeyRE.MatchString(value) || diagnosticBearerRE.MatchString(value) ||
-		diagnosticJWTRE.MatchString(value) || diagnosticEmailRE.MatchString(value) ||
+		diagnosticJWTRE.MatchString(value) || diagnosticSecretPrefixRE.MatchString(value) ||
+		diagnosticContainsUnsafeRequestID(value) || diagnosticEmailRE.MatchString(value) ||
 		diagnosticURLRE.MatchString(value) || diagnosticIPv4RE.MatchString(value) ||
 		diagnosticIPv6RE.MatchString(value) || diagnosticWindowsPathRE.MatchString(value) ||
 		diagnosticUnixPathRE.MatchString(value) {
 		return true
 	}
-	return diagnosticHighEntropyRE.MatchString(value)
+	return diagnosticContainsHighEntropy(value)
+}
+
+func diagnosticContainsUnsafeRequestID(value string) bool {
+	for _, candidate := range diagnosticRequestIDRE.FindAllString(value, -1) {
+		if !diagnosticStableAliasRE.MatchString(strings.ToUpper(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 var diagnosticIPv6RE = regexp.MustCompile(`(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{0,4}\b`)
@@ -535,25 +602,211 @@ func (s *Server) validDiagnosticArtifactPath(path string) bool {
 	return filepath.Dir(absolute) == dir && strings.HasSuffix(filepath.Base(absolute), ".zip")
 }
 
-func (s *Server) removeDiagnosticArtifact(path string) error {
-	if !s.validDiagnosticArtifactPath(path) {
-		return errors.New("invalid diagnostic artifact path")
+func diagnosticMountID(dir string) (string, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", err
 	}
-	err := os.Remove(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", errors.New("diagnostic filesystem identity unavailable")
 	}
-	return err
+	return "dev:" + strconv.FormatUint(uint64(stat.Dev), 10), nil
 }
 
-func (s *Server) cleanupExpiredDiagnosticJobs(ctx context.Context) {
-	paths, err := s.store.ExpireDiagnosticJobs(ctx, storage.Now())
+func (s *Server) diagnosticArtifactMountID() (string, error) {
+	dir, err := s.diagnosticArtifactDirectory()
+	if err != nil {
+		return "", err
+	}
+	return diagnosticMountID(dir)
+}
+
+func validDiagnosticStorageResourcePath(dir, path string) bool {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	dir = filepath.Clean(dir)
+	parent, base := filepath.Dir(absolute), filepath.Base(absolute)
+	if parent == dir {
+		return strings.HasSuffix(base, ".zip") ||
+			(strings.HasPrefix(base, ".") && strings.HasSuffix(base, ".partial"))
+	}
+	return parent == filepath.Join(dir, ".trash") && strings.HasSuffix(base, ".trash")
+}
+
+func alternateDiagnosticArtifactPath(dir, path string) string {
+	base := filepath.Base(path)
+	switch {
+	case filepath.Dir(path) == dir && strings.HasPrefix(base, ".") && strings.HasSuffix(base, ".partial"):
+		jobID := strings.TrimSuffix(strings.TrimPrefix(base, "."), ".partial")
+		return filepath.Join(dir, jobID+".zip")
+	case filepath.Dir(path) == dir && strings.HasSuffix(base, ".zip"):
+		jobID := strings.TrimSuffix(base, ".zip")
+		return filepath.Join(dir, "."+jobID+".partial")
+	default:
+		return ""
+	}
+}
+
+func diagnosticTrashPath(dir string, resource storage.StorageResource) string {
+	sum := sha256.Sum256([]byte(resource.ID))
+	base := filepath.Base(resource.Path)
+	return filepath.Join(dir, ".trash", base+"."+hex.EncodeToString(sum[:8])+".trash")
+}
+
+func regularDiagnosticFile(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, errors.New("diagnostic resource is not a regular file")
+	}
+	return true, nil
+}
+
+// cleanupEligibleDiagnosticArtifacts is the only diagnostic artifact deletion
+// path. It requires a durable eligible record, claims it with a fencing CAS,
+// atomically moves the file into a private trash directory, then removes it.
+func (s *Server) cleanupEligibleDiagnosticArtifacts(ctx context.Context) {
+	dir, err := s.diagnosticArtifactDirectory()
 	if err != nil {
 		return
 	}
-	for _, path := range paths {
-		_ = s.removeDiagnosticArtifact(path)
+	mountID, err := diagnosticMountID(dir)
+	if err != nil {
+		return
 	}
+	trashDir := filepath.Join(dir, ".trash")
+	if err := datadir.RecoverDirectory(trashDir); err != nil {
+		return
+	}
+	resources, err := s.store.ListStorageResourcesForGC(
+		ctx,
+		storage.StorageResourceTypeDiagnosticArtifact,
+		storage.StorageRetentionDiagnosticArtifact,
+		storage.Now(),
+		32,
+	)
+	if err != nil {
+		return
+	}
+	for _, resource := range resources {
+		if resource.MountID != mountID || !validDiagnosticStorageResourcePath(dir, resource.Path) {
+			continue
+		}
+		if resource.State == storage.StorageResourceEligible {
+			if err := s.store.ClaimStorageResourceTrash(ctx, resource); err != nil {
+				continue
+			}
+			resource.State = storage.StorageResourceTrash
+		}
+		if resource.State != storage.StorageResourceTrash {
+			continue
+		}
+		if s.deleteTrashedDiagnosticResource(ctx, dir, trashDir, resource) == nil {
+			s.recordDiagnosticGCGap(ctx, resource)
+		}
+	}
+}
+
+func (s *Server) deleteTrashedDiagnosticResource(
+	ctx context.Context,
+	dir, trashDir string,
+	resource storage.StorageResource,
+) error {
+	path := filepath.Clean(resource.Path)
+	trashPath := diagnosticTrashPath(dir, resource)
+	if filepath.Dir(path) == trashDir {
+		trashPath = path
+	}
+	exists, err := regularDiagnosticFile(path)
+	if err != nil {
+		return err
+	}
+	if !exists && filepath.Dir(path) == dir {
+		alternate := alternateDiagnosticArtifactPath(dir, path)
+		if alternate != "" {
+			if alternateExists, alternateErr := regularDiagnosticFile(alternate); alternateErr != nil {
+				return alternateErr
+			} else if alternateExists {
+				path, exists = alternate, true
+			}
+		}
+	}
+	if !exists && path != trashPath {
+		if trashExists, trashErr := regularDiagnosticFile(trashPath); trashErr != nil {
+			return trashErr
+		} else if trashExists {
+			path, exists = trashPath, true
+		}
+	}
+	if !exists {
+		return s.store.MarkStorageResourceDeleted(ctx, resource)
+	}
+	if filepath.Dir(path) != trashDir {
+		if destinationExists, destinationErr := regularDiagnosticFile(trashPath); destinationErr != nil {
+			return destinationErr
+		} else if destinationExists {
+			return errors.New("diagnostic trash destination already exists")
+		}
+		if err := os.Rename(path, trashPath); err != nil {
+			return err
+		}
+		if err := fsyncDiagnosticDirectory(dir); err != nil {
+			return err
+		}
+		if err := fsyncDiagnosticDirectory(trashDir); err != nil {
+			return err
+		}
+		if err := s.store.UpdateStorageResourceTrashPath(ctx, resource, trashPath); err != nil {
+			return err
+		}
+		resource.Path = trashPath
+	}
+	if exists, err = regularDiagnosticFile(resource.Path); err != nil {
+		return err
+	} else if exists {
+		if err := os.Remove(resource.Path); err != nil {
+			return err
+		}
+		if err := fsyncDiagnosticDirectory(trashDir); err != nil {
+			return err
+		}
+	}
+	return s.store.MarkStorageResourceDeleted(ctx, resource)
+}
+
+func (s *Server) recordDiagnosticGCGap(ctx context.Context, resource storage.StorageResource) {
+	alias := ""
+	if len(s.cfg.RuntimeDiagnosticAliasKey) > 0 {
+		alias = diagnosticAlias(s.cfg.RuntimeDiagnosticAliasKey, "JOB", "diagnostic-job", resource.OwnerID)
+	}
+	_ = s.store.AddDiagnosticEvent(ctx, storage.DiagnosticEvent{
+		ID:            "diagevt_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		EventType:     "storage_gc",
+		Severity:      "warning",
+		EntityType:    "diagnostic_job",
+		EntityAlias:   alias,
+		DetailJSON:    `{"reason":"retention_or_cancellation","resource_type":"diagnostic_artifact"}`,
+		DiagnosticGap: true,
+	})
+}
+
+func (s *Server) cleanupExpiredDiagnosticJobs(ctx context.Context) {
+	mountID, err := s.diagnosticArtifactMountID()
+	if err != nil {
+		return
+	}
+	if _, err = s.store.ExpireDiagnosticJobs(ctx, storage.Now(), mountID); err != nil {
+		return
+	}
+	s.cleanupEligibleDiagnosticArtifacts(ctx)
 }
 
 // The legacy synchronous endpoint now creates an asynchronous v3 job.

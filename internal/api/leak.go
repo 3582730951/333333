@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -409,7 +408,14 @@ func (s *Server) streamSSE(ctx context.Context, w http.ResponseWriter, body io.R
 	if parsed, ok := scanner.Parsed(); ok {
 		s.recordParsedUsage(ctx, accountID, routeHash, parsed)
 	} else {
-		log.Printf("[STREAM-USAGE] provider=%s, account=%s: NO USAGE EXTRACTED", provider, accountID)
+		// Some otherwise successful upstream streams omit response.usage. Feed a
+		// zero-valued record into the existing billing-hold fallback instead of
+		// dropping metering entirely; recordParsedUsage substitutes the bounded
+		// admission estimate and marks it as estimated.
+		modelDiag := modelDiagnosticsFromCtx(ctx)
+		s.recordParsedUsage(ctx, accountID, routeHash, usage.Parsed{
+			Model: firstNonEmpty(modelDiag.Resolved, modelDiag.Requested),
+		})
 	}
 	return err
 }

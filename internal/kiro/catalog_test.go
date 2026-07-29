@@ -95,6 +95,12 @@ func TestRefreshModelCatalogRequiresCompletePagination(t *testing.T) {
 	if !opus.Default || opus.MaxInputTokens != 1_000_000 || opus.MaxOutputTokens != 128_000 || !opus.Complete {
 		t.Fatalf("Opus descriptor=%+v", opus)
 	}
+	if supported, known := CatalogAdaptiveThinking(opus); !known || !supported {
+		t.Fatalf("Opus 5 adaptive-thinking descriptor was not honored: supported=%v known=%v raw=%s", supported, known, opus.ThinkingJSON)
+	}
+	if effort, known := CatalogMaximumEffort(opus); !known || effort != "max" {
+		t.Fatalf("Opus 5 effort descriptor=(%q,%v), want max", effort, known)
+	}
 	endpointHash, _ := EndpointHash(credential.Endpoint, credential.APIRegion, manager.Config().KiroEndpointAllowlist)
 	capabilityKey, _ := KiroCapabilityKey(endpointHash, credential.APIRegion, credential.ProfileARN)
 	persisted, err := store.ListKiroModelCatalog(context.Background(), account.ID, capabilityKey)

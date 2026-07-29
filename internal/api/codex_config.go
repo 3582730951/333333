@@ -213,7 +213,9 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 	contextWindow, compactLimit, manageContextLimits := capability.CodexClientContextOverrides(model)
 	if manageContextLimits {
 		fmt.Fprintf(&extra, "model_context_window = %d\n", contextWindow)
-		fmt.Fprintf(&extra, "model_auto_compact_token_limit = %d\n", compactLimit)
+		if compactLimit > 0 {
+			fmt.Fprintf(&extra, "model_auto_compact_token_limit = %d\n", compactLimit)
+		}
 	}
 	if e := clean(effort); e != "" {
 		fmt.Fprintf(&extra, "model_reasoning_effort = \"%s\"\n", e)

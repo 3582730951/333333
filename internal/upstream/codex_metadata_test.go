@@ -76,7 +76,7 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	cfg := config.Default()
 	cfg.UpstreamBaseURL = server.URL + "/backend-api/codex"
 	client := NewClient(cfg)
-	rawTurn := `{"installation_id":"real-install","session_id":"real-session","thread_id":"real-thread","turn_id":"real-turn","window_id":"real-thread:7","request_kind":"turn","thread_source":"user","sandbox":"workspace-write"}`
+	rawTurn := `{"installation_id":"real-install","session_id":"real-session","thread_id":"real-thread","turn_id":"real-turn","window_id":"real-thread:7","request_kind":"turn","thread_source":"user","sandbox":"workspace-write","workspace_label":"工作区","code_mode_tool_names":{"exec":"functions.exec","search":"tool_search"}}`
 	body := []byte(`{"model":"gpt-5.6-sol","store":false,"stream":true,"parallel_tool_calls":false,"reasoning":{"effort":"ultra","context":"all_turns"},"previous_response_id":"resp_keep","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"keep","parameters":{"const":900719925474099312345}}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep exact context"}]},{"role":"user","content":"do not truncate","exact_id":900719925474099312345}],"client_metadata":{"session_id":"real-session","thread_id":"real-thread","turn_id":"real-turn","x-codex-window-id":"real-thread:7","x-codex-turn-metadata":` + strconvJSON(rawTurn) + `,"custom-safe-key":"keep","custom_exact_id":900719925474099312345}}`)
 	resp, err := client.Do(context.Background(), Request{
 		DownstreamPath: "/v1/responses",
@@ -153,6 +153,20 @@ func TestCodexHTTPFingerprintUsesCanonicalClientMetadata(t *testing.T) {
 	var turn map[string]interface{}
 	if json.Unmarshal([]byte(turnRaw), &turn) != nil || turn["request_kind"] != "turn" || turn["turn_started_at_unix_ms"] == nil || turn["sandbox"] != "workspace-write" {
 		t.Fatalf("canonical turn metadata malformed: %q", turnRaw)
+	}
+	if turn["workspace_label"] != "工作区" || turn["code_mode_tool_names"] == nil {
+		t.Fatalf("full client_metadata lost current Codex fields: %q", turnRaw)
+	}
+	headerTurnRaw := gotHeader.Get("x-codex-turn-metadata")
+	if headerTurnRaw == "" || strings.Contains(headerTurnRaw, "code_mode_tool_names") {
+		t.Fatalf("compatibility header retained unbounded Code Mode data: %q", headerTurnRaw)
+	}
+	if strings.Contains(headerTurnRaw, "工作区") || !strings.Contains(headerTurnRaw, `\u5de5`) {
+		t.Fatalf("compatibility header must be ASCII JSON: %q", headerTurnRaw)
+	}
+	var headerTurn map[string]interface{}
+	if err := json.Unmarshal([]byte(headerTurnRaw), &headerTurn); err != nil || headerTurn["workspace_label"] != "工作区" {
+		t.Fatalf("compatibility header is not semantically equivalent: %q err=%v", headerTurnRaw, err)
 	}
 }
 

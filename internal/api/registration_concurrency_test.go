@@ -73,6 +73,60 @@ func TestRunBoundedLimitFloor(t *testing.T) {
 	}
 }
 
+func TestRegistrationRuntimeStopCancelsAndWaitsForJobs(t *testing.T) {
+	h := &Handler{jobCancels: map[string]context.CancelFunc{}}
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	defer runtimeCancel()
+	h.StartRuntime(runtimeCtx)
+
+	h.mu.Lock()
+	jobCtx, jobCancel := context.WithCancel(h.runtimeCtx)
+	h.jobCancels["job-runtime-stop"] = jobCancel
+	h.jobWG.Add(1)
+	h.mu.Unlock()
+
+	jobStopped := make(chan struct{})
+	go func() {
+		defer h.jobWG.Done()
+		<-jobCtx.Done()
+		h.mu.Lock()
+		delete(h.jobCancels, "job-runtime-stop")
+		h.mu.Unlock()
+		close(jobStopped)
+	}()
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+	defer stopCancel()
+	if err := h.StopRuntime(stopCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-jobStopped:
+	default:
+		t.Fatal("registration runtime returned before the job observed cancellation")
+	}
+	h.mu.Lock()
+	active := h.runtimeActive
+	h.mu.Unlock()
+	if active {
+		t.Fatal("registration runtime remained active after shutdown")
+	}
+}
+
+func TestRegistrationPersistenceContextIsDetachedButBounded(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+	ctx, cancel := registrationPersistenceContext(parent)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("persistence context inherited cancellation: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > registrationPersistenceTimeout+time.Second {
+		t.Fatalf("unexpected persistence deadline: %v (present=%v)", deadline, ok)
+	}
+}
+
 func TestProcessBatchRecordsWorkerPanicAsFailure(t *testing.T) {
 	store, err := storage.OpenInMemory()
 	if err != nil {

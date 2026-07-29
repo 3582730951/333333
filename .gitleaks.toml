@@ -1,0 +1,52 @@
+title = "codex-account-pool secret scanning"
+
+[extend]
+useDefault = true
+
+# These are exact, public protocol identifiers or deliberately synthetic test
+# values. Every exception requires both the expected path and expected line
+# content so the rest of each file remains fully scanned.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Public OAuth client identifiers"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)internal/config/config\.go$''']
+regexes = ['''Default(?:Claude|Codex)OAuthClientID\s*=''']
+
+[[rules.allowlists]]
+description = "RFC 6455 sample WebSocket nonce"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)internal/api/codex_config\.go$''']
+regexes = ['''Sec-WebSocket-Key:\s*dGhlIHNhbXBsZSBub25jZQ==''']
+
+[[rules.allowlists]]
+description = "Synthetic usage hash test value"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)internal/api/usage_cache_test\.go$''']
+regexes = ['''abcdef1234567890''']
+
+[[rules.allowlists]]
+description = "Synthetic Anthropic beta test identifier"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)internal/upstream/anthropic_test\.go$''']
+regexes = ['''oauth-2025-04-20",\s*"interleaved-thinking-2025-05-14''']
+
+[[rules.allowlists]]
+description = "Non-secret local E2E bearer placeholder"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)tools/e2e/codex_(?:mock_)?pool_config\.toml$''']
+regexes = ['''experimental_bearer_token\s*=\s*"e2e-non-secret-placeholder"''']
+
+[[rules.allowlists]]
+description = "Synthetic UI review fixtures"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(?:^|/)web-spa/scripts/capture-ui-review\.mjs$''']
+regexes = ['''(?:cap_fixture_secret_admin|abcdef1234567890abcdef|abcdef123456|deadbeef9876|routeabc12345)''']

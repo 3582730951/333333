@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -421,6 +422,77 @@ func TestAdmissionControlRejectsNonLoopbackAndWrongMethod(t *testing.T) {
 	h.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET pause status = %d", recorder.Code)
+	}
+}
+
+func TestBackendFailureUsesFixedPublicErrorFirewall(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "secret-account-worker.sock")
+	h := newHandoff(missing)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5"}`))
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	requestID := recorder.Header().Get("X-Request-ID")
+	if !regexp.MustCompile(`^REQ-[A-F0-9]{16}$`).MatchString(requestID) {
+		t.Fatalf("request id = %q", requestID)
+	}
+	if recorder.Header().Get("Retry-After") != publicRetryAfter {
+		t.Fatalf("Retry-After = %q", recorder.Header().Get("Retry-After"))
+	}
+	for name := range recorder.Header() {
+		switch http.CanonicalHeaderKey(name) {
+		case "Content-Type", "Retry-After", "X-Request-Id":
+		default:
+			t.Fatalf("unexpected public response header %q", name)
+		}
+	}
+	body := recorder.Body.String()
+	for _, forbidden := range []string{missing, "secret-account", "dial unix", "worker_unavailable"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("public body leaked %q: %s", forbidden, body)
+		}
+	}
+	for _, required := range []string{
+		`"type":"server_error"`,
+		`"code":"service_unavailable"`,
+		publicServiceUnavailableText,
+		`"request_id":"` + requestID + `"`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("public body missing %q: %s", required, body)
+		}
+	}
+}
+
+func TestPublicHandoffStatusDoesNotExposeBackendPathOrRawError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "secret-backend.sock")
+	h := newHandoff(missing)
+	req := httptest.NewRequest(http.MethodGet, "/handoffz", nil)
+	recorder := httptest.NewRecorder()
+
+	h.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
+	}
+	body := recorder.Body.String()
+	for _, forbidden := range []string{missing, "secret-backend", "no such file", "active_backend"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("public handoff status leaked %q: %s", forbidden, body)
+		}
+	}
+	if !strings.Contains(body, `"code":"worker_unavailable"`) {
+		t.Fatalf("public handoff status missing safe code: %s", body)
+	}
+
+	trusted := httptest.NewRecorder()
+	h.serveStatus(trusted, true)
+	if !strings.Contains(trusted.Body.String(), missing) {
+		t.Fatalf("trusted local status must retain backend diagnostics: %s", trusted.Body.String())
 	}
 }
 

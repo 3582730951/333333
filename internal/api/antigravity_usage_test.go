@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -190,6 +192,7 @@ func TestAntigravityGeminiHandlerRecordsAttributedCacheUsage(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"text":"hello"`) {
 		t.Fatalf("translated response = %s", w.Body.String())
 	}
+	h.app.WaitForAsyncWrites()
 
 	var (
 		gotRouteHash, gotKeyHash, gotUserID, gotProvider, gotSource, gotAffinitySource string
@@ -279,7 +282,7 @@ func TestAntigravityRetriesAreBoundedAndUpstream4xxIsFirewalled(t *testing.T) {
 		wantStatus  int
 		wantExclude bool
 	}{
-		{name: "transient bounded", status: http.StatusServiceUnavailable, body: `{"error":{"message":"temporarily unavailable"}}`, wantCalls: 4, wantOutcome: outcomeRetry, wantStatus: http.StatusOK, wantExclude: true},
+		{name: "transient unique-target bounded", status: http.StatusServiceUnavailable, body: `{"error":{"message":"temporarily unavailable"}}`, wantCalls: 1, wantOutcome: outcomeRetry, wantStatus: http.StatusOK, wantExclude: true},
 		{name: "upstream client error hidden", status: http.StatusBadRequest, body: `{"error":{"message":"invalid exact model input"}}`, wantCalls: 1, wantOutcome: outcomeDone, wantStatus: http.StatusServiceUnavailable},
 	}
 	for _, tt := range tests {
@@ -483,5 +486,81 @@ func TestAdminRefreshAntigravityUsesOAuthRefresh(t *testing.T) {
 	}
 	if refreshCalls.Load() != 1 || creds.AccessToken != "fresh-access" || creds.RefreshToken != "fresh-refresh" || creds.ExpiresAt <= time.Now().Unix() {
 		t.Fatalf("refresh calls=%d credentials=%+v", refreshCalls.Load(), creds)
+	}
+}
+
+func TestEnsureAntigravityTokenSingleflightsRotatingRefresh(t *testing.T) {
+	var refreshCalls atomic.Int32
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls.Add(1)
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
+		if got := r.Form.Get("refresh_token"); got != "rotating-refresh-1" {
+			t.Errorf("refresh token = %q", got)
+			http.Error(w, "bad refresh token", http.StatusUnauthorized)
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"access_token":"fresh-access","refresh_token":"rotating-refresh-2","expires_in":3600}`)
+	}))
+	defer oauth.Close()
+
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("credential refresh must not use the inference upstream")
+	})
+	h.app.cfg.AntigravityOAuthTokenURL = oauth.URL
+	ctx := context.Background()
+	account := storage.Account{ID: "antigravity-refresh-flight", GroupName: "antigravity", Provider: "antigravity", Status: "active"}
+	initial := storage.AntigravityCredentials{
+		AccountID:    account.ID,
+		ProjectID:    "refresh-project",
+		AccessToken:  "stale-access",
+		RefreshToken: "rotating-refresh-1",
+		ExpiresAt:    time.Now().Add(10 * time.Second).Unix(),
+	}
+	if err := h.store.UpsertAccountWithAntigravityCredentials(ctx, account, storage.AccountToken{}, initial); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := h.store.GetAntigravityCredentials(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 24
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for range callers {
+		go func() {
+			defer wg.Done()
+			<-start
+			token, refreshed, refreshErr := h.app.ensureAntigravityToken(ctx, initial, account, storage.EgressProfile{}, "")
+			if refreshErr == nil && (token != "fresh-access" || refreshed.RefreshToken != "rotating-refresh-2") {
+				refreshErr = fmt.Errorf("unexpected refreshed credentials: token=%q refresh=%q", token, refreshed.RefreshToken)
+			}
+			errs <- refreshErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for refreshErr := range errs {
+		if refreshErr != nil {
+			t.Fatal(refreshErr)
+		}
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("OAuth refresh calls = %d, want 1", got)
+	}
+	stored, err := h.store.GetAntigravityCredentials(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.AccessToken != "fresh-access" || stored.RefreshToken != "rotating-refresh-2" || stored.ExpiresAt <= time.Now().Unix() {
+		t.Fatalf("stored credentials = %+v", stored)
 	}
 }

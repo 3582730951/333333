@@ -429,15 +429,15 @@ func applyCodexWebSocketHeaders(dst http.Header, ids codexWebSocketIDs) {
 	setHeaderPreserveCase(dst, "x-client-request-id", ids.threadID)
 	setHeaderPreserveCase(dst, "x-codex-window-id", ids.windowID)
 	// `version` and `x-codex-beta-features` are installed by applyCodexHeaders and
-	// deliberately survive here; both are present in a real 0.144.5 WS capture.
+	// deliberately survive here; both remain present in the 0.146.0 protocol.
 	if ids.parentThreadID != "" {
 		setHeaderPreserveCase(dst, "x-codex-parent-thread-id", ids.parentThreadID)
 	}
 	if ids.subagent != "" {
 		setHeaderPreserveCase(dst, codexSubagentHeader, ids.subagent)
 	}
-	if ids.turnMetadata != "" {
-		setHeaderPreserveCase(dst, "x-codex-turn-metadata", ids.turnMetadata)
+	if ids.turnMetadataHeader != "" {
+		setHeaderPreserveCase(dst, "x-codex-turn-metadata", ids.turnMetadataHeader)
 	}
 }
 

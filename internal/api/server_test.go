@@ -5717,17 +5717,20 @@ func TestClaudeCacheTTLEmptySettingDowngradesToStandard(t *testing.T) {
 	}
 }
 
-// TestHealthTestClaudeUsesCloakedCountTokens locks in the 429 fix: a Claude OAuth
-// liveness probe must be a CLOAKED count_tokens call (carrying the "You are Claude
-// Code" identity block Anthropic silently requires of OAuth traffic), not a bare
-// /v1/messages generation ping. The bare ping was rejected (400→429 under repeats)
-// and consumed generation quota; count_tokens is free and high-limit, so a healthy
-// account returns a clean 200/alive.
+// TestHealthTestClaudeUsesCloakedCountTokens locks in both sides of the probe shape:
+// keep the Claude Code identity block, but omit messages-only metadata which the
+// count_tokens schema rejects.
 func TestHealthTestClaudeUsesCloakedCountTokens(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.Contains(r.URL.Path, "count_tokens"):
+			body := readBody(t, r)
+			if strings.Contains(body, `"metadata"`) {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"metadata: Extra inputs are not permitted"}}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"input_tokens":7}`))
 		case r.URL.Path == "/v1/models":
 			_, _ = w.Write([]byte(`{"data":[{"id":"claude-opus-4-7"}]}`))
@@ -5772,6 +5775,9 @@ func TestHealthTestClaudeUsesCloakedCountTokens(t *testing.T) {
 	// OAuth liveness MUST carry the Claude Code identity block, else Anthropic 400/429.
 	if !strings.Contains(probe.Body, "Anthropic's Claude Agent SDK") {
 		t.Fatalf("count_tokens body missing cloak identity block: %s", probe.Body)
+	}
+	if strings.Contains(probe.Body, `"metadata"`) {
+		t.Fatalf("count_tokens probe carried messages-only metadata: %s", probe.Body)
 	}
 	// count_tokens counts input only — it must not request generation tokens.
 	if strings.Contains(probe.Body, "max_tokens") {

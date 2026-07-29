@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/prompt"
 )
 
@@ -110,6 +111,34 @@ func TestConvertAnthropicUsesExactLiveCatalogDescriptor(t *testing.T) {
 	output := fields["output_config"].(map[string]any)
 	if output["effort"] != "high" {
 		t.Fatalf("catalog effort was not authoritative: %v", output)
+	}
+}
+
+func TestConvertAnthropicOpus5ThinkingAliasUsesExactGeneration5Contract(t *testing.T) {
+	raw := []byte(`{"model":"claude-opus-5-thinking","messages":[{"role":"user","content":"hello"}]}`)
+	got, err := ConvertAnthropicRequestWithOptions(raw, "opus5-thinking", ConversionOptions{
+		DefaultThinking: true,
+		ForceMaxQuality: true,
+		ContextWindow:   1_000_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "claude-opus-5" || got.ContextWindow != 1_000_000 ||
+		!got.ThinkingEnabled || got.MaxOutputTokens != 128_000 {
+		t.Fatalf("Opus 5 thinking alias conversion=%+v", got)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(got.Body, &root); err != nil {
+		t.Fatal(err)
+	}
+	fields := root["additionalModelRequestFields"].(map[string]any)
+	thinking := fields["thinking"].(map[string]any)
+	if thinking["type"] != "adaptive" || strings.Contains(string(got.Body), "<thinking>") {
+		t.Fatalf("Opus 5 did not use native adaptive thinking: %s", got.Body)
+	}
+	if canonical, ok := capability.KiroCanonicalModel("claude-opus-4-5-20251101"); !ok || canonical != "claude-opus-4.5" {
+		t.Fatalf("Opus 5 mapping attracted Opus 4.5: %q %v", canonical, ok)
 	}
 }
 

@@ -1295,8 +1295,8 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 		setHeaderPreserveCase(dst, "thread-id", metadata.threadID)
 		setHeaderPreserveCase(dst, "x-client-request-id", metadata.threadID)
 		setHeaderPreserveCase(dst, "x-codex-window-id", metadata.windowID)
-		if metadata.turnMetadata != "" {
-			setHeaderPreserveCase(dst, "x-codex-turn-metadata", metadata.turnMetadata)
+		if metadata.turnMetadataHeader != "" {
+			setHeaderPreserveCase(dst, "x-codex-turn-metadata", metadata.turnMetadataHeader)
 		}
 		if metadata.parentThreadID != "" {
 			setHeaderPreserveCase(dst, "x-codex-parent-thread-id", metadata.parentThreadID)

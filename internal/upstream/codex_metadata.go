@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/identity"
@@ -63,6 +64,9 @@ type codexRequestMetadata struct {
 	subagent           string
 	turnState          string
 	turnMetadata       string
+	// turnMetadataHeader is the bounded ASCII compatibility projection used on
+	// HTTP/WebSocket headers. The full value remains in client_metadata.
+	turnMetadataHeader string
 	responsesLite      bool
 	// mappedIdentity marks a CPA-v2 snapshot. In that path hierarchy correlators
 	// must come solely from the persisted mapping; falling back to a derived value
@@ -118,6 +122,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 			metadata.turnID = ""
 		}
 		metadata.turnMetadata = buildCodexTurnMetadata(metadata, incomingTurn, requestKind, startedAt)
+		metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata)
 		return metadata
 	}
 	id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
@@ -199,6 +204,7 @@ func (c *Client) newCodexRequestMetadataWithResponsesLite(spec Request, response
 		responsesLite: responsesLite,
 	}
 	metadata.turnMetadata = buildCodexTurnMetadata(metadata, incomingTurn, requestKind, startedAt)
+	metadata.turnMetadataHeader = codexTurnMetadataCompatibilityHeader(metadata.turnMetadata)
 	return metadata
 }
 
@@ -444,6 +450,44 @@ func buildCodexTurnMetadata(metadata codexRequestMetadata, incoming map[string]i
 		return ""
 	}
 	return string(raw)
+}
+
+// codexTurnMetadataCompatibilityHeader mirrors Codex 0.146.0's split metadata
+// transport. The complete turn snapshot belongs in client_metadata, while the
+// direct header omits the potentially unbounded Code Mode tool-name map. Header
+// JSON is ASCII escaped exactly so workspace labels cannot make net/http reject
+// an otherwise valid request.
+func codexTurnMetadataCompatibilityHeader(full string) string {
+	if strings.TrimSpace(full) == "" {
+		return ""
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(full), &fields); err != nil {
+		return ""
+	}
+	delete(fields, "code_mode_tool_names")
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return ""
+	}
+	return asciiJSON(raw)
+}
+
+func asciiJSON(raw []byte) string {
+	var out strings.Builder
+	out.Grow(len(raw))
+	for _, r := range string(raw) {
+		switch {
+		case r <= 0x7f:
+			out.WriteRune(r)
+		case r <= 0xffff:
+			_, _ = fmt.Fprintf(&out, `\u%04x`, r)
+		default:
+			high, low := utf16.EncodeRune(r)
+			_, _ = fmt.Fprintf(&out, `\u%04x\u%04x`, high, low)
+		}
+	}
+	return out.String()
 }
 
 func codexRequestKind(spec Request, incoming map[string]interface{}) string {

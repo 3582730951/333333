@@ -107,6 +107,8 @@ function blankUserGroup() {
     model_instruction_profiles: Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => [key, { enabled: false, files: [] }])),
     force_model: '',
     force_effort: '',
+    block_claude_target_groups: [],
+    block_gpt_target_groups: [],
     target_keys: [],
     model_routing: [],
   };
@@ -134,6 +136,8 @@ function userGroupDraft(row) {
     target_keys: (row.targets || []).map(targetKey),
     model_instructions_files: uniqueStrings(row.model_instructions_files),
     model_instruction_profiles: normalizedInstructionProfiles(row),
+    block_claude_target_groups: uniqueStrings(row.block_claude_target_groups),
+    block_gpt_target_groups: uniqueStrings(row.block_gpt_target_groups),
     model_routing: (row.model_routing || []).map((rule) => ({
       model: rule.model || '',
       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
@@ -144,6 +148,9 @@ function userGroupDraft(row) {
 function normalizedUserGroupPayload(draft, providers = []) {
   const selected = new Set(uniqueStrings(draft.target_keys));
   const targets = [...selected].map(parseTargetKey);
+  const selectedAccountGroups = new Set(targets
+    .filter((target) => target.kind === TARGET_ACCOUNT_GROUP)
+    .map((target) => target.id));
   const profiles = Object.fromEntries(INSTRUCTION_FAMILIES.map(({ key }) => [key, {
     enabled: Boolean(draft.model_instruction_profiles?.[key]?.enabled),
     files: uniqueStrings(draft.model_instruction_profiles?.[key]?.files),
@@ -160,6 +167,10 @@ function normalizedUserGroupPayload(draft, providers = []) {
     model_instruction_profiles: profiles,
     force_model: String(draft.force_model || '').trim(),
     force_effort: String(draft.force_effort || '').trim(),
+    block_claude_target_groups: uniqueStrings(draft.block_claude_target_groups)
+      .filter((groupName) => selectedAccountGroups.has(groupName)),
+    block_gpt_target_groups: uniqueStrings(draft.block_gpt_target_groups)
+      .filter((groupName) => selectedAccountGroups.has(groupName)),
     targets,
     model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
       const mentioned = new Set();
@@ -309,13 +320,24 @@ function UserGroupEditor({
     ...providers.map((provider) => ({ label: `模型提供商 · ${provider.name || provider.id}`, value: `${TARGET_PROVIDER}:${provider.id}` })),
   ], [groups, providers]);
   const selectedTargetOptions = targetOptions.filter((option) => draft.target_keys.includes(option.value));
+  const blockedAccountGroupOptions = groups
+    .filter((group) => draft.target_keys.includes(`${TARGET_ACCOUNT_GROUP}:${group.name}`))
+    .map((group) => ({ label: `账号池分组 · ${group.name}`, value: group.name }));
   const payload = normalizedUserGroupPayload(draft, providers);
 
   const setTargets = (targetKeys) => setDraft((current) => {
     const selected = new Set(targetKeys);
+    const selectedAccountGroups = new Set(targetKeys
+      .map(parseTargetKey)
+      .filter((target) => target.kind === TARGET_ACCOUNT_GROUP)
+      .map((target) => target.id));
     return {
       ...current,
       target_keys: targetKeys,
+      block_claude_target_groups: uniqueStrings(current.block_claude_target_groups)
+        .filter((groupName) => selectedAccountGroups.has(groupName)),
+      block_gpt_target_groups: uniqueStrings(current.block_gpt_target_groups)
+        .filter((groupName) => selectedAccountGroups.has(groupName)),
       model_routing: current.model_routing.map((rule) => ({
         ...rule,
         tiers: rule.tiers.map((tier) => tier.filter((key) => selected.has(key))),
@@ -358,6 +380,39 @@ function UserGroupEditor({
           actions={[<Button key="retry" size="small" loading={catalogLoading} onClick={onRetryCatalog}>重试目标目录</Button>]}
         />
       ) : null}
+      <Card title="流量接收策略" className="pool-card">
+        <Banner
+          type="info"
+          title="策略只属于当前用户分组"
+          description="默认不屏蔽任何目标。勾选后会跳过当前用户分组里的指定账号池，并把请求转移给其他可承载目标；全部暂不可用时保持连接并动态等待最多 10 分钟。底层账号池本身不会被全局禁用。"
+        />
+        <div className="pool-user-group-grid">
+          <div className="pool-field pool-field--top">
+            <span className="pool-field__label">Claude 流量跳过的账号池分组</span>
+            <Select
+              multiple
+              filter
+              value={draft.block_claude_target_groups}
+              onChange={(block_claude_target_groups) => setDraft((current) => ({ ...current, block_claude_target_groups }))}
+              optionList={blockedAccountGroupOptions}
+              placeholder="默认无；勾选当前用户分组内的账号池"
+              style={{ width: '100%' }}
+            />
+          </div>
+          <div className="pool-field pool-field--top">
+            <span className="pool-field__label">GPT / Codex 流量跳过的账号池分组</span>
+            <Select
+              multiple
+              filter
+              value={draft.block_gpt_target_groups}
+              onChange={(block_gpt_target_groups) => setDraft((current) => ({ ...current, block_gpt_target_groups }))}
+              optionList={blockedAccountGroupOptions}
+              placeholder="默认无；勾选当前用户分组内的账号池"
+              style={{ width: '100%' }}
+            />
+          </div>
+        </div>
+      </Card>
       <Card title="指令与模型策略" className="pool-card">
         <Form.TextArea label="系统提示词" value={draft.system_prompt} onChange={(system_prompt) => setDraft((current) => ({ ...current, system_prompt }))} rows={5} placeholder="留空则不注入额外系统提示" />
         <div className="pool-user-group-grid">
@@ -606,6 +661,8 @@ export default function Groups() {
         ...INSTRUCTION_FAMILIES.filter(({ key }) => row.model_instruction_profiles?.[key]?.enabled).map(({ label }) => `${label} 指令`),
         !row.model_instruction_profiles && row.model_instructions_enabled ? `兼容指令 ${row.model_instructions_files?.length || 0}` : '',
         row.system_prompt_apply_to_compaction ? '压缩时应用' : '',
+        row.block_claude_target_groups?.length ? `Claude 跳过 ${row.block_claude_target_groups.length} 组` : '',
+        row.block_gpt_target_groups?.length ? `GPT 跳过 ${row.block_gpt_target_groups.length} 组` : '',
       ].filter(Boolean)} max={3} />,
     },
     {
@@ -704,3 +761,5 @@ export default function Groups() {
     </div>
   );
 }
+
+export { blankUserGroup, normalizedUserGroupPayload, userGroupDraft };

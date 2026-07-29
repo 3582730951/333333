@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -170,6 +171,29 @@ func TestResponsesRecoveryEligibleForTurnStateHeaderOnly(t *testing.T) {
 	header := http.Header{"X-Codex-Turn-State": []string{"old-account-state"}}
 	if !responsesRecoveryEligible([]byte(`{"model":"gpt","input":"next"}`), header) {
 		t.Fatal("turn-state-only request must receive a recovery retry budget")
+	}
+}
+
+func TestStatelessHTTPSFallbackRecoveryNeutralizesOriginalOrphan(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	body := []byte(`{"model":"gpt","previous_response_id":"resp_lost_ws","input":[{"type":"custom_tool_call_output","call_id":"call_finished","output":"preserve this result"}]}`)
+	retry, mode, recovered := h.app.recoverResponsesContext(
+		context.Background(),
+		body,
+		http.Header{"X-Codex-Turn-State": []string{"lost-socket-state"}},
+		leakfilter.ResponsesContextErrorPreviousResponseNotFound,
+	)
+	if !recovered || mode != "degraded" {
+		t.Fatalf("fallback recovery mode=%q recovered=%v", mode, recovered)
+	}
+	if responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone) {
+		t.Fatalf("recovered HTTPS payload still has an orphaned tool output: %s", retry.Raw)
+	}
+	text := string(retry.Raw)
+	if !strings.Contains(text, "preserve this result") ||
+		strings.Contains(text, "previous_response_id") ||
+		strings.Contains(text, "custom_tool_call_output") {
+		t.Fatalf("fallback recovery lost result or retained server state: %s", retry.Raw)
 	}
 }
 

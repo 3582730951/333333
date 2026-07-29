@@ -19,7 +19,7 @@ func TestPerAccountVersionTupleMatchesCapturedRelease(t *testing.T) {
 		t.Fatalf("version tuple drift: node=%v cli=%v sdk=%v", node, cli, sdk)
 	}
 	if !node["v26.3.0"] || !cli[ClaudeCLIVersion] || !sdk["0.94.0"] {
-		t.Fatalf("version tuple does not match captured 2.1.206 release: node=%v cli=%v sdk=%v", node, cli, sdk)
+		t.Fatalf("version tuple does not match captured 2.1.220 release: node=%v cli=%v sdk=%v", node, cli, sdk)
 	}
 }
 

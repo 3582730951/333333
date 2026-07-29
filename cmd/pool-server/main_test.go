@@ -39,7 +39,7 @@ func TestDeploymentHandlerReadinessAndInflight(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status["release_id"] != "release-test" || status["deployment_state"] != "ready" || status["inflight"] != float64(1) {
+	if status["release_id"] != "release-test" || status["deployment_state"] != "active" || status["inflight"] != float64(1) {
 		t.Fatalf("unexpected readiness: %#v", status)
 	}
 	close(release)
@@ -50,6 +50,37 @@ func TestDeploymentHandlerReadinessAndInflight(t *testing.T) {
 	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"draining"`) {
 		t.Fatalf("draining readiness = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestDeploymentHandlerStandbyIsObservableButRejectsTraffic(t *testing.T) {
+	h := newDeploymentHandler(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("standby request reached application handler")
+	}), "release-standby", "/tmp/worker-standby.sock")
+	h.standbyReady.Store(true)
+
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/standbyz", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"standby_ready":true`) ||
+		!strings.Contains(recorder.Body.String(), `"deployment_state":"standby_ready"`) {
+		t.Fatalf("standby readiness = %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil))
+	if recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), `"code":"service_unavailable"`) ||
+		strings.Contains(recorder.Body.String(), "worker-standby.sock") {
+		t.Fatalf("standby traffic response = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Retry-After") != "3" || !strings.HasPrefix(recorder.Header().Get("X-Request-ID"), "REQ-") {
+		t.Fatalf("standby traffic headers = %#v", recorder.Header())
+	}
+
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"deployment_state":"standby_ready"`) {
+		t.Fatalf("active readiness while standby = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

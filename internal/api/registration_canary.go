@@ -174,7 +174,8 @@ func isLoopbackHost(host string) bool {
 func registrationArtifacts(method string) []string {
 	switch method {
 	case "protocol_v2":
-		return []string{firstNonEmpty(os.Getenv("CODEX_REG_PROTOCOL_SCRIPT"), "services/codex_register/protocol_register.py")}
+		script := firstNonEmpty(os.Getenv("CODEX_REG_PROTOCOL_SCRIPT"), "services/codex_register/protocol_register.py")
+		return []string{script, filepath.Join(filepath.Dir(script), "requirements.txt")}
 	case "node":
 		dir := firstNonEmpty(os.Getenv("CODEX_REG_NODE_DIR"), "workers/node-registrar")
 		entry := firstNonEmpty(os.Getenv("CODEX_REG_NODE_ENTRY"), "index.js")
@@ -190,9 +191,15 @@ func registrationArtifacts(method string) []string {
 			filepath.Join(dir, "node_modules", "playwright-core", "package.json"),
 		}
 	case "browser":
-		return []string{firstNonEmpty(os.Getenv("CODEX_REG_SCRIPT"), "services/codex_register/browser_register.py")}
+		script := firstNonEmpty(os.Getenv("CODEX_REG_SCRIPT"), "services/codex_register/browser_register.py")
+		return []string{script, filepath.Join(filepath.Dir(script), "requirements.txt")}
 	case "browser_v3":
-		return []string{firstNonEmpty(os.Getenv("CODEX_REG_V3_SCRIPT"), "services/codex_register/reg_v3.py")}
+		script := firstNonEmpty(os.Getenv("CODEX_REG_V3_SCRIPT"), "services/codex_register/reg_v3.py")
+		return []string{
+			script,
+			filepath.Join(filepath.Dir(script), "phone_verify.py"),
+			filepath.Join(filepath.Dir(script), "requirements.txt"),
+		}
 	default:
 		return nil
 	}

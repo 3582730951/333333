@@ -622,21 +622,6 @@ async function healthTestAll() {
   toast(summary, authFailed || inferenceSuspended || inferenceUnchecked || otherFailed ? "bad" : "ok"); loadAudit();
 }
 
-/* gopay */
-async function loadGopay() {
-  const egs = (await api("/admin/egress-profiles").catch(() => [])) || []; EGRESS = egs;
-  let st = {}; try { st = await api("/admin/gopay"); } catch (e) { $("#gopayView").innerHTML = '<div class="empty">' + esc(e.message) + "</div>"; return; }
-  const s = st.settings || {};
-  $("#gopayView").innerHTML = `<div class="panel"><div class="hd"><h2>GoPay ${LANG === "en" ? "auto-subscribe" : "自动订阅"}</h2><span class="sp"></span>${st.enabled ? '<span class="chip ok">on</span>' : '<span class="chip warn">off</span>'}</div><div class="bd">
-    <div class="swrow"><div class="lbl"><b>${LANG === "en" ? "Enable GoPay" : "启用 GoPay 自动订阅"}</b><small>${LANG === "en" ? "Default off. Needs python deps." : "默认关闭，需服务器 python 依赖。"}</small></div><label class="sw"><input type="checkbox" ${st.enabled ? "checked" : ""} onchange="toggleGopay(this.checked)"><i></i></label></div>
-    ${st.warning ? `<div class="note" style="border-color:var(--bad)">${esc(st.warning)}</div>` : ""}
-    <div class="sect">${LANG === "en" ? "Run subscription" : "运行订阅"}</div><div class="row"><input class="t" id="gpAccId" placeholder="account id" style="flex:1"><button class="btn pri" onclick="gopaySubscribeInput()">${LANG === "en" ? "Subscribe" : "订阅"}</button></div>
-    <div class="sect">${LANG === "en" ? "Orchestrator log" : "编排器日志"}</div><pre class="mono" style="height:160px;overflow:auto;white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px">${esc((st.logs || []).join("\n") || "—")}</pre></div></div>`;
-}
-async function toggleGopay(on) { try { const st = await api("/admin/gopay", { method: "PATCH", body: JSON.stringify({ enabled: on }) }); toast(t("ok.saved") + (st.warning ? " (" + st.warning + ")" : ""), st.warning ? "bad" : "ok"); loadGopay(); } catch (e) { toast(e.message, "bad"); loadGopay(); } }
-async function gopaySubscribe(accountId, phone, pin) { toast(LANG === "en" ? "Subscribing…" : "订阅中…"); try { const r = await api("/admin/gopay/subscribe", { method: "POST", body: JSON.stringify({ account_id: accountId, phone_number: phone || "", pin: pin || "" }) }); toast(r.ok ? "✓ " + (r.charge_ref || "") : "✕ " + (r.error || ""), r.ok ? "ok" : "bad"); return r; } catch (e) { toast(e.message, "bad"); return null; } }
-function gopaySubscribeInput() { const id = $("#gpAccId").value.trim(); if (!id) { toast(LANG === "en" ? "Enter account id" : "请输入账号 ID", "bad"); return; } gopaySubscribe(id).then(() => loadGopay()); }
-
 /* org */
 async function loadOrg() {
   $("#orgView").innerHTML = `<div class="grid three">

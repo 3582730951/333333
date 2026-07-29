@@ -18,11 +18,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"codex-account-pool/internal/routing"
@@ -37,6 +39,52 @@ const (
 	// before expiry — matches the CLIProxyAPI refreshSkew constant (3000s).
 	antigravityRefreshLeadSeconds = 3000
 )
+
+// antigravityRefreshFlights prevents concurrent requests for one account from
+// exchanging the same rotating refresh token more than once. Each waiter gets
+// the credentials that were durably persisted by the leader.
+type antigravityRefreshFlights struct {
+	mu    sync.Mutex
+	calls map[string]*antigravityRefreshCall
+}
+
+type antigravityRefreshCall struct {
+	done  chan struct{}
+	creds storage.AntigravityCredentials
+	err   error
+}
+
+func newAntigravityRefreshFlights() *antigravityRefreshFlights {
+	return &antigravityRefreshFlights{calls: make(map[string]*antigravityRefreshCall)}
+}
+
+func (f *antigravityRefreshFlights) do(
+	ctx context.Context,
+	accountID string,
+	refresh func(context.Context) (storage.AntigravityCredentials, error),
+) (storage.AntigravityCredentials, error) {
+	f.mu.Lock()
+	if call := f.calls[accountID]; call != nil {
+		f.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return storage.AntigravityCredentials{}, ctx.Err()
+		case <-call.done:
+			return call.creds, call.err
+		}
+	}
+	call := &antigravityRefreshCall{done: make(chan struct{})}
+	f.calls[accountID] = call
+	f.mu.Unlock()
+
+	call.creds, call.err = refresh(ctx)
+
+	f.mu.Lock()
+	delete(f.calls, accountID)
+	close(call.done)
+	f.mu.Unlock()
+	return call.creds, call.err
+}
 
 // antigravityMessagesWithLease serves a single /v1/messages request via the
 // Antigravity upstream.  It has the same signature as kiroMessagesWithLease so
@@ -102,8 +150,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 	if resp.StatusCode == http.StatusUnauthorized && strings.TrimSpace(creds.RefreshToken) != "" {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
 		_ = resp.Body.Close()
-		creds.ExpiresAt = 0
-		token, creds, err = s.ensureAntigravityToken(ctx, creds, lease.Account, lease.Egress, lease.Binding.CookieJarKey)
+		token, creds, err = s.forceRefreshAntigravityToken(ctx, creds, lease.Account, lease.Egress, lease.Binding.CookieJarKey)
 		if err != nil {
 			log.Printf("[ANTIGRAVITY] forced token refresh failed account=%s: %v", lease.Account.ID, err)
 			return retry()
@@ -127,7 +174,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 			return outcomeDone
 		}
 		_ = s.onUpstreamError(ctx, lease.Account, resp.StatusCode, resp.Header, errorBody)
-		log.Printf("[ANTIGRAVITY] upstream status account=%s model=%s status=%d class=%s; retrying another account", lease.Account.ID, req.Model, resp.StatusCode, failure.Class)
+		log.Printf("[ANTIGRAVITY] upstream status account=%s model=%s status=%d class=%s; account attempt exhausted", lease.Account.ID, req.Model, resp.StatusCode, failure.Class)
 		return retry()
 	}
 
@@ -163,7 +210,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
 		inputTok, outputTok, cachedTok, stopReason, streamErr := upstream.AntigravityStreamToAnthropic(ctx, io.MultiReader(bytes.NewReader(prefix), reader), w, displayModel, msgID)
-		if streamErr != nil {
+		if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
 			// The converter always emits a valid Anthropic terminal sequence after
 			// downstream commit. Never replay here because tool calls or billable
 			// output may already have reached the client.
@@ -186,7 +233,8 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 	}
 	// Persist session-sticky affinity binding for this account.
 	if affinity.Hash != "" {
-		_ = s.scheduler.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
+		bindingCtx, bindingCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		_ = s.scheduler.UpsertAffinityBinding(bindingCtx, storage.AffinityBinding{
 			RouteKeyHash: affinity.Hash,
 			RouteKey:     affinity.Key,
 			Source:       "antigravity",
@@ -195,6 +243,7 @@ func (s *Server) antigravityMessagesWithLease(w http.ResponseWriter, r *http.Req
 			Model:        displayModel,
 			EgressID:     finalEgress.ID,
 		})
+		bindingCancel()
 	}
 	return outcomeDone
 }
@@ -242,13 +291,20 @@ func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.
 	if len(targets) == 0 {
 		targets = append(targets, attemptTarget{egress: lease.Egress, base: req.BaseURL})
 	}
-	const maxRetries = 3
 	var lastResp *upstream.Response
 	var lastBody []byte
 	var lastErr error
 	lastEgress := lease.Egress
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		target := targets[attempt%len(targets)]
+	// Each distinct endpoint/outlet is attempted once. Replaying the same target
+	// four times in a tight loop amplified the observed upstream capacity incident
+	// and delayed account-level failover without adding redundancy.
+	seenTargets := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		targetKey := strings.TrimSpace(target.egress.ID) + "\x00" + strings.TrimRight(strings.TrimSpace(target.base), "/")
+		if _, duplicate := seenTargets[targetKey]; duplicate {
+			continue
+		}
+		seenTargets[targetKey] = struct{}{}
 		attemptReq := req
 		attemptReq.BaseURL = target.base
 		resp, requestErr := send(target.egress, attemptReq)
@@ -301,27 +357,74 @@ func (s *Server) doAntigravityWithEgressRetry(ctx context.Context, req upstream.
 // ensureAntigravityToken returns a valid access token for the account, refreshing
 // it when it is within antigravityRefreshLeadSeconds of expiry.
 func (s *Server) ensureAntigravityToken(ctx context.Context, creds storage.AntigravityCredentials, account storage.Account, egress storage.EgressProfile, cookieJarKey string) (string, storage.AntigravityCredentials, error) {
+	return s.refreshAntigravityTokenIfNeeded(ctx, creds, account, egress, cookieJarKey, false)
+}
+
+func (s *Server) forceRefreshAntigravityToken(ctx context.Context, creds storage.AntigravityCredentials, account storage.Account, egress storage.EgressProfile, cookieJarKey string) (string, storage.AntigravityCredentials, error) {
+	return s.refreshAntigravityTokenIfNeeded(ctx, creds, account, egress, cookieJarKey, true)
+}
+
+func (s *Server) refreshAntigravityTokenIfNeeded(
+	ctx context.Context,
+	creds storage.AntigravityCredentials,
+	account storage.Account,
+	egress storage.EgressProfile,
+	cookieJarKey string,
+	force bool,
+) (string, storage.AntigravityCredentials, error) {
 	now := time.Now().Unix()
-	if creds.AccessToken != "" && creds.ExpiresAt > now+antigravityRefreshLeadSeconds {
+	if !force && creds.AccessToken != "" && creds.ExpiresAt > now+antigravityRefreshLeadSeconds {
 		return creds.AccessToken, creds, nil
 	}
-	if creds.RefreshToken == "" {
-		return "", creds, fmt.Errorf("no refresh token for account %s", account.ID)
+	if s.antigravityRefresh == nil {
+		s.antigravityRefresh = newAntigravityRefreshFlights()
 	}
-	tr, err := s.upstream.RefreshAntigravityToken(ctx, egress, cookieJarKey, creds.RefreshToken, &s.cfg)
+	refreshed, err := s.antigravityRefresh.do(ctx, account.ID, func(refreshCtx context.Context) (storage.AntigravityCredentials, error) {
+		latest, loadErr := s.store.GetAntigravityCredentials(refreshCtx, account.ID)
+		if loadErr != nil {
+			return storage.AntigravityCredentials{}, fmt.Errorf("load antigravity credentials: %w", loadErr)
+		}
+		now := time.Now().Unix()
+		advanced := antigravityCredentialsAdvanced(creds, latest)
+		if latest.AccessToken != "" && latest.ExpiresAt > now+antigravityRefreshLeadSeconds && (!force || advanced) {
+			return latest, nil
+		}
+		if strings.TrimSpace(latest.RefreshToken) == "" {
+			return storage.AntigravityCredentials{}, fmt.Errorf("antigravity refresh credential missing for account %s", account.ID)
+		}
+		tr, refreshErr := s.upstream.RefreshAntigravityToken(refreshCtx, egress, cookieJarKey, latest.RefreshToken, &s.cfg)
+		if refreshErr != nil {
+			return storage.AntigravityCredentials{}, refreshErr
+		}
+		latest.AccessToken = tr.AccessToken
+		if tr.RefreshToken != "" {
+			latest.RefreshToken = tr.RefreshToken
+		}
+		latest.ExpiresAt = time.Now().Unix() + tr.ExpiresIn
+
+		// OAuth servers may rotate the refresh token. Persist the complete new
+		// credential even if the downstream request was cancelled after exchange.
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(refreshCtx), 5*time.Second)
+		defer cancel()
+		if persistErr := s.store.UpsertAntigravityCredentials(persistCtx, latest); persistErr != nil {
+			return storage.AntigravityCredentials{}, fmt.Errorf("persist antigravity credentials: %w", persistErr)
+		}
+		return latest, nil
+	})
 	if err != nil {
 		return "", creds, err
 	}
-	creds.AccessToken = tr.AccessToken
-	if tr.RefreshToken != "" {
-		creds.RefreshToken = tr.RefreshToken
+	if strings.TrimSpace(refreshed.AccessToken) == "" {
+		return "", creds, errors.New("refreshed antigravity credential is missing access token")
 	}
-	creds.ExpiresAt = now + tr.ExpiresIn
-	// Persist the refreshed token; non-fatal if the write fails.
-	if wErr := s.store.UpsertAntigravityCredentials(ctx, creds); wErr != nil {
-		log.Printf("[ANTIGRAVITY] failed to persist refreshed token account=%s: %v", account.ID, wErr)
-	}
-	return creds.AccessToken, creds, nil
+	return refreshed.AccessToken, refreshed, nil
+}
+
+func antigravityCredentialsAdvanced(before, after storage.AntigravityCredentials) bool {
+	return before.AccessToken != after.AccessToken ||
+		before.RefreshToken != after.RefreshToken ||
+		before.ExpiresAt != after.ExpiresAt ||
+		(before.UpdatedAt != 0 && after.UpdatedAt > before.UpdatedAt)
 }
 
 // resolvedAntigravityModel picks the effective Gemini/Claude model slug for this
@@ -365,18 +468,21 @@ func antigravityBodyHash(body []byte) string {
 // recordAntigravityUsage writes a lightweight usage row for billing/analytics.
 // cachedTok is the number of tokens served from the Gemini explicit cache (0 = no hit).
 func (s *Server) recordAntigravityUsage(r *http.Request, accountID, model string, affinity routing.AffinityKey, inputTok, outputTok, cachedTok int64, stopReason string) {
-	ctx := context.Background()
 	keyHash, userID := downstreamFromCtx(r.Context())
 	raw, _ := json.Marshal(map[string]interface{}{
 		"stop_reason":           stopReason,
 		"provider":              "antigravity",
 		"cached_content_tokens": cachedTok,
 	})
-	_ = s.store.InsertUsageRecordWithDiagnostics(ctx, accountID, affinity.Hash, keyHash, userID, model,
-		inputTok, outputTok, inputTok+outputTok, cachedTok, cachedTok, 0, json.RawMessage(raw), storage.UsageDiagnostics{
+	s.enqueueUsage(storage.UsageRecordWrite{
+		AccountID: accountID, RouteKeyHash: affinity.Hash, APIKeyHash: keyHash, UserID: userID, Model: model,
+		Prompt: inputTok, Completion: outputTok, Total: inputTok + outputTok, Cached: cachedTok,
+		CacheRead: cachedTok, Raw: json.RawMessage(raw), Diagnostics: storage.UsageDiagnostics{
+			UsageEventID:     firstNonEmpty(usageEventIDFromContext(r.Context()), requestIDFromContext(r.Context())),
 			UsageProvider:    "antigravity",
 			UsageSource:      "upstream",
 			CacheReadPresent: cachedTok > 0,
 			AffinitySource:   affinity.Source,
-		})
+		},
+	})
 }

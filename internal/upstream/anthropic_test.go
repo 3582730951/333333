@@ -65,6 +65,8 @@ func TestMergeBetasFallsBackToCanonical(t *testing.T) {
 		"thinking-token-count-2026-05-13",
 		"mid-conversation-system-2026-04-07",
 		"effort-2025-11-24",
+		"fallback-credit-2026-06-01",
+		"extended-cache-ttl-2025-04-11",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("canonical fallback missing %q: %s", want, got)
@@ -81,6 +83,13 @@ func TestMergeBetasAPIKeyDropsOAuth(t *testing.T) {
 	}
 	if !strings.Contains(got, "x-extra-feature") {
 		t.Fatalf("dropped a non-oauth client beta on the api-key path: %s", got)
+	}
+	canonical := mergeBetas(claudeAPIKeyBetas, http.Header{}, true)
+	if !strings.Contains(canonical, "fallback-credit-2026-06-01") {
+		t.Fatalf("current API-key fingerprint is missing fallback credit: %s", canonical)
+	}
+	if strings.Contains(canonical, "extended-cache-ttl-2025-04-11") {
+		t.Fatalf("API-key fingerprint carried OAuth-only extended cache TTL: %s", canonical)
 	}
 }
 
@@ -190,6 +199,78 @@ func TestClaudePassthroughBetaFallback(t *testing.T) {
 	}
 }
 
+func TestClaudeAgentContextHeadersPreservedWithoutFabrication(t *testing.T) {
+	c, secret := fixedSecretClient(t, config.Default())
+	id := identity.For(secret, "acc-agent-context")
+	input := http.Header{}
+	input.Set("x-claude-code-agent-id", "agent_01JZ8N6K7M")
+	input.Set("x-claude-code-parent-agent-id", "agent parent-01")
+
+	for _, tc := range []struct {
+		name  string
+		apply func(http.Header, Request)
+	}{
+		{
+			name: "messages",
+			apply: func(dst http.Header, spec Request) {
+				c.applyClaudeHeaders(dst, spec, id, true)
+			},
+		},
+		{
+			name: "passthrough",
+			apply: func(dst http.Header, spec Request) {
+				c.applyClaudePassthroughHeaders(dst, spec, id, false)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dst := http.Header{}
+			tc.apply(dst, Request{
+				Provider: "claude",
+				Account:  storage.Account{ID: "acc-agent-context"},
+				Token:    storage.AccountToken{AccessToken: "sk-ant-oat-test"},
+				Headers:  input,
+			})
+			if got := dst.Get(claudeAgentIDHeader); got != "agent_01JZ8N6K7M" {
+				t.Fatalf("agent id = %q", got)
+			}
+			if got := dst.Get(claudeParentAgentHeader); got != "agent parent-01" {
+				t.Fatalf("parent agent id = %q", got)
+			}
+
+			withoutContext := http.Header{}
+			tc.apply(withoutContext, Request{
+				Provider: "claude",
+				Account:  storage.Account{ID: "acc-agent-context"},
+				Token:    storage.AccountToken{AccessToken: "sk-ant-oat-test"},
+				Headers:  http.Header{},
+			})
+			if withoutContext.Get(claudeAgentIDHeader) != "" || withoutContext.Get(claudeParentAgentHeader) != "" {
+				t.Fatalf("agent ancestry must not be fabricated: %#v", withoutContext)
+			}
+		})
+	}
+}
+
+func TestClaudeAgentContextHeadersRejectUnsafeValues(t *testing.T) {
+	for name, value := range map[string]string{
+		"control":  "agent-ok\ninjected",
+		"tab":      "agent\tid",
+		"nonascii": "agent-\u2603",
+		"oversize": strings.Repeat("a", 129),
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := http.Header{}
+			src[claudeAgentIDHeader] = []string{value}
+			dst := http.Header{}
+			forwardClaudeAgentContextHeaders(dst, src)
+			if got := dst.Get(claudeAgentIDHeader); got != "" {
+				t.Fatalf("unsafe value forwarded: %q", got)
+			}
+		})
+	}
+}
+
 func TestClaudeMessagesFinalSanitizerBeforeSidecar(t *testing.T) {
 	var cap sidecarCapture
 	sidecar := newFakeSidecar(t, &cap)
@@ -250,7 +331,7 @@ func TestClaudeMessagesFinalSanitizerBeforeSidecar(t *testing.T) {
 	}
 }
 
-func TestClaudeMessagesFinalSanitizerNormalizesThinkingSampling(t *testing.T) {
+func TestClaudeMessagesFinalSanitizerRemovesThinkingSampling(t *testing.T) {
 	var cap sidecarCapture
 	sidecar := newFakeSidecar(t, &cap)
 	defer sidecar.Close()
@@ -274,17 +355,101 @@ func TestClaudeMessagesFinalSanitizerNormalizesThinkingSampling(t *testing.T) {
 	if err := json.Unmarshal([]byte(cap.body), &got); err != nil {
 		t.Fatal(err)
 	}
-	if got["temperature"].(float64) != 1 {
-		t.Fatalf("thinking requests must force temperature=1, body=%s", cap.body)
-	}
-	if _, ok := got["top_p"]; ok {
-		t.Fatalf("thinking requests must not send top_p: %s", cap.body)
-	}
-	if _, ok := got["top_k"]; ok {
-		t.Fatalf("thinking requests must not send top_k: %s", cap.body)
+	for _, key := range []string{"temperature", "top_p", "top_k"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("thinking requests must omit %s: %s", key, cap.body)
+		}
 	}
 	if got["thinking"].(map[string]interface{})["type"] != "enabled" {
 		t.Fatalf("thinking block should remain enabled: %s", cap.body)
+	}
+}
+
+func TestClaudeCurrentModelsUseAdaptiveThinkingContract(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantType    string
+		wantDisplay string
+	}{
+		{
+			name:        "fable cannot disable thinking",
+			body:        `{"model":"claude-fable-5","temperature":0.2,"top_p":0.7,"top_k":20,"thinking":{"type":"disabled","display":"summarized"},"output_config":{"effort":"low"},"messages":[]}`,
+			wantType:    "adaptive",
+			wantDisplay: "summarized",
+		},
+		{
+			name:     "opus5 manual budget becomes adaptive",
+			body:     `{"model":"claude-opus-5","temperature":1,"thinking":{"type":"enabled","budget_tokens":32000},"output_config":{"effort":"high"},"messages":[]}`,
+			wantType: "adaptive",
+		},
+		{
+			name:     "sonnet5 manual budget becomes adaptive",
+			body:     `{"model":"claude-sonnet-5","top_p":1,"thinking":{"type":"enabled","budget_tokens":4096},"messages":[]}`,
+			wantType: "adaptive",
+		},
+		{
+			name:     "opus5 high effort conflict keeps effort and enables thinking",
+			body:     `{"model":"claude-opus-5","thinking":{"type":"disabled"},"output_config":{"effort":"xhigh"},"messages":[]}`,
+			wantType: "adaptive",
+		},
+	}
+	client, _ := fixedSecretClient(t, config.Default())
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := client.normalizeClaudeMessagesSpec(Request{
+				Provider: "claude",
+				Model:    "",
+				Body:     testBody([]byte(tc.body)),
+				Account:  storage.Account{ID: "acc-current-contract"},
+				Token:    storage.AccountToken{AccessToken: "sk-ant-oat-test"},
+			})
+			var got map[string]interface{}
+			if err := json.Unmarshal(requestBody(spec), &got); err != nil {
+				t.Fatal(err)
+			}
+			thinking, _ := got["thinking"].(map[string]interface{})
+			if thinking["type"] != tc.wantType {
+				t.Fatalf("thinking=%v body=%s", thinking, requestBody(spec))
+			}
+			if _, ok := thinking["budget_tokens"]; ok {
+				t.Fatalf("legacy budget survived: %s", requestBody(spec))
+			}
+			if tc.wantDisplay != "" && thinking["display"] != tc.wantDisplay {
+				t.Fatalf("thinking display=%v, want %q", thinking["display"], tc.wantDisplay)
+			}
+			for _, key := range []string{"temperature", "top_p", "top_k"} {
+				if _, ok := got[key]; ok {
+					t.Fatalf("current model retained %s: %s", key, requestBody(spec))
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeAdaptiveThinkingSupportsForcedToolChoice(t *testing.T) {
+	client, _ := fixedSecretClient(t, config.Default())
+	spec := client.normalizeClaudeMessagesSpec(Request{
+		Provider: "claude",
+		Body: testBody([]byte(`{
+			"model":"claude-sonnet-5",
+			"thinking":{"type":"enabled","budget_tokens":8192},
+			"output_config":{"effort":"xhigh"},
+			"tool_choice":{"type":"tool","name":"Bash"},
+			"tools":[{"name":"Bash","input_schema":{"type":"object"}}],
+			"messages":[]
+		}`)),
+		Account: storage.Account{ID: "acc-forced-tool"},
+		Token:   storage.AccountToken{AccessToken: "sk-ant-oat-test"},
+	})
+	var got map[string]interface{}
+	if err := json.Unmarshal(requestBody(spec), &got); err != nil {
+		t.Fatal(err)
+	}
+	thinking, _ := got["thinking"].(map[string]interface{})
+	output, _ := got["output_config"].(map[string]interface{})
+	if thinking["type"] != "adaptive" || output["effort"] != "xhigh" {
+		t.Fatalf("adaptive forced-tool contract was stripped: %s", requestBody(spec))
 	}
 }
 

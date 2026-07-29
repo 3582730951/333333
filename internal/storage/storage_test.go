@@ -221,6 +221,72 @@ func TestAccountTokenOAuthMetadataPersists(t *testing.T) {
 	}
 }
 
+func TestUpdateTokenAfterCredentialRefreshReactivatesOnlyAuthExpiredAccount(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for _, status := range []string{"auth_expired", "disabled"} {
+		id := "claude-refresh-" + status
+		account := Account{
+			ID: id, Label: id, GroupName: "cyber", Provider: "claude",
+			Status: status, QuarantineUntil: Now() + 3600, QuarantineReason: "old auth failure",
+		}
+		token := AccountToken{
+			AccessToken: "sk-ant-oat-old-" + status, RefreshToken: "refresh-old-" + status,
+			ExpiresAt: Now() - 1,
+		}
+		if err := store.UpsertAccount(ctx, account, token); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.BenchBindingForRecheck(ctx, id, Now()+300); err != nil {
+			t.Fatal(err)
+		}
+		token.AccountID = id
+		token.AccessToken = "sk-ant-oat-new-" + status
+		token.RefreshToken = "refresh-new-" + status
+		token.ExpiresAt = Now() + 3600
+		token.LastRefresh = Now()
+
+		reactivated, err := store.UpdateTokenAfterCredentialRefresh(ctx, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantReactivated := status == "auth_expired"
+		if reactivated != wantReactivated {
+			t.Fatalf("status %q reactivated=%v, want %v", status, reactivated, wantReactivated)
+		}
+		gotAccount, err := store.GetAccount(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotToken, err := store.GetToken(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binding, err := store.GetEgressBinding(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotToken.AccessToken != token.AccessToken || gotToken.RefreshToken != token.RefreshToken || gotToken.ExpiresAt != token.ExpiresAt {
+			t.Fatalf("status %q refreshed token mismatch: %+v", status, gotToken)
+		}
+		if wantReactivated {
+			if gotAccount.Status != "active" || gotAccount.QuarantineUntil != 0 || gotAccount.QuarantineReason != "" {
+				t.Fatalf("auth-expired account not fully restored: %+v", gotAccount)
+			}
+			if binding.RecheckPending || binding.CooldownUntil != 0 {
+				t.Fatalf("auth-expired binding still benched: %+v", binding)
+			}
+		} else {
+			if gotAccount.Status != "disabled" || gotAccount.QuarantineUntil == 0 {
+				t.Fatalf("explicit disabled state changed: %+v", gotAccount)
+			}
+			if !binding.RecheckPending || binding.CooldownUntil == 0 {
+				t.Fatalf("disabled account binding unexpectedly cleared: %+v", binding)
+			}
+		}
+	}
+}
+
 func TestBackfillUsageCacheDiagnosticsIncludesZeroPromptAnthropicRows(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

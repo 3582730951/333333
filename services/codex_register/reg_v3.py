@@ -585,7 +585,7 @@ def main():
                         oauth_refresh_token = token_resp.get("refresh_token", "")
                         oauth_id_token = token_resp.get("id_token", "")
                         expires_in = token_resp.get("expires_in", 0)
-                        log(f"✅ OAuth tokens obtained: access_token={oauth_access_token[:20]}... refresh_token={'yes' if oauth_refresh_token else 'NO'} id_token={'yes' if oauth_id_token else 'NO'} expires_in={expires_in}s")
+                        log(f"✅ OAuth tokens obtained: access_token=yes refresh_token={'yes' if oauth_refresh_token else 'NO'} id_token={'yes' if oauth_id_token else 'NO'} expires_in={expires_in}s")
                     else:
                         log("⚠️ token exchange returned no tokens — falling back to session accessToken")
                 else:

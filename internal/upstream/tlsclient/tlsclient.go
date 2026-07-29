@@ -347,7 +347,7 @@ func (f *Factory) storeCookies(key, rawURL string, header stdhttp.Header) {
 type TLSDialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // TLSDialerFor returns a TLS dialer matching the HTTP client's browser profile
-// and proxy route. tls-client v1.9 does not expose its internal TLS dialer, so
+// and proxy route. tls-client does not expose its internal TLS dialer, so
 // the small WebSocket-specific path is built directly with the same uTLS
 // profile. HTTP traffic still uses tls-client and retains its HTTP/2 fingerprint.
 func (f *Factory) TLSDialerFor(r Request) (TLSDialerFunc, error) {
@@ -378,7 +378,9 @@ func (f *Factory) TLSDialerFor(r Request) (TLSDialerFunc, error) {
 			OmitEmptyPsk:       true,
 			MinVersion:         utls.VersionTLS12,
 		}
-		conn := utls.UClient(rawConn, tlsConfig, profile.GetClientHelloId(), false, true)
+		// WebSocket upgrades are HTTP/1.1 only. Disable HTTP/3 explicitly as well
+		// so the uTLS profile cannot advertise a transport this dialer cannot use.
+		conn := utls.UClient(rawConn, tlsConfig, profile.GetClientHelloId(), false, true, true)
 		if err = conn.HandshakeContext(ctx); err != nil {
 			_ = rawConn.Close()
 			return nil, err

@@ -26,8 +26,14 @@ MIGRATE_USER_GROUPS="${MIGRATE_USER_GROUPS:-0}"
 WITH_REGISTRATION="${WITH_REGISTRATION:-1}"
 NODE_MIN_MAJOR="${NODE_MIN_MAJOR:-22}"
 NODE_INSTALL_MAJOR="${NODE_INSTALL_MAJOR:-22}"
+if [[ -n "${REGISTRAR_INSTALL:-}" ]]; then
+  REGISTRAR_INSTALL_EXPLICIT=1
+else
+  REGISTRAR_INSTALL_EXPLICIT=0
+fi
 REGISTRAR_SOURCE="${REGISTRAR_SOURCE:-${PROJECT_ROOT}/workers/node-registrar}"
 REGISTRAR_INSTALL="${REGISTRAR_INSTALL:-${DATA_DIR%/}/registrar}"
+PY_REGISTRAR_SOURCE="${PY_REGISTRAR_SOURCE:-${PROJECT_ROOT}/services/codex_register}"
 NODE_BIN="${NODE_BIN:-}"
 CHROME_BIN="${CHROME_BIN:-}"
 WARP_EXITS="${WARP_EXITS:-8}"
@@ -39,7 +45,7 @@ ADMIN_TOKEN="${ADMIN_TOKEN:-}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PUBLIC_URL="${PUBLIC_URL:-}"
 INSTALL_GO="${INSTALL_GO:-auto}"
-GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.24.1}"
+GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.25.12}"
 GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/.build}"
 SKIP_OS_PACKAGES="${SKIP_OS_PACKAGES:-0}"
@@ -47,8 +53,10 @@ SIDECAR_ADDR="${SIDECAR_ADDR:-127.0.0.1:8790}"
 # HEALTH_TIMEOUT bounds private-worker and post-switch /readyz gates.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
+WORKER_DESTROY_TIMEOUT="${WORKER_DESTROY_TIMEOUT:-30}"
 DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
 HANDOFF_CONTROL_SOCKET="${HANDOFF_CONTROL_SOCKET:-${DATA_DIR%/}/run/handoff-control.sock}"
+PROC_ROOT="${PROC_ROOT:-/proc}"
 HANDOFF_PAUSE_STATE="${HANDOFF_PAUSE_STATE:-${DATA_DIR%/}/run/admission-paused.json}"
 RELEASE_ID=""
 RELEASE_DIR=""
@@ -58,6 +66,8 @@ LEGACY_SERVICE_ACTIVE=0
 ACTIVATION_PENDING=0
 ACTIVATION_OLD_RELEASE=""
 ACTIVATION_OLD_SOCKET=""
+ACTIVATION_OLD_WORKER_RELEASE=""
+ACTIVATION_OLD_DESTROYED=0
 ACTIVATION_NEW_RELEASE=""
 # Set by install_sidecar: 1 when the sidecar source changed (or first install), 0 when
 # unchanged — lets the restart block skip a needless sidecar restart that would sever
@@ -141,10 +151,11 @@ Options:
   --minimal                 Install only the Go gateway
   --with-sidecar            Install and manage the curl_cffi sidecar (default)
   --without-sidecar         Do not install the curl_cffi sidecar
-  --with-registration       Install the Node auto-registration engine: Node.js + headless Chrome + Xvfb + the
-                            repository-owned Playwright registrar. Default. Works on a
-                            no-display cloud VPS (Chrome runs headed inside a per-process Xvfb).
-  --without-registration    Do not install the Node auto-registration engine
+  --with-registration       Install all repository-owned registration workers: the locked
+                            Python protocol/browser runtime plus Node.js, Chrome and Xvfb.
+                            Default. Registration remains disabled until readiness and a
+                            disposable per-method canary have succeeded.
+  --without-registration    Do not install registration worker runtimes
   --migrate-user-groups     Copy missing account-pool groups to same-named user groups on service start
   --no-migrate-user-groups  Keep account-pool groups separate (default)
   --with-warp               Provision the multi-exit WARP CF-fallback pool (wgcf + wireproxy)
@@ -172,7 +183,7 @@ Environment overrides:
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
-  REGISTRAR_SOURCE, REGISTRAR_INSTALL
+  REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE
 EOF
 }
 
@@ -565,7 +576,7 @@ render_runtime_config() {
 }
 
 python_runtime_enabled() {
-  bool_enabled "$WITH_SIDECAR"
+  bool_enabled "$WITH_SIDECAR" || bool_enabled "$WITH_REGISTRATION"
 }
 
 group_exists() {
@@ -809,6 +820,12 @@ ensure_project_files() {
   if bool_enabled "$WITH_REGISTRATION"; then
     [[ -f "${REGISTRAR_SOURCE%/}/package.json" ]] || die "repository-owned Node registrar not found: ${REGISTRAR_SOURCE}"
     [[ -f "${REGISTRAR_SOURCE%/}/package-lock.json" ]] || die "Node registrar lockfile not found: ${REGISTRAR_SOURCE}/package-lock.json"
+    [[ -f "${REGISTRAR_SOURCE%/}/sbom.cdx.json" ]] || die "Node registrar SBOM not found: ${REGISTRAR_SOURCE}/sbom.cdx.json"
+    local registrar_file
+    for registrar_file in protocol_register.py browser_register.py reg_v3.py phone_verify.py requirements.txt; do
+      [[ -f "${PY_REGISTRAR_SOURCE%/}/${registrar_file}" ]] ||
+        die "repository-owned Python registrar artifact not found: ${PY_REGISTRAR_SOURCE}/${registrar_file}"
+    done
   fi
   if bool_enabled "$WITH_WARP"; then
     [[ -f scripts/warp-exit.sh ]] || die "scripts/warp-exit.sh not found (required for --with-warp)"
@@ -834,6 +851,7 @@ ensure_absolute_paths() {
   require_absolute_path "SIDECAR_COOKIE_DIR" "$SIDECAR_COOKIE_DIR"
   require_absolute_path "REGISTRAR_SOURCE" "$REGISTRAR_SOURCE"
   require_absolute_path "REGISTRAR_INSTALL" "$REGISTRAR_INSTALL"
+  require_absolute_path "PY_REGISTRAR_SOURCE" "$PY_REGISTRAR_SOURCE"
 }
 
 ensure_system_deps() {
@@ -1106,8 +1124,8 @@ wait_for_service_health() {
 wait_worker_ready() {
   local socket="$1" expected="$2" max="$3" started="$SECONDS" payload
   while (( SECONDS - started < max )); do
-    payload="$(curl --noproxy '*' --silent --show-error --max-time 2 --unix-socket "$socket" http://localhost/readyz 2>/dev/null || true)"
-    if [[ "$payload" == *'"ready":true'* && "$payload" == *"\"release_id\":\"${expected}\""* ]]; then
+    payload="$(curl --noproxy '*' --silent --show-error --max-time 2 --unix-socket "$socket" http://localhost/standbyz 2>/dev/null || true)"
+    if [[ "$payload" == *'"standby_ready":true'* && "$payload" == *"\"release_id\":\"${expected}\""* ]]; then
       return 0
     fi
     sleep 1
@@ -1241,15 +1259,236 @@ resume_handoff_admission() {
   return 1
 }
 
+valid_worker_release_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+worker_unit_destroyed() {
+  local unit="$1" state pid
+  state="$(run_root systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
+  pid="$(run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)"
+  [[ -z "$pid" || "$pid" == "0" ]] || return 1
+  case "$state" in
+    ""|inactive|failed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_worker_unit_destroyed() {
+  local unit="$1" timeout="$2" started="$SECONDS"
+  while (( SECONDS - started < timeout )); do
+    worker_unit_destroyed "$unit" && return 0
+    sleep 0.2
+  done
+  worker_unit_destroyed "$unit"
+}
+
+destroy_worker_instance() {
+  local release="$1" socket="${2:-}" unit
+  if ! valid_worker_release_id "$release"; then
+    warn "Refusing malformed worker release id: ${release}"
+    return 1
+  fi
+  if [[ ! "$WORKER_DESTROY_TIMEOUT" =~ ^[0-9]+$ ]]; then
+    warn "WORKER_DESTROY_TIMEOUT must be a non-negative integer: ${WORKER_DESTROY_TIMEOUT}"
+    return 1
+  fi
+  unit="${SERVICE_NAME}-worker@${release}.service"
+
+  log "Destroying superseded worker instance ${unit}"
+  run_root systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
+  if ! wait_worker_unit_destroyed "$unit" "$WORKER_DESTROY_TIMEOUT"; then
+    warn "${unit} did not exit within ${WORKER_DESTROY_TIMEOUT}s; killing its complete cgroup"
+    run_root systemctl kill --kill-who=all --signal=SIGKILL "$unit" >/dev/null 2>&1 || true
+    run_root systemctl stop "$unit" >/dev/null 2>&1 || true
+  fi
+  run_root systemctl disable "$unit" >/dev/null 2>&1 || true
+  run_root systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  if [[ -n "$socket" ]]; then
+    run_root rm -f -- "$socket"
+  fi
+  if ! worker_unit_destroyed "$unit"; then
+    warn "Superseded worker ${unit} is still running after forced destruction"
+    return 1
+  fi
+}
+
+destroy_stale_worker_instances() {
+  local current_release="$1" current_unit unit release socket
+  current_unit="${SERVICE_NAME}-worker@${current_release}.service"
+  while IFS= read -r unit; do
+    [[ -n "$unit" && "$unit" != "$current_unit" ]] || continue
+    release="${unit#${SERVICE_NAME}-worker@}"
+    release="${release%.service}"
+    valid_worker_release_id "$release" || die "malformed loaded worker unit: ${unit}"
+    socket="${DATA_DIR%/}/run/worker-${release}.sock"
+    destroy_worker_instance "$release" "$socket" || die "failed to destroy stale worker ${unit}"
+  done < <(
+    {
+      run_root systemctl list-units --type=service --all --plain --no-legend "${SERVICE_NAME}-worker@*.service" 2>/dev/null || true
+      run_root systemctl list-unit-files --type=service --no-legend "${SERVICE_NAME}-worker@*.service" 2>/dev/null || true
+    } | awk '{print $1}' | grep -F "${SERVICE_NAME}-worker@" | grep -E '@[^[:space:]]+\.service$' | sort -u || true
+  )
+
+  # A killed process can leave an unlinked or stale Unix socket without a loaded
+  # systemd unit. Remove every non-current worker socket through the same validated
+  # instance cleanup path so the next deployment cannot accidentally rediscover it.
+  while IFS= read -r socket; do
+    [[ -n "$socket" && "$socket" != "${DATA_DIR%/}/run/worker-${current_release}.sock" ]] || continue
+    release="${socket##*/worker-}"
+    release="${release%.sock}"
+    valid_worker_release_id "$release" || die "malformed stale worker socket: ${socket}"
+    destroy_worker_instance "$release" "$socket" || die "failed to destroy stale worker socket ${socket}"
+  done < <(run_root find "${DATA_DIR%/}/run" -maxdepth 1 \( -type s -o -type l \) -name 'worker-*.sock' -print 2>/dev/null || true)
+}
+
+destroy_legacy_worker_process() {
+  local unit="${SERVICE_NAME}.service" pid state
+  pid="$(run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null || true)"
+  state="$(run_root systemctl show "$unit" --property=ActiveState --value 2>/dev/null || true)"
+  if [[ "$state" == "active" || "$state" == "activating" || "$state" == "deactivating" || "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    log "Destroying superseded legacy worker process in ${unit}"
+    run_root systemctl stop --no-block "$unit" >/dev/null 2>&1 || true
+    if ! wait_worker_unit_destroyed "$unit" "$WORKER_DESTROY_TIMEOUT"; then
+      run_root systemctl kill --kill-who=all --signal=SIGKILL "$unit" >/dev/null 2>&1 || true
+      run_root systemctl stop "$unit" >/dev/null 2>&1 || true
+    fi
+  fi
+  run_root systemctl disable "$unit" >/dev/null 2>&1 || true
+  run_root systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  worker_unit_destroyed "$unit" || die "legacy worker process is still running after forced destruction"
+}
+
+superseded_release_process() {
+  local pid="$1" current_release="$2" target release prefix
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  target="$(readlink "${PROC_ROOT%/}/${pid}/exe" 2>/dev/null || true)"
+  target="${target% (deleted)}"
+  prefix="${APP_DIR%/}/releases/"
+  [[ "$target" == "${prefix}"*"${APP_NAME}" ]] || return 1
+  release="${target#${prefix}}"
+  release="${release%%/*}"
+  valid_worker_release_id "$release" || return 1
+  [[ "$target" == "${prefix}${release}/${APP_NAME}" && "$release" != "$current_release" ]]
+}
+
+destroy_superseded_release_processes() {
+  local current_release="$1" exe pid started
+  local -a stale_pids=()
+  for exe in "${PROC_ROOT%/}"/[0-9]*/exe; do
+    [[ -L "$exe" ]] || continue
+    pid="${exe%/exe}"
+    pid="${pid##*/}"
+    superseded_release_process "$pid" "$current_release" || continue
+    stale_pids+=("$pid")
+    log "Terminating detached superseded release process pid=${pid}"
+    run_root kill -TERM "$pid" >/dev/null 2>&1 || true
+  done
+  for pid in "${stale_pids[@]}"; do
+    started="$SECONDS"
+    while superseded_release_process "$pid" "$current_release" &&
+      (( SECONDS - started < WORKER_DESTROY_TIMEOUT )); do
+      sleep 0.2
+    done
+    if superseded_release_process "$pid" "$current_release"; then
+      warn "Detached superseded release process pid=${pid} ignored TERM; forcing exit"
+      run_root kill -KILL "$pid" >/dev/null 2>&1 || true
+    fi
+    superseded_release_process "$pid" "$current_release" &&
+      die "detached superseded release process pid=${pid} remains after forced destruction"
+  done
+  return 0
+}
+
+release_directory_has_process() {
+  local release_dir="$1" exe target
+  for exe in "${PROC_ROOT%/}"/[0-9]*/exe; do
+    [[ -L "$exe" ]] || continue
+    target="$(readlink "$exe" 2>/dev/null || true)"
+    target="${target% (deleted)}"
+    [[ "$target" == "${release_dir%/}/"* ]] && return 0
+  done
+  return 1
+}
+
+prune_superseded_release_artifacts() {
+  local current_release="$1" current_path previous_path path base staging_release
+  current_path="${APP_DIR%/}/releases/${current_release}"
+  previous_path="$(run_root readlink -f "${APP_DIR%/}/previous" 2>/dev/null || true)"
+  while IFS= read -r path; do
+    [[ -n "$path" && "$path" != "$current_path" && "$path" != "$previous_path" ]] || continue
+    base="${path##*/}"
+    if [[ "$base" == .staging-* ]]; then
+      staging_release="${base#.staging-}"
+      valid_worker_release_id "$staging_release" || die "malformed stale release staging directory: ${path}"
+    else
+      valid_worker_release_id "$base" || die "malformed stale release directory: ${path}"
+    fi
+    release_directory_has_process "$path" &&
+      die "refusing to delete release artifact still used by a process: ${path}"
+    log "Reclaiming superseded release artifact ${path}"
+    run_root rm -rf -- "$path"
+    [[ ! -e "$path" ]] || die "superseded release artifact was not removed: ${path}"
+  done < <(run_root find "${APP_DIR%/}/releases" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+  return 0
+}
+
+reclaim_superseded_install_resources() {
+  local current_release="$1"
+  destroy_stale_worker_instances "$current_release"
+  destroy_legacy_worker_process
+  destroy_superseded_release_processes "$current_release"
+  # A detached process may have held a stale socket after its systemd instance was
+  # already forgotten. Sweep worker resources once more after process destruction.
+  destroy_stale_worker_instances "$current_release"
+  verify_single_active_worker "$current_release"
+  prune_superseded_release_artifacts "$current_release"
+  log "Superseded release processes and runtime resources were reclaimed"
+}
+
+verify_single_active_worker() {
+  local current_release="$1" expected
+  local unit pid count=0
+  expected="${SERVICE_NAME}-worker@${current_release}.service"
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    ((count += 1))
+    [[ "$unit" == "$expected" ]] || die "unexpected active worker remains after cutover: ${unit}"
+  done < <(run_root systemctl list-units --type=service --state=active --plain --no-legend "${SERVICE_NAME}-worker@*.service" 2>/dev/null | awk '{print $1}')
+  (( count == 1 )) || die "expected exactly one active worker (${expected}), found ${count}"
+  pid="$(run_root systemctl show "$expected" --property=MainPID --value 2>/dev/null || true)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "active worker ${expected} has no live MainPID"
+  log "Single-worker invariant verified: ${expected} (MainPID=${pid})"
+}
+
 rollback_pending_activation() {
   (( ACTIVATION_PENDING == 1 )) || return 0
+  if (( ACTIVATION_OLD_DESTROYED == 1 )); then
+    warn "Previous worker is already destroyed; completing convergence on the verified new release"
+    atomic_symlink "$RELEASE_DIR" "${APP_DIR%/}/current" || return 1
+    atomic_symlink "${DATA_DIR%/}/run/worker-${ACTIVATION_NEW_RELEASE}.sock" "${DATA_DIR%/}/run/active-worker.sock" || return 1
+    destroy_stale_worker_instances "$ACTIVATION_NEW_RELEASE" || return 1
+    destroy_legacy_worker_process || return 1
+    verify_single_active_worker "$ACTIVATION_NEW_RELEASE" || return 1
+    ACTIVATION_PENDING=0
+    return 0
+  fi
   warn "Rolling back the incomplete traffic switch before reopening admission"
   if [[ -n "$ACTIVATION_OLD_RELEASE" && -n "$ACTIVATION_OLD_SOCKET" ]]; then
     atomic_symlink "$ACTIVATION_OLD_RELEASE" "${APP_DIR%/}/current" || return 1
     atomic_symlink "$ACTIVATION_OLD_SOCKET" "${DATA_DIR%/}/run/active-worker.sock" || return 1
+    if [[ -n "$ACTIVATION_OLD_WORKER_RELEASE" ]]; then
+      run_root systemctl enable "${SERVICE_NAME}-worker@${ACTIVATION_OLD_WORKER_RELEASE}.service" >/dev/null || return 1
+      run_root systemctl start "${SERVICE_NAME}-worker@${ACTIVATION_OLD_WORKER_RELEASE}.service" >/dev/null || return 1
+      wait_for_service_health "$(handoff_public_base_url)/readyz" "$HEALTH_TIMEOUT" "activation rollback" "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
+    fi
   fi
   if [[ -n "$ACTIVATION_NEW_RELEASE" ]]; then
-    run_root systemctl stop "${SERVICE_NAME}-worker@${ACTIVATION_NEW_RELEASE}.service" >/dev/null 2>&1 || true
+    destroy_worker_instance "$ACTIVATION_NEW_RELEASE" "${DATA_DIR%/}/run/worker-${ACTIVATION_NEW_RELEASE}.sock" || return 1
+  fi
+  if [[ -n "$ACTIVATION_OLD_WORKER_RELEASE" ]]; then
+    destroy_stale_worker_instances "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
+    verify_single_active_worker "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
   fi
   ACTIVATION_PENDING=0
 }
@@ -1258,6 +1497,9 @@ deployment_exit_cleanup() {
   local status="$?"
   if (( ACTIVATION_PENDING == 1 )); then
     set +e
+    if (( HANDOFF_PAUSED == 0 )) && handoff_control_is_available; then
+      pause_handoff_admission || warn "could not pause admission before incomplete activation rollback"
+    fi
     rollback_pending_activation || warn "incomplete activation rollback needs operator inspection"
     set -e
   fi
@@ -1325,11 +1567,20 @@ activate_staged_release() {
   }
 
   local new_socket="${DATA_DIR%/}/run/worker-${RELEASE_ID}.sock"
-  local old_socket old_release inflight started health_url had_handoff=0
+  local old_socket old_release old_worker_release="" inflight="unknown" started health_url had_handoff=0
   [[ "$DRAIN_TIMEOUT" =~ ^[0-9]+$ ]] || die "DRAIN_TIMEOUT must be a non-negative integer: ${DRAIN_TIMEOUT}"
+  [[ "$WORKER_DESTROY_TIMEOUT" =~ ^[0-9]+$ ]] || die "WORKER_DESTROY_TIMEOUT must be a non-negative integer: ${WORKER_DESTROY_TIMEOUT}"
   (( ${#new_socket} < 104 )) || die "worker Unix socket path is too long: ${new_socket}"
   old_socket="$(run_root readlink "${DATA_DIR%/}/run/active-worker.sock" 2>/dev/null || true)"
   old_release="$(run_root readlink "${APP_DIR%/}/current" 2>/dev/null || true)"
+  if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
+    old_worker_release="${old_socket##*/worker-}"
+    old_worker_release="${old_worker_release%.sock}"
+    valid_worker_release_id "$old_worker_release" || die "malformed active worker socket target: ${old_socket}"
+    # Remove leftovers from any previously interrupted deployment before a new
+    # candidate is introduced. The currently active worker is the sole exception.
+    destroy_stale_worker_instances "$old_worker_release"
+  fi
 
   log "Starting staged worker ${RELEASE_ID} on ${new_socket}"
   if ! run_root systemctl start "${SERVICE_NAME}-worker@${RELEASE_ID}.service"; then
@@ -1339,12 +1590,14 @@ activate_staged_release() {
   if ! wait_worker_ready "$new_socket" "$RELEASE_ID" "$HEALTH_TIMEOUT"; then
     run_root systemctl --no-pager --full status "${SERVICE_NAME}-worker@${RELEASE_ID}.service" >&2 || true
     run_root systemctl stop "${SERVICE_NAME}-worker@${RELEASE_ID}.service" || true
-    die "staged worker ${RELEASE_ID} did not pass /readyz; active release was not changed"
+    die "staged worker ${RELEASE_ID} did not pass /standbyz; active release was not changed"
   fi
 
   ACTIVATION_PENDING=1
   ACTIVATION_OLD_RELEASE="$old_release"
   ACTIVATION_OLD_SOCKET="$old_socket"
+  ACTIVATION_OLD_WORKER_RELEASE="$old_worker_release"
+  ACTIVATION_OLD_DESTROYED=0
   ACTIVATION_NEW_RELEASE="$RELEASE_ID"
   # The new worker is fully ready before the admission barrier closes. Requests which
   # began earlier remain pinned to the old worker; only not-yet-admitted requests wait.
@@ -1375,8 +1628,15 @@ activate_staged_release() {
     die "first handoff activation failed; staged release remains at ${RELEASE_DIR}"
   fi
 
+  run_root systemctl enable "${SERVICE_NAME}-worker@${RELEASE_ID}.service" >/dev/null ||
+    die "new worker passed readiness but could not be enabled for reboot"
+  if [[ -n "$old_worker_release" ]]; then
+    # Disable boot activation before reopening admission. Even if the host
+    # reboots during the bounded drain, systemd starts only the new release.
+    run_root systemctl disable "${SERVICE_NAME}-worker@${old_worker_release}.service" >/dev/null ||
+      die "superseded worker could not be disabled before drain"
+  fi
   resume_handoff_admission || die "release switched but queued request admission did not resume"
-  ACTIVATION_PENDING=0
   log "Release ${RELEASE_ID} is active; stable public listener was not restarted"
 
   if [[ -n "$old_socket" && "$old_socket" != "$new_socket" ]]; then
@@ -1385,17 +1645,22 @@ activate_staged_release() {
     while (( SECONDS - started < DRAIN_TIMEOUT )); do
       inflight="$(worker_inflight "$old_socket")"
       if [[ "$inflight" == "0" ]]; then
-        OLD_WORKER_DRAINED=1
-        old_release="${old_socket##*/worker-}"
-        old_release="${old_release%.sock}"
-        log "Previous worker ${old_release} drained; stopping it"
-        run_root systemctl stop "${SERVICE_NAME}-worker@${old_release}.service" || true
-        return 0
+        log "Previous worker ${old_worker_release} drained"
+        break
       fi
       sleep 1
     done
-    warn "previous worker still has ${inflight:-unknown} in-flight connection(s); leaving it alive to finish without interruption"
+    if [[ "$inflight" != "0" ]]; then
+      warn "previous worker still has ${inflight:-unknown} in-flight connection(s) after ${DRAIN_TIMEOUT}s; enforcing the bounded drain deadline"
+    fi
+    destroy_worker_instance "$old_worker_release" "$old_socket" || die "failed to destroy previous worker ${old_worker_release}"
+    ACTIVATION_OLD_DESTROYED=1
   fi
+  destroy_stale_worker_instances "$RELEASE_ID"
+  destroy_legacy_worker_process
+  verify_single_active_worker "$RELEASE_ID"
+  ACTIVATION_PENDING=0
+  OLD_WORKER_DRAINED=1
 }
 
 install_systemd_unit() {
@@ -1406,6 +1671,7 @@ install_systemd_unit() {
   fi
 
   local database_parent read_write_paths tmp unit handoff_unit worker_unit sidecar_unit extra_env admin_env no_new_priv warp_dir_env legacy_pid
+  local node_registrar_unit_dir python_registrar_unit_dir python_registrar_unit_venv
   if systemd_running && ! run_root systemctl is-active --quiet "${HANDOFF_SERVICE_NAME}.service" 2>/dev/null; then
     legacy_pid="$(run_root systemctl show "${SERVICE_NAME}.service" --property=MainPID --value 2>/dev/null || true)"
     if [[ "$legacy_pid" =~ ^[1-9][0-9]*$ ]]; then
@@ -1424,18 +1690,29 @@ install_systemd_unit() {
 Environment=\"CODEX_POOL_DEFAULT_SIDECAR_ENDPOINT=http://${SIDECAR_ADDR}\""
   fi
   if bool_enabled "$WITH_REGISTRATION"; then
-    # Point the Go orchestrator at the installed Node registrar + Node binary; Chrome is
-    # auto-detected by puppeteer-real-browser but we pass CHROME_PATH as a backstop. The
-    # orchestrator strips DISPLAY/REG_HEADLESS itself, so headed-in-Xvfb works with no
-    # display on the server.
+    if (( REGISTRAR_INSTALL_EXPLICIT == 1 )); then
+      node_registrar_unit_dir="$REGISTRAR_INSTALL"
+    else
+      node_registrar_unit_dir="${APP_DIR%/}/releases/%i/registrar-node"
+    fi
+    python_registrar_unit_dir="${APP_DIR%/}/releases/%i/registrar-python"
+    python_registrar_unit_venv="${APP_DIR%/}/releases/%i/registrar-python-venv"
+    # Every worker resolves the immutable registrar artifacts from its own release.
+    # Chrome is an OS runtime dependency; credentials are injected only into the
+    # short-lived child process and never into the systemd unit.
     extra_env="${extra_env}
-Environment=\"CODEX_REG_NODE_DIR=${REGISTRAR_INSTALL}\""
+Environment=\"CODEX_REG_NODE_DIR=${node_registrar_unit_dir}\"
+Environment=\"CODEX_REG_PYTHON=${python_registrar_unit_venv}/bin/python\"
+Environment=\"CODEX_REG_PROTOCOL_SCRIPT=${python_registrar_unit_dir}/protocol_register.py\"
+Environment=\"CODEX_REG_SCRIPT=${python_registrar_unit_dir}/browser_register.py\"
+Environment=\"CODEX_REG_V3_SCRIPT=${python_registrar_unit_dir}/reg_v3.py\""
     if [[ -n "${NODE_BIN:-}" ]]; then
       extra_env="${extra_env}
 Environment=\"CODEX_REG_NODE=${NODE_BIN}\""
     fi
     if [[ -n "${CHROME_BIN:-}" ]]; then
       extra_env="${extra_env}
+Environment=\"CODEX_REG_CHROME=${CHROME_BIN}\"
 Environment=\"CHROME_PATH=${CHROME_BIN}\""
     fi
   fi
@@ -1465,8 +1742,7 @@ Environment=\"CODEX_POOL_CF_SOLVER_URL=${CF_SOLVER_URL}\""
   admin_env=""
   if [[ -n "$ADMIN_TOKEN" ]]; then
     admin_env="
-LoadCredential=admin.token:${DATA_DIR%/}/data/keys/admin.token
-Environment=\"CODEX_POOL_ADMIN_TOKEN_FILE=%d/admin.token\""
+LoadCredential=admin.token:${DATA_DIR%/}/data/keys/admin.token"
   fi
 
   run_root install -d -m 0755 "$SYSTEMD_DIR"
@@ -1544,14 +1820,12 @@ WorkingDirectory=${DATA_DIR}
 Environment="CODEX_POOL_DATABASE=${DATABASE_PATH}"
 Environment="CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS}"
 Environment="CODEX_POOL_DATA_DIR=${DATA_DIR%/}/data"
-Environment="CODEX_POOL_MASTER_KEY_FILE=%d/master.key"
-Environment="CODEX_POOL_IDENTITY_KEY_FILE=%d/identity.key"
-Environment="CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE=%d/diagnostic-alias.key"
 LoadCredential=master.key:${DATA_DIR%/}/data/keys/master.key
 LoadCredential=identity.key:${DATA_DIR%/}/data/keys/identity.key
 LoadCredential=diagnostic-alias.key:${DATA_DIR%/}/data/keys/diagnostic-alias.key
-Environment="CODEX_POOL_RELEASE_ID=%i"${admin_env}${extra_env}
-ExecStart=${APP_DIR%/}/releases/%i/${APP_NAME} --config ${CONFIG_FILE} --release-id %i --unix-socket ${DATA_DIR%/}/run/worker-%i.sock
+Environment="CODEX_POOL_RELEASE_ID=%i"
+Environment="CODEX_POOL_INSTANCE_ID=%i"${admin_env}${extra_env}
+ExecStart=${APP_DIR%/}/releases/%i/${APP_NAME} --config ${CONFIG_FILE} --release-id %i --deployment-role auto --unix-socket ${DATA_DIR%/}/run/worker-%i.sock
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=300
@@ -1643,10 +1917,10 @@ EOF
 
       # Restart the sidecar only when its source changed (or it is not running): an
       # unchanged sidecar is left alone so its in-flight upstream streams are never cut.
-		if bool_enabled "$WITH_SIDECAR"; then
-			if [[ "${SIDECAR_CHANGED:-1}" == "1" && "${OLD_WORKER_DRAINED:-1}" != "1" ]]; then
-				warn "Previous worker still streams through the existing sidecar; deferring the sidecar version switch to avoid severing HTTP/SSE/WS traffic"
-			elif [[ "${SIDECAR_CHANGED:-1}" == "1" ]] || ! run_root systemctl is-active --quiet "${SERVICE_NAME}-sidecar.service"; then
+      if bool_enabled "$WITH_SIDECAR"; then
+        if [[ "${SIDECAR_CHANGED:-1}" == "1" && "${OLD_WORKER_DRAINED:-1}" != "1" ]]; then
+          warn "Previous worker still streams through the existing sidecar; deferring the sidecar version switch to avoid severing HTTP/SSE/WS traffic"
+        elif [[ "${SIDECAR_CHANGED:-1}" == "1" ]] || ! run_root systemctl is-active --quiet "${SERVICE_NAME}-sidecar.service"; then
           log "Restarting ${SERVICE_NAME}-sidecar.service"
           run_root systemctl restart "${SERVICE_NAME}-sidecar.service" || true
           run_root systemctl --no-pager --full status "${SERVICE_NAME}-sidecar.service" || true
@@ -1655,6 +1929,11 @@ EOF
         fi
       fi
 
+      # The new worker and any release-scoped sidecar are now live. Find every
+      # superseded instance, including detached processes no longer represented by
+      # a loaded systemd unit, and release their cgroups, sockets and old artifacts.
+      # Keep only the immutable `previous` target as the runnable rollback copy.
+      reclaim_superseded_install_resources "$RELEASE_ID"
     else
       atomic_symlink "$RELEASE_DIR" "${APP_DIR%/}/current"
       warn "Service installed but not started"
@@ -1847,11 +2126,12 @@ install_node_registrar() {
     warn "Node registrar source not found at ${REGISTRAR_SOURCE}; the node auto-registration engine will be unavailable (the relay still runs and serves accounts)."
     return 0
   fi
-  local npm_bin tmp
+  local npm_bin release_install tmp
   npm_bin="$(find_npm)" || die "npm not found after Node install"
 
-  tmp="${REGISTRAR_INSTALL}.tmp"
-  log "Installing Node registrar to ${REGISTRAR_INSTALL}"
+  release_install="${RELEASE_DIR%/}/registrar-node"
+  tmp="${release_install}.tmp"
+  log "Installing immutable Node registrar to ${release_install}"
   run_root rm -rf "$tmp"
   run_root install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$tmp"
   # Copy source only — never node_modules, browser profiles, logs, tokens, or the
@@ -1865,19 +2145,56 @@ install_node_registrar() {
       --exclude=./username.json --exclude=./shibai.json \
       -cf - . | tar -xf - -C '$tmp'"
   run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$tmp"
-  run_root rm -rf "$REGISTRAR_INSTALL"
-  run_root mv "$tmp" "$REGISTRAR_INSTALL"
+  run_root rm -rf "$release_install"
+  run_root mv "$tmp" "$release_install"
 
   log "Installing Node registrar dependencies (pulls puppeteer-real-browser; may take a minute)"
   local npm_common="--no-audit --no-fund --omit=dev"
-  if [[ -f "${REGISTRAR_INSTALL}/package-lock.json" ]]; then
-    run_root env HOME="$DATA_DIR" sh -c "cd '$REGISTRAR_INSTALL' && '$npm_bin' ci $npm_common" \
-      || run_root env HOME="$DATA_DIR" sh -c "cd '$REGISTRAR_INSTALL' && '$npm_bin' install $npm_common"
+  run_root env HOME="$DATA_DIR" sh -c "cd '$release_install' && '$npm_bin' ci $npm_common"
+  run_root chown -R "root:${SERVICE_GROUP}" "$release_install"
+  run_root chmod -R u=rwX,g=rX,o= "$release_install"
+
+  if (( REGISTRAR_INSTALL_EXPLICIT == 1 )); then
+    tmp="${REGISTRAR_INSTALL}.tmp"
+    run_root rm -rf "$tmp"
+    run_root cp -a "$release_install" "$tmp"
+    run_root rm -rf "$REGISTRAR_INSTALL"
+    run_root mv "$tmp" "$REGISTRAR_INSTALL"
   else
-    run_root env HOME="$DATA_DIR" sh -c "cd '$REGISTRAR_INSTALL' && '$npm_bin' install $npm_common"
+    REGISTRAR_INSTALL="$release_install"
   fi
-  run_root chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "$REGISTRAR_INSTALL"
   log "Node registrar ready at ${REGISTRAR_INSTALL}"
+}
+
+install_python_registrar() {
+  bool_enabled "$WITH_REGISTRATION" || return 0
+
+  local release_source release_venv registrar_file
+  release_source="${RELEASE_DIR%/}/registrar-python"
+  release_venv="${RELEASE_DIR%/}/registrar-python-venv"
+  log "Installing immutable Python registrar runtime to ${release_source}"
+
+  run_root install -d -m 0750 -o root -g "$SERVICE_GROUP" "$release_source"
+  for registrar_file in protocol_register.py browser_register.py reg_v3.py phone_verify.py requirements.txt; do
+    run_root install -m 0640 -o root -g "$SERVICE_GROUP" \
+      "${PY_REGISTRAR_SOURCE%/}/${registrar_file}" "${release_source}/${registrar_file}"
+  done
+
+  run_root python3 -m venv "$release_venv"
+  run_root "$release_venv/bin/pip" install --disable-pip-version-check \
+    --requirement "${release_source}/requirements.txt"
+  run_root "$release_venv/bin/pip" check
+  for registrar_file in protocol_register.py browser_register.py reg_v3.py phone_verify.py; do
+    run_root env PYTHONDONTWRITEBYTECODE=1 "$release_venv/bin/python" -c \
+      'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), filename=sys.argv[1])' \
+      "${release_source}/${registrar_file}"
+  done
+  run_root env PYTHONDONTWRITEBYTECODE=1 "$release_venv/bin/python" -c \
+    'import curl_cffi, playwright, playwright_stealth, requests, urllib3'
+
+  run_root chown -R "root:${SERVICE_GROUP}" "$release_source" "$release_venv"
+  run_root chmod -R u=rwX,g=rX,o= "$release_source" "$release_venv"
+  log "Python registration workers ready at ${release_source}"
 }
 
 # install_warp provisions the multi-exit WARP fallback pool (wgcf + wireproxy): one
@@ -2093,6 +2410,7 @@ main() {
   install_nodejs
   install_chrome
   install_node_registrar
+  install_python_registrar
   install_warp
   printf '%s\n' "$RELEASE_ID" | run_root tee "${RELEASE_DIR%/}/.staged-ok" >/dev/null
   install_systemd_unit
@@ -2100,4 +2418,6 @@ main() {
   print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

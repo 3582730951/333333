@@ -1410,6 +1410,13 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 		s.recordCodexUpstreamAttempt(ctx, mapping, lease, egress, "terminal_success", http.StatusOK)
 		return nil
 	}
+	// A client is allowed to close as soon as it receives the terminal frame. The
+	// response/turn-state aliases are durability work for the following turn, so
+	// detach downstream cancellation while keeping all request-scoped values and
+	// cap the write. This also prevents a graceful worker drain from abandoning a
+	// terminal it has already delivered.
+	persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer persistCancel()
 	mapping.mu.Lock()
 	defer mapping.mu.Unlock()
 	binding := mapping.binding
@@ -1432,14 +1439,20 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	binding.ForkedFromThreadID = mapping.snapshot.ForkedFromThreadID
 	binding.WindowGeneration = mapping.snapshot.WindowGeneration
 	created := binding.ID == ""
-	expiresAt := time.Now().Add(s.codexSessionMappingRetention(ctx)).Unix()
+	expiresAt := time.Now().Add(s.codexSessionMappingRetention(persistCtx)).Unix()
 	instructionSnapshot := mapping.instructions.snapshotCommit(binding.TreeID, expiresAt)
 	aliases := mapping.identity.aliasesForBinding(*binding, responseID, turnState)
 	aliases = append(aliases, mapping.recoveryAliases...)
-	committed, err := s.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
+	filteredAliases, droppedHierarchyAliases, err := s.filterLegacyCodexHierarchyAliasConflicts(
+		persistCtx, mapping.namespace, binding.ID, aliases,
+	)
+	if err != nil {
+		return err
+	}
+	committed, err := s.store.CommitCodexSessionBinding(persistCtx, storage.CodexSessionCommit{
 		Namespace:           mapping.namespace,
 		Binding:             *binding,
-		Aliases:             aliases,
+		Aliases:             filteredAliases,
 		ExpiresAt:           expiresAt,
 		InstructionSnapshot: instructionSnapshot,
 	})
@@ -1447,7 +1460,7 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 		return err
 	}
 	if compact {
-		advanced, advanceErr := s.store.AdvanceCodexSessionWindowGeneration(ctx, committed.ID, committed.Epoch, committed.WindowGeneration, expiresAt)
+		advanced, advanceErr := s.store.AdvanceCodexSessionWindowGeneration(persistCtx, committed.ID, committed.Epoch, committed.WindowGeneration, expiresAt)
 		if advanceErr != nil {
 			return advanceErr
 		}
@@ -1458,15 +1471,72 @@ func (s *Server) commitCodexSessionMapping(ctx context.Context, mapping *codexSe
 	mapping.requiredAccount, mapping.requiredEgress = committed.AccountID, committed.EgressID
 	if created {
 		atomic.AddUint64(&s.codexMappingBindingsCreated, 1)
-		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+		_ = s.store.InsertAuditLog(persistCtx, storage.AuditLogRow{
 			Action: "codex_session_binding_created",
 			State:  "active",
 			Reason: "terminal_success",
 			Detail: "metadata_only_no_raw_identifiers",
 		})
 	}
-	s.recordCodexUpstreamAttemptBinding(ctx, committed, lease, egress, "terminal_success", http.StatusOK)
+	if droppedHierarchyAliases > 0 {
+		_ = s.store.InsertAuditLog(persistCtx, storage.AuditLogRow{
+			Action: "codex_session_hierarchy_alias_conflict",
+			State:  "degraded",
+			Reason: "legacy_active_owner",
+			Detail: fmt.Sprintf("dropped_count=%d;terminal_state_alias_preserved", droppedHierarchyAliases),
+		})
+	}
+	s.recordCodexUpstreamAttemptBinding(persistCtx, committed, lease, egress, "terminal_success", http.StatusOK)
 	return nil
+}
+
+// filterLegacyCodexHierarchyAliasConflicts contains damage left by older or
+// concurrently active workers without weakening the state-pointer contract.
+// A unique terminal response alias is still committed, so the next stateful turn
+// can resume exactly. Conflicting root/session/branch hints are omitted rather
+// than rolling back that terminal mapping. Response aliases remain strict and
+// CommitCodexSessionBinding will reject any collision involving them.
+func (s *Server) filterLegacyCodexHierarchyAliasConflicts(ctx context.Context, namespace, bindingID string, aliases []storage.CodexSessionAlias) ([]storage.CodexSessionAlias, int, error) {
+	hasResponseAlias := false
+	for _, alias := range aliases {
+		if strings.EqualFold(strings.TrimSpace(alias.Type), "response") && strings.TrimSpace(alias.Value) != "" {
+			hasResponseAlias = true
+			break
+		}
+	}
+	if !hasResponseAlias {
+		return aliases, 0, nil
+	}
+	filtered := make([]storage.CodexSessionAlias, 0, len(aliases))
+	dropped := 0
+	for _, alias := range aliases {
+		typ := strings.ToLower(strings.TrimSpace(alias.Type))
+		if typ != "root" && typ != "session" && typ != "branch" {
+			filtered = append(filtered, alias)
+			continue
+		}
+		rows, err := s.store.FindCodexSessionAlias(ctx, namespace, alias)
+		if errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
+			filtered = append(filtered, alias)
+			continue
+		}
+		if err != nil {
+			return nil, dropped, err
+		}
+		conflict := false
+		for _, owner := range rows {
+			if owner.State == "active" && owner.ID != bindingID {
+				conflict = true
+				break
+			}
+		}
+		if conflict {
+			dropped++
+			continue
+		}
+		filtered = append(filtered, alias)
+	}
+	return filtered, dropped, nil
 }
 
 func (s *Server) recordCodexUpstreamAttempt(ctx context.Context, mapping *codexSessionMapping, lease scheduler.Lease, egress storage.EgressProfile, state string, statusCode int) {

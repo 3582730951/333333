@@ -38,11 +38,18 @@ type Handler struct {
 	concurrency   int    // max parallel registrations per batch (boot default)
 	enabled       bool
 
-	mu         sync.Mutex
-	jobCancels map[string]context.CancelFunc // running job id → cancel
+	mu            sync.Mutex
+	jobCancels    map[string]context.CancelFunc // running job id → cancel
+	jobWG         sync.WaitGroup
+	runtimeCtx    context.Context
+	runtimeCancel context.CancelFunc
+	runtimeActive bool
 }
 
-const registrationBatchMaxCount = 100
+const (
+	registrationBatchMaxCount      = 100
+	registrationPersistenceTimeout = 5 * time.Second
+)
 
 var errInvalidRegisterRequest = errors.New("invalid registration request")
 var errPaymentFeatureRemoved = errors.New("payment_feature_removed")
@@ -76,6 +83,85 @@ func NewHandler(store *storage.Store, up *upstream.Client, defaultMethod string,
 	// registration_task_events and appear in the admin "注册事件记录" view.
 	h.pipeline.LogEvent = h.logEventDetail
 	return h
+}
+
+// StartRuntime binds future registration jobs to the active worker lifetime.
+// Standby workers never call this method, so they cannot launch registrar
+// subprocesses or acquire provider resources.
+func (h *Handler) StartRuntime(ctx context.Context) {
+	if h == nil || ctx == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.runtimeActive && h.runtimeCtx != nil && h.runtimeCtx.Err() == nil {
+		return
+	}
+	if h.store != nil {
+		recoveryCtx, recoveryCancel := context.WithTimeout(ctx, registrationPersistenceTimeout)
+		recovered, err := h.store.RecoverInterruptedRegistrationWorkflows(recoveryCtx)
+		recoveryCancel()
+		if err != nil {
+			h.runtimeActive = false
+			log.Printf("[REGISTRATION] interrupted workflow recovery failed; runtime remains disabled: %v", err)
+			return
+		}
+		if recovered.JobsFinalized > 0 {
+			log.Printf(
+				"[REGISTRATION] isolated interrupted workflows: jobs=%d records=%d items=%d",
+				recovered.JobsFinalized,
+				recovered.RecordsFailed,
+				recovered.ItemsQuarantined,
+			)
+		}
+	}
+	if h.runtimeCancel != nil {
+		h.runtimeCancel()
+	}
+	if ctx.Err() != nil {
+		h.runtimeActive = false
+		return
+	}
+	h.runtimeCtx, h.runtimeCancel = context.WithCancel(ctx)
+	h.runtimeActive = true
+}
+
+// StopRuntime prevents new jobs, cancels every child process through its job
+// context, and waits only until the caller's shutdown deadline.
+func (h *Handler) StopRuntime(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	h.runtimeActive = false
+	if h.runtimeCancel != nil {
+		h.runtimeCancel()
+	}
+	for _, cancel := range h.jobCancels {
+		cancel()
+	}
+	h.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer supervisor.Recover("registration-runtime-wait")
+		h.jobWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func registrationPersistenceContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, registrationPersistenceTimeout)
 }
 
 // resolveConcurrency returns the max parallel registrations for a batch: the admin-set
@@ -543,22 +629,34 @@ func (h *Handler) startRegistrationJob(ctx context.Context, req pipeline.Registe
 	req.ReadinessFingerprint = readiness.Fingerprint
 	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
 	configJSON, _ := json.Marshal(req)
+
+	h.mu.Lock()
+	if !h.runtimeActive || h.runtimeCtx == nil || h.runtimeCtx.Err() != nil {
+		h.mu.Unlock()
+		return "", errRegistrationNotReady
+	}
+	jctx, cancel := context.WithCancel(h.runtimeCtx)
+	h.jobCancels[jobID] = cancel
+	h.jobWG.Add(1)
+	h.mu.Unlock()
+
 	if _, err := h.store.DB().ExecContext(ctx,
 		`INSERT INTO registration_jobs (id, platform, method, total, status, config_json, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`,
 		jobID, req.Platform, req.Method, req.Count, string(configJSON), time.Now().Unix(), time.Now().Unix()); err != nil {
+		cancel()
+		h.mu.Lock()
+		delete(h.jobCancels, jobID)
+		h.mu.Unlock()
+		h.jobWG.Done()
 		return "", err
 	}
-	// The job outlives the triggering request → fresh cancelable context (not r.Context()).
-	jctx, cancel := context.WithCancel(context.Background())
-	h.mu.Lock()
-	h.jobCancels[jobID] = cancel
-	h.mu.Unlock()
 	go h.runProcessBatch(jctx, jobID, req)
 	return jobID, nil
 }
 
 func (h *Handler) runProcessBatch(ctx context.Context, jobID string, req pipeline.RegisterRequest) {
+	defer h.jobWG.Done()
 	defer func() {
 		if v := recover(); v != nil {
 			supervisor.LogPanic("registration-job", v)
@@ -569,7 +667,8 @@ func (h *Handler) runProcessBatch(ctx context.Context, jobID string, req pipelin
 }
 
 func (h *Handler) failRegistrationJob(jobID, _ string) {
-	bg := context.Background()
+	bg, cancel := registrationPersistenceContext(nil)
+	defer cancel()
 	now := time.Now().Unix()
 	_, _ = h.store.DB().ExecContext(bg,
 		`UPDATE registration_jobs SET status='failed', error=?, completed_at=?, updated_at=? WHERE id=?`,
@@ -589,10 +688,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		h.mu.Unlock()
 	}()
 
-	// DB writes use a background context so progress/cancelled status is still recorded
-	// after the job's own context is cancelled.
-	bg := context.Background()
-	h.store.DB().ExecContext(bg,
+	h.store.DB().ExecContext(ctx,
 		`UPDATE registration_jobs SET status='running', started_at=?, updated_at=? WHERE id=?`,
 		time.Now().Unix(), time.Now().Unix(), jobID)
 
@@ -607,7 +703,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 	// shared counters run under `mu`, so concurrency never trips sqlite — only the slow
 	// part (RegisterOne: the browser automation) runs in parallel. concurrency=1 (default)
 	// preserves the original sequential behavior exactly.
-	concurrency := h.resolveConcurrency(bg)
+	concurrency := h.resolveConcurrency(ctx)
 	var mu sync.Mutex
 	cancelled = runBounded(ctx, req.Count, concurrency, func(i int) {
 		recordID := fmt.Sprintf("rec_%d_%d", time.Now().UnixNano(), i)
@@ -621,6 +717,8 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 				if settled {
 					return
 				}
+				bg, cancel := registrationPersistenceContext(ctx)
+				defer cancel()
 				message := fmt.Sprintf("Registration %d failed (internal_failure)", i+1)
 				duration := int(time.Since(start).Seconds())
 				mu.Lock()
@@ -644,11 +742,11 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 			}
 		}()
 		mu.Lock()
-		h.store.DB().ExecContext(bg,
+		h.store.DB().ExecContext(ctx,
 			`INSERT INTO registration_records (id, job_id, status, created_at)
 				 VALUES (?, ?, 'pending', ?)`,
 			recordID, jobID, time.Now().Unix())
-		_ = h.store.CreateRegistrationWorkflowItem(bg, workflowItemID, jobID, req.Method, req.Platform)
+		_ = h.store.CreateRegistrationWorkflowItem(ctx, workflowItemID, jobID, req.Method, req.Platform)
 		recordCreated = true
 		mu.Unlock()
 
@@ -676,9 +774,11 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 			account, err = h.pipeline.RegisterOne(ctx, workerReq)
 		}
 		if err == nil && account != nil {
-			err = h.bindRegisteredAccountToRuntimePool(bg, workerReq, account.ID)
+			err = h.bindRegisteredAccountToRuntimePool(ctx, workerReq, account.ID)
 		}
 		duration := int(time.Since(start).Seconds())
+		bg, cancel := registrationPersistenceContext(ctx)
+		defer cancel()
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -710,6 +810,8 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		settled = true
 	})
 
+	bg, cancel := registrationPersistenceContext(ctx)
+	defer cancel()
 	status := "completed"
 	if cancelled {
 		status = "cancelled"

@@ -98,9 +98,13 @@ func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64
 }
 
 // claudeModelWindows records the model's technical maximum. It is deliberately
-// separate from NativeContextWindow: the latter is the window this account may
-// use without the context-1m beta and is 200K for current Claude accounts.
+// separate from NativeContextWindow: older extended-context models may still
+// require account evidence, while generation-5 Fable/Opus/Sonnet have 1M as both
+// the default and maximum window.
 var claudeModelWindows = map[string]int64{
+	"claude-fable-5":             1000000,
+	"claude-opus-5":              1000000,
+	"claude-sonnet-5":            1000000,
 	"claude-haiku-4-5-20251001":  200000,
 	"claude-sonnet-4-5-20250929": 200000,
 	"claude-sonnet-4-6":          200000,
@@ -117,6 +121,9 @@ var claudeModelWindows = map[string]int64{
 // models (notably some OAuth tokens). Static rows are never advertised as verified
 // and are never unioned into a successful live model response.
 var claudeStaticModels = []string{
+	"claude-fable-5",
+	"claude-opus-5",
+	"claude-sonnet-5",
 	"claude-opus-4-8",
 	"claude-opus-4-7",
 	"claude-opus-4-6",
@@ -154,14 +161,16 @@ func KiroModelAlias(model string) bool {
 }
 
 // KiroCanonicalModel canonicalizes concrete Kiro model identifiers. Claude dot
-// and hyphen spellings, and an optional dated suffix, map to the same numeric
-// version. The GPT family is deliberately exact: only the GPT-5.6 ids exposed by
-// Kiro are accepted, so an unrelated Codex GPT model is never silently rerouted.
+// and hyphen spellings, an optional dated suffix, and the explicit CLI
+// "-thinking" presentation alias map to the same numeric version. Matching stays
+// anchored, so Opus 5 can never attract Opus 4.5 by substring. The GPT family is
+// deliberately exact: only the GPT-5.6 ids exposed by Kiro are accepted.
 func KiroCanonicalModel(model string) (string, bool) {
 	m := strings.ToLower(strings.TrimSpace(model))
 	if match := kiroGPTModelRE.FindStringSubmatch(m); match != nil {
 		return "gpt-5.6-" + match[1], true
 	}
+	m = strings.TrimSuffix(m, "-thinking")
 	match := kiroConcreteModelRE.FindStringSubmatch(m)
 	if match == nil {
 		return "", false
@@ -412,17 +421,29 @@ func claudeWindow(slug string) int64 {
 	return 200000
 }
 
+// Claude Fable 5, Opus 5, and Sonnet 5 ship with a one-million-token context as
+// the standard and maximum window. Unlike older extended-context models, they
+// have no 200K variant and do not require a context-1m beta entitlement.
+func claudeDefault1M(slug string) bool {
+	slug = strings.ReplaceAll(strings.ToLower(strings.TrimSpace(slug)), ".", "-")
+	return slug == "claude-fable-5" || slug == "claude-opus-5" || slug == "claude-sonnet-5"
+}
+
 // NormalizeClaudeModelAlias maps a Claude model alias that Anthropic's API would reject
-// — bare "sonnet"/"opus"/"haiku", "auto"/"default", or a family name without a version —
+// — bare "fable"/"sonnet"/"opus"/"haiku", "auto"/"default", or a family name without a version —
 // to a concrete current-generation model id of the SAME tier. It never crosses to a
 // lower tier, so model quality is never downgraded; "auto"/"default" resolve to the
-// strongest available model (opus). A value that is already a concrete claude-* id, or
+// strongest broadly compatible model (opus). A value that is already a concrete claude-* id, or
 // any non-Claude model, is returned unchanged. This is what makes Claude Code's default/
 // auto model selection work against the pool without silently weakening the model.
 func NormalizeClaudeModelAlias(model string) string {
 	switch strings.ToLower(strings.TrimSpace(model)) {
 	case "auto", "default", "opus", "claude-opus":
 		if v := newestStaticClaudeByTier("opus"); v != "" {
+			return v
+		}
+	case "fable", "claude-fable":
+		if v := newestStaticClaudeByTier("fable"); v != "" {
 			return v
 		}
 	case "sonnet", "claude-sonnet":
@@ -441,7 +462,7 @@ func NormalizeClaudeModelAlias(model string) string {
 // the candidate account's capabilities rather than from the bundled catalog.
 func ClaudeModelAlias(model string) bool {
 	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "auto", "default", "opus", "claude-opus", "sonnet", "claude-sonnet", "haiku", "claude-haiku":
+	case "auto", "default", "fable", "claude-fable", "opus", "claude-opus", "sonnet", "claude-sonnet", "haiku", "claude-haiku":
 		return true
 	default:
 		return false
@@ -498,18 +519,18 @@ func claudeModelRank(model string) (string, int64) {
 	if match == nil {
 		return "", -1
 	}
-	familyRank := map[string]int64{"haiku": 1, "sonnet": 2, "opus": 3}[match[1]]
+	familyRank := map[string]int64{"haiku": 1, "sonnet": 2, "opus": 3, "fable": 4}[match[1]]
 	major, _ := strconv.ParseInt(match[2], 10, 64)
 	minor, _ := strconv.ParseInt(match[3], 10, 64)
 	date, _ := strconv.ParseInt(match[4], 10, 64)
 	return match[1], familyRank*1_000_000_000_000_000 + major*1_000_000_000_000 + minor*1_000_000_000 + date
 }
 
-// ClaudeModelFamily returns opus, sonnet or haiku for a concrete Claude id or
+// ClaudeModelFamily returns fable, opus, sonnet or haiku for a concrete Claude id or
 // family alias. It is used to keep fallback advice inside the requested tier.
 func ClaudeModelFamily(model string) string {
 	trimmed := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model)), "claude-")
-	for _, family := range []string{"opus", "sonnet", "haiku"} {
+	for _, family := range []string{"fable", "opus", "sonnet", "haiku"} {
 		if trimmed == family || strings.HasPrefix(trimmed, family+"-") || strings.HasPrefix(trimmed, family+".") {
 			return family
 		}
@@ -554,10 +575,9 @@ func newestStaticClaudeByTier(tier string) string {
 }
 
 // ParseClaudeModels parses Anthropic's GET /v1/models response (data[].id) into
-// capabilities. The standard window remains 200K. A larger technical maximum is
-// only entitlement evidence when the live payload reports it explicitly; the
-// curated model table is discovery metadata, not proof that this credential may
-// use the 1M beta.
+// capabilities. Generation-5 Fable/Opus/Sonnet use 1M as their standard window; older
+// models keep 200K unless the live payload reports an extended-context grant.
+// The curated table remains discovery metadata, not account availability proof.
 func ParseClaudeModels(accountID string, raw []byte, etag string) ([]storage.ModelCapability, error) {
 	var root interface{}
 	if err := json.Unmarshal(raw, &root); err != nil {
@@ -582,10 +602,16 @@ func ParseClaudeModels(accountID string, raw []byte, etag string) ([]storage.Mod
 		if reportedMax >= 1000000 || modelDeclaresContext1M(model) {
 			contextState, contextSource = Context1MSupported, "live_models"
 		}
+		nativeWindow := int64(200000)
+		if claudeDefault1M(slug) {
+			nativeWindow = 1000000
+			technicalMax = 1000000
+			contextState, contextSource = Context1MSupported, "model_default"
+		}
 		out = append(out, storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     slug,
-			NativeContextWindow:           200000,
+			NativeContextWindow:           nativeWindow,
 			NativeMaxContextWindow:        technicalMax,
 			EffectiveContextWindowPercent: 100,
 			AvailabilityState:             AvailabilityVerified,
@@ -609,10 +635,14 @@ func StaticClaudeModels(accountID string) []storage.ModelCapability {
 	out := make([]storage.ModelCapability, 0, len(claudeStaticModels))
 	for _, slug := range claudeStaticModels {
 		technicalMax := claudeWindow(slug)
+		nativeWindow := int64(200000)
+		if claudeDefault1M(slug) {
+			nativeWindow = technicalMax
+		}
 		out = append(out, storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     slug,
-			NativeContextWindow:           200000,
+			NativeContextWindow:           nativeWindow,
 			NativeMaxContextWindow:        technicalMax,
 			EffectiveContextWindowPercent: 100,
 			AvailabilityState:             AvailabilityUnverified,
@@ -632,14 +662,24 @@ func MergeClaudeStatic(accountID string, probeCaps []storage.ModelCapability) []
 }
 
 // ApplyClaudeAccountPolicy converts technical/live metadata into the context
-// entitlement of this credential. Pro is permanently 200K. API keys may use 1M
-// only when live model metadata proves it; eligible OAuth plans may use 1M only
-// on qualifying Opus models.
+// entitlement of this credential. Fable/Opus/Sonnet 5 always use their model-default
+// 1M window. For older extended-context models, API keys still require live
+// evidence and OAuth credentials still use plan-specific entitlement.
 func ApplyClaudeAccountPolicy(caps []storage.ModelCapability, account storage.Account, token storage.AccountToken) []storage.ModelCapability {
 	method := accountprovider.EffectiveAuthMethod("claude", token)
 	plan := strings.ToLower(strings.TrimSpace(account.PlanType))
 	for i := range caps {
 		c := &caps[i]
+		if claudeDefault1M(c.ModelSlug) {
+			c.NativeContextWindow = 1000000
+			c.NativeMaxContextWindow = 1000000
+			if c.AvailabilityState == AvailabilityVerified {
+				c.Context1MState, c.Context1MSource = Context1MSupported, "model_default"
+			} else {
+				c.Context1MState, c.Context1MSource = Context1MUnknown, ""
+			}
+			continue
+		}
 		c.NativeContextWindow = 200000
 		if c.NativeMaxContextWindow == 0 {
 			c.NativeMaxContextWindow = claudeWindow(c.ModelSlug)
@@ -706,6 +746,7 @@ type codexStaticModel struct {
 	window                int64
 	maxWindow             int64
 	autoCompactTokenLimit int64
+	overrideClientContext bool
 	minimumClientVersion  string
 	requiresCurrentClient bool
 	preferWebSocket       bool
@@ -719,9 +760,9 @@ type codexStaticModel struct {
 // listed (the hidden codex-auto-review preset is omitted). Ordered most-capable
 // first. The live probe — when it works — is authoritative and supersedes this.
 var codexStaticModels = []codexStaticModel{
-	{slug: "gpt-5.6-sol", window: 272000, maxWindow: 272000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-terra", window: 272000, maxWindow: 272000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-luna", window: 272000, maxWindow: 272000, autoCompactTokenLimit: 272000, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
+	{slug: "gpt-5.6-sol", window: 372000, maxWindow: 372000, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-terra", window: 372000, maxWindow: 372000, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-luna", window: 372000, maxWindow: 372000, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
 	{slug: "gpt-5.5", window: 272000, maxWindow: 272000, minimumClientVersion: "0.124.0", requiresCurrentClient: true, preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4", window: 272000, maxWindow: 1000000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4-mini", window: 272000, maxWindow: 272000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
@@ -729,13 +770,24 @@ var codexStaticModels = []codexStaticModel{
 }
 
 func codexStaticModelForSlug(slug string) (codexStaticModel, bool) {
-	slug = strings.ToLower(strings.TrimSpace(slug))
+	slug = NormalizeCodexModelAlias(slug)
 	for _, m := range codexStaticModels {
 		if strings.ToLower(m.slug) == slug {
 			return m, true
 		}
 	}
 	return codexStaticModel{}, false
+}
+
+// NormalizeCodexModelAlias resolves only aliases documented by the direct
+// OpenAI/Codex surface. Kiro keeps its own exact model namespace and deliberately
+// does not call this helper.
+func NormalizeCodexModelAlias(slug string) string {
+	slug = strings.ToLower(strings.TrimSpace(slug))
+	if slug == "gpt-5.6" {
+		return "gpt-5.6-sol"
+	}
+	return slug
 }
 
 func CodexRequiresCurrentClientVersion(slug string) bool {
@@ -754,13 +806,13 @@ func CodexMinimumClientVersion(slug string) string {
 	return m.minimumClientVersion
 }
 
-// CodexClientContextOverrides returns the explicit full-window and automatic
-// compaction settings that the generated official-client config should install.
-// They are independent Codex settings: the full window controls the hard context
-// cap, while the smaller threshold starts compaction before that cap is reached.
+// CodexClientContextOverrides returns context settings managed by the generated
+// official-client config. A zero autoCompactTokenLimit is intentional: the setup
+// script removes any stale explicit threshold and leaves compaction policy to the
+// current Codex client.
 func CodexClientContextOverrides(slug string) (contextWindow, autoCompactTokenLimit int64, ok bool) {
 	m, found := codexStaticModelForSlug(slug)
-	if !found || m.window <= 0 || m.autoCompactTokenLimit <= 0 {
+	if !found || !m.overrideClientContext || m.window <= 0 {
 		return 0, 0, false
 	}
 	return m.window, m.autoCompactTokenLimit, true
@@ -1205,17 +1257,18 @@ func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage
 		percent = 95
 	}
 	static, knownStatic := codexStaticModelForSlug(selected.ModelSlug)
-	// Current 5.6 clients deliberately use a 372K full window with a separate
-	// 272K compaction trigger. Codex clamps config.model_context_window to the
-	// ModelInfo maximum, so both live and synthesized ModelInfo must expose the
-	// same full-window contract. This changes only the three context-limit fields;
+	clientManagedCompaction := knownStatic && static.overrideClientContext
+	// Current 5.6 deployments use the verified 372K hard window. Deliberately
+	// leave auto_compact_token_limit absent: current Codex derives and manages its
+	// own trigger from ModelInfo, and an explicit threshold can disable or delay
+	// the client's evolving compaction policy. This changes only context metadata;
 	// every live reasoning/tool/instruction/future field above remains intact.
-	if knownStatic && static.autoCompactTokenLimit > 0 {
+	if clientManagedCompaction {
 		window = static.window
 		maxWindow = static.maxWindow
 		autoCompact = static.autoCompactTokenLimit
 	}
-	if window > 0 {
+	if window > 0 && !clientManagedCompaction {
 		derivedLimit := (window * 9) / 10
 		if autoCompact == 0 || autoCompact > derivedLimit {
 			autoCompact = derivedLimit
@@ -1262,7 +1315,11 @@ func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage
 	setModelInfoDefault(item, "input_modalities", []interface{}{"text", "image"})
 	item["context_window"] = window
 	item["max_context_window"] = maxWindow
-	item["auto_compact_token_limit"] = autoCompact
+	if autoCompact > 0 && !clientManagedCompaction {
+		item["auto_compact_token_limit"] = autoCompact
+	} else {
+		delete(item, "auto_compact_token_limit")
+	}
 	item["effective_context_window_percent"] = percent
 	if knownStatic {
 		setModelInfoDefault(item, "minimal_client_version", static.minimumClientVersion)

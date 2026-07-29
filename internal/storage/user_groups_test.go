@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -19,6 +20,8 @@ func TestUserGroupCRUD(t *testing.T) {
 			ModelInstructionFamilyClaude: {Files: []string{"claude.md"}},
 		},
 		ForceModel: "", ForceEffort: "",
+		BlockClaudeTargetGroups: []string{"claude-pool"},
+		BlockGPTTargetGroups:    []string{"gpt-pool"},
 	}
 	if err := s.CreateUserGroup(ctx, g); err != nil {
 		t.Fatal(err)
@@ -34,6 +37,10 @@ func TestUserGroupCRUD(t *testing.T) {
 	}
 	if profile := got.ModelInstructionProfiles[ModelInstructionFamilyGPT]; !profile.Enabled || len(profile.Files) != 1 || profile.Files[0] != "gpt.md" {
 		t.Errorf("model instruction profiles not persisted: %+v", got.ModelInstructionProfiles)
+	}
+	if !reflect.DeepEqual(got.BlockClaudeTargetGroups, []string{"claude-pool"}) ||
+		!reflect.DeepEqual(got.BlockGPTTargetGroups, []string{"gpt-pool"}) {
+		t.Errorf("target-family blocks not persisted: claude=%v gpt=%v", got.BlockClaudeTargetGroups, got.BlockGPTTargetGroups)
 	}
 
 	// Get by name
@@ -65,6 +72,75 @@ func TestUserGroupCRUD(t *testing.T) {
 	_, ok4, _ := s.GetUserGroup(ctx, "ug_test001")
 	if ok4 {
 		t.Error("expected not found after delete")
+	}
+}
+
+func TestUserGroupTargetFamilyBlocksAreScopedAndValidated(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	if err := s.CreateGroup(ctx, Group{Name: "traffic-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateGroup(ctx, Group{Name: "traffic-b"}); err != nil {
+		t.Fatal(err)
+	}
+	group := UserGroup{
+		ID:   "ug_target_family_blocks",
+		Name: "target-family-blocks",
+		Targets: []TargetRef{
+			{Kind: TargetKindAccountPoolGroup, ID: "traffic-a"},
+			{Kind: TargetKindAccountPoolGroup, ID: "traffic-b"},
+		},
+		BlockClaudeTargetGroups: []string{" traffic-a ", "traffic-a"},
+		BlockGPTTargetGroups:    []string{"traffic-b"},
+	}
+	if err := s.CreateUserGroupDefinition(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := s.GetUserGroup(ctx, group.ID)
+	if err != nil || !found {
+		t.Fatalf("get user group found=%v err=%v", found, err)
+	}
+	if !reflect.DeepEqual(got.BlockClaudeTargetGroups, []string{"traffic-a"}) ||
+		!reflect.DeepEqual(got.BlockGPTTargetGroups, []string{"traffic-b"}) {
+		t.Fatalf("normalized blocks claude=%v gpt=%v", got.BlockClaudeTargetGroups, got.BlockGPTTargetGroups)
+	}
+
+	group.BlockClaudeTargetGroups = []string{"not-selected"}
+	if err := s.ReplaceUserGroupDefinition(ctx, group); err == nil {
+		t.Fatal("unselected account-pool block was accepted")
+	}
+}
+
+func TestUserGroupRouteGenerationChangesWhenCapacityIsAdded(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	if err := s.CreateGroup(ctx, Group{Name: "generation-pool"}); err != nil {
+		t.Fatal(err)
+	}
+	group := UserGroup{
+		ID:      "ug_route_generation",
+		Name:    "route-generation",
+		Targets: []TargetRef{{Kind: TargetKindAccountPoolGroup, ID: "generation-pool"}},
+	}
+	if err := s.CreateUserGroupDefinition(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.UserGroupRouteGeneration(ctx, group.ID, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertAccount(ctx, Account{
+		ID: "acc_generation", Label: "generation", GroupName: "generation-pool", Status: "active",
+	}, AccountToken{AccountID: "acc_generation", AccessToken: "fixture-token"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.UserGroupRouteGeneration(ctx, group.ID, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatalf("route generation did not change after account import: %q", before)
 	}
 }
 

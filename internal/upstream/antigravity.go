@@ -233,8 +233,8 @@ func refreshAntigravityToken(ctx context.Context, refreshToken string, cfg *conf
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return AntigravityTokenResponse{}, fmt.Errorf("antigravity token refresh %d: %s", resp.StatusCode, body)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return AntigravityTokenResponse{}, fmt.Errorf("antigravity token refresh failed with status %d", resp.StatusCode)
 	}
 	var tr AntigravityTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {

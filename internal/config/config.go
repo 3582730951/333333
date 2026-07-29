@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -21,9 +22,9 @@ const (
 	// discovery and on version-gated live Codex requests. ChatGPT gates the returned
 	// model catalog and some live models by this value, so old preserved config
 	// values are floored to this default during normalization.
-	// Refreshed 2026-07-10 from the installed shipping CLI (codex-cli 0.144.5)
-	// and other_codex's 0.144.0-gated GPT-5.6 catalog.
-	DefaultClientVersion                  = "0.144.5"
+	// Refreshed 2026-07-29 from the official Codex rust-v0.146.0 release and
+	// matching source tree.
+	DefaultClientVersion                  = "0.146.0"
 	DefaultStickyWaitMillis               = 100
 	DefaultStrictStickyMaxCooldownSeconds = 60
 	DefaultCooldownWaitMaxSeconds         = 30
@@ -79,7 +80,7 @@ const (
 	// DefaultClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version. Kept here (not in the identity package) so the
 	// upstream Node fingerprint can be bumped from one place / overridden by config.
-	// Reconfirmed 2026-07-10 from Claude Code 2.1.206 Docker capture.
+	// Reconfirmed 2026-07-29 from the Claude Code 2.1.220 shipping binary.
 	DefaultClaudeNodeVersion = "v26.3.0"
 	// DefaultModelProbeIntervalHours refreshes each account's last-good model
 	// catalog every six hours. The worker adds per-account jitter.
@@ -180,9 +181,8 @@ type Config struct {
 	// BodyMemoryBudgetBytes is process-wide. Zero selects min(256 MiB, 12.5% of the cgroup/system memory limit).
 	BodyMemoryBudgetBytes int64 `json:"body_memory_budget_bytes"`
 	BodySpoolMaxBytes     int64 `json:"body_spool_max_bytes"`
-	// BodyDiskReserveBytes is retained only so older config files round-trip. The
-	// request pipeline admits actual bytes like CLIProxyAPI and does not enforce a
-	// fixed free-space floor; capacity and BodySpoolMaxBytes remain hard limits.
+	// BodyDiskReserveBytes optionally raises the automatic emergency reserve. Zero
+	// keeps the automatic max(128 MiB, 2% of the spool filesystem) reserve.
 	BodyDiskReserveBytes     int64  `json:"body_disk_reserve_bytes"`
 	BodySpoolDir             string `json:"body_spool_dir"`
 	UsageJournalEnabled      bool   `json:"usage_journal_enabled"`
@@ -1194,6 +1194,13 @@ func looksLikeDotVersion(s string) bool {
 }
 
 func (c *Config) applyEnv() error {
+	credentialDirectory := strings.TrimSpace(os.Getenv("CREDENTIALS_DIRECTORY"))
+	credentialPath := func(name string) string {
+		if credentialDirectory == "" {
+			return ""
+		}
+		return filepath.Join(credentialDirectory, name)
+	}
 	if v := os.Getenv("CODEX_POOL_LISTEN_ADDR"); v != "" {
 		c.ListenAddr = v
 	}
@@ -1202,12 +1209,18 @@ func (c *Config) applyEnv() error {
 	}
 	if v := os.Getenv("CODEX_POOL_MASTER_KEY_FILE"); v != "" {
 		c.MasterKeyFile = v
+	} else if strings.TrimSpace(c.MasterKeyFile) == "" && credentialDirectory != "" {
+		c.MasterKeyFile = credentialPath("master.key")
 	}
 	if v := os.Getenv("CODEX_POOL_IDENTITY_KEY_FILE"); v != "" {
 		c.IdentityKeyFile = v
+	} else if strings.TrimSpace(c.IdentityKeyFile) == "" && credentialDirectory != "" {
+		c.IdentityKeyFile = credentialPath("identity.key")
 	}
 	if v := os.Getenv("CODEX_POOL_DIAGNOSTIC_ALIAS_KEY_FILE"); v != "" {
 		c.DiagnosticAliasKeyFile = v
+	} else if strings.TrimSpace(c.DiagnosticAliasKeyFile) == "" && credentialDirectory != "" {
+		c.DiagnosticAliasKeyFile = credentialPath("diagnostic-alias.key")
 	}
 	if v := os.Getenv("CODEX_POOL_DATABASE"); v != "" {
 		c.DatabasePath = v
@@ -1280,6 +1293,16 @@ func (c *Config) applyEnv() error {
 			return fmt.Errorf("load admin token credential: %w", err)
 		}
 		c.AdminToken = value
+	} else if path := credentialPath("admin.token"); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			value, readErr := readSecretFile(path, 4096)
+			if readErr != nil {
+				return fmt.Errorf("load admin token credential: %w", readErr)
+			}
+			c.AdminToken = value
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat admin token credential: %w", err)
+		}
 	}
 	if v := os.Getenv("CODEX_POOL_TRUSTED_PROXY_CIDRS"); v != "" {
 		c.TrustedProxyCIDRs = strings.Split(v, ",")

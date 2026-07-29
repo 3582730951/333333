@@ -166,6 +166,7 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 		"REG_COUNT=1",
 		"REG_WORKERS=1",
 		"REG_RETRIES=2",
+		"CODEX_REG_EMIT_ONLY=1",
 		"REG_PROXY="+proxyURL,
 		"EMAIL_PROVIDER="+emailProvider,
 		"HOTMAIL_BASE_EMAIL="+baseEmail,

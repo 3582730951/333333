@@ -232,7 +232,7 @@ func codexHookPromptFragment(text string) bool {
 	return strings.HasPrefix(lower, "<hook_prompt ") && strings.Contains(lower, "hook_run_id=") && strings.HasSuffix(lower, "</hook_prompt>")
 }
 
-// This is the user-role fragment registry used by Codex 0.144.5's
+// This is the user-role fragment registry used by Codex 0.146.0's
 // is_contextual_user_fragment. Prefix matching is deliberately narrow so an
 // arbitrary user-authored XML tag is never discarded as internal context.
 func codexContextualUserText(text string) bool {

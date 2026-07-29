@@ -170,6 +170,43 @@ func TestSidecarEgressRecordsUsageStreaming(t *testing.T) {
 	}
 }
 
+func TestSidecarEgressRecordsEstimatedUsageWhenTerminalOmitsUsage(t *testing.T) {
+	sse := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp-no-usage","model":"gpt-5.6-sol"}}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"ok"}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"resp-no-usage","model":"gpt-5.6-sol","status":"completed","output":[]}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	sc := mockSidecar(t, "text/event-stream", sse)
+	defer sc.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("direct upstream must not be called when bound to sidecar")
+	})
+	acc := h.importAccount(t, "missing-usage", "upstream-missing-usage", "access-missing-usage")
+	bindSidecarEgress(t, h, acc, sc.URL)
+
+	resp, err := http.Post(h.pool.URL+"/v1/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5.6-sol","input":"meter this successful turn","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	h.app.WaitForAsyncWrites()
+
+	var total int64
+	var model, raw string
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT total_tokens,model,raw_usage_json
+FROM usage_records WHERE account_id=? ORDER BY id DESC LIMIT 1`, acc).Scan(&total, &model, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if total <= 0 || model != "gpt-5.6-sol" || !strings.Contains(raw, `"estimated":true`) || !strings.Contains(raw, `"upstream_usage_missing"`) {
+		t.Fatalf("estimated usage total=%d model=%q raw=%s", total, model, raw)
+	}
+}
+
 func TestStrictCPASidecarTrailerDoesNotNativeContinueOrRetireTree(t *testing.T) {
 	var directCalls atomic.Int32
 	var sidecarCalls atomic.Int32

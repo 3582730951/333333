@@ -18,6 +18,8 @@ func TestAdminUserGroupsCreatePersistsBaseAndRelayTargets(t *testing.T) {
 	}
 	code, raw := grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
 		"name":"mixed-targets",
+		"block_claude_target_groups":["cyber"],
+		"block_gpt_target_groups":["cyber"],
 		"targets":[
 			{"target_type":"base_group","target_ref":"cyber","affinity_weight":2},
 			{"target_type":"relay","target_ref":"relay-one","affinity_weight":1}
@@ -33,6 +35,10 @@ func TestAdminUserGroupsCreatePersistsBaseAndRelayTargets(t *testing.T) {
 	if created.ID == "" || len(created.Targets) != 2 {
 		t.Fatalf("created user group missing targets: %+v", created)
 	}
+	if len(created.BlockClaudeTargetGroups) != 1 || created.BlockClaudeTargetGroups[0] != "cyber" ||
+		len(created.BlockGPTTargetGroups) != 1 || created.BlockGPTTargetGroups[0] != "cyber" {
+		t.Fatalf("created user group missing target-family policy: %+v", created)
+	}
 
 	code, raw = grpReq(t, h, http.MethodGet, "/admin/user-groups", "")
 	if code != http.StatusOK {
@@ -45,11 +51,25 @@ func TestAdminUserGroupsCreatePersistsBaseAndRelayTargets(t *testing.T) {
 	found := false
 	for _, group := range groups {
 		if group.ID == created.ID {
-			found = len(group.Targets) == 2
+			found = len(group.Targets) == 2 &&
+				len(group.BlockClaudeTargetGroups) == 1 &&
+				len(group.BlockGPTTargetGroups) == 1
 		}
 	}
 	if !found {
 		t.Fatalf("list response did not hydrate targets: %+v", groups)
+	}
+}
+
+func TestAdminUserGroupsRejectsBlockOutsideSelectedAccountPools(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
+		"name":"invalid-block-target",
+		"block_claude_target_groups":["not-selected"],
+		"targets":[{"kind":"account_pool_group","id":"cyber"}]
+	}`)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST invalid block target = %d, want 422: %s", code, raw)
 	}
 }
 

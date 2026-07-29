@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"codex-account-pool/internal/identity"
 	"codex-account-pool/internal/storage"
 )
 
@@ -19,6 +20,9 @@ func TestApplyOpenAICompatHeadersUsesAnthropicAuthForMessages(t *testing.T) {
 	}
 	if headers.Get("Anthropic-Version") != "2023-06-01" || headers.Get("Anthropic-Beta") != "test-beta" {
 		t.Fatalf("anthropic headers not preserved: %#v", headers)
+	}
+	if got, want := headers.Get("User-Agent"), "claude-cli/"+identity.ClaudeCLIVersion+" (external, cli)"; got != want {
+		t.Fatalf("User-Agent = %q, want %q", got, want)
 	}
 }
 

@@ -34,6 +34,86 @@ type RegistrationCommit struct {
 	RemoteIdentityAlias string
 }
 
+// RegistrationRecoveryResult reports durable work isolated after an unclean
+// active-worker exit. Interrupted registrations are never resumed automatically:
+// doing so could consume a second paid provider resource or create a duplicate
+// upstream identity.
+type RegistrationRecoveryResult struct {
+	JobsFinalized    int64
+	RecordsFailed    int64
+	ItemsQuarantined int64
+}
+
+// RecoverInterruptedRegistrationWorkflows atomically moves every unfinished
+// registration owned by a previous active worker into an operator-review state.
+// Successfully committed records/items are retained exactly as-is.
+func (s *Store) RecoverInterruptedRegistrationWorkflows(ctx context.Context) (RegistrationRecoveryResult, error) {
+	var recovered RegistrationRecoveryResult
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return recovered, err
+	}
+	defer tx.Rollback()
+
+	now := Now()
+	result, err := tx.ExecContext(ctx, `
+UPDATE registration_workflow_items
+SET state='quarantined',error_class='interrupted_requires_review',updated_at=?
+WHERE job_id IN (
+  SELECT id FROM registration_jobs WHERE status IN ('queued','pending','running')
+)
+AND state IN (
+  'preflight','resources_leased','registering','credentials_obtained',
+  'remote_account_verifying','imported_provisioning','retry_wait'
+)`, now)
+	if err != nil {
+		return recovered, fmt.Errorf("quarantine interrupted registration items: %w", err)
+	}
+	recovered.ItemsQuarantined, _ = result.RowsAffected()
+
+	result, err = tx.ExecContext(ctx, `
+UPDATE registration_records
+SET status='failed',error='interrupted_requires_review'
+WHERE job_id IN (
+  SELECT id FROM registration_jobs WHERE status IN ('queued','pending','running')
+)
+AND status IN ('pending','running')`)
+	if err != nil {
+		return recovered, fmt.Errorf("fail interrupted registration records: %w", err)
+	}
+	recovered.RecordsFailed, _ = result.RowsAffected()
+
+	// Recalculate succeeded first so a crash between the atomic account commit and
+	// the job-counter update does not hide a successfully imported account.
+	if _, err = tx.ExecContext(ctx, `
+UPDATE registration_jobs
+SET succeeded=(
+  SELECT COUNT(*) FROM registration_records
+  WHERE registration_records.job_id=registration_jobs.id
+    AND registration_records.status='success'
+)
+WHERE status IN ('queued','pending','running')`); err != nil {
+		return recovered, fmt.Errorf("recount interrupted registration successes: %w", err)
+	}
+	result, err = tx.ExecContext(ctx, `
+UPDATE registration_jobs
+SET status=CASE WHEN succeeded>0 THEN 'completed_with_review' ELSE 'failed' END,
+    failed=CASE WHEN total>succeeded THEN total-succeeded ELSE 0 END,
+    error='interrupted_requires_review',
+    completed_at=CASE WHEN completed_at=0 THEN ? ELSE completed_at END,
+    updated_at=?
+WHERE status IN ('queued','pending','running')`, now, now)
+	if err != nil {
+		return recovered, fmt.Errorf("finalize interrupted registration jobs: %w", err)
+	}
+	recovered.JobsFinalized, _ = result.RowsAffected()
+
+	if err = tx.Commit(); err != nil {
+		return RegistrationRecoveryResult{}, err
+	}
+	return recovered, nil
+}
+
 func (s *Store) CreateRegistrationWorkflowItem(ctx context.Context, id, jobID, method, platform string) error {
 	now := Now()
 	_, err := s.db.ExecContext(ctx, `

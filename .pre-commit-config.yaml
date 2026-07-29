@@ -1,0 +1,13 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: repository-hygiene
+        name: Reject tracked binaries and large files
+        entry: scripts/check-repository-hygiene.sh
+        language: system
+        pass_filenames: false

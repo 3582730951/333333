@@ -84,6 +84,74 @@ func TestClaudeProOpus48StandardSucceedsButOneMillionIsVisibleRejection(t *testi
 	}
 }
 
+func TestClaudeOpus5UsesOneMillionByDefaultWithoutLegacyBeta(t *testing.T) {
+	var calls atomic.Int64
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+			http.NotFound(w, r)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		if !bytes.Contains(raw, []byte(`"model":"claude-opus-5"`)) {
+			t.Errorf("Opus 5 request model changed: %s", raw)
+		}
+		if strings.Contains(strings.ToLower(r.Header.Get("Anthropic-Beta")), anthropicContext1MBeta) {
+			t.Errorf("Opus 5 request synthesized obsolete context beta: %q", r.Header.Get("Anthropic-Beta"))
+		}
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg-opus5","type":"message","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}`)
+	})
+	account := storage.Account{
+		ID: "claude-opus5-pro", Label: "claude-opus5-pro", GroupName: "cyber",
+		Provider: "claude", PlanType: "Pro", Status: "active",
+	}
+	token := storage.AccountToken{
+		AccountID: account.ID, AuthMethod: accountprovider.AuthMethodOAuth,
+		AccessToken: "credential-opus5", RefreshToken: "refresh-opus5",
+	}
+	if err := h.store.UpsertAccount(t.Context(), account, token); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertEgressBinding(t.Context(), storage.AccountEgressBinding{
+		AccountID: account.ID, PrimaryEgressID: storage.DefaultDirectEgressID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.UpsertCapabilities(t.Context(), []storage.ModelCapability{{
+		AccountID: account.ID, ModelSlug: "claude-opus-5",
+		AvailabilityState:             capability.AvailabilityVerified,
+		Context1MState:                capability.Context1MSupported,
+		Context1MSource:               "model_default",
+		NativeContextWindow:           1_000_000,
+		NativeMaxContextWindow:        1_000_000,
+		EffectiveContextWindowPercent: 100,
+		Source:                        "claude_probe",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	for _, model := range []string{"claude-opus-5", "claude-opus-5[1m]"} {
+		request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(
+			`{"model":"`+model+`","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`,
+		))
+		request.Header.Set("Content-Type", "application/json")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", model, response.StatusCode, body)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("Opus 5 upstream calls=%d, want 2", calls.Load())
+	}
+}
+
 func TestClaudeAPIKeyOneMillionCapabilityRoutesWithAPIKeyAuth(t *testing.T) {
 	var gotBeta, gotAPIKey, gotAuthorization string
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -49,10 +51,12 @@ func run() int {
 	var configPath string
 	var unixSocket string
 	var releaseID string
+	var deploymentRole string
 	var selfTest bool
 	flag.StringVar(&configPath, "config", "", "path to JSON configuration file")
 	flag.StringVar(&unixSocket, "unix-socket", "", "serve on a private Unix socket instead of the configured TCP address")
 	flag.StringVar(&releaseID, "release-id", strings.TrimSpace(os.Getenv("CODEX_POOL_RELEASE_ID")), "deployed release identifier exposed by /readyz")
+	flag.StringVar(&deploymentRole, "deployment-role", strings.TrimSpace(os.Getenv("CODEX_POOL_DEPLOYMENT_ROLE")), "worker role: auto, active, or standby")
 	flag.BoolVar(&selfTest, "self-test", false, "verify that the worker binary can start")
 	flag.Parse()
 	if selfTest {
@@ -143,15 +147,6 @@ func run() int {
 		return 1
 	}
 	log.Printf("startup: storage initialized in %s", time.Since(storageInitStarted).Round(time.Millisecond))
-	paymentRemoval, err := store.RemovePaymentFeatureData(ctx)
-	if err != nil {
-		log.Printf("[SECURITY] remove legacy payment state: %v", err)
-		return 1
-	}
-	if paymentRemoval.CancelledTasks+paymentRemoval.ClearedPaymentRows+paymentRemoval.QuarantinedMocks+paymentRemoval.AccountsForReview > 0 {
-		log.Printf("[SECURITY] removed legacy payment state: cancelled_tasks=%d cleared_rows=%d quarantined_mocks=%d manual_review=%d",
-			paymentRemoval.CancelledTasks, paymentRemoval.ClearedPaymentRows, paymentRemoval.QuarantinedMocks, paymentRemoval.AccountsForReview)
-	}
 	// Keep the former host/config-derived key readable for exactly this migration
 	// window. Every value is then rewritten with the independent persistent master.
 	legacyStorageKey := secretbox.DeriveKey(identity.ResolveSecret([]byte(cfg.IdentitySecret)))
@@ -178,22 +173,6 @@ func run() int {
 		log.Printf("[SECURITY] credential validation: %v", err)
 		return 1
 	}
-	if cfg.DefaultSidecarEndpoint != "" {
-		if err := store.UpsertEgressProfile(ctx, storage.EgressProfile{
-			ID:             "egress_sidecar",
-			Name:           "local curl_cffi sidecar",
-			Type:           "curl_cffi_sidecar",
-			Endpoint:       cfg.DefaultSidecarEndpoint,
-			ChainProxy:     cfg.DefaultSidecarChainProxy,
-			StreamCapable:  true,
-			Health:         "healthy",
-			MaxConcurrency: 0,
-		}); err != nil {
-			log.Printf("init sidecar egress: %v", err)
-			return 1
-		}
-	}
-
 	up := upstream.NewClient(cfg)
 	// WARP CF-fallback manager. The prober wraps ProbeEgress so the manager can refresh
 	// an exit's IP after a re-registration without importing the upstream package.
@@ -202,9 +181,6 @@ func run() int {
 		return r.IP, r.Country, perr
 	}
 	warpMgr := warp.NewManager(cfg, store, warpProber, log.Printf)
-	if err := warpMgr.EnsurePool(ctx); err != nil {
-		log.Printf("warp: ensure pool: %v", err)
-	}
 	solver := cfsolve.NewClient(cfg)
 
 	leaseCoordinator, err := scheduler.NewLeaseCoordinator(cfg)
@@ -213,59 +189,14 @@ func run() int {
 		return 1
 	}
 	app := api.NewServer(api.Dependencies{
-		Config:    cfg,
-		Store:     store,
-		Scheduler: scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
-		Upstream:  up,
-		Planner:   virtual.NewPlanner(store, cfg),
-		Warp:      warpMgr,
-		Solver:    solver,
-	})
-
-	// Background model-capability probe sweep (periodic; honors
-	// ModelProbeIntervalHours, 0 = disabled). Stops when ctx is cancelled below.
-	app.StartBackground(ctx)
-
-	// Background registration-automation scheduler (operator-opt-in policies: auto-refill
-	// keeps the active pool topped up). No-op until a policy is enabled.
-	app.StartAutomation(ctx)
-
-	// Background quota poller: periodically fetches /backend-api/wham/usage for
-	// every active Codex account so the admin dashboard quota gauges show 5h/7d
-	// usage even for curl_cffi_sidecar-egressed accounts (their responses carry no
-	// x-ratelimit-* headers).
-	app.StartQuotaPoller(ctx)
-
-	// Low-cost group×model intelligence/degradation monitor. It is opt-in and
-	// never iterates accounts; one normal scheduler sample is used per combination.
-	app.StartModelQualityMonitor(ctx)
-
-	// Background ledger purge: prevents unbounded virtual_context_ledger growth by
-	// periodically evicting rows older than the configured TTL (default 1 hour).
-	// Runs every 5 minutes; the purge itself uses batched DELETEs (500 rows/batch)
-	// to avoid long write transactions on SQLite.
-	supervisor.Go(ctx, "virtual-ledger-purge", func(ctx context.Context) {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				deleted, err := store.PurgeVirtualLedger(ctx, cfg.VirtualContextLedgerTTLSeconds)
-				if err != nil {
-					log.Printf("[ledger] purge: %v", err)
-				} else if deleted > 0 {
-					log.Printf("[ledger] purged %d old rows", deleted)
-				}
-				journalDeleted, err := store.CleanupContextJournal(ctx)
-				if err != nil {
-					log.Printf("[context-journal] purge: %v", err)
-				} else if journalDeleted > 0 {
-					log.Printf("[context-journal] purged %d expired rows", journalDeleted)
-				}
-			}
-		}
+		Config:            cfg,
+		Store:             store,
+		Scheduler:         scheduler.NewWithLeaseCoordinator(store, cfg, leaseCoordinator),
+		Upstream:          up,
+		Planner:           virtual.NewPlanner(store, cfg),
+		Warp:              warpMgr,
+		Solver:            solver,
+		DeferRuntimeStart: true,
 	})
 
 	deployment := newDeploymentHandler(app, releaseID, unixSocket)
@@ -290,6 +221,62 @@ func run() int {
 		}
 		return nil
 	}
+	var deferredMigrationsOnce sync.Once
+	startActive := func(activeCtx context.Context, fencingToken int64) error {
+		if err := app.StartRuntime(); err != nil {
+			return fmt.Errorf("start active runtime: %w", err)
+		}
+		paymentRemoval, err := store.RemovePaymentFeatureData(activeCtx)
+		if err != nil {
+			return fmt.Errorf("remove legacy payment state: %w", err)
+		}
+		if paymentRemoval.CancelledTasks+paymentRemoval.ClearedPaymentRows+paymentRemoval.QuarantinedMocks+paymentRemoval.AccountsForReview > 0 {
+			log.Printf("[SECURITY] removed legacy payment state: cancelled_tasks=%d cleared_rows=%d quarantined_mocks=%d manual_review=%d",
+				paymentRemoval.CancelledTasks, paymentRemoval.ClearedPaymentRows, paymentRemoval.QuarantinedMocks, paymentRemoval.AccountsForReview)
+		}
+		if cfg.DefaultSidecarEndpoint != "" {
+			if err := store.UpsertEgressProfile(activeCtx, storage.EgressProfile{
+				ID:             "egress_sidecar",
+				Name:           "local curl_cffi sidecar",
+				Type:           "curl_cffi_sidecar",
+				Endpoint:       cfg.DefaultSidecarEndpoint,
+				ChainProxy:     cfg.DefaultSidecarChainProxy,
+				StreamCapable:  true,
+				Health:         "healthy",
+				MaxConcurrency: 0,
+			}); err != nil {
+				return fmt.Errorf("init sidecar egress: %w", err)
+			}
+		}
+		if err := warpMgr.EnsurePool(activeCtx); err != nil {
+			log.Printf("warp: ensure pool: %v", err)
+		}
+		app.StartBackground(activeCtx)
+		app.StartAutomation(activeCtx)
+		app.StartQuotaPoller(activeCtx)
+		app.StartModelQualityMonitor(activeCtx)
+		startActiveLedgerPurge(activeCtx, store, cfg)
+		deferredMigrationsOnce.Do(func() {
+			supervisor.GoOnce("storage-deferred-migrations", func() {
+				started := time.Now()
+				if err := store.RunDeferredMigrations(activeCtx); err != nil {
+					if !errors.Is(err, context.Canceled) {
+						log.Printf("deferred storage migrations: %v", err)
+					}
+					return
+				}
+				log.Printf("startup: deferred storage migrations completed in %s", time.Since(started).Round(time.Millisecond))
+			})
+		})
+		log.Printf("worker role active release=%s fencing_token=%d", releaseID, fencingToken)
+		return nil
+	}
+	roleOwner := fmt.Sprintf("%s:%d:%d", releaseID, os.Getpid(), time.Now().UnixNano())
+	roleController, err := newWorkerRoleController(store, deployment, deploymentRole, unixSocket, roleOwner, startActive)
+	if err != nil {
+		log.Printf("deployment role: %v", err)
+		return 1
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           deployment,
@@ -300,22 +287,9 @@ func run() int {
 	}
 
 	serveErr := make(chan error, 1)
-	deployment.ready.Store(true)
+	deployment.standbyReady.Store(true)
 	serveHTTPServerAsync(serveErr, func() error { return serveHTTPServerOn(httpServer, unixSocket) })
-	// Historical usage diagnostics affect reports, not request correctness. Run their
-	// potentially large JSON backfill only after the listener is accepting health
-	// checks; synchronous execution here previously made an active systemd service look
-	// dead long enough for install.sh to roll back both the new and previous binaries.
-	supervisor.GoOnce("storage-deferred-migrations", func() {
-		started := time.Now()
-		if err := store.RunDeferredMigrations(ctx); err != nil {
-			if !errors.Is(err, context.Canceled) {
-				log.Printf("deferred storage migrations: %v", err)
-			}
-			return
-		}
-		log.Printf("startup: deferred storage migrations completed in %s", time.Since(started).Round(time.Millisecond))
-	})
+	supervisor.Go(ctx, "worker-role", roleController.Run)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -331,9 +305,7 @@ func run() int {
 			log.Printf("http server: %v", err)
 		}
 	}
-	deployment.ready.Store(false)
-	deployment.draining.Store(true)
-	cancelBackground()
+	deployment.beginDraining()
 
 	// Graceful drain: stop accepting new connections and let in-flight requests (the
 	// long-lived SSE streams this relay serves) finish, up to the configured window.
@@ -345,6 +317,12 @@ func run() int {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("graceful drain exceeded %s, exiting with streams still active: %v", cfg.ShutdownDrainTimeout(), err)
 	}
+	cancelBackground()
+	registrationCtx, cancelRegistration := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := app.StopRegistrationJobs(registrationCtx); err != nil {
+		log.Printf("bounded registration shutdown incomplete: %v", err)
+	}
+	cancelRegistration()
 	// In-flight requests have now drained, so no new async writes will be enqueued.
 	// Flush the deferred fire-and-forget DB writes (usage / virtual-ledger rows) before
 	// the deferred store.Close runs, so a clean shutdown loses no recorded usage.
@@ -359,18 +337,46 @@ func run() int {
 	return 0
 }
 
+func startActiveLedgerPurge(ctx context.Context, store *storage.Store, cfg config.Config) {
+	supervisor.Go(ctx, "virtual-ledger-purge", func(ctx context.Context) {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				deleted, err := store.PurgeVirtualLedger(ctx, cfg.VirtualContextLedgerTTLSeconds)
+				if err != nil {
+					log.Printf("[ledger] purge: %v", err)
+				} else if deleted > 0 {
+					log.Printf("[ledger] purged %d old rows", deleted)
+				}
+				journalDeleted, err := store.CleanupContextJournal(ctx)
+				if err != nil {
+					log.Printf("[context-journal] purge: %v", err)
+				} else if journalDeleted > 0 {
+					log.Printf("[context-journal] purged %d expired rows", journalDeleted)
+				}
+			}
+		}
+	})
+}
+
 // deploymentHandler provides the worker-local deployment contract used by the
 // stable handoff process. It deliberately lives outside the API router so readiness
 // remains available while normal admission middleware is saturated.
 type deploymentHandler struct {
-	next       http.Handler
-	releaseID  string
-	workerAddr string
-	startedAt  time.Time
-	ready      atomic.Bool
-	draining   atomic.Bool
-	inflight   atomic.Int64
-	check      func(context.Context) error
+	next         http.Handler
+	releaseID    string
+	workerAddr   string
+	startedAt    time.Time
+	ready        atomic.Bool
+	standbyReady atomic.Bool
+	draining     atomic.Bool
+	inflight     atomic.Int64
+	fencingToken atomic.Int64
+	check        func(context.Context) error
 }
 
 func newDeploymentHandler(next http.Handler, releaseID, workerAddr string) *deploymentHandler {
@@ -388,6 +394,14 @@ func (h *deploymentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveReady(w, r)
 		return
 	}
+	if r.URL.Path == "/standbyz" {
+		h.serveStandbyReady(w, r)
+		return
+	}
+	if !h.ready.Load() || h.draining.Load() || h.next == nil {
+		writeWorkerUnavailable(w)
+		return
+	}
 	h.inflight.Add(1)
 	defer h.inflight.Add(-1)
 	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
@@ -403,10 +417,13 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 		cancel()
 		ready = checkErr == nil
 	}
-	state := "ready"
+	state := "active"
 	status := http.StatusOK
 	if h.draining.Load() {
 		state = "draining"
+		status = http.StatusServiceUnavailable
+	} else if h.standbyReady.Load() && !ready {
+		state = "standby_ready"
 		status = http.StatusServiceUnavailable
 	} else if !ready {
 		state = "starting"
@@ -424,7 +441,93 @@ func (h *deploymentHandler) serveReady(w http.ResponseWriter, r *http.Request) {
 		"inflight":         h.inflight.Load(),
 		"started_at":       h.startedAt.Format(time.RFC3339Nano),
 		"worker_socket":    h.workerAddr,
+		"fencing_token":    h.fencingToken.Load(),
 		"checks":           map[string]bool{"storage": checkErr == nil},
+	})
+}
+
+func (h *deploymentHandler) serveStandbyReady(w http.ResponseWriter, r *http.Request) {
+	ready := h.standbyReady.Load() || h.ready.Load()
+	var checkErr error
+	if ready && h.check != nil {
+		checkCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		checkErr = h.check(checkCtx)
+		cancel()
+		ready = checkErr == nil
+	}
+	state := "standby_ready"
+	if h.ready.Load() && !h.draining.Load() {
+		state = "active"
+	} else if h.draining.Load() {
+		state = "draining"
+	} else if !ready {
+		state = "starting"
+	}
+	status := http.StatusOK
+	if !ready {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Codex-Pool-Release", h.releaseID)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"ok":               ready,
+		"standby_ready":    ready,
+		"release_id":       h.releaseID,
+		"deployment_state": state,
+		"inflight":         h.inflight.Load(),
+		"started_at":       h.startedAt.Format(time.RFC3339Nano),
+		"worker_socket":    h.workerAddr,
+		"fencing_token":    h.fencingToken.Load(),
+		"checks":           map[string]bool{"storage": checkErr == nil},
+	})
+}
+
+func (h *deploymentHandler) markActive(fencingToken int64) {
+	h.fencingToken.Store(fencingToken)
+	h.standbyReady.Store(true)
+	h.draining.Store(false)
+	h.ready.Store(true)
+}
+
+func (h *deploymentHandler) beginDraining() {
+	h.ready.Store(false)
+	h.draining.Store(true)
+}
+
+func (h *deploymentHandler) markStandby() {
+	h.ready.Store(false)
+	h.standbyReady.Store(true)
+	h.fencingToken.Store(0)
+	if h.inflight.Load() == 0 {
+		h.draining.Store(false)
+	}
+}
+
+func writeWorkerUnavailable(w http.ResponseWriter) {
+	var random [8]byte
+	requestID := ""
+	if _, err := rand.Read(random[:]); err == nil {
+		requestID = fmt.Sprintf("REQ-%X", random[:])
+	} else {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d", os.Getpid(), time.Now().UnixNano())))
+		requestID = fmt.Sprintf("REQ-%X", sum[:8])
+	}
+	for name := range w.Header() {
+		w.Header().Del(name)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "3")
+	w.Header().Set("X-Request-ID", requestID)
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]string{
+			"type":       "server_error",
+			"code":       "service_unavailable",
+			"message":    "The relay service is temporarily unavailable. Please retry.",
+			"request_id": requestID,
+		},
 	})
 }
 

@@ -148,10 +148,16 @@ type UserGroup struct {
 	ModelInstructionProfiles      ModelInstructionProfiles `json:"model_instruction_profiles,omitempty"`
 	ForceModel                    string                   `json:"force_model"`
 	ForceEffort                   string                   `json:"force_effort"`
-	Targets                       []TargetRef              `json:"targets"`
-	ModelRouting                  []ModelRoutingRule       `json:"model_routing"`
-	CreatedAt                     int64                    `json:"created_at"`
-	UpdatedAt                     int64                    `json:"updated_at"`
+	// BlockClaudeTargetGroups and BlockGPTTargetGroups are user-group routing
+	// policy. Each value names an account-pool target selected by this user
+	// group; the underlying account-pool group itself remains unchanged and may
+	// still receive that family through another user group.
+	BlockClaudeTargetGroups []string           `json:"block_claude_target_groups"`
+	BlockGPTTargetGroups    []string           `json:"block_gpt_target_groups"`
+	Targets                 []TargetRef        `json:"targets"`
+	ModelRouting            []ModelRoutingRule `json:"model_routing"`
+	CreatedAt               int64              `json:"created_at"`
+	UpdatedAt               int64              `json:"updated_at"`
 }
 
 const (
@@ -2156,6 +2162,17 @@ WHERE availability_state = 'unverified'
 )`,
 		`CREATE INDEX IF NOT EXISTS idx_diagnostic_jobs_status ON diagnostic_jobs(status,created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_diagnostic_jobs_expiry ON diagnostic_jobs(expires_at,status)`,
+		`CREATE TABLE IF NOT EXISTS diagnostic_download_leases(
+  lease_id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(job_id) REFERENCES diagnostic_jobs(id) ON DELETE CASCADE
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_diagnostic_download_leases_job ON diagnostic_download_leases(job_id,expires_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_diagnostic_download_leases_expiry ON diagnostic_download_leases(expires_at)`,
 		`CREATE TABLE IF NOT EXISTS diagnostic_events(
   id TEXT PRIMARY KEY,
   event_type TEXT NOT NULL,
@@ -2529,6 +2546,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   model_instruction_profiles TEXT NOT NULL DEFAULT '{}',
   force_model TEXT NOT NULL DEFAULT '',
   force_effort TEXT NOT NULL DEFAULT '',
+  block_claude_target_groups TEXT NOT NULL DEFAULT '[]',
+  block_gpt_target_groups TEXT NOT NULL DEFAULT '[]',
   model_routing_json TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -2559,6 +2578,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		`CREATE INDEX IF NOT EXISTS idx_user_group_target_bindings_updated ON user_group_target_bindings(updated_at)`,
 		`ALTER TABLE user_groups ADD COLUMN model_routing_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN model_instruction_profiles TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE user_groups ADD COLUMN block_claude_target_groups TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE user_groups ADD COLUMN block_gpt_target_groups TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -2954,17 +2975,19 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, model_routing_json, created_at, updated_at`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled int
-	var filesJSON, profilesJSON, routingJSON string
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
+	var filesJSON, profilesJSON, blockClaudeJSON, blockGPTJSON, routingJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
 	g.ModelInstructionProfiles = decodeModelInstructionProfiles(profilesJSON)
+	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
+	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
 	if err == nil {
 		_ = json.Unmarshal([]byte(routingJSON), &g.ModelRouting)
 		if g.ModelRouting == nil {
@@ -3039,6 +3062,66 @@ func (s *Store) ListUserGroups(ctx context.Context) ([]UserGroup, error) {
 	return out, nil
 }
 
+// UserGroupRouteGeneration is a cheap, non-secret change token for a waiting
+// inference request. It changes when the user-group target policy, a referenced
+// provider, an account in any eligible pool, its credential metadata, or its
+// model catalog changes. Callers can therefore keep a downstream connection
+// alive without repeatedly replaying a large inference request against unchanged
+// capacity.
+func (s *Store) UserGroupRouteGeneration(ctx context.Context, userGroupID, baseGroup string) (string, error) {
+	var groupUpdated, targetCount, targetUpdated, providerUpdated int64
+	err := s.rdb.QueryRowContext(ctx, `
+SELECT g.updated_at,
+       COUNT(t.id),
+       COALESCE(MAX(t.created_at), 0),
+       COALESCE(MAX(p.updated_at), 0)
+FROM user_groups g
+LEFT JOIN user_group_targets t ON t.user_group_id = g.id
+LEFT JOIN custom_providers p
+       ON t.target_type = ? AND p.id = t.target_ref
+WHERE g.id = ?
+GROUP BY g.updated_at`, UserGroupTargetTypeRelay, strings.TrimSpace(userGroupID)).Scan(
+		&groupUpdated, &targetCount, &targetUpdated, &providerUpdated,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrUserGroupNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+
+	var accountCount, accountUpdated, tokenUpdated, kiroUpdated, capabilityCount, capabilityUpdated int64
+	err = s.rdb.QueryRowContext(ctx, `
+SELECT COUNT(DISTINCT a.id),
+       COALESCE(MAX(a.updated_at), 0),
+       COALESCE(MAX(tok.updated_at), 0),
+       COALESCE(MAX(kc.updated_at), 0),
+       COUNT(cap.model_slug),
+       COALESCE(MAX(cap.last_probe_at), 0)
+FROM accounts a
+LEFT JOIN account_auth_tokens tok ON tok.account_id = a.id
+LEFT JOIN account_kiro_credentials kc ON kc.account_id = a.id
+LEFT JOIN account_model_capabilities cap ON cap.account_id = a.id
+WHERE a.group_name = ?
+   OR EXISTS (
+       SELECT 1
+       FROM user_group_targets t
+       WHERE t.user_group_id = ?
+         AND t.target_type = ?
+         AND t.target_ref = a.group_name
+   )`, strings.TrimSpace(baseGroup), strings.TrimSpace(userGroupID), UserGroupTargetTypeBaseGroup).Scan(
+		&accountCount, &accountUpdated, &tokenUpdated, &kiroUpdated, &capabilityCount, &capabilityUpdated,
+	)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%d:%d:%d:%d:%d:%d:%d:%d:%d",
+		groupUpdated, targetCount, targetUpdated, providerUpdated,
+		accountCount, accountUpdated, tokenUpdated, kiroUpdated,
+		capabilityCount, capabilityUpdated,
+	), nil
+}
+
 func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.ID) == "" {
 		return errors.New("user group id required")
@@ -3055,9 +3138,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, routingJSON, g.CreatedAt, g.UpdatedAt)
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), routingJSON, g.CreatedAt, g.UpdatedAt)
 	return err
 }
 
@@ -3203,6 +3286,35 @@ func normalizeModelRouting(rules []ModelRoutingRule, targets []TargetRef, provid
 	return out, nil
 }
 
+func normalizeBlockedAccountPoolGroups(field string, values []string, targets []TargetRef) ([]string, error) {
+	selected := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target.Kind == TargetKindAccountPoolGroup {
+			selected[target.ID] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		if _, ok := selected[name]; !ok {
+			return nil, fmt.Errorf("%s account-pool target %q is not selected by this user group", field, name)
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out, nil
+}
+
 func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g UserGroup) (UserGroup, error) {
 	g.ID = strings.TrimSpace(g.ID)
 	g.Name = strings.TrimSpace(g.Name)
@@ -3227,6 +3339,14 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g 
 	}
 	if len(targets) == 0 {
 		return UserGroup{}, errors.New("at least one user group target required")
+	}
+	g.BlockClaudeTargetGroups, err = normalizeBlockedAccountPoolGroups("block_claude_target_groups", g.BlockClaudeTargetGroups, targets)
+	if err != nil {
+		return UserGroup{}, err
+	}
+	g.BlockGPTTargetGroups, err = normalizeBlockedAccountPoolGroups("block_gpt_target_groups", g.BlockGPTTargetGroups, targets)
+	if err != nil {
+		return UserGroup{}, err
 	}
 	providerModels := make(map[string][]string)
 	for _, target := range targets {
@@ -3293,8 +3413,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -3316,8 +3436,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -3337,8 +3457,8 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeModelRouting(g.ModelRouting), Now(), g.ID)
+	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), Now(), g.ID)
 	return err
 }
 
@@ -4650,6 +4770,19 @@ func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, e
 	if cached, ok := s.tokenCache.Load(accountID); ok {
 		return cached.(AccountToken), nil
 	}
+	return s.loadToken(ctx, accountID, true)
+}
+
+// GetTokenFresh bypasses the process-local decrypted-token cache. OAuth refresh
+// tokens rotate on use, so a second worker that receives invalid_grant must
+// re-read the committed database row before declaring the credential dead.
+// The fresh value replaces this process's cache after a successful read.
+func (s *Store) GetTokenFresh(ctx context.Context, accountID string) (AccountToken, error) {
+	s.tokenCache.Delete(accountID)
+	return s.loadToken(ctx, accountID, true)
+}
+
+func (s *Store) loadToken(ctx context.Context, accountID string, cache bool) (AccountToken, error) {
 	row := s.rdb.QueryRowContext(ctx, `SELECT account_id, auth_method, credential_mode, access_token, refresh_token, openai_api_key, id_token_raw, agent_runtime_id, agent_private_key, agent_task_id, last_refresh, expires_at, scopes, oauth_rate_limit_tier, created_at, updated_at FROM account_auth_tokens WHERE account_id = ?`, accountID)
 	var t AccountToken
 	err := row.Scan(&t.AccountID, &t.AuthMethod, &t.CredentialMode, &t.AccessToken, &t.RefreshToken, &t.OpenAIAPIKey, &t.IDTokenRaw, &t.AgentRuntimeID, &t.AgentPrivateKey, &t.AgentTaskID, &t.LastRefresh, &t.ExpiresAt, &t.Scopes, &t.OAuthRateLimitTier, &t.CreatedAt, &t.UpdatedAt)
@@ -4660,7 +4793,7 @@ func (s *Store) GetToken(ctx context.Context, accountID string) (AccountToken, e
 	t.AgentRuntimeID = s.openToken(t.AgentRuntimeID)
 	t.AgentPrivateKey = s.openToken(t.AgentPrivateKey)
 	t.AgentTaskID = s.openToken(t.AgentTaskID)
-	if err == nil {
+	if err == nil && cache {
 		s.tokenCache.Store(accountID, t)
 	}
 	return t, err
@@ -4711,6 +4844,51 @@ func (s *Store) UpdateToken(ctx context.Context, t AccountToken) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE account_auth_tokens SET auth_method = ?, credential_mode = ?, access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, agent_runtime_id = ?, agent_private_key = ?, agent_task_id = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
 		t.AuthMethod, t.CredentialMode, s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), s.sealToken(t.AgentRuntimeID), s.sealToken(t.AgentPrivateKey), s.sealToken(t.AgentTaskID), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, Now(), t.AccountID)
 	return err
+}
+
+// UpdateTokenAfterCredentialRefresh persists a successfully refreshed credential and
+// atomically returns an auth_expired account to service. The conditional status
+// transition deliberately preserves explicit administrative states such as disabled
+// or invalid. Clearing the binding bench in the same transaction prevents a recovered
+// credential from remaining invisible to the scheduler.
+func (s *Store) UpdateTokenAfterCredentialRefresh(ctx context.Context, t AccountToken) (bool, error) {
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `UPDATE account_auth_tokens SET auth_method = ?, credential_mode = ?, access_token = ?, refresh_token = ?, openai_api_key = ?, id_token_raw = ?, agent_runtime_id = ?, agent_private_key = ?, agent_task_id = ?, last_refresh = ?, expires_at = ?, scopes = ?, oauth_rate_limit_tier = ?, updated_at = ? WHERE account_id = ?`,
+		t.AuthMethod, t.CredentialMode, s.sealToken(t.AccessToken), s.sealToken(t.RefreshToken), s.sealToken(t.OpenAIAPIKey), s.sealToken(t.IDTokenRaw), s.sealToken(t.AgentRuntimeID), s.sealToken(t.AgentPrivateKey), s.sealToken(t.AgentTaskID), t.LastRefresh, t.ExpiresAt, t.Scopes, t.OAuthRateLimitTier, now, t.AccountID)
+	if err != nil {
+		return false, err
+	}
+	if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return false, rowsErr
+	} else if affected != 1 {
+		return false, sql.ErrNoRows
+	}
+
+	statusResult, err := tx.ExecContext(ctx, `UPDATE accounts SET status = 'active', quarantine_until = 0, quarantine_reason = '', updated_at = ? WHERE id = ? AND status = 'auth_expired'`, now, t.AccountID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := statusResult.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	reactivated := affected == 1
+	if reactivated {
+		if _, err := tx.ExecContext(ctx, `UPDATE account_egress_bindings SET cooldown_until = 0, recheck_pending = 0, updated_at = ? WHERE account_id = ?`, now, t.AccountID); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	s.tokenCache.Delete(t.AccountID)
+	return reactivated, nil
 }
 
 func (s *Store) UpsertKiroCredentials(ctx context.Context, c KiroCredentials) error {

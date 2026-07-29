@@ -26,6 +26,19 @@ type schedulerWaitState struct {
 func withSchedulerWait(ctx context.Context, w http.ResponseWriter, stream bool, protocol string) context.Context {
 	return context.WithValue(ctx, schedulerWaitKey{}, &schedulerWaitState{w: w, stream: stream, protocol: protocol})
 }
+
+// withBufferedSchedulerWait prevents a nested user-group candidate from writing
+// a terminal event directly to the already-heartbeating outer response. The
+// candidate must first return an ordinary buffered HTTP failure so the group
+// router can continue waiting or transfer to another target.
+func withBufferedSchedulerWait(ctx context.Context, w http.ResponseWriter) context.Context {
+	protocol := "openai"
+	if current, _ := ctx.Value(schedulerWaitKey{}).(*schedulerWaitState); current != nil && current.protocol != "" {
+		protocol = current.protocol
+	}
+	return withSchedulerWait(ctx, w, false, protocol)
+}
+
 func schedulerWaitCallback(ctx context.Context) func(string, time.Duration) {
 	state, _ := ctx.Value(schedulerWaitKey{}).(*schedulerWaitState)
 	if state == nil || !state.stream {

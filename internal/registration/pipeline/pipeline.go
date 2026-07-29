@@ -179,7 +179,9 @@ func (p *Pipeline) settleSMSLease(ctx context.Context, req RegisterRequest, smsP
 		err = smsProvider.CancelNumber(settleCtx, orderID)
 	}
 	if err != nil && p.LogEvent != nil {
-		p.LogEvent(context.WithoutCancel(ctx), req.JobID, "warn",
+		logCtx, logCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer logCancel()
+		p.LogEvent(logCtx, req.JobID, "warn",
 			"SMS resource settlement failed",
 			map[string]interface{}{"provider": smsProvider.Name(), "action": action})
 	}

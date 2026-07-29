@@ -86,3 +86,30 @@ func TestUltraSolRetainsCLISettingAndMapsToMaxOnWire(t *testing.T) {
 		t.Fatalf("status=%d upstream=%s", resp.StatusCode, upstreamBody)
 	}
 }
+
+func TestDirectCodexGPT56AliasRoutesAsSol(t *testing.T) {
+	var upstreamBody []byte
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-alias","object":"response","status":"completed","output":[]}`))
+	})
+	accountID := h.importAccount(t, "alias-sol", "up-alias-sol", "access-alias-sol")
+	setTestCapability(t, h, accountID, "gpt-5.6-sol", 372000)
+
+	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6","reasoning":{"effort":"ultra"},"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(upstreamBody), `"model":"gpt-5.6-sol"`) ||
+		!strings.Contains(string(upstreamBody), `"effort":"max"`) {
+		t.Fatalf("status=%d body=%s upstream=%s", resp.StatusCode, body, upstreamBody)
+	}
+}

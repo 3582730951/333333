@@ -165,7 +165,7 @@ func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
 		dst.Set("Accept", "application/json")
 	}
 	if dst.Get("Anthropic-Version") != "" {
-		dst.Set("User-Agent", "claude-cli/2.1.0")
+		dst.Set("User-Agent", "claude-cli/"+identity.ClaudeCLIVersion+" (external, cli)")
 	} else {
 		dst.Set("User-Agent", openAICompatUserAgent)
 	}

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -29,9 +30,13 @@ import (
 )
 
 const (
-	pausePath  = "/_codex_pool/handoff/pause"
-	resumePath = "/_codex_pool/handoff/resume"
+	pausePath                    = "/_codex_pool/handoff/pause"
+	resumePath                   = "/_codex_pool/handoff/resume"
+	publicRetryAfter             = "3"
+	publicServiceUnavailableText = "The relay service is temporarily unavailable. Please retry."
 )
+
+var handoffRequestSequence atomic.Uint64
 
 type pauseState struct {
 	PausedAt time.Time `json:"paused_at"`
@@ -219,20 +224,44 @@ func newHandoffWithState(backendLink, pauseStateFile, instanceID string) *handof
 	h.proxy.Transport = transport
 	h.proxy.FlushInterval = -1
 	h.proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Retry-After", "1")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"error": map[string]string{"code": "worker_unavailable", "message": err.Error()},
-		})
+		requestID := newHandoffRequestID()
+		log.Printf("[HANDOFF] request_id=%s backend unavailable: %v", requestID, err)
+		writeHandoffUnavailable(w, requestID)
 	}
 	return h
+}
+
+func newHandoffRequestID() string {
+	var random [8]byte
+	if _, err := rand.Read(random[:]); err == nil {
+		return fmt.Sprintf("REQ-%X", random[:])
+	}
+	return fmt.Sprintf("REQ-%016X", handoffRequestSequence.Add(1))
+}
+
+func writeHandoffUnavailable(w http.ResponseWriter, requestID string) {
+	headers := w.Header()
+	for name := range headers {
+		headers.Del(name)
+	}
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Retry-After", publicRetryAfter)
+	headers.Set("X-Request-ID", requestID)
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]string{
+			"type":       "server_error",
+			"code":       "service_unavailable",
+			"message":    publicServiceUnavailableText,
+			"request_id": requestID,
+		},
+	})
 }
 
 func (h *handoff) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/handoffz":
-		h.serveStatus(w)
+		h.serveStatus(w, false)
 		return
 	case pausePath, resumePath:
 		h.serveControl(w, r, false)
@@ -303,7 +332,7 @@ func formatOptionalTime(t time.Time) interface{} {
 	return t.Format(time.RFC3339Nano)
 }
 
-func (h *handoff) serveStatus(w http.ResponseWriter) {
+func (h *handoff) serveStatus(w http.ResponseWriter, trusted bool) {
 	resolved, err := filepath.EvalSymlinks(h.backendLink)
 	if err == nil {
 		var conn net.Conn
@@ -326,7 +355,6 @@ func (h *handoff) serveStatus(w http.ResponseWriter) {
 		"ready":            ready,
 		"deployment_state": "handoff",
 		"instance_id":      h.instanceID,
-		"active_backend":   resolved,
 		"inflight":         h.inflight.Load(),
 		"admission_paused": paused,
 		"queued":           queued,
@@ -335,8 +363,16 @@ func (h *handoff) serveStatus(w http.ResponseWriter) {
 		"pause_release":    release,
 		"started_at":       h.startedAt.Format(time.RFC3339Nano),
 	}
-	if err != nil {
-		body["error"] = err.Error()
+	if trusted {
+		body["active_backend"] = resolved
+		if err != nil {
+			body["error"] = err.Error()
+		}
+	} else if err != nil {
+		body["error"] = map[string]string{
+			"code":    "worker_unavailable",
+			"message": "The active worker is temporarily unavailable.",
+		}
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }
@@ -396,7 +432,7 @@ func main() {
 		defer os.Remove(controlSocket)
 		controlServer = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/handoffz" {
-				h.serveStatus(w)
+				h.serveStatus(w, true)
 				return
 			}
 			h.serveControl(w, r, true)

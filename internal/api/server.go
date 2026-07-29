@@ -48,11 +48,12 @@ import (
 )
 
 type Dependencies struct {
-	Config    config.Config
-	Store     *storage.Store
-	Scheduler *scheduler.Scheduler
-	Upstream  *upstream.Client
-	Planner   *virtual.Planner
+	Config            config.Config
+	Store             *storage.Store
+	Scheduler         *scheduler.Scheduler
+	Upstream          *upstream.Client
+	Planner           *virtual.Planner
+	DeferRuntimeStart bool
 	// Warp is the multi-exit WARP CF-fallback manager (nil = WARP disabled).
 	Warp *warp.Manager
 	// Solver is the cf_clearance solver client (nil/disabled = no solver rung).
@@ -77,7 +78,6 @@ type Server struct {
 	responseBodyBudget *bodysource.Budget
 	bodyDiskReserver   *bodysource.DiskReserver
 	diagnostics        diagnosticRuntime
-	diagnosticJobsOnce sync.Once
 	// oauth holds in-flight web-login (paste-back) PKCE sessions for the
 	// /admin/oauth/* import flow. In-memory + TTL'd; see oauth.go.
 	oauth *oauthStore
@@ -96,9 +96,10 @@ type Server struct {
 	// when the gateway_reliability flag is on. See reliability.go.
 	relState *reliability.Store
 	// regHandler handles registration API requests
-	regHandler    *Handler
-	claudeRefresh *claudeRefreshGates
-	kiro          *kiro.Manager
+	regHandler         *Handler
+	claudeRefresh      *claudeRefreshGates
+	antigravityRefresh *antigravityRefreshFlights
+	kiro               *kiro.Manager
 	// asyncWrites carries fire-and-forget DB writes (usage rows, virtual-ledger rows)
 	// off the request path so the response is not blocked on a write through the single
 	// SQLite write connection. A single drainer goroutine runs them FIFO (matching the
@@ -117,6 +118,8 @@ type Server struct {
 	asyncClosed           bool
 	asyncWriteCtx         context.Context
 	asyncWriteCancel      context.CancelFunc
+	runtimeStartOnce      sync.Once
+	runtimeStartErr       error
 	asyncFlushOnce        sync.Once
 	asyncFlushDone        chan struct{}
 	asyncBytes            int64
@@ -170,11 +173,15 @@ func NewServer(dep Dependencies) *Server {
 	requestBodyBudget, responseBodyBudget := bodysource.NewSplitBudget(
 		dep.Config.EffectiveBodyMemoryBudgetBytes(), dep.Config.BodySpoolMaxBytes, .25,
 	)
-	// Match CLIProxyAPI's request-body behavior: admit against the bytes actually
-	// needed and the configured spool ceiling, not an arbitrary fixed free-space
-	// floor. Keep the legacy config field readable for config compatibility, but do
-	// not let an old saved 10 GiB value reject otherwise fitting requests.
-	bodyDiskReserver := bodysource.NewDiskReserver(dep.Config.BodySpoolDir, 0, dep.Config.BodySpoolMaxBytes)
+	// Admit against the bytes actually needed while preserving the disk guard's
+	// emergency headroom. Without a reserve, one large/unknown-length spool can
+	// consume the filesystem between 15-second guard probes and strand the database
+	// and journal before admission is withdrawn.
+	bodyDiskReserver := bodysource.NewDiskReserver(
+		dep.Config.BodySpoolDir,
+		bodySpoolMinimumFreeBytes(dep.Config.BodySpoolDir, dep.Config.BodyDiskReserveBytes),
+		dep.Config.BodySpoolMaxBytes,
+	)
 	requestBodyBudget.SetDiskReserver(bodyDiskReserver)
 	responseBodyBudget.SetDiskReserver(bodyDiskReserver)
 	s := &Server{
@@ -198,6 +205,7 @@ func NewServer(dep Dependencies) *Server {
 		relState:            reliability.NewStore(relStateTTL, relStateMax),
 		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		claudeRefresh:       newClaudeRefreshGates(),
+		antigravityRefresh:  newAntigravityRefreshFlights(),
 		kiro:                kiro.NewManager(dep.Store, dep.Upstream, dep.Config),
 		claudeCacheFlights:  map[string]chan struct{}{},
 		codexCacheFlights:   map[string]chan struct{}{},
@@ -213,27 +221,12 @@ func NewServer(dep Dependencies) *Server {
 	} else {
 		s.identitySecretCached = identity.ResolveSecret([]byte(dep.Config.IdentitySecret))
 	}
-	if dep.Config.UsageJournalEnabled && dep.Store != nil && !dep.Store.InMemory() {
-		journalDir, err := usageJournalDirectory(dep.Config, dep.Store.Path())
-		if err != nil {
-			panic(fmt.Sprintf("usage journal path: %v", err))
+	if !dep.DeferRuntimeStart {
+		if err := s.StartRuntime(); err != nil {
+			panic(fmt.Sprintf("start server runtime: %v", err))
 		}
-		s.usageJournal, err = usagejournal.Open(journalDir, dep.Config.UsageJournalSegmentBytes)
-		if err != nil {
-			panic(fmt.Sprintf("open usage journal: %v", err))
-		}
-		s.usageJournalStop = make(chan struct{})
-		s.usageJournalWake = make(chan struct{}, 1)
-		if err = s.replayUsageJournal(context.Background()); err != nil {
-			_ = s.usageJournal.Close()
-			panic(fmt.Sprintf("replay usage journal: %v", err))
-		}
-		if snapshot, snapshotErr := s.usageJournal.Snapshot(); snapshotErr == nil {
-			s.usageJournalAcked.Store(snapshot.AckedSequence)
-		}
+		s.regHandler.StartRuntime(context.Background())
 	}
-	s.startAsyncWriter()
-	s.startGoalCompactionWorkers()
 	// Apply any persisted runtime overrides for the upstream-consumed fingerprint /
 	// identity fields to the upstream client at boot, so admin settings survive a
 	// restart (the request-time getters already overlay the rest live).
@@ -246,6 +239,43 @@ func NewServer(dep Dependencies) *Server {
 	}
 	s.routes()
 	return s
+}
+
+// StartRuntime opens the usage journal and starts write/compaction workers.
+// A/B standby processes defer this until they hold the active fencing lease, so
+// staging a release cannot replay journals or perform singleton DB side effects.
+func (s *Server) StartRuntime() error {
+	if s == nil {
+		return errors.New("server runtime is nil")
+	}
+	s.runtimeStartOnce.Do(func() {
+		if s.cfg.UsageJournalEnabled && s.store != nil && !s.store.InMemory() {
+			journalDir, err := usageJournalDirectory(s.cfg, s.store.Path())
+			if err != nil {
+				s.runtimeStartErr = fmt.Errorf("usage journal path: %w", err)
+				return
+			}
+			s.usageJournal, err = usagejournal.Open(journalDir, s.cfg.UsageJournalSegmentBytes)
+			if err != nil {
+				s.runtimeStartErr = fmt.Errorf("open usage journal: %w", err)
+				return
+			}
+			s.usageJournalStop = make(chan struct{})
+			s.usageJournalWake = make(chan struct{}, 1)
+			if err = s.replayUsageJournal(context.Background()); err != nil {
+				_ = s.usageJournal.Close()
+				s.usageJournal = nil
+				s.runtimeStartErr = fmt.Errorf("replay usage journal: %w", err)
+				return
+			}
+			if snapshot, snapshotErr := s.usageJournal.Snapshot(); snapshotErr == nil {
+				s.usageJournalAcked.Store(snapshot.AckedSequence)
+			}
+		}
+		s.startAsyncWriter()
+		s.startGoalCompactionWorkers()
+	})
+	return s.runtimeStartErr
 }
 
 func usageJournalDirectory(cfg config.Config, databasePath string) (string, error) {
@@ -612,7 +642,8 @@ func (s *Server) modelsRoutableCapabilityScopes(ctx context.Context, baseGroup, 
 	// router's base-group fallback instead of presenting an empty catalog.
 	if len(group.Targets) == 0 {
 		caps, listErr := s.store.ListRoutableCapabilities(ctx, baseGroup)
-		return [][]storage.ModelCapability{caps}, listErr
+		target := storage.TargetRef{Kind: storage.TargetKindAccountPoolGroup, ID: baseGroup}
+		return [][]storage.ModelCapability{filterUserGroupBlockedCapabilities(group, target, caps)}, listErr
 	}
 
 	var baseCaps []storage.ModelCapability
@@ -630,7 +661,7 @@ func (s *Server) modelsRoutableCapabilityScopes(ctx context.Context, baseGroup, 
 			if listErr != nil {
 				return nil, listErr
 			}
-			scopes = append(scopes, caps)
+			scopes = append(scopes, filterUserGroupBlockedCapabilities(group, target, caps))
 			continue
 		}
 		if routeProvider == "" {
@@ -652,6 +683,20 @@ func (s *Server) modelsRoutableCapabilityScopes(ctx context.Context, baseGroup, 
 		scopes = append(scopes, filterModelsCapabilitiesByProvider(baseCaps, providers, routeProvider))
 	}
 	return scopes, nil
+}
+
+func filterUserGroupBlockedCapabilities(group storage.UserGroup, target storage.TargetRef, caps []storage.ModelCapability) []storage.ModelCapability {
+	if target.Kind != storage.TargetKindAccountPoolGroup ||
+		(len(group.BlockClaudeTargetGroups) == 0 && len(group.BlockGPTTargetGroups) == 0) {
+		return caps
+	}
+	filtered := make([]storage.ModelCapability, 0, len(caps))
+	for _, capability := range caps {
+		if !blockedUserGroupTarget(group, target, capability.ModelSlug) {
+			filtered = append(filtered, capability)
+		}
+	}
+	return filtered
 }
 
 func (s *Server) modelsAccountProviders(ctx context.Context) (map[string]string, error) {
@@ -901,12 +946,13 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 			// then keep all later turns on the stateless HTTPS bridge.
 			contextError := leakfilter.ResponsesContextErrorPreviousResponseNotFound
 			retry, mode, recovered := s.recoverResponsesContext(r.Context(), raw, r.Header, contextError)
-			unpaired := false
-			if recovered && mode == "rebuilt" {
-				unpaired = responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone)
-			} else if recovered {
-				unpaired = responsesHasUnpairedToolOutput(raw, contextError)
-			}
+			// The HTTPS bridge is explicitly stateless. A degraded recovery has
+			// already converted an orphaned client tool output into inert user
+			// context while preserving its result; re-check the recovered payload,
+			// not the original stateful append. Checking the original made every
+			// valid WebSocket-to-HTTPS fallback loop forever on
+			// codex_tool_context_unrecoverable even though the retry was safe.
+			unpaired := recovered && responsesHasUnpairedToolOutput(retry.Raw, leakfilter.ResponsesContextErrorNone)
 			if !recovered || unpaired {
 				code := "codex_context_epoch_retired"
 				if unpaired {
@@ -3522,6 +3568,10 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	if isInternalCall(ctx) {
 		return // relay-internal (moderation) calls must not be metered against pool accounts
 	}
+	modelDiag := modelDiagnosticsFromCtx(ctx)
+	if strings.TrimSpace(parsed.Model) == "" {
+		parsed.Model = firstNonEmpty(modelDiag.Resolved, modelDiag.Requested)
+	}
 	if parsed.TotalTokens == 0 && parsed.PromptTokens == 0 && parsed.CompletionTokens == 0 {
 		// Session 33: When the stream scanner cannot extract countable tokens
 		// (e.g. the upstream terminated with an error instead of a normal
@@ -3541,7 +3591,7 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 					Model:        parsed.Model,
 					PromptTokens: estimate,
 					TotalTokens:  estimate,
-					RawUsage:     json.RawMessage(`{"estimated":true}`),
+					RawUsage:     json.RawMessage(`{"estimated":true,"reason":"upstream_usage_missing"}`),
 				}
 			} else {
 				log.Printf("[USAGE-WARN] account=%s: all tokens are zero, model=%s, raw=%s",
@@ -3556,7 +3606,6 @@ func (s *Server) recordParsedUsage(ctx context.Context, accountID, routeHash str
 	}
 	keyHash, userID := downstreamFromCtx(ctx)
 	diag := usageDiagnosticsFromCtx(ctx)
-	modelDiag := modelDiagnosticsFromCtx(ctx)
 	diag.BillingHoldID = holdIDFromCtx(ctx)
 	diag.RequestedModel, diag.ResolvedModel, diag.ModelOverrideSource = modelDiag.Requested, modelDiag.Resolved, modelDiag.Source
 	if diag.UsageEventID == "" {

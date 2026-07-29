@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -255,8 +256,8 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if runtimeStorage.Filesystem.FilesystemTotalBytes <= 0 || runtimeStorage.Filesystem.FilesystemAvailableBytes <= 0 || runtimeStorage.Filesystem.GlobalLimitBytes <= 0 {
 		t.Fatalf("runtime_storage filesystem/reserver missing: %+v", runtimeStorage.Filesystem)
 	}
-	if runtimeStorage.Filesystem.MinimumFreeBytes != 0 {
-		t.Fatalf("runtime_storage retained a fixed filesystem reserve: %+v", runtimeStorage.Filesystem)
+	if runtimeStorage.Filesystem.MinimumFreeBytes < 128<<20 {
+		t.Fatalf("runtime_storage does not preserve emergency filesystem headroom: %+v", runtimeStorage.Filesystem)
 	}
 	if runtimeStorage.Rejections["request_body_storage_exhausted"] != 1 || runtimeStorage.Rejections["local_spool_capacity"] != 1 {
 		t.Fatalf("runtime_storage rejection counts: %+v", runtimeStorage.Rejections)
@@ -313,6 +314,54 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}
 	if bytes.Contains(journalJSON, []byte("usage-journal")) || bytes.Contains(journalJSON, []byte(h.store.Path())) {
 		t.Fatalf("usage journal diagnostics leaked a local path: %s", journalJSON)
+	}
+}
+
+func TestDiagnosticSanitizerPreservesSchemaAndEnumText(t *testing.T) {
+	codebook := buildDiagnosticCodebookWithKey(
+		[]byte("stable-diagnostic-alias-key"),
+		[]storage.Account{{ID: "account-short", Label: "rt"}},
+		nil, nil, nil, nil, nil,
+	)
+	accountAlias := codebook.code("account-short")
+	input := "started_at,import,supported,unsupported,unreported,rt,account=rt"
+	got := codebook.sanitize(input)
+	want := "started_at,import,supported,unsupported,unreported," + accountAlias + ",account=" + accountAlias
+	if got != want {
+		t.Fatalf("boundary-aware identity sanitization = %q, want %q", got, want)
+	}
+
+	longEnum := "model_available_but_account_not_capable_after_catalog_refresh"
+	if got := codebook.sanitize(longEnum); got != longEnum {
+		t.Fatalf("long snake_case enum was corrupted: %q", got)
+	}
+	secret := strings.Repeat("0123456789abcdef", 4)
+	if got := codebook.sanitize(secret); !strings.HasPrefix(got, "TOKEN-") || strings.Contains(got, secret) {
+		t.Fatalf("high-entropy secret was not aliased: %q", got)
+	}
+	upstreamRequestID := "req_011CdWLhB6LpPonmxYYxwQdD"
+	if got := codebook.sanitize(`request_id="` + upstreamRequestID + `"`); !strings.Contains(got, "REQ-") || strings.Contains(got, upstreamRequestID) {
+		t.Fatalf("upstream request id was not aliased: %q", got)
+	}
+}
+
+func TestDiagnosticWholeFileSanitizationPreservesCSVHeader(t *testing.T) {
+	codebook := buildDiagnosticCodebookWithKey(
+		[]byte("stable-diagnostic-alias-key"),
+		[]storage.Account{{ID: "account-short", Label: "rt"}},
+		nil, nil, nil, nil, nil,
+	)
+	content := csvString(
+		[]string{"id", "created_at", "updated_at", "started_at", "finished_at"},
+		[][]string{{"1", "2", "3", "4", "5"}},
+	)
+	rows, err := csv.NewReader(strings.NewReader(codebook.sanitize(content))).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "created_at", "updated_at", "started_at", "finished_at"}
+	if len(rows) != 2 || !slices.Equal(rows[0], want) {
+		t.Fatalf("sanitized CSV header = %v, want %v", rows, want)
 	}
 }
 

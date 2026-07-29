@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/bodysource"
@@ -133,10 +136,16 @@ type diagnosticReplacement struct {
 	Code   string
 }
 
+type diagnosticReplacementNode struct {
+	children       map[byte]*diagnosticReplacementNode
+	replacement    diagnosticReplacement
+	hasReplacement bool
+}
+
 type diagnosticCodebook struct {
 	byID         map[string]diagnosticAccountIdentity
 	replacements []diagnosticReplacement
-	replacer     *strings.Replacer
+	replacement  *diagnosticReplacementNode
 	aliasKey     []byte
 }
 
@@ -152,6 +161,7 @@ func diagnosticFileOrder() []string {
 		"manifest.json",
 		"diagnostic_summary.json",
 		"runtime_storage.json",
+		"diagnostic_events.csv",
 		"route_attempts.csv",
 		"provider_attempts.csv",
 		"account_auth_metadata.csv",
@@ -514,6 +524,8 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	for _, name := range diagnosticFileOrder() {
 		var written int64
 		switch name {
+		case "diagnostic_events.csv":
+			written, err = streamDiagnosticEventsCSV(ctx, snapshotStore.ReadDB(), zw, codebook)
 		case "audit_log.csv":
 			written, err = streamDiagnosticAuditCSV(ctx, snapshotStore.ReadDB(), zw, codebook)
 		case "cf_events.csv":
@@ -794,6 +806,9 @@ func diagnosticLargeTableStats(ctx context.Context, db storage.ReadQuerier, snap
 		"cf_events.csv":     {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM cf_events`},
 		"usage_records.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM usage_records`},
 		"billing_holds.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM billing_holds`},
+		"diagnostic_events.csv": {
+			sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM diagnostic_events`,
+		},
 		"affinity_bindings.csv": {sql: `SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(created_at),0) FROM (
 SELECT created_at FROM affinity_aliases WHERE expires_at>?
 UNION ALL
@@ -829,6 +844,161 @@ func streamDiagnosticCSV(zw *zip.Writer, name string, header []string, writeRows
 	}
 	cw.Flush()
 	return rows, cw.Error()
+}
+
+func streamDiagnosticEventsCSV(
+	ctx context.Context,
+	db storage.ReadQuerier,
+	zw *zip.Writer,
+	codebook diagnosticCodebook,
+) (int64, error) {
+	header := []string{
+		"event_code", "created_at", "event_type", "severity", "entity_type",
+		"entity_alias", "detail_json", "diagnostic_gap",
+	}
+	return streamDiagnosticCSV(zw, "diagnostic_events.csv", header, func(cw *csv.Writer) (int64, error) {
+		rows, err := db.QueryContext(ctx, `
+SELECT id,event_type,severity,entity_type,entity_alias,detail_json,diagnostic_gap,created_at
+FROM diagnostic_events ORDER BY created_at,id`)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		var written int64
+		for rows.Next() {
+			var event storage.DiagnosticEvent
+			var gap int
+			if err := rows.Scan(
+				&event.ID, &event.EventType, &event.Severity, &event.EntityType,
+				&event.EntityAlias, &event.DetailJSON, &gap, &event.CreatedAt,
+			); err != nil {
+				return written, err
+			}
+			event.DiagnosticGap = gap != 0
+			if err := cw.Write(codebook.safeCSVRow(diagnosticEventRow(event, codebook))); err != nil {
+				return written, err
+			}
+			written++
+		}
+		return written, rows.Err()
+	})
+}
+
+var (
+	diagnosticEventEnumRE   = regexp.MustCompile(`^[a-z][a-z0-9_.:-]{0,63}$`)
+	diagnosticEntityAliasRE = regexp.MustCompile(`^(?:ACC|EGR|GRP|USR|KEY|REQ|SES|TSK|HST|JOB|ENT)-[A-Z2-7]{26}$`)
+)
+
+func diagnosticEventRow(event storage.DiagnosticEvent, codebook diagnosticCodebook) []string {
+	eventType := strings.ToLower(strings.TrimSpace(event.EventType))
+	if !diagnosticEventEnumRE.MatchString(eventType) {
+		eventType = "unknown"
+	}
+	severity := strings.ToLower(strings.TrimSpace(event.Severity))
+	switch severity {
+	case "debug", "info", "warning", "error", "normal", "pressure", "critical", "emergency":
+	default:
+		severity = "unknown"
+	}
+	entityType := strings.ToLower(strings.TrimSpace(event.EntityType))
+	if entityType != "" && !diagnosticEventEnumRE.MatchString(entityType) {
+		entityType = "unknown"
+	}
+	return []string{
+		diagnosticAlias(codebook.aliasKey, "EVT", "diagnostic-event", event.ID),
+		strconv.FormatInt(event.CreatedAt, 10),
+		eventType,
+		severity,
+		entityType,
+		diagnosticExportEntityAlias(codebook, entityType, event.EntityAlias),
+		sanitizeDiagnosticEventDetail(event.DetailJSON, codebook),
+		strconv.FormatBool(event.DiagnosticGap),
+	}
+}
+
+func diagnosticExportEntityAlias(codebook diagnosticCodebook, entityType, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	upper := strings.ToUpper(value)
+	if diagnosticEntityAliasRE.MatchString(upper) {
+		return upper
+	}
+	prefix := map[string]string{
+		"account": "ACC", "egress": "EGR", "group": "GRP", "user": "USR",
+		"key": "KEY", "request": "REQ", "session": "SES", "task": "TSK",
+		"host": "HST", "diagnostic_job": "JOB",
+	}[entityType]
+	if prefix == "" {
+		prefix = "ENT"
+	}
+	return diagnosticAlias(codebook.aliasKey, prefix, entityType, value)
+}
+
+func sanitizeDiagnosticEventDetail(raw string, codebook diagnosticCodebook) string {
+	var value interface{}
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(raw)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		value = map[string]interface{}{
+			"unparsed": diagnosticAlias(codebook.aliasKey, "TEXT", "event-detail", raw),
+		}
+	}
+	value = sanitizeDiagnosticEventValue("", value, codebook)
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return `{"unparsed":"TEXT-INVALID"}`
+	}
+	return string(encoded)
+}
+
+func sanitizeDiagnosticEventValue(field string, value interface{}, codebook diagnosticCodebook) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		safe := make(map[string]interface{}, len(typed))
+		for key, child := range typed {
+			safeKey := strings.ToLower(strings.TrimSpace(key))
+			if !diagnosticEventEnumRE.MatchString(safeKey) {
+				safeKey = strings.ToLower(diagnosticAlias(codebook.aliasKey, "FIELD", "event-field", key))
+			}
+			safe[safeKey] = sanitizeDiagnosticEventValue(safeKey, child, codebook)
+		}
+		return safe
+	case []interface{}:
+		safe := make([]interface{}, len(typed))
+		for index := range typed {
+			safe[index] = sanitizeDiagnosticEventValue(field, typed[index], codebook)
+		}
+		return safe
+	case string:
+		typed = strings.TrimSpace(typed)
+		if typed == "" {
+			return ""
+		}
+		if diagnosticEventTypedStringField(field) && diagnosticEventEnumRE.MatchString(strings.ToLower(typed)) {
+			return strings.ToLower(typed)
+		}
+		sanitized := codebook.sanitize(typed)
+		if sanitized != typed {
+			return sanitized
+		}
+		return diagnosticAlias(codebook.aliasKey, "TEXT", "event-detail:"+field, typed)
+	case json.Number, float64, bool, nil:
+		return typed
+	default:
+		return diagnosticAlias(codebook.aliasKey, "TEXT", "event-detail:"+field, fmt.Sprint(typed))
+	}
+}
+
+func diagnosticEventTypedStringField(field string) bool {
+	switch field {
+	case "action", "component", "error_code", "level", "mode", "operation", "phase",
+		"previous_level", "reason", "resource_type", "result", "role", "source", "state", "status":
+		return true
+	default:
+		return false
+	}
 }
 
 func streamDiagnosticAuditCSV(ctx context.Context, db storage.ReadQuerier, zw *zip.Writer, codebook diagnosticCodebook) (int64, error) {
@@ -1037,6 +1207,7 @@ func buildDiagnosticsZipFiles(accounts []storage.Account, tokensByID map[string]
 	addCSV("codex_upstream_attempts_daily.csv", []string{"day_start", "account_code", "egress_id", "state", "status_code", "attempt_count", "first_created_at", "last_created_at"}, nil)
 	addCSV("route_attempts.csv", []string{"request_id", "tier", "target", "selection_type", "status_class", "fallback_target", "created_at"}, nil)
 	addCSV("provider_attempts.csv", []string{"request_id", "account_code", "provider", "phase", "status", "error_class", "body_hash", "retry_after", "created_at"}, nil)
+	addCSV("diagnostic_events.csv", []string{"event_code", "created_at", "event_type", "severity", "entity_type", "entity_alias", "detail_json", "diagnostic_gap"}, nil)
 	addCSV("codex_group_policy_revisions.csv", []string{"group_name", "instructions_enabled", "instruction_file_count", "policy_revision_hmac_prefix", "updated_at"}, nil)
 	addCSV("sidecar_status.csv", []string{"sidecar_egress_id", "real_egress_id", "health", "profile_max_concurrency", "adaptive_limit", "inflight", "queue_depth", "recent_failures", "circuit_state", "circuit_until", "bypass_until", "cooldown_until", "bound_account_count", "created_at", "updated_at"}, nil)
 	addCSV("settings.csv", []string{"key", "value", "updated_at"}, settingRows(settings))
@@ -1508,15 +1679,24 @@ func buildDiagnosticCodebookWithKey(aliasKey []byte, accounts []storage.Account,
 	sort.Slice(replacements, func(i, j int) bool {
 		return len(replacements[i].Needle) > len(replacements[j].Needle)
 	})
-	oldnew := make([]string, 0, len(replacements)*2)
+	var replacementRoot *diagnosticReplacementNode
+	if len(replacements) > 0 {
+		replacementRoot = &diagnosticReplacementNode{children: map[byte]*diagnosticReplacementNode{}}
+	}
 	for _, repl := range replacements {
-		oldnew = append(oldnew, repl.Needle, repl.Code)
+		node := replacementRoot
+		for index := 0; index < len(repl.Needle); index++ {
+			next := node.children[repl.Needle[index]]
+			if next == nil {
+				next = &diagnosticReplacementNode{children: map[byte]*diagnosticReplacementNode{}}
+				node.children[repl.Needle[index]] = next
+			}
+			node = next
+		}
+		node.replacement = repl
+		node.hasReplacement = true
 	}
-	var replacer *strings.Replacer
-	if len(oldnew) > 0 {
-		replacer = strings.NewReplacer(oldnew...)
-	}
-	return diagnosticCodebook{byID: identities, replacements: replacements, replacer: replacer, aliasKey: append([]byte(nil), aliasKey...)}
+	return diagnosticCodebook{byID: identities, replacements: replacements, replacement: replacementRoot, aliasKey: append([]byte(nil), aliasKey...)}
 }
 
 var diagnosticBase32 = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -1539,13 +1719,20 @@ func (b diagnosticCodebook) code(accountID string) string {
 }
 
 func (b diagnosticCodebook) sanitize(text string) string {
-	if b.replacer != nil {
-		text = b.replacer.Replace(text)
-	}
+	text = b.replaceIdentities(text)
 	text = diagnosticPrivateKeyRE.ReplaceAllString(text, "[REDACTED-CREDENTIAL]")
 	text = diagnosticBearerRE.ReplaceAllString(text, "Bearer [REDACTED-CREDENTIAL]")
 	text = diagnosticJWTRE.ReplaceAllStringFunc(text, func(value string) string {
 		return diagnosticAlias(b.aliasKey, "TOKEN", "credential", value)
+	})
+	text = diagnosticSecretPrefixRE.ReplaceAllStringFunc(text, func(value string) string {
+		return diagnosticAlias(b.aliasKey, "TOKEN", "credential", value)
+	})
+	text = diagnosticRequestIDRE.ReplaceAllStringFunc(text, func(value string) string {
+		if diagnosticStableAliasRE.MatchString(strings.ToUpper(value)) {
+			return value
+		}
+		return diagnosticAlias(b.aliasKey, "REQ", "request", value)
 	})
 	text = diagnosticEmailRE.ReplaceAllStringFunc(text, func(value string) string {
 		return diagnosticAlias(b.aliasKey, "EMAIL", "email", strings.ToLower(value))
@@ -1574,27 +1761,129 @@ func (b diagnosticCodebook) sanitize(text string) string {
 		return prefix + diagnosticAlias(b.aliasKey, "PATH", "path", path)
 	})
 	text = diagnosticHighEntropyRE.ReplaceAllStringFunc(text, func(value string) string {
-		upper := strings.ToUpper(value)
-		for _, prefix := range []string{"ACC-", "EMAIL-", "URL-", "IP-", "PATH-", "TOKEN-", "REQ-"} {
-			if strings.HasPrefix(upper, prefix) {
-				return value
-			}
+		if !diagnosticHighEntropyCandidate(value) {
+			return value
 		}
 		return diagnosticAlias(b.aliasKey, "TOKEN", "unknown-string", value)
 	})
 	return text
 }
 
+func (b diagnosticCodebook) replaceIdentities(text string) string {
+	if b.replacement == nil || text == "" {
+		return text
+	}
+	var out strings.Builder
+	out.Grow(len(text))
+	changed := false
+	for index := 0; index < len(text); {
+		node := b.replacement
+		var match diagnosticReplacement
+		matchEnd := index
+		for cursor := index; cursor < len(text); cursor++ {
+			node = node.children[text[cursor]]
+			if node == nil {
+				break
+			}
+			if node.hasReplacement && diagnosticIdentityBoundaries(text, index, cursor+1, node.replacement.Needle) {
+				match = node.replacement
+				matchEnd = cursor + 1
+			}
+		}
+		if matchEnd > index {
+			out.WriteString(match.Code)
+			index = matchEnd
+			changed = true
+			continue
+		}
+		out.WriteByte(text[index])
+		index++
+	}
+	if !changed {
+		return text
+	}
+	return out.String()
+}
+
+func diagnosticIdentityBoundaries(text string, start, end int, needle string) bool {
+	first, _ := utf8.DecodeRuneInString(needle)
+	if diagnosticIdentityWordRune(first) && start > 0 {
+		previous, _ := utf8.DecodeLastRuneInString(text[:start])
+		if diagnosticIdentityWordRune(previous) {
+			return false
+		}
+	}
+	last, _ := utf8.DecodeLastRuneInString(needle)
+	if diagnosticIdentityWordRune(last) && end < len(text) {
+		next, _ := utf8.DecodeRuneInString(text[end:])
+		if diagnosticIdentityWordRune(next) {
+			return false
+		}
+	}
+	return true
+}
+
+func diagnosticIdentityWordRune(value rune) bool {
+	return value == '_' || unicode.IsLetter(value) || unicode.IsNumber(value)
+}
+
+func diagnosticHighEntropyCandidate(value string) bool {
+	if len(value) < 40 || diagnosticStableAliasRE.MatchString(strings.ToUpper(value)) {
+		return false
+	}
+	lowerSnakeCase := true
+	underscoreCount := 0
+	counts := map[rune]int{}
+	runeCount := 0
+	for _, character := range value {
+		runeCount++
+		counts[character]++
+		if character == '_' {
+			underscoreCount++
+		}
+		if (character < 'a' || character > 'z') && character != '_' {
+			lowerSnakeCase = false
+		}
+	}
+	// Long schema fields and enum values are identifiers, not secrets. The old
+	// regexp classified any 40-byte snake_case value as high entropy and
+	// destroyed otherwise useful diagnostic state.
+	if lowerSnakeCase && underscoreCount >= 2 {
+		return false
+	}
+	if runeCount == 0 {
+		return false
+	}
+	var entropy float64
+	for _, count := range counts {
+		probability := float64(count) / float64(runeCount)
+		entropy -= probability * (math.Log(probability) / math.Ln2)
+	}
+	return entropy >= 3.5
+}
+
+func diagnosticContainsHighEntropy(value string) bool {
+	for _, candidate := range diagnosticHighEntropyRE.FindAllString(value, -1) {
+		if diagnosticHighEntropyCandidate(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 var (
-	diagnosticPrivateKeyRE  = regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY-----.*?-----END[ A-Z0-9_-]{0,40}PRIVATE KEY-----`)
-	diagnosticBearerRE      = regexp.MustCompile(`(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}`)
-	diagnosticJWTRE         = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	diagnosticEmailRE       = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
-	diagnosticURLRE         = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s,"'<>]+`)
-	diagnosticIPv4RE        = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
-	diagnosticWindowsPathRE = regexp.MustCompile(`(?i)\b[A-Z]:\\(?:[^\\\s,"'<>]+\\)*[^\\\s,"'<>]*`)
-	diagnosticUnixPathRE    = regexp.MustCompile(`(?:^|[\s="'(])(/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+:-]+)+)`)
-	diagnosticHighEntropyRE = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
+	diagnosticPrivateKeyRE   = regexp.MustCompile(`(?is)-----BEGIN[ A-Z0-9_-]{0,40}PRIVATE KEY-----.*?-----END[ A-Z0-9_-]{0,40}PRIVATE KEY-----`)
+	diagnosticBearerRE       = regexp.MustCompile(`(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}`)
+	diagnosticJWTRE          = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
+	diagnosticSecretPrefixRE = regexp.MustCompile(`(?i)\b(?:sk|rk|ghp|github_pat|xox[baprs]|ya29|AIza)[_-][A-Za-z0-9._~+/=-]{12,}`)
+	diagnosticRequestIDRE    = regexp.MustCompile(`(?i)\breq[_-][A-Za-z0-9][A-Za-z0-9_-]{11,}\b`)
+	diagnosticEmailRE        = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
+	diagnosticURLRE          = regexp.MustCompile(`(?i)\b(?:https?|socks5h?)://[^\s,"'<>]+`)
+	diagnosticIPv4RE         = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b`)
+	diagnosticWindowsPathRE  = regexp.MustCompile(`(?i)\b[A-Z]:\\(?:[^\\\s,"'<>]+\\)*[^\\\s,"'<>]*`)
+	diagnosticUnixPathRE     = regexp.MustCompile(`(?:^|[\s="'(])(/[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+:-]+)+)`)
+	diagnosticHighEntropyRE  = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
+	diagnosticStableAliasRE  = regexp.MustCompile(`^(?:ACC|EGR|GRP|USR|KEY|REQ|SES|TSK|HST|JOB|ENT|EVT|EMAIL|URL|IP|PATH|TOKEN|TEXT|FIELD)-[A-Z2-7]{26}$`)
 )
 
 func diagnosticSafeCSVCell(value string) string {

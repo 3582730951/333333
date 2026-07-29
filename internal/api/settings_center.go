@@ -785,16 +785,9 @@ func (s *Server) automationStats(ctx context.Context) (map[string]interface{}, e
 			cooling++
 		}
 	}
-	plusCount := 0
-	for _, acc := range accounts {
-		if acc.PlanType == "plus" || acc.PlanType == "chatgptplusplan" {
-			plusCount++
-		}
-	}
 	return map[string]interface{}{
 		"pool_count": len(accounts),
 		"health":     map[string]int{"alive": alive, "dead": dead, "cooling": cooling},
-		"plus_count": plusCount,
 	}, nil
 }
 

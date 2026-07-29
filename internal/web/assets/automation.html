@@ -133,31 +133,6 @@
       <button class="btn" style="width:100%;margin-top:10px" onclick="savePolicy('health')">保存配置</button>
     </div>
 
-    <!-- Policy 4: Plus Upgrade (Optional) -->
-    <div class="policy-card" id="policy-plus">
-      <h3>⭐ Plus 升级自动化 <label class="toggle"><input type="checkbox" id="plus-enabled" onchange="togglePolicy('plus')"><span class="slider"></span></label></h3>
-
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-        <input type="checkbox" id="plus-auto">
-        <span>自动升级新注册账号</span>
-      </label>
-
-      <label class="f" style="margin-top:12px">支付方式</label>
-      <select class="t" id="plus-payment">
-        <option value="gopay">Gopay 自动支付</option>
-        <option value="manual">手动支付</option>
-      </select>
-
-      <label class="f">失败重试次数</label>
-      <input class="t" type="number" id="plus-retry" value="3" min="0" max="10">
-
-      <div class="stat-box" style="margin-top:12px">
-        <div class="num" id="plus-count">--</div>
-        <div class="lbl">已升级账号数</div>
-      </div>
-
-      <button class="btn" style="width:100%;margin-top:10px" onclick="savePolicy('plus')">保存配置</button>
-    </div>
   </div>
 </div>
 
@@ -238,10 +213,6 @@
       config.interval = parseInt(document.getElementById('health-interval').value);
       config.quarantine = document.getElementById('health-quarantine').checked;
       config.refresh = document.getElementById('health-refresh').checked;
-    } else if (type === 'plus') {
-      config.auto = document.getElementById('plus-auto').checked;
-      config.payment = document.getElementById('plus-payment').value;
-      config.retry = parseInt(document.getElementById('plus-retry').value);
     }
     try {
       const res = await fetch(`${API_BASE}/admin/automation/policies`, {
@@ -265,9 +236,6 @@
         document.getElementById('health-alive').textContent = data.health.alive || 0;
         document.getElementById('health-dead').textContent = data.health.dead || 0;
         document.getElementById('health-cooling').textContent = data.health.cooling || 0;
-      }
-      if (data.plus_count !== undefined) {
-        document.getElementById('plus-count').textContent = data.plus_count;
       }
     } catch (e) { console.error('加载统计失败:', e); }
   }

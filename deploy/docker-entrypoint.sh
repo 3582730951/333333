@@ -23,7 +23,7 @@ fi
 
 mkdir -p "$run_dir"
 rm -f "$worker_socket"
-"$worker" "$@" --release-id "$release_id" --unix-socket "$worker_socket" &
+"$worker" "$@" --release-id "$release_id" --deployment-role active --unix-socket "$worker_socket" &
 worker_pid=$!
 
 i=0

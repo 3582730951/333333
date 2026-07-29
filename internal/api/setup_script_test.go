@@ -62,19 +62,21 @@ func TestSetupScriptBashSyntaxAndContents(t *testing.T) {
 	}
 }
 
-func TestSetupScriptWritesIndependent56ContextAndCompactionLimits(t *testing.T) {
+func TestSetupScriptWrites56HardLimitAndLeavesCompactionToClient(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.6-sol", "ultra", "never", "danger-full-access")
 	for _, want := range []string{
-		"model_context_window = 272000",
-		"model_auto_compact_token_limit = 272000",
+		"model_context_window = 372000",
 		`model_reasoning_effort = "ultra"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("5.6 setup script missing %q\n---\n%s", want, script)
 		}
 	}
+	if strings.Contains(script, "model_auto_compact_token_limit =") {
+		t.Fatalf("5.6 setup script must leave automatic compaction to Codex\n---\n%s", script)
+	}
 	legacy := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "xhigh", "never", "danger-full-access")
-	for _, forbidden := range []string{"model_context_window = 272000", "model_auto_compact_token_limit = 272000"} {
+	for _, forbidden := range []string{"model_context_window = 372000", "model_auto_compact_token_limit ="} {
 		if strings.Contains(legacy, forbidden) {
 			t.Fatalf("non-5.6 setup script received 5.6 override %q", forbidden)
 		}
@@ -114,12 +116,12 @@ func TestSetupScriptInstallsUnique56ContextKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := string(data)
-	for _, line := range []string{"model_context_window = 272000", "model_auto_compact_token_limit = 272000"} {
+	for _, line := range []string{"model_context_window = 372000"} {
 		if strings.Count(config, line) != 1 {
 			t.Fatalf("installed config must contain exactly one %q\n---\n%s", line, config)
 		}
 	}
-	for _, stale := range []string{"model_context_window = 111000", "model_auto_compact_token_limit = 100000"} {
+	for _, stale := range []string{"model_context_window = 111000", "model_auto_compact_token_limit = 100000", "model_auto_compact_token_limit ="} {
 		if strings.Contains(config, stale) {
 			t.Fatalf("installed config retained stale key %q\n---\n%s", stale, config)
 		}

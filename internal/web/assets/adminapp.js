@@ -32,7 +32,6 @@ const NAV_ADMIN_GROUPS = [
     { v: "keys", ic: "key", key: "nav.keys" },
     { v: "groups", ic: "folder", key: "nav.groups" },
     { v: "org", ic: "briefcase", key: "nav.org" },
-    { v: "gopay", ic: "card", key: "nav.gopay" },
   ] },
   { key: "grp.admin_system", items: [
     { v: "settings", ic: "gear", key: "nav.settings" },
@@ -148,7 +147,6 @@ function loadView(v) {
     moderation: typeof loadModeration === "function" ? loadModeration : null,
     cf: typeof loadCF === "function" ? loadCF : null,
     audit: typeof loadAudit === "function" ? loadAudit : null,
-    gopay: typeof loadGopay === "function" ? loadGopay : null,
     org: typeof loadOrg === "function" ? loadOrg : null,
     settings: typeof loadSettings === "function" ? loadSettings : null,
     sysconfig: typeof loadSystemConfig === "function" ? loadSystemConfig : null,

@@ -1,6 +1,8 @@
 package api
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestDiskGuardThresholdsAndHysteresis(t *testing.T) {
 	cases := []struct {
@@ -23,5 +25,16 @@ func TestDiskGuardThresholdsAndHysteresis(t *testing.T) {
 		if got := diskGuardLevel(tc.free, tc.bytes, tc.previous); got != tc.want {
 			t.Errorf("free=%v bytes=%d previous=%s got=%s want=%s", tc.free, tc.bytes, tc.previous, got, tc.want)
 		}
+	}
+}
+
+func TestBodySpoolReservePreservesEmergencyHeadroom(t *testing.T) {
+	reserve := bodySpoolMinimumFreeBytes(t.TempDir(), 0)
+	if reserve < int64(diskEmergencyFreeBytes) {
+		t.Fatalf("automatic spool reserve = %d, want at least %d", reserve, diskEmergencyFreeBytes)
+	}
+	explicit := reserve + 64<<20
+	if got := bodySpoolMinimumFreeBytes(t.TempDir(), explicit); got < explicit {
+		t.Fatalf("explicit spool reserve = %d, want at least %d", got, explicit)
 	}
 }

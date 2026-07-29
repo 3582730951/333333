@@ -274,7 +274,7 @@ func neutralizeOrphanedToolOutputs(input []interface{}) ([]interface{}, int) {
 }
 
 // toolCallPairKind and toolOutputPairKind intentionally enumerate the stable
-// rust-v0.144.5 pairing rules. Unknown future *_call fields are not guessed at: native
+// rust-v0.146.0 pairing rules. Unknown future *_call fields are not guessed at: native
 // Responses forwarding preserves them, while context recovery leaves them untouched.
 func toolCallPairKind(t string) string {
 	switch strings.ToLower(strings.TrimSpace(t)) {

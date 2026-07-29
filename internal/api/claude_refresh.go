@@ -38,6 +38,7 @@ type claudeRefreshGate struct {
 type claudeRefreshResult struct {
 	Token               storage.AccountToken
 	Refreshed           bool
+	Reactivated         bool
 	Method              string
 	Reason              string
 	TerminalAuthFailure bool
@@ -299,6 +300,20 @@ func (s *Server) forceRefreshClaudeTokenWithHeartbeat(ctx context.Context, accou
 			s.handleClaudeRefreshFailure(refreshCtx, account, refreshed, err, source)
 			return err
 		}
+		if refreshed.Reactivated {
+			_ = s.store.InsertAuditLog(refreshCtx, storage.AuditLogRow{
+				AccountID:    account.ID,
+				AccountLabel: firstNonEmpty(account.Label, account.Email, account.ID),
+				Action:       "auth_recovered",
+				State:        "active",
+				Reason:       "credential_refresh",
+				Detail:       fmt.Sprintf("provider=claude source=%s method=%s", source, refreshed.Method),
+			})
+			if s.scheduler != nil {
+				s.scheduler.InvalidateAccountCache()
+				s.scheduler.NotifyStateChanged()
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -479,8 +494,26 @@ func (s *Server) refreshClaudeToken(ctx context.Context, account storage.Account
 			result.Header = resp.Header.Clone()
 			result.Body = raw
 			result.Reason, result.TerminalAuthFailure = claudeRefreshFailureReason(resp.StatusCode, raw)
-			err := fmt.Errorf("anthropic token refresh failed (%d): %s", resp.StatusCode, bodySnippet(raw, 300))
-			if result.TerminalAuthFailure || (resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500) {
+			err := fmt.Errorf("anthropic token refresh failed (%d): %s", resp.StatusCode, result.Reason)
+			if result.TerminalAuthFailure {
+				// A rotating refresh token can be consumed by the previous worker
+				// during a release handoff. Re-read the committed credential before
+				// quarantining the account: if another worker persisted a newer
+				// access/refresh pair, this invalid_grant belongs to the stale copy.
+				if fresh, recovered := s.recoverClaudeRefreshRace(ctx, token); recovered {
+					result.Token = fresh
+					result.Refreshed = true
+					result.TerminalAuthFailure = false
+					result.Method = "database_race_recovery"
+					result.Reason = "rotated_credential_recovered"
+					result.StatusCode = 0
+					result.Header = nil
+					result.Body = nil
+					return result, nil
+				}
+				return result, err
+			}
+			if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 				return result, err
 			}
 			if waitErr := waitRefreshBackoff(ctx, resp.Header, backoff); waitErr != nil {
@@ -529,7 +562,8 @@ func (s *Server) refreshClaudeToken(ctx context.Context, account storage.Account
 			token.OAuthRateLimitTier = strings.TrimSpace(refreshed.RateLimitTier)
 		}
 		token.LastRefresh = storage.Now()
-		if err := s.store.UpdateToken(ctx, token); err != nil {
+		reactivated, err := s.store.UpdateTokenAfterCredentialRefresh(ctx, token)
+		if err != nil {
 			return result, err
 		}
 		if strings.TrimSpace(refreshed.SubscriptionType) != "" {
@@ -537,9 +571,54 @@ func (s *Server) refreshClaudeToken(ctx context.Context, account storage.Account
 		}
 		result.Token = token
 		result.Refreshed = true
+		result.Reactivated = reactivated
 		result.Method = "anthropic_oauth"
 		return result, nil
 	}
+}
+
+func (s *Server) recoverClaudeRefreshRace(ctx context.Context, used storage.AccountToken) (storage.AccountToken, bool) {
+	// A successful peer refresh normally commits before the losing invalid_grant
+	// response arrives. Short bounded retries cover the remaining commit race
+	// without turning a genuinely revoked credential into an unbounded retry loop.
+	delays := []time.Duration{0, 100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond}
+	for _, delay := range delays {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return storage.AccountToken{}, false
+			case <-timer.C:
+			}
+		}
+		fresh, err := s.store.GetTokenFresh(ctx, used.AccountID)
+		if err != nil {
+			continue
+		}
+		if claudeCredentialAdvanced(used, fresh) {
+			return fresh, true
+		}
+	}
+	return storage.AccountToken{}, false
+}
+
+func claudeCredentialAdvanced(used, fresh storage.AccountToken) bool {
+	if strings.TrimSpace(fresh.AccessToken) == "" {
+		return false
+	}
+	rotated := fresh.RefreshToken != used.RefreshToken || fresh.AccessToken != used.AccessToken
+	if !rotated {
+		return false
+	}
+	// UpdatedAt is the durable row version. LastRefresh is retained as a fallback
+	// for imported legacy rows that predate reliable updated_at timestamps.
+	return fresh.UpdatedAt > used.UpdatedAt || fresh.LastRefresh > used.LastRefresh || fresh.ExpiresAt > used.ExpiresAt
 }
 
 func waitRefreshBackoff(ctx context.Context, header http.Header, fallback time.Duration) error {
@@ -585,6 +664,7 @@ func claudeRefreshFailureReason(status int, body []byte) (string, bool) {
 }
 
 func (s *Server) handleClaudeRefreshFailure(ctx context.Context, account storage.Account, result claudeRefreshResult, err error, source string) {
+	_ = err
 	reason := firstNonEmpty(result.Reason, "refresh_failed")
 	if result.TerminalAuthFailure {
 		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
@@ -593,7 +673,7 @@ func (s *Server) handleClaudeRefreshFailure(ctx context.Context, account storage
 			Action:       "auth_expired",
 			State:        string(ban.AuthExpired),
 			Reason:       reason,
-			Detail:       fmt.Sprintf("source=%s http=%d error=%v body=%s", source, result.StatusCode, err, bodySnippet(result.Body, 600)),
+			Detail:       fmt.Sprintf("source=%s http=%d class=%s", source, result.StatusCode, reason),
 		})
 		_ = s.store.SetAccountStatus(ctx, account.ID, "auth_expired")
 		return

@@ -21,8 +21,6 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from datetime import datetime, timezone, timedelta
 import requests as std_requests
 from curl_cffi import requests as curl_requests
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= 加载配置 =================
 def _load_config():
@@ -401,12 +399,14 @@ def _save_codex_tokens(email: str, tokens: dict):
     refresh_token = tokens.get("refresh_token", "")
     id_token = tokens.get("id_token", "")
 
-    if access_token:
+    emit_only = _as_bool(os.environ.get("CODEX_REG_EMIT_ONLY", "0"))
+
+    if access_token and not emit_only:
         with _file_lock:
             with open(AK_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{access_token}\n")
 
-    if refresh_token:
+    if refresh_token and not emit_only:
         with _file_lock:
             with open(RK_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{refresh_token}\n")
@@ -436,12 +436,15 @@ def _save_codex_tokens(email: str, tokens: dict):
         "refresh_token": refresh_token,
     }
 
+    # Machine-readable marker so a parent process (pool_server Go) can import the account.
+    print("__CODEX_ACCOUNT__ " + json.dumps(token_data, ensure_ascii=False), flush=True)
+
+    if emit_only:
+        return
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     token_dir = TOKEN_JSON_DIR if os.path.isabs(TOKEN_JSON_DIR) else os.path.join(base_dir, TOKEN_JSON_DIR)
     os.makedirs(token_dir, exist_ok=True)
-
-    # Machine-readable marker so a parent process (pool_server Go) can import the account.
-    print("__CODEX_ACCOUNT__ " + json.dumps(token_data, ensure_ascii=False), flush=True)
 
     token_path = os.path.join(token_dir, f"{email}.json")
     with _file_lock:
@@ -1835,7 +1838,7 @@ class ChatGPTRegister:
         self._print(f"[OAuth] /oauth/token -> {token_resp.status_code}")
 
         if token_resp.status_code != 200:
-            self._print(f"[OAuth] token 交换失败: {token_resp.status_code} {token_resp.text[:200]}")
+            self._print(f"[OAuth] token 交换失败: status={token_resp.status_code}")
             return None
 
         try:
@@ -1934,11 +1937,14 @@ def _register_one(idx, total, proxy, output_file, max_retries=3):
                     if OAUTH_REQUIRED:
                         raise Exception("OAuth 获取失败 (required=true)")
 
-            # 4. 写入结果
-            with _file_lock:
-                with open(output_file, "a", encoding="utf-8") as out:
-                    out.write(f"{email}----{chatgpt_password}----{email_pwd}"
-                              f"----oauth={'ok' if oauth_ok else 'fail'}\n")
+            # 4. Standalone mode may keep its historical result file. The Go
+            # orchestrator uses emit-only mode so credentials exist only in the
+            # bounded child stdout buffer and the encrypted DB transaction.
+            if not _as_bool(os.environ.get("CODEX_REG_EMIT_ONLY", "0")):
+                with _file_lock:
+                    with open(output_file, "a", encoding="utf-8") as out:
+                        out.write(f"{email}----{chatgpt_password}----{email_pwd}"
+                                  f"----oauth={'ok' if oauth_ok else 'fail'}\n")
 
             _update_stats(success=1, running=-1)
             _print_progress(idx, total, email, "ok",

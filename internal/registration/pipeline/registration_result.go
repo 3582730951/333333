@@ -35,30 +35,40 @@ func (p *Pipeline) updateWorkflow(ctx context.Context, req RegisterRequest, stat
 	_ = p.store.UpdateRegistrationWorkflowItem(ctx, req.WorkflowItemID, state, errorClass)
 }
 
+func (p *Pipeline) finalizeWorkflow(ctx context.Context, req RegisterRequest, state, errorClass string) {
+	base := context.Background()
+	if ctx != nil {
+		base = context.WithoutCancel(ctx)
+	}
+	persistCtx, cancel := context.WithTimeout(base, 5*time.Second)
+	defer cancel()
+	p.updateWorkflow(persistCtx, req, state, errorClass)
+}
+
 func (p *Pipeline) persistVerifiedRegistration(ctx context.Context, req RegisterRequest, candidate registrationCredential) (*storage.Account, error) {
 	p.updateWorkflow(ctx, req, storage.RegistrationItemCredentialsObtained, "")
 	parsed, err := authparse.ParseAccessToken(candidate.AccessToken, candidate.UpstreamAccountID)
 	if err != nil {
-		p.updateWorkflow(context.WithoutCancel(ctx), req, storage.RegistrationItemQuarantined, "credential_invalid")
+		p.finalizeWorkflow(ctx, req, storage.RegistrationItemQuarantined, "credential_invalid")
 		return nil, fmt.Errorf("registration credential validation failed: %w", err)
 	}
 	if got, want := strings.TrimSpace(parsed.UpstreamAccountID), strings.TrimSpace(candidate.UpstreamAccountID); want != "" && got != want {
-		p.updateWorkflow(context.WithoutCancel(ctx), req, storage.RegistrationItemQuarantined, "remote_identity_mismatch")
+		p.finalizeWorkflow(ctx, req, storage.RegistrationItemQuarantined, "remote_identity_mismatch")
 		return nil, errors.New("registration remote account identity mismatch")
 	}
 	if got, want := strings.TrimSpace(parsed.ChatGPTUserID), strings.TrimSpace(candidate.ChatGPTUserID); want != "" && got != "" && got != want {
-		p.updateWorkflow(context.WithoutCancel(ctx), req, storage.RegistrationItemQuarantined, "remote_identity_mismatch")
+		p.finalizeWorkflow(ctx, req, storage.RegistrationItemQuarantined, "remote_identity_mismatch")
 		return nil, errors.New("registration remote user identity mismatch")
 	}
 	if got, want := strings.TrimSpace(parsed.Email), strings.TrimSpace(candidate.Email); want != "" && got != "" && !strings.EqualFold(got, want) {
-		p.updateWorkflow(context.WithoutCancel(ctx), req, storage.RegistrationItemQuarantined, "remote_identity_mismatch")
+		p.finalizeWorkflow(ctx, req, storage.RegistrationItemQuarantined, "remote_identity_mismatch")
 		return nil, errors.New("registration remote email identity mismatch")
 	}
 
 	p.updateWorkflow(ctx, req, storage.RegistrationItemRemoteAccountVerifying, "")
 	if p.remoteVerificationRequired || req.Canary {
 		if err := p.verifyRegistrationLiveness(ctx, req, parsed.AccessToken, parsed.UpstreamAccountID); err != nil {
-			p.updateWorkflow(context.WithoutCancel(ctx), req, storage.RegistrationItemQuarantined, "remote_liveness_failed")
+			p.finalizeWorkflow(ctx, req, storage.RegistrationItemQuarantined, "remote_liveness_failed")
 			return nil, err
 		}
 	}
@@ -108,7 +118,7 @@ func (p *Pipeline) persistVerifiedRegistration(ctx context.Context, req Register
 			state = storage.RegistrationItemQuarantined
 			class = "duplicate_remote_identity"
 		}
-		p.updateWorkflow(context.WithoutCancel(ctx), req, state, class)
+		p.finalizeWorkflow(ctx, req, state, class)
 		return nil, fmt.Errorf("commit verified registration: %w", err)
 	}
 	return &account, nil

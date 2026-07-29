@@ -286,6 +286,114 @@ func TestClaudeMessagesRefreshesOnceAfterAuthExpired401(t *testing.T) {
 	}
 }
 
+func TestClaudeInvalidGrantRecoversCredentialRotatedByPreviousWorker(t *testing.T) {
+	var h *testHarness
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current, err := h.store.GetTokenFresh(r.Context(), "claude-oauth")
+		if err != nil {
+			t.Fatalf("load peer credential: %v", err)
+		}
+		current.AccessToken = "sk-ant-oat-peer"
+		current.RefreshToken = "refresh-peer"
+		current.ExpiresAt = storage.Now() + 3600
+		current.LastRefresh = storage.Now()
+		if _, err := h.store.UpdateTokenAfterCredentialRefresh(r.Context(), current); err != nil {
+			t.Fatalf("persist peer credential: %v", err)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"refresh token already used"}`))
+	}))
+	defer oauth.Close()
+
+	h = newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"msg","type":"message","role":"assistant","content":[]}`))
+	})
+	rebuildHarnessForClaudeOAuth(t, h, oauth.URL)
+	account := upsertClaudeOAuthAccount(t, h, "sk-ant-oat-old", "refresh-old", storage.Now()-1)
+
+	got, err := h.app.forceRefreshClaudeToken(context.Background(), account, "admin_refresh")
+	if err != nil {
+		t.Fatalf("rotating-token race was treated as terminal auth failure: %v", err)
+	}
+	if got.AccessToken != "sk-ant-oat-peer" || got.RefreshToken != "refresh-peer" {
+		t.Fatalf("recovered token = access:%q refresh:%q", got.AccessToken, got.RefreshToken)
+	}
+	storedAccount, err := h.store.GetAccount(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedAccount.Status != "active" {
+		t.Fatalf("race recovery quarantined a valid account: %+v", storedAccount)
+	}
+}
+
+func TestClaudeSuccessfulRefreshReactivatesAuthExpiredAccount(t *testing.T) {
+	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"sk-ant-oat-recovered","refresh_token":"refresh-recovered","expires_in":3600}`))
+	}))
+	defer oauth.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-ant-oat-recovered" {
+			t.Fatalf("auth = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	})
+	rebuildHarnessForClaudeOAuth(t, h, oauth.URL)
+	account := upsertClaudeOAuthAccount(t, h, "sk-ant-oat-stale", "refresh-current", storage.Now()+3600)
+	if err := h.store.SetAccountStatus(context.Background(), account.ID, "auth_expired"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetAccountQuarantine(context.Background(), account.ID, storage.Now()+3600, "old credential failure"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.BenchBindingForRecheck(context.Background(), account.ID, storage.Now()+300); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
+
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/accounts/"+account.ID+"/refresh", "")
+	if code != http.StatusOK {
+		t.Fatalf("admin refresh = %d: %s", code, raw)
+	}
+	gotAccount, err := h.store.GetAccount(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAccount.Status != "active" || gotAccount.QuarantineUntil != 0 || gotAccount.QuarantineReason != "" {
+		t.Fatalf("recovered account = %+v", gotAccount)
+	}
+	binding, err := h.store.GetEgressBinding(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.RecheckPending || binding.CooldownUntil != 0 {
+		t.Fatalf("recovered binding still benched: %+v", binding)
+	}
+	token := mustToken(t, h, account.ID)
+	if token.AccessToken != "sk-ant-oat-recovered" || token.RefreshToken != "refresh-recovered" || token.ExpiresAt <= storage.Now() {
+		t.Fatalf("recovered token = %+v", token)
+	}
+	var recoveredAudit int
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM audit_log WHERE account_id=? AND action='auth_recovered' AND state='active'`, account.ID).Scan(&recoveredAudit); err != nil {
+		t.Fatal(err)
+	}
+	if recoveredAudit != 1 {
+		t.Fatalf("auth recovery audit rows = %d, want 1", recoveredAudit)
+	}
+
+	resp, err := http.Post(h.pool.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("recovered account did not rejoin scheduler: status=%d body=%s", resp.StatusCode, body)
+	}
+}
+
 func TestClaudeMessagesStreamSendsRefreshWaitHeartbeat(t *testing.T) {
 	releaseRefresh := make(chan struct{})
 	oauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

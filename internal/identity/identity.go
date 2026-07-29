@@ -32,12 +32,12 @@ import (
 
 // Current official client versions. Kept here so a single edit updates the
 // fingerprint everywhere. These should track the real shipping clients.
-// Refreshed 2026-07-10 from Docker captures of Claude Code 2.1.206 and Codex
-// 0.144.5 plus the matching local open-source Codex tree. Claude's captured tuple
-// is Node v26.3.0 with Stainless package 0.94.0.
+// Refreshed 2026-07-29 from the shipping Claude Code 2.1.220 binary and the
+// official Codex rust-v0.146.0 source/release. Claude's shipping tuple remains
+// Node v26.3.0 with Stainless package 0.94.0.
 const (
-	CodexCLIVersion  = "0.144.5"
-	ClaudeCLIVersion = "2.1.206"
+	CodexCLIVersion  = "0.146.0"
+	ClaudeCLIVersion = "2.1.220"
 	// CodexOriginator is the interactive Codex CLI entrypoint id; CodexOriginatorExec
 	// is the `codex exec` (non-interactive) entrypoint. The official client sends one
 	// or the other depending on how it was launched, so the relay mirrors whichever
@@ -48,7 +48,7 @@ const (
 	CodexOriginatorVSCode = "codex_vscode"
 	// CodexJA3 is the TLS ClientHello fingerprint (ja3 string) captured from the real
 	// Codex (Rust) binary against api.openai.com — ja3 hash 69d274b521896ab1d71737c4d804e22c
-	// (/tmp/pool-capture-20260710/manifest.json; the 0.144.5 source still uses stock
+	// (/tmp/pool-capture-20260710/manifest.json; current Codex source still uses stock
 	// reqwest/rustls without ClientHello customization).
 	// It is REFERENCE DATA, not a default or an alias target: verified against the Codex
 	// source (other_codex), the real client does NO JA3 spoofing — it builds a stock
@@ -231,7 +231,7 @@ type Identity struct {
 	ClaudeCLIVersion string // claude-cli/<v> (User-Agent)
 	// StainlessPackageVersion is the @anthropic-ai/sdk (Stainless) version reported
 	// in X-Stainless-Package-Version. It is a SEPARATE axis from the claude-cli
-	// version (the real client sends claude-cli/2.1.206 with SDK 0.94.0), so
+	// version (the real client sends claude-cli/2.1.220 with SDK 0.94.0), so
 	// it must not be conflated with ClaudeCLIVersion.
 	StainlessPackageVersion string
 	CodexCLIVersion         string // codex_cli_rs/<v>
@@ -302,7 +302,7 @@ var allProfiles = func() []profile {
 // supersedes these.
 var (
 	// Keep the three coupled Claude version axes on the one combination captured
-	// from the shipping 2.1.206 binary. Independently rotating stale values can
+	// from the shipping 2.1.220 binary. Independently rotating stale values can
 	// create a cli/runtime/SDK tuple that no real Claude Code release ever shipped.
 	claudeCLIVersionPool = []string{ClaudeCLIVersion}
 	// Newer Codex models are actively client-version gated, so the Codex UA/version
@@ -581,7 +581,7 @@ func (i Identity) CodexUserAgentForOriginator(originator, version string) string
 }
 
 // ClaudeUserAgent returns the Claude Code CLI User-Agent, e.g.
-// "claude-cli/2.1.206 (external, cli)".
+// "claude-cli/2.1.220 (external, cli)".
 func (i Identity) ClaudeUserAgent() string {
 	return i.ClaudeUserAgentVersion(ClaudeCLIVersion)
 }

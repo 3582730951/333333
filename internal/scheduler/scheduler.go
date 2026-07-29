@@ -1368,7 +1368,7 @@ func resolveAntigravityRouteModel(route Route, caps []storage.ModelCapability) (
 }
 
 func resolveCodexRouteModel(route Route, caps []storage.ModelCapability) (string, bool, bool) {
-	requested := strings.TrimSpace(route.Model)
+	requested := capability.NormalizeCodexModelAlias(route.Model)
 	for _, c := range caps {
 		if !strings.EqualFold(strings.TrimSpace(c.ModelSlug), requested) {
 			continue

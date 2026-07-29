@@ -563,6 +563,9 @@ func (s *Server) adminProbeModels(w http.ResponseWriter, r *http.Request, accoun
 // ModelProbeIntervalHours is 0 the background refresh is disabled (imports and the
 // manual admin probe still work).
 func (s *Server) StartBackground(ctx context.Context) {
+	if s.regHandler != nil {
+		s.regHandler.StartRuntime(ctx)
+	}
 	// Cooldown→health-recheck loop runs independently of the model-probe sweep (it
 	// must work even when model probing is disabled).
 	s.startRecheckLoop(ctx)
@@ -578,6 +581,16 @@ func (s *Server) StartBackground(ctx context.Context) {
 		s.probeAllAccounts(ctx)
 		s.probeLoop(ctx, interval)
 	})
+}
+
+// StopRegistrationJobs cancels registrar subprocesses and waits within the
+// caller's shutdown deadline. It is separate from async telemetry flushing so
+// account/provider transactions settle before the database is closed.
+func (s *Server) StopRegistrationJobs(ctx context.Context) error {
+	if s == nil || s.regHandler == nil {
+		return nil
+	}
+	return s.regHandler.StopRuntime(ctx)
 }
 
 func (s *Server) probeLoop(ctx context.Context, interval time.Duration) {

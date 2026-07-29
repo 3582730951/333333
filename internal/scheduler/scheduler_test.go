@@ -1088,6 +1088,11 @@ func TestClaudeAliasRequiresVerifiedCapabilityAndRejectionsStayModelScoped(t *te
 	}}); ok || resolved != "" {
 		t.Fatalf("rejected Codex model was retried as %q", resolved)
 	}
+	if resolved, bootstrap, ok := resolveCodexRouteModel(Route{Model: "gpt-5.6"}, []storage.ModelCapability{{
+		ModelSlug: "gpt-5.6-sol", AvailabilityState: capability.AvailabilityVerified, Source: "probe",
+	}}); !ok || bootstrap || resolved != "gpt-5.6-sol" {
+		t.Fatalf("official direct Codex alias resolved=%q bootstrap=%v ok=%v", resolved, bootstrap, ok)
+	}
 }
 
 func TestAntigravityRouteRequiresExactVerifiedAccountCapability(t *testing.T) {

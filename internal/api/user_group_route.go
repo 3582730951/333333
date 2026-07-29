@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/bodysource"
 	"codex-account-pool/internal/routing"
@@ -20,6 +21,130 @@ import (
 
 type userGroupRouteOverrideKey struct{}
 type userGroupFallbackProbeKey struct{}
+
+var (
+	// A request that currently has no eligible account-pool target stays queued
+	// for one full request window. Polling watches only cheap DB generations; the
+	// original inference body is retried only after capacity changes (plus a slow
+	// safety recheck for external providers).
+	userGroupCapacityWaitTimeout         = 10 * time.Minute
+	userGroupCapacityPollInterval        = 5 * time.Second
+	userGroupCapacityHeartbeatInterval   = 15 * time.Second
+	userGroupCapacitySafetyRetryInterval = time.Minute
+)
+
+type userGroupCapacityWaitState struct {
+	deadline      time.Time
+	generation    string
+	lastHeartbeat time.Time
+	lastRetry     time.Time
+	started       bool
+}
+
+type userGroupCapacityUnavailableError struct {
+	UserGroupID string
+	Model       string
+}
+
+func (e *userGroupCapacityUnavailableError) Error() string {
+	return fmt.Sprintf("user group %s has no eligible target for model %q", e.UserGroupID, e.Model)
+}
+
+func (s *Server) newUserGroupCapacityWaitState(ctx context.Context, pol downstreamPolicy) userGroupCapacityWaitState {
+	now := time.Now()
+	deadline := now.Add(userGroupCapacityWaitTimeout)
+	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+		deadline = requestDeadline
+	}
+	generation, _ := s.store.UserGroupRouteGeneration(ctx, pol.UserGroupID, pol.Group)
+	return userGroupCapacityWaitState{
+		deadline:   deadline,
+		generation: generation,
+		lastRetry:  now,
+	}
+}
+
+// waitForUserGroupCapacityChange keeps a streaming client alive without
+// repeatedly replaying its potentially large body. A target/policy/account/model
+// generation change wakes it immediately; a slow safety retry covers provider
+// recovery that is external to the local database.
+func (s *Server) waitForUserGroupCapacityChange(ctx context.Context, pol downstreamPolicy, state *userGroupCapacityWaitState) bool {
+	if state == nil || !time.Now().Before(state.deadline) {
+		return false
+	}
+	heartbeat := schedulerWaitCallback(ctx)
+	if !state.started {
+		state.started = true
+		state.lastHeartbeat = time.Now()
+		if heartbeat != nil {
+			heartbeat("user_group_capacity", 0)
+		}
+	}
+	for {
+		now := time.Now()
+		if !now.Before(state.deadline) {
+			return false
+		}
+		wait := userGroupCapacityPollInterval
+		if remaining := time.Until(state.deadline); remaining < wait {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return false
+		case <-timer.C:
+		}
+
+		now = time.Now()
+		if heartbeat != nil && now.Sub(state.lastHeartbeat) >= userGroupCapacityHeartbeatInterval {
+			heartbeat("user_group_capacity", now.Sub(state.lastRetry))
+			state.lastHeartbeat = now
+		}
+		generation, err := s.store.UserGroupRouteGeneration(ctx, pol.UserGroupID, pol.Group)
+		if err == nil && generation != state.generation {
+			state.generation = generation
+			state.lastRetry = now
+			return true
+		}
+		if now.Sub(state.lastRetry) >= userGroupCapacitySafetyRetryInterval {
+			state.lastRetry = now
+			return true
+		}
+	}
+}
+
+func finishUserGroupCapacityWait(ctx context.Context, w http.ResponseWriter) {
+	if schedulerWaitTerminal(ctx, "The configured group has no available service.") {
+		return
+	}
+	writePublicServiceUnavailable(w)
+}
+
+func blockedUserGroupTarget(group storage.UserGroup, target storage.TargetRef, model string) bool {
+	if target.Kind != storage.TargetKindAccountPoolGroup {
+		return false
+	}
+	var blocked []string
+	switch modelInstructionFamily(model) {
+	case storage.ModelInstructionFamilyClaude:
+		blocked = group.BlockClaudeTargetGroups
+	case storage.ModelInstructionFamilyGPT:
+		blocked = group.BlockGPTTargetGroups
+	}
+	for _, groupName := range blocked {
+		if strings.TrimSpace(groupName) == target.ID {
+			return true
+		}
+	}
+	return false
+}
 
 type userGroupRoutePlan struct {
 	UserGroupID  string
@@ -31,6 +156,10 @@ type userGroupRoutePlan struct {
 	Persist      bool
 	Bound        bool
 	BoundTarget  storage.TargetRef
+	// PolicyTransfer is set when an existing model-scoped binding now points at
+	// an account-pool target blocked by the user-group policy. The next eligible
+	// target atomically takes over that binding instead of returning a rejection.
+	PolicyTransfer bool
 }
 
 func withUserGroupRouteOverride(ctx context.Context, target storage.TargetRef) context.Context {
@@ -105,7 +234,7 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 		tiers = userGroupTiersForProvider(tiers, hint)
 	}
 	if len(tiers) == 0 {
-		return userGroupRoutePlan{}, fmt.Errorf("user group %s has no target compatible with model %q", group.ID, model)
+		return userGroupRoutePlan{}, &userGroupCapacityUnavailableError{UserGroupID: group.ID, Model: model}
 	}
 	affinityKeyObj := routing.ExtractAffinityKey(r, raw)
 	if strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/messages") {
@@ -153,6 +282,13 @@ func resolveUserGroupRouteCandidates(ctx context.Context, store *storage.Store, 
 				plan.BoundTarget = exception.Target
 				plan.Tiers = prioritizeUserGroupTargetInTiers(orderedTiers, exception.Target)
 				plan.Candidates = flattenUserGroupTiers(plan.Tiers)
+			} else if exceptionFound {
+				// A policy edit can invalidate a durable model-specific target while
+				// no traffic is present. Preserve the old value as the CAS expected
+				// target and let the first later request transfer it atomically.
+				plan.Bound = true
+				plan.BoundTarget = exception.Target
+				plan.PolicyTransfer = true
 			}
 		}
 	}
@@ -235,8 +371,18 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 	if _, forced := userGroupRouteOverride(r.Context()); forced {
 		return false
 	}
+	capacityWait := s.newUserGroupCapacityWaitState(r.Context(), pol)
+
+retryUserGroupRoute:
 	plan, err := resolveUserGroupRouteCandidates(r.Context(), s.store, pol, r, resolvedRaw)
 	if err != nil {
+		if _, unavailable := err.(*userGroupCapacityUnavailableError); unavailable {
+			if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
+				goto retryUserGroupRoute
+			}
+			finishUserGroupCapacityWait(r.Context(), w)
+			return true
+		}
 		writePoolCodeError(w, http.StatusUnprocessableEntity, "user_group_route_unavailable", err.Error())
 		return true
 	}
@@ -247,7 +393,7 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 	replaySafe := !routing.HasServerSideState(r.URL.Path, r, resolvedRaw)
 	streamRequest := isStreamRequest(resolvedRaw)
 	units := buildUserGroupDispatchUnits(plan)
-	allowBindingMigration := false
+	allowBindingMigration := plan.PolicyTransfer
 	for index := 0; index < len(units); index++ {
 		unit := units[index]
 		target := unit.Targets[0]
@@ -261,6 +407,15 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-route-response-*",
 		}, speculative)
 		candidateContext := withUserGroupRouteOverride(r.Context(), target)
+		stopCapacityHeartbeat := func() {}
+		if capacityWait.started {
+			// The outer response has already emitted a protocol heartbeat. Keep
+			// that heartbeat running while a changed target is tried, but buffer
+			// any nested scheduler failure so it cannot terminate the outer stream
+			// before the full 10-minute takeover window expires.
+			stopCapacityHeartbeat = startSchedulerWaitKeepalive(r.Context(), userGroupCapacityHeartbeatInterval)
+			candidateContext = withBufferedSchedulerWait(candidateContext, attempt)
+		}
 		var choiceState *scheduler.RouteChoiceState
 		if replaySafe && userGroupTargetsAreAccountPools(unit.Targets) {
 			choices := make([]scheduler.RouteChoice, 0, len(unit.Targets))
@@ -323,6 +478,7 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 		candidate.Body, candidate.GetBody = replayUserGroupRequestBody(r.Context(), originalRaw)
 		candidate.ContentLength = int64(len(originalRaw))
 		dispatch(attempt, candidate)
+		stopCapacityHeartbeat()
 		if candidate.Body != nil {
 			_ = candidate.Body.Close()
 		}
@@ -341,13 +497,17 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 		}
 		status := attempt.Status()
 		if status < http.StatusBadRequest {
+			// The client may close immediately after receiving the terminal frame.
+			// Route/response bindings are durability work for the *next* turn, so
+			// retain request values but detach cancellation and bound the write.
+			bindingCtx, bindingCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
 			// Scheduler-backed pool migrations CAS before releasing the winning lease.
 			// Provider targets have no lease boundary, so migrate only after the
 			// replacement produced a successful response. A concurrent CAS winner is
 			// retained, while this response ID is still aliased to the target that
 			// actually produced it below.
 			if plan.Persist && plan.Bound && allowBindingMigration && target != plan.BoundTarget {
-				actual, _, migrationErr := s.store.CompareAndSwapUserGroupTargetBinding(r.Context(), plan.BoundTarget, storage.UserGroupTargetBinding{
+				actual, _, migrationErr := s.store.CompareAndSwapUserGroupTargetBinding(bindingCtx, plan.BoundTarget, storage.UserGroupTargetBinding{
 					UserGroupID: plan.UserGroupID, AffinityKey: plan.AffinityKey,
 					Model: plan.BindingModel, Target: target,
 				})
@@ -358,7 +518,7 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 					plan.BoundTarget = actual.Target
 				}
 			}
-			if bindingErr := commitUserGroupRouteBinding(r.Context(), s.store, plan, target); bindingErr != nil {
+			if bindingErr := commitUserGroupRouteBinding(bindingCtx, s.store, plan, target); bindingErr != nil {
 				log.Printf("[USER-GROUP-ROUTE] binding persistence failed request_id=%s user_group=%s target_kind=%s target_id=%s model=%s: %v",
 					requestIDFromContext(r.Context()), plan.UserGroupID, target.Kind, target.ID, plan.BindingModel, bindingErr)
 			}
@@ -372,11 +532,12 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 				aliasPlan.BindingModel = ""
 				aliasPlan.Persist = true
 				aliasPlan.Bound = false
-				if bindingErr := commitUserGroupRouteBinding(r.Context(), s.store, aliasPlan, target); bindingErr != nil {
+				if bindingErr := commitUserGroupRouteBinding(bindingCtx, s.store, aliasPlan, target); bindingErr != nil {
 					log.Printf("[USER-GROUP-ROUTE] response binding persistence failed request_id=%s user_group=%s target_kind=%s target_id=%s: %v",
 						requestIDFromContext(r.Context()), plan.UserGroupID, target.Kind, target.ID, bindingErr)
 				}
 			}
+			bindingCancel()
 			s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, "success", "")
 			attempt.Commit()
 			return true
@@ -403,6 +564,14 @@ func (s *Server) dispatchUserGroupRouteCandidates(w http.ResponseWriter, r *http
 		}
 		s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), fallbackName)
 		if !moreUnits || !replaySafe || !retryable {
+			if !moreUnits && replaySafe && retryable && attempt.PermanentTargetFailure() {
+				_ = attempt.Close()
+				if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
+					goto retryUserGroupRoute
+				}
+				finishUserGroupCapacityWait(r.Context(), w)
+				return true
+			}
 			attempt.Commit()
 			return true
 		}
@@ -1062,7 +1231,9 @@ func compatibleUserGroupTiers(ctx context.Context, store *storage.Store, group s
 			if _, configured := selected[key]; !configured {
 				return nil, fmt.Errorf("user group routing target %s/%s is not selected", normalized.Kind, normalized.ID)
 			}
-			if _, duplicate := seen[key]; duplicate || !userGroupTargetSupportsModel(ctx, store, normalized, model) {
+			if _, duplicate := seen[key]; duplicate ||
+				blockedUserGroupTarget(group, normalized, model) ||
+				!userGroupTargetSupportsModel(ctx, store, normalized, model) {
 				continue
 			}
 			seen[key] = struct{}{}

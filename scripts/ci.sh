@@ -16,30 +16,35 @@ export GOFLAGS="-buildvcs=false"
 
 step() { printf '\n\033[1;36m=== %s ===\033[0m\n' "$1"; }
 
-step "1/6 gofmt"
+step "1/7 gofmt"
 unformatted="$(gofmt -l . | grep -v '^web-spa/' || true)"
 if [ -n "$unformatted" ]; then
   echo "gofmt needs running on:"; echo "$unformatted"; exit 1
 fi
 echo "ok"
 
-step "2/6 go vet"
+step "2/7 deployment shell lifecycle"
+bash -n scripts/install.sh scripts/rollback-release.sh scripts/fetch-diagnostics.sh scripts/collect-vps-diagnostics.sh scripts/test-install-single-worker.sh
+bash scripts/test-install-single-worker.sh
+echo "ok"
+
+step "3/7 go vet"
 go vet ./...
 echo "ok"
 
-step "3/6 go build"
+step "4/7 go build"
 go build ./...
 go build -trimpath -o /tmp/pool-server ./cmd/pool-server
 echo "ok ($(du -h /tmp/pool-server | cut -f1))"
 
-step "4/6 go test"
+step "5/7 go test"
 go test ./...
 
 if [ "${SKIP_RACE:-0}" != "1" ]; then
-  step "5/6 go test -race (concurrency-heavy packages)"
+  step "6/7 go test -race (concurrency-heavy packages)"
   go test -race ./internal/scheduler/... ./internal/api/... ./internal/upstream/... ./internal/registration/...
 else
-  step "5/6 go test -race — SKIPPED (SKIP_RACE=1)"
+  step "6/7 go test -race — SKIPPED (SKIP_RACE=1)"
 fi
 
 if command -v staticcheck >/dev/null 2>&1; then
@@ -48,7 +53,7 @@ if command -v staticcheck >/dev/null 2>&1; then
 fi
 
 if [ "${SKIP_SPA:-0}" != "1" ]; then
-  step "6/6 SPA build + visual smoke (web-spa → internal/console/dist)"
+  step "7/7 SPA build + visual smoke (web-spa → internal/console/dist)"
   if command -v npm >/dev/null 2>&1; then
     [ -d web-spa/node_modules ] || npm --prefix web-spa install
     if [ "${SKIP_VISUAL_SMOKE:-0}" != "1" ]; then
@@ -62,7 +67,7 @@ if [ "${SKIP_SPA:-0}" != "1" ]; then
     echo "npm not found — skipping SPA build"
   fi
 else
-  step "6/6 SPA build — SKIPPED (SKIP_SPA=1)"
+  step "7/7 SPA build — SKIPPED (SKIP_SPA=1)"
 fi
 
 printf '\n\033[1;32mAll automated checks passed.\033[0m\n'

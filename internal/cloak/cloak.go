@@ -273,7 +273,7 @@ func normalizeClaudeCodeIdentityCacheTTL(root map[string]interface{}, ttl string
 		if strings.HasPrefix(trimmed, legacyClaudeCodeIdentityLine) {
 			// A downstream may still be an older Claude Code build. Keep any
 			// environment suffix but align the leading identity with the captured
-			// shipping client so the body agrees with the synthesized 2.1.206 UA.
+			// shipping client so the body agrees with the configured shipping UA.
 			trimmed = claudeCodeIdentityLine + strings.TrimPrefix(trimmed, legacyClaudeCodeIdentityLine)
 			m["text"] = trimmed
 		}
@@ -690,7 +690,7 @@ func setClaudeBillingBlock(root map[string]interface{}, version string) bool {
 }
 
 // claudeBillingHeaderText builds the billing-header block for a claude-cli version.
-// Shipping 2.1.206 emits a fresh three-hex suffix on every request and no cch field.
+// Shipping 2.1.220 emits a fresh three-hex suffix on every request and no cch field.
 // The launch entrypoint is projected from an existing native billing block.
 func claudeBillingHeaderText(version string) string {
 	return claudeBillingHeaderTextForEntrypoint(version, "cli")

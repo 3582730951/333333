@@ -56,8 +56,8 @@ func TestDiagnosticsWSRegressionDataset(t *testing.T) {
 		} `json:"goal_write_amplification"`
 		CacheTelemetryLag struct {
 			PendingUsageRequests int  `json:"pending_usage_requests"`
-			UsageLagSeconds       int  `json:"usage_lag_seconds"`
-			PartialData           bool `json:"partial_data"`
+			UsageLagSeconds      int  `json:"usage_lag_seconds"`
+			PartialData          bool `json:"partial_data"`
 		} `json:"cache_telemetry_lag"`
 	}
 	if err := json.Unmarshal(raw, &fixture); err != nil {

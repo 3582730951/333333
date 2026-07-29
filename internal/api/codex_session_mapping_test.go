@@ -1191,6 +1191,70 @@ func TestCodexSessionMappingCreatesDistinctChildAndForkTrees(t *testing.T) {
 	}
 }
 
+func TestCodexTerminalCommitPreservesResponseAliasAcrossLegacyHierarchyConflict(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	enableCodexSessionMappingForTest(h)
+	ctx := context.Background()
+	const downstreamRoot = "client-root-with-legacy-owner"
+	body := []byte(`{"model":"gpt","session_id":"` + downstreamRoot + `","thread_id":"` + downstreamRoot + `","input":"fresh turn"}`)
+	request, err := http.NewRequest(http.MethodPost, "http://example.invalid/v1/responses", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapping, err := h.app.resolveCodexSessionMapping(ctx, request, body, downstreamPolicy{})
+	if err != nil || mapping.binding != nil {
+		t.Fatalf("fresh mapping=%+v err=%v", mapping.binding, err)
+	}
+	lease := scheduler.Lease{
+		Account: storage.Account{ID: "account-new"},
+		Egress:  storage.EgressProfile{ID: storage.DefaultDirectEgressID, Type: "direct"},
+	}
+	snapshot, err := mapping.identitySnapshot(h.app.identitySecret(), lease, "Linux")
+	if err != nil || snapshot == nil {
+		t.Fatalf("identity snapshot=%+v err=%v", snapshot, err)
+	}
+
+	// Simulate an older concurrently active worker winning the hierarchy alias
+	// after this request resolved but before its successful terminal was persisted.
+	competing, err := h.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
+		Namespace: "unauthenticated",
+		Binding: storage.CodexSessionBinding{
+			ID: "legacy-winner", TreeID: "legacy-tree", AccountID: "account-legacy", EgressID: storage.DefaultDirectEgressID,
+			State: "active", RootSessionID: "legacy-internal-root", ThreadID: "legacy-internal-root",
+		},
+		Aliases: []storage.CodexSessionAlias{
+			{Type: "root", Value: downstreamRoot},
+			{Type: "session", Value: downstreamRoot},
+			{Type: "response", Value: "resp-legacy-winner"},
+		},
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := h.app.commitCodexSessionMapping(cancelled, mapping, lease, lease.Egress, "resp-new-terminal", "state-new-terminal", false); err != nil {
+		t.Fatalf("terminal commit must retain its unique state aliases: %v", err)
+	}
+	resolved, err := h.store.ResolveCodexSessionAliases(ctx, "unauthenticated", []storage.CodexSessionAlias{
+		{Type: "response", Value: "resp-new-terminal"},
+		{Type: "turn_state", Value: "state-new-terminal"},
+	})
+	if err != nil || resolved.ID == competing.ID || resolved.AccountID != lease.Account.ID {
+		t.Fatalf("new terminal alias resolved=%+v err=%v competing=%+v", resolved, err, competing)
+	}
+	root, err := h.store.ResolveCodexSessionAliases(ctx, "unauthenticated", []storage.CodexSessionAlias{{Type: "root", Value: downstreamRoot}})
+	if err != nil || root.ID != competing.ID {
+		t.Fatalf("legacy hierarchy owner changed root=%+v err=%v", root, err)
+	}
+	var audits int
+	if err := h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='codex_session_hierarchy_alias_conflict' AND reason='legacy_active_owner'`).Scan(&audits); err != nil || audits != 1 {
+		t.Fatalf("hierarchy conflict audit count=%d err=%v", audits, err)
+	}
+}
+
 func turnIDFromHeader(raw string) string {
 	var metadata map[string]interface{}
 	if json.Unmarshal([]byte(raw), &metadata) != nil {
