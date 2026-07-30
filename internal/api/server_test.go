@@ -2882,20 +2882,47 @@ func TestCodexStatelessContinuationFailsOverOn429(t *testing.T) {
 	h.app.cfg.CodexCPAStrict = true
 	h.app.cfg.CodexStatelessPassthrough = true
 	accountA := h.importAccount(t, "a", "upstream-a", "access-a")
-	h.importAccount(t, "b", "upstream-b", "access-b")
+	accountB := h.importAccount(t, "b", "upstream-b", "access-b")
+	// Make the failover precondition explicit instead of depending on the
+	// generic model's unverified static-catalog treatment. The production route
+	// has two healthy accounts that both advertise the requested model.
+	setTestCapability(t, h, accountA, "gpt", 372000)
+	setTestCapability(t, h, accountB, "gpt", 372000)
+	if err := h.store.SetSettings(context.Background(), map[string]string{
+		"seamless_failover":     "true",
+		"failover_max_attempts": "2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.app.scheduler.InvalidateAccountCache()
 
 	reqBody := `{"model":"gpt","previous_response_id":"resp_from_a","prompt_cache_key":"stateless-429","input":[{"type":"custom_tool_call_output","call_id":"call_from_a","output":"keep this tool result"}]}`
 	keyReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(reqBody))
-	key := routing.ExtractAffinityKey(keyReq, []byte(reqBody))
-	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source, AccountID: accountA}); err != nil {
+	keyReq.Header.Set("Thread-Id", "stateless-429-thread")
+	key := routing.ExtractAffinityKey(keyReq, degradedResponsesReplay([]byte(reqBody)))
+	if err := h.store.UpsertAffinityBinding(context.Background(), storage.AffinityBinding{
+		RouteKeyHash: key.Hash, RouteKey: key.Key, Source: key.Source,
+		AccountID: accountA, Provider: "codex", Model: "gpt",
+		EgressID: storage.DefaultDirectEgressID,
+	}); err != nil {
 		t.Fatal(err)
+	}
+	if candidates, err := h.app.scheduler.EligibleCandidateCount(context.Background(), scheduler.Route{
+		Group: h.app.cfg.DefaultGroup, Provider: "codex", Model: "gpt",
+	}); err != nil || candidates != 2 {
+		t.Fatalf("stateless 429 fixture has %d eligible candidates, want 2: %v", candidates, err)
 	}
 	req, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Thread-Id", "stateless-429-thread")
 	req.Header.Set("X-Codex-Turn-State", "state-from-a")
+	started := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 5*time.Second {
+		t.Fatalf("stateless 429 failover waited for sticky capacity instead of switching accounts: %s", elapsed)
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()

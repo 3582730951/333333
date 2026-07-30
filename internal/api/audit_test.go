@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"codex-account-pool/internal/storage"
@@ -40,5 +41,17 @@ func TestAdminAuditCanFilterByAccountID(t *testing.T) {
 		if row.AccountID != "acc-a" {
 			t.Fatalf("filtered audit included unrelated row: %#v", row)
 		}
+	}
+}
+
+func TestAdminAuditEmptyReturnsJSONArray(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+
+	code, raw := grpReq(t, h, http.MethodGet, "/admin/audit?limit=10", "")
+	if code != http.StatusOK {
+		t.Fatalf("admin audit = %d: %s", code, raw)
+	}
+	if strings.TrimSpace(string(raw)) != "[]" {
+		t.Fatalf("empty audit response = %s, want []", raw)
 	}
 }

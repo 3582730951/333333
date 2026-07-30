@@ -48,8 +48,10 @@ func TestBuildBubblewrapArgsPreservesRuntimeCWD(t *testing.T) {
 		"165.254.109.23,165.254.109.23:8787,api.openai.com",
 		"\x00--setenv\x00ANTHROPIC_BASE_URL\x00http://165.254.109.23:8787\x00",
 		"\x00--setenv\x00ANTHROPIC_AUTH_TOKEN\x00cap_secret\x00",
-		"\x00--setenv\x00ANTHROPIC_API_KEY\x00cap_secret\x00",
 		"\x00--unsetenv\x00ANTHROPIC_API_KEY\x00",
+		"\x00--unsetenv\x00CLAUDE_CODE_USE_BEDROCK\x00",
+		"\x00--setenv\x00CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY\x001\x00",
+		"\x00--setenv\x00CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING\x001\x00",
 		"\x00--\x00/bin/claude\x00--version\x00",
 	} {
 		if !strings.Contains(joined, want) {
@@ -78,6 +80,8 @@ func TestStrictRuntimeEnvPointsClaudeCodeAtPoolAPI(t *testing.T) {
 		"\nANTHROPIC_BASE_URL=https://pool.example:1455\n",
 		"\nANTHROPIC_AUTH_TOKEN=cap_secret\n",
 		"\nCLAUDE_CODE_ENABLE_AUTO_MODE=1\n",
+		"\nCLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1\n",
+		"\nCLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1\n",
 		"pool.example,pool.example:1455,api.openai.com",
 	} {
 		if !strings.Contains(joined, want) {
@@ -112,42 +116,107 @@ func TestCompatRuntimeEnvPointsClaudeAtPoolAndKeepsHome(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.PoolServerURL = "https://pool.example/"
 	cfg.DownstreamKey = "cap_secret"
-	env := compatRuntimeEnv([]string{
+	base := []string{
 		"HOME=/home/real",
+		"ANTHROPIC_BASE_URL",
 		"ANTHROPIC_BASE_URL=https://api.anthropic.com",
+		"ANTHROPIC_BASE_URL=https://duplicate.example",
+		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_AUTH_TOKEN=old",
 		"ANTHROPIC_AUTH_TOKEN=duplicate-old",
-		"ANTHROPIC_API_KEY=host-secret",
-		"ANTHROPIC_API_KEY=duplicate-host-secret",
+		"CLAUDE_CODE_ENABLE_AUTO_MODE",
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=0",
+		"CLAUDE_CODE_ENABLE_AUTO_MODE=duplicate",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=duplicate",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=0",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=duplicate",
+		"POOL_CLIENT_RUNTIME=strict",
+		"POOL_CLIENT_RUNTIME=duplicate",
+		"POOL_STRICT_LINUX=1",
+		"POOL_STRICT_LINUX=duplicate",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 		"ANTHROPIC_MODEL=claude-opus-old",
 		"CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-old",
-	}, cfg)
+	}
+	for _, key := range claudeGatewayConflictingEnvKeys() {
+		base = append(base, key, key+"=host-value", key+"=duplicate-host-value")
+	}
+	env := compatRuntimeEnv(base, cfg)
 	joined := "\n" + strings.Join(env, "\n") + "\n"
-	for _, want := range []string{
-		"\nHOME=/home/real\n",
-		"\nANTHROPIC_BASE_URL=https://pool.example\n",
-		"\nANTHROPIC_AUTH_TOKEN=cap_secret\n",
-		"\nCLAUDE_CODE_ENABLE_AUTO_MODE=1\n",
-		"\nPOOL_CLIENT_RUNTIME=compat\n",
-		"\nPOOL_STRICT_LINUX=0\n",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("compat runtime env missing %q\n---\n%s", want, joined)
+	expected := map[string]string{
+		"HOME":                         "/home/real",
+		"ANTHROPIC_BASE_URL":           "https://pool.example",
+		"ANTHROPIC_AUTH_TOKEN":         "cap_secret",
+		"CLAUDE_CODE_ENABLE_AUTO_MODE": "1",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":     "1",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING": "1",
+		"POOL_CLIENT_RUNTIME":                            "compat",
+		"POOL_STRICT_LINUX":                              "0",
+	}
+	for key, value := range expected {
+		needle := "\n" + key + "="
+		if strings.Count(joined, needle) != 1 || !strings.Contains(joined, needle+value+"\n") {
+			t.Fatalf("compat runtime env must contain exactly one %s=%s\n---\n%s", key, value, joined)
 		}
 	}
-	if strings.Contains(joined, "https://api.anthropic.com") ||
-		strings.Contains(joined, "ANTHROPIC_AUTH_TOKEN=old") ||
-		strings.Count(joined, "\nANTHROPIC_AUTH_TOKEN=") != 1 ||
-		strings.Count(joined, "\nANTHROPIC_API_KEY=") != 1 ||
-		!strings.Contains(joined, "\nANTHROPIC_API_KEY=cap_secret\n") {
-		t.Fatalf("compat runtime env did not replace old Anthropic settings\n---\n%s", joined)
+	for _, key := range claudeGatewayConflictingEnvKeys() {
+		if key == "ANTHROPIC_AUTH_TOKEN" {
+			continue
+		}
+		if strings.Contains(joined, "\n"+key+"\n") || strings.Contains(joined, "\n"+key+"=") {
+			t.Fatalf("compat runtime env retained conflicting %s\n---\n%s", key, joined)
+		}
+	}
+	if strings.Contains(joined, "\nCLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\n") ||
+		strings.Contains(joined, "\nCLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=") {
+		t.Fatalf("compat parity mode retained total nonessential-traffic disable\n---\n%s", joined)
 	}
 	if !strings.Contains(joined, "ANTHROPIC_MODEL=claude-opus-old") || !strings.Contains(joined, "CLAUDE_CODE_SUBAGENT_MODEL=claude-haiku-old") {
 		t.Fatalf("compat runtime must preserve user-maintained model variables\n---\n%s", joined)
 	}
 }
 
-func TestCompatRuntimeEnvReplacesBareAnthropicAPIKeyWithoutMutatingInput(t *testing.T) {
+func TestCompatRuntimeEnvPrivacyPolicyReinstallsNonessentialControls(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PoolServerURL = "https://pool.example/"
+	cfg.DownstreamKey = "cap_secret"
+	base := []string{
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=old",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=duplicate",
+		"DO_NOT_TRACK=old",
+		"DO_NOT_TRACK=duplicate",
+		"DISABLE_TELEMETRY=old",
+		"DISABLE_ERROR_REPORTING=old",
+		"DISABLE_AUTOUPDATER=old",
+		"OTEL_METRICS_EXPORTER=old",
+		"OTEL_LOGS_EXPORTER=old",
+	}
+	policy := GatewayPolicy{
+		UnknownTargetPolicy:    "forward",
+		DisableNonessentialEnv: true,
+	}
+
+	joined := "\n" + strings.Join(compatRuntimeEnv(base, cfg, policy), "\n") + "\n"
+	expected := map[string]string{
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+		"DO_NOT_TRACK":            "1",
+		"DISABLE_TELEMETRY":       "1",
+		"DISABLE_ERROR_REPORTING": "1",
+		"DISABLE_AUTOUPDATER":     "1",
+		"OTEL_METRICS_EXPORTER":   "none",
+		"OTEL_LOGS_EXPORTER":      "none",
+	}
+	for key, value := range expected {
+		needle := "\n" + key + "="
+		if strings.Count(joined, needle) != 1 || !strings.Contains(joined, needle+value+"\n") {
+			t.Fatalf("compat privacy policy must install exactly one %s=%s\n---\n%s", key, value, joined)
+		}
+	}
+}
+
+func TestCompatRuntimeEnvRemovesBareAnthropicAPIKeyWithoutMutatingInput(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.PoolServerURL = "https://pool.example/"
 	cfg.DownstreamKey = "cap_secret"
@@ -161,9 +230,8 @@ func TestCompatRuntimeEnvReplacesBareAnthropicAPIKeyWithoutMutatingInput(t *test
 	env := compatRuntimeEnv(base, cfg)
 	joined := "\n" + strings.Join(env, "\n") + "\n"
 	if strings.Contains(joined, "\nANTHROPIC_API_KEY\n") ||
-		strings.Count(joined, "\nANTHROPIC_API_KEY=") != 1 ||
-		!strings.Contains(joined, "\nANTHROPIC_API_KEY=cap_secret\n") {
-		t.Fatalf("compat runtime did not replace ANTHROPIC_API_KEY\n---\n%s", joined)
+		strings.Contains(joined, "\nANTHROPIC_API_KEY=") {
+		t.Fatalf("compat runtime did not remove ANTHROPIC_API_KEY\n---\n%s", joined)
 	}
 	if !strings.Contains(joined, "\nANTHROPIC_AUTH_TOKEN=cap_secret\n") ||
 		!strings.Contains(joined, "\nKEEP=value\n") {
@@ -174,7 +242,7 @@ func TestCompatRuntimeEnvReplacesBareAnthropicAPIKeyWithoutMutatingInput(t *test
 	}
 }
 
-func TestBubblewrapReplacesAnthropicAPIKeyWithGatewayKey(t *testing.T) {
+func TestBubblewrapRemovesAnthropicAPIKeyAndUsesGatewayBearer(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ListenAddr = "127.0.0.1:8765"
 	cfg.PoolServerURL = "https://pool.example/"
@@ -200,11 +268,19 @@ func TestBubblewrapReplacesAnthropicAPIKeyWithGatewayKey(t *testing.T) {
 	if !strings.Contains(joined, "\x00--unsetenv\x00ANTHROPIC_API_KEY\x00") {
 		t.Fatalf("strict runtime does not unset host ANTHROPIC_API_KEY\nargs=%q", args)
 	}
-	if !strings.Contains(joined, "\x00--setenv\x00ANTHROPIC_API_KEY\x00cap_secret\x00") {
-		t.Fatalf("strict runtime does not install gateway API key\nargs=%q", args)
+	if strings.Contains(joined, "\x00--setenv\x00ANTHROPIC_API_KEY\x00") {
+		t.Fatalf("strict runtime reinstalled direct Anthropic API key\nargs=%q", args)
 	}
 	if !strings.Contains(joined, "\x00--setenv\x00ANTHROPIC_AUTH_TOKEN\x00cap_secret\x00") {
 		t.Fatalf("strict runtime does not install gateway auth token\nargs=%q", args)
+	}
+	for _, key := range claudeGatewayRuntimeUnsetEnvKeys() {
+		if !strings.Contains(joined, "\x00--unsetenv\x00"+key+"\x00") {
+			t.Fatalf("strict runtime did not remove %s\nargs=%q", key, args)
+		}
+	}
+	if strings.Contains(joined, "\x00--setenv\x00CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\x00") {
+		t.Fatalf("strict parity mode reinstalled total nonessential-traffic disable\nargs=%q", args)
 	}
 }
 
@@ -247,20 +323,79 @@ func claudeModelRuntimeEnvKeys() []string {
 	}
 }
 
-func TestClaudeGatewayRuntimeArgsSkipUnavailableWebFetchPreflight(t *testing.T) {
-	args := claudeGatewayRuntimeArgs([]string{"--model", "opus", "fetch docs"})
-	if len(args) < 2 || args[0] != "--settings" || args[1] != gatewayClaudeSettingsJSON {
-		t.Fatalf("gateway settings overlay missing: %q", args)
+func TestClaudeGatewayRuntimeArgsUsePrivateAuthoritativeSettingsOverlay(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PoolServerURL = "https://pool.example/"
+	cfg.DownstreamKey = "cap_secret"
+	dir := t.TempDir()
+	explicit := filepath.Join(dir, "explicit.json")
+	if err := os.WriteFile(explicit, []byte(`{
+		"permissions":{"defaultMode":"plan"},
+		"env":{
+			"KEEP_SETTING":"yes",
+			"ANTHROPIC_BASE_URL":"https://stale.example",
+			"CLAUDE_CODE_USE_BEDROCK":"1",
+			"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1"
+		},
+		"apiKeyHelper":"/tmp/stale-helper"
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args, cleanup, err := prepareClaudeGatewayRuntimeArgs(
+		[]string{"--settings", explicit, "--model", "opus", "fetch docs"},
+		cfg,
+		defaultGatewayPolicy(),
+		dir,
+		dir,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if len(args) < 2 || args[0] != "--settings" || args[1] == explicit {
+		t.Fatalf("private gateway settings overlay missing: %q", args)
+	}
+	info, err := os.Stat(args[1])
+	if err != nil || info.Mode().Perm() != gatewayConfigFileMode {
+		t.Fatalf("settings overlay mode=%v err=%v", info, err)
+	}
+	raw, err := os.ReadFile(args[1])
+	if err != nil {
+		t.Fatal(err)
 	}
 	var settings map[string]interface{}
-	if err := json.Unmarshal([]byte(args[1]), &settings); err != nil {
+	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatalf("settings overlay is invalid JSON: %v", err)
 	}
-	if settings["skipWebFetchPreflight"] != true {
-		t.Fatalf("WebFetch preflight is not disabled: %v", settings)
+	env, _ := settings["env"].(map[string]interface{})
+	for key, want := range map[string]interface{}{
+		"KEEP_SETTING":                                   "yes",
+		"ANTHROPIC_BASE_URL":                             "https://pool.example",
+		"ANTHROPIC_AUTH_TOKEN":                           "cap_secret",
+		"ANTHROPIC_API_KEY":                              "",
+		"CLAUDE_CODE_USE_BEDROCK":                        "",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST":           "",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":       "",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":     "1",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING": "1",
+	} {
+		if env[key] != want {
+			t.Fatalf("gateway settings env[%s]=%#v, want %#v\n%s", key, env[key], want, raw)
+		}
+	}
+	if settings["skipWebFetchPreflight"] != true || settings["apiKeyHelper"] != "" {
+		t.Fatalf("gateway settings did not neutralize preflight/helper: %v", settings)
+	}
+	permissions, _ := settings["permissions"].(map[string]interface{})
+	if permissions["defaultMode"] != "plan" {
+		t.Fatalf("explicit non-gateway settings were not preserved: %v", settings)
 	}
 	if got := strings.Join(args[2:], "\x00"); got != "--model\x00opus\x00fetch docs" {
 		t.Fatalf("caller args changed: %q", args)
+	}
+	cleanup()
+	if _, err := os.Stat(args[1]); !os.IsNotExist(err) {
+		t.Fatalf("ephemeral settings overlay survived cleanup: %v", err)
 	}
 }
 

@@ -432,7 +432,48 @@ func (s *Server) seedImportedAccountCapabilities(ctx context.Context, account st
 	case "", "codex":
 		caps = capability.StaticCodexModels(account.ID)
 	default:
-		return nil
+		provider, ok, err := s.store.GetCustomProvider(ctx, account.Provider)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		seen := map[string]struct{}{}
+		add := func(model string) {
+			model = strings.TrimSpace(model)
+			if model == "" {
+				return
+			}
+			if _, exists := seen[model]; exists {
+				return
+			}
+			seen[model] = struct{}{}
+			caps = append(caps, storage.ModelCapability{
+				AccountID: account.ID, ModelSlug: model,
+				AvailabilityState:             capability.AvailabilityUnverified,
+				EffectiveContextWindowPercent: 100,
+				Visibility:                    "list",
+				Source:                        "custom_static_unverified:" + provider.ID,
+				LastProbeAt:                   storage.Now(),
+			})
+		}
+		for _, model := range provider.Models {
+			add(model)
+		}
+		for source, target := range provider.ModelMappings {
+			if strings.TrimSpace(source) != "*" {
+				add(source)
+			}
+			add(target)
+		}
+		if provider.AutoDiscoverModels &&
+			provider.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
+			len(caps) == 0 {
+			for _, model := range capability.ClaudeProbeModelTable() {
+				add(model)
+			}
+		}
 	}
 	return s.store.UpsertCapabilities(ctx, caps)
 }
@@ -623,6 +664,8 @@ func (s *Server) adminAccountAction(w http.ResponseWriter, r *http.Request) {
 		s.adminSetAccountStatus(w, r, accountID, "active")
 	case "clear-quarantine":
 		s.adminClearQuarantine(w, r, accountID)
+	case "clear-cooldown":
+		s.adminClearCooldown(w, r, accountID)
 	case "rate-limit-controls":
 		s.adminSetAccountRateLimitControls(w, r, accountID)
 	case "group":
@@ -812,6 +855,10 @@ func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, ac
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
+		s.scheduler.NotifyStateChanged()
+	}
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 		AccountID: accountID,
 		Action:    "clear_quarantine",
@@ -819,6 +866,39 @@ func (s *Server) adminClearQuarantine(w http.ResponseWriter, r *http.Request, ac
 		Reason:    "cleared by admin",
 	})
 	writeJSON(w, http.StatusOK, map[string]interface{}{"account_id": accountID, "quarantine_until": 0})
+}
+
+func (s *Server) adminClearCooldown(w http.ResponseWriter, r *http.Request, accountID string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	rateLimitSnapshotsCleared, err := s.store.ClearAccountCooldown(r.Context(), accountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.scheduler != nil {
+		s.scheduler.InvalidateAccountCache()
+		s.scheduler.NotifyStateChanged()
+	}
+	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
+		AccountID: accountID,
+		Action:    "clear_cooldown",
+		State:     "manual",
+		Reason:    "cleared by admin",
+		Detail:    fmt.Sprintf("rate_limit_snapshots_cleared=%d", rateLimitSnapshotsCleared),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"account_id":                   accountID,
+		"cooldown_until":               0,
+		"recheck_pending":              false,
+		"rate_limit_snapshots_cleared": rateLimitSnapshotsCleared,
+	})
 }
 
 func (s *Server) adminDeleteAccount(w http.ResponseWriter, r *http.Request, accountID string) {

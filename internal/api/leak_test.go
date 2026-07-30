@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,6 +12,22 @@ import (
 
 	upstreamrules "codex-account-pool/internal/upstream_error_rules"
 )
+
+func TestWriteUpstreamHeadersDropsAccountScopedModelsETag(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	source := http.Header{
+		"Content-Type":  []string{"text/event-stream"},
+		"X-Models-Etag": []string{`W/"single-account"`},
+	}
+	destination := http.Header{}
+	h.app.writeUpstreamHeaders(context.Background(), destination, source)
+	if got := destination.Get("X-Models-Etag"); got != "" {
+		t.Fatalf("account-scoped models ETag leaked downstream: %q", got)
+	}
+	if got := destination.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("ordinary response header was dropped: %q", got)
+	}
+}
 
 func TestProbeEarlyCodexSSEFailureDetectsFailedAfterCreated(t *testing.T) {
 	stream := "event: response.created\n" +

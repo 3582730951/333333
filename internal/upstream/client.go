@@ -183,6 +183,10 @@ type Request struct {
 	// TransportProfile selects the first-party request identity simulated for a
 	// custom provider: generic, codex_cli, or claude_code.
 	TransportProfile string
+	// UpstreamProtocol identifies the custom provider's native wire protocol.
+	// It is used by opaque shared-endpoint passthrough to install the correct
+	// provider authentication without inspecting or rewriting the request body.
+	UpstreamProtocol string
 	DownstreamPath   string
 	Headers          http.Header
 	Body             bodysource.BodySource
@@ -225,13 +229,11 @@ type Request struct {
 	// choke point. HTTP headers, HTTP client_metadata and the WS handshake/body all
 	// consume the same snapshot so account-virtualized identifiers cannot drift.
 	codexMetadata *codexRequestMetadata
-	// PassThrough (Claude provider only) forwards the request to api.anthropic.com as a
-	// TRANSPARENT proxy: the client's own Content-Type / Accept / Anthropic-Beta are
-	// preserved verbatim and the body is NOT cloaked/virtualized. It is for the extra
-	// Anthropic endpoints Claude Code skills / code-execution use — /v1/files (multipart
-	// uploads), /v1/skills, /v1/agents|environments|sessions — which are not message
-	// turns and must not be rewritten. Account auth + the Claude Code identity headers
-	// are still attached, and the call still routes through the account's egress/sidecar.
+	// PassThrough forwards an opaque auxiliary endpoint without parsing or
+	// rewriting its body. The client's Content-Type / Accept and protocol beta
+	// headers are preserved while downstream credentials are replaced with the
+	// selected account's auth. It is used for Files, Skills, Agents and related
+	// endpoints on both the built-in Claude route and custom providers.
 	PassThrough bool
 	// MinimalProbe sends the caller-provided provider-native body unchanged. It is
 	// used only by the administrator-confirmed API-key inference probe, which must
@@ -1173,7 +1175,8 @@ func (c *Client) postDirectThroughSidecarChain(ctx context.Context, spec Request
 // on this list (random User-Agent, x-stainless-*, x-forwarded-*, cookies, etc.)
 // is dropped so the upstream sees a clean, official-looking request.
 var codexProtocolHeaders = map[string]bool{
-	"accept": true,
+	"accept":       true,
+	"content-type": true,
 	// Claude Code requests bridged to Responses retain non-1M beta markers. The
 	// bridge strips the Anthropic-only context marker before this allowlist runs.
 	"anthropic-beta":                        true,
@@ -1200,6 +1203,12 @@ func (c *Client) applyCodexHeaders(dst http.Header, spec Request) error {
 	for k, values := range spec.Headers {
 		lowerName := strings.ToLower(strings.TrimSpace(k))
 		if !codexProtocolHeaders[lowerName] || lowerName == "x-codex-beta-features" {
+			continue
+		}
+		// Responses always uses the canonical JSON content type installed below.
+		// Auxiliary Codex endpoints may use multipart/form-data (image edits and
+		// file uploads), so their exact boundary must survive the proxy.
+		if lowerName == "content-type" && strings.Contains(strings.ToLower(spec.DownstreamPath), "/responses") {
 			continue
 		}
 		for _, v := range values {

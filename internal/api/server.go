@@ -91,6 +91,9 @@ type Server struct {
 	// clientErrors throttles browser-side error reports so the diagnostics endpoint
 	// cannot amplify a frontend fault or unauthenticated request flood into log spam.
 	clientErrors *clientErrorLimiter
+	// httpMetrics is fixed-cardinality and allocation-free on the request path.
+	// Operators can inspect it in /admin/system or scrape /admin/metrics.
+	httpMetrics httpRequestMetrics
 	// relState holds per-conversation working_state for the gateway reliability layer
 	// (in-memory + TTL'd + size-bounded; same pattern as oauth/login). Only written
 	// when the gateway_reliability flag is on. See reliability.go.
@@ -109,6 +112,7 @@ type Server struct {
 	usageJournal          *usagejournal.Journal
 	usageJournalStop      chan struct{}
 	usageJournalWake      chan struct{}
+	diagnosticJobWake     chan struct{}
 	usageJournalCommitMu  sync.Mutex
 	usageEnqueueMu        sync.Mutex
 	usageJournalAcked     atomic.Uint64
@@ -213,6 +217,7 @@ func NewServer(dep Dependencies) *Server {
 		kiroCacheFlights:    map[string]chan struct{}{},
 		codexSessionGates:   map[string]*codexSessionGate{},
 		codexResetLocks:     map[string]*sync.Mutex{},
+		diagnosticJobWake:   make(chan struct{}, 1),
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
@@ -314,6 +319,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/responses", s.handleGatewayPost)
 	s.mux.HandleFunc("/v1/responses/compact", s.handleGatewayPost)
 	s.mux.HandleFunc("/v1/chat/completions", s.handleGatewayPost)
+	// Auxiliary first-party Codex surfaces used by the stock CLI when the
+	// configured provider is OpenAI. Keep these on the same scheduler/account
+	// path as Responses so URL + API-key setup retains hosted tools.
+	for _, p := range []string{
+		"/v1/alpha/search",
+		"/v1/images/generations",
+		"/v1/images/edits",
+		"/v1/realtime/calls",
+	} {
+		s.mux.HandleFunc(p, s.handleCodexPassthrough)
+	}
 	// Local gateway identity API - returns virtual identity for client-side rewriting
 	s.mux.HandleFunc("/v1/gateway/identity", s.handleGatewayIdentity)
 	// Gateway download and install script
@@ -334,9 +350,11 @@ func (s *Server) routes() {
 	for _, p := range []string{"/v1/files", "/v1/files/", "/v1/skills", "/v1/skills/"} {
 		s.mux.HandleFunc(p, s.handleSharedEndpoint)
 	}
-	// Claude-only extra surfaces for skills / code-execution beyond the message turn.
+	// Claude-native extra surfaces for skills / code-execution beyond the message
+	// turn. The shared dispatcher preserves Claude as the built-in default and
+	// admits a custom provider only when its hint/key/user-group route is explicit.
 	for _, p := range []string{"/v1/agents", "/v1/agents/", "/v1/environments", "/v1/environments/", "/v1/sessions", "/v1/sessions/"} {
-		s.mux.HandleFunc(p, s.handleAnthropicPassthrough)
+		s.mux.HandleFunc(p, s.handleSharedEndpoint)
 	}
 	// End-user portal authentication (multi-user). Cookie sessions; coexists with the
 	// legacy admin_token. See userauth.go.
@@ -366,6 +384,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/models", s.handleAdminModels)
 	s.mux.HandleFunc("/admin/accounts/summary", s.adminAccountsSummary)
 	s.mux.HandleFunc("/admin/accounts/export", s.adminAccountsExport)
+	s.mux.HandleFunc("/admin/accounts/import-archive", s.adminAccountsArchiveImport)
 	s.mux.HandleFunc("/admin/accounts/import-auth-json", s.adminImportAuthJSON)
 	s.mux.HandleFunc("/admin/accounts/import-token", s.adminImportToken)
 	s.mux.HandleFunc("/admin/accounts/import-cookie", s.adminImportCookie)
@@ -408,6 +427,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/quota", s.adminQuota)
 	// Host + registration-task resource metrics (CPU/mem/disk + node/Chrome/Xvfb RSS).
 	s.mux.HandleFunc("/admin/system", s.adminSystem)
+	s.mux.HandleFunc("/admin/metrics", s.adminMetrics)
 	s.mux.HandleFunc("/admin/settings", s.adminSettings)
 	// /admin/config is the registry-backed System-config surface (requirement #1):
 	// GET returns every runtime-editable field with its effective value + metadata;
@@ -859,10 +879,38 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve custom providers before the generic Claude-model branch. A custom
+	// Anthropic relay is allowed to map a standard Claude slug; built-in Claude
+	// must not steal that traffic merely because the downstream name begins with
+	// "claude-".
+	var selectedCustom storage.CustomProvider
+	var selectedCustomOK bool
+	customRouteHint := userGroupProvider
+	if customRouteHint == "" {
+		if hint := effectiveGatewayProviderHint(r, pol); strings.HasPrefix(hint, "custom:") {
+			customRouteHint = hint
+		}
+	}
+	explicitCustom := strings.HasPrefix(customRouteHint, "custom:")
+	if explicitCustom {
+		selectedCustom, selectedCustomOK = s.customProviderByID(r.Context(), strings.TrimPrefix(customRouteHint, "custom:"))
+	} else if userGroupProvider == "" && effectiveGatewayProviderHint(r, pol) == "auto" {
+		selectedCustom, selectedCustomOK = s.customProviderForModel(r.Context(), model, pol.Group, raw)
+	}
+	if explicitCustom && !selectedCustomOK {
+		s.writeCapabilityUnavailable(w, http.StatusServiceUnavailable,
+			"selected custom model provider is disabled or unavailable",
+			[]string{"provider:" + strings.TrimPrefix(customRouteHint, "custom:"), "model:" + model},
+			"enabled_custom_provider",
+			customRouteHint,
+			"Enable the selected model provider and import an active API-key account.")
+		return
+	}
+
 	// OpenAI-compatible requests targeting a Claude model are transparently
 	// relayed to the Anthropic upstream (format-converted both ways) instead of
 	// Codex; everything else continues down the Codex/Responses path.
-	if isChat && (userGroupProvider == "claude" || (userGroupProvider == "" && isClaudeModel(model))) {
+	if !selectedCustomOK && isChat && (userGroupProvider == "claude" || (userGroupProvider == "" && isClaudeModel(model))) {
 		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
@@ -876,15 +924,15 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// A model served by a custom OpenAI-compatible provider (DeepSeek, …) is routed to
 	// that provider's generic adapter, converting both the chat-completions entrypoint
 	// (near-passthrough) and the Codex /v1/responses entrypoint (Responses ↔ chat).
-	var selectedCustom storage.CustomProvider
-	var selectedCustomOK bool
-	if strings.HasPrefix(userGroupProvider, "custom:") {
-		selectedCustom, selectedCustomOK = s.customProviderByID(r.Context(), strings.TrimPrefix(userGroupProvider, "custom:"))
-	} else if userGroupProvider == "" {
-		selectedCustom, selectedCustomOK = s.customProviderForModel(r.Context(), model)
-	}
 	if selectedCustomOK {
 		prov := selectedCustom
+		if mappedRaw, targetModel, mapped := applyCustomProviderModelMapping(prov, raw, model); mapped {
+			raw = mappedRaw
+			model = targetModel
+			r = r.WithContext(withModelDiagnostics(r.Context(), requestedModel, targetModel, "custom_provider_mapping:"+prov.ID))
+			w.Header().Set("X-Pool-Resolved-Model", targetModel)
+			w.Header().Set("X-Pool-Model-Override-Source", "custom_provider_mapping:"+prov.ID)
+		}
 		raw, err = s.applyModelInstructionsForEntrypoint(r.Context(), requestUserGroupPolicy(r.Context()), model, path, raw)
 		if err != nil {
 			writeCodexInstructionConfigurationError(w, err)
@@ -1999,7 +2047,14 @@ codexResponse:
 			detection = cf.Detect(resp.StatusCode, resp.Header, errorBody)
 			v = ban.Classify(false, resp.StatusCode, resp.Header, errorBody)
 		}
-		if !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
+		// A movable turn with another healthy account already available must switch
+		// before probing quota/reset-credit endpoints. Those auxiliary endpoints use
+		// their own upstream timeout and can otherwise add ~30s after the first 429,
+		// even though the next account is ready to serve immediately.
+		distinctFailoverReady := allowRetry && movable &&
+			retryableForFailover(v, resp.StatusCode) &&
+			s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
+		if !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(resp.StatusCode, errorBody) &&
 			!upstream.AccountUsesAPIKey(token) &&
 			!isAgentIdentityToken(token) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, resp.StatusCode, resp.Header, errorBody, "http_error") {
@@ -2124,6 +2179,9 @@ codexResponse:
 		}
 		if movable && retryableForFailover(v, resp.StatusCode) {
 			if v.State == ban.RateLimited || resp.StatusCode == http.StatusTooManyRequests {
+				if allowRetry {
+					return retry()
+				}
 				return retryAfterCapacity()
 			}
 			if !allowRetry {
@@ -2185,7 +2243,9 @@ codexSuccess:
 				}
 				goto codexResponse
 			}
-			if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
+			distinctFailoverReady := allowRetry && movable &&
+				s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
+			if !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
 				!isAgentIdentityToken(token) &&
 				s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
 				codexResetRetried = true
@@ -2213,6 +2273,9 @@ codexSuccess:
 			// healthy; otherwise it waits for quota recovery instead of leaking a
 			// synthetic 503 merely because the distinct-account retry budget ended.
 			if movable {
+				if allowRetry {
+					return retry()
+				}
 				return retryAfterCapacity()
 			}
 			if !strictNativeCPA && s.leakScrubEnabled(r.Context()) {
@@ -2430,25 +2493,6 @@ codexSuccess:
 						// prevents its terminal [DONE] write from retaining the WS request mutex.
 						_ = resp.Body.Close()
 					}
-					if shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
-						s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
-						codexResetRetried = true
-						if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
-							token = latest
-						}
-						retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
-						if retryErr == nil && retryResp.StatusCode < 400 {
-							resp = retryResp
-							finalEgress = retryEgress
-							goto codexSuccess
-						}
-						if retryResp != nil && retryResp.Body != nil {
-							_ = retryResp.Body.Close()
-						}
-						if retryErr != nil {
-							log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
-						}
-					}
 					mapping := codexSessionMappingFromContext(r.Context())
 					rotationAllowed := !ruleMatched ||
 						decision.Match.DownstreamAction == upstreamrules.DownstreamActionBuiltin ||
@@ -2484,6 +2528,33 @@ codexSuccess:
 							RecoveryContextError: leakfilter.ResponsesContextErrorNone,
 						}
 					}
+					// A mapped, stateful turn with a healthy replacement account must
+					// rotate immediately. Polling quota/reset-credit endpoints first can
+					// block the downstream WebSocket for an entire upstream timeout and
+					// defeats the durable context failover that was already proven safe
+					// above. Reset credits remain the preferred in-place recovery when no
+					// mapped rotation is available.
+					distinctFailoverReady := shouldRetry && allowRetry && movable &&
+						s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
+					if !distinctFailoverReady && shouldRetry && !codexResetRetried && !isAgentIdentityToken(token) && codexResetTriggerAllowed(failureStatus, failureBody) &&
+						s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, failureStatus, failureHeader, failureBody, "stream_retryable_limit") {
+						codexResetRetried = true
+						if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
+							token = latest
+						}
+						retryResp, retryEgress, retryErr := s.doWithCFRetry(r.Context(), requestForToken(token), lease, mappingTransportStrict)
+						if retryErr == nil && retryResp.StatusCode < 400 {
+							resp = retryResp
+							finalEgress = retryEgress
+							goto codexSuccess
+						}
+						if retryResp != nil && retryResp.Body != nil {
+							_ = retryResp.Body.Close()
+						}
+						if retryErr != nil {
+							log.Printf("codex stream reset-credit retry %s: %v", lease.Account.ID, retryErr)
+						}
+					}
 					// The early-frame probe has not committed any downstream bytes, so a
 					// stateful failover rule may make one safe retry through the exact
 					// same account+egress. Do not convert an ordinary repeated upstream
@@ -2516,6 +2587,9 @@ codexSuccess:
 					}
 					_ = resp.Body.Close()
 					if movable && failureVerdict.State == ban.RateLimited {
+						if allowRetry {
+							return retry()
+						}
 						return retryAfterCapacity()
 					}
 					if allowRetry && movable {
@@ -2963,7 +3037,9 @@ codexSuccess:
 			}
 			goto codexResponse
 		}
-		if !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
+		distinctFailoverReady := allowRetry && movable &&
+			s.hasCodexFailoverCandidate(r.Context(), routeGroup, model, lease.Account.ID)
+		if !distinctFailoverReady && !codexResetRetried && codexResetTriggerAllowed(200, responseBody) &&
 			s.tryAutoConsumeCodexResetCredit(r.Context(), lease.Account, token, lease.Egress, true, 200, resp.Header, responseBody, "soft_200_body") {
 			codexResetRetried = true
 			if latest, terr := s.store.GetToken(r.Context(), lease.Account.ID); terr == nil {
@@ -2988,6 +3064,9 @@ codexSuccess:
 		// Honor failover here too: a soft rate-limit in a 200 body is the same condition
 		// as a 429, so a movable request should fail over rather than surface it.
 		if movable {
+			if allowRetry {
+				return retry()
+			}
 			return retryAfterCapacity()
 		}
 		if s.leakScrubEnabled(r.Context()) {

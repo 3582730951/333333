@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -459,8 +460,23 @@ func TestGoalCleanupNeverEvictsExpiredLiveRun(t *testing.T) {
 	if err := store.FinishGoalRun(ctx, run.ID, "live-owner", "completed", ""); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := store.CleanupGoalContinuity(ctx); err != nil || deleted != 1 {
-		t.Fatalf("completed expired goal cleanup deleted=%d err=%v", deleted, err)
+	if stepDeleted, err := store.CleanupGoalContinuity(ctx); err != nil || stepDeleted != 0 {
+		t.Fatalf("first expired reclaim phase deleted=%d err=%v, want bounded progress", stepDeleted, err)
+	}
+	var reclaimState string
+	if err := store.DB().QueryRowContext(ctx, `SELECT state FROM goal_session WHERE id=?`, goal.ID).Scan(&reclaimState); err != nil || reclaimState != goalReclaimingState {
+		t.Fatalf("expired goal state=%q err=%v, want reclaiming", reclaimState, err)
+	}
+	var deleted int64
+	for i := 0; i < 7 && deleted == 0; i++ {
+		stepDeleted, err := store.CleanupGoalContinuity(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deleted += stepDeleted
+	}
+	if deleted != 1 {
+		t.Fatalf("completed expired goal cleanup deleted=%d, want 1", deleted)
 	}
 }
 
@@ -473,7 +489,7 @@ func goalEncryptedPayloadBytes(t *testing.T, store *Store) int64 {
 	return stored
 }
 
-func TestGoalStorageBudgetReclaimsLeastRecentlyUsedInactiveGoal(t *testing.T) {
+func TestGoalStorageBudgetDefersInactiveReclaimToMaintenance(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()
 	if err != nil {
@@ -495,22 +511,34 @@ func TestGoalStorageBudgetReclaimsLeastRecentlyUsedInactiveGoal(t *testing.T) {
 	second.WorkspaceHash = "other-workspace"
 	second.InitialGoalHash = "other-initial"
 	second.StorageMaxBytes = used + 256
+	if _, err := store.CommitGoalTurn(ctx, second); !errors.Is(err, ErrGoalStorageBudget) {
+		t.Fatalf("foreground storage error=%v, want %v", err, ErrGoalStorageBudget)
+	}
+	if _, err := store.GetGoalSession(ctx, oldGoal.ID); err != nil {
+		t.Fatalf("foreground budget check reclaimed existing goal: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, _, err := store.EnforceGoalStorageBudget(ctx, used-1); err != nil {
+			t.Fatal(err)
+		}
+		var remaining int
+		if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_session WHERE id=?`, oldGoal.ID).Scan(&remaining); err != nil {
+			t.Fatal(err)
+		}
+		if remaining == 0 {
+			break
+		}
+	}
+	var remaining int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_session WHERE id=?`, oldGoal.ID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("maintenance did not finish old goal remaining=%d err=%v", remaining, err)
+	}
 	newGoal, err := store.CommitGoalTurn(ctx, second)
 	if err != nil {
-		t.Fatalf("new goal should reclaim inactive storage: %v", err)
+		t.Fatalf("new goal after maintenance reclaim: %v", err)
 	}
 	if newGoal.ID == oldGoal.ID {
-		t.Fatal("new goal unexpectedly reused the old identity")
-	}
-	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "budget-old"}}); !errors.Is(err, ErrGoalNotFound) {
-		t.Fatalf("least-recently-used goal was not reclaimed: %v", err)
-	}
-	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "budget-new"}}); err != nil {
-		t.Fatalf("new goal was not committed: %v", err)
-	}
-	var reclaimed int
-	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='goal_storage_reclaimed' AND reason='storage_budget_lru'`).Scan(&reclaimed); err != nil || reclaimed != 1 {
-		t.Fatalf("reclaim audit count=%d err=%v", reclaimed, err)
+		t.Fatal("new goal unexpectedly reused the reclaimed identity")
 	}
 }
 
@@ -543,6 +571,277 @@ func TestGoalStorageBudgetNeverReclaimsLiveGoal(t *testing.T) {
 	}
 	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "budget-live"}}); err != nil {
 		t.Fatalf("live goal was reclaimed: %v", err)
+	}
+}
+
+func TestEnforceGoalStorageBudgetReclaimsExistingInactiveGoals(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	large := strings.Repeat("m", 4096)
+	oldGoal, err := store.CommitGoalTurn(ctx, goalTurnForTest("maintenance-old", "maintenance-old-response", large, large))
+	if err != nil {
+		t.Fatal(err)
+	}
+	newTurn := goalTurnForTest("maintenance-new", "maintenance-new-response", large, large)
+	newTurn.DownstreamKeyHash = "maintenance-new-key"
+	newTurn.WorkspaceHash = "maintenance-new-workspace"
+	newTurn.InitialGoalHash = "maintenance-new-initial"
+	newGoal, err := store.CommitGoalTurn(ctx, newTurn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE goal_session SET updated_at=? WHERE id=?`, Now()-100, oldGoal.ID); err != nil {
+		t.Fatal(err)
+	}
+	var oldBytes, totalBytes int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=?`, oldGoal.ID).Scan(&oldBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT SUM(storage_bytes) FROM goal_session`).Scan(&totalBytes); err != nil {
+		t.Fatal(err)
+	}
+	var freed, deleted int64
+	for i := 0; i < 8 && deleted == 0; i++ {
+		stepFreed, stepDeleted, err := store.EnforceGoalStorageBudget(ctx, totalBytes-oldBytes+1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		freed += stepFreed
+		deleted += stepDeleted
+	}
+	if deleted != 1 || freed != oldBytes {
+		t.Fatalf("maintenance budget freed=%d deleted=%d, want %d/1", freed, deleted, oldBytes)
+	}
+	if _, err := store.GetGoalSession(ctx, oldGoal.ID); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("old goal survived maintenance budget: %v", err)
+	}
+	if _, err := store.GetGoalSession(ctx, newGoal.ID); err != nil {
+		t.Fatalf("new goal was reclaimed: %v", err)
+	}
+	var audits int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE action='goal_storage_reclaimed' AND reason='storage_budget_maintenance'`).Scan(&audits); err != nil || audits != 1 {
+		t.Fatalf("maintenance reclaim audit count=%d err=%v", audits, err)
+	}
+}
+
+func TestEnforceGoalStorageBudgetPreservesLiveRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("maintenance-live", "maintenance-live-response", strings.Repeat("l", 4096), strings.Repeat("l", 4096)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireGoalRun(ctx, goal.ID, "maintenance-owner", "running", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	freed, deleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+	if err != nil || freed != 0 || deleted != 0 {
+		t.Fatalf("live maintenance budget freed=%d deleted=%d err=%v", freed, deleted, err)
+	}
+	if _, err := store.GetGoalSession(ctx, goal.ID); err != nil {
+		t.Fatalf("live goal was reclaimed: %v", err)
+	}
+}
+
+func TestEnforceGoalStorageBudgetPreservesAwaitingToolSessionWithoutRun(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("maintenance-awaiting", "maintenance-awaiting-response", "input", "out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE goal_session SET state='awaiting_tool_result' WHERE id=?`, goal.ID); err != nil {
+		t.Fatal(err)
+	}
+	freed, deleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+	if err != nil || freed != 0 || deleted != 0 {
+		t.Fatalf("awaiting maintenance budget freed=%d deleted=%d err=%v", freed, deleted, err)
+	}
+	var state string
+	if err := store.DB().QueryRowContext(ctx, `SELECT state FROM goal_session WHERE id=?`, goal.ID).Scan(&state); err != nil || state != "awaiting_tool_result" {
+		t.Fatalf("awaiting goal state=%q err=%v", state, err)
+	}
+	if _, err := store.GetGoalSession(ctx, goal.ID); err != nil {
+		t.Fatalf("awaiting goal was hidden or reclaimed: %v", err)
+	}
+}
+
+func TestEnforceGoalStorageBudgetUsesHiddenBoundedReclaimingSteps(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	goal, err := store.CommitGoalTurn(ctx, goalTurnForTest("maintenance-batch", "maintenance-batch-response", "input", "out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < goalReclaimRowsPerStep+1; i++ {
+		if _, err := store.DB().ExecContext(ctx, `INSERT INTO goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+			goal.ID, "test-extra", 999, i, fmt.Sprint(i), 1, "x", Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE goal_session SET storage_bytes=storage_bytes+? WHERE id=?`, goalReclaimRowsPerStep+1, goal.ID); err != nil {
+		t.Fatal(err)
+	}
+	var chunksBefore int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_payload_chunk WHERE goal_id=?`, goal.ID).Scan(&chunksBefore); err != nil {
+		t.Fatal(err)
+	}
+	freed, deleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+	if err != nil || freed <= 0 || deleted != 0 {
+		t.Fatalf("first bounded reclaim freed=%d deleted=%d err=%v", freed, deleted, err)
+	}
+	var state string
+	if err := store.DB().QueryRowContext(ctx, `SELECT state FROM goal_session WHERE id=?`, goal.ID).Scan(&state); err != nil || state != goalReclaimingState {
+		t.Fatalf("physical goal state=%q err=%v, want reclaiming", state, err)
+	}
+	var chunksAfter int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_payload_chunk WHERE goal_id=?`, goal.ID).Scan(&chunksAfter); err != nil {
+		t.Fatal(err)
+	}
+	if removed := chunksBefore - chunksAfter; removed != goalReclaimRowsPerStep {
+		t.Fatalf("first reclaim removed %d chunks, want bounded %d", removed, goalReclaimRowsPerStep)
+	}
+	if _, err := store.GetGoalSession(ctx, goal.ID); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("reclaiming goal remained visible by id: %v", err)
+	}
+	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "maintenance-batch"}}); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("reclaiming goal remained visible by alias: %v", err)
+	}
+	sessions, err := store.ListGoalSessions(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range sessions {
+		if session.ID == goal.ID {
+			t.Fatal("reclaiming goal remained visible in list")
+		}
+	}
+	if _, _, err := store.BuildGoalReplay(ctx, goal.ID); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("reclaiming goal remained directly replayable: %v", err)
+	}
+	if _, err := store.getGoalCheckpoint(ctx, goal.CurrentCheckpoint); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("reclaiming checkpoint remained directly readable: %v", err)
+	}
+	var totalDeleted int64
+	for i := 0; i < 8 && totalDeleted == 0; i++ {
+		_, stepDeleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		totalDeleted += stepDeleted
+	}
+	if totalDeleted != 1 {
+		t.Fatalf("bounded reclaim completion deleted=%d, want 1", totalDeleted)
+	}
+}
+
+func TestReclaimingGoalAliasTransfersToNewGoal(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	oldGoal, err := store.CommitGoalTurn(ctx, goalTurnForTest("reused-after-reclaim", "reused-old-response", "old", "old-out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnforceGoalStorageBudget(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := store.DB().QueryRowContext(ctx, `SELECT state FROM goal_session WHERE id=?`, oldGoal.ID).Scan(&state); err != nil || state != goalReclaimingState {
+		t.Fatalf("old goal state=%q err=%v", state, err)
+	}
+	replacement := goalTurnForTest("reused-after-reclaim", "reused-new-response", "new", "new-out")
+	replacement.DownstreamKeyHash = "replacement-key"
+	replacement.WorkspaceHash = "replacement-workspace"
+	replacement.InitialGoalHash = "replacement-initial"
+	newGoal, err := store.CommitGoalTurn(ctx, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newGoal.ID == oldGoal.ID {
+		t.Fatal("replacement reused reclaiming goal id")
+	}
+	resolved, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "reused-after-reclaim"}})
+	if err != nil || resolved.Session.ID != newGoal.ID {
+		t.Fatalf("transferred alias resolved=%+v err=%v, want %s", resolved, err, newGoal.ID)
+	}
+	var oldDeleted int64
+	for i := 0; i < 8 && oldDeleted == 0; i++ {
+		_, stepDeleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldDeleted += stepDeleted
+	}
+	if oldDeleted != 1 {
+		t.Fatalf("old goal physical deletion=%d, want 1", oldDeleted)
+	}
+	resolved, err = store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "reused-after-reclaim"}})
+	if err != nil || resolved.Session.ID != newGoal.ID {
+		t.Fatalf("old reclaim removed transferred alias resolved=%+v err=%v", resolved, err)
+	}
+}
+
+func TestLegacyOversizedGoalRowStillConverges(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := Now()
+	legacy := strings.Repeat("l", goalReclaimBytesPerStep+1)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO goal_session(id,protocol,state,storage_bytes,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`,
+		"legacy-oversized-reclaim", "codex", "ready", len(legacy), now+3600, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO goal_segment(id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,format_version,state,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		"legacy-oversized-segment", "legacy-oversized-reclaim", 1, "legacy", len(legacy), legacy, 1, "committed", now); err != nil {
+		t.Fatal(err)
+	}
+	freed, deleted, err := store.EnforceGoalStorageBudget(ctx, 1)
+	if err != nil || freed != int64(len(legacy)) || deleted != 0 {
+		t.Fatalf("legacy oversized reclaim freed=%d deleted=%d err=%v", freed, deleted, err)
+	}
+	if _, deleted, err = store.EnforceGoalStorageBudget(ctx, 1); err != nil || deleted != 1 {
+		t.Fatalf("legacy oversized completion deleted=%d err=%v", deleted, err)
 	}
 }
 

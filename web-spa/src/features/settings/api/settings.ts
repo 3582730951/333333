@@ -23,6 +23,7 @@ const logRecordCountsSchema = z.object({
   audit_log: z.coerce.number().int().nonnegative(),
   cf_events: z.coerce.number().int().nonnegative(),
   usage_records: z.coerce.number().int().nonnegative(),
+  usage_events: z.coerce.number().int().nonnegative(),
   registration_task_events: z.coerce.number().int().nonnegative(),
   lifecycle_task_logs: z.coerce.number().int().nonnegative(),
   lifecycle_events: z.coerce.number().int().nonnegative(),

@@ -2,8 +2,10 @@ package kiro
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,21 +60,58 @@ func newTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 func TestRefreshModelCatalogRequiresCompletePagination(t *testing.T) {
 	var calls atomic.Int32
 	manager, store, account, credential, egress := kiroCatalogHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		page := calls.Add(1)
+		if r.Method != http.MethodPost {
+			t.Errorf("method=%q", r.Method)
+		}
 		if r.URL.Path != "/listAvailableModels" {
 			t.Errorf("path=%q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("origin"); got != kiroCLIOrigin {
+			t.Errorf("origin query=%q", got)
+		}
+		if got := r.URL.Query().Get("nextToken"); got != "" {
+			t.Errorf("pagination leaked into query: %q", got)
 		}
 		if got := r.Header.Get("Authorization"); got != "Bearer bearer" {
 			t.Errorf("authorization header=%q", got)
 		}
-		switch calls.Add(1) {
+		if got := r.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererService.ListAvailableModels" {
+			t.Errorf("x-amz-target=%q", got)
+		}
+		wantAmzUA := "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17975 os/linux lang/rust/1.92.0 m/F,C app/AmazonQ-For-CLI"
+		if got := r.Header.Get("X-Amz-User-Agent"); got != wantAmzUA {
+			t.Errorf("x-amz-user-agent=%q, want %q", got, wantAmzUA)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/x-amz-json-1.0" {
+			t.Errorf("content-type=%q", got)
+		}
+		raw, readErr := io.ReadAll(r.Body)
+		if readErr != nil {
+			t.Errorf("read body: %v", readErr)
+		}
+		var body map[string]any
+		if decodeErr := json.Unmarshal(raw, &body); decodeErr != nil {
+			t.Errorf("body=%q: %v", raw, decodeErr)
+		}
+		if got := body["origin"]; got != kiroCLIOrigin {
+			t.Errorf("body origin=%v", got)
+		}
+		switch page {
 		case 1:
-			if r.URL.Query().Get("nextToken") != "" {
-				t.Errorf("first page had token")
+			if string(raw) != `{"origin":"KIRO_CLI"}` {
+				t.Errorf("first page wire body=%q", raw)
+			}
+			if _, present := body["nextToken"]; present {
+				t.Errorf("first page body had nextToken: %s", raw)
 			}
 			_, _ = w.Write([]byte(`{"models":[{"modelId":"claude-opus-5","aliases":["opus"],"maxInputTokens":1000000,"maxOutputTokens":128000,"thinking":{"type":"adaptive"},"supportedEfforts":["high","max"]}],"nextToken":"page-2"}`))
 		case 2:
-			if r.URL.Query().Get("nextToken") != "page-2" {
-				t.Errorf("second page token=%q", r.URL.Query().Get("nextToken"))
+			if string(raw) != `{"origin":"KIRO_CLI","nextToken":"page-2"}` {
+				t.Errorf("second page wire body=%q", raw)
+			}
+			if body["nextToken"] != "page-2" {
+				t.Errorf("second page body token=%v", body["nextToken"])
 			}
 			_, _ = w.Write([]byte(`{"availableModels":[{"id":"auto","maxInputTokens":1000000}],"defaultModelId":"claude-opus-5"}`))
 		default:
@@ -116,7 +155,15 @@ func TestRefreshModelCatalogPartialFailurePreservesLastGood(t *testing.T) {
 			_, _ = w.Write([]byte(`{"models":[{"id":"claude-opus-5","maxInputTokens":1000000}]}`))
 			return
 		}
-		if r.URL.Query().Get("nextToken") == "" {
+		var request struct {
+			NextToken string `json:"nextToken"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode catalog request: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if request.NextToken == "" {
 			_, _ = w.Write([]byte(`{"models":[{"id":"claude-sonnet-5","maxInputTokens":1000000}],"nextToken":"incomplete"}`))
 			return
 		}

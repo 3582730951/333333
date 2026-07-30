@@ -82,6 +82,18 @@ if (!/quota_summary/.test(accounts)) {
   problems.push('Accounts page must render quota_summary rather than ad hoc quota fields.');
 }
 const drawer = read('components/AccountDrawer.jsx');
+for (const [action, label] of [['clear-quarantine', '解除隔离'], ['clear-cooldown', '解除冷却']]) {
+  if (!accounts.includes(`'${action}'`) || !accounts.includes(label) || !drawer.includes(`'${action}'`) || !drawer.includes(label)) {
+    problems.push(`Accounts page and drawer must expose the ${action} (${label}) administrator action.`);
+  }
+}
+if (!/clearedCooldownPatch\s*=\s*\{[\s\S]{0,160}cooldown_until:\s*0[\s\S]{0,80}recheck_pending:\s*false/.test(accounts)
+  || !/act\s*===\s*'clear-cooldown'[\s\S]{0,100}clearedCooldownPatch/.test(accounts)) {
+  problems.push('Clear-cooldown must immediately clear the cached binding cooldown and pending recheck state.');
+}
+if (!/bulkAction\('clear-cooldown',\s*'解除冷却'\)/.test(accounts)) {
+  problems.push('Accounts bulk toolbar must expose the clear-cooldown administrator action.');
+}
 if (!/saveGroup/.test(drawer) || !/groupPolicy/.test(drawer) || !/\/admin\/accounts\/.*\/group/.test(drawer)) {
   problems.push('AccountDrawer must support changing group and displaying inherited group policy.');
 }
@@ -95,6 +107,26 @@ if (!/quota_summary\?\.reset_credits/.test(drawer) || !/formatResetCredits/.test
 }
 if (!/available_count[\s\S]{0,160}`\$\{credits\.available_count\} 次`/.test(drawer)) {
   problems.push('AccountDrawer reset-credit formatter must preserve known 0 as "0 次" instead of unknown.');
+}
+
+const providers = read('pages/Providers.jsx');
+if (!/CLAUDE_MODEL_TABLE\s*=\s*\[/.test(providers)
+  || !/anthropic_messages[\s\S]{0,300}Claude 候选模型表探测/.test(providers)) {
+  problems.push('Providers must expose the maintained Claude candidate table when Anthropic auto-discovery is selected.');
+}
+if (!/model_mappings:\s*splitModelMappings/.test(providers)
+  || !/下游 → 上游模型映射/.test(providers)
+  || !/source => target/.test(providers)) {
+  problems.push('Providers must persist and explain downstream-to-upstream model mappings.');
+}
+if (!/\/admin\/providers\/\$\{encodeURIComponent\(tester\.id\)\}\/test/.test(providers)
+  || !/requested_model/.test(providers)
+  || !/target_model/.test(providers)) {
+  problems.push('Providers must expose the administrator model reachability test and render requested/target models.');
+}
+const importKeyCall = providers.match(/post\('\/admin\/accounts\/import-key',\s*\{([\s\S]{0,360}?)\}\)/);
+if (!importKeyCall || /group_name/.test(importKeyCall[1])) {
+  problems.push('Custom provider key import must require only provider, API key, and optional label—not a group field.');
 }
 
 if (problems.length > 0) {

@@ -1,7 +1,10 @@
 import { z } from 'zod';
+import api from '../../../api.js';
 import { get } from '../../../api.js';
 import { createApiError, parseApiResponse } from '../../../api/contracts';
 import type { AccountGroup, AccountRow, AccountsBundle, AccountsPageParams } from '../model/types';
+
+const accountArchiveTimeoutMs = 30 * 60 * 1_000;
 
 const accountSchema = z.object({
   id: z.string(),
@@ -71,4 +74,103 @@ export async function fetchAccountsBundle(params: AccountsPageParams, signal?: A
     cause: groups.reason,
   });
   return { ...accounts.value, groups: [], error: secondary };
+}
+
+export interface AccountArchiveDownload {
+  blob: Blob;
+  filename: string;
+}
+
+export interface AccountArchiveImportResult {
+  recognized: number;
+  imported: number;
+  replaced: number;
+  files: number;
+  zip: boolean;
+  formats: string[];
+  accounts: Array<{ id: string; label?: string; provider?: string; status: string }>;
+}
+
+function responseHeader(headers: unknown, name: string): string {
+  if (!headers || typeof headers !== 'object') return '';
+  const candidate = headers as Record<string, unknown> & { get?: (headerName: string) => unknown };
+  if (typeof candidate.get === 'function') {
+    const value = candidate.get(name);
+    if (value != null) return String(value);
+  }
+  const value = candidate[name] ?? candidate[name.toLowerCase()];
+  return value == null ? '' : String(value);
+}
+
+function filenameFromDisposition(value: unknown): string {
+  const raw = String(value || '');
+  const utf8 = raw.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    const encoded = utf8[1].trim().replace(/^"|"$/g, '');
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
+  }
+  return raw.match(/filename=([^;]+)/i)?.[1]?.trim().replace(/^"|"$/g, '') || '';
+}
+
+function archiveBlob(data: unknown, contentType: string): Blob {
+  return data instanceof Blob ? data : new Blob([data as BlobPart], { type: contentType });
+}
+
+export async function fetchAccountArchive(ids: string[] = [], signal?: AbortSignal): Promise<AccountArchiveDownload> {
+  const normalizedIDs = [...new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))];
+  const response = await api.get('/admin/accounts/export', {
+    params: {
+      format: 'backup',
+      ...(normalizedIDs.length ? { ids: normalizedIDs.join(',') } : {}),
+    },
+    responseType: 'blob',
+    timeout: accountArchiveTimeoutMs,
+    ...(signal ? { signal } : {}),
+  });
+  const contentType = responseHeader(response.headers, 'content-type').toLowerCase();
+  const isZIP = contentType.includes('application/zip');
+  const isJSON = contentType.includes('application/json');
+  if (!isZIP && !isJSON) throw new Error('服务器未返回账号 JSON 或 ZIP 备份。');
+  const blob = archiveBlob(response.data, isZIP ? 'application/zip' : 'application/json');
+  if (blob.size < 2) throw new Error('账号备份文件为空或不完整。');
+  const prefix = new Uint8Array(await blob.slice(0, Math.min(32, blob.size)).arrayBuffer());
+  if (isZIP && (prefix[0] !== 0x50 || prefix[1] !== 0x4b)) {
+    throw new Error('服务器返回的账号 ZIP 备份无效。');
+  }
+  if (isJSON) {
+    const text = new TextDecoder().decode(prefix).trimStart();
+    if (!text.startsWith('{') && !text.startsWith('[')) {
+      throw new Error('服务器返回的账号 JSON 备份无效。');
+    }
+  }
+  const fallbackName = isZIP ? 'account-pool.zip' : 'account.json';
+  const filename = filenameFromDisposition(responseHeader(response.headers, 'content-disposition')) || fallbackName;
+  return { blob, filename };
+}
+
+export async function importAccountArchive(file: File, signal?: AbortSignal): Promise<AccountArchiveImportResult> {
+  if (!(file instanceof File) || file.size === 0) throw new Error('请选择非空的 JSON 或 ZIP 文件。');
+  const form = new FormData();
+  form.append('file', file, file.name);
+  const response = await api.post('/admin/accounts/import-archive', form, {
+    timeout: accountArchiveTimeoutMs,
+    ...(signal ? { signal } : {}),
+  });
+  const data = response.data as Partial<AccountArchiveImportResult>;
+  if (!Number.isFinite(data.recognized) || Number(data.recognized) <= 0 || !Array.isArray(data.accounts)) {
+    throw new Error('服务器返回了无效的账号导入结果。');
+  }
+  return {
+    recognized: Number(data.recognized),
+    imported: Number(data.imported || 0),
+    replaced: Number(data.replaced || 0),
+    files: Number(data.files || 0),
+    zip: Boolean(data.zip),
+    formats: Array.isArray(data.formats) ? data.formats.map(String) : [],
+    accounts: data.accounts,
+  };
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -37,6 +38,193 @@ func enableCodexSessionMappingForTest(h *testHarness) {
 	h.app.cfg.CodexStatelessPassthrough = false
 	h.app.cfg.CodexSessionMappingEnabled = true
 	h.app.cfg.CodexCPAStrict = true
+}
+
+func TestCodexDownstreamIdentityPrefersConcreteThreadOverWeakSession(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Thread-Id", "cli-thread-alpha")
+	headers.Set("Session-Id", "shared-process-session")
+	identity := codexDownstreamSessionIdentity(headers, []byte(`{"model":"gpt","conversation_id":"conversation-fallback"}`))
+	if identity.RootID != "cli-thread-alpha" || identity.ThreadID != "cli-thread-alpha" ||
+		identity.SessionID != "shared-process-session" || identity.durableSessionAlias() {
+		t.Fatalf("weak session replaced concrete root: %+v", identity)
+	}
+	for _, alias := range identity.directAliases() {
+		if alias.Type == "session" {
+			t.Fatalf("weak process session became a durable alias: %+v", identity.directAliases())
+		}
+	}
+
+	childHeaders := headers.Clone()
+	childHeaders.Set("Thread-Id", "cli-child")
+	childHeaders.Set("X-Codex-Parent-Thread-Id", "cli-thread-alpha")
+	child := codexDownstreamSessionIdentity(childHeaders, []byte(`{"model":"gpt"}`))
+	if child.RootID != "" || child.ThreadID != "cli-child" || child.ParentID != "cli-thread-alpha" {
+		t.Fatalf("child claimed a weak root instead of resolving its parent: %+v", child)
+	}
+
+	sessionOnly := codexDownstreamSessionIdentity(nil, []byte(`{"model":"gpt","session_id":"session-only"}`))
+	if sessionOnly.RootID != "session-only" || sessionOnly.ThreadID != "session-only" || !sessionOnly.durableSessionAlias() {
+		t.Fatalf("session-only legacy client lost its usable root: %+v", sessionOnly)
+	}
+}
+
+func TestCodexUpstreamAttemptPersistsAfterRequestCancellation(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	accountID := h.importAccount(t, "cancelled-attempt", "upstream-cancelled-attempt", "access-cancelled-attempt")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.app.recordCodexUpstreamAttemptBinding(ctx, storage.CodexSessionBinding{
+		TreeID:    "tree-cancelled-attempt",
+		AccountID: accountID,
+		EgressID:  storage.DefaultDirectEgressID,
+		Epoch:     1,
+		ExpiresAt: storage.Now() + 60,
+	}, scheduler.Lease{
+		Account:    storage.Account{ID: accountID},
+		RouteEpoch: 1,
+	}, storage.EgressProfile{ID: storage.DefaultDirectEgressID}, "transport_attempted", 0)
+
+	rows, err := h.store.ListCodexUpstreamAttemptDiagnostics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.AccountID == accountID && row.EgressID == storage.DefaultDirectEgressID && row.State == "transport_attempted" {
+			return
+		}
+	}
+	t.Fatalf("cancelled request lost its upstream attempt record: %+v", rows)
+}
+
+func TestCodexSessionMappingSeparatesConcurrentCLIThreadsWithSharedWeakSession(t *testing.T) {
+	type capture struct {
+		kind, session, thread, body string
+	}
+	var (
+		mu       sync.Mutex
+		captures []capture
+		starts   atomic.Int32
+		release  = make(chan struct{})
+	)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		kind := ""
+		for _, candidate := range []string{"alpha-start", "beta-start", "alpha-next", "beta-next"} {
+			if strings.Contains(string(raw), candidate) {
+				kind = candidate
+				break
+			}
+		}
+		if strings.HasSuffix(kind, "-start") {
+			if starts.Add(1) == 2 {
+				close(release)
+			}
+			select {
+			case <-release:
+			case <-time.After(2 * time.Second):
+				t.Errorf("independent CLI roots did not reach upstream concurrently")
+			}
+		}
+		mu.Lock()
+		captures = append(captures, capture{
+			kind: kind, session: r.Header.Get("Session-Id"),
+			thread: r.Header.Get("Thread-Id"), body: string(raw),
+		})
+		mu.Unlock()
+		responseID := "resp_" + strings.ReplaceAll(kind, "-", "_")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"`+responseID+`","object":"response","model":"gpt","status":"completed","output":[]}`)
+	})
+	enableCodexSessionMappingForTest(h)
+	h.importAccount(t, "shared-cli", "upstream-shared-cli", "access-shared-cli")
+	const apiKey = "cap_shared_cli_isolation"
+	if err := h.store.UpsertAPIKey(context.Background(), storage.APIKey{
+		KeyHash: hashAPIKey(apiKey), Label: "shared-cli", GroupName: "cyber", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(thread, body string) (int, string, error) {
+		req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/responses", strings.NewReader(body))
+		if err != nil {
+			return 0, "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Thread-Id", thread)
+		req.Header.Set("Session-Id", "shared-process-session")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, "", err
+		}
+		defer resp.Body.Close()
+		raw, readErr := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw), readErr
+	}
+	runPair := func(cases []struct{ thread, body, response string }) {
+		t.Helper()
+		var wg sync.WaitGroup
+		errs := make(chan string, len(cases))
+		for _, tc := range cases {
+			tc := tc
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				status, body, err := post(tc.thread, tc.body)
+				if err != nil || status != http.StatusOK || !strings.Contains(body, tc.response) {
+					errs <- fmt.Sprintf("thread=%s status=%d body=%s err=%v", tc.thread, status, body, err)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for failure := range errs {
+			t.Error(failure)
+		}
+	}
+	runPair([]struct{ thread, body, response string }{
+		{"cli-thread-alpha", `{"model":"gpt","session_id":"shared-process-session","input":"alpha-start"}`, "resp_alpha_start"},
+		{"cli-thread-beta", `{"model":"gpt","session_id":"shared-process-session","input":"beta-start"}`, "resp_beta_start"},
+	})
+	runPair([]struct{ thread, body, response string }{
+		{"cli-thread-alpha", `{"model":"gpt","session_id":"shared-process-session","previous_response_id":"resp_alpha_start","input":"alpha-next"}`, "resp_alpha_next"},
+		{"cli-thread-beta", `{"model":"gpt","session_id":"shared-process-session","previous_response_id":"resp_beta_start","input":"beta-next"}`, "resp_beta_next"},
+	})
+
+	mu.Lock()
+	got := append([]capture(nil), captures...)
+	mu.Unlock()
+	if len(got) != 4 {
+		t.Fatalf("upstream calls=%d captures=%+v", len(got), got)
+	}
+	byKind := make(map[string]capture, len(got))
+	for _, item := range got {
+		byKind[item.kind] = item
+	}
+	alpha, beta := byKind["alpha-start"], byKind["beta-start"]
+	if alpha.session == "" || beta.session == "" || alpha.session != alpha.thread || beta.session != beta.thread ||
+		alpha.session == beta.session {
+		t.Fatalf("independent CLI roots shared an upstream identity alpha=%+v beta=%+v", alpha, beta)
+	}
+	if byKind["alpha-next"].session != alpha.session || byKind["beta-next"].session != beta.session {
+		t.Fatalf("continuations changed or crossed identities captures=%+v", got)
+	}
+	if strings.Contains(byKind["alpha-next"].body, "resp_beta_start") ||
+		strings.Contains(byKind["beta-next"].body, "resp_alpha_start") {
+		t.Fatalf("continuation state crossed CLI roots captures=%+v", got)
+	}
+
+	namespace := "key:" + hashAPIKey(apiKey)
+	alphaRows, alphaErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "root", Value: "cli-thread-alpha"})
+	betaRows, betaErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "root", Value: "cli-thread-beta"})
+	if alphaErr != nil || betaErr != nil || len(alphaRows) != 1 || len(betaRows) != 1 ||
+		alphaRows[0].TreeID == betaRows[0].TreeID {
+		t.Fatalf("durable roots were not isolated alpha=%+v/%v beta=%+v/%v", alphaRows, alphaErr, betaRows, betaErr)
+	}
+	if rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "session", Value: "shared-process-session"}); err == nil || len(rows) != 0 {
+		t.Fatalf("weak shared session unexpectedly became durable rows=%+v err=%v", rows, err)
+	}
 }
 
 func TestCodexSessionMappingKeepsNativeIdentityAndToolOutput(t *testing.T) {

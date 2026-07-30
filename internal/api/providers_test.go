@@ -16,6 +16,9 @@ func TestAdminProvidersRejectsInvalidBaseURL(t *testing.T) {
 		`{"id":"bad","name":"Bad"}`,
 		`{"id":"bad","name":"Bad","base_url":"not-a-url"}`,
 		`{"id":"bad","name":"Bad","base_url":"ftp://example.com/v1"}`,
+		`{"id":"bad","name":"Bad","base_url":"https://user:pass@example.com/v1"}`,
+		`{"id":"bad","name":"Bad","base_url":"https://example.com/v1?tenant=unexpected"}`,
+		`{"id":"bad","name":"Bad","base_url":"https://example.com/v1#fragment"}`,
 	}
 	for _, body := range cases {
 		code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", body)
@@ -29,6 +32,38 @@ func TestAdminProvidersRejectsInvalidBaseURL(t *testing.T) {
 			t.Fatal(err)
 		} else if ok {
 			t.Fatalf("invalid provider %q was persisted", id)
+		}
+	}
+}
+
+func TestAdminProvidersRejectsCaseFoldedMappingConflicts(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"mapping-conflict",
+		"name":"Mapping Conflict",
+		"base_url":"https://relay.example/v1",
+		"model_mappings":{
+			"Claude-Sonnet-5":"relay-a",
+			"claude-sonnet-5":"relay-b"
+		}
+	}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("case-folded conflicting mapping status=%d, want 400: %s", code, raw)
+	}
+	if _, ok, err := h.store.GetCustomProvider(t.Context(), "mapping-conflict"); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("provider with ambiguous model mapping was persisted")
+	}
+}
+
+func TestAdminProvidersRejectsAllBuiltInProviderIDs(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	for _, id := range []string{"codex", "claude", "kiro", "antigravity"} {
+		code, raw := grpReq(t, h, http.MethodPost, "/admin/providers",
+			`{"id":"`+id+`","base_url":"https://relay.example/v1"}`)
+		if code != http.StatusBadRequest {
+			t.Fatalf("built-in provider id %q status=%d body=%s", id, code, raw)
 		}
 	}
 }

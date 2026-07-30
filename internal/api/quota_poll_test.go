@@ -21,6 +21,8 @@ func TestCodexQuotaPollTargetsBatchTokenFiltering(t *testing.T) {
 		{ID: "codex-explicit", Provider: "codex", Status: "active"},
 		{ID: "legacy-codex", Status: "active"},
 		{ID: "legacy-claude", Status: "active"},
+		{ID: "kiro-explicit", Provider: "kiro", Status: "active"},
+		{ID: "kiro-quarantined", Provider: "kiro", Status: "active", QuarantineUntil: now + 60},
 		{ID: "custom", Provider: "deepseek", Status: "active"},
 		{ID: "disabled", Provider: "codex", Status: "disabled"},
 		{ID: "quarantined", Provider: "codex", Status: "active", QuarantineUntil: now + 60},
@@ -28,7 +30,7 @@ func TestCodexQuotaPollTargetsBatchTokenFiltering(t *testing.T) {
 	}
 
 	ids := quotaPollCandidateAccountIDs(accounts, now)
-	wantIDs := []string{"codex-explicit", "legacy-codex", "legacy-claude", "missing-token"}
+	wantIDs := []string{"codex-explicit", "legacy-codex", "legacy-claude", "kiro-explicit", "missing-token"}
 	if !reflect.DeepEqual(ids, wantIDs) {
 		t.Fatalf("candidate ids = %#v, want %#v", ids, wantIDs)
 	}
@@ -48,6 +50,78 @@ func TestCodexQuotaPollTargetsBatchTokenFiltering(t *testing.T) {
 	wantTargets := []string{"codex-explicit", "legacy-codex"}
 	if !reflect.DeepEqual(gotIDs, wantTargets) {
 		t.Fatalf("target ids = %#v, want %#v", gotIDs, wantTargets)
+	}
+}
+
+func TestKiroQuotaPollTargetsAreReachableAndStateFiltered(t *testing.T) {
+	now := int64(1_700_000_000)
+	accounts := []storage.Account{
+		{ID: "kiro-active", Provider: "kiro", Status: "active"},
+		{ID: "kiro-case", Provider: "KIRO", Status: "active"},
+		{ID: "kiro-disabled", Provider: "kiro", Status: "disabled"},
+		{ID: "kiro-quarantined", Provider: "kiro", Status: "active", QuarantineUntil: now + 60},
+		{ID: "claude", Provider: "claude", Status: "active"},
+	}
+	targets := kiroQuotaPollTargets(accounts, map[string]storage.AccountToken{
+		"kiro-active":      {AccountID: "kiro-active", AccessToken: "a"},
+		"kiro-case":        {AccountID: "kiro-case", AccessToken: "b"},
+		"kiro-disabled":    {AccountID: "kiro-disabled", AccessToken: "c"},
+		"kiro-quarantined": {AccountID: "kiro-quarantined", AccessToken: "d"},
+		"claude":           {AccountID: "claude", AccessToken: "e"},
+	}, now)
+	got := make([]string, 0, len(targets))
+	for _, target := range targets {
+		got = append(got, target.Account.ID)
+	}
+	if want := []string{"kiro-active", "kiro-case"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Kiro quota targets=%v, want %v", got, want)
+	}
+}
+
+func TestParseKiroUsageLimitsSelectsAgenticAndClampsExhaustion(t *testing.T) {
+	limits := map[string]interface{}{
+		"nextDateReset": "2026-08-01T00:00:00Z",
+		"usageBreakdownList": []interface{}{
+			map[string]interface{}{"resourceType": "CODE_COMPLETION", "usageLimit": float64(999), "currentUsage": float64(1)},
+			map[string]interface{}{
+				"resourceType":              "AGENTIC_REQUEST",
+				"usageLimitWithPrecision":   float64(10),
+				"currentUsageWithPrecision": float64(14),
+				"freeTrialInfo": map[string]interface{}{
+					"freeTrialStatus": "INACTIVE", "usageLimit": float64(100), "currentUsage": float64(0),
+				},
+				"bonuses": []interface{}{
+					map[string]interface{}{"status": "ACTIVE", "usageLimitWithPrecision": "2.5", "currentUsageWithPrecision": "0.5"},
+					map[string]interface{}{"status": "EXPIRED", "usageLimit": float64(500), "currentUsage": float64(0)},
+				},
+			},
+		},
+	}
+	got, err := parseKiroUsageLimits(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Limit != 12.5 || got.Current != 14.5 || got.Remaining != 0 ||
+		got.UsedPercent != 100 || got.Status != "exhausted" ||
+		got.ResetAt != 1785542400 {
+		t.Fatalf("parsed Kiro usage=%+v", got)
+	}
+}
+
+func TestParseKiroUsageLimitsNormalizesMillisecondReset(t *testing.T) {
+	got, err := parseKiroUsageLimits(map[string]interface{}{
+		"usageBreakdownList": []interface{}{
+			map[string]interface{}{
+				"usageLimit": float64(100), "currentUsage": float64(25),
+				"nextDateReset": float64(1_785_542_400_000),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Remaining != 75 || got.UsedPercent != 25 || got.Status != "allowed" || got.ResetAt != 1785542400 {
+		t.Fatalf("parsed legacy Kiro usage=%+v", got)
 	}
 }
 

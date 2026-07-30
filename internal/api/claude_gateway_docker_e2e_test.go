@@ -36,9 +36,9 @@ const (
 //	  -> gateway run-claude -> local proxy -> pool
 //
 // It intentionally poisons ANTHROPIC_API_KEY before launching the real,
-// version-pinned Claude Code. Both credential forms observed at the pool must
-// still contain the bundled downstream key, and the proxy must preserve the
-// current beta query/header, streaming body, tool schemas and project Skill.
+// version-pinned Claude Code. The runtime must remove that direct credential,
+// send only the bundled bearer token, and preserve the current beta
+// query/header, streaming body, tool schemas and project Skill.
 //
 //	CLAUDE_GATEWAY_DOCKER_E2E=1 go test ./internal/api \
 //	  -run '^TestClaudeCodeBundledGatewayDockerEndToEnd$' -count=1 -v
@@ -100,7 +100,6 @@ const request = http.request({
   headers: {
     host: target.host,
     authorization: "Bearer " + process.env.ANTHROPIC_AUTH_TOKEN,
-    "x-api-key": process.env.ANTHROPIC_API_KEY,
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "claude-code-20250219",
     "content-type": "application/json",
@@ -306,7 +305,7 @@ func (c *claudeGatewayE2ECapture) serve(w http.ResponseWriter, r *http.Request) 
 			"hostname":"gateway-e2e",
 			"home_dir":"/root",
 			"dns_servers":["1.1.1.1"],
-			"gateway_policy":{"unknown_target_policy":"forward","disable_nonessential_env":true}
+			"gateway_policy":{"unknown_target_policy":"forward","disable_nonessential_env":false}
 		}`)
 		return
 	case "/v1/messages/count_tokens":
@@ -354,17 +353,15 @@ func (c *claudeGatewayE2ECapture) serve(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-func (c *claudeGatewayE2ECapture) checkGatewayHeadersLocked(r *http.Request, expectBothCredentials bool) {
+func (c *claudeGatewayE2ECapture) checkGatewayHeadersLocked(r *http.Request, expectClaudeCredential bool) {
 	if got := r.Header.Get("Authorization"); got != "Bearer "+claudeGatewayE2EKey {
 		c.errors = append(c.errors, fmt.Sprintf("%s authorization = %q", r.URL.Path, got))
 	}
-	if expectBothCredentials {
-		if got := r.Header.Get("x-api-key"); got != claudeGatewayE2EKey {
-			c.errors = append(c.errors, fmt.Sprintf("%s x-api-key = %q", r.URL.Path, got))
-		}
-		if strings.Contains(r.Header.Get("x-api-key"), claudeGatewayE2EStaleKey) {
-			c.errors = append(c.errors, fmt.Sprintf("%s leaked stale x-api-key", r.URL.Path))
-		}
+	if expectClaudeCredential && strings.TrimSpace(r.Header.Get("x-api-key")) != "" {
+		c.errors = append(c.errors, fmt.Sprintf("%s unexpected x-api-key = %q", r.URL.Path, r.Header.Get("x-api-key")))
+	}
+	if strings.Contains(r.Header.Get("x-api-key"), claudeGatewayE2EStaleKey) {
+		c.errors = append(c.errors, fmt.Sprintf("%s leaked stale x-api-key", r.URL.Path))
 	}
 	if got := r.Header.Get("X-Gateway-Mode"); got != "local" {
 		c.errors = append(c.errors, fmt.Sprintf("%s X-Gateway-Mode = %q", r.URL.Path, got))

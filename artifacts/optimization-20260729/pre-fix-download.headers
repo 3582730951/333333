@@ -1,0 +1,13 @@
+HTTP/1.1 200 OK
+Accept-Ranges: bytes
+Content-Disposition: attachment; filename="codex-pool-diagnostics-v3-diagjob_6e8b07160ac34f0789f0f42d925dbee1.zip"
+Content-Length: 9359
+Content-Type: application/zip
+Etag: "504f2a41eca5b82333a875993b84f63d79984966bb0df36a7c55782b05a37691"
+Last-Modified: Wed, 29 Jul 2026 19:45:44 GMT
+Referrer-Policy: same-origin
+X-Codex-Pool-Release: development
+X-Content-Type-Options: nosniff
+X-Request-Id: REQ-94A837DE310BFEAD
+Date: Wed, 29 Jul 2026 19:45:44 GMT
+

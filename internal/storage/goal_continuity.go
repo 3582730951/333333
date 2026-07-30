@@ -167,10 +167,13 @@ type GoalSegment struct {
 }
 
 const (
-	goalPayloadFormatV2  = int64(2)
-	goalPayloadChunkSize = 64 << 10
-	goalChunkCheckpoint  = "checkpoint"
-	goalChunkSegment     = "segment"
+	goalPayloadFormatV2     = int64(2)
+	goalPayloadChunkSize    = 64 << 10
+	goalChunkCheckpoint     = "checkpoint"
+	goalChunkSegment        = "segment"
+	goalReclaimRowsPerStep  = 64
+	goalReclaimBytesPerStep = 8 << 20
+	goalReclaimingState     = "reclaiming"
 )
 
 func (s *Store) estimateGoalChunkStorage(payload string) int64 {
@@ -180,7 +183,8 @@ func (s *Store) estimateGoalChunkStorage(payload string) int64 {
 		if end > len(payload) {
 			end = len(payload)
 		}
-		plainBytes := end - offset
+		durable := compressContextPayload(payload[offset:end])
+		plainBytes := len(durable)
 		if len(s.tokenKey) == 32 {
 			stored += int64(len(secretbox.Prefix) + base64.StdEncoding.EncodedLen(plainBytes+12+16))
 		} else {
@@ -199,7 +203,7 @@ func (s *Store) insertGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind s
 			end = len(payload)
 		}
 		part := payload[offset:end]
-		encrypted := s.sealToken(part)
+		encrypted := s.sealToken(compressContextPayload(part))
 		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_payload_chunk(goal_id,payload_kind,segment_sequence,chunk_index,payload_hash,payload_bytes,encrypted_payload,created_at) VALUES(?,?,?,?,?,?,?,?)`,
 			goalID, kind, segmentSequence, index, hashGoalPayload(part), len(part), encrypted, createdAt); err != nil {
 			return stored, err
@@ -211,18 +215,35 @@ func (s *Store) insertGoalChunks(ctx context.Context, tx *sql.Tx, goalID, kind s
 }
 
 func (s *Store) readGoalChunks(ctx context.Context, goalID, kind string, segmentSequence int64) (string, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT encrypted_payload FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence=? ORDER BY chunk_index`, goalID, kind, segmentSequence)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT p.payload_hash,p.payload_bytes,p.encrypted_payload
+FROM goal_payload_chunk p JOIN goal_session s ON s.id=p.goal_id
+WHERE p.goal_id=? AND p.payload_kind=? AND p.segment_sequence=? AND s.state<>'reclaiming'
+ORDER BY p.chunk_index`, goalID, kind, segmentSequence)
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
 	var payload bytes.Buffer
 	for rows.Next() {
-		var encrypted string
-		if err = rows.Scan(&encrypted); err != nil {
+		var hash, encrypted string
+		var plainBytes int64
+		if err = rows.Scan(&hash, &plainBytes, &encrypted); err != nil {
 			return "", err
 		}
-		payload.WriteString(s.openToken(encrypted))
+		if plainBytes < 0 || plainBytes > goalPayloadChunkSize {
+			return "", fmt.Errorf("goal payload chunk declares invalid plaintext length %d", plainBytes)
+		}
+		decoded, decodeErr := s.openContextPayload(encrypted, goalPayloadChunkSize)
+		if decodeErr != nil {
+			return "", fmt.Errorf("decode goal payload chunk: %w", decodeErr)
+		}
+		if int64(len(decoded)) != plainBytes || hashGoalPayload(decoded) != hash {
+			return "", errors.New("goal payload chunk failed plaintext length/hash verification")
+		}
+		if int64(payload.Len())+plainBytes > maxStoredContextPayloadBytes {
+			return "", fmt.Errorf("goal payload exceeds %d-byte reconstruction limit", maxStoredContextPayloadBytes)
+		}
+		payload.WriteString(decoded)
 	}
 	if err = rows.Err(); err != nil {
 		return "", err
@@ -398,7 +419,7 @@ func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []
  s.downstream_key_hash, s.workspace_hash, s.initial_goal_hash, s.last_response_hash,
 	 s.state, s.current_checkpoint_id, s.encrypted_working_state, s.storage_bytes, s.expires_at, s.created_at, s.updated_at
  FROM goal_alias a JOIN goal_session s ON s.id=a.goal_id
- WHERE a.alias_hash IN (` + strings.Join(marks, ",") + `) AND s.expires_at>?`
+	 WHERE a.alias_hash IN (` + strings.Join(marks, ",") + `) AND s.expires_at>? AND s.state<>'reclaiming'`
 	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return GoalResolution{}, err
@@ -413,7 +434,10 @@ func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []
 			&item.State, &item.CurrentCheckpoint, &encrypted, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return GoalResolution{}, err
 		}
-		item.WorkingState = s.openToken(encrypted)
+		item.WorkingState, err = s.openContextPayload(encrypted, maxStoredContextPayloadBytes)
+		if err != nil {
+			return GoalResolution{}, fmt.Errorf("decode goal working state: %w", err)
+		}
 		out = append(out, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -477,7 +501,7 @@ func (s *Store) ResolveFallbackGoal(ctx context.Context, downstreamKeyHash, work
 	rows, err := s.rdb.QueryContext(ctx, `SELECT id, protocol, parent_goal_id, branch_hash,
  downstream_key_hash, workspace_hash, initial_goal_hash, last_response_hash, state,
 	 current_checkpoint_id, encrypted_working_state, storage_bytes, expires_at, created_at, updated_at
- FROM goal_session WHERE downstream_key_hash=? AND workspace_hash=? AND initial_goal_hash=? AND expires_at>?`,
+ FROM goal_session WHERE downstream_key_hash=? AND workspace_hash=? AND initial_goal_hash=? AND expires_at>? AND state<>'reclaiming'`,
 		downstreamKeyHash, workspaceHash, initialGoalHash, Now())
 	if err != nil {
 		return GoalResolution{}, err
@@ -492,7 +516,10 @@ func (s *Store) ResolveFallbackGoal(ctx context.Context, downstreamKeyHash, work
 			&item.State, &item.CurrentCheckpoint, &encrypted, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return GoalResolution{}, err
 		}
-		item.WorkingState = s.openToken(encrypted)
+		item.WorkingState, err = s.openContextPayload(encrypted, maxStoredContextPayloadBytes)
+		if err != nil {
+			return GoalResolution{}, fmt.Errorf("decode goal working state: %w", err)
+		}
 		matches = append(matches, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -521,6 +548,11 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	if turn.Protocol == "" || strings.TrimSpace(turn.CheckpointPayload) == "" || strings.TrimSpace(turn.SegmentPayload) == "" {
 		return GoalSession{}, errors.New("invalid goal turn")
 	}
+	if int64(len(turn.CheckpointPayload)) > maxStoredContextPayloadBytes ||
+		int64(len(turn.SegmentPayload)) > maxStoredContextPayloadBytes ||
+		int64(len(turn.WorkingState)) > maxStoredContextPayloadBytes {
+		return GoalSession{}, fmt.Errorf("goal context exceeds %d-byte storage limit", maxStoredContextPayloadBytes)
+	}
 	if turn.ExpiresAt <= Now() {
 		return GoalSession{}, errors.New("goal turn expiry must be in the future")
 	}
@@ -536,11 +568,6 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	}
 	defer tx.Rollback()
 
-	// Expired completed/retryable work is always reclaimed before rejecting a new
-	// checkpoint.  Active runs never participate in eviction.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM goal_session WHERE expires_at<=? AND id NOT IN (SELECT goal_id FROM goal_run WHERE state IN ('running','compacting','awaiting_tool_result') AND lease_expires_at>?)`, now, now); err != nil {
-		return GoalSession{}, err
-	}
 	// A Codex child branch always resolves by its own concrete thread first.  The
 	// parent/root alias remains owned by the root session and is relationship data,
 	// never an instruction to merge a child's raw segment stream into its parent.
@@ -572,6 +599,17 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	var checkpointEstimatedBytes int64
 	if created {
 		checkpointEstimatedBytes = s.estimateGoalChunkStorage(turn.CheckpointPayload)
+	} else {
+		// Serialize this foreground append with the maintenance CAS that changes a
+		// goal to reclaiming. The no-op update takes the parent-row write lock on
+		// both SQLite and PostgreSQL without changing its LRU timestamp.
+		locked, lockErr := tx.ExecContext(ctx, `UPDATE goal_session SET updated_at=updated_at WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID)
+		if lockErr != nil {
+			return GoalSession{}, lockErr
+		}
+		if affected, _ := locked.RowsAffected(); affected != 1 {
+			return GoalSession{}, ErrGoalNotFound
+		}
 	}
 	if turn.StorageMaxBytes > 0 {
 		var used int64
@@ -583,23 +621,9 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 			estimate += checkpointEstimatedBytes
 		}
 		if used+estimate > turn.StorageMaxBytes {
-			protectedGoalID := ""
-			if !created {
-				protectedGoalID = resolution.Session.ID
-			}
-			freed, deleted, reclaimErr := s.reclaimGoalStorageBudget(ctx, tx, protectedGoalID, now, used+estimate-turn.StorageMaxBytes)
-			if reclaimErr != nil {
-				return GoalSession{}, reclaimErr
-			}
-			used -= freed
-			if deleted > 0 {
-				if _, auditErr := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
-					"goal_storage_reclaimed", "completed", "storage_budget_lru", fmt.Sprintf("goals=%d bytes=%d", deleted, freed), now); auditErr != nil {
-					return GoalSession{}, auditErr
-				}
-			}
-		}
-		if used+estimate > turn.StorageMaxBytes {
+			// Physical reclamation is deliberately maintenance-only. A foreground
+			// turn never cascades through a multi-gigabyte goal while holding its
+			// successful-terminal transaction.
 			return GoalSession{}, ErrGoalStorageBudget
 		}
 	}
@@ -614,7 +638,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		// Insert the session shell first, then fill current_checkpoint_id in the
 		// final upsert below; the entire sequence remains one transaction.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_session(id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			session.ID, session.Protocol, session.ParentGoalID, session.BranchHash, session.DownstreamKeyHash, session.WorkspaceHash, session.InitialGoalHash, "", session.State, "", s.sealToken(turn.WorkingState), 0, session.ExpiresAt, session.CreatedAt, session.UpdatedAt); err != nil {
+			session.ID, session.Protocol, session.ParentGoalID, session.BranchHash, session.DownstreamKeyHash, session.WorkspaceHash, session.InitialGoalHash, "", session.State, "", s.sealToken(compressContextPayload(turn.WorkingState)), 0, session.ExpiresAt, session.CreatedAt, session.UpdatedAt); err != nil {
 			return GoalSession{}, err
 		}
 		checkpoint := GoalCheckpoint{ID: newGoalID("gcp"), GoalID: session.ID, Sequence: 1, Payload: turn.CheckpointPayload, CreatedAt: now}
@@ -677,7 +701,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	if strings.TrimSpace(turn.ResponseID) != "" {
 		session.LastResponseHash = hashGoalValue("response_id", turn.ResponseID)
 	}
-	working := s.sealToken(turn.WorkingState)
+	working := s.sealToken(compressContextPayload(turn.WorkingState))
 	if _, err := tx.ExecContext(ctx, `INSERT INTO goal_session(id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at)
 	VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(id) DO UPDATE SET parent_goal_id=excluded.parent_goal_id, branch_hash=excluded.branch_hash, downstream_key_hash=excluded.downstream_key_hash, workspace_hash=excluded.workspace_hash, initial_goal_hash=excluded.initial_goal_hash, last_response_hash=excluded.last_response_hash, state=excluded.state, current_checkpoint_id=excluded.current_checkpoint_id, encrypted_working_state=excluded.encrypted_working_state, storage_bytes=excluded.storage_bytes, expires_at=excluded.expires_at, updated_at=excluded.updated_at`,
@@ -690,12 +714,24 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 			// child stores only its branch alias and parent_goal_id.
 			continue
 		}
-		// Never overwrite an alias owned by another goal.  That would silently merge
-		// sibling agents after a client bug/retry; the resolution query above catches
-		// normal conflicts before we get here.
-		if _, err := tx.ExecContext(ctx, `INSERT INTO goal_alias(alias_hash,alias_type,goal_id,created_at) VALUES(?,?,?,?) ON CONFLICT(alias_hash) DO UPDATE SET alias_type=excluded.alias_type WHERE goal_alias.goal_id=excluded.goal_id`,
-			hashGoalValue(alias.Type, alias.Value), alias.Type, session.ID, now); err != nil {
+		// Never overwrite an alias owned by another visible goal. A reclaiming owner
+		// is already a logical tombstone, however, and the alias must be transferred
+		// atomically so a new turn cannot commit an identity that will never resolve.
+		aliasHash := hashGoalValue(alias.Type, alias.Value)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM goal_alias
+WHERE alias_hash=? AND EXISTS (
+ SELECT 1 FROM goal_session owner WHERE owner.id=goal_alias.goal_id AND owner.state='reclaiming'
+)`, aliasHash); err != nil {
 			return GoalSession{}, err
+		}
+		bound, err := tx.ExecContext(ctx, `INSERT INTO goal_alias(alias_hash,alias_type,goal_id,created_at) VALUES(?,?,?,?)
+ON CONFLICT(alias_hash) DO UPDATE SET alias_type=excluded.alias_type
+WHERE goal_alias.goal_id=excluded.goal_id`, aliasHash, alias.Type, session.ID, now)
+		if err != nil {
+			return GoalSession{}, err
+		}
+		if affected, _ := bound.RowsAffected(); affected != 1 {
+			return GoalSession{}, ErrGoalAmbiguous
 		}
 	}
 	if created {
@@ -717,61 +753,330 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	return session, nil
 }
 
-// reclaimGoalStorageBudget evicts the least-recently-used inactive goals. The
-// current goal and every live run are protected, so a storage cap cannot delete a
-// task while a relay, resume, or compaction lease is active.
-func (s *Store) reclaimGoalStorageBudget(ctx context.Context, tx *sql.Tx, protectedGoalID string, now, bytesNeeded int64) (int64, int64, error) {
-	if bytesNeeded <= 0 {
-		return 0, 0, nil
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT s.id,s.storage_bytes
-FROM goal_session s
-WHERE (?='' OR s.id<>?)
+type goalReclaimRow struct {
+	id     string
+	kind   string
+	seq    int64
+	index  int64
+	bytes  int64
+	format int64
+}
+
+// findReclaimingGoal always resumes an already-hidden goal before claiming
+// another. A live lease is checked again even though current code never creates
+// one after the reclaiming CAS; this also makes recovery safe for manually edited
+// and pre-release databases.
+func (s *Store) findReclaimingGoal(ctx context.Context, tx *sql.Tx, now int64) (string, error) {
+	var goalID string
+	err := tx.QueryRowContext(ctx, `SELECT s.id FROM goal_session s
+WHERE s.state='reclaiming'
   AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
-ORDER BY CASE s.state WHEN 'retryable' THEN 0 WHEN 'ready' THEN 1 WHEN 'awaiting_tool_result' THEN 2 ELSE 3 END,
-         s.updated_at ASC, s.id ASC`, protectedGoalID, protectedGoalID, now)
+ORDER BY s.updated_at ASC,s.id ASC LIMIT 1`, now).Scan(&goalID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return goalID, err
+}
+
+// markGoalReclaiming is the visibility boundary for physical reclamation. The
+// conditional parent-row update serializes with CommitGoalTurn and AcquireGoalRun,
+// and the live-run predicate is re-evaluated while that write lock is held.
+func (s *Store) markGoalReclaiming(ctx context.Context, tx *sql.Tx, goalID string, now int64) (bool, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE goal_session SET state='reclaiming',updated_at=?
+WHERE id=? AND state<>'reclaiming'
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`, now, goalID, now)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
+}
+
+func (s *Store) markNextBudgetGoalReclaiming(ctx context.Context, tx *sql.Tx, now int64) (string, error) {
+	var goalID string
+	var storageBytes, updatedAt int64
+	err := tx.QueryRowContext(ctx, `SELECT s.id,s.storage_bytes,s.updated_at FROM goal_session s
+WHERE s.state<>'reclaiming'
+  AND s.state IN ('ready','retryable','completed','failed')
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
+ORDER BY CASE s.state WHEN 'retryable' THEN 0 WHEN 'ready' THEN 1 WHEN 'completed' THEN 2 ELSE 3 END,
+         s.updated_at ASC,s.id ASC LIMIT 1`, now).Scan(&goalID, &storageBytes, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE goal_session SET state='reclaiming',updated_at=?
+WHERE id=? AND state IN ('ready','retryable','completed','failed') AND storage_bytes=? AND updated_at=?
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`,
+		now, goalID, storageBytes, updatedAt, now)
+	if err != nil {
+		return "", err
+	}
+	affected, err := result.RowsAffected()
+	marked := affected == 1
+	if err != nil || !marked {
+		return "", err
+	}
+	return goalID, nil
+}
+
+func (s *Store) markNextExpiredGoalReclaiming(ctx context.Context, tx *sql.Tx, now int64) (string, error) {
+	var goalID string
+	var storageBytes, updatedAt int64
+	err := tx.QueryRowContext(ctx, `SELECT s.id,s.storage_bytes,s.updated_at FROM goal_session s
+WHERE s.state<>'reclaiming' AND s.expires_at<=?
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=s.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)
+ORDER BY s.expires_at ASC,s.updated_at ASC,s.id ASC LIMIT 1`, now, now).Scan(&goalID, &storageBytes, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE goal_session SET state='reclaiming',updated_at=?
+WHERE id=? AND state<>'reclaiming' AND expires_at<=? AND storage_bytes=? AND updated_at=?
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`,
+		now, goalID, now, storageBytes, updatedAt, now)
+	if err != nil {
+		return "", err
+	}
+	affected, err := result.RowsAffected()
+	marked := affected == 1
+	if err != nil || !marked {
+		return "", err
+	}
+	return goalID, nil
+}
+
+func goalReclaimRowsWithinBounds(rows []goalReclaimRow) ([]goalReclaimRow, int64, error) {
+	selected := make([]goalReclaimRow, 0, len(rows))
+	var bytes int64
+	for _, row := range rows {
+		if row.bytes < 0 {
+			row.bytes = 0
+		}
+		if row.bytes > goalReclaimBytesPerStep {
+			if len(selected) > 0 {
+				break
+			}
+			return nil, 0, fmt.Errorf("goal reclaim row exceeds %d-byte maintenance bound", goalReclaimBytesPerStep)
+		}
+		if len(selected) >= goalReclaimRowsPerStep || bytes+row.bytes > goalReclaimBytesPerStep {
+			break
+		}
+		selected = append(selected, row)
+		bytes += row.bytes
+	}
+	return selected, bytes, nil
+}
+
+func (s *Store) reclaimGoalChunkStep(ctx context.Context, tx *sql.Tx, goalID string) (bool, int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT payload_kind,segment_sequence,chunk_index,LENGTH(encrypted_payload)
+FROM goal_payload_chunk WHERE goal_id=?
+ORDER BY payload_kind,segment_sequence,chunk_index LIMIT ?`, goalID, goalReclaimRowsPerStep+1)
+	if err != nil {
+		return false, 0, err
+	}
+	var candidates []goalReclaimRow
+	for rows.Next() {
+		var row goalReclaimRow
+		if err = rows.Scan(&row.kind, &row.seq, &row.index, &row.bytes); err != nil {
+			_ = rows.Close()
+			return false, 0, err
+		}
+		candidates = append(candidates, row)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, 0, err
+	}
+	if err = rows.Close(); err != nil {
+		return false, 0, err
+	}
+	if len(candidates) == 0 {
+		return false, 0, nil
+	}
+	selected, _, err := goalReclaimRowsWithinBounds(candidates)
+	if err != nil {
+		return false, 0, err
+	}
+	var freed int64
+	for _, row := range selected {
+		result, deleteErr := tx.ExecContext(ctx, `DELETE FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence=? AND chunk_index=?`, goalID, row.kind, row.seq, row.index)
+		if deleteErr != nil {
+			return false, freed, deleteErr
+		}
+		if affected, _ := result.RowsAffected(); affected == 1 {
+			freed += row.bytes
+		}
+	}
+	if freed > 0 {
+		if _, err = tx.ExecContext(ctx, `UPDATE goal_session SET storage_bytes=CASE WHEN storage_bytes>? THEN storage_bytes-? ELSE 0 END WHERE id=? AND state='reclaiming'`, freed, freed, goalID); err != nil {
+			return false, freed, err
+		}
+	}
+	return true, freed, nil
+}
+
+func (s *Store) reclaimGoalIDTableStep(ctx context.Context, tx *sql.Tx, goalID, table, idColumn string, accountPayloadBytes bool) (bool, int64, error) {
+	lengthExpr := "0"
+	if accountPayloadBytes {
+		lengthExpr = "LENGTH(encrypted_payload),format_version"
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+idColumn+`,`+lengthExpr+` FROM `+table+` WHERE goal_id=? LIMIT ?`, goalID, goalReclaimRowsPerStep+1)
+	if err != nil {
+		return false, 0, err
+	}
+	var candidates []goalReclaimRow
+	for rows.Next() {
+		var row goalReclaimRow
+		if accountPayloadBytes {
+			err = rows.Scan(&row.id, &row.bytes, &row.format)
+		} else {
+			err = rows.Scan(&row.id, &row.bytes)
+		}
+		if err != nil {
+			_ = rows.Close()
+			return false, 0, err
+		}
+		candidates = append(candidates, row)
+	}
+	if err = rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, 0, err
+	}
+	if err = rows.Close(); err != nil {
+		return false, 0, err
+	}
+	if len(candidates) == 0 {
+		return false, 0, nil
+	}
+	var selected []goalReclaimRow
+	if accountPayloadBytes && candidates[0].bytes > goalReclaimBytesPerStep && candidates[0].format < goalPayloadFormatV2 {
+		// v1 stored the whole encrypted checkpoint/segment in one SQL value. It
+		// cannot be split without first decrypting and rewriting that same giant
+		// value, so guarantee convergence by deleting exactly one legacy row. All
+		// current v2 large payloads take the hard byte-bounded chunk path above.
+		selected = candidates[:1]
+	} else {
+		selected, _, err = goalReclaimRowsWithinBounds(candidates)
+		if err != nil {
+			return false, 0, err
+		}
+	}
+	var freed int64
+	for _, row := range selected {
+		result, deleteErr := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE goal_id=? AND `+idColumn+`=?`, goalID, row.id)
+		if deleteErr != nil {
+			return false, freed, deleteErr
+		}
+		if affected, _ := result.RowsAffected(); affected == 1 {
+			freed += row.bytes
+		}
+	}
+	if freed > 0 {
+		if _, err = tx.ExecContext(ctx, `UPDATE goal_session SET storage_bytes=CASE WHEN storage_bytes>? THEN storage_bytes-? ELSE 0 END WHERE id=? AND state='reclaiming'`, freed, freed, goalID); err != nil {
+			return false, freed, err
+		}
+	}
+	return true, freed, nil
+}
+
+// reclaimGoalStep advances exactly one child-table phase for one hidden goal.
+// Large v2 payloads live in fixed-size goal_payload_chunk rows, so both the row
+// count and ciphertext bytes removed by a transaction have hard upper bounds.
+// The parent is deleted only after every cascading child table is empty.
+func (s *Store) reclaimGoalStep(ctx context.Context, tx *sql.Tx, goalID string, now int64) (int64, int64, error) {
+	if progressed, freed, err := s.reclaimGoalChunkStep(ctx, tx, goalID); progressed || err != nil {
+		return freed, 0, err
+	}
+	for _, phase := range []struct {
+		table, idColumn string
+		payload         bool
+	}{
+		{table: "goal_segment", idColumn: "id", payload: true},
+		{table: "goal_checkpoint", idColumn: "id", payload: true},
+		{table: "goal_alias", idColumn: "alias_hash"},
+		{table: "goal_run", idColumn: "id"},
+	} {
+		if progressed, freed, err := s.reclaimGoalIDTableStep(ctx, tx, goalID, phase.table, phase.idColumn, phase.payload); progressed || err != nil {
+			return freed, 0, err
+		}
+	}
+	var remainingStorage int64
+	if err := tx.QueryRowContext(ctx, `SELECT storage_bytes FROM goal_session WHERE id=? AND state='reclaiming'`, goalID).Scan(&remainingStorage); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM goal_session
+WHERE id=? AND state='reclaiming'
+  AND NOT EXISTS (SELECT 1 FROM goal_payload_chunk WHERE goal_id=goal_session.id)
+  AND NOT EXISTS (SELECT 1 FROM goal_segment WHERE goal_id=goal_session.id)
+  AND NOT EXISTS (SELECT 1 FROM goal_checkpoint WHERE goal_id=goal_session.id)
+  AND NOT EXISTS (SELECT 1 FROM goal_alias WHERE goal_id=goal_session.id)
+  AND NOT EXISTS (SELECT 1 FROM goal_run WHERE goal_id=goal_session.id)
+  AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`, goalID, now)
 	if err != nil {
 		return 0, 0, err
 	}
-	type candidate struct {
-		id    string
-		bytes int64
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, 0, err
 	}
-	var candidates []candidate
-	for rows.Next() {
-		var item candidate
-		if err := rows.Scan(&item.id, &item.bytes); err != nil {
-			_ = rows.Close()
+	return remainingStorage, deleted, nil
+}
+
+// EnforceGoalStorageBudget converges databases created by older releases to the
+// configured global budget. CommitGoalTurn already enforces the same limit for new
+// writes, but an upgraded database may begin above the limit and otherwise remain
+// oversized until every retained goal expires. Live runs are protected by the same
+// lease predicate used on the foreground commit path.
+func (s *Store) EnforceGoalStorageBudget(ctx context.Context, maxBytes int64) (int64, int64, error) {
+	if maxBytes <= 0 {
+		return 0, 0, nil
+	}
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	goalID, err := s.findReclaimingGoal(ctx, tx, now)
+	if err != nil {
+		return 0, 0, err
+	}
+	if goalID == "" {
+		var used int64
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used); err != nil {
 			return 0, 0, err
 		}
-		candidates = append(candidates, item)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return 0, 0, err
-	}
-	if err := rows.Close(); err != nil {
-		return 0, 0, err
-	}
-	var freed, deleted int64
-	for _, item := range candidates {
-		result, err := tx.ExecContext(ctx, `DELETE FROM goal_session
-WHERE id=? AND NOT EXISTS (SELECT 1 FROM goal_run r WHERE r.goal_id=goal_session.id AND r.state IN ('running','compacting','awaiting_tool_result') AND r.lease_expires_at>?)`, item.id, now)
+		if used <= maxBytes {
+			return 0, 0, nil
+		}
+		goalID, err = s.markNextBudgetGoalReclaiming(ctx, tx, now)
 		if err != nil {
+			return 0, 0, err
+		}
+		if goalID == "" {
+			return 0, 0, nil
+		}
+	}
+	freed, deleted, err := s.reclaimGoalStep(ctx, tx, goalID, now)
+	if err != nil {
+		return freed, deleted, err
+	}
+	if deleted > 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
+			"goal_storage_reclaimed", "completed", "storage_budget_maintenance", fmt.Sprintf("goal=%s goals=%d bytes=%d max_bytes=%d", goalID, deleted, freed, maxBytes), now); err != nil {
 			return freed, deleted, err
 		}
-		removed, err := result.RowsAffected()
-		if err != nil {
-			return freed, deleted, err
-		}
-		if removed == 0 {
-			continue
-		}
-		freed += item.bytes
-		deleted += removed
-		if freed >= bytesNeeded {
-			break
-		}
+	}
+	if err := tx.Commit(); err != nil {
+		return freed, deleted, err
 	}
 	return freed, deleted, nil
 }
@@ -898,6 +1203,12 @@ func (s *Store) BuildGoalReplay(ctx context.Context, goalID string) ([]byte, Goa
 	}
 	delete(root, "previous_response_id")
 	delete(root, "turn_state")
+	// Each payload query excludes reclaiming. Recheck after the last query as
+	// well, so a maintenance CAS between the initial session lookup and an empty
+	// segment result cannot return a truncated replay that looks successful.
+	if _, err := s.GetGoalSession(ctx, goalID); err != nil {
+		return nil, GoalSession{}, err
+	}
 	body, err := json.Marshal(root)
 	return body, session, err
 }
@@ -911,7 +1222,7 @@ func decodeGoalReplayJSON(raw string, dst interface{}) error {
 func (s *Store) GetGoalSession(ctx context.Context, id string) (GoalSession, error) {
 	var item GoalSession
 	var encrypted string
-	err := s.rdb.QueryRowContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at FROM goal_session WHERE id=? AND expires_at>?`, id, Now()).Scan(
+	err := s.rdb.QueryRowContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,encrypted_working_state,storage_bytes,expires_at,created_at,updated_at FROM goal_session WHERE id=? AND expires_at>? AND state<>'reclaiming'`, id, Now()).Scan(
 		&item.ID, &item.Protocol, &item.ParentGoalID, &item.BranchHash, &item.DownstreamKeyHash, &item.WorkspaceHash, &item.InitialGoalHash, &item.LastResponseHash, &item.State, &item.CurrentCheckpoint, &encrypted, &item.StorageBytes, &item.ExpiresAt, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -919,14 +1230,19 @@ func (s *Store) GetGoalSession(ctx context.Context, id string) (GoalSession, err
 		}
 		return GoalSession{}, err
 	}
-	item.WorkingState = s.openToken(encrypted)
+	item.WorkingState, err = s.openContextPayload(encrypted, maxStoredContextPayloadBytes)
+	if err != nil {
+		return GoalSession{}, fmt.Errorf("decode goal working state: %w", err)
+	}
 	return item, nil
 }
 
 func (s *Store) getGoalCheckpoint(ctx context.Context, id string) (GoalCheckpoint, error) {
 	var item GoalCheckpoint
 	var encrypted string
-	err := s.rdb.QueryRowContext(ctx, `SELECT id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,format_version,created_at FROM goal_checkpoint WHERE id=?`, id).Scan(
+	err := s.rdb.QueryRowContext(ctx, `SELECT c.id,c.goal_id,c.sequence,c.through_segment_sequence,c.payload_hash,c.payload_bytes,c.encrypted_payload,c.format_version,c.created_at
+FROM goal_checkpoint c JOIN goal_session s ON s.id=c.goal_id
+WHERE c.id=? AND s.state<>'reclaiming'`, id).Scan(
 		&item.ID, &item.GoalID, &item.Sequence, &item.ThroughSegmentSequence, &item.PayloadHash, &item.PayloadBytes, &encrypted, &item.FormatVersion, &item.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -943,7 +1259,10 @@ func (s *Store) getGoalCheckpoint(ctx context.Context, id string) (GoalCheckpoin
 }
 
 func (s *Store) listGoalSegmentsAfter(ctx context.Context, goalID string, after int64) ([]GoalSegment, error) {
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id,goal_id,sequence,payload_hash,payload_bytes,encrypted_payload,format_version,state,created_at FROM goal_segment WHERE goal_id=? AND sequence>? ORDER BY sequence ASC`, goalID, after)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT g.id,g.goal_id,g.sequence,g.payload_hash,g.payload_bytes,g.encrypted_payload,g.format_version,g.state,g.created_at
+FROM goal_segment g JOIN goal_session s ON s.id=g.goal_id
+WHERE g.goal_id=? AND g.sequence>? AND s.state<>'reclaiming'
+ORDER BY g.sequence ASC`, goalID, after)
 	if err != nil {
 		return nil, err
 	}
@@ -982,7 +1301,10 @@ func (s *Store) listGoalCompactedSegments(ctx context.Context, goalID string, th
 	if through <= 0 {
 		return nil, nil
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT segment_sequence,encrypted_payload FROM goal_payload_chunk WHERE goal_id=? AND payload_kind=? AND segment_sequence>0 AND segment_sequence<=? ORDER BY segment_sequence,chunk_index`, goalID, goalChunkSegment, through)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT p.segment_sequence,p.payload_hash,p.payload_bytes,p.encrypted_payload
+FROM goal_payload_chunk p JOIN goal_session s ON s.id=p.goal_id
+WHERE p.goal_id=? AND p.payload_kind=? AND p.segment_sequence>0 AND p.segment_sequence<=? AND s.state<>'reclaiming'
+ORDER BY p.segment_sequence,p.chunk_index`, goalID, goalChunkSegment, through)
 	if err != nil {
 		return nil, err
 	}
@@ -998,15 +1320,29 @@ func (s *Store) listGoalCompactedSegments(ctx context.Context, goalID string, th
 	}
 	for rows.Next() {
 		var current int64
-		var encrypted string
-		if err = rows.Scan(&current, &encrypted); err != nil {
+		var hash, encrypted string
+		var plainBytes int64
+		if err = rows.Scan(&current, &hash, &plainBytes, &encrypted); err != nil {
 			return nil, err
 		}
 		if sequence != 0 && current != sequence {
 			flush()
 		}
 		sequence = current
-		payload.WriteString(s.openToken(encrypted))
+		if plainBytes < 0 || plainBytes > goalPayloadChunkSize {
+			return nil, fmt.Errorf("goal payload chunk declares invalid plaintext length %d", plainBytes)
+		}
+		decoded, decodeErr := s.openContextPayload(encrypted, goalPayloadChunkSize)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if int64(len(decoded)) != plainBytes || hashGoalPayload(decoded) != hash {
+			return nil, errors.New("goal payload chunk failed plaintext length/hash verification")
+		}
+		if int64(payload.Len())+plainBytes > maxStoredContextPayloadBytes {
+			return nil, fmt.Errorf("goal segment exceeds %d-byte reconstruction limit", maxStoredContextPayloadBytes)
+		}
+		payload.WriteString(decoded)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, err
@@ -1060,10 +1396,18 @@ func (s *Store) CompactGoalSegmentsWithRatio(ctx context.Context, goalID string,
 		return err
 	}
 	defer tx.Rollback()
+	locked, err := tx.ExecContext(ctx, `UPDATE goal_session SET updated_at=updated_at WHERE id=? AND expires_at>? AND state<>'reclaiming'`, goalID, Now())
+	if err != nil {
+		return err
+	}
+	if affected, _ := locked.RowsAffected(); affected != 1 {
+		return ErrGoalNotFound
+	}
 	var checkpoint GoalCheckpoint
 	var encryptedCheckpoint string
 	if err = tx.QueryRowContext(ctx, `SELECT c.id,c.goal_id,c.sequence,c.through_segment_sequence,c.payload_hash,c.payload_bytes,c.encrypted_payload,c.format_version,c.created_at
-FROM goal_session s JOIN goal_checkpoint c ON c.id=s.current_checkpoint_id WHERE s.id=? AND s.expires_at>?`, goalID, Now()).Scan(
+FROM goal_session s JOIN goal_checkpoint c ON c.id=s.current_checkpoint_id
+WHERE s.id=? AND s.expires_at>? AND s.state<>'reclaiming'`, goalID, Now()).Scan(
 		&checkpoint.ID, &checkpoint.GoalID, &checkpoint.Sequence, &checkpoint.ThroughSegmentSequence, &checkpoint.PayloadHash, &checkpoint.PayloadBytes, &encryptedCheckpoint, &checkpoint.FormatVersion, &checkpoint.CreatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrGoalNotFound
@@ -1149,7 +1493,7 @@ FROM goal_session s JOIN goal_checkpoint c ON c.id=s.current_checkpoint_id WHERE
 	for _, segment := range selected {
 		removedStorage += int64(len(segment.encrypted))
 	}
-	updated, err := tx.ExecContext(ctx, `UPDATE goal_session SET current_checkpoint_id=?,storage_bytes=MAX(0,storage_bytes+?),updated_at=? WHERE id=? AND current_checkpoint_id=?`, newCheckpointID, addedStorage-removedStorage, now, goalID, checkpoint.ID)
+	updated, err := tx.ExecContext(ctx, `UPDATE goal_session SET current_checkpoint_id=?,storage_bytes=MAX(0,storage_bytes+?),updated_at=? WHERE id=? AND current_checkpoint_id=? AND state<>'reclaiming'`, newCheckpointID, addedStorage-removedStorage, now, goalID, checkpoint.ID)
 	if err != nil {
 		return err
 	}
@@ -1196,6 +1540,13 @@ func (s *Store) AcquireGoalRun(ctx context.Context, goalID, owner, phase string,
 		return GoalRun{}, err
 	}
 	defer tx.Rollback()
+	locked, err := tx.ExecContext(ctx, `UPDATE goal_session SET updated_at=updated_at WHERE id=? AND expires_at>? AND state<>'reclaiming'`, goalID, now)
+	if err != nil {
+		return GoalRun{}, err
+	}
+	if affected, _ := locked.RowsAffected(); affected != 1 {
+		return GoalRun{}, ErrGoalNotFound
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,goal_id,state,lease_owner,lease_expires_at,heartbeat_at,checkpoint_id,failure_code,created_at,updated_at FROM goal_run WHERE goal_id=? AND state IN ('running','compacting','awaiting_tool_result') ORDER BY updated_at DESC`, goalID)
 	if err != nil {
 		return GoalRun{}, err
@@ -1239,14 +1590,29 @@ func (s *Store) HeartbeatGoalRun(ctx context.Context, runID, owner string, lease
 		lease = 90 * time.Second
 	}
 	now := Now()
-	result, err := s.db.ExecContext(ctx, `UPDATE goal_run SET heartbeat_at=?,lease_expires_at=?,updated_at=? WHERE id=? AND lease_owner=? AND state IN ('running','compacting','awaiting_tool_result')`, now, now+int64(lease/time.Second), now, runID, owner)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	locked, err := tx.ExecContext(ctx, `UPDATE goal_session SET updated_at=updated_at
+WHERE id=(SELECT goal_id FROM goal_run WHERE id=? AND lease_owner=?)
+  AND state<>'reclaiming'`, runID, owner)
+	if err != nil {
+		return err
+	}
+	if affected, _ := locked.RowsAffected(); affected != 1 {
+		return ErrGoalNotFound
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE goal_run SET heartbeat_at=?,lease_expires_at=?,updated_at=?
+WHERE id=? AND lease_owner=? AND state IN ('running','compacting','awaiting_tool_result')`, now, now+int64(lease/time.Second), now, runID, owner)
 	if err != nil {
 		return err
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
 		return ErrGoalNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) FinishGoalRun(ctx context.Context, runID, owner, state, failureCode string) error {
@@ -1288,7 +1654,7 @@ func (s *Store) MarkGoalRetryable(ctx context.Context, goalID, reason string) er
 		return ErrGoalNotFound
 	}
 	now := Now()
-	result, err := s.db.ExecContext(ctx, `UPDATE goal_session SET state='retryable', updated_at=? WHERE id=? AND expires_at>?`, now, goalID, now)
+	result, err := s.db.ExecContext(ctx, `UPDATE goal_session SET state='retryable', updated_at=? WHERE id=? AND expires_at>? AND state<>'reclaiming'`, now, goalID, now)
 	if err != nil {
 		return err
 	}
@@ -1307,7 +1673,7 @@ func (s *Store) SetGoalCompactionState(ctx context.Context, goalID, state string
 		return errors.New("invalid goal compaction state")
 	}
 	now := Now()
-	result, err := s.db.ExecContext(ctx, `UPDATE goal_session SET state=?,updated_at=? WHERE id=? AND expires_at>?`, state, now, strings.TrimSpace(goalID), now)
+	result, err := s.db.ExecContext(ctx, `UPDATE goal_session SET state=?,updated_at=? WHERE id=? AND expires_at>? AND state<>'reclaiming'`, state, now, strings.TrimSpace(goalID), now)
 	if err != nil {
 		return err
 	}
@@ -1321,7 +1687,7 @@ func (s *Store) ListGoalSessions(ctx context.Context, limit int) ([]GoalSession,
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,storage_bytes,expires_at,created_at,updated_at FROM goal_session ORDER BY updated_at DESC LIMIT ?`, limit)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT id,protocol,parent_goal_id,branch_hash,downstream_key_hash,workspace_hash,initial_goal_hash,last_response_hash,state,current_checkpoint_id,storage_bytes,expires_at,created_at,updated_at FROM goal_session WHERE state<>'reclaiming' ORDER BY updated_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1391,33 +1757,83 @@ func (s *Store) GoalContinuityMetrics(ctx context.Context) (GoalMetrics, error) 
 }
 
 func (s *Store) DeleteGoalSafely(ctx context.Context, goalID string) error {
-	session, err := s.GetGoalSession(ctx, goalID)
+	goalID = strings.TrimSpace(goalID)
+	if goalID == "" {
+		return ErrGoalNotFound
+	}
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM goal_session WHERE id=?`, goalID).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrGoalNotFound
+		}
 		return err
 	}
 	var activeRuns int
-	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_run WHERE goal_id=? AND state IN ('running','compacting','awaiting_tool_result') AND lease_expires_at>?`, goalID, Now()).Scan(&activeRuns); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_run WHERE goal_id=? AND state IN ('running','compacting','awaiting_tool_result') AND lease_expires_at>?`, goalID, now).Scan(&activeRuns); err != nil {
 		return err
 	}
-	if activeGoalRunState(session.State) || session.State == "awaiting_tool_result" || activeRuns > 0 {
+	if state != goalReclaimingState && (activeGoalRunState(state) || activeRuns > 0) {
 		return ErrGoalActiveCannotBePurged
 	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM goal_session WHERE id=?`, goalID)
+	if state != goalReclaimingState {
+		marked, markErr := s.markGoalReclaiming(ctx, tx, goalID, now)
+		if markErr != nil {
+			return markErr
+		}
+		if !marked {
+			return ErrGoalActiveCannotBePurged
+		}
+	}
+	_, deleted, err := s.reclaimGoalStep(ctx, tx, goalID, now)
 	if err != nil {
 		return err
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
-		return ErrGoalNotFound
+	auditState := goalReclaimingState
+	if deleted > 0 {
+		auditState = "deleted"
 	}
-	return s.InsertAuditLog(ctx, AuditLogRow{Action: "goal_cleaned", State: "deleted", Reason: "admin_safe_cleanup", Detail: "goal=" + goalID})
+	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
+		"goal_cleaned", auditState, "admin_safe_cleanup", "goal="+goalID, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// CleanupGoalContinuity removes only expired work that has no live run.  It is safe to
-// call on every maintenance pass and returns the number of sessions reclaimed.
+// CleanupGoalContinuity marks at most one expired inactive goal and advances one
+// bounded physical-reclamation phase. Existing reclaiming work is always resumed,
+// including work originally claimed by the budget or admin paths.
 func (s *Store) CleanupGoalContinuity(ctx context.Context) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM goal_session WHERE expires_at<=? AND id NOT IN (SELECT goal_id FROM goal_run WHERE state IN ('running','compacting','awaiting_tool_result') AND lease_expires_at>?)`, Now(), Now())
+	now := Now()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	defer tx.Rollback()
+	goalID, err := s.findReclaimingGoal(ctx, tx, now)
+	if err != nil {
+		return 0, err
+	}
+	if goalID == "" {
+		goalID, err = s.markNextExpiredGoalReclaiming(ctx, tx, now)
+		if err != nil {
+			return 0, err
+		}
+		if goalID == "" {
+			return 0, nil
+		}
+	}
+	_, deleted, err := s.reclaimGoalStep(ctx, tx, goalID, now)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }

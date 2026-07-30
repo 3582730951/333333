@@ -40,6 +40,7 @@ export interface LogRecordCounts {
   audit_log: number;
   cf_events: number;
   usage_records: number;
+  usage_events: number;
   registration_task_events: number;
   lifecycle_task_logs: number;
   lifecycle_events: number;

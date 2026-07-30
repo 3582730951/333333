@@ -1,9 +1,9 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   ActionMenu, Button, ConfirmDialog, Tag, Toast, Modal, Form, Typography, Input, Select,
 } from '../components/pool/index.jsx';
-import { IconRefresh, IconPlus, IconSearch, IconDownload } from '../components/pool/icons.jsx';
+import { IconRefresh, IconPlus, IconSearch, IconDownload, IconFile } from '../components/pool/icons.jsx';
 import { post, batchOp } from '../api.js';
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
@@ -18,6 +18,9 @@ import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
 import { toCSV, downloadCSV } from '../lib/csv.js';
 import { fmtInt, fmtTokens } from '../lib/format.js';
 import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
+import { fetchAccountArchive, importAccountArchive } from '../features/accounts/api/accounts.ts';
+import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
+import { downloadBlob } from '../lib/browserDownload.js';
 import {
   healthBatchPresentation, healthResultPresentation, healthTestRequestBody,
   isKiroSuspended, isProtectedProbeQuarantine, requiresPaidHealthTest, selectedHasPaidProbe,
@@ -56,6 +59,7 @@ const accountActionKey = (id, act) => `${id}:${act}`;
 const ACCOUNT_ACTION_LABEL = {
   'health-test': '测活',
   'clear-quarantine': '解除隔离',
+  'clear-cooldown': '解除冷却',
   delete: '删除',
 };
 
@@ -107,8 +111,22 @@ function mergeAccountUpdate(account, patch) {
     return { ...account, egress_binding: { ...(account.egress_binding || {}), ...patch } };
   }
   const normalized = patch.group && !patch.group_name ? { ...patch, group_name: patch.group } : patch;
-  return { ...account, ...normalized };
+  const merged = { ...account, ...normalized };
+  if (Object.prototype.hasOwnProperty.call(normalized, 'egress_binding')) {
+    merged.egress_binding = {
+      ...(account.egress_binding || {}),
+      ...(normalized.egress_binding || {}),
+    };
+  }
+  return merged;
 }
+
+const clearedCooldownPatch = {
+  egress_binding: {
+    cooldown_until: 0,
+    recheck_pending: false,
+  },
+};
 
 export default function Accounts() {
   const responsive = useResponsiveLayout();
@@ -125,6 +143,14 @@ export default function Accounts() {
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveGroup, setMoveGroup] = useState('');
   const [moveIDs, setMoveIDs] = useState([]);
+  const [archiveImportOpen, setArchiveImportOpen] = useState(false);
+  const [archiveFile, setArchiveFile] = useState(null);
+  const accountArchiveAbortRef = useRef(null);
+
+  useEffect(() => () => {
+    abortController(accountArchiveAbortRef.current);
+    accountArchiveAbortRef.current = null;
+  }, []);
 
   const {
     data = EMPTY_ACCOUNT_DATA,
@@ -203,6 +229,7 @@ export default function Accounts() {
         quarantine_until: 0,
         quarantine_reason: '',
       });
+      if (act === 'clear-cooldown') updateCachedAccount(id, clearedCooldownPatch);
       void Promise.resolve(load()).then((nextData) => {
         if (act === 'delete') return;
         const fresh = nextData?.rows?.find((row) => row.id === id);
@@ -251,6 +278,7 @@ export default function Accounts() {
       quarantine_until: 0,
       quarantine_reason: '',
     }));
+    if (act === 'clear-cooldown') result.success.forEach((id) => updateCachedAccount(id, clearedCooldownPatch));
     setSelected(failedIDs);
     void load();
   });
@@ -273,7 +301,81 @@ export default function Accounts() {
       void load();
     } catch (e) { showErrorToast(e); }
   });
-  const anyAccountOperationRunning = accountActionRunning || bulkActionRunning || bulkMoveRunning;
+
+  const { run: exportAccountBackup, running: accountExportRunning } = useAsyncAction(async (ids = []) => {
+    abortController(accountArchiveAbortRef.current);
+    const controller = createAbortController();
+    accountArchiveAbortRef.current = controller;
+    try {
+      const archive = await fetchAccountArchive(ids, abortSignal(controller));
+      if (controller?.signal.aborted) return false;
+      if (!downloadBlob(archive.filename, archive.blob)) {
+        Toast.error('浏览器未能开始下载，请检查下载权限');
+        return false;
+      }
+      Toast.success(ids.length ? `已导出 ${ids.length} 个账号` : '已导出全部账号');
+      return true;
+    } catch (e) {
+      if (controller?.signal.aborted) return false;
+      showErrorToast(e);
+      return false;
+    } finally {
+      if (accountArchiveAbortRef.current === controller) accountArchiveAbortRef.current = null;
+    }
+  });
+
+  const { run: restoreAccountBackup, running: accountImportRunning } = useAsyncAction(async () => {
+    if (!archiveFile) {
+      Toast.warning('请先选择 JSON 或 ZIP 账号备份');
+      return false;
+    }
+    abortController(accountArchiveAbortRef.current);
+    const controller = createAbortController();
+    accountArchiveAbortRef.current = controller;
+    try {
+      const result = await importAccountArchive(archiveFile, abortSignal(controller));
+      if (controller?.signal.aborted) return false;
+      setArchiveImportOpen(false);
+      setArchiveFile(null);
+      setSelected([]);
+      setSelectedAccountMeta({});
+      setPage(1);
+      await load();
+      if (controller?.signal.aborted) return false;
+      Toast.success(`完整导入 ${result.recognized} 个账号（新增 ${result.imported}，覆盖 ${result.replaced}）`);
+      return true;
+    } catch (e) {
+      if (controller?.signal.aborted) return false;
+      showErrorToast(e);
+      return false;
+    } finally {
+      if (accountArchiveAbortRef.current === controller) accountArchiveAbortRef.current = null;
+    }
+  });
+
+  const chooseArchiveFile = (event) => {
+    const file = event.target.files?.[0] || null;
+    if (!file) {
+      setArchiveFile(null);
+      return;
+    }
+    const lowerName = String(file.name || '').toLowerCase();
+    if (!lowerName.endsWith('.json') && !lowerName.endsWith('.zip')) {
+      Toast.error('仅支持 .json 或 .zip 账号备份');
+      event.target.value = '';
+      setArchiveFile(null);
+      return;
+    }
+    if (file.size > 64 * 1024 * 1024) {
+      Toast.error('账号备份不能超过 64 MiB');
+      event.target.value = '';
+      setArchiveFile(null);
+      return;
+    }
+    setArchiveFile(file);
+  };
+
+  const anyAccountOperationRunning = accountActionRunning || bulkActionRunning || bulkMoveRunning || accountExportRunning || accountImportRunning;
   const isAccountActionLoading = (id, act) => isAccountActionKeyRunning(accountActionKey(id, act));
   const isAccountRowRunning = (id) => [...activeAccountActionKeys].some((key) => String(key).startsWith(`${id}:`));
 
@@ -294,9 +396,14 @@ export default function Accounts() {
           onSelect: () => action(r.id, 'health-test', healthTestRequestBody(r, requiresPaidHealthTest(r))),
         },
         {
-          label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解隔中' : '解隔',
+          label: isAccountActionLoading(r.id, 'clear-quarantine') ? '解除中' : '解除隔离',
           disabled: isProtectedProbeQuarantine(r) || batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'clear-quarantine')),
           onSelect: () => action(r.id, 'clear-quarantine'),
+        },
+        {
+          label: isAccountActionLoading(r.id, 'clear-cooldown') ? '解除中' : '解除冷却',
+          disabled: batchRunning || (rowRunning && !isAccountActionLoading(r.id, 'clear-cooldown')),
+          onSelect: () => action(r.id, 'clear-cooldown'),
         },
         {
           label: '移动分组',
@@ -306,6 +413,11 @@ export default function Accounts() {
             setMoveGroup(r.group_name || '');
             setMoveOpen(true);
           },
+        },
+        {
+          label: accountExportRunning ? '导出中' : '导出账号',
+          disabled: batchRunning || rowRunning || accountImportRunning,
+          onSelect: () => exportAccountBackup([r.id]),
         },
         { label: '详情', disabled: batchRunning || rowRunning, onSelect: () => setDrawerAcct(r) },
         {
@@ -469,6 +581,8 @@ export default function Accounts() {
             onEnterPress={doSearch} style={{ width: responsive.isMobile ? 210 : 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />
           <Button icon={<IconSearch />} onClick={doSearch}>搜索</Button>
           {!responsive.isMobile ? <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button> : null}
+          <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>导出全部</Button>
+          <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入</Button>
           <Button icon={<IconRefresh />} onClick={() => load()}>刷新</Button>
           {responsive.isMobile ? (
             <Button onClick={() => { setSelectMode((value) => !value); if (selectMode) setSelected([]); }}>
@@ -493,8 +607,10 @@ export default function Accounts() {
           ) : (
             <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('health-test', '测活')}>批量测活</Button>
           )}
-          <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解隔离')}>批量解隔离</Button>
+          <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解除隔离')}>批量解除隔离</Button>
+          <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-cooldown', '解除冷却')}>批量解除冷却</Button>
           <Button size="small" disabled={anyAccountOperationRunning} onClick={() => { setMoveIDs([...selected]); setMoveGroup(''); setMoveOpen(true); }}>移动分组</Button>
+          <Button size="small" icon={<IconDownload />} loading={accountExportRunning} disabled={accountActionRunning || bulkActionRunning || bulkMoveRunning || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>导出所选</Button>
           <ConfirmDialog
             title={`删除选中的 ${selected.length} 个账号？`}
             description="批量删除后不可恢复，失败项会保留在已选列表中。"
@@ -546,6 +662,38 @@ export default function Accounts() {
       <Modal title={moveIDs.length === 1 ? '移动账号到分组' : '批量移动到分组'} visible={moveOpen} onCancel={() => { if (!bulkMoveRunning) { setMoveOpen(false); setMoveIDs([]); } }} onOk={bulkMove} confirmLoading={bulkMoveRunning} okText="移动">
         <Select value={moveGroup} onChange={setMoveGroup} style={{ width: '100%' }} placeholder="选择目标分组"
           optionList={groups.map((g) => ({ label: g.name, value: g.name }))} />
+      </Modal>
+      <Modal
+        title="一键完整导入账号池"
+        visible={archiveImportOpen}
+        onCancel={() => {
+          if (!accountImportRunning) {
+            setArchiveImportOpen(false);
+            setArchiveFile(null);
+          }
+        }}
+        onOk={restoreAccountBackup}
+        confirmLoading={accountImportRunning}
+        okText="完整导入"
+        maskClosable={!accountImportRunning}
+      >
+        <div className="pool-field">
+          <label className="pool-field__label" htmlFor="account-archive-file">账号备份文件</label>
+          <span>
+            <input
+              id="account-archive-file"
+              className="pool-input"
+              type="file"
+              accept=".json,.zip,application/json,application/zip"
+              disabled={accountImportRunning}
+              onChange={chooseArchiveFile}
+            />
+            <div className="pool-field__help">
+              支持本系统逐账号 JSON、批量 ZIP，以及历史 auth.json、账号数组、sub2api v1 和 Kiro JSON。匹配 ID 的账号会被完整覆盖，未包含的账号保持不变。
+            </div>
+            {archiveFile ? <div className="pool-resource-summary__meta">已选择：{archiveFile.name} · {Math.max(1, Math.ceil(archiveFile.size / 1024))} KiB</div> : null}
+          </span>
+        </div>
       </Modal>
       <OAuthLoginModal open={importOpen} onClose={() => setImportOpen(false)} onSuccess={load} />
     </div>

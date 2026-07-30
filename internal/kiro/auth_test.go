@@ -3,8 +3,10 @@ package kiro
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -131,5 +133,112 @@ func TestRefreshIsSingleflightAndAPIKeyBypassesRefresh(t *testing.T) {
 	headers := Headers(config.Default(), cred, bearer, true)
 	if headers.Get("Authorization") != "Bearer kiro-key" || headers.Get("tokentype") != "API_KEY" {
 		t.Fatalf("api key headers=%v", headers)
+	}
+}
+
+func TestHeadersMatchOfficialKiroCLI2152WireProfile(t *testing.T) {
+	cfg := config.Default() // legacy 0.11.x config is normalized to the CLI release train.
+	cred := storage.KiroCredentials{
+		AccountID:  "account-that-must-not-leak",
+		AuthMethod: "api_key",
+		KiroAPIKey: "key-that-must-not-leak",
+		MachineID:  strings.Repeat("a", 64),
+	}
+	got := Headers(cfg, cred, "test-bearer", true)
+	wantUA := "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/linux lang/rust/1.92.0 md/appVersion-2.15.2 app/AmazonQ-For-CLI"
+	wantAmzUA := "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"
+	if got.Get("User-Agent") != wantUA {
+		t.Fatalf("User-Agent=%q, want %q", got.Get("User-Agent"), wantUA)
+	}
+	if got.Get("X-Amz-User-Agent") != wantAmzUA {
+		t.Fatalf("X-Amz-User-Agent=%q, want %q", got.Get("X-Amz-User-Agent"), wantAmzUA)
+	}
+	for name, want := range map[string]string{
+		"Content-Type":                "application/x-amz-json-1.0",
+		"Accept":                      "*/*",
+		"Accept-Encoding":             "gzip",
+		"X-Amzn-Codewhisperer-Optout": "false",
+		"TokenType":                   "API_KEY",
+		"Authorization":               "Bearer test-bearer",
+		"Amz-Sdk-Request":             "attempt=1; max=3",
+		"X-Amzn-Kiro-Agent-Mode":      "",
+		"X-Amzn-Kiro-Profile-Arn":     "",
+	} {
+		if value := got.Get(name); value != want {
+			t.Errorf("%s=%q, want %q", name, value, want)
+		}
+	}
+	if got.Get("Amz-Sdk-Invocation-Id") == "" {
+		t.Fatal("Amz-Sdk-Invocation-Id is empty")
+	}
+	combined := got.Get("User-Agent") + got.Get("X-Amz-User-Agent")
+	for _, forbidden := range []string{"KiroIDE", cred.MachineID, cred.AccountID, cred.KiroAPIKey} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("wire user agent leaked obsolete/device identity %q: %q", forbidden, combined)
+		}
+	}
+}
+
+func TestHeadersUseRuntimeServiceAndAuthSpecificTokenType(t *testing.T) {
+	cfg := config.Default()
+	cfg.KiroVersion = "2.16.0"
+	social := Headers(cfg, storage.KiroCredentials{
+		AuthMethod: "social",
+		ProfileARN: "arn:aws:codewhisperer:us-east-1:123456789012:profile/test",
+	}, "social-bearer", false)
+	if !strings.Contains(social.Get("User-Agent"), "api/codewhispererruntime/0.1.17975") ||
+		!strings.Contains(social.Get("User-Agent"), "md/appVersion-2.16.0") {
+		t.Fatalf("runtime User-Agent=%q", social.Get("User-Agent"))
+	}
+	if social.Get("TokenType") != "EXTERNAL_IDP" {
+		t.Fatalf("social TokenType=%q", social.Get("TokenType"))
+	}
+	if social.Get("X-Amzn-Kiro-Profile-Arn") == "" {
+		t.Fatal("social profile ARN header is empty")
+	}
+	idc := Headers(cfg, storage.KiroCredentials{AuthMethod: "idc"}, "idc-bearer", false)
+	if idc.Get("TokenType") != "" {
+		t.Fatalf("IDC TokenType=%q, want omitted", idc.Get("TokenType"))
+	}
+	if idc.Get("Amz-Sdk-Invocation-Id") == social.Get("Amz-Sdk-Invocation-Id") {
+		t.Fatal("independent requests reused an invocation id")
+	}
+}
+
+func TestUsageLimitsMatchesOfficialKiroCLI2152WireRequest(t *testing.T) {
+	m, _, account, cred, _, egress := kiroAuthHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method=%q", r.Method)
+		}
+		if r.URL.Path != "/getUsageLimits" {
+			t.Errorf("path=%q", r.URL.Path)
+		}
+		if r.URL.RawQuery != "origin=KIRO_CLI&isEmailRequired=false" {
+			t.Errorf("query=%q", r.URL.RawQuery)
+		}
+		if got := r.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererService.GetUsageLimits" {
+			t.Errorf("x-amz-target=%q", got)
+		}
+		wantAmzUA := "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17975 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"
+		if got := r.Header.Get("X-Amz-User-Agent"); got != wantAmzUA {
+			t.Errorf("x-amz-user-agent=%q, want %q", got, wantAmzUA)
+		}
+		if got := r.Header.Get("TokenType"); got != "API_KEY" {
+			t.Errorf("tokentype=%q", got)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		if string(raw) != `{"origin":"KIRO_CLI","isEmailRequired":false}` {
+			t.Errorf("wire body=%q", raw)
+		}
+		_, _ = w.Write([]byte(`{"usageLimitList":[]}`))
+	}, "api_key")
+	cred.KiroAPIKey = "bearer"
+
+	result, err := m.UsageLimitsProbe(context.Background(), account, cred, "bearer", egress)
+	if err != nil || result.StatusCode != http.StatusOK || result.Limits == nil {
+		t.Fatalf("usage result=%+v err=%v", result, err)
 	}
 }

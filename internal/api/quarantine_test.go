@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"testing"
 
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -52,6 +53,11 @@ func TestClearQuarantineEndpoint(t *testing.T) {
 	if err := h.store.SetAccountQuarantine(ctx, accID, now+7200, "manual test"); err != nil {
 		t.Fatal(err)
 	}
+	h.app.scheduler.InvalidateAccountCache()
+	if lease, err := h.app.scheduler.Select(ctx, scheduler.Route{Group: "cyber"}); err == nil {
+		lease.Release()
+		t.Fatal("quarantined account unexpectedly remained schedulable")
+	}
 	// Clear via the new endpoint.
 	resp, err := http.Post(h.pool.URL+"/admin/accounts/"+accID+"/clear-quarantine", "application/json", nil)
 	if err != nil {
@@ -66,6 +72,15 @@ func TestClearQuarantineEndpoint(t *testing.T) {
 	if acc.QuarantineUntil != 0 {
 		t.Fatalf("manual clear did not work: quarantine_until=%d, want 0", acc.QuarantineUntil)
 	}
+	lease, err := h.app.scheduler.Select(ctx, scheduler.Route{Group: "cyber"})
+	if err != nil {
+		t.Fatalf("cleared quarantine was not published to scheduler: %v", err)
+	}
+	if lease.Account.ID != accID {
+		lease.Release()
+		t.Fatalf("selected account = %q, want %q", lease.Account.ID, accID)
+	}
+	lease.Release()
 }
 
 // TestQuarantineDurationConfigurable confirms the new config field controls how long

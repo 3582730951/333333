@@ -32,13 +32,13 @@ func IsCustomProvider(provider string) bool {
 // doOpenAICompatible performs a request against a custom OpenAI-compatible provider
 // (Chat Completions or native Responses). The target is the provider's BaseURL
 // (which already carries any "/v1" prefix) + DownstreamPath ("/chat/completions",
-// "/responses", or "/models"). Headers are a clean Bearer-auth OpenAI client set — no
-// downstream header passthrough (which would leak the relay), no Codex/Claude
-// fingerprint (irrelevant to these providers). A sidecar-bound account still routes
-// through the impersonating sidecar (Chrome JA3) for proxy-chaining / IP control;
-// otherwise the cached direct/proxy transport is used. The same idle-timeout guard
-// as every other path bounds the call without truncating a long-but-progressing
-// stream (see requestGuard).
+// "/responses", or "/models"). Normal model calls use a clean provider-authenticated
+// header set with no downstream passthrough. Opaque Files/Skills/Agents calls opt into
+// PassThrough, which retains only endpoint-semantic headers while still replacing all
+// credentials. A sidecar-bound account routes through the impersonating sidecar for
+// proxy-chaining / IP control; otherwise the cached direct/proxy transport is used.
+// The same idle-timeout guard as every other path bounds the call without truncating a
+// long-but-progressing stream (see requestGuard).
 func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Response, error) {
 	base := strings.TrimRight(strings.TrimSpace(spec.BaseURL), "/")
 	if base == "" {
@@ -60,18 +60,49 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 	}
 	method := firstNonEmpty(spec.Method, http.MethodPost)
-	stream := requestStreamTrue(spec)
+	stream := false
+	if spec.PassThrough {
+		// Shared Files/Skills/Agents bodies may be multipart or arbitrary binary
+		// data. Never inspect them as JSON merely to determine response framing.
+		stream = strings.Contains(strings.ToLower(spec.Headers.Get("Accept")), "text/event-stream")
+	} else {
+		stream = requestStreamTrue(spec)
+	}
 
 	built := http.Header{}
 	switch spec.TransportProfile {
 	case storage.CustomProviderTransportClaudeCode:
 		id := identity.ForOS(c.identitySecret, spec.Account.ID, spec.OSHint)
-		c.applyClaudeHeaders(built, spec, id, stream)
+		if spec.PassThrough {
+			c.applyClaudePassthroughHeaders(built, spec, id, stream)
+			copyOpenAICompatPassthroughHeaders(built, spec, []string{
+				"Content-Range",
+				"Idempotency-Key",
+				"If-Match",
+				"If-Modified-Since",
+				"If-None-Match",
+				"If-Unmodified-Since",
+				"Last-Event-ID",
+				"OpenAI-Beta",
+				"Prefer",
+				"Range",
+			})
+		} else {
+			c.applyClaudeHeaders(built, spec, id, stream)
+		}
 	case storage.CustomProviderTransportCodexCLI:
-		applyOpenAICompatHeaders(built, spec, stream)
+		if spec.PassThrough {
+			applyOpenAICompatPassthroughHeaders(built, spec, stream)
+		} else {
+			applyOpenAICompatHeaders(built, spec, stream)
+		}
 		c.applyOpenAICompatCodexIdentity(built, spec)
 	default:
-		applyOpenAICompatHeaders(built, spec, stream)
+		if spec.PassThrough {
+			applyOpenAICompatPassthroughHeaders(built, spec, stream)
+		} else {
+			applyOpenAICompatHeaders(built, spec, stream)
+		}
 	}
 
 	// Sidecar egress: present a real client TLS/JA3 + HTTP2 fingerprint and (optionally)
@@ -85,7 +116,11 @@ func (c *Client) doOpenAICompatible(ctx context.Context, spec Request) (*Respons
 		}
 		sidecarSpec := spec
 		sidecarSpec.Method = method
-		return c.postViaSidecar(ctx, sidecarSpec, target, built, timeout, "", true)
+		// Only this opaque Claude-Code-shaped path builds the complete Node/SDK
+		// header set. Keep existing custom message transport behavior unchanged.
+		defaultHeaders := !(spec.PassThrough &&
+			spec.TransportProfile == storage.CustomProviderTransportClaudeCode)
+		return c.postViaSidecar(ctx, sidecarSpec, target, built, timeout, "", defaultHeaders)
 	}
 
 	ctx, guard := newRequestGuard(ctx, c.cfg.RequestTimeout())
@@ -168,5 +203,70 @@ func applyOpenAICompatHeaders(dst http.Header, spec Request, stream bool) {
 		dst.Set("User-Agent", "claude-cli/"+identity.ClaudeCLIVersion+" (external, cli)")
 	} else {
 		dst.Set("User-Agent", openAICompatUserAgent)
+	}
+}
+
+// applyOpenAICompatPassthroughHeaders builds a minimal safe header set for
+// opaque custom-provider endpoints. It intentionally does not forward the
+// downstream Authorization, x-api-key, Cookie, forwarding, or pool headers:
+// those can contain the pool credential or internal routing metadata. Endpoint
+// semantics (multipart boundary, beta/version selection, range and conditional
+// resource headers) survive verbatim, and account auth is installed afterward.
+func applyOpenAICompatPassthroughHeaders(dst http.Header, spec Request, stream bool) {
+	copyOpenAICompatPassthroughHeaders(dst, spec, []string{
+		"Accept",
+		"Anthropic-Beta",
+		"Anthropic-Version",
+		"Content-Range",
+		"Content-Type",
+		"Idempotency-Key",
+		"If-Match",
+		"If-Modified-Since",
+		"If-None-Match",
+		"If-Unmodified-Since",
+		"Last-Event-ID",
+		"OpenAI-Beta",
+		"Prefer",
+		"Range",
+	})
+
+	credential := accountprovider.Credential(spec.Account.Provider, spec.Token)
+	if credential != "" {
+		dst.Set("Authorization", "Bearer "+credential)
+	}
+	if spec.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages ||
+		dst.Get("Anthropic-Version") != "" {
+		if credential != "" {
+			dst.Set("X-Api-Key", credential)
+		}
+		if dst.Get("Anthropic-Version") == "" {
+			dst.Set("Anthropic-Version", claudeAnthropicVersion)
+		}
+		dst.Set("User-Agent", "claude-cli/"+identity.ClaudeCLIVersion+" (external, cli)")
+	} else {
+		dst.Set("User-Agent", openAICompatUserAgent)
+	}
+	if dst.Get("Accept") == "" {
+		if stream {
+			dst.Set("Accept", "text/event-stream")
+		} else {
+			dst.Set("Accept", "application/json")
+		}
+	}
+	if requestBodySize(spec) > 0 && dst.Get("Content-Type") == "" {
+		dst.Set("Content-Type", "application/json")
+	}
+}
+
+func copyOpenAICompatPassthroughHeaders(dst http.Header, spec Request, names []string) {
+	for _, name := range names {
+		values := spec.Headers.Values(name)
+		if len(values) == 0 {
+			continue
+		}
+		dst.Del(name)
+		for _, value := range values {
+			dst.Add(name, value)
+		}
 	}
 }

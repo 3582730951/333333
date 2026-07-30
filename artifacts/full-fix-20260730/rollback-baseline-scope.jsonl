@@ -1,0 +1,206 @@
+{"mode": "0644", "path": "cmd/gateway/policy.go", "sha256": "8715c493e3ebecf1d7c20e0a06c98e91703602ca1bdfe208ead8c7960ad13828", "size": 6588, "state": "file"}
+{"mode": "0644", "path": "cmd/gateway/runtime.go", "sha256": "5807b60695bf509429e0c68c49ec7bd7a2a7dbcecd9aec62882842f0c21238b4", "size": 20503, "state": "file"}
+{"mode": "0644", "path": "cmd/gateway/runtime_test.go", "sha256": "f33d40f418e2b354b9f95c4496542a1cf361e8ed472f6920e2c1dc854bdb4a57", "size": 13218, "state": "file"}
+{"path": "cmd/pool-server/deferred_migrations.go", "state": "absent"}
+{"path": "cmd/pool-server/deferred_migrations_test.go", "state": "absent"}
+{"mode": "0644", "path": "cmd/pool-server/main.go", "sha256": "b535b97b56ac2ee88ccda80c271af5fa85493fb331e85d1be8a7f48289cb2859", "size": 26254, "state": "file"}
+{"mode": "0644", "path": "config.example.json", "sha256": "79d776357b63b890afb533632366a707ff26a3c3da69039a54e803c8ef49cb4b", "size": 5524, "state": "file"}
+{"path": "internal/api/account_archive.go", "state": "absent"}
+{"path": "internal/api/account_archive_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/api/account_probe.go", "sha256": "b2a56b4b7531731aee7a784566c5466954e22bf178e65fd97013d33e1f2e9c75", "size": 38456, "state": "file"}
+{"mode": "0644", "path": "internal/api/accounts_export.go", "sha256": "ca2e4eaa8e853fc7a4c675b1ded8afb61686fb4eb5547ce31f829ff645b721af", "size": 3475, "state": "file"}
+{"mode": "0644", "path": "internal/api/admin_accounts.go", "sha256": "0eb4d3f9798e49f4cd5a5557cb85c960b936b9d254645b043d4785d682fef710", "size": 32052, "state": "file"}
+{"mode": "0644", "path": "internal/api/admin_config.go", "sha256": "62138948813448e10975047d364ec08de765ad49d21c8f52f19985be70e98aad", "size": 48306, "state": "file"}
+{"mode": "0644", "path": "internal/api/audit_test.go", "sha256": "ea80ec067702ef4b9fb13e2efd8eee9974902645839072f2ae51cb1bb588aa68", "size": 1332, "state": "file"}
+{"mode": "0644", "path": "internal/api/body_meta.go", "sha256": "e7c5263e62d70fa500e5875cd1576d19225aaaef70392ed518e55de73f45f193", "size": 4958, "state": "file"}
+{"mode": "0644", "path": "internal/api/body_source_test.go", "sha256": "065568dc6b6daaa3d23fc9a42e79614d7766235463f9857fe839ee46dcc44872", "size": 4684, "state": "file"}
+{"mode": "0644", "path": "internal/api/chat_custom.go", "sha256": "cb55b7993e18eeb3150cc1170d2f1d6120347e34d3056930f76a4c3e63172381", "size": 43006, "state": "file"}
+{"mode": "0644", "path": "internal/api/claude_code_docker_e2e_test.go", "sha256": "77783b4aa08dcf2a5f2fae803bf8584e659c7b2c61740613c6033f6162e85a64", "size": 15985, "state": "file"}
+{"mode": "0644", "path": "internal/api/claude_gateway_docker_e2e_test.go", "sha256": "24852426965a68be5973beed6c8ee7bddbfa728f985e6febbcfd707beb114a6b", "size": 14965, "state": "file"}
+{"mode": "0644", "path": "internal/api/claude_route_policy.go", "sha256": "d782ed3e8c99a53271b085001d02edec8c964cbe8b27bad8853c2e239c3f9a15", "size": 4855, "state": "file"}
+{"mode": "0644", "path": "internal/api/codex_cli_docker_e2e_test.go", "sha256": "1e5f196dff0327802a8244d82aadc27cf32d7fc7c1f3bcecf573edb11f2a5b1e", "size": 6772, "state": "file"}
+{"mode": "0644", "path": "internal/api/codex_config.go", "sha256": "94e692a83f53ca5a4a3bf68f19ccf0bbcc5eff6bba3aed6ffeae63b2913e9d4f", "size": 20247, "state": "file"}
+{"mode": "0644", "path": "internal/api/codex_config_test.go", "sha256": "e6b63fd6b88c9cfadc1adb228b787d472d10d61d5991ab18fd6f534bb9118c71", "size": 5217, "state": "file"}
+{"path": "internal/api/codex_passthrough.go", "state": "absent"}
+{"path": "internal/api/codex_passthrough_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/api/codex_session_mapping.go", "sha256": "722aa9645b0951b3b13f4b17313f30377d0fdc86ed4173b2e045af2e022f558a", "size": 64890, "state": "file"}
+{"mode": "0644", "path": "internal/api/codex_session_mapping_test.go", "sha256": "3fa7f3e8bab2afe1ea0c290b9e4afc8aba318d21de6202086e28980d7c7ec5b3", "size": 61422, "state": "file"}
+{"mode": "0644", "path": "internal/api/config_fields.go", "sha256": "3d1811d598c7e3330ab0f7b2ba3f44efdf4902c09324c62e2df339fc27746b0b", "size": 58243, "state": "file"}
+{"mode": "0644", "path": "internal/api/config_hotreload_test.go", "sha256": "b6394df0c4bfd1c2ad718894ff541c90908b50527753c3a7ef26b2fcff9aa2ee", "size": 49179, "state": "file"}
+{"path": "internal/api/custom_provider_admin_probe.go", "state": "absent"}
+{"path": "internal/api/custom_provider_passthrough.go", "state": "absent"}
+{"path": "internal/api/custom_provider_passthrough_test.go", "state": "absent"}
+{"path": "internal/api/custom_provider_routing_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/api/diagnostic_jobs.go", "sha256": "e44c601147eff0c8f29e9f3f27bb4daf679aee323c1dd7dcc2cf47c167a8678e", "size": 28988, "state": "file"}
+{"mode": "0644", "path": "internal/api/diagnostic_jobs_test.go", "sha256": "4cb2f1433a64da75b426b8d82eb8ea888358e693283714d2faf01ae5e703cac6", "size": 12452, "state": "file"}
+{"mode": "0644", "path": "internal/api/diagnostic_runtime.go", "sha256": "ce6fc031a0640c1f77fab9d661f32e1c6988cd12ef8e8a346484c8591497c41a", "size": 6132, "state": "file"}
+{"mode": "0644", "path": "internal/api/diagnostics_export.go", "sha256": "6dd088ae2b1a2a9295b955c70e8165dfc175fa9f6f7a539d79a630bf8869a700", "size": 106533, "state": "file"}
+{"mode": "0644", "path": "internal/api/diagnostics_export_test.go", "sha256": "1c752ddfc8f1010a353ae8d771c952922ec1c57941b95621f1f74a961fc17241", "size": 25871, "state": "file"}
+{"mode": "0644", "path": "internal/api/disk_guard.go", "sha256": "3c2d4f2e776ce8648210b62dba88cb199320726817347bc4add791449e54aaa2", "size": 14474, "state": "file"}
+{"mode": "0644", "path": "internal/api/gpt_kiro_spillover_test.go", "sha256": "a5ff8ca45758075d06cbf73b9d5309810d283f6dd9740e3bc79c498866edf403", "size": 10722, "state": "file"}
+{"mode": "0644", "path": "internal/api/httputil.go", "sha256": "1b56790181de4fefac924f41989aaa54aa6e76ff49a0509d6ad66bb58c5fa131", "size": 24637, "state": "file"}
+{"mode": "0644", "path": "internal/api/isolate.go", "sha256": "1eafe95b38e9a71198bf1aa62af31e28736aeff14af31ed52924b2b36cdb204b", "size": 22209, "state": "file"}
+{"mode": "0644", "path": "internal/api/kiro_cache_singleflight.go", "sha256": "703b28adaa8b01e37543ed8157b4fdf96254959ce4ee4dc54084fcc964ab429e", "size": 2161, "state": "file"}
+{"mode": "0644", "path": "internal/api/kiro_e2e_test.go", "sha256": "7d7d6c0f90c334158a62b12ccf98964d91faee2150f72a00c0a2d2b220f371d4", "size": 59957, "state": "file"}
+{"mode": "0644", "path": "internal/api/kiro_health.go", "sha256": "12a0e073774a374655382ef22da020920283c190074acf453589256d479ecbd8", "size": 13839, "state": "file"}
+{"mode": "0644", "path": "internal/api/kiro_messages.go", "sha256": "ea3e35fb61ebefab1e03cbc11aa98c4b4c147872e9f7d0e61408deb624286e45", "size": 53885, "state": "file"}
+{"path": "internal/api/kiro_usage_limits.go", "state": "absent"}
+{"mode": "0644", "path": "internal/api/leak.go", "sha256": "a320f8503d2b5df04b4ede6254f16e6660f1db952fb5c3ac3f0d2f7e7d35059b", "size": 32720, "state": "file"}
+{"mode": "0644", "path": "internal/api/leak_test.go", "sha256": "be227bace7c75a2c3ec5069c0e0162ef02b05d51e69c249fb87e6ede450d61f9", "size": 11044, "state": "file"}
+{"path": "internal/api/long_context_failover_stress_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/api/messages.go", "sha256": "1b0c40d47fb55423e2847a6176b748ef8b19aeca346862fe18a67696d3619594", "size": 43164, "state": "file"}
+{"mode": "0644", "path": "internal/api/middleware.go", "sha256": "ca38bf34704d30852e00c1a0b8ac6e67ba4cbbf93e0b2b5c0a7c9d3d46db317d", "size": 13479, "state": "file"}
+{"mode": "0644", "path": "internal/api/providers.go", "sha256": "f98af1a33fa105c6deadc565e29d670cf557bc91b763e2c4614611b73fbf331b", "size": 9912, "state": "file"}
+{"mode": "0644", "path": "internal/api/providers_test.go", "sha256": "6004814d4888d1e038fa8965e93fbe430edf96c36dc6abb796022d6e59de525a", "size": 5309, "state": "file"}
+{"mode": "0644", "path": "internal/api/quota_poll.go", "sha256": "65a3e5519cca1a1d76679a92be425d6af5f21850596be1955a8017aa57dbfab1", "size": 31517, "state": "file"}
+{"mode": "0644", "path": "internal/api/quota_poll_test.go", "sha256": "e728b63c948cc0aaa58b57946fdc8b5c59802dbb6a96d81778b0182299bd3fe1", "size": 9264, "state": "file"}
+{"path": "internal/api/request_metrics.go", "state": "absent"}
+{"path": "internal/api/request_metrics_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/api/server.go", "sha256": "92bf8748d5e31e169e22c139d066f4d89d41be12be6bf337eb83f2658da273ee", "size": 176377, "state": "file"}
+{"mode": "0644", "path": "internal/api/server_test.go", "sha256": "59feb04cb36d93c4b75dfef8d432dd1546fe900dc32e91ec487c0586e7000947", "size": 272750, "state": "file"}
+{"mode": "0644", "path": "internal/api/settings_center.go", "sha256": "ce052cbacc0e6631af1893dcabd02be908a5a85b5fc503f2d82f2c1d98831459", "size": 36736, "state": "file"}
+{"mode": "0644", "path": "internal/api/setup_script_test.go", "sha256": "1869450b72ea7b2cccd829179a8539100915ea233b7f55fbd11754b71af63e6b", "size": 17199, "state": "file"}
+{"mode": "0644", "path": "internal/api/shared_endpoint.go", "sha256": "409be1eab7a35b79625596d2e6a66bd34febbfc4171a130f20119d1c64e380ce", "size": 2960, "state": "file"}
+{"mode": "0644", "path": "internal/api/shared_endpoint_test.go", "sha256": "46482e3fcf30ed3e16f884e0ce126b51893548ddfeb30a3a8713a16d323fc965", "size": 6426, "state": "file"}
+{"mode": "0644", "path": "internal/api/system.go", "sha256": "81f70c67031d75b7696ccda7cf2834c2d18daab511ce2b9479c6543d9151fd0e", "size": 3346, "state": "file"}
+{"mode": "0644", "path": "internal/api/user_group_route.go", "sha256": "5a600409d38bfe35847c484f8c808cf1b0318dac4a371039a167405e71d1bdd3", "size": 46906, "state": "file"}
+{"mode": "0644", "path": "internal/api/user_group_route_test.go", "sha256": "b601d6918f090a23867a985a4796b4b540cd36661dcc744557106ea5d57b9fd8", "size": 49988, "state": "file"}
+{"mode": "0644", "path": "internal/capability/models.go", "sha256": "e17e121fe1d4642f88c517b1026527723a37201d785b592d4ff2ce54b95ef81e", "size": 59758, "state": "file"}
+{"mode": "0644", "path": "internal/capability/models_test.go", "sha256": "08a6acf2280e874b789a1091e76b787991dffeed24d3b394b21b30fb0fb136fa", "size": 32775, "state": "file"}
+{"mode": "0644", "path": "internal/config/config.go", "sha256": "b2436f41e2589d4bf0255ea8992fa69b8066b79906c73353f53f5ee53b66dc47", "size": 90719, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/AISettings-CZVGBfGe.js", "sha256": "6e0659bee72899c0f10f9971d917a2e509339c4ec378db1decd449d7990771ab", "size": 6611, "state": "file"}
+{"path": "internal/console/dist/assets/AISettings-DVliwtRm.js", "state": "absent"}
+{"path": "internal/console/dist/assets/Accounts-C085iICH.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Accounts-FgY7rPQU.js", "sha256": "ec664f5900ed7f7f27589d84f3353e015273896774186ea289530397dcfd1167", "size": 58920, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/Audit-C2D8LO8d.js", "sha256": "8d55139320dcd0fefee77d68bebb2d70c9df00e8c05573b2eeee51b7f32a5ced", "size": 7745, "state": "file"}
+{"path": "internal/console/dist/assets/Audit-Tve9piCU.js", "state": "absent"}
+{"path": "internal/console/dist/assets/CFEvents-BQYz1p3b.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/CFEvents-DcyTRVxo.js", "sha256": "ebbbc3ada1d4d9495e567fad027ea27a79d9ab4cd2e14108fd2a218901c2f71b", "size": 2984, "state": "file"}
+{"path": "internal/console/dist/assets/Charts-BDkWJ2E3.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Charts-inIaq1Eh.js", "sha256": "49c90aac08afa535b4dbb708ba1ee9dac7cbe3fc289589abd90d401ed22230f2", "size": 8910, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/Dashboard-BDt-Y370.js", "sha256": "ab18756548861d37354401548f1b7421c4cf26dd99ac202232d6a11859863ad7", "size": 15489, "state": "file"}
+{"path": "internal/console/dist/assets/Dashboard-CnwfYM-B.js", "state": "absent"}
+{"path": "internal/console/dist/assets/DisplayPrimitives-B2wvs7mN.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/DisplayPrimitives-C-wNtT1z.js", "sha256": "20560babc58ae9675c7e9bb1f9bcecd5aa65098443e4cb00d40e3905b95c4d9d", "size": 2218, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/Egress-CNon1TT7.js", "sha256": "8faad070f6c0667352933136b09e711d714faaf418bbdcb5f310897215640747", "size": 18969, "state": "file"}
+{"path": "internal/console/dist/assets/Egress-YxJUawUG.js", "state": "absent"}
+{"path": "internal/console/dist/assets/EmailPool-BX_sCeQB.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/EmailPool-BxpfdBW4.js", "sha256": "efc97dd71904c0458ce75d273015acc08e1eb33777f835a355d8528601a3bcfb", "size": 8479, "state": "file"}
+{"path": "internal/console/dist/assets/Groups-CpowwnEQ.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Groups-jiiK5S4R.js", "sha256": "60c21bbd6c194bef8016b559c5f52f97a9fd90dccd8da2c95aa4d2682affbe87", "size": 24766, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/Keys-DIWANrIy.js", "sha256": "9377ffe4818302c3707065a8499a3d1030df9a6fddef4ce559f5d4f482e93c52", "size": 5393, "state": "file"}
+{"path": "internal/console/dist/assets/Keys-DlajLt7Y.js", "state": "absent"}
+{"path": "internal/console/dist/assets/Login-BbD2Q_WI.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Login-bpgsv_I9.js", "sha256": "08d8fbb3a166ec4d1a4f5cdb1025ab0b7df0de76c53ffcca3a0c00498cdc7a65", "size": 2896, "state": "file"}
+{"path": "internal/console/dist/assets/MobileResourceCell-BeZ9BriS.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/MobileResourceCell-FPglmxWx.js", "sha256": "4c0613a36e3663cfad616d35af70397d89596670c29e29fa2cbc00edf66a9be0", "size": 1701, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/ModelNameList-2AaSLjPT.js", "sha256": "19997ca50766adac9186c81ccb10b5bbf1badfa6f4d7e87610c6205a68de80b4", "size": 1122, "state": "file"}
+{"path": "internal/console/dist/assets/ModelNameList-Cn35kg9v.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/ModelQuality-BAowEaQY.js", "sha256": "a31d0af0d6439a9c313a0d0305afdccf183b1de9dbd110c8b13578515f70f343", "size": 6688, "state": "file"}
+{"path": "internal/console/dist/assets/ModelQuality-DJEsZp6h.js", "state": "absent"}
+{"path": "internal/console/dist/assets/Models-Bgo621Yj.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Models-CfSusX70.js", "sha256": "25bf9379daf6a3b861e65a2ee5577257faedf72a95d9ef803a89e83e3af6dad3", "size": 354, "state": "file"}
+{"path": "internal/console/dist/assets/OrderedEgressSelect-CNug0DHD.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/OrderedEgressSelect-Cawn3pqa.js", "sha256": "74936db5fcbc059123a3d5995a6d6b7e7895a8596c7a33e4f8bed4bc0e3bf317", "size": 2263, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/PageHeader-BZ3u-EQU.js", "sha256": "ffdb87ad55f6ac3c07eb72f15592151dd4d946660cacfbf9d34d6aebd8aeb15a", "size": 1436, "state": "file"}
+{"path": "internal/console/dist/assets/PageHeader-DslXHOe6.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/PortalDashboard-BdjGnto5.js", "sha256": "dd99c2a3be4f3a0c6f25a5e8c1292530d44db81e21a51c2d74f5e2bbe66c747c", "size": 5041, "state": "file"}
+{"path": "internal/console/dist/assets/PortalDashboard-C1vpBIUA.js", "state": "absent"}
+{"path": "internal/console/dist/assets/PortalKeys-CNhin23K.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/PortalKeys-Jbf7S6QG.js", "sha256": "fd324a241cf1dc81f2f47c7955e456fd7aef91f9c177ce71050724b128adf185", "size": 1598, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/PortalModels-CnraNDMf.js", "sha256": "5842b301828dd8dade581bab9ff442c9759eeda2107f7cfd6ec722b7f348f3e0", "size": 367, "state": "file"}
+{"path": "internal/console/dist/assets/PortalModels-Cy9vkptn.js", "state": "absent"}
+{"path": "internal/console/dist/assets/PortalProfile-B9SWUoRS.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/PortalProfile-N7zBHvF8.js", "sha256": "9d19679267f5abe542daeb60ec736326986f8591b93bb61053d5b4aa8599526b", "size": 2425, "state": "file"}
+{"path": "internal/console/dist/assets/Providers-8hLFZIxX.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Providers-BQo3UKLs.js", "sha256": "422ca00c673db8eb071520650086c439d45399ff5f747fa4600393b17f662abb", "size": 11498, "state": "file"}
+{"path": "internal/console/dist/assets/Quota-BzBPmtrL.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Quota-CAlj4C5l.js", "sha256": "9d273961f22835fa7320da15fcf254903ca2f118d10cd465e5e32ac9243497f1", "size": 5092, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/Registration-DyaE7GW9.js", "sha256": "d6f95b237a6e879cd1e30980e7dfbc00b8acd5b175745259f45b4eccfc92452a", "size": 19096, "state": "file"}
+{"path": "internal/console/dist/assets/Registration-ICDRpTOi.js", "state": "absent"}
+{"path": "internal/console/dist/assets/ResourceTable-B47CB4s4.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/ResourceTable-CBIHnQKR.js", "sha256": "d0eff969538e90dc8f526cc01933981257f144d9b29b5d5f13d002454bc1c2db", "size": 5379, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/SettingsV2-DjPQNM6u.js", "sha256": "8bf4e3addbe4eb008b3c4ac4429da6ed55f19e2947dc49767b04940eb38a2032", "size": 36564, "state": "file"}
+{"path": "internal/console/dist/assets/SettingsV2-o-sC89Oj.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/System-BRFYpcuv.js", "sha256": "3801f6a42452fc15321c95be739d6224d7bd33f9783606cbc1846893bfb9c311", "size": 7303, "state": "file"}
+{"path": "internal/console/dist/assets/System-iBVy4t9X.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/UpstreamErrorRules-D0PxFCpN.js", "sha256": "1917303094a59339d5e34e2e6e85fa04d359224ffb6590fb669dbf36aec87df6", "size": 20195, "state": "file"}
+{"path": "internal/console/dist/assets/UpstreamErrorRules-SRQVjuUG.js", "state": "absent"}
+{"path": "internal/console/dist/assets/Usage-B4frI11v.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Usage-VHv8FlVL.js", "sha256": "1c917db48cbfd7605d8a73964cbfb65d374ec979bb1b9df9d6e48b1e3bc7c496", "size": 28216, "state": "file"}
+{"path": "internal/console/dist/assets/Users-4Sa7hOJK.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/Users-BWhatZ2-.js", "sha256": "5bebfd847b69b9101501eb9e386ad8e7296c01c7dfff0cb95f70294c39f596dd", "size": 6129, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/VendorLogo-C6YhQ9-c.js", "sha256": "6197221818d5f7b701d561867c9c1c088f89f7b9627a8d15cd76ee138b9bf0a7", "size": 4987, "state": "file"}
+{"path": "internal/console/dist/assets/VendorLogo-DKsDkm9T.js", "state": "absent"}
+{"path": "internal/console/dist/assets/coerce-BjB--GdN.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/coerce-_VOWRwOX.js", "sha256": "b0dd99af5e15d9c8322a04200c82386c8593f46034048bd40a4d0b02d82df1ca", "size": 90, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/csv-CEM5MeXt.js", "sha256": "071f64f54967ac0d43c2d4d0b92028f54403dab7675bdd255a86b5f25cecb998", "size": 839, "state": "file"}
+{"path": "internal/console/dist/assets/csv-D0-NCzVb.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/events-DeZiUbQA.js", "sha256": "d2c92f311a2e27f3b879481a06972c8a93701301d2d5451a58edaab3c0898943", "size": 1292, "state": "file"}
+{"path": "internal/console/dist/assets/events-l3tQrNHy.js", "state": "absent"}
+{"path": "internal/console/dist/assets/format-D4BFy-Rb.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/format-pGugDWI8.js", "sha256": "aaed9e4a6250cc789c04d7280edff2307c5c37968aaffe03205c66791aafe02c", "size": 1616, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/index-B7FFo378.js", "sha256": "48212693d0c685ca070cae089e57d7d4316cc129e26aefbd26c863e41e7c9efa", "size": 397719, "state": "file"}
+{"path": "internal/console/dist/assets/index-C_rDca0o.js", "state": "absent"}
+{"path": "internal/console/dist/assets/keys-CC3M5-0w.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/keys-eFjHUjOC.js", "sha256": "5cfa6829ad624165aa7e045b9b9b36c42bd8bd375873a98b675d96a91c73e496", "size": 12632, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/queries-BG5oEd6O.js", "sha256": "75d007f1d5e5e399a51cc6a1fe812f495fe0027cd939829a45cd720faec77a67", "size": 836, "state": "file"}
+{"path": "internal/console/dist/assets/queries-Cid24tjg.js", "state": "absent"}
+{"path": "internal/console/dist/assets/settings-DaOVGHmF.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/settings-_G8SLqaI.js", "sha256": "7ee7a6e92d8496bad50c43d93f618cde92278f163f70733d18ca5bd172e11184", "size": 8925, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/system-BqDAnB8m.js", "sha256": "a121e89e4b2a28d9e259b798d6f768cabf8456b7dc2f9e48426a0f4f11961a91", "size": 6979, "state": "file"}
+{"path": "internal/console/dist/assets/system-CQaLyeVv.js", "state": "absent"}
+{"path": "internal/console/dist/assets/usage-B8mJJ3oz.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/usage-BgZQB7q3.js", "sha256": "c42517dc690fb89f3baed7433ec1459fc75a2dcd13197a90bad4a07e10783afc", "size": 5061, "state": "file"}
+{"path": "internal/console/dist/assets/useAsyncAction-BqxkREXx.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/useAsyncAction-ls-vnmnN.js", "sha256": "f23b68388a09a2aaf373f06ff6cca56c5b4578dd6ca873775741c9843897eeff", "size": 505, "state": "file"}
+{"path": "internal/console/dist/assets/useAsyncResource-Boz4SZOf.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/assets/useAsyncResource-WU_1xrW9.js", "sha256": "f3bbd4392b203dcd2f52ea8d269833815de96bfd3e7c221b242d6048fe95a1b4", "size": 969, "state": "file"}
+{"mode": "0644", "path": "internal/console/dist/assets/useMutation-DRKFbzMm.js", "sha256": "70a0eb04932d25c28704a72f4deae4a7121c780e3d3003b3d93a201fdd21ecaa", "size": 2304, "state": "file"}
+{"path": "internal/console/dist/assets/useMutation-bld8iitk.js", "state": "absent"}
+{"mode": "0644", "path": "internal/console/dist/index.html", "sha256": "253d38b6e99d74a7eb3742c6d5d2035c43d83e9e83f405ed2edb3b976c92a7f4", "size": 1151, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/auth.go", "sha256": "e416be3372638efeb2257e88fe4476666f4d8416f00e4723c0ad455e70b7a388", "size": 13925, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/auth_test.go", "sha256": "6d03075d6ea1878108c6164f5f81a0a052ef0a832e37570be5f67281aae1ac11", "size": 5094, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/catalog.go", "sha256": "0d1bde7fae59695efe796651225ad8dd60142f2ebdaee3a60247e75bbb6545ca", "size": 17049, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/catalog_test.go", "sha256": "6088b8f0eea772c856c48af7dfb520038b62e1d1ad72d4709022481dd9e485d3", "size": 6760, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/converter.go", "sha256": "330070517e1410d24575541f1ab6128b5ca890b09024d3d11263040b3d6ff7e2", "size": 44790, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/converter_test.go", "sha256": "8cd3f8241f7925a46088f83975d1d03500fc0f087663bfb71532585f270b55c6", "size": 25172, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/endpoint.go", "sha256": "37aae2fc64926e56e778847336100914a0d5959253d6e9b8184ac38c51e7969a", "size": 3327, "state": "file"}
+{"mode": "0644", "path": "internal/kiro/endpoint_test.go", "sha256": "eff1aa71b3480984686f566e304a56a2cce1685a99b1f90da1a46bcf8b13a315", "size": 2035, "state": "file"}
+{"mode": "0644", "path": "internal/routing/routing.go", "sha256": "c71ee7adf514a754701771a36ea4f1a0f4b6303afbfe53b10ee3b5e258a382b3", "size": 19674, "state": "file"}
+{"mode": "0644", "path": "internal/routing/routing_test.go", "sha256": "5a94018ed7cc96580a6f2953f018105b05b14ada6c56ada8921f0e26fe29b772", "size": 17172, "state": "file"}
+{"path": "internal/storage/account_backup.go", "state": "absent"}
+{"path": "internal/storage/account_backup_test.go", "state": "absent"}
+{"path": "internal/storage/context_compression_migration.go", "state": "absent"}
+{"path": "internal/storage/context_compression_migration_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/storage/context_journal.go", "sha256": "7784271b6706133cb170eef3cb69bd15baadda2a8fe6b19282ddda195220acbe", "size": 6295, "state": "file"}
+{"mode": "0644", "path": "internal/storage/context_journal_test.go", "sha256": "63de6876a2a3ec5945bbeb730ebb495041cf9e54c9aeef08934e566f827c80c0", "size": 3124, "state": "file"}
+{"path": "internal/storage/custom_provider_mapping_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/storage/diagnostic_snapshot.go", "sha256": "fd9a58ae141ec8449e8dec043e220cefc7944d19caaf4cb6d3bd2e4029033b9d", "size": 8322, "state": "file"}
+{"mode": "0644", "path": "internal/storage/goal_continuity.go", "sha256": "55f60d46fc8e9663eff2939bc41dc13cc036ad8d6b78b076de6fb604989e32f4", "size": 59358, "state": "file"}
+{"mode": "0644", "path": "internal/storage/goal_continuity_test.go", "sha256": "51d96fbfc44dac3ccaf31adc9a7452bb5c3d008250e1f8af78600ed0157ba027", "size": 24338, "state": "file"}
+{"mode": "0644", "path": "internal/storage/log_cleanup.go", "sha256": "cfd1ab8be276b55975ae24eb26a20fcada45a02efb7e2c0f99fe155d87d4ca13", "size": 6592, "state": "file"}
+{"mode": "0644", "path": "internal/storage/log_cleanup_test.go", "sha256": "494042272889de91d75373db102ba749f78cf5950b79cd886ac397c72711c0cd", "size": 4356, "state": "file"}
+{"path": "internal/storage/route_binding_retention_test.go", "state": "absent"}
+{"mode": "0644", "path": "internal/storage/storage.go", "sha256": "24e4af8effa5e19e3c97348445e2f19c16f26fde63cd040181eed112141f443a", "size": 423362, "state": "file"}
+{"mode": "0644", "path": "internal/supervisor/state.go", "sha256": "72ec0b72769530a6cef2e669e31573536acd822e2b534ba0c60cde2d51625f0f", "size": 7146, "state": "file"}
+{"mode": "0644", "path": "internal/supervisor/supervisor.go", "sha256": "a4d927498ecaa7a00057fe5d150f230a3a881de5ecb7f233d9479f6138fd255d", "size": 5465, "state": "file"}
+{"mode": "0644", "path": "internal/supervisor/supervisor_test.go", "sha256": "11061a5cec75fcb1e93a7076f11387f36daaff64abb630b2a4ab53b0d3931492", "size": 8706, "state": "file"}
+{"mode": "0644", "path": "internal/upstream/anthropic.go", "sha256": "a051690ae0b147fa4dfc57ca15e9de09d78218bfde4c5e09bbdab7feab6a91a6", "size": 35948, "state": "file"}
+{"mode": "0644", "path": "internal/upstream/client.go", "sha256": "da643275deac3ed15529ab6f11c2d71ae3f1130afe44367d2338fa54d238a51c", "size": 68734, "state": "file"}
+{"mode": "0644", "path": "internal/upstream/openai_compat.go", "sha256": "990535868a1628248f24e2640cc24307520506ec279e996bd67f3634d53da643", "size": 6753, "state": "file"}
+{"path": "scripts/maintenance/README-reclaim-disk-space.md", "state": "absent"}
+{"path": "scripts/maintenance/reclaim-disk-space.sh", "state": "absent"}
+{"mode": "0644", "path": "web-spa/scripts/check-ui-regression-contracts.mjs", "sha256": "f94834a3c000b30af2f4262cb4467b05a0071f9ca0248b051769f5a31a07ac35", "size": 6464, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/features/accounts/api/accounts.ts", "sha256": "0875b027f2bc1228bf59ec1431a47b32639b4177a69af7e782ebcd9fa1757bd7", "size": 3118, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/features/observability/api/exports.ts", "sha256": "81327a7491821416c462fafa4a8528517937816f0d49a8859b8c2729a8c9c32c", "size": 7943, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/features/observability/queries/exports.ts", "sha256": "4ff3438111a073d5e3d9998ed4af55744f9abf0710814755b029c9769584e343", "size": 214, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/features/settings/api/settings.ts", "sha256": "b47e8d25d84f7ca3364680bdb8d0eef787ffba71bd61098e24b6ce74c14c3808", "size": 15544, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/features/settings/model/settings.ts", "sha256": "0d8fcc0d467c9860fd9379806238c4b92e79d7d38e0c0ba0ca79fd0baa2ebaa0", "size": 4429, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/lib/browserDownload.js", "sha256": "9ce45acba5ac77416e718d0f6de2d51e5200ab53d6366565a8c2656a477cb219", "size": 1085, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/pages/Accounts.jsx", "sha256": "3d4f0ca4a76c6766e23c474bd3956022a77910de77929420979ccc581bcb0377", "size": 27187, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/pages/Audit.tsx", "sha256": "59c6b300430b87c71ab81d0e6191be1c92162fc8b9a87f3c214d39b10550561e", "size": 7008, "state": "file"}
+{"mode": "0644", "path": "web-spa/src/pages/Providers.jsx", "sha256": "ec0c4e93477943e5e11d6f09e3e1b32d2531ee5eedd151a41dc6b8e3956c636c", "size": 16542, "state": "file"}
+{"path": "web-spa/tests/account-archive.test.ts", "state": "absent"}
+{"path": "web-spa/tests/browser-download.test.ts", "state": "absent"}
+{"mode": "0644", "path": "web-spa/tests/diagnostic-export.test.ts", "sha256": "6a53cf002fed2a934b96ae50ded96b806f0560ef65c6a683ce115a97851af81c", "size": 5597, "state": "file"}

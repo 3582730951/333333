@@ -190,6 +190,95 @@ func TestGoOnceWithLogfLogsPanic(t *testing.T) {
 	}
 }
 
+func TestGoUntilSuccessRetriesErrorsAndStopsAfterSuccess(t *testing.T) {
+	clearRecentEventsForTest()
+	clearModuleStatesForTest()
+	t.Cleanup(clearRecentEventsForTest)
+	t.Cleanup(clearModuleStatesForTest)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	completed := make(chan struct{})
+	var completedOnce sync.Once
+	logs := captureLogs()
+	GoUntilSuccessWithOptions(ctx, Options{
+		Name:           "finite-retry-task",
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		Logf:           logs.logf,
+	}, func(context.Context) error {
+		call := calls.Add(1)
+		if call < 3 {
+			return fmt.Errorf("transient-%d", call)
+		}
+		completedOnce.Do(func() { close(completed) })
+		return nil
+	})
+
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("finite task did not reach success")
+	}
+	state := waitForModuleState(t, "finite-retry-task", func(state ModuleState) bool {
+		return state.Status == StatusStopped && state.LastMessage == "task completed"
+	})
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("successful finite task calls=%d, want exactly 3", got)
+	}
+	if got := logs.string(); !strings.Contains(got, "error=transient-1") ||
+		strings.Contains(got, "exited unexpectedly") {
+		t.Fatalf("finite retry logs=%q", got)
+	}
+	if state.Status != StatusStopped || state.LastMessage != "task completed" ||
+		state.RestartCount != 2 || state.UnexpectedExitCount != 0 {
+		t.Fatalf("finite retry state=%#v", state)
+	}
+}
+
+func TestGoUntilSuccessRetriesPanicThenCompletes(t *testing.T) {
+	clearRecentEventsForTest()
+	clearModuleStatesForTest()
+	t.Cleanup(clearRecentEventsForTest)
+	t.Cleanup(clearModuleStatesForTest)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int32
+	completed := make(chan struct{})
+	logs := captureLogs()
+	GoUntilSuccessWithOptions(ctx, Options{
+		Name:           "finite-panic-task",
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		Logf:           logs.logf,
+	}, func(context.Context) error {
+		if calls.Add(1) == 1 {
+			panic("finite boom")
+		}
+		close(completed)
+		return nil
+	})
+
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("finite task did not retry its panic")
+	}
+	state := waitForModuleState(t, "finite-panic-task", func(state ModuleState) bool {
+		return state.Status == StatusStopped && state.LastMessage == "task completed"
+	})
+	if state.Status != StatusStopped || state.LastMessage != "task completed" ||
+		state.RestartCount != 1 || state.PanicCount != 1 {
+		t.Fatalf("finite panic state=%#v", state)
+	}
+	if got := logs.string(); !strings.Contains(got, "panic=finite boom") ||
+		!strings.Contains(got, "goroutine") {
+		t.Fatalf("finite panic log=%q", got)
+	}
+}
+
 func TestRecentEventsNewestFirstAndBounded(t *testing.T) {
 	clearRecentEventsForTest()
 	clearModuleStatesForTest()
@@ -298,4 +387,20 @@ func moduleStateByName(t *testing.T, name string) ModuleState {
 	}
 	t.Fatalf("module state %q not found in %#v", name, ModuleStates())
 	return ModuleState{}
+}
+
+func waitForModuleState(t *testing.T, name string, ready func(ModuleState) bool) ModuleState {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		for _, state := range ModuleStates() {
+			if state.Name == name && ready(state) {
+				return state
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("module state %q did not become ready: %#v", name, ModuleStates())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

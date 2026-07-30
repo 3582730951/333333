@@ -40,6 +40,7 @@ type DiskGuardSnapshot struct {
 	ContextsDeleted         int64                    `json:"contexts_deleted"`
 	GoalsDeleted            int64                    `json:"goals_deleted"`
 	CodexMappingsDeleted    int64                    `json:"codex_mappings_deleted"`
+	RouteBindingsDeleted    int64                    `json:"route_bindings_deleted"`
 	LogsDeleted             int64                    `json:"logs_deleted"`
 	LastRunAt               int64                    `json:"last_run_at"`
 	LastLogCleanupAt        int64                    `json:"last_log_cleanup_at,omitempty"`
@@ -112,6 +113,7 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 		ContextsDeleted:      previous.ContextsDeleted,
 		GoalsDeleted:         previous.GoalsDeleted,
 		CodexMappingsDeleted: previous.CodexMappingsDeleted,
+		RouteBindingsDeleted: previous.RouteBindingsDeleted,
 		LogsDeleted:          previous.LogsDeleted,
 		LastLogCleanupAt:     previous.LastLogCleanupAt,
 		DatabaseWritable:     s.databaseWritable(ctx),
@@ -159,10 +161,10 @@ func (s *Server) runDiskGuard(ctx context.Context) {
 		cancel()
 	}
 	if diskGuardChanged(previous, snap) {
-		log.Printf("[DISK-GUARD] level=%s free_pct=%.1f free_bytes=%d db_writable=%t journal_writable=%t spool_writable=%t admission_blocked=%t cleanup_contexts=%d cleanup_goals=%d cleanup_mappings=%d error_code=%s",
+		log.Printf("[DISK-GUARD] level=%s free_pct=%.1f free_bytes=%d db_writable=%t journal_writable=%t spool_writable=%t admission_blocked=%t cleanup_contexts=%d cleanup_goals=%d cleanup_mappings=%d cleanup_route_bindings=%d error_code=%s",
 			snap.Level, snap.FreePercent, snap.FreeBytes, snap.DatabaseWritable, snap.JournalWritable,
 			snap.SpoolWritable, snap.AdmissionBlocked, snap.ContextsDeleted, snap.GoalsDeleted,
-			snap.CodexMappingsDeleted, snap.LastError)
+			snap.CodexMappingsDeleted, snap.RouteBindingsDeleted, snap.LastError)
 		s.recordDiskGuardEvent(ctx, previous, snap)
 	}
 	s.diskGuard.Store(snap)
@@ -181,10 +183,20 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
 	} else {
 		snap.GoalsDeleted += goals
 	}
+	if _, goals, err := s.store.EnforceGoalStorageBudget(cleanupCtx, s.goalStorageMaxBytes(cleanupCtx)); err != nil {
+		snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_cleanup_failed")
+	} else {
+		snap.GoalsDeleted += goals
+	}
 	if mappings, err := s.store.CleanupCodexSessionMappings(cleanupCtx); err != nil {
 		snap.LastError = appendDiskGuardCode(snap.LastError, "mapping_cleanup_failed")
 	} else {
 		snap.CodexMappingsDeleted += mappings
+	}
+	if bindings, err := s.store.CleanupInactiveRouteBindings(cleanupCtx, 256); err != nil {
+		snap.LastError = appendDiskGuardCode(snap.LastError, "route_binding_cleanup_failed")
+	} else {
+		snap.RouteBindingsDeleted += bindings.Total()
 	}
 	s.cleanupExpiredDiagnosticJobs(cleanupCtx)
 }
@@ -419,6 +431,7 @@ func diskGuardChanged(previous, current DiskGuardSnapshot) bool {
 		previous.ContextsDeleted != current.ContextsDeleted ||
 		previous.GoalsDeleted != current.GoalsDeleted ||
 		previous.CodexMappingsDeleted != current.CodexMappingsDeleted ||
+		previous.RouteBindingsDeleted != current.RouteBindingsDeleted ||
 		previous.LastError != current.LastError
 }
 

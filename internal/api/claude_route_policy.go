@@ -116,13 +116,10 @@ func namespaceClaudeAffinity(base routing.AffinityKey, routeMode, contextMode st
 	return routing.AffinityFromKey("claude_route:"+routeMode+":"+contextMode+":"+base.Hash, base.Source)
 }
 
-func kiroAffinityWait(ctx context.Context, s *Server, providers []string) time.Duration {
-	if len(providers) != 1 || !strings.EqualFold(providers[0], "kiro") {
-		return 0
-	}
-	millis := s.settingInt(ctx, "kiro_affinity_wait_millis", 1500)
-	if millis < 1 {
-		millis = 1500
-	}
-	return time.Duration(millis) * time.Millisecond
+func kiroAffinityWait(_ context.Context, _ *Server, _ []string) time.Duration {
+	// Do not add a proxy-side pacing delay to Kiro traffic. Exact conversation
+	// affinity is enforced by the binding itself; when that account is immediately
+	// available it is selected without sleeping, and otherwise normal scheduler
+	// failover/error semantics apply.
+	return 0
 }

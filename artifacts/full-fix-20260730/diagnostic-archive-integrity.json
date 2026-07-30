@@ -1,0 +1,193 @@
+{
+  "schema": "diagnostic-archive-integrity/v1",
+  "tar_bundle": {
+    "all_member_paths_safe": true,
+    "archive_read": "ok",
+    "dlp_scan": {
+      "false_positive_counts": {
+        "systemd_template_instance": 13
+      },
+      "files_scanned": 32,
+      "potential_sensitive_value_findings": []
+    },
+    "entry_count": 37,
+    "internal_checksum_count": 31,
+    "internal_checksum_mismatches": [],
+    "manifest": {
+      "application_bundle_included": false,
+      "collection_policy": {
+        "config_contents_copied": false,
+        "database_copied": false,
+        "dlp_scanned": true,
+        "key_files_copied": false,
+        "process_arguments_copied": false,
+        "text_redacted": true
+      },
+      "created_at_utc": "20260730T023455Z",
+      "format": "codex-pool-vps-diagnostics",
+      "format_version": "2",
+      "python_version": "3.10.12"
+    },
+    "path": "example_zip/codex-pool-vps-diagnostics.tar.gz",
+    "regular_file_count": 32,
+    "sha256": "90b53b1ae13b4522f687418eca925fd81d1d17f7c935a121a6858a6dc1cecfea"
+  },
+  "zip_bundles": [
+    {
+      "all_member_paths_safe": true,
+      "archive_bytes": 9938,
+      "crc_test": "ok",
+      "csv_rows_recounted": {
+        "audit_log.csv": 0,
+        "usage_records.csv": 0
+      },
+      "dlp_scan": {
+        "false_positive_counts": {
+          "json_schema_key": 1
+        },
+        "files_scanned": 30,
+        "potential_sensitive_value_findings": []
+      },
+      "entry_count": 30,
+      "large_table_row_limit": null,
+      "manifest_format": "codex-pool-diagnostics-v3",
+      "manifest_row_counts": {
+        "audit_log.csv": 0,
+        "usage_records.csv": 0
+      },
+      "path": "verification/codex-pool-diagnostics-v3-canary.zip",
+      "sha256": "87fc25c5c3e8c24467fc48d058f3b636b09727681756a77fbeb0ed4e13a9a751",
+      "source_row_counts": null,
+      "total_uncompressed_bytes": 15035,
+      "truncated_tables": null
+    },
+    {
+      "all_member_paths_safe": true,
+      "archive_bytes": 9359,
+      "crc_test": "ok",
+      "csv_rows_recounted": {
+        "audit_log.csv": 0,
+        "usage_records.csv": 0
+      },
+      "dlp_scan": {
+        "false_positive_counts": {
+          "json_schema_key": 1
+        },
+        "files_scanned": 30,
+        "potential_sensitive_value_findings": []
+      },
+      "entry_count": 30,
+      "large_table_row_limit": null,
+      "manifest_format": "codex-pool-diagnostics-v3",
+      "manifest_row_counts": {
+        "audit_log.csv": 0,
+        "usage_records.csv": 0
+      },
+      "path": "artifacts/optimization-20260729/pre-fix-diagnostics.zip",
+      "sha256": "504f2a41eca5b82333a875993b84f63d79984966bb0df36a7c55782b05a37691",
+      "source_row_counts": null,
+      "total_uncompressed_bytes": 13458,
+      "truncated_tables": null
+    },
+    {
+      "all_member_paths_safe": true,
+      "archive_bytes": 3981227,
+      "crc_test": "ok",
+      "csv_rows_recounted": {
+        "audit_log.csv": 200000,
+        "usage_records.csv": 500000
+      },
+      "dlp_scan": {
+        "false_positive_counts": {
+          "json_schema_key": 1
+        },
+        "files_scanned": 30,
+        "potential_sensitive_value_findings": []
+      },
+      "entry_count": 30,
+      "large_table_row_limit": null,
+      "manifest_format": "codex-pool-diagnostics-v3",
+      "manifest_row_counts": {
+        "audit_log.csv": 200000,
+        "usage_records.csv": 500000
+      },
+      "path": "artifacts/optimization-20260729/pre-fix-large-diagnostics.zip",
+      "sha256": "357e05e6c7b1871da27c979f40e856bbdd67804f7c553e2507c2db73d22b3f9e",
+      "source_row_counts": null,
+      "total_uncompressed_bytes": 102591296,
+      "truncated_tables": null
+    },
+    {
+      "all_member_paths_safe": true,
+      "archive_bytes": 3991141,
+      "crc_test": "ok",
+      "csv_rows_recounted": {
+        "audit_log.csv": 200000,
+        "usage_records.csv": 500000
+      },
+      "dlp_scan": {
+        "false_positive_counts": {
+          "json_schema_key": 1
+        },
+        "files_scanned": 30,
+        "potential_sensitive_value_findings": []
+      },
+      "entry_count": 30,
+      "large_table_row_limit": null,
+      "manifest_format": "codex-pool-diagnostics-v3",
+      "manifest_row_counts": {
+        "audit_log.csv": 200000,
+        "usage_records.csv": 500000
+      },
+      "path": "artifacts/optimization-20260729/remote-evidence/perf-pre-fix/pre-fix-diagnostics.zip",
+      "sha256": "2c704ddf6f10340681c07b9d748c9f2dbf3a3e45a598c88b02213b2a6a1d1171",
+      "source_row_counts": null,
+      "total_uncompressed_bytes": 102591293,
+      "truncated_tables": null
+    },
+    {
+      "all_member_paths_safe": true,
+      "archive_bytes": 239466,
+      "crc_test": "ok",
+      "csv_rows_recounted": {
+        "audit_log.csv": 20000,
+        "usage_records.csv": 20000
+      },
+      "dlp_scan": {
+        "false_positive_counts": {
+          "json_schema_key": 1
+        },
+        "files_scanned": 30,
+        "potential_sensitive_value_findings": []
+      },
+      "entry_count": 30,
+      "large_table_row_limit": 20000,
+      "manifest_format": "codex-pool-diagnostics-v3",
+      "manifest_row_counts": {
+        "audit_log.csv": 20000,
+        "usage_records.csv": 20000
+      },
+      "path": "artifacts/optimization-20260729/remote-evidence/perf-final/final-diagnostics.zip",
+      "sha256": "5807f7fbaa08ee32efc928ff6f8848ac5ab74995ad738371825510c8719d0110",
+      "source_row_counts": {
+        "audit_log.csv": 200000,
+        "usage_records.csv": 500000
+      },
+      "total_uncompressed_bytes": 5194208,
+      "truncated_tables": {
+        "audit_log.csv": {
+          "exported_rows": 20000,
+          "omitted_rows": 180000,
+          "selection": "most_recent",
+          "source_rows": 200000
+        },
+        "usage_records.csv": {
+          "exported_rows": 20000,
+          "omitted_rows": 480000,
+          "selection": "most_recent",
+          "source_rows": 500000
+        }
+      }
+    }
+  ]
+}

@@ -23,6 +23,10 @@ func (s *Server) adminAccountsExport(w http.ResponseWriter, r *http.Request) {
 	if format == "" {
 		format = "json"
 	}
+	if format == "backup" || format == "archive" || format == "portable" {
+		s.writeAccountsBackupDownload(w, r)
+		return
+	}
 	accounts, err := s.store.ListAccounts(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)

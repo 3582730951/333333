@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -14,8 +15,6 @@ import (
 )
 
 const strictRuntimeMissingMessage = "strict Linux runtime requires bubblewrap (bwrap) with user/mount/UTS namespace support"
-
-const gatewayClaudeSettingsJSON = `{"skipWebFetchPreflight":true}`
 
 type strictRuntimePaths struct {
 	GatewayDir      string
@@ -75,19 +74,44 @@ func handleRunClaude(configPath string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	args = claudeGatewayRuntimeArgs(args)
+	policy := defaultGatewayPolicy()
+	if identity != nil && identity.Virtual != nil {
+		policy = effectiveGatewayPolicy(identity.Virtual.GatewayPolicy)
+	}
 	if !strictLinuxRequested() {
-		return runCompatClaude(cfg, realClaude, args)
+		settingsDir, dirErr := gatewayRuntimeSettingsDir()
+		if dirErr != nil {
+			fmt.Fprintln(os.Stderr, dirErr)
+			return 1
+		}
+		var cleanup func()
+		args, cleanup, err = prepareClaudeGatewayRuntimeArgs(args, cfg, policy, settingsDir, settingsDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer cleanup()
+		return runCompatClaude(cfg, identity, realClaude, args)
 	}
 	if err := runStrictRuntimeSelfCheck(cfg, identity); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	cmd, err := buildStrictRuntimeCommand(cfg, identity, realClaude, args)
+	paths, err := prepareStrictRuntimePaths(identity)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	hostSettingsDir := filepath.Join(paths.VirtualHomeHost, ".claude")
+	clientSettingsDir := filepath.Join(identity.Virtual.HomeDir, ".claude")
+	var cleanup func()
+	args, cleanup, err = prepareClaudeGatewayRuntimeArgs(args, cfg, policy, hostSettingsDir, clientSettingsDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer cleanup()
+	cmd := strictRuntimeCommandWithPaths(cfg, identity, paths, realClaude, args)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -97,16 +121,171 @@ func handleRunClaude(configPath string) int {
 	return 0
 }
 
-// claudeGatewayRuntimeArgs adds a process-scoped settings overlay. Kiro and other
-// pool-backed providers cannot answer Claude Code's separate api.anthropic.com
-// WebFetch domain-safety preflight, so the official client otherwise rejects every
-// Fetch before contacting the requested site. --settings merges the omitted keys
-// from the user's normal settings and confines this override to gateway launches.
-func claudeGatewayRuntimeArgs(args []string) []string {
-	out := make([]string, 0, len(args)+2)
-	out = append(out, "--settings", gatewayClaudeSettingsJSON)
-	out = append(out, args...)
-	return out
+func gatewayRuntimeSettingsDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".claude-gateway", "runtime")
+	if err := os.MkdirAll(dir, gatewayPrivateDirMode); err != nil {
+		return "", err
+	}
+	if err := chmodGatewayPrivateDir(filepath.Dir(dir)); err != nil {
+		return "", err
+	}
+	if err := chmodGatewayPrivateDir(dir); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// prepareClaudeGatewayRuntimeArgs materializes a private, process-scoped
+// --settings overlay. Claude Code reapplies settings.json "env" after reading the
+// launcher environment, so process env alone is insufficient: a stale user/project
+// provider selector can silently route around URL + pool key. Existing explicit
+// --settings JSON/files are merged first and all non-gateway keys are preserved.
+func prepareClaudeGatewayRuntimeArgs(
+	args []string,
+	cfg Config,
+	policy GatewayPolicy,
+	hostDir, clientDir string,
+) ([]string, func(), error) {
+	cleanArgs, settings, err := mergeExplicitClaudeSettings(args)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	env := mapSetting(settings, "env")
+	for _, key := range claudeGatewayConflictingEnvKeys() {
+		env[key] = ""
+	}
+	env["ANTHROPIC_BASE_URL"] = poolServerBaseURL(cfg)
+	env["ANTHROPIC_AUTH_TOKEN"] = strings.TrimSpace(cfg.DownstreamKey)
+	env["CLAUDE_CODE_ENABLE_AUTO_MODE"] = "1"
+	env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+	env["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"] = "1"
+	env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = ""
+	if policy.DisableNonessentialEnv {
+		env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+		env["DO_NOT_TRACK"] = "1"
+		env["DISABLE_TELEMETRY"] = "1"
+		env["DISABLE_ERROR_REPORTING"] = "1"
+		env["DISABLE_AUTOUPDATER"] = "1"
+		env["OTEL_METRICS_EXPORTER"] = "none"
+		env["OTEL_LOGS_EXPORTER"] = "none"
+	}
+	settings["env"] = env
+	// A user apiKeyHelper can otherwise install a different credential after env
+	// resolution. Empty explicitly disables it for this gateway launch only.
+	settings["apiKeyHelper"] = ""
+	// Pool-backed providers cannot answer Claude Code's independent
+	// api.anthropic.com domain-safety preflight. Gateway CONNECT policy remains the
+	// egress authority for the actual requested URL.
+	settings["skipWebFetchPreflight"] = true
+
+	data, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(hostDir, gatewayPrivateDirMode); err != nil {
+		return nil, func() {}, err
+	}
+	file, err := os.CreateTemp(hostDir, ".pool-claude-settings-*.json")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	hostPath := file.Name()
+	cleanup := func() { _ = os.Remove(hostPath) }
+	if err := file.Chmod(gatewayConfigFileMode); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, func() {}, err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		cleanup()
+		return nil, func() {}, err
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	if err := os.Chmod(hostPath, gatewayConfigFileMode); err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	clientPath := filepath.Join(clientDir, filepath.Base(hostPath))
+	out := make([]string, 0, len(cleanArgs)+2)
+	out = append(out, "--settings", clientPath)
+	out = append(out, cleanArgs...)
+	return out, cleanup, nil
+}
+
+func mergeExplicitClaudeSettings(args []string) ([]string, map[string]interface{}, error) {
+	settings := map[string]interface{}{}
+	clean := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			clean = append(clean, args[i:]...)
+			break
+		}
+		var value string
+		switch {
+		case arg == "--settings":
+			if i+1 >= len(args) {
+				return nil, nil, errors.New("--settings requires a JSON object or file path")
+			}
+			i++
+			value = args[i]
+		case strings.HasPrefix(arg, "--settings="):
+			value = strings.TrimPrefix(arg, "--settings=")
+		default:
+			clean = append(clean, arg)
+			continue
+		}
+		explicit, err := readClaudeSettingsValue(value)
+		if err != nil {
+			return nil, nil, err
+		}
+		deepMergeClaudeSettings(settings, explicit)
+	}
+	return clean, settings, nil
+}
+
+func readClaudeSettingsValue(value string) (map[string]interface{}, error) {
+	value = strings.TrimSpace(value)
+	var raw []byte
+	if strings.HasPrefix(value, "{") {
+		raw = []byte(value)
+	} else {
+		file, err := os.Open(value)
+		if err != nil {
+			return nil, fmt.Errorf("read Claude Code --settings %q: %w", value, err)
+		}
+		defer file.Close()
+		raw, err = io.ReadAll(io.LimitReader(file, 2<<20))
+		if err != nil {
+			return nil, fmt.Errorf("read Claude Code --settings %q: %w", value, err)
+		}
+	}
+	out := map[string]interface{}{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("parse Claude Code --settings: %w", err)
+	}
+	return out, nil
+}
+
+func deepMergeClaudeSettings(dst, src map[string]interface{}) {
+	for key, value := range src {
+		incoming, incomingMap := value.(map[string]interface{})
+		current, currentMap := dst[key].(map[string]interface{})
+		if incomingMap && currentMap {
+			deepMergeClaudeSettings(current, incoming)
+			continue
+		}
+		dst[key] = value
+	}
 }
 
 func loadRuntimeIdentity(configPath string) (Config, *CachedIdentity, error) {
@@ -174,48 +353,88 @@ func strictLinuxRequested() bool {
 	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 }
 
-func runCompatClaude(cfg Config, realClaude string, args []string) int {
+func runCompatClaude(cfg Config, identity *CachedIdentity, realClaude string, args []string) int {
 	cmd := exec.Command(realClaude, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = compatRuntimeEnv(os.Environ(), cfg)
+	policy := defaultGatewayPolicy()
+	if identity != nil && identity.Virtual != nil {
+		policy = effectiveGatewayPolicy(identity.Virtual.GatewayPolicy)
+	}
+	cmd.Env = compatRuntimeEnv(os.Environ(), cfg, policy)
 	if err := cmd.Run(); err != nil {
 		return exitCode(err)
 	}
 	return 0
 }
 
-func compatRuntimeEnv(base []string, cfg Config) []string {
-	// Claude Code accepts both ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN and
-	// currently sends both headers when both variables are set. A key inherited
-	// from the host (or supplied by an apiKeyHelper) can therefore take
-	// precedence over the gateway token at the pool. Remove all inherited
-	// occurrences, then pin both supported credential forms to the same
-	// downstream key so neither client precedence nor helper behavior can select
-	// a stale official credential.
-	env := removeRuntimeEnvKey(base, "ANTHROPIC_API_KEY")
-	// Remove every inherited token occurrence before adding exactly one gateway
-	// token. This also handles unusual exec environments containing duplicate
-	// keys, where replacing only the first value could leave a later host token.
-	env = removeRuntimeEnvKey(env, "ANTHROPIC_AUTH_TOKEN")
+func compatRuntimeEnv(base []string, cfg Config, policies ...GatewayPolicy) []string {
+	// Use the bearer-token path recommended for custom gateways. Remove every
+	// inherited direct/provider credential selector first so an existing cloud
+	// provider or API-key login cannot outrank URL + pool key.
+	policy := defaultGatewayPolicy()
+	if len(policies) > 0 {
+		policy = effectiveGatewayPolicy(policies[0])
+	}
+	env := append([]string(nil), base...)
+	for _, key := range claudeGatewayRuntimeUnsetEnvKeys() {
+		env = removeRuntimeEnvKey(env, key)
+	}
 	set := func(key, value string) {
-		prefix := key + "="
-		for i, item := range env {
-			if strings.HasPrefix(item, prefix) {
-				env[i] = prefix + value
-				return
-			}
-		}
-		env = append(env, prefix+value)
+		// Remove both bare and KEY=value occurrences before installing exactly
+		// one gateway-owned value. Exec environments can contain duplicates.
+		env = removeRuntimeEnvKey(env, key)
+		env = append(env, key+"="+value)
 	}
 	set("ANTHROPIC_BASE_URL", strings.TrimRight(strings.TrimSpace(cfg.PoolServerURL), "/"))
 	set("ANTHROPIC_AUTH_TOKEN", strings.TrimSpace(cfg.DownstreamKey))
-	set("ANTHROPIC_API_KEY", strings.TrimSpace(cfg.DownstreamKey))
 	set("CLAUDE_CODE_ENABLE_AUTO_MODE", "1")
+	set("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
+	set("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING", "1")
 	set("POOL_CLIENT_RUNTIME", "compat")
 	set("POOL_STRICT_LINUX", "0")
+	if policy.DisableNonessentialEnv {
+		set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+		set("DO_NOT_TRACK", "1")
+		set("DISABLE_TELEMETRY", "1")
+		set("DISABLE_ERROR_REPORTING", "1")
+		set("DISABLE_AUTOUPDATER", "1")
+		set("OTEL_METRICS_EXPORTER", "none")
+		set("OTEL_LOGS_EXPORTER", "none")
+	}
 	return env
+}
+
+func claudeGatewayConflictingEnvKeys() []string {
+	return []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_AWS_API_KEY",
+		"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+		"CLAUDE_CODE_USE_ANTHROPIC_AWS",
+		"CLAUDE_CODE_USE_BEDROCK",
+		"CLAUDE_CODE_USE_FOUNDRY",
+		"CLAUDE_CODE_USE_MANTLE",
+		"CLAUDE_CODE_USE_VERTEX",
+		"ANTHROPIC_AWS_BASE_URL",
+		"ANTHROPIC_AWS_WORKSPACE_ID",
+		"ANTHROPIC_BEDROCK_BASE_URL",
+		"ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"ANTHROPIC_FOUNDRY_API_KEY",
+		"ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+		"ANTHROPIC_FOUNDRY_BASE_URL",
+		"ANTHROPIC_FOUNDRY_RESOURCE",
+		"ANTHROPIC_VERTEX_BASE_URL",
+		"ANTHROPIC_VERTEX_PROJECT_ID",
+		"ANTHROPIC_WORKSPACE_ID",
+	}
+}
+
+func claudeGatewayRuntimeUnsetEnvKeys() []string {
+	keys := append([]string(nil), claudeGatewayConflictingEnvKeys()...)
+	return append(keys, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
 }
 
 func removeRuntimeEnvKey(env []string, key string) []string {
@@ -285,10 +504,20 @@ func buildStrictRuntimeCommand(cfg Config, identity *CachedIdentity, command str
 	if err != nil {
 		return nil, err
 	}
+	return strictRuntimeCommandWithPaths(cfg, identity, paths, command, args), nil
+}
+
+func strictRuntimeCommandWithPaths(
+	cfg Config,
+	identity *CachedIdentity,
+	paths strictRuntimePaths,
+	command string,
+	args []string,
+) *exec.Cmd {
 	bwrapArgs := buildBubblewrapArgs(cfg, identity, paths, command, args)
 	cmd := exec.Command("bwrap", bwrapArgs...)
 	cmd.Env = os.Environ()
-	return cmd, nil
+	return cmd
 }
 
 func prepareStrictRuntimePaths(identity *CachedIdentity) (strictRuntimePaths, error) {
@@ -440,9 +669,11 @@ func buildBubblewrapArgs(cfg Config, identity *CachedIdentity, paths strictRunti
 		"--chdir", paths.RuntimeCWD,
 	)
 	// bwrap otherwise inherits the launcher environment. Remove the host
-	// credential first; strictRuntimeEnv then installs both supported credential
-	// forms with the same gateway key.
-	out = append(out, "--unsetenv", "ANTHROPIC_API_KEY")
+	// credentials/provider selectors first; strictRuntimeEnv then installs the
+	// single bearer-token gateway credential.
+	for _, key := range claudeGatewayRuntimeUnsetEnvKeys() {
+		out = append(out, "--unsetenv", key)
+	}
 	for _, kv := range strictRuntimeEnv(cfg, identity) {
 		parts := strings.SplitN(kv, "=", 2)
 		value := ""
@@ -508,8 +739,9 @@ func strictRuntimeEnv(cfg Config, identity *CachedIdentity) []string {
 		"NO_PROXY=" + gatewayNoProxy(cfg, policy),
 		"ANTHROPIC_BASE_URL=" + poolServerBaseURL(cfg),
 		"ANTHROPIC_AUTH_TOKEN=" + cfg.DownstreamKey,
-		"ANTHROPIC_API_KEY=" + cfg.DownstreamKey,
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1",
 	}
 	if policy.DisableNonessentialEnv {
 		out = append(out,

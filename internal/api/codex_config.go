@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-
-	"codex-account-pool/internal/capability"
 )
 
 // handleCodexConfigScript serves GET /file/{apikey} (the key may also arrive as
@@ -22,9 +20,9 @@ import (
 //   - supports_websockets enables the current Responses WebSocket transport; the
 //     installer probes the public ingress and disables it when a 101 upgrade cannot
 //     complete, while pool_server can bridge an accepted downstream socket to SSE.
-//   - experimental_bearer_token carries the key as `Authorization: Bearer <token>`;
-//     it is the field codex documents for programmatic/self-hosted setups, so no
-//     env var, auth.json, or shell-rc edit is needed.
+//   - command auth reads a mode-0600 token file and carries the result as
+//     `Authorization: Bearer <token>`. Besides avoiding auth.json/shell-rc edits,
+//     this makes stock Codex refresh the provider's native /models catalog.
 //   - requires_openai_auth defaults false for a custom provider, so codex skips the
 //     login screen entirely.
 func (s *Server) handleCodexConfigScript(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +163,7 @@ type CodexSetupScriptOptions struct {
 func defaultCodexSetupScriptOptions() CodexSetupScriptOptions {
 	return CodexSetupScriptOptions{
 		StrictLinuxDefault:     false,
-		DisableNonessentialEnv: true,
+		DisableNonessentialEnv: false,
 	}
 }
 
@@ -183,14 +181,6 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 	}
 	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
 	safeKey := strings.ReplaceAll(apiKey, "'", "")
-	keyLine := ""
-	if safeKey != "" {
-		keyLine = "experimental_bearer_token = \"$API_KEY\""
-	} else {
-		// No key (open pool): codex still needs a non-empty token shape downstream,
-		// but an open pool accepts any. Emit a placeholder the user can edit.
-		keyLine = "experimental_bearer_token = \"any-non-empty\""
-	}
 	// Operator-configured behavior lines, emitted only when set. Values are
 	// config-sourced (not request input); still strip quotes/newlines defensively so a
 	// stray value can't break out of the TOML string or inject extra keys.
@@ -210,13 +200,10 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 		return "'" + strings.ReplaceAll(v, "'", "'\"'\"'") + "'"
 	}
 	var extra strings.Builder
-	contextWindow, compactLimit, manageContextLimits := capability.CodexClientContextOverrides(model)
-	if manageContextLimits {
-		fmt.Fprintf(&extra, "model_context_window = %d\n", contextWindow)
-		if compactLimit > 0 {
-			fmt.Fprintf(&extra, "model_auto_compact_token_limit = %d\n", compactLimit)
-		}
-	}
+	// Context limits are server-rendered model metadata, not installer defaults.
+	// Command authentication below makes stock Codex refresh /v1/models. Remove
+	// stale root overrides from prior installers so GPT-5.6 consistently receives
+	// the 372K/334.8K contract while users still configure only URL and API key.
 	if e := clean(effort); e != "" {
 		fmt.Fprintf(&extra, "model_reasoning_effort = \"%s\"\n", e)
 	}
@@ -226,10 +213,7 @@ func buildCodexConfigScript(origin, apiKey, model, effort, approval, sandbox str
 	if sb := clean(sandbox); sb != "" {
 		fmt.Fprintf(&extra, "sandbox_mode = \"%s\"\n", sb)
 	}
-	managedRootKeys := "model|model_provider|model_reasoning_effort|approval_policy|sandbox_mode"
-	if manageContextLimits {
-		managedRootKeys += "|model_context_window|model_auto_compact_token_limit"
-	}
+	managedRootKeys := "model|model_provider|model_reasoning_effort|model_context_window|model_auto_compact_token_limit|approval_policy|sandbox_mode"
 	strictDefault := "1"
 	if !scriptOptions.StrictLinuxDefault {
 		strictDefault = "0"
@@ -428,6 +412,7 @@ configure_codex() {
   local install_rtk="$1"
   local CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
   local CONFIG="$CODEX_HOME/config.toml"
+  local TOKEN_FILE="$CODEX_HOME/pool-token"
   local supports_websockets=false
 
   case "${POOL_CODEX_WEBSOCKETS:-auto}" in
@@ -443,45 +428,91 @@ configure_codex() {
 
   say "配置 Codex 接入 Pool: $ORIGIN"
   mkdir -p "$CODEX_HOME"
+  umask 077
+  if [ -L "$TOKEN_FILE" ] || [ -L "$CONFIG" ]; then
+    say "Refusing to replace a symlinked Codex config or token file."
+    exit 1
+  fi
+  local TOKEN_TMP CONFIG_TMP
+  TOKEN_TMP="$(mktemp "$CODEX_HOME/.pool-token.tmp.XXXXXX")"
+  CONFIG_TMP="$(mktemp "$CODEX_HOME/.config.toml.tmp.XXXXXX")"
+  printf '%%s\n' "${API_KEY:-any-non-empty}" > "$TOKEN_TMP"
+  chmod 600 "$TOKEN_TMP"
 
   if [ -f "$CONFIG" ]; then
-    local BAK="$CONFIG.bak.$(date +%%Y%%m%%d%%H%%M%%S)"
+    local BAK="$CONFIG.bak.$(date +%%Y%%m%%d%%H%%M%%S).$$"
     cp "$CONFIG" "$BAK"
     say "已备份原有配置 -> $BAK"
   fi
 
-  local TMP="$CONFIG.tmp.$$"
+  # TOML root keys must precede every table.  Writing these after a preserved
+  # [features] (or any other table) silently nests them in that table and leaves
+  # Codex using its old provider/model.  Seed the managed root first, then append
+  # preserved user root keys/tables, and finally replace only Pool's provider.
+  cat > "$CONFIG_TMP" <<EOF
+# Generated by Pool — points the codex CLI at a self-hosted pool.
+model = "$MODEL"
+model_provider = "$PROVIDER_ID"
+%s
+EOF
+
   if [ -f "$CONFIG" ]; then
     awk -v provider="$PROVIDER_ID" -v managed_root_keys=%s '
       BEGIN { section=""; skip=0 }
       /^\[/ {
         section=$0
         skip=0
-        if ($0 == "[model_providers." provider "]") { skip=1; next }
+        if ($0 == "[model_providers." provider "]" ||
+            index($0, "[model_providers." provider ".") == 1) { skip=1; next }
       }
       skip { next }
       section == "" && $0 ~ ("^(" managed_root_keys ")[[:space:]]*=") { next }
       { print }
-    ' "$CONFIG" > "$TMP"
-  else
-    : > "$TMP"
+    ' "$CONFIG" >> "$CONFIG_TMP"
   fi
 
-  cat >> "$TMP" <<EOF
-# Generated by Pool — points the codex CLI at a self-hosted pool.
-model = "$MODEL"
-model_provider = "$PROVIDER_ID"
-%s
+  cat >> "$CONFIG_TMP" <<EOF
 [model_providers.$PROVIDER_ID]
-name = "Pool Server"
+name = "OpenAI"
 base_url = "$ORIGIN/v1"
 wire_api = "responses"
 supports_websockets = $supports_websockets
-%s
+requires_openai_auth = false
+
+[model_providers.$PROVIDER_ID.auth]
+command = "/bin/cat"
+args = ["$TOKEN_FILE"]
+timeout_ms = 5000
+refresh_interval_ms = 300000
 EOF
-  mv "$TMP" "$CONFIG"
+
+  local TOKEN_BAK=""
+  if [ -f "$TOKEN_FILE" ]; then
+    TOKEN_BAK="$TOKEN_FILE.bak.$(date +%%Y%%m%%d%%H%%M%%S).$$"
+    cp -p "$TOKEN_FILE" "$TOKEN_BAK"
+  fi
+  mv "$TOKEN_TMP" "$TOKEN_FILE"
+  if ! mv "$CONFIG_TMP" "$CONFIG"; then
+    if [ -n "$TOKEN_BAK" ]; then
+      cp -p "$TOKEN_BAK" "$TOKEN_FILE"
+    else
+      rm -f "$TOKEN_FILE"
+    fi
+    say "Codex config commit failed; token was rolled back."
+    exit 1
+  fi
+
+  # Codex 0.146 and earlier do not include provider identity in the model-cache
+  # key. Preserve a rollback copy, then force the first Pool launch to fetch this
+  # server's model catalog instead of reusing another provider's limits.
+  if [ -f "$CODEX_HOME/models_cache.json" ]; then
+    local CACHE_BAK="$CODEX_HOME/models_cache.json.bak.$(date +%%Y%%m%%d%%H%%M%%S).$$"
+    mv "$CODEX_HOME/models_cache.json" "$CACHE_BAK"
+    say "已备份旧模型缓存 -> $CACHE_BAK"
+  fi
 
   say "已写入 $CONFIG"
+  say "已写入 command-auth token -> $TOKEN_FILE (mode 600)"
   say "model=$MODEL"
   say "supports_websockets=$supports_websockets"
   say "提示: Codex 官方 skills / plugins / Browser Use 最大兼容需要路由到官方 Codex 账号通道；第三方供应商为 best-effort。"
@@ -528,26 +559,29 @@ install_gateway_binary() {
 
 configure_claude() {
   local install_rtk="$1"
+  local GATEWAY_KEY="${API_KEY:-any-non-empty}"
   if [ "$POOL_CLIENT_RUNTIME" = "strict" ] && [ "$(uname -s)" != "Linux" ]; then
     say "Claude Code strict runtime only supports Linux. Use POOL_CLIENT_RUNTIME=compat to preserve the official local client ecosystem."
     exit 1
   fi
   export POOL_CLIENT_RUNTIME="${POOL_CLIENT_RUNTIME:-%s}"
   export POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-%s}"
-  # Claude Code 2.1.x may send both supported credentials. Pin both to the
-  # bundled gateway key so an inherited official key or apiKeyHelper cannot win
-  # header precedence and make this valid install look unauthorized.
+  # Gateway mode uses the bearer-token credential path recommended for custom
+  # Anthropic-compatible endpoints. Remove an inherited API key so Claude Code
+  # does not enter its direct API-key approval/login flow.
   export ANTHROPIC_BASE_URL="$ORIGIN"
-  export ANTHROPIC_AUTH_TOKEN="$API_KEY"
-  export ANTHROPIC_API_KEY="$API_KEY"
+  export ANTHROPIC_AUTH_TOKEN="$GATEWAY_KEY"
+  unset ANTHROPIC_API_KEY
   export CLAUDE_CODE_ENABLE_AUTO_MODE=1
+  export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+  export CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1
 %s
 
   say "配置 Claude Code 本地 gateway runtime ($POOL_CLIENT_RUNTIME): $ORIGIN"
   say "Claude Code API: ANTHROPIC_BASE_URL=$ORIGIN"
   say "Claude Code 模型由客户端自行选择；VPS force_model 可能在服务端覆盖"
   install_gateway_binary
-  "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"
+  "$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$GATEWAY_KEY"
   "$GATEWAY_BIN" stop || true
   if ! "$GATEWAY_BIN" trust-ca; then
     say "CA 自动信任失败；安装尚未完成。请执行 $GATEWAY_BIN trust-ca --print-commands 后重跑本脚本"
@@ -586,7 +620,7 @@ main() {
 }
 
 main "$@"
-`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), runtimeDefault, shellQuote(managedRootKeys), extra.String(), keyLine, runtimeDefault, strictDefault, disableNonessentialEnv)
+`, shellQuote(origin), shellQuote(safeKey), shellQuote(model), runtimeDefault, extra.String(), shellQuote(managedRootKeys), runtimeDefault, strictDefault, disableNonessentialEnv)
 }
 
 func renderClaudeDisableNonessentialEnvExports(enabled bool, indent string) string {

@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,12 +28,18 @@ import (
 )
 
 const (
-	diagnosticJobTimeout       = 30 * time.Minute
-	diagnosticArtifactTTL      = 24 * time.Hour
-	diagnosticJobPollInterval  = time.Second
-	diagnosticJobQueueCapacity = 3 // one running + two queued
-	diagnosticArtifactMaxCount = 5
-	diagnosticDownloadLeaseTTL = 24 * time.Hour
+	// Finish on the server before the browser's five-minute deadline so the
+	// final failed/timeout state is observable instead of racing the UI timer.
+	diagnosticJobTimeout           = 4*time.Minute + 30*time.Second
+	diagnosticArtifactTTL          = 24 * time.Hour
+	diagnosticJobPollInterval      = time.Second
+	diagnosticJobQueueCapacity     = 3 // one running + two queued
+	diagnosticArtifactMaxCount     = 5
+	diagnosticDownloadLeaseTTL     = 24 * time.Hour
+	diagnosticSnapshotGuardPoll    = 500 * time.Millisecond
+	diagnosticSnapshotMaxWALGrowth = int64(512 << 20)
+	diagnosticWALFinalizeThreshold = int64(256 << 20)
+	diagnosticWALFinalizeTimeout   = 2 * time.Second
 )
 
 var (
@@ -41,6 +48,7 @@ var (
 )
 
 func (s *Server) adminDiagnosticJobs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !s.adminAllowed(w, r) {
 		return
 	}
@@ -63,6 +71,7 @@ func (s *Server) adminDiagnosticJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminDiagnosticJobAction(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !s.adminAllowed(w, r) {
 		return
 	}
@@ -158,6 +167,7 @@ func (s *Server) createDiagnosticJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"job": job, "location": location,
 	})
+	s.wakeDiagnosticJobWorker()
 }
 
 func (s *Server) downloadDiagnosticJob(w http.ResponseWriter, r *http.Request, id string) {
@@ -232,6 +242,7 @@ func (s *Server) startDiagnosticJobLoop(ctx context.Context) {
 			}
 			return
 		}
+		s.cleanupLegacyDiagnosticSnapshots()
 		ticker := time.NewTicker(diagnosticJobPollInterval)
 		defer ticker.Stop()
 		for {
@@ -239,6 +250,7 @@ func (s *Server) startDiagnosticJobLoop(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-s.diagnosticJobWake:
 			case <-ticker.C:
 			}
 		}
@@ -248,6 +260,10 @@ func (s *Server) startDiagnosticJobLoop(ctx context.Context) {
 		defer ticker.Stop()
 		for {
 			s.cleanupExpiredDiagnosticJobs(ctx)
+			// A previous active process can still hold an old snapshot during the
+			// first cleanup pass. Retry in the maintenance loop so it is reclaimed
+			// promptly after the final descriptor is released.
+			s.cleanupLegacyDiagnosticSnapshots()
 			select {
 			case <-ctx.Done():
 				return
@@ -255,6 +271,76 @@ func (s *Server) startDiagnosticJobLoop(ctx context.Context) {
 			}
 		}
 	})
+}
+
+func (s *Server) cleanupLegacyDiagnosticSnapshots() {
+	if s == nil || s.store == nil {
+		return
+	}
+	removed, err := s.store.CleanupLegacyDiagnosticSnapshots()
+	if err != nil {
+		log.Printf("[DIAGNOSTICS] legacy snapshot cleanup incomplete: %v", err)
+	} else if removed > 0 {
+		log.Printf("[DIAGNOSTICS] reclaimed %d legacy SQLite snapshot files", removed)
+		s.diagnostics.walFinalizePending.Store(true)
+	}
+	s.finalizeDiagnosticWALIfNeeded()
+}
+
+// finalizeDiagnosticWALIfNeeded is deliberately called only by the diagnostics
+// maintenance loops. A legacy physical snapshot or an unusually large WAL arms
+// one short TRUNCATE attempt; a busy reader leaves a pending bit for the next
+// minute instead of blocking request traffic or spinning.
+func (s *Server) finalizeDiagnosticWALIfNeeded() {
+	if s == nil || s.store == nil {
+		return
+	}
+	walPath := s.store.DiagnosticWALPath()
+	if walPath == "" {
+		s.diagnostics.walFinalizePending.Store(false)
+		return
+	}
+	before := diagnosticFileSize(walPath)
+	if before < diagnosticWALFinalizeThreshold && !s.diagnostics.walFinalizePending.Load() {
+		return
+	}
+	s.diagnostics.walFinalizePending.Store(true)
+	if !s.diagnostics.walFinalizeRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.diagnostics.walFinalizeRunning.Store(false)
+	checkpointCtx, cancel := context.WithTimeout(context.Background(), diagnosticWALFinalizeTimeout)
+	completed, err := s.store.TryTruncateDiagnosticWAL(checkpointCtx)
+	cancel()
+	if err != nil {
+		// Cancellation, a live reader, or a transient SQLite lock is retried by the
+		// next diagnostics maintenance pass. Keep logs for persistent non-timeout
+		// failures without turning maintenance into a request-path dependency.
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("[DIAGNOSTICS] SQLite WAL finalization deferred: %v", err)
+		}
+		return
+	}
+	if !completed {
+		return
+	}
+	s.diagnostics.walFinalizePending.Store(false)
+	after := diagnosticFileSize(walPath)
+	if before >= diagnosticWALFinalizeThreshold || before > after {
+		log.Printf("[DIAGNOSTICS] finalized SQLite WAL before_bytes=%d after_bytes=%d", before, after)
+	}
+}
+
+func (s *Server) wakeDiagnosticJobWorker() {
+	if s == nil || s.diagnosticJobWake == nil {
+		return
+	}
+	select {
+	case s.diagnosticJobWake <- struct{}{}:
+	default:
+		// One pending notification is sufficient to avoid a missed wake; the
+		// periodic poll handles any additional jobs coalesced behind it.
+	}
 }
 
 func (s *Server) runNextDiagnosticJob(ctx context.Context) {
@@ -373,15 +459,27 @@ func (s *Server) generateDiagnosticArtifact(ctx context.Context, jobID string) (
 		return partialPath, err
 	}
 	defer snapshot.Close()
+	snapshotCtx, stopSnapshotGuard := s.startDiagnosticSnapshotGuard(
+		ctx, dir, reserve, available,
+	)
+	defer stopSnapshotGuard()
 	snapshotStore, err := snapshot.Store(s.store)
 	if err != nil {
 		return partialPath, err
 	}
-	if err := s.store.SetDiagnosticJobStatus(ctx, jobID, storage.DiagnosticJobRendering); err != nil {
+	if err := s.store.SetDiagnosticJobStatus(snapshotCtx, jobID, storage.DiagnosticJobRendering); err != nil {
+		if errors.Is(context.Cause(snapshotCtx), errDiagnosticCapacity) {
+			s.recordDiagnosticExportGap(jobID, "snapshot_storage_pressure")
+			return partialPath, errDiagnosticCapacity
+		}
 		return partialPath, err
 	}
 	limited := &diagnosticLimitedWriter{writer: file, remaining: singleLimit}
-	if err := s.writeDiagnosticsExport(ctx, limited, snapshot.ID(), snapshotStore); err != nil {
+	if err := s.writeDiagnosticsExport(snapshotCtx, limited, snapshot.ID(), snapshotStore); err != nil {
+		if errors.Is(context.Cause(snapshotCtx), errDiagnosticCapacity) {
+			s.recordDiagnosticExportGap(jobID, "snapshot_storage_pressure")
+			return partialPath, errDiagnosticCapacity
+		}
 		return partialPath, err
 	}
 	if err := file.Sync(); err != nil {
@@ -391,6 +489,10 @@ func (s *Server) generateDiagnosticArtifact(ctx context.Context, jobID string) (
 		return partialPath, err
 	}
 	if err := snapshot.Close(); err != nil {
+		return partialPath, err
+	}
+	if err := stopSnapshotGuard(); err != nil {
+		s.recordDiagnosticExportGap(jobID, "snapshot_storage_pressure")
 		return partialPath, err
 	}
 	cancelled, err := s.store.DiagnosticJobCancelled(ctx, jobID)
@@ -427,6 +529,131 @@ func (s *Server) generateDiagnosticArtifact(ctx context.Context, jobID string) (
 		return finalPath, err
 	}
 	return finalPath, nil
+}
+
+func (s *Server) startDiagnosticSnapshotGuard(
+	parent context.Context,
+	artifactDir string,
+	reserve, initialAvailable int64,
+) (context.Context, func() error) {
+	return s.startDiagnosticSnapshotGuardWithInterval(
+		parent, artifactDir, reserve, initialAvailable, diagnosticSnapshotGuardPoll,
+	)
+}
+
+func (s *Server) startDiagnosticSnapshotGuardWithInterval(
+	parent context.Context,
+	artifactDir string,
+	reserve, initialAvailable int64,
+	pollInterval time.Duration,
+) (context.Context, func() error) {
+	if pollInterval <= 0 {
+		pollInterval = diagnosticSnapshotGuardPoll
+	}
+	ctx, cancel := context.WithCancelCause(parent)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	databaseWAL := ""
+	if s != nil && s.store != nil {
+		databaseWAL = s.store.DiagnosticWALPath()
+	}
+	databaseDir := ""
+	databaseReserve := int64(0)
+	databaseAvailable := int64(0)
+	var databaseStatErr error
+	if databaseWAL != "" {
+		databaseDir = filepath.Dir(databaseWAL)
+		_, _, databaseReserve, databaseAvailable, databaseStatErr = diagnosticFilesystemLimits(databaseDir)
+	}
+	baselineWAL := diagnosticFileSize(databaseWAL)
+	headroom := initialAvailable - reserve
+	if databaseDir != "" && databaseAvailable-databaseReserve < headroom {
+		headroom = databaseAvailable - databaseReserve
+	}
+	maxWALGrowth := diagnosticSnapshotMaxWALGrowth
+	if half := headroom / 2; half < maxWALGrowth {
+		maxWALGrowth = half
+	}
+	if maxWALGrowth < 0 {
+		maxWALGrowth = 0
+	}
+
+	go func() {
+		defer supervisor.Recover("diagnostic-snapshot-guard")
+		defer close(done)
+		if databaseStatErr != nil {
+			cancel(errDiagnosticCapacity)
+			return
+		}
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				_, _, _, available, statErr := diagnosticFilesystemLimits(artifactDir)
+				if statErr != nil || available <= reserve {
+					cancel(errDiagnosticCapacity)
+					return
+				}
+				if databaseDir != "" {
+					_, _, currentReserve, currentAvailable, databaseErr := diagnosticFilesystemLimits(databaseDir)
+					if databaseErr != nil || currentAvailable <= currentReserve {
+						cancel(errDiagnosticCapacity)
+						return
+					}
+				}
+				if databaseWAL != "" && diagnosticFileSize(databaseWAL)-baselineWAL > maxWALGrowth {
+					cancel(errDiagnosticCapacity)
+					return
+				}
+			}
+		}
+	}()
+	stopGuard := func() error {
+		stopOnce.Do(func() { close(stop) })
+		<-done
+		cause := context.Cause(ctx)
+		cancel(context.Canceled)
+		if errors.Is(cause, errDiagnosticCapacity) {
+			return errDiagnosticCapacity
+		}
+		return nil
+	}
+	return ctx, stopGuard
+}
+
+func diagnosticFileSize(path string) int64 {
+	if strings.TrimSpace(path) == "" {
+		return 0
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return 0
+	}
+	return info.Size()
+}
+
+func (s *Server) recordDiagnosticExportGap(jobID, reason string) {
+	eventCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	alias := ""
+	if len(s.cfg.RuntimeDiagnosticAliasKey) > 0 {
+		alias = diagnosticAlias(s.cfg.RuntimeDiagnosticAliasKey, "JOB", "diagnostic-job", jobID)
+	}
+	_ = s.store.AddDiagnosticEvent(eventCtx, storage.DiagnosticEvent{
+		ID:            "diagevt_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		EventType:     "diagnostic_export",
+		Severity:      "warning",
+		EntityType:    "diagnostic_job",
+		EntityAlias:   alias,
+		DetailJSON:    `{"reason":"` + reason + `","stage":"snapshot"}`,
+		DiagnosticGap: true,
+	})
 }
 
 type diagnosticLimitedWriter struct {
@@ -811,6 +1038,7 @@ func (s *Server) cleanupExpiredDiagnosticJobs(ctx context.Context) {
 
 // The legacy synchronous endpoint now creates an asynchronous v3 job.
 func (s *Server) adminDiagnosticsExport(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !s.adminAllowed(w, r) {
 		return
 	}

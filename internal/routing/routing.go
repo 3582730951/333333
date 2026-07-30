@@ -33,8 +33,8 @@ func IsTrueConversationAffinity(key AffinityKey) bool {
 	switch strings.ToLower(strings.TrimSpace(key.Source)) {
 	case CodexRootThreadAffinitySource,
 		"x-codex-parent-thread-id", "thread_id", "conversation_id",
-		"x-codex-window-id", "previous_response_id", "x-codex-turn-metadata",
-		"x-claude-code-session-id", "claude_item_id", "claude_resource":
+		"x-codex-window-id", "previous_response_id", "x-codex-turn-state",
+		"x-claude-code-session-id", "claude_item_id", "claude_resource", "codex_resource":
 		return strings.TrimSpace(key.Hash) != ""
 	default:
 		return false
@@ -137,11 +137,34 @@ func ExtractClaudeTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 }
 
 func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
+	// Terminal-issued state pointers are the exact continuation identity and must
+	// win over shared prompt-cache or hierarchy hints.
+	if v := JSONStringField(body, "previous_response_id"); v != "" {
+		return ResponseAffinityKey(v)
+	}
+	if v := headerValue(r, "x-codex-turn-state"); v != "" {
+		return newKey("x-codex-turn-state:"+v, "x-codex-turn-state")
+	}
 	if v := headerValue(r, "x-codex-parent-thread-id"); v != "" {
 		return codexRootThreadAffinity(v)
 	}
 	if v := headerValue(r, "thread-id"); v != "" {
 		return codexRootThreadAffinity(v)
+	}
+	// The full turn-metadata JSON is not a conversation identifier: official
+	// Codex changes turn_id, start time, and workspace state between turns.  Only
+	// derive affinity from its stable hierarchy fields so retries stay together
+	// without allocating a durable binding per turn.
+	if raw := headerValue(r, "x-codex-turn-metadata"); raw != "" {
+		if v := JSONStringField([]byte(raw), "parent_thread_id"); v != "" {
+			return codexRootThreadAffinity(v)
+		}
+		if v := JSONStringField([]byte(raw), "thread_id"); v != "" {
+			return codexRootThreadAffinity(v)
+		}
+		if v := JSONStringField([]byte(raw), "window_id"); v != "" {
+			return newKey("x-codex-window-id:"+v, "x-codex-window-id")
+		}
 	}
 	if v := JSONStringField(body, "thread_id"); v != "" {
 		return newKey("thread_id:"+v, "thread_id")
@@ -154,12 +177,6 @@ func extractGenericTrueAffinityKey(r *http.Request, body []byte) AffinityKey {
 	}
 	if v := JSONStringField(body, "prompt_cache_key"); v != "" {
 		return newKey("prompt_cache_key:"+v, "prompt_cache_key")
-	}
-	if v := JSONStringField(body, "previous_response_id"); v != "" {
-		return ResponseAffinityKey(v)
-	}
-	if v := headerValue(r, "x-codex-turn-metadata"); v != "" {
-		return newKey("x-codex-turn-metadata:"+v, "x-codex-turn-metadata")
 	}
 	return AffinityKey{}
 }

@@ -480,7 +480,8 @@ export default function AccountDrawer({
         ) : (
           <Button loading={isActionLoading('health-test')} disabled={isActionDisabled('health-test')} onClick={() => onAction(account.id, 'health-test')}>测活</Button>
         )}
-        <Button loading={isActionLoading('clear-quarantine')} disabled={protectedProbeQuarantine || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解隔离</Button>
+        <Button loading={isActionLoading('clear-quarantine')} disabled={protectedProbeQuarantine || isActionDisabled('clear-quarantine')} onClick={() => onAction(account.id, 'clear-quarantine')}>解除隔离</Button>
+        <Button loading={isActionLoading('clear-cooldown')} disabled={isActionDisabled('clear-cooldown')} onClick={() => onAction(account.id, 'clear-cooldown')}>解除冷却</Button>
         {!providerAPIKey && account.credential_mode !== 'agent_identity' ? <Button loading={isActionLoading('refresh')} disabled={isActionDisabled('refresh')} onClick={() => onAction(account.id, 'refresh')}>刷新</Button> : null}
         <ConfirmDialog
           title="删除该账号？"

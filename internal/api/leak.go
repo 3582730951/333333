@@ -281,6 +281,10 @@ func (s *Server) writeUpstreamHeaders(ctx context.Context, dst, src http.Header)
 		if lower == "authorization" ||
 			lower == "chatgpt-account-id" ||
 			lower == "x-openai-fedramp" ||
+			// An upstream account's catalog ETag is not the ETag of the pool's
+			// route-scoped aggregate. Reflecting it makes stock Codex repeatedly
+			// refresh otherwise-current model metadata.
+			lower == "x-models-etag" ||
 			strings.HasPrefix(lower, "x-pool-") ||
 			strings.HasPrefix(lower, "x-sidecar-") ||
 			lower == "content-length" ||

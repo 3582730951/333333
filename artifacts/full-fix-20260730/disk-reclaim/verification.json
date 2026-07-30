@@ -1,0 +1,406 @@
+{
+  "accounts_after": {
+    "rows": 8,
+    "sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
+    "tables": {
+      "account_auth_tokens": 1,
+      "account_egress_bindings": 1,
+      "account_group_memberships": 1,
+      "account_lifecycle_status": 1,
+      "account_rate_limits": 1,
+      "account_session_cookies": 1,
+      "accounts": 1,
+      "codex_reset_credit_consumptions": 1
+    }
+  },
+  "accounts_before": {
+    "rows": 8,
+    "sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
+    "tables": {
+      "account_auth_tokens": 1,
+      "account_egress_bindings": 1,
+      "account_group_memberships": 1,
+      "account_lifecycle_status": 1,
+      "account_rate_limits": 1,
+      "account_session_cookies": 1,
+      "accounts": 1,
+      "codex_reset_credit_consumptions": 1
+    }
+  },
+  "archived_rows": 19,
+  "archives": [
+    {
+      "bytes": 201,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-audit_log.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "d10e42960dc7e9a737cea2580cf381f8eb133726435949f8412d2fece05750cd",
+      "sha256_rows": "657e284875cc5118515fb7ac8f82f4934391c17416ae35b3b87fc81a76a8ae98",
+      "table": "audit_log"
+    },
+    {
+      "bytes": 202,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-cf_events.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "1a2122b768637da09a840bad915ffd85c244c20bb2e298cac9356aea1a874f2b",
+      "sha256_rows": "13c29bbf1996abd58d037e7534d02a5f7e5ea19f90a4187b6df5050480c2ddde",
+      "table": "cf_events"
+    },
+    {
+      "bytes": 8382,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-usage_records.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "2752fefcc8740f6d26c5b973381b16698b920e9396e1c1452cbef0641cc52075",
+      "sha256_rows": "f90f96e41791824dc0e6584a9c7a0225517496e1fb0f7ef944c923d42485d2ee",
+      "table": "usage_records"
+    },
+    {
+      "bytes": 311,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-usage_events.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "770c306e21ed24cfc2f59490f9302f871815bf9962df324323c05e1492825129",
+      "sha256_rows": "9689a8eda222a439e9887f4a560ae1bb782e41c64f313213f9522a48a417d15e",
+      "table": "usage_events"
+    },
+    {
+      "bytes": 228,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-registration_task_events.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "5ffee35e68f76001bad7fb30f5b5afdaee3db45d92473435b7f3d0d359bd820a",
+      "sha256_rows": "7e1284752dd4c6a6ade1ec7ce8054d4f33028b40df47d6df78e7ee6676641dd7",
+      "table": "registration_task_events"
+    },
+    {
+      "bytes": 217,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-lifecycle_task_logs.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "55176306f2f55bc0d787fcd7dccb3c627ff45e87fc2d26242e2d0e084e8344a4",
+      "sha256_rows": "4f6a5688ec8a19f8c9ad2be24f11f21f6e1f4ea29665dbb8b32198dfc0bd3d35",
+      "table": "lifecycle_task_logs"
+    },
+    {
+      "bytes": 215,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-lifecycle_events.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "a83dca5c743e0a73426ecac89f8511d8fcc0cfe7ea4ef165096be9bae834a9cc",
+      "sha256_rows": "df5c453020fb44ca6ce952769b54d82d6c8831aaec141dcfb15ada94af472470",
+      "table": "lifecycle_events"
+    },
+    {
+      "bytes": 222,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-proxy_usage_records.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "056f566963ab8c72b53b9915a72b4cb8bb9746e215e59401b3e01d431433ec39",
+      "sha256_rows": "3642e86c1d4ec98fd091b38c806993f8eb2056dee7090f76b724aa020b6df9c2",
+      "table": "proxy_usage_records"
+    },
+    {
+      "bytes": 232,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-billing_holds.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "78d1fac4e99abedc86f1bef6773158644c84bd0ea1682377343f9a7e5e5a959c",
+      "sha256_rows": "4997dd374ed37c65a63882be30a2e1a5f99726f8a21c70cfa7df0496d8997252",
+      "table": "billing_holds"
+    },
+    {
+      "bytes": 221,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-model_quality_runs.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "5cacd993bc5662c4698eb86d7422d4d139d3f61d6672f65dfbca7ce780a456ed",
+      "sha256_rows": "8e8d98482bfa6ce92cdb35f69d8efb8c533daae212dbffbb6b33faa46cf01e9a",
+      "table": "model_quality_runs"
+    },
+    {
+      "bytes": 223,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-member_rotation_log.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "9cc564c665217d0557bc26056aca26b1b0ef13eed945657544e4b5d82de1a336",
+      "sha256_rows": "d45b35d4043d08f6ea8b65c77c17bfa7749f1cd3c6e32330fea6947442392dfe",
+      "table": "member_rotation_log"
+    },
+    {
+      "bytes": 214,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-quota_check_log.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "8b47f51afa748c21c601c3130797a6693720ab4313d1529e83a71c27cc49a2a1",
+      "sha256_rows": "b8fbe9065073260dff63ce9af083365b14d1ec239f7120c2842a070a63e9feb5",
+      "table": "quota_check_log"
+    },
+    {
+      "bytes": 207,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-diagnostic_download_leases.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "2132522d6fed3afca806b4d6386e83a7ecd3106b7a673be20aa99923792b1fdd",
+      "sha256_rows": "25409b85e54c24e6fc57b8b6aa78f2fcc749af41616139947adfb9f2c2f078f7",
+      "table": "diagnostic_download_leases"
+    },
+    {
+      "bytes": 202,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-diagnostic_events.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "39775363983f36a916e88eb7f608eb4d51eda948b41d7be991fa1bbb30736482",
+      "sha256_rows": "44a615013147fa67934e514edce5e43bcb27e25bae89aa37e4d3bb53213c5746",
+      "table": "diagnostic_events"
+    },
+    {
+      "bytes": 189,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-diagnostic_jobs.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "3734e6be3551e311eea5eb2b3bd66874f3083b0b7285649c08a58ac0c63604a8",
+      "sha256_rows": "4f46b31963f9acc412a04fd65b784d05cbd8f0fc02d67be4ed715a4a5397b6ca",
+      "table": "diagnostic_jobs"
+    },
+    {
+      "bytes": 264,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/terminal-history-account_codex_reauth_jobs.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "aafba055f969018ee25b0af36556ee9521cd7afa6e8f0a77826fe681c371cc60",
+      "sha256_rows": "f3bac70e0cb57ef88e45304ba2f160b59fea02c7318b1a6a1ee1cc2179842278",
+      "table": "account_codex_reauth_jobs"
+    },
+    {
+      "bytes": 219,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/terminal-history-codex_upstream_attempt.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "05d249406bf669947519499bdd5752c74e06f337d7e19a6e2b155ad41d47808c",
+      "sha256_rows": "c8fba35098ae64d856772859739411c875df676dde5d3b74b0cd8598d451128e",
+      "table": "codex_upstream_attempt"
+    },
+    {
+      "bytes": 267,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/terminal-history-codex_upstream_attempt_daily.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "9f5ed2b4ea2a84cc71158f598e2e3aa78c630710f00fcb0a86571833718aa5d6",
+      "sha256_rows": "496e16dc7ee69a8f8af860ab02213dea891c51f07fc7fa1546d9833537f1beb7",
+      "table": "codex_upstream_attempt_daily"
+    },
+    {
+      "bytes": 240,
+      "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-storage_resources.jsonl.gz",
+      "rows": 1,
+      "sha256_gzip": "9b61e032a588a4c052876afcb1dee0044ae3b8dde1fb08152fa4726622e9feb1",
+      "sha256_rows": "2d57f13dba682531a63aadf9dbba632f29ab59e120b478ea91c80aae15db6029",
+      "table": "storage_resources"
+    }
+  ],
+  "backup_dir": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups",
+  "candidate_files": {
+    "by_role": {
+      "browser_tmp": {
+        "bytes": 1048576,
+        "count": 1
+      },
+      "diagnostics": {
+        "bytes": 1048576,
+        "count": 1
+      },
+      "legacy_snapshot": {
+        "bytes": 1048576,
+        "count": 1
+      },
+      "spool": {
+        "bytes": 1048576,
+        "count": 1
+      }
+    },
+    "bytes": 4194304,
+    "count": 4
+  },
+  "candidate_rows": {
+    "cache:account_codex_reauth_jobs": 1,
+    "cache:account_model_capabilities": 1,
+    "cache:account_model_catalog_status": 1,
+    "cache:affinity_aliases": 1,
+    "cache:affinity_bindings": 1,
+    "cache:antigravity_cache_entries": 1,
+    "cache:codex_upstream_attempt": 1,
+    "cache:codex_upstream_attempt_daily": 1,
+    "cache:kiro_model_catalog": 1,
+    "cache:kiro_probe_state": 1,
+    "cache:kiro_runtime_capabilities": 1,
+    "cache:maintenance_leases": 1,
+    "cache:user_group_target_bindings": 1,
+    "cache:user_sessions": 1,
+    "diagnostic:diagnostic_download_leases": 1,
+    "diagnostic:diagnostic_events": 1,
+    "diagnostic:diagnostic_jobs": 1,
+    "diagnostic:storage_resources": 1,
+    "log:audit_log": 1,
+    "log:billing_holds": 1,
+    "log:cf_events": 1,
+    "log:lifecycle_events": 1,
+    "log:lifecycle_task_logs": 1,
+    "log:member_rotation_log": 1,
+    "log:model_quality_runs": 1,
+    "log:proxy_usage_records": 1,
+    "log:quota_check_log": 1,
+    "log:registration_task_events": 1,
+    "log:usage_events": 1,
+    "log:usage_records": 1
+  },
+  "compressed_file_logs": [
+    {
+      "after_bytes": 1067,
+      "before_bytes": 1048576,
+      "source": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/logs/old.log",
+      "target": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/logs/old.log.gz"
+    }
+  ],
+  "config_optimization": {
+    "backup": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/config.json.before.json",
+    "changed": true,
+    "legacy_dual_write_coverage": {
+      "active_context_rows": 1,
+      "can_disable": true,
+      "covered_context_rows": 1,
+      "goal_continuity_confirmed": true,
+      "reason": "every unexpired context_journal response alias has one live goal with a checkpoint and all uncompacted segment payloads"
+    },
+    "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/config.json",
+    "sha256": "5b0bc5fce1d9c7c1bb9e7d3f309093cf9f55f48e0414f1c3e03a0f14215f76d3"
+  },
+  "contexts_after": {
+    "rows": 12,
+    "sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
+    "tables": {
+      "codex_instruction_snapshot": 1,
+      "codex_session_alias": 1,
+      "codex_session_binding": 1,
+      "context_journal": 1,
+      "goal_alias": 1,
+      "goal_checkpoint": 1,
+      "goal_payload_chunk": 2,
+      "goal_run": 1,
+      "goal_segment": 1,
+      "goal_session": 1,
+      "virtual_context_ledger": 1
+    }
+  },
+  "contexts_before": {
+    "rows": 12,
+    "sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
+    "tables": {
+      "codex_instruction_snapshot": 1,
+      "codex_session_alias": 1,
+      "codex_session_binding": 1,
+      "context_journal": 1,
+      "goal_alias": 1,
+      "goal_checkpoint": 1,
+      "goal_payload_chunk": 2,
+      "goal_run": 1,
+      "goal_segment": 1,
+      "goal_session": 1,
+      "virtual_context_ledger": 1
+    }
+  },
+  "cutoff_epoch": 1784786122,
+  "data_dir": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data",
+  "database": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/pool.sqlite3",
+  "database_bytes_after": 368640,
+  "database_bytes_before": 8765440,
+  "database_bytes_reclaimed": 8396800,
+  "deleted_files": {
+    "bytes": 4194304,
+    "count": 4,
+    "items": [
+      {
+        "bytes": 1048576,
+        "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/diagnostics/bundle.zip",
+        "role": "diagnostics"
+      },
+      {
+        "bytes": 1048576,
+        "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/spool/stale.body",
+        "role": "spool"
+      },
+      {
+        "bytes": 1048576,
+        "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/tmp/browser/stale.profile",
+        "role": "browser_tmp"
+      },
+      {
+        "bytes": 1048576,
+        "path": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/.diagnostic-snapshot-stale.sqlite3",
+        "role": "legacy_snapshot"
+      }
+    ]
+  },
+  "filesystem_free_bytes_after": 63646212096,
+  "filesystem_free_bytes_before": 63632732160,
+  "filesystem_free_bytes_gained": 13479936,
+  "legacy_dual_write_coverage": {
+    "active_context_rows": 1,
+    "can_disable": true,
+    "covered_context_rows": 1,
+    "goal_continuity_confirmed": true,
+    "reason": "every unexpired context_journal response alias has one live goal with a checkpoint and all uncompacted segment payloads"
+  },
+  "logs_after": {
+    "rows": 13,
+    "sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
+    "tables": {
+      "audit_log": 1,
+      "billing_holds": 1,
+      "cf_events": 1,
+      "lifecycle_events": 1,
+      "lifecycle_task_logs": 1,
+      "member_rotation_log": 1,
+      "model_quality_runs": 1,
+      "proxy_usage_records": 1,
+      "quota_check_log": 1,
+      "registration_task_events": 1,
+      "usage_events": 2,
+      "usage_records": 1
+    }
+  },
+  "logs_all_before": {
+    "rows": 25,
+    "sha256": "be86a176071d36acf07259bbe7148dca084c61f636108a4f134f352834d76a3f",
+    "tables": {
+      "audit_log": 2,
+      "billing_holds": 2,
+      "cf_events": 2,
+      "lifecycle_events": 2,
+      "lifecycle_task_logs": 2,
+      "member_rotation_log": 2,
+      "model_quality_runs": 2,
+      "proxy_usage_records": 2,
+      "quota_check_log": 2,
+      "registration_task_events": 2,
+      "usage_events": 3,
+      "usage_records": 2
+    }
+  },
+  "logs_retained_before": {
+    "rows": 13,
+    "sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
+    "tables": {
+      "audit_log": 1,
+      "billing_holds": 1,
+      "cf_events": 1,
+      "lifecycle_events": 1,
+      "lifecycle_task_logs": 1,
+      "member_rotation_log": 1,
+      "model_quality_runs": 1,
+      "proxy_usage_records": 1,
+      "quota_check_log": 1,
+      "registration_task_events": 1,
+      "usage_events": 2,
+      "usage_records": 1
+    }
+  },
+  "mode": "apply",
+  "retention_days": 7,
+  "rollback_backup": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz",
+  "rollback_backup_sha256": "cd9d5ccc8d0a1ba531ad087c51dcdf519fed37bcc9085efccf56df465d58a793",
+  "rollback_command": "reclaim-disk-space.sh --apply --db /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/pool.sqlite3 --data-dir /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data --rollback /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz --assume-quiesced",
+  "verified": {
+    "accounts_exact_match": true,
+    "contexts_exact_match": true,
+    "historical_logs_archived_before_delete": true,
+    "retained_logs_exact_match": true,
+    "sqlite_quick_check": "ok",
+    "usage_journal_untouched": true
+  },
+  "wal_bytes_after": 0,
+  "wal_bytes_before": 0
+}

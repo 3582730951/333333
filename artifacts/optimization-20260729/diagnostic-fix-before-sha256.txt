@@ -1,0 +1,2 @@
+6dd088ae2b1a2a9295b955c70e8165dfc175fa9f6f7a539d79a630bf8869a700  artifacts/optimization-20260729/diagnostics_export.go.before
+81327a7491821416c462fafa4a8528517937816f0d49a8859b8c2729a8c9c32c  artifacts/optimization-20260729/exports.ts.before

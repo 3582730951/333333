@@ -24,12 +24,24 @@ import (
 
 const DefaultDirectEgressID = "egress_direct"
 
+const (
+	// Route bindings preserve account/provider affinity across CLI resumptions.
+	// Retire only conversations that have been inactive for a full month; every
+	// successful lookup refreshes updated_at at most once per hour, keeping the
+	// hot path stable without one write per request.
+	routeBindingRetentionSeconds   = int64((30 * 24 * time.Hour) / time.Second)
+	routeBindingTouchInterval      = int64(time.Hour / time.Second)
+	defaultRouteBindingCleanupSize = 256
+	maxRouteBindingCleanupSize     = 1024
+)
+
 var (
-	ErrUserEmailExists    = errors.New("user email already exists")
-	ErrRegistrationClosed = errors.New("user registration is disabled")
-	ErrUserGroupNotFound  = errors.New("user group not found")
-	ErrEgressInUse        = errors.New("egress is in use")
-	ErrTargetInUse        = errors.New("routing target is in use")
+	ErrUserEmailExists             = errors.New("user email already exists")
+	ErrRegistrationClosed          = errors.New("user registration is disabled")
+	ErrUserGroupNotFound           = errors.New("user group not found")
+	ErrEgressInUse                 = errors.New("egress is in use")
+	ErrTargetInUse                 = errors.New("routing target is in use")
+	ErrInvalidProviderModelMapping = errors.New("invalid provider model mapping")
 )
 
 type Store struct {
@@ -861,8 +873,13 @@ type CustomProvider struct {
 	Enabled            bool     `json:"enabled"`
 	AutoDiscoverModels bool     `json:"auto_discover_models"`
 	Models             []string `json:"models"`
-	CreatedAt          int64    `json:"created_at"`
-	UpdatedAt          int64    `json:"updated_at"`
+	// ModelMappings rewrites a downstream model name to the concrete name
+	// accepted by this relay. Exact keys win; "*" is an optional provider-wide
+	// fallback. The requested and resolved names remain separately attributable
+	// in request diagnostics.
+	ModelMappings map[string]string `json:"model_mappings"`
+	CreatedAt     int64             `json:"created_at"`
+	UpdatedAt     int64             `json:"updated_at"`
 }
 
 const (
@@ -2069,6 +2086,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE email_pool ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE email_pool ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name)`,
+		// goalContinuitySchemaSQL participates in PostgreSQL's immutable base-v1
+		// checksum. Keep new indexes in the additive migration surface so upgrades
+		// do not fail checksum validation.
+		`CREATE INDEX IF NOT EXISTS idx_goal_session_reclaiming ON goal_session(state, updated_at)`,
 		`ALTER TABLE groups ADD COLUMN force_model TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN force_effort TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE groups ADD COLUMN default_egress_id TEXT NOT NULL DEFAULT ''`,
@@ -2077,6 +2098,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE groups ADD COLUMN model_instructions_files TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE custom_providers ADD COLUMN transport_profile TEXT NOT NULL DEFAULT 'generic'`,
 		`ALTER TABLE custom_providers ADD COLUMN egress_ids TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE custom_providers ADD COLUMN model_mappings_json TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE egress_profiles ADD COLUMN chain_proxy TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
@@ -3364,14 +3386,18 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g 
 				providerModels[target.key()] = nil
 				continue
 			}
-			var modelsJSON string
-			if err := tx.QueryRowContext(ctx, `SELECT models_json FROM custom_providers WHERE id = ?`, target.ID).Scan(&modelsJSON); err != nil {
+			var modelsJSON, modelMappingsJSON string
+			if err := tx.QueryRowContext(ctx, `SELECT models_json, model_mappings_json FROM custom_providers WHERE id = ?`, target.ID).Scan(&modelsJSON, &modelMappingsJSON); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return UserGroup{}, fmt.Errorf("model provider %q not found", target.ID)
 				}
 				return UserGroup{}, err
 			}
-			providerModels[target.key()] = decodeProviderModels(modelsJSON)
+			models := decodeProviderModels(modelsJSON)
+			for source := range decodeProviderModelMappings(modelMappingsJSON) {
+				models = append(models, source)
+			}
+			providerModels[target.key()] = decodeProviderModelsFromSlice(models)
 		}
 	}
 	g.Targets = targets
@@ -3539,22 +3565,45 @@ func (s *Store) GetUserGroupTargetRefsWithLegacyIDs(ctx context.Context, userGro
 }
 
 func (s *Store) GetUserGroupTargetBinding(ctx context.Context, userGroupID, affinityKey, model string) (UserGroupTargetBinding, bool, error) {
-	var binding UserGroupTargetBinding
-	var kind, targetID string
-	err := s.rdb.QueryRowContext(ctx, `SELECT user_group_id, affinity_key, model, target_kind, target_id, created_at, updated_at FROM user_group_target_bindings WHERE user_group_id=? AND affinity_key=? AND model=?`,
-		strings.TrimSpace(userGroupID), strings.TrimSpace(affinityKey), strings.TrimSpace(model)).Scan(
-		&binding.UserGroupID, &binding.AffinityKey, &binding.Model, &kind, &targetID, &binding.CreatedAt, &binding.UpdatedAt)
+	userGroupID = strings.TrimSpace(userGroupID)
+	affinityKey = strings.TrimSpace(affinityKey)
+	model = strings.TrimSpace(model)
+	binding, err := scanUserGroupTargetBinding(ctx, s.rdb, userGroupID, affinityKey, model)
 	if errors.Is(err, sql.ErrNoRows) {
 		return UserGroupTargetBinding{}, false, nil
 	}
 	if err != nil {
 		return UserGroupTargetBinding{}, false, err
 	}
-	target, err := NormalizeTargetRef(TargetRef{Kind: kind, ID: targetID})
-	if err != nil {
-		return UserGroupTargetBinding{}, false, err
+
+	now := Now()
+	if _, liveStore := s.rdb.(*sql.DB); liveStore && binding.UpdatedAt <= now-routeBindingTouchInterval {
+		result, touchErr := s.db.ExecContext(ctx, `UPDATE user_group_target_bindings
+SET updated_at=?
+WHERE user_group_id=? AND affinity_key=? AND model=? AND updated_at=?`,
+			now, userGroupID, affinityKey, model, binding.UpdatedAt)
+		if touchErr != nil {
+			return UserGroupTargetBinding{}, false, touchErr
+		}
+		touched, touchErr := result.RowsAffected()
+		if touchErr != nil {
+			return UserGroupTargetBinding{}, false, touchErr
+		}
+		if touched == 1 {
+			binding.UpdatedAt = now
+		} else {
+			// A concurrent lookup may already have refreshed the row. If bounded
+			// cleanup won the race instead, report a miss so the router claims a
+			// new binding rather than using a row that is no longer durable.
+			binding, err = scanUserGroupTargetBinding(ctx, s.rdb, userGroupID, affinityKey, model)
+			if errors.Is(err, sql.ErrNoRows) {
+				return UserGroupTargetBinding{}, false, nil
+			}
+			if err != nil {
+				return UserGroupTargetBinding{}, false, err
+			}
+		}
 	}
-	binding.Target = target
 	return binding, true, nil
 }
 
@@ -6951,6 +7000,76 @@ func (s *Store) ClearBindingRecheck(ctx context.Context, accountID string) error
 	return err
 }
 
+// ClearAccountCooldown atomically releases every account-local scheduling cooldown:
+// the binding cooldown/recheck gate and any active exhausted quota snapshot. Shared
+// egress profile state is deliberately outside this operation because clearing it
+// would affect every account using that exit.
+//
+// Quota rows are retained as diagnostic snapshots, but their active reset window is
+// cleared and status records the administrator action. A later upstream quota poll
+// remains authoritative and may establish a new cooldown when the provider still
+// reports exhaustion.
+func (s *Store) ClearAccountCooldown(ctx context.Context, accountID string) (int64, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return 0, errors.New("account_id required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM accounts WHERE id = ?`, accountID).Scan(&exists); err != nil {
+		return 0, err
+	}
+	now := Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE account_egress_bindings SET cooldown_until = 0, recheck_pending = 0, updated_at = ? WHERE account_id = ?`, now, accountID); err != nil {
+		return 0, err
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT `+rateLimitCols+` FROM account_rate_limits WHERE account_id = ? AND reset_at > ?`, accountID, now)
+	if err != nil {
+		return 0, err
+	}
+	var active []AccountRateLimit
+	for rows.Next() {
+		row, scanErr := scanAccountRateLimit(rows.Scan)
+		if scanErr != nil {
+			_ = rows.Close()
+			return 0, scanErr
+		}
+		if accountRateLimitExhausted(row) {
+			active = append(active, row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	for _, row := range active {
+		if _, err := tx.ExecContext(ctx, `
+UPDATE account_rate_limits
+SET reset_at = 0, status = 'manual_cleared', updated_at = ?
+WHERE account_id = ? AND provider = ? AND model = ? AND limiter_type = ?`,
+			now, row.AccountID, row.Provider, row.Model, row.LimiterType); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if len(active) > 0 {
+		s.rateLimitGen.Add(1)
+	}
+	return int64(len(active)), nil
+}
+
 // ListBindingsNeedingRecheck returns the bindings whose cooldown has elapsed but
 // which are still recheck-pending — i.e. the accounts the recheck loop should now
 // probe. Gating on cooldown_until <= now means the initial cooldown window (often a
@@ -7027,7 +7146,7 @@ func (s *Store) ListEgressBindings(ctx context.Context) ([]AccountEgressBinding,
 	return out, rows.Err()
 }
 
-func (s *Store) GetAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
+func (s *Store) getAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
 	now := Now()
 	row := s.rdb.QueryRowContext(ctx, `SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at FROM (
 SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch,created_at,updated_at,expires_at,0 AS source_rank FROM affinity_aliases WHERE route_key_hash=? AND expires_at>?
@@ -7037,6 +7156,40 @@ SELECT route_key_hash,route_key,source,account_id,provider,model,egress_id,epoch
 	var b AffinityBinding
 	err := row.Scan(&b.RouteKeyHash, &b.RouteKey, &b.Source, &b.AccountID, &b.Provider, &b.Model, &b.EgressID, &b.Epoch, &b.CreatedAt, &b.UpdatedAt, &b.ExpiresAt)
 	return b, err
+}
+
+func (s *Store) GetAffinityBinding(ctx context.Context, routeKeyHash string) (AffinityBinding, error) {
+	routeKeyHash = strings.TrimSpace(routeKeyHash)
+	binding, err := s.getAffinityBinding(ctx, routeKeyHash)
+	if err != nil {
+		return AffinityBinding{}, err
+	}
+	// Aliases already carry their own seven-day expiry and are intentionally not
+	// converted into permanent session rows by the sliding-retention policy.
+	now := Now()
+	if _, liveStore := s.rdb.(*sql.DB); liveStore &&
+		binding.Source != "previous_response_id" &&
+		binding.UpdatedAt <= now-routeBindingTouchInterval {
+		result, touchErr := s.db.ExecContext(ctx, `UPDATE affinity_bindings
+SET updated_at=?
+WHERE route_key_hash=? AND updated_at=?`,
+			now, routeKeyHash, binding.UpdatedAt)
+		if touchErr != nil {
+			return AffinityBinding{}, touchErr
+		}
+		touched, touchErr := result.RowsAffected()
+		if touchErr != nil {
+			return AffinityBinding{}, touchErr
+		}
+		if touched == 1 {
+			binding.UpdatedAt = now
+		} else {
+			// Preserve a concurrently refreshed/rebound row, or surface not-found
+			// when cleanup removed the inactive binding before this touch.
+			return s.getAffinityBinding(ctx, routeKeyHash)
+		}
+	}
+	return binding, nil
 }
 
 func (s *Store) UpsertAffinityBinding(ctx context.Context, b AffinityBinding) error {
@@ -7111,6 +7264,80 @@ func (s *Store) CleanupAffinityAliases(ctx context.Context, batch int) (int64, e
 		s.affinityGen.Add(1)
 	}
 	return deleted, nil
+}
+
+type RouteBindingCleanupResult struct {
+	UserGroupTargetBindings int64
+	AffinityBindings        int64
+}
+
+func (r RouteBindingCleanupResult) Total() int64 {
+	return r.UserGroupTargetBindings + r.AffinityBindings
+}
+
+// CleanupInactiveRouteBindings removes only long-idle, non-alias routing state
+// in one bounded transaction. The batch cap is shared by both tables so a disk
+// maintenance tick has a predictable write budget. Bindings with a future
+// explicit expiry remain intact even when their last lookup is old.
+func (s *Store) CleanupInactiveRouteBindings(ctx context.Context, batch int) (RouteBindingCleanupResult, error) {
+	if batch <= 0 {
+		batch = defaultRouteBindingCleanupSize
+	}
+	if batch > maxRouteBindingCleanupSize {
+		batch = maxRouteBindingCleanupSize
+	}
+	now := Now()
+	cutoff := now - routeBindingRetentionSeconds
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RouteBindingCleanupResult{}, err
+	}
+	defer tx.Rollback()
+
+	var cleaned RouteBindingCleanupResult
+	result, err := tx.ExecContext(ctx, `DELETE FROM user_group_target_bindings
+WHERE (user_group_id, affinity_key, model) IN (
+ SELECT user_group_id, affinity_key, model
+ FROM user_group_target_bindings
+ WHERE updated_at<?
+ ORDER BY updated_at, user_group_id, affinity_key, model
+ LIMIT ?
+)`, cutoff, batch)
+	if err != nil {
+		return RouteBindingCleanupResult{}, err
+	}
+	cleaned.UserGroupTargetBindings, err = result.RowsAffected()
+	if err != nil {
+		return RouteBindingCleanupResult{}, err
+	}
+
+	remaining := int64(batch) - cleaned.UserGroupTargetBindings
+	if remaining > 0 {
+		result, err = tx.ExecContext(ctx, `DELETE FROM affinity_bindings
+WHERE route_key_hash IN (
+ SELECT route_key_hash
+ FROM affinity_bindings
+ WHERE source<>'previous_response_id'
+   AND updated_at<?
+   AND (expires_at=0 OR expires_at<=?)
+ ORDER BY updated_at, route_key_hash
+ LIMIT ?
+)`, cutoff, now, remaining)
+		if err != nil {
+			return RouteBindingCleanupResult{}, err
+		}
+		cleaned.AffinityBindings, err = result.RowsAffected()
+		if err != nil {
+			return RouteBindingCleanupResult{}, err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return RouteBindingCleanupResult{}, err
+	}
+	if cleaned.AffinityBindings > 0 {
+		s.affinityGen.Add(1)
+	}
+	return cleaned, nil
 }
 
 func (s *Store) AffinityGeneration() uint64 { return s.affinityGen.Load() }
@@ -7280,8 +7507,8 @@ func (s *Store) SetModerationConfig(ctx context.Context, cfg ModerationConfig) e
 func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error) {
 	var p CustomProvider
 	var enabled, auto int
-	var modelsJSON, egressJSON string
-	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &p.TransportProfile, &egressJSON, &enabled, &auto, &modelsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var modelsJSON, modelMappingsJSON, egressJSON string
+	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &p.TransportProfile, &egressJSON, &enabled, &auto, &modelsJSON, &modelMappingsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return CustomProvider{}, err
 	}
 	if proto, ok := NormalizeCustomProviderProtocol(p.UpstreamProtocol); ok {
@@ -7301,6 +7528,7 @@ func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error)
 	p.Enabled = enabled != 0
 	p.AutoDiscoverModels = auto != 0
 	p.Models = decodeProviderModels(modelsJSON)
+	p.ModelMappings = decodeProviderModelMappings(modelMappingsJSON)
 	return p, nil
 }
 
@@ -7328,7 +7556,46 @@ func decodeProviderModels(raw string) []string {
 	return out
 }
 
-const customProviderCols = `id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, created_at, updated_at`
+func decodeProviderModelMappings(raw string) map[string]string {
+	var mappings map[string]string
+	if json.Unmarshal([]byte(strings.TrimSpace(raw)), &mappings) != nil {
+		return map[string]string{}
+	}
+	normalized, _ := canonicalProviderModelMappings(mappings, false)
+	return normalized
+}
+
+func canonicalProviderModelMappings(in map[string]string, rejectConflicts bool) (map[string]string, error) {
+	out := make(map[string]string, len(in))
+	keys := make([]string, 0, len(in))
+	for requested := range in {
+		keys = append(keys, requested)
+	}
+	sort.Strings(keys)
+	for _, original := range keys {
+		requested, target := original, in[original]
+		// Model matching in the gateway is case-insensitive. Persist one canonical
+		// key so differently-cased duplicates cannot make map iteration choose a
+		// random target.
+		requested = strings.ToLower(strings.TrimSpace(requested))
+		target = strings.TrimSpace(target)
+		if requested == "" || target == "" {
+			continue
+		}
+		if existing, duplicate := out[requested]; duplicate {
+			if existing != target && rejectConflicts {
+				return nil, fmt.Errorf("%w: %q has conflicting targets %q and %q", ErrInvalidProviderModelMapping, requested, existing, target)
+			}
+			// Legacy rows can contain differently-cased duplicate keys. Sorted
+			// source keys make the compatibility winner deterministic.
+			continue
+		}
+		out[requested] = target
+	}
+	return out, nil
+}
+
+const customProviderCols = `id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at`
 
 func (s *Store) ListCustomProviders(ctx context.Context) ([]CustomProvider, error) {
 	rows, err := s.rdb.QueryContext(ctx, `SELECT `+customProviderCols+` FROM custom_providers ORDER BY id`)
@@ -7391,9 +7658,21 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 			modelsJSON = string(raw)
 		}
 	}
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	modelMappingsJSON := "{}"
+	mappings, err := canonicalProviderModelMappings(p.ModelMappings, true)
+	if err != nil {
+		return err
+	}
+	if len(mappings) > 0 {
+		raw, err := json.Marshal(mappings)
+		if err != nil {
+			return err
+		}
+		modelMappingsJSON = string(raw)
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name = excluded.name,
  base_url = excluded.base_url,
@@ -7403,8 +7682,9 @@ ON CONFLICT(id) DO UPDATE SET
  enabled = excluded.enabled,
  auto_discover_models = excluded.auto_discover_models,
  models_json = excluded.models_json,
+ model_mappings_json = excluded.model_mappings_json,
  updated_at = excluded.updated_at`,
-		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, p.TransportProfile, encodeOrderedIDs(p.EgressIDs), boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, p.CreatedAt, p.UpdatedAt)
+		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, p.TransportProfile, encodeOrderedIDs(p.EgressIDs), boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, modelMappingsJSON, p.CreatedAt, p.UpdatedAt)
 	return err
 }
 
@@ -7808,8 +8088,11 @@ func (s *Store) InsertVirtualLedger(ctx context.Context, item VirtualLedgerItem)
 	if item.CreatedAt == 0 {
 		item.CreatedAt = Now()
 	}
+	if int64(len(item.Content)) > maxStoredContextPayloadBytes || int64(len(item.RawJSON)) > maxStoredContextPayloadBytes {
+		return fmt.Errorf("virtual context payload exceeds %d-byte storage limit", maxStoredContextPayloadBytes)
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO virtual_context_ledger(route_key_hash, account_id, model, prompt_cache_key, role, content, token_estimate, raw_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		item.RouteKeyHash, item.AccountID, item.Model, item.PromptCacheKey, item.Role, item.Content, item.TokenEstimate, item.RawJSON, item.CreatedAt)
+		item.RouteKeyHash, item.AccountID, item.Model, item.PromptCacheKey, item.Role, compressContextPayload(item.Content), item.TokenEstimate, compressContextPayload(item.RawJSON), item.CreatedAt)
 	return err
 }
 
@@ -7858,6 +8141,14 @@ func (s *Store) ListVirtualLedger(ctx context.Context, routeKeyHash string, limi
 		var item VirtualLedgerItem
 		if err := rows.Scan(&item.ID, &item.RouteKeyHash, &item.AccountID, &item.Model, &item.PromptCacheKey, &item.Role, &item.Content, &item.TokenEstimate, &item.RawJSON, &item.CreatedAt); err != nil {
 			return nil, err
+		}
+		item.Content, err = decompressContextPayloadChecked(item.Content, maxStoredContextPayloadBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode virtual context content: %w", err)
+		}
+		item.RawJSON, err = decompressContextPayloadChecked(item.RawJSON, maxStoredContextPayloadBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode virtual context raw_json: %w", err)
 		}
 		reversed = append(reversed, item)
 	}
@@ -8332,10 +8623,11 @@ func nestedUsageInt(m map[string]interface{}, parent, child string) int64 {
 
 const usageCacheDiagnosticsMigrationMarker = "usage_cache_diagnostics_v3_backfilled"
 
-// RunDeferredMigrations performs reporting-only historical repairs after the HTTP
-// listener is available. Schema and billing-integrity migrations remain synchronous;
-// this potentially large JSON backfill must not hold a socket-activated service in
-// the pre-listener state long enough for the install health gate to roll it back.
+// RunDeferredMigrations performs historical repairs after the HTTP listener is
+// available. Schema and billing-integrity migrations remain synchronous; these
+// potentially large, bounded-batch rewrites must not hold a socket-activated
+// service in the pre-listener state long enough for the install health gate to
+// roll it back.
 func (s *Store) RunDeferredMigrations(ctx context.Context) error {
 	if s == nil || s.driver == "postgres" {
 		return nil
@@ -8344,15 +8636,16 @@ func (s *Store) RunDeferredMigrations(ctx context.Context) error {
 	if err := s.rdb.QueryRowContext(ctx, `SELECT COUNT(*) FROM settings WHERE key=?`, usageCacheDiagnosticsMigrationMarker).Scan(&completed); err != nil {
 		return err
 	}
-	if completed > 0 {
-		return nil
+	if completed == 0 {
+		if err := s.backfillUsageCacheDiagnostics(ctx); err != nil {
+			return err
+		}
+		now := Now()
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, usageCacheDiagnosticsMigrationMarker, "1", now); err != nil {
+			return err
+		}
 	}
-	if err := s.backfillUsageCacheDiagnostics(ctx); err != nil {
-		return err
-	}
-	now := Now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO NOTHING`, usageCacheDiagnosticsMigrationMarker, "1", now)
-	return err
+	return s.migrateStoredContextCompression(ctx)
 }
 
 func (s *Store) backfillUsageCacheDiagnostics(ctx context.Context) error {

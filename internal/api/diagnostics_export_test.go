@@ -34,7 +34,10 @@ func awaitLegacyDiagnosticExport(t *testing.T, h *testHarness) []byte {
 	if err := json.Unmarshal(raw, &envelope); err != nil || envelope.Job.ID == "" {
 		t.Fatalf("decode diagnostics job: %v (%s)", err, raw)
 	}
-	deadline := time.Now().Add(15 * time.Second)
+	// Large capped-table fixtures are intentionally exercised under -race on the
+	// shared CI profile. Instrumented SQLite/ZIP/DLP work can exceed 15 seconds
+	// there even though the normal build completes in a few seconds.
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		job, err := h.store.GetDiagnosticJob(context.Background(), envelope.Job.ID)
 		if err != nil {
@@ -314,6 +317,74 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	}
 	if bytes.Contains(journalJSON, []byte("usage-journal")) || bytes.Contains(journalJSON, []byte(h.store.Path())) {
 		t.Fatalf("usage journal diagnostics leaked a local path: %s", journalJSON)
+	}
+}
+
+func TestDiagnosticsExportCapsAppendHeavyTablesToRecentRows(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := context.Background()
+	var beforeRows, beforeMaxID int64
+	if err := h.store.ReadDB().QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(MAX(id),0) FROM audit_log`).Scan(&beforeRows, &beforeMaxID); err != nil {
+		t.Fatal(err)
+	}
+	const extraRows int64 = 7
+	insertRows := diagnosticExportRowLimit + extraRows
+	if _, err := h.store.DB().ExecContext(ctx, `
+WITH RECURSIVE rows(value) AS (
+	VALUES(1) UNION ALL SELECT value+1 FROM rows WHERE value<?
+)
+INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at)
+SELECT 'historical-account-'||(value%10),'','request','alive','ok','row='||value,?
+FROM rows`, insertRows, storage.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := awaitLegacyDiagnosticExport(t, h)
+	files := readZipFiles(t, raw)
+	var manifest struct {
+		Rows       map[string]int64 `json:"row_counts"`
+		SourceRows map[string]int64 `json:"source_row_counts"`
+		Truncated  map[string]struct {
+			SourceRows   int64  `json:"source_rows"`
+			ExportedRows int64  `json:"exported_rows"`
+			OmittedRows  int64  `json:"omitted_rows"`
+			Selection    string `json:"selection"`
+		} `json:"truncated_tables"`
+		RowLimit int64 `json:"large_table_row_limit"`
+	}
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	wantSource := beforeRows + insertRows
+	if manifest.RowLimit != diagnosticExportRowLimit ||
+		manifest.Rows["audit_log.csv"] != diagnosticExportRowLimit ||
+		manifest.SourceRows["audit_log.csv"] != wantSource {
+		t.Fatalf("manifest cap metadata=%+v", manifest)
+	}
+	truncated := manifest.Truncated["audit_log.csv"]
+	if truncated.SourceRows != wantSource ||
+		truncated.ExportedRows != diagnosticExportRowLimit ||
+		truncated.OmittedRows != wantSource-diagnosticExportRowLimit ||
+		truncated.Selection != "most_recent" {
+		t.Fatalf("audit truncation metadata=%+v", truncated)
+	}
+	rows, err := csv.NewReader(strings.NewReader(files["audit_log.csv"])).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(len(rows) - 1); got != diagnosticExportRowLimit {
+		t.Fatalf("exported audit rows=%d want=%d", got, diagnosticExportRowLimit)
+	}
+	firstID, err := strconv.ParseInt(rows[1][0], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastID, err := strconv.ParseInt(rows[len(rows)-1][0], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID != beforeMaxID+extraRows+1 || lastID != beforeMaxID+insertRows {
+		t.Fatalf("export did not keep newest rows: first=%d last=%d before=%d inserted=%d", firstID, lastID, beforeMaxID, insertRows)
 	}
 }
 

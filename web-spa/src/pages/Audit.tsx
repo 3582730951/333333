@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import * as PoolUI from '../components/pool/index.jsx';
 import { IconRefresh, IconDownload } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
@@ -45,6 +45,12 @@ export default function Audit() {
     reload: load,
   } = useAuditData();
   const archiveMutation = useAuditArchiveMutation();
+  const archiveAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    archiveAbortRef.current?.abort();
+    archiveAbortRef.current = null;
+  }, []);
 
   const actions = useMemo(() => Array.from(new Set(rows.map((row) => row.action).filter((value): value is string => Boolean(value)))), [rows]);
   const filtered = action ? rows.filter((r) => r.action === action) : rows;
@@ -59,12 +65,22 @@ export default function Audit() {
   };
 
   const exportArchive = async (kind: AuditExportKind, successMessage: string) => {
+    archiveAbortRef.current?.abort();
+    const controller = typeof AbortController === 'undefined' ? null : new AbortController();
+    archiveAbortRef.current = controller;
     try {
-      const archive = await archiveMutation.mutateAsync(kind);
+      const archive = await archiveMutation.mutateAsync({
+        kind,
+        diagnosticOptions: controller ? { signal: controller.signal } : {},
+      });
       if (!downloadBlob(archive.filename, archive.blob)) Toast.error(t('audit.export_failed'));
       else Toast.success(successMessage);
-    } catch {
-      Toast.error(t('audit.archive_failed'));
+    } catch (error) {
+      if (controller?.signal.aborted) return;
+      const detail = error instanceof Error ? error.message.trim() : '';
+      Toast.error(detail || t('audit.archive_failed'));
+    } finally {
+      if (archiveAbortRef.current === controller) archiveAbortRef.current = null;
     }
   };
 
@@ -91,8 +107,8 @@ export default function Audit() {
           <Select value={action} onChange={(value: string) => setAction(value)} placeholder={t('audit.all_actions')} style={{ width: 180 }}
             optionList={[{ label: t('audit.all_actions'), value: '' }, ...actions.map((value) => ({ label: actionLabel(value), value }))]} />
           <span className="pool-audit-export-group">
-            <Button icon={<IconDownload />} disabled={archiveMutation.isPending} loading={archiveMutation.isPending && archiveMutation.variables === 'cache-hits'} onClick={() => exportArchive('cache-hits', t('audit.cache_done'))}>{t('audit.export_cache')}</Button>
-            <Button icon={<IconDownload />} disabled={archiveMutation.isPending} loading={archiveMutation.isPending && archiveMutation.variables === 'diagnostics'} onClick={() => exportArchive('diagnostics', t('audit.diagnostics_done'))}>{t('audit.export_diagnostics')}</Button>
+            <Button icon={<IconDownload />} disabled={archiveMutation.isPending} loading={archiveMutation.isPending && archiveMutation.variables?.kind === 'cache-hits'} onClick={() => exportArchive('cache-hits', t('audit.cache_done'))}>{t('audit.export_cache')}</Button>
+            <Button icon={<IconDownload />} disabled={archiveMutation.isPending} loading={archiveMutation.isPending && archiveMutation.variables?.kind === 'diagnostics'} onClick={() => exportArchive('diagnostics', t('audit.diagnostics_done'))}>{t('audit.export_diagnostics')}</Button>
             <Button icon={<IconDownload />} onClick={exportCSV}>{t('audit.export_csv')}</Button>
           </span>
           <Button icon={<IconRefresh />} onClick={load}>{t('common.refresh')}</Button>

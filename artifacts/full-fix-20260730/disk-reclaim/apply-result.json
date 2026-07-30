@@ -1,0 +1,13 @@
+{
+  "accounts_sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
+  "archive_files": 19,
+  "archive_rows": 19,
+  "contexts_sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
+  "database_bytes_after": 368640,
+  "database_bytes_before": 8765440,
+  "dual_write_disabled_after_coverage_proof": true,
+  "retained_logs_sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
+  "rollback_backup": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz",
+  "sqlite_quick_check": "ok",
+  "verification": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/verification.json"
+}

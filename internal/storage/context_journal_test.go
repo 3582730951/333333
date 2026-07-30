@@ -2,7 +2,9 @@ package storage
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -91,10 +93,46 @@ func TestContextJournalCompressionRoundTripAndLegacyCompatibility(t *testing.T) 
 	if len(compressed) >= len(payload)/2 {
 		t.Fatalf("compression ineffective: before=%d after=%d", len(payload), len(compressed))
 	}
-	if got := decompressContextPayload(compressed); got != payload {
-		t.Fatal("compressed round trip changed payload")
+	if got, err := decompressContextPayloadChecked(compressed, maxStoredContextPayloadBytes); err != nil || got != payload {
+		t.Fatalf("compressed round trip changed payload: %v", err)
 	}
-	if got := decompressContextPayload(payload); got != payload {
-		t.Fatal("legacy compatibility failed")
+	if got, err := decompressContextPayloadChecked(payload, maxStoredContextPayloadBytes); err != nil || got != payload {
+		t.Fatalf("legacy compatibility failed: %v", err)
+	}
+}
+
+func TestContextCodecEscapesMarkersReadsLegacyAndBoundsExpansion(t *testing.T) {
+	var legacy bytes.Buffer
+	zw := gzip.NewWriter(&legacy)
+	_, _ = zw.Write([]byte("legacy-value"))
+	_ = zw.Close()
+	legacyValue := legacyCompressedContextPrefix + base64.RawStdEncoding.EncodeToString(legacy.Bytes())
+	if got, err := decompressContextPayloadChecked(legacyValue, 1024); err != nil || got != "legacy-value" {
+		t.Fatalf("legacy gzip got=%q err=%v", got, err)
+	}
+
+	for _, literal := range []string{
+		legacyValue,
+		"gz1:not-a-codec",
+		compressedContextPrefix + "1:x",
+		rawContextPrefix + "1:x",
+	} {
+		durable := compressContextPayload(literal)
+		got, err := decompressContextPayloadChecked(durable, 4096)
+		if err != nil || got != literal {
+			t.Fatalf("literal marker changed: durable=%q got=%q err=%v", durable, got, err)
+		}
+	}
+
+	bomb := compressContextPayload(strings.Repeat("x", 64<<10))
+	if _, err := decompressContextPayloadChecked(bomb, 1024); err == nil {
+		t.Fatal("length-bearing gzip exceeded caller decompression limit")
+	}
+	legacy.Reset()
+	zw = gzip.NewWriter(&legacy)
+	_, _ = zw.Write([]byte(strings.Repeat("y", 64<<10)))
+	_ = zw.Close()
+	if _, err := decompressContextPayloadChecked(legacyCompressedContextPrefix+base64.RawStdEncoding.EncodeToString(legacy.Bytes()), 1024); err == nil {
+		t.Fatal("legacy gzip exceeded streaming decompression limit")
 	}
 }

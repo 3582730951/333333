@@ -1,0 +1,55 @@
+{
+  "archive_bytes": 239466,
+  "archive_sha256": "5807f7fbaa08ee32efc928ff6f8848ac5ab74995ad738371825510c8719d0110",
+  "database_bytes": 125243392,
+  "export_elapsed_seconds": 5.246,
+  "exported_rows": {
+    "audit_log": 20000,
+    "usage_records": 20000
+  },
+  "label": "final",
+  "load_elapsed_seconds": 2.279,
+  "manifest_large_table_row_limit": 20000,
+  "manifest_source_row_counts": {
+    "affinity_bindings.csv": 0,
+    "audit_log.csv": 200000,
+    "billing_holds.csv": 0,
+    "cf_events.csv": 0,
+    "codex_upstream_attempts.csv": 0,
+    "codex_upstream_attempts_daily.csv": 0,
+    "diagnostic_events.csv": 0,
+    "usage_records.csv": 500000
+  },
+  "manifest_truncated_tables": {
+    "audit_log.csv": {
+      "exported_rows": 20000,
+      "omitted_rows": 180000,
+      "selection": "most_recent",
+      "source_rows": 200000
+    },
+    "usage_records.csv": {
+      "exported_rows": 20000,
+      "omitted_rows": 480000,
+      "selection": "most_recent",
+      "source_rows": 500000
+    }
+  },
+  "source_counts": {
+    "audit_log": 200000,
+    "usage_records": 500000
+  },
+  "states": [
+    {
+      "at_ms": 8.876,
+      "status": "rendering"
+    },
+    {
+      "at_ms": 4121.284,
+      "status": "validating"
+    },
+    {
+      "at_ms": 5244.83,
+      "status": "ready"
+    }
+  ]
+}

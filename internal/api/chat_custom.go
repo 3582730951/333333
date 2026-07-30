@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/cloak"
 	"codex-account-pool/internal/prompt"
 	"codex-account-pool/internal/routing"
@@ -32,49 +34,168 @@ import (
 //   - handleMessagesViaCustom : /v1/messages (Claude Code) — Anthropic ↔ chat
 // The shared lease → upstream → error plumbing lives in callCustom.
 
-// customProviderForModel returns the enabled custom provider that should serve a model
-// id, or ok=false for the built-in codex/claude upstreams. Model membership is the
-// authoritative signal (auto-discovery unions discovered ids into the provider's model
-// list); a provider-id prefix (e.g. "deepseek-chat" → "deepseek") is a fallback for a
+// customProvidersForModel returns every enabled custom provider that advertises a
+// model, in deterministic preference order. Exact mappings/catalog membership win;
+// a provider-id prefix (e.g. "deepseek-chat" → "deepseek") is only a fallback for a
 // model requested before the first discovery probe ran.
-func (s *Server) customProviderForModel(ctx context.Context, model string) (storage.CustomProvider, bool) {
+func (s *Server) customProvidersForModel(ctx context.Context, model string) []storage.CustomProvider {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return storage.CustomProvider{}, false
+		return nil
 	}
 	providers, err := s.store.ListCustomProviders(ctx)
 	if err != nil {
-		return storage.CustomProvider{}, false
+		return nil
 	}
+	matches := make([]storage.CustomProvider, 0, len(providers))
+	matched := make(map[string]bool, len(providers))
 	for _, p := range providers {
 		if !p.Enabled {
+			continue
+		}
+		if _, mapped := customProviderMappedModel(p, model); mapped {
+			matches = append(matches, p)
+			matched[p.ID] = true
 			continue
 		}
 		for _, m := range p.Models {
 			if strings.EqualFold(strings.TrimSpace(m), model) {
-				return p, true
+				matches = append(matches, p)
+				matched[p.ID] = true
+				break
 			}
+		}
+		if matched[p.ID] {
+			continue
+		}
+		// Anthropic-compatible relays frequently omit /models. Until their first
+		// account probe has produced an authoritative list, the maintained Claude
+		// candidate table makes an auto-discovery provider immediately routable.
+		if p.AutoDiscoverModels && len(p.Models) == 0 &&
+			p.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
+			capability.IsClaudeProbeModel(model) {
+			matches = append(matches, p)
+			matched[p.ID] = true
 		}
 	}
 	lower := strings.ToLower(model)
 	for _, p := range providers {
-		if !p.Enabled {
+		if !p.Enabled || matched[p.ID] {
 			continue
 		}
 		id := strings.ToLower(strings.TrimSpace(p.ID))
 		if id != "" && (strings.HasPrefix(lower, id+"-") || strings.HasPrefix(lower, id+"/") || strings.HasPrefix(lower, id+":")) {
-			return p, true
+			matches = append(matches, p)
 		}
+	}
+	return matches
+}
+
+// customProviderForModel returns the first matching custom provider that the
+// production scheduler can lease in this request's account-pool group. A matching
+// provider with no active account, no healthy configured egress, or exhausted
+// admission capacity therefore cannot shadow a later healthy provider. When every
+// custom candidate is unavailable, ok=false deliberately lets automatic routing
+// continue to the built-in Codex/Claude providers.
+func (s *Server) customProviderForModel(ctx context.Context, model, group string, body []byte) (storage.CustomProvider, bool) {
+	for _, provider := range s.customProvidersForModel(ctx, model) {
+		targetModel, mapped := customProviderMappedModel(provider, model)
+		if !mapped {
+			targetModel = model
+		}
+		lease, err := s.scheduler.Select(ctx, scheduler.Route{
+			Group:              group,
+			Provider:           provider.ID,
+			PreferredEgressIDs: provider.EgressIDs,
+			Model:              targetModel,
+			EstimatedTokens:    virtual.EstimateTokensJSON(body),
+			SkipWait:           true,
+		})
+		if err != nil {
+			continue
+		}
+		lease.Release()
+		return provider, true
 	}
 	return storage.CustomProvider{}, false
 }
 
+// customProviderMappedModel resolves an operator model rewrite. Exact mappings
+// are case-insensitive; "*" is a provider-wide fallback. The boolean distinguishes
+// an explicit identity mapping from no mapping.
+func customProviderMappedModel(provider storage.CustomProvider, requested string) (string, bool) {
+	requested = strings.TrimSpace(requested)
+	if target := strings.TrimSpace(provider.ModelMappings[strings.ToLower(requested)]); target != "" {
+		return target, true
+	}
+	// Keep compatibility with provider rows written before mapping keys were
+	// canonicalized by the storage layer. Claude Code spells concrete versions
+	// with hyphens while the routing core canonicalizes them with a dot; compare
+	// only recognized concrete Claude aliases so arbitrary provider-owned model
+	// slugs retain exact semantics. Sort map keys so an old row containing two
+	// equivalent aliases has a deterministic winner. The exact lookup above
+	// always takes priority and the wildcard remains last.
+	sources := make([]string, 0, len(provider.ModelMappings))
+	for source := range provider.ModelMappings {
+		if strings.TrimSpace(source) != "*" {
+			sources = append(sources, source)
+		}
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		left, right := strings.ToLower(strings.TrimSpace(sources[i])), strings.ToLower(strings.TrimSpace(sources[j]))
+		if left == right {
+			return sources[i] < sources[j]
+		}
+		return left < right
+	})
+	for _, source := range sources {
+		if !strings.EqualFold(strings.TrimSpace(source), requested) &&
+			!customProviderClaudeModelAliasesEquivalent(source, requested) {
+			continue
+		}
+		target := provider.ModelMappings[source]
+		target = strings.TrimSpace(target)
+		return target, target != ""
+	}
+	if target := strings.TrimSpace(provider.ModelMappings["*"]); target != "" {
+		return target, true
+	}
+	return requested, false
+}
+
+func customProviderClaudeModelAliasesEquivalent(left, right string) bool {
+	parseConcrete := func(model string) (string, bool) {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "claude-") {
+			return "", false
+		}
+		parsed, err := capability.ParseRequestedClaudeModel(model)
+		if err != nil {
+			return "", false
+		}
+		if _, concrete := capability.KiroCanonicalModel(parsed.BaseModel); !concrete {
+			return "", false
+		}
+		return parsed.BaseModel, true
+	}
+	left, leftOK := parseConcrete(left)
+	right, rightOK := parseConcrete(right)
+	return leftOK && rightOK && claudeRouteModelsEquivalent(left, right)
+}
+
+func applyCustomProviderModelMapping(provider storage.CustomProvider, raw []byte, requested string) ([]byte, string, bool) {
+	target, mapped := customProviderMappedModel(provider, requested)
+	if !mapped || strings.EqualFold(strings.TrimSpace(target), strings.TrimSpace(requested)) {
+		return raw, requested, mapped
+	}
+	return setForcedModel(raw, target), target, true
+}
+
 func (s *Server) customProviderByID(ctx context.Context, id string) (storage.CustomProvider, bool) {
 	p, ok, err := s.store.GetCustomProvider(ctx, id)
-	if err != nil {
+	if err != nil || !ok || !p.Enabled {
 		return storage.CustomProvider{}, false
 	}
-	return p, ok
+	return p, true
 }
 
 // customCall is the result of the shared lease+upstream step for a custom provider.
@@ -840,6 +961,10 @@ func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request,
 // to the provider's base_url + /messages endpoint; the response passes through as-is.
 func (s *Server) handleNativeAnthropicMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
 	stream := isStreamRequest(raw)
+	// A bare URL+API-key client is allowed to omit Anthropic-Version. The official
+	// Messages API and most compatible relays require it, so supply the protocol
+	// default before the custom transport builds its clean upstream header set.
+	r = withAnthropicCustomHeaders(r)
 	cc, ok := s.callCustom(w, r, provider, raw, model, routeGroup, "claude", "/messages")
 	if !ok {
 		return
@@ -995,6 +1120,26 @@ func withAnthropicCustomHeaders(r *http.Request) *http.Request {
 	if strings.TrimSpace(clone.Header.Get("Anthropic-Version")) == "" {
 		clone.Header.Set("Anthropic-Version", "2023-06-01")
 	}
+	return clone
+}
+
+func withAnthropicContext1MBeta(r *http.Request) *http.Request {
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	if anthropicContext1MRequested(clone.Header) {
+		return clone
+	}
+	betas := make([]string, 0)
+	for _, value := range clone.Header.Values("Anthropic-Beta") {
+		for _, token := range strings.Split(value, ",") {
+			if token = strings.TrimSpace(token); token != "" {
+				betas = append(betas, token)
+			}
+		}
+	}
+	betas = append(betas, anthropicContext1MBeta)
+	clone.Header.Del("Anthropic-Beta")
+	clone.Header.Set("Anthropic-Beta", strings.Join(betas, ","))
 	return clone
 }
 

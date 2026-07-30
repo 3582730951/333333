@@ -219,6 +219,9 @@ func TestConvertAnthropicUsesNativeThinkingAndSystemHistory(t *testing.T) {
 	if current["content"] != "Draft the introduction." {
 		t.Fatalf("current content polluted by compatibility prompts: %q", current["content"])
 	}
+	if current["origin"] != kiroCLIOrigin {
+		t.Fatalf("current origin=%q, want %q", current["origin"], kiroCLIOrigin)
+	}
 	history := state["history"].([]interface{})
 	if len(history) != 2 {
 		t.Fatalf("system history length = %d, want 2: %#v", len(history), history)
@@ -226,6 +229,15 @@ func TestConvertAnthropicUsesNativeThinkingAndSystemHistory(t *testing.T) {
 	first := history[0].(map[string]interface{})["userInputMessage"].(map[string]interface{})
 	if first["content"] != "Use only verified sources." {
 		t.Fatalf("system history content = %q", first["content"])
+	}
+	for index, item := range history {
+		envelope := item.(map[string]interface{})
+		if user, ok := envelope["userInputMessage"].(map[string]interface{}); ok && user["origin"] != kiroCLIOrigin {
+			t.Fatalf("history[%d] origin=%q, want %q", index, user["origin"], kiroCLIOrigin)
+		}
+	}
+	if strings.Contains(string(got.Body), `"origin":"AI_EDITOR"`) {
+		t.Fatalf("legacy origin remains in Kiro request: %s", got.Body)
 	}
 	if strings.Contains(string(got.Body), "<system>") || strings.Contains(string(got.Body), "<thinking_mode>") {
 		t.Fatalf("legacy prompt tags remain in Kiro request: %s", got.Body)

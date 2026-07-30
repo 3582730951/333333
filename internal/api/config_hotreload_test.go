@@ -177,7 +177,7 @@ func TestSettingsCenterAppliesKiroNoDegradationTemplate(t *testing.T) {
 		"kiro_default_thinking":           true,
 		"kiro_cache_mode":                 "auto",
 		"kiro_cache_unreported_threshold": float64(20),
-		"kiro_affinity_wait_millis":       float64(1500),
+		"kiro_affinity_wait_millis":       float64(0),
 	}
 	for key, want := range wants {
 		if values[key] != want {

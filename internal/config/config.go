@@ -347,8 +347,10 @@ type Config struct {
 	// ClaudeNodeVersion is the Node runtime version reported in
 	// X-Stainless-Runtime-Version (real Claude Code runs on Node). Empty = default.
 	ClaudeNodeVersion string `json:"claude_node_version"`
-	// Kiro IDE fingerprint and regional endpoints. These are hot-reloadable through
-	// the settings registry; endpoint overrides on an individual credential win.
+	// Kiro CLI wire version and regional service planes. These are hot-reloadable
+	// through the settings registry; endpoint overrides on an individual credential
+	// win, while legacy official q.<region>.amazonaws.com values are translated to
+	// the operation-specific runtime/management host.
 	KiroVersion           string `json:"kiro_version"`
 	KiroNodeVersion       string `json:"kiro_node_version"`
 	KiroDefaultAuthRegion string `json:"kiro_default_auth_region"`
@@ -910,30 +912,33 @@ func Default() Config {
 		ClaudeGatewayForwardHosts:              DefaultClaudeGatewayForwardHosts(),
 		ClaudeGatewayBlockedHostPatterns:       DefaultClaudeGatewayBlockedHostPatterns(),
 		ClaudeGatewayUnknownTargetPolicy:       "forward",
-		ClaudeGatewayDisableNonessentialEnv:    true,
-		ClaudeGatewayStrictLinuxDefault:        false,
-		DefaultRegisterMethod:                  "protocol_v2",
-		StrictStickyMaxCooldownSeconds:         DefaultStrictStickyMaxCooldownSeconds,
-		StatefulStickyWaitSeconds:              0,
-		CooldownWaitMaxSeconds:                 DefaultCooldownWaitMaxSeconds,
-		LeakScrubEnabled:                       true,
-		ModelProbeIntervalHours:                DefaultModelProbeIntervalHours,
-		ModelQualityMonitorEnabled:             false,
-		ModelQualityIntervalMinutes:            DefaultModelQualityIntervalMinutes,
-		ModelQualityReasoningEffort:            DefaultModelQualityReasoningEffort,
-		ModelQualityDegradedThreshold:          DefaultModelQualityDegradedThreshold,
-		ModelQualityHistoryDays:                DefaultModelQualityHistoryDays,
-		GeoProbeURL:                            DefaultGeoProbeURL,
-		CodexReauthWorkerURL:                   DefaultCodexReauthWorkerURL,
-		CodexReauthWorkerConcurrency:           1,
-		WarpExitBasePort:                       40000,
-		WarpAccountsPerExit:                    3,
-		RegistrationConcurrency:                1,
-		RegistrationTimeout:                    300,
-		CodexPreferSidecarJA3OverWS:            true,
-		SMSPlatformStrategy:                    "auto",
-		SMSPreferredCountries:                  "BR,CO,PL",
-		SMSStatsTopN:                           3,
+		// Parity mode is the default: keep Claude Code's model discovery, feature
+		// flags, updates, and tool streaming behavior unless the operator opts into
+		// the stricter privacy switch.
+		ClaudeGatewayDisableNonessentialEnv: false,
+		ClaudeGatewayStrictLinuxDefault:     false,
+		DefaultRegisterMethod:               "protocol_v2",
+		StrictStickyMaxCooldownSeconds:      DefaultStrictStickyMaxCooldownSeconds,
+		StatefulStickyWaitSeconds:           0,
+		CooldownWaitMaxSeconds:              DefaultCooldownWaitMaxSeconds,
+		LeakScrubEnabled:                    true,
+		ModelProbeIntervalHours:             DefaultModelProbeIntervalHours,
+		ModelQualityMonitorEnabled:          false,
+		ModelQualityIntervalMinutes:         DefaultModelQualityIntervalMinutes,
+		ModelQualityReasoningEffort:         DefaultModelQualityReasoningEffort,
+		ModelQualityDegradedThreshold:       DefaultModelQualityDegradedThreshold,
+		ModelQualityHistoryDays:             DefaultModelQualityHistoryDays,
+		GeoProbeURL:                         DefaultGeoProbeURL,
+		CodexReauthWorkerURL:                DefaultCodexReauthWorkerURL,
+		CodexReauthWorkerConcurrency:        1,
+		WarpExitBasePort:                    40000,
+		WarpAccountsPerExit:                 3,
+		RegistrationConcurrency:             1,
+		RegistrationTimeout:                 300,
+		CodexPreferSidecarJA3OverWS:         true,
+		SMSPlatformStrategy:                 "auto",
+		SMSPreferredCountries:               "BR,CO,PL",
+		SMSStatsTopN:                        3,
 
 		// Thinking defaults: disabled by default (opt-in feature)
 		ThinkingEnabled:       false,

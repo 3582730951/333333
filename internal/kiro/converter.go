@@ -371,7 +371,7 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 	systemAcknowledgementHistoryIndex := -1
 	if systemPresent {
 		history = append(history,
-			map[string]any{"userInputMessage": map[string]any{"content": systemPrompt, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}},
+			map[string]any{"userInputMessage": map[string]any{"content": systemPrompt, "origin": kiroCLIOrigin, "userInputMessageContext": map[string]any{}}},
 			map[string]any{"assistantResponseMessage": map[string]any{"content": systemAcknowledgement}},
 		)
 		systemAcknowledgementHistoryIndex = len(history) - 1
@@ -392,7 +392,7 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 		}
 		if role == "assistant" && (len(history) == 0 || historyItemRole(history[len(history)-1]) == "assistant") {
 			history = append(history, map[string]any{
-				"userInputMessage": map[string]any{"content": assistantFirstPadding, "modelId": wireModel, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}},
+				"userInputMessage": map[string]any{"content": assistantFirstPadding, "modelId": wireModel, "origin": kiroCLIOrigin, "userInputMessageContext": map[string]any{}},
 			})
 			losses.add(LossAssistantFirstPadded)
 		}
@@ -417,7 +417,7 @@ func ConvertAnthropicRequestWithOptions(raw []byte, affinity string, options Con
 			return Conversion{}, err
 		}
 	} else {
-		current = map[string]any{"content": prefillContinuation, "modelId": wireModel, "origin": "AI_EDITOR", "userInputMessageContext": map[string]any{}}
+		current = map[string]any{"content": prefillContinuation, "modelId": wireModel, "origin": kiroCLIOrigin, "userInputMessageContext": map[string]any{}}
 	}
 	ctx, _ := current["userInputMessageContext"].(map[string]any)
 	if ctx == nil {
@@ -1053,7 +1053,7 @@ func convertUserMessage(message anthropicMessage, model string, uses map[string]
 	if len(results) > 0 {
 		ctx["toolResults"] = results
 	}
-	user := map[string]any{"content": text, "modelId": model, "origin": "AI_EDITOR", "userInputMessageContext": ctx}
+	user := map[string]any{"content": text, "modelId": model, "origin": kiroCLIOrigin, "userInputMessageContext": ctx}
 	if len(images) > 0 {
 		user["images"] = images
 	}

@@ -42,7 +42,7 @@ func defaultGatewayPolicy() GatewayPolicy {
 		ForwardHosts:           poolconfig.DefaultClaudeGatewayForwardHosts(),
 		BlockedHostPatterns:    poolconfig.DefaultClaudeGatewayBlockedHostPatterns(),
 		UnknownTargetPolicy:    "forward",
-		DisableNonessentialEnv: true,
+		DisableNonessentialEnv: false,
 		StrictLinuxDefault:     true,
 	}
 }

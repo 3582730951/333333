@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from 'react';
 import { ActionMenu, Banner, Button, Toast, Modal, Form, Tag } from '../components/pool/index.jsx';
-import { IconPlus, IconRefresh, IconEdit, IconKey, IconDelete } from '../components/pool/icons.jsx';
+import { IconPlus, IconRefresh, IconEdit, IconKey, IconDelete, IconPlay } from '../components/pool/icons.jsx';
 import { get, post, del } from '../api.js';
 import { rowsOf } from '../components/DataPage.jsx';
 import PageHeader from '../components/PageHeader.jsx';
@@ -20,6 +20,36 @@ const splitModels = (value) => String(value || '')
   .filter(Boolean);
 
 const joinModels = (models) => Array.isArray(models) ? models.join('\n') : '';
+
+const splitModelMappings = (value) => {
+  const out = {};
+  for (const line of String(value || '').split('\n')) {
+    const match = line.match(/^\s*(.+?)\s*(?:=>|=)\s*(.+?)\s*$/);
+    if (match?.[1] && match?.[2]) out[match[1].trim()] = match[2].trim();
+  }
+  return out;
+};
+
+const joinModelMappings = (mappings) => Object.entries(mappings || {})
+  .sort(([left], [right]) => left.localeCompare(right))
+  .map(([source, target]) => `${source} => ${target}`)
+  .join('\n');
+
+const CLAUDE_MODEL_TABLE = [
+  'claude-fable-5',
+  'claude-opus-5',
+  'claude-sonnet-5',
+  'claude-opus-4-8',
+  'claude-opus-4-7',
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+  'claude-sonnet-4-5-20250929',
+  'claude-opus-4-5-20251101',
+  'claude-haiku-4-5-20251001',
+  'claude-sonnet-4-5',
+  'claude-opus-4-5',
+  'claude-haiku-4-5',
+];
 
 const PROTOCOL_OPTIONS = [
   { label: 'Chat Completions 格式（OpenAI 兼容）', value: 'chat_completions' },
@@ -78,6 +108,7 @@ const providerFormValues = (row) => ({
   enabled: row?.enabled !== false,
   auto_discover_models: row?.auto_discover_models !== false,
   models_text: joinModels(row?.models),
+  model_mappings_text: joinModelMappings(row?.model_mappings),
 });
 
 function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
@@ -131,7 +162,15 @@ function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
         <label className="pool-inline-switch"><Form.Switch value={values.enabled} onChange={(value) => setValue('enabled', value)} /><span>启用提供商</span></label>
         <label className="pool-inline-switch"><Form.Switch value={values.auto_discover_models} onChange={(value) => setValue('auto_discover_models', value)} /><span>自动发现模型</span></label>
       </div>
-      <Form.TextArea label="模型能力 / 映射" value={values.models_text} onChange={(value) => setValue('models_text', value)} autosize placeholder={'gpt-5.3-codex\nclaude-opus-4-1'} help="每行一个模型；留空时暂按支持全部模型处理，并建议尽快补齐能力。" />
+      {values.upstream_protocol === 'anthropic_messages' && values.auto_discover_models ? (
+        <Banner
+          type="info"
+          title="Claude 候选模型表探测"
+          description={`若中转站没有 /models，系统会逐个发送最小 Messages 请求验证：${CLAUDE_MODEL_TABLE.join('、')}`}
+        />
+      ) : null}
+      <Form.TextArea label="上游模型表" value={values.models_text} onChange={(value) => setValue('models_text', value)} autosize placeholder={'claude-sonnet-5\nrelay-model-pro'} help="每行一个目标中转站实际接受的模型；自动发现结果会回写到这里。" />
+      <Form.TextArea label="下游 → 上游模型映射" value={values.model_mappings_text} onChange={(value) => setValue('model_mappings_text', value)} autosize placeholder={'claude-sonnet-5 => relay-model-pro\n* => relay-default'} help="每行 source => target；支持 * 作为该提供商的默认目标模型。" />
       <div className="pool-modal-actions">
         <Button onClick={onCancel} disabled={saving}>取消</Button>
         <Button theme="solid" loading={saving} disabled={!String(values.id || values.name).trim() || !String(values.base_url).trim()} onClick={() => onSave(values)}>保存</Button>
@@ -143,6 +182,9 @@ function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
 export default function Providers() {
   const [editor, setEditor] = useState(null);
   const [importer, setImporter] = useState(null);
+  const [tester, setTester] = useState(null);
+  const [testModel, setTestModel] = useState('');
+  const [testResult, setTestResult] = useState(null);
 
   const fetchRows = useCallback(async ({ signal }) => {
     return rowsOf(await get('/admin/providers', undefined, { signal }));
@@ -176,6 +218,7 @@ export default function Providers() {
         enabled: values.enabled !== false,
         auto_discover_models: values.auto_discover_models !== false,
         models: splitModels(values.models_text),
+        model_mappings: splitModelMappings(values.model_mappings_text),
       });
       Toast.success('已保存');
       setEditor(null);
@@ -198,13 +241,34 @@ export default function Providers() {
         provider_id: importer.id,
         api_key: values.api_key,
         label: values.label,
-        group_name: values.group_name,
       });
       Toast.success('账号已导入');
       setImporter(null);
     } catch (e) { showErrorToast(e); }
   });
-  const providerOperationRunning = savingProvider || importingKey || removingProvider;
+  const { run: testProvider, running: testingProvider } = useAsyncAction(async () => {
+    if (!tester?.id || !String(testModel || '').trim()) {
+      Toast.warning('请输入要测试的模型');
+      return;
+    }
+    try {
+      const result = await post(`/admin/providers/${encodeURIComponent(tester.id)}/test`, { model: String(testModel).trim() });
+      setTestResult(result);
+      if (result?.ok) {
+        Toast.success(`已到达目标中转站：${result.target_model || testModel}`);
+        void load();
+      } else {
+        Toast.error(`测试未通过：${result?.error_code || 'unknown'}`);
+      }
+    } catch (e) {
+      const result = e?.response?.data;
+      if (result?.provider_id && result?.requested_model) {
+        setTestResult(result);
+      }
+      showErrorToast(e);
+    }
+  });
+  const providerOperationRunning = savingProvider || importingKey || testingProvider || removingProvider;
 
   const renderModels = (models, row) => {
     const list = Array.isArray(models) ? models : [];
@@ -218,6 +282,7 @@ export default function Providers() {
       items={[
         { label: '编辑', icon: <IconEdit />, disabled: providerOperationRunning, onSelect: () => setEditor({ mode: 'edit', values: providerFormValues(row) }) },
         { label: '导入 Key', icon: <IconKey />, disabled: providerOperationRunning, onSelect: () => setImporter(row) },
+        { label: '测试模型', icon: <IconPlay />, disabled: providerOperationRunning, onSelect: () => { setTester(row); setTestModel(row.models?.[0] || Object.keys(row.model_mappings || {})[0] || ''); setTestResult(null); } },
         {
           label: isRemovingProvider(row.id) ? '删除中' : '删除',
           icon: <IconDelete />,
@@ -361,10 +426,31 @@ export default function Providers() {
           <Form onSubmit={importKey} labelPosition="top">
             <Form.Input field="api_key" label="API Key" mode="password" rules={[{ required: true }]} />
             <Form.Input field="label" label="账号标签" placeholder={importer.name || importer.id} />
-            <Form.Input field="group_name" label="分组" />
-            <div className="pool-field__help">账号请求时动态继承所选账号池分组的有序出口，不在账号记录中复制出口配置。</div>
+            <div className="pool-field__help">无需配置分组；账号会自动加入系统默认账号池分组并继承其有序出口。</div>
             <Button htmlType="submit" theme="solid" loading={importingKey} style={{ marginTop: 12 }}>导入</Button>
           </Form>
+        ) : null}
+      </Modal>
+      <Modal
+        title={tester ? `测试 ${tester.name || tester.id}` : '测试模型提供商'}
+        visible={!!tester}
+        onCancel={() => { if (!testingProvider) { setTester(null); setTestResult(null); } }}
+        onOk={testProvider}
+        confirmLoading={testingProvider}
+        okText="发送最小测试"
+        maskClosable={!testingProvider}
+      >
+        <Form.Input label="测试模型" value={testModel} onChange={setTestModel} placeholder="例如 claude-sonnet-5" />
+        <div className="pool-field__help">请求会经过该提供商的 Base URL、协议画像、API Key、出口及模型映射；结果同时显示下游模型与目标模型。</div>
+        {testResult ? (
+          <div className="pool-resource-summary" style={{ marginTop: 12 }}>
+            <strong>{testResult.ok ? '到达成功' : '测试失败'}</strong>
+            <div className="pool-resource-summary__meta">
+              {testResult.requested_model || '-'} → {testResult.target_model || '-'} · HTTP {testResult.http_status || 0} · {testResult.latency_ms || 0} ms
+            </div>
+            {testResult.error_code ? <div className="pool-resource-summary__meta">错误：{testResult.error_code}</div> : null}
+            {testResult.response_sample ? <TextClamp>{testResult.response_sample}</TextClamp> : null}
+          </div>
         ) : null}
       </Modal>
     </div>

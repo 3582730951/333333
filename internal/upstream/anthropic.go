@@ -37,10 +37,20 @@ func claudeBaseURL(cfg config.Config) string {
 	return "https://api.anthropic.com"
 }
 
-// claudeUsesAPIKey reports whether the credential is an Anthropic API key
-// (sk-ant-api...) rather than an OAuth access token (sk-ant-oat...).
-func claudeUsesAPIKey(token storage.AccountToken) bool {
-	return accountprovider.UsesAPIKey("claude", token)
+// claudeCredentialProvider keeps built-in/legacy Claude rows on Claude's native
+// credential inference while letting custom Claude-profile providers use their
+// own account provider id. The latter matters for legacy custom keys with an
+// arbitrary prefix: custom-provider OpenAIAPIKey rows are API keys even when they
+// do not begin with sk-ant-api.
+func claudeCredentialProvider(spec Request) string {
+	if provider := strings.TrimSpace(spec.Account.Provider); provider != "" {
+		return provider
+	}
+	return "claude"
+}
+
+func claudeUsesAPIKey(spec Request) bool {
+	return accountprovider.UsesAPIKey(claudeCredentialProvider(spec), spec.Token)
 }
 
 func (c *Client) doClaude(ctx context.Context, spec Request) (*Response, error) {
@@ -203,8 +213,8 @@ func resolveClaudeJA3(override string) string {
 // scratch using the account-bound virtual identity, so the upstream sees a
 // consistent, first-party-looking client instead of the relay/host machine.
 func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.Identity, stream bool) {
-	token := accountprovider.Credential("claude", spec.Token)
-	apiKey := claudeUsesAPIKey(spec.Token)
+	token := accountprovider.Credential(claudeCredentialProvider(spec), spec.Token)
+	apiKey := claudeUsesAPIKey(spec)
 
 	dst.Set("Content-Type", "application/json")
 	if apiKey {
@@ -269,8 +279,8 @@ func (c *Client) applyClaudeHeaders(dst http.Header, spec Request, id identity.I
 // auth and the Claude Code identity fingerprint (X-App, X-Stainless-*, UA) so the call
 // looks like it came from the same first-party client as the account's message turns.
 func (c *Client) applyClaudePassthroughHeaders(dst http.Header, spec Request, id identity.Identity, stream bool) {
-	token := accountprovider.Credential("claude", spec.Token)
-	apiKey := claudeUsesAPIKey(spec.Token)
+	token := accountprovider.Credential(claudeCredentialProvider(spec), spec.Token)
+	apiKey := claudeUsesAPIKey(spec)
 
 	// Auth, per credential type (mirrors applyClaudeHeaders).
 	if apiKey {
@@ -559,8 +569,8 @@ func decodeClaudeJSONObject(body []byte, root *map[string]interface{}) error {
 // opaque user id, while OAuth and native Claude Code requests use the JSON shape.
 func (c *Client) normalizeClaudeMessagesMetadata(root map[string]interface{}, spec Request) bool {
 	metadata, hasMetadata := root["metadata"].(map[string]interface{})
-	token := accountprovider.Credential("claude", spec.Token)
-	claudeCode := (token != "" && !claudeUsesAPIKey(spec.Token)) || claudeRootHasCodeIdentity(root)
+	token := accountprovider.Credential(claudeCredentialProvider(spec), spec.Token)
+	claudeCode := (token != "" && !claudeUsesAPIKey(spec)) || claudeRootHasCodeIdentity(root)
 	if !hasMetadata && !claudeCode {
 		return false
 	}

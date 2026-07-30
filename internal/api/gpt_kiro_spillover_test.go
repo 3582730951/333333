@@ -29,16 +29,25 @@ func newAutoKiroGPTMock(t *testing.T) *autoKiroGPTMock {
 	t.Helper()
 	mock := &autoKiroGPTMock{}
 	mock.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/generateAssistantResponse":
-			body, _ := io.ReadAll(r.Body)
+			switch r.URL.Path {
+			case "/generateAssistantResponse":
+				if r.Method != http.MethodPost {
+					t.Errorf("Kiro generation method=%q", r.Method)
+				}
+				if got := r.Header.Get("X-Amz-Target"); got != "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
+					t.Errorf("Kiro generation x-amz-target=%q", got)
+				}
+				body, _ := io.ReadAll(r.Body)
 			mock.mu.Lock()
 			mock.calls++
 			mock.bodies = append(mock.bodies, append([]byte(nil), body...))
 			mock.mu.Unlock()
-			if !bytes.Contains(body, []byte(`"modelId":"`+autoKiroGPTModel+`"`)) {
-				t.Errorf("Kiro GPT request lost model id: %s", body)
-			}
+				if !bytes.Contains(body, []byte(`"modelId":"`+autoKiroGPTModel+`"`)) {
+					t.Errorf("Kiro GPT request lost model id: %s", body)
+				}
+				if !bytes.Contains(body, []byte(`"origin":"KIRO_CLI"`)) || bytes.Contains(body, []byte(`"origin":"AI_EDITOR"`)) {
+					t.Errorf("Kiro GPT request origin does not match CLI: %s", body)
+				}
 			for _, forbidden := range []string{`"thinking"`, `"output_config"`, `"max_tokens"`} {
 				if bytes.Contains(body, []byte(forbidden)) {
 					t.Errorf("Kiro GPT request sent Claude-only %s: %s", forbidden, body)

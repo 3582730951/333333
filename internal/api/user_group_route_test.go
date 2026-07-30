@@ -48,6 +48,33 @@ func setUserGroupCapacityTestIntervals(t *testing.T, timeout, poll, heartbeat, s
 	})
 }
 
+func TestUserGroupCustomTargetSupportsDownstreamModelMappingSource(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	provider := storage.CustomProvider{
+		ID:      "mapped-user-group-provider",
+		Name:    "Mapped User Group Provider",
+		BaseURL: "https://relay.example/v1",
+		Enabled: true,
+		Models:  []string{"relay-internal-model"},
+		ModelMappings: map[string]string{
+			"client-visible-model": "relay-internal-model",
+			"team-*":               "relay-team-model",
+		},
+	}
+	if err := h.store.UpsertCustomProvider(t.Context(), provider); err != nil {
+		t.Fatal(err)
+	}
+	target := storage.TargetRef{Kind: storage.TargetKindModelProvider, ID: provider.ID}
+	for _, model := range []string{"client-visible-model", "team-coding"} {
+		if !userGroupTargetSupportsModel(t.Context(), h.store, target, model) {
+			t.Fatalf("mapped downstream model %q was filtered before custom provider routing", model)
+		}
+	}
+	if userGroupTargetSupportsModel(t.Context(), h.store, target, "unrelated-model") {
+		t.Fatal("unrelated model unexpectedly matched custom provider")
+	}
+}
+
 func TestUserGroupTargetFamilyPolicySkipsOnlySelectedAccountPool(t *testing.T) {
 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
 	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "family-policy-secondary"}); err != nil {

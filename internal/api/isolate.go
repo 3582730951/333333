@@ -80,7 +80,7 @@ func inferDownstreamOS(raw []byte) string {
 func ledgerKey(a routing.AffinityKey) string {
 	switch a.Source {
 	case routing.CodexRootThreadAffinitySource, "x-codex-parent-thread-id", "thread_id", "conversation_id",
-		"x-codex-window-id", "prompt_cache_key", "x-codex-turn-metadata":
+		"x-codex-window-id", "x-codex-turn-metadata":
 		return a.Hash
 	}
 	return ""

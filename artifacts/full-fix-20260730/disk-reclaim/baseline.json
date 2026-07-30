@@ -1,0 +1,17 @@
+{
+  "accounts": {
+    "rows": 8,
+    "sha256": "9d05e4639c10078247d860333a668eba9ccfda3faab7493e126fadb42c1a12f6"
+  },
+  "all_db": {
+    "rows": 65,
+    "sha256": "7d971b36d769b26c5afa20247133339b12664c04b4a9a55d19ef1f7f0231a4d6"
+  },
+  "config_sha256": "b857b6e8fd0691486f3942366e53344e2e2dde8f7dbf355b49b334b22a636edf",
+  "contexts": {
+    "rows": 12,
+    "sha256": "de3ffdb3a0f9de3f223392ef2c611c220752e47f1a262f24c833b87ebb224410"
+  },
+  "database_bytes": 8765440,
+  "database_sha256": "2a6348b515aae83870ff4bb1b3494a1a2ba0965d758547da9fba485c51df2cf2"
+}

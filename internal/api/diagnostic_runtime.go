@@ -25,6 +25,13 @@ type diagnosticRuntime struct {
 	providerHead     int
 	diskRejects      atomic.Int64
 	capacityRejects  atomic.Int64
+	// walFinalizePending remains set after a live SQLite reader reports a busy
+	// TRUNCATE checkpoint. Diagnostic maintenance retries it on the next pass,
+	// even if the triggering legacy snapshot family has already been removed.
+	walFinalizePending atomic.Bool
+	// walFinalizeRunning makes overlapping worker/expiry maintenance passes skip
+	// rather than queue behind the same SQLite checkpoint.
+	walFinalizeRunning atomic.Bool
 }
 
 type diagnosticRouteAttempt struct {

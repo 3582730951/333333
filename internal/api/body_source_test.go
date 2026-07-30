@@ -91,6 +91,8 @@ func TestAffinityWithMetaMatchesLegacyPrecedence(t *testing.T) {
 		{name: "window header", body: `{"prompt_cache_key":"cache"}`, header: map[string]string{"X-Codex-Window-ID": "window"}},
 		{name: "prompt cache", body: `{"prompt_cache_key":"cache"}`},
 		{name: "previous response", body: `{"previous_response_id":"resp_1"}`},
+		{name: "state beats cache", body: `{"previous_response_id":"resp_exact","prompt_cache_key":"cache","thread_id":"body"}`, header: map[string]string{"Thread-ID": "header-thread"}},
+		{name: "turn state beats cache", body: `{"prompt_cache_key":"cache","thread_id":"body"}`, header: map[string]string{"X-Codex-Turn-State": "state-exact", "Thread-ID": "header-thread"}},
 		{name: "turn metadata header", body: `{"input":"fallback"}`, header: map[string]string{"X-Codex-Turn-Metadata": "turn"}},
 		{name: "fallback", body: `{"model":"gpt-5.6-sol","input":"fallback"}`, header: map[string]string{"Authorization": "Bearer downstream"}},
 	}

@@ -5,7 +5,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +26,9 @@ func (s *Store) PutContextJournal(ctx context.Context, j ContextJournal) error {
 	if j.CreatedAt == 0 {
 		j.CreatedAt = now
 	}
+	if int64(len(j.Payload)) > maxStoredContextPayloadBytes {
+		return fmt.Errorf("context journal payload contains %d bytes, limit is %d", len(j.Payload), maxStoredContextPayloadBytes)
+	}
 	payload := compressContextPayload(j.Payload)
 	_, err := s.db.ExecContext(ctx, `INSERT INTO context_journal(response_id,affinity_hash,account_id,encrypted_payload,created_at,expires_at) VALUES(?,?,?,?,?,?) ON CONFLICT(response_id) DO UPDATE SET affinity_hash=excluded.affinity_hash,account_id=excluded.account_id,encrypted_payload=excluded.encrypted_payload,created_at=excluded.created_at,expires_at=excluded.expires_at`, j.ResponseID, j.AffinityHash, j.AccountID, s.sealToken(payload), j.CreatedAt, j.ExpiresAt)
 	return err
@@ -31,7 +37,10 @@ func (s *Store) GetContextJournal(ctx context.Context, id string) (ContextJourna
 	var j ContextJournal
 	var p string
 	err := s.rdb.QueryRowContext(ctx, `SELECT response_id,affinity_hash,account_id,encrypted_payload,created_at,expires_at FROM context_journal WHERE response_id=? AND expires_at>?`, id, Now()).Scan(&j.ResponseID, &j.AffinityHash, &j.AccountID, &p, &j.CreatedAt, &j.ExpiresAt)
-	j.Payload = decompressContextPayload(s.openToken(p))
+	if err != nil {
+		return j, err
+	}
+	j.Payload, err = s.openContextPayload(p, maxStoredContextPayloadBytes)
 	return j, err
 }
 
@@ -144,37 +153,142 @@ func (s *Store) EvictContextJournalToBudget(ctx context.Context, maxRows, maxByt
 	}
 }
 
-const compressedContextPrefix = "gz1:"
+const (
+	// ctx2 is an unambiguous envelope: every new non-empty application payload,
+	// including a literal string beginning with "gz1:" or "ctx2:", is placed
+	// inside either the raw or gzip form. The byte count is authenticated by the
+	// outer storage encryption where enabled and is always verified before use.
+	compressedContextPrefix       = "ctx2:g:"
+	rawContextPrefix              = "ctx2:r:"
+	legacyCompressedContextPrefix = "gz1:"
+
+	// This mirrors the project's 1 GiB request-body ceiling without importing the
+	// config package into storage. Call sites with tighter metadata (goal chunks)
+	// pass that smaller bound instead.
+	maxStoredContextPayloadBytes = int64(1 << 30)
+)
+
+func contextEnvelope(prefix string, plainBytes int, body string) string {
+	return prefix + strconv.Itoa(plainBytes) + ":" + body
+}
 
 func compressContextPayload(payload string) string {
+	if payload == "" {
+		return ""
+	}
+	rawEnvelope := contextEnvelope(rawContextPrefix, len(payload), payload)
 	if len(payload) < 1024 {
-		return payload
+		return rawEnvelope
 	}
 	var out bytes.Buffer
-	zw, _ := gzip.NewWriterLevel(&out, gzip.BestSpeed)
-	_, _ = zw.Write([]byte(payload))
-	_ = zw.Close()
-	if base64.RawStdEncoding.EncodedLen(out.Len())+len(compressedContextPrefix) >= len(payload) {
-		return payload
+	zw, err := gzip.NewWriterLevel(&out, gzip.BestSpeed)
+	if err != nil {
+		return rawEnvelope
 	}
-	return compressedContextPrefix + base64.RawStdEncoding.EncodeToString(out.Bytes())
+	if _, err = zw.Write([]byte(payload)); err != nil {
+		return rawEnvelope
+	}
+	if err = zw.Close(); err != nil {
+		return rawEnvelope
+	}
+	compressedEnvelope := contextEnvelope(compressedContextPrefix, len(payload), base64.RawStdEncoding.EncodeToString(out.Bytes()))
+	if len(compressedEnvelope) >= len(rawEnvelope) {
+		return rawEnvelope
+	}
+	return compressedEnvelope
 }
-func decompressContextPayload(payload string) string {
-	if !strings.HasPrefix(payload, compressedContextPrefix) {
-		return payload
+
+func splitContextEnvelope(payload, prefix string) (int64, string, error) {
+	rest := strings.TrimPrefix(payload, prefix)
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 {
+		return 0, "", errors.New("context envelope is missing its plaintext length")
 	}
-	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(payload, compressedContextPrefix))
+	plainBytes, err := strconv.ParseInt(rest[:colon], 10, 64)
 	if err != nil {
-		return payload
+		return 0, "", fmt.Errorf("invalid context envelope length: %w", err)
 	}
-	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if plainBytes < 0 {
+		return 0, "", errors.New("context envelope has a negative plaintext length")
+	}
+	return plainBytes, rest[colon+1:], nil
+}
+
+func readGzipContext(encoded string, expectedBytes, maxBytes int64) (string, error) {
+	if maxBytes < 0 {
+		return "", errors.New("invalid context decompression limit")
+	}
+	if expectedBytes >= 0 && expectedBytes > maxBytes {
+		return "", fmt.Errorf("context payload declares %d bytes, limit is %d", expectedBytes, maxBytes)
+	}
+	zr, err := gzip.NewReader(base64.NewDecoder(base64.RawStdEncoding, strings.NewReader(encoded)))
 	if err != nil {
-		return payload
+		return "", err
 	}
-	decoded, err := io.ReadAll(zr)
-	_ = zr.Close()
-	if err != nil {
-		return payload
+	limit := maxBytes
+	if expectedBytes >= 0 {
+		limit = expectedBytes
 	}
-	return string(decoded)
+	decoded, readErr := io.ReadAll(io.LimitReader(zr, limit+1))
+	closeErr := zr.Close()
+	if readErr != nil {
+		return "", readErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if int64(len(decoded)) > limit {
+		return "", fmt.Errorf("context payload exceeds %d-byte decompression limit", limit)
+	}
+	if expectedBytes >= 0 && int64(len(decoded)) != expectedBytes {
+		return "", fmt.Errorf("context payload decoded to %d bytes, expected %d", len(decoded), expectedBytes)
+	}
+	return string(decoded), nil
+}
+
+func decompressContextPayloadChecked(payload string, maxBytes int64) (string, error) {
+	if maxBytes < 0 {
+		return "", errors.New("invalid context decompression limit")
+	}
+	switch {
+	case payload == "":
+		return "", nil
+	case strings.HasPrefix(payload, rawContextPrefix):
+		expectedBytes, raw, err := splitContextEnvelope(payload, rawContextPrefix)
+		if err != nil {
+			return "", err
+		}
+		if expectedBytes > maxBytes {
+			return "", fmt.Errorf("context payload declares %d bytes, limit is %d", expectedBytes, maxBytes)
+		}
+		if int64(len(raw)) != expectedBytes {
+			return "", fmt.Errorf("raw context payload contains %d bytes, expected %d", len(raw), expectedBytes)
+		}
+		return raw, nil
+	case strings.HasPrefix(payload, compressedContextPrefix):
+		expectedBytes, encoded, err := splitContextEnvelope(payload, compressedContextPrefix)
+		if err != nil {
+			return "", err
+		}
+		return readGzipContext(encoded, expectedBytes, maxBytes)
+	case strings.HasPrefix(payload, legacyCompressedContextPrefix):
+		// Legacy gz1 did not carry its plaintext size. The streaming limit still
+		// prevents an old/corrupt value from allocating past the caller's bound.
+		return readGzipContext(strings.TrimPrefix(payload, legacyCompressedContextPrefix), -1, maxBytes)
+	default:
+		if int64(len(payload)) > maxBytes {
+			return "", fmt.Errorf("legacy context payload contains %d bytes, limit is %d", len(payload), maxBytes)
+		}
+		return payload, nil
+	}
+}
+
+func (s *Store) openContextPayload(encrypted string, maxBytes int64) (string, error) {
+	plain := s.openToken(encrypted)
+	if encrypted != "" && plain == "" {
+		if err := s.CryptoError(); err != nil {
+			return "", err
+		}
+	}
+	return decompressContextPayloadChecked(plain, maxBytes)
 }

@@ -61,6 +61,44 @@ func TestAffinityPriorityParentThreadWins(t *testing.T) {
 	}
 }
 
+func TestAffinityPriorityStatePointerWinsOverCacheAndHierarchyHints(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("thread-id", "shared-thread-hint")
+	body := []byte(`{"previous_response_id":"resp_exact","prompt_cache_key":"shared-cache","thread_id":"body-thread"}`)
+	key := ExtractAffinityKey(req, body)
+	if key.Source != "previous_response_id" || !strings.Contains(key.Key, "resp_exact") {
+		t.Fatalf("exact response state did not win affinity: %+v", key)
+	}
+
+	req.Header.Set("x-codex-turn-state", "state-exact")
+	body = []byte(`{"prompt_cache_key":"shared-cache","thread_id":"body-thread"}`)
+	key = ExtractAffinityKey(req, body)
+	if key.Source != "x-codex-turn-state" || !strings.Contains(key.Key, "state-exact") {
+		t.Fatalf("exact turn state did not win affinity: %+v", key)
+	}
+}
+
+func TestOfficialCodexTurnMetadataUsesStableThreadNotPerTurnSnapshot(t *testing.T) {
+	first, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	first.Header.Set("x-codex-turn-metadata", `{"thread_id":"thread-stable","turn_id":"turn-a","turn_started_at_unix_ms":100,"workspaces":{"a":{"has_changes":false}}}`)
+	second, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	second.Header.Set("x-codex-turn-metadata", `{"thread_id":"thread-stable","turn_id":"turn-b","turn_started_at_unix_ms":200,"workspaces":{"a":{"has_changes":true}}}`)
+
+	firstKey := ExtractAffinityKey(first, []byte(`{"model":"gpt-5.6-sol"}`))
+	secondKey := ExtractAffinityKey(second, []byte(`{"model":"gpt-5.6-sol"}`))
+	if firstKey.Source != CodexRootThreadAffinitySource || secondKey.Source != CodexRootThreadAffinitySource ||
+		firstKey.Hash == "" || firstKey.Hash != secondKey.Hash {
+		t.Fatalf("per-turn metadata changed durable thread affinity: first=%+v second=%+v", firstKey, secondKey)
+	}
+
+	opaque, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	opaque.Header.Set("x-codex-turn-metadata", `{"turn_id":"turn-only","turn_started_at_unix_ms":300}`)
+	opaqueKey := ExtractAffinityKey(opaque, []byte(`{"model":"gpt-5.6-sol"}`))
+	if opaqueKey.Source == "x-codex-turn-metadata" || IsTrueConversationAffinity(opaqueKey) {
+		t.Fatalf("opaque per-turn snapshot became durable affinity: %+v", opaqueKey)
+	}
+}
+
 func TestOfficialCodexRootAndSubagentShareAffinity(t *testing.T) {
 	root, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
 	root.Header.Set("thread-id", "root-thread-1")

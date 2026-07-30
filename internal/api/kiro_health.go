@@ -55,7 +55,9 @@ func (s *Server) adminKiroHealthTest(w http.ResponseWriter, r *http.Request, acc
 	if authResult.Err != nil {
 		authProbe.State = "unreachable"
 	} else {
-		authProbe.Alive = authResult.Ready
+		// Valid credentials with exhausted credits remain alive, but are not ready
+		// for the paid inference stage until their reset/add-on takes effect.
+		authProbe.Alive = authResult.Alive
 	}
 	if authProbe.State == "" {
 		authProbe.State = "unknown"

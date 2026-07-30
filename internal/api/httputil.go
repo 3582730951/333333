@@ -303,6 +303,7 @@ func publicRequestID(w http.ResponseWriter) string {
 func resetPublicErrorHeaders(w http.ResponseWriter) {
 	requestID := strings.TrimSpace(w.Header().Get(requestIDHeader))
 	retryAfter := strings.TrimSpace(w.Header().Get("Retry-After"))
+	cacheControl := strings.TrimSpace(w.Header().Get("Cache-Control"))
 	for name := range w.Header() {
 		w.Header().Del(name)
 	}
@@ -311,6 +312,9 @@ func resetPublicErrorHeaders(w http.ResponseWriter) {
 	}
 	if retryAfter != "" {
 		w.Header().Set("Retry-After", retryAfter)
+	}
+	if strings.Contains(strings.ToLower(cacheControl), "no-store") {
+		w.Header().Set("Cache-Control", cacheControl)
 	}
 	w.Header().Set("Content-Type", "application/json")
 }
@@ -647,7 +651,7 @@ func claudeRequestUsageDiagnostics(body []byte, affinity routing.AffinityKey, tt
 func isTrueConversationAffinity(source string) bool {
 	switch source {
 	case routing.CodexRootThreadAffinitySource, "x-codex-parent-thread-id", "thread_id", "conversation_id",
-		"x-codex-window-id", "prompt_cache_key", "previous_response_id", "x-codex-turn-metadata":
+		"x-codex-window-id", "previous_response_id", "x-codex-turn-state", "x-codex-turn-metadata":
 		return true
 	}
 	return false

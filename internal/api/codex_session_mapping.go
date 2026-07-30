@@ -60,6 +60,14 @@ func (i codexDownstreamIdentity) stateful() bool {
 	return i.ResponseID != "" || i.TurnState != ""
 }
 
+// durableSessionAlias reports whether session_id is the canonical root selected
+// for this request. Some clients expose one process-level session_id across
+// several independent windows; when a concrete thread/conversation id differs,
+// persisting or resolving that weak marker would merge those windows.
+func (i codexDownstreamIdentity) durableSessionAlias() bool {
+	return i.SessionID != "" && i.RootID != "" && i.SessionID == i.RootID
+}
+
 func (i codexDownstreamIdentity) directAliases() []storage.CodexSessionAlias {
 	aliases := make([]storage.CodexSessionAlias, 0, 4)
 	if i.RootID != "" {
@@ -68,7 +76,7 @@ func (i codexDownstreamIdentity) directAliases() []storage.CodexSessionAlias {
 	if i.ThreadID != "" && i.ThreadID != i.RootID {
 		aliases = append(aliases, storage.CodexSessionAlias{Type: "branch", Value: i.ThreadID})
 	}
-	if i.SessionID != "" {
+	if i.durableSessionAlias() {
 		aliases = append(aliases, storage.CodexSessionAlias{Type: "session", Value: i.SessionID})
 	}
 	return aliases
@@ -94,7 +102,7 @@ func (i codexDownstreamIdentity) aliasesForBinding(binding storage.CodexSessionB
 		if i.RootID != "" {
 			aliases = append(aliases, storage.CodexSessionAlias{Type: "root", Value: i.RootID})
 		}
-		if i.SessionID != "" {
+		if i.durableSessionAlias() {
 			aliases = append(aliases, storage.CodexSessionAlias{Type: "session", Value: i.SessionID})
 		}
 	} else if i.ThreadID != "" {
@@ -326,6 +334,7 @@ func codexDownstreamSessionIdentityWithMeta(headers http.Header, body []byte, me
 		threadID = codexHeaderValue(headers, "x-client-request-id")
 	}
 	sessionID := value("session-id", "session_id")
+	conversationID := value("conversation-id", "conversation_id")
 	parentID := value("x-codex-parent-thread-id", "x-codex-parent-thread-id", "parent_thread_id")
 	forkedFrom := value("x-codex-forked-from-thread-id", "forked_from_thread_id")
 	responseID := rootString("previous_response_id")
@@ -346,14 +355,16 @@ func codexDownstreamSessionIdentityWithMeta(headers http.Header, body []byte, me
 			}
 		}
 	}
-	// A child agent uses session_id for its root and parent_thread_id for its
-	// immediate branch relation. The parent must not overwrite the root identity.
-	// When a child omits session_id, its thread id is *not* a root id: retain an
-	// empty root here so resolution can use the parent and persist the child as a
-	// branch instead of accidentally allocating another root session.
-	rootID := sessionID
-	if rootID == "" && parentID == "" {
-		rootID = threadID
+	// A concrete root thread/conversation is stronger than session_id. Several
+	// downstream CLIs use one process-level session marker for independent windows;
+	// choosing that marker first made those windows share one upstream tree.
+	//
+	// A child keeps RootID empty: its exact parent alias establishes tree ownership.
+	// Treating either the child thread or a weak session marker as a root here can
+	// allocate or attach the branch to an unrelated tree.
+	rootID := ""
+	if parentID == "" {
+		rootID = firstNonEmpty(threadID, conversationID, sessionID)
 	}
 	if threadID == "" {
 		threadID = rootID
@@ -789,7 +800,12 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 			for _, alias := range id.directAliases() {
 				candidate, lookupErr := s.lookupCodexSessionAlias(ctx, mapping.namespace, alias)
 				if errors.Is(lookupErr, storage.ErrCodexSessionMappingNotFound) {
-					return mapping, storage.ErrCodexSessionMappingNotFound
+					// A state pointer is the authoritative, terminal-issued alias.
+					// Tolerate an unbound hierarchy value so a pre-fix
+					// session_id-root mapping can migrate to the concrete thread on
+					// its next successful terminal. A hierarchy alias already owned
+					// by another tree is still rejected below.
+					continue
 				}
 				if lookupErr != nil {
 					return mapping, lookupErr
@@ -945,7 +961,7 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 			return mapping, err
 		}
 	}
-	if id.SessionID != "" {
+	if id.durableSessionAlias() {
 		if session, err := s.lookupCodexSessionAlias(ctx, mapping.namespace, storage.CodexSessionAlias{Type: "session", Value: id.SessionID}); err == nil {
 			if session.State != "active" {
 				mapping.anchor = session
@@ -1570,6 +1586,12 @@ func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding 
 	if s == nil || s.store == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	requestID := requestIDFromContext(ctx)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
 	if accountID := strings.TrimSpace(lease.Account.ID); accountID != "" {
 		binding.AccountID = accountID
 	}
@@ -1578,9 +1600,9 @@ func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding 
 	}
 	expiresAt := binding.ExpiresAt
 	if expiresAt <= time.Now().Unix() {
-		expiresAt = time.Now().Add(s.codexSessionMappingRetention(ctx)).Unix()
+		expiresAt = time.Now().Add(s.codexSessionMappingRetention(persistCtx)).Unix()
 	}
-	if err := s.store.InsertCodexUpstreamAttempt(ctx, storage.CodexUpstreamAttempt{
+	if err := s.store.InsertCodexUpstreamAttempt(persistCtx, storage.CodexUpstreamAttempt{
 		TreeID:     binding.TreeID,
 		AccountID:  binding.AccountID,
 		EgressID:   binding.EgressID,
@@ -1589,7 +1611,7 @@ func (s *Server) recordCodexUpstreamAttemptBinding(ctx context.Context, binding 
 		StatusCode: statusCode,
 		ExpiresAt:  expiresAt,
 	}); err != nil {
-		log.Printf("[CODEX-UPSTREAM-ATTEMPT] record request_id=%s: %v", requestIDFromContext(ctx), err)
+		log.Printf("[CODEX-UPSTREAM-ATTEMPT] record request_id=%s: %v", requestID, err)
 	}
 }
 

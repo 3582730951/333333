@@ -271,7 +271,7 @@ func (s *Server) pollAllCodexQuotas(ctx context.Context) {
 func kiroQuotaPollTargets(accounts []storage.Account, tokens map[string]storage.AccountToken, now int64) []quotaPollTarget {
 	var out []quotaPollTarget
 	for _, account := range accounts {
-		if isQuotaPollCandidate(account, now) && strings.TrimSpace(account.Provider) == "kiro" {
+		if isKiroQuotaPollCandidate(account, now) {
 			if token, ok := tokens[account.ID]; ok {
 				out = append(out, quotaPollTarget{Account: account, Token: token})
 			}
@@ -300,56 +300,23 @@ func (s *Server) pollOneKiroQuota(ctx context.Context, acc storage.Account, toke
 	if plan := kiroPlan(limits); plan != "" {
 		_ = s.store.SetAccountPlanType(ctx, acc.ID, plan)
 	}
-	list, _ := lookup(limits, "usageBreakdownList").([]interface{})
-	if len(list) == 0 {
-		return newQuotaPollError("partial", 0, nil, errors.New("kiro usage breakdown missing"))
-	}
-	base, _ := list[0].(map[string]interface{})
-	current := kiroJSONFloat(base, "currentUsageWithPrecision", "currentUsage")
-	limit := kiroJSONFloat(base, "usageLimitWithPrecision", "usageLimit")
-	if trial, ok := lookup(base, "freeTrialInfo").(map[string]interface{}); ok && strings.EqualFold(fmt.Sprint(lookup(trial, "freeTrialStatus")), "ACTIVE") {
-		current += kiroJSONFloat(trial, "currentUsageWithPrecision", "currentUsage")
-		limit += kiroJSONFloat(trial, "usageLimitWithPrecision", "usageLimit")
-	}
-	if bonuses, ok := lookup(base, "bonuses").([]interface{}); ok {
-		for _, v := range bonuses {
-			if b, ok := v.(map[string]interface{}); ok && strings.EqualFold(fmt.Sprint(lookup(b, "status")), "ACTIVE") {
-				current += kiroJSONFloat(b, "currentUsage")
-				limit += kiroJSONFloat(b, "usageLimit")
-			}
-		}
-	}
-	used := -1.0
-	if limit > 0 {
-		used = current / limit * 100
-	}
-	reset := int64(kiroJSONFloat(base, "nextDateReset"))
-	if reset == 0 {
-		reset = int64(kiroJSONFloat(limits, "nextDateReset"))
+	usage, err := parseKiroUsageLimits(limits)
+	if err != nil {
+		return newQuotaPollError("partial", 0, nil, err)
 	}
 	raw, _ := json.Marshal(limits)
-	return s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{AccountID: acc.ID, Provider: "kiro", LimiterType: "kiro_usage", Source: "kiro_usage", UsedPercent: used, LimitTokens: int64(limit), RemainingTokens: int64(limit - current), LimitRequests: -1, RemainingRequests: -1, ResetAt: reset, Status: "allowed", Raw: string(raw), UpdatedAt: storage.Now()})
-}
-
-func kiroJSONFloat(m map[string]interface{}, keys ...string) float64 {
-	for _, k := range keys {
-		if v := lookup(m, k); v != nil {
-			switch n := v.(type) {
-			case float64:
-				return n
-			case json.Number:
-				f, _ := n.Float64()
-				return f
-			}
-		}
-	}
-	return 0
+	return s.store.UpsertAccountRateLimit(ctx, storage.AccountRateLimit{
+		AccountID: acc.ID, Provider: "kiro", LimiterType: "kiro_usage", Source: "kiro_usage",
+		UsedPercent: usage.UsedPercent, LimitTokens: int64(usage.Limit),
+		RemainingTokens: int64(usage.Remaining), LimitRequests: -1, RemainingRequests: -1,
+		ResetAt: usage.ResetAt, Status: usage.Status, Raw: string(raw), UpdatedAt: storage.Now(),
+	})
 }
 
 func quotaPollCandidateAccountIDs(accounts []storage.Account, now int64) []string {
 	ids := make([]string, 0, len(accounts))
 	for _, account := range accounts {
-		if !isQuotaPollCandidate(account, now) {
+		if !isQuotaPollCandidate(account, now) && !isKiroQuotaPollCandidate(account, now) {
 			continue
 		}
 		ids = append(ids, account.ID)
@@ -481,6 +448,12 @@ func isQuotaPollCandidate(account storage.Account, now int64) bool {
 	}
 	provider := strings.TrimSpace(account.Provider)
 	return provider == "" || provider == "codex" || provider == "chatgpt" || provider == "openai" || provider == "claude"
+}
+
+func isKiroQuotaPollCandidate(account storage.Account, now int64) bool {
+	return account.Status == "active" &&
+		account.QuarantineUntil <= now &&
+		strings.EqualFold(strings.TrimSpace(account.Provider), "kiro")
 }
 
 func (s *Server) recordQuotaPollError(ctx context.Context, acc storage.Account, provider string, err error) {

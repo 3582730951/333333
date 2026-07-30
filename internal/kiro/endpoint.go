@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"strings"
@@ -11,10 +12,11 @@ import (
 
 var ErrEndpointNotAllowed = errors.New("kiro endpoint is not allowlisted")
 
-// ValidateEndpoint authorizes the host before any bearer token is attached. Empty
-// endpoints resolve to the official regional Amazon Q host. Custom/private test
-// endpoints require an exact host (including port, when present) in the admin
-// allowlist.
+// ValidateEndpoint authorizes the configured host before any bearer token is
+// attached. Empty endpoints retain the legacy q.<region>.amazonaws.com
+// compatibility value; the operation helpers below translate official values to
+// the Kiro CLI runtime/management service plane. Custom/private test endpoints
+// require an exact host (including port, when present) in the admin allowlist.
 func ValidateEndpoint(raw, region string, allowlist []string) (string, error) {
 	if strings.TrimSpace(raw) == "" {
 		region = normalizeRegion(region)
@@ -89,19 +91,73 @@ func EndpointHash(raw, region string, allowlist []string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// GenerateAssistantResponseEndpoint, ListAvailableModelsEndpoint, and
+// GetUsageLimitsEndpoint keep the service plane separate while retaining the
+// legacy operation paths of an explicitly allowlisted compatibility endpoint.
+// The official Kiro CLI uses the runtime host for generation and the management
+// host for catalog/profile/usage operations, all at the root path.
+func GenerateAssistantResponseEndpoint(raw, region string, allowlist []string) (string, error) {
+	return operationEndpoint(raw, region, allowlist, "runtime", "/generateAssistantResponse")
+}
+
+func ListAvailableModelsEndpoint(raw, region string, allowlist []string) (string, error) {
+	return operationEndpoint(raw, region, allowlist, "management", "/listAvailableModels")
+}
+
+func GetUsageLimitsEndpoint(raw, region string, allowlist []string) (string, error) {
+	return operationEndpoint(raw, region, allowlist, "management", "/getUsageLimits")
+}
+
+func operationEndpoint(raw, region string, allowlist []string, plane, compatibilityPath string) (string, error) {
+	validated, err := ValidateEndpoint(raw, region, allowlist)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(validated)
+	if err != nil {
+		return "", ErrEndpointNotAllowed
+	}
+	if endpointRegion, official := officialKiroRegion(strings.ToLower(parsed.Hostname())); official {
+		return fmt.Sprintf("https://%s.%s.kiro.dev/", plane, endpointRegion), nil
+	}
+
+	// An administrator may explicitly point at an allowlisted compatibility
+	// service. Preserve that authority and any base path instead of rewriting it
+	// to a public Kiro host.
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	for _, suffix := range []string{"/generateAssistantResponse", "/getUsageLimits", "/listAvailableModels"} {
+		parsed.Path = strings.TrimSuffix(strings.TrimRight(parsed.Path, "/"), suffix)
+	}
+	parsed.RawPath = ""
+	base := strings.TrimRight(parsed.String(), "/")
+	if base == "" {
+		return "", ErrEndpointNotAllowed
+	}
+	return base + compatibilityPath, nil
+}
+
 func officialKiroHost(host string) bool {
-	if !strings.HasPrefix(host, "q.") || !strings.HasSuffix(host, ".amazonaws.com") {
-		return false
+	_, ok := officialKiroRegion(strings.ToLower(strings.TrimSpace(host)))
+	return ok
+}
+
+func officialKiroRegion(host string) (string, bool) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	var region string
+	switch {
+	case strings.HasPrefix(host, "q.") && strings.HasSuffix(host, ".amazonaws.com"):
+		region = strings.TrimSuffix(strings.TrimPrefix(host, "q."), ".amazonaws.com")
+	case strings.HasPrefix(host, "runtime.") && strings.HasSuffix(host, ".kiro.dev"):
+		region = strings.TrimSuffix(strings.TrimPrefix(host, "runtime."), ".kiro.dev")
+	case strings.HasPrefix(host, "management.") && strings.HasSuffix(host, ".kiro.dev"):
+		region = strings.TrimSuffix(strings.TrimPrefix(host, "management."), ".kiro.dev")
+	default:
+		return "", false
 	}
-	region := strings.TrimSuffix(strings.TrimPrefix(host, "q."), ".amazonaws.com")
-	if region == "" || strings.Contains(region, ".") {
-		return false
-	}
-	for _, r := range region {
-		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
-			return false
-		}
+	if region == "" || strings.Contains(region, ".") || !validRegion(region) {
+		return "", false
 	}
 	// Reject numeric IP spellings that happen to pass textual suffix checks.
-	return net.ParseIP(host) == nil
+	return region, net.ParseIP(host) == nil
 }

@@ -17,7 +17,6 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -221,7 +220,7 @@ func run() int {
 		}
 		return nil
 	}
-	var deferredMigrationsOnce sync.Once
+	deferredMigrations := newDeferredMigrationTask(store.RunDeferredMigrations, log.Printf)
 	startActive := func(activeCtx context.Context, fencingToken int64) error {
 		if err := app.StartRuntime(); err != nil {
 			return fmt.Errorf("start active runtime: %w", err)
@@ -256,18 +255,7 @@ func run() int {
 		app.StartQuotaPoller(activeCtx)
 		app.StartModelQualityMonitor(activeCtx)
 		startActiveLedgerPurge(activeCtx, store, cfg)
-		deferredMigrationsOnce.Do(func() {
-			supervisor.GoOnce("storage-deferred-migrations", func() {
-				started := time.Now()
-				if err := store.RunDeferredMigrations(activeCtx); err != nil {
-					if !errors.Is(err, context.Canceled) {
-						log.Printf("deferred storage migrations: %v", err)
-					}
-					return
-				}
-				log.Printf("startup: deferred storage migrations completed in %s", time.Since(started).Round(time.Millisecond))
-			})
-		})
+		deferredMigrations.Start(activeCtx)
 		log.Printf("worker role active release=%s fencing_token=%d", releaseID, fencingToken)
 		return nil
 	}

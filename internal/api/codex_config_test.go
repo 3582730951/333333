@@ -47,18 +47,22 @@ func TestCodexConfigScript(t *testing.T) {
 		`supports_websockets = $supports_websockets`,
 		`probe_codex_websocket`,
 		`POOL_CODEX_WEBSOCKETS`,
-		"experimental_bearer_token",
 		`API_KEY='` + plain + `'`,
 		`MODEL='gpt-5.6-sol'`,
-		`model_context_window = 372000`,
+		`name = "OpenAI"`,
+		`[model_providers.$PROVIDER_ID.auth]`,
+		`command = "/bin/cat"`,
+		`args = ["$TOKEN_FILE"]`,
 		"/v1\"", // base_url ends with /v1
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("codex config script missing %q\n---\n%s", want, s)
 		}
 	}
-	if strings.Contains(s, "model_auto_compact_token_limit =") {
-		t.Fatalf("codex config script must leave automatic compaction to the current client\n---\n%s", s)
+	for _, forbidden := range []string{"experimental_bearer_token =", "model_context_window =", "model_auto_compact_token_limit ="} {
+		if strings.Contains(s, forbidden) {
+			t.Fatalf("codex config script must use command auth + live model metadata, found %q\n---\n%s", forbidden, s)
+		}
 	}
 	// chat wire_api was removed upstream — never emit it.
 	if strings.Contains(s, `wire_api = "chat"`) {

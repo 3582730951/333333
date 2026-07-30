@@ -472,9 +472,18 @@ func (s *Server) probeAccountLiveness(ctx context.Context, account storage.Accou
 		if len(res.Body) == 0 {
 			res.Body, _ = json.Marshal(usageResult.Limits)
 		}
-		res.Verdict = ban.Classify(true, usageResult.StatusCode, usageResult.Header, res.Body)
+		usage, usageErr := parseKiroUsageLimits(usageResult.Limits)
+		if usageErr != nil {
+			res.Err = usageErr
+			return res
+		}
 		res.Alive = true
-		res.Ready = true
+		res.Ready = usage.Status != "exhausted"
+		if res.Ready {
+			res.Verdict = ban.Classify(true, usageResult.StatusCode, usageResult.Header, res.Body)
+		} else {
+			res.Verdict = ban.Verdict{State: ban.RateLimited, Reason: "kiro_usage_exhausted"}
+		}
 		return res
 	}
 	req := upstream.Request{
@@ -790,6 +799,9 @@ func (s *Server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if rows == nil {
+		rows = []storage.AuditLogRow{}
 	}
 	writeJSON(w, http.StatusOK, rows)
 }

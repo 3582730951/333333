@@ -195,6 +195,97 @@ func TestAccountRateLimitBatchLookupAndSnapshotFiltering(t *testing.T) {
 	}
 }
 
+func TestClearAccountCooldownAtomicallyClearsOnlyAccountLocalGates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := Now()
+	accountID := "manual-cooldown-clear"
+	if err := store.UpsertAccount(ctx, Account{ID: accountID, Label: accountID, GroupName: "cyber", Provider: "codex", Status: "active"}, AccountToken{AccessToken: "token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BenchBindingForRecheck(ctx, accountID, now+3600); err != nil {
+		t.Fatal(err)
+	}
+
+	egress, err := store.GetEgressProfile(ctx, DefaultDirectEgressID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	egress.CooldownUntil = now + 7200
+	egress.Health = "cooldown"
+	if err := store.UpsertEgressProfile(ctx, egress); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshots := []AccountRateLimit{
+		{AccountID: accountID, Provider: "codex", Model: "gpt-5", LimiterType: "tokens", RemainingTokens: 0, RemainingRequests: -1, ResetAt: now + 900, Status: "rejected"},
+		{AccountID: accountID, Provider: "codex", Model: "", LimiterType: "requests", RemainingTokens: -1, RemainingRequests: 0, ResetAt: now + 600, Status: "allowed_warning"},
+		{AccountID: accountID, Provider: "claude", Model: "", LimiterType: "unified", RemainingTokens: 100, RemainingRequests: -1, ResetAt: now + 1200, Status: "allowed"},
+		{AccountID: accountID, Provider: "codex", Model: "expired", LimiterType: "tokens", RemainingTokens: 0, RemainingRequests: -1, ResetAt: now - 60, Status: "rejected"},
+	}
+	for _, snapshot := range snapshots {
+		if err := store.UpsertAccountRateLimit(ctx, snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	generation := store.RateLimitGeneration()
+	cleared, err := store.ClearAccountCooldown(ctx, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared != 2 {
+		t.Fatalf("cleared snapshots = %d, want 2", cleared)
+	}
+	if store.RateLimitGeneration() <= generation {
+		t.Fatal("rate-limit generation was not advanced")
+	}
+	binding, err := store.GetEgressBinding(ctx, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.CooldownUntil != 0 || binding.RecheckPending {
+		t.Fatalf("binding cooldown remained after clear: %+v", binding)
+	}
+	if until, limited, err := store.AccountRateLimitCooldownUntil(ctx, accountID, "codex", "gpt-5", now); err != nil || limited || until != 0 {
+		t.Fatalf("account rate-limit cooldown remained: until=%d limited=%v err=%v", until, limited, err)
+	}
+
+	for _, key := range []struct {
+		provider, model, limiter, status string
+		resetAt                          int64
+	}{
+		{"codex", "gpt-5", "tokens", "manual_cleared", 0},
+		{"codex", "", "requests", "manual_cleared", 0},
+		{"claude", "", "unified", "allowed", now + 1200},
+		{"codex", "expired", "tokens", "rejected", now - 60},
+	} {
+		row, ok, err := store.GetAccountRateLimitFor(ctx, accountID, key.provider, key.model, key.limiter)
+		if err != nil || !ok {
+			t.Fatalf("snapshot %s/%s/%s: ok=%v err=%v", key.provider, key.model, key.limiter, ok, err)
+		}
+		if row.Status != key.status || row.ResetAt != key.resetAt {
+			t.Fatalf("snapshot %s/%s/%s = status %q reset %d, want %q/%d", key.provider, key.model, key.limiter, row.Status, row.ResetAt, key.status, key.resetAt)
+		}
+	}
+	unchangedEgress, err := store.GetEgressProfile(ctx, DefaultDirectEgressID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchangedEgress.CooldownUntil != now+7200 || unchangedEgress.Health != "cooldown" {
+		t.Fatalf("account clear mutated shared egress: %+v", unchangedEgress)
+	}
+
+	generation = store.RateLimitGeneration()
+	cleared, err = store.ClearAccountCooldown(ctx, accountID)
+	if err != nil || cleared != 0 {
+		t.Fatalf("idempotent clear = (%d, %v), want (0, nil)", cleared, err)
+	}
+	if store.RateLimitGeneration() != generation {
+		t.Fatal("idempotent clear unexpectedly advanced rate-limit generation")
+	}
+}
+
 func TestAccountRateLimitMigrationAddsCompositeDimension(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
 	if err != nil {

@@ -196,6 +196,18 @@ func markModuleStopped(name string) {
 	})
 }
 
+func markModuleCompleted(name string) {
+	now := time.Now().Unix()
+	moduleStates.update(name, func(state ModuleState) ModuleState {
+		state.Status = StatusStopped
+		state.LastEventUnix = now
+		state.NextRestartUnix = 0
+		state.RestartBackoffMillis = 0
+		state.LastMessage = "task completed"
+		return state
+	})
+}
+
 func clearModuleStatesForTest() {
 	moduleStates.clear()
 }

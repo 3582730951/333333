@@ -121,6 +121,108 @@ type runResult struct {
 	stack    []byte
 }
 
+// GoUntilSuccess runs a finite background task until it returns nil. Errors and
+// panics are retried with the same bounded backoff used by long-lived modules,
+// while a successful return is terminal rather than an "unexpected exit".
+func GoUntilSuccess(ctx context.Context, name string, run func(context.Context) error) {
+	GoUntilSuccessWithOptions(ctx, Options{Name: name}, run)
+}
+
+// GoUntilSuccessWithOptions is GoUntilSuccess with explicit retry/backoff
+// settings. It is suitable for idempotent migrations and other finite startup
+// work that must survive a transient database lock but must not restart forever
+// after it has completed.
+func GoUntilSuccessWithOptions(ctx context.Context, opts Options, run func(context.Context) error) {
+	opts = normalizeOptions(opts)
+	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				LogPanicWithLogf(opts.Name, fmt.Sprintf("supervisor task loop panic: %v", v), opts.Logf)
+			}
+		}()
+		retryUntilSuccess(ctx, opts, run)
+	}()
+}
+
+type taskRunResult struct {
+	err      error
+	panicked bool
+	panicVal any
+	stack    []byte
+}
+
+func retryUntilSuccess(ctx context.Context, opts Options, run func(context.Context) error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if run == nil {
+		markModuleCompleted(opts.Name)
+		return
+	}
+	backoff := opts.InitialBackoff
+	for {
+		if ctx.Err() != nil {
+			markModuleStopped(opts.Name)
+			return
+		}
+
+		started := time.Now()
+		markModuleStarted(opts.Name)
+		result := runTaskProtected(ctx, run)
+		if !result.panicked && result.err == nil {
+			markModuleCompleted(opts.Name)
+			return
+		}
+		if ctx.Err() != nil {
+			markModuleStopped(opts.Name)
+			return
+		}
+
+		uptime := time.Since(started).Round(time.Millisecond)
+		event := Event{
+			Module:        opts.Name,
+			UptimeMillis:  uptime.Milliseconds(),
+			BackoffMillis: backoff.Milliseconds(),
+		}
+		if result.panicked {
+			event.Type = "panic_restart"
+			event.Message = "task panic; retrying"
+			event.Panic = fmt.Sprint(result.panicVal)
+			opts.Logf("[SUPERVISOR] module=%s panic=%v uptime=%s; retrying after %s\n%s",
+				opts.Name, result.panicVal, uptime, backoff, result.stack)
+		} else {
+			event.Type = "error_retry"
+			event.Message = fmt.Sprintf("task failed; retrying: %v", result.err)
+			opts.Logf("[SUPERVISOR] module=%s error=%v uptime=%s; retrying after %s",
+				opts.Name, result.err, uptime, backoff)
+		}
+		recordEvent(event)
+		markModuleRestarting(opts.Name, event)
+
+		if !sleepContext(ctx, backoff) {
+			markModuleStopped(opts.Name)
+			return
+		}
+		if uptime >= opts.ResetAfter {
+			backoff = opts.InitialBackoff
+		} else {
+			backoff = nextBackoff(backoff, opts.MaxBackoff)
+		}
+	}
+}
+
+func runTaskProtected(ctx context.Context, run func(context.Context) error) (result taskRunResult) {
+	defer func() {
+		if v := recover(); v != nil {
+			result.panicked = true
+			result.panicVal = v
+			result.stack = debug.Stack()
+		}
+	}()
+	result.err = run(ctx)
+	return result
+}
+
 func supervise(ctx context.Context, opts Options, run func(context.Context)) {
 	if ctx == nil {
 		ctx = context.Background()

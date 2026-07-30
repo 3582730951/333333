@@ -120,6 +120,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w, r)
 
 	rec := &responseRecorder{ResponseWriter: w, status: http.StatusOK}
+	requestBytes := r.ContentLength
+	metricRoute := s.httpMetrics.begin(r.URL.Path)
+	defer func() {
+		s.httpMetrics.finish(metricRoute, rec.status, requestBytes, rec.bytes, time.Since(start))
+	}()
 	if s.rejectForStoragePressure(r) {
 		writePublicServiceUnavailable(rec)
 		return

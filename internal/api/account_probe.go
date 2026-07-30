@@ -10,6 +10,7 @@ import (
 	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/config"
 	kirowire "codex-account-pool/internal/kiro"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"codex-account-pool/internal/upstream"
@@ -23,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -139,6 +141,41 @@ func (s *Server) probeAccountModelsWithDeps(ctx context.Context, account storage
 		// fall through to the Codex /models probe below
 	default:
 		// Custom OpenAI-compatible provider (DeepSeek, …).
+		custom, found, loadErr := s.store.GetCustomProvider(ctx, provider)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if !found {
+			return nil, nil
+		}
+		// A disabled provider is a hard network boundary for every automatic
+		// discovery path (periodic sweep and post-import async probe). Preserve
+		// the last capability snapshot so disabling/re-enabling a provider does
+		// not destroy operator state, but do not contact its relay.
+		if !custom.Enabled {
+			return s.store.ListCapabilities(ctx, account.ID)
+		}
+		// Manual provider catalogs are seeded synchronously at import/update
+		// time. When discovery is disabled, the detached post-import probe must
+		// be a strict no-op: probing that same static list would race operator or
+		// runtime capability evidence and replace unrelated rows.
+		if !custom.AutoDiscoverModels {
+			return s.store.ListCapabilities(ctx, account.ID)
+		}
+		if len(custom.EgressIDs) > 0 && s.scheduler != nil {
+			lease, selectErr := s.scheduler.Select(ctx, scheduler.Route{
+				Group:              account.GroupName,
+				Provider:           provider,
+				PreferredEgressIDs: custom.EgressIDs,
+				RequiredAccountID:  account.ID,
+				SkipWait:           true,
+			})
+			if selectErr != nil {
+				return nil, selectErr
+			}
+			defer lease.Release()
+			binding, egress = lease.Binding, lease.Egress
+		}
 		return s.probeCustomModels(ctx, account, token, binding, egress, provider)
 	}
 	token, err = s.ensureAgentIdentityTask(ctx, account, token, egress, binding.CookieJarKey, "")
@@ -248,7 +285,7 @@ func kiroCatalogCapabilities(accountID string, catalog []storage.KiroModelDescri
 			contextState = capability.Context1MUnknown
 			contextSource = ""
 		}
-		out = append(out, storage.ModelCapability{
+		cap := storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     descriptor.PublicID,
 			AvailabilityState:             capability.AvailabilityVerified,
@@ -260,7 +297,8 @@ func kiroCatalogCapabilities(accountID string, catalog []storage.KiroModelDescri
 			RawModelJSONHash:              descriptor.RawJSONHash,
 			Source:                        "kiro_live_catalog",
 			LastProbeAt:                   now,
-		})
+		}
+		out = append(out, capability.ApplyGPT56ContextContract(cap))
 	}
 	return out
 }
@@ -441,6 +479,9 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 	if !ok {
 		return nil, nil
 	}
+	if !prov.Enabled {
+		return s.store.ListCapabilities(ctx, account.ID)
+	}
 	seen := map[string]bool{}
 	var ordered []string
 	add := func(slug string) {
@@ -454,7 +495,22 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 	for _, m := range prov.Models {
 		add(m)
 	}
+	mappingSources := make([]string, 0, len(prov.ModelMappings))
+	for source := range prov.ModelMappings {
+		mappingSources = append(mappingSources, source)
+	}
+	sort.Strings(mappingSources)
+	for _, source := range mappingSources {
+		add(prov.ModelMappings[source])
+	}
 	var discovered []string
+	verified := map[string]bool{}
+	markVerified := func(model string) {
+		verified[strings.ToLower(strings.TrimSpace(model))] = true
+	}
+	isVerified := func(model string) bool {
+		return verified[strings.ToLower(strings.TrimSpace(model))]
+	}
 	if prov.AutoDiscoverModels && strings.TrimSpace(prov.BaseURL) != "" {
 		headers := http.Header{}
 		if prov.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages {
@@ -492,11 +548,52 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 					for _, c := range caps {
 						discovered = append(discovered, c.ModelSlug)
 						add(c.ModelSlug)
+						markVerified(c.ModelSlug)
 					}
 				} else {
 					log.Printf("custom model probe %s (%s, protocol=%s): parse: %v", account.ID, providerID, prov.UpstreamProtocol, perr)
 				}
 			}
+		}
+		// Many Anthropic-compatible relay stations implement /messages but not
+		// /models. Fall back to the maintained Claude candidate table and verify
+		// each candidate with the smallest valid non-streaming request. Stop on
+		// auth, throttling, transport, or server failure so discovery never turns a
+		// transient outage into a burst.
+		if prov.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages && len(discovered) == 0 {
+			candidates := append([]string(nil), ordered...)
+			candidates = append(candidates, capability.ClaudeProbeModelTable()...)
+			candidateSeen := map[string]bool{}
+			for _, candidate := range candidates {
+				candidate = strings.TrimSpace(candidate)
+				key := strings.ToLower(candidate)
+				if candidate == "" || candidateSeen[key] {
+					continue
+				}
+				candidateSeen[key] = true
+				available, stop := s.probeCustomAnthropicModelCandidate(ctx, account, token, binding, egress, prov, candidate)
+				if available {
+					discovered = append(discovered, candidate)
+					add(candidate)
+					markVerified(candidate)
+				}
+				if stop {
+					break
+				}
+			}
+		}
+	}
+	// Mapping sources are downstream-visible model aliases. Probe only each concrete
+	// target above, then mirror its evidence onto the source so /v1/models advertises
+	// what clients should request rather than forcing them to know relay internals.
+	for _, source := range mappingSources {
+		target := prov.ModelMappings[source]
+		if strings.TrimSpace(source) == "*" {
+			continue
+		}
+		add(source)
+		if isVerified(target) {
+			markVerified(source)
 		}
 	}
 	// Persist newly discovered models into the provider's list so routing + the admin UI
@@ -522,12 +619,19 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 	now := storage.Now()
 	caps := make([]storage.ModelCapability, 0, len(ordered))
 	for _, slug := range ordered {
+		availability := capability.AvailabilityUnverified
+		source := "custom_manual:" + providerID
+		if isVerified(slug) {
+			availability = capability.AvailabilityVerified
+			source = "custom_probe:" + providerID
+		}
 		caps = append(caps, storage.ModelCapability{
 			AccountID:                     account.ID,
 			ModelSlug:                     slug,
+			AvailabilityState:             availability,
 			EffectiveContextWindowPercent: 100,
 			Visibility:                    "list",
-			Source:                        "custom:" + providerID,
+			Source:                        source,
 			LastProbeAt:                   now,
 		})
 	}
@@ -538,6 +642,57 @@ func (s *Server) probeCustomModels(ctx context.Context, account storage.Account,
 		return nil, err
 	}
 	return caps, nil
+}
+
+// probeCustomAnthropicModelCandidate performs one explicit model reachability
+// check. The bool pair is (available, stopDiscovery). Unsupported-model responses
+// continue to the next table entry; infrastructure/auth/rate failures stop.
+func (s *Server) probeCustomAnthropicModelCandidate(
+	ctx context.Context,
+	account storage.Account,
+	token storage.AccountToken,
+	binding storage.AccountEgressBinding,
+	egress storage.EgressProfile,
+	provider storage.CustomProvider,
+	model string,
+) (bool, bool) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": model, "max_tokens": 1, "stream": false,
+		"messages": []map[string]interface{}{{"role": "user", "content": "Reply OK"}},
+	})
+	headers := http.Header{}
+	headers.Set("Anthropic-Version", "2023-06-01")
+	req := upstream.Request{
+		Method: http.MethodPost, Provider: provider.ID, BaseURL: provider.BaseURL,
+		TransportProfile: provider.TransportProfile, DownstreamPath: "/messages",
+		Headers: headers, Account: account, Token: token, Egress: egress,
+		CookieJarKey: binding.CookieJarKey, MinimalProbe: true,
+	}
+	req.SetBodyBytes(body)
+	resp, err := s.upstream.Do(ctx, req)
+	if err != nil {
+		log.Printf("custom Claude model probe %s (%s/%s): %v", account.ID, provider.ID, model, err)
+		return false, true
+	}
+	raw, readErr := upstream.DrainAndClose(resp.Body)
+	if readErr != nil {
+		return false, true
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if validateCustomUpstreamJSONResponse(storage.CustomProviderProtocolAnthropicMessages, raw) == nil {
+			return true, false
+		}
+		return false, true
+	}
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized,
+		resp.StatusCode == http.StatusForbidden,
+		resp.StatusCode == http.StatusTooManyRequests,
+		resp.StatusCode >= http.StatusInternalServerError:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func (s *Server) adminProbeModels(w http.ResponseWriter, r *http.Request, accountID string) {

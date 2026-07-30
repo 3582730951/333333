@@ -30,8 +30,11 @@ func TestSetupScriptBashSyntaxAndContents(t *testing.T) {
 		"configure_codex",
 		"configure_claude",
 		"$GATEWAY_BIN run-claude --",
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-		"DISABLE_AUTOUPDATER",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING",
+		`GATEWAY_KEY="${API_KEY:-any-non-empty}"`,
+		`export ANTHROPIC_AUTH_TOKEN="$GATEWAY_KEY"`,
+		`--key "$GATEWAY_KEY"`,
 		"rtk init --codex",
 		`MODEL='gpt-5.5'`, // model via shell var → config.toml
 		`model_reasoning_effort = "xhigh"`,
@@ -62,28 +65,33 @@ func TestSetupScriptBashSyntaxAndContents(t *testing.T) {
 	}
 }
 
-func TestSetupScriptWrites56HardLimitAndLeavesCompactionToClient(t *testing.T) {
+func TestSetupScriptUsesLiveCatalogFor56ContextLimits(t *testing.T) {
 	script := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.6-sol", "ultra", "never", "danger-full-access")
 	for _, want := range []string{
-		"model_context_window = 372000",
 		`model_reasoning_effort = "ultra"`,
+		`name = "OpenAI"`,
+		`[model_providers.$PROVIDER_ID.auth]`,
+		`command = "/bin/cat"`,
+		`args = ["$TOKEN_FILE"]`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("5.6 setup script missing %q\n---\n%s", want, script)
 		}
 	}
-	if strings.Contains(script, "model_auto_compact_token_limit =") {
-		t.Fatalf("5.6 setup script must leave automatic compaction to Codex\n---\n%s", script)
+	for _, forbidden := range []string{"model_context_window =", "model_auto_compact_token_limit =", "experimental_bearer_token ="} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("setup script must obtain live context/auth metadata instead of writing %q\n---\n%s", forbidden, script)
+		}
 	}
 	legacy := buildCodexConfigScript("https://pool.example/", "cap_abc123", "gpt-5.5", "xhigh", "never", "danger-full-access")
-	for _, forbidden := range []string{"model_context_window = 372000", "model_auto_compact_token_limit ="} {
+	for _, forbidden := range []string{"model_context_window =", "model_auto_compact_token_limit ="} {
 		if strings.Contains(legacy, forbidden) {
-			t.Fatalf("non-5.6 setup script received 5.6 override %q", forbidden)
+			t.Fatalf("non-5.6 setup script received a static context override %q", forbidden)
 		}
 	}
 }
 
-func TestSetupScriptInstallsUnique56ContextKeys(t *testing.T) {
+func TestSetupScriptRemovesStaleContextKeysAndInstallsCommandAuth(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
@@ -94,6 +102,9 @@ func TestSetupScriptInstallsUnique56ContextKeys(t *testing.T) {
 	}
 	existing := "model_context_window = 111000\nmodel_auto_compact_token_limit = 100000\n[features]\nmulti_agent = true\n"
 	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "models_cache.json"), []byte(`{"provider":"old"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	scriptPath := filepath.Join(t.TempDir(), "setup.sh")
@@ -116,22 +127,51 @@ func TestSetupScriptInstallsUnique56ContextKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := string(data)
-	for _, line := range []string{"model_context_window = 372000"} {
+	for _, line := range []string{
+		`name = "OpenAI"`,
+		`command = "/bin/cat"`,
+		`refresh_interval_ms = 300000`,
+	} {
 		if strings.Count(config, line) != 1 {
 			t.Fatalf("installed config must contain exactly one %q\n---\n%s", line, config)
 		}
 	}
-	for _, stale := range []string{"model_context_window = 111000", "model_auto_compact_token_limit = 100000", "model_auto_compact_token_limit ="} {
+	for _, stale := range []string{"model_context_window =", "model_auto_compact_token_limit ="} {
 		if strings.Contains(config, stale) {
-			t.Fatalf("installed config retained stale key %q\n---\n%s", stale, config)
+			t.Fatalf("stale client-side context override %q survived\n---\n%s", stale, config)
 		}
 	}
 	if !strings.Contains(config, "multi_agent = true") || !strings.Contains(config, `model_reasoning_effort = "ultra"`) {
 		t.Fatalf("setup reduced existing features or reasoning effort\n---\n%s", config)
 	}
+	firstTable := strings.Index(config, "[")
+	for _, rootKey := range []string{`model = "gpt-5.6-sol"`, `model_provider = "poolserver"`, `model_reasoning_effort = "ultra"`} {
+		pos := strings.Index(config, rootKey)
+		if pos < 0 || firstTable < 0 || pos > firstTable {
+			t.Fatalf("managed TOML root key %q was nested below a table\n---\n%s", rootKey, config)
+		}
+	}
+	if providerPos, featuresPos := strings.Index(config, "[model_providers.poolserver]"), strings.Index(config, "[features]"); providerPos <= featuresPos {
+		t.Fatalf("Pool provider replacement should follow preserved user tables without nesting root keys\n---\n%s", config)
+	}
+	tokenPath := filepath.Join(codexDir, "pool-token")
+	token, err := os.ReadFile(tokenPath)
+	if err != nil || strings.TrimSpace(string(token)) != "cap_abc123" {
+		t.Fatalf("command-auth token=%q err=%v", token, err)
+	}
+	if info, err := os.Stat(tokenPath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("command-auth token mode=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(filepath.Join(codexDir, "models_cache.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale cross-provider model cache was not moved: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(codexDir, "models_cache.json.bak.*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("model cache rollback copy=%v err=%v", matches, err)
+	}
 }
 
-func TestSetupScriptPreservesNon56ContextKeys(t *testing.T) {
+func TestSetupScriptRemovesContextKeysForEveryModel(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
 	}
@@ -164,10 +204,49 @@ func TestSetupScriptPreservesNon56ContextKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	config := string(data)
-	for _, preserved := range []string{"model_context_window = 256000", "model_auto_compact_token_limit = 220000", "multi_agent = true"} {
-		if strings.Count(config, preserved) != 1 {
-			t.Fatalf("non-5.6 setup did not preserve %q exactly once\n---\n%s", preserved, config)
+	for _, stale := range []string{"model_context_window =", "model_auto_compact_token_limit ="} {
+		if strings.Contains(config, stale) {
+			t.Fatalf("non-5.6 setup retained stale context override %q\n---\n%s", stale, config)
 		}
+	}
+	if strings.Count(config, "multi_agent = true") != 1 {
+		t.Fatalf("non-context user config was not preserved exactly once\n---\n%s", config)
+	}
+}
+
+func TestSetupScriptRefusesSymlinkedCredentialFile(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	home := t.TempDir()
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "must-not-change")
+	if err := os.WriteFile(outside, []byte("original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(codexDir, "pool-token")); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(t.TempDir(), "setup.sh")
+	if err := os.WriteFile(scriptPath, []byte(buildCodexConfigScript("https://pool.example/", "replacement-secret", "gpt-5.6-sol", "ultra", "never", "danger-full-access")), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = []string{
+		"HOME=" + home,
+		"PATH=" + os.Getenv("PATH"),
+		"POOL_CLIENT=codex",
+		"POOL_INSTALL_RTK=0",
+		"POOL_CODEX_WEBSOCKETS=0",
+	}
+	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "symlinked") {
+		t.Fatalf("symlinked token was not rejected: err=%v output=%s", err, out)
+	}
+	if raw, err := os.ReadFile(outside); err != nil || string(raw) != "original\n" {
+		t.Fatalf("symlink target changed: raw=%q err=%v", raw, err)
 	}
 }
 
@@ -179,7 +258,8 @@ func TestSetupScriptCodexBranchIsIsolatedFromClaudeGateway(t *testing.T) {
 		`CONFIG="$CODEX_HOME/config.toml"`,
 		`base_url = "$ORIGIN/v1"`,
 		`wire_api = "responses"`,
-		`experimental_bearer_token`,
+		`[model_providers.$PROVIDER_ID.auth]`,
+		`command = "/bin/cat"`,
 		`rtk init --codex`,
 	} {
 		if !strings.Contains(codexBranch, want) {
@@ -204,7 +284,7 @@ func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) 
 	claudeBranch := scriptBetween(t, script, "configure_claude() {", "\n}\n\nmain()")
 	for _, want := range []string{
 		"install_gateway_binary",
-		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$API_KEY"`,
+		`"$GATEWAY_BIN" init --pool-url "$ORIGIN" --key "$GATEWAY_KEY"`,
 		`Claude Code 模型由客户端自行选择；VPS force_model 可能在服务端覆盖`,
 		`"$GATEWAY_BIN" stop`,
 		`CA 自动信任失败；安装尚未完成`,
@@ -212,18 +292,14 @@ func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) 
 		`"$GATEWAY_BIN" probe-identity`,
 		"$GATEWAY_BIN run-claude --",
 		"ANTHROPIC_BASE_URL=$ORIGIN",
-		`ANTHROPIC_API_KEY="$API_KEY"`,
+		"unset ANTHROPIC_API_KEY",
+		`ANTHROPIC_AUTH_TOKEN="$GATEWAY_KEY"`,
 		"CLAUDE_CODE_ENABLE_AUTO_MODE=1",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1",
+		"CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1",
 		"claude-plan",
 		`POOL_CLIENT_RUNTIME="${POOL_CLIENT_RUNTIME:-compat}"`,
 		`POOL_STRICT_LINUX="${POOL_STRICT_LINUX:-0}"`,
-		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-		"DO_NOT_TRACK=1",
-		"DISABLE_TELEMETRY=1",
-		"DISABLE_ERROR_REPORTING=1",
-		"DISABLE_AUTOUPDATER=1",
-		"OTEL_METRICS_EXPORTER=none",
-		"OTEL_LOGS_EXPORTER=none",
 	} {
 		if !strings.Contains(claudeBranch, want) {
 			t.Fatalf("claude branch missing %q\n---\n%s", want, claudeBranch)
@@ -234,6 +310,7 @@ func TestSetupScriptClaudeBranchUsesGatewayCompatRuntimeByDefault(t *testing.T) 
 		`--model "$MODEL"`,
 		"ANTHROPIC_MODEL",
 		"CLAUDE_CODE_SUBAGENT_MODEL",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
 	} {
 		if strings.Contains(claudeBranch, forbidden) {
 			t.Fatalf("claude branch must not contain %q\n---\n%s", forbidden, claudeBranch)
@@ -352,10 +429,14 @@ base_url = "https://other.example/v1"
 		t.Fatalf("codex config missing: %v\noutput:\n%s", err, out)
 	}
 	config := string(data)
-	for _, want := range []string{`model = "gpt-5.5"`, `base_url = "https://pool.example/v1"`, `wire_api = "responses"`, `supports_websockets = false`, `experimental_bearer_token = "cap_abc123"`} {
+	for _, want := range []string{`model = "gpt-5.5"`, `base_url = "https://pool.example/v1"`, `wire_api = "responses"`, `supports_websockets = false`, `[model_providers.poolserver.auth]`, `command = "/bin/cat"`} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("codex config missing %q\n---\n%s", want, config)
 		}
+	}
+	token, err := os.ReadFile(filepath.Join(codexDir, "pool-token"))
+	if err != nil || strings.TrimSpace(string(token)) != "cap_abc123" {
+		t.Fatalf("codex command-auth token=%q err=%v", token, err)
 	}
 	for _, want := range []string{`[mcp_servers.keep]`, `command = "keep-mcp"`, `[plugins.keep]`, `skill = "repo-review"`, `[features]`, `multi_agent = true`, `[model_providers.other]`} {
 		if !strings.Contains(config, want) {

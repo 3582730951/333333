@@ -1096,7 +1096,7 @@ func kiroNoDegradationTemplateValues() map[string]interface{} {
 		"kiro_default_thinking":           true,
 		"kiro_cache_mode":                 "auto",
 		"kiro_cache_unreported_threshold": float64(config.DefaultKiroCacheUnreportedThreshold),
-		"kiro_affinity_wait_millis":       float64(1500),
+		"kiro_affinity_wait_millis":       float64(0),
 	}
 }
 

@@ -189,20 +189,78 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Custom models and built-in GPT/Codex models are resolved before Claude-family
-	// provider validation. This lets the same Anthropic Messages endpoint serve Claude
-	// Code through either a custom Chat provider or the pool's native Codex/Responses
-	// accounts instead of restricting every request to Claude/Kiro up front.
+	// provider validation. Parse Claude-family suffixes early so a custom mapping can
+	// match the base model (notably "[1m]"), but preserve every other custom model
+	// literally: brackets are valid provider-owned model-name characters. A non-Claude
+	// model that misses both custom and Codex routing is parsed later by the native
+	// Claude path, retaining its original validation behavior.
+	customRequestedModel := capability.RequestedClaudeModel{
+		RequestedModel: model,
+		BaseModel:      model,
+	}
+	customModelIsClaude := isClaudeModel(model)
+	if customModelIsClaude {
+		customRequestedModel, err = capability.ParseRequestedClaudeModel(model)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+	}
+	localCountTokens := strings.HasSuffix(path, "/count_tokens")
 	providerHint := effectiveGatewayProviderHint(r, pol)
 	var selectedCustom storage.CustomProvider
 	var selectedCustomOK bool
-	if strings.HasPrefix(providerHint, "custom:") {
+	explicitCustom := strings.HasPrefix(providerHint, "custom:")
+	if explicitCustom {
 		selectedCustom, selectedCustomOK = s.customProviderByID(r.Context(), strings.TrimPrefix(providerHint, "custom:"))
 	} else if providerHint == "auto" {
-		selectedCustom, selectedCustomOK = s.customProviderForModel(r.Context(), model)
+		if localCountTokens {
+			// Counting is a deterministic, provider-specific local estimate. It does
+			// not consume an account or egress lease and must remain available while
+			// the matching provider has no account, is cooling down, or is saturated.
+			if providers := s.customProvidersForModel(r.Context(), customRequestedModel.BaseModel); len(providers) > 0 {
+				selectedCustom, selectedCustomOK = providers[0], true
+			}
+		} else {
+			// Real inference keeps the scheduler preflight so an unschedulable
+			// provider cannot shadow a later custom or built-in route.
+			selectedCustom, selectedCustomOK = s.customProviderForModel(r.Context(), customRequestedModel.BaseModel, pol.Group, raw)
+		}
+	}
+	if explicitCustom && !selectedCustomOK {
+		s.writeCapabilityUnavailable(w, http.StatusServiceUnavailable,
+			"selected custom model provider is disabled or unavailable",
+			[]string{"provider:" + strings.TrimPrefix(providerHint, "custom:"), "model:" + model},
+			"enabled_custom_provider",
+			providerHint,
+			"Enable the selected model provider and import an active API-key account.")
+		return
 	}
 	if selectedCustomOK {
 		prov := selectedCustom
-		if strings.HasSuffix(path, "/count_tokens") {
+		if anthropicContext1MRequested(r.Header) {
+			customRequestedModel.ContextMode = "1m"
+		}
+		if customRequestedModel.BaseModel != model {
+			raw = setForcedModel(raw, customRequestedModel.BaseModel)
+			model = customRequestedModel.BaseModel
+			r = r.WithContext(withModelDiagnostics(r.Context(), clientRequestedModel, model, "claude_context_mode"))
+			w.Header().Set("X-Pool-Resolved-Model", model)
+			w.Header().Set("X-Pool-Model-Override-Source", "claude_context_mode")
+		}
+		r = r.WithContext(withRequestedClaudeModel(r.Context(), customRequestedModel))
+		if mappedRaw, targetModel, mapped := applyCustomProviderModelMapping(prov, raw, model); mapped {
+			raw = mappedRaw
+			model = targetModel
+			r = r.WithContext(withModelDiagnostics(r.Context(), clientRequestedModel, targetModel, "custom_provider_mapping:"+prov.ID))
+			w.Header().Set("X-Pool-Resolved-Model", targetModel)
+			w.Header().Set("X-Pool-Model-Override-Source", "custom_provider_mapping:"+prov.ID)
+		}
+		if prov.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
+			strings.EqualFold(customRequestedModel.ContextMode, "1m") {
+			r = withAnthropicContext1MBeta(r)
+		}
+		if localCountTokens {
 			writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": virtual.EstimateTokensJSON(raw)})
 			return
 		}
@@ -225,10 +283,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestedModel, err := capability.ParseRequestedClaudeModel(model)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+	requestedModel := customRequestedModel
+	if !customModelIsClaude {
+		requestedModel, err = capability.ParseRequestedClaudeModel(model)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 	if anthropicContext1MRequested(r.Header) {
 		requestedModel.ContextMode = "1m"

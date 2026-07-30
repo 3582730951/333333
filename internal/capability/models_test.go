@@ -2,6 +2,7 @@ package capability
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"codex-account-pool/internal/config"
@@ -410,6 +411,32 @@ func TestStaticClaudeModelsNonEmpty(t *testing.T) {
 	}
 }
 
+func TestClaudeProbeModelTableIncludesPinnedIDsAndLegacyAliases(t *testing.T) {
+	table := ClaudeProbeModelTable()
+	have := map[string]bool{}
+	for _, model := range table {
+		have[model] = true
+	}
+	for _, model := range []string{
+		"claude-fable-5",
+		"claude-opus-5",
+		"claude-sonnet-5",
+		"claude-opus-4-8",
+		"claude-sonnet-4-5-20250929",
+		"claude-sonnet-4-5",
+		"claude-opus-4-5",
+		"claude-haiku-4-5",
+	} {
+		if !have[model] || !IsClaudeProbeModel(strings.ToUpper(model)) {
+			t.Fatalf("Claude probe table missing case-insensitive candidate %q: %v", model, table)
+		}
+	}
+	table[0] = "mutated"
+	if ClaudeProbeModelTable()[0] == "mutated" {
+		t.Fatal("ClaudeProbeModelTable returned mutable package storage")
+	}
+}
+
 func TestKiroConcreteVersionsNeverDrift(t *testing.T) {
 	cases := map[string]string{
 		"claude-opus-5":            "claude-opus-5",
@@ -439,8 +466,8 @@ func TestKiroGPTModelsAreExactAndKeepTheirNativeWindow(t *testing.T) {
 		if !ok || !KiroSupportsGPTModel(model) {
 			t.Fatalf("Kiro GPT model %q was not recognized", model)
 		}
-		if got := KiroEffectiveContextWindow(canonical, "", 0); got != 272000 {
-			t.Fatalf("%s standard window=%d, want 272000", canonical, got)
+		if got := KiroEffectiveContextWindow(canonical, "", 0); got != 372000 {
+			t.Fatalf("%s standard window=%d, want 372000", canonical, got)
 		}
 	}
 	for _, model := range []string{"gpt-5.6", "gpt-5.6-sol-preview", "gpt-5.5-sol", "gpt-4.1"} {
@@ -518,13 +545,13 @@ func TestStaticKiroSeparatesStandardAndTechnicalContextWindows(t *testing.T) {
 	for _, c := range StaticKiroModels("account") {
 		wantNative := int64(200000)
 		if KiroSupportsGPTModel(c.ModelSlug) {
-			wantNative = 272000
+			wantNative = 372000
 		}
 		if c.NativeContextWindow != wantNative {
 			t.Fatalf("%s standard window=%d, want %d", c.ModelSlug, c.NativeContextWindow, wantNative)
 		}
-		if KiroSupportsGPTModel(c.ModelSlug) && c.NativeMaxContextWindow != 272000 {
-			t.Fatalf("%s GPT maximum window=%d, want 272000", c.ModelSlug, c.NativeMaxContextWindow)
+		if KiroSupportsGPTModel(c.ModelSlug) && c.NativeMaxContextWindow != 372000 {
+			t.Fatalf("%s GPT maximum window=%d, want 372000", c.ModelSlug, c.NativeMaxContextWindow)
 		}
 		if KiroContextWindow(c.ModelSlug) == 1000000 && c.NativeMaxContextWindow != 1000000 {
 			t.Fatalf("%s technical window=%d, want 1000000", c.ModelSlug, c.NativeMaxContextWindow)
@@ -624,13 +651,17 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 	}
 	bySlug := map[string]storage.ModelCapability{}
 	for _, c := range caps {
-		if c.AccountID != "acc" || c.NativeMaxContextWindow == 0 || c.EffectiveContextWindowPercent != 95 || c.Source != "codex_static" {
+		expectedPercent := int64(95)
+		if strings.HasPrefix(c.ModelSlug, "gpt-5.6-") {
+			expectedPercent = GPT56EffectivePercent
+		}
+		if c.AccountID != "acc" || c.NativeMaxContextWindow == 0 || c.EffectiveContextWindowPercent != expectedPercent || c.Source != "codex_static" {
 			t.Fatalf("malformed static Codex capability: %+v", c)
 		}
 		bySlug[c.ModelSlug] = c
 	}
 	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
-		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 || got.AutoCompactTokenLimit != 0 {
+		if got, ok := bySlug[slug]; !ok || got.NativeContextWindow != 372000 || got.NativeMaxContextWindow != 372000 || got.AutoCompactTokenLimit != 334800 {
 			t.Fatalf("current model %s missing or wrong window: %+v", slug, got)
 		}
 	}
@@ -643,19 +674,19 @@ func TestStaticCodexModelsCurrent(t *testing.T) {
 	}
 }
 
-func TestCodexClientContextOverridesLeaveCompactionToClient(t *testing.T) {
+func TestCodexClientContextOverridesAreConservativeFallbacks(t *testing.T) {
 	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		window, compact, ok := CodexClientContextOverrides(slug)
 		if !ok {
-			t.Fatalf("%s missing generated-client context overrides", slug)
+			t.Fatalf("%s missing fallback context limits", slug)
 		}
-		if window != 372000 || compact != 0 {
-			t.Fatalf("%s context overrides = (%d, %d), want (372000, unset)", slug, window, compact)
+		if window != 372000 || compact != 334800 {
+			t.Fatalf("%s fallback limits = (%d, %d), want (372000, 334800)", slug, window, compact)
 		}
 	}
 }
 
-func TestBuildCodexModelsResponseAppliesIndependent56ContextLimits(t *testing.T) {
+func TestBuildCodexModelsResponseEnforcesFixed56ContextLimits(t *testing.T) {
 	raw := `{
 		"slug":"gpt-5.6-sol",
 		"context_window":272000,
@@ -682,10 +713,13 @@ func TestBuildCodexModelsResponseAppliesIndependent56ContextLimits(t *testing.T)
 	}
 	model := root.Models[0]
 	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
-		t.Fatalf("5.6 full context contract missing: %#v", model)
+		t.Fatalf("5.6 fixed context contract was not enforced: %#v", model)
 	}
-	if _, exists := model["auto_compact_token_limit"]; exists {
-		t.Fatalf("5.6 auto-compaction trigger must be client-managed: %#v", model["auto_compact_token_limit"])
+	if model["auto_compact_token_limit"] != float64(334800) {
+		t.Fatalf("5.6 90%% auto-compaction trigger was lost: %#v", model["auto_compact_token_limit"])
+	}
+	if model["effective_context_window_percent"] != float64(100) {
+		t.Fatalf("5.6 effective hard window is not exactly 372K: %#v", model)
 	}
 	levels, _ := model["supported_reasoning_levels"].([]interface{})
 	tools, _ := model["experimental_supported_tools"].([]interface{})
@@ -721,14 +755,93 @@ func TestBuildCodexModelsResponseSynthesizes56ContextLimitsFromStaticMetadata(t 
 	}
 	model := root.Models[0]
 	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
-		t.Fatalf("synthesized 5.6 limits are not 372K: %#v", model)
+		t.Fatalf("synthesized 5.6 fixed limits are wrong: %#v", model)
 	}
-	if _, exists := model["auto_compact_token_limit"]; exists {
-		t.Fatalf("synthesized 5.6 auto-compaction trigger must be client-managed: %#v", model)
+	if model["auto_compact_token_limit"] != float64(334800) {
+		t.Fatalf("synthesized 5.6 trigger is wrong: %#v", model)
 	}
 	levels, _ := model["supported_reasoning_levels"].([]interface{})
 	if len(levels) != 6 || levels[5].(map[string]interface{})["effort"] != "ultra" || model["supports_parallel_tool_calls"] != true {
 		t.Fatalf("synthesized reasoning/tool capabilities were reduced: %#v", model)
+	}
+}
+
+func TestBuildCodexModelsResponseKeepsFixed56WindowAcrossStaleRouteMetadata(t *testing.T) {
+	caps := []storage.ModelCapability{
+		{
+			AccountID: "large", ModelSlug: "gpt-5.6-sol", AvailabilityState: AvailabilityVerified,
+			NativeContextWindow: 372000, NativeMaxContextWindow: 372000,
+			AutoCompactTokenLimit: 334800, Visibility: "list", Source: "probe",
+		},
+		{
+			AccountID: "small", ModelSlug: "gpt-5.6-sol", AvailabilityState: AvailabilityVerified,
+			NativeContextWindow: 128000, NativeMaxContextWindow: 128000,
+			Visibility: "list", Source: "probe",
+		},
+	}
+	body, _, err := BuildCodexModelsResponse(caps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Models []map[string]interface{} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil || len(root.Models) != 1 {
+		t.Fatalf("catalog decode: models=%#v err=%v body=%s", root.Models, err, body)
+	}
+	model := root.Models[0]
+	if model["context_window"] != float64(372000) || model["max_context_window"] != float64(372000) {
+		t.Fatalf("catalog did not keep the fixed GPT-5.6 limit: %#v", model)
+	}
+	if model["auto_compact_token_limit"] != float64(334800) {
+		t.Fatalf("catalog did not keep the fixed 90%% trigger: %#v", model)
+	}
+}
+
+func TestBuildCodexModelsResponseForScopesBootstrapsFixed56Catalog(t *testing.T) {
+	static := StaticCodexModels("active-cold-start-account")
+	body, _, err := BuildCodexModelsResponseForScopes([][]storage.ModelCapability{static})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root struct {
+		Models []map[string]interface{} `json:"models"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]map[string]interface{}{}
+	for _, model := range root.Models {
+		seen[model["slug"].(string)] = model
+	}
+	for _, slug := range []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
+		model := seen[slug]
+		if model == nil || model["context_window"] != float64(GPT56ContextWindow) ||
+			model["max_context_window"] != float64(GPT56ContextWindow) ||
+			model["auto_compact_token_limit"] != float64(GPT56AutoCompactTokenLimit) ||
+			model["effective_context_window_percent"] != float64(GPT56EffectivePercent) {
+			t.Fatalf("cold-start %s contract=%#v body=%s", slug, model, body)
+		}
+	}
+}
+
+func TestParseNormalizesStaleGPT56CatalogContract(t *testing.T) {
+	caps, err := Parse("stale", []byte(`{"models":[{
+		"slug":"gpt-5.6-sol",
+		"context_window":272000,
+		"max_context_window":272000,
+		"effective_context_window_percent":95,
+		"auto_compact_token_limit":244800
+	}]}`), "")
+	if err != nil || len(caps) != 1 {
+		t.Fatalf("Parse() caps=%+v err=%v", caps, err)
+	}
+	got := caps[0]
+	if got.NativeContextWindow != GPT56ContextWindow ||
+		got.NativeMaxContextWindow != GPT56ContextWindow ||
+		got.EffectiveContextWindowPercent != GPT56EffectivePercent ||
+		got.AutoCompactTokenLimit != GPT56AutoCompactTokenLimit {
+		t.Fatalf("stale GPT-5.6 contract was not normalized: %+v", got)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -215,6 +216,137 @@ func TestLegacyDiagnosticExportReturnsAsyncLocationWithoutPrematureDownload(t *t
 	}
 	if envelope.Download != "" || envelope.Job.DownloadURL != "" {
 		t.Fatalf("queued job exposed a premature download link: %+v", envelope)
+	}
+}
+
+func TestDiagnosticJobCreateWakesActiveWorker(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/admin/diagnostics/jobs", strings.NewReader(`{}`))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		raw, _ := io.ReadAll(response.Body)
+		t.Fatalf("create status=%d body=%s", response.StatusCode, raw)
+	}
+	select {
+	case <-h.app.diagnosticJobWake:
+	case <-time.After(time.Second):
+		t.Fatal("diagnostic job creation did not wake the worker")
+	}
+}
+
+func TestDiagnosticJobAPIDisablesCaching(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	for _, fixture := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodGet, path: "/admin/diagnostics/jobs"},
+		{method: http.MethodPost, path: "/admin/diagnostics/jobs", body: `{}`},
+		{method: http.MethodGet, path: "/admin/diagnostics/jobs/diagjob_missing"},
+		{method: http.MethodGet, path: "/admin/diagnostics/jobs/diagjob_missing/download"},
+	} {
+		request, err := http.NewRequest(fixture.method, h.pool.URL+fixture.path, strings.NewReader(fixture.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if got := response.Header.Get("Cache-Control"); got != "no-store" {
+			t.Fatalf("%s %s Cache-Control=%q, want no-store", fixture.method, fixture.path, got)
+		}
+	}
+}
+
+func TestDiagnosticSnapshotGuardCancelsOnReservePressureAndStopsIdempotently(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	const unavailableReserve = int64(1 << 62)
+	guardCtx, stop := h.app.startDiagnosticSnapshotGuardWithInterval(
+		context.Background(), t.TempDir(), unavailableReserve, unavailableReserve, time.Millisecond,
+	)
+	select {
+	case <-guardCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("diagnostic snapshot guard did not cancel under reserve pressure")
+	}
+	if !errors.Is(context.Cause(guardCtx), errDiagnosticCapacity) {
+		t.Fatalf("guard cause=%v", context.Cause(guardCtx))
+	}
+	if err := stop(); !errors.Is(err, errDiagnosticCapacity) {
+		t.Fatalf("first stop error=%v", err)
+	}
+	if err := stop(); !errors.Is(err, errDiagnosticCapacity) {
+		t.Fatalf("idempotent stop error=%v", err)
+	}
+}
+
+func TestDiagnosticMaintenanceRetriesBusyWALThenTruncatesAfterReaderCloses(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("legacy snapshot family detection is Linux-specific")
+	}
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	ctx := context.Background()
+	snapshot, err := h.store.BeginDiagnosticSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 192; index++ {
+		if err = h.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			Action: "diagnostic_wal_finalize",
+			State:  "complete",
+			Detail: strings.Repeat("w", 16<<10),
+		}); err != nil {
+			_ = snapshot.Close()
+			t.Fatal(err)
+		}
+	}
+	walPath := h.store.DiagnosticWALPath()
+	before, err := os.Stat(walPath)
+	if err != nil || before.Size() == 0 {
+		_ = snapshot.Close()
+		t.Fatalf("WAL was not created: info=%v err=%v", before, err)
+	}
+	legacyPath := filepath.Join(filepath.Dir(h.store.Path()), ".diagnostic-snapshot-wal-retry.sqlite3")
+	if err = os.WriteFile(legacyPath, []byte("legacy"), 0o600); err != nil {
+		_ = snapshot.Close()
+		t.Fatal(err)
+	}
+
+	h.app.cleanupLegacyDiagnosticSnapshots()
+	if !h.app.diagnostics.walFinalizePending.Load() {
+		_ = snapshot.Close()
+		t.Fatal("busy checkpoint did not remain pending for the next maintenance pass")
+	}
+	if _, err = os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		_ = snapshot.Close()
+		t.Fatalf("legacy trigger was not reclaimed: %v", err)
+	}
+	if err = snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h.app.cleanupLegacyDiagnosticSnapshots()
+	if h.app.diagnostics.walFinalizePending.Load() {
+		t.Fatal("WAL finalization remained pending after the reader closed")
+	}
+	if info, statErr := os.Stat(walPath); statErr == nil && info.Size() != 0 {
+		t.Fatalf("WAL size after retry=%d, want 0", info.Size())
+	}
+	var rows int
+	if err = h.store.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM audit_log WHERE action='diagnostic_wal_finalize'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 192 {
+		t.Fatalf("durable audit rows=%d, want 192", rows)
 	}
 }
 

@@ -94,11 +94,20 @@ func (m *Manager) Prepare(ctx context.Context, account storage.Account, cred sto
 		if validationErr != nil {
 			return "", token, cred, validationErr
 		}
-		base := strings.TrimSuffix(strings.TrimRight(allowed, "/"), "/generateAssistantResponse")
-		if cred.AuthMethod == "idc" {
-			endpoint = base + "/token"
-		} else {
-			endpoint = base + "/refreshToken"
+		parsed, parseErr := url.Parse(allowed)
+		if parseErr != nil {
+			return "", token, cred, ErrEndpointNotAllowed
+		}
+		// Official runtime/management endpoints do not host token refresh. Keep
+		// using the documented auth plane selected above. Only an explicitly
+		// allowlisted compatibility endpoint overrides refresh routing.
+		if !officialKiroHost(parsed.Hostname()) {
+			base := strings.TrimSuffix(strings.TrimRight(allowed, "/"), "/generateAssistantResponse")
+			if cred.AuthMethod == "idc" {
+				endpoint = base + "/token"
+			} else {
+				endpoint = base + "/refreshToken"
+			}
 		}
 	}
 	body, _ := json.Marshal(payload)
@@ -186,19 +195,24 @@ func (m *Manager) UsageLimitsProbe(ctx context.Context, account storage.Account,
 	var result UsageLimitsResult
 	cfg := m.Config()
 	region := first(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1")
-	base, err := ValidateEndpoint(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
+	base, err := GetUsageLimitsEndpoint(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
 	if err != nil {
 		return result, err
 	}
-	if strings.HasSuffix(base, "/generateAssistantResponse") {
-		base = strings.TrimSuffix(base, "/generateAssistantResponse")
-	}
-	u := base + "/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
-	if cred.ProfileARN != "" {
-		u += "&profileArn=" + url.QueryEscape(cred.ProfileARN)
+	u := base + "?origin=" + url.QueryEscape(kiroCLIOrigin) + "&isEmailRequired=false"
+	body, err := json.Marshal(struct {
+		Origin          string `json:"origin"`
+		IsEmailRequired bool   `json:"isEmailRequired"`
+	}{
+		Origin:          kiroCLIOrigin,
+		IsEmailRequired: false,
+	})
+	if err != nil {
+		return result, err
 	}
 	head := Headers(cfg, cred, bearer, false)
-	status, header, raw, err := m.do(ctx, egress, http.MethodGet, u, head, nil, account.ID+":"+egress.ID)
+	ApplyOperationHeaders(head, OperationGetUsageLimits)
+	status, header, raw, err := m.do(ctx, egress, http.MethodPost, u, head, body, account.ID+":"+egress.ID)
 	result.StatusCode = status
 	result.Header = header
 	result.Body = raw
@@ -221,28 +235,90 @@ func (m *Manager) UsageLimits(ctx context.Context, account storage.Account, cred
 	return result.Limits, err
 }
 
+const (
+	// Captured from the signed Linux x86_64 Kiro CLI 2.15.2 release. Keep the
+	// generated AWS SDK and Smithy model versions together: mixing these with the
+	// former Electron/KiroIDE fingerprint produces a client that never existed.
+	kiroCLIDefaultVersion  = "2.15.2"
+	kiroCLIRustVersion     = "1.92.0"
+	kiroCLIAWSSDKVersion   = "1.3.15"
+	kiroCLIServiceVersion  = "0.1.17975"
+	kiroCLIApplicationName = "AmazonQ-For-CLI"
+	kiroCLIOrigin          = "KIRO_CLI"
+)
+
+type Operation string
+
+const (
+	OperationGenerateAssistantResponse Operation = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+	OperationGetUsageLimits            Operation = "AmazonCodeWhispererService.GetUsageLimits"
+	OperationListAvailableModels       Operation = "AmazonCodeWhispererService.ListAvailableModels"
+)
+
 func Headers(cfg config.Config, cred storage.KiroCredentials, bearer string, stream bool) http.Header {
-	mid := MachineID(cred, storage.AccountToken{RefreshToken: bearer})
-	version := first(cfg.KiroVersion, "0.11.107")
-	node := first(cfg.KiroNodeVersion, "22.22.0")
+	version := kiroCLIWireVersion(cfg.KiroVersion)
+	api := "codewhispererruntime"
+	if stream {
+		api = "codewhispererstreaming"
+	}
+	uaBase := fmt.Sprintf(
+		"aws-sdk-rust/%s ua/2.1 api/%s/%s os/linux lang/rust/%s",
+		kiroCLIAWSSDKVersion,
+		api,
+		kiroCLIServiceVersion,
+		kiroCLIRustVersion,
+	)
 	h := http.Header{}
-	h.Set("content-type", "application/json")
-	h.Set("accept", "application/vnd.amazon.eventstream")
-	h.Set("x-amzn-codewhisperer-optout", "true")
-	h.Set("x-amzn-kiro-agent-mode", "vibe")
-	h.Set("x-amz-user-agent", fmt.Sprintf("aws-sdk-js/1.0.34 KiroIDE-%s-%s", version, mid))
-	h.Set("user-agent", fmt.Sprintf("aws-sdk-js/1.0.34 ua/2.1 os/%s lang/js md/nodejs#%s api/codewhispererstreaming#1.0.34 m/E KiroIDE-%s-%s", kiroOSToken(first(cred.AccountID, mid)), node, version, mid))
+	h.Set("content-type", "application/x-amz-json-1.0")
+	h.Set("accept", "*/*")
+	h.Set("accept-encoding", "gzip")
+	h.Set("x-amzn-codewhisperer-optout", "false")
+	// The signed CLI includes md/appVersion in User-Agent, but its Smithy
+	// X-Amz-User-Agent contains only feature metadata followed by app/. Keep
+	// these two wire values intentionally different.
+	h.Set("x-amz-user-agent", fmt.Sprintf("%s m/F app/%s", uaBase, kiroCLIApplicationName))
+	h.Set("user-agent", fmt.Sprintf("%s md/appVersion-%s app/%s", uaBase, version, kiroCLIApplicationName))
 	h.Set("amz-sdk-invocation-id", uuid.NewString())
 	h.Set("amz-sdk-request", "attempt=1; max=3")
 	h.Set("authorization", "Bearer "+bearer)
 	if cred.ProfileARN != "" {
 		h.Set("x-amzn-kiro-profile-arn", cred.ProfileARN)
 	}
-	if cred.AuthMethod == "api_key" {
+	switch cred.AuthMethod {
+	case "api_key":
 		h.Set("tokentype", "API_KEY")
+	case "social":
+		h.Set("tokentype", "EXTERNAL_IDP")
 	}
 	return h
 }
+
+// ApplyOperationHeaders applies the operation target and the operation-specific
+// Smithy feature metadata captured from the signed Kiro CLI. Catalog requests
+// advertise both F and C; generation and usage requests advertise F only.
+func ApplyOperationHeaders(h http.Header, operation Operation) {
+	h.Set("x-amz-target", string(operation))
+	amzUA := h.Get("x-amz-user-agent")
+	if operation == OperationListAvailableModels {
+		amzUA = strings.Replace(amzUA, " m/F app/", " m/F,C app/", 1)
+	} else {
+		amzUA = strings.Replace(amzUA, " m/F,C app/", " m/F app/", 1)
+	}
+	h.Set("x-amz-user-agent", amzUA)
+}
+
+// kiro_version used to mean an Electron IDE release and therefore existing
+// installations commonly contain 0.11.x. Kiro CLI has a different release
+// train. Normalize only that known legacy shape while retaining a future CLI
+// version explicitly configured by an operator.
+func kiroCLIWireVersion(configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" || strings.HasPrefix(configured, "0.") {
+		return kiroCLIDefaultVersion
+	}
+	return configured
+}
+
 func MachineID(c storage.KiroCredentials, t storage.AccountToken) string {
 	if raw := strings.TrimSpace(c.MachineID); raw != "" {
 		// A real Kiro client presents a 64-hex machine-id on the wire. An imported

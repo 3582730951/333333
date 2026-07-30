@@ -14,6 +14,7 @@ type LogRecordCounts struct {
 	AuditLog               int64 `json:"audit_log"`
 	CFEvents               int64 `json:"cf_events"`
 	UsageRecords           int64 `json:"usage_records"`
+	UsageEvents            int64 `json:"usage_events"`
 	RegistrationTaskEvents int64 `json:"registration_task_events"`
 	LifecycleTaskLogs      int64 `json:"lifecycle_task_logs"`
 	LifecycleEvents        int64 `json:"lifecycle_events"`
@@ -22,7 +23,7 @@ type LogRecordCounts struct {
 }
 
 func (c LogRecordCounts) Total() int64 {
-	return c.AuditLog + c.CFEvents + c.UsageRecords + c.RegistrationTaskEvents +
+	return c.AuditLog + c.CFEvents + c.UsageRecords + c.UsageEvents + c.RegistrationTaskEvents +
 		c.LifecycleTaskLogs + c.LifecycleEvents + c.ProxyUsageRecords + c.TerminalBillingHolds
 }
 
@@ -55,6 +56,10 @@ func (s *Store) ClearLogRecords(ctx context.Context) (LogClearResult, error) {
 		{`DELETE FROM audit_log`, &result.Deleted.AuditLog},
 		{`DELETE FROM cf_events`, &result.Deleted.CFEvents},
 		{`DELETE FROM usage_records`, &result.Deleted.UsageRecords},
+		{`DELETE FROM usage_events
+WHERE hold_id='' OR NOT EXISTS (
+	SELECT 1 FROM billing_holds h WHERE h.id=usage_events.hold_id AND h.status='held'
+)`, &result.Deleted.UsageEvents},
 		{`DELETE FROM registration_task_events`, &result.Deleted.RegistrationTaskEvents},
 		{`DELETE FROM lifecycle_task_logs`, &result.Deleted.LifecycleTaskLogs},
 		{`DELETE FROM lifecycle_events`, &result.Deleted.LifecycleEvents},
@@ -121,6 +126,13 @@ func (s *Store) PurgeLogRecordsBefore(ctx context.Context, cutoff int64, batchSi
 		{`DELETE FROM audit_log WHERE rowid IN (SELECT rowid FROM audit_log WHERE created_at < ? LIMIT ?)`, &counts.AuditLog},
 		{`DELETE FROM cf_events WHERE rowid IN (SELECT rowid FROM cf_events WHERE created_at < ? LIMIT ?)`, &counts.CFEvents},
 		{`DELETE FROM usage_records WHERE rowid IN (SELECT rowid FROM usage_records WHERE created_at < ? LIMIT ?)`, &counts.UsageRecords},
+		{`DELETE FROM usage_events WHERE rowid IN (
+SELECT e.rowid FROM usage_events e
+WHERE e.updated_at < ?
+  AND (e.hold_id='' OR NOT EXISTS (
+	  SELECT 1 FROM billing_holds h WHERE h.id=e.hold_id AND h.status='held'
+  ))
+LIMIT ?)`, &counts.UsageEvents},
 		{`DELETE FROM registration_task_events WHERE rowid IN (SELECT rowid FROM registration_task_events WHERE created_at < ? LIMIT ?)`, &counts.RegistrationTaskEvents},
 		{`DELETE FROM lifecycle_task_logs WHERE rowid IN (SELECT rowid FROM lifecycle_task_logs WHERE timestamp < ? LIMIT ?)`, &counts.LifecycleTaskLogs},
 		{`DELETE FROM lifecycle_events WHERE rowid IN (SELECT rowid FROM lifecycle_events WHERE timestamp < ? LIMIT ?)`, &counts.LifecycleEvents},

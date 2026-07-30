@@ -12,20 +12,173 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/mattn/go-sqlite3"
 )
 
-// DiagnosticSnapshot pins one read-only SQLite WAL snapshot. Writers continue to
+// DiagnosticSnapshot pins one read-only database snapshot. SQLite readers use a
+// WAL transaction on a dedicated read-pool connection, so writers continue to
 // commit while every query issued through Store() observes the same boundary.
+//
+// Do not materialize the whole SQLite database into a temporary backup here. A
+// busy source database causes sqlite3_backup_step to restart after concurrent
+// writes; on multi-gigabyte production databases that turned a small diagnostics
+// export into an unbounded, CPU-heavy copy and left jobs in "snapshotting".
 type DiagnosticSnapshot struct {
-	id         string
-	conn       *sql.Conn
-	tx         *sql.Tx
-	driver     string
-	mu         sync.Mutex
-	backupDB   *sql.DB
-	backupPath string
+	id     string
+	conn   *sql.Conn
+	tx     *sql.Tx
+	driver string
+	mu     sync.Mutex
+}
+
+// DiagnosticWALPath returns the local SQLite WAL watched while a logical
+// diagnostic snapshot is open. PostgreSQL and in-memory stores have no local WAL.
+func (s *Store) DiagnosticWALPath() string {
+	if s == nil || s.driver != "sqlite" || s.InMemory() {
+		return ""
+	}
+	path := strings.SplitN(strings.TrimSpace(s.path), "?", 2)[0]
+	if path == "" {
+		return ""
+	}
+	return path + "-wal"
+}
+
+// TryTruncateDiagnosticWAL makes one non-destructive attempt to checkpoint and
+// truncate the local SQLite WAL. A live reader can legitimately keep frames
+// pinned; that condition is returned as completed=false rather than an error so
+// the diagnostics maintenance loop can retry after the reader releases its
+// snapshot. The caller owns the timeout policy.
+func (s *Store) TryTruncateDiagnosticWAL(ctx context.Context) (completed bool, err error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("diagnostic WAL store is unavailable")
+	}
+	if s.DiagnosticWALPath() == "" {
+		return true, nil
+	}
+	var busy, logFrames, checkpointed int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
+		&busy, &logFrames, &checkpointed,
+	); err != nil {
+		return false, err
+	}
+	return busy == 0, nil
+}
+
+// CleanupLegacyDiagnosticSnapshots removes physical SQLite copies left by the
+// pre-v3 snapshot implementation after a crash or worker handoff. Only regular
+// files with the exact private prefix in the database directory are eligible;
+// symlinks and directories are left untouched.
+func (s *Store) CleanupLegacyDiagnosticSnapshots() (int, error) {
+	if s == nil || s.driver != "sqlite" || s.InMemory() {
+		return 0, nil
+	}
+	databasePath := strings.SplitN(strings.TrimSpace(s.path), "?", 2)[0]
+	if databasePath == "" {
+		return 0, nil
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(databasePath), ".diagnostic-snapshot-*"))
+	if err != nil {
+		return 0, err
+	}
+	type legacyFile struct {
+		path string
+		info os.FileInfo
+	}
+	type legacyFamily struct {
+		files  []legacyFile
+		unsafe bool
+	}
+	families := make(map[string]*legacyFamily)
+	var cleanupErr error
+	for _, match := range matches {
+		stem, valid := legacyDiagnosticSnapshotStem(filepath.Base(match))
+		if !valid {
+			continue
+		}
+		family := families[stem]
+		if family == nil {
+			family = &legacyFamily{}
+			families[stem] = family
+		}
+		info, statErr := os.Lstat(match)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+			continue
+		case statErr != nil:
+			family.unsafe = true
+			cleanupErr = errors.Join(cleanupErr, statErr)
+		case !info.Mode().IsRegular():
+			// A symlink, directory, or device using a snapshot-family name makes
+			// the entire family ineligible.
+			family.unsafe = true
+		default:
+			family.files = append(family.files, legacyFile{path: match, info: info})
+		}
+	}
+	removed := 0
+	for _, family := range families {
+		if family.unsafe || len(family.files) == 0 {
+			continue
+		}
+		for _, file := range family.files {
+			open, openErr := diagnosticFileOpenBySameUID(file.path)
+			if openErr != nil {
+				cleanupErr = errors.Join(cleanupErr, openErr)
+				family.unsafe = true
+				break
+			}
+			if open {
+				family.unsafe = true
+				break
+			}
+		}
+		if family.unsafe {
+			continue
+		}
+		// Recheck the complete family after scanning /proc. If any member was
+		// replaced, keep every member; partially deleting a live SQLite family can
+		// corrupt the draining worker's snapshot.
+		for _, file := range family.files {
+			current, currentErr := os.Lstat(file.path)
+			if currentErr != nil {
+				if !errors.Is(currentErr, os.ErrNotExist) {
+					cleanupErr = errors.Join(cleanupErr, currentErr)
+				}
+				family.unsafe = true
+				break
+			}
+			if !current.Mode().IsRegular() || !os.SameFile(file.info, current) {
+				family.unsafe = true
+				break
+			}
+		}
+		if family.unsafe {
+			continue
+		}
+		for _, file := range family.files {
+			if removeErr := os.Remove(file.path); removeErr != nil {
+				if !errors.Is(removeErr, os.ErrNotExist) {
+					cleanupErr = errors.Join(cleanupErr, removeErr)
+				}
+				continue
+			}
+			removed++
+		}
+	}
+	return removed, cleanupErr
+}
+
+func legacyDiagnosticSnapshotStem(name string) (string, bool) {
+	if !strings.HasPrefix(name, ".diagnostic-snapshot-") {
+		return "", false
+	}
+	for _, suffix := range []string{".sqlite3-journal", ".sqlite3-wal", ".sqlite3-shm", ".sqlite3"} {
+		stem := strings.TrimSuffix(name, suffix)
+		if stem != name && len(stem) > len(".diagnostic-snapshot-") {
+			return stem, true
+		}
+	}
+	return "", false
 }
 
 func (s *Store) BeginDiagnosticSnapshot(ctx context.Context) (*DiagnosticSnapshot, error) {
@@ -54,97 +207,24 @@ func (s *Store) BeginDiagnosticSnapshot(ctx context.Context) (*DiagnosticSnapsho
 		}
 		return &DiagnosticSnapshot{id: newDiagnosticSnapshotID(), conn: conn, tx: tx, driver: s.driver}, nil
 	}
-	_ = conn.Close()
-	return s.beginSQLiteDiagnosticBackup(ctx, pool)
-}
-
-func (s *Store) beginSQLiteDiagnosticBackup(ctx context.Context, pool *sql.DB) (*DiagnosticSnapshot, error) {
-	tempDir := os.TempDir()
-	databasePath := strings.SplitN(s.path, "?", 2)[0]
-	if databasePath != "" && databasePath != ":memory:" && !strings.Contains(databasePath, "mode=memory") {
-		if candidate := filepath.Dir(databasePath); candidate != "" {
-			tempDir = candidate
-		}
+	if _, err = conn.ExecContext(ctx, `PRAGMA query_only=ON`); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("enable diagnostic SQLite query-only mode: %w", err)
 	}
-	temp, err := os.CreateTemp(tempDir, ".diagnostic-snapshot-*.sqlite3")
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, fmt.Errorf("create diagnostic SQLite backup: %w", err)
+		resetSQLiteDiagnosticConnection(conn)
+		return nil, fmt.Errorf("begin diagnostic SQLite snapshot: %w", err)
 	}
-	tempPath := temp.Name()
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		_ = os.Remove(tempPath)
-		return nil, err
+	// BEGIN is deferred in SQLite. Execute a read now so the snapshot boundary is
+	// fixed before request-time writers can commit additional rows.
+	var established int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master`).Scan(&established); err != nil {
+		_ = tx.Rollback()
+		resetSQLiteDiagnosticConnection(conn)
+		return nil, fmt.Errorf("establish diagnostic SQLite snapshot: %w", err)
 	}
-	if err := temp.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return nil, err
-	}
-	destination, err := sql.Open("sqlite3", tempPath+"?_busy_timeout=5000&_foreign_keys=on")
-	if err != nil {
-		_ = os.Remove(tempPath)
-		return nil, err
-	}
-	destination.SetMaxOpenConns(1)
-	sourceConn, err := pool.Conn(ctx)
-	if err != nil {
-		_ = destination.Close()
-		_ = os.Remove(tempPath)
-		return nil, err
-	}
-	defer sourceConn.Close()
-	destinationConn, err := destination.Conn(ctx)
-	if err != nil {
-		_ = destination.Close()
-		_ = os.Remove(tempPath)
-		return nil, err
-	}
-	backupErr := sourceConn.Raw(func(sourceDriver any) error {
-		sourceSQLite, ok := sourceDriver.(*sqlite3.SQLiteConn)
-		if !ok {
-			return errors.New("unexpected SQLite source driver")
-		}
-		return destinationConn.Raw(func(destinationDriver any) error {
-			destinationSQLite, ok := destinationDriver.(*sqlite3.SQLiteConn)
-			if !ok {
-				return errors.New("unexpected SQLite destination driver")
-			}
-			backup, err := destinationSQLite.Backup("main", sourceSQLite, "main")
-			if err != nil {
-				return err
-			}
-			defer backup.Finish()
-			for {
-				done, stepErr := backup.Step(256)
-				if stepErr != nil {
-					return stepErr
-				}
-				if done {
-					return nil
-				}
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(2 * time.Millisecond):
-				}
-			}
-		})
-	})
-	_ = destinationConn.Close()
-	if backupErr != nil {
-		_ = destination.Close()
-		_ = os.Remove(tempPath)
-		return nil, fmt.Errorf("backup diagnostic SQLite snapshot: %w", backupErr)
-	}
-	if _, err := destination.ExecContext(ctx, `PRAGMA query_only=ON`); err != nil {
-		_ = destination.Close()
-		_ = os.Remove(tempPath)
-		return nil, err
-	}
-	return &DiagnosticSnapshot{
-		id: newDiagnosticSnapshotID(), driver: s.driver,
-		backupDB: destination, backupPath: tempPath,
-	}, nil
+	return &DiagnosticSnapshot{id: newDiagnosticSnapshotID(), conn: conn, tx: tx, driver: s.driver}, nil
 }
 
 func (s *DiagnosticSnapshot) ID() string {
@@ -162,16 +242,13 @@ func (s *DiagnosticSnapshot) Store(source *Store) (*Store, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.backupDB != nil {
-		return &Store{
-			path: s.backupPath, driver: source.driver, db: s.backupDB, rdb: s.backupDB,
-			tokenKey: source.tokenKey, tokenKeys: source.tokenKeys, cryptoStrict: source.cryptoStrict,
-		}, nil
-	}
 	if s.tx == nil {
 		return nil, errors.New("diagnostic snapshot is closed")
 	}
-	return &Store{path: source.path, driver: source.driver, db: source.db, rdb: s.tx, tokenKey: source.tokenKey}, nil
+	return &Store{
+		path: source.path, driver: source.driver, db: source.db, rdb: s.tx,
+		tokenKey: source.tokenKey, tokenKeys: source.tokenKeys, cryptoStrict: source.cryptoStrict,
+	}, nil
 }
 
 func (s *DiagnosticSnapshot) Close() error {
@@ -180,19 +257,19 @@ func (s *DiagnosticSnapshot) Close() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.backupDB != nil {
-		closeErr := s.backupDB.Close()
-		s.backupDB = nil
-		removeErr := os.Remove(s.backupPath)
-		s.backupPath = ""
-		return errors.Join(closeErr, removeErr)
-	}
 	if s.tx == nil || s.conn == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	commitErr := s.tx.Commit()
+	if errors.Is(commitErr, sql.ErrTxDone) ||
+		errors.Is(commitErr, context.Canceled) ||
+		errors.Is(commitErr, context.DeadlineExceeded) {
+		// database/sql rolls a context-bound transaction back asynchronously when
+		// its context is cancelled. Closing the snapshot remains idempotent.
+		commitErr = nil
+	}
 	s.tx = nil
 	var resetErr error
 	if s.driver != "postgres" {
@@ -201,6 +278,16 @@ func (s *DiagnosticSnapshot) Close() error {
 	closeErr := s.conn.Close()
 	s.conn = nil
 	return errors.Join(commitErr, resetErr, closeErr)
+}
+
+func resetSQLiteDiagnosticConnection(conn *sql.Conn) {
+	if conn == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, _ = conn.ExecContext(ctx, `PRAGMA query_only=OFF`)
+	cancel()
+	_ = conn.Close()
 }
 
 func newDiagnosticSnapshotID() string {

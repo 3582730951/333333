@@ -25,6 +25,13 @@ const (
 	Context1MSupported   = "supported"
 	Context1MUnsupported = "unsupported"
 	Context1MUnknown     = "unknown"
+
+	// GPT-5.6 has one client-visible contract across the pool. The effective
+	// percentage is 100 so Codex's resolved hard window is exactly 372K; automatic
+	// compaction starts at 90%, leaving 37.2K tokens of headroom.
+	GPT56ContextWindow         = int64(372000)
+	GPT56AutoCompactTokenLimit = int64(334800)
+	GPT56EffectivePercent      = int64(100)
 )
 
 // RequestedClaudeModel separates the downstream model spelling from the model
@@ -78,7 +85,7 @@ func normalizeRequestedClaudeBase(model string) string {
 func KiroEffectiveContextWindow(model, contextMode string, measured int64) int64 {
 	limit := KiroContextWindow(model)
 	requestLimit := int64(200000)
-	// GPT-5.6 is a native Kiro model family with a 272K standard context
+	// GPT-5.6 is a native Kiro model family with a 372K standard context
 	// window. This is not the paid Claude-only 1M extension, so a normal GPT
 	// request must retain the model's documented window rather than being
 	// artificially reduced to the generic 200K default.
@@ -133,6 +140,34 @@ var claudeStaticModels = []string{
 	"claude-haiku-4-5-20251001",
 }
 
+var claudeProbeModels = append(append([]string(nil), claudeStaticModels...),
+	// Pre-4.6 Claude API aliases are accepted by many relay stations even when
+	// their catalog exposes only the pinned dated IDs.
+	"claude-sonnet-4-5",
+	"claude-opus-4-5",
+	"claude-haiku-4-5",
+)
+
+// ClaudeProbeModelTable returns the maintained candidate table used by
+// Anthropic-compatible third-party relays that do not implement GET /v1/models.
+// Callers must verify candidates against that relay before advertising them as
+// authoritative; this table is a discovery input, not an entitlement claim.
+func ClaudeProbeModelTable() []string {
+	return append([]string(nil), claudeProbeModels...)
+}
+
+// IsClaudeProbeModel reports whether a model is one of the maintained
+// third-party discovery candidates.
+func IsClaudeProbeModel(model string) bool {
+	model = strings.TrimSpace(model)
+	for _, candidate := range claudeProbeModels {
+		if strings.EqualFold(candidate, model) {
+			return true
+		}
+	}
+	return false
+}
+
 var kiroStaticModels = []string{
 	"claude-opus-5",
 	"claude-sonnet-5", "claude-sonnet-4.6", "claude-sonnet-4.5",
@@ -146,6 +181,25 @@ var kiroStaticModels = []string{
 
 var kiroConcreteModelRE = regexp.MustCompile(`^claude-(opus|sonnet|haiku|fable)-([0-9]+)(?:[.-]([0-9]+))?(?:-([0-9]{8}))?$`)
 var kiroGPTModelRE = regexp.MustCompile(`^gpt-5\.6-(sol|terra|luna)$`)
+
+func isGPT56Model(model string) bool {
+	canonical, ok := KiroCanonicalModel(NormalizeCodexModelAlias(model))
+	return ok && strings.HasPrefix(canonical, "gpt-5.6-")
+}
+
+// ApplyGPT56ContextContract normalizes stale discovery metadata before it is
+// persisted or rendered. Some upstream catalogs inherit an older client bundle's
+// 272K value even though the pool product contract is 372K.
+func ApplyGPT56ContextContract(cap storage.ModelCapability) storage.ModelCapability {
+	if !isGPT56Model(cap.ModelSlug) {
+		return cap
+	}
+	cap.NativeContextWindow = GPT56ContextWindow
+	cap.NativeMaxContextWindow = GPT56ContextWindow
+	cap.EffectiveContextWindowPercent = GPT56EffectivePercent
+	cap.AutoCompactTokenLimit = GPT56AutoCompactTokenLimit
+	return cap
+}
 
 // KiroModelAlias reports whether model needs account-specific capability
 // resolution. Aliases are deliberately not resolved from the static catalog: those
@@ -346,14 +400,14 @@ func KiroSupportsAdaptiveThinking(model string) bool {
 // models retain the 200k window. Unknown future versions use 200k until a live
 // capability proves otherwise.
 //
-// GPT-5.6 uses the 272K window documented by Kiro.
+// GPT-5.6 uses the pool-wide 372K window contract.
 func KiroContextWindow(model string) int64 {
 	canonical, ok := KiroCanonicalModel(model)
 	if !ok {
 		return 200000
 	}
 	if strings.HasPrefix(canonical, "gpt-") {
-		return 272000
+		return GPT56ContextWindow
 	}
 	switch canonical {
 	case "claude-sonnet-5", "claude-sonnet-4.6",
@@ -401,7 +455,7 @@ func StaticKiroModels(accountID string) []storage.ModelCapability {
 	for _, slug := range kiroStaticModels {
 		window := int64(1000000)
 		if strings.HasPrefix(slug, "gpt-") {
-			window = 272000
+			window = GPT56ContextWindow
 		} else if strings.Contains(slug, "4.5") || strings.Contains(slug, "haiku") {
 			window = 200000
 		}
@@ -760,9 +814,9 @@ type codexStaticModel struct {
 // listed (the hidden codex-auto-review preset is omitted). Ordered most-capable
 // first. The live probe — when it works — is authoritative and supersedes this.
 var codexStaticModels = []codexStaticModel{
-	{slug: "gpt-5.6-sol", window: 372000, maxWindow: 372000, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-terra", window: 372000, maxWindow: 372000, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
-	{slug: "gpt-5.6-luna", window: 372000, maxWindow: 372000, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
+	{slug: "gpt-5.6-sol", window: GPT56ContextWindow, maxWindow: GPT56ContextWindow, autoCompactTokenLimit: GPT56AutoCompactTokenLimit, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-terra", window: GPT56ContextWindow, maxWindow: GPT56ContextWindow, autoCompactTokenLimit: GPT56AutoCompactTokenLimit, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max", "ultra"}},
+	{slug: "gpt-5.6-luna", window: GPT56ContextWindow, maxWindow: GPT56ContextWindow, autoCompactTokenLimit: GPT56AutoCompactTokenLimit, overrideClientContext: true, minimumClientVersion: "0.144.0", requiresCurrentClient: true, preferWebSocket: true, responsesLite: true, reasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}},
 	{slug: "gpt-5.5", window: 272000, maxWindow: 272000, minimumClientVersion: "0.124.0", requiresCurrentClient: true, preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4", window: 272000, maxWindow: 1000000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
 	{slug: "gpt-5.4-mini", window: 272000, maxWindow: 272000, minimumClientVersion: "0.98.0", preferWebSocket: true, reasoningLevels: []string{"low", "medium", "high", "xhigh"}},
@@ -806,10 +860,10 @@ func CodexMinimumClientVersion(slug string) string {
 	return m.minimumClientVersion
 }
 
-// CodexClientContextOverrides returns context settings managed by the generated
-// official-client config. A zero autoCompactTokenLimit is intentional: the setup
-// script removes any stale explicit threshold and leaves compaction policy to the
-// current Codex client.
+// CodexClientContextOverrides returns the fixed GPT-5.6 context contract for
+// callers that cannot consume the native /models catalog. The generated official
+// client config deliberately does not use these values: command authentication
+// makes Codex fetch the server-rendered model contract from /v1/models instead.
 func CodexClientContextOverrides(slug string) (contextWindow, autoCompactTokenLimit int64, ok bool) {
 	m, found := codexStaticModelForSlug(slug)
 	if !found || !m.overrideClientContext || m.window <= 0 {
@@ -858,7 +912,7 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 	now := storage.Now()
 	out := make([]storage.ModelCapability, 0, len(codexStaticModels))
 	for _, m := range codexStaticModels {
-		out = append(out, storage.ModelCapability{
+		cap := storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     m.slug,
 			NativeContextWindow:           m.window,
@@ -870,7 +924,8 @@ func StaticCodexModels(accountID string) []storage.ModelCapability {
 			Visibility:                    "list",
 			Source:                        "codex_static",
 			LastProbeAt:                   now,
-		})
+		}
+		out = append(out, ApplyGPT56ContextContract(cap))
 	}
 	return out
 }
@@ -920,7 +975,7 @@ func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability
 		if b, err := json.Marshal(model); err == nil {
 			rawModel = string(b)
 		}
-		out = append(out, storage.ModelCapability{
+		cap := storage.ModelCapability{
 			AccountID:                     accountID,
 			ModelSlug:                     slug,
 			NativeContextWindow:           native,
@@ -935,7 +990,8 @@ func Parse(accountID string, raw []byte, etag string) ([]storage.ModelCapability
 			RawModelJSON:                  rawModel,
 			Source:                        "probe",
 			LastProbeAt:                   now,
-		})
+		}
+		out = append(out, ApplyGPT56ContextContract(cap))
 	}
 	return out, nil
 }
@@ -1051,7 +1107,35 @@ func BuildModelsResponseForScopes(scopes [][]storage.ModelCapability, cfg config
 // BuildCodexModelsResponseForScopes is the native Codex schema counterpart of
 // BuildModelsResponseForScopes.
 func BuildCodexModelsResponseForScopes(scopes [][]storage.ModelCapability) ([]byte, string, error) {
-	return BuildCodexModelsResponse(scopedCatalogCapabilities(scopes))
+	selected := scopedCatalogCapabilities(scopes)
+	seen56 := make(map[string]bool)
+	for _, cap := range selected {
+		if isGPT56Model(cap.ModelSlug) {
+			seen56[strings.ToLower(strings.TrimSpace(cap.ModelSlug))] = true
+		}
+	}
+	// A live probe can be temporarily unavailable on a newly imported account.
+	// The scoped list already contains only active/routable accounts, so promote a
+	// cloned GPT-5.6 static hint for this native client response only. The stored
+	// row remains unverified and normal routing still bootstraps/records evidence.
+	for scopeIndex, scope := range scopes {
+		for _, cap := range scope {
+			slug := strings.ToLower(strings.TrimSpace(cap.ModelSlug))
+			if seen56[slug] || !isGPT56Model(slug) || capabilityIsVerified(cap) {
+				continue
+			}
+			source := strings.ToLower(strings.TrimSpace(cap.Source))
+			if !strings.Contains(source, "static") && !strings.Contains(source, "unknown") {
+				continue
+			}
+			cap = ApplyGPT56ContextContract(cap)
+			cap.AccountID = fmt.Sprintf("\x00scoped-codex-bootstrap\x00%d", scopeIndex)
+			cap.AvailabilityState = AvailabilityVerified
+			selected = append(selected, cap)
+			seen56[slug] = true
+		}
+	}
+	return BuildCodexModelsResponse(selected)
 }
 
 // BuildAnthropicModelsResponseForScopes is the native Anthropic schema
@@ -1257,18 +1341,27 @@ func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage
 		percent = 95
 	}
 	static, knownStatic := codexStaticModelForSlug(selected.ModelSlug)
-	clientManagedCompaction := knownStatic && static.overrideClientContext
-	// Current 5.6 deployments use the verified 372K hard window. Deliberately
-	// leave auto_compact_token_limit absent: current Codex derives and manages its
-	// own trigger from ModelInfo, and an explicit threshold can disable or delay
-	// the client's evolving compaction policy. This changes only context metadata;
-	// every live reasoning/tool/instruction/future field above remains intact.
-	if clientManagedCompaction {
+	// GPT-5.6 has one pool-wide client contract: 372K with compaction at 90%.
+	// Live account probes can arrive with stale bundled-client metadata, so the
+	// curated override wins for this family. Other models retain route-scoped
+	// conservative limits.
+	if knownStatic && static.overrideClientContext {
 		window = static.window
 		maxWindow = static.maxWindow
 		autoCompact = static.autoCompactTokenLimit
+		percent = GPT56EffectivePercent
+	} else {
+		if window == 0 && knownStatic {
+			window = static.window
+		}
+		if maxWindow == 0 && knownStatic {
+			maxWindow = static.maxWindow
+		}
 	}
-	if window > 0 && !clientManagedCompaction {
+	if maxWindow > 0 && (window == 0 || window > maxWindow) {
+		window = maxWindow
+	}
+	if window > 0 {
 		derivedLimit := (window * 9) / 10
 		if autoCompact == 0 || autoCompact > derivedLimit {
 			autoCompact = derivedLimit
@@ -1315,7 +1408,7 @@ func codexModelInfoItem(selected storage.ModelCapability, capabilities []storage
 	setModelInfoDefault(item, "input_modalities", []interface{}{"text", "image"})
 	item["context_window"] = window
 	item["max_context_window"] = maxWindow
-	if autoCompact > 0 && !clientManagedCompaction {
+	if autoCompact > 0 {
 		item["auto_compact_token_limit"] = autoCompact
 	} else {
 		delete(item, "auto_compact_token_limit")

@@ -20,6 +20,14 @@ func TestLogRetentionAndManualClearPreserveActiveBillingHolds(t *testing.T) {
 		{`INSERT INTO audit_log(action, created_at) VALUES('old', ?), ('new', ?)`, []interface{}{oldAt, newAt}},
 		{`INSERT INTO cf_events(account_id, egress_id, status, category, created_at) VALUES('log-account','egress_direct',403,'old',?), ('log-account','egress_direct',200,'new',?)`, []interface{}{oldAt, newAt}},
 		{`INSERT INTO usage_records(account_id, route_key_hash, model, created_at) VALUES('log-account','old','gpt',?), ('log-account','new','gpt',?)`, []interface{}{oldAt, newAt}},
+		{`INSERT INTO usage_events(event_id,hold_id,account_id,usage_state,created_at,updated_at) VALUES
+('terminal-old-event','terminal-old','log-account','real',?,?),
+('terminal-new-event','terminal-new','log-account','real',?,?),
+('active-old-event','active-old','log-account','pending',?,?),
+('orphan-old-event','missing-hold','log-account','real',?,?),
+('standalone-old-event','','log-account','real',?,?),
+('standalone-new-event','','log-account','real',?,?)`,
+			[]interface{}{oldAt, oldAt, newAt, newAt, oldAt, oldAt, oldAt, oldAt, oldAt, oldAt, newAt, newAt}},
 		{`INSERT INTO registration_task_events(task_id, message, created_at) VALUES('old','old',?), ('new','new',?)`, []interface{}{oldAt, newAt}},
 		{`INSERT INTO lifecycle_tasks(id, task_type, created_at) VALUES('log-task','test',?)`, []interface{}{oldAt}},
 		{`INSERT INTO lifecycle_task_logs(task_id, message, timestamp) VALUES('log-task','old',?), ('log-task','new',?)`, []interface{}{oldAt, newAt}},
@@ -39,13 +47,15 @@ func TestLogRetentionAndManualClearPreserveActiveBillingHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	if counts.AuditLog != 1 || counts.CFEvents != 1 || counts.UsageRecords != 1 ||
+		counts.UsageEvents != 3 ||
 		counts.RegistrationTaskEvents != 1 || counts.LifecycleTaskLogs != 1 ||
-		counts.LifecycleEvents != 1 || counts.ProxyUsageRecords != 1 || counts.TerminalBillingHolds != 1 || counts.Total() != 8 {
+		counts.LifecycleEvents != 1 || counts.ProxyUsageRecords != 1 || counts.TerminalBillingHolds != 1 || counts.Total() != 11 {
 		t.Fatalf("retention counts = %+v total=%d", counts, counts.Total())
 	}
 	assertTableCount(t, store, "audit_log", 1)
 	assertTableCount(t, store, "cf_events", 1)
 	assertTableCount(t, store, "usage_records", 1)
+	assertTableCount(t, store, "usage_events", 3)
 	assertTableCount(t, store, "registration_task_events", 1)
 	assertTableCount(t, store, "lifecycle_task_logs", 1)
 	assertTableCount(t, store, "lifecycle_events", 1)
@@ -60,13 +70,14 @@ func TestLogRetentionAndManualClearPreserveActiveBillingHolds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cleared.PreservedActiveBillingHolds != 1 || cleared.Deleted.Total() != 8 {
+	if cleared.PreservedActiveBillingHolds != 1 || cleared.Deleted.UsageEvents != 2 || cleared.Deleted.Total() != 10 {
 		t.Fatalf("manual clear result = %+v", cleared)
 	}
 	for _, table := range []string{"audit_log", "cf_events", "usage_records", "registration_task_events", "lifecycle_task_logs", "lifecycle_events", "proxy_usage_records"} {
 		assertTableCount(t, store, table, 0)
 	}
 	assertTableCount(t, store, "billing_holds", 1)
+	assertTableCount(t, store, "usage_events", 1)
 	if err := store.ReclaimLogStorage(ctx); err != nil {
 		t.Fatalf("reclaim log storage: %v", err)
 	}

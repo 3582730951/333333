@@ -152,7 +152,7 @@
     "autoupdate"
   ],
   "claude_gateway_unknown_target_policy": "forward",
-  "claude_gateway_disable_nonessential_env": true,
+  "claude_gateway_disable_nonessential_env": false,
   "claude_gateway_strict_linux_default": true,
   "claude_gateway_virtual_dns_servers": [],
   "default_register_method": "protocol_v2",

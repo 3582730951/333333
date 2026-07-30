@@ -66,12 +66,11 @@ func KiroCapabilityKey(endpointHash, region, governance string) (capabilityKey, 
 func (m *Manager) RefreshModelCatalog(ctx context.Context, account storage.Account, cred storage.KiroCredentials, bearer string, egress storage.EgressProfile) ([]storage.KiroModelDescriptor, error) {
 	cfg := m.Config()
 	region := first(cred.APIRegion, cfg.KiroDefaultAPIRegion, "us-east-1")
-	base, err := ValidateEndpoint(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
+	base, err := ListAvailableModelsEndpoint(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
 	if err != nil {
 		return nil, err
 	}
-	base = trimKiroOperation(base)
-	endpointHash, err := EndpointHash(base, region, cfg.KiroEndpointAllowlist)
+	endpointHash, err := EndpointHash(cred.Endpoint, region, cfg.KiroEndpointAllowlist)
 	if err != nil {
 		return nil, err
 	}
@@ -190,22 +189,27 @@ func (m *Manager) fetchCompleteModelCatalog(ctx context.Context, account storage
 		seen      = map[string]struct{}{"": {}}
 	)
 	for page := 1; page <= kiroCatalogMaxPages; page++ {
-		target, err := url.Parse(base + "/listAvailableModels")
+		target, err := url.Parse(base)
 		if err != nil {
 			return nil, "", page - 1, &CatalogProbeError{Class: "internal"}
 		}
 		query := target.Query()
-		query.Set("origin", "AI_EDITOR")
-		if cred.ProfileARN != "" {
-			query.Set("profileArn", cred.ProfileARN)
-		}
-		if nextToken != "" {
-			query.Set("nextToken", nextToken)
-		}
+		query.Set("origin", kiroCLIOrigin)
 		target.RawQuery = query.Encode()
+		request := struct {
+			Origin    string `json:"origin"`
+			NextToken string `json:"nextToken,omitempty"`
+		}{
+			Origin:    kiroCLIOrigin,
+			NextToken: nextToken,
+		}
+		body, marshalErr := json.Marshal(request)
+		if marshalErr != nil {
+			return nil, "", page - 1, &CatalogProbeError{Class: "internal"}
+		}
 		headers := Headers(m.Config(), cred, bearer, false)
-		headers.Set("Accept", "application/json")
-		status, _, raw, requestErr := m.do(ctx, egress, http.MethodGet, target.String(), headers, nil, account.ID+":"+egress.ID)
+		ApplyOperationHeaders(headers, OperationListAvailableModels)
+		status, _, raw, requestErr := m.do(ctx, egress, http.MethodPost, target.String(), headers, body, account.ID+":"+egress.ID)
 		if requestErr != nil {
 			return nil, "", page - 1, &CatalogProbeError{Class: "network"}
 		}

@@ -1196,7 +1196,20 @@ func userGroupTargetSupportsModel(ctx context.Context, store *storage.Store, tar
 	}
 	provider, ok, err := store.GetCustomProvider(ctx, target.ID)
 	if err != nil || !ok || !provider.Enabled || len(provider.Models) == 0 {
-		return err == nil && ok && provider.Enabled
+		if err != nil || !ok || !provider.Enabled {
+			return false
+		}
+		for source := range provider.ModelMappings {
+			if userGroupRuleMatchesModel(source, model) {
+				return true
+			}
+		}
+		return len(provider.Models) == 0
+	}
+	for source := range provider.ModelMappings {
+		if userGroupRuleMatchesModel(source, model) {
+			return true
+		}
 	}
 	for _, candidate := range provider.Models {
 		if userGroupRuleMatchesModel(candidate, model) {

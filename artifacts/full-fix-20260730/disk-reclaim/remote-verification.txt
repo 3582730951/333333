@@ -1,0 +1,330 @@
+
+===== reset isolated fixture =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 rm -rf /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case
+EXIT_STATUS=0
+
+===== create fixture directories =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 mkdir -p /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/diagnostics /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/spool /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/tmp/browser /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data/logs /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups
+EXIT_STATUS=0
+
+===== create SQLite fixture and baseline hashes =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 python3 - /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case
+{
+  "accounts": {
+    "rows": 8,
+    "sha256": "9d05e4639c10078247d860333a668eba9ccfda3faab7493e126fadb42c1a12f6"
+  },
+  "all_db": {
+    "rows": 65,
+    "sha256": "7d971b36d769b26c5afa20247133339b12664c04b4a9a55d19ef1f7f0231a4d6"
+  },
+  "config_sha256": "b857b6e8fd0691486f3942366e53344e2e2dde8f7dbf355b49b334b22a636edf",
+  "contexts": {
+    "rows": 12,
+    "sha256": "de3ffdb3a0f9de3f223392ef2c611c220752e47f1a262f24c833b87ebb224410"
+  },
+  "database_bytes": 8765440,
+  "database_sha256": "2a6348b515aae83870ff4bb1b3494a1a2ba0965d758547da9fba485c51df2cf2"
+}
+EXIT_STATUS=0
+
+===== script sha256 =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 sha256sum /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh
+19d2107558ae70cb95ba9447f53b6ca384f7fda8c84a6ae9ee7cfa7301f42681  /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh
+EXIT_STATUS=0
+
+===== bash static syntax =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 bash -n /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh
+EXIT_STATUS=0
+
+===== help contract =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 bash /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh --help
+Usage:
+  reclaim-disk-space.sh [options]                 # dry-run (default)
+  reclaim-disk-space.sh --apply [options]         # perform reclamation
+  reclaim-disk-space.sh --apply --rollback FILE [options]
+
+Database selection:
+  --config FILE              Read data_dir/database_path/storage_driver/DSN.
+  --data-dir DIR             Persistent data root.
+  --db FILE                  SQLite database path.
+  --postgres-dsn DSN         PostgreSQL DSN (never written to reports).
+  --driver sqlite|postgres   Explicit storage driver.
+
+Safety and retention:
+  --retention-days N         Historical-log cutoff; default is the stored
+                             reg_log_retention_days setting, then 7.
+  --stale-file-hours N       Minimum age for spool/browser temp removal (24).
+  --backup-dir DIR           Backup/archive destination.  Prefer another disk.
+  --service UNIT             Exact systemd unit owned by this deployment.
+  --stop-service             Stop UNIT for --apply and restart it on exit.
+  --assume-quiesced          Assert all writers are already stopped.  Required
+                             for PostgreSQL apply without --stop-service.
+  --optimize-config          Atomically write conservative space bounds to the
+                             JSON config; never lowers a bound below live data.
+  --apply                    Mutate.  Without this flag no file is changed.
+  --rollback FILE            Restore a SQLite .sqlite3 or .sqlite3.gz backup.
+  -h, --help                 Show this help.
+
+Always preserved and verified:
+  * account rows, credentials, cookies, group membership and egress bindings;
+  * goal/context/session payloads and the virtual context ledger;
+  * logs inside the retention window; older logs are losslessly JSONL+gzip
+    archived and checksummed before their database rows are removed;
+  * keys, users/API keys, groups, providers, egress and all static settings.
+
+Reclaimed:
+  * expired/stale route and model-discovery caches;
+  * expired user/maintenance leases and terminal reauth history;
+  * diagnostic artifacts/rows and stale spool/browser/snapshot files;
+  * archived log rows older than the configured retention window;
+  * SQLite free pages and WAL via VACUUM + TRUNCATE checkpoint.
+
+The usage journal and host-wide/system logs are never touched.
+EXIT_STATUS=0
+
+===== capture pre-dry-run state =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 python3 - /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case
+4436538fd3e4170fcbd9d9db1ecfaccc0dedf219eff9f6e41618120474ec9202
+EXIT_STATUS=0
+
+===== default dry-run =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 bash /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh --config /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/config.json --backup-dir /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups --retention-days 7 --stale-file-hours 1 --optimize-config
+{
+  "accounts_before": {
+    "rows": 8,
+    "sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
+    "tables": {
+      "account_auth_tokens": 1,
+      "account_egress_bindings": 1,
+      "account_group_memberships": 1,
+      "account_lifecycle_status": 1,
+      "account_rate_limits": 1,
+      "account_session_cookies": 1,
+      "accounts": 1,
+      "codex_reset_credit_consumptions": 1
+    }
+  },
+  "backup_dir": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups",
+  "candidate_files": {
+    "by_role": {
+      "browser_tmp": {
+        "bytes": 1048576,
+        "count": 1
+      },
+      "diagnostics": {
+        "bytes": 1048576,
+        "count": 1
+      },
+      "legacy_snapshot": {
+        "bytes": 1048576,
+        "count": 1
+      },
+      "spool": {
+        "bytes": 1048576,
+        "count": 1
+      }
+    },
+    "bytes": 4194304,
+    "count": 4
+  },
+  "candidate_rows": {
+    "cache:account_codex_reauth_jobs": 1,
+    "cache:account_model_capabilities": 1,
+    "cache:account_model_catalog_status": 1,
+    "cache:affinity_aliases": 1,
+    "cache:affinity_bindings": 1,
+    "cache:antigravity_cache_entries": 1,
+    "cache:codex_upstream_attempt": 1,
+    "cache:codex_upstream_attempt_daily": 1,
+    "cache:kiro_model_catalog": 1,
+    "cache:kiro_probe_state": 1,
+    "cache:kiro_runtime_capabilities": 1,
+    "cache:maintenance_leases": 1,
+    "cache:user_group_target_bindings": 1,
+    "cache:user_sessions": 1,
+    "diagnostic:diagnostic_download_leases": 1,
+    "diagnostic:diagnostic_events": 1,
+    "diagnostic:diagnostic_jobs": 1,
+    "diagnostic:storage_resources": 1,
+    "log:audit_log": 1,
+    "log:billing_holds": 1,
+    "log:cf_events": 1,
+    "log:lifecycle_events": 1,
+    "log:lifecycle_task_logs": 1,
+    "log:member_rotation_log": 1,
+    "log:model_quality_runs": 1,
+    "log:proxy_usage_records": 1,
+    "log:quota_check_log": 1,
+    "log:registration_task_events": 1,
+    "log:usage_events": 1,
+    "log:usage_records": 1
+  },
+  "contexts_before": {
+    "rows": 12,
+    "sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
+    "tables": {
+      "codex_instruction_snapshot": 1,
+      "codex_session_alias": 1,
+      "codex_session_binding": 1,
+      "context_journal": 1,
+      "goal_alias": 1,
+      "goal_checkpoint": 1,
+      "goal_payload_chunk": 2,
+      "goal_run": 1,
+      "goal_segment": 1,
+      "goal_session": 1,
+      "virtual_context_ledger": 1
+    }
+  },
+  "cutoff_epoch": 1784786122,
+  "data_dir": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/data",
+  "database": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/pool.sqlite3",
+  "database_bytes_before": 8765440,
+  "filesystem_free_bytes_before": 63632769024,
+  "legacy_dual_write_coverage": {
+    "active_context_rows": 1,
+    "can_disable": true,
+    "covered_context_rows": 1,
+    "goal_continuity_confirmed": true,
+    "reason": "every unexpired context_journal response alias has one live goal with a checkpoint and all uncompacted segment payloads"
+  },
+  "logs_all_before": {
+    "rows": 25,
+    "sha256": "be86a176071d36acf07259bbe7148dca084c61f636108a4f134f352834d76a3f",
+    "tables": {
+      "audit_log": 2,
+      "billing_holds": 2,
+      "cf_events": 2,
+      "lifecycle_events": 2,
+      "lifecycle_task_logs": 2,
+      "member_rotation_log": 2,
+      "model_quality_runs": 2,
+      "proxy_usage_records": 2,
+      "quota_check_log": 2,
+      "registration_task_events": 2,
+      "usage_events": 3,
+      "usage_records": 2
+    }
+  },
+  "logs_retained_before": {
+    "rows": 13,
+    "sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
+    "tables": {
+      "audit_log": 1,
+      "billing_holds": 1,
+      "cf_events": 1,
+      "lifecycle_events": 1,
+      "lifecycle_task_logs": 1,
+      "member_rotation_log": 1,
+      "model_quality_runs": 1,
+      "proxy_usage_records": 1,
+      "quota_check_log": 1,
+      "registration_task_events": 1,
+      "usage_events": 2,
+      "usage_records": 1
+    }
+  },
+  "mode": "dry-run",
+  "retention_days": 7,
+  "wal_bytes_before": 0
+}
+DRY-RUN: no database row, file, or config was changed.
+EXIT_STATUS=0
+
+===== verify dry-run made zero changes =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 python3 - /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case
+{"after_files": 9, "before_files": 9, "exact_match": true}
+EXIT_STATUS=0
+
+===== apply reclamation =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 bash /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh --apply --config /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/config.json --backup-dir /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups --retention-days 7 --stale-file-hours 1 --optimize-config --assume-quiesced
+{
+  "accounts_sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
+  "archived_rows": 19,
+  "contexts_sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
+  "database_bytes_reclaimed": 8396800,
+  "files_bytes_reclaimed": 4194304,
+  "ok": true,
+  "retained_logs_sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
+  "rollback_backup": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz",
+  "verification": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/verification.json"
+}
+EXIT_STATUS=0
+
+===== verify apply invariants archives files config and vacuum =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 python3 - /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case
+{
+  "accounts_sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
+  "archive_files": 19,
+  "archive_rows": 19,
+  "contexts_sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
+  "database_bytes_after": 368640,
+  "database_bytes_before": 8765440,
+  "dual_write_disabled_after_coverage_proof": true,
+  "retained_logs_sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
+  "rollback_backup": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz",
+  "sqlite_quick_check": "ok",
+  "verification": "/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/verification.json"
+}
+EXIT_STATUS=0
+
+===== rollback full SQLite and config =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 bash /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/reclaim-disk-space.sh --apply --config /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/config.json --backup-dir /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups --rollback /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz --assume-quiesced
+Rollback verified and restored: /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/pool.sqlite3
+Rollback restored config: /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/config.json
+EXIT_STATUS=0
+
+===== verify rollback restored original logical hash and rows =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 python3 - /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case
+{
+  "accounts": 1,
+  "config_sha256": "b857b6e8fd0691486f3942366e53344e2e2dde8f7dbf355b49b334b22a636edf",
+  "contexts": 1,
+  "diagnostic_jobs": 1,
+  "expected": {
+    "rows": 65,
+    "sha256": "7d971b36d769b26c5afa20247133339b12664c04b4a9a55d19ef1f7f0231a4d6"
+  },
+  "expected_config_sha256": "b857b6e8fd0691486f3942366e53344e2e2dde8f7dbf355b49b334b22a636edf",
+  "old_usage_rows": 1,
+  "quick_check": "ok",
+  "rows": 65,
+  "sha256": "7d971b36d769b26c5afa20247133339b12664c04b4a9a55d19ef1f7f0231a4d6"
+}
+EXIT_STATUS=0
+
+===== verification artifacts hashes =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 find /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups -type f -maxdepth 4 -print
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-audit_log.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-cf_events.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-usage_records.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-usage_events.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-registration_task_events.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-lifecycle_task_logs.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-lifecycle_events.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-proxy_usage_records.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-billing_holds.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-model_quality_runs.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-member_rotation_log.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/historical-log-quota_check_log.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-diagnostic_download_leases.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-diagnostic_events.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-diagnostic_jobs.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/terminal-history-account_codex_reauth_jobs.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/terminal-history-codex_upstream_attempt.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/terminal-history-codex_upstream_attempt_daily.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/history/diagnostic-storage_resources.jsonl.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3-wal
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3-shm
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/config.json.before.json
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/pool.sqlite3.before.sqlite3.gz
+/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/backups/reclaim-20260730T055522Z/verification.json
+EXIT_STATUS=0
+
+===== remote log sha256 =====
+COMMAND: /usr/local/bin/rtk taskset -c 190\,191 nice -n 15 ionice -c3 sha256sum /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/remote-verification.log
+b8f0680803b661a56b2b3db14af46cdb7f74f6ea70e8ef314920164ebc05c5c0  /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/remote-verification.log
+EXIT_STATUS=0
+
+ALL_REMOTE_DISK_RECLAIM_TESTS_PASSED

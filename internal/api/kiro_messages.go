@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"codex-account-pool/internal/ban"
@@ -28,8 +29,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/sjson"
 )
-
-const kiroContextMinRetryOutputTokens int64 = 4096
 
 func (s *Server) kiroMessagesWithLease(w http.ResponseWriter, r *http.Request, raw []byte, model string, affinity routing.AffinityKey, lease scheduler.Lease, _ bool, _ map[string]bool) attemptOutcome {
 	defer lease.Release()
@@ -445,40 +444,38 @@ func (s *Server) doKiroAttempt(w http.ResponseWriter, r *http.Request, converted
 }
 
 func (s *Server) doKiroAttemptOnResponse(w http.ResponseWriter, r *http.Request, converted *kirowire.Conversion, lease scheduler.Lease, onResponse func()) (*kirowire.ResponseData, string, attemptOutcome) {
-	for attempt := 0; attempt < 2; attempt++ {
-		response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
-		if response == nil {
-			return nil, endpointHash, outcome
-		}
-		if onResponse != nil {
-			onResponse()
-			onResponse = nil
-		}
-		var data kirowire.ResponseData
-		var err error
-		if converted.WebSearch != nil {
-			var raw []byte
-			raw, err = readLimited(response.Body, s.cfg.MaxBodyBytes)
-			if err == nil {
-				data, err = kirowire.DecodeWebSearchResponse(raw, *converted.WebSearch, converted.EstimatedInputTokens)
-			}
-		} else {
-			data, err = kirowire.DecodeResponseWithOptions(r.Context(), response.Body, converted.ToolNameMap, s.responseBodyCaptureOptions(r.Context()))
-		}
-		response.Body.Close()
-		if err != nil {
-			writeKiroError(w, r, http.StatusBadGateway, normalizeKiroContextError(r.Context(), err, *converted))
-			return nil, endpointHash, outcomeDone
-		}
-		finalizeKiroUsage(&data, *converted)
-		if converted.WebSearch != nil || strings.TrimSpace(data.Text) != "" || len(data.Tools) > 0 || attempt == 1 {
-			return &data, endpointHash, outcomeDone
-		}
-		// Empty or thinking-only completions are retried once with the exact same
-		// account, endpoint, model, effort, system prompt, and tool schema.
-		log.Printf("[KIRO-QUALITY] account=%s model=%s action=retry_empty_response", lease.Account.ID, converted.Model)
+	response, endpointHash, outcome := s.openKiroAttempt(w, r, converted, lease)
+	if response == nil {
+		return nil, endpointHash, outcome
 	}
-	return nil, "", outcomeDone
+	if onResponse != nil {
+		onResponse()
+	}
+	var data kirowire.ResponseData
+	var err error
+	if converted.WebSearch != nil {
+		var raw []byte
+		raw, err = readLimited(response.Body, s.cfg.MaxBodyBytes)
+		if err == nil {
+			data, err = kirowire.DecodeWebSearchResponse(raw, *converted.WebSearch, converted.EstimatedInputTokens)
+		}
+	} else {
+		data, err = kirowire.DecodeResponseWithOptions(r.Context(), response.Body, converted.ToolNameMap, s.responseBodyCaptureOptions(r.Context()))
+	}
+	response.Body.Close()
+	if err != nil {
+		writeKiroError(w, r, http.StatusBadGateway, normalizeKiroContextError(r.Context(), err, *converted))
+		return nil, endpointHash, outcomeDone
+	}
+	finalizeKiroUsage(&data, *converted)
+	if converted.WebSearch == nil && strings.TrimSpace(data.Text) == "" && len(data.Tools) == 0 {
+		// generateAssistantResponse is a non-idempotent, metered POST. An empty
+		// successful response may already have consumed credits, so transparently
+		// replaying it can double-charge and create a request burst.
+		writePoolCodeError(w, http.StatusBadGateway, "kiro_empty_response", "Kiro completed without text or tool output")
+		return nil, endpointHash, outcomeDone
+	}
+	return &data, endpointHash, outcomeDone
 }
 
 func finalizeKiroUsage(data *kirowire.ResponseData, converted kirowire.Conversion) {
@@ -550,7 +547,7 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		return nil, "", outcomeDone
 	}
 	region := firstNonEmpty(credentials.APIRegion, kiroCfg.KiroDefaultAPIRegion, "us-east-1")
-	base, err := kirowire.ValidateEndpoint(credentials.Endpoint, region, kiroCfg.KiroEndpointAllowlist)
+	target, err := kirowire.GenerateAssistantResponseEndpoint(credentials.Endpoint, region, kiroCfg.KiroEndpointAllowlist)
 	if err != nil {
 		writeKiroError(w, r, http.StatusBadRequest, err)
 		return nil, "", outcomeDone
@@ -585,18 +582,16 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 			}
 		}
 	}
-	target := strings.TrimRight(base, "/")
-	if !strings.HasSuffix(target, "/generateAssistantResponse") {
-		target += "/generateAssistantResponse"
-	}
 	requestHeaders := kirowire.Headers(kiroCfg, credentials, bearer, true)
 	if converted.WebSearch != nil {
-		target = strings.TrimSuffix(target, "/generateAssistantResponse") + "/mcp"
+		target = strings.TrimSuffix(strings.TrimRight(target, "/"), "/generateAssistantResponse") + "/mcp"
 		body, _ = json.Marshal(map[string]any{
 			"jsonrpc": "2.0", "id": converted.WebSearch.ToolUseID, "method": "tools/call",
 			"params": map[string]any{"name": "web_search", "arguments": map[string]any{"query": converted.WebSearch.Query}},
 		})
 		requestHeaders.Set("accept", "application/json")
+	} else {
+		kirowire.ApplyOperationHeaders(requestHeaders, kirowire.OperationGenerateAssistantResponse)
 	}
 	send := func(accessToken string, requestBody []byte) (*upstream.Response, error) {
 		headers := requestHeaders.Clone()
@@ -608,22 +603,16 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
 		return nil, endpointHash, outcomeDone
 	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+	if response.StatusCode == http.StatusUnauthorized {
+		header := response.Header
 		rawError := readUpstreamErrorBody(response.Body)
 		response.Body.Close()
-		if credentials.AuthMethod == "api_key" {
-			// A single Kiro 401 can be transient and a 403 can describe model or
-			// subscription policy rather than an invalid API key. Retry the exact
-			// request once; only a repeated 401 is allowed to invalidate credentials.
-			response, err = send(bearer, body)
-			if err != nil {
-				s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
-				return nil, endpointHash, outcomeDone
-			}
-		} else {
+		if credentials.AuthMethod != "api_key" && kiroAccessTokenExpired(rawError) {
 			refreshed, _, updated, refreshErr := s.kiro.Prepare(r.Context(), lease.Account, credentials, token, lease.Egress, true)
 			if refreshErr != nil {
-				s.kiroAttemptError(w, r, lease, response.StatusCode, response.Header, rawError, false, nil, refreshErr)
+				// Refresh failures are surfaced as an availability failure without
+				// classifying the already-expired access token as an account ban.
+				s.kiroAttemptError(w, r, lease, http.StatusServiceUnavailable, header, rawError, false, nil, refreshErr)
 				return nil, endpointHash, outcomeDone
 			}
 			credentials = updated
@@ -633,13 +622,17 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 				s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
 				return nil, endpointHash, outcomeDone
 			}
+		} else {
+			// generateAssistantResponse is metered and non-idempotent. Preserve the
+			// first error body and return it without replaying a generic 401/API-key
+			// rejection or permanently invalidating an otherwise recoverable account.
+			s.kiroAttemptError(w, r, lease, http.StatusServiceUnavailable, header, rawError, false, nil, nil)
+			return nil, endpointHash, outcomeDone
 		}
 	}
 	activeBody := body
 	activeFallbackBody := fallbackBody
 	cacheFallbackUsed := false
-	contextOutputReduced := false
-	contextHistoryRetries := 0
 	for response.StatusCode < 200 || response.StatusCode >= 300 {
 		status := response.StatusCode
 		header := response.Header
@@ -647,44 +640,9 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		response.Body.Close()
 
 		if kirowire.ContentLengthExceeded(rawError) {
-			if !contextOutputReduced {
-				if reduced, changed, reduceErr := kirowire.ReduceKiroMaxOutput(activeBody, 4096); reduceErr == nil && changed {
-					activeBody = reduced
-					converted.Body = reduced
-					converted.MaxOutputTokens = 4096
-					converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossMaxOutputReducedForContext})
-					setKiroQualityHeaders(w, *converted)
-					if len(activeFallbackBody) > 0 {
-						if fallback, fallbackChanged, fallbackErr := kirowire.ReduceKiroMaxOutput(activeFallbackBody, 4096); fallbackErr == nil && fallbackChanged {
-							activeFallbackBody = fallback
-						}
-					}
-					contextOutputReduced = true
-					response, err = send(bearer, activeBody)
-					if err != nil {
-						s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
-						return nil, endpointHash, outcomeDone
-					}
-					continue
-				}
-				contextOutputReduced = true
-			}
-			if contextHistoryRetries < 3 {
-				if trimmed, dropped, changed, trimErr := kirowire.TrimOldestKiroHistory(activeBody, 3, 4); trimErr == nil && changed {
-					activeBody = trimmed
-					converted.Body = trimmed
-					converted.HistoryMessagesDropped += dropped
-					converted.CompatibilityLosses = mergeCompatibilityLosses(converted.CompatibilityLosses, []string{kirowire.LossContextHistoryTruncated})
-					setKiroQualityHeaders(w, *converted)
-					contextHistoryRetries++
-					response, err = send(bearer, activeBody)
-					if err != nil {
-						s.kiroAttemptError(w, r, lease, 0, nil, nil, false, nil, err)
-						return nil, endpointHash, outcomeDone
-					}
-					continue
-				}
-			}
+			// Preserve the exact downstream prompt and requested output budget.
+			// Claude Code owns compaction and can resubmit after receiving this
+			// structured context signal; silently dropping history is irreversible.
 			requested := requestedClaudeModelFromContext(r.Context())
 			writeKiroError(w, r, http.StatusBadRequest, &kirowire.ContextLengthError{
 				RequestedModel: firstNonEmpty(requested.RequestedModel, converted.Model),
@@ -715,15 +673,6 @@ func (s *Server) openKiroAttempt(w http.ResponseWriter, r *http.Request, convert
 		}
 
 		downstreamStatus := status
-		if status == http.StatusUnauthorized {
-			_ = s.store.SetAccountStatus(r.Context(), lease.Account.ID, "invalid")
-			s.scheduler.InvalidateAccountCache()
-			_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
-				AccountID: lease.Account.ID, AccountLabel: firstNonEmpty(lease.Account.Label, lease.Account.Email, lease.Account.ID),
-				Action: "kiro_auth_invalidated", State: "invalid", Reason: "repeated_unauthorized",
-				Detail: "generateAssistantResponse returned HTTP 401 after credential retry",
-			})
-		}
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			downstreamStatus = http.StatusServiceUnavailable
 		}
@@ -1027,6 +976,35 @@ func writeKiroError(w http.ResponseWriter, r *http.Request, status int, err erro
 	}})
 }
 
+func kiroAccessTokenExpired(body []byte) bool {
+	text := strings.ToLower(strings.TrimSpace(string(body)))
+	if text == "" {
+		return false
+	}
+	compactJSON := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(text)
+	for _, marker := range []string{
+		`"code":"expired_token"`,
+		`"code":"token_expired"`,
+		`"error":"expired_token"`,
+		`"error":"token_expired"`,
+	} {
+		if strings.Contains(compactJSON, marker) {
+			return true
+		}
+	}
+	for _, marker := range []string{
+		"access token has expired",
+		"access token expired",
+		"token has expired",
+		"token is expired",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func writePoolCodeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{
 		"message": message, "type": "codex_pool_error", "code": code,
@@ -1102,6 +1080,11 @@ func (s *Server) kiroAttemptError(w http.ResponseWriter, r *http.Request, lease 
 	}
 	if schedulerWaitTerminal(r.Context(), message) {
 		return outcomeDone
+	}
+	if (code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable) && header != nil {
+		if seconds := retryAfterSeconds(header, storage.Now()); seconds > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		}
 	}
 	writeKiroError(w, r, code, errors.New(message))
 	return outcomeDone

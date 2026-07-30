@@ -19,7 +19,6 @@ import (
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
-	"codex-account-pool/internal/supervisor"
 )
 
 func kiroEventFrame(headers map[string]string, payload []byte) []byte {
@@ -336,7 +335,7 @@ func TestKiroTwoJSONIdCImportEndToEnd(t *testing.T) {
 	}
 }
 
-func TestKiroRepeatedUnauthorizedInvalidatesAccount(t *testing.T) {
+func TestKiroGenericUnauthorizedIsNotReplayedOrInvalidated(t *testing.T) {
 	var generateCalls int
 	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -369,18 +368,19 @@ func TestKiroRepeatedUnauthorizedInvalidatesAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable || generateCalls != 2 {
-		t.Fatalf("status=%d generate_calls=%d", resp.StatusCode, generateCalls)
+	if resp.StatusCode != http.StatusServiceUnavailable || generateCalls != 1 ||
+		!bytes.Contains(body, []byte("invalid credential")) {
+		t.Fatalf("status=%d generate_calls=%d body=%s", resp.StatusCode, generateCalls, body)
 	}
 	accounts, _ := h.store.ListAccounts(context.Background())
-	if len(accounts) != 1 || accounts[0].Status != "invalid" {
+	if len(accounts) != 1 || accounts[0].Status != "active" {
 		t.Fatalf("accounts=%+v", accounts)
 	}
 }
 
-func TestKiroTransientForbiddenRetriesWithoutInvalidatingAPIKey(t *testing.T) {
+func TestKiroForbiddenIsNotReplayedOrInvalidated(t *testing.T) {
 	var generateCalls int
 	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -388,12 +388,8 @@ func TestKiroTransientForbiddenRetriesWithoutInvalidatingAPIKey(t *testing.T) {
 			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
 		case "/generateAssistantResponse":
 			generateCalls++
-			if generateCalls == 1 {
-				w.WriteHeader(http.StatusForbidden)
-				_, _ = w.Write([]byte(`{"message":"temporarily unavailable"}`))
-				return
-			}
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"recovered"}`)))
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"temporarily unavailable"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -410,12 +406,72 @@ func TestKiroTransientForbiddenRetriesWithoutInvalidatingAPIKey(t *testing.T) {
 	}
 	body, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || generateCalls != 2 || !bytes.Contains(body, []byte("recovered")) {
-		t.Fatalf("transient forbidden was not recovered: status=%d calls=%d body=%s", response.StatusCode, generateCalls, body)
+	if response.StatusCode != http.StatusServiceUnavailable || generateCalls != 1 ||
+		!bytes.Contains(body, []byte("temporarily unavailable")) {
+		t.Fatalf("forbidden response was replayed or lost: status=%d calls=%d body=%s", response.StatusCode, generateCalls, body)
 	}
 	stored, err := h.store.GetAccount(context.Background(), account.ID)
 	if err != nil || stored.Status != "active" {
-		t.Fatalf("transient forbidden invalidated API key: account=%+v err=%v", stored, err)
+		t.Fatalf("forbidden response invalidated API key: account=%+v err=%v", stored, err)
+	}
+}
+
+func TestKiroAccessTokenExpiredRequiresExplicitExpiryMarker(t *testing.T) {
+	for _, body := range [][]byte{
+		[]byte(`{"code": "expired_token"}`),
+		[]byte(`{"error":"token_expired"}`),
+		[]byte(`{"message":"Access token has expired"}`),
+	} {
+		if !kiroAccessTokenExpired(body) {
+			t.Fatalf("explicit expiry marker was not detected: %s", body)
+		}
+	}
+	for _, body := range [][]byte{
+		[]byte(`{"message":"invalid credential"}`),
+		[]byte(`{"code":"invalid_token"}`),
+		[]byte(`{"message":"not authorized"}`),
+	} {
+		if kiroAccessTokenExpired(body) {
+			t.Fatalf("generic auth failure was treated as expiry: %s", body)
+		}
+	}
+}
+
+func TestKiroRateLimitForwardsRetryAfterWithoutReplaying(t *testing.T) {
+	var generateCalls int
+	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/getUsageLimits":
+			_, _ = w.Write([]byte(`{"subscriptionTitle":"KIRO PRO"}`))
+		case "/generateAssistantResponse":
+			generateCalls++
+			w.Header().Set("Retry-After", "37")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"message":"quota temporarily unavailable"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer kiroMock.Close()
+
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	account := importKiroEndpointForTest(t, h, kiroMock.URL, "rate-limited-key")
+	request, _ := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Pool-Provider", "kiro")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("Retry-After") != "37" ||
+		generateCalls != 1 || !bytes.Contains(body, []byte("quota temporarily unavailable")) {
+		t.Fatalf("status=%d retry_after=%q calls=%d body=%s", response.StatusCode, response.Header.Get("Retry-After"), generateCalls, body)
+	}
+	stored, err := h.store.GetAccount(context.Background(), account.ID)
+	if err != nil || stored.Status != "active" {
+		t.Fatalf("rate limit invalidated account: account=%+v err=%v", stored, err)
 	}
 }
 
@@ -780,7 +836,7 @@ func TestKiroCachePointRejectionFallsBackOnceAndPersistsUnsupported(t *testing.T
 	}
 }
 
-func TestKiroContentLengthRegressionRetriesWithReducedOutputBeforeHistory(t *testing.T) {
+func TestKiroContentLengthErrorPreservesOutputAndRequestsClientCompaction(t *testing.T) {
 	var bodies [][]byte
 	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -815,14 +871,15 @@ func TestKiroContentLengthRegressionRetriesWithReducedOutputBeforeHistory(t *tes
 	}
 	responseBody, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || len(bodies) != 2 {
+	if response.StatusCode != http.StatusBadRequest || len(bodies) != 1 ||
+		!bytes.Contains(responseBody, []byte(`"code":"context_length_exceeded"`)) {
 		t.Fatalf("status=%d requests=%d body=%s", response.StatusCode, len(bodies), responseBody)
 	}
-	if !bytes.Contains(bodies[0], []byte(`"max_tokens":64000`)) || !bytes.Contains(bodies[1], []byte(`"max_tokens":4096`)) {
-		t.Fatalf("adaptive output retry bodies=%q", bodies)
-	}
-	if !bytes.Contains(bodies[1], []byte("preserve this request")) || response.Header.Get("X-Pool-Kiro-Max-Output-Tokens") != "4096" {
-		t.Fatalf("retry lost input or diagnostics: headers=%v body=%s", response.Header, bodies[1])
+	if !bytes.Contains(bodies[0], []byte(`"max_tokens":64000`)) ||
+		!bytes.Contains(bodies[0], []byte("preserve this request")) ||
+		response.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" ||
+		response.Header.Get("X-MiCliProxy-Auto-Compact") != "client_retry" {
+		t.Fatalf("context signal changed the request or lost diagnostics: headers=%v body=%s", response.Header, bodies[0])
 	}
 	endpointHash, _ := kirowire.EndpointHash(kiroMock.URL, "us-east-1", []string{kiroMock.URL})
 	state, stateErr := h.store.GetKiroRuntimeCapability(context.Background(), account.ID, endpointHash, "claude-sonnet-4.6")
@@ -831,7 +888,7 @@ func TestKiroContentLengthRegressionRetriesWithReducedOutputBeforeHistory(t *tes
 	}
 }
 
-func TestKiroContentLengthRetryTrimsOldestTurnOnlyAfterReducedOutputFails(t *testing.T) {
+func TestKiroContentLengthErrorNeverDropsHistoryOrReplays(t *testing.T) {
 	var bodies [][]byte
 	kiroMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -840,13 +897,8 @@ func TestKiroContentLengthRetryTrimsOldestTurnOnlyAfterReducedOutputFails(t *tes
 		case "/generateAssistantResponse":
 			body, _ := io.ReadAll(r.Body)
 			bodies = append(bodies, append([]byte(nil), body...))
-			if len(bodies) < 3 {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`))
-				return
-			}
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "assistantResponseEvent"}, []byte(`{"content":"trimmed-ok"}`)))
-			_, _ = w.Write(kiroEventFrame(map[string]string{":message-type": "event", ":event-type": "metadataEvent"}, []byte(`{"tokenUsage":{"uncachedInputTokens":30,"outputTokens":2,"totalTokens":32}}`)))
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -875,19 +927,24 @@ func TestKiroContentLengthRetryTrimsOldestTurnOnlyAfterReducedOutputFails(t *tes
 	}
 	responseBody, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || len(bodies) != 3 {
+	if response.StatusCode != http.StatusBadRequest || len(bodies) != 1 ||
+		!bytes.Contains(responseBody, []byte(`"code":"context_length_exceeded"`)) {
 		t.Fatalf("status=%d requests=%d body=%s", response.StatusCode, len(bodies), responseBody)
 	}
-	if !bytes.Contains(bodies[1], []byte("old-context-")) || bytes.Contains(bodies[2], []byte("old-context-")) || bytes.Contains(bodies[2], []byte("old-answer")) {
-		t.Fatalf("oldest turn retry sequence=%q", bodies)
-	}
-	for _, required := range [][]byte{[]byte("recent-context"), []byte("recent-answer"), []byte("current-context")} {
-		if !bytes.Contains(bodies[2], required) {
-			t.Fatalf("trimmed retry lost %q: %s", required, bodies[2])
+	for _, required := range [][]byte{
+		[]byte("old-context-"),
+		[]byte("old-answer"),
+		[]byte("recent-context"),
+		[]byte("recent-answer"),
+		[]byte("current-context"),
+	} {
+		if !bytes.Contains(bodies[0], required) {
+			t.Fatalf("original request lost %q: %s", required, bodies[0])
 		}
 	}
-	if response.Header.Get("X-Pool-Kiro-History-Messages-Dropped") == "" {
-		t.Fatalf("trim diagnostics missing: %v", response.Header)
+	if response.Header.Get("X-Pool-Kiro-History-Messages-Dropped") != "" ||
+		response.Header.Get("X-MiCliProxy-Context-Status") != "compact_required" {
+		t.Fatalf("history was silently trimmed or compaction signal missing: %v", response.Header)
 	}
 }
 
@@ -1046,7 +1103,7 @@ func importKiroEndpointForTest(t *testing.T, h *testHarness, endpoint, apiKey st
 	return accounts[0]
 }
 
-func TestKiroCacheSingleflightForUnknownCachePointCapabilityAndCancellation(t *testing.T) {
+func TestKiroCachePointsNeverSerializeConcurrentDownstreamCalls(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) })
 	ctx := context.Background()
 	account := storage.Account{ID: "kiro-flight", Label: "kiro", GroupName: "cyber", Provider: "kiro", Status: "active"}
@@ -1080,52 +1137,12 @@ func TestKiroCacheSingleflightForUnknownCachePointCapabilityAndCancellation(t *t
 	if waited {
 		t.Fatal("first request unexpectedly waited")
 	}
-	type result struct {
-		release func()
-		waited  bool
+	releaseSecond, waitedSecond := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
+	if waitedSecond {
+		t.Fatal("second same-prefix request was proxy-paced")
 	}
-	second := make(chan result, 1)
-	go func() {
-		defer supervisor.Recover("kiro-singleflight-test")
-		release, didWait := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
-		second <- result{release: release, waited: didWait}
-	}()
-	select {
-	case <-second:
-		t.Fatal("second request did not wait for the active stable-prefix flight")
-	case <-time.After(40 * time.Millisecond):
-	}
+	releaseSecond()
 	releaseFirst()
-	select {
-	case got := <-second:
-		if !got.waited {
-			t.Fatal("second request was released without recording a wait")
-		}
-		got.release()
-	case <-time.After(time.Second):
-		t.Fatal("singleflight waiter did not resume")
-	}
-
-	releaseLeader, _ := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
-	cancelled, cancel := context.WithCancel(ctx)
-	cancelResult := make(chan result, 1)
-	go func() {
-		release, didWait := h.app.enterKiroCacheSingleflight(cancelled, raw, affinity, lease, model, 1)
-		cancelResult <- result{release: release, waited: didWait}
-	}()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	cancelledWaiter := <-cancelResult
-	cancelledWaiter.release()
-	if !cancelledWaiter.waited {
-		t.Fatal("cancelled waiter did not record that it encountered an active flight")
-	}
-	releaseLeader()
-	releaseAfterCancel, waitedAfterCancel := h.app.enterKiroCacheSingleflight(ctx, raw, affinity, lease, model, 1)
-	if waitedAfterCancel {
-		t.Fatal("cancelled waiter left a stale Kiro cache flight")
-	}
-	releaseAfterCancel()
 }
 
 func TestFinalizeKiroUsageCreditsOnlyUsesExplicitEstimate(t *testing.T) {

@@ -22,8 +22,26 @@ func affinityWithMeta(r *http.Request, raw []byte, meta *bodysource.BodyMeta) ro
 		}
 		return strings.TrimSpace(r.Header.Get(name))
 	}
+	// A terminal-issued state pointer is more exact than hierarchy/cache hints.
+	if value := strings.TrimSpace(meta.PreviousResponseID); value != "" {
+		return routing.ResponseAffinityKey(value)
+	}
+	if value := header("x-codex-turn-state"); value != "" {
+		return routing.AffinityFromKey("x-codex-turn-state:"+value, "x-codex-turn-state")
+	}
 	if value := firstNonEmpty(header("x-codex-parent-thread-id"), header("thread-id")); value != "" {
 		return routing.AffinityFromKey(routing.CodexRootThreadAffinitySource+":"+value, routing.CodexRootThreadAffinitySource)
+	}
+	if turnMetadata := header("x-codex-turn-metadata"); turnMetadata != "" {
+		if value := routing.JSONStringField([]byte(turnMetadata), "parent_thread_id"); value != "" {
+			return routing.AffinityFromKey(routing.CodexRootThreadAffinitySource+":"+value, routing.CodexRootThreadAffinitySource)
+		}
+		if value := routing.JSONStringField([]byte(turnMetadata), "thread_id"); value != "" {
+			return routing.AffinityFromKey(routing.CodexRootThreadAffinitySource+":"+value, routing.CodexRootThreadAffinitySource)
+		}
+		if value := routing.JSONStringField([]byte(turnMetadata), "window_id"); value != "" {
+			return routing.AffinityFromKey("x-codex-window-id:"+value, "x-codex-window-id")
+		}
 	}
 	if value := strings.TrimSpace(meta.ThreadID); value != "" {
 		return routing.AffinityFromKey("thread_id:"+value, "thread_id")
@@ -36,12 +54,6 @@ func affinityWithMeta(r *http.Request, raw []byte, meta *bodysource.BodyMeta) ro
 	}
 	if value := strings.TrimSpace(meta.PromptCacheKey); value != "" {
 		return routing.AffinityFromKey("prompt_cache_key:"+value, "prompt_cache_key")
-	}
-	if value := strings.TrimSpace(meta.PreviousResponseID); value != "" {
-		return routing.ResponseAffinityKey(value)
-	}
-	if value := header("x-codex-turn-metadata"); value != "" {
-		return routing.AffinityFromKey("x-codex-turn-metadata:"+value, "x-codex-turn-metadata")
 	}
 	return routing.ExtractAffinityKey(r, raw)
 }

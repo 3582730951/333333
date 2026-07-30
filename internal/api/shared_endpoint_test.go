@@ -23,12 +23,26 @@ func seedClaudePassthroughAccount(t *testing.T, h *testHarness) {
 	}
 }
 
+func seedCodexPassthroughAccount(t *testing.T, h *testHarness, label, token string) {
+	t.Helper()
+	h.importAccount(t, label, "", token)
+}
+
 func TestSharedEndpointCodexHintDoesNotFallThroughToClaude(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("OpenAI/Codex /v1/skills request should not hit Claude upstream: %s %s", r.Method, r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/skills" {
+			t.Fatalf("path = %s, want Codex skills path", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer codex-skill-token" {
+			t.Fatalf("auth = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"skill_1"}`))
 	})
 	seedClaudePassthroughAccount(t, h)
-	seedDownstreamKey(t, h, "cap_codex_hint", "codex")
+	seedCodexPassthroughAccount(t, h, "codex-skill", "codex-skill-token")
+	// A provider-shaped protocol signal outranks the downstream key's policy.
+	seedDownstreamKey(t, h, "cap_codex_hint", "claude")
 
 	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/skills", strings.NewReader(`{"name":"local-skill"}`))
 	if err != nil {
@@ -41,18 +55,13 @@ func TestSharedEndpointCodexHintDoesNotFallThroughToClaude(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	errObj := decodeErrorBody(t, resp.Body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, error=%#v", resp.StatusCode, errObj)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
 	}
-	if errObj["type"] != "capability_unavailable" {
-		t.Fatalf("error type = %#v, want capability_unavailable", errObj["type"])
-	}
-	if errObj["current_route"] != "codex_shared_endpoint" {
-		t.Fatalf("current_route = %#v", errObj["current_route"])
-	}
-	if len(h.requests()) != 0 {
-		t.Fatalf("unexpected upstream calls: %+v", h.requests())
+	reqs := h.requests()
+	if len(reqs) != 1 || reqs[0].Path != "/backend-api/codex/skills" || reqs[0].Auth != "Bearer codex-skill-token" {
+		t.Fatalf("unexpected upstream calls: %+v", reqs)
 	}
 }
 
@@ -75,7 +84,9 @@ func TestSharedEndpointClaudeHintRoutesToClaudePassthrough(t *testing.T) {
 		_, _ = w.Write([]byte(`{"id":"file_1"}`))
 	})
 	seedClaudePassthroughAccount(t, h)
-	seedDownstreamKey(t, h, "cap_claude_hint", "claude")
+	seedCodexPassthroughAccount(t, h, "codex-should-not-win", "codex-should-not-win-token")
+	// Anthropic wire headers are stronger than a conflicting key policy.
+	seedDownstreamKey(t, h, "cap_claude_hint", "codex")
 
 	req, err := http.NewRequest(http.MethodPost, h.pool.URL+"/v1/files", strings.NewReader("opaque-bytes"))
 	if err != nil {
@@ -99,11 +110,19 @@ func TestSharedEndpointClaudeHintRoutesToClaudePassthrough(t *testing.T) {
 	}
 }
 
-func TestSharedEndpointAutoWithoutProviderSignalIsExplicitError(t *testing.T) {
+func TestSharedEndpointAutoWithoutProviderSignalDefaultsToCodex(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatalf("ambiguous shared endpoint should not hit upstream: %s %s", r.Method, r.URL.Path)
+		if r.URL.Path != "/backend-api/codex/files" {
+			t.Fatalf("path = %s, want Codex files path", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer codex-default-token" {
+			t.Fatalf("auth = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
 	})
 	seedClaudePassthroughAccount(t, h)
+	seedCodexPassthroughAccount(t, h, "codex-default", "codex-default-token")
 	seedDownstreamKey(t, h, "cap_auto_hint", "auto")
 
 	req, err := http.NewRequest(http.MethodGet, h.pool.URL+"/v1/files", nil)
@@ -116,18 +135,61 @@ func TestSharedEndpointAutoWithoutProviderSignalIsExplicitError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	errObj := decodeErrorBody(t, resp.Body)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status = %d, error=%#v", resp.StatusCode, errObj)
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
 	}
-	if errObj["type"] != "capability_unavailable" {
-		t.Fatalf("error type = %#v", errObj["type"])
+	reqs := h.requests()
+	if len(reqs) != 1 || reqs[0].Path != "/backend-api/codex/files" || reqs[0].Auth != "Bearer codex-default-token" {
+		t.Fatalf("unexpected upstream calls: %+v", reqs)
 	}
-	if !strings.Contains(errObj["fix_hint"].(string), "provider_hint") {
-		t.Fatalf("fix_hint missing provider_hint guidance: %#v", errObj["fix_hint"])
+}
+
+func TestSharedEndpointCodexClientSignalsOverrideKeyPolicy(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/skills" {
+			t.Fatalf("path = %s, want Codex skills path", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer codex-client-token" {
+			t.Fatalf("auth = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	})
+	seedClaudePassthroughAccount(t, h)
+	seedCodexPassthroughAccount(t, h, "codex-client", "codex-client-token")
+	seedDownstreamKey(t, h, "cap_conflicting_claude_hint", "claude")
+
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "user agent", key: "User-Agent", value: "codex_cli_rs/0.146.0 (Linux; x86_64)"},
+		{name: "originator", key: "Originator", value: "codex_exec"},
+		{name: "protocol header", key: "X-Codex-Window-ID", value: "window_fixture"},
 	}
-	if len(h.requests()) != 0 {
-		t.Fatalf("unexpected upstream calls: %+v", h.requests())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, h.pool.URL+"/v1/skills", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer cap_conflicting_claude_hint")
+			req.Header.Set(test.key, test.value)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+			}
+		})
+	}
+	if reqs := h.requests(); len(reqs) != len(tests) {
+		t.Fatalf("upstream calls = %d, want %d: %+v", len(reqs), len(tests), reqs)
 	}
 }
 

@@ -39,15 +39,16 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, ps)
 	case http.MethodPost, http.MethodPatch:
 		var req struct {
-			ID                 string    `json:"id"`
-			Name               string    `json:"name"`
-			BaseURL            string    `json:"base_url"`
-			UpstreamProtocol   *string   `json:"upstream_protocol"`
-			TransportProfile   *string   `json:"transport_profile"`
-			EgressIDs          *[]string `json:"egress_ids"`
-			Enabled            *bool     `json:"enabled"`
-			AutoDiscoverModels *bool     `json:"auto_discover_models"`
-			Models             []string  `json:"models"`
+			ID                 string            `json:"id"`
+			Name               string            `json:"name"`
+			BaseURL            string            `json:"base_url"`
+			UpstreamProtocol   *string           `json:"upstream_protocol"`
+			TransportProfile   *string           `json:"transport_profile"`
+			EgressIDs          *[]string         `json:"egress_ids"`
+			Enabled            *bool             `json:"enabled"`
+			AutoDiscoverModels *bool             `json:"auto_discover_models"`
+			Models             []string          `json:"models"`
+			ModelMappings      map[string]string `json:"model_mappings"`
 		}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -61,8 +62,8 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, errors.New("provider id or name required"))
 			return
 		}
-		if id == "codex" || id == "claude" {
-			writeError(w, http.StatusBadRequest, errors.New("'codex' and 'claude' are reserved provider ids"))
+		if id == "codex" || id == "claude" || id == "kiro" || id == "antigravity" {
+			writeError(w, http.StatusBadRequest, errors.New("'codex', 'claude', 'kiro', and 'antigravity' are reserved provider ids"))
 			return
 		}
 		existing, exists, err := s.store.GetCustomProvider(r.Context(), id)
@@ -77,6 +78,7 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			Enabled:            true,
 			AutoDiscoverModels: true,
 			Models:             req.Models,
+			ModelMappings:      req.ModelMappings,
 			TransportProfile:   inferredProviderTransportProfile(id, req.Name),
 		}
 		if exists {
@@ -89,6 +91,9 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.Models != nil {
 				p.Models = req.Models
+			}
+			if req.ModelMappings != nil {
+				p.ModelMappings = req.ModelMappings
 			}
 		}
 		baseURL := p.BaseURL
@@ -128,6 +133,10 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			p.AutoDiscoverModels = *req.AutoDiscoverModels
 		}
 		if err := s.store.UpsertCustomProvider(r.Context(), p); err != nil {
+			if errors.Is(err, storage.ErrInvalidProviderModelMapping) {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -192,8 +201,18 @@ func (s *Server) adminProviderAction(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAllowed(w, r) {
 		return
 	}
-	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/providers/"), "/")
+	relative := strings.Trim(strings.TrimPrefix(r.URL.Path, "/admin/providers/"), "/")
+	parts := strings.Split(relative, "/")
+	id := strings.TrimSpace(parts[0])
 	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "test" {
+		s.adminCustomProviderModelTest(w, r, id)
+		return
+	}
+	if len(parts) != 1 {
 		http.NotFound(w, r)
 		return
 	}
@@ -303,6 +322,9 @@ func validateCustomProviderBaseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return errors.New("base_url must be an absolute URL")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("base_url must not contain credentials, query parameters, or a fragment")
 	}
 	switch u.Scheme {
 	case "http", "https":
