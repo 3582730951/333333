@@ -19,20 +19,59 @@ func requestedImportEgressID(egressID, primaryEgressID string) string {
 }
 
 func (s *Server) resolveImportPrimaryEgress(ctx context.Context, requested string) (string, error) {
+	return s.resolveImportPrimaryEgressForGroup(ctx, requested, "")
+}
+
+func (s *Server) resolveImportPrimaryEgressForGroup(ctx context.Context, requested, groupName string) (string, error) {
 	requested = strings.TrimSpace(requested)
 	if requested == "" {
-		return storage.DefaultDirectEgressID, nil
+		return s.resolveGroupDefaultImportEgress(ctx, groupName)
 	}
 	if _, err := s.store.GetEgressProfile(ctx, requested); err == nil {
 		return requested, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
+	return s.resolveGroupDefaultImportEgress(ctx, groupName)
+}
+
+func (s *Server) resolveGroupDefaultImportEgress(ctx context.Context, groupName string) (string, error) {
+	groupName = strings.TrimSpace(groupName)
+	var candidates []string
+	if groupName != "" {
+		if group, err := s.store.GetGroup(ctx, groupName); err == nil {
+			candidates = append(candidates, group.DefaultEgressID)
+			candidates = append(candidates, group.EgressIDs...)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+	candidates = append(candidates, storage.DefaultDirectEgressID)
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, duplicate := seen[candidate]; duplicate {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		if _, err := s.store.GetEgressProfile(ctx, candidate); err == nil {
+			return candidate, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
 	return storage.DefaultDirectEgressID, nil
 }
 
 func (s *Server) bindImportedAccountPrimaryEgress(ctx context.Context, accountID, requested string) error {
-	primary, err := s.resolveImportPrimaryEgress(ctx, requested)
+	account, err := s.store.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	primary, err := s.resolveImportPrimaryEgressForGroup(ctx, requested, account.GroupName)
 	if err != nil {
 		return err
 	}

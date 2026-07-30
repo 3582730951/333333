@@ -1164,6 +1164,9 @@ ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, CustomProviderProtocolChat
 			return err
 		}
 	}
+	if _, err := s.RepairMissingAccountEgressBindings(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -4394,10 +4397,14 @@ ON CONFLICT(account_id) DO UPDATE SET
 	if err != nil {
 		return err
 	}
+	primaryEgressID, err := restoreAccountBackupDefaultEgressIDTx(ctx, tx, account)
+	if err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, created_at, updated_at)
 VALUES(?, ?, '', '', ?, 0, ?, ?)
-ON CONFLICT(account_id) DO NOTHING`, account.ID, DefaultDirectEgressID, account.ID+":"+DefaultDirectEgressID, now, now)
+ON CONFLICT(account_id) DO NOTHING`, account.ID, primaryEgressID, account.ID+":"+primaryEgressID, now, now)
 	if err != nil {
 		return err
 	}
@@ -6911,6 +6918,70 @@ func (s *Store) SetEgressCooldown(ctx context.Context, id string, until int64, r
 func (s *Store) SetEgressHealth(ctx context.Context, id, health string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE egress_profiles SET health = ?, updated_at = ? WHERE id = ?`, health, Now(), id)
 	return err
+}
+
+// RepairMissingAccountEgressBindings heals legacy account-only imports that
+// predate portable egress bindings. The chosen primary follows the account's
+// pool group outlet order, with the direct outlet used only as the final
+// installed fallback.
+func (s *Store) RepairMissingAccountEgressBindings(ctx context.Context) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+SELECT a.id, a.group_name
+FROM accounts a
+LEFT JOIN account_egress_bindings b ON b.account_id = a.id
+WHERE b.account_id IS NULL
+ORDER BY a.id`)
+	if err != nil {
+		return 0, err
+	}
+	var accounts []Account
+	for rows.Next() {
+		var account Account
+		if err = rows.Scan(&account.ID, &account.GroupName); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		accounts = append(accounts, account)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err = rows.Close(); err != nil {
+		return 0, err
+	}
+	now := Now()
+	repaired := 0
+	for _, account := range accounts {
+		primaryEgressID, err := restoreAccountBackupDefaultEgressIDTx(ctx, tx, account)
+		if err != nil {
+			return 0, err
+		}
+		result, err := tx.ExecContext(ctx, `
+INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
+VALUES(?, ?, '', '', ?, 0, 0, ?, ?)
+ON CONFLICT(account_id) DO NOTHING`, account.ID, primaryEgressID, account.ID+":"+primaryEgressID, now, now)
+		if err != nil {
+			return 0, err
+		}
+		if affected, err := result.RowsAffected(); err == nil {
+			repaired += int(affected)
+		} else {
+			repaired++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if repaired > 0 {
+		s.affinityGen.Add(1)
+	}
+	return repaired, nil
 }
 
 func (s *Store) GetEgressBinding(ctx context.Context, accountID string) (AccountEgressBinding, error) {

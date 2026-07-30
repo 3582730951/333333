@@ -76,7 +76,7 @@ func (s *Server) adminImportProviderAPIKey(w http.ResponseWriter, r *http.Reques
 	}
 	account := storage.Account{ID: accountID, Label: label, GroupName: group, Provider: provider, Status: "active", PlanType: "api"}
 	token := storage.AccountToken{AccountID: accountID, AuthMethod: accountprovider.AuthMethodAPIKey, AccessToken: key, OpenAIAPIKey: key, LastRefresh: storage.Now()}
-	egressID, err := s.resolveImportPrimaryEgress(r.Context(), req.EgressID)
+	egressID, err := s.resolveImportPrimaryEgressForGroup(r.Context(), req.EgressID, group)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

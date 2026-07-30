@@ -941,6 +941,43 @@ func backupTimestamp(value, fallback int64) int64 {
 	return fallback
 }
 
+func restoreAccountBackupDefaultEgressIDTx(ctx context.Context, tx *sql.Tx, account Account) (string, error) {
+	candidates := make([]string, 0, 4)
+	groupName := strings.TrimSpace(account.GroupName)
+	if groupName != "" {
+		var defaultEgressID, egressJSON string
+		err := tx.QueryRowContext(ctx, `SELECT default_egress_id, egress_ids FROM groups WHERE name = ?`, groupName).Scan(&defaultEgressID, &egressJSON)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if err == nil {
+			candidates = append(candidates, defaultEgressID)
+			candidates = append(candidates, decodeStringList(egressJSON)...)
+		}
+	}
+	candidates = append(candidates, DefaultDirectEgressID)
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, duplicate := seen[candidate]; duplicate {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		var exists int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM egress_profiles WHERE id = ?`, candidate).Scan(&exists)
+		if err == nil {
+			return candidate, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+	return DefaultDirectEgressID, nil
+}
+
 func (s *Store) restoreAccountBackupTx(ctx context.Context, tx *sql.Tx, backup AccountBackup) error {
 	now := Now()
 	account := backup.Account
@@ -1050,21 +1087,39 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`,
 			return err
 		}
 	}
-	if item := backup.EgressBinding; item != nil {
-		item.CreatedAt = backupTimestamp(item.CreatedAt, now)
-		item.UpdatedAt = backupTimestamp(item.UpdatedAt, now)
-		if item.CookieJarKey == "" {
-			item.CookieJarKey = account.ID + ":" + item.PrimaryEgressID
-		}
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			account.ID, item.PrimaryEgressID, item.StandbyEgressIDs, item.SidecarEgressID,
-			item.CookieJarKey, item.CooldownUntil, boolInt(item.RecheckPending),
-			item.CreatedAt, item.UpdatedAt,
-		); err != nil {
+	item := backup.EgressBinding
+	if item == nil {
+		defaultEgressID, err := restoreAccountBackupDefaultEgressIDTx(ctx, tx, account)
+		if err != nil {
 			return err
 		}
+		item = &AccountEgressBinding{
+			AccountID:        account.ID,
+			PrimaryEgressID:  defaultEgressID,
+			StandbyEgressIDs: "",
+			SidecarEgressID:  "",
+			CookieJarKey:     account.ID + ":" + defaultEgressID,
+			CooldownUntil:    0,
+			CreatedAt:        account.CreatedAt,
+			UpdatedAt:        now,
+		}
+	}
+	item.CreatedAt = backupTimestamp(item.CreatedAt, now)
+	item.UpdatedAt = backupTimestamp(item.UpdatedAt, now)
+	if strings.TrimSpace(item.PrimaryEgressID) == "" {
+		item.PrimaryEgressID = DefaultDirectEgressID
+	}
+	if item.CookieJarKey == "" {
+		item.CookieJarKey = account.ID + ":" + item.PrimaryEgressID
+	}
+	if _, err := tx.ExecContext(ctx, `
+	INSERT INTO account_egress_bindings(account_id, primary_egress_id, standby_egress_ids, sidecar_egress_id, cookie_jar_key, cooldown_until, recheck_pending, created_at, updated_at)
+	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		account.ID, item.PrimaryEgressID, item.StandbyEgressIDs, item.SidecarEgressID,
+		item.CookieJarKey, item.CooldownUntil, boolInt(item.RecheckPending),
+		item.CreatedAt, item.UpdatedAt,
+	); err != nil {
+		return err
 	}
 	for _, item := range backup.Capabilities {
 		if strings.TrimSpace(item.ModelSlug) == "" {

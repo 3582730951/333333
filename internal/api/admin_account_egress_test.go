@@ -127,7 +127,7 @@ func TestAdminEgressBindingConfiguresIndependentSidecarTransport(t *testing.T) {
 	}
 }
 
-func TestSaveImportedAccountIgnoresGroupDefaultEgress(t *testing.T) {
+func TestSaveImportedAccountUsesGroupDefaultEgress(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	upsertTestEgressProfile(t, h, "egress_group_default")
 	group, err := h.store.GetGroup(context.Background(), config.DefaultGroupName)
@@ -135,6 +135,7 @@ func TestSaveImportedAccountIgnoresGroupDefaultEgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	group.DefaultEgressID = "egress_group_default"
+	group.EgressIDs = []string{"egress_group_default"}
 	if err := h.store.UpdateGroup(context.Background(), group); err != nil {
 		t.Fatal(err)
 	}
@@ -152,8 +153,8 @@ func TestSaveImportedAccountIgnoresGroupDefaultEgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if binding.PrimaryEgressID != storage.DefaultDirectEgressID {
-		t.Fatalf("primary egress = %q, want direct despite group default %q", binding.PrimaryEgressID, group.DefaultEgressID)
+	if binding.PrimaryEgressID != "egress_group_default" {
+		t.Fatalf("primary egress = %q, want group default %q", binding.PrimaryEgressID, group.DefaultEgressID)
 	}
 }
 

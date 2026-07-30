@@ -480,7 +480,11 @@ VALUES(?,?,?,'chat_completions',1,1,?,?,?) ON CONFLICT(id) DO NOTHING`, provider
 	if err = s.migrate(ctx); err != nil {
 		return fmt.Errorf("apply PostgreSQL additive migrations: %w", err)
 	}
-	return s.applyCheckedPostgresMigrations(ctx)
+	if err = s.applyCheckedPostgresMigrations(ctx); err != nil {
+		return err
+	}
+	_, err = s.RepairMissingAccountEgressBindings(ctx)
+	return err
 }
 
 type checkedPostgresMigration struct {

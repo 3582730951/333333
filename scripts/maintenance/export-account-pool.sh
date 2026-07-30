@@ -206,6 +206,9 @@ def boolv(v):
     if isinstance(v, (int, float)): return v != 0
     return str(v).strip().lower() in ('1','true','yes','on')
 
+def is_custom_provider(provider):
+    return str(provider or '').strip() not in ('', 'codex', 'claude', 'kiro', 'antigravity')
+
 def portable_from_item(item, index):
     if is_portable(item):
         return item
@@ -232,6 +235,8 @@ def portable_from_item(item, index):
             'created_at': intv(item.get('created_at')),
             'updated_at': intv(item.get('updated_at')),
         }
+    if is_custom_provider(account.get('provider')) and not isinstance(item.get('custom_provider'), dict):
+        raise ValueError('legacy JSON contains custom provider rows without provider definitions; direct SQLite export is required')
     if token is None:
         token = {
             'auth_method': item.get('auth_method') or '',
@@ -247,7 +252,12 @@ def portable_from_item(item, index):
             'created_at': intv(item.get('token_created_at') or item.get('created_at')),
             'updated_at': intv(item.get('token_updated_at') or item.get('updated_at')),
         }
-    return {'type':'codex-account-pool-account','version':1,'exported_at':int(time.time()),'account':account,'token':token}
+    doc = {'type':'codex-account-pool-account','version':1,'exported_at':int(time.time()),'account':account,'token':token}
+    if isinstance(item.get('custom_provider'), dict):
+        doc['custom_provider'] = item['custom_provider']
+    if isinstance(item.get('egress_profiles'), list):
+        doc['egress_profiles'] = item['egress_profiles']
+    return doc
 
 def zip_name(doc, index):
     account = doc.get('account') if isinstance(doc.get('account'), dict) else {}
@@ -354,6 +364,23 @@ def fetch_by_account(con, table, account_ids):
         out.setdefault(str(item.get('account_id') or ''), []).append(item)
     return out
 
+def fetch_by_id(con, table, ids, id_col='id'):
+    cols = columns(con, table)
+    clean = []
+    seen = set()
+    for value in ids:
+        value = str(value or '').strip()
+        if value and value not in seen:
+            clean.append(value); seen.add(value)
+    if not cols or id_col not in cols or not clean: return {}
+    placeholders = ','.join(['?'] * len(clean))
+    select_cols = ', '.join('"%s"' % c.replace('"','""') for c in cols)
+    out = {}
+    for row in con.execute(f"SELECT {select_cols} FROM {table} WHERE {id_col} IN ({placeholders})", clean):
+        item = dict(zip(cols, row))
+        out[str(item.get(id_col) or '')] = item
+    return out
+
 def first(mapping, account_id):
     return (mapping.get(account_id) or [None])[0]
 
@@ -377,6 +404,69 @@ def safe_name(value, index):
     safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value or '')).strip('._-')[:96]
     return f"account-{safe or ('account-%d' % (index+1))}.json"
 
+def json_list(raw):
+    try:
+        value = json.loads(str(raw or '').strip() or '[]')
+    except Exception:
+        return []
+    return [str(x).strip() for x in value if str(x).strip()] if isinstance(value, list) else []
+
+def json_dict(raw):
+    try:
+        value = json.loads(str(raw or '').strip() or '{}')
+    except Exception:
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in value.items() if str(k).strip() and str(v).strip()} if isinstance(value, dict) else {}
+
+def split_ids(raw):
+    return [x.strip() for x in str(raw or '').split(',') if x.strip()]
+
+def is_custom_provider(provider):
+    return str(provider or '').strip() not in ('', 'codex', 'claude', 'kiro', 'antigravity')
+
+def custom_provider_doc(row):
+    if not row: return None
+    return {
+        'id': row.get('id') or '',
+        'name': row.get('name') or row.get('id') or '',
+        'base_url': row.get('base_url') or '',
+        'upstream_protocol': row.get('upstream_protocol') or 'chat_completions',
+        'transport_profile': row.get('transport_profile') or 'generic',
+        'egress_ids': json_list(row.get('egress_ids')),
+        'enabled': boolv(row.get('enabled')),
+        'auto_discover_models': boolv(row.get('auto_discover_models')),
+        'models': json_list(row.get('models_json')),
+        'model_mappings': json_dict(row.get('model_mappings_json')),
+        'created_at': intv(row.get('created_at')),
+        'updated_at': intv(row.get('updated_at')),
+    }
+
+def egress_profile_doc(row):
+    if not row: return None
+    return {
+        'id': row.get('id') or '',
+        'name': row.get('name') or row.get('id') or '',
+        'type': row.get('type') or 'direct',
+        'endpoint': row.get('endpoint') or '',
+        'chain_proxy': row.get('chain_proxy') or '',
+        'region': row.get('region') or '',
+        'exit_ip': row.get('exit_ip') or '',
+        'stream_capable': boolv(row.get('stream_capable')),
+        'health': row.get('health') or 'healthy',
+        'latency_millis': intv(row.get('latency_millis')),
+        'cf_score': intv(row.get('cf_score')),
+        'last_cf_ray': row.get('last_cf_ray') or '',
+        'cooldown_until': intv(row.get('cooldown_until')),
+        'max_concurrency': intv(row.get('max_concurrency')),
+        'created_at': intv(row.get('created_at')),
+        'updated_at': intv(row.get('updated_at')),
+        'proxy_auth_mode': row.get('proxy_auth_mode') or '',
+        'proxy_api_key': row.get('proxy_api_key') or '',
+        'ip_mode': row.get('ip_mode') or '',
+        'provider_key': row.get('provider_key') or '',
+        'dynamic_config_json': row.get('dynamic_config_json') or '{}',
+    }
+
 con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
 account_cols = columns(con, 'accounts')
 if not account_cols: raise SystemExit('accounts table not found')
@@ -393,6 +483,27 @@ capabilities = fetch_by_account(con, 'account_model_capabilities', account_ids)
 catalog = fetch_by_account(con, 'account_model_catalog_status', account_ids)
 reauth = fetch_by_account(con, 'account_codex_reauth_config', account_ids)
 memberships = fetch_by_account(con, 'account_group_memberships', account_ids)
+provider_ids = sorted({str(a.get('provider') or '').strip() for a in accounts if is_custom_provider(a.get('provider'))})
+custom_provider_rows = fetch_by_id(con, 'custom_providers', provider_ids)
+missing_providers = [pid for pid in provider_ids if pid not in custom_provider_rows]
+if missing_providers:
+    raise SystemExit('direct export cannot build a portable backup because custom provider definitions are missing: ' + ','.join(missing_providers))
+egress_ids = set()
+for rows in bindings.values():
+    for binding in rows:
+        egress_ids.add(str(binding.get('primary_egress_id') or '').strip())
+        egress_ids.update(split_ids(binding.get('standby_egress_ids')))
+        egress_ids.add(str(binding.get('sidecar_egress_id') or '').strip())
+for rows in cookies.values():
+    for cookie in rows:
+        egress_ids.add(str(cookie.get('egress_id') or '').strip())
+for row in custom_provider_rows.values():
+    egress_ids.update(json_list(row.get('egress_ids')))
+egress_ids.discard('')
+egress_rows = fetch_by_id(con, 'egress_profiles', sorted(egress_ids))
+missing_egresses = sorted(eid for eid in egress_ids if eid not in egress_rows)
+if missing_egresses:
+    raise SystemExit('direct export cannot build a portable backup because egress definitions are missing: ' + ','.join(missing_egresses))
 exported_at = int(time.time())
 out_path.parent.mkdir(parents=True, exist_ok=True)
 tmp = out_path.with_name(out_path.name + '.tmp')
@@ -426,9 +537,26 @@ with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
         for key, mapping in [('egress_binding', bindings), ('kiro_credentials', kiro), ('antigravity_credentials', antigravity), ('model_catalog_status', catalog), ('codex_reauth_config', reauth)]:
             item = first(mapping, aid)
             if item: doc[key] = item
+        provider_id = str(account.get('provider') or '').strip()
+        if is_custom_provider(provider_id):
+            doc['custom_provider'] = custom_provider_doc(custom_provider_rows[provider_id])
+        referenced_egress_ids = set()
+        if doc.get('egress_binding'):
+            binding = doc['egress_binding']
+            referenced_egress_ids.add(str(binding.get('primary_egress_id') or '').strip())
+            referenced_egress_ids.update(split_ids(binding.get('standby_egress_ids')))
+            referenced_egress_ids.add(str(binding.get('sidecar_egress_id') or '').strip())
         item = first(sessions, aid)
         if item: doc['session_cookie'] = item.get('cookie') or ''
-        if cookies.get(aid): doc['injected_cookies'] = cookies[aid]
+        if cookies.get(aid):
+            doc['injected_cookies'] = cookies[aid]
+            for cookie in cookies[aid]:
+                referenced_egress_ids.add(str(cookie.get('egress_id') or '').strip())
+        if doc.get('custom_provider'):
+            referenced_egress_ids.update(doc['custom_provider'].get('egress_ids') or [])
+        referenced_egress_ids.discard('')
+        if referenced_egress_ids:
+            doc['egress_profiles'] = [egress_profile_doc(egress_rows[eid]) for eid in sorted(referenced_egress_ids)]
         if capabilities.get(aid): doc['model_capabilities'] = capabilities[aid]
         if memberships.get(aid): doc['group_memberships'] = memberships[aid]
         name = safe_name(aid or account.get('label'), index)

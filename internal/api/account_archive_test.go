@@ -703,6 +703,35 @@ func TestAccountBackupImportRejectsDiagnosticsZIPWithActionableMessage(t *testin
 	}
 }
 
+func TestAccountBackupImportWithoutEgressBindingUsesGroupDefaultEgress(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{}`) })
+	ctx := context.Background()
+	upsertTestEgressProfile(t, h, "egress_group_default")
+	group, err := h.store.GetGroup(ctx, "cyber")
+	if err != nil {
+		t.Fatal(err)
+	}
+	group.DefaultEgressID = "egress_group_default"
+	group.EgressIDs = []string{"egress_group_default"}
+	if err := h.store.UpdateGroup(ctx, group); err != nil {
+		t.Fatal(err)
+	}
+	code, raw := uploadAccountArchiveForTest(t, h, "legacy-account.json", []byte(`{
+		"id":"legacy-no-egress","email":"legacy-no-egress@example.internal","label":"legacy no egress",
+		"group_name":"cyber","provider":"codex","status":"active","access_token":"legacy-access-token"
+	}`))
+	if code != http.StatusOK {
+		t.Fatalf("legacy import = %d: %s", code, raw)
+	}
+	binding, err := h.store.GetEgressBinding(ctx, "legacy-no-egress")
+	if err != nil {
+		t.Fatalf("default egress binding missing after restore: %v", err)
+	}
+	if binding.PrimaryEgressID != "egress_group_default" || binding.CookieJarKey == "" {
+		t.Fatalf("binding = %+v, want group default with cookie jar", binding)
+	}
+}
+
 func TestAccountBackupImportReplacesMatchingAccountCompletely(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{}`) })
 	ids := seedPortableAccountsForTest(t, h)
