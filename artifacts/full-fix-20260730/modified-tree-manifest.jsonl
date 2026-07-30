@@ -39,6 +39,7 @@
 {"mode": "0644", "path": "cmd/pool-server/main_test.go", "sha256": "bf5ae696bedcc74422712809a5f094a4229ca93ea0366e467ebd6fdb067313e4", "size": 7337, "state": "file"}
 {"mode": "0644", "path": "cmd/pool-server/worker_role.go", "sha256": "dc53a182754674a24b78cdd7301947f2304acab866acecb1cb4defeaf4a56b0c", "size": 4896, "state": "file"}
 {"mode": "0644", "path": "cmd/pool-server/worker_role_test.go", "sha256": "ad5396f6447714ddd00ffd172ffa64ba0c807751ec9b314129184acb90f6c486", "size": 3427, "state": "file"}
+{"mode": "0644", "path": "codex-pool-full-fix-v7-delivery.tar.gz.sha256", "sha256": "6b813f30151236f6b816d4351375e5bed64249d7aa0db3fb77d9da9a1df25f15", "size": 105, "state": "file"}
 {"mode": "0644", "path": "config.example.json", "sha256": "7e2f0f39899d9cf81bba71399bafd033234d3344f6869b245943e7a3fadfb315", "size": 5525, "state": "file"}
 {"mode": "0644", "path": "config.toml", "sha256": "ca23dc55497b5cc7242264c79e1b61b17f90bda4ddafbb254258373fb08085b9", "size": 345, "state": "file"}
 {"mode": "0644", "path": "deploy/caddy/Caddyfile", "sha256": "750e2e08d2ab7e7e18fd026c0532426c3488f19ca5b5cfcf685d06293fda350e", "size": 243, "state": "file"}
@@ -735,8 +736,8 @@
 {"mode": "0644", "path": "scripts/fetch-diagnostics.sh", "sha256": "d6eb6758a0731853f961042d4fe3c97f9f7ba3b07a96c0c5a904d4f8c8c01124", "size": 8244, "state": "file"}
 {"mode": "0644", "path": "scripts/install.sh", "sha256": "358982fef0a6df76b4e3befddd4e8e46279c80713486ccea29f6012b818efc4c", "size": 94557, "state": "file"}
 {"mode": "0644", "path": "scripts/install_chrome_headless.sh", "sha256": "4fa3fdab3956b9179b88d94cf63c49a58bb749691b0ef5b36310db9968259bb9", "size": 1745, "state": "file"}
-{"mode": "0644", "path": "scripts/maintenance/README-reclaim-disk-space.md", "sha256": "c3fa4796ab1b41ac2c11921d2bad7417dbe132243486edf16e2efbf77cde425f", "size": 4604, "state": "file"}
-{"mode": "0755", "path": "scripts/maintenance/reclaim-disk-space.sh", "sha256": "19d2107558ae70cb95ba9447f53b6ca384f7fda8c84a6ae9ee7cfa7301f42681", "size": 63408, "state": "file"}
+{"mode": "0644", "path": "scripts/maintenance/README-reclaim-disk-space.md", "sha256": "a73d4ec5a3042edb3fc0de90802a591f777296bb9958635551dc1aef4e19a84f", "size": 4811, "state": "file"}
+{"mode": "0644", "path": "scripts/maintenance/reclaim-disk-space.sh", "sha256": "0d47997244443f137b136c79c080955ea7d48f48157377366aa2886f15d1adbb", "size": 64635, "state": "file"}
 {"mode": "0644", "path": "scripts/rollback-release.sh", "sha256": "e8325dc3a9c822f53c0ea34a81e1f8cbbc46288d839635faba053b71b623f364", "size": 11842, "state": "file"}
 {"mode": "0644", "path": "scripts/selftest.sh", "sha256": "c0c9584e0a6e8be810355e9a6fe40692eaa9dfe5891874e7cc3f98cbe375f3c5", "size": 668, "state": "file"}
 {"mode": "0644", "path": "scripts/test-install-single-worker.sh", "sha256": "d50e25a622a90701727b69498117bded422a8ec07d79828ac4e4b41b7ca96789", "size": 4369, "state": "file"}

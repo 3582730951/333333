@@ -4,6 +4,7 @@
 {"mode": "0644", "path": "cmd/pool-server/deferred_migrations.go", "sha256": "427207d9832e5353794cdbe85c3735a698f96c28a23e043de6da10635aa95b10", "size": 1841, "state": "file"}
 {"mode": "0644", "path": "cmd/pool-server/deferred_migrations_test.go", "sha256": "2d3eb6be5174fd7a00ab02d0625be2bbd3bc76c980a986ab60f1fc700e2aa00a", "size": 3221, "state": "file"}
 {"mode": "0644", "path": "cmd/pool-server/main.go", "sha256": "bd21be5c4fb350cf919c4aef705a72d72ac5ff85b0974893e81ff33e37d7553f", "size": 25891, "state": "file"}
+{"mode": "0644", "path": "codex-pool-full-fix-v7-delivery.tar.gz.sha256", "sha256": "6b813f30151236f6b816d4351375e5bed64249d7aa0db3fb77d9da9a1df25f15", "size": 105, "state": "file"}
 {"mode": "0644", "path": "config.example.json", "sha256": "7e2f0f39899d9cf81bba71399bafd033234d3344f6869b245943e7a3fadfb315", "size": 5525, "state": "file"}
 {"mode": "0644", "path": "internal/api/account_archive.go", "sha256": "6b53a93e704cf4d00d16c1ef03d138659bbee0ebd13f71bdc6a41605f1406e59", "size": 47652, "state": "file"}
 {"mode": "0644", "path": "internal/api/account_archive_test.go", "sha256": "15a6a60ce8e628525d28f0f212a4686d7720d986e6cd26656ec9914be8421698", "size": 39994, "state": "file"}
@@ -189,8 +190,8 @@
 {"mode": "0644", "path": "internal/upstream/anthropic.go", "sha256": "2cbfd720ca1f8dbc190da3705b9eb942f9e55a7f9443ce910bf71639ca99be05", "size": 36388, "state": "file"}
 {"mode": "0644", "path": "internal/upstream/client.go", "sha256": "0c2b1195948a08b82c965ca2c27fb282039a165d343e093afc776268d1748dc3", "size": 69136, "state": "file"}
 {"mode": "0644", "path": "internal/upstream/openai_compat.go", "sha256": "2b174e09df7c433c0d55abd5de2558f08febb927499214602adf09e0dcb7cf0c", "size": 9925, "state": "file"}
-{"mode": "0644", "path": "scripts/maintenance/README-reclaim-disk-space.md", "sha256": "c3fa4796ab1b41ac2c11921d2bad7417dbe132243486edf16e2efbf77cde425f", "size": 4604, "state": "file"}
-{"mode": "0755", "path": "scripts/maintenance/reclaim-disk-space.sh", "sha256": "19d2107558ae70cb95ba9447f53b6ca384f7fda8c84a6ae9ee7cfa7301f42681", "size": 63408, "state": "file"}
+{"mode": "0644", "path": "scripts/maintenance/README-reclaim-disk-space.md", "sha256": "a73d4ec5a3042edb3fc0de90802a591f777296bb9958635551dc1aef4e19a84f", "size": 4811, "state": "file"}
+{"mode": "0644", "path": "scripts/maintenance/reclaim-disk-space.sh", "sha256": "0d47997244443f137b136c79c080955ea7d48f48157377366aa2886f15d1adbb", "size": 64635, "state": "file"}
 {"mode": "0644", "path": "web-spa/scripts/check-ui-regression-contracts.mjs", "sha256": "e2b7e7cec248273bc5cb8a05bf3884ae794115db975abd929f1456172f3918cd", "size": 7612, "state": "file"}
 {"mode": "0644", "path": "web-spa/src/features/accounts/api/accounts.ts", "sha256": "c353243d590f0290cf3281d4f22c60e807e87982e1a3a6bddfca13612ce76922", "size": 7222, "state": "file"}
 {"mode": "0644", "path": "web-spa/src/features/observability/api/exports.ts", "sha256": "68ebb070a145c98dc8d722c55f1ec9a20880005c07729439525cf6bc9d135d4e", "size": 12956, "state": "file"}

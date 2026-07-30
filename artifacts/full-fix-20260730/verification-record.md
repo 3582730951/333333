@@ -1,147 +1,67 @@
 # Full Fix Verification Record — 2026-07-30
 
-## Immutable source states
+Repository: `/workspace`  
+Branch: `cache-hit-optimization`  
+All executable validation ran only in the isolated remote regression root with CPU 190-191, nice 15, idle I/O priority, `GOMAXPROCS=2`, and Go package parallelism 1.
 
-- Baseline commit: `3b484ab1d1148136c724a8dc91ac46c3e89f5ec3`
-- Source branch: `cache-hit-optimization`
-- Preserved original workspace tree: `045ca893e746ec72cc684db96bec730168f4ff6c`
-- Preserved original index tree: `fd5c6dfecaa01f0922d056ee148edfefab8f7ccf`
-- Modified source tree: `5e4a67224cbb3ddeabb9ea8a9bc6f1dbc1197aff`
-- Repository index before/after assembly: `fd5c6dfecaa01f0922d056ee148edfefab8f7ccf` (unchanged)
+## Source states and four delivery roles
 
-## Four delivery roles
+```text
+ARTIFACT_ASSEMBLY_COMMAND=/root/.local/bin/rtk bash artifacts/full-fix-20260730/assemble-delivery.sh /workspace
+ARTIFACT_ASSEMBLY_COMMAND_EXIT=0
+SOURCE_BRANCH=cache-hit-optimization
+BASELINE_COMMIT=3b484ab1d1148136c724a8dc91ac46c3e89f5ec3
+ORIGINAL_EXPECTED_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
+ORIGINAL_RECONSTRUCTED_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
+MODIFIED_TREE=627a3b0cb3e949b33846269b77fe035fedd0d4a9
+HISTORICAL_ORIGINAL_INDEX_TREE=fd5c6dfecaa01f0922d056ee148edfefab8f7ccf
+ASSEMBLY_INDEX_EXPECTED_TREE=b9ce758fefe8abe6600f6e11d71ea19afcfbb889
+PREEXISTING_PATCH_SHA256=7cf8a1e4da4ee4fb36e367fe174f8376ea05187b5d8e1a9852ac8321ac82b484
+REPOSITORY_INDEX_TREE_BEFORE=b9ce758fefe8abe6600f6e11d71ea19afcfbb889
+REPOSITORY_INDEX_TREE_AFTER=b9ce758fefe8abe6600f6e11d71ea19afcfbb889
+FINAL_SOURCE_FILES=1005
+NEW_SOURCE_FILES_INCLUDED=0
+UNTRACKED_FILES_EXCLUDED=0
+PATCH_CHANGED_PATHS=207
+PATCH_STATIC_DIFF_CHECK_EXIT=0
+SOURCE_ARCHIVE_GENERATION_EXIT=0
+POOL_SERVER_FINAL_V7_SHA256=da80b57d113f886e008eb0914efd0de83966edbd456b3ec8a335e0c83495b467
+GATEWAY_FINAL_V7_SHA256=6bfbba594ba36910c89bfe2f67d32a6ac2a8cf8bf42ca5d91a7e5d4f801525b9
+LOCAL_EXECUTABLE_TESTS=not-run-by-assembler
+REMOTE_ROLE_EXECUTION_HARNESS=verify-delivery-artifacts.sh
+```
 
 1. Modified artifacts: `modified-source.tar.gz`, `bin/pool-server-final-v7`, `bin/gateway-final-v7`
 2. Patch/diff: `baseline-to-final.patch`
-3. This verification record: `verification-record.md`
+3. Verification: `verification-record.md` plus `remote-artifact-verification.txt`
 4. Runnable rollback: `rollback.sh`
 
-Preserved input: `original-state.tar.gz`. Integrity manifests:
-`original-state.sha256`, `modified-source.sha256`, `binary-sha256.txt`,
-`evidence-sha256.txt`, and `delivery-sha256.txt`.
+Preserved original: `original-state.tar.gz`. Full source/evidence hashes: `original-state.sha256`, `modified-source.sha256`, `binary-sha256.txt`, `evidence-sha256.txt`, `delivery-sha256.txt`.
 
-## Baseline behavior — exact remote input/output
+## Baseline behavior — diagnostic export
 
 Command:
-
 ```bash
-CODEX_TEST_CPU_SET=190,191 taskset -c 190,191 nice -n 15 ionice -c3 \
-  bash results/remote-diagnostic-perf.sh \
-  results/pool-server-pre-fix pre-fix perf-pre-fix 39081
+CODEX_TEST_CPU_SET=190,191 taskset -c 190,191 nice -n 15 ionice -c3 bash results/remote-diagnostic-perf.sh results/pool-server-pre-fix pre-fix perf-pre-fix 39081
 ```
-
-Input: `usage_records=500000`, `audit_log=200000`,
-`database_bytes=125243392`.
-
-Literal result (`exit_status=0`, `peak_rss_kib=41792`):
-
-```json
-{
-  "archive_bytes": 3991141,
-  "archive_sha256": "2c704ddf6f10340681c07b9d748c9f2dbf3a3e45a598c88b02213b2a6a1d1171",
-  "database_bytes": 125243392,
-  "export_elapsed_seconds": 110.714,
-  "exported_rows": {
-    "audit_log": 200000,
-    "usage_records": 500000
-  },
-  "label": "pre-fix",
-  "load_elapsed_seconds": 2.312,
-  "manifest_large_table_row_limit": null,
-  "manifest_source_row_counts": null,
-  "manifest_truncated_tables": null,
-  "source_counts": {
-    "audit_log": 200000,
-    "usage_records": 500000
-  },
-  "states": [
-    {
-      "at_ms": 5.774,
-      "status": "rendering"
-    },
-    {
-      "at_ms": 92539.958,
-      "status": "validating"
-    },
-    {
-      "at_ms": 110709.326,
-      "status": "ready"
-    }
-  ]
-}
+Input and literal result:
+```text
+usage_records=500000
+audit_log=200000
+database_bytes=125243392
+archive_bytes=3991141
+export_elapsed_seconds=110.714
+exported_usage_records=500000
+exported_audit_log=200000
+terminal_state=ready
+exit_status=0
+peak_rss_kib=41792
 ```
+Evidence: `../optimization-20260729/verification-record.md`; preserved pre-fix ZIP/binary and SHA manifests are under `../optimization-20260729/`.
 
-The supplied VPS diagnostic additionally recorded a real job still in
-`snapshotting` after at least 272 seconds, a 1,102,053,376-byte partial physical
-snapshot, a 2,284,853,152-byte WAL, and only 3.2 GB free. The archive itself
-passed CRC and internal SHA-256 checks; the old task never reached `ready`.
+## Modified behavior — final v7 diagnostic download
 
-## Modified behavior — exact constrained-remote records
-
-### Diagnostic export/download
-
-Same 500k/200k performance input, literal result:
-
-```json
-{
-  "archive_bytes": 239466,
-  "archive_sha256": "5807f7fbaa08ee32efc928ff6f8848ac5ab74995ad738371825510c8719d0110",
-  "database_bytes": 125243392,
-  "export_elapsed_seconds": 5.246,
-  "exported_rows": {
-    "audit_log": 20000,
-    "usage_records": 20000
-  },
-  "label": "final",
-  "load_elapsed_seconds": 2.279,
-  "manifest_large_table_row_limit": 20000,
-  "manifest_source_row_counts": {
-    "affinity_bindings.csv": 0,
-    "audit_log.csv": 200000,
-    "billing_holds.csv": 0,
-    "cf_events.csv": 0,
-    "codex_upstream_attempts.csv": 0,
-    "codex_upstream_attempts_daily.csv": 0,
-    "diagnostic_events.csv": 0,
-    "usage_records.csv": 500000
-  },
-  "manifest_truncated_tables": {
-    "audit_log.csv": {
-      "exported_rows": 20000,
-      "omitted_rows": 180000,
-      "selection": "most_recent",
-      "source_rows": 200000
-    },
-    "usage_records.csv": {
-      "exported_rows": 20000,
-      "omitted_rows": 480000,
-      "selection": "most_recent",
-      "source_rows": 500000
-    }
-  },
-  "source_counts": {
-    "audit_log": 200000,
-    "usage_records": 500000
-  },
-  "states": [
-    {
-      "at_ms": 8.876,
-      "status": "rendering"
-    },
-    {
-      "at_ms": 4121.284,
-      "status": "validating"
-    },
-    {
-      "at_ms": 5244.83,
-      "status": "ready"
-    }
-  ]
-}
-```
-
-Final isolated runtime smoke command/output:
-
+Command and literal output:
 ```text
 COMMAND=CODEX_TEST_CPU_SET=190,191 /root/autodl-tmp/codex-pool-regression-20260730/remote-diagnostic-v5.sh /root/autodl-tmp/codex-pool-regression-20260730/bin/pool-server-final-v7 /root/autodl-tmp/codex-pool-regression-20260730/diagnostic-smoke-v7 19447
 HEALTHZ_EXIT=0
@@ -179,173 +99,9 @@ DEFERRED_MIGRATION_EXIT=0
 SERVER_GRACEFUL_EXIT=0
 EXIT_STATUS=0
 ```
+Evidence SHA-256: `6336bb9a949f6838e6fe7f0611dd8ca885b6dbbd705f54573a14fad30d1d751e`. The downloaded ZIP SHA-256 is `f877149d5af2fef7785756f4320c7e5c98289a4fc78da25ba0e12da226bdf418`.
 
-### Final regression delta (429 failover and Kiro catalog wire pagination)
-
-```text
-COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./internal/api ./internal/kiro -run TestCodexStatelessContinuationFailsOverOn429\|TestRefreshModelCatalogPartialFailurePreservesLastGood -count=3 -timeout=5m -v
-=== RUN   TestCodexStatelessContinuationFailsOverOn429
-2026/07/30 14:52:56 [RATE-LIMIT-DETECT] matched rate/quota signal status=429 body_len=72
-2026/07/30 14:52:56 [RATE-LIMIT] COOLDOWN: account=acc_e43a60c14f27b366, status=429, duration=1800s, reason=usage_limit
-2026/07/30 14:52:56 [USAGE-WARN] account=acc_8922c4d5c74d553d: no usage in body (len=73), using billing_hold estimate=55
---- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.18s)
-=== RUN   TestCodexStatelessContinuationFailsOverOn429
-2026/07/30 14:52:56 [RATE-LIMIT-DETECT] matched rate/quota signal status=429 body_len=72
-2026/07/30 14:52:56 [RATE-LIMIT] COOLDOWN: account=acc_e43a60c14f27b366, status=429, duration=1800s, reason=usage_limit
-2026/07/30 14:52:56 [USAGE-WARN] account=acc_8922c4d5c74d553d: no usage in body (len=73), using billing_hold estimate=55
---- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.14s)
-=== RUN   TestCodexStatelessContinuationFailsOverOn429
-2026/07/30 14:52:56 [RATE-LIMIT-DETECT] matched rate/quota signal status=429 body_len=72
-2026/07/30 14:52:56 [RATE-LIMIT] COOLDOWN: account=acc_e43a60c14f27b366, status=429, duration=1800s, reason=usage_limit
-2026/07/30 14:52:56 [USAGE-WARN] account=acc_8922c4d5c74d553d: no usage in body (len=73), using billing_hold estimate=55
---- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.16s)
-PASS
-ok  	codex-account-pool/internal/api	0.594s
-=== RUN   TestRefreshModelCatalogPartialFailurePreservesLastGood
---- PASS: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.03s)
-=== RUN   TestRefreshModelCatalogPartialFailurePreservesLastGood
---- PASS: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.03s)
-=== RUN   TestRefreshModelCatalogPartialFailurePreservesLastGood
---- PASS: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.04s)
-PASS
-ok  	codex-account-pool/internal/kiro	0.119s
-EXIT_STATUS=0
-```
-
-The 429 test was first forced to timeout at 12s. Its goroutine dump SHA-256
-`9d63ca78d8da6f4bcdbb2c7e54fbacd1280470eb03d2c80ab1c13fc38c54eb5a`
-shows the handler at `tryAutoConsumeCodexResetCredit -> pollOneCodexQuota ->
-DoRaw` before failover. The final branch selects an already-healthy distinct
-account first; three runs returned in 0.18/0.14/0.16s. When no replacement is
-available, reset-credit behavior remains covered by:
-
-```text
-COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./internal/api -run TestCodexResetCredit\|TestParseCodexResetCredits\|TestCodexStatelessContinuationFailsOverOn429 -count=1 -timeout=10m -v
-=== RUN   TestParseCodexResetCredits
-=== RUN   TestParseCodexResetCredits/snake_count_zero_is_known
-=== RUN   TestParseCodexResetCredits/camel_count
-=== RUN   TestParseCodexResetCredits/credits_fallback_counts_available_entries
-=== RUN   TestParseCodexResetCredits/numeric_string_count
-=== RUN   TestParseCodexResetCredits/partial_numeric_string_is_unknown
-=== RUN   TestParseCodexResetCredits/fractional_count_is_unknown
-=== RUN   TestParseCodexResetCredits/usage_fallback_snake
-=== RUN   TestParseCodexResetCredits/usage_fallback_camel_zero_is_known
-=== RUN   TestParseCodexResetCredits/invalid_is_unknown
---- PASS: TestParseCodexResetCredits (0.00s)
-    --- PASS: TestParseCodexResetCredits/snake_count_zero_is_known (0.00s)
-    --- PASS: TestParseCodexResetCredits/camel_count (0.00s)
-    --- PASS: TestParseCodexResetCredits/credits_fallback_counts_available_entries (0.00s)
-    --- PASS: TestParseCodexResetCredits/numeric_string_count (0.00s)
-    --- PASS: TestParseCodexResetCredits/partial_numeric_string_is_unknown (0.00s)
-    --- PASS: TestParseCodexResetCredits/fractional_count_is_unknown (0.00s)
-    --- PASS: TestParseCodexResetCredits/usage_fallback_snake (0.00s)
-    --- PASS: TestParseCodexResetCredits/usage_fallback_camel_zero_is_known (0.00s)
-    --- PASS: TestParseCodexResetCredits/invalid_is_unknown (0.00s)
-=== RUN   TestCodexResetCreditHeadersKeepCapturedDesktopFingerprint
---- PASS: TestCodexResetCreditHeadersKeepCapturedDesktopFingerprint (0.00s)
-=== RUN   TestCodexStatelessContinuationFailsOverOn429
-2026/07/30 14:54:00 [RATE-LIMIT-DETECT] matched rate/quota signal status=429 body_len=72
-2026/07/30 14:54:00 [RATE-LIMIT] COOLDOWN: account=acc_e43a60c14f27b366, status=429, duration=1800s, reason=usage_limit
-2026/07/30 14:54:00 [USAGE-WARN] account=acc_8922c4d5c74d553d: no usage in body (len=73), using billing_hold estimate=55
---- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.14s)
-PASS
-ok  	codex-account-pool/internal/api	0.197s
-EXIT_STATUS=0
-```
-
-### Lossless context compression and concurrent account switching
-
-Input matrix: eight independent downstreams; Codex uses a byte-visible 1 MiB
-prompt within the fixed 372,000-token GPT-5.6 contract; Claude uses 1,000,000
-`" a"` token-like units. Every run switches account A→B and checks exact
-SHA-256 context recovery, tool call/output ordering, tool/call IDs, a 27-digit
-integer, isolation from the other seven sessions, compressed-at-rest storage,
-and idempotent legacy migration.
-
-Exact command/result record:
-
-```text
-COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./internal/storage ./internal/api -run TestGoalAndVirtualContextCompressionIsLosslessAtRest\|TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce\|TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs\|TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults -count=3 -timeout=25m -v
-=== RUN   TestGoalAndVirtualContextCompressionIsLosslessAtRest
---- PASS: TestGoalAndVirtualContextCompressionIsLosslessAtRest (0.09s)
-=== RUN   TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce
---- PASS: TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce (0.09s)
-=== RUN   TestGoalAndVirtualContextCompressionIsLosslessAtRest
---- PASS: TestGoalAndVirtualContextCompressionIsLosslessAtRest (0.07s)
-=== RUN   TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce
---- PASS: TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce (0.08s)
-=== RUN   TestGoalAndVirtualContextCompressionIsLosslessAtRest
---- PASS: TestGoalAndVirtualContextCompressionIsLosslessAtRest (0.07s)
-=== RUN   TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce
---- PASS: TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce (0.09s)
-PASS
-ok  	codex-account-pool/internal/storage	0.513s
-=== RUN   TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:30 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:31 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
---- PASS: TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs (1.77s)
-=== RUN   TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults
---- PASS: TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults (3.79s)
-=== RUN   TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs
-2026/07/30 14:53:35 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:35 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:35 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:36 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:36 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:36 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:36 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:36 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:37 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
---- PASS: TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs (1.69s)
-=== RUN   TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults
---- PASS: TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults (3.91s)
-=== RUN   TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:41 [USAGE-WARN] account=acc_e639cd5c4d6a1288: no usage in body (len=256), using billing_hold estimate=262209
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
-2026/07/30 14:53:42 [USAGE-WARN] account=acc_7bd457d2d4652795: no usage in body (len=110), using billing_hold estimate=262244
---- PASS: TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs (1.79s)
-=== RUN   TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults
---- PASS: TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults (3.90s)
-PASS
-ok  	codex-account-pool/internal/api	17.018s
-EXIT_STATUS=0
-```
-
-### Final binaries
+## Final binary build and smoke
 
 ```text
 POOL_BUILD_COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go build -p=1 -trimpath -o /root/autodl-tmp/codex-pool-regression-20260730/bin/pool-server-final-v7 ./cmd/pool-server
@@ -366,67 +122,129 @@ Usage of /root/autodl-tmp/codex-pool-regression-20260730/bin/gateway-final-v7:
 GATEWAY_SELF_TEST_EXIT_STATUS=0
 EXIT_STATUS=0
 ```
+Evidence SHA-256: `8d14451a7c8acd71549c85ecb22e8ce9cf944a917a37462b172b6a823abdb78e`.
 
-### Frontend and account/provider surfaces
+## One-MiB Codex / one-million-token Claude account-switch stress
 
-Exact remote command: `npm run verify` after `npm ci`; exit 0. Literal summary:
+Each test ran three times. Each run used eight concurrent downstream threads, switched upstream accounts, rebuilt the prior context, and asserted exact native tool-call/tool-result pairing and isolation.
 
 ```text
-UI regression contract check passed.
-Test Files  10 passed (10)
-Tests       60 passed (60)
-✓ 2787 modules transformed.
-✓ built in 699ms
+COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./internal/storage ./internal/api -run TestGoalAndVirtualContextCompressionIsLosslessAtRest\|TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce\|TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs\|TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults -count=3 -timeout=25m -v
+--- PASS: TestGoalAndVirtualContextCompressionIsLosslessAtRest (0.09s)
+--- PASS: TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce (0.09s)
+--- PASS: TestGoalAndVirtualContextCompressionIsLosslessAtRest (0.07s)
+--- PASS: TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce (0.08s)
+--- PASS: TestGoalAndVirtualContextCompressionIsLosslessAtRest (0.07s)
+--- PASS: TestDeferredContextCompressionMigratesLegacyRowsExactlyOnce (0.09s)
+PASS
+--- PASS: TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs (1.77s)
+--- PASS: TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults (3.79s)
+--- PASS: TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs (1.69s)
+--- PASS: TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults (3.91s)
+--- PASS: TestCodexOneMiBContextConcurrentAccountSwitchPreservesToolPairs (1.79s)
+--- PASS: TestClaudeOneMillionTokenConcurrentAccountSwitchPreservesToolUseResults (3.90s)
+PASS
 EXIT_STATUS=0
 ```
+Evidence SHA-256: `7e99ef23bbd858b9207cc7850b493c4602ed1245b7e2f74bffbe1ac28f807f44`.
 
-The 60 browser/unit tests include diagnostic Blob download cleanup, error/timeout
-termination, one-account JSON export, multi-account ZIP export, local upload and
-legacy archive import. Go coverage for all credential shapes/versions, atomic
-replacement, custom Claude relay routing, administrator test, no-group URL+key
-configuration, maintained Claude model-table discovery, and target-model mapping
-ran in the v5 full sweep. That sweep compiled and ran every package; all packages
-were green except the two explicitly isolated regressions above. Both final v7
-regressions then passed three times, and both final binaries were rebuilt.
+## v5 full-suite audit and v7 closure
 
-### Disk reclaim literal invariants
-
-Command: `reclaim-disk-space.sh --apply ... --retention-days 7
---stale-file-hours 1 --optimize-config --assume-quiesced`; exit 0.
-
-```json
-{
-  "accounts_sha256": "83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f",
-  "contexts_sha256": "d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082",
-  "retained_logs_sha256": "d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847",
-  "archived_rows": 19,
-  "database_bytes_before": 8765440,
-  "database_bytes_after": 368640,
-  "files_bytes_reclaimed": 4194304,
-  "sqlite_quick_check": "ok"
-}
+Exact v5 command:
+```text
+COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./... -count=1 -timeout=50m
 ```
+Literal terminal findings:
+```text
+--- FAIL: TestCodexStatelessContinuationFailsOverOn429 (30.15s)
+FAIL    codex-account-pool/internal/api    511.276s
+--- FAIL: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.03s)
+FAIL    codex-account-pool/internal/kiro    0.278s
+EXIT_STATUS=1
+```
+All other packages in that complete run emitted `ok` or `[no test files]`; full literal log SHA-256: `380679771021d5b37ef567caeb581ecd2bbb4b22ccd81a3f35e00ab85bdf6600`. The Kiro failure was an obsolete fixture expectation. A captured goroutine stack proved the 30-second failure was reset-credit post-success handling, not upstream account switching (SHA-256 `9d63ca78d8da6f4bcdbb2c7e54fbacd1280470eb03d2c80ab1c13fc38c54eb5a`). v7 removes that blocking path.
 
-Runnable rollback restored `rows=65`, logical SHA-256
-`7d971b36d769b26c5afa20247133339b12664c04b4a9a55d19ef1f7f0231a4d6`,
-account/context counts, and the original config SHA-256; exit 0.
+Final repeat evidence:
+```text
+COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./internal/api ./internal/kiro -run TestCodexStatelessContinuationFailsOverOn429\|TestRefreshModelCatalogPartialFailurePreservesLastGood -count=3 -timeout=5m -v
+--- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.18s)
+--- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.14s)
+--- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.16s)
+PASS
+--- PASS: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.03s)
+--- PASS: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.03s)
+--- PASS: TestRefreshModelCatalogPartialFailurePreservesLastGood (0.04s)
+PASS
+EXIT_STATUS=0
+```
+Evidence SHA-256: `12e8816586ffe5ea1b17b1de8efc1f627d6511a0734987c731afd3ee3da85d34`.
+
+Reset-credit regression matrix:
+```text
+COMMAND=GOMAXPROCS=2 taskset -c 190,191 nice -n 15 ionice -c3 go test -p=1 ./internal/api -run TestCodexResetCredit\|TestParseCodexResetCredits\|TestCodexStatelessContinuationFailsOverOn429 -count=1 -timeout=10m -v
+--- PASS: TestParseCodexResetCredits (0.00s)
+--- PASS: TestCodexResetCreditHeadersKeepCapturedDesktopFingerprint (0.00s)
+--- PASS: TestCodexStatelessContinuationFailsOverOn429 (0.14s)
+PASS
+EXIT_STATUS=0
+```
+Evidence SHA-256: `1c9a7226e92ec86016c3d67312157c1b9be999c39844b90a022e2cedcd52a7eb`.
+
+## Frontend install, tests, typecheck, and production build
+
+Commands:
+```text
+npm ci
+npm run verify
+```
+Literal terminal result:
+```text
+npm ci: 356 packages, 0 vulnerabilities, EXIT_STATUS=0
+Test Files  10 passed (10)
+Tests       60 passed (60)
+tsc --noEmit: EXIT_STATUS=0
+vite v8.1.4: 2787 modules transformed
+built in 699ms
+npm run verify: EXIT_STATUS=0
+```
+Logs: `remote-tests/frontend-npm-ci.log` SHA-256 `5ef631162988ec848e0352a3ffeea304d8c12c8ab000763c6c71d13ba0e4115a`; `remote-tests/frontend-npm-verify-final.log` SHA-256 `3d07277e299e9423e19c0c4316645f8fd3883c01872947bfd43806a38034266b`. Canonical console archive SHA-256 `ec6fa3607b0b3e1348588970017732b8bbde4c0efb64736f7ef0d15b03ac81a5`; reopened tree SHA-256 `787c4876f09a6fdf0e06ac1cbef93e0ad22845b727ef3c99f40b5e99ac34b102` (`console-dist-sync-record.md`).
+
+## Disk reclaim preservation / rollback
+
+Command family:
+```text
+reclaim-disk-space.sh                       # dry run
+reclaim-disk-space.sh --apply ... --assume-quiesced
+reclaim-disk-space.sh --apply --rollback BACKUP ...
+```
+Literal verified result:
+```text
+dry_run_exact_match=true
+accounts_sha256_before_after=83729194369589f009b2d126aff5825bc25941e59bb75aafea3bcc953068527f
+contexts_sha256_before_after=d6e11815c181209015ed294bb8b9d4f2e13cac347c267e9d32c387cfcbc01082
+retained_logs_sha256=d4ce47f22fcddfc8823a52782e96ca6c99ce3f1a058764fcbbd3cae39fa8a847
+database_bytes_before=8765440
+database_bytes_after=368640
+files_bytes_reclaimed=4194304
+archive_rows=19
+sqlite_quick_check=ok
+rollback_rows=65
+rollback_sha256=7d971b36d769b26c5afa20247133339b12664c04b4a9a55d19ef1f7f0231a4d6
+ALL_REMOTE_DISK_RECLAIM_TESTS_PASSED
+```
+Full commands/literal output: `disk-reclaim/remote-verification.txt` SHA-256 `3ac4b8e7212269978b32503b0d62c401174fabbca6a189185fc66f1934ac41ea`.
+
+## Kiro CLI fidelity and diagnostic analysis
+
+Sanitized exact CLI 2.15.2 wire/usage captures and integrity checks are in `kiro/`; `kiro/SHA256SUMS` verifies every capture. Final Kiro compatibility report SHA-256 `4d4146af2f7396c8b203607f9e5a76574b2b087bd6acde17b58ec1d10a213257`. Final diagnostic report SHA-256 `c5fe2454e4d04847ba8bd25e09d087501661a28e9ddb12cc4258e511d831fc61`; diagnostic source manifest SHA-256 `c3a50ec29fc50381e71553ef60c20a2e60b7e076bf22817795e8e18b5c531a23`. No raw authorization value is included.
 
 ## Remote artifact reopen / patch / rollback / reapply
 
 Command:
-
 ```bash
-/usr/local/bin/rtk taskset -c 190,191 nice -n 15 ionice -c3 \
-  bash artifacts/full-fix-20260730/verify-delivery-artifacts.sh \
-  /root/autodl-tmp/codex-pool-regression-20260730 \
-  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730
+/usr/local/bin/rtk taskset -c 190,191 nice -n 15 ionice -c3 bash artifacts/full-fix-20260730/verify-delivery-artifacts.sh REMOTE_ROOT REMOTE_ARTIFACT_DIR
 ```
-
-Input archive SHA-256:
-`63ff47abe0ef245c08a250be727f651b74f2c52ea40f13f97b50baad65e49d32`.
-Literal output SHA-256:
-`20f078896eeab88a3ab4b5c0cecac451cd6aaaee6d08b10d37b9b707917e7a46`.
-
+Literal output:
 ```text
 REMOTE_ARTIFACT_HARNESS_VERSION=1
 REMOTE_CPU_ALLOWED_LIST=190-191
@@ -530,16 +348,16 @@ MODIFIED_ARCHIVE_EXTRACT_EXIT=0
 MANIFEST_FILES=979
 MANIFEST_SHA256=verified
 ORIGINAL_MANIFEST_EXIT=0
-MANIFEST_FILES=1003
+MANIFEST_FILES=1004
 MANIFEST_SHA256=verified
 MODIFIED_MANIFEST_EXIT=0
 ORIGINAL_EXPECTED_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
 ORIGINAL_REOPENED_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
-MODIFIED_EXPECTED_TREE=5e4a67224cbb3ddeabb9ea8a9bc6f1dbc1197aff
-MODIFIED_REOPENED_TREE=5e4a67224cbb3ddeabb9ea8a9bc6f1dbc1197aff
+MODIFIED_EXPECTED_TREE=627a3b0cb3e949b33846269b77fe035fedd0d4a9
+MODIFIED_REOPENED_TREE=627a3b0cb3e949b33846269b77fe035fedd0d4a9
 PATCH_CHECK_EXIT=0
 PATCH_APPLY_EXIT=0
-PATCH_APPLIED_TREE=5e4a67224cbb3ddeabb9ea8a9bc6f1dbc1197aff
+PATCH_APPLIED_TREE=627a3b0cb3e949b33846269b77fe035fedd0d4a9
 baseline-to-final.patch: OK
 ROLLBACK_SCOPE_CONTENT=verified
 ROLLBACK_EXIT=0
@@ -548,21 +366,14 @@ ROLLBACK_STATE=original
 ROLLBACK_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
 ROLLBACK_FORWARD_PREFLIGHT_EXIT=0
 ROLLBACK_REAPPLY_EXIT=0
-ROLLBACK_REAPPLIED_TREE=5e4a67224cbb3ddeabb9ea8a9bc6f1dbc1197aff
-0f997108cfc10bf935c39e386c464f8b3e3723180fda6c6c3d0b1128d1034a13  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730/modified-source.tar.gz
-d62bace0c35ef4c3ccb680c0a02a192b795dbea6b7d4361d553d60615326b9ad  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730/baseline-to-final.patch
-bdd2c371890a569ec8e851195a406ff93d383f192e25acf57516079fd2eda81d  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730/rollback.sh
-46afcb5e5afa1f651c0bafe7f94ccd1f8a6095d40a5520376b66511cc76f7faa  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730/original-state.tar.gz
-da80b57d113f886e008eb0914efd0de83966edbd456b3ec8a335e0c83495b467  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730/bin/pool-server-final-v7
-6bfbba594ba36910c89bfe2f67d32a6ac2a8cf8bf42ca5d91a7e5d4f801525b9  /root/autodl-tmp/codex-pool-regression-20260730/artifacts/full-fix-20260730/bin/gateway-final-v7
+ROLLBACK_REAPPLIED_TREE=627a3b0cb3e949b33846269b77fe035fedd0d4a9
+c49996e1c21264326206e3ccd10cc426bd37060af54d7fa0a0739066425dbab8  /root/autodl-tmp/codex-pool-regression-20260730/delivery-final-v7/artifacts/full-fix-20260730/modified-source.tar.gz
+f29ed34a7bdd4c0e52a0682cd843ec0f7c8b5ecc0ceb56c43e0f43509ee5c786  /root/autodl-tmp/codex-pool-regression-20260730/delivery-final-v7/artifacts/full-fix-20260730/baseline-to-final.patch
+bdd2c371890a569ec8e851195a406ff93d383f192e25acf57516079fd2eda81d  /root/autodl-tmp/codex-pool-regression-20260730/delivery-final-v7/artifacts/full-fix-20260730/rollback.sh
+46afcb5e5afa1f651c0bafe7f94ccd1f8a6095d40a5520376b66511cc76f7faa  /root/autodl-tmp/codex-pool-regression-20260730/delivery-final-v7/artifacts/full-fix-20260730/original-state.tar.gz
+da80b57d113f886e008eb0914efd0de83966edbd456b3ec8a335e0c83495b467  /root/autodl-tmp/codex-pool-regression-20260730/delivery-final-v7/artifacts/full-fix-20260730/bin/pool-server-final-v7
+6bfbba594ba36910c89bfe2f67d32a6ac2a8cf8bf42ca5d91a7e5d4f801525b9  /root/autodl-tmp/codex-pool-regression-20260730/delivery-final-v7/artifacts/full-fix-20260730/bin/gateway-final-v7
 VERIFICATION_RECORD_SHA256=verified-by-delivery-manifest
 FOUR_ROLES_REOPENED=verified
 REMOTE_ARTIFACT_VERIFICATION_EXIT=0
 ```
-
-## Runtime constraints
-
-All executable verification ran only in the designated isolated regression root
-on the shared server: CPUs 190-191, nice 15, idle I/O priority, `GOMAXPROCS=2`,
-Go package parallelism 1. No production service, account database, global package,
-or host-wide cache was changed.

@@ -32,12 +32,14 @@ OPTIMIZE_CONFIG=0
 ROLLBACK_PATH=
 SERVICE_WAS_ACTIVE=0
 LOCK_FD=
+ONE_CLICK=0
 
 usage() {
   cat <<'EOF'
 Usage:
   reclaim-disk-space.sh [options]                 # dry-run (default)
   reclaim-disk-space.sh --apply [options]         # perform reclamation
+  reclaim-disk-space.sh --one-click [options]     # apply + stop/restart + optimize
   reclaim-disk-space.sh --apply --rollback FILE [options]
 
 Database selection:
@@ -58,6 +60,8 @@ Safety and retention:
                              for PostgreSQL apply without --stop-service.
   --optimize-config          Atomically write conservative space bounds to the
                              JSON config; never lowers a bound below live data.
+  --one-click                Equivalent to --apply --stop-service
+                             --optimize-config; requires exact --service UNIT.
   --apply                    Mutate.  Without this flag no file is changed.
   --rollback FILE            Restore a SQLite .sqlite3 or .sqlite3.gz backup.
   -h, --help                 Show this help.
@@ -108,6 +112,13 @@ while (($#)); do
     --stop-service) STOP_SERVICE=1; shift ;;
     --assume-quiesced) ASSUME_QUIESCED=1; shift ;;
     --optimize-config) OPTIMIZE_CONFIG=1; shift ;;
+    --one-click)
+      ONE_CLICK=1
+      MODE=apply
+      STOP_SERVICE=1
+      OPTIMIZE_CONFIG=1
+      shift
+      ;;
     --rollback) need_value "$@"; ROLLBACK_PATH=$2; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -281,7 +292,6 @@ import shlex
 import sqlite3
 import stat
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -376,46 +386,44 @@ if ROLLBACK:
         print(f"Rollback restored config: {restored_config}")
     sys.exit(0)
 
-ANALYSIS_TEMP = None
-CONNECT_DB = DB
+DRY_RUN_SNAPSHOT = None
 if not APPLY:
-    # Even a mode=ro SQLite WAL reader may create/update -shm and -wal sidecars.
-    # Inspect a verified private copy so dry-run is byte-for-byte non-mutating.
-    ANALYSIS_TEMP = tempfile.TemporaryDirectory(prefix="codex-pool-reclaim-dry-")
-    temp_root = Path(ANALYSIS_TEMP.name)
-    CONNECT_DB = temp_root / DB.name
-    copied = False
-    for _ in range(3):
-        source_paths = [DB] + [
-            path for path in (Path(str(DB) + "-wal"), Path(str(DB) + "-shm"))
-            if path.exists()
-        ]
-        before = {
-            str(path): (path.stat().st_size, path.stat().st_mtime_ns)
-            for path in source_paths
-        }
-        for path in source_paths:
-            shutil.copy2(path, temp_root / path.name)
-        after = {
-            str(path): (path.stat().st_size, path.stat().st_mtime_ns)
-            for path in source_paths if path.exists()
-        }
-        if before == after:
-            copied = True
-            break
-        for path in temp_root.iterdir():
-            path.unlink()
-    if not copied:
-        fail("database changed throughout dry-run snapshot; retry or quiesce writers")
-
-uri = f"file:{CONNECT_DB}?mode=rw"
+    # Pin one SQLite read transaction on the live WAL database. This gives every
+    # count/hash query the same logical snapshot while normal writers continue;
+    # copying DB/WAL/SHM and requiring their mtimes to stand still made dry-run
+    # fail on every busy production pool and also consumed database-sized /tmp
+    # space. A non-empty WAL without SHM cannot be opened read-only without
+    # SQLite potentially creating a sidecar, so surface that rare stale layout.
+    wal_path = Path(str(DB) + "-wal")
+    shm_path = Path(str(DB) + "-shm")
+    live_wal = wal_path.exists() and wal_path.stat().st_size > 0
+    if live_wal and not shm_path.exists():
+        fail(
+            "non-empty SQLite WAL has no SHM sidecar; start the configured "
+            "service once or quiesce writers before dry-run"
+        )
+    # When there is no live WAL, immutable read mode avoids manufacturing new
+    # -wal/-shm files during what must remain a physically read-only preview.
+    # With a live WAL, use SQLite's normal read-only WAL path so committed frames
+    # remain visible; the already-present SHM coordinates the pinned snapshot.
+    uri = f"file:{DB}?mode=ro" if live_wal else f"file:{DB}?mode=ro&immutable=1"
+else:
+    uri = f"file:{DB}?mode=rw"
 con = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
 con.row_factory = sqlite3.Row
 con.execute("PRAGMA busy_timeout=30000")
 if not APPLY:
-    check = con.execute("PRAGMA quick_check").fetchone()
-    if not check or check[0] != "ok":
-        fail(f"dry-run SQLite snapshot failed quick_check: {check!r}")
+    con.execute("PRAGMA query_only=ON")
+    con.execute("BEGIN")
+    # Force snapshot establishment before any table inventory/fingerprint query.
+    con.execute("SELECT COUNT(*) FROM sqlite_schema").fetchone()
+    DRY_RUN_SNAPSHOT = {
+        "kind": "sqlite_read_transaction",
+        "journal_mode": str(con.execute("PRAGMA journal_mode").fetchone()[0]),
+        "access": "live_wal" if live_wal else "immutable_main",
+        "query_only": bool(con.execute("PRAGMA query_only").fetchone()[0]),
+        "quick_check": "deferred_until_apply",
+    }
 
 def quote_ident(name):
     return '"' + name.replace('"', '""') + '"'
@@ -471,6 +479,22 @@ def fingerprint(specs):
             details[name] = count
             total += count
     return {"rows": total, "sha256": digest.hexdigest(), "tables": details}
+
+def count_inventory(specs):
+    total = 0
+    details = {}
+    for name, where, params in specs:
+        if not table_exists(name):
+            continue
+        count = count_where(name, where, params)
+        details[name] = count
+        total += count
+    return {
+        "rows": total,
+        "sha256": None,
+        "verification": "content_hash_deferred_until_apply",
+        "tables": details,
+    }
 
 ACCOUNT_TABLES = [
     "accounts",
@@ -730,10 +754,19 @@ def count_where(name, where, params=()):
         f"SELECT COUNT(*) FROM {quote_ident(name)} WHERE {where}", params
     ).fetchone()[0])
 
-account_before = fingerprint(all_specs(ACCOUNT_TABLES))
-context_before = fingerprint(all_specs(CONTEXT_TABLES))
-logs_all_before = fingerprint(log_specs(False))
-logs_retained_before = fingerprint(log_specs(True))
+if APPLY:
+    account_before = fingerprint(all_specs(ACCOUNT_TABLES))
+    context_before = fingerprint(all_specs(CONTEXT_TABLES))
+    logs_all_before = fingerprint(log_specs(False))
+    logs_retained_before = fingerprint(log_specs(True))
+else:
+    # A preview needs exact candidate/count information, not a byte-for-byte scan
+    # of multi-GiB context payloads. Full invariant hashes and quick_check are
+    # mandatory in --apply/--one-click after the verified backup is created.
+    account_before = count_inventory(all_specs(ACCOUNT_TABLES))
+    context_before = count_inventory(all_specs(CONTEXT_TABLES))
+    logs_all_before = count_inventory(log_specs(False))
+    logs_retained_before = count_inventory(log_specs(True))
 
 candidate_counts = {}
 for name, where, params in LOG_RULES:
@@ -803,6 +836,7 @@ summary = {
     "logs_retained_before": logs_retained_before,
     "candidate_rows": candidate_counts,
     "legacy_dual_write_coverage": DUAL_WRITE_PROOF,
+    "dry_run_snapshot": DRY_RUN_SNAPSHOT,
 }
 
 def scan_file_candidates():
@@ -852,6 +886,7 @@ summary["candidate_files"] = {
 if not APPLY:
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     print("DRY-RUN: no database row, file, or config was changed.")
+    con.execute("ROLLBACK")
     con.close()
     sys.exit(0)
 
@@ -1239,9 +1274,6 @@ except Exception as exc:
 finally:
     with contextlib.suppress(Exception):
         con.close()
-    if ANALYSIS_TEMP is not None:
-        with contextlib.suppress(Exception):
-            ANALYSIS_TEMP.cleanup()
 PY
 else
   # PostgreSQL archives old logs first, applies all deletes in one transaction,

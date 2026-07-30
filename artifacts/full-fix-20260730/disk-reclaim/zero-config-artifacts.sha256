@@ -1,0 +1,3 @@
+d022adce990715acc047a813328bdcf7d230882b63155c3d66ad3b6383f5fd5e  artifacts/full-fix-20260730/disk-reclaim/zero-config-reclaim.patch
+d9d8f47dc7b4583c3096be8504c0921025d52a2b822f03d20e1218178e5b9310  artifacts/full-fix-20260730/disk-reclaim/zero-config-verification.txt
+7fd91f493d20021155e0b3b1a368bfe76f68f378970e132d530fd64be0b18f33  artifacts/full-fix-20260730/disk-reclaim/rollback-zero-config-reclaim.sh

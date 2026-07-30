@@ -1,9 +1,10 @@
  cmd/gateway/policy.go                              |    2 +-
  cmd/gateway/runtime.go                             |  320 +++-
  cmd/gateway/runtime_test.go                        |  205 ++-
- cmd/pool-server/deferred_migrations.go             |   84 ++
+ cmd/pool-server/deferred_migrations.go             |   84 +
  cmd/pool-server/deferred_migrations_test.go        |  118 ++
  cmd/pool-server/main.go                            |   16 +-
+ codex-pool-full-fix-v7-delivery.tar.gz.sha256      |    1 +
  config.example.json                                |    2 +-
  internal/api/account_archive.go                    | 1291 ++++++++++++++++
  internal/api/account_archive_test.go               |  966 ++++++++++++
@@ -14,7 +15,7 @@
  internal/api/audit_test.go                         |   13 +
  internal/api/body_meta.go                          |   24 +-
  internal/api/body_source_test.go                   |    2 +
- internal/api/chat_custom.go                        |  169 ++-
+ internal/api/chat_custom.go                        |  169 +-
  internal/api/claude_code_docker_e2e_test.go        |    7 +-
  internal/api/claude_gateway_docker_e2e_test.go     |   23 +-
  internal/api/claude_route_policy.go                |   15 +-
@@ -43,7 +44,7 @@
  internal/api/kiro_cache_singleflight.go            |   74 +-
  internal/api/kiro_e2e_test.go                      |  187 +--
  internal/api/kiro_health.go                        |    4 +-
- internal/api/kiro_messages.go                      |  185 ++-
+ internal/api/kiro_messages.go                      |  185 +--
  internal/api/kiro_usage_limits.go                  |  171 +++
  internal/api/leak.go                               |    4 +
  internal/api/leak_test.go                          |   17 +
@@ -189,8 +190,8 @@
  internal/upstream/anthropic.go                     |   30 +-
  internal/upstream/client.go                        |   25 +-
  internal/upstream/openai_compat.go                 |  124 +-
- scripts/maintenance/README-reclaim-disk-space.md   |   99 ++
- scripts/maintenance/reclaim-disk-space.sh          | 1587 ++++++++++++++++++++
+ scripts/maintenance/README-reclaim-disk-space.md   |  101 ++
+ scripts/maintenance/reclaim-disk-space.sh          | 1613 ++++++++++++++++++++
  web-spa/scripts/check-ui-regression-contracts.mjs  |   20 +
  web-spa/src/features/accounts/api/accounts.ts      |  102 ++
  web-spa/src/features/observability/api/exports.ts  |  249 ++-
@@ -204,4 +205,4 @@
  web-spa/tests/account-archive.test.ts              |  150 ++
  web-spa/tests/browser-download.test.ts             |   28 +
  web-spa/tests/diagnostic-export.test.ts            |  152 +-
- 206 files changed, 15366 insertions(+), 1342 deletions(-)
+ 207 files changed, 15395 insertions(+), 1342 deletions(-)

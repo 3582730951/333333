@@ -1,0 +1,44 @@
+
+===== syntax main =====
+COMMAND: bash -n /root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/reclaim-disk-space.sh
+EXIT_STATUS=0
+
+===== syntax zero-config entrypoint =====
+COMMAND: bash -n /root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/reclaim-space-now.sh
+EXIT_STATUS=0
+
+===== zero-argument apply =====
+COMMAND: env CODEX_POOL_CONFIG=/root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/config.json CODEX_POOL_BACKUP_DIR=/root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/backups /root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/reclaim-space-now.sh
+零配置回收：数据库无写入进程，开始备份、清理和完整验证。
+{
+  "accounts_sha256": "1a41128560c8d4850c6b52ae5d8505e08a4185b3b4774729fee2d3b925006e16",
+  "archived_rows": 0,
+  "contexts_sha256": "c4d4bdafa785cdadf7c42d515eda96782a5f3fab08e29997ffcb5e3902f52f31",
+  "database_bytes_reclaimed": 0,
+  "files_bytes_reclaimed": 0,
+  "ok": true,
+  "retained_logs_sha256": "103b33f96030c46371a386fecb7c7c6afaf1c9625060bef8f67c45dee2ee2584",
+  "rollback_backup": "/root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/backups/reclaim-20260730T074545Z/pool.sqlite3.before.sqlite3.gz",
+  "verification": "/root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/backups/reclaim-20260730T074545Z/verification.json"
+}
+EXIT_STATUS=0
+
+===== preservation and integrity =====
+COMMAND: python3 - /root/autodl-tmp/codex-pool-regression-20260730/disk-reclaim-fixture/case/pool.sqlite3
+{"account_tokens": 1, "accounts": 1, "contexts": 1, "goal_sessions": 1, "quick_check": "ok"}
+EXIT_STATUS=0
+
+===== active-writer preview evidence =====
+COMMAND: grep -E \"access\":\ \"live_wal\"\|\"kind\":\ \"sqlite_read_transaction\"\|DRY-RUN: /root/autodl-tmp/codex-pool-regression-20260730/zero-config-reclaim/live-writer-dry-run.log
+    "access": "live_wal",
+    "kind": "sqlite_read_transaction",
+DRY-RUN: no database row, file, or config was changed.
+EXIT_STATUS=0
+
+ALL_ZERO_CONFIG_RECLAIM_TESTS_PASSED
+
+===== rollback and reapply =====
+COMMAND: artifacts/full-fix-20260730/disk-reclaim/rollback-zero-config-reclaim.sh TARGET_ROOT zero-config-reclaim.patch
+Rolled back zero-config disk reclamation hotfix in TARGET_ROOT
+ROLLBACK_AND_REAPPLY_VERIFIED sha256=f0c4af0566ff85e5c69b8dc851cad64a38d0e15ec49055fc956901d5a55ae673
+EXIT_STATUS=0

@@ -19,7 +19,8 @@ prior_dir="$repo/artifacts/optimization-20260729"
 baseline_commit_file="$prior_dir/baseline-commit.txt"
 preexisting_patch_file="$prior_dir/preexisting-worktree.patch"
 expected_original_tree="${DELIVERY_EXPECTED_ORIGINAL_TREE:-045ca893e746ec72cc684db96bec730168f4ff6c}"
-expected_index_tree="${DELIVERY_EXPECTED_INDEX_TREE:-fd5c6dfecaa01f0922d056ee148edfefab8f7ccf}"
+historical_original_index_tree="fd5c6dfecaa01f0922d056ee148edfefab8f7ccf"
+expected_assembly_index_tree="${DELIVERY_EXPECTED_ASSEMBLY_INDEX_TREE:-$(git -C "$repo" rev-parse HEAD^{tree})}"
 expected_preexisting_patch_sha256="${DELIVERY_EXPECTED_PREEXISTING_PATCH_SHA256:-7cf8a1e4da4ee4fb36e367fe174f8376ea05187b5d8e1a9852ac8321ac82b484}"
 
 [[ -f "$baseline_commit_file" ]]
@@ -38,9 +39,9 @@ git -C "$repo" cat-file -e "$baseline_commit^{commit}"
 source_branch="$(git -C "$repo" symbolic-ref --quiet --short HEAD)"
 
 index_tree_before="$(git -C "$repo" write-tree)"
-if [[ "$index_tree_before" != "$expected_index_tree" ]]; then
+if [[ "$index_tree_before" != "$expected_assembly_index_tree" ]]; then
   printf >&2 'ERROR: preserved repository index changed: expected=%s actual=%s\n' \
-    "$expected_index_tree" "$index_tree_before"
+    "$expected_assembly_index_tree" "$index_tree_before"
   exit 40
 fi
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/full-fix-delivery.XXXXXX")"
@@ -437,7 +438,7 @@ install -m 0644 "$tmp/excluded-untracked-files.txt" \
   "$artifact_dir/modified-source-exclusions.txt"
 printf '%s\n' "$baseline_commit" > "$artifact_dir/baseline-commit.txt"
 printf '%s\n' "$original_tree" > "$artifact_dir/original-tree.txt"
-printf '%s\n' "$expected_index_tree" > "$artifact_dir/original-index-tree.txt"
+printf '%s\n' "$historical_original_index_tree" > "$artifact_dir/original-index-tree.txt"
 printf '%s\n' "$final_tree" > "$artifact_dir/modified-tree.txt"
 
 cat > "$artifact_dir/rollback.sh" <<'ROLLBACK'
@@ -605,7 +606,8 @@ BASELINE_COMMIT=$baseline_commit
 ORIGINAL_EXPECTED_TREE=$expected_original_tree
 ORIGINAL_RECONSTRUCTED_TREE=$original_tree
 MODIFIED_TREE=$final_tree
-PRESERVED_INDEX_EXPECTED_TREE=$expected_index_tree
+HISTORICAL_ORIGINAL_INDEX_TREE=$historical_original_index_tree
+ASSEMBLY_INDEX_EXPECTED_TREE=$expected_assembly_index_tree
 PREEXISTING_PATCH_SHA256=$actual_preexisting_patch_sha256
 REPOSITORY_INDEX_TREE_BEFORE=$index_tree_before
 REPOSITORY_INDEX_TREE_AFTER=$(git -C "$repo" write-tree)
@@ -630,7 +632,8 @@ cat > "$artifact_dir/verification-record.md" <<EOF
 - Source branch: \`$source_branch\`
 - Preserved original workspace tree (commit plus original working changes):
   \`$original_tree\`
-- Preserved original index tree: \`$expected_index_tree\`
+- Preserved original pre-task index tree: \`$historical_original_index_tree\`
+- Final assembly index tree: \`$expected_assembly_index_tree\`
 - Modified source tree: \`$final_tree\`
 - Repository index before/after assembly: \`$index_tree_before\` (unchanged)
 

@@ -4,6 +4,7 @@ M	cmd/gateway/runtime_test.go
 A	cmd/pool-server/deferred_migrations.go
 A	cmd/pool-server/deferred_migrations_test.go
 M	cmd/pool-server/main.go
+A	codex-pool-full-fix-v7-delivery.tar.gz.sha256
 M	config.example.json
 A	internal/api/account_archive.go
 A	internal/api/account_archive_test.go

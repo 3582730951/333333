@@ -22,7 +22,20 @@
 
 ## 推荐执行顺序
 
-先 dry-run，不会创建备份或修改任何文件：
+零配置一键回收（自动发现配置、数据库所属的精确 systemd worker 和备份盘）：
+
+```bash
+sudo ./scripts/maintenance/reclaim-space-now.sh
+```
+
+这个入口只清理 codex-pool 自己的诊断、过期缓存、临时文件和已归档日志，
+不会运行主机级清理。它在数据库无人占用时直接执行；数据库在线时，只有在全部
+持有者能唯一映射到同一个 systemd unit 后才会短暂停止并自动恢复该 unit。
+默认优先使用 `/mnt/backup/codex-pool`，否则使用数据目录旁的维护备份目录。
+
+先 dry-run，不会创建备份或修改任何数据库行、业务文件或配置。SQLite
+dry-run 使用一个只读事务固定逻辑快照，因此 WAL 模式下服务保持在线并持续写入时也能完成，
+且不会再把主库/WAL 复制到 `/tmp`：
 
 ```bash
 sudo ./scripts/maintenance/reclaim-disk-space.sh \

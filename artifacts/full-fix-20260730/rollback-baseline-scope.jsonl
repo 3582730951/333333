@@ -4,6 +4,7 @@
 {"path": "cmd/pool-server/deferred_migrations.go", "state": "absent"}
 {"path": "cmd/pool-server/deferred_migrations_test.go", "state": "absent"}
 {"mode": "0644", "path": "cmd/pool-server/main.go", "sha256": "b535b97b56ac2ee88ccda80c271af5fa85493fb331e85d1be8a7f48289cb2859", "size": 26254, "state": "file"}
+{"path": "codex-pool-full-fix-v7-delivery.tar.gz.sha256", "state": "absent"}
 {"mode": "0644", "path": "config.example.json", "sha256": "79d776357b63b890afb533632366a707ff26a3c3da69039a54e803c8ef49cb4b", "size": 5524, "state": "file"}
 {"path": "internal/api/account_archive.go", "state": "absent"}
 {"path": "internal/api/account_archive_test.go", "state": "absent"}

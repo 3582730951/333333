@@ -2,8 +2,51 @@ BASELINE_COMMIT=3b484ab1d1148136c724a8dc91ac46c3e89f5ec3
 ORIGINAL_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
 EXPECTED_ORIGINAL_TREE=045ca893e746ec72cc684db96bec730168f4ff6c
 ORIGINAL_TREE_MATCH=yes
-REPOSITORY_INDEX_TREE_BEFORE=fd5c6dfecaa01f0922d056ee148edfefab8f7ccf
-TRACKED_PRESENT=935
-NEW_SOURCE_INCLUDED=69
-UNTRACKED_EXCLUDED=93
-FINAL_FILES_SELECTED=1004
+REPOSITORY_INDEX_TREE_BEFORE=b9ce758fefe8abe6600f6e11d71ea19afcfbb889
+TRACKED_PRESENT=1123
+NEW_SOURCE_INCLUDED=0
+UNTRACKED_EXCLUDED=0
+FINAL_FILES_SELECTED=1005
+baseline-to-final.patch: OK
+original-state.tar.gz: OK
+original-tree-manifest.jsonl: OK
+original-tree.txt: OK
+original-index-tree.txt: OK
+baseline-commit.txt: OK
+modified-source.tar.gz: OK
+modified-tree-manifest.jsonl: OK
+modified-tree.txt: OK
+modified-source-new-files.txt: OK
+modified-source-exclusions.txt: OK
+baseline-commit.txt: OK
+original-tree.txt: OK
+original-index-tree.txt: OK
+original-state.tar.gz: OK
+original-state.sha256: OK
+original-tree-manifest.jsonl: OK
+modified-tree.txt: OK
+modified-source.tar.gz: OK
+modified-source.sha256: OK
+modified-tree-manifest.jsonl: OK
+modified-source-new-files.txt: OK
+modified-source-exclusions.txt: OK
+baseline-to-final.patch: OK
+baseline-to-final.files.txt: OK
+baseline-to-final.stat.txt: OK
+baseline-to-final.patch.sha256: OK
+rollback-baseline-scope.jsonl: OK
+rollback-final-scope.jsonl: OK
+rollback.sh: OK
+binary-sha256.txt: OK
+evidence-sha256.txt: OK
+bin/pool-server-final-v7: OK
+bin/gateway-final-v7: OK
+artifact-assembly.txt: OK
+verification-record.md: OK
+verify-delivery-artifacts.sh: OK
+assemble-delivery.sh: OK
+FINAL_TREE=627a3b0cb3e949b33846269b77fe035fedd0d4a9
+PRESERVED_INDEX_TREE=b9ce758fefe8abe6600f6e11d71ea19afcfbb889
+REPOSITORY_INDEX_TREE_AFTER=b9ce758fefe8abe6600f6e11d71ea19afcfbb889
+REMOTE_VERIFICATION_REQUIRED=yes
+DELIVERY_ASSEMBLY_EXIT=0
