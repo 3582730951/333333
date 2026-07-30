@@ -581,8 +581,9 @@ export default function Accounts() {
             onEnterPress={doSearch} style={{ width: responsive.isMobile ? 210 : 220 }} placeholder="搜索 标签/邮箱/分组" showClear onClear={doSearch} />
           <Button icon={<IconSearch />} onClick={doSearch}>搜索</Button>
           {!responsive.isMobile ? <Button icon={<IconDownload />} onClick={exportCSV}>导出 CSV</Button> : null}
-          <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>导出全部</Button>
-          <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入</Button>
+          <Button icon={<IconDownload />} loading={accountExportRunning} disabled={accountImportRunning} onClick={() => exportAccountBackup([])}>一键导出全部</Button>
+          <Button icon={<IconDownload />} loading={accountExportRunning} disabled={!selected.length || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>一键导出所选{selected.length ? `(${selected.length})` : ''}</Button>
+          <Button icon={<IconFile />} disabled={accountExportRunning || accountImportRunning} onClick={() => setArchiveImportOpen(true)}>一键导入账号池</Button>
           <Button icon={<IconRefresh />} onClick={() => load()}>刷新</Button>
           {responsive.isMobile ? (
             <Button onClick={() => { setSelectMode((value) => !value); if (selectMode) setSelected([]); }}>
@@ -610,7 +611,7 @@ export default function Accounts() {
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-quarantine', '解除隔离')}>批量解除隔离</Button>
           <Button size="small" loading={bulkActionRunning} disabled={accountActionRunning || bulkMoveRunning} onClick={() => bulkAction('clear-cooldown', '解除冷却')}>批量解除冷却</Button>
           <Button size="small" disabled={anyAccountOperationRunning} onClick={() => { setMoveIDs([...selected]); setMoveGroup(''); setMoveOpen(true); }}>移动分组</Button>
-          <Button size="small" icon={<IconDownload />} loading={accountExportRunning} disabled={accountActionRunning || bulkActionRunning || bulkMoveRunning || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>导出所选</Button>
+          <Button size="small" icon={<IconDownload />} loading={accountExportRunning} disabled={accountActionRunning || bulkActionRunning || bulkMoveRunning || accountImportRunning} onClick={() => exportAccountBackup([...selected])}>一键导出所选</Button>
           <ConfirmDialog
             title={`删除选中的 ${selected.length} 个账号？`}
             description="批量删除后不可恢复，失败项会保留在已选列表中。"

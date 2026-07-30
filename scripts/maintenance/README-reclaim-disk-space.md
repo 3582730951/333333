@@ -32,6 +32,10 @@ sudo ./scripts/maintenance/reclaim-space-now.sh
 不会运行主机级清理。它在数据库无人占用时直接执行；数据库在线时，只有在全部
 持有者能唯一映射到同一个 systemd unit 后才会短暂停止并自动恢复该 unit。
 默认优先使用 `/mnt/backup/codex-pool`，否则使用数据目录旁的维护备份目录。
+worker 收到停止信号后会先排空正在流式返回的请求；脚本每 5 秒输出状态和已等待
+时间，然后分七阶段输出备份、归档、VACUUM 和验证进度。默认 worker 的 systemd
+停止上限是 300 秒，这段等待不会重复清理或触碰账号；此时中断脚本也会请求恢复
+原 worker。
 
 先 dry-run，不会创建备份或修改任何数据库行、业务文件或配置。SQLite
 dry-run 使用一个只读事务固定逻辑快照，因此 WAL 模式下服务保持在线并持续写入时也能完成，

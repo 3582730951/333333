@@ -703,6 +703,7 @@ func accountArchivePayloads(raw []byte, filename string) ([][]byte, bool, error)
 	if len(reader.File) > accountArchiveMaxFiles {
 		return nil, true, fmt.Errorf("ZIP contains more than %d files", accountArchiveMaxFiles)
 	}
+	isDiagnosticArchive := accountArchiveLooksLikeDiagnostics(reader)
 	payloads := make([][]byte, 0, len(reader.File))
 	var expanded uint64
 	entryNames := make(map[string]struct{}, len(reader.File))
@@ -716,6 +717,9 @@ func accountArchivePayloads(raw []byte, filename string) ([][]byte, bool, error)
 			continue
 		}
 		if !strings.EqualFold(path.Ext(clean), ".json") {
+			if isDiagnosticArchive {
+				return nil, true, accountArchiveDiagnosticsUploadError()
+			}
 			return nil, true, fmt.Errorf("ZIP entry %q is not JSON", file.Name)
 		}
 		if strings.EqualFold(path.Base(clean), "manifest.json") {
@@ -751,9 +755,51 @@ func accountArchivePayloads(raw []byte, filename string) ([][]byte, bool, error)
 		payloads = append(payloads, payload)
 	}
 	if len(payloads) == 0 {
+		if isDiagnosticArchive {
+			return nil, true, accountArchiveDiagnosticsUploadError()
+		}
 		return nil, true, fmt.Errorf("ZIP %q contains no account JSON files", filename)
 	}
 	return payloads, true, nil
+}
+
+func accountArchiveDiagnosticsUploadError() error {
+	return &PublicError{
+		Code:    "account_archive_is_diagnostics",
+		Message: "上传的是诊断包 ZIP，不是账号池备份。请在账号池页面点击「一键导出全部」或「一键导出所选」得到 account-pool*.zip 后再导入。",
+	}
+}
+
+func accountArchiveLooksLikeDiagnostics(reader *zip.Reader) bool {
+	for _, file := range reader.File {
+		name := strings.ReplaceAll(file.Name, "\\", "/")
+		clean := path.Clean(name)
+		if strings.HasPrefix(clean, "../") || clean == ".." || strings.HasPrefix(name, "/") {
+			continue
+		}
+		if !strings.EqualFold(path.Base(clean), "manifest.json") || file.FileInfo().IsDir() || file.UncompressedSize64 > 1<<20 {
+			continue
+		}
+		entry, err := file.Open()
+		if err != nil {
+			continue
+		}
+		payload, readErr := io.ReadAll(io.LimitReader(entry, 1<<20))
+		closeErr := entry.Close()
+		if readErr != nil || closeErr != nil {
+			continue
+		}
+		var manifest struct {
+			Format string `json:"format"`
+		}
+		if json.Unmarshal(payload, &manifest) == nil && strings.HasPrefix(manifest.Format, "codex-pool-diagnostics") {
+			return true
+		}
+		if bytes.Contains(payload, []byte("codex-pool-diagnostics-v")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) decodeAccountImportPayload(raw []byte) ([]storage.AccountBackup, string, error) {

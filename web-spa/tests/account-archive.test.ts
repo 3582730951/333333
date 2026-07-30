@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import api from '../src/api.js';
+import api, { get } from '../src/api.js';
 import {
+  fetchAccountsPage,
   fetchAccountArchive,
   importAccountArchive,
 } from '../src/features/accounts/api/accounts';
@@ -17,6 +18,40 @@ describe('account archive API', () => {
   beforeEach(() => {
     vi.mocked(api.get).mockReset();
     vi.mocked(api.post).mockReset();
+    vi.mocked(get).mockReset();
+  });
+
+  it('loads account pages when imported accounts have null optional arrays', async () => {
+    vi.mocked(get).mockResolvedValue({
+      accounts: [{
+        id: 'acc-imported',
+        label: 'Imported',
+        provider: 'codex',
+        status: 'active',
+        capabilities: null,
+        usage: null,
+      }],
+      total: 1,
+    });
+
+    const result = await fetchAccountsPage({ page: 1, pageSize: 50, search: '' });
+
+    expect(result.total).toBe(1);
+    expect(result.rows[0]).toMatchObject({ id: 'acc-imported', capabilities: [] });
+  });
+
+  it('accepts alternate account list envelopes used by older admin builds', async () => {
+    vi.mocked(get).mockResolvedValue({
+      data: {
+        items: [{ id: 'legacy-row', status: 'active', capabilities: null }],
+        total: 1,
+      },
+    });
+
+    const result = await fetchAccountsPage({ page: 1, pageSize: 50, search: '' });
+
+    expect(result).toMatchObject({ total: 1 });
+    expect(result.rows.map((row) => row.id)).toEqual(['legacy-row']);
   });
 
   it('downloads one selected account as a validated JSON document', async () => {
@@ -95,6 +130,28 @@ describe('account archive API', () => {
     });
     expect(await (uploaded as File).text()).toBe(await file.text());
     expect(config).toEqual({ timeout: 1_800_000 });
+  });
+
+  it('accepts enveloped import summaries from compatible admin gateways', async () => {
+    const file = new File(['{"version":1}'], 'account.json', { type: 'application/json' });
+    vi.mocked(api.post).mockResolvedValue({
+      data: {
+        data: {
+          recognized: 2,
+          imported: 2,
+          replaced: 0,
+          files: 1,
+          zip: true,
+          formats: ['pool-account-v1-array'],
+          accounts: [{ id: 'acc-a', status: 'imported' }, { id: 'acc-b', status: 'imported' }],
+        },
+      },
+    });
+
+    const result = await importAccountArchive(file);
+
+    expect(result.recognized).toBe(2);
+    expect(result.accounts.map((account) => account.id)).toEqual(['acc-a', 'acc-b']);
   });
 
   it('forwards abort signals to account archive downloads and uploads', async () => {

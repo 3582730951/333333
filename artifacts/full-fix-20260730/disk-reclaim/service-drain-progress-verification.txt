@@ -1,0 +1,56 @@
+===== full reclamation regression =====
+COMMAND: taskset -c 190,191 nice -n 15 ionice -c3 bash remote-test-harness.sh
+
+ALL_REMOTE_DISK_RECLAIM_TESTS_PASSED
+EXIT_STATUS=0
+
+===== graceful-drain progress and apply =====
+COMMAND: reclaim-disk-space.sh --one-click --config FIXTURE/config.json --service fake-worker.service --backup-dir FIXTURE/backups
+Stopping service: fake-worker.service
+Waiting for in-flight requests to drain: 0s (state=deactivating/unknown, systemd limit=5min)
+Waiting for in-flight requests to drain: 5s (state=deactivating/unknown, systemd limit=5min)
+Service stopped cleanly after 6s; starting verified reclamation.
+Reclaim progress: 1/7 inventorying protected account, context and retained-log data
+Reclaim progress: 2/7 creating and checking the rollback database
+Reclaim backup progress: 100% (90/90 pages)
+Reclaim progress: 3/7 archiving expired history and committing cleanup
+Reclaim progress: 4/7 checkpointing WAL and compacting the SQLite database
+Reclaim progress: 5/7 removing managed diagnostic, spool and browser temporary files
+Reclaim progress: 6/7 compressing and rereading the rollback image
+Reclaim progress: 7/7 complete; account/context hashes and SQLite integrity match
+{
+  "accounts_sha256": "6504f2a1cc0cf6ab63eff70bb6085d7de341635771e710e0457908e137d731d0",
+  "archived_rows": 0,
+  "contexts_sha256": "56cc7834cfdd3262040213030520471bb87e1b4c1a93a76381c0bdfa7cfc7301",
+  "database_bytes_reclaimed": 0,
+  "files_bytes_reclaimed": 0,
+  "ok": true,
+  "retained_logs_sha256": "37717f8abda257025167c9cb02c8d4e64b30b7416579214ae2c1b1fa3d303961",
+  "rollback_backup": "/root/autodl-tmp/codex-pool-regression-20260730/service-drain-progress/backups/reclaim-20260730T080058Z/pool.sqlite3.before.sqlite3.gz",
+  "verification": "/root/autodl-tmp/codex-pool-regression-20260730/service-drain-progress/backups/reclaim-20260730T080058Z/verification.json"
+}
+Service restarted: fake-worker.service
+EXIT_STATUS=0
+
+===== interrupt during service drain =====
+COMMAND: timeout --preserve-status -s INT 2 reclaim-disk-space.sh --one-click ...
+Stopping service: fake-worker.service
+Waiting for in-flight requests to drain: 0s (state=deactivating/unknown, systemd limit=5min)
+Service restarted: fake-worker.service
+EXPECTED_EXIT_STATUS=130
+
+===== failed-state abort =====
+COMMAND: reclaim-disk-space.sh --one-click ... (systemctl reports failed)
+Stopping service: fake-worker.service
+ERROR: service entered failed state while draining; cleanup was not started and restart has been requested
+Service restarted: fake-worker.service
+EXPECTED_EXIT_STATUS=1
+DATABASE_SHA256_UNCHANGED=true
+SERVICE_RESTART_REQUESTED=true
+
+ALL_SERVICE_DRAIN_TESTS_PASSED
+
+===== rollback and reapply =====
+COMMAND: rollback-service-drain-progress.sh TARGET_ROOT service-drain-progress.patch; git apply service-drain-progress.patch
+FINAL_ROLLBACK_REAPPLY_OK sha256=3482a0626d781b64c1aa0f0c05efef2cfe01810834e5ce014a6d79640fb2e081
+EXIT_STATUS=0

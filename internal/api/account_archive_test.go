@@ -671,6 +671,38 @@ func TestAccountArchiveUploadSeparatesFileLimitFromMultipartEnvelope(t *testing.
 	}
 }
 
+func TestAccountBackupImportRejectsDiagnosticsZIPWithActionableMessage(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{}`) })
+	var archive bytes.Buffer
+	writer := zip.NewWriter(&archive)
+	manifest, err := writer.Create("manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manifest.Write([]byte(`{"format":"codex-pool-diagnostics-v3","account_count":14}`)); err != nil {
+		t.Fatal(err)
+	}
+	csvEntry, err := writer.Create("accounts_snapshot.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := csvEntry.Write([]byte("account_code,status\nACC-EXAMPLE,active\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, raw := uploadAccountArchiveForTest(t, h, "codex-pool-diagnostics-v3.zip", archive.Bytes())
+	if code != http.StatusBadRequest {
+		t.Fatalf("diagnostic ZIP status = %d: %s", code, raw)
+	}
+	text := string(raw)
+	if !strings.Contains(text, "account_archive_is_diagnostics") || !strings.Contains(text, "诊断包 ZIP") || !strings.Contains(text, "一键导出全部") {
+		t.Fatalf("diagnostic ZIP response is not actionable: %s", raw)
+	}
+}
+
 func TestAccountBackupImportReplacesMatchingAccountCompletely(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{}`) })
 	ids := seedPortableAccountsForTest(t, h)

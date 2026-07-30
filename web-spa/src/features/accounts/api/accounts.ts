@@ -28,7 +28,7 @@ const accountSchema = z.object({
     native_context_window: z.coerce.number().optional(),
     native_max_context_window: z.coerce.number().optional(),
     source: z.string().optional(),
-  }).passthrough()).optional(),
+  }).passthrough()).nullable().optional().transform((value) => value ?? []),
   usage: z.record(z.string(), z.unknown()).nullable().optional(),
 }).passthrough();
 
@@ -37,11 +37,28 @@ export const accountsResponseSchema = z.union([
   z.object({
     accounts: z.array(accountSchema).optional(),
     rows: z.array(accountSchema).optional(),
+    items: z.array(accountSchema).optional(),
+    data: z.array(accountSchema).optional(),
     total: z.coerce.number().int().nonnegative().optional(),
   }).passthrough().transform((value) => {
-    const rows = value.accounts ?? value.rows ?? [];
+    const rows = value.accounts ?? value.rows ?? value.items ?? value.data ?? [];
     return { rows, total: value.total ?? rows.length };
   }),
+  z.object({
+    data: z.union([
+      z.array(accountSchema).transform((rows) => ({ rows, total: rows.length })),
+      z.object({
+        accounts: z.array(accountSchema).optional(),
+        rows: z.array(accountSchema).optional(),
+        items: z.array(accountSchema).optional(),
+        data: z.array(accountSchema).optional(),
+        total: z.coerce.number().int().nonnegative().optional(),
+      }).passthrough().transform((value) => {
+        const rows = value.accounts ?? value.rows ?? value.items ?? value.data ?? [];
+        return { rows, total: value.total ?? rows.length };
+      }),
+    ]),
+  }).passthrough().transform((value) => value.data),
 ]);
 
 const groupSchema = z.object({ name: z.string() }).passthrough();
@@ -160,7 +177,11 @@ export async function importAccountArchive(file: File, signal?: AbortSignal): Pr
     timeout: accountArchiveTimeoutMs,
     ...(signal ? { signal } : {}),
   });
-  const data = response.data as Partial<AccountArchiveImportResult>;
+  const responseData = response.data as unknown;
+  const responseRecord = responseData && typeof responseData === 'object' ? responseData as Record<string, unknown> : {};
+  const data = (responseRecord.data && typeof responseRecord.data === 'object'
+    ? responseRecord.data
+    : responseRecord) as Partial<AccountArchiveImportResult>;
   if (!Number.isFinite(data.recognized) || Number(data.recognized) <= 0 || !Array.isArray(data.accounts)) {
     throw new Error('服务器返回了无效的账号导入结果。');
   }
