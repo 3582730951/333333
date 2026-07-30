@@ -1400,13 +1400,21 @@ destroy_superseded_release_processes() {
   return 0
 }
 
-release_directory_has_process() {
+release_directory_has_blocking_process() {
   local release_dir="$1" exe target
   for exe in "${PROC_ROOT%/}"/[0-9]*/exe; do
     [[ -L "$exe" ]] || continue
     target="$(readlink "$exe" 2>/dev/null || true)"
     target="${target% (deleted)}"
-    [[ "$target" == "${release_dir%/}/"* ]] && return 0
+    [[ "$target" == "${release_dir%/}/"* ]] || continue
+    # The handoff binary is intentionally allowed to keep running across worker
+    # cutovers so established streams are not severed. Removing its old immutable
+    # release directory is safe on Unix: the live process keeps its executable
+    # inode until its next normal restart, while the directory contents become
+    # reclaimable and systemd's ExecStart points at the current compatibility
+    # entrypoint.
+    [[ "$target" == "${release_dir%/}/${HANDOFF_NAME}" ]] && continue
+    return 0
   done
   return 1
 }
@@ -1424,7 +1432,7 @@ prune_superseded_release_artifacts() {
     else
       valid_worker_release_id "$base" || die "malformed stale release directory: ${path}"
     fi
-    release_directory_has_process "$path" &&
+    release_directory_has_blocking_process "$path" &&
       die "refusing to delete release artifact still used by a process: ${path}"
     log "Reclaiming superseded release artifact ${path}"
     run_root rm -rf -- "$path"

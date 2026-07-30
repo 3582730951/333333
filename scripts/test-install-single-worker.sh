@@ -124,15 +124,18 @@ destroy_legacy_worker_process
 for release in release-current release-old release-orphan release-older; do
   mkdir -p "$APP_DIR/releases/$release"
   : >"$APP_DIR/releases/$release/$APP_NAME"
+  : >"$APP_DIR/releases/$release/$HANDOFF_NAME"
 done
 mkdir -p "$APP_DIR/releases/.staging-release-interrupted"
 ln -s "$APP_DIR/releases/release-old" "$APP_DIR/previous"
-mkdir -p "$PROC_ROOT/555" "$PROC_ROOT/666"
+mkdir -p "$PROC_ROOT/555" "$PROC_ROOT/666" "$PROC_ROOT/777"
 ln -s "$APP_DIR/releases/release-orphan/$APP_NAME" "$PROC_ROOT/555/exe"
 ln -s "$APP_DIR/releases/release-current/$APP_NAME" "$PROC_ROOT/666/exe"
+ln -s "$APP_DIR/releases/release-older/$HANDOFF_NAME" "$PROC_ROOT/777/exe"
 
 reclaim_superseded_install_resources "release-current"
 [[ ! -e "$PROC_ROOT/555" && -e "$PROC_ROOT/666/exe" ]]
+[[ -L "$PROC_ROOT/777/exe" ]]
 [[ -d "$APP_DIR/releases/release-current" && -d "$APP_DIR/releases/release-old" ]]
 [[ ! -e "$APP_DIR/releases/release-orphan" && ! -e "$APP_DIR/releases/release-older" ]]
 [[ ! -e "$APP_DIR/releases/.staging-release-interrupted" ]]
