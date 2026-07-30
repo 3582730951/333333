@@ -610,6 +610,15 @@ func TestClaudeMessagesUserGroupFallsThroughCodexTierToExactAntigravityModel(t *
 			t.Fatalf("model=%s binding=%+v found=%v err=%v, want %+v", model, binding, found, err, antigravityTarget)
 		}
 	}
+	audit, err := h.store.ListAuditLog(t.Context(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range audit {
+		if row.Action == "model_fallback_required" || row.Action == "model_capability_rejected" {
+			t.Fatalf("successful zero-config group fallback retained a private target error: %+v", audit)
+		}
+	}
 
 	before := len(h.requests())
 	unknownBody := []byte(`{"model":"gemini-unverified","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)

@@ -1,0 +1,2 @@
+{"checks": {"storage": true}, "deployment_state": "active", "fencing_token": 4, "inflight": 0, "ok": true, "ready": true, "release_id": "old-0873de57", "started_at": "2026-07-30T19:42:37.533623843Z", "worker_socket": ""}
+active_release=old-0873de57 pid=379129 current=/root/autodl-tmp/cpupg-20260730/prefix/lib/codex-pool/releases/old-0873de57

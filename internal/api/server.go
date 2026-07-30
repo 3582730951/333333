@@ -793,6 +793,10 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 	// Carry the matched key/user identity in the context so usage is attributed to the
 	// owning portal user (their console reads /user/usage).
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
+	// Pin the automatically available downstream identity before any later
+	// Responses recovery strips state-bearing headers. Goal replay can then resolve
+	// the same namespace even during an early WebSocket-to-HTTPS bridge rebuild.
+	r = r.WithContext(withDownstreamClientScope(r.Context(), pol.KeyHash, r))
 	// Keep the exact downstream aliases and turn body available to the durable Codex
 	// recovery journal.  Native CPA remains the steady-state fast path; these values
 	// are consulted only if its bound account disappears or the upstream confirms
@@ -1086,7 +1090,9 @@ func (s *Server) handleGatewayPost(w http.ResponseWriter, r *http.Request) {
 					raw = resetBody
 					r = r.Clone(r.Context())
 					r.Header = resetHeader
-					codexMapping, mappingErr = s.resolveCodexSessionMapping(r.Context(), r, raw, pol)
+					codexMapping, mappingErr = s.resolveCodexSessionMappingInNamespace(
+						r.Context(), r, raw, pol, codexMapping.namespace, codexMapping.clientScope,
+					)
 					if mappingErr == nil {
 						codexMapping.retainRetiredEpochHierarchy(retiredIdentity)
 						freshRootAfterContextLoss = true
@@ -1434,7 +1440,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		ImmutableAffinity: !movable,
 		Movable:           movable,
 		Model:             model,
-		EstimatedTokens:   estimatedTokensWithMeta(raw, replayMeta),
+		EstimatedTokens:   codexEstimatedTokensWithMeta(model, raw, replayMeta),
 		Compaction:        compactionRequestWithMeta(path, raw, replayMeta),
 		Exclude:           exclude,
 		OnWait:            onSchedulerWait,
@@ -1764,7 +1770,7 @@ func (s *Server) codexAttempt(w http.ResponseWriter, r *http.Request, raw []byte
 		logicalUsageDiag.SingleflightWaitedRequests = 1
 	}
 	defer releaseCacheFlight()
-	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, estimatedTokensWithMeta(body, forwardMeta))
+	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, codexEstimatedTokensWithMeta(resolvedModel, body, forwardMeta))
 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()

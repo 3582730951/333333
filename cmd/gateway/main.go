@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,13 +20,14 @@ import (
 
 // Config 网关配置
 type Config struct {
-	ListenAddr    string        `json:"listen_addr"`
-	PoolServerURL string        `json:"pool_server_url"`
-	DownstreamKey string        `json:"downstream_key"`
-	Providers     []string      `json:"providers"`
-	IdentityTTL   time.Duration `json:"identity_ttl_seconds"`
-	LogLevel      string        `json:"log_level"`
-	MITM          MITMConfig    `json:"mitm"`
+	ListenAddr       string        `json:"listen_addr"`
+	PoolServerURL    string        `json:"pool_server_url"`
+	DownstreamKey    string        `json:"downstream_key"`
+	ClientInstanceID string        `json:"client_instance_id"`
+	Providers        []string      `json:"providers"`
+	IdentityTTL      time.Duration `json:"identity_ttl_seconds"`
+	LogLevel         string        `json:"log_level"`
+	MITM             MITMConfig    `json:"mitm"`
 }
 
 type MITMConfig struct {
@@ -35,6 +39,7 @@ type gatewayConfigDisk struct {
 	ListenAddr         string     `json:"listen_addr"`
 	PoolServerURL      string     `json:"pool_server_url"`
 	DownstreamKey      string     `json:"downstream_key"`
+	ClientInstanceID   string     `json:"client_instance_id"`
 	Providers          []string   `json:"providers"`
 	IdentityTTLSeconds int64      `json:"identity_ttl_seconds"`
 	LogLevel           string     `json:"log_level"`
@@ -45,6 +50,7 @@ type gatewayConfigPatch struct {
 	ListenAddr         *string     `json:"listen_addr"`
 	PoolServerURL      *string     `json:"pool_server_url"`
 	DownstreamKey      *string     `json:"downstream_key"`
+	ClientInstanceID   *string     `json:"client_instance_id"`
 	Providers          []string    `json:"providers"`
 	IdentityTTLSeconds *int64      `json:"identity_ttl_seconds"`
 	LogLevel           *string     `json:"log_level"`
@@ -64,12 +70,13 @@ func DefaultConfig() Config {
 	gatewayDir := filepath.Join(home, ".claude-gateway")
 
 	return Config{
-		ListenAddr:    "127.0.0.1:8765",
-		PoolServerURL: "https://localhost:1455",
-		DownstreamKey: "",
-		Providers:     []string{"claude", "codex"},
-		IdentityTTL:   5 * time.Minute,
-		LogLevel:      "info",
+		ListenAddr:       "127.0.0.1:8765",
+		PoolServerURL:    "https://localhost:1455",
+		DownstreamKey:    "",
+		ClientInstanceID: newGatewayClientInstanceID(),
+		Providers:        []string{"claude", "codex"},
+		IdentityTTL:      5 * time.Minute,
+		LogLevel:         "info",
 		MITM: MITMConfig{
 			CACert: filepath.Join(gatewayDir, "ca-cert.pem"),
 			CAKey:  filepath.Join(gatewayDir, "ca-key.pem"),
@@ -89,13 +96,22 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, err
 	}
 
+	var diskPatch gatewayConfigPatch
+	if err := json.Unmarshal(data, &diskPatch); err != nil {
+		return cfg, err
+	}
 	if err := applyGatewayConfigJSON(&cfg, data); err != nil {
 		return cfg, err
+	}
+	if diskPatch.ClientInstanceID == nil || !validGatewayClientInstanceID(cfg.ClientInstanceID) {
+		cfg.ClientInstanceID = newGatewayClientInstanceID()
 	}
 	// claude_model was written by older gateway releases. It is deliberately
 	// ignored at runtime and removed best-effort so upgrades immediately return
 	// model selection to Claude Code without touching native Claude settings.
-	_ = removeLegacyClaudeModel(path, data)
+	if err := migrateGatewayConfig(path, data, cfg.ClientInstanceID); err != nil {
+		return cfg, err
+	}
 
 	// 展开 ~ 路径
 	cfg.MITM.CACert = ExpandPath(cfg.MITM.CACert)
@@ -106,6 +122,9 @@ func LoadConfig(path string) (Config, error) {
 
 // SaveConfig 保存配置文件
 func SaveConfig(path string, cfg Config) error {
+	if !validGatewayClientInstanceID(cfg.ClientInstanceID) {
+		cfg.ClientInstanceID = newGatewayClientInstanceID()
+	}
 	data, err := json.MarshalIndent(gatewayConfigForDisk(cfg), "", "  ")
 	if err != nil {
 		return err
@@ -139,6 +158,9 @@ func applyGatewayConfigJSON(cfg *Config, data []byte) error {
 	if patch.DownstreamKey != nil {
 		cfg.DownstreamKey = *patch.DownstreamKey
 	}
+	if patch.ClientInstanceID != nil {
+		cfg.ClientInstanceID = *patch.ClientInstanceID
+	}
 	if patch.Providers != nil {
 		cfg.Providers = patch.Providers
 	}
@@ -163,6 +185,7 @@ func gatewayConfigForDisk(cfg Config) gatewayConfigDisk {
 		ListenAddr:         cfg.ListenAddr,
 		PoolServerURL:      cfg.PoolServerURL,
 		DownstreamKey:      cfg.DownstreamKey,
+		ClientInstanceID:   cfg.ClientInstanceID,
 		Providers:          cfg.Providers,
 		IdentityTTLSeconds: ttlSeconds,
 		LogLevel:           cfg.LogLevel,
@@ -170,15 +193,48 @@ func gatewayConfigForDisk(cfg Config) gatewayConfigDisk {
 	}
 }
 
-func removeLegacyClaudeModel(path string, data []byte) error {
+func newGatewayClientInstanceID() string {
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err == nil {
+		return hex.EncodeToString(random)
+	}
+	// Keep startup available during an exceptional entropy failure while still
+	// deriving a process-local opaque value that SaveConfig will persist.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("gateway-client-fallback\x00%d\x00%d", os.Getpid(), time.Now().UnixNano())))
+	return hex.EncodeToString(sum[:])
+}
+
+func validGatewayClientInstanceID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 64 {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32
+}
+
+func migrateGatewayConfig(path string, data []byte, clientInstanceID string) error {
 	var values map[string]json.RawMessage
 	if err := json.Unmarshal(data, &values); err != nil {
 		return err
 	}
-	if _, ok := values["claude_model"]; !ok {
+	changed := false
+	if _, ok := values["claude_model"]; ok {
+		delete(values, "claude_model")
+		changed = true
+	}
+	var existingClientID string
+	if raw := values["client_instance_id"]; len(raw) == 0 || json.Unmarshal(raw, &existingClientID) != nil || !validGatewayClientInstanceID(existingClientID) {
+		encoded, err := json.Marshal(clientInstanceID)
+		if err != nil {
+			return err
+		}
+		values["client_instance_id"] = encoded
+		changed = true
+	}
+	if !changed {
 		return nil
 	}
-	delete(values, "claude_model")
 	cleaned, err := json.MarshalIndent(values, "", "  ")
 	if err != nil {
 		return err
@@ -342,22 +398,23 @@ func handleStart(configPath string) {
 }
 
 type gatewayStatusReport struct {
-	ConfigPath              string
-	ConfigLoaded            bool
-	ConfigError             string
-	ListenAddr              string
-	PoolServerURL           string
-	DownstreamKeyConfigured bool
-	CACertPresent           bool
-	CAKeyPresent            bool
-	GatewayReachable        bool
-	GatewayError            string
-	PoolReachable           bool
-	PoolStatus              int
-	PoolError               string
-	StrictRuntimeSupported  bool
-	StrictRuntimeError      string
-	IdentityCachePresent    bool
+	ConfigPath               string
+	ConfigLoaded             bool
+	ConfigError              string
+	ListenAddr               string
+	PoolServerURL            string
+	DownstreamKeyConfigured  bool
+	ClientInstanceConfigured bool
+	CACertPresent            bool
+	CAKeyPresent             bool
+	GatewayReachable         bool
+	GatewayError             string
+	PoolReachable            bool
+	PoolStatus               int
+	PoolError                string
+	StrictRuntimeSupported   bool
+	StrictRuntimeError       string
+	IdentityCachePresent     bool
 }
 
 func handleStatus(configPath string) int {
@@ -383,6 +440,7 @@ func inspectGatewayStatus(ctx context.Context, configPath string) gatewayStatusR
 	report.ListenAddr = cfg.ListenAddr
 	report.PoolServerURL = cfg.PoolServerURL
 	report.DownstreamKeyConfigured = cfg.DownstreamKey != ""
+	report.ClientInstanceConfigured = validGatewayClientInstanceID(cfg.ClientInstanceID)
 	report.CACertPresent = fileExists(cfg.MITM.CACert)
 	report.CAKeyPresent = fileExists(cfg.MITM.CAKey)
 	report.IdentityCachePresent = identityCachePresent()
@@ -423,6 +481,7 @@ func printGatewayStatus(report gatewayStatusReport) {
 	fmt.Println("  Listen:", report.ListenAddr)
 	fmt.Println("  Pool:", report.PoolServerURL)
 	fmt.Println("  Downstream key:", yesNo(report.DownstreamKeyConfigured))
+	fmt.Println("  Client instance:", yesNo(report.ClientInstanceConfigured))
 	fmt.Println("  CA cert:", yesNo(report.CACertPresent))
 	fmt.Println("  CA key:", yesNo(report.CAKeyPresent))
 	fmt.Println("  Identity cache:", yesNo(report.IdentityCachePresent))

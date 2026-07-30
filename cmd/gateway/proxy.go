@@ -20,6 +20,7 @@ import (
 type Proxy struct {
 	listenAddr string
 	poolURL    string
+	clientID   string
 	cache      *IdentityCache
 	caMgr      *CAManager
 	poolClient *http.Client
@@ -36,6 +37,7 @@ func NewProxy(cfg Config) (*Proxy, error) {
 	return &Proxy{
 		listenAddr: cfg.ListenAddr,
 		poolURL:    cfg.PoolServerURL,
+		clientID:   cfg.ClientInstanceID,
 		cache:      NewIdentityCache(cfg.PoolServerURL, cfg.DownstreamKey, cfg.IdentityTTL, poolClient),
 		caMgr:      caMgr,
 		poolClient: poolClient,
@@ -262,6 +264,9 @@ func (p *Proxy) forwardToPool(clientConn io.Writer, req *http.Request) {
 	}
 	// 添加网关模式标记
 	proxyReq.Header.Set("X-Gateway-Mode", "local")
+	// Overwrite rather than forward a caller-selected value: one gateway install
+	// is one durable client namespace even when many Claude Code processes share it.
+	proxyReq.Header.Set("X-Pool-Client-ID", p.clientID)
 
 	resp, err := p.poolClient.Do(proxyReq)
 	if err != nil {

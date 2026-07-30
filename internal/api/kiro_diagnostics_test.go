@@ -5,10 +5,12 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"codex-account-pool/internal/capability"
+	"codex-account-pool/internal/scheduler"
 	"codex-account-pool/internal/storage"
 )
 
@@ -69,8 +71,35 @@ func TestKiroModelUnsupportedAuditUsesActualAutoRouteDiagnostics(t *testing.T) {
 			foundCapability = true
 		}
 	}
-	if !foundFallback || !foundCapability {
-		t.Fatalf("structured fallback audits missing: %+v", audit)
+	if !foundFallback || foundCapability {
+		t.Fatalf("fallback must have one terminal audit and no false upstream rejection: %+v", audit)
+	}
+}
+
+func TestCapabilityFallbackProbeDoesNotPolluteTerminalAudit(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	ctx := withUserGroupFallbackProbe(context.Background())
+	rec := httptest.NewRecorder()
+	err := &scheduler.NoAccountError{
+		Model: "claude-opus-4-8",
+		Counters: scheduler.NoAccountCounters{
+			ModelUnsupported: 1,
+		},
+	}
+	if !h.app.handleCapabilitySelectionError(ctx, rec, err, true, "cyber", "claude,kiro", "claude-opus-4-8", "") {
+		t.Fatal("fallback probe was not classified")
+	}
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"model_fallback_required"`) {
+		t.Fatalf("private probe response changed: %d %s", rec.Code, rec.Body.String())
+	}
+	rows, queryErr := h.store.ListAuditLog(context.Background(), 20)
+	if queryErr != nil {
+		t.Fatal(queryErr)
+	}
+	for _, row := range rows {
+		if row.Action == "model_fallback_required" || row.Action == "model_capability_rejected" {
+			t.Fatalf("speculative probe leaked into terminal audit: %+v", rows)
+		}
 	}
 }
 

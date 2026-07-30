@@ -622,9 +622,9 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?)`, binding.ID, binding.TreeID, namespaceHash, bindi
 		return CodexSessionBinding{}, ErrCodexSessionEpochConflict
 	default:
 		result, updateErr := tx.ExecContext(ctx, `UPDATE codex_session_binding
-SET account_id=?,egress_id=?,state=?,encrypted_identity=?,updated_at=?,expires_at=?
-WHERE id=? AND epoch=? AND state='active'`, binding.AccountID, binding.EgressID, binding.State, encrypted,
-			binding.UpdatedAt, binding.ExpiresAt, binding.ID, binding.Epoch)
+SET namespace_hash=?,account_id=?,egress_id=?,state=?,encrypted_identity=?,updated_at=?,expires_at=?
+WHERE id=? AND epoch=? AND state='active'`, namespaceHash, binding.AccountID, binding.EgressID, binding.State,
+			encrypted, binding.UpdatedAt, binding.ExpiresAt, binding.ID, binding.Epoch)
 		if updateErr != nil {
 			return CodexSessionBinding{}, updateErr
 		}

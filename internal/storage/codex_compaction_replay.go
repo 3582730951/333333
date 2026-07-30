@@ -24,7 +24,14 @@ const (
 // reasoning, and assistant items before installing the opaque compaction item.
 func appendGoalReplayTurn(items []interface{}, turn goalReplaySegment, historyKey string) []interface{} {
 	if historyKey == "messages" {
-		items = appendGoalItems(items, turn.Input)
+		if len(turn.ReplacementHistory) > 0 {
+			return append([]interface{}(nil), turn.ReplacementHistory...)
+		}
+		if turn.ReplaceInput {
+			items = appendGoalItems(nil, turn.Input)
+		} else {
+			items = appendGoalItems(items, turn.Input)
+		}
 		return append(items, claudeAssistantMessages(turn.Output)...)
 	}
 
@@ -36,6 +43,9 @@ func appendGoalReplayTurn(items []interface{}, turn goalReplaySegment, historyKe
 	turnPrefix, turnInput := codexSeparateLiteReplayPrefix(appendGoalItems(nil, turn.Input))
 	if len(turnPrefix) > 0 {
 		prefix = turnPrefix
+	}
+	if len(turn.ReplacementPrefix) > 0 {
+		prefix = append([]interface{}(nil), turn.ReplacementPrefix...)
 	}
 	if len(turn.ReplacementHistory) > 0 {
 		// RemoteCompactionV2 installs replacement_history atomically. The trigger

@@ -99,6 +99,7 @@ func TestProxyPlainHTTPPoolRequestForwardsOneMiBBody(t *testing.T) {
 	type receivedRequest struct {
 		body          string
 		contentLength int64
+		clientID      string
 	}
 	gotRequest := make(chan receivedRequest, 1)
 	pool := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +116,7 @@ func TestProxyPlainHTTPPoolRequestForwardsOneMiBBody(t *testing.T) {
 		gotRequest <- receivedRequest{
 			body:          string(data),
 			contentLength: r.ContentLength,
+			clientID:      r.Header.Get("X-Pool-Client-ID"),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -123,6 +125,7 @@ func TestProxyPlainHTTPPoolRequestForwardsOneMiBBody(t *testing.T) {
 
 	p := &Proxy{
 		poolURL:    pool.URL,
+		clientID:   strings.Repeat("a", 64),
 		poolClient: pool.Client(),
 	}
 	client, server := net.Pipe()
@@ -154,6 +157,9 @@ func TestProxyPlainHTTPPoolRequestForwardsOneMiBBody(t *testing.T) {
 		}
 		if got.contentLength != int64(len(body)) {
 			t.Fatalf("forwarded content length = %d, want %d", got.contentLength, len(body))
+		}
+		if got.clientID != strings.Repeat("a", 64) {
+			t.Fatalf("forwarded client instance = %q", got.clientID)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("pool did not receive request")
@@ -263,8 +269,11 @@ func TestGatewayConfigRemovesLegacyClaudeModel(t *testing.T) {
 	if legacy.DownstreamKey != "cap_legacy" {
 		t.Fatalf("legacy config changed semantics: %#v", legacy)
 	}
+	if !validGatewayClientInstanceID(legacy.ClientInstanceID) {
+		t.Fatalf("legacy config did not receive a client instance: %#v", legacy)
+	}
 	cleaned, err := os.ReadFile(legacyPath)
-	if err != nil || strings.Contains(string(cleaned), "claude_model") {
+	if err != nil || strings.Contains(string(cleaned), "claude_model") || !strings.Contains(string(cleaned), `"client_instance_id"`) {
 		t.Fatalf("legacy claude_model was not removed: %v %s", err, cleaned)
 	}
 }
@@ -285,6 +294,14 @@ func TestLoadConfigHardensLegacyWidePermissions(t *testing.T) {
 	}
 	if cfg.DownstreamKey != "cap_legacy" {
 		t.Fatalf("downstream key = %q", cfg.DownstreamKey)
+	}
+	firstClientID := cfg.ClientInstanceID
+	reloaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstClientID == "" || reloaded.ClientInstanceID != firstClientID {
+		t.Fatalf("legacy client instance was not stable: first=%q second=%q", firstClientID, reloaded.ClientInstanceID)
 	}
 	assertFileMode(t, dir, gatewayPrivateDirMode)
 	assertFileMode(t, path, gatewayConfigFileMode)
@@ -751,6 +768,9 @@ func TestInspectGatewayStatusReportsConfiguredServices(t *testing.T) {
 	}
 	if !report.DownstreamKeyConfigured {
 		t.Fatal("downstream key should be reported as configured")
+	}
+	if !report.ClientInstanceConfigured {
+		t.Fatal("client instance should be reported as configured")
 	}
 	if !report.CACertPresent || !report.CAKeyPresent {
 		t.Fatalf("ca presence = cert:%v key:%v, want both true", report.CACertPresent, report.CAKeyPresent)

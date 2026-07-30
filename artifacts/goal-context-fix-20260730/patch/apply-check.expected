@@ -1,0 +1,46 @@
+error: patch failed: README.md:176
+error: README.md: patch does not apply
+error: patch failed: cmd/gateway/main.go:2
+error: cmd/gateway/main.go: patch does not apply
+error: patch failed: cmd/gateway/proxy.go:20
+error: cmd/gateway/proxy.go: patch does not apply
+error: patch failed: cmd/gateway/proxy_test.go:99
+error: cmd/gateway/proxy_test.go: patch does not apply
+error: patch failed: internal/api/codex_config.go:9
+error: internal/api/codex_config.go: patch does not apply
+error: patch failed: internal/api/codex_config_test.go:15
+error: internal/api/codex_config_test.go: patch does not apply
+error: patch failed: internal/api/codex_session_mapping.go:124
+error: internal/api/codex_session_mapping.go: patch does not apply
+error: patch failed: internal/api/codex_session_mapping_test.go:40
+error: internal/api/codex_session_mapping_test.go: patch does not apply
+error: patch failed: internal/api/codex_session_recovery_test.go:91
+error: internal/api/codex_session_recovery_test.go: patch does not apply
+error: patch failed: internal/api/codex_session_stability_test.go:107
+error: internal/api/codex_session_stability_test.go: patch does not apply
+error: patch failed: internal/api/diagnostics_export.go:330
+error: internal/api/diagnostics_export.go: patch does not apply
+error: patch failed: internal/api/diagnostics_export_test.go:306
+error: internal/api/diagnostics_export_test.go: patch does not apply
+error: patch failed: internal/api/goal_continuity.go:21
+error: internal/api/goal_continuity.go: patch does not apply
+error: patch failed: internal/api/goal_continuity_test.go:34
+error: internal/api/goal_continuity_test.go: patch does not apply
+error: patch failed: internal/api/messages.go:100
+error: internal/api/messages.go: patch does not apply
+error: patch failed: internal/api/model_instructions_test.go:333
+error: internal/api/model_instructions_test.go: patch does not apply
+error: patch failed: internal/api/server.go:793
+error: internal/api/server.go: patch does not apply
+error: patch failed: internal/api/setup_script_test.go:1
+error: internal/api/setup_script_test.go: patch does not apply
+error: patch failed: internal/api/usage_sidecar_test.go:279
+error: internal/api/usage_sidecar_test.go: patch does not apply
+error: patch failed: internal/storage/codex_compaction_replay.go:24
+error: internal/storage/codex_compaction_replay.go: patch does not apply
+error: patch failed: internal/storage/codex_session_mapping.go:622
+error: internal/storage/codex_session_mapping.go: patch does not apply
+error: patch failed: internal/storage/goal_continuity.go:120
+error: internal/storage/goal_continuity.go: patch does not apply
+error: internal/api/downstream_client_namespace.go: already exists in working directory
+error: scripts/analyze_goal_context_diagnostics.py: already exists in working directory

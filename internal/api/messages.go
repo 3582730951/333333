@@ -100,6 +100,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-MiCliProxy-Context-Engine", "v2; build=goal-continuity-v2")
 	}
 	r = r.WithContext(withDownstreamKey(r.Context(), pol))
+	r = r.WithContext(withDownstreamClientScope(r.Context(), pol.KeyHash, r))
 	r = r.WithContext(withGoalIdentityAliases(r.Context(), goalAliases(r, raw, "claude")))
 	r = r.WithContext(withGoalOriginalBody(r.Context(), raw))
 	if pol.ForceModel != "" {

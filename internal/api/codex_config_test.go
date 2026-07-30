@@ -15,7 +15,8 @@ import (
 // TestCodexConfigScript verifies GET /file/{key} returns a bash script that
 // configures the codex CLI against THIS pool: a custom model_provider whose
 // base_url is the pool origin + /v1, wire_api=responses, and the caller's key as
-// the bearer token. The model defaults to the key's force_model.
+// the bearer token. The model defaults to the key's force_model, Goal mode is
+// enabled, and no unrelated Codex feature/configuration is added.
 func TestCodexConfigScript(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	ctx := context.Background()
@@ -44,29 +45,76 @@ func TestCodexConfigScript(t *testing.T) {
 		`model = "$MODEL"`,
 		`model_provider = "$PROVIDER_ID"`,
 		`wire_api = "responses"`,
-		`supports_websockets = $supports_websockets`,
-		`probe_codex_websocket`,
-		`POOL_CODEX_WEBSOCKETS`,
 		`API_KEY='` + plain + `'`,
 		`MODEL='gpt-5.6-sol'`,
 		`name = "OpenAI"`,
-		`[model_providers.$PROVIDER_ID.auth]`,
-		`command = "/bin/cat"`,
-		`args = ["$TOKEN_FILE"]`,
+		`goals = true`,
+		`experimental_bearer_token = "$API_KEY"`,
 		"/v1\"", // base_url ends with /v1
 	} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("codex config script missing %q\n---\n%s", want, s)
 		}
 	}
-	for _, forbidden := range []string{"experimental_bearer_token =", "model_context_window =", "model_auto_compact_token_limit ="} {
+	for _, forbidden := range []string{
+		"model_context_window =",
+		"model_auto_compact_token_limit =",
+		`http_headers = { "X-Pool-Client-ID"`,
+		"pool-client-id",
+		"pool-token",
+		"supports_websockets =",
+		"rtk init --codex",
+	} {
 		if strings.Contains(s, forbidden) {
-			t.Fatalf("codex config script must use command auth + live model metadata, found %q\n---\n%s", forbidden, s)
+			t.Fatalf("Codex branch exceeded the requested configuration allowlist; found %q\n---\n%s", forbidden, s)
 		}
 	}
 	// chat wire_api was removed upstream — never emit it.
 	if strings.Contains(s, `wire_api = "chat"`) {
 		t.Fatalf("script must not use the removed chat wire_api")
+	}
+}
+
+func TestCodexOnlyConfigScriptEndpointContainsNoOtherInstallerBranches(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+	const plain = "cap_codex_only"
+	if err := h.store.UpsertAPIKey(context.Background(), storage.APIKey{
+		KeyHash: hashAPIKey(plain), Label: "codex-only", GroupName: "cyber",
+		ForceModel: "gpt-5.6-sol", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(h.pool.URL + "/file/" + plain + "?client=codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	script := string(body)
+	if got := resp.Header.Get("Content-Disposition"); got != "attachment; filename=setup-pool-codex.sh" {
+		t.Fatalf("content disposition=%q", got)
+	}
+	for _, want := range []string{
+		`model = "$MODEL"`,
+		`model_reasoning_effort = "xhigh"`,
+		`approval_policy = "never"`,
+		`sandbox_mode = "danger-full-access"`,
+		`goals = true`,
+		`base_url = "$ORIGIN/v1"`,
+		`experimental_bearer_token = "$API_KEY"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("Codex-only script missing %q\n---\n%s", want, script)
+		}
+	}
+	for _, forbidden := range []string{
+		"select_client", "configure_claude", "gateway", "claude", "rtk",
+		"curl ", "models_cache.json", "pool-token", "pool-client-id",
+		"X-Pool-Client-ID", "mcp_servers", "plugins.",
+	} {
+		if strings.Contains(strings.ToLower(script), strings.ToLower(forbidden)) {
+			t.Fatalf("Codex-only endpoint contains unrelated branch/config %q\n---\n%s", forbidden, script)
+		}
 	}
 }
 

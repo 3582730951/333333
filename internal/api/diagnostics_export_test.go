@@ -62,6 +62,9 @@ func awaitLegacyDiagnosticExport(t *testing.T, h *testHarness) []byte {
 func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, "goal_storage_max_mb", "384"); err != nil {
+		t.Fatal(err)
+	}
 	account := storage.Account{
 		ID:                "acc-real-1",
 		Label:             "Alpha Sensitive",
@@ -306,10 +309,20 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
 	if err := json.Unmarshal([]byte(files["diagnostic_summary.json"]), &summary); err != nil {
 		t.Fatalf("diagnostic_summary.json: %v\n%s", err, files["diagnostic_summary.json"])
 	}
-	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "usage_journal"} {
+	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "goal_continuity", "goal_policy", "usage_journal"} {
 		if _, ok := summary[key]; !ok {
 			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
 		}
+	}
+	goalPolicy, ok := summary["goal_policy"].(map[string]interface{})
+	if !ok || goalPolicy["storage_max_mb"] != float64(384) ||
+		goalPolicy["storage_max_bytes"] != float64(384<<20) {
+		t.Fatalf("diagnostic Goal policy does not expose effective storage limit: %+v", summary["goal_policy"])
+	}
+	sources, ok := goalPolicy["sources"].(map[string]interface{})
+	if !ok || sources["goal_storage_max_mb"] != "runtime_setting" ||
+		sources["goal_retention_days"] != "bootstrap_config" {
+		t.Fatalf("diagnostic Goal policy sources are not actionable: %+v", goalPolicy["sources"])
 	}
 	journalJSON, err := json.Marshal(summary["usage_journal"])
 	if err != nil {

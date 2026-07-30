@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/routing"
 	"codex-account-pool/internal/virtual"
 	"github.com/tidwall/gjson"
@@ -164,6 +165,21 @@ func estimatedTokensWithMeta(raw []byte, meta *bodysource.BodyMeta) int64 {
 		return meta.EstimatedTokens
 	}
 	return virtual.EstimateTokensJSON(raw)
+}
+
+// codexEstimatedTokensWithMeta bounds the gateway's coarse JSON-size estimate by
+// the fixed context contract advertised to the official Codex CLI. This value is
+// used only for internal admission accounting and the billing-hold fallback when
+// an upstream terminal omits usage; the downstream request and response are left
+// untouched. In particular, a replay body containing large JSON/tool envelopes
+// must not become a multi-million-token synthetic usage row for a 372K model.
+func codexEstimatedTokensWithMeta(model string, raw []byte, meta *bodysource.BodyMeta) int64 {
+	estimate := estimatedTokensWithMeta(raw, meta)
+	contextWindow, _, fixed := capability.CodexClientContextOverrides(model)
+	if fixed && contextWindow > 0 && estimate > contextWindow {
+		return contextWindow
+	}
+	return estimate
 }
 
 func (s *Server) responseBodyCaptureOptions(ctx context.Context) bodysource.CaptureOptions {

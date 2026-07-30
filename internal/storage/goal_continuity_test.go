@@ -74,6 +74,107 @@ func TestGoalContinuityEncryptedReplaySurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestGoalAliasesAreScopedByClientNamespace(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	first := goalTurnForTest("same-visible-root", "namespace-response-a", "client-a", "answer-a")
+	first.AliasNamespace = "client-scope-a"
+	first.DownstreamKeyHash = "scoped-key-a"
+	clientA, err := store.CommitGoalTurn(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := goalTurnForTest("same-visible-root", "namespace-response-b", "client-b", "answer-b")
+	second.AliasNamespace = "client-scope-b"
+	second.DownstreamKeyHash = "scoped-key-b"
+	clientB, err := store.CommitGoalTurn(ctx, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clientA.ID == clientB.ID {
+		t.Fatalf("client namespaces merged into %s", clientA.ID)
+	}
+	for _, testCase := range []struct {
+		namespace, want string
+	}{
+		{"client-scope-a", clientA.ID},
+		{"client-scope-b", clientB.ID},
+	} {
+		resolved, resolveErr := store.ResolveGoalAliases(ctx, []GoalAlias{{
+			Type: "codex_root_thread", Value: "same-visible-root", Namespace: testCase.namespace,
+		}})
+		if resolveErr != nil || resolved.Session.ID != testCase.want {
+			t.Fatalf("namespace=%s resolution=%+v err=%v", testCase.namespace, resolved, resolveErr)
+		}
+	}
+	if _, err := store.ResolveGoalAliases(ctx, []GoalAlias{{Type: "codex_root_thread", Value: "same-visible-root"}}); !errors.Is(err, ErrGoalNotFound) {
+		t.Fatalf("unscoped alias crossed namespaced goals: %v", err)
+	}
+}
+
+func TestGoalHistoryReplacementReclaimsStorageAtBudgetBoundary(t *testing.T) {
+	ctx := context.Background()
+	store, err := OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDetail := strings.Repeat("old-context-0123456789abcdef", 8192)
+	first := goalTurnForTest("replace-budget-root", "replace-budget-r1", "unused", "unused")
+	first.Protocol = "claude"
+	first.CheckpointPayload = `{"model":"claude","messages":[]}`
+	first.SegmentPayload = fmt.Sprintf(`{"history_key":"messages","input":[{"role":"user","content":%q}],"output":[{"role":"assistant","content":"old answer"}]}`, oldDetail)
+	goal, err := store.CommitGoalTurn(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := goalEncryptedPayloadBytes(t, store)
+
+	replacement := goalTurnForTest("replace-budget-root", "replace-budget-r2", "unused", "unused")
+	replacement.Protocol = "claude"
+	replacement.CheckpointPayload = `{"model":"claude","messages":[]}`
+	replacement.SegmentPayload = `{"history_key":"messages","replace_input":true,"input":[{"role":"user","content":"bounded summary"}],"output":[{"role":"assistant","content":"continued"}]}`
+	replacement.ReplaceHistory = true
+	replacement.StorageMaxBytes = used
+	updated, err := store.CommitGoalTurn(ctx, replacement)
+	if err != nil {
+		t.Fatalf("shrinking replacement at full budget: %v", err)
+	}
+	if updated.ID != goal.ID || updated.StorageBytes >= used {
+		t.Fatalf("replacement goal=%s/%s bytes=%d before=%d", updated.ID, goal.ID, updated.StorageBytes, used)
+	}
+	replay, _, err := store.BuildGoalReplay(ctx, goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(replay), "bounded summary") || !strings.Contains(string(replay), "continued") ||
+		strings.Contains(string(replay), "old-context") || strings.Contains(string(replay), "old answer") {
+		t.Fatalf("replacement replay retained superseded history: %s", replay)
+	}
+	var checkpoints, segments int
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id=?`, goal.ID).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_segment WHERE goal_id=?`, goal.ID).Scan(&segments); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints != 1 || segments != 1 {
+		t.Fatalf("physical replacement checkpoints=%d segments=%d", checkpoints, segments)
+	}
+}
+
 func TestGoalContinuityFallbackRejectsAmbiguity(t *testing.T) {
 	ctx := context.Background()
 	store, err := OpenInMemory()

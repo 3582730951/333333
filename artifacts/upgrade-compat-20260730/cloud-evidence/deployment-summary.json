@@ -1,0 +1,34 @@
+{
+  "config_path": "/root/autodl-tmp/cpupg-20260730/etc/config.json",
+  "config_sha256": "cde01a26751948a159065d1a5d288e24f5d25d95ec4912ed78b281be406c5a57",
+  "current_release": "/root/autodl-tmp/cpupg-20260730/prefix/lib/codex-pool/releases/new-goal-context-fix",
+  "database_path": "/root/autodl-tmp/cpupg-20260730/state/pool.sqlite3",
+  "fixture_counts": {
+    "accounts": 2,
+    "custom_providers": 1,
+    "egress_pools": 1,
+    "egress_profiles": 3
+  },
+  "hostname": "autodl-container-edfb41a5b4-03240cea",
+  "isolated_root": "/root/autodl-tmp/cpupg-20260730",
+  "listen_addr": "127.0.0.1:34273",
+  "new_binary_sha256": "4028a0fd4c5123b6b571dc1f0b355d463e0e60ed83efa1447b549e06109ff74a",
+  "old_binary_sha256": "d39cf2ceed92dc29638c9058093079efe24ed38894e1beb513c7d3fdbff40b0c",
+  "ready": {
+    "checks": {
+      "storage": true
+    },
+    "deployment_state": "active",
+    "fencing_token": 5,
+    "inflight": 0,
+    "ok": true,
+    "ready": true,
+    "release_id": "new-goal-context-fix",
+    "started_at": "2026-07-30T19:42:38.00210814Z",
+    "worker_socket": ""
+  },
+  "rollback_command": "bash /root/autodl-tmp/rollback-no-systemd.sh old",
+  "rollback_release": "/root/autodl-tmp/cpupg-20260730/prefix/lib/codex-pool/releases/old-0873de57",
+  "rollforward_command": "bash /root/autodl-tmp/rollback-no-systemd.sh new",
+  "sqlite_integrity": "ok"
+}

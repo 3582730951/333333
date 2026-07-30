@@ -1,0 +1,136 @@
+{
+  "archive": {
+    "build": {
+      "modified": true,
+      "revision": "TOKEN-QCF72XIFFE5USCOX7EBOXEW3LU",
+      "vcs_time": "2026-07-30T09:33:35Z",
+      "version": "v0.0.0-20260730093335-0873de57a411+dirty"
+    },
+    "crc_ok": true,
+    "declared_row_counts": {
+      "account_auth_metadata.csv": 13,
+      "account_lifecycle_status.csv": 0,
+      "account_model_capabilities.csv": 41,
+      "account_rate_limits.csv": 29,
+      "accounts_snapshot.csv": 13,
+      "affinity_bindings.csv": 1165,
+      "audit_log.csv": 20000,
+      "billing_holds.csv": 6778,
+      "cf_events.csv": 0,
+      "codex_group_policy_revisions.csv": 8,
+      "codex_instruction_snapshots.csv": 1504,
+      "codex_reauth_config.csv": 0,
+      "codex_reauth_jobs.csv": 0,
+      "codex_reset_credit_consumptions.csv": 0,
+      "codex_session_mappings.csv": 1504,
+      "codex_upstream_attempts.csv": 20000,
+      "codex_upstream_attempts_daily.csv": 0,
+      "custom_providers.csv": 0,
+      "diagnostic_events.csv": 0,
+      "diagnostic_summary.json": 1,
+      "egress_snapshot.csv": 4,
+      "kiro_runtime_capabilities.csv": 0,
+      "manifest.json": 1,
+      "provider_attempts.csv": 0,
+      "route_attempts.csv": 8192,
+      "runtime_storage.json": 1,
+      "settings.csv": 10,
+      "sidecar_status.csv": 1,
+      "upstream_error_rules.csv": 0,
+      "usage_records.csv": 6722
+    },
+    "file_count": 30,
+    "format": "codex-pool-diagnostics-v3",
+    "generated_at": 1785441037,
+    "name": "codex-pool-diagnostics-v3-diagjob_69a4f1da1af8446aaf848d5c4b08aa0f.zip",
+    "sha256": "96d4afe4f6de724e376427c65321540c816ab544d76d7673ee9661305d31618f"
+  },
+  "codex_cpa": {
+    "active": 1485,
+    "ambiguous": 537,
+    "bindings_created": 1504,
+    "distinct_namespace_prefixes": 2,
+    "distinct_tree_prefixes": 1504,
+    "enabled": true,
+    "eof_compensations": 28,
+    "epoch_rotations": 19,
+    "fresh_roots_after_context_loss": 18,
+    "instruction_policy_groups": 8,
+    "native_continues": 0,
+    "retention_days": 7,
+    "retired": 19,
+    "stateless_passthrough": false,
+    "strict_cpa": true,
+    "unidentified": 103
+  },
+  "context_pressure": {
+    "gpt_5_6_rows_at_or_above_334800": 29,
+    "max_prompt_tokens_by_model": {
+      "claude-opus-4-6": 3648,
+      "claude-opus-5": 3204,
+      "gpt-5.5": 245660,
+      "gpt-5.6-sol": 7378934
+    },
+    "max_total_input_tokens_by_model": {
+      "claude-opus-4-6": 4156,
+      "claude-opus-5": 149679,
+      "gpt-5.5": 245660,
+      "gpt-5.6-sol": 7378934
+    },
+    "max_total_tokens_by_model": {
+      "claude-opus-4-6": 4161,
+      "claude-opus-5": 152515,
+      "gpt-5.5": 248627,
+      "gpt-5.6-sol": 7378934
+    },
+    "model_rows": {
+      "claude-opus-4-6": 4,
+      "claude-opus-5": 69,
+      "gpt-5.5": 277,
+      "gpt-5.6-sol": 6372
+    },
+    "usage_rows": 6722
+  },
+  "goal_audit": {
+    "actions": {
+      "codex_context_epoch_retired": 6,
+      "codex_context_migrated": 353,
+      "goal_alias_bound": 875,
+      "goal_checkpoint_committed": 896,
+      "goal_compaction_completed": 25,
+      "goal_created": 21,
+      "goal_persistence_degraded": 4386,
+      "goal_resume_recovered": 483,
+      "goal_resume_started": 189
+    },
+    "persistence_degraded_error_codes": {
+      "storage_budget": 4386
+    }
+  },
+  "schema": "codex-pool.goal-context-diagnosis.v1",
+  "shared_downstream": {
+    "affinity_sources": {
+      "cache_prefix_hash": 100,
+      "codex-root-thread-id": 1799,
+      "previous_response_id": 4065,
+      "prompt_cache_key": 685,
+      "x-claude-code-session-id": 73
+    },
+    "api_key_count": 2,
+    "distinct_route_keys_per_api_key_desc": [
+      2631,
+      1539
+    ],
+    "route_keys_observed_under_multiple_api_keys": 0,
+    "usage_rows_per_api_key_desc": [
+      3653,
+      3069
+    ]
+  },
+  "storage_policy_evidence": {
+    "goal_storage_max_mb_exported": false,
+    "goal_storage_max_mb_value": null,
+    "payload_compression_migration": "1",
+    "storage_accounting_migration": "1"
+  }
+}

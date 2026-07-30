@@ -107,7 +107,8 @@ func TestCodexMappedFirstRootRiskRotatesWithoutLeakingDownstreamIdentity(t *test
 	if got[0].session == got[1].session {
 		t.Fatalf("risk retry reused upstream session UUID %q", got[0].session)
 	}
-	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-first-risk-recovered"})
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-first-risk-recovered"})
 	if err != nil || len(rows) != 1 || rows[0].RootSessionID != got[1].session {
 		t.Fatalf("recovered response mapping rows=%+v err=%v", rows, err)
 	}
@@ -171,8 +172,9 @@ func TestCodexMappedRiskRotationRestoresPairedToolContext(t *testing.T) {
 			t.Fatalf("downstream identity leaked in upstream body: %s", call.body)
 		}
 	}
-	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-tool-risk-root"})
-	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-tool-risk-recovered"})
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
+	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-tool-risk-root"})
+	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-tool-risk-recovered"})
 	if oldErr != nil || len(oldRows) != 1 || oldRows[0].State != "retired" || newErr != nil || len(newRows) != 1 || newRows[0].State != "active" {
 		t.Fatalf("rotation state old=%+v old_err=%v new=%+v new_err=%v", oldRows, oldErr, newRows, newErr)
 	}
@@ -219,7 +221,8 @@ func TestCodexChildRiskDoesNotRotateRootSession(t *testing.T) {
 	if len(got) != 3 || got[0].session == "" || got[0].session != got[1].session || got[0].session != got[2].session || got[1].thread == got[1].session {
 		t.Fatalf("child failure altered root identity: %+v", got)
 	}
-	root, err := h.store.ResolveCodexSessionAliases(context.Background(), "unauthenticated", []storage.CodexSessionAlias{{Type: "response", Value: "resp-child-risk-root"}})
+	namespace := codexNativeNamespaceForTest(t, "", "client-root")
+	root, err := h.store.ResolveCodexSessionAliases(context.Background(), namespace, []storage.CodexSessionAlias{{Type: "response", Value: "resp-child-risk-root"}})
 	if err != nil || root.State != "active" || root.RootSessionID != got[0].session {
 		t.Fatalf("root mapping after child failure=%+v err=%v", root, err)
 	}
@@ -504,8 +507,9 @@ func TestCodexMappedConcurrentRootSerializesCommitAndReleasesCancelledWaiter(t *
 		t.Fatalf("serialized upstream sessions=%q", sessions)
 	}
 	requireMappedUUIDv7(t, sessions[0])
-	first, firstErr := h.store.ResolveCodexSessionAliases(context.Background(), "unauthenticated", []storage.CodexSessionAlias{{Type: "response", Value: "resp-concurrent-1"}})
-	second, secondErr := h.store.ResolveCodexSessionAliases(context.Background(), "unauthenticated", []storage.CodexSessionAlias{{Type: "response", Value: "resp-concurrent-2"}})
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
+	first, firstErr := h.store.ResolveCodexSessionAliases(context.Background(), namespace, []storage.CodexSessionAlias{{Type: "response", Value: "resp-concurrent-1"}})
+	second, secondErr := h.store.ResolveCodexSessionAliases(context.Background(), namespace, []storage.CodexSessionAlias{{Type: "response", Value: "resp-concurrent-2"}})
 	if firstErr != nil || secondErr != nil || first.ID == "" || second.ID != first.ID || first.RootSessionID != sessions[0] {
 		t.Fatalf("serialized aliases first=%+v err=%v second=%+v err=%v", first, firstErr, second, secondErr)
 	}
@@ -585,7 +589,8 @@ func TestCodexMappedStreamingRiskSwitchesBeforeCommitAndAcceptsTerminalTail(t *t
 	if len(got) != 3 || got[0].auth != "Bearer access-stream-risk-a" || got[1].auth != got[0].auth || got[2].auth != "Bearer access-stream-risk-b" || got[0].session != got[1].session || got[2].session == got[1].session {
 		t.Fatalf("stream account/session lifecycle=%+v", got)
 	}
-	if rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-stream-risk-recovered"}); err != nil || len(rows) != 1 || rows[0].RootSessionID != got[2].session {
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
+	if rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-stream-risk-recovered"}); err != nil || len(rows) != 1 || rows[0].RootSessionID != got[2].session {
 		t.Fatalf("stream terminal mapping rows=%+v err=%v", rows, err)
 	}
 }
@@ -736,8 +741,9 @@ func TestCodexMappedDownstreamWebSocketQuotaRotatesAccountAndRestoresToolContext
 			t.Fatalf("downstream websocket session leaked upstream: %+v", call)
 		}
 	}
-	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-quota-root"})
-	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-quota-recovered"})
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
+	oldRows, oldErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-quota-root"})
+	newRows, newErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-quota-recovered"})
 	if oldErr != nil || len(oldRows) != 1 || oldRows[0].State != "retired" || newErr != nil || len(newRows) != 1 || newRows[0].State != "active" || newRows[0].RootSessionID != gotCalls[2].session {
 		t.Fatalf("websocket rotation state old=%+v old_err=%v new=%+v new_err=%v", oldRows, oldErr, newRows, newErr)
 	}
@@ -749,6 +755,7 @@ func TestDownstreamWebSocketPersistsGoalAfterMappingCommitConflict(t *testing.T)
 	const callID = "call-websocket-mapping-conflict"
 	var h *testHarness
 	var conflictErr error
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
 	upgrader := websocket.Upgrader{}
 	h = newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -762,7 +769,7 @@ func TestDownstreamWebSocketPersistsGoalAfterMappingCommitConflict(t *testing.T)
 			return
 		}
 		_, conflictErr = h.store.CommitCodexSessionBinding(context.Background(), storage.CodexSessionCommit{
-			Namespace: "unauthenticated",
+			Namespace: namespace,
 			Binding: storage.CodexSessionBinding{
 				ID: "competing-binding", TreeID: "competing-tree", AccountID: "competing-account", EgressID: storage.DefaultDirectEgressID,
 				State: "active", RootSessionID: "competing-session", ThreadID: "competing-session",
@@ -919,7 +926,8 @@ func TestCodexMappedDownstreamWebSocketSurvivesTruncatedUpstreamTurn(t *testing.
 			t.Fatalf("downstream session reached upstream: %q", sessions)
 		}
 	}
-	if rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-after-truncation"}); err != nil || len(rows) != 1 || rows[0].RootSessionID != sessions[1] {
+	namespace := codexNativeNamespaceForTest(t, "", downstreamID)
+	if rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-websocket-after-truncation"}); err != nil || len(rows) != 1 || rows[0].RootSessionID != sessions[1] {
 		t.Fatalf("post-truncation terminal mapping rows=%+v err=%v", rows, err)
 	}
 }

@@ -102,19 +102,23 @@ func (s *Server) handleCapabilitySelectionError(ctx context.Context, w http.Resp
 	if !anthropicShape {
 		errorObject["param"] = "model"
 	}
-	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
-		Action: action,
-		State:  "rejected",
-		Reason: code,
-		Detail: fmt.Sprintf("provider=%s requested_model=%s fallback_model=%s requested_context_window=%d fallback_context_window=%d manual_switch_required=true",
-			provider, requestedModel, fallbackModel, requestedWindow, fallbackWindow),
-	})
-	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
-		Action: "model_capability_rejected",
-		State:  "rejected",
-		Reason: code,
-		Detail: fmt.Sprintf("provider=%s requested_model=%s", provider, requestedModel),
-	})
+	// A user-group fallback probe writes into a private attempt buffer and may
+	// immediately succeed on the next authorized target. Route-attempt diagnostics
+	// already record that internal miss; auditing it here produced two durable rows
+	// per probe and filled the 20K support-log window with failures the CLI never
+	// received. Emit one semantic row only for the terminal selection result.
+	//
+	// model_capability_rejected remains reserved for rejectAccountModel, where an
+	// upstream model_not_found response is real account-scoped capability evidence.
+	if !userGroupFallbackProbe(ctx) {
+		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+			Action: action,
+			State:  "rejected",
+			Reason: code,
+			Detail: fmt.Sprintf("provider=%s requested_model=%s fallback_model=%s requested_context_window=%d fallback_context_window=%d manual_switch_required=true",
+				provider, requestedModel, fallbackModel, requestedWindow, fallbackWindow),
+		})
+	}
 	if anthropicShape {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"type": "error", "error": errorObject})
 	} else {

@@ -1,0 +1,216 @@
+{
+  "account_code_format": "ACC-Base32(HMAC-SHA256(alias_key,domain||entity_type||raw_id)[:16])",
+  "account_count": 13,
+  "account_redaction": "all entity identifiers use type-isolated stable HMAC aliases; no reverse map or alias key is included",
+  "build": {
+    "modified": true,
+    "revision": "TOKEN-QCF72XIFFE5USCOX7EBOXEW3LU",
+    "vcs_time": "2026-07-30T09:33:35Z",
+    "version": "v0.0.0-20260730093335-0873de57a411+dirty"
+  },
+  "current_account_count": 13,
+  "files": [
+    "manifest.json",
+    "diagnostic_summary.json",
+    "runtime_storage.json",
+    "diagnostic_events.csv",
+    "route_attempts.csv",
+    "provider_attempts.csv",
+    "account_auth_metadata.csv",
+    "account_model_capabilities.csv",
+    "kiro_runtime_capabilities.csv",
+    "account_rate_limits.csv",
+    "affinity_bindings.csv",
+    "codex_session_mappings.csv",
+    "codex_instruction_snapshots.csv",
+    "codex_upstream_attempts.csv",
+    "codex_upstream_attempts_daily.csv",
+    "codex_group_policy_revisions.csv",
+    "sidecar_status.csv",
+    "settings.csv",
+    "custom_providers.csv",
+    "upstream_error_rules.csv",
+    "codex_reset_credit_consumptions.csv",
+    "account_lifecycle_status.csv",
+    "codex_reauth_config.csv",
+    "codex_reauth_jobs.csv",
+    "audit_log.csv",
+    "cf_events.csv",
+    "usage_records.csv",
+    "billing_holds.csv",
+    "accounts_snapshot.csv",
+    "egress_snapshot.csv"
+  ],
+  "format": "codex-pool-diagnostics-v3",
+  "generated_at": 1785441037,
+  "historical_reference_account_count": 17,
+  "large_table_row_limit": 20000,
+  "row_counts": {
+    "account_auth_metadata.csv": 13,
+    "account_lifecycle_status.csv": 0,
+    "account_model_capabilities.csv": 41,
+    "account_rate_limits.csv": 29,
+    "accounts_snapshot.csv": 13,
+    "affinity_bindings.csv": 1165,
+    "audit_log.csv": 20000,
+    "billing_holds.csv": 6778,
+    "cf_events.csv": 0,
+    "codex_group_policy_revisions.csv": 8,
+    "codex_instruction_snapshots.csv": 1504,
+    "codex_reauth_config.csv": 0,
+    "codex_reauth_jobs.csv": 0,
+    "codex_reset_credit_consumptions.csv": 0,
+    "codex_session_mappings.csv": 1504,
+    "codex_upstream_attempts.csv": 20000,
+    "codex_upstream_attempts_daily.csv": 0,
+    "custom_providers.csv": 0,
+    "diagnostic_events.csv": 0,
+    "diagnostic_summary.json": 1,
+    "egress_snapshot.csv": 4,
+    "kiro_runtime_capabilities.csv": 0,
+    "manifest.json": 1,
+    "provider_attempts.csv": 0,
+    "route_attempts.csv": 8192,
+    "runtime_storage.json": 1,
+    "settings.csv": 10,
+    "sidecar_status.csv": 1,
+    "upstream_error_rules.csv": 0,
+    "usage_records.csv": 6722
+  },
+  "snapshot_id": "diag_783b1788aa3e05d5c583b184f6b69f8c",
+  "source_row_counts": {
+    "affinity_bindings.csv": 1165,
+    "audit_log.csv": 25137,
+    "billing_holds.csv": 6778,
+    "cf_events.csv": 0,
+    "codex_upstream_attempts.csv": 26796,
+    "codex_upstream_attempts_daily.csv": 0,
+    "diagnostic_events.csv": 0,
+    "usage_records.csv": 6722
+  },
+  "table_time_ranges": {
+    "account_auth_metadata.csv": {
+      "max_created_at": 1785428811,
+      "min_created_at": 1785406806
+    },
+    "account_lifecycle_status.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "account_model_capabilities.csv": {
+      "max_created_at": 1785440994,
+      "min_created_at": 1785407470
+    },
+    "account_rate_limits.csv": {
+      "max_created_at": 1785440997,
+      "min_created_at": 1785414897
+    },
+    "accounts_snapshot.csv": {
+      "max_created_at": 1785428811,
+      "min_created_at": 1785406806
+    },
+    "affinity_bindings.csv": {
+      "max_created_at": 1785440263,
+      "min_created_at": 1785407471
+    },
+    "audit_log.csv": {
+      "max_created_at": 1785441006,
+      "min_created_at": 1785406806
+    },
+    "billing_holds.csv": {
+      "max_created_at": 1785440994,
+      "min_created_at": 1785407474
+    },
+    "cf_events.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "codex_group_policy_revisions.csv": {
+      "max_created_at": 1785407508,
+      "min_created_at": 1785406765
+    },
+    "codex_instruction_snapshots.csv": {
+      "max_created_at": 1785440802,
+      "min_created_at": 1785407588
+    },
+    "codex_reauth_config.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "codex_reauth_jobs.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "codex_reset_credit_consumptions.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "codex_session_mappings.csv": {
+      "max_created_at": 1785440802,
+      "min_created_at": 1785407588
+    },
+    "codex_upstream_attempts.csv": {
+      "max_created_at": 1785440994,
+      "min_created_at": 1785407587
+    },
+    "codex_upstream_attempts_daily.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "custom_providers.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "diagnostic_events.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "egress_snapshot.csv": {
+      "max_created_at": 1785406937,
+      "min_created_at": 1785406765
+    },
+    "kiro_runtime_capabilities.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "provider_attempts.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "route_attempts.csv": {
+      "max_created_at": 1785440997,
+      "min_created_at": 1785431624
+    },
+    "settings.csv": {
+      "max_created_at": 1785441018,
+      "min_created_at": 1785406765
+    },
+    "sidecar_status.csv": {
+      "max_created_at": 1785406766,
+      "min_created_at": 1785406766
+    },
+    "upstream_error_rules.csv": {
+      "max_created_at": 0,
+      "min_created_at": 0
+    },
+    "usage_records.csv": {
+      "max_created_at": 1785440994,
+      "min_created_at": 1785407478
+    }
+  },
+  "table_time_ranges_scope": "source_snapshot",
+  "truncated_tables": {
+    "audit_log.csv": {
+      "exported_rows": 20000,
+      "omitted_rows": 5137,
+      "selection": "most_recent",
+      "source_rows": 25137
+    },
+    "codex_upstream_attempts.csv": {
+      "exported_rows": 20000,
+      "omitted_rows": 6796,
+      "selection": "most_recent",
+      "source_rows": 26796
+    }
+  }
+}

@@ -124,7 +124,11 @@ type codexSessionMapping struct {
 	mu        sync.Mutex
 	enabled   bool
 	namespace string
-	identity  codexDownstreamIdentity
+	// clientScope is the Goal alias namespace captured before any recovery path
+	// strips account-local Session-Id fields from a retry. It is already an opaque
+	// digest and never contains a raw downstream identifier.
+	clientScope string
+	identity    codexDownstreamIdentity
 
 	// binding is a durable exact branch. anchor is an existing root/parent used to
 	// create a child/fork branch only after the new branch succeeds.
@@ -575,7 +579,9 @@ func (s *Server) recoverCodexSessionMapping(ctx context.Context, r *http.Request
 
 	recoveryRequest := r.Clone(ctx)
 	recoveryRequest.Header = retry.Header
-	freshMapping, err := s.resolveCodexSessionMapping(ctx, recoveryRequest, retry.Raw, pol)
+	freshMapping, err := s.resolveCodexSessionMappingInNamespace(
+		ctx, recoveryRequest, retry.Raw, pol, mapping.namespace, mapping.clientScope,
+	)
 	if err != nil {
 		return codexContextMigration{}, false, err
 	}
@@ -629,31 +635,61 @@ func stripCodexRetiredEpochTurnMetadata(raw string) (string, bool) {
 	return string(cleaned), true
 }
 
-func codexSessionNamespace(pol downstreamPolicy, r *http.Request) string {
-	// Check for X-Session-ID header for explicit session isolation
-	// This allows multiple CLI instances with the same API key to maintain separate contexts
-	if sessionID := strings.TrimSpace(r.Header.Get("X-Session-ID")); sessionID != "" {
-		keyPart := strings.TrimSpace(pol.KeyHash)
-		if keyPart == "" {
-			if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
-				keyPart = hashAPIKey(token)
-			}
+// codexLegacySessionNamespace reproduces the pre-native-client namespace exactly.
+// It is used only as a one-turn compatibility bridge for an exact response or
+// turn-state alias created before automatic protocol-native isolation shipped.
+func codexLegacySessionNamespace(pol downstreamPolicy, r *http.Request) string {
+	policyKeyPart := strings.TrimSpace(pol.KeyHash)
+	keyPart := policyKeyPart
+	bearerDerived := false
+	if keyPart == "" && r != nil {
+		if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
+			keyPart = hashAPIKey(token)
+			bearerDerived = true
 		}
-		if keyPart != "" {
-			return "key:" + keyPart + ":session:" + sessionID
-		}
-		return "session:" + sessionID
 	}
-
-	if strings.TrimSpace(pol.KeyHash) != "" {
-		return "key:" + strings.TrimSpace(pol.KeyHash)
+	if policyKeyPart != "" {
+		return "key:" + policyKeyPart
 	}
-	if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
-		return "bearer:" + hashAPIKey(token)
+	if bearerDerived {
+		return "bearer:" + keyPart
 	}
 	// Open-mode requests still need a namespace, but this is never used by itself
 	// to resolve a session: an exact root/thread/response/turn alias is mandatory.
 	return "unauthenticated"
+}
+
+func codexSessionNamespace(pol downstreamPolicy, r *http.Request) string {
+	policyKeyPart := strings.TrimSpace(pol.KeyHash)
+	keyPart := policyKeyPart
+	if keyPart == "" && r != nil {
+		if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
+			keyPart = hashAPIKey(token)
+		}
+	}
+	if r != nil {
+		// Preserve both previously supported explicit namespace formats.
+		if strings.TrimSpace(r.Header.Get(poolClientInstanceHeader)) != "" {
+			return "client:" + downstreamClientScope(keyPart, r)
+		}
+		if sessionID := strings.TrimSpace(r.Header.Get("X-Session-ID")); sessionID != "" {
+			if keyPart != "" {
+				return "key:" + keyPart + ":session:" + sessionID
+			}
+			return "session:" + sessionID
+		}
+
+		// Codex emits Session-Id without provider-specific configuration. It is a
+		// process/client boundary while Thread-Id remains the exact tree alias.
+		// Conversation-Id is accepted for compatible clients. A bare Thread-Id is
+		// deliberately not used as the CPA namespace because child agents need to
+		// resolve parent aliases in the same namespace; it still scopes Goal state.
+		kind, _ := downstreamClientIdentity(r)
+		if kind == "codex_session" || kind == "codex_conversation" {
+			return "client:" + downstreamClientScope(keyPart, r)
+		}
+	}
+	return codexLegacySessionNamespace(pol, r)
 }
 
 // codexSessionGateKey identifies the exact downstream branch that must commit in
@@ -761,27 +797,61 @@ func (s *Server) lookupCodexSessionAlias(ctx context.Context, namespace string, 
 // resolve through response/turn-state aliases; ordinary requests may use a concrete
 // root/branch identity but never a key/model/cache fallback.
 func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request, body []byte, pol downstreamPolicy) (*codexSessionMapping, error) {
+	return s.resolveCodexSessionMappingInNamespace(ctx, r, body, pol, "", "")
+}
+
+// resolveCodexSessionMappingInNamespace keeps an already-identified downstream
+// namespace across context-recovery retries. Those retries intentionally strip the
+// downstream Session-Id before building a fresh upstream identity; recomputing the
+// namespace from that sanitized request would silently move the tree back to the
+// shared API-key namespace.
+func (s *Server) resolveCodexSessionMappingInNamespace(ctx context.Context, r *http.Request, body []byte, pol downstreamPolicy, forcedNamespace, forcedClientScope string) (*codexSessionMapping, error) {
 	mapping := &codexSessionMapping{enabled: s.codexSessionMappingEnabled(ctx)}
 	if !mapping.enabled {
 		return mapping, nil
 	}
-	mapping.namespace = codexSessionNamespace(pol, r)
+	keyPart := strings.TrimSpace(pol.KeyHash)
+	if keyPart == "" && r != nil {
+		if token := strings.TrimSpace(downstreamBearer(r)); token != "" {
+			keyPart = hashAPIKey(token)
+		}
+	}
+	mapping.clientScope = downstreamClientScope(keyPart, r)
+	if strings.TrimSpace(forcedNamespace) != "" {
+		mapping.namespace = strings.TrimSpace(forcedNamespace)
+		mapping.clientScope = strings.TrimSpace(forcedClientScope)
+	} else {
+		mapping.namespace = codexSessionNamespace(pol, r)
+	}
 	mapping.identity = codexDownstreamSessionIdentityForRequest(r, body)
 	id := mapping.identity
+	resolutionNamespace := mapping.namespace
 	lookupBranchOrRoot := func(value string) (*storage.CodexSessionBinding, error) {
 		if value == "" {
 			return nil, storage.ErrCodexSessionMappingNotFound
 		}
-		if binding, err := s.lookupCodexSessionAlias(ctx, mapping.namespace, storage.CodexSessionAlias{Type: "branch", Value: value}); err == nil {
+		if binding, err := s.lookupCodexSessionAlias(ctx, resolutionNamespace, storage.CodexSessionAlias{Type: "branch", Value: value}); err == nil {
 			return binding, nil
 		} else if !errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
 			return nil, err
 		}
-		return s.lookupCodexSessionAlias(ctx, mapping.namespace, storage.CodexSessionAlias{Type: "root", Value: value})
+		return s.lookupCodexSessionAlias(ctx, resolutionNamespace, storage.CodexSessionAlias{Type: "root", Value: value})
 	}
 
 	if id.stateful() {
 		binding, err := s.store.ResolveCodexSessionAliases(ctx, mapping.namespace, id.stateAliases())
+		if errors.Is(err, storage.ErrCodexSessionMappingNotFound) {
+			legacyNamespace := codexLegacySessionNamespace(pol, r)
+			if legacyNamespace != mapping.namespace {
+				legacyBinding, legacyErr := s.store.ResolveCodexSessionAliases(ctx, legacyNamespace, id.stateAliases())
+				if legacyErr == nil || errors.Is(legacyErr, storage.ErrCodexSessionEpochRetired) {
+					binding, err = legacyBinding, legacyErr
+					resolutionNamespace = legacyNamespace
+				} else if !errors.Is(legacyErr, storage.ErrCodexSessionMappingNotFound) {
+					return mapping, legacyErr
+				}
+			}
+		}
 		if err != nil {
 			// Preserve the retired binding long enough for the gateway to build a
 			// durable fresh-root replay. It is never selected as an upstream route:
@@ -798,7 +868,7 @@ func (s *Server) resolveCodexSessionMapping(ctx context.Context, r *http.Request
 		// only a claimed current branch must resolve to this exact binding.
 		if len(id.directAliases()) > 0 {
 			for _, alias := range id.directAliases() {
-				candidate, lookupErr := s.lookupCodexSessionAlias(ctx, mapping.namespace, alias)
+				candidate, lookupErr := s.lookupCodexSessionAlias(ctx, resolutionNamespace, alias)
 				if errors.Is(lookupErr, storage.ErrCodexSessionMappingNotFound) {
 					// A state pointer is the authoritative, terminal-issued alias.
 					// Tolerate an unbound hierarchy value so a pre-fix

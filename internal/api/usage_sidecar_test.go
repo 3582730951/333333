@@ -279,7 +279,8 @@ func TestStrictCPASidecarTrailerDoesNotNativeContinueOrRetireTree(t *testing.T) 
 	if got := directCalls.Load(); got != 1 {
 		t.Fatalf("sidecar interruption triggered an upstream continue/direct call: %d", got)
 	}
-	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-sidecar-root"})
+	namespace := codexNativeNamespaceForTest(t, "", "sidecar-cpa-root")
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-sidecar-root"})
 	if err != nil || len(rows) != 1 || rows[0].State != "active" {
 		t.Fatalf("sidecar interruption retired tree rows=%+v err=%v", rows, err)
 	}

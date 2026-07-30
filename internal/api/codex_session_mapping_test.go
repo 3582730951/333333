@@ -40,6 +40,102 @@ func enableCodexSessionMappingForTest(h *testHarness) {
 	h.app.cfg.CodexCPAStrict = true
 }
 
+func codexNativeNamespaceForTest(t *testing.T, keyHash, sessionID string) string {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Session-Id", sessionID)
+	return codexSessionNamespace(downstreamPolicy{KeyHash: keyHash}, request)
+}
+
+func TestCodexSessionNamespaceUsesNativeSessionWithoutExtraConfig(t *testing.T) {
+	policy := downstreamPolicy{KeyHash: hashAPIKey("cap-shared-client-key")}
+	requestA, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	requestB, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	requestA.Header.Set("Thread-Id", "same-visible-thread")
+	requestB.Header.Set("Thread-Id", "same-visible-thread")
+	requestA.Header.Set("Session-Id", "native-codex-session-a")
+	requestB.Header.Set("Session-Id", "native-codex-session-b")
+
+	namespaceA := codexSessionNamespace(policy, requestA)
+	namespaceB := codexSessionNamespace(policy, requestB)
+	if namespaceA == namespaceB {
+		t.Fatalf("shared API key ignored Codex's native session identity: %q", namespaceA)
+	}
+	for _, namespace := range []string{namespaceA, namespaceB} {
+		if strings.Contains(namespace, "native-codex-session-") {
+			t.Fatalf("raw native session leaked into namespace: %q", namespace)
+		}
+	}
+}
+
+func TestCodexNativeNamespaceMigratesOnlyExactLegacyState(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	enableCodexSessionMappingForTest(h)
+	ctx := context.Background()
+	policy := downstreamPolicy{KeyHash: hashAPIKey("cap-native-migration")}
+	legacyRequest, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	legacyNamespace := codexLegacySessionNamespace(policy, legacyRequest)
+	legacy, err := h.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
+		Namespace: legacyNamespace,
+		Binding: storage.CodexSessionBinding{
+			ID: "legacy-native-binding", TreeID: "legacy-native-tree",
+			AccountID: "legacy-native-account", EgressID: storage.DefaultDirectEgressID,
+			State: "active", RootSessionID: "upstream-root", ThreadID: "upstream-root",
+		},
+		Aliases: []storage.CodexSessionAlias{
+			{Type: "root", Value: "same-visible-thread"},
+			{Type: "response", Value: "legacy-exact-response"},
+		},
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"model":"gpt","previous_response_id":"legacy-exact-response","input":"continue"}`)
+	request, _ := http.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	request.Header.Set("Thread-Id", "same-visible-thread")
+	request.Header.Set("Session-Id", "native-session-after-upgrade")
+	nativeNamespace := codexSessionNamespace(policy, request)
+	if nativeNamespace == legacyNamespace {
+		t.Fatalf("native namespace did not differ from key-only legacy namespace: %q", nativeNamespace)
+	}
+	mapping, err := h.app.resolveCodexSessionMapping(ctx, request, body, policy)
+	if err != nil || mapping.binding == nil || mapping.binding.ID != legacy.ID {
+		t.Fatalf("exact legacy response migration binding=%+v err=%v", mapping.binding, err)
+	}
+
+	migrated, err := h.store.CommitCodexSessionBinding(ctx, storage.CodexSessionCommit{
+		Namespace: nativeNamespace,
+		Binding:   *mapping.binding,
+		Aliases: []storage.CodexSessionAlias{
+			{Type: "root", Value: "same-visible-thread"},
+			{Type: "response", Value: "native-response"},
+		},
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := h.store.ResolveCodexSessionAliases(ctx, nativeNamespace, []storage.CodexSessionAlias{{Type: "response", Value: "native-response"}})
+	if err != nil || resolved.ID != migrated.ID {
+		t.Fatalf("migrated native response binding=%+v err=%v", resolved, err)
+	}
+
+	// A different zero-config Codex client cannot cross via the weak root alias.
+	otherBody := []byte(`{"model":"gpt","input":"fresh"}`)
+	otherRequest, _ := http.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(otherBody))
+	otherRequest.Header.Set("Thread-Id", "same-visible-thread")
+	otherRequest.Header.Set("Session-Id", "different-native-session")
+	other, err := h.app.resolveCodexSessionMapping(ctx, otherRequest, otherBody, policy)
+	if err != nil || other.binding != nil {
+		t.Fatalf("weak legacy hierarchy crossed native namespaces binding=%+v err=%v", other.binding, err)
+	}
+}
+
 func TestCodexDownstreamIdentityPrefersConcreteThreadOverWeakSession(t *testing.T) {
 	headers := http.Header{}
 	headers.Set("Thread-Id", "cli-thread-alpha")
@@ -215,7 +311,7 @@ func TestCodexSessionMappingSeparatesConcurrentCLIThreadsWithSharedWeakSession(t
 		t.Fatalf("continuation state crossed CLI roots captures=%+v", got)
 	}
 
-	namespace := "key:" + hashAPIKey(apiKey)
+	namespace := codexNativeNamespaceForTest(t, hashAPIKey(apiKey), "shared-process-session")
 	alphaRows, alphaErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "root", Value: "cli-thread-alpha"})
 	betaRows, betaErr := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "root", Value: "cli-thread-beta"})
 	if alphaErr != nil || betaErr != nil || len(alphaRows) != 1 || len(betaRows) != 1 ||
@@ -311,7 +407,8 @@ func TestCodexSessionMappingKeepsNativeIdentityAndToolOutput(t *testing.T) {
 		t.Fatalf("window lifecycle first=%q second=%q", got[0].Window, got[1].Window)
 	}
 
-	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-map-1"})
+	namespace := codexNativeNamespaceForTest(t, "", "client-root-thread")
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-map-1"})
 	if err != nil || len(rows) != 1 || rows[0].AccountID == "" {
 		t.Fatalf("durable response mapping rows=%+v err=%v", rows, err)
 	}

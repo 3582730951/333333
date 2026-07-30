@@ -1,0 +1,554 @@
+--- a/internal/api/body_meta.go
++++ b/internal/api/body_meta.go
+@@ -7,6 +7,7 @@
+ 	"strings"
+ 
+ 	"codex-account-pool/internal/bodysource"
++	"codex-account-pool/internal/capability"
+ 	"codex-account-pool/internal/routing"
+ 	"codex-account-pool/internal/virtual"
+ 	"github.com/tidwall/gjson"
+@@ -166,6 +167,21 @@
+ 	return virtual.EstimateTokensJSON(raw)
+ }
+ 
++// codexEstimatedTokensWithMeta bounds the gateway's coarse JSON-size estimate by
++// the fixed context contract advertised to the official Codex CLI. This value is
++// used only for internal admission accounting and the billing-hold fallback when
++// an upstream terminal omits usage; the downstream request and response are left
++// untouched. In particular, a replay body containing large JSON/tool envelopes
++// must not become a multi-million-token synthetic usage row for a 372K model.
++func codexEstimatedTokensWithMeta(model string, raw []byte, meta *bodysource.BodyMeta) int64 {
++	estimate := estimatedTokensWithMeta(raw, meta)
++	contextWindow, _, fixed := capability.CodexClientContextOverrides(model)
++	if fixed && contextWindow > 0 && estimate > contextWindow {
++		return contextWindow
++	}
++	return estimate
++}
++
+ func (s *Server) responseBodyCaptureOptions(ctx context.Context) bodysource.CaptureOptions {
+ 	_ = ctx
+ 	return bodysource.CaptureOptions{
+--- a/internal/api/body_source_test.go
++++ b/internal/api/body_source_test.go
+@@ -7,6 +7,7 @@
+ 	"testing"
+ 
+ 	"codex-account-pool/internal/bodysource"
++	"codex-account-pool/internal/capability"
+ 	"codex-account-pool/internal/routing"
+ )
+ 
+@@ -64,6 +65,25 @@
+ 	}
+ }
+ 
++func TestCodexEstimatedTokensWithMetaCapsOnlyFixedContextModels(t *testing.T) {
++	const oversized = int64(7_378_934)
++	meta := &bodysource.BodyMeta{EstimatedTokens: oversized}
++	raw := []byte(`{"model":"gpt-5.6-sol","input":"kept byte-for-byte"}`)
++
++	if got := codexEstimatedTokensWithMeta("gpt-5.6-sol", raw, meta); got != capability.GPT56ContextWindow {
++		t.Fatalf("gpt-5.6 estimate=%d want fixed context=%d", got, capability.GPT56ContextWindow)
++	}
++	if got := codexEstimatedTokensWithMeta("gpt-5.6", raw, meta); got != capability.GPT56ContextWindow {
++		t.Fatalf("gpt-5.6 alias estimate=%d want fixed context=%d", got, capability.GPT56ContextWindow)
++	}
++	if got := codexEstimatedTokensWithMeta("custom-unbounded-model", raw, meta); got != oversized {
++		t.Fatalf("unknown model estimate=%d want unchanged=%d", got, oversized)
++	}
++	if got := codexEstimatedTokensWithMeta("gpt-5.6-sol", raw, &bodysource.BodyMeta{EstimatedTokens: 1234}); got != 1234 {
++		t.Fatalf("in-window estimate=%d want unchanged=1234", got)
++	}
++}
++
+ func TestRequestBodyBytesReusesContiguousCapturedBody(t *testing.T) {
+ 	raw := []byte(`{"model":"gpt-5.6-sol","input":"large-owned-request"}`)
+ 	source := bodysource.Bytes(raw)
+--- a/internal/api/diagnostics_export.go
++++ b/internal/api/diagnostics_export.go
+@@ -28,6 +28,7 @@
+ 
+ 	"codex-account-pool/internal/accountprovider"
+ 	"codex-account-pool/internal/bodysource"
++	"codex-account-pool/internal/config"
+ 	"codex-account-pool/internal/storage"
+ 	"codex-account-pool/internal/upstream"
+ )
+@@ -335,6 +336,7 @@
+ 		return err
+ 	}
+ 	summary["goal_continuity"] = goalMetrics
++	summary["goal_policy"] = diagnosticGoalPolicy(settings, s.cfg)
+ 	codexCPA := s.codexSessionMappingStatsFromSnapshot(ctx, snapshotStore, settings)
+ 	codexCPA["instruction_policy_groups"] = len(groups)
+ 	namespacePrefixes := make(map[string]struct{})
+@@ -1539,6 +1541,110 @@
+ 		out = append(out, s)
+ 	}
+ 	return out, rows.Err()
++}
++
++// diagnosticGoalPolicy exports the effective, non-secret Goal controls even when
++// they came from startup config and therefore have no row in settings.csv. Support
++// bundles previously showed thousands of storage_budget events without exposing
++// the active limit, making a full diagnostic impossible. Values are resolved from
++// the snapshot's runtime overrides, so the export stays internally consistent and
++// has no effect on downstream CLI requests.
++func diagnosticGoalPolicy(rows []diagnosticSetting, cfg config.Config) map[string]interface{} {
++	values := make(map[string]string, len(rows))
++	for _, row := range rows {
++		values[row.Key] = strings.TrimSpace(row.Value)
++	}
++	sources := map[string]string{}
++	raw := func(key string) (string, bool) {
++		value, ok := values[key]
++		return value, ok && value != ""
++	}
++	boolean := func(key string, fallback bool) bool {
++		if value, ok := raw(key); ok {
++			switch strings.ToLower(value) {
++			case "1", "true", "on", "yes":
++				sources[key] = "runtime_setting"
++				return true
++			case "0", "false", "off", "no":
++				sources[key] = "runtime_setting"
++				return false
++			}
++		}
++		sources[key] = "bootstrap_config"
++		return fallback
++	}
++	integer := func(key string, fallback int) int {
++		if value, ok := raw(key); ok {
++			if parsed, err := strconv.Atoi(value); err == nil {
++				sources[key] = "runtime_setting"
++				return parsed
++			}
++		}
++		sources[key] = "bootstrap_config"
++		return fallback
++	}
++	floating := func(key string, fallback float64) float64 {
++		if value, ok := raw(key); ok {
++			if parsed, err := strconv.ParseFloat(value, 64); err == nil {
++				sources[key] = "runtime_setting"
++				return parsed
++			}
++		}
++		sources[key] = "bootstrap_config"
++		return fallback
++	}
++
++	retentionDays := integer("goal_retention_days", cfg.GoalRetentionDays)
++	if retentionDays <= 0 {
++		retentionDays = 7
++	}
++	storageMaxMB := integer("goal_storage_max_mb", cfg.GoalStorageMaxMB)
++	if storageMaxMB <= 0 {
++		storageMaxMB = 256
++	}
++	chunkRatio := floating("goal_compression_chunk_ratio", cfg.GoalCompressionChunkRatio)
++	if chunkRatio <= 0 || chunkRatio > 1 {
++		chunkRatio = 0.70
++	}
++	compressionStages := integer("goal_compression_max_stages", cfg.GoalCompressionMaxStages)
++	if compressionStages <= 0 {
++		compressionStages = 16
++	}
++	compressionConcurrency := integer("goal_compression_concurrency", cfg.GoalCompressionConcurrency)
++	if compressionConcurrency <= 0 {
++		compressionConcurrency = 1
++	}
++	if compressionConcurrency > 32 {
++		compressionConcurrency = 32
++	}
++	leaseSeconds := integer("goal_lease_seconds", cfg.GoalLeaseSeconds)
++	if leaseSeconds <= 0 {
++		leaseSeconds = 90
++	}
++	heartbeatSeconds := integer("goal_heartbeat_seconds", cfg.GoalHeartbeatSeconds)
++	if heartbeatSeconds <= 0 {
++		heartbeatSeconds = 15
++	}
++	if heartbeatSeconds >= leaseSeconds {
++		heartbeatSeconds = leaseSeconds / 2
++	}
++	if heartbeatSeconds <= 0 {
++		heartbeatSeconds = 15
++	}
++
++	return map[string]interface{}{
++		"continuity_enabled":        boolean("goal_continuity_enabled", cfg.GoalContinuityEnabled),
++		"legacy_journal_dual_write": boolean("goal_legacy_journal_dual_write", cfg.GoalLegacyJournalDualWrite),
++		"retention_days":            retentionDays,
++		"storage_max_mb":            storageMaxMB,
++		"storage_max_bytes":         int64(storageMaxMB) << 20,
++		"compression_chunk_ratio":   chunkRatio,
++		"compression_max_stages":    compressionStages,
++		"compression_concurrency":   compressionConcurrency,
++		"lease_seconds":             leaseSeconds,
++		"heartbeat_seconds":         heartbeatSeconds,
++		"sources":                   sources,
++	}
+ }
+ 
+ func listDiagnosticTokenMetadata(ctx context.Context, db storage.ReadQuerier) (map[string]storage.AccountToken, error) {
+--- a/internal/api/diagnostics_export_test.go
++++ b/internal/api/diagnostics_export_test.go
+@@ -62,6 +62,9 @@
+ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
+ 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
+ 	ctx := context.Background()
++	if err := h.store.SetSetting(ctx, "goal_storage_max_mb", "384"); err != nil {
++		t.Fatal(err)
++	}
+ 	account := storage.Account{
+ 		ID:                "acc-real-1",
+ 		Label:             "Alpha Sensitive",
+@@ -306,10 +309,20 @@
+ 	if err := json.Unmarshal([]byte(files["diagnostic_summary.json"]), &summary); err != nil {
+ 		t.Fatalf("diagnostic_summary.json: %v\n%s", err, files["diagnostic_summary.json"])
+ 	}
+-	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "goal_continuity", "usage_journal"} {
++	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "goal_continuity", "goal_policy", "usage_journal"} {
+ 		if _, ok := summary[key]; !ok {
+ 			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
+ 		}
++	}
++	goalPolicy, ok := summary["goal_policy"].(map[string]interface{})
++	if !ok || goalPolicy["storage_max_mb"] != float64(384) ||
++		goalPolicy["storage_max_bytes"] != float64(384<<20) {
++		t.Fatalf("diagnostic Goal policy does not expose effective storage limit: %+v", summary["goal_policy"])
++	}
++	sources, ok := goalPolicy["sources"].(map[string]interface{})
++	if !ok || sources["goal_storage_max_mb"] != "runtime_setting" ||
++		sources["goal_retention_days"] != "bootstrap_config" {
++		t.Fatalf("diagnostic Goal policy sources are not actionable: %+v", goalPolicy["sources"])
+ 	}
+ 	journalJSON, err := json.Marshal(summary["usage_journal"])
+ 	if err != nil {
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -1440,7 +1440,7 @@
+ 		ImmutableAffinity: !movable,
+ 		Movable:           movable,
+ 		Model:             model,
+-		EstimatedTokens:   estimatedTokensWithMeta(raw, replayMeta),
++		EstimatedTokens:   codexEstimatedTokensWithMeta(model, raw, replayMeta),
+ 		Compaction:        compactionRequestWithMeta(path, raw, replayMeta),
+ 		Exclude:           exclude,
+ 		OnWait:            onSchedulerWait,
+@@ -1770,7 +1770,7 @@
+ 		logicalUsageDiag.SingleflightWaitedRequests = 1
+ 	}
+ 	defer releaseCacheFlight()
+-	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, estimatedTokensWithMeta(body, forwardMeta))
++	holdID := s.createBillingHold(r.Context(), affinity.Hash, lease.Account.ID, lease.RouteEpoch, codexEstimatedTokensWithMeta(resolvedModel, body, forwardMeta))
+ 	// Backstop: settle-if-held on return so a cancelled/streaming disconnect can't leak
+ 	// the hold; an explicit settle below always wins (WHERE status='held' no longer matches).
+ 	defer func() { _ = s.settleBillingHoldIfHeld(r.Context(), holdID, "abandoned") }()
+--- a/internal/api/model_capability_errors.go
++++ b/internal/api/model_capability_errors.go
+@@ -102,19 +102,23 @@
+ 	if !anthropicShape {
+ 		errorObject["param"] = "model"
+ 	}
+-	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+-		Action: action,
+-		State:  "rejected",
+-		Reason: code,
+-		Detail: fmt.Sprintf("provider=%s requested_model=%s fallback_model=%s requested_context_window=%d fallback_context_window=%d manual_switch_required=true",
+-			provider, requestedModel, fallbackModel, requestedWindow, fallbackWindow),
+-	})
+-	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+-		Action: "model_capability_rejected",
+-		State:  "rejected",
+-		Reason: code,
+-		Detail: fmt.Sprintf("provider=%s requested_model=%s", provider, requestedModel),
+-	})
++	// A user-group fallback probe writes into a private attempt buffer and may
++	// immediately succeed on the next authorized target. Route-attempt diagnostics
++	// already record that internal miss; auditing it here produced two durable rows
++	// per probe and filled the 20K support-log window with failures the CLI never
++	// received. Emit one semantic row only for the terminal selection result.
++	//
++	// model_capability_rejected remains reserved for rejectAccountModel, where an
++	// upstream model_not_found response is real account-scoped capability evidence.
++	if !userGroupFallbackProbe(ctx) {
++		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
++			Action: action,
++			State:  "rejected",
++			Reason: code,
++			Detail: fmt.Sprintf("provider=%s requested_model=%s fallback_model=%s requested_context_window=%d fallback_context_window=%d manual_switch_required=true",
++				provider, requestedModel, fallbackModel, requestedWindow, fallbackWindow),
++		})
++	}
+ 	if anthropicShape {
+ 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"type": "error", "error": errorObject})
+ 	} else {
+--- a/internal/api/kiro_diagnostics_test.go
++++ b/internal/api/kiro_diagnostics_test.go
+@@ -5,10 +5,12 @@
+ 	"context"
+ 	"io"
+ 	"net/http"
++	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+ 
+ 	"codex-account-pool/internal/capability"
++	"codex-account-pool/internal/scheduler"
+ 	"codex-account-pool/internal/storage"
+ )
+ 
+@@ -69,8 +71,35 @@
+ 			foundCapability = true
+ 		}
+ 	}
+-	if !foundFallback || !foundCapability {
+-		t.Fatalf("structured fallback audits missing: %+v", audit)
++	if !foundFallback || foundCapability {
++		t.Fatalf("fallback must have one terminal audit and no false upstream rejection: %+v", audit)
++	}
++}
++
++func TestCapabilityFallbackProbeDoesNotPolluteTerminalAudit(t *testing.T) {
++	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
++	ctx := withUserGroupFallbackProbe(context.Background())
++	rec := httptest.NewRecorder()
++	err := &scheduler.NoAccountError{
++		Model: "claude-opus-4-8",
++		Counters: scheduler.NoAccountCounters{
++			ModelUnsupported: 1,
++		},
++	}
++	if !h.app.handleCapabilitySelectionError(ctx, rec, err, true, "cyber", "claude,kiro", "claude-opus-4-8", "") {
++		t.Fatal("fallback probe was not classified")
++	}
++	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"model_fallback_required"`) {
++		t.Fatalf("private probe response changed: %d %s", rec.Code, rec.Body.String())
++	}
++	rows, queryErr := h.store.ListAuditLog(context.Background(), 20)
++	if queryErr != nil {
++		t.Fatal(queryErr)
++	}
++	for _, row := range rows {
++		if row.Action == "model_fallback_required" || row.Action == "model_capability_rejected" {
++			t.Fatalf("speculative probe leaked into terminal audit: %+v", rows)
++		}
+ 	}
+ }
+ 
+--- a/internal/api/user_group_route_test.go
++++ b/internal/api/user_group_route_test.go
+@@ -610,6 +610,15 @@
+ 			t.Fatalf("model=%s binding=%+v found=%v err=%v, want %+v", model, binding, found, err, antigravityTarget)
+ 		}
+ 	}
++	audit, err := h.store.ListAuditLog(t.Context(), 50)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, row := range audit {
++		if row.Action == "model_fallback_required" || row.Action == "model_capability_rejected" {
++			t.Fatalf("successful zero-config group fallback retained a private target error: %+v", audit)
++		}
++	}
+ 
+ 	before := len(h.requests())
+ 	unknownBody := []byte(`{"model":"gemini-unverified","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`)
+--- a/scripts/analyze_goal_context_diagnostics.py
++++ b/scripts/analyze_goal_context_diagnostics.py
+@@ -44,6 +44,8 @@
+         mappings = rows(archive, "codex_session_mappings.csv")
+         usage = rows(archive, "usage_records.csv")
+         settings_rows = rows(archive, "settings.csv")
++        billing_holds = rows(archive, "billing_holds.csv")
++        runtime_storage = json.loads(archive.read("runtime_storage.json"))
+ 
+     action_counts = collections.Counter(row["action"] for row in audit)
+     degraded_codes: collections.Counter[str] = collections.Counter()
+@@ -82,11 +84,128 @@
+         for row in usage
+         if row["model"].startswith("gpt-5.6") and integer(row["prompt_tokens"]) >= 334_800
+     )
++    gpt56_estimated_over_window = sum(
++        1
++        for row in usage
++        if row["model"].startswith("gpt-5.6")
++        and integer(row.get("estimated")) > 0
++        and integer(row["prompt_tokens"]) > 372_000
++    )
++    gpt56_upstream_over_window = sum(
++        1
++        for row in usage
++        if row["model"].startswith("gpt-5.6")
++        and integer(row.get("estimated")) == 0
++        and integer(row["prompt_tokens"]) > 372_000
++    )
++    estimated_usage = [row for row in usage if integer(row.get("estimated")) > 0]
++    max_estimated_prompt = max(
++        (integer(row.get("prompt_tokens")) for row in estimated_usage), default=0
++    )
+ 
+     cpa = summary.get("codex_cpa", {})
+     settings = {row["key"]: row["value"] for row in settings_rows}
++    goal_policy = summary.get("goal_policy") or {}
++    goal_storage_max_mb = goal_policy.get("storage_max_mb")
++    if goal_storage_max_mb is None:
++        goal_storage_max_mb = settings.get("goal_storage_max_mb")
++
++    namespace_count = len({row["namespace_hmac_prefix"] for row in mappings})
++    tree_count = len({row["tree_hmac_prefix"] for row in mappings})
++    storage_budget_failures = degraded_codes["storage_budget"]
++    hold_statuses = collections.Counter(row["status"] for row in billing_holds)
++    findings: list[dict[str, Any]] = []
++
++    if storage_budget_failures:
++        findings.append(
++            {
++                "id": "goal_storage_budget_exhaustion",
++                "severity": "critical",
++                "evidence": {
++                    "persistence_degraded_storage_budget": storage_budget_failures,
++                    "goal_storage_max_mb": goal_storage_max_mb,
++                },
++                "required_regression": (
++                    "authoritative compaction/edit replaces durable history and "
++                    "reclaims bytes without changing the downstream terminal"
++                ),
++            }
++        )
++    if gpt56_estimated_over_window:
++        findings.append(
++            {
++                "id": "estimated_usage_exceeds_gpt_5_6_context",
++                "severity": "high",
++                "evidence": {
++                    "estimated_rows_over_372000": gpt56_estimated_over_window,
++                    "upstream_rows_over_372000": gpt56_upstream_over_window,
++                    "max_estimated_prompt_tokens": max_estimated_prompt,
++                },
++                "required_regression": (
++                    "missing-upstream-usage fallback is bounded by the advertised "
++                    "model context without modifying the CLI request or response"
++                ),
++            }
++        )
++    if goal_storage_max_mb is None:
++        findings.append(
++            {
++                "id": "diagnostics_missing_effective_goal_policy",
++                "severity": "high",
++                "evidence": {
++                    "goal_storage_max_mb_in_settings": False,
++                    "goal_policy_in_summary": False,
++                },
++                "required_regression": (
++                    "support ZIP exports effective non-secret Goal policy even when "
++                    "the value came from bootstrap config"
++                ),
++            }
++        )
++    if tree_count >= 10 and namespace_count <= max(2, len(api_key_rows)):
++        findings.append(
++            {
++                "id": "codex_namespace_cardinality_risk",
++                "severity": "high",
++                "evidence": {
++                    "distinct_trees": tree_count,
++                    "distinct_namespaces": namespace_count,
++                    "downstream_api_keys": len(api_key_rows),
++                },
++                "required_regression": (
++                    "protocol-native client/session identity scopes CPA and Goal "
++                    "aliases while remaining zero-config for the downstream CLI"
++                ),
++            }
++        )
++    model_fallback_errors = action_counts["model_fallback_required"]
++    if model_fallback_errors:
++        audit_truncation = (manifest.get("truncated_tables") or {}).get(
++            "audit_log.csv", {}
++        )
++        findings.append(
++            {
++                "id": "model_fallback_audit_amplification",
++                "severity": "medium",
++                "evidence": {
++                    "audit_rows": model_fallback_errors,
++                    "capability_rejected_rows": action_counts[
++                        "model_capability_rejected"
++                    ],
++                    "audit_rows_omitted_from_bundle": audit_truncation.get(
++                        "omitted_rows", 0
++                    ),
++                },
++                "classification": (
++                    "speculative target misses and a duplicate rejection action "
++                    "amplify pool availability evidence; preserve transparent "
++                    "target fallback and change diagnostics only"
++                ),
++            }
++        )
++
+     return {
+-        "schema": "codex-pool.goal-context-diagnosis.v1",
++        "schema": "codex-pool.goal-context-diagnosis.v2",
+         "archive": {
+             "name": path.name,
+             "sha256": hashlib.sha256(raw).hexdigest(),
+@@ -96,13 +215,13 @@
+             "generated_at": manifest.get("generated_at"),
+             "build": manifest.get("build", {}),
+             "declared_row_counts": manifest.get("row_counts", {}),
++            "source_row_counts": manifest.get("source_row_counts", {}),
++            "truncated_tables": manifest.get("truncated_tables", {}),
+         },
+         "codex_cpa": {
+             **cpa,
+-            "distinct_namespace_prefixes": len(
+-                {row["namespace_hmac_prefix"] for row in mappings}
+-            ),
+-            "distinct_tree_prefixes": len({row["tree_hmac_prefix"] for row in mappings}),
++            "distinct_namespace_prefixes": namespace_count,
++            "distinct_tree_prefixes": tree_count,
+         },
+         "goal_audit": {
+             "actions": {
+@@ -132,10 +251,14 @@
+             ),
+             "max_total_tokens_by_model": dict(sorted(max_total_by_model.items())),
+             "gpt_5_6_rows_at_or_above_334800": gpt56_over_trigger,
++            "gpt_5_6_estimated_rows_above_372000": gpt56_estimated_over_window,
++            "gpt_5_6_upstream_rows_above_372000": gpt56_upstream_over_window,
++            "max_estimated_prompt_tokens": max_estimated_prompt,
+         },
+         "storage_policy_evidence": {
+-            "goal_storage_max_mb_exported": "goal_storage_max_mb" in settings,
+-            "goal_storage_max_mb_value": settings.get("goal_storage_max_mb"),
++            "goal_storage_max_mb_exported": goal_storage_max_mb is not None,
++            "goal_storage_max_mb_value": goal_storage_max_mb,
++            "goal_policy": goal_policy,
+             "payload_compression_migration": settings.get(
+                 "context_payload_compression_ctx2"
+             ),
+@@ -143,6 +266,16 @@
+                 "goal_continuity_v2_storage_accounted"
+             ),
+         },
++        "billing_holds": {
++            "rows": len(billing_holds),
++            "statuses": dict(sorted(hold_statuses.items())),
++            "currently_held": hold_statuses["held"],
++        },
++        "runtime_storage": {
++            "rejection_counts": runtime_storage.get("rejection_counts", {}),
++            "policy": runtime_storage.get("policy", {}),
++        },
++        "findings": findings,
+     }
+ 
+ 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"codex-account-pool/internal/bodysource"
+	kirowire "codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/supervisor"
 	"github.com/tidwall/gjson"
@@ -516,13 +517,13 @@ func goalPersistentAliases(aliases []storage.GoalAlias) []storage.GoalAlias {
 	out := append([]storage.GoalAlias(nil), sets[0]...)
 	seen := make(map[string]bool, len(out))
 	for _, alias := range out {
-		seen[alias.Type+"\x00"+alias.Value] = true
+		seen[alias.Namespace+"\x00"+alias.Type+"\x00"+alias.Value] = true
 	}
 	for _, alias := range aliases {
 		if alias.Type != "response_id" && alias.Type != "codex_turn_state" {
 			continue
 		}
-		key := alias.Type + "\x00" + alias.Value
+		key := alias.Namespace + "\x00" + alias.Type + "\x00" + alias.Value
 		if strings.TrimSpace(alias.Value) != "" && !seen[key] {
 			seen[key] = true
 			out = append(out, alias)
@@ -664,8 +665,61 @@ func goalWorkingState(body []byte) string {
 
 type goalSegmentSemantics struct {
 	ReplacementHistory       []interface{}
+	ReplacementPrefix        []interface{}
 	ReplaceInput             bool
 	CodexCompactionEvaluated bool
+}
+
+func claudeCodeCompactionReplacement(requestBody, responseBody []byte) ([]interface{}, bool) {
+	if !kirowire.IsClaudeCodeCompactionRequest(requestBody) {
+		return nil, false
+	}
+	request, requestErr := decodeContextJSONMap(requestBody)
+	response, responseErr := decodeContextJSONMap(responseBody)
+	if requestErr != nil || responseErr != nil {
+		return nil, false
+	}
+	messages, ok := request["messages"].([]interface{})
+	if !ok || len(messages) == 0 {
+		return nil, false
+	}
+	var finalUser interface{}
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, ok := messages[index].(map[string]interface{})
+		if ok && strings.EqualFold(strings.TrimSpace(streamString(message["role"])), "user") {
+			finalUser = messages[index]
+			break
+		}
+	}
+	if finalUser == nil {
+		return nil, false
+	}
+	candidates := []interface{}{response}
+	if output, ok := response["output"].([]interface{}); ok {
+		candidates = output
+	}
+	assistants := make([]interface{}, 0, 1)
+	for _, raw := range candidates {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if assistant, ok := item["assistant_message"].(map[string]interface{}); ok && assistant["content"] != nil {
+			assistants = append(assistants, assistant)
+			continue
+		}
+		if item["content"] != nil &&
+			(strings.EqualFold(strings.TrimSpace(streamString(item["role"])), "assistant") ||
+				strings.EqualFold(strings.TrimSpace(streamString(item["type"])), "message")) {
+			assistants = append(assistants, map[string]interface{}{"role": "assistant", "content": item["content"]})
+		}
+	}
+	if len(assistants) == 0 {
+		return nil, false
+	}
+	replacement := []interface{}{finalUser}
+	replacement = append(replacement, assistants...)
+	return replacement, true
 }
 
 func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []byte, semantics ...goalSegmentSemantics) (string, string, string, bool, error) {
@@ -715,6 +769,9 @@ func goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody []by
 		if len(semantics[0].ReplacementHistory) > 0 {
 			segmentFields["replacement_history"] = semantics[0].ReplacementHistory
 		}
+		if len(semantics[0].ReplacementPrefix) > 0 {
+			segmentFields["replacement_prefix"] = semantics[0].ReplacementPrefix
+		}
 		if semantics[0].ReplaceInput {
 			segmentFields["replace_input"] = true
 		}
@@ -757,10 +814,16 @@ func incrementalGoalRequestWithMode(currentBody, durableReplay []byte) ([]byte, 
 	currentHistory, currentOK := current[historyKey].([]interface{})
 	durableHistory, durableOK := durable[historyKey].([]interface{})
 	if !currentOK || !durableOK || len(durableHistory) == 0 || len(durableHistory) > len(currentHistory) {
+		if historyKey == "messages" {
+			return currentBody, claudeFullHistoryReplacesDurable(currentHistory)
+		}
 		return currentBody, goalFullInputReplacesDurable(currentHistory, durableHistory)
 	}
 	for index := range durableHistory {
 		if !reflect.DeepEqual(durableHistory[index], currentHistory[index]) {
+			if historyKey == "messages" {
+				return currentBody, claudeFullHistoryReplacesDurable(currentHistory)
+			}
 			return currentBody, goalFullInputReplacesDurable(currentHistory, durableHistory)
 		}
 	}
@@ -770,6 +833,27 @@ func incrementalGoalRequestWithMode(currentBody, durableReplay []byte) ([]byte, 
 		return currentBody, false
 	}
 	return encoded, false
+}
+
+// A native Messages delta contains only the new user/tool-result side. A
+// self-contained snapshot contains at least one user and one assistant turn; when
+// such a snapshot no longer has the durable prefix, Claude Code has compacted,
+// rewound, or edited history and the snapshot must be authoritative.
+func claudeFullHistoryReplacesDurable(items []interface{}) bool {
+	var user, assistant bool
+	for _, raw := range items {
+		message, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(streamString(message["role"]))) {
+		case "user":
+			user = true
+		case "assistant":
+			assistant = true
+		}
+	}
+	return user && assistant
 }
 
 func goalFullInputReplacesDurable(current, durable []interface{}) bool {
@@ -930,6 +1014,20 @@ func codexRemoteCompactionReplacement(durableReplay, incrementalBody, responseBo
 	return storage.CodexRemoteCompactionV2Replacement(logicalInput, response["output"])
 }
 
+func codexCompactionReplacementPrefix(durableReplay, logicalBody []byte) []interface{} {
+	for _, body := range [][]byte{logicalBody, durableReplay} {
+		root, err := decodeContextJSONMap(body)
+		if err != nil {
+			continue
+		}
+		prefix, _ := removeCodexLiteReplayPrefixes(appendItems(nil, root["input"]))
+		if len(prefix) > 0 {
+			return prefix
+		}
+	}
+	return nil
+}
+
 // goalResponseFromSSE retains a protocol stream as encrypted structured segment data
 // without pretending its provider-specific events are Responses output.
 func goalResponseFromSSE(raw []byte) []byte {
@@ -1086,12 +1184,13 @@ func (s *Server) markGoalStreamRetryable(ctx context.Context, r *http.Request, p
 	if !s.goalContinuityEnabled(ctx) {
 		return
 	}
-	aliases := goalAliases(r, requestBody, protocol)
-	aliases = append(aliases, goalIdentityAliases(ctx)...)
-	resolved, err := s.resolveGoalAliasesByPriority(ctx, aliases, goalHasResumeAlias(aliases))
+	rawAliases := goalAliases(r, requestBody, protocol)
+	rawAliases = append(rawAliases, goalIdentityAliases(ctx)...)
+	keyHash, _ := downstreamFromCtx(ctx)
+	namespace := goalDownstreamClientScope(ctx, keyHash, r)
+	resolved, err := s.store.ResolveGoalAliasSets(ctx, goalResolutionSetsForClient(rawAliases, namespace, goalHasResumeAlias(rawAliases)))
 	if errors.Is(err, storage.ErrGoalNotFound) {
-		keyHash, _ := downstreamFromCtx(ctx)
-		resolved, err = s.store.ResolveFallbackGoal(ctx, keyHash, goalWorkspaceFingerprint(r, requestBody), goalInitialFingerprint(requestBody))
+		resolved, err = s.store.ResolveFallbackGoal(ctx, scopedGoalDownstreamKeyHash(keyHash, namespace), goalWorkspaceFingerprint(r, requestBody), goalInitialFingerprint(requestBody))
 	}
 	if err != nil {
 		return
@@ -1105,10 +1204,13 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	if !s.goalContinuityEnabled(ctx) {
 		return storage.GoalSession{}, nil
 	}
-	requestAliases := goalAliases(r, requestBody, protocol)
-	requestAliases = append(requestAliases, goalIdentityAliases(ctx)...)
-	resolutionSets := goalResolutionAliasSets(requestAliases, goalHasResumeAlias(requestAliases))
+	rawRequestAliases := goalAliases(r, requestBody, protocol)
+	rawRequestAliases = append(rawRequestAliases, goalIdentityAliases(ctx)...)
 	keyHash, _ := downstreamFromCtx(ctx)
+	namespace := goalDownstreamClientScope(ctx, keyHash, r)
+	requestAliases := namespacedGoalAliases(rawRequestAliases, namespace)
+	resolutionSets := goalResolutionSetsForClient(rawRequestAliases, namespace, goalHasResumeAlias(rawRequestAliases))
+	scopedKeyHash := scopedGoalDownstreamKeyHash(keyHash, namespace)
 	workspaceHash := goalWorkspaceFingerprint(r, requestBody)
 	initialGoalHash := goalInitialFingerprint(requestBody)
 	// A terminal without an exact identity or the complete fallback tuple can never
@@ -1136,6 +1238,11 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	if strings.EqualFold(strings.TrimSpace(protocol), "codex") {
 		semantics.CodexCompactionEvaluated = true
 		semantics.ReplacementHistory, _ = codexRemoteCompactionReplacement(durableReplay, logicalRequestBody, responseBody, replaceInput)
+		if len(semantics.ReplacementHistory) > 0 {
+			semantics.ReplacementPrefix = codexCompactionReplacementPrefix(durableReplay, logicalRequestBody)
+		}
+	} else if strings.EqualFold(strings.TrimSpace(protocol), "claude") || strings.EqualFold(strings.TrimSpace(protocol), "kiro") {
+		semantics.ReplacementHistory, _ = claudeCodeCompactionReplacement(logicalRequestBody, responseBody)
 	}
 	checkpoint, segment, responseID, awaitingTool, err := goalCheckpointAndSegment(requestBody, segmentRequestBody, responseBody, semantics)
 	if err != nil {
@@ -1143,7 +1250,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	}
 	aliases := goalPersistentAliases(requestAliases)
 	if responseID != "" {
-		aliases = append(aliases, storage.GoalAlias{Type: "response_id", Value: responseID})
+		aliases = append(aliases, storage.GoalAlias{Type: "response_id", Value: responseID, Namespace: namespace})
 	}
 	parentThread := ""
 	branchThread := ""
@@ -1156,10 +1263,11 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 		}
 	}
 	turn := storage.GoalTurn{
-		Protocol: protocol, ParentGoalID: "", BranchHash: branchHash, DownstreamKeyHash: keyHash,
+		Protocol: protocol, ParentGoalID: "", BranchHash: branchHash, DownstreamKeyHash: scopedKeyHash,
 		WorkspaceHash: workspaceHash, InitialGoalHash: initialGoalHash,
-		ResponseID: responseID, Aliases: aliases, CheckpointPayload: checkpoint, SegmentPayload: segment,
+		ResponseID: responseID, AliasNamespace: namespace, Aliases: aliases, CheckpointPayload: checkpoint, SegmentPayload: segment,
 		ResolutionAliasSets: resolutionSets,
+		ReplaceHistory:      replaceInput || len(semantics.ReplacementHistory) > 0,
 		WorkingState:        goalWorkingState(requestBody), AwaitingTool: awaitingTool,
 		ExpiresAt: time.Now().Add(s.goalRetention(ctx)).Unix(), StorageMaxBytes: s.goalStorageMaxBytes(ctx),
 		CompressionStages: s.goalCompressionStages(ctx),
@@ -1168,7 +1276,7 @@ func (s *Server) persistGoalContinuity(ctx context.Context, r *http.Request, pro
 	// already been resolved.  Keeping the thread itself out of this column avoids a
 	// second plaintext identifier at rest.
 	if parentThread != "" && branchThread != "" {
-		if resolved, err := s.store.ResolveGoalAliases(ctx, []storage.GoalAlias{{Type: "codex_root_thread", Value: parentThread}}); err == nil {
+		if resolved, err := s.store.ResolveGoalAliases(ctx, []storage.GoalAlias{{Type: "codex_root_thread", Value: parentThread, Namespace: namespace}}); err == nil {
 			turn.ParentGoalID = resolved.Session.ID
 		}
 	}
@@ -1220,11 +1328,12 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 	if !s.goalContinuityEnabled(ctx) {
 		return goalResumeResult{Kind: goalResumeUnidentified}
 	}
-	aliases := goalAliases(r, current, protocol)
-	resolution, err := s.resolveGoalAliasesByPriority(ctx, aliases, goalHasResumeAlias(aliases))
+	rawAliases := goalAliases(r, current, protocol)
+	keyHash, _ := downstreamFromCtx(ctx)
+	namespace := goalDownstreamClientScope(ctx, keyHash, r)
+	resolution, err := s.store.ResolveGoalAliasSets(ctx, goalResolutionSetsForClient(rawAliases, namespace, goalHasResumeAlias(rawAliases)))
 	if errors.Is(err, storage.ErrGoalNotFound) {
-		keyHash, _ := downstreamFromCtx(ctx)
-		resolution, err = s.store.ResolveFallbackGoal(ctx, keyHash, goalWorkspaceFingerprint(r, current), goalInitialFingerprint(current))
+		resolution, err = s.store.ResolveFallbackGoal(ctx, scopedGoalDownstreamKeyHash(keyHash, namespace), goalWorkspaceFingerprint(r, current), goalInitialFingerprint(current))
 	}
 	if errors.Is(err, storage.ErrGoalAmbiguous) {
 		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{Action: "goal_resume_ambiguous", State: "failed", Reason: protocol, Detail: "multiple hashed goal aliases matched"})
@@ -1262,7 +1371,14 @@ func (s *Server) goalReplayBody(ctx context.Context, r *http.Request, protocol s
 				replayed[key] = value
 			}
 		}
-		replayed[historyKey] = appendItems(replayed[historyKey], cur[historyKey])
+		incrementalBody, replaceInput := incrementalGoalRequestWithMode(current, base)
+		if replaceInput {
+			replayed[historyKey] = cur[historyKey]
+		} else if incremental, incrementalErr := decodeContextJSONMap(incrementalBody); incrementalErr == nil {
+			replayed[historyKey] = appendItems(replayed[historyKey], incremental[historyKey])
+		} else {
+			replayed[historyKey] = appendItems(replayed[historyKey], cur[historyKey])
+		}
 	} else {
 		// The current request is authoritative for every current-turn setting,
 		// including future fields. Keeping only a historical whitelist silently

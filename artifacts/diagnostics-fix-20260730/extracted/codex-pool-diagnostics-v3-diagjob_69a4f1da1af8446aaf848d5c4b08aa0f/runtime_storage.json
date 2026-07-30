@@ -1,0 +1,46 @@
+{
+  "budget": {
+    "memory_limit": 268435456,
+    "memory_used": 53610,
+    "request_memory_minimum": 67108864,
+    "request_memory_used": 8327,
+    "response_memory_minimum": 67108864,
+    "response_memory_used": 45283,
+    "spool_limit": 34359738368,
+    "spool_used": 0,
+    "captures": 10367,
+    "captured_bytes": 3025896221,
+    "memory_captured_bytes": 2062988638,
+    "spooled_bytes": 962907583,
+    "replay_opens": 44798,
+    "active_sources": 2,
+    "memory_fallbacks": 0,
+    "spool_rejections": 0,
+    "spill_count": 84
+  },
+  "filesystem": {
+    "filesystem_total_bytes": 20629221376,
+    "filesystem_available_bytes": 14453899264,
+    "minimum_free_bytes": 412584427,
+    "global_limit_bytes": 34359738368,
+    "reserved_bytes": 0,
+    "allocated_bytes": 0,
+    "active_reservations": 0,
+    "reservations": 84,
+    "growth_operations": 10,
+    "releases": 84,
+    "rejections": 0
+  },
+  "generated_at": 1785441038,
+  "policy": {
+    "max_request_body_bytes": 1073741824,
+    "memory_spill_threshold_bytes": 8388608,
+    "unknown_length_growth_chunk_bytes": 8388608
+  },
+  "rejection_counts": {
+    "budget_spool_rejections": 0,
+    "disk_reserver_rejections": 0,
+    "local_spool_capacity": 0,
+    "request_body_storage_exhausted": 0
+  }
+}

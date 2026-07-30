@@ -1,0 +1,17 @@
+hostname=autodl-container-edfb41a5b4-03240cea
+port=34273
+config=/root/autodl-tmp/cpupg-20260730/etc/config.json
+binary=/root/autodl-tmp/cpupg-20260730/prefix/lib/codex-pool/releases/old-0873de57/codex-pool-server
+binary_sha256=d39cf2ceed92dc29638c9058093079efe24ed38894e1beb513c7d3fdbff40b0c
+flag provided but not defined: -version
+Usage of /root/autodl-tmp/cpupg-20260730/prefix/bin/codex-pool-server:
+  -config string
+    	path to JSON configuration file
+  -deployment-role string
+    	worker role: auto, active, or standby
+  -release-id string
+    	deployed release identifier exposed by /readyz
+  -self-test
+    	verify that the worker binary can start
+  -unix-socket string
+    	serve on a private Unix socket instead of the configured TCP address

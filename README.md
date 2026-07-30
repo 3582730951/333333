@@ -176,9 +176,13 @@ PKCE verifier/state 只存在于服务端内存（15 分钟有效，单次使用
 > 复制它再粘回面板；PKCE 保证授权码即便走明文 HTTP 也无法被重放。复制按钮在非 HTTPS 源会自动改用
 > 兜底方式（或直接选中文本框手动复制）。建议给面板配置 `admin_token` 并放行/限制对应端口。
 
-Codex CLI 指向 pool：
+Codex CLI 指向 pool（示例仅列必要连接字段；一键脚本还按服务端选项写入模型、推理强度、
+Goal/实验开关与沙箱审批）：
 
 ```toml
+[features]
+goals = true
+
 [model_providers.codex-pool]
 name = "Codex Pool"
 base_url = "http://127.0.0.1:8787/v1"
@@ -186,6 +190,21 @@ wire_api = "responses"
 requires_openai_auth = false
 experimental_bearer_token = "local-downstream-key"
 ```
+
+Codex 分支采用配置白名单：只管理 Goal/实验模式、模型、推理强度、沙箱/审批、Pool URL
+和 API key；不写静态 header，不创建额外 token/client-id 文件，不探测 WebSocket，不安装
+RTK，也不改模型缓存或其他既有配置。服务端直接使用 Codex 自带的 `Session-Id`/`Thread-Id`
+派生不透明命名空间，所以共享同一 API key 时仍能隔离上下文，下游无需再填任何标识。
+
+Codex 专用的一键入口不会包含 Claude gateway、RTK、skills/plugins 或其他安装分支：
+
+```bash
+curl -fsSL 'https://<POOL_HOST>/file/<API_KEY>?client=codex' | bash
+```
+
+它会备份并原子合并 `~/.codex/config.toml`，只写上述白名单。当前 Codex 的
+`/experimental` 是逐项 feature 开关而不是全局模式；脚本只显式写入与本需求对应的
+`[features] goals = true`，不顺带开启 `network_proxy`、`prevent_idle_sleep` 等无关实验项。
 
 > 兼容提示：上面的 Codex CLI 配置始终使用 `wire_api = "responses"`。完整官方 Codex skills / plugins / Browser Use 体验需要下游模型路由到官方 Codex 账号池；第三方 API 供应商按 `upstream_protocol` 分层 best-effort。
 
@@ -197,6 +216,11 @@ experimental_bearer_token = "local-downstream-key"
 ```bash
 gateway init --pool-url http://127.0.0.1:8787 --key <downstream-key>
 ```
+
+用户侧仍只传 URL 与 API key。`gateway init` 会在内部生成并持久化
+`client_instance_id`；升级旧配置时第一次加载会自动补齐。直连时服务端使用 Claude Code
+自带的 `X-Claude-Code-Session-Id`，经 gateway 时由 gateway 自动携带内部实例标识，两种路径
+都不要求用户配置额外 header。
 
 模型由 Claude Code 和用户自行选择。下游 Key 或分组的 `force_model` 是 VPS 侧策略：请求到达
 服务器并完成认证后才可能被覆盖，不会写回本地 gateway 或 Claude Code 配置。旧版

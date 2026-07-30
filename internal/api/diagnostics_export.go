@@ -28,6 +28,7 @@ import (
 
 	"codex-account-pool/internal/accountprovider"
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/storage"
 	"codex-account-pool/internal/upstream"
 )
@@ -330,8 +331,19 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
 	}
 	summary := diagnosticSummary(accounts, tokensByID, nil, nil, bindings, rateLimits)
 	summary["usage_journal"] = s.usageJournalMetrics()
+	goalMetrics, err := snapshotStore.GoalContinuityMetrics(ctx)
+	if err != nil {
+		return err
+	}
+	summary["goal_continuity"] = goalMetrics
+	summary["goal_policy"] = diagnosticGoalPolicy(settings, s.cfg)
 	codexCPA := s.codexSessionMappingStatsFromSnapshot(ctx, snapshotStore, settings)
 	codexCPA["instruction_policy_groups"] = len(groups)
+	namespacePrefixes := make(map[string]struct{})
+	for _, mapping := range codexMappings {
+		namespacePrefixes[mapping.NamespaceHMACPrefix] = struct{}{}
+	}
+	codexCPA["namespace_count"] = len(namespacePrefixes)
 	summary["codex_cpa"] = codexCPA
 	if err := applyDiagnosticAuditSummary(ctx, snapshotStore.ReadDB(), summary); err != nil {
 		return err
@@ -1529,6 +1541,110 @@ func listDiagnosticSettings(ctx context.Context, db storage.ReadQuerier) ([]diag
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// diagnosticGoalPolicy exports the effective, non-secret Goal controls even when
+// they came from startup config and therefore have no row in settings.csv. Support
+// bundles previously showed thousands of storage_budget events without exposing
+// the active limit, making a full diagnostic impossible. Values are resolved from
+// the snapshot's runtime overrides, so the export stays internally consistent and
+// has no effect on downstream CLI requests.
+func diagnosticGoalPolicy(rows []diagnosticSetting, cfg config.Config) map[string]interface{} {
+	values := make(map[string]string, len(rows))
+	for _, row := range rows {
+		values[row.Key] = strings.TrimSpace(row.Value)
+	}
+	sources := map[string]string{}
+	raw := func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok && value != ""
+	}
+	boolean := func(key string, fallback bool) bool {
+		if value, ok := raw(key); ok {
+			switch strings.ToLower(value) {
+			case "1", "true", "on", "yes":
+				sources[key] = "runtime_setting"
+				return true
+			case "0", "false", "off", "no":
+				sources[key] = "runtime_setting"
+				return false
+			}
+		}
+		sources[key] = "bootstrap_config"
+		return fallback
+	}
+	integer := func(key string, fallback int) int {
+		if value, ok := raw(key); ok {
+			if parsed, err := strconv.Atoi(value); err == nil {
+				sources[key] = "runtime_setting"
+				return parsed
+			}
+		}
+		sources[key] = "bootstrap_config"
+		return fallback
+	}
+	floating := func(key string, fallback float64) float64 {
+		if value, ok := raw(key); ok {
+			if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+				sources[key] = "runtime_setting"
+				return parsed
+			}
+		}
+		sources[key] = "bootstrap_config"
+		return fallback
+	}
+
+	retentionDays := integer("goal_retention_days", cfg.GoalRetentionDays)
+	if retentionDays <= 0 {
+		retentionDays = 7
+	}
+	storageMaxMB := integer("goal_storage_max_mb", cfg.GoalStorageMaxMB)
+	if storageMaxMB <= 0 {
+		storageMaxMB = 256
+	}
+	chunkRatio := floating("goal_compression_chunk_ratio", cfg.GoalCompressionChunkRatio)
+	if chunkRatio <= 0 || chunkRatio > 1 {
+		chunkRatio = 0.70
+	}
+	compressionStages := integer("goal_compression_max_stages", cfg.GoalCompressionMaxStages)
+	if compressionStages <= 0 {
+		compressionStages = 16
+	}
+	compressionConcurrency := integer("goal_compression_concurrency", cfg.GoalCompressionConcurrency)
+	if compressionConcurrency <= 0 {
+		compressionConcurrency = 1
+	}
+	if compressionConcurrency > 32 {
+		compressionConcurrency = 32
+	}
+	leaseSeconds := integer("goal_lease_seconds", cfg.GoalLeaseSeconds)
+	if leaseSeconds <= 0 {
+		leaseSeconds = 90
+	}
+	heartbeatSeconds := integer("goal_heartbeat_seconds", cfg.GoalHeartbeatSeconds)
+	if heartbeatSeconds <= 0 {
+		heartbeatSeconds = 15
+	}
+	if heartbeatSeconds >= leaseSeconds {
+		heartbeatSeconds = leaseSeconds / 2
+	}
+	if heartbeatSeconds <= 0 {
+		heartbeatSeconds = 15
+	}
+
+	return map[string]interface{}{
+		"continuity_enabled":        boolean("goal_continuity_enabled", cfg.GoalContinuityEnabled),
+		"legacy_journal_dual_write": boolean("goal_legacy_journal_dual_write", cfg.GoalLegacyJournalDualWrite),
+		"retention_days":            retentionDays,
+		"storage_max_mb":            storageMaxMB,
+		"storage_max_bytes":         int64(storageMaxMB) << 20,
+		"compression_chunk_ratio":   chunkRatio,
+		"compression_max_stages":    compressionStages,
+		"compression_concurrency":   compressionConcurrency,
+		"lease_seconds":             leaseSeconds,
+		"heartbeat_seconds":         heartbeatSeconds,
+		"sources":                   sources,
+	}
 }
 
 func listDiagnosticTokenMetadata(ctx context.Context, db storage.ReadQuerier) (map[string]storage.AccountToken, error) {

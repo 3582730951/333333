@@ -34,6 +34,207 @@ func TestIncrementalGoalRequestStoresOnlyDurableHistorySuffix(t *testing.T) {
 	if got := incrementalGoalRequest(mismatch, durable); string(got) != string(mismatch) {
 		t.Fatalf("mismatched history must be preserved: %s", got)
 	}
+
+	// A full Claude snapshot contains both sides of the conversation. When it no
+	// longer has the durable prefix, it is an authoritative compact/edit boundary,
+	// not a delta to append after the old context.
+	compacted := []byte(`{"model":"claude","messages":[{"role":"user","content":"summary of the retained task"},{"role":"assistant","content":"summary acknowledged"},{"role":"user","content":"continue after compact"}]}`)
+	trimmed, replace := incrementalGoalRequestWithMode(compacted, durable)
+	if !replace || string(trimmed) != string(compacted) {
+		t.Fatalf("full Claude replacement snapshot replace=%v body=%s", replace, trimmed)
+	}
+}
+
+func TestGoalContinuityScopesSharedKeyByNativeClientSession(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+	const sharedKeyHash = "shared-downstream-key-hash"
+
+	persist := func(clientID, marker, responseID string) storage.GoalSession {
+		t.Helper()
+		body := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"` + marker + `"}]}]}`)
+		response := []byte(`{"id":"` + responseID + `","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer-` + marker + `"}]}]}`)
+		req, err := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Thread-Id", "same-client-visible-thread")
+		req.Header.Set("Session-Id", clientID)
+		ctx := withDownstreamKey(withGoalOriginalBody(context.Background(), body), downstreamPolicy{KeyHash: sharedKeyHash})
+		goal, err := h.app.persistGoalContinuity(ctx, req, "codex", body, response)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return goal
+	}
+
+	clientA := persist("client-installation-a", "only-client-a", "response-client-a")
+	clientB := persist("client-installation-b", "only-client-b", "response-client-b")
+	if clientA.ID == clientB.ID {
+		t.Fatalf("same API key and visible thread merged two client installations into goal %s", clientA.ID)
+	}
+	goals, err := h.store.ListGoalSessions(context.Background(), 10)
+	if err != nil || len(goals) != 2 {
+		t.Fatalf("client-scoped goals=%+v err=%v", goals, err)
+	}
+
+	current := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"continue-a"}]}]}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(current)))
+	req.Header.Set("Thread-Id", "same-client-visible-thread")
+	req.Header.Set("Session-Id", "client-installation-a")
+	ctx := withDownstreamKey(context.Background(), downstreamPolicy{KeyHash: sharedKeyHash})
+	replay := h.app.goalReplayBody(ctx, req, "codex", current)
+	if replay.Kind != goalResumeFound || replay.Session.ID != clientA.ID ||
+		!strings.Contains(string(replay.Body), "only-client-a") ||
+		strings.Contains(string(replay.Body), "only-client-b") {
+		t.Fatalf("client A replay crossed namespace: kind=%s session=%s body=%s", replay.Kind, replay.Session.ID, replay.Body)
+	}
+}
+
+func TestGoalNamespaceUsesNativeClaudeAndCodexHeadersWithoutExtraConfig(t *testing.T) {
+	const keyHash = "shared-native-header-key"
+	claudeA, _ := http.NewRequest(http.MethodPost, "/v1/messages", nil)
+	claudeB, _ := http.NewRequest(http.MethodPost, "/v1/messages", nil)
+	claudeA.Header.Set("X-Claude-Code-Session-Id", "claude-native-a")
+	claudeB.Header.Set("X-Claude-Code-Session-Id", "claude-native-b")
+	claudeScopeA := downstreamClientScope(keyHash, claudeA)
+	claudeScopeB := downstreamClientScope(keyHash, claudeB)
+	if claudeScopeA == "" || claudeScopeB == "" || claudeScopeA == claudeScopeB {
+		t.Fatalf("Claude Code native sessions were not isolated: a=%q b=%q", claudeScopeA, claudeScopeB)
+	}
+
+	codexA, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	codexB, _ := http.NewRequest(http.MethodPost, "/v1/responses", nil)
+	codexA.Header.Set("Thread-Id", "codex-native-thread-a")
+	codexB.Header.Set("Thread-Id", "codex-native-thread-b")
+	codexScopeA := downstreamClientScope(keyHash, codexA)
+	codexScopeB := downstreamClientScope(keyHash, codexB)
+	if codexScopeA == "" || codexScopeB == "" || codexScopeA == codexScopeB {
+		t.Fatalf("Codex native thread fallback was not isolated: a=%q b=%q", codexScopeA, codexScopeB)
+	}
+	for _, scope := range []string{claudeScopeA, claudeScopeB, codexScopeA, codexScopeB} {
+		if strings.Contains(scope, "native-") {
+			t.Fatalf("raw protocol-native identity leaked into scope: %q", scope)
+		}
+	}
+}
+
+func TestGoalClientNamespaceMigratesOnlyExactLegacyStateAlias(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+	ctx := context.Background()
+	legacy, err := h.store.CommitGoalTurn(ctx, storage.GoalTurn{
+		Protocol:          "codex",
+		DownstreamKeyHash: "legacy-shared-key",
+		WorkspaceHash:     "legacy-workspace",
+		InitialGoalHash:   "legacy-initial",
+		ResponseID:        "legacy-exact-response",
+		Aliases:           []storage.GoalAlias{{Type: "codex_root_thread", Value: "legacy-visible-root"}},
+		CheckpointPayload: `{"model":"gpt-5.6-sol","input":[]}`,
+		SegmentPayload:    `{"history_key":"input","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"legacy durable task"}]}],"output":[]}`,
+		ExpiresAt:         storage.Now() + 3600,
+		StorageMaxBytes:   8 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"legacy-exact-response","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"migrate exact state"}]}]}`)
+	response := []byte(`{"id":"namespaced-response","status":"completed","output":[]}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	req.Header.Set("Thread-Id", "legacy-visible-root")
+	req.Header.Set("Session-Id", "upgraded-installation")
+	requestCtx := withDownstreamKey(withGoalOriginalBody(ctx, body), downstreamPolicy{KeyHash: "legacy-shared-key"})
+	migrated, err := h.app.persistGoalContinuity(requestCtx, req, "codex", body, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated.ID != legacy.ID {
+		t.Fatalf("exact legacy response did not migrate in place: old=%s new=%s", legacy.ID, migrated.ID)
+	}
+
+	// Once rebound, the scoped root works without a legacy response pointer.
+	next := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"scoped next"}]}]}`)
+	nextReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(next)))
+	nextReq.Header.Set("Thread-Id", "legacy-visible-root")
+	nextReq.Header.Set("Session-Id", "upgraded-installation")
+	replay := h.app.goalReplayBody(withDownstreamKey(ctx, downstreamPolicy{KeyHash: "legacy-shared-key"}), nextReq, "codex", next)
+	if replay.Kind != goalResumeFound || replay.Session.ID != legacy.ID {
+		t.Fatalf("scoped alias was not rebound after migration: %+v", replay)
+	}
+
+	// A different installation with only the weak/root alias never crosses the
+	// one-time exact-state bridge.
+	otherReq, _ := http.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(next)))
+	otherReq.Header.Set("Thread-Id", "legacy-visible-root")
+	otherReq.Header.Set("Session-Id", "different-installation")
+	other := h.app.goalReplayBody(withDownstreamKey(ctx, downstreamPolicy{KeyHash: "legacy-shared-key"}), otherReq, "codex", next)
+	if other.Kind != goalResumeUnidentified {
+		t.Fatalf("weak legacy alias crossed client namespaces: %+v", other)
+	}
+}
+
+func TestClaudeCodeCompactionReplacesDurableGoalHistory(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	h.app.cfg.GoalContinuityEnabled = true
+
+	request := func(body []byte) *http.Request {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Claude-Code-Session-Id", "claude-compaction-session")
+		return req
+	}
+	ctxFor := func(body []byte) context.Context {
+		return withDownstreamKey(withGoalOriginalBody(context.Background(), body), downstreamPolicy{KeyHash: "claude-compaction-key"})
+	}
+
+	firstBody := []byte(`{"model":"claude-opus-5","system":"You are Claude Code","messages":[{"role":"user","content":"old detail that must be summarized"}]}`)
+	firstResponse := []byte(`{"id":"msg-before-compact","type":"message","role":"assistant","content":[{"type":"text","text":"old detailed answer"}],"stop_reason":"end_turn"}`)
+	goal, err := h.app.persistGoalContinuity(ctxFor(firstBody), request(firstBody), "claude", firstBody, firstResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	compactBody := []byte(`{
+		"model":"claude-opus-5",
+		"system":"You are a helpful AI assistant tasked with summarizing conversations.",
+		"messages":[
+			{"role":"user","content":"old detail that must be summarized"},
+			{"role":"assistant","content":[{"type":"text","text":"old detailed answer"}]},
+			{"role":"user","content":"Your task is to create a detailed summary of the conversation so far. REMINDER: Do NOT call any tools. Respond with plain text only"}
+		]
+	}`)
+	compactResponse := []byte(`{"id":"msg-compact","type":"message","role":"assistant","content":[{"type":"text","text":"bounded durable summary"}],"stop_reason":"end_turn"}`)
+	compacted, err := h.app.persistGoalContinuity(ctxFor(compactBody), request(compactBody), "claude", compactBody, compactResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compacted.ID != goal.ID {
+		t.Fatalf("compaction opened a new goal: before=%s after=%s", goal.ID, compacted.ID)
+	}
+	replay, session, err := h.store.BuildGoalReplay(context.Background(), goal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(replay)
+	if !strings.Contains(text, "bounded durable summary") ||
+		strings.Contains(text, "old detail that must be summarized") ||
+		strings.Contains(text, "old detailed answer") {
+		t.Fatalf("Claude compaction did not replace old durable history: %s", replay)
+	}
+	var checkpoints, segments int
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id=?`, session.ID).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.DB().QueryRowContext(context.Background(), `SELECT COUNT(*) FROM goal_segment WHERE goal_id=?`, session.ID).Scan(&segments); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints != 1 || segments != 1 {
+		t.Fatalf("compaction retained superseded physical history checkpoints=%d segments=%d", checkpoints, segments)
+	}
 }
 
 func TestIncrementalGoalRequestRecognizesPostCompactLiteSnapshot(t *testing.T) {
@@ -180,6 +381,16 @@ func TestPersistGoalContinuityFullRootRemoteCompactionRetainsLogicalUsers(t *tes
 		if strings.Contains(text, compacted) {
 			t.Fatalf("compacted marker %q remained in replay=%s", compacted, text)
 		}
+	}
+	var checkpoints, segments int
+	if err := h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_checkpoint WHERE goal_id=?`, goal.ID).Scan(&checkpoints); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal_segment WHERE goal_id=?`, goal.ID).Scan(&segments); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoints != 1 || segments != 1 {
+		t.Fatalf("Codex compaction retained superseded physical history checkpoints=%d segments=%d", checkpoints, segments)
 	}
 }
 

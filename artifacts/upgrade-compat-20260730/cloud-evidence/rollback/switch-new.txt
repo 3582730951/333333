@@ -1,0 +1,2 @@
+{"checks": {"storage": true}, "deployment_state": "active", "fencing_token": 5, "inflight": 0, "ok": true, "ready": true, "release_id": "new-goal-context-fix", "started_at": "2026-07-30T19:42:38.00210814Z", "worker_socket": ""}
+active_release=new-goal-context-fix pid=379190 current=/root/autodl-tmp/cpupg-20260730/prefix/lib/codex-pool/releases/new-goal-context-fix

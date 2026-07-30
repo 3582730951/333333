@@ -333,7 +333,8 @@ func TestStrictCPAModelInstructionsAreTreeSnapshots(t *testing.T) {
 	// Retiring an epoch turns a later self-contained request into a fresh root.
 	// It must read the current operator configuration rather than inherit the old
 	// tree snapshot through the retired anchor used only to allocate the next epoch.
-	rows, err := h.store.FindCodexSessionAlias(context.Background(), "key:"+hashAPIKey(key), storage.CodexSessionAlias{Type: "root", Value: "strict-instruction-root"})
+	namespace := codexNativeNamespaceForTest(t, hashAPIKey(key), "strict-instruction-root")
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "root", Value: "strict-instruction-root"})
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("root mapping before rotation rows=%+v err=%v", rows, err)
 	}

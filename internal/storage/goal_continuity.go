@@ -120,8 +120,9 @@ var (
 // GoalAlias is intentionally accepted in plaintext at the storage boundary but is
 // immediately hashed.  Callers must not log Value.
 type GoalAlias struct {
-	Type  string
-	Value string
+	Type      string
+	Value     string
+	Namespace string
 }
 
 type GoalSession struct {
@@ -278,6 +279,7 @@ type GoalTurn struct {
 	WorkspaceHash     string
 	InitialGoalHash   string
 	ResponseID        string
+	AliasNamespace    string
 	Aliases           []GoalAlias
 	// ResolutionAliasSets are ordered strongest-to-weakest identity candidates.
 	// CommitGoalTurn resolves the first set that actually has a durable match;
@@ -288,11 +290,16 @@ type GoalTurn struct {
 	ResolutionAliasSets [][]GoalAlias
 	CheckpointPayload   string
 	SegmentPayload      string
-	WorkingState        string
-	AwaitingTool        bool
-	ExpiresAt           int64
-	StorageMaxBytes     int64
-	CompressionStages   int
+	// ReplaceHistory is set only when the successful terminal establishes an
+	// authoritative compaction/edit boundary. The commit atomically swaps the
+	// prior checkpoint/segments for this self-contained turn, allowing official
+	// client compaction to reclaim storage even when the global budget is full.
+	ReplaceHistory    bool
+	WorkingState      string
+	AwaitingTool      bool
+	ExpiresAt         int64
+	StorageMaxBytes   int64
+	CompressionStages int
 }
 
 type GoalResolution struct {
@@ -318,6 +325,8 @@ type GoalMetrics struct {
 	ResumeAmbiguous           int64 `json:"resume_ambiguous"`
 	StreamTerminalSynthesized int64 `json:"stream_terminal_synthesized"`
 	PersistenceDegraded       int64 `json:"persistence_degraded"`
+	HistoryReplaced           int64 `json:"history_replaced"`
+	CompactionCompleted       int64 `json:"compaction_completed"`
 }
 
 const goalContinuityV2MigrationMarker = "goal_continuity_v2_storage_accounted"
@@ -369,6 +378,18 @@ func hashGoalValue(kind, value string) string {
 	return hex.EncodeToString(s[:])
 }
 
+func hashGoalAlias(alias GoalAlias) string {
+	namespace := strings.TrimSpace(alias.Namespace)
+	if namespace == "" {
+		// Preserve the deployed hash format for clients that do not yet emit an
+		// installation namespace and for one-time exact state-alias migration.
+		return hashGoalValue(alias.Type, alias.Value)
+	}
+	s := sha256.Sum256([]byte("goal-alias-v2\x00" + namespace + "\x00" +
+		strings.TrimSpace(alias.Type) + "\x00" + strings.TrimSpace(alias.Value)))
+	return hex.EncodeToString(s[:])
+}
+
 func hashGoalPayload(payload string) string {
 	s := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(s[:])
@@ -390,10 +411,11 @@ func normalizedGoalAliases(in []GoalAlias) []GoalAlias {
 	for _, alias := range in {
 		alias.Type = strings.TrimSpace(strings.ToLower(alias.Type))
 		alias.Value = strings.TrimSpace(alias.Value)
+		alias.Namespace = strings.TrimSpace(alias.Namespace)
 		if alias.Type == "" || alias.Value == "" {
 			continue
 		}
-		h := hashGoalValue(alias.Type, alias.Value)
+		h := hashGoalAlias(alias)
 		if seen[h] {
 			continue
 		}
@@ -412,7 +434,7 @@ func (s *Store) resolveGoalAliases(ctx context.Context, q sqlQueryer, aliases []
 	marks := make([]string, 0, len(aliases))
 	for _, alias := range aliases {
 		marks = append(marks, "?")
-		args = append(args, hashGoalValue(alias.Type, alias.Value))
+		args = append(args, hashGoalAlias(alias))
 	}
 	args = append(args, Now())
 	query := `SELECT DISTINCT s.id, s.protocol, s.parent_goal_id, s.branch_hash,
@@ -556,9 +578,17 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	if turn.ExpiresAt <= Now() {
 		return GoalSession{}, errors.New("goal turn expiry must be in the future")
 	}
-	aliases := normalizedGoalAliases(turn.Aliases)
+	turnAliases := append([]GoalAlias(nil), turn.Aliases...)
+	if namespace := strings.TrimSpace(turn.AliasNamespace); namespace != "" {
+		for index := range turnAliases {
+			if strings.TrimSpace(turnAliases[index].Namespace) == "" {
+				turnAliases[index].Namespace = namespace
+			}
+		}
+	}
+	aliases := normalizedGoalAliases(turnAliases)
 	if strings.TrimSpace(turn.ResponseID) != "" {
-		aliases = append(aliases, GoalAlias{Type: "response_id", Value: turn.ResponseID})
+		aliases = append(aliases, GoalAlias{Type: "response_id", Value: turn.ResponseID, Namespace: turn.AliasNamespace})
 		aliases = normalizedGoalAliases(aliases)
 	}
 	now := Now()
@@ -597,7 +627,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 	created := errors.Is(resolveErr, ErrGoalNotFound)
 	segmentEstimatedBytes := s.estimateGoalChunkStorage(turn.SegmentPayload)
 	var checkpointEstimatedBytes int64
-	if created {
+	if created || turn.ReplaceHistory {
 		checkpointEstimatedBytes = s.estimateGoalChunkStorage(turn.CheckpointPayload)
 	} else {
 		// Serialize this foreground append with the maintenance CAS that changes a
@@ -610,6 +640,10 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		if affected, _ := locked.RowsAffected(); affected != 1 {
 			return GoalSession{}, ErrGoalNotFound
 		}
+		if err := tx.QueryRowContext(ctx, `SELECT current_checkpoint_id,storage_bytes,updated_at FROM goal_session WHERE id=? AND state<>'reclaiming'`, resolution.Session.ID).Scan(
+			&resolution.Session.CurrentCheckpoint, &resolution.Session.StorageBytes, &resolution.Session.UpdatedAt); err != nil {
+			return GoalSession{}, err
+		}
 	}
 	if turn.StorageMaxBytes > 0 {
 		var used int64
@@ -617,10 +651,19 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 			return GoalSession{}, err
 		}
 		estimate := segmentEstimatedBytes
-		if created {
+		if created || turn.ReplaceHistory {
 			estimate += checkpointEstimatedBytes
 		}
-		if used+estimate > turn.StorageMaxBytes {
+		projected := used + estimate
+		replacementShrinks := false
+		if !created && turn.ReplaceHistory {
+			projected = used - resolution.Session.StorageBytes + estimate
+			// An upgraded database can already exceed its configured budget.
+			// Permit a replacement that strictly reduces physical storage; the
+			// maintenance worker can then continue converging other inactive goals.
+			replacementShrinks = estimate < resolution.Session.StorageBytes
+		}
+		if projected > turn.StorageMaxBytes && !replacementShrinks {
 			// Physical reclamation is deliberately maintenance-only. A foreground
 			// turn never cascades through a multi-gigabyte goal while holding its
 			// successful-terminal transaction.
@@ -662,6 +705,42 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		}
 		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM goal_segment WHERE goal_id=?`, session.ID).Scan(&nextSegment); err != nil {
 			return GoalSession{}, err
+		}
+		if turn.ReplaceHistory {
+			var nextCheckpoint int64
+			if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM goal_checkpoint WHERE goal_id=?`, session.ID).Scan(&nextCheckpoint); err != nil {
+				return GoalSession{}, err
+			}
+			// Delete and recreate inside this transaction. SQLite restores all
+			// rows on rollback; PostgreSQL keeps the parent-row lock acquired
+			// above, so readers observe either the old chain or the complete new
+			// chain and never a partial replacement.
+			if _, err := tx.ExecContext(ctx, `DELETE FROM goal_payload_chunk WHERE goal_id=?`, session.ID); err != nil {
+				return GoalSession{}, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM goal_segment WHERE goal_id=?`, session.ID); err != nil {
+				return GoalSession{}, err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM goal_checkpoint WHERE goal_id=?`, session.ID); err != nil {
+				return GoalSession{}, err
+			}
+			checkpoint := GoalCheckpoint{
+				ID: newGoalID("gcp"), GoalID: session.ID, Sequence: nextCheckpoint,
+				ThroughSegmentSequence: nextSegment - 1, Payload: turn.CheckpointPayload,
+				FormatVersion: goalPayloadFormatV2, CreatedAt: now,
+			}
+			checkpoint.PayloadHash, checkpoint.PayloadBytes = hashGoalPayload(checkpoint.Payload), int64(len(checkpoint.Payload))
+			if _, err := tx.ExecContext(ctx, `INSERT INTO goal_checkpoint(id,goal_id,sequence,through_segment_sequence,payload_hash,payload_bytes,encrypted_payload,format_version,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+				checkpoint.ID, checkpoint.GoalID, checkpoint.Sequence, checkpoint.ThroughSegmentSequence,
+				checkpoint.PayloadHash, checkpoint.PayloadBytes, "", checkpoint.FormatVersion, checkpoint.CreatedAt); err != nil {
+				return GoalSession{}, err
+			}
+			checkpointStoredBytes, insertErr := s.insertGoalChunks(ctx, tx, session.ID, goalChunkCheckpoint, 0, now, turn.CheckpointPayload)
+			if insertErr != nil {
+				return GoalSession{}, insertErr
+			}
+			session.StorageBytes = checkpointStoredBytes
+			session.CurrentCheckpoint = checkpoint.ID
 		}
 		if strings.TrimSpace(turn.ParentGoalID) != "" {
 			session.ParentGoalID = strings.TrimSpace(turn.ParentGoalID)
@@ -717,7 +796,7 @@ func (s *Store) CommitGoalTurn(ctx context.Context, turn GoalTurn) (GoalSession,
 		// Never overwrite an alias owned by another visible goal. A reclaiming owner
 		// is already a logical tombstone, however, and the alias must be transferred
 		// atomically so a new turn cannot commit an identity that will never resolve.
-		aliasHash := hashGoalValue(alias.Type, alias.Value)
+		aliasHash := hashGoalAlias(alias)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM goal_alias
 WHERE alias_hash=? AND EXISTS (
  SELECT 1 FROM goal_session owner WHERE owner.id=goal_alias.goal_id AND owner.state='reclaiming'
@@ -746,6 +825,12 @@ WHERE goal_alias.goal_id=excluded.goal_id`, aliasHash, alias.Type, session.ID, n
 	if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
 		"goal_checkpoint_committed", session.State, turn.Protocol, fmt.Sprintf("goal=%s checkpoint=%s segment=%d bytes=%d", session.ID, session.CurrentCheckpoint, segment.Sequence, segment.PayloadBytes), now); err != nil {
 		return GoalSession{}, err
+	}
+	if !created && turn.ReplaceHistory {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO audit_log(account_id,account_label,action,state,reason,detail,created_at) VALUES('', '', ?, ?, ?, ?, ?)`,
+			"goal_history_replaced", session.State, turn.Protocol, fmt.Sprintf("goal=%s checkpoint=%s segment=%d storage_bytes=%d", session.ID, session.CurrentCheckpoint, segment.Sequence, session.StorageBytes), now); err != nil {
+			return GoalSession{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return GoalSession{}, err
@@ -1086,6 +1171,7 @@ type goalReplaySegment struct {
 	Input                    interface{}   `json:"input"`
 	Output                   interface{}   `json:"output"`
 	ReplacementHistory       []interface{} `json:"replacement_history,omitempty"`
+	ReplacementPrefix        []interface{} `json:"replacement_prefix,omitempty"`
 	ReplaceInput             bool          `json:"replace_input,omitempty"`
 	CodexCompactionEvaluated bool          `json:"codex_compaction_evaluated,omitempty"`
 }
@@ -1731,7 +1817,7 @@ func (s *Store) GoalContinuityMetrics(ctx context.Context) (GoalMetrics, error) 
 	if err := s.rdb.QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&metrics.StorageBytes); err != nil {
 		return GoalMetrics{}, err
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT action,COUNT(*) FROM audit_log WHERE action IN ('goal_resume_recovered','goal_resume_ambiguous','goal_stream_terminal_synthesized','goal_persistence_degraded') GROUP BY action`)
+	rows, err := s.rdb.QueryContext(ctx, `SELECT action,COUNT(*) FROM audit_log WHERE action IN ('goal_resume_recovered','goal_resume_ambiguous','goal_stream_terminal_synthesized','goal_persistence_degraded','goal_history_replaced','goal_compaction_completed') GROUP BY action`)
 	if err != nil {
 		return GoalMetrics{}, err
 	}
@@ -1751,6 +1837,10 @@ func (s *Store) GoalContinuityMetrics(ctx context.Context) (GoalMetrics, error) 
 			metrics.StreamTerminalSynthesized = count
 		case "goal_persistence_degraded":
 			metrics.PersistenceDegraded = count
+		case "goal_history_replaced":
+			metrics.HistoryReplaced = count
+		case "goal_compaction_completed":
+			metrics.CompactionCompleted = count
 		}
 	}
 	return metrics, rows.Err()

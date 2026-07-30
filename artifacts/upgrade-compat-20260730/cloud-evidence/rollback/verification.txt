@@ -1,0 +1,6 @@
+rollback_exit=0
+old_ready={"checks": {"storage": true}, "deployment_state": "active", "fencing_token": 4, "inflight": 0, "ok": true, "ready": true, "release_id": "old-0873de57", "started_at": "2026-07-30T19:42:37.533623843Z", "worker_socket": ""}
+rollforward_exit=0
+new_ready={"checks": {"storage": true}, "deployment_state": "active", "fencing_token": 5, "inflight": 0, "ok": true, "ready": true, "release_id": "new-goal-context-fix", "started_at": "2026-07-30T19:42:38.00210814Z", "worker_socket": ""}
+final_current=/root/autodl-tmp/cpupg-20260730/prefix/lib/codex-pool/releases/new-goal-context-fix
+final_pid=379190

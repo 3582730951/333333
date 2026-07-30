@@ -91,7 +91,8 @@ func TestCodexSessionMappingMigratesUnavailableBoundAccountWithDurableReplay(t *
 	if len(got) != 2 || got[0].auth != "Bearer access-bound-origin" || got[1].auth != "Bearer access-bound-replacement" {
 		t.Fatalf("unexpected upstream route: %+v", got)
 	}
-	rows, err := h.store.FindCodexSessionAlias(context.Background(), "unauthenticated", storage.CodexSessionAlias{Type: "response", Value: "resp-bound-recovered"})
+	namespace := codexNativeNamespaceForTest(t, "", "bound-durable-root")
+	rows, err := h.store.FindCodexSessionAlias(context.Background(), namespace, storage.CodexSessionAlias{Type: "response", Value: "resp-bound-recovered"})
 	if err != nil || len(rows) != 1 || rows[0].AccountID == boundID || rows[0].State != "active" {
 		t.Fatalf("recovered mapping rows=%+v err=%v", rows, err)
 	}

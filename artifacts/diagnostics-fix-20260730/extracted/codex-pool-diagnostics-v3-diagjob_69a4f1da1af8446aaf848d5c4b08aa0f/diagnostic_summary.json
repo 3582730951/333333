@@ -1,0 +1,203 @@
+{
+  "banned_accounts": {
+    "events": {
+      "delete_failed": 0,
+      "deleted": 0,
+      "discovered": 3
+    },
+    "unique_accounts": {
+      "delete_failed": 0,
+      "deleted": 0,
+      "discovered": 2
+    }
+  },
+  "billing_holds": {
+    "current_fresh_held": 2,
+    "expired_unsettled": 0,
+    "historical_stale_held": 0,
+    "oldest_fresh_held_age_seconds": 77
+  },
+  "codex_cpa": {
+    "active": 1485,
+    "ambiguous": 537,
+    "bindings_created": 1504,
+    "enabled": true,
+    "eof_compensations": 28,
+    "epoch_rotations": 19,
+    "fresh_roots_after_context_loss": 18,
+    "instruction_policy_groups": 8,
+    "native_continues": 0,
+    "retention_days": 7,
+    "retired": 19,
+    "stateless_passthrough": false,
+    "strict_cpa": true,
+    "unidentified": 103
+  },
+  "current_state": {
+    "fresh_billing_holds": 2,
+    "groups": {
+      "claude": {
+        "active": 0,
+        "providers": {},
+        "cooldown": 0,
+        "recheck_pending": 0,
+        "rate_limit_cooldown": 0
+      },
+      "cyber": {
+        "active": 1,
+        "providers": {
+          "antigravity": 1
+        },
+        "cooldown": 0,
+        "recheck_pending": 0,
+        "rate_limit_cooldown": 0
+      },
+      "gpt-plus-备用2(可破甲)": {
+        "active": 5,
+        "providers": {
+          "codex": 5
+        },
+        "cooldown": 5,
+        "recheck_pending": 5,
+        "rate_limit_cooldown": 5
+      },
+      "gpt-plus-正常(备用1)": {
+        "active": 5,
+        "providers": {
+          "codex": 5
+        },
+        "cooldown": 3,
+        "recheck_pending": 3,
+        "rate_limit_cooldown": 5
+      },
+      "gpt-pro": {
+        "active": 1,
+        "providers": {
+          "codex": 1
+        },
+        "cooldown": 0,
+        "recheck_pending": 0,
+        "rate_limit_cooldown": 0
+      }
+    },
+    "stale_historical_holds": 0
+  },
+  "groups": {
+    "claude": {
+      "active": 0,
+      "providers": {},
+      "cooldown": 0,
+      "recheck_pending": 0,
+      "rate_limit_cooldown": 0
+    },
+    "cyber": {
+      "active": 1,
+      "providers": {
+        "antigravity": 1
+      },
+      "cooldown": 0,
+      "recheck_pending": 0,
+      "rate_limit_cooldown": 0
+    },
+    "gpt-plus-备用2(可破甲)": {
+      "active": 5,
+      "providers": {
+        "codex": 5
+      },
+      "cooldown": 5,
+      "recheck_pending": 5,
+      "rate_limit_cooldown": 5
+    },
+    "gpt-plus-正常(备用1)": {
+      "active": 5,
+      "providers": {
+        "codex": 5
+      },
+      "cooldown": 3,
+      "recheck_pending": 3,
+      "rate_limit_cooldown": 5
+    },
+    "gpt-pro": {
+      "active": 1,
+      "providers": {
+        "codex": 1
+      },
+      "cooldown": 0,
+      "recheck_pending": 0,
+      "rate_limit_cooldown": 0
+    }
+  },
+  "health_test_models": {
+    "claude-opus-4-6-thinking": 1,
+    "claude-sonnet-4-5": 5,
+    "gpt-5.6-sol": 14
+  },
+  "last_24h": {
+    "routing_409_events": {},
+    "health_test_events_by_model": {
+      "claude-opus-4-6-thinking": 1,
+      "claude-sonnet-4-5": 5,
+      "gpt-5.6-sol": 14
+    },
+    "banned_accounts": {
+      "events": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 3
+      },
+      "unique_accounts": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 2
+      }
+    },
+    "billing_hold_events_by_status": {
+      "failed_upstream": 12,
+      "held": 2,
+      "settled_streaming": 6693,
+      "stream_interrupted_compensated": 29,
+      "stream_mapped_session_risk_rotating": 5,
+      "stream_retryable_error_retry": 2,
+      "websocket_fallback_context_recovering": 35
+    }
+  },
+  "lifetime": {
+    "routing_409_events": {},
+    "health_test_events_by_model": {
+      "claude-opus-4-6-thinking": 1,
+      "claude-sonnet-4-5": 5,
+      "gpt-5.6-sol": 14
+    },
+    "banned_accounts": {
+      "events": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 3
+      },
+      "unique_accounts": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 2
+      }
+    },
+    "billing_hold_events_by_status": {
+      "failed_upstream": 12,
+      "held": 2,
+      "settled_streaming": 6693,
+      "stream_interrupted_compensated": 29,
+      "stream_mapped_session_risk_rotating": 5,
+      "stream_retryable_error_retry": 2,
+      "websocket_fallback_context_recovering": 35
+    }
+  },
+  "routing_409": {},
+  "usage_journal": {
+    "acked_sequence": 27052,
+    "bytes": 698551,
+    "enabled": true,
+    "healthy": true,
+    "next_sequence": 27053,
+    "pending_records": 0,
+    "segments": 1
+  }
+}

@@ -1,0 +1,3 @@
+5d903970bd05597e8b736bb235783c62fe4980225df68f03a69df4282039ad84  /root/autodl-tmp/cpupg-20260730/etc/config.pre-customization.json
+cde01a26751948a159065d1a5d288e24f5d25d95ec4912ed78b281be406c5a57  /root/autodl-tmp/cpupg-20260730/etc/config.json
+5c9dec1886cc01f5f2307ee1ea87f9b32a4cef0f8f9a2c68beebc558013bedab  /root/autodl-tmp/cpupg-20260730/state/pool.sqlite3

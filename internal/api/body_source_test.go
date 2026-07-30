@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"codex-account-pool/internal/bodysource"
+	"codex-account-pool/internal/capability"
 	"codex-account-pool/internal/routing"
 )
 
@@ -61,6 +62,25 @@ func TestBodyMetaHotValuesMatchLegacyScans(t *testing.T) {
 		if got, want := estimatedTokensWithMeta(raw, &meta), estimatedTokensWithMeta(raw, nil); got != want {
 			t.Fatalf("token estimate mismatch for %s: got=%d want=%d", raw, got, want)
 		}
+	}
+}
+
+func TestCodexEstimatedTokensWithMetaCapsOnlyFixedContextModels(t *testing.T) {
+	const oversized = int64(7_378_934)
+	meta := &bodysource.BodyMeta{EstimatedTokens: oversized}
+	raw := []byte(`{"model":"gpt-5.6-sol","input":"kept byte-for-byte"}`)
+
+	if got := codexEstimatedTokensWithMeta("gpt-5.6-sol", raw, meta); got != capability.GPT56ContextWindow {
+		t.Fatalf("gpt-5.6 estimate=%d want fixed context=%d", got, capability.GPT56ContextWindow)
+	}
+	if got := codexEstimatedTokensWithMeta("gpt-5.6", raw, meta); got != capability.GPT56ContextWindow {
+		t.Fatalf("gpt-5.6 alias estimate=%d want fixed context=%d", got, capability.GPT56ContextWindow)
+	}
+	if got := codexEstimatedTokensWithMeta("custom-unbounded-model", raw, meta); got != oversized {
+		t.Fatalf("unknown model estimate=%d want unchanged=%d", got, oversized)
+	}
+	if got := codexEstimatedTokensWithMeta("gpt-5.6-sol", raw, &bodysource.BodyMeta{EstimatedTokens: 1234}); got != 1234 {
+		t.Fatalf("in-window estimate=%d want unchanged=1234", got)
 	}
 }
 

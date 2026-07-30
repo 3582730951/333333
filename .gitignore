@@ -54,6 +54,12 @@ pngs/
 pngs_s/
 screenshot*.png
 
+# Local verification source bundles and downloaded toolchains
+/artifacts/**/baseline/original.tar.gz
+/artifacts/**/modified/workspace-source.tar.gz
+/artifacts/**/go*.linux-amd64.tar.gz
+/artifacts/**/old-src/
+
 # Keep the embedded console bundle tracked for the Go binary.
 !internal/console/dist/
 !internal/console/dist/**
