@@ -14,6 +14,12 @@ const (
 	AuthMethodAccessToken = "access_token"
 	AuthMethodAPIKey      = "api_key"
 
+	// CredentialModePersonalAccessToken keeps a workspace-scoped Codex personal
+	// access token in the encrypted OpenAIAPIKey column while preserving the
+	// refreshable ChatGPT OAuth fields beside it. It is bearer authentication,
+	// not pay-as-you-go API-key billing.
+	CredentialModePersonalAccessToken = "personal_access_token"
+
 	BillingModeSubscription = "subscription"
 	BillingModePayAsYouGo   = "pay_as_you_go"
 )
@@ -76,6 +82,10 @@ func EffectiveAuthMethod(provider string, token storage.AccountToken) string {
 	if IsAgentIdentity(token) {
 		return AuthMethodOAuth
 	}
+	if strings.EqualFold(strings.TrimSpace(token.CredentialMode), CredentialModePersonalAccessToken) &&
+		strings.TrimSpace(token.OpenAIAPIKey) != "" {
+		return AuthMethodAccessToken
+	}
 	if method := NormalizeAuthMethod(token.AuthMethod); method != "" {
 		return method
 	}
@@ -137,6 +147,11 @@ func LooksLikeAPIKey(provider, credential string) bool {
 // the legacy encrypted column for compatibility, but callers no longer need to
 // know whether a provider key happens to live in OpenAIAPIKey or AccessToken.
 func Credential(provider string, token storage.AccountToken) string {
+	if strings.EqualFold(strings.TrimSpace(token.CredentialMode), CredentialModePersonalAccessToken) {
+		if token := strings.TrimSpace(token.OpenAIAPIKey); token != "" {
+			return token
+		}
+	}
 	if EffectiveAuthMethod(provider, token) == AuthMethodAPIKey {
 		if key := strings.TrimSpace(token.OpenAIAPIKey); key != "" {
 			return key

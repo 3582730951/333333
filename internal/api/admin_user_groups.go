@@ -152,6 +152,10 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id 
 		writeJSON(w, http.StatusOK, updated)
 	case http.MethodDelete:
 		if err := s.store.DeleteUserGroup(r.Context(), id); err != nil {
+			if errors.Is(err, storage.ErrTargetInUse) {
+				writePoolCodeError(w, http.StatusConflict, "user_group_in_use", err.Error())
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}

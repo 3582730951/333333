@@ -1,0 +1,547 @@
+.pool-app-layout {
+  min-height: 100vh;
+  background: var(--pool-bg-page);
+  color: var(--pool-text);
+}
+
+.pool-app-layout.pool-layout,
+.pool-main-layout.pool-layout {
+  display: block;
+}
+
+.pool-layout {
+  display: flex;
+  min-height: 100%;
+}
+
+.pool-main-layout {
+  min-height: 100vh;
+  width: calc(100vw - var(--pool-sidebar-width, 0px));
+  min-width: 0;
+}
+
+.pool-sider {
+  background: var(--pool-bg-surface);
+  border-right: 1px solid var(--pool-border);
+}
+
+.pool-header {
+  background: var(--pool-bg-surface);
+  border-bottom: 1px solid var(--pool-border);
+}
+
+.pool-content {
+  min-height: calc(100vh - 56px);
+  min-width: 0;
+  overflow: auto;
+}
+
+.pool-shell {
+  width: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 22px;
+}
+
+.pool-brand {
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 10px;
+  font-weight: 650;
+  letter-spacing: 0;
+  color: var(--pool-text);
+}
+
+.pool-sidebar-collapse {
+  height: 48px;
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border-top: 1px solid var(--pool-border);
+}
+
+.pool-topbar-left,
+.pool-topbar-actions {
+  min-width: 0;
+}
+
+.pool-topbar-title {
+  min-width: 0;
+}
+
+.pool-topbar-current,
+.pool-topbar-title-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-pagehead {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.pool-pagehead-copy {
+  min-width: 0;
+}
+
+.pool-pagehead .sub {
+  color: var(--pool-text-2);
+  margin-top: 4px;
+}
+
+.pool-pagehead-actions,
+.pool-page-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.pool-page-actions > * {
+  flex: 0 0 auto;
+}
+
+.pool-resource-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 180px;
+  gap: 14px;
+  align-items: start;
+}
+
+@media (max-width: 767px) {
+  .pool-app-mobile .pool-main-layout {
+    width: 100vw;
+  }
+
+  .pool-shell {
+    padding: 16px;
+  }
+
+  .pool-pagehead {
+    flex-direction: column;
+  }
+
+  .pool-pagehead-actions,
+  .pool-page-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .pool-resource-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .pool-shell {
+    padding: 12px;
+  }
+}
+
+@media (max-width: 520px) {
+  .pool-page-actions {
+    width: 100%;
+  }
+
+  .pool-page-actions > * {
+    max-width: 100%;
+  }
+}
+
+/* Apple-like shell */
+.pool-app-layout {
+  background: var(--pool-bg-page);
+}
+
+.pool-main-layout {
+  background: var(--pool-bg-page);
+}
+
+.pool-sider {
+  background: color-mix(in srgb, var(--pool-bg-surface) 96%, transparent);
+  backdrop-filter: blur(20px);
+}
+
+.pool-header {
+  background: color-mix(in srgb, var(--pool-bg-surface) 86%, transparent);
+  border-bottom: 1px solid var(--pool-border);
+  backdrop-filter: blur(20px) saturate(1.3);
+}
+
+.pool-shell {
+  max-width: 1460px;
+  padding: 24px;
+}
+
+.pool-brand {
+  padding: 0 14px;
+  font-weight: 720;
+  letter-spacing: -0.018em;
+}
+
+.pool-sidebar-collapse {
+  height: 52px;
+  padding: 8px;
+  background: color-mix(in srgb, var(--pool-bg-surface) 92%, transparent);
+}
+
+.pool-shell-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: var(--pool-bg-overlay);
+  backdrop-filter: blur(12px);
+  animation: pool-fade-in var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-shell-sider {
+  transition: width var(--pool-motion-normal) var(--pool-motion-ease), transform var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-shell-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 56px;
+  padding: 0 20px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.pool-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.pool-topbar-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--pool-text);
+  font-weight: 700;
+  letter-spacing: -0.018em;
+}
+
+.pool-topbar-title-main {
+  font-size: 14px;
+}
+
+.pool-topbar-current {
+  color: var(--pool-text-2);
+  font-weight: 500;
+}
+
+.pool-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pool-topbar-icon-button {
+  border-radius: 999px;
+}
+
+.pool-account-menu-button {
+  max-width: 280px;
+  min-width: 0;
+  gap: 8px;
+  border-radius: 999px;
+}
+
+.pool-account-menu-ident {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-account-menu-caret {
+  width: 14px;
+  height: 14px;
+  color: var(--pool-text-3);
+}
+
+.pool-pagehead {
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.pool-pagehead-copy .pool-page-title {
+  font-size: 28px;
+}
+
+.pool-pagehead .sub {
+  max-width: 760px;
+  color: var(--pool-text-2);
+  font-size: 14px;
+}
+
+.pool-pagehead-actions,
+.pool-page-actions {
+  gap: 8px;
+}
+
+@media (max-width: 767px) {
+  .pool-app-mobile .pool-main-layout {
+    width: 100vw;
+  }
+
+  .pool-shell-header {
+    height: 52px;
+    padding: 0 10px;
+  }
+
+  .pool-shell {
+    padding: 18px 14px max(24px, env(safe-area-inset-bottom));
+  }
+
+  .pool-topbar-left {
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 8px;
+  }
+
+  .pool-topbar-title {
+    flex: 1 1 auto;
+    justify-content: center;
+    font-size: 15px;
+  }
+
+  .pool-topbar-title-main {
+    display: none;
+  }
+
+  .pool-topbar-divider,
+  .pool-desktop-only {
+    display: none !important;
+  }
+
+  .pool-topbar-current {
+    color: var(--pool-text);
+    font-weight: 720;
+  }
+
+  .pool-mobile-menu-btn {
+    flex: 0 0 auto;
+  }
+
+  .pool-account-menu-button {
+    min-width: var(--pool-hit-target);
+    padding: 0;
+  }
+
+  .pool-account-menu-ident,
+  .pool-account-menu-caret {
+    display: none;
+  }
+
+  .pool-pagehead {
+    display: block;
+    margin-bottom: 16px;
+  }
+
+  .pool-pagehead-copy .pool-page-title {
+    font-size: 34px;
+    line-height: 1.05;
+    letter-spacing: -0.035em;
+  }
+
+  .pool-pagehead .sub {
+    font-size: 14px;
+  }
+
+  .pool-pagehead-actions,
+  .pool-page-actions {
+    justify-content: flex-start;
+    width: 100%;
+    margin-top: 12px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 2px;
+  }
+
+  .pool-page-actions > * {
+    flex: 0 0 auto;
+  }
+
+  .pool-sider {
+    box-shadow: var(--pool-shadow-md);
+  }
+}
+
+/* Unified application shell and deterministic screenshot readiness. */
+.pool-shell-sider {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  min-width: var(--pool-sidebar-width);
+  max-width: var(--pool-sidebar-width);
+  height: 100dvh;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--pool-bg-surface) 94%, transparent);
+  border-right: 1px solid var(--pool-border);
+  backdrop-filter: blur(24px) saturate(1.35);
+}
+
+.pool-brand {
+  flex: 0 0 60px;
+  min-height: 60px;
+  border-bottom: 1px solid var(--pool-border);
+}
+
+.pool-nav-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+.pool-main-layout {
+  width: calc(100vw - var(--pool-sidebar-width));
+  transition: margin-left var(--pool-motion-normal) var(--pool-motion-ease), width var(--pool-motion-normal) var(--pool-motion-ease);
+}
+
+.pool-route-content,
+.pool-route-content > div,
+.pool-shell,
+.pool-resource-split > * {
+  min-width: 0;
+}
+
+.pool-route-fallback {
+  display: grid;
+  gap: 18px;
+  padding: 4px 0;
+}
+
+.pool-route-fallback__title {
+  width: min(320px, 70%);
+  height: 34px;
+  border-radius: var(--pool-radius-md);
+}
+
+.pool-route-fallback__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.pool-route-fallback__metric {
+  height: 112px;
+  border-radius: var(--pool-radius-lg);
+}
+
+.pool-route-fallback__content {
+  height: 360px;
+  border-radius: var(--pool-radius-lg);
+}
+
+.pool-boot-shell {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  min-height: 100dvh;
+  background: var(--pool-bg-page);
+}
+
+.pool-boot-sidebar {
+  padding: 10px;
+  background: var(--pool-bg-surface);
+  border-right: 1px solid var(--pool-border);
+}
+
+.pool-boot-brand,
+.pool-boot-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 52px;
+}
+
+.pool-boot-brand .pool-skel:first-child,
+.pool-boot-header .pool-skel:first-child { width: 34px; height: 34px; border-radius: 50%; }
+.pool-boot-brand .pool-skel:last-child { width: 140px; height: 18px; }
+.pool-boot-nav { height: 38px; margin: 9px 0; border-radius: var(--pool-radius-md); }
+.pool-boot-main { min-width: 0; }
+.pool-boot-header { padding: 0 22px; background: var(--pool-bg-surface); border-bottom: 1px solid var(--pool-border); }
+.pool-boot-header .pool-skel:first-child { width: 180px; height: 16px; border-radius: 6px; }
+.pool-boot-header .pool-skel:last-child { width: 36px; height: 36px; }
+.pool-boot-main > .pool-route-fallback { padding: 26px; }
+
+.pool-auth-error {
+  width: min(620px, calc(100% - 32px));
+  min-height: 100dvh;
+  margin: 0 auto;
+  display: grid;
+  align-content: center;
+  gap: 18px;
+}
+
+.pool-auth-error__brand { display: flex; align-items: center; gap: 10px; font-size: 18px; }
+
+.pool-disclosure {
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-lg);
+  background: var(--pool-bg-surface);
+  overflow: hidden;
+}
+
+.pool-disclosure > summary {
+  min-height: var(--pool-hit-target);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.pool-disclosure > :not(summary) { margin: 0 12px 12px; }
+
+.pool-settings-shell > .pool-toolbar:first-child {
+  position: sticky;
+  top: 66px;
+  z-index: 20;
+  padding: 10px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+  background: color-mix(in srgb, var(--pool-bg-elevated) 92%, transparent);
+  box-shadow: var(--pool-shadow-sm);
+  backdrop-filter: blur(18px);
+}
+
+.pool-instruction-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
+
+@media (max-width: 767px) {
+  .pool-shell-sider {
+    width: min(86vw, 304px) !important;
+    min-width: min(86vw, 304px);
+    max-width: min(86vw, 304px);
+  }
+
+  .pool-main-layout { width: 100vw; margin-left: 0 !important; }
+  .pool-route-fallback__metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pool-route-fallback__metric { height: 92px; }
+  .pool-boot-shell { grid-template-columns: 1fr; }
+  .pool-boot-sidebar { display: none; }
+  .pool-boot-main > .pool-route-fallback { padding: 18px 12px; }
+  .pool-settings-shell > .pool-toolbar:first-child { top: 58px; }
+}
+
+@media (max-width: 640px) {
+  .pool-shell {
+    padding: 14px 12px max(22px, env(safe-area-inset-bottom));
+  }
+}

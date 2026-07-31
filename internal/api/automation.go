@@ -223,6 +223,11 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 		mailboxN, smsN, captchaN = len(mgr.Mailbox), len(mgr.SMS), len(mgr.Captcha)
 	}
 	emailOTPN := s.enabledProviderKeyCount(ctx, "email", "hotmail_otp")
+	if s.regHandler != nil {
+		if ready, _, _ := s.regHandler.mailboxRelayProviderReady(ctx, "", mgr); ready {
+			emailOTPN++
+		}
+	}
 
 	accounts, accountErr := s.store.ListAccounts(ctx)
 	active := 0
@@ -264,7 +269,7 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 		blockers = append(blockers, "未配置任何 mailbox provider（邮箱验证需要）")
 	}
 	if registrationMethodRequiresEmailOTPProvider(method) && emailOTPN == 0 {
-		blockers = append(blockers, "未配置 hotmail_otp provider（protocol_v2/browser_v3 需要）")
+		blockers = append(blockers, "未配置可用的认证邮箱 OTP 或默认 mailbox provider（protocol_v2/browser_v3 需要）")
 	}
 	if registrationMethodRequiresSMSProvider(method, identityMode) && smsN == 0 {
 		blockers = append(blockers, "identity_mode=sms 但未配置任何 SMS provider")

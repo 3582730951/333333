@@ -1,0 +1,53 @@
+--- a/web-spa/src/styles/components.css
++++ b/web-spa/src/styles/components.css
+@@ -2947,7 +2947,27 @@
+ }
+ 
+ .pool-email-address {
++  display: block;
++  width: 100%;
+   max-width: 100%;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  overflow-wrap: normal;
++}
++
++.pool-email-table .pool-table td {
++  overflow: hidden;
++}
++
++.pool-email-table .pool-text-clamp {
++  display: block;
++  width: 100%;
++  max-width: 100%;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++  overflow-wrap: normal;
+ }
+ 
+ .pool-email-row-actions {
+--- a/web-spa/tests/email-pool-responsive.test.tsx
++++ b/web-spa/tests/email-pool-responsive.test.tsx
+@@ -1,4 +1,6 @@
+ import React from 'react';
++import { readFileSync } from 'node:fs';
++import { resolve } from 'node:path';
+ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+ import { fireEvent, render, screen, within } from '@testing-library/react';
+ import { http, HttpResponse } from 'msw';
+@@ -14,6 +16,13 @@
+ const longEmail = 'registration-automation-production-owner-with-an-extraordinarily-long-identity@subdomain.sample.test';
+ 
+ describe('email pool responsive presentation', () => {
++  it('hard-clips every desktop text cell so long mailbox identities cannot cross columns', () => {
++    const css = readFileSync(resolve(process.cwd(), 'src/styles/components.css'), 'utf8');
++    expect(css).toMatch(/\.pool-email-table \.pool-table td\s*\{[^}]*overflow:\s*hidden;/s);
++    expect(css).toMatch(/\.pool-email-table \.pool-text-clamp\s*\{[^}]*display:\s*block;[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s);
++    expect(css).toMatch(/\.pool-email-address\s*\{[^}]*display:\s*block;[^}]*width:\s*100%;[^}]*overflow:\s*hidden;/s);
++  });
++
+   it('uses compact mobile cards while preserving long identities, status, selection, and row actions', async () => {
+     server.use(http.get('*/admin/email-pool', () => HttpResponse.json({
+       accounts: [

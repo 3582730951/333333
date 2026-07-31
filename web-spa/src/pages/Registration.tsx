@@ -40,6 +40,7 @@ interface RegistrationFormValues {
   method?: string;
   registration_egress_pool_id?: string;
   sms_provider?: string;
+  mailbox_provider?: string;
 }
 
 function jobTag(status: unknown) {
@@ -59,6 +60,39 @@ function providerOptionValue(option: RegistrationProviderOption): string {
 
 function providerOptionLabel(option: RegistrationProviderOption): string {
   return typeof option === 'string' ? option : option.label;
+}
+
+export function RegistrationJobCard({ job, onOpen }: { job: RegistrationJob; onOpen: () => void }) {
+  const group = job.group_name || t('registration.default_group');
+  const egress = job.egress_id || t('registration.default_egress');
+  return (
+    <button
+      type="button"
+      className="pool-compact-record pool-registration-job-card"
+      onClick={onOpen}
+      aria-label={`${t('registration.drawer_title')} ${job.id || 'register-job'}`}
+    >
+      <span className="pool-compact-record__head">
+        <span className="pool-compact-record__identity">
+          <Clamp strong title={job.id || 'register-job'} ariaLabel={job.id || 'register-job'}>
+            {job.id || 'register-job'}
+          </Clamp>
+          <span className="pool-compact-record__chips">
+            <Tag size="small">{job.method || 'node'}</Tag>
+            {job.identity_mode ? <Tag size="small" color="blue">{job.identity_mode}</Tag> : null}
+          </span>
+        </span>
+        {jobTag(job.status)}
+      </span>
+      <Progress task={job} totalKey="total" successKey="succeeded" failedKey="failed" />
+      <span className="pool-compact-record__foot">
+        <span title={group}>{group}</span>
+        <span aria-hidden="true">·</span>
+        <span title={egress}>{egress}</span>
+        <span className="pool-compact-record__disclosure" aria-hidden="true">›</span>
+      </span>
+    </button>
+  );
 }
 
 export default function Registration() {
@@ -146,6 +180,7 @@ export default function Registration() {
         method: requestMethod,
         registration_egress_pool_id: values.registration_egress_pool_id || '',
         sms_provider: values.sms_provider || '',
+        mailbox_provider: values.mailbox_provider || '',
         identity_mode: requestIdentityMode,
         country: requestUsesCountry && strategy === 'manual' ? manualCountry : '',
       };
@@ -216,6 +251,13 @@ export default function Registration() {
       .filter((option) => !['smsbower', 'herosms'].includes(providerOptionValue(option).toLowerCase()))
       .map((option) => ({ label: providerOptionLabel(option), value: providerOptionValue(option) })),
   ];
+  const mailboxProviderOptions = [
+    { label: t('registration.mailbox_default'), value: '' },
+    ...providerOptions.mailbox.map((option) => ({
+      label: providerOptionLabel(option),
+      value: providerOptionValue(option),
+    })),
+  ];
 
   return (
     <div>
@@ -277,6 +319,16 @@ export default function Registration() {
                 onChange={(value: RegistrationIdentityMode) => setIdentityMode(value || 'phone')}
               />
             </div>
+
+            {activeIdentityMode === 'email' ? (
+              <Form.Select
+                field="mailbox_provider"
+                label={t('registration.mailbox_provider')}
+                initValue=""
+                disabled={starting || savingStrategy}
+                optionList={mailboxProviderOptions}
+              />
+            ) : null}
 
             {smsCountryRequired ? (
               <div className="pool-registration-strategy-row">
@@ -358,8 +410,12 @@ export default function Registration() {
           skeletonRows={6}
           skeletonCols={4}
           onRow={(row: RegistrationJob) => ({ onClick: () => setDetailJob(row) })}
+          mobileRenderer={(row: RegistrationJob) => (
+            <RegistrationJobCard job={row} onOpen={() => setDetailJob(row)} />
+          )}
+          mobileListLabel={t('registration.jobs')}
         />
-        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} /> : null}
+        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} className="pool-registration-metrics" /> : null}
       </div>
       <DetailDrawer
         task={detailJob}

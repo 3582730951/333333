@@ -1,0 +1,53 @@
+{
+  "phase": "deploy",
+  "services": {
+    "frontend": {
+      "paths": {
+        "/admin/accounts?page=1&pageSize=1": {
+          "bytes": 1655,
+          "status": 200
+        },
+        "/admin/email-pool/cloudflare": {
+          "bytes": 483,
+          "status": 200
+        },
+        "/admin/register/readiness": {
+          "bytes": 1219,
+          "status": 200
+        },
+        "/admin/team-lifecycle/stats": {
+          "bytes": 233,
+          "status": 200
+        },
+        "/console/": {
+          "bytes": 1151,
+          "status": 200
+        }
+      }
+    },
+    "main": {
+      "paths": {
+        "/admin/accounts?page=1&pageSize=1": {
+          "bytes": 3452,
+          "status": 200
+        },
+        "/admin/email-pool/cloudflare": {
+          "bytes": 483,
+          "status": 200
+        },
+        "/admin/register/readiness": {
+          "bytes": 1218,
+          "status": 200
+        },
+        "/admin/team-lifecycle/stats": {
+          "bytes": 233,
+          "status": 200
+        },
+        "/console/": {
+          "bytes": 1151,
+          "status": 200
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,239 @@
+{
+  "banned_accounts": {
+    "events": {
+      "delete_failed": 0,
+      "deleted": 0,
+      "discovered": 3
+    },
+    "unique_accounts": {
+      "delete_failed": 0,
+      "deleted": 0,
+      "discovered": 2
+    }
+  },
+  "billing_holds": {
+    "current_fresh_held": 8,
+    "expired_unsettled": 0,
+    "historical_stale_held": 0,
+    "oldest_fresh_held_age_seconds": 2803
+  },
+  "codex_cpa": {
+    "active": 1598,
+    "ambiguous": 108,
+    "bindings_created": 128,
+    "enabled": true,
+    "eof_compensations": 13,
+    "epoch_rotations": 15,
+    "fresh_roots_after_context_loss": 14,
+    "instruction_policy_groups": 8,
+    "namespace_count": 25,
+    "native_continues": 2,
+    "retention_days": 7,
+    "retired": 40,
+    "stateless_passthrough": false,
+    "strict_cpa": true,
+    "unidentified": 48
+  },
+  "current_state": {
+    "fresh_billing_holds": 8,
+    "groups": {
+      "claude": {
+        "active": 0,
+        "providers": {},
+        "cooldown": 0,
+        "recheck_pending": 0,
+        "rate_limit_cooldown": 0
+      },
+      "cyber": {
+        "active": 1,
+        "providers": {
+          "antigravity": 1
+        },
+        "cooldown": 0,
+        "recheck_pending": 0,
+        "rate_limit_cooldown": 0
+      },
+      "gpt-plus-备用2(可破甲)": {
+        "active": 5,
+        "providers": {
+          "codex": 5
+        },
+        "cooldown": 3,
+        "recheck_pending": 4,
+        "rate_limit_cooldown": 5
+      },
+      "gpt-plus-正常(备用1)": {
+        "active": 5,
+        "providers": {
+          "codex": 5
+        },
+        "cooldown": 3,
+        "recheck_pending": 3,
+        "rate_limit_cooldown": 5
+      },
+      "gpt-pro": {
+        "active": 1,
+        "providers": {
+          "codex": 1
+        },
+        "cooldown": 0,
+        "recheck_pending": 0,
+        "rate_limit_cooldown": 0
+      }
+    },
+    "stale_historical_holds": 0
+  },
+  "goal_continuity": {
+    "sessions": 35,
+    "storage_bytes": 268435116,
+    "resume_recovered": 1052,
+    "resume_ambiguous": 0,
+    "stream_terminal_synthesized": 2,
+    "persistence_degraded": 5876,
+    "history_replaced": 0,
+    "compaction_completed": 160
+  },
+  "goal_policy": {
+    "compression_chunk_ratio": 0.7,
+    "compression_concurrency": 1,
+    "compression_max_stages": 16,
+    "continuity_enabled": true,
+    "heartbeat_seconds": 15,
+    "lease_seconds": 90,
+    "legacy_journal_dual_write": true,
+    "retention_days": 7,
+    "sources": {
+      "goal_compression_chunk_ratio": "bootstrap_config",
+      "goal_compression_concurrency": "bootstrap_config",
+      "goal_compression_max_stages": "bootstrap_config",
+      "goal_continuity_enabled": "bootstrap_config",
+      "goal_heartbeat_seconds": "bootstrap_config",
+      "goal_lease_seconds": "bootstrap_config",
+      "goal_legacy_journal_dual_write": "bootstrap_config",
+      "goal_retention_days": "bootstrap_config",
+      "goal_storage_max_mb": "bootstrap_config"
+    },
+    "storage_max_bytes": 268435456,
+    "storage_max_mb": 256
+  },
+  "groups": {
+    "claude": {
+      "active": 0,
+      "providers": {},
+      "cooldown": 0,
+      "recheck_pending": 0,
+      "rate_limit_cooldown": 0
+    },
+    "cyber": {
+      "active": 1,
+      "providers": {
+        "antigravity": 1
+      },
+      "cooldown": 0,
+      "recheck_pending": 0,
+      "rate_limit_cooldown": 0
+    },
+    "gpt-plus-备用2(可破甲)": {
+      "active": 5,
+      "providers": {
+        "codex": 5
+      },
+      "cooldown": 3,
+      "recheck_pending": 4,
+      "rate_limit_cooldown": 5
+    },
+    "gpt-plus-正常(备用1)": {
+      "active": 5,
+      "providers": {
+        "codex": 5
+      },
+      "cooldown": 3,
+      "recheck_pending": 3,
+      "rate_limit_cooldown": 5
+    },
+    "gpt-pro": {
+      "active": 1,
+      "providers": {
+        "codex": 1
+      },
+      "cooldown": 0,
+      "recheck_pending": 0,
+      "rate_limit_cooldown": 0
+    }
+  },
+  "health_test_models": {
+    "claude-opus-4-6-thinking": 1,
+    "claude-sonnet-4-5": 7,
+    "gpt-5.6-sol": 14
+  },
+  "last_24h": {
+    "routing_409_events": {},
+    "health_test_events_by_model": {
+      "claude-opus-4-6-thinking": 1,
+      "claude-sonnet-4-5": 7,
+      "gpt-5.6-sol": 14
+    },
+    "banned_accounts": {
+      "events": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 3
+      },
+      "unique_accounts": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 2
+      }
+    },
+    "billing_hold_events_by_status": {
+      "failed_before_response": 2,
+      "failed_upstream": 13,
+      "held": 8,
+      "settled_streaming": 8186,
+      "stream_interrupted_compensated": 44,
+      "stream_mapped_session_risk_rotating": 5,
+      "stream_retryable_error_retry": 2,
+      "websocket_fallback_context_recovering": 63
+    }
+  },
+  "lifetime": {
+    "routing_409_events": {},
+    "health_test_events_by_model": {
+      "claude-opus-4-6-thinking": 1,
+      "claude-sonnet-4-5": 7,
+      "gpt-5.6-sol": 14
+    },
+    "banned_accounts": {
+      "events": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 3
+      },
+      "unique_accounts": {
+        "delete_failed": 0,
+        "deleted": 0,
+        "discovered": 2
+      }
+    },
+    "billing_hold_events_by_status": {
+      "failed_before_response": 2,
+      "failed_upstream": 13,
+      "held": 8,
+      "settled_streaming": 8186,
+      "stream_interrupted_compensated": 44,
+      "stream_mapped_session_risk_rotating": 5,
+      "stream_retryable_error_retry": 2,
+      "websocket_fallback_context_recovering": 63
+    }
+  },
+  "routing_409": {},
+  "usage_journal": {
+    "acked_sequence": 4101,
+    "bytes": 2634483,
+    "enabled": true,
+    "healthy": true,
+    "next_sequence": 4102,
+    "pending_records": 0,
+    "segments": 1
+  }
+}

@@ -12,6 +12,7 @@ export interface RouteDefinition {
   lazyLoader: () => Promise<{ default: React.ComponentType<any> }>;
   prefetch?: 'eager' | 'idle' | 'never';
   legacy?: boolean;
+  navHidden?: boolean;
 }
 
 export interface ApiError extends Error {

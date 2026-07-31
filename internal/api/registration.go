@@ -3,7 +3,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,7 @@ type Handler struct {
 	httpClient *http.Client
 	pipeline   *pipeline.Pipeline
 	cfg        *config.Config
+	pipelineMu sync.RWMutex
 
 	defaultMethod string // registration engine when a trigger names none (boot default)
 	defaultGroup  string // account group when a trigger names none (boot default)
@@ -498,7 +501,17 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		}
 	}
 	req.SMSProvider = strings.ToLower(strings.TrimSpace(req.SMSProvider))
-	req.MailboxProvider = strings.TrimSpace(req.MailboxProvider)
+	req.MailboxProvider = strings.ToLower(strings.TrimSpace(req.MailboxProvider))
+	if req.MailboxProvider == "" && req.IdentityMode == "email" {
+		if value, ok := h.setting(ctx, "reg_default_mailbox"); ok {
+			req.MailboxProvider = strings.ToLower(strings.TrimSpace(value))
+		}
+	}
+	var mailboxDomainErr error
+	req.MailboxDomain, mailboxDomainErr = storage.NormalizeMailboxDomain(req.MailboxDomain)
+	if mailboxDomainErr != nil {
+		return invalidRegisterRequest("mailbox_domain: %v", mailboxDomainErr)
+	}
 	req.CaptchaSolver = strings.TrimSpace(req.CaptchaSolver)
 	return nil
 }
@@ -544,9 +557,18 @@ func (h *Handler) ReloadProviders(ctx context.Context) error {
 	}
 	// cfg is nil here — ReloadProviders is called after save, the pipeline already has
 	// its original cfg from NewHandler. We keep the same pipeline's httpClient/cfg.
-	h.pipeline = pipeline.NewPipeline(h.store, mgr, h.up, h.cfg)
-	h.pipeline.LogEvent = h.logEventDetail
+	next := pipeline.NewPipeline(h.store, mgr, h.up, h.cfg)
+	next.LogEvent = h.logEventDetail
+	h.pipelineMu.Lock()
+	h.pipeline = next
+	h.pipelineMu.Unlock()
 	return nil
+}
+
+func (h *Handler) currentPipeline() *pipeline.Pipeline {
+	h.pipelineMu.RLock()
+	defer h.pipelineMu.RUnlock()
+	return h.pipeline
 }
 
 // HandleRegisterBatch starts a batch registration job
@@ -595,6 +617,39 @@ func (h *Handler) StartJob(ctx context.Context, req pipeline.RegisterRequest) (s
 		return "", invalidRegisterRequest("canary jobs must use /admin/register/canary")
 	}
 	return h.startRegistrationJob(ctx, req, false)
+}
+
+// EnqueueLifecycleReplacement reuses the exact registration readiness, canary,
+// egress-pool, provider, concurrency, and persistence gates used by manual and
+// refill jobs. The team workflow never grows a second registration stack.
+func (h *Handler) EnqueueLifecycleReplacement(ctx context.Context, workflow storage.TeamLifecycleWorkflow) (string, error) {
+	if h == nil {
+		return "", errRegistrationNotReady
+	}
+	method := h.defaultMethod
+	if candidate := strings.TrimSpace(workflow.ReplacementMethod); candidate != "" {
+		method = candidate
+	}
+	identityMode := ""
+	if strings.TrimSpace(workflow.MailboxProviderKey) != "" ||
+		strings.TrimSpace(workflow.RequiredEmailDomain) != "" {
+		identityMode = "email"
+	}
+	return h.StartJob(ctx, pipeline.RegisterRequest{
+		Platform:                        "chatgpt",
+		Method:                          method,
+		Count:                           1,
+		GroupName:                       h.defaultGroup,
+		IdentityMode:                    identityMode,
+		MailboxProvider:                 workflow.MailboxProviderKey,
+		MailboxDomain:                   workflow.RequiredEmailDomain,
+		TeamLifecycleSourceWorkflowID:   workflow.ID,
+		TeamLifecycleWorkspaceID:        workflow.WorkspaceID,
+		TeamLifecycleParentAccountID:    workflow.ParentAccountID,
+		TeamLifecycleReplacementMethod:  method,
+		TeamLifecycleRotateThresholdBPS: workflow.RotateThresholdBPS,
+		TeamLifecycleMaxAttempts:        workflow.MaxAttempts,
+	})
 }
 
 func (h *Handler) StartCanary(ctx context.Context, req pipeline.RegisterRequest) (string, error) {
@@ -771,10 +826,21 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		}
 		var account *storage.Account
 		if err == nil {
-			account, err = h.pipeline.RegisterOne(ctx, workerReq)
+			activePipeline := h.currentPipeline()
+			if activePipeline == nil {
+				err = errors.New("registration pipeline is not initialized")
+			} else {
+				// Snapshot one immutable pipeline for the complete attempt. A provider
+				// reload affects the next attempt and cannot swap dependencies midway
+				// through a browser/OAuth transaction.
+				account, err = activePipeline.RegisterOne(ctx, workerReq)
+			}
 		}
 		if err == nil && account != nil {
 			err = h.bindRegisteredAccountToRuntimePool(ctx, workerReq, account.ID)
+		}
+		if err == nil && account != nil {
+			err = h.enqueueRegisteredTeamLifecycle(ctx, workerReq, account.ID)
 		}
 		duration := int(time.Since(start).Seconds())
 		bg, cancel := registrationPersistenceContext(ctx)
@@ -862,6 +928,38 @@ func (h *Handler) bindRegisteredAccountToRuntimePool(ctx context.Context, req pi
 	_ = ctx
 	_ = req
 	_ = accountID
+	return nil
+}
+
+func (h *Handler) enqueueRegisteredTeamLifecycle(
+	ctx context.Context,
+	req pipeline.RegisterRequest,
+	accountID string,
+) error {
+	workspaceID := strings.TrimSpace(req.TeamLifecycleWorkspaceID)
+	if workspaceID == "" {
+		return nil
+	}
+	source := strings.TrimSpace(req.TeamLifecycleSourceWorkflowID)
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		"team-replacement", source, workspaceID, strings.TrimSpace(accountID),
+	}, "\x00")))
+	idempotencyKey := "team-replacement:" + hex.EncodeToString(sum[:16])
+	_, _, err := h.store.CreateTeamLifecycleWorkflow(ctx, storage.CreateTeamLifecycleWorkflowInput{
+		IdempotencyKey:      idempotencyKey,
+		WorkspaceID:         workspaceID,
+		ParentAccountID:     req.TeamLifecycleParentAccountID,
+		ChildAccountID:      accountID,
+		ReplacementMethod:   req.TeamLifecycleReplacementMethod,
+		MailboxProviderKey:  req.MailboxProvider,
+		RequiredEmailDomain: req.MailboxDomain,
+		RotateThresholdBPS:  req.TeamLifecycleRotateThresholdBPS,
+		MaxAttempts:         req.TeamLifecycleMaxAttempts,
+		ShadowMode:          false,
+	})
+	if err != nil {
+		return fmt.Errorf("enqueue next team lifecycle: %w", err)
+	}
 	return nil
 }
 
@@ -1541,6 +1639,14 @@ func normalizeProviderInput(p providerInput) (providerInput, error) {
 	}
 	if p.Config == nil {
 		p.Config = map[string]interface{}{}
+	}
+	if p.Type == "mailbox" {
+		switch providerKey := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(p.Key, "_", ""), "-", "")); providerKey {
+		case "cloudflare", "moemail", "freemail", "cftempemail", "cfworker":
+			if strings.TrimSpace(cfgString(p.Config["adapter"])) == "" {
+				p.Config["adapter"] = cloudflareMailboxAdapter
+			}
+		}
 	}
 	return p, nil
 }

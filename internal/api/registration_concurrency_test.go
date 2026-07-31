@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/registration/pipeline"
 	"codex-account-pool/internal/storage"
 )
@@ -125,6 +126,46 @@ func TestRegistrationPersistenceContextIsDetachedButBounded(t *testing.T) {
 	if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > registrationPersistenceTimeout+time.Second {
 		t.Fatalf("unexpected persistence deadline: %v (present=%v)", deadline, ok)
 	}
+}
+
+func TestRegistrationProviderReloadUsesAtomicPipelineSnapshots(t *testing.T) {
+	store, err := storage.OpenInMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	handler := NewHandler(store, nil, "protocol_v2", 2, &cfg)
+
+	var wait sync.WaitGroup
+	for reader := 0; reader < 8; reader++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for iteration := 0; iteration < 1000; iteration++ {
+				if handler.currentPipeline() == nil {
+					t.Error("pipeline snapshot is nil")
+					return
+				}
+			}
+		}()
+	}
+	for reloader := 0; reloader < 4; reloader++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for iteration := 0; iteration < 25; iteration++ {
+				if err := handler.ReloadProviders(context.Background()); err != nil {
+					t.Errorf("reload providers: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
 }
 
 func TestProcessBatchRecordsWorkerPanicAsFailure(t *testing.T) {

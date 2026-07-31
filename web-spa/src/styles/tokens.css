@@ -24,6 +24,12 @@ html[data-theme='dark'] {
 
   --pool-shadow-sm: 0 1px 1px rgba(0, 0, 0, 0.20), 0 10px 26px rgba(0, 0, 0, 0.22);
   --pool-shadow-md: 0 1px 2px rgba(0, 0, 0, 0.30), 0 22px 60px rgba(0, 0, 0, 0.36);
+  --pool-shadow-compact: 0 5px 16px rgba(0, 0, 0, 0.24);
+  --pool-shadow-orbit: 0 12px 28px rgba(0, 0, 0, 0.26);
+  --pool-shadow-card-lift: 0 14px 32px rgba(0, 0, 0, 0.28);
+  --pool-shadow-glass: 0 18px 42px rgba(0, 0, 0, 0.30);
+  --pool-shadow-hero: 0 20px 52px rgba(0, 0, 0, 0.32);
+  --pool-shadow-hero-lg: 0 24px 60px rgba(0, 0, 0, 0.34);
   --pool-shadow-hover: var(--pool-shadow-md);
   --pool-shadow: var(--pool-shadow-md);
 
@@ -126,6 +132,12 @@ html[data-theme='light'] {
 
   --pool-shadow-sm: 0 1px 1px rgba(0, 0, 0, 0.035), 0 10px 24px rgba(0, 0, 0, 0.055);
   --pool-shadow-md: 0 1px 2px rgba(0, 0, 0, 0.06), 0 22px 58px rgba(0, 0, 0, 0.12);
+  --pool-shadow-compact: 0 5px 16px rgba(15, 23, 42, 0.08);
+  --pool-shadow-orbit: 0 12px 28px rgba(15, 23, 42, 0.08);
+  --pool-shadow-card-lift: 0 14px 32px rgba(15, 23, 42, 0.07);
+  --pool-shadow-glass: 0 18px 42px rgba(15, 23, 42, 0.09);
+  --pool-shadow-hero: 0 20px 52px rgba(15, 23, 42, 0.07);
+  --pool-shadow-hero-lg: 0 24px 60px rgba(15, 23, 42, 0.08);
   --pool-shadow-hover: var(--pool-shadow-md);
   --pool-shadow: var(--pool-shadow-md);
 

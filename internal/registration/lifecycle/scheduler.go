@@ -16,7 +16,7 @@ import (
 // Scheduler manages periodic health checks and renewals
 type Scheduler struct {
 	store   *storage.Store
-	checker *HealthChecker
+	checker lifecycleHealthChecker
 
 	mu       sync.RWMutex
 	running  bool
@@ -30,6 +30,11 @@ type Scheduler struct {
 	// settings table on each cycle (defaults: 200 / 10).
 	batchSize   int
 	concurrency int
+}
+
+type lifecycleHealthChecker interface {
+	CheckAccount(context.Context, storage.Account) HealthStatus
+	BatchCheckAccountsN(context.Context, []storage.Account, int) []HealthStatus
 }
 
 // Statistics tracks lifecycle metrics
@@ -147,32 +152,33 @@ func (s *Scheduler) runHealthCheckCycle(ctx context.Context) {
 		concurrency = 1
 	}
 
-	// Fetch all accounts
-	accounts, err := s.store.ListAccounts(ctx)
-	if err != nil {
-		log.Printf("[lifecycle] Failed to list accounts: %v", err)
-		return
-	}
-
-	if len(accounts) == 0 {
-		log.Println("[lifecycle] No accounts to check")
-		return
-	}
-
-	log.Printf("[lifecycle] Checking %d accounts (batch=%d concurrency=%d)...", len(accounts), batchSize, concurrency)
-
 	aliveCount := int64(0)
 	deadCount := int64(0)
-
-	for start := 0; start < len(accounts); start += batchSize {
+	offset := 0
+	total := 0
+	for {
 		if ctx.Err() != nil {
 			break
 		}
-		end := start + batchSize
-		if end > len(accounts) {
-			end = len(accounts)
+		// Pull one page at a time. The previous implementation sliced bounded
+		// batches only after ListAccounts had already materialized the complete
+		// pool, defeating the memory cap on large installations.
+		batch, count, err := s.store.ListAccountsPage(ctx, batchSize, offset, "", "")
+		if err != nil {
+			log.Printf("[lifecycle] Failed to list account batch at offset %d: %v", offset, err)
+			return
 		}
-		batch := accounts[start:end]
+		if offset == 0 {
+			total = count
+			if total == 0 {
+				log.Println("[lifecycle] No accounts to check")
+				return
+			}
+			log.Printf("[lifecycle] Checking %d accounts (batch=%d concurrency=%d)...", total, batchSize, concurrency)
+		}
+		if len(batch) == 0 {
+			break
+		}
 		results := s.checker.BatchCheckAccountsN(ctx, batch, concurrency)
 
 		for i, result := range results {
@@ -194,6 +200,10 @@ func (s *Scheduler) runHealthCheckCycle(ctx context.Context) {
 				_ = s.store.SetAccountQuarantine(ctx, account.ID,
 					time.Now().Add(24*time.Hour).Unix(), result.ErrorReason)
 			}
+		}
+		offset += len(batch)
+		if len(batch) < batchSize || offset >= total {
+			break
 		}
 	}
 

@@ -1,0 +1,29 @@
+{
+  "phase": "rollback",
+  "services": {
+    "frontend": {
+      "paths": {
+        "/admin/accounts?page=1&pageSize=1": {
+          "bytes": 1655,
+          "status": 200
+        },
+        "/console/": {
+          "bytes": 1151,
+          "status": 200
+        }
+      }
+    },
+    "main": {
+      "paths": {
+        "/admin/accounts?page=1&pageSize=1": {
+          "bytes": 3452,
+          "status": 200
+        },
+        "/console/": {
+          "bytes": 1151,
+          "status": 200
+        }
+      }
+    }
+  }
+}

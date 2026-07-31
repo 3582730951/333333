@@ -1,0 +1,68 @@
+{
+  "captured_at": "2026-07-31T03:11:34.968Z",
+  "total": 4,
+  "passed": 4,
+  "issues": 0,
+  "results": [
+    {
+      "name": "desktop-light",
+      "file": "desktop-light-team-lifecycle.png",
+      "theme": "light",
+      "h1": "团队生命周期",
+      "hero": true,
+      "rows": 4,
+      "horizontalOverflow": false,
+      "activeText": true,
+      "thresholdText": true,
+      "longIdentityVisible": true,
+      "failedResponses": [],
+      "consoleErrors": [],
+      "ok": true
+    },
+    {
+      "name": "desktop-dark",
+      "file": "desktop-dark-team-lifecycle.png",
+      "theme": "dark",
+      "h1": "团队生命周期",
+      "hero": true,
+      "rows": 4,
+      "horizontalOverflow": false,
+      "activeText": true,
+      "thresholdText": true,
+      "longIdentityVisible": true,
+      "failedResponses": [],
+      "consoleErrors": [],
+      "ok": true
+    },
+    {
+      "name": "mobile-light",
+      "file": "mobile-light-team-lifecycle.png",
+      "theme": "light",
+      "h1": "团队生命周期",
+      "hero": true,
+      "rows": 4,
+      "horizontalOverflow": false,
+      "activeText": true,
+      "thresholdText": true,
+      "longIdentityVisible": true,
+      "failedResponses": [],
+      "consoleErrors": [],
+      "ok": true
+    },
+    {
+      "name": "mobile-dark",
+      "file": "mobile-dark-team-lifecycle.png",
+      "theme": "dark",
+      "h1": "团队生命周期",
+      "hero": true,
+      "rows": 4,
+      "horizontalOverflow": false,
+      "activeText": true,
+      "thresholdText": true,
+      "longIdentityVisible": true,
+      "failedResponses": [],
+      "consoleErrors": [],
+      "ok": true
+    }
+  ]
+}

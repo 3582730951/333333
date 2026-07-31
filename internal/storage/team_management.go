@@ -1,196 +1,360 @@
 package storage
 
-// ChatGPT Team 空间管理相关的数据结构和SQL schema
+// Team lifecycle storage is deliberately connector-neutral. Remote membership,
+// browser, OAuth, and phone-provider implementations exchange opaque references
+// with the workflow engine; credentials continue to live only in the encrypted
+// account_auth_tokens path.
 
 const teamManagementSchemaSQL = `
--- Team空间管理表
 CREATE TABLE IF NOT EXISTS team_workspaces (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   parent_account_id TEXT NOT NULL,
   workspace_id TEXT NOT NULL,
-  workspace_type TEXT NOT NULL DEFAULT 'chatgpt_team',
+  workspace_type TEXT NOT NULL DEFAULT 'fixture',
   max_members INTEGER NOT NULL DEFAULT 10,
   status TEXT NOT NULL DEFAULT 'active',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_team_workspaces_parent ON team_workspaces(parent_account_id);
-CREATE INDEX IF NOT EXISTS idx_team_workspaces_status ON team_workspaces(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_team_workspaces_connector_ref
+  ON team_workspaces(workspace_type, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_team_workspaces_parent
+  ON team_workspaces(parent_account_id);
+CREATE INDEX IF NOT EXISTS idx_team_workspaces_status
+  ON team_workspaces(status);
 
--- Team成员管理表
 CREATE TABLE IF NOT EXISTS team_members (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
   account_id TEXT NOT NULL,
-  email TEXT NOT NULL,
+  identity_ref TEXT NOT NULL DEFAULT '',
+  display_label TEXT NOT NULL DEFAULT '',
   invite_status TEXT NOT NULL DEFAULT 'pending',
-  codex_quota_used INTEGER NOT NULL DEFAULT 0,
-  codex_quota_limit INTEGER NOT NULL DEFAULT 0,
-  last_activity_at INTEGER,
-  last_quota_check_at INTEGER,
+  quota_remaining_bps INTEGER NOT NULL DEFAULT -1,
+  last_activity_at INTEGER NOT NULL DEFAULT 0,
+  last_quota_check_at INTEGER NOT NULL DEFAULT 0,
   added_at INTEGER NOT NULL,
-  removed_at INTEGER,
+  removed_at INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(workspace_id) REFERENCES team_workspaces(id) ON DELETE CASCADE,
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_team_members_workspace ON team_members(workspace_id, invite_status);
-CREATE INDEX IF NOT EXISTS idx_team_members_account ON team_members(account_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_team_members_workspace_account
+  ON team_members(workspace_id, account_id);
+CREATE INDEX IF NOT EXISTS idx_team_members_workspace_status
+  ON team_members(workspace_id, invite_status);
+CREATE INDEX IF NOT EXISTS idx_team_members_account
+  ON team_members(account_id);
 
--- 子账号池表
+-- This table stores account references only. Secret material is persisted through
+-- account_auth_tokens, where the deployment identity key protects it at rest.
 CREATE TABLE IF NOT EXISTS child_account_pool (
   id TEXT PRIMARY KEY,
-  email TEXT NOT NULL UNIQUE,
-  encrypted_password TEXT,
-  oauth_token TEXT,
-  oauth_refresh_token TEXT,
-  token_expires_at INTEGER,
+  account_id TEXT NOT NULL UNIQUE,
+  identity_ref TEXT NOT NULL DEFAULT '',
+  display_label TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT 'available',
-  sms_receive_method TEXT,
-  sms_api_config TEXT,
-  phone_number TEXT,
-  last_used_at INTEGER,
+  last_used_at INTEGER NOT NULL DEFAULT 0,
   use_count INTEGER NOT NULL DEFAULT 0,
-  ban_count INTEGER NOT NULL DEFAULT 0,
+  failure_count INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_child_account_pool_status ON child_account_pool(status);
-CREATE INDEX IF NOT EXISTS idx_child_account_pool_email ON child_account_pool(email);
+CREATE INDEX IF NOT EXISTS idx_child_account_pool_status
+  ON child_account_pool(status);
 
--- 成员轮换历史表
 CREATE TABLE IF NOT EXISTS member_rotation_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workspace_id TEXT NOT NULL,
-  removed_account_id TEXT,
-  removed_email TEXT,
-  removed_reason TEXT,
-  added_account_id TEXT,
-  added_email TEXT,
+  workflow_id TEXT NOT NULL DEFAULT '',
+  removed_account_id TEXT NOT NULL DEFAULT '',
+  removed_reason TEXT NOT NULL DEFAULT '',
+  added_account_id TEXT NOT NULL DEFAULT '',
   success INTEGER NOT NULL,
-  error_message TEXT,
-  duration_ms INTEGER,
+  error_class TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   FOREIGN KEY(workspace_id) REFERENCES team_workspaces(id)
 );
-CREATE INDEX IF NOT EXISTS idx_rotation_log_workspace ON member_rotation_log(workspace_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_rotation_log_time ON member_rotation_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rotation_log_workspace
+  ON member_rotation_log(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rotation_log_time
+  ON member_rotation_log(created_at DESC);
 
--- 额度监控历史表
 CREATE TABLE IF NOT EXISTS quota_check_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   workspace_id TEXT NOT NULL,
+  workflow_id TEXT NOT NULL DEFAULT '',
   account_id TEXT NOT NULL,
-  quota_used INTEGER NOT NULL,
-  quota_limit INTEGER NOT NULL,
-  quota_remaining INTEGER NOT NULL,
-  check_method TEXT NOT NULL,
+  quota_remaining_bps INTEGER NOT NULL,
+  source TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   FOREIGN KEY(workspace_id) REFERENCES team_workspaces(id),
   FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
-CREATE INDEX IF NOT EXISTS idx_quota_check_workspace ON quota_check_log(workspace_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_quota_check_account ON quota_check_log(account_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_quota_check_workspace
+  ON quota_check_log(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_quota_check_account
+  ON quota_check_log(account_id, created_at DESC);
+
+-- Durable, idempotent workflow state. Every externally visible operation gets a
+-- stable operation key derived from workflow id + state. Leases and optimistic
+-- versions prevent duplicate workers; retry state survives process restarts.
+CREATE TABLE IF NOT EXISTS team_lifecycle_workflows (
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  workspace_id TEXT NOT NULL,
+  parent_account_id TEXT NOT NULL,
+  child_account_id TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued',
+  resume_state TEXT NOT NULL DEFAULT '',
+  credential_path TEXT NOT NULL DEFAULT '',
+  membership_ref TEXT NOT NULL DEFAULT '',
+  credential_ref TEXT NOT NULL DEFAULT '',
+  phone_challenge_ref TEXT NOT NULL DEFAULT '',
+  imported_account_id TEXT NOT NULL DEFAULT '',
+  replacement_method TEXT NOT NULL DEFAULT '',
+  replacement_job_ref TEXT NOT NULL DEFAULT '',
+  quota_remaining_bps INTEGER NOT NULL DEFAULT -1,
+  rotate_threshold_bps INTEGER NOT NULL DEFAULT 100,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 5,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_expires_at INTEGER NOT NULL DEFAULT 0,
+  error_class TEXT NOT NULL DEFAULT '',
+  shadow_mode INTEGER NOT NULL DEFAULT 1,
+  version INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  completed_at INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(workspace_id) REFERENCES team_workspaces(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_team_lifecycle_due
+  ON team_lifecycle_workflows(state, next_attempt_at, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_team_lifecycle_workspace
+  ON team_lifecycle_workflows(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_team_lifecycle_child
+  ON team_lifecycle_workflows(child_account_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS team_lifecycle_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workflow_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  from_state TEXT NOT NULL,
+  to_state TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  detail_json TEXT NOT NULL DEFAULT '{}',
+  created_at INTEGER NOT NULL,
+  UNIQUE(workflow_id, sequence),
+  FOREIGN KEY(workflow_id) REFERENCES team_lifecycle_workflows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_team_lifecycle_events_workflow
+  ON team_lifecycle_events(workflow_id, sequence);
 `
 
-// TeamWorkspace 表示一个 ChatGPT Team 工作区
 type TeamWorkspace struct {
-	ID              string
-	Name            string
-	ParentAccountID string
-	WorkspaceID     string
-	WorkspaceType   string
-	MaxMembers      int
-	Status          string
-	CreatedAt       int64
-	UpdatedAt       int64
+	ID                  string `json:"id"`
+	Name                string `json:"name"`
+	ParentAccountID     string `json:"parent_account_id"`
+	WorkspaceRef        string `json:"workspace_ref"`
+	ConnectorKind       string `json:"connector_kind"`
+	MaxMembers          int    `json:"max_members"`
+	Status              string `json:"status"`
+	MailboxProviderKey  string `json:"mailbox_provider_key,omitempty"`
+	RequiredEmailDomain string `json:"required_email_domain,omitempty"`
+	SameDomainRequired  bool   `json:"same_domain_required"`
+	CreatedAt           int64  `json:"created_at"`
+	UpdatedAt           int64  `json:"updated_at"`
 }
 
-// TeamMember 表示 Team 中的一个成员
 type TeamMember struct {
-	ID                string
-	WorkspaceID       string
-	AccountID         string
-	Email             string
-	InviteStatus      string
-	CodexQuotaUsed    int64
-	CodexQuotaLimit   int64
-	LastActivityAt    int64
-	LastQuotaCheckAt  int64
-	AddedAt           int64
-	RemovedAt         int64
+	ID                string `json:"id"`
+	WorkspaceID       string `json:"workspace_id"`
+	AccountID         string `json:"account_id"`
+	IdentityRef       string `json:"identity_ref,omitempty"`
+	DisplayLabel      string `json:"display_label,omitempty"`
+	InviteStatus      string `json:"invite_status"`
+	QuotaRemainingBPS int    `json:"quota_remaining_bps"`
+	LastActivityAt    int64  `json:"last_activity_at"`
+	LastQuotaCheckAt  int64  `json:"last_quota_check_at"`
+	AddedAt           int64  `json:"added_at"`
+	RemovedAt         int64  `json:"removed_at"`
 }
 
-// ChildAccount 表示子账号池中的账号
 type ChildAccount struct {
-	ID                 string
-	Email              string
-	EncryptedPassword  string
-	OAuthToken         string
-	OAuthRefreshToken  string
-	TokenExpiresAt     int64
-	Status             string
-	SMSReceiveMethod   string
-	SMSAPIConfig       string
-	PhoneNumber        string
-	LastUsedAt         int64
-	UseCount           int
-	BanCount           int
-	CreatedAt          int64
-	UpdatedAt          int64
+	ID           string `json:"id"`
+	AccountID    string `json:"account_id"`
+	IdentityRef  string `json:"identity_ref,omitempty"`
+	DisplayLabel string `json:"display_label,omitempty"`
+	Status       string `json:"status"`
+	LastUsedAt   int64  `json:"last_used_at"`
+	UseCount     int    `json:"use_count"`
+	FailureCount int    `json:"failure_count"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
 }
 
-// MemberRotationLog 表示成员轮换历史记录
 type MemberRotationLog struct {
-	ID                int64
-	WorkspaceID       string
-	RemovedAccountID  string
-	RemovedEmail      string
-	RemovedReason     string
-	AddedAccountID    string
-	AddedEmail        string
-	Success           bool
-	ErrorMessage      string
-	DurationMs        int64
-	CreatedAt         int64
+	ID               int64  `json:"id"`
+	WorkspaceID      string `json:"workspace_id"`
+	WorkflowID       string `json:"workflow_id"`
+	RemovedAccountID string `json:"removed_account_id,omitempty"`
+	RemovedReason    string `json:"removed_reason,omitempty"`
+	AddedAccountID   string `json:"added_account_id,omitempty"`
+	Success          bool   `json:"success"`
+	ErrorClass       string `json:"error_class,omitempty"`
+	DurationMS       int64  `json:"duration_ms"`
+	CreatedAt        int64  `json:"created_at"`
 }
 
-// QuotaCheckLog 表示额度检查历史记录
 type QuotaCheckLog struct {
-	ID              int64
-	WorkspaceID     string
-	AccountID       string
-	QuotaUsed       int64
-	QuotaLimit      int64
-	QuotaRemaining  int64
-	CheckMethod     string
-	CreatedAt       int64
+	ID                int64  `json:"id"`
+	WorkspaceID       string `json:"workspace_id"`
+	WorkflowID        string `json:"workflow_id"`
+	AccountID         string `json:"account_id"`
+	QuotaRemainingBPS int    `json:"quota_remaining_bps"`
+	Source            string `json:"source"`
+	CreatedAt         int64  `json:"created_at"`
 }
 
-// 状态常量
 const (
-	// TeamWorkspace 状态
 	TeamWorkspaceStatusActive   = "active"
 	TeamWorkspaceStatusPaused   = "paused"
 	TeamWorkspaceStatusDisabled = "disabled"
 
-	// TeamMember 邀请状态
 	TeamMemberInviteStatusPending  = "pending"
 	TeamMemberInviteStatusActive   = "active"
 	TeamMemberInviteStatusRemoved  = "removed"
 	TeamMemberInviteStatusRejected = "rejected"
 
-	// ChildAccount 状态
 	ChildAccountStatusAvailable      = "available"
 	ChildAccountStatusInUse          = "in_use"
 	ChildAccountStatusQuotaExhausted = "quota_exhausted"
 	ChildAccountStatusBanned         = "banned"
 	ChildAccountStatusTokenInvalid   = "token_invalid"
 
-	// 轮换原因
-	RotationReasonQuotaExhausted = "quota_exhausted"
+	RotationReasonQuotaThreshold = "quota_threshold"
 	RotationReasonBanned         = "banned"
 	RotationReasonTokenInvalid   = "token_invalid"
 	RotationReasonManual         = "manual"
 	RotationReasonAutoRotation   = "auto_rotation"
 )
+
+const (
+	TeamLifecycleQueued              = "queued"
+	TeamLifecycleInviting            = "inviting"
+	TeamLifecycleResolvingCredential = "resolving_credential"
+	TeamLifecycleCredentialLogin     = "credential_login"
+	TeamLifecycleOAuthLogin          = "oauth_login"
+	TeamLifecyclePhoneVerification   = "phone_verification"
+	TeamLifecycleImporting           = "importing"
+	TeamLifecycleActive              = "active"
+	TeamLifecycleRemoving            = "removing"
+	TeamLifecycleEnqueueReplacement  = "enqueue_replacement"
+	TeamLifecycleRetryWait           = "retry_wait"
+	TeamLifecycleReviewRequired      = "review_required"
+	TeamLifecycleCompleted           = "completed"
+	TeamLifecycleCancelled           = "cancelled"
+)
+
+func IsTerminalTeamLifecycleState(state string) bool {
+	switch state {
+	case TeamLifecycleReviewRequired, TeamLifecycleCompleted, TeamLifecycleCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidTeamLifecycleState(state string) bool {
+	switch state {
+	case TeamLifecycleQueued, TeamLifecycleInviting, TeamLifecycleResolvingCredential,
+		TeamLifecycleCredentialLogin, TeamLifecycleOAuthLogin, TeamLifecyclePhoneVerification,
+		TeamLifecycleImporting, TeamLifecycleActive, TeamLifecycleRemoving,
+		TeamLifecycleEnqueueReplacement, TeamLifecycleRetryWait,
+		TeamLifecycleReviewRequired, TeamLifecycleCompleted, TeamLifecycleCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+type TeamLifecycleWorkflow struct {
+	ID                  string `json:"id"`
+	IdempotencyKey      string `json:"idempotency_key"`
+	WorkspaceID         string `json:"workspace_id"`
+	ParentAccountID     string `json:"parent_account_id"`
+	ChildAccountID      string `json:"child_account_id"`
+	State               string `json:"state"`
+	ResumeState         string `json:"resume_state,omitempty"`
+	CredentialPath      string `json:"credential_path,omitempty"`
+	MembershipRef       string `json:"membership_ref,omitempty"`
+	CredentialRef       string `json:"credential_ref,omitempty"`
+	PhoneChallengeRef   string `json:"phone_challenge_ref,omitempty"`
+	ImportedAccountID   string `json:"imported_account_id,omitempty"`
+	ReplacementMethod   string `json:"replacement_method,omitempty"`
+	ReplacementJobRef   string `json:"replacement_job_ref,omitempty"`
+	MailboxProviderKey  string `json:"mailbox_provider_key,omitempty"`
+	RequiredEmailDomain string `json:"required_email_domain,omitempty"`
+	QuotaRemainingBPS   int    `json:"quota_remaining_bps"`
+	RotateThresholdBPS  int    `json:"rotate_threshold_bps"`
+	Attempt             int    `json:"attempt"`
+	MaxAttempts         int    `json:"max_attempts"`
+	NextAttemptAt       int64  `json:"next_attempt_at"`
+	LeaseOwner          string `json:"-"`
+	LeaseExpiresAt      int64  `json:"-"`
+	ErrorClass          string `json:"error_class,omitempty"`
+	ShadowMode          bool   `json:"shadow_mode"`
+	Version             int64  `json:"version"`
+	CreatedAt           int64  `json:"created_at"`
+	UpdatedAt           int64  `json:"updated_at"`
+	CompletedAt         int64  `json:"completed_at"`
+}
+
+type TeamLifecycleEvent struct {
+	ID         int64  `json:"id"`
+	WorkflowID string `json:"workflow_id"`
+	Sequence   int64  `json:"sequence"`
+	FromState  string `json:"from_state"`
+	ToState    string `json:"to_state"`
+	EventType  string `json:"event_type"`
+	DetailJSON string `json:"detail_json"`
+	CreatedAt  int64  `json:"created_at"`
+}
+
+type CreateTeamLifecycleWorkflowInput struct {
+	ID                  string
+	IdempotencyKey      string
+	WorkspaceID         string
+	ParentAccountID     string
+	ChildAccountID      string
+	ReplacementMethod   string
+	MailboxProviderKey  string
+	RequiredEmailDomain string
+	RotateThresholdBPS  int
+	MaxAttempts         int
+	ShadowMode          bool
+}
+
+type TeamLifecycleUpdate struct {
+	ToState           string
+	ResumeState       string
+	CredentialPath    string
+	MembershipRef     string
+	CredentialRef     string
+	PhoneChallengeRef string
+	ImportedAccountID string
+	ReplacementJobRef string
+	QuotaRemainingBPS int
+	SetQuota          bool
+	Attempt           int
+	NextAttemptAt     int64
+	ErrorClass        string
+	ClearError        bool
+	ClearResume       bool
+	CompletedAt       int64
+	EventType         string
+	EventDetailJSON   string
+}

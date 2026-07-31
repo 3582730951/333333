@@ -1,0 +1,2364 @@
+diff --git a/internal/api/admin_user_groups.go b/internal/api/admin_user_groups.go
+index bfcc887..bd125cc 100644
+--- a/internal/api/admin_user_groups.go
++++ b/internal/api/admin_user_groups.go
+@@ -152,6 +152,10 @@ func (s *Server) adminUserGroupsItem(w http.ResponseWriter, r *http.Request, id
+ 		writeJSON(w, http.StatusOK, updated)
+ 	case http.MethodDelete:
+ 		if err := s.store.DeleteUserGroup(r.Context(), id); err != nil {
++			if errors.Is(err, storage.ErrTargetInUse) {
++				writePoolCodeError(w, http.StatusConflict, "user_group_in_use", err.Error())
++				return
++			}
+ 			writeError(w, http.StatusInternalServerError, err)
+ 			return
+ 		}
+diff --git a/internal/api/admin_user_groups_test.go b/internal/api/admin_user_groups_test.go
+index 6d3b40e..9b704ac 100644
+--- a/internal/api/admin_user_groups_test.go
++++ b/internal/api/admin_user_groups_test.go
+@@ -80,3 +80,62 @@ func TestAdminUserGroupsRejectsEmptyTargets(t *testing.T) {
+ 		t.Fatalf("POST empty targets = %d, want 400: %s", code, raw)
+ 	}
+ }
++
++func TestAdminUserGroupsTrafficFallbackRoundTrip(t *testing.T) {
++	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
++	fallback := storage.UserGroup{
++		ID:      "ug_api_fallback",
++		Name:    "api-fallback",
++		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}},
++	}
++	if err := h.store.CreateUserGroupDefinition(t.Context(), fallback); err != nil {
++		t.Fatal(err)
++	}
++	code, raw := grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
++		"name":"api-fallback-source",
++		"targets":[{"kind":"account_pool_group","id":"cyber"}],
++		"traffic_fallback_groups":{"gpt":["ug_api_fallback"],"claude":[],"gemini":[]},
++		"traffic_fallback_model_mappings":[
++			{"family":"gpt","source_model":"gpt-5.6-sol","target_user_group_id":"ug_api_fallback","target_model":"gpt-5.5"},
++			{"family":"gpt","source_model":"gpt-5.*","target_user_group_id":"ug_api_fallback","target_model":"gpt-5.4"}
++		]
++	}`)
++	if code != http.StatusCreated {
++		t.Fatalf("POST traffic fallback user group = %d: %s", code, raw)
++	}
++	var created storage.UserGroup
++	if err := json.Unmarshal(raw, &created); err != nil {
++		t.Fatal(err)
++	}
++	if len(created.TrafficFallbackGroups.GPT) != 1 ||
++		created.TrafficFallbackGroups.GPT[0] != fallback.ID ||
++		len(created.TrafficFallbackModelMappings) != 2 {
++		t.Fatalf("traffic fallback policy missing from response: %+v", created)
++	}
++
++	code, raw = grpReq(t, h, http.MethodDelete, "/admin/user-groups/"+fallback.ID, "")
++	if code != http.StatusConflict {
++		t.Fatalf("DELETE referenced fallback user group = %d, want 409: %s", code, raw)
++	}
++}
++
++func TestAdminUserGroupsRejectsIncompleteTrafficFallback(t *testing.T) {
++	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
++	fallback := storage.UserGroup{
++		ID:      "ug_api_incomplete_fallback",
++		Name:    "api-incomplete-fallback",
++		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "cyber"}},
++	}
++	if err := h.store.CreateUserGroupDefinition(t.Context(), fallback); err != nil {
++		t.Fatal(err)
++	}
++	code, raw := grpReq(t, h, http.MethodPost, "/admin/user-groups", `{
++		"name":"api-incomplete-source",
++		"targets":[{"kind":"account_pool_group","id":"cyber"}],
++		"traffic_fallback_groups":{"gpt":["ug_api_incomplete_fallback"],"claude":[],"gemini":[]},
++		"traffic_fallback_model_mappings":[]
++	}`)
++	if code != http.StatusUnprocessableEntity {
++		t.Fatalf("POST incomplete traffic fallback = %d, want 422: %s", code, raw)
++	}
++}
+diff --git a/internal/api/override.go b/internal/api/override.go
+index b7c22f8..72c45b5 100644
+--- a/internal/api/override.go
++++ b/internal/api/override.go
+@@ -236,6 +236,16 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
+ 			}
+ 		}
+ 	}
++	// A server-selected traffic fallback is applied after ordinary API-key and
++	// source-group policy resolution. It is therefore authoritative for the
++	// destination user group and rewritten model, while identity / attribution
++	// remain tied to the caller's original key.
++	if fallback, ok := trafficFallbackExecutionFromContext(ctx); ok {
++		pol.UserGroupID = strings.TrimSpace(fallback.TargetUserGroupID)
++		pol.ForceModel = strings.TrimSpace(fallback.TargetModel)
++		pol.ProviderHint = "auto"
++		pol.ModelOverrideSource = "traffic_fallback"
++	}
+ 	return pol, true
+ }
+ 
+diff --git a/internal/api/user_group_route.go b/internal/api/user_group_route.go
+index 19bd61d..f34ab16 100644
+--- a/internal/api/user_group_route.go
++++ b/internal/api/user_group_route.go
+@@ -21,6 +21,26 @@ import (
+ 
+ type userGroupRouteOverrideKey struct{}
+ type userGroupFallbackProbeKey struct{}
++type trafficFallbackExecutionKey struct{}
++type trafficFallbackProbeKey struct{}
++
++const maxTrafficFallbackDepth = 8
++
++type trafficFallbackExecution struct {
++	SourceUserGroupID string
++	TargetUserGroupID string
++	SourceModel       string
++	TargetModel       string
++	Family            string
++	Trail             []string
++}
++
++type trafficFallbackCandidate struct {
++	UserGroupID string
++	SourceModel string
++	TargetModel string
++	Family      string
++}
+ 
+ var (
+ 	// A request that currently has no eligible account-pool target stays queued
+@@ -56,7 +76,7 @@ func (s *Server) newUserGroupCapacityWaitState(ctx context.Context, pol downstre
+ 	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
+ 		deadline = requestDeadline
+ 	}
+-	generation, _ := s.store.UserGroupRouteGeneration(ctx, pol.UserGroupID, pol.Group)
++	generation, _ := s.userGroupRouteGeneration(ctx, pol)
+ 	return userGroupCapacityWaitState{
+ 		deadline:   deadline,
+ 		generation: generation,
+@@ -64,6 +84,45 @@ func (s *Server) newUserGroupCapacityWaitState(ctx context.Context, pol downstre
+ 	}
+ }
+ 
++func (s *Server) userGroupRouteGeneration(ctx context.Context, pol downstreamPolicy) (string, error) {
++	type pendingGroup struct {
++		id        string
++		baseGroup string
++		depth     int
++	}
++	queue := []pendingGroup{{id: strings.TrimSpace(pol.UserGroupID), baseGroup: pol.Group}}
++	seen := make(map[string]struct{})
++	parts := make([]string, 0, maxTrafficFallbackDepth)
++	for len(queue) > 0 {
++		current := queue[0]
++		queue = queue[1:]
++		if current.id == "" || current.depth >= maxTrafficFallbackDepth {
++			continue
++		}
++		if _, duplicate := seen[current.id]; duplicate {
++			continue
++		}
++		seen[current.id] = struct{}{}
++		generation, err := s.store.UserGroupRouteGeneration(ctx, current.id, current.baseGroup)
++		if err != nil {
++			return "", err
++		}
++		parts = append(parts, current.id+"="+generation)
++		group, found, err := s.store.GetUserGroup(ctx, current.id)
++		if err != nil {
++			return "", err
++		}
++		if !found {
++			continue
++		}
++		nextIDs := append(append(append([]string{}, group.TrafficFallbackGroups.GPT...), group.TrafficFallbackGroups.Claude...), group.TrafficFallbackGroups.Gemini...)
++		for _, id := range nextIDs {
++			queue = append(queue, pendingGroup{id: id, depth: current.depth + 1})
++		}
++	}
++	return strings.Join(parts, "|"), nil
++}
++
+ // waitForUserGroupCapacityChange keeps a streaming client alive without
+ // repeatedly replaying its potentially large body. A target/policy/account/model
+ // generation change wakes it immediately; a slow safety retry covers provider
+@@ -107,7 +166,7 @@ func (s *Server) waitForUserGroupCapacityChange(ctx context.Context, pol downstr
+ 			heartbeat("user_group_capacity", now.Sub(state.lastRetry))
+ 			state.lastHeartbeat = now
+ 		}
+-		generation, err := s.store.UserGroupRouteGeneration(ctx, pol.UserGroupID, pol.Group)
++		generation, err := s.userGroupRouteGeneration(ctx, pol)
+ 		if err == nil && generation != state.generation {
+ 			state.generation = generation
+ 			state.lastRetry = now
+@@ -180,6 +239,22 @@ func userGroupFallbackProbe(ctx context.Context) bool {
+ 	return probe
+ }
+ 
++func withTrafficFallbackExecution(ctx context.Context, execution trafficFallbackExecution) context.Context {
++	execution.Trail = append([]string(nil), execution.Trail...)
++	ctx = context.WithValue(ctx, trafficFallbackExecutionKey{}, execution)
++	return context.WithValue(ctx, trafficFallbackProbeKey{}, true)
++}
++
++func trafficFallbackExecutionFromContext(ctx context.Context) (trafficFallbackExecution, bool) {
++	execution, ok := ctx.Value(trafficFallbackExecutionKey{}).(trafficFallbackExecution)
++	return execution, ok
++}
++
++func trafficFallbackProbe(ctx context.Context) bool {
++	probe, _ := ctx.Value(trafficFallbackProbeKey{}).(bool)
++	return probe
++}
++
+ // resolveUserGroupRoute selects the routing target for a request that uses the
+ // two-layer group model (pol.UserGroupID != ""). Returns:
+ //   - resolvedGroup: base group name (empty for built-in providers like kiro/antigravity)
+@@ -361,6 +436,202 @@ func prioritizeUserGroupTargetInTiers(tiers [][]storage.TargetRef, target storag
+ 	return out
+ }
+ 
++func trafficFallbackGroupsForFamily(groups storage.TrafficFallbackGroups, family string) []string {
++	switch family {
++	case storage.ModelInstructionFamilyGPT:
++		return groups.GPT
++	case storage.ModelInstructionFamilyClaude:
++		return groups.Claude
++	case storage.ModelInstructionFamilyGemini:
++		return groups.Gemini
++	default:
++		return nil
++	}
++}
++
++func trafficFallbackMappingScore(sourcePattern, model string) int {
++	sourcePattern = strings.ToLower(strings.TrimSpace(sourcePattern))
++	model = strings.ToLower(strings.TrimSpace(model))
++	if sourcePattern == model {
++		return 10000 + len(sourcePattern)
++	}
++	if sourcePattern == "*" {
++		return 1
++	}
++	if strings.HasSuffix(sourcePattern, "*") && strings.HasPrefix(model, strings.TrimSuffix(sourcePattern, "*")) {
++		return 100 + len(sourcePattern)
++	}
++	return -1
++}
++
++func trafficFallbackFamilies(group storage.UserGroup, model string) []string {
++	if family := modelInstructionFamily(model); family != "" {
++		return []string{family}
++	}
++	bestFamily := ""
++	bestScore := -1
++	for _, family := range []string{
++		storage.ModelInstructionFamilyGPT,
++		storage.ModelInstructionFamilyClaude,
++		storage.ModelInstructionFamilyGemini,
++	} {
++		for _, mapping := range group.TrafficFallbackModelMappings {
++			if mapping.Family != family {
++				continue
++			}
++			score := trafficFallbackMappingScore(mapping.SourceModel, model)
++			// A family-less manual model must be named explicitly (or by a
++			// non-empty prefix). A global "*" in several families is otherwise
++			// ambiguous and could silently cross providers.
++			if score <= 1 {
++				continue
++			}
++			if score > bestScore {
++				bestScore = score
++				bestFamily = family
++			}
++		}
++	}
++	if bestFamily == "" {
++		return nil
++	}
++	return []string{bestFamily}
++}
++
++func trafficFallbackCandidates(group storage.UserGroup, model string, trail []string) []trafficFallbackCandidate {
++	if len(trail) >= maxTrafficFallbackDepth {
++		return nil
++	}
++	visited := make(map[string]struct{}, len(trail)+1)
++	for _, id := range trail {
++		visited[strings.TrimSpace(id)] = struct{}{}
++	}
++	out := make([]trafficFallbackCandidate, 0)
++	for _, family := range trafficFallbackFamilies(group, model) {
++		for _, targetID := range trafficFallbackGroupsForFamily(group.TrafficFallbackGroups, family) {
++			targetID = strings.TrimSpace(targetID)
++			if targetID == "" {
++				continue
++			}
++			if _, seen := visited[targetID]; seen {
++				continue
++			}
++			bestScore := -1
++			targetModel := ""
++			for _, mapping := range group.TrafficFallbackModelMappings {
++				if mapping.Family != family || strings.TrimSpace(mapping.TargetUserGroupID) != targetID {
++					continue
++				}
++				score := trafficFallbackMappingScore(mapping.SourceModel, model)
++				if score > bestScore {
++					bestScore = score
++					targetModel = strings.TrimSpace(mapping.TargetModel)
++				}
++			}
++			if bestScore < 0 || targetModel == "" {
++				continue
++			}
++			out = append(out, trafficFallbackCandidate{
++				UserGroupID: targetID,
++				SourceModel: model,
++				TargetModel: targetModel,
++				Family:      family,
++			})
++		}
++	}
++	return out
++}
++
++func trafficFallbackTrail(ctx context.Context, currentUserGroupID string) []string {
++	trail := make([]string, 0, maxTrafficFallbackDepth)
++	if execution, ok := trafficFallbackExecutionFromContext(ctx); ok {
++		trail = append(trail, execution.Trail...)
++	}
++	currentUserGroupID = strings.TrimSpace(currentUserGroupID)
++	if currentUserGroupID != "" && (len(trail) == 0 || trail[len(trail)-1] != currentUserGroupID) {
++		trail = append(trail, currentUserGroupID)
++	}
++	return trail
++}
++
++// dispatchUserGroupTrafficFallback re-enters the same inference handler with an
++// authoritative destination user group and model. The response remains buffered
++// until a fallback succeeds, so a failed destination never leaks headers/body to
++// the client and the next configured destination may be tried safely.
++func (s *Server) dispatchUserGroupTrafficFallback(
++	w http.ResponseWriter,
++	r *http.Request,
++	originalRaw, resolvedRaw []byte,
++	pol downstreamPolicy,
++	dispatch func(http.ResponseWriter, *http.Request),
++) bool {
++	if routing.HasServerSideState(r.URL.Path, r, resolvedRaw) {
++		return false
++	}
++	group, found, err := s.store.GetUserGroup(r.Context(), pol.UserGroupID)
++	if err != nil || !found {
++		return false
++	}
++	sourceModel := routing.Model(resolvedRaw)
++	trail := trafficFallbackTrail(r.Context(), pol.UserGroupID)
++	candidates := trafficFallbackCandidates(group, sourceModel, trail)
++	if len(candidates) == 0 {
++		return false
++	}
++	streamRequest := isStreamRequest(resolvedRaw)
++	for index, fallback := range candidates {
++		nextTrail := append(append([]string(nil), trail...), fallback.UserGroupID)
++		execution := trafficFallbackExecution{
++			SourceUserGroupID: pol.UserGroupID,
++			TargetUserGroupID: fallback.UserGroupID,
++			SourceModel:       fallback.SourceModel,
++			TargetModel:       fallback.TargetModel,
++			Family:            fallback.Family,
++			Trail:             nextTrail,
++		}
++		attempt := newUserGroupAttemptWriter(r.Context(), w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"), bodysource.CaptureOptions{
++			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
++			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-traffic-fallback-response-*",
++		}, true)
++		attempt.Header().Set("X-Pool-Fallback-From-Group", pol.UserGroupID)
++		attempt.Header().Set("X-Pool-Fallback-Group", fallback.UserGroupID)
++		attempt.Header().Set("X-Pool-Fallback-Model", fallback.TargetModel)
++		fallbackContext := withTrafficFallbackExecution(r.Context(), execution)
++		fallbackContext = withBufferedSchedulerWait(fallbackContext, attempt)
++		fallbackRequest := r.Clone(fallbackContext)
++		fallbackRequest.Header = r.Header.Clone()
++		// A configured cross-family rewrite is authoritative; an incoming provider
++		// pin must not silently filter the destination group's compatible targets.
++		fallbackRequest.Header.Del("X-Pool-Provider")
++		fallbackRaw := setForcedModel(originalRaw, fallback.TargetModel)
++		fallbackRequest.Body, fallbackRequest.GetBody = replayUserGroupRequestBody(fallbackContext, fallbackRaw)
++		fallbackRequest.ContentLength = int64(len(fallbackRaw))
++		dispatch(attempt, fallbackRequest)
++		if fallbackRequest.Body != nil {
++			_ = fallbackRequest.Body.Close()
++		}
++
++		status := attempt.Status()
++		if status < http.StatusBadRequest || attempt.Committed() {
++			s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", "success", "")
++			attempt.Commit()
++			return true
++		}
++		retryable := attempt.RetryableFailure()
++		next := ""
++		if retryable && index+1 < len(candidates) {
++			next = "user_group:" + candidates[index+1].UserGroupID
++		}
++		s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", userGroupRouteStatusClass(attempt), next)
++		if !retryable {
++			attempt.Commit()
++			return true
++		}
++		_ = attempt.Close()
++	}
++	return false
++}
++
+ // dispatchUserGroupRouteCandidates runs an entrypoint once per ordered target and
+ // discards only pre-commit, target-scoped failures. A successful stream is passed
+ // through on its first flush/write; after that point another target is never tried.
+@@ -377,6 +648,13 @@ retryUserGroupRoute:
+ 	plan, err := resolveUserGroupRouteCandidates(r.Context(), s.store, pol, r, resolvedRaw)
+ 	if err != nil {
+ 		if _, unavailable := err.(*userGroupCapacityUnavailableError); unavailable {
++			if s.dispatchUserGroupTrafficFallback(w, r, originalRaw, resolvedRaw, pol, dispatch) {
++				return true
++			}
++			if trafficFallbackProbe(r.Context()) {
++				finishUserGroupCapacityWait(r.Context(), w)
++				return true
++			}
+ 			if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
+ 				goto retryUserGroupRoute
+ 			}
+@@ -564,13 +842,23 @@ retryUserGroupRoute:
+ 		}
+ 		s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), fallbackName)
+ 		if !moreUnits || !replaySafe || !retryable {
+-			if !moreUnits && replaySafe && retryable && attempt.PermanentTargetFailure() {
+-				_ = attempt.Close()
+-				if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
+-					goto retryUserGroupRoute
++			if !moreUnits && replaySafe && retryable {
++				if s.dispatchUserGroupTrafficFallback(w, r, originalRaw, resolvedRaw, pol, dispatch) {
++					_ = attempt.Close()
++					return true
++				}
++				if attempt.PermanentTargetFailure() {
++					_ = attempt.Close()
++					if trafficFallbackProbe(r.Context()) {
++						finishUserGroupCapacityWait(r.Context(), w)
++						return true
++					}
++					if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
++						goto retryUserGroupRoute
++					}
++					finishUserGroupCapacityWait(r.Context(), w)
++					return true
+ 				}
+-				finishUserGroupCapacityWait(r.Context(), w)
+-				return true
+ 			}
+ 			attempt.Commit()
+ 			return true
+diff --git a/internal/api/user_group_route_test.go b/internal/api/user_group_route_test.go
+index 9a666d9..9c0ffec 100644
+--- a/internal/api/user_group_route_test.go
++++ b/internal/api/user_group_route_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"os"
++	"reflect"
+ 	"strings"
+ 	"testing"
+ 	"time"
+@@ -110,6 +111,186 @@ func TestUserGroupTargetFamilyPolicySkipsOnlySelectedAccountPool(t *testing.T) {
+ 	}
+ }
+ 
++func TestUserGroupTrafficFallbackRewritesModelAndTriesOrderedGroups(t *testing.T) {
++	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
++	for _, name := range []string{"traffic-fallback-primary", "traffic-fallback-first", "traffic-fallback-second"} {
++		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: name}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	firstID := "ug_traffic_fallback_first"
++	secondID := "ug_traffic_fallback_second"
++	sourceID := "ug_traffic_fallback_source"
++	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
++		ID: firstID, Name: firstID,
++		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "traffic-fallback-first"}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
++		ID: secondID, Name: secondID,
++		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "traffic-fallback-second"}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
++		ID: sourceID, Name: sourceID,
++		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "traffic-fallback-primary"}},
++		TrafficFallbackGroups: storage.TrafficFallbackGroups{
++			GPT: []string{firstID, secondID},
++		},
++		TrafficFallbackModelMappings: []storage.TrafficFallbackModelMapping{
++			{Family: "gpt", SourceModel: "gpt-5.*", TargetUserGroupID: firstID, TargetModel: "gpt-wildcard"},
++			{Family: "gpt", SourceModel: "gpt-5.6-sol", TargetUserGroupID: firstID, TargetModel: "gpt-5.5"},
++			{Family: "gpt", SourceModel: "*", TargetUserGroupID: secondID, TargetModel: "gpt-5.4"},
++		},
++	}); err != nil {
++		t.Fatal(err)
++	}
++
++	raw := []byte(`{"model":"gpt-5.6-sol","input":"fallback","stream":false}`)
++	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(raw))
++	recorder := httptest.NewRecorder()
++	targetModels := make(map[string]string)
++	targetOrder := make([]string, 0, 3)
++	var dispatch func(http.ResponseWriter, *http.Request)
++	dispatch = func(w http.ResponseWriter, candidate *http.Request) {
++		if target, forced := userGroupRouteOverride(candidate.Context()); forced {
++			body, err := io.ReadAll(candidate.Body)
++			if err != nil {
++				t.Fatal(err)
++			}
++			targetOrder = append(targetOrder, target.ID)
++			targetModels[target.ID] = routing.Model(body)
++			switch target.ID {
++			case "traffic-fallback-primary", "traffic-fallback-first":
++				writePoolCodeError(w, http.StatusServiceUnavailable, "capability_unavailable", "fixture target unavailable")
++			case "traffic-fallback-second":
++				writeJSON(w, http.StatusOK, map[string]string{"id": "resp_cross_group_fallback", "status": "completed"})
++			default:
++				t.Fatalf("unexpected target: %+v", target)
++			}
++			return
++		}
++		fallbackPolicy, ok := h.app.resolveDownstreamPolicy(w, candidate)
++		if !ok {
++			return
++		}
++		body, err := io.ReadAll(candidate.Body)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if !h.app.dispatchUserGroupRouteCandidates(w, candidate, body, body, fallbackPolicy, dispatch) {
++			t.Fatalf("fallback policy %q did not dispatch", fallbackPolicy.UserGroupID)
++		}
++	}
++
++	handled := h.app.dispatchUserGroupRouteCandidates(
++		recorder,
++		request,
++		raw,
++		raw,
++		downstreamPolicy{UserGroupID: sourceID, Group: "cyber"},
++		dispatch,
++	)
++	if !handled || recorder.Code != http.StatusOK {
++		t.Fatalf("handled=%v status=%d body=%s", handled, recorder.Code, recorder.Body.String())
++	}
++	wantOrder := []string{"traffic-fallback-primary", "traffic-fallback-first", "traffic-fallback-second"}
++	if !reflect.DeepEqual(targetOrder, wantOrder) {
++		t.Fatalf("target order=%v, want %v", targetOrder, wantOrder)
++	}
++	if targetModels["traffic-fallback-first"] != "gpt-5.5" {
++		t.Fatalf("exact mapping did not outrank wildcard: models=%v", targetModels)
++	}
++	if targetModels["traffic-fallback-second"] != "gpt-5.4" {
++		t.Fatalf("second fallback model=%q, want gpt-5.4", targetModels["traffic-fallback-second"])
++	}
++	if recorder.Header().Get("X-Pool-Fallback-Group") != secondID ||
++		recorder.Header().Get("X-Pool-Fallback-Model") != "gpt-5.4" ||
++		recorder.Header().Get("X-Pool-Fallback-From-Group") != sourceID {
++		t.Fatalf("fallback diagnostics headers=%v", recorder.Header())
++	}
++}
++
++func TestTrafficFallbackCandidatesCoverClaudeGeminiAndManualModels(t *testing.T) {
++	group := storage.UserGroup{
++		TrafficFallbackGroups: storage.TrafficFallbackGroups{
++			Claude: []string{"ug_claude_fallback"},
++			Gemini: []string{"ug_gemini_fallback"},
++			GPT:    []string{"ug_manual_fallback"},
++		},
++		TrafficFallbackModelMappings: []storage.TrafficFallbackModelMapping{
++			{Family: "claude", SourceModel: "claude-*", TargetUserGroupID: "ug_claude_fallback", TargetModel: "claude-sonnet-4-5"},
++			{Family: "gemini", SourceModel: "*", TargetUserGroupID: "ug_gemini_fallback", TargetModel: "gemini-3-flash"},
++			{Family: "gpt", SourceModel: "vendor-manual", TargetUserGroupID: "ug_manual_fallback", TargetModel: "gpt-5.5"},
++		},
++	}
++	cases := []struct {
++		model, groupID, targetModel, family string
++	}{
++		{"claude-opus-5", "ug_claude_fallback", "claude-sonnet-4-5", "claude"},
++		{"gemini-3-pro", "ug_gemini_fallback", "gemini-3-flash", "gemini"},
++		{"vendor-manual", "ug_manual_fallback", "gpt-5.5", "gpt"},
++	}
++	for _, tc := range cases {
++		candidates := trafficFallbackCandidates(group, tc.model, []string{"ug_source"})
++		if len(candidates) != 1 ||
++			candidates[0].UserGroupID != tc.groupID ||
++			candidates[0].TargetModel != tc.targetModel ||
++			candidates[0].Family != tc.family {
++			t.Fatalf("%s candidates=%+v", tc.model, candidates)
++		}
++	}
++	if candidates := trafficFallbackCandidates(group, "claude-opus-5", []string{
++		"one", "two", "three", "four", "five", "six", "seven", "eight",
++	}); len(candidates) != 0 {
++		t.Fatalf("fallback depth guard returned candidates: %+v", candidates)
++	}
++}
++
++func TestUserGroupTrafficFallbackDoesNotReplayServerSideState(t *testing.T) {
++	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
++	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "stateful-fallback-primary"}); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "stateful-fallback-target"}); err != nil {
++		t.Fatal(err)
++	}
++	fallbackID := "ug_stateful_fallback_target"
++	sourceID := "ug_stateful_fallback_source"
++	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
++		ID: fallbackID, Name: fallbackID,
++		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "stateful-fallback-target"}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
++		ID: sourceID, Name: sourceID,
++		Targets:               []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "stateful-fallback-primary"}},
++		TrafficFallbackGroups: storage.TrafficFallbackGroups{GPT: []string{fallbackID}},
++		TrafficFallbackModelMappings: []storage.TrafficFallbackModelMapping{{
++			Family: "gpt", SourceModel: "*", TargetUserGroupID: fallbackID, TargetModel: "gpt-5.5",
++		}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	raw := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_existing","input":[]}`)
++	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++	recorder := httptest.NewRecorder()
++	attempts := 0
++	h.app.dispatchUserGroupRouteCandidates(recorder, request, raw, raw, downstreamPolicy{UserGroupID: sourceID}, func(w http.ResponseWriter, candidate *http.Request) {
++		attempts++
++		if _, fallback := trafficFallbackExecutionFromContext(candidate.Context()); fallback {
++			t.Fatal("stateful request entered traffic fallback")
++		}
++		writePoolCodeError(w, http.StatusServiceUnavailable, "capability_unavailable", "fixture unavailable")
++	})
++	if attempts != 1 || recorder.Code != http.StatusServiceUnavailable {
++		t.Fatalf("stateful traffic fallback attempts=%d status=%d body=%s", attempts, recorder.Code, recorder.Body.String())
++	}
++}
++
+ func TestUserGroupPolicyTransfersStaleModelBindingToEligiblePool(t *testing.T) {
+ 	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+ 	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "policy-transfer-secondary"}); err != nil {
+diff --git a/internal/storage/migration_test.go b/internal/storage/migration_test.go
+index fb2f6c1..fc2c6e3 100644
+--- a/internal/storage/migration_test.go
++++ b/internal/storage/migration_test.go
+@@ -96,3 +96,58 @@ func TestInitAddsBillingHoldColumnBeforeRecoveryIndex(t *testing.T) {
+ 		t.Fatalf("billing_hold_id columns=%d indexes=%d, want 1/1", columnCount, indexCount)
+ 	}
+ }
++
++func TestInitAddsTrafficFallbackColumnsToLegacyUserGroups(t *testing.T) {
++	ctx := context.Background()
++	store, err := Open(filepath.Join(t.TempDir(), "legacy-user-groups.sqlite3"))
++	if err != nil {
++		t.Fatalf("open store: %v", err)
++	}
++	t.Cleanup(func() { _ = store.Close() })
++
++	if _, err := store.DB().ExecContext(ctx, `CREATE TABLE user_groups(
++  id TEXT PRIMARY KEY,
++  name TEXT NOT NULL,
++  system_prompt TEXT NOT NULL DEFAULT '',
++  prompt_mode TEXT NOT NULL DEFAULT 'prepend',
++  system_prompt_apply_to_compaction INTEGER NOT NULL DEFAULT 1,
++  model_instructions_enabled INTEGER NOT NULL DEFAULT 0,
++  model_instructions_files TEXT NOT NULL DEFAULT '[]',
++  model_instruction_profiles TEXT NOT NULL DEFAULT '{}',
++  force_model TEXT NOT NULL DEFAULT '',
++  force_effort TEXT NOT NULL DEFAULT '',
++  block_claude_target_groups TEXT NOT NULL DEFAULT '[]',
++  block_gpt_target_groups TEXT NOT NULL DEFAULT '[]',
++  model_routing_json TEXT NOT NULL DEFAULT '[]',
++  created_at INTEGER NOT NULL,
++  updated_at INTEGER NOT NULL
++)`); err != nil {
++		t.Fatalf("create legacy user_groups: %v", err)
++	}
++	if _, err := store.DB().ExecContext(ctx, `INSERT INTO user_groups(id,name,created_at,updated_at) VALUES('ug_legacy_fallback','legacy fallback',1,1)`); err != nil {
++		t.Fatalf("seed legacy user group: %v", err)
++	}
++
++	if err := store.Init(ctx); err != nil {
++		t.Fatalf("migrate legacy user groups: %v", err)
++	}
++	for _, column := range []string{"traffic_fallback_groups_json", "traffic_fallback_model_mappings_json"} {
++		var count int
++		if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('user_groups') WHERE name=?`, column).Scan(&count); err != nil {
++			t.Fatalf("inspect %s: %v", column, err)
++		}
++		if count != 1 {
++			t.Fatalf("%s column count=%d, want 1", column, count)
++		}
++	}
++	group, found, err := store.GetUserGroup(ctx, "ug_legacy_fallback")
++	if err != nil || !found {
++		t.Fatalf("read migrated user group found=%v err=%v", found, err)
++	}
++	if len(group.TrafficFallbackGroups.GPT) != 0 ||
++		len(group.TrafficFallbackGroups.Claude) != 0 ||
++		len(group.TrafficFallbackGroups.Gemini) != 0 ||
++		len(group.TrafficFallbackModelMappings) != 0 {
++		t.Fatalf("legacy fallback defaults changed: groups=%+v mappings=%+v", group.TrafficFallbackGroups, group.TrafficFallbackModelMappings)
++	}
++}
+diff --git a/internal/storage/storage.go b/internal/storage/storage.go
+index 43d1cd8..4f3755a 100644
+--- a/internal/storage/storage.go
++++ b/internal/storage/storage.go
+@@ -139,6 +139,25 @@ type ModelInstructionProfile struct {
+ // Once any profile exists, unlisted families are intentionally disabled.
+ type ModelInstructionProfiles map[string]ModelInstructionProfile
+ 
++// TrafficFallbackGroups is the ordered set of user groups that may receive
++// replay-safe traffic after every compatible target in the current user group
++// has been exhausted. Order is significant and is preserved per model family.
++type TrafficFallbackGroups struct {
++	GPT    []string `json:"gpt"`
++	Claude []string `json:"claude"`
++	Gemini []string `json:"gemini"`
++}
++
++// TrafficFallbackModelMapping rewrites one logical source model when traffic
++// moves to a fallback user group. SourceModel supports the same exact / trailing
++// wildcard syntax as ModelRoutingRule (for example "gpt-5.*" or "*").
++type TrafficFallbackModelMapping struct {
++	Family            string `json:"family"`
++	SourceModel       string `json:"source_model"`
++	TargetUserGroupID string `json:"target_user_group_id"`
++	TargetModel       string `json:"target_model"`
++}
++
+ type GroupAccountCounts struct {
+ 	AccountCount       int `json:"account_count"`
+ 	ActiveAccountCount int `json:"active_account_count"`
+@@ -164,12 +183,14 @@ type UserGroup struct {
+ 	// policy. Each value names an account-pool target selected by this user
+ 	// group; the underlying account-pool group itself remains unchanged and may
+ 	// still receive that family through another user group.
+-	BlockClaudeTargetGroups []string           `json:"block_claude_target_groups"`
+-	BlockGPTTargetGroups    []string           `json:"block_gpt_target_groups"`
+-	Targets                 []TargetRef        `json:"targets"`
+-	ModelRouting            []ModelRoutingRule `json:"model_routing"`
+-	CreatedAt               int64              `json:"created_at"`
+-	UpdatedAt               int64              `json:"updated_at"`
++	BlockClaudeTargetGroups      []string                      `json:"block_claude_target_groups"`
++	BlockGPTTargetGroups         []string                      `json:"block_gpt_target_groups"`
++	TrafficFallbackGroups        TrafficFallbackGroups         `json:"traffic_fallback_groups"`
++	TrafficFallbackModelMappings []TrafficFallbackModelMapping `json:"traffic_fallback_model_mappings"`
++	Targets                      []TargetRef                   `json:"targets"`
++	ModelRouting                 []ModelRoutingRule            `json:"model_routing"`
++	CreatedAt                    int64                         `json:"created_at"`
++	UpdatedAt                    int64                         `json:"updated_at"`
+ }
+ 
+ const (
+@@ -2593,6 +2614,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
+   force_effort TEXT NOT NULL DEFAULT '',
+   block_claude_target_groups TEXT NOT NULL DEFAULT '[]',
+   block_gpt_target_groups TEXT NOT NULL DEFAULT '[]',
++  traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}',
++  traffic_fallback_model_mappings_json TEXT NOT NULL DEFAULT '[]',
+   model_routing_json TEXT NOT NULL DEFAULT '[]',
+   created_at INTEGER NOT NULL,
+   updated_at INTEGER NOT NULL
+@@ -2625,6 +2648,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
+ 		`ALTER TABLE user_groups ADD COLUMN model_instruction_profiles TEXT NOT NULL DEFAULT '{}'`,
+ 		`ALTER TABLE user_groups ADD COLUMN block_claude_target_groups TEXT NOT NULL DEFAULT '[]'`,
+ 		`ALTER TABLE user_groups ADD COLUMN block_gpt_target_groups TEXT NOT NULL DEFAULT '[]'`,
++		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}'`,
++		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_model_mappings_json TEXT NOT NULL DEFAULT '[]'`,
+ 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
+ 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
+ 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
+@@ -3020,13 +3045,13 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
+ 
+ // ── UserGroup CRUD ──────────────────────────────────────────────────────────
+ 
+-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at`
++const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at`
+ 
+ func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
+ 	var g UserGroup
+ 	var apply, miEnabled int
+-	var filesJSON, profilesJSON, blockClaudeJSON, blockGPTJSON, routingJSON string
+-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
++	var filesJSON, profilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
++	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
+ 	g.SystemPromptApplyToCompaction = apply != 0
+ 	g.ModelInstructionsEnabled = miEnabled != 0
+ 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
+@@ -3034,6 +3059,11 @@ func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
+ 	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
+ 	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
+ 	if err == nil {
++		g.TrafficFallbackGroups = decodeTrafficFallbackGroups(fallbackGroupsJSON)
++		_ = json.Unmarshal([]byte(fallbackMappingsJSON), &g.TrafficFallbackModelMappings)
++		if g.TrafficFallbackModelMappings == nil {
++			g.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{}
++		}
+ 		_ = json.Unmarshal([]byte(routingJSON), &g.ModelRouting)
+ 		if g.ModelRouting == nil {
+ 			g.ModelRouting = []ModelRoutingRule{}
+@@ -3183,9 +3213,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
+ 	}
+ 	g.UpdatedAt = now
+ 	routingJSON := encodeModelRouting(g.ModelRouting)
+-	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
++	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ ON CONFLICT(id) DO NOTHING`,
+-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), routingJSON, g.CreatedAt, g.UpdatedAt)
++		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt)
+ 	return err
+ }
+ 
+@@ -3360,6 +3390,226 @@ func normalizeBlockedAccountPoolGroups(field string, values []string, targets []
+ 	return out, nil
+ }
+ 
++const (
++	maxTrafficFallbackGroupsPerFamily = 16
++	maxTrafficFallbackModelMappings   = 128
++	maxTrafficFallbackModelLength     = 200
++)
++
++func trafficFallbackGroupIDs(groups TrafficFallbackGroups, family string) []string {
++	switch strings.ToLower(strings.TrimSpace(family)) {
++	case ModelInstructionFamilyGPT:
++		return groups.GPT
++	case ModelInstructionFamilyClaude:
++		return groups.Claude
++	case ModelInstructionFamilyGemini:
++		return groups.Gemini
++	default:
++		return nil
++	}
++}
++
++func setTrafficFallbackGroupIDs(groups *TrafficFallbackGroups, family string, ids []string) {
++	switch family {
++	case ModelInstructionFamilyGPT:
++		groups.GPT = ids
++	case ModelInstructionFamilyClaude:
++		groups.Claude = ids
++	case ModelInstructionFamilyGemini:
++		groups.Gemini = ids
++	}
++}
++
++func encodeTrafficFallbackGroups(groups TrafficFallbackGroups) string {
++	normalized := TrafficFallbackGroups{
++		GPT:    decodeStringList(encodeStringList(groups.GPT)),
++		Claude: decodeStringList(encodeStringList(groups.Claude)),
++		Gemini: decodeStringList(encodeStringList(groups.Gemini)),
++	}
++	raw, err := json.Marshal(normalized)
++	if err != nil {
++		return `{"gpt":[],"claude":[],"gemini":[]}`
++	}
++	return string(raw)
++}
++
++func decodeTrafficFallbackGroups(raw string) TrafficFallbackGroups {
++	var groups TrafficFallbackGroups
++	_ = json.Unmarshal([]byte(raw), &groups)
++	groups.GPT = decodeStringList(encodeStringList(groups.GPT))
++	groups.Claude = decodeStringList(encodeStringList(groups.Claude))
++	groups.Gemini = decodeStringList(encodeStringList(groups.Gemini))
++	return groups
++}
++
++func encodeTrafficFallbackModelMappings(mappings []TrafficFallbackModelMapping) string {
++	if mappings == nil {
++		mappings = []TrafficFallbackModelMapping{}
++	}
++	raw, err := json.Marshal(mappings)
++	if err != nil {
++		return "[]"
++	}
++	return string(raw)
++}
++
++func normalizeTrafficFallbackConfig(ctx context.Context, tx *sql.Tx, g UserGroup) (TrafficFallbackGroups, []TrafficFallbackModelMapping, error) {
++	var groups TrafficFallbackGroups
++	selectedByFamily := make(map[string]map[string]struct{}, 3)
++	for _, family := range []string{ModelInstructionFamilyGPT, ModelInstructionFamilyClaude, ModelInstructionFamilyGemini} {
++		values := trafficFallbackGroupIDs(g.TrafficFallbackGroups, family)
++		if len(values) > maxTrafficFallbackGroupsPerFamily {
++			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_groups.%s supports at most %d user groups", family, maxTrafficFallbackGroupsPerFamily)
++		}
++		seen := make(map[string]struct{}, len(values))
++		clean := make([]string, 0, len(values))
++		for _, rawID := range values {
++			id := strings.TrimSpace(rawID)
++			if id == "" {
++				continue
++			}
++			if id == g.ID {
++				return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_groups.%s cannot reference the current user group", family)
++			}
++			if _, duplicate := seen[id]; duplicate {
++				continue
++			}
++			var exists int
++			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM user_groups WHERE id = ?`, id).Scan(&exists); err != nil {
++				if errors.Is(err, sql.ErrNoRows) {
++					return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_groups.%s user group %q not found", family, id)
++				}
++				return TrafficFallbackGroups{}, nil, err
++			}
++			seen[id] = struct{}{}
++			clean = append(clean, id)
++		}
++		if clean == nil {
++			clean = []string{}
++		}
++		selectedByFamily[family] = seen
++		setTrafficFallbackGroupIDs(&groups, family, clean)
++	}
++
++	if len(g.TrafficFallbackModelMappings) > maxTrafficFallbackModelMappings {
++		return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_model_mappings supports at most %d rules", maxTrafficFallbackModelMappings)
++	}
++	mappings := make([]TrafficFallbackModelMapping, 0, len(g.TrafficFallbackModelMappings))
++	seenMappings := make(map[string]struct{}, len(g.TrafficFallbackModelMappings))
++	mappedTargets := make(map[string]struct{}, len(g.TrafficFallbackModelMappings))
++	for _, mapping := range g.TrafficFallbackModelMappings {
++		family := strings.ToLower(strings.TrimSpace(mapping.Family))
++		if family != ModelInstructionFamilyGPT && family != ModelInstructionFamilyClaude && family != ModelInstructionFamilyGemini {
++			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback mapping family %q is unsupported", mapping.Family)
++		}
++		sourceModel := strings.TrimSpace(mapping.SourceModel)
++		targetModel := strings.TrimSpace(mapping.TargetModel)
++		targetID := strings.TrimSpace(mapping.TargetUserGroupID)
++		if sourceModel == "" || targetModel == "" {
++			return TrafficFallbackGroups{}, nil, errors.New("traffic fallback mapping source_model and target_model are required")
++		}
++		if len(sourceModel) > maxTrafficFallbackModelLength || len(targetModel) > maxTrafficFallbackModelLength {
++			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback model names support at most %d characters", maxTrafficFallbackModelLength)
++		}
++		if strings.Contains(sourceModel[:len(sourceModel)-1], "*") {
++			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback source_model %q only supports a trailing wildcard", sourceModel)
++		}
++		if _, selected := selectedByFamily[family][targetID]; !selected {
++			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback mapping target user group %q is not selected for %s", targetID, family)
++		}
++		key := family + "\x00" + strings.ToLower(sourceModel) + "\x00" + targetID
++		if _, duplicate := seenMappings[key]; duplicate {
++			return TrafficFallbackGroups{}, nil, fmt.Errorf("duplicate traffic fallback mapping for %s model %q and user group %q", family, sourceModel, targetID)
++		}
++		seenMappings[key] = struct{}{}
++		mappedTargets[family+"\x00"+targetID] = struct{}{}
++		mappings = append(mappings, TrafficFallbackModelMapping{
++			Family: family, SourceModel: sourceModel, TargetUserGroupID: targetID, TargetModel: targetModel,
++		})
++	}
++	for family, selected := range selectedByFamily {
++		for targetID := range selected {
++			if _, configured := mappedTargets[family+"\x00"+targetID]; !configured {
++				return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback user group %q requires at least one %s model mapping", targetID, family)
++			}
++		}
++	}
++	if mappings == nil {
++		mappings = []TrafficFallbackModelMapping{}
++	}
++	return groups, mappings, nil
++}
++
++func trafficFallbackGraphIsAcyclic(ctx context.Context, tx *sql.Tx, currentID string, current TrafficFallbackGroups) error {
++	graph := make(map[string][]string)
++	rows, err := tx.QueryContext(ctx, `SELECT id, traffic_fallback_groups_json FROM user_groups`)
++	if err != nil {
++		return err
++	}
++	for rows.Next() {
++		var id, raw string
++		if err := rows.Scan(&id, &raw); err != nil {
++			_ = rows.Close()
++			return err
++		}
++		groups := decodeTrafficFallbackGroups(raw)
++		graph[id] = uniqueStringsPreserveOrder(append(append(append([]string{}, groups.GPT...), groups.Claude...), groups.Gemini...))
++	}
++	if err := rows.Err(); err != nil {
++		_ = rows.Close()
++		return err
++	}
++	if err := rows.Close(); err != nil {
++		return err
++	}
++	graph[currentID] = uniqueStringsPreserveOrder(append(append(append([]string{}, current.GPT...), current.Claude...), current.Gemini...))
++
++	state := make(map[string]uint8, len(graph))
++	var visit func(string) error
++	visit = func(id string) error {
++		switch state[id] {
++		case 1:
++			return fmt.Errorf("traffic fallback cycle detected at user group %q", id)
++		case 2:
++			return nil
++		}
++		state[id] = 1
++		for _, targetID := range graph[id] {
++			if _, known := graph[targetID]; !known {
++				continue
++			}
++			if err := visit(targetID); err != nil {
++				return err
++			}
++		}
++		state[id] = 2
++		return nil
++	}
++	for id := range graph {
++		if err := visit(id); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func uniqueStringsPreserveOrder(values []string) []string {
++	seen := make(map[string]struct{}, len(values))
++	out := make([]string, 0, len(values))
++	for _, value := range values {
++		value = strings.TrimSpace(value)
++		if value == "" {
++			continue
++		}
++		if _, duplicate := seen[value]; duplicate {
++			continue
++		}
++		seen[value] = struct{}{}
++		out = append(out, value)
++	}
++	return out
++}
++
+ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g UserGroup) (UserGroup, error) {
+ 	g.ID = strings.TrimSpace(g.ID)
+ 	g.Name = strings.TrimSpace(g.Name)
+@@ -3428,6 +3678,13 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g
+ 	if err != nil {
+ 		return UserGroup{}, err
+ 	}
++	g.TrafficFallbackGroups, g.TrafficFallbackModelMappings, err = normalizeTrafficFallbackConfig(ctx, tx, g)
++	if err != nil {
++		return UserGroup{}, err
++	}
++	if err := trafficFallbackGraphIsAcyclic(ctx, tx, g.ID, g.TrafficFallbackGroups); err != nil {
++		return UserGroup{}, err
++	}
+ 	return g, nil
+ }
+ 
+@@ -3462,8 +3719,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
+ 		g.CreatedAt = now
+ 	}
+ 	g.UpdatedAt = now
+-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
++	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
++		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+ 		return err
+ 	}
+ 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
+@@ -3485,8 +3742,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
+ 		return err
+ 	}
+ 	now := Now()
+-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, model_routing_json=?, updated_at=? WHERE id=?`,
+-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), now, g.ID)
++	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
++		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), now, g.ID)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -3506,14 +3763,52 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
+ 	if strings.TrimSpace(g.PromptMode) == "" {
+ 		g.PromptMode = "prepend"
+ 	}
+-	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, model_routing_json=?, updated_at=? WHERE id=?`,
+-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), Now(), g.ID)
++	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
++		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), Now(), g.ID)
+ 	return err
+ }
+ 
+ func (s *Store) DeleteUserGroup(ctx context.Context, id string) error {
+-	_, err := s.db.ExecContext(ctx, `DELETE FROM user_groups WHERE id = ?`, id)
+-	return err
++	id = strings.TrimSpace(id)
++	tx, err := s.db.BeginTx(ctx, nil)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = tx.Rollback() }()
++	rows, err := tx.QueryContext(ctx, `SELECT id, traffic_fallback_groups_json FROM user_groups WHERE id <> ?`, id)
++	if err != nil {
++		return err
++	}
++	var references []string
++	for rows.Next() {
++		var sourceID, raw string
++		if err := rows.Scan(&sourceID, &raw); err != nil {
++			_ = rows.Close()
++			return err
++		}
++		groups := decodeTrafficFallbackGroups(raw)
++		for _, candidate := range append(append(append([]string{}, groups.GPT...), groups.Claude...), groups.Gemini...) {
++			if candidate == id {
++				references = append(references, sourceID)
++				break
++			}
++		}
++	}
++	if err := rows.Err(); err != nil {
++		_ = rows.Close()
++		return err
++	}
++	if err := rows.Close(); err != nil {
++		return err
++	}
++	if len(references) > 0 {
++		sort.Strings(references)
++		return fmt.Errorf("%w: user_group/%s referenced as traffic fallback by %s", ErrTargetInUse, id, strings.Join(references, ", "))
++	}
++	if _, err := tx.ExecContext(ctx, `DELETE FROM user_groups WHERE id = ?`, id); err != nil {
++		return err
++	}
++	return tx.Commit()
+ }
+ 
+ // GetUserGroupTargets returns all targets for a user group, ordered by affinity_weight DESC.
+diff --git a/internal/storage/user_groups_test.go b/internal/storage/user_groups_test.go
+index a3c5e68..e36517a 100644
+--- a/internal/storage/user_groups_test.go
++++ b/internal/storage/user_groups_test.go
+@@ -2,6 +2,7 @@ package storage
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"reflect"
+ 	"testing"
+ )
+@@ -112,6 +113,92 @@ func TestUserGroupTargetFamilyBlocksAreScopedAndValidated(t *testing.T) {
+ 	}
+ }
+ 
++func TestUserGroupTrafficFallbackRoundTripValidationAndCycleGuard(t *testing.T) {
++	s := newTestStore(t)
++	ctx := t.Context()
++	if err := s.CreateGroup(ctx, Group{Name: "fallback-routing-pool"}); err != nil {
++		t.Fatal(err)
++	}
++	base := func(id, name string) UserGroup {
++		return UserGroup{
++			ID:      id,
++			Name:    name,
++			Targets: []TargetRef{{Kind: TargetKindAccountPoolGroup, ID: "fallback-routing-pool"}},
++		}
++	}
++	fallbackB := base("ug_fallback_b", "fallback-b")
++	fallbackC := base("ug_fallback_c", "fallback-c")
++	if err := s.CreateUserGroupDefinition(ctx, fallbackB); err != nil {
++		t.Fatal(err)
++	}
++	if err := s.CreateUserGroupDefinition(ctx, fallbackC); err != nil {
++		t.Fatal(err)
++	}
++
++	primary := base("ug_fallback_primary", "fallback-primary")
++	primary.TrafficFallbackGroups = TrafficFallbackGroups{
++		GPT:    []string{" ug_fallback_b ", "ug_fallback_b"},
++		Claude: []string{"ug_fallback_c"},
++		Gemini: []string{},
++	}
++	primary.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
++		{Family: "GPT", SourceModel: "gpt-5.6-sol", TargetUserGroupID: "ug_fallback_b", TargetModel: "gpt-5.5"},
++		{Family: "gpt", SourceModel: "gpt-5.*", TargetUserGroupID: "ug_fallback_b", TargetModel: "gpt-5.4"},
++		{Family: "claude", SourceModel: "*", TargetUserGroupID: "ug_fallback_c", TargetModel: "claude-sonnet-4-5"},
++	}
++	if err := s.CreateUserGroupDefinition(ctx, primary); err != nil {
++		t.Fatal(err)
++	}
++	got, found, err := s.GetUserGroup(ctx, primary.ID)
++	if err != nil || !found {
++		t.Fatalf("get traffic fallback group found=%v err=%v", found, err)
++	}
++	if !reflect.DeepEqual(got.TrafficFallbackGroups.GPT, []string{"ug_fallback_b"}) ||
++		!reflect.DeepEqual(got.TrafficFallbackGroups.Claude, []string{"ug_fallback_c"}) ||
++		len(got.TrafficFallbackGroups.Gemini) != 0 {
++		t.Fatalf("unexpected normalized traffic fallback groups: %+v", got.TrafficFallbackGroups)
++	}
++	if len(got.TrafficFallbackModelMappings) != 3 ||
++		got.TrafficFallbackModelMappings[0].Family != ModelInstructionFamilyGPT ||
++		got.TrafficFallbackModelMappings[0].TargetModel != "gpt-5.5" {
++		t.Fatalf("unexpected traffic fallback mappings: %+v", got.TrafficFallbackModelMappings)
++	}
++
++	missingMapping := base("ug_fallback_missing_mapping", "fallback-missing-mapping")
++	missingMapping.TrafficFallbackGroups.GPT = []string{"ug_fallback_b"}
++	if err := s.CreateUserGroupDefinition(ctx, missingMapping); err == nil {
++		t.Fatal("selected fallback group without a model mapping was accepted")
++	}
++
++	selfReference := base("ug_fallback_self", "fallback-self")
++	selfReference.TrafficFallbackGroups.GPT = []string{selfReference.ID}
++	selfReference.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
++		{Family: "gpt", SourceModel: "*", TargetUserGroupID: selfReference.ID, TargetModel: "gpt-5.5"},
++	}
++	if err := s.CreateUserGroupDefinition(ctx, selfReference); err == nil {
++		t.Fatal("self-referencing traffic fallback was accepted")
++	}
++
++	fallbackB.TrafficFallbackGroups.GPT = []string{"ug_fallback_c"}
++	fallbackB.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
++		{Family: "gpt", SourceModel: "*", TargetUserGroupID: "ug_fallback_c", TargetModel: "gpt-5.4"},
++	}
++	if err := s.ReplaceUserGroupDefinition(ctx, fallbackB); err != nil {
++		t.Fatal(err)
++	}
++	fallbackC.TrafficFallbackGroups.GPT = []string{primary.ID}
++	fallbackC.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
++		{Family: "gpt", SourceModel: "*", TargetUserGroupID: primary.ID, TargetModel: "gpt-5.3"},
++	}
++	if err := s.ReplaceUserGroupDefinition(ctx, fallbackC); err == nil {
++		t.Fatal("traffic fallback cycle was accepted")
++	}
++
++	if err := s.DeleteUserGroup(ctx, fallbackB.ID); !errors.Is(err, ErrTargetInUse) {
++		t.Fatalf("delete referenced fallback group error=%v, want ErrTargetInUse", err)
++	}
++}
++
+ func TestUserGroupRouteGenerationChangesWhenCapacityIsAdded(t *testing.T) {
+ 	s := newTestStore(t)
+ 	ctx := t.Context()
+diff --git a/web-spa/src/pages/Groups.jsx b/web-spa/src/pages/Groups.jsx
+index c159ab8..e1a069d 100644
+--- a/web-spa/src/pages/Groups.jsx
++++ b/web-spa/src/pages/Groups.jsx
+@@ -1,4 +1,5 @@
+-import React, { useCallback, useMemo, useState } from 'react';
++import React, { useCallback, useId, useMemo, useState } from 'react';
++import * as PopoverPrimitive from '@radix-ui/react-popover';
+ import { ActionMenu, Banner, Button, Card, Form, Modal, Select, Switch, Tabs, TabPane, Tag, Toast } from '../components/pool/index.jsx';
+ import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
+ import { del, get, patch, post, put } from '../api.js';
+@@ -19,6 +20,7 @@ const INSTRUCTION_FAMILIES = [
+   { key: 'claude', label: 'Claude', help: '用于原生 Claude、Claude Code，以及 Kiro / Antigravity 中的 Claude 模型。' },
+   { key: 'gemini', label: 'Gemini', help: '用于 Antigravity 等目标中的 Gemini 模型，并进入其 systemInstruction。' },
+ ];
++const FALLBACK_FAMILIES = INSTRUCTION_FAMILIES.map(({ key, label }) => ({ key, label }));
+ 
+ function rowsOf(value, keys = []) {
+   if (Array.isArray(value)) return value;
+@@ -35,6 +37,27 @@ function uniqueStrings(values) {
+   });
+ }
+ 
++function blankTrafficFallbackGroups() {
++  return Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [key, []]));
++}
++
++function modelFamily(model) {
++  const value = String(model || '').trim().toLowerCase();
++  if (/^(claude(?:-|$)|opus$|sonnet$|haiku$|fable$)/.test(value)) return 'claude';
++  if (/^gemini(?:-|$)/.test(value)) return 'gemini';
++  if (/^(gpt(?:-|$)|chatgpt(?:-|$)|codex(?:-|$)|o[134])/.test(value)) return 'gpt';
++  return '';
++}
++
++function modelsByFamily(models) {
++  const output = { gpt: [], claude: [], gemini: [], other: [] };
++  uniqueStrings(models).forEach((model) => {
++    const family = modelFamily(model);
++    output[family || 'other'].push(model);
++  });
++  return output;
++}
++
+ function groupEgressIDs(group) {
+   if (Array.isArray(group?.egress_ids)) return uniqueStrings(group.egress_ids);
+   return group?.default_egress_id ? [group.default_egress_id] : [];
+@@ -109,6 +132,8 @@ function blankUserGroup() {
+     force_effort: '',
+     block_claude_target_groups: [],
+     block_gpt_target_groups: [],
++    traffic_fallback_groups: blankTrafficFallbackGroups(),
++    traffic_fallback_model_mappings: [],
+     target_keys: [],
+     model_routing: [],
+   };
+@@ -138,6 +163,16 @@ function userGroupDraft(row) {
+     model_instruction_profiles: normalizedInstructionProfiles(row),
+     block_claude_target_groups: uniqueStrings(row.block_claude_target_groups),
+     block_gpt_target_groups: uniqueStrings(row.block_gpt_target_groups),
++    traffic_fallback_groups: Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [
++      key,
++      uniqueStrings(row.traffic_fallback_groups?.[key]),
++    ])),
++    traffic_fallback_model_mappings: (row.traffic_fallback_model_mappings || []).map((mapping) => ({
++      family: String(mapping.family || '').trim().toLowerCase(),
++      source_model: String(mapping.source_model || ''),
++      target_user_group_id: String(mapping.target_user_group_id || ''),
++      target_model: String(mapping.target_model || ''),
++    })),
+     model_routing: (row.model_routing || []).map((rule) => ({
+       model: rule.model || '',
+       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
+@@ -157,6 +192,21 @@ function normalizedUserGroupPayload(draft, providers = []) {
+   }]));
+   const enabledProfiles = Object.values(profiles).filter((profile) => profile.enabled);
+   const legacyFiles = uniqueStrings(enabledProfiles.flatMap((profile) => profile.files));
++  const trafficFallbackGroups = Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [
++    key,
++    uniqueStrings(draft.traffic_fallback_groups?.[key]),
++  ]));
++  const trafficFallbackModelMappings = (draft.traffic_fallback_model_mappings || [])
++    .map((mapping) => ({
++      family: String(mapping.family || '').trim().toLowerCase(),
++      source_model: String(mapping.source_model || '').trim(),
++      target_user_group_id: String(mapping.target_user_group_id || '').trim(),
++      target_model: String(mapping.target_model || '').trim(),
++    }))
++    .filter((mapping) => FALLBACK_FAMILIES.some(({ key }) => key === mapping.family)
++      && trafficFallbackGroups[mapping.family].includes(mapping.target_user_group_id)
++      && mapping.source_model
++      && mapping.target_model);
+   return {
+     name: String(draft.name || '').trim(),
+     system_prompt: String(draft.system_prompt || ''),
+@@ -171,6 +221,8 @@ function normalizedUserGroupPayload(draft, providers = []) {
+       .filter((groupName) => selectedAccountGroups.has(groupName)),
+     block_gpt_target_groups: uniqueStrings(draft.block_gpt_target_groups)
+       .filter((groupName) => selectedAccountGroups.has(groupName)),
++    traffic_fallback_groups: trafficFallbackGroups,
++    traffic_fallback_model_mappings: trafficFallbackModelMappings,
+     targets,
+     model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
+       const mentioned = new Set();
+@@ -302,11 +354,288 @@ function ModelRoutingEditor({ draft, setDraft, targetOptions, providers }) {
+   );
+ }
+ 
++function fallbackConfigurationIssues(draft) {
++  const mappings = Array.isArray(draft.traffic_fallback_model_mappings) ? draft.traffic_fallback_model_mappings : [];
++  const issues = [];
++  const seenMappings = new Set();
++  FALLBACK_FAMILIES.forEach(({ key, label }) => {
++    uniqueStrings(draft.traffic_fallback_groups?.[key]).forEach((groupID) => {
++      const configured = mappings.some((mapping) => mapping.family === key
++        && mapping.target_user_group_id === groupID
++        && String(mapping.source_model || '').trim()
++        && String(mapping.target_model || '').trim());
++      if (!configured) issues.push(`${label} · ${groupID} 尚未配置模型转换`);
++    });
++  });
++  mappings.forEach((mapping, index) => {
++    const sourceModel = String(mapping.source_model || '').trim();
++    const targetModel = String(mapping.target_model || '').trim();
++    if (!mapping.family || !mapping.target_user_group_id || !sourceModel || !targetModel) {
++      issues.push(`模型转换 ${index + 1} 尚未填写完整`);
++      return;
++    }
++    if (!uniqueStrings(draft.traffic_fallback_groups?.[mapping.family]).includes(mapping.target_user_group_id)) {
++      issues.push(`模型转换 ${index + 1} 的兜底分组未在 ${mapping.family} 家族中勾选`);
++    }
++    if (sourceModel.slice(0, -1).includes('*')) {
++      issues.push(`模型转换 ${index + 1} 仅支持末尾通配符`);
++    }
++    if (sourceModel.length > 200 || targetModel.length > 200) {
++      issues.push(`模型转换 ${index + 1} 的模型名不能超过 200 个字符`);
++    }
++    const key = `${mapping.family}\u0000${sourceModel.toLowerCase()}\u0000${mapping.target_user_group_id}`;
++    if (seenMappings.has(key)) {
++      issues.push(`模型转换 ${index + 1} 与已有规则重复`);
++    }
++    seenMappings.add(key);
++  });
++  return uniqueStrings(issues);
++}
++
++function TrafficFallbackGroupSelector({ value, onChange, options, disabled }) {
++  const [open, setOpen] = useState(false);
++  const [activeFamily, setActiveFamily] = useState('gpt');
++  const [query, setQuery] = useState('');
++  const triggerID = useId();
++  const normalized = Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [key, uniqueStrings(value?.[key])]));
++  const selectedCount = FALLBACK_FAMILIES.reduce((sum, { key }) => sum + normalized[key].length, 0);
++  const activeSelected = new Set(normalized[activeFamily]);
++  const filteredOptions = options.filter((option) => {
++    const needle = query.trim().toLowerCase();
++    return !needle || `${option.label} ${option.id}`.toLowerCase().includes(needle);
++  });
++  const toggle = (id) => {
++    const current = normalized[activeFamily];
++    const next = activeSelected.has(id) ? current.filter((item) => item !== id) : [...current, id];
++    onChange({ ...normalized, [activeFamily]: next });
++  };
++
++  return (
++    <PopoverPrimitive.Root open={open} onOpenChange={(next) => {
++      if (disabled) return;
++      setOpen(next);
++      if (!next) setQuery('');
++    }}>
++      <PopoverPrimitive.Trigger asChild>
++        <button
++          id={triggerID}
++          type="button"
++          className="pool-fallback-selector__trigger"
++          aria-label="选择 GPT、Claude、Gemini 流量的兜底用户分组"
++          aria-expanded={open}
++          disabled={disabled}
++        >
++          <span className="pool-fallback-selector__summary">
++            {selectedCount ? FALLBACK_FAMILIES.map(({ key, label }) => (
++              <span className="pool-fallback-selector__pill" key={key}>{label} <b>{normalized[key].length}</b></span>
++            )) : <span className="pool-fallback-selector__placeholder">选择流量家族与兜底用户分组</span>}
++          </span>
++          <span className="pool-fallback-selector__chevron" aria-hidden="true">⌄</span>
++        </button>
++      </PopoverPrimitive.Trigger>
++      <PopoverPrimitive.Portal>
++        <PopoverPrimitive.Content
++          className="pool-fallback-selector__content"
++          align="start"
++          sideOffset={6}
++          collisionPadding={16}
++        >
++          <div className="pool-fallback-selector__families" aria-label="模型家族">
++            {FALLBACK_FAMILIES.map(({ key, label }) => (
++              <button
++                type="button"
++                key={key}
++                className={activeFamily === key ? 'is-active' : ''}
++                aria-pressed={activeFamily === key}
++                onClick={() => { setActiveFamily(key); setQuery(''); }}
++              >
++                <span>{label}</span>
++                <b>{normalized[key].length}</b>
++              </button>
++            ))}
++          </div>
++          <div className="pool-fallback-selector__groups">
++            <div className="pool-fallback-selector__groups-head">
++              <strong>{FALLBACK_FAMILIES.find(({ key }) => key === activeFamily)?.label} 兜底分组</strong>
++              <span>{activeSelected.size} 已选</span>
++            </div>
++            <input
++              className="pool-input"
++              value={query}
++              onChange={(event) => setQuery(event.target.value)}
++              placeholder="搜索用户分组"
++              aria-label="搜索兜底用户分组"
++            />
++            <div className="pool-fallback-selector__list" role="group" aria-label="可选兜底用户分组">
++              {filteredOptions.length ? filteredOptions.map((option) => {
++                const checked = activeSelected.has(option.id);
++                return (
++                  <button
++                    type="button"
++                    key={option.id}
++                    className={checked ? 'is-selected' : ''}
++                    role="checkbox"
++                    aria-checked={checked}
++                    onClick={() => toggle(option.id)}
++                  >
++                    <span className="pool-fallback-selector__option-copy">
++                      <strong title={option.label}>{option.label}</strong>
++                      <small title={option.id}>{option.id}</small>
++                    </span>
++                    <span className="pool-fallback-selector__check" aria-hidden="true">{checked ? '✓' : ''}</span>
++                  </button>
++                );
++              }) : <div className="pool-fallback-selector__empty">{options.length ? '没有匹配的用户分组' : '请先创建另一个用户分组'}</div>}
++            </div>
++          </div>
++        </PopoverPrimitive.Content>
++      </PopoverPrimitive.Portal>
++    </PopoverPrimitive.Root>
++  );
++}
++
++function ModelCatalogInput({ label, value, onChange, models, placeholder, help }) {
++  const listID = `pool-model-catalog-${useId().replace(/:/g, '')}`;
++  return (
++    <>
++      <Form.Input
++        label={label}
++        value={value}
++        onChange={onChange}
++        list={listID}
++        placeholder={placeholder}
++        help={help}
++        autoComplete="off"
++      />
++      <datalist id={listID}>
++        {uniqueStrings(models).map((model) => <option key={model} value={model} />)}
++      </datalist>
++    </>
++  );
++}
++
++function TrafficFallbackModelEditor({ draft, setDraft, userGroups, models }) {
++  const catalog = useMemo(() => modelsByFamily(models), [models]);
++  const mappings = draft.traffic_fallback_model_mappings || [];
++  const updateMapping = (index, patchValue) => setDraft((current) => ({
++    ...current,
++    traffic_fallback_model_mappings: current.traffic_fallback_model_mappings.map((mapping, mappingIndex) => (
++      mappingIndex === index ? { ...mapping, ...patchValue } : mapping
++    )),
++  }));
++  const addMapping = () => setDraft((current) => {
++    let family = 'gpt';
++    let targetUserGroupID = '';
++    for (const candidate of FALLBACK_FAMILIES) {
++      const selected = uniqueStrings(current.traffic_fallback_groups?.[candidate.key]);
++      const missing = selected.find((groupID) => !(current.traffic_fallback_model_mappings || []).some((mapping) => (
++        mapping.family === candidate.key && mapping.target_user_group_id === groupID
++      )));
++      if (missing) {
++        family = candidate.key;
++        targetUserGroupID = missing;
++        break;
++      }
++      if (!targetUserGroupID && selected[0]) {
++        family = candidate.key;
++        targetUserGroupID = selected[0];
++      }
++    }
++    return {
++      ...current,
++      traffic_fallback_model_mappings: [...(current.traffic_fallback_model_mappings || []), {
++        family,
++        source_model: '',
++        target_user_group_id: targetUserGroupID,
++        target_model: '',
++      }],
++    };
++  });
++  const removeMapping = (index) => setDraft((current) => ({
++    ...current,
++    traffic_fallback_model_mappings: current.traffic_fallback_model_mappings.filter((_, mappingIndex) => mappingIndex !== index),
++  }));
++  const selectedCount = FALLBACK_FAMILIES.reduce((sum, { key }) => sum + uniqueStrings(draft.traffic_fallback_groups?.[key]).length, 0);
++
++  return (
++    <section className="pool-traffic-fallback-editor">
++      <div className="pool-user-routing-editor__head">
++        <div>
++          <strong>模型流量转换</strong>
++          <div className="pool-field__help">精确模型优先于前缀通配符；可从实时模型目录选择，也可直接输入尚未探测到的模型名。</div>
++        </div>
++        <Button onClick={addMapping} disabled={!selectedCount}>添加模型转换</Button>
++      </div>
++      {mappings.length ? mappings.map((mapping, index) => {
++        const selectedGroups = uniqueStrings(draft.traffic_fallback_groups?.[mapping.family]);
++        const groupOptions = selectedGroups.map((id) => {
++          const group = userGroups.find((item) => item.id === id);
++          return { label: group?.name || id, value: id };
++        });
++        const sourceModels = [...(catalog[mapping.family] || []), ...catalog.other];
++        return (
++          <Card key={`${index}:${mapping.family}:${mapping.target_user_group_id}`} className="pool-fallback-mapping-card">
++            <div className="pool-fallback-mapping-card__index">
++              <span>{String(index + 1).padStart(2, '0')}</span>
++              <small>转换规则</small>
++            </div>
++            <div className="pool-fallback-mapping-card__fields">
++              <Form.Select
++                label="流量家族"
++                value={mapping.family}
++                onChange={(family) => updateMapping(index, {
++                  family,
++                  target_user_group_id: uniqueStrings(draft.traffic_fallback_groups?.[family])[0] || '',
++                })}
++                optionList={FALLBACK_FAMILIES.map(({ key, label }) => ({ label, value: key }))}
++              />
++              <ModelCatalogInput
++                label="来源模型"
++                value={mapping.source_model}
++                onChange={(source_model) => updateMapping(index, { source_model })}
++                models={sourceModels}
++                placeholder="gpt-5.6-sol 或 gpt-5.*"
++              />
++              <div className="pool-fallback-mapping-card__arrow" aria-hidden="true">→</div>
++              <Form.Select
++                label="请求转入用户分组"
++                value={mapping.target_user_group_id}
++                onChange={(target_user_group_id) => updateMapping(index, { target_user_group_id })}
++                optionList={groupOptions}
++                placeholder="选择已勾选的兜底分组"
++              />
++              <ModelCatalogInput
++                label="目标模型"
++                value={mapping.target_model}
++                onChange={(target_model) => updateMapping(index, { target_model })}
++                models={[...catalog.gpt, ...catalog.claude, ...catalog.gemini, ...catalog.other]}
++                placeholder="gpt-5.5（支持手动输入）"
++              />
++            </div>
++            <Button size="small" type="danger" onClick={() => removeMapping(index)}>删除</Button>
++          </Card>
++        );
++      }) : (
++        <Banner
++          type={selectedCount ? 'warning' : 'info'}
++          title={selectedCount ? '为已选兜底分组添加模型转换' : '尚未启用流量兜底'}
++          description={selectedCount
++            ? '每个已勾选的模型家族与兜底分组至少需要一条来源模型 → 目标模型规则；使用 * 可覆盖该家族的所有模型。'
++            : '先在上方二级下拉框中选择 GPT、Claude 或 Gemini 的兜底用户分组。'}
++        />
++      )}
++    </section>
++  );
++}
++
+ function UserGroupEditor({
+   editor,
+   groups,
++  userGroups,
+   providers,
+   instructionFiles,
++  models,
++  modelsError,
+   catalogLoading,
+   catalogError,
+   onRetryCatalog,
+@@ -323,7 +652,11 @@ function UserGroupEditor({
+   const blockedAccountGroupOptions = groups
+     .filter((group) => draft.target_keys.includes(`${TARGET_ACCOUNT_GROUP}:${group.name}`))
+     .map((group) => ({ label: `账号池分组 · ${group.name}`, value: group.name }));
++  const fallbackGroupOptions = userGroups
++    .filter((group) => group.id !== editor?.row?.id)
++    .map((group) => ({ id: group.id, label: group.name || group.id }));
+   const payload = normalizedUserGroupPayload(draft, providers);
++  const fallbackIssues = fallbackConfigurationIssues(draft);
+ 
+   const setTargets = (targetKeys) => setDraft((current) => {
+     const selected = new Set(targetKeys);
+@@ -351,6 +684,13 @@ function UserGroupEditor({
+       [family]: { ...current.model_instruction_profiles?.[family], ...patchValue },
+     },
+   }));
++  const setTrafficFallbackGroups = (traffic_fallback_groups) => setDraft((current) => ({
++    ...current,
++    traffic_fallback_groups,
++    traffic_fallback_model_mappings: (current.traffic_fallback_model_mappings || []).filter((mapping) => (
++      uniqueStrings(traffic_fallback_groups?.[mapping.family]).includes(mapping.target_user_group_id)
++    )),
++  }));
+ 
+   return (
+     <div className="pool-user-group-editor">
+@@ -413,6 +753,33 @@ function UserGroupEditor({
+           </div>
+         </div>
+       </Card>
++      <Card title="流量兜底" className="pool-card pool-traffic-fallback-card">
++        <Banner
++          type="info"
++          title="仅在当前分组全部候选失败后接管"
++          description="按 GPT / Claude / Gemini 分别选择兜底用户分组，再配置来源模型到目标模型的转换。只重放尚未提交且不携带服务端会话状态的请求；循环引用会在保存时被拦截。"
++        />
++        <div className="pool-field pool-field--top">
++          <span className="pool-field__label">流量兜底分组</span>
++          <TrafficFallbackGroupSelector
++            value={draft.traffic_fallback_groups}
++            onChange={setTrafficFallbackGroups}
++            options={fallbackGroupOptions}
++            disabled={catalogLoading && fallbackGroupOptions.length === 0}
++          />
++          <div className="pool-field__help">一级选择模型家族，二级列表勾选有序兜底分组；同一家族按勾选顺序尝试。</div>
++        </div>
++        {modelsError ? (
++          <Banner type="warning" title="模型目录暂不可用" description="手动输入仍可正常配置与保存，目录恢复后会自动补全候选项。" />
++        ) : null}
++        <TrafficFallbackModelEditor draft={draft} setDraft={setDraft} userGroups={userGroups} models={models} />
++        {fallbackIssues.length ? (
++          <div className="pool-fallback-validation" role="alert">
++            <strong>还需完成 {fallbackIssues.length} 项配置</strong>
++            <span>{fallbackIssues.slice(0, 3).join('；')}{fallbackIssues.length > 3 ? `；另有 ${fallbackIssues.length - 3} 项` : ''}</span>
++          </div>
++        ) : null}
++      </Card>
+       <Card title="指令与模型策略" className="pool-card">
+         <Form.TextArea label="系统提示词" value={draft.system_prompt} onChange={(system_prompt) => setDraft((current) => ({ ...current, system_prompt }))} rows={5} placeholder="留空则不注入额外系统提示" />
+         <div className="pool-user-group-grid">
+@@ -463,12 +830,21 @@ function UserGroupEditor({
+                   : '所有兼容目标等权'}
+               </div>
+             ))}
++            {FALLBACK_FAMILIES.flatMap(({ key, label }) => (payload.traffic_fallback_groups[key] || []).map((groupID) => {
++              const group = userGroups.find((item) => item.id === groupID);
++              const mappings = payload.traffic_fallback_model_mappings.filter((mapping) => mapping.family === key && mapping.target_user_group_id === groupID);
++              return (
++                <div key={`fallback:${key}:${groupID}`}>
++                  <strong>{label} 兜底</strong>：{group?.name || groupID} · {mappings.map((mapping) => `${mapping.source_model} → ${mapping.target_model}`).join('，')}
++                </div>
++              );
++            }))}
+           </>
+         ) : <span className="pool-muted">至少选择一个目标后显示路由摘要。</span>}
+       </Card>
+       <div className="pool-modal-actions">
+         <Button onClick={onCancel} disabled={saving}>取消</Button>
+-        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0} onClick={() => onSave(payload)}>保存用户分组</Button>
++        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0 || fallbackIssues.length > 0} onClick={() => onSave(payload)}>保存用户分组</Button>
+       </div>
+     </div>
+   );
+@@ -489,19 +865,22 @@ export default function Groups() {
+   const fetchEgresses = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal }), ['profiles', 'egress_profiles']), []);
+   const fetchUserGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/user-groups', undefined, { signal }), ['user_groups']), []);
+   const fetchProviders = useCallback(async ({ signal }) => rowsOf(await get('/admin/providers', undefined, { signal }), ['providers']), []);
++  const fetchModels = useCallback(async ({ signal }) => rowsOf(await get('/admin/models', undefined, { signal }), ['models']), []);
+ 
+   const groupsResource = useAsyncResource(fetchGroups, [fetchGroups], { initialData: [] });
+   const instructionsResource = useAsyncResource(fetchInstructions, [fetchInstructions], { initialData: [] });
+   const egressesResource = useAsyncResource(fetchEgresses, [fetchEgresses], { initialData: [] });
+   const userGroupsResource = useAsyncResource(fetchUserGroups, [fetchUserGroups], { initialData: [] });
+   const providersResource = useAsyncResource(fetchProviders, [fetchProviders], { initialData: [] });
+-  const resources = [groupsResource, instructionsResource, egressesResource, userGroupsResource, providersResource];
++  const modelsResource = useAsyncResource(fetchModels, [fetchModels], { initialData: [] });
++  const resources = [groupsResource, instructionsResource, egressesResource, userGroupsResource, providersResource, modelsResource];
+   const data = {
+     groups: groupsResource.data || [],
+     instructions: instructionsResource.data || [],
+     egresses: egressesResource.data || [],
+     userGroups: userGroupsResource.data || [],
+     providers: providersResource.data || [],
++    models: modelsResource.data || [],
+   };
+   const loading = resources.some((resource) => resource.loading);
+   const lastRefresh = resources.reduce((latest, resource) => {
+@@ -515,6 +894,7 @@ export default function Groups() {
+       egressesResource.reload(),
+       userGroupsResource.reload(),
+       providersResource.reload(),
++      modelsResource.reload(),
+     ]);
+   }, [
+     groupsResource.reload,
+@@ -522,14 +902,16 @@ export default function Groups() {
+     egressesResource.reload,
+     userGroupsResource.reload,
+     providersResource.reload,
++    modelsResource.reload,
+   ]);
+   const refreshUserGroupCatalog = useCallback(() => {
+     void Promise.allSettled([
+       groupsResource.reload(),
+       providersResource.reload(),
+       instructionsResource.reload(),
++      modelsResource.reload(),
+     ]);
+-  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload]);
++  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, modelsResource.reload]);
+   const openUserGroupEditor = useCallback((editor) => {
+     setUserEditor(editor);
+     refreshUserGroupCatalog();
+@@ -538,7 +920,7 @@ export default function Groups() {
+     setAccountEditor(editor);
+     void egressesResource.reload();
+   }, [egressesResource.reload]);
+-  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading;
++  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading || modelsResource.loading;
+   const targetCatalogError = groupsResource.error || providersResource.error || instructionsResource.error;
+ 
+   const { run: saveAccountGroup, running: savingAccountGroup } = useAsyncAction(async (values) => {
+@@ -663,6 +1045,9 @@ export default function Groups() {
+         row.system_prompt_apply_to_compaction ? '压缩时应用' : '',
+         row.block_claude_target_groups?.length ? `Claude 跳过 ${row.block_claude_target_groups.length} 组` : '',
+         row.block_gpt_target_groups?.length ? `GPT 跳过 ${row.block_gpt_target_groups.length} 组` : '',
++        FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)
++          ? `流量兜底 ${FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)} 组`
++          : '',
+       ].filter(Boolean)} max={3} />,
+     },
+     {
+@@ -691,6 +1076,7 @@ export default function Groups() {
+     { label: '用户分组', value: data.userGroups.length },
+     { label: '混合目标', value: data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length },
+     { label: '模型分层', value: data.userGroups.filter((row) => row.model_routing?.length).length, tone: 'success' },
++    { label: '流量兜底', value: data.userGroups.filter((row) => FALLBACK_FAMILIES.some(({ key }) => row.traffic_fallback_groups?.[key]?.length)).length, tone: 'success' },
+   ];
+ 
+   return (
+@@ -737,8 +1123,11 @@ export default function Groups() {
+             key={`${userEditor.mode}:${userEditor.row?.id || 'new'}`}
+             editor={userEditor}
+             groups={data.groups}
++            userGroups={data.userGroups}
+             providers={data.providers}
+             instructionFiles={data.instructions}
++            models={data.models}
++            modelsError={modelsResource.error}
+             catalogLoading={targetCatalogLoading}
+             catalogError={targetCatalogError}
+             onRetryCatalog={refreshUserGroupCatalog}
+@@ -762,4 +1151,11 @@ export default function Groups() {
+   );
+ }
+ 
+-export { blankUserGroup, normalizedUserGroupPayload, userGroupDraft };
++export {
++  blankUserGroup,
++  fallbackConfigurationIssues,
++  modelFamily,
++  modelsByFamily,
++  normalizedUserGroupPayload,
++  userGroupDraft,
++};
+diff --git a/web-spa/src/styles/components.css b/web-spa/src/styles/components.css
+index db40743..39e4380 100644
+--- a/web-spa/src/styles/components.css
++++ b/web-spa/src/styles/components.css
+@@ -4018,6 +4018,337 @@
+   gap: 8px;
+ }
+ 
++.pool-traffic-fallback-card .pool-card-body,
++.pool-traffic-fallback-editor {
++  display: grid;
++  gap: 14px;
++}
++
++.pool-fallback-selector__trigger {
++  width: 100%;
++  min-height: 48px;
++  display: flex;
++  min-width: 0;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  padding: 7px 11px;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-md);
++  background:
++    linear-gradient(180deg, color-mix(in srgb, var(--pool-bg-surface) 96%, white 4%), var(--pool-bg-surface-2));
++  color: var(--pool-text);
++  box-shadow: 0 1px 0 color-mix(in srgb, white 8%, transparent);
++  font: inherit;
++  text-align: left;
++  cursor: pointer;
++  transition: border-color var(--pool-motion-fast) var(--pool-motion-ease),
++    box-shadow var(--pool-motion-fast) var(--pool-motion-ease),
++    transform var(--pool-motion-fast) var(--pool-motion-ease);
++}
++
++.pool-fallback-selector__trigger:hover {
++  border-color: var(--pool-border-strong);
++}
++
++.pool-fallback-selector__trigger:active {
++  transform: scale(0.997);
++}
++
++.pool-fallback-selector__trigger:focus-visible,
++.pool-fallback-selector__trigger[data-state='open'] {
++  outline: 0;
++  border-color: var(--pool-accent);
++  box-shadow: var(--pool-focus);
++}
++
++.pool-fallback-selector__trigger:disabled {
++  opacity: 0.56;
++  cursor: not-allowed;
++}
++
++.pool-fallback-selector__summary {
++  display: flex;
++  min-width: 0;
++  flex-wrap: wrap;
++  gap: 6px;
++}
++
++.pool-fallback-selector__placeholder,
++.pool-fallback-selector__chevron {
++  color: var(--pool-text-3);
++}
++
++.pool-fallback-selector__pill {
++  display: inline-flex;
++  min-width: 0;
++  align-items: center;
++  gap: 6px;
++  padding: 5px 9px;
++  border-radius: 999px;
++  background: var(--pool-accent-soft);
++  color: var(--pool-accent-text);
++  font-size: 12px;
++  font-weight: 650;
++}
++
++.pool-fallback-selector__pill b {
++  min-width: 18px;
++  padding: 1px 5px;
++  border-radius: 999px;
++  background: color-mix(in srgb, var(--pool-accent) 15%, transparent);
++  text-align: center;
++}
++
++.pool-fallback-selector__content {
++  /* The selector is portalled from inside the user-group modal. Keep it above
++     the modal content (2001) so pointer events and the visual surface agree. */
++  z-index: 2100;
++  pointer-events: auto;
++  width: min(680px, calc(100vw - 32px));
++  max-height: min(430px, var(--radix-popover-content-available-height));
++  display: grid;
++  grid-template-columns: minmax(150px, 0.64fr) minmax(280px, 1.36fr);
++  overflow: hidden;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-xl);
++  background: color-mix(in srgb, var(--pool-bg-elevated) 96%, transparent);
++  box-shadow: var(--pool-shadow-hero-lg);
++  backdrop-filter: blur(24px) saturate(1.3);
++  -webkit-backdrop-filter: blur(24px) saturate(1.3);
++  transform-origin: var(--radix-popover-content-transform-origin);
++  animation: pool-fallback-popover-in var(--pool-motion-normal) var(--pool-motion-ease);
++}
++
++@keyframes pool-fallback-popover-in {
++  from { opacity: 0; transform: translateY(-4px) scale(0.985); }
++  to { opacity: 1; transform: translateY(0) scale(1); }
++}
++
++.pool-fallback-selector__families {
++  display: grid;
++  align-content: start;
++  gap: 5px;
++  padding: 12px;
++  border-right: 1px solid var(--pool-border);
++  background: color-mix(in srgb, var(--pool-bg-surface-2) 82%, transparent);
++}
++
++.pool-fallback-selector__families button {
++  min-width: 0;
++  min-height: 43px;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 8px;
++  padding: 9px 11px;
++  border: 0;
++  border-radius: var(--pool-radius-md);
++  background: transparent;
++  color: var(--pool-text-2);
++  font: inherit;
++  font-weight: 650;
++  text-align: left;
++  cursor: pointer;
++}
++
++.pool-fallback-selector__families button:hover {
++  background: var(--pool-bg-hover);
++  color: var(--pool-text);
++}
++
++.pool-fallback-selector__families button:focus-visible {
++  outline: 2px solid var(--pool-accent);
++  outline-offset: -2px;
++}
++
++.pool-fallback-selector__families button.is-active {
++  background: var(--pool-bg-selected);
++  color: var(--pool-accent-text);
++}
++
++.pool-fallback-selector__families b {
++  min-width: 22px;
++  color: var(--pool-text-3);
++  font-size: 12px;
++  text-align: center;
++}
++
++.pool-fallback-selector__groups {
++  min-width: 0;
++  display: grid;
++  grid-template-rows: auto auto minmax(0, 1fr);
++  gap: 10px;
++  padding: 14px;
++}
++
++.pool-fallback-selector__groups-head {
++  display: flex;
++  min-width: 0;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: 12px;
++}
++
++.pool-fallback-selector__groups-head span {
++  color: var(--pool-text-3);
++  font-size: 12px;
++  white-space: nowrap;
++}
++
++.pool-fallback-selector__list {
++  max-height: 292px;
++  display: grid;
++  align-content: start;
++  gap: 4px;
++  overflow-y: auto;
++  overscroll-behavior: contain;
++}
++
++.pool-fallback-selector__list button {
++  width: 100%;
++  min-width: 0;
++  min-height: 52px;
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) 24px;
++  gap: 10px;
++  align-items: center;
++  padding: 8px 10px;
++  border: 1px solid transparent;
++  border-radius: var(--pool-radius-md);
++  background: transparent;
++  color: var(--pool-text);
++  font: inherit;
++  text-align: left;
++  cursor: pointer;
++}
++
++.pool-fallback-selector__list button:hover {
++  background: var(--pool-bg-hover);
++}
++
++.pool-fallback-selector__list button:focus-visible {
++  outline: 2px solid var(--pool-accent);
++  outline-offset: -2px;
++}
++
++.pool-fallback-selector__list button.is-selected {
++  border-color: color-mix(in srgb, var(--pool-accent) 32%, transparent);
++  background: var(--pool-bg-selected);
++}
++
++.pool-fallback-selector__option-copy {
++  display: grid;
++  min-width: 0;
++  gap: 2px;
++}
++
++.pool-fallback-selector__option-copy strong,
++.pool-fallback-selector__option-copy small {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-fallback-selector__option-copy small {
++  color: var(--pool-text-3);
++  font-family: var(--pool-font-mono);
++  font-size: 11px;
++}
++
++.pool-fallback-selector__check {
++  width: 22px;
++  height: 22px;
++  display: grid;
++  place-items: center;
++  border: 1px solid var(--pool-border-strong);
++  border-radius: 999px;
++  color: white;
++  font-size: 12px;
++  font-weight: 800;
++}
++
++.pool-fallback-selector__list button.is-selected .pool-fallback-selector__check {
++  border-color: var(--pool-accent);
++  background: var(--pool-accent);
++}
++
++.pool-fallback-selector__empty {
++  padding: 34px 12px;
++  color: var(--pool-text-3);
++  text-align: center;
++}
++
++.pool-fallback-mapping-card .pool-card-body {
++  display: grid;
++  grid-template-columns: 48px minmax(0, 1fr) auto;
++  gap: 12px;
++  align-items: end;
++}
++
++.pool-fallback-mapping-card__index {
++  min-height: 40px;
++  display: grid;
++  align-content: center;
++  gap: 1px;
++  color: var(--pool-text-3);
++}
++
++.pool-fallback-mapping-card__index span {
++  color: var(--pool-accent-text);
++  font-family: var(--pool-font-mono);
++  font-size: 18px;
++  font-weight: 720;
++}
++
++.pool-fallback-mapping-card__index small {
++  font-size: 10px;
++  white-space: nowrap;
++}
++
++.pool-fallback-mapping-card__fields {
++  display: grid;
++  grid-template-columns: minmax(105px, 0.7fr) minmax(145px, 1.15fr) 24px minmax(145px, 1.15fr) minmax(145px, 1.15fr);
++  gap: 10px;
++  align-items: end;
++}
++
++.pool-fallback-mapping-card__fields > .pool-field {
++  min-width: 0;
++  margin-bottom: 0;
++}
++
++.pool-fallback-mapping-card__fields .pool-input,
++.pool-fallback-mapping-card__fields .pool-select {
++  width: 100%;
++  min-width: 0;
++}
++
++.pool-fallback-mapping-card__arrow {
++  min-height: 40px;
++  display: grid;
++  place-items: center;
++  color: var(--pool-accent-text);
++  font-size: 19px;
++}
++
++.pool-fallback-validation {
++  display: grid;
++  gap: 3px;
++  padding: 11px 13px;
++  border: 1px solid color-mix(in srgb, var(--pool-warning) 30%, transparent);
++  border-radius: var(--pool-radius-md);
++  background: var(--pool-warning-soft);
++  color: var(--pool-text-2);
++  font-size: 12px;
++}
++
++.pool-fallback-validation strong {
++  color: var(--pool-warning);
++  font-size: 13px;
++}
++
+ .pool-modal-actions {
+   justify-content: flex-end;
+   padding-top: 4px;
+@@ -4215,6 +4546,55 @@
+     grid-template-columns: 1fr;
+   }
+ 
++  .pool-fallback-selector__content {
++    width: min(440px, calc(100vw - 20px));
++    grid-template-columns: 1fr;
++    border-radius: var(--pool-radius-lg);
++  }
++
++  .pool-fallback-selector__families {
++    grid-auto-flow: column;
++    grid-template-columns: repeat(3, minmax(0, 1fr));
++    padding: 8px;
++    border-right: 0;
++    border-bottom: 1px solid var(--pool-border);
++  }
++
++  .pool-fallback-selector__families button {
++    min-height: 40px;
++    padding: 7px 8px;
++  }
++
++  .pool-fallback-selector__groups {
++    padding: 10px;
++  }
++
++  .pool-fallback-selector__list {
++    max-height: min(230px, 40vh);
++  }
++
++  .pool-fallback-mapping-card .pool-card-body {
++    grid-template-columns: minmax(0, 1fr) auto;
++    align-items: start;
++  }
++
++  .pool-fallback-mapping-card__index {
++    grid-column: 1 / -1;
++    grid-auto-flow: column;
++    justify-content: start;
++    gap: 6px;
++    min-height: 0;
++  }
++
++  .pool-fallback-mapping-card__fields {
++    grid-template-columns: 1fr;
++  }
++
++  .pool-fallback-mapping-card__arrow {
++    min-height: 18px;
++    transform: rotate(90deg);
++  }
++
+   .pool-route-tier__actions {
+     justify-content: flex-end;
+   }
+diff --git a/web-spa/tests/user-group-traffic-policy.test.ts b/web-spa/tests/user-group-traffic-policy.test.ts
+index 4d3d6d9..36e79a8 100644
+--- a/web-spa/tests/user-group-traffic-policy.test.ts
++++ b/web-spa/tests/user-group-traffic-policy.test.ts
+@@ -1,6 +1,9 @@
+ import { describe, expect, it } from 'vitest';
+ import {
+   blankUserGroup,
++  fallbackConfigurationIssues,
++  modelFamily,
++  modelsByFamily,
+   normalizedUserGroupPayload,
+   userGroupDraft,
+ } from '../src/pages/Groups.jsx';
+@@ -54,3 +57,108 @@ describe('user-group target-family traffic policy', () => {
+     expect(draft.block_gpt_target_groups).toEqual(['pool-b']);
+   });
+ });
++
++describe('user-group cross-group traffic fallback policy', () => {
++  it('defaults every supported family to an empty ordered fallback list', () => {
++    const draft = blankUserGroup();
++    expect(draft.traffic_fallback_groups).toEqual({ gpt: [], claude: [], gemini: [] });
++    expect(draft.traffic_fallback_model_mappings).toEqual([]);
++  });
++
++  it('round-trips ordered groups and multiple model rewrites', () => {
++    const draft = userGroupDraft({
++      id: 'ug-primary',
++      name: 'primary',
++      targets: [{ kind: 'account_pool_group', id: 'pool-a' }],
++      traffic_fallback_groups: {
++        gpt: ['ug-gpt-b', 'ug-gpt-c'],
++        claude: ['ug-claude'],
++        gemini: [],
++      },
++      traffic_fallback_model_mappings: [
++        { family: 'gpt', source_model: 'gpt-5.6-sol', target_user_group_id: 'ug-gpt-b', target_model: 'gpt-5.5' },
++        { family: 'gpt', source_model: 'gpt-5.*', target_user_group_id: 'ug-gpt-c', target_model: 'gpt-5.4' },
++        { family: 'claude', source_model: '*', target_user_group_id: 'ug-claude', target_model: 'claude-sonnet-4-5' },
++      ],
++    });
++
++    expect(draft.traffic_fallback_groups.gpt).toEqual(['ug-gpt-b', 'ug-gpt-c']);
++    expect(draft.traffic_fallback_model_mappings).toHaveLength(3);
++    expect(fallbackConfigurationIssues(draft)).toEqual([]);
++  });
++
++  it('normalizes duplicates while retaining manual model names', () => {
++    const payload = normalizedUserGroupPayload({
++      ...blankUserGroup(),
++      name: 'fallback-policy',
++      target_keys: ['account_pool_group:pool-a'],
++      traffic_fallback_groups: {
++        gpt: ['ug-backup', 'ug-backup'],
++        claude: [],
++        gemini: [],
++      },
++      traffic_fallback_model_mappings: [
++        {
++          family: 'gpt',
++          source_model: 'manual-gpt-edge',
++          target_user_group_id: 'ug-backup',
++          target_model: 'manually-entered-target',
++        },
++        {
++          family: 'claude',
++          source_model: 'claude-*',
++          target_user_group_id: 'not-selected',
++          target_model: 'claude-sonnet',
++        },
++      ],
++    });
++
++    expect(payload.traffic_fallback_groups.gpt).toEqual(['ug-backup']);
++    expect(payload.traffic_fallback_model_mappings).toEqual([{
++      family: 'gpt',
++      source_model: 'manual-gpt-edge',
++      target_user_group_id: 'ug-backup',
++      target_model: 'manually-entered-target',
++    }]);
++  });
++
++  it('reports an incomplete selected fallback before save', () => {
++    const draft = {
++      ...blankUserGroup(),
++      traffic_fallback_groups: { gpt: ['ug-backup'], claude: [], gemini: [] },
++    };
++    expect(fallbackConfigurationIssues(draft)).toEqual(['GPT / Codex · ug-backup 尚未配置模型转换']);
++  });
++
++  it('reports duplicate and malformed wildcard mappings before save', () => {
++    const mapping = {
++      family: 'gpt',
++      source_model: 'gpt-*broken',
++      target_user_group_id: 'ug-backup',
++      target_model: 'gpt-5.5',
++    };
++    const draft = {
++      ...blankUserGroup(),
++      traffic_fallback_groups: { gpt: ['ug-backup'], claude: [], gemini: [] },
++      traffic_fallback_model_mappings: [mapping, { ...mapping }],
++    };
++    expect(fallbackConfigurationIssues(draft)).toEqual([
++      '模型转换 1 仅支持末尾通配符',
++      '模型转换 2 仅支持末尾通配符',
++      '模型转换 2 与已有规则重复',
++    ]);
++  });
++
++  it('groups live catalog suggestions without blocking unknown manual models', () => {
++    expect(modelFamily('gpt-5.6-sol')).toBe('gpt');
++    expect(modelFamily('claude-sonnet-4-5')).toBe('claude');
++    expect(modelFamily('gemini-3-pro')).toBe('gemini');
++    expect(modelFamily('vendor-private-model')).toBe('');
++    expect(modelsByFamily(['gpt-5.6-sol', 'claude-sonnet-4-5', 'gemini-3-pro', 'vendor-private-model'])).toEqual({
++      gpt: ['gpt-5.6-sol'],
++      claude: ['claude-sonnet-4-5'],
++      gemini: ['gemini-3-pro'],
++      other: ['vendor-private-model'],
++    });
++  });
++});

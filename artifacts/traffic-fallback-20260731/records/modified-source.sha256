@@ -1,0 +1,11 @@
+92eeec97e8aa1e573fbf94f7e4a050e0f9110b6eec8a076161585afdc01f579e  ./internal/api/admin_user_groups.go
+97efa7210577aef5fce8e3b9440dd18a4a808810148a8c4ff328a7c18a02ba97  ./internal/api/admin_user_groups_test.go
+dedc16e275b6879742396bfe0bd058868289c14cf81f4f1e924a90521874e5c3  ./internal/api/override.go
+2d613d83021879c4bbcadb046b9847e34896f21a63fb07d9f3b5c81758ebb29d  ./internal/api/user_group_route.go
+4f655a6b42430e72c8b95e76e03ba69867a53d01222cf1b050fce505afcf65fa  ./internal/api/user_group_route_test.go
+18b7b2ea98030b3944eda8f6faaee68b3bbf4aff40055ddd1a45d4401bb81254  ./internal/storage/migration_test.go
+8edc8f54bf54175b9cfcac987d9f19857a471c5d6e3b7073464e94a2131636e3  ./internal/storage/storage.go
+10f1c53f45e5232f9bb304ec942d259bbcfadc1679e5fc813677ad3dd1be7d86  ./internal/storage/user_groups_test.go
+8fcdb2afbda2117344bde9ae75014a111421673033a45f3872c14dc7e245f14b  ./web-spa/src/pages/Groups.jsx
+0a7f7e0a81d3b0075d6f1bdbd4f62899d3198ab5e2c248e744ad4f96a0777a2b  ./web-spa/src/styles/components.css
+39e09eaed06676c0bf1536b76ae2abd51a4c523457b1d052b2f42e1e087f94c1  ./web-spa/tests/user-group-traffic-policy.test.ts

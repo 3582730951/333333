@@ -1,0 +1,20 @@
+{
+  "seed_method": "direct_sqlite",
+  "database": "/root/autodl-tmp/legacy-install-upgrade-20260731/data/pool.sqlite3",
+  "logical_fingerprint_sha256": "be7b9be9822fa9b4c1a502acf3c99f63b47831321aa9acbe143ae43bbd4d1b56",
+  "counts": {
+    "groups": 7,
+    "accounts": 16,
+    "account_rate_limits": 16,
+    "account_model_capabilities": 32,
+    "usage_records": 336,
+    "email_pool": 18,
+    "audit_log": 48,
+    "registration_jobs": 6,
+    "registration_records": 18,
+    "lifecycle_tasks": 8
+  },
+  "longest_account_label": 68,
+  "longest_email": 81,
+  "fixture_marker": "cache-hit-optimization-to-optimized"
+}

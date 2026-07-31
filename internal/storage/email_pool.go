@@ -5,9 +5,20 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const emailAccountSelectColumns = `COALESCE(id,''), COALESCE(email,''), COALESCE(password,''), COALESCE(client_id,''), COALESCE(refresh_token,''), COALESCE(status,'idle'), COALESCE(group_name,''), COALESCE(error_message,''), COALESCE(last_used_at,0), COALESCE(created_at,0), COALESCE(updated_at,0)`
+
+func (s *Store) openEmailAccountSecrets(account *EmailAccount) {
+	if account == nil {
+		return
+	}
+	account.Password = s.openToken(account.Password)
+	account.ClientID = s.openToken(account.ClientID)
+	account.RefreshToken = s.openToken(account.RefreshToken)
+}
 
 // InsertEmailAccount inserts a single email account into the pool.
 func (s *Store) InsertEmailAccount(ctx context.Context, a EmailAccount) error {
@@ -19,7 +30,7 @@ func (s *Store) InsertEmailAccount(ctx context.Context, a EmailAccount) error {
 		a.UpdatedAt = now
 	}
 	if a.ID == "" {
-		a.ID = fmt.Sprintf("email_%x", now)
+		a.ID = "email_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
 	if a.Status == "" {
 		a.Status = "idle"
@@ -27,7 +38,8 @@ func (s *Store) InsertEmailAccount(ctx context.Context, a EmailAccount) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO email_pool(id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Email, a.Password, a.ClientID, a.RefreshToken, a.Status, a.GroupName, a.ErrorMessage, a.LastUsedAt, a.CreatedAt, a.UpdatedAt)
+		a.ID, a.Email, s.sealToken(a.Password), s.sealToken(a.ClientID), s.sealToken(a.RefreshToken),
+		a.Status, a.GroupName, a.ErrorMessage, a.LastUsedAt, a.CreatedAt, a.UpdatedAt)
 	return err
 }
 
@@ -36,9 +48,14 @@ func (s *Store) InsertEmailAccount(ctx context.Context, a EmailAccount) error {
 func (s *Store) BulkInsertEmailAccounts(ctx context.Context, accounts []EmailAccount) (int, error) {
 	now := Now()
 	inserted := 0
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	for i := range accounts {
 		if accounts[i].ID == "" {
-			accounts[i].ID = fmt.Sprintf("email_%s_%d", strings.ReplaceAll(accounts[i].Email, "@", "_"), now)
+			accounts[i].ID = "email_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		}
 		if accounts[i].Status == "" {
 			accounts[i].Status = "idle"
@@ -49,18 +66,24 @@ func (s *Store) BulkInsertEmailAccounts(ctx context.Context, accounts []EmailAcc
 		if accounts[i].UpdatedAt == 0 {
 			accounts[i].UpdatedAt = now
 		}
-		result, err := s.db.ExecContext(ctx,
+		result, err := tx.ExecContext(ctx,
 			`INSERT INTO email_pool(id, email, password, client_id, refresh_token, status, group_name, error_message, last_used_at, created_at, updated_at)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
-			accounts[i].ID, accounts[i].Email, accounts[i].Password, accounts[i].ClientID, accounts[i].RefreshToken,
+			 SELECT ?,?,?,?,?,?,?,?,?,?,?
+			 WHERE NOT EXISTS (SELECT 1 FROM email_pool WHERE LOWER(email)=LOWER(?))
+			 ON CONFLICT(id) DO NOTHING`,
+			accounts[i].ID, accounts[i].Email, s.sealToken(accounts[i].Password),
+			s.sealToken(accounts[i].ClientID), s.sealToken(accounts[i].RefreshToken),
 			accounts[i].Status, accounts[i].GroupName, accounts[i].ErrorMessage, accounts[i].LastUsedAt,
-			accounts[i].CreatedAt, accounts[i].UpdatedAt)
+			accounts[i].CreatedAt, accounts[i].UpdatedAt, accounts[i].Email)
 		if err != nil {
 			return inserted, err
 		}
 		if affected, affectedErr := result.RowsAffected(); affectedErr == nil {
 			inserted += int(affected)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return inserted, nil
 }
@@ -107,6 +130,7 @@ func (s *Store) ListEmailAccounts(ctx context.Context, page, pageSize int, searc
 			&a.Status, &a.GroupName, &a.ErrorMessage, &a.LastUsedAt, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
+		s.openEmailAccountSecrets(&a)
 		out = append(out, a)
 	}
 	return out, total, rows.Err()
@@ -125,6 +149,7 @@ func (s *Store) GetEmailAccount(ctx context.Context, id string) (EmailAccount, b
 	if err != nil {
 		return EmailAccount{}, false, err
 	}
+	s.openEmailAccountSecrets(&a)
 	return a, true, nil
 }
 
@@ -133,7 +158,8 @@ func (s *Store) UpdateEmailAccount(ctx context.Context, a EmailAccount) error {
 	a.UpdatedAt = Now()
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE email_pool SET password=?, client_id=?, refresh_token=?, status=?, group_name=?, error_message=?, last_used_at=?, updated_at=? WHERE id=?`,
-		a.Password, a.ClientID, a.RefreshToken, a.Status, a.GroupName, a.ErrorMessage, a.LastUsedAt, a.UpdatedAt, a.ID)
+		s.sealToken(a.Password), s.sealToken(a.ClientID), s.sealToken(a.RefreshToken),
+		a.Status, a.GroupName, a.ErrorMessage, a.LastUsedAt, a.UpdatedAt, a.ID)
 	return err
 }
 
@@ -146,29 +172,55 @@ func (s *Store) DeleteEmailAccount(ctx context.Context, id string) error {
 // ReserveEmailAccount atomically picks an idle email account and marks it as in_use.
 // Returns sql.ErrNoRows if no idle accounts are available.
 func (s *Store) ReserveEmailAccount(ctx context.Context, groupName string) (EmailAccount, error) {
-	var a EmailAccount
-	query := `SELECT ` + emailAccountSelectColumns + ` FROM email_pool WHERE status = 'idle'`
-	args := []interface{}{}
-	if groupName != "" {
-		query += " AND group_name = ?"
-		args = append(args, groupName)
+	for attempt := 0; attempt < 4; attempt++ {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return EmailAccount{}, err
+		}
+		var a EmailAccount
+		query := `SELECT ` + emailAccountSelectColumns + ` FROM email_pool WHERE status = 'idle'`
+		args := []interface{}{}
+		if groupName != "" {
+			query += " AND group_name = ?"
+			args = append(args, groupName)
+		}
+		query += " ORDER BY last_used_at ASC, created_at ASC, id ASC LIMIT 1"
+		err = tx.QueryRowContext(ctx, query, args...).Scan(
+			&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken,
+			&a.Status, &a.GroupName, &a.ErrorMessage, &a.LastUsedAt, &a.CreatedAt, &a.UpdatedAt,
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return EmailAccount{}, err
+		}
+		now := Now()
+		result, err := tx.ExecContext(ctx,
+			`UPDATE email_pool SET status='in_use',last_used_at=?,updated_at=? WHERE id=? AND status='idle'`,
+			now, now, a.ID,
+		)
+		if err != nil {
+			_ = tx.Rollback()
+			return EmailAccount{}, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			_ = tx.Rollback()
+			return EmailAccount{}, err
+		}
+		if affected != 1 {
+			_ = tx.Rollback()
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			return EmailAccount{}, err
+		}
+		a.Status = "in_use"
+		a.LastUsedAt = now
+		a.UpdatedAt = now
+		s.openEmailAccountSecrets(&a)
+		return a, nil
 	}
-	query += " ORDER BY last_used_at ASC LIMIT 1"
-	if err := s.rdb.QueryRowContext(ctx, query, args...).Scan(
-		&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken,
-		&a.Status, &a.GroupName, &a.ErrorMessage, &a.LastUsedAt, &a.CreatedAt, &a.UpdatedAt,
-	); err != nil {
-		return EmailAccount{}, err
-	}
-	now := Now()
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE email_pool SET status = 'in_use', last_used_at = ?, updated_at = ? WHERE id = ? AND status = 'idle'`,
-		now, now, a.ID); err != nil {
-		return EmailAccount{}, err
-	}
-	a.Status = "in_use"
-	a.LastUsedAt = now
-	return a, nil
+	return EmailAccount{}, sql.ErrNoRows
 }
 
 // ReleaseEmailAccount sets an email account's status back after a registration attempt.

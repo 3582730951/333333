@@ -1,0 +1,10 @@
+{
+  "required_tables": [
+    "team_lifecycle_events",
+    "team_lifecycle_workflows",
+    "team_members",
+    "team_workspaces"
+  ],
+  "missing_tables": [],
+  "forbidden_secret_columns": []
+}

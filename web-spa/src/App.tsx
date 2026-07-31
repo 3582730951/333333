@@ -111,7 +111,7 @@ function adminNavigation() {
   for (const group of ADMIN_GROUPS) {
     const Icon = group.icon;
     const children = adminRoutes
-      .filter((route) => route.navGroup === group.key)
+      .filter((route) => route.navGroup === group.key && !('navHidden' in route && route.navHidden))
       .map((route) => ({ itemKey: route.path, text: t(route.titleKey) }));
     if (children.length) items.push({ itemKey: `group:${group.key}`, text: t(group.labelKey), icon: <Icon />, items: children });
   }

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +104,7 @@ func TestCommitRegistrationKeepsCanaryQuarantinedAtomically(t *testing.T) {
 	if err := store.Init(ctx); err != nil {
 		t.Fatal(err)
 	}
+	store.SetTokenEncryptionKey([]byte("registration-recovery-test-secret"))
 	now := Now()
 	if _, err := store.DB().ExecContext(ctx, `
 INSERT INTO registration_jobs(id,platform,method,total,status,config_json,created_at,updated_at)
@@ -122,6 +124,7 @@ VALUES('record-canary','job-canary','pending',?)`, now); err != nil {
 	account := Account{
 		ID: "account-canary", Label: "canary", GroupName: "default",
 		UpstreamAccountID: "upstream-canary", ChatGPTUserID: "user-canary",
+		Email:    "canary@example.test",
 		Provider: "codex", Status: "quarantined", CreatedAt: now, UpdatedAt: now,
 	}
 	if err := store.CommitRegistration(ctx, RegistrationCommit{
@@ -133,6 +136,8 @@ VALUES('record-canary','job-canary','pending',?)`, now); err != nil {
 		EgressID: storageDefaultDirectEgressIDForTest(t, store),
 		Method:   "protocol", JobID: "job-canary", RecordID: "record-canary",
 		WorkflowItemID: "workflow-canary", RemoteIdentityAlias: "ACC-CANARY",
+		SessionCookie: "__Secure-next-auth.session-token=session-secret",
+		LoginPassword: "registration-password-secret",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +152,27 @@ VALUES('record-canary','job-canary','pending',?)`, now); err != nil {
 	}
 	if accountStatus != "quarantined" || workflowState != RegistrationItemQuarantined {
 		t.Fatalf("canary state = account:%q workflow:%q", accountStatus, workflowState)
+	}
+	cookie, err := store.GetSessionCookie(ctx, account.ID)
+	if err != nil || cookie != "__Secure-next-auth.session-token=session-secret" {
+		t.Fatalf("session cookie=%q err=%v", cookie, err)
+	}
+	reauth, found, err := store.GetCodexReauthConfig(ctx, account.ID)
+	if err != nil || !found || reauth.LoginEmail != account.Email ||
+		reauth.Password != "registration-password-secret" || !reauth.AutoEnabled {
+		t.Fatalf("reauth config=%+v found=%v err=%v", reauth, found, err)
+	}
+	var rawCookie, rawPassword string
+	if err := store.DB().QueryRowContext(ctx, `
+SELECT c.cookie,r.encrypted_password
+FROM account_session_cookies c
+JOIN account_codex_reauth_config r ON r.account_id=c.account_id
+WHERE c.account_id=?`, account.ID).Scan(&rawCookie, &rawPassword); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rawCookie, "session-secret") ||
+		strings.Contains(rawPassword, "registration-password-secret") {
+		t.Fatalf("registration recovery material was stored in plaintext")
 	}
 }
 

@@ -1,0 +1,65 @@
+{
+  "deployment_mode": "native_no_docker",
+  "final_releases": {
+    "main": "team-lifecycle-final-main",
+    "frontend": "team-lifecycle-final-frontend"
+  },
+  "final_binary_sha256": "3b5a7aa6fa106414ff379e79d075ddec56afa9f53872e2688f4a9633e2fd8fd8",
+  "final_console_sha256": "0fb32e4bcb7a3c6a497ef3ccbf5822ae09436276603ba4a6896b3fc9e9b8b000",
+  "tests": {
+    "go_full_exit": 0,
+    "go_race_exit": 0,
+    "frontend_files_passed": 17,
+    "frontend_tests_passed": 78,
+    "typecheck_exit": 0,
+    "vite_build_exit": 0
+  },
+  "visual": {
+    "seeded_lifecycle_passed": 4,
+    "seeded_lifecycle_total": 4,
+    "dark_mode_passed": 72,
+    "dark_mode_total": 72,
+    "production_lifecycle_passed": 4,
+    "production_lifecycle_total": 4
+  },
+  "install_sh": {
+    "exit": 0,
+    "release": "team-lifecycle-final",
+    "sqlite_quick_check": "ok",
+    "sqlite_integrity_check": "ok",
+    "seeded_workflows": 4
+  },
+  "production": {
+    "data_preserved": true,
+    "config_preserved": true,
+    "team_schema_verified": true,
+    "unauthenticated_status": 401,
+    "rollback_verified": true,
+    "redeploy_verified": true,
+    "final_status_verified": true
+  },
+  "security_contract": {
+    "credential_persistence": "encrypted_account_reference",
+    "default_shadow_mode": true,
+    "lease_heartbeat": true,
+    "rotation_threshold_bps": 100,
+    "raw_secret_columns": []
+  },
+  "patch": {
+    "sha256": "423514de12022b0ab963d1e867e19edf39817f9d3707c0b3800d8f5d76e09405",
+    "modified_files_reopened": 51,
+    "forward_check": true,
+    "reverse_check": true
+  },
+  "cleanup": {
+    "temporary_ports_stopped": [
+      34276,
+      34277
+    ],
+    "temporary_process_matches": 0,
+    "temporary_runtime_secrets_removed": true,
+    "remote_session_key_removed": true,
+    "key_auth_after_removal_exit": 255,
+    "local_session_key_removed": true
+  }
+}

@@ -21,6 +21,26 @@ import (
 
 type userGroupRouteOverrideKey struct{}
 type userGroupFallbackProbeKey struct{}
+type trafficFallbackExecutionKey struct{}
+type trafficFallbackProbeKey struct{}
+
+const maxTrafficFallbackDepth = 8
+
+type trafficFallbackExecution struct {
+	SourceUserGroupID string
+	TargetUserGroupID string
+	SourceModel       string
+	TargetModel       string
+	Family            string
+	Trail             []string
+}
+
+type trafficFallbackCandidate struct {
+	UserGroupID string
+	SourceModel string
+	TargetModel string
+	Family      string
+}
 
 var (
 	// A request that currently has no eligible account-pool target stays queued
@@ -56,12 +76,51 @@ func (s *Server) newUserGroupCapacityWaitState(ctx context.Context, pol downstre
 	if requestDeadline, ok := ctx.Deadline(); ok && requestDeadline.Before(deadline) {
 		deadline = requestDeadline
 	}
-	generation, _ := s.store.UserGroupRouteGeneration(ctx, pol.UserGroupID, pol.Group)
+	generation, _ := s.userGroupRouteGeneration(ctx, pol)
 	return userGroupCapacityWaitState{
 		deadline:   deadline,
 		generation: generation,
 		lastRetry:  now,
 	}
+}
+
+func (s *Server) userGroupRouteGeneration(ctx context.Context, pol downstreamPolicy) (string, error) {
+	type pendingGroup struct {
+		id        string
+		baseGroup string
+		depth     int
+	}
+	queue := []pendingGroup{{id: strings.TrimSpace(pol.UserGroupID), baseGroup: pol.Group}}
+	seen := make(map[string]struct{})
+	parts := make([]string, 0, maxTrafficFallbackDepth)
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if current.id == "" || current.depth >= maxTrafficFallbackDepth {
+			continue
+		}
+		if _, duplicate := seen[current.id]; duplicate {
+			continue
+		}
+		seen[current.id] = struct{}{}
+		generation, err := s.store.UserGroupRouteGeneration(ctx, current.id, current.baseGroup)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, current.id+"="+generation)
+		group, found, err := s.store.GetUserGroup(ctx, current.id)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			continue
+		}
+		nextIDs := append(append(append([]string{}, group.TrafficFallbackGroups.GPT...), group.TrafficFallbackGroups.Claude...), group.TrafficFallbackGroups.Gemini...)
+		for _, id := range nextIDs {
+			queue = append(queue, pendingGroup{id: id, depth: current.depth + 1})
+		}
+	}
+	return strings.Join(parts, "|"), nil
 }
 
 // waitForUserGroupCapacityChange keeps a streaming client alive without
@@ -107,7 +166,7 @@ func (s *Server) waitForUserGroupCapacityChange(ctx context.Context, pol downstr
 			heartbeat("user_group_capacity", now.Sub(state.lastRetry))
 			state.lastHeartbeat = now
 		}
-		generation, err := s.store.UserGroupRouteGeneration(ctx, pol.UserGroupID, pol.Group)
+		generation, err := s.userGroupRouteGeneration(ctx, pol)
 		if err == nil && generation != state.generation {
 			state.generation = generation
 			state.lastRetry = now
@@ -177,6 +236,22 @@ func withUserGroupFallbackProbe(ctx context.Context) context.Context {
 
 func userGroupFallbackProbe(ctx context.Context) bool {
 	probe, _ := ctx.Value(userGroupFallbackProbeKey{}).(bool)
+	return probe
+}
+
+func withTrafficFallbackExecution(ctx context.Context, execution trafficFallbackExecution) context.Context {
+	execution.Trail = append([]string(nil), execution.Trail...)
+	ctx = context.WithValue(ctx, trafficFallbackExecutionKey{}, execution)
+	return context.WithValue(ctx, trafficFallbackProbeKey{}, true)
+}
+
+func trafficFallbackExecutionFromContext(ctx context.Context) (trafficFallbackExecution, bool) {
+	execution, ok := ctx.Value(trafficFallbackExecutionKey{}).(trafficFallbackExecution)
+	return execution, ok
+}
+
+func trafficFallbackProbe(ctx context.Context) bool {
+	probe, _ := ctx.Value(trafficFallbackProbeKey{}).(bool)
 	return probe
 }
 
@@ -361,6 +436,202 @@ func prioritizeUserGroupTargetInTiers(tiers [][]storage.TargetRef, target storag
 	return out
 }
 
+func trafficFallbackGroupsForFamily(groups storage.TrafficFallbackGroups, family string) []string {
+	switch family {
+	case storage.ModelInstructionFamilyGPT:
+		return groups.GPT
+	case storage.ModelInstructionFamilyClaude:
+		return groups.Claude
+	case storage.ModelInstructionFamilyGemini:
+		return groups.Gemini
+	default:
+		return nil
+	}
+}
+
+func trafficFallbackMappingScore(sourcePattern, model string) int {
+	sourcePattern = strings.ToLower(strings.TrimSpace(sourcePattern))
+	model = strings.ToLower(strings.TrimSpace(model))
+	if sourcePattern == model {
+		return 10000 + len(sourcePattern)
+	}
+	if sourcePattern == "*" {
+		return 1
+	}
+	if strings.HasSuffix(sourcePattern, "*") && strings.HasPrefix(model, strings.TrimSuffix(sourcePattern, "*")) {
+		return 100 + len(sourcePattern)
+	}
+	return -1
+}
+
+func trafficFallbackFamilies(group storage.UserGroup, model string) []string {
+	if family := modelInstructionFamily(model); family != "" {
+		return []string{family}
+	}
+	bestFamily := ""
+	bestScore := -1
+	for _, family := range []string{
+		storage.ModelInstructionFamilyGPT,
+		storage.ModelInstructionFamilyClaude,
+		storage.ModelInstructionFamilyGemini,
+	} {
+		for _, mapping := range group.TrafficFallbackModelMappings {
+			if mapping.Family != family {
+				continue
+			}
+			score := trafficFallbackMappingScore(mapping.SourceModel, model)
+			// A family-less manual model must be named explicitly (or by a
+			// non-empty prefix). A global "*" in several families is otherwise
+			// ambiguous and could silently cross providers.
+			if score <= 1 {
+				continue
+			}
+			if score > bestScore {
+				bestScore = score
+				bestFamily = family
+			}
+		}
+	}
+	if bestFamily == "" {
+		return nil
+	}
+	return []string{bestFamily}
+}
+
+func trafficFallbackCandidates(group storage.UserGroup, model string, trail []string) []trafficFallbackCandidate {
+	if len(trail) >= maxTrafficFallbackDepth {
+		return nil
+	}
+	visited := make(map[string]struct{}, len(trail)+1)
+	for _, id := range trail {
+		visited[strings.TrimSpace(id)] = struct{}{}
+	}
+	out := make([]trafficFallbackCandidate, 0)
+	for _, family := range trafficFallbackFamilies(group, model) {
+		for _, targetID := range trafficFallbackGroupsForFamily(group.TrafficFallbackGroups, family) {
+			targetID = strings.TrimSpace(targetID)
+			if targetID == "" {
+				continue
+			}
+			if _, seen := visited[targetID]; seen {
+				continue
+			}
+			bestScore := -1
+			targetModel := ""
+			for _, mapping := range group.TrafficFallbackModelMappings {
+				if mapping.Family != family || strings.TrimSpace(mapping.TargetUserGroupID) != targetID {
+					continue
+				}
+				score := trafficFallbackMappingScore(mapping.SourceModel, model)
+				if score > bestScore {
+					bestScore = score
+					targetModel = strings.TrimSpace(mapping.TargetModel)
+				}
+			}
+			if bestScore < 0 || targetModel == "" {
+				continue
+			}
+			out = append(out, trafficFallbackCandidate{
+				UserGroupID: targetID,
+				SourceModel: model,
+				TargetModel: targetModel,
+				Family:      family,
+			})
+		}
+	}
+	return out
+}
+
+func trafficFallbackTrail(ctx context.Context, currentUserGroupID string) []string {
+	trail := make([]string, 0, maxTrafficFallbackDepth)
+	if execution, ok := trafficFallbackExecutionFromContext(ctx); ok {
+		trail = append(trail, execution.Trail...)
+	}
+	currentUserGroupID = strings.TrimSpace(currentUserGroupID)
+	if currentUserGroupID != "" && (len(trail) == 0 || trail[len(trail)-1] != currentUserGroupID) {
+		trail = append(trail, currentUserGroupID)
+	}
+	return trail
+}
+
+// dispatchUserGroupTrafficFallback re-enters the same inference handler with an
+// authoritative destination user group and model. The response remains buffered
+// until a fallback succeeds, so a failed destination never leaks headers/body to
+// the client and the next configured destination may be tried safely.
+func (s *Server) dispatchUserGroupTrafficFallback(
+	w http.ResponseWriter,
+	r *http.Request,
+	originalRaw, resolvedRaw []byte,
+	pol downstreamPolicy,
+	dispatch func(http.ResponseWriter, *http.Request),
+) bool {
+	if routing.HasServerSideState(r.URL.Path, r, resolvedRaw) {
+		return false
+	}
+	group, found, err := s.store.GetUserGroup(r.Context(), pol.UserGroupID)
+	if err != nil || !found {
+		return false
+	}
+	sourceModel := routing.Model(resolvedRaw)
+	trail := trafficFallbackTrail(r.Context(), pol.UserGroupID)
+	candidates := trafficFallbackCandidates(group, sourceModel, trail)
+	if len(candidates) == 0 {
+		return false
+	}
+	streamRequest := isStreamRequest(resolvedRaw)
+	for index, fallback := range candidates {
+		nextTrail := append(append([]string(nil), trail...), fallback.UserGroupID)
+		execution := trafficFallbackExecution{
+			SourceUserGroupID: pol.UserGroupID,
+			TargetUserGroupID: fallback.UserGroupID,
+			SourceModel:       fallback.SourceModel,
+			TargetModel:       fallback.TargetModel,
+			Family:            fallback.Family,
+			Trail:             nextTrail,
+		}
+		attempt := newUserGroupAttemptWriter(r.Context(), w, streamRequest, strings.HasPrefix(strings.TrimSpace(r.URL.Path), "/v1/responses"), bodysource.CaptureOptions{
+			MaxBytes: s.cfg.MaxBodyBytes, MemoryThreshold: s.cfg.BodyMemoryThresholdBytes, TempDir: s.cfg.BodySpoolDir,
+			Budget: s.responseBodyBudget, DiskReserver: s.bodyDiskReserver, TempFileNamePrefix: "codex-pool-traffic-fallback-response-*",
+		}, true)
+		attempt.Header().Set("X-Pool-Fallback-From-Group", pol.UserGroupID)
+		attempt.Header().Set("X-Pool-Fallback-Group", fallback.UserGroupID)
+		attempt.Header().Set("X-Pool-Fallback-Model", fallback.TargetModel)
+		fallbackContext := withTrafficFallbackExecution(r.Context(), execution)
+		fallbackContext = withBufferedSchedulerWait(fallbackContext, attempt)
+		fallbackRequest := r.Clone(fallbackContext)
+		fallbackRequest.Header = r.Header.Clone()
+		// A configured cross-family rewrite is authoritative; an incoming provider
+		// pin must not silently filter the destination group's compatible targets.
+		fallbackRequest.Header.Del("X-Pool-Provider")
+		fallbackRaw := setForcedModel(originalRaw, fallback.TargetModel)
+		fallbackRequest.Body, fallbackRequest.GetBody = replayUserGroupRequestBody(fallbackContext, fallbackRaw)
+		fallbackRequest.ContentLength = int64(len(fallbackRaw))
+		dispatch(attempt, fallbackRequest)
+		if fallbackRequest.Body != nil {
+			_ = fallbackRequest.Body.Close()
+		}
+
+		status := attempt.Status()
+		if status < http.StatusBadRequest || attempt.Committed() {
+			s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", "success", "")
+			attempt.Commit()
+			return true
+		}
+		retryable := attempt.RetryableFailure()
+		next := ""
+		if retryable && index+1 < len(candidates) {
+			next = "user_group:" + candidates[index+1].UserGroupID
+		}
+		s.recordRouteAttempt(requestIDFromContext(r.Context()), -1, "user_group:"+fallback.UserGroupID, "traffic_fallback", userGroupRouteStatusClass(attempt), next)
+		if !retryable {
+			attempt.Commit()
+			return true
+		}
+		_ = attempt.Close()
+	}
+	return false
+}
+
 // dispatchUserGroupRouteCandidates runs an entrypoint once per ordered target and
 // discards only pre-commit, target-scoped failures. A successful stream is passed
 // through on its first flush/write; after that point another target is never tried.
@@ -377,6 +648,13 @@ retryUserGroupRoute:
 	plan, err := resolveUserGroupRouteCandidates(r.Context(), s.store, pol, r, resolvedRaw)
 	if err != nil {
 		if _, unavailable := err.(*userGroupCapacityUnavailableError); unavailable {
+			if s.dispatchUserGroupTrafficFallback(w, r, originalRaw, resolvedRaw, pol, dispatch) {
+				return true
+			}
+			if trafficFallbackProbe(r.Context()) {
+				finishUserGroupCapacityWait(r.Context(), w)
+				return true
+			}
 			if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
 				goto retryUserGroupRoute
 			}
@@ -564,13 +842,23 @@ retryUserGroupRoute:
 		}
 		s.recordRouteAttempt(requestIDFromContext(r.Context()), unit.Tier, userGroupTargetDiagnosticName(target), unit.SelectionType, userGroupRouteStatusClass(attempt), fallbackName)
 		if !moreUnits || !replaySafe || !retryable {
-			if !moreUnits && replaySafe && retryable && attempt.PermanentTargetFailure() {
-				_ = attempt.Close()
-				if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
-					goto retryUserGroupRoute
+			if !moreUnits && replaySafe && retryable {
+				if s.dispatchUserGroupTrafficFallback(w, r, originalRaw, resolvedRaw, pol, dispatch) {
+					_ = attempt.Close()
+					return true
 				}
-				finishUserGroupCapacityWait(r.Context(), w)
-				return true
+				if attempt.PermanentTargetFailure() {
+					_ = attempt.Close()
+					if trafficFallbackProbe(r.Context()) {
+						finishUserGroupCapacityWait(r.Context(), w)
+						return true
+					}
+					if s.waitForUserGroupCapacityChange(r.Context(), pol, &capacityWait) {
+						goto retryUserGroupRoute
+					}
+					finishUserGroupCapacityWait(r.Context(), w)
+					return true
+				}
 			}
 			attempt.Commit()
 			return true

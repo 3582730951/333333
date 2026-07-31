@@ -240,9 +240,21 @@ async function runCase(browser, testCase) {
     await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   }
   await installMocks(page);
-  await page.goto(`${baseURL}${testCase.route}`, { waitUntil: 'networkidle0', timeout: 60000 });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    badResponses.length = 0;
+    if (attempt === 0) {
+      await page.goto(`${baseURL}${testCase.route}`, { waitUntil: 'networkidle0', timeout: 60000 });
+    } else {
+      await page.reload({ waitUntil: 'networkidle0', timeout: 60000 });
+    }
+    const optimizerRace = badResponses.length > 0 && badResponses.every(
+      ({ status, url }) => status === 504 && url.includes('/node_modules/.vite/deps/'),
+    );
+    if (!optimizerRace || attempt === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
   await page.screenshot({ path: testCase.screenshot, fullPage: true });
-  const metrics = await page.evaluate(({ expectedMobileHeader, requiredText, requiredLabels }) => {
+  const metrics = await page.evaluate(({ expectedMobileHeader, expectedMobileCards, requiredText, requiredLabels }) => {
     const viewport = { width: window.innerWidth, height: window.innerHeight };
     const text = document.body.textContent.replace(/\s+/g, ' ').trim();
     const headers = [...document.querySelectorAll('.pool-table-wrapper th')].map((el) => el.textContent.trim()).filter(Boolean);
@@ -256,6 +268,8 @@ async function runCase(browser, testCase) {
     const sider = rect('.pool-sider');
     const topTitle = rect('.pool-topbar-title');
     const topActions = rect('.pool-topbar-actions');
+    const mobileLists = [...document.querySelectorAll('.pool-mobile-list[role="list"]')];
+    const mobileListItems = [...document.querySelectorAll('.pool-mobile-list[role="list"] > [role="listitem"]')];
     return {
       documentWidth: document.documentElement.scrollWidth,
       noPageOverflow: document.documentElement.scrollWidth <= viewport.width + 1,
@@ -264,11 +278,21 @@ async function runCase(browser, testCase) {
       headers,
       hasDesktopColumns: headers.includes('Key / 一键安装') && headers.includes('操作'),
       hasExpectedMobileHeader: !expectedMobileHeader || (headers.length === 1 && headers[0] === expectedMobileHeader),
+      hasExpectedMobileCards: !expectedMobileCards || (
+        headers.length === 0
+        && mobileLists.length === 1
+        && mobileListItems.length > 0
+      ),
       hasRequiredText: requiredText.every((item) => text.includes(item)),
       hasRequiredLabels: requiredLabels.every((item) => labels.includes(item)),
       reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
     };
-  }, { expectedMobileHeader: testCase.expectedMobileHeader || '', requiredText: testCase.requiredText || [], requiredLabels: testCase.requiredLabels || [] });
+  }, {
+    expectedMobileHeader: testCase.expectedMobileHeader || '',
+    expectedMobileCards: Boolean(testCase.expectedMobileCards),
+    requiredText: testCase.requiredText || [],
+    requiredLabels: testCase.requiredLabels || [],
+  });
   await page.close();
   return { name: testCase.name, badResponses, metrics, screenshot: testCase.screenshot };
 }
@@ -283,6 +307,7 @@ function assertCase(result) {
   if (!result.metrics.siderHidden) failures.push('mobile sidebar is visible while closed');
   if (result.name === 'desktop-keys' && !result.metrics.hasDesktopColumns) failures.push('desktop table columns are missing');
   if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileHeader) failures.push('mobile table is not using the expected single-column layout');
+  if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileCards) failures.push('mobile card list is missing');
   if (result.name.startsWith('mobile-') && !result.metrics.hasRequiredText) failures.push('mobile page is missing required row text/actions');
   if (result.name.startsWith('mobile-') && !result.metrics.hasRequiredLabels) failures.push('mobile page is missing required accessible action labels');
   if (result.name === 'mobile-keys' && !result.metrics.reducedMotion) failures.push('reduced-motion media query is not active');
@@ -316,7 +341,7 @@ async function main() {
           width: 390,
           height: 844,
           reducedMotion: true,
-          expectedMobileHeader: '账号',
+          expectedMobileCards: true,
           requiredText: ['primary-prod'],
           requiredLabels: ['账号操作'],
           screenshot: path.join(screenshotDir, 'accept-mobile-accounts.png'),
@@ -351,7 +376,7 @@ async function main() {
         console.error('Visual smoke check failed:');
         for (const failure of failures) console.error(`- ${failure}`);
         console.error(JSON.stringify(results, null, 2));
-        process.exit(1);
+        throw new Error('Visual smoke assertions failed.');
       }
       console.log('Visual smoke check passed.');
       for (const result of results) {

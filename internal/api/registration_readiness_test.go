@@ -55,7 +55,7 @@ func TestRegistrationReadiness(t *testing.T) {
 	if rd["ready"] != false {
 		t.Fatalf("expected not-ready initially: %v", rd)
 	}
-	if !blockersContain(rd, "默认关闭") || !blockersContain(rd, "refill") || !blockersContain(rd, "hotmail_otp") {
+	if !blockersContain(rd, "默认关闭") || !blockersContain(rd, "refill") || !blockersContain(rd, "mailbox provider") {
 		t.Fatalf("expected disabled + refill + email OTP blockers, got %v", rd["blockers"])
 	}
 

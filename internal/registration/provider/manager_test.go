@@ -25,6 +25,33 @@ type mockSMSProvider struct {
 	calls []string // record GetNumber country-arg sequence
 }
 
+type mockMailboxProvider struct {
+	name        string
+	domains     []string
+	email       string
+	createErr   error
+	createCalls int
+	deleteCalls int
+}
+
+func (m *mockMailboxProvider) Name() string { return m.name }
+func (m *mockMailboxProvider) Type() string { return "mailbox" }
+func (m *mockMailboxProvider) MailboxDomains() []string {
+	return append([]string(nil), m.domains...)
+}
+func (m *mockMailboxProvider) MailboxUsesCustomDomain() bool { return len(m.domains) > 0 }
+func (m *mockMailboxProvider) CreateEmail(context.Context) (string, string, string, error) {
+	m.createCalls++
+	return m.email, "", m.name + "-lease", m.createErr
+}
+func (m *mockMailboxProvider) WaitOTP(context.Context, string, time.Duration) (string, error) {
+	return "", nil
+}
+func (m *mockMailboxProvider) DeleteEmail(context.Context, string) error {
+	m.deleteCalls++
+	return nil
+}
+
 func (m *mockSMSProvider) Name() string { return m.namev }
 func (m *mockSMSProvider) Type() string { return "sms" }
 func (m *mockSMSProvider) GetNumber(ctx context.Context, country string) (string, string, error) {
@@ -209,5 +236,43 @@ func TestGetSMSFromProviderOnlyCallsNamedPlatform(t *testing.T) {
 	}
 	if len(smsbower.calls) != 1 || smsbower.calls[0] != "BR" {
 		t.Fatalf("smsbower calls=%v, want [BR]", smsbower.calls)
+	}
+}
+
+func TestGetMailboxWithConstraintsSkipsIncompatibleProvider(t *testing.T) {
+	incompatible := &mockMailboxProvider{
+		name: "other-domain", domains: []string{"other.test"}, email: "child@other.test",
+	}
+	compatible := &mockMailboxProvider{
+		name: "team-domain", domains: []string{"example.test"}, email: "child@example.test",
+	}
+	manager := &Manager{Mailbox: []MailboxProvider{incompatible, compatible}}
+	selected, email, _, _, err := manager.GetMailboxWithConstraints(
+		context.Background(), "auto", "EXAMPLE.TEST.",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Name() != "team-domain" || email != "child@example.test" {
+		t.Fatalf("selected=%v email=%q", selected.Name(), email)
+	}
+	if incompatible.createCalls != 0 || compatible.createCalls != 1 {
+		t.Fatalf("create calls incompatible=%d compatible=%d", incompatible.createCalls, compatible.createCalls)
+	}
+}
+
+func TestGetMailboxWithConstraintsReleasesMismatchedAddress(t *testing.T) {
+	mismatched := &mockMailboxProvider{
+		name: "dynamic", email: "child@unexpected.test",
+	}
+	manager := &Manager{Mailbox: []MailboxProvider{mismatched}}
+	_, _, _, _, err := manager.GetMailboxWithConstraints(
+		context.Background(), "dynamic", "example.test",
+	)
+	if err == nil {
+		t.Fatal("mismatched address was accepted")
+	}
+	if mismatched.createCalls != 1 || mismatched.deleteCalls != 1 {
+		t.Fatalf("create=%d delete=%d", mismatched.createCalls, mismatched.deleteCalls)
 	}
 }

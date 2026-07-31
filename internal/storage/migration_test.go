@@ -96,3 +96,58 @@ func TestInitAddsBillingHoldColumnBeforeRecoveryIndex(t *testing.T) {
 		t.Fatalf("billing_hold_id columns=%d indexes=%d, want 1/1", columnCount, indexCount)
 	}
 }
+
+func TestInitAddsTrafficFallbackColumnsToLegacyUserGroups(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "legacy-user-groups.sqlite3"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, err := store.DB().ExecContext(ctx, `CREATE TABLE user_groups(
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  system_prompt TEXT NOT NULL DEFAULT '',
+  prompt_mode TEXT NOT NULL DEFAULT 'prepend',
+  system_prompt_apply_to_compaction INTEGER NOT NULL DEFAULT 1,
+  model_instructions_enabled INTEGER NOT NULL DEFAULT 0,
+  model_instructions_files TEXT NOT NULL DEFAULT '[]',
+  model_instruction_profiles TEXT NOT NULL DEFAULT '{}',
+  force_model TEXT NOT NULL DEFAULT '',
+  force_effort TEXT NOT NULL DEFAULT '',
+  block_claude_target_groups TEXT NOT NULL DEFAULT '[]',
+  block_gpt_target_groups TEXT NOT NULL DEFAULT '[]',
+  model_routing_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+)`); err != nil {
+		t.Fatalf("create legacy user_groups: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO user_groups(id,name,created_at,updated_at) VALUES('ug_legacy_fallback','legacy fallback',1,1)`); err != nil {
+		t.Fatalf("seed legacy user group: %v", err)
+	}
+
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("migrate legacy user groups: %v", err)
+	}
+	for _, column := range []string{"traffic_fallback_groups_json", "traffic_fallback_model_mappings_json"} {
+		var count int
+		if err := store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('user_groups') WHERE name=?`, column).Scan(&count); err != nil {
+			t.Fatalf("inspect %s: %v", column, err)
+		}
+		if count != 1 {
+			t.Fatalf("%s column count=%d, want 1", column, count)
+		}
+	}
+	group, found, err := store.GetUserGroup(ctx, "ug_legacy_fallback")
+	if err != nil || !found {
+		t.Fatalf("read migrated user group found=%v err=%v", found, err)
+	}
+	if len(group.TrafficFallbackGroups.GPT) != 0 ||
+		len(group.TrafficFallbackGroups.Claude) != 0 ||
+		len(group.TrafficFallbackGroups.Gemini) != 0 ||
+		len(group.TrafficFallbackModelMappings) != 0 {
+		t.Fatalf("legacy fallback defaults changed: groups=%+v mappings=%+v", group.TrafficFallbackGroups, group.TrafficFallbackModelMappings)
+	}
+}

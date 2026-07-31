@@ -48,6 +48,7 @@ func NewGenericHTTP(pipelineConfig, settings map[string]interface{}, proxyURL st
 			g.session.Transport = &http.Transport{Proxy: http.ProxyURL(purl)}
 		}
 	}
+	g.session = newGuardedMailboxHTTPClient(g.session, getStr(settings, "api_url", ""))
 	return g, nil
 }
 
@@ -155,9 +156,16 @@ func (g *GenericHTTP) WaitForCode(ctx context.Context, email, accountID string, 
 	start := time.Now()
 	codeRe := regexp.MustCompile(`(?:\D|^)(\d{6})(?:\D|$)`)
 	for time.Since(start) < time.Duration(timeout)*time.Second {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("mailbox wait cancelled: %w", ctx.Err())
+		default:
+		}
 		resp, err := g.executeStep(ctx, listStep)
 		if err != nil {
-			time.Sleep(3 * time.Second)
+			if !waitMailboxPoll(ctx, 3*time.Second) {
+				return "", fmt.Errorf("mailbox wait cancelled: %w", ctx.Err())
+			}
 			continue
 		}
 		items := deepGet(resp, listPath)
@@ -199,7 +207,9 @@ func (g *GenericHTTP) WaitForCode(ctx context.Context, email, accountID string, 
 				return matches[1], nil
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if !waitMailboxPoll(ctx, 3*time.Second) {
+			return "", fmt.Errorf("mailbox wait cancelled: %w", ctx.Err())
+		}
 	}
 	return "", fmt.Errorf("timeout waiting for code (%ds)", timeout)
 }
@@ -231,9 +241,16 @@ func (g *GenericHTTP) WaitForLink(ctx context.Context, email, accountID string, 
 	start := time.Now()
 	linkRe := regexp.MustCompile(`https?://[^\s<>"]+`)
 	for time.Since(start) < time.Duration(timeout)*time.Second {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("mailbox wait cancelled: %w", ctx.Err())
+		default:
+		}
 		resp, err := g.executeStep(ctx, listStep)
 		if err != nil {
-			time.Sleep(3 * time.Second)
+			if !waitMailboxPoll(ctx, 3*time.Second) {
+				return "", fmt.Errorf("mailbox wait cancelled: %w", ctx.Err())
+			}
 			continue
 		}
 		items := deepGet(resp, listPath)
@@ -273,9 +290,22 @@ func (g *GenericHTTP) WaitForLink(ctx context.Context, email, accountID string, 
 				}
 			}
 		}
-		time.Sleep(3 * time.Second)
+		if !waitMailboxPoll(ctx, 3*time.Second) {
+			return "", fmt.Errorf("mailbox wait cancelled: %w", ctx.Err())
+		}
 	}
 	return "", fmt.Errorf("timeout waiting for link (%ds)", timeout)
+}
+
+func waitMailboxPoll(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // ── step execution engine ──
@@ -369,6 +399,9 @@ func (g *GenericHTTP) executeStep(ctx context.Context, step map[string]interface
 	if err := json.Unmarshal(raw, &respData); err != nil {
 		// fallback to text
 		respData = map[string]interface{}{"_text": string(raw)}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("mailbox HTTP step returned status %d", resp.StatusCode)
 	}
 	// extract variables
 	extractMap := getMap(step, "extract")

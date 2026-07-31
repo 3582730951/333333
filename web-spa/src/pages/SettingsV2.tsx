@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
-import { IconSave, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
+import { IconChevronDown, IconSave, IconRefresh, IconSearch, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeaderBase from '../components/PageHeader.jsx';
 import SettingsTabShellBase from '../components/SettingsTabShell.jsx';
@@ -80,11 +80,123 @@ function configCategories(fields: ConfigField[]): Record<string, ConfigField[]> 
   }, {});
 }
 
+export function filterConfigCategories(fields: ConfigField[], query: string): Array<[string, ConfigField[]]> {
+  const normalized = query.trim().toLocaleLowerCase();
+  return Object.entries(configCategories(fields))
+    .map(([category, categoryFields]) => {
+      if (!normalized) return [category, categoryFields] as [string, ConfigField[]];
+      const visible = categoryFields.filter((field) => (
+        [category, field.label, field.help, field.key]
+          .filter(Boolean)
+          .some((value) => String(value).toLocaleLowerCase().includes(normalized))
+      ));
+      return [category, visible] as [string, ConfigField[]];
+    })
+    .filter(([, categoryFields]) => categoryFields.length > 0);
+}
+
 function configSettingsErrors(fields: ConfigField[]) {
   return Object.fromEntries(
     fields
       .filter((f) => typeof f.settings_error === 'string' && f.settings_error.trim())
       .map((f) => [f.key, f.settings_error])
+  );
+}
+
+export function SettingsCategorySection({
+  category,
+  fields,
+  pending,
+  onChange,
+  initialOpen = false,
+  forceOpen = false,
+}: {
+  category: string;
+  fields: ConfigField[];
+  pending: SettingsValues;
+  onChange: (key: string, value: unknown) => void;
+  initialOpen?: boolean;
+  forceOpen?: boolean;
+}) {
+  const panelId = React.useId();
+  const hasError = fields.some((field) => Boolean(field.settings_error));
+  const pendingCount = fields.filter((field) => hasPendingValue(pending, field.key)).length;
+  const restartCount = fields.filter((field) => field.effect === 'restart').length;
+  const [expanded, setExpanded] = useState(initialOpen || hasError);
+  const open = forceOpen || expanded;
+
+  useEffect(() => {
+    if (hasError) setExpanded(true);
+  }, [hasError]);
+
+  return (
+    <section className="pool-settings-category" data-expanded={open ? 'true' : 'false'}>
+      <button
+        type="button"
+        className="pool-settings-category__trigger"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="pool-settings-category__leading">
+          <span className="pool-settings-category__icon" aria-hidden="true"><IconChevronDown /></span>
+          <span className="pool-settings-category__copy">
+            <strong>{category}</strong>
+            <span>{t('settings.fields_count').replace('{count}', String(fields.length))}</span>
+          </span>
+        </span>
+        <span className="pool-settings-category__badges">
+          {pendingCount > 0 ? <Tag size="small" color="green">{t('settings.pending_count').replace('{count}', String(pendingCount))}</Tag> : null}
+          {hasError ? <Tag size="small" color="red">{t('settings.stored_error')}</Tag> : null}
+          {restartCount > 0 ? <Tag size="small" color="orange">{t('settings.restart_count').replace('{count}', String(restartCount))}</Tag> : null}
+        </span>
+      </button>
+      <div id={panelId} className="pool-settings-category__body" hidden={!open}>
+        {fields.map((field) => (
+          <ConfigFieldRow key={field.key} field={field} pending={pending} onChange={onChange} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+export function SettingsDisclosure({
+  title,
+  subtitle,
+  badge,
+  initialOpen = false,
+  children,
+}: {
+  title: ReactNode;
+  subtitle?: ReactNode;
+  badge?: ReactNode;
+  initialOpen?: boolean;
+  children: ReactNode;
+}) {
+  const panelId = React.useId();
+  const [expanded, setExpanded] = useState(initialOpen);
+  return (
+    <section className="pool-settings-category pool-settings-disclosure" data-expanded={expanded ? 'true' : 'false'}>
+      <button
+        type="button"
+        className="pool-settings-category__trigger"
+        aria-expanded={expanded}
+        aria-controls={panelId}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="pool-settings-category__leading">
+          <span className="pool-settings-category__icon" aria-hidden="true"><IconChevronDown /></span>
+          <span className="pool-settings-category__copy">
+            <strong>{title}</strong>
+            {subtitle ? <span>{subtitle}</span> : null}
+          </span>
+        </span>
+        {badge ? <span className="pool-settings-category__badges">{badge}</span> : null}
+      </button>
+      <div id={panelId} className="pool-settings-category__body pool-settings-disclosure__body" hidden={!expanded}>
+        {children}
+      </div>
+    </section>
   );
 }
 
@@ -118,6 +230,7 @@ function ConfigTab() {
   const [pending, setPending] = useState<SettingsValues>({});
   const [diffs, setDiffs] = useState<SettingsDiff[] | null>(null);
   const [prevSnapshot, setPrevSnapshot] = useState<{ oldSnap: SettingsValues; pending: SettingsValues } | null>(null);
+  const [query, setQuery] = useState('');
 
   const {
     data: fields = [],
@@ -190,8 +303,9 @@ function ConfigTab() {
   const undoing = undoMutation.isPending;
   const applyingTemplate = templateMutation.isPending;
 
-  const cats = useMemo(() => configCategories(fields), [fields]);
+  const visibleCategories = useMemo(() => filterConfigCategories(fields, query), [fields, query]);
   const configErrors = useMemo(() => configSettingsErrors(fields), [fields]);
+  const searching = Boolean(query.trim());
 
   return (
     <SettingsTabShell
@@ -206,28 +320,56 @@ function ConfigTab() {
       onClearDiffs={() => setDiffs(null)}
       settingsErrorTitle={t('settings.general_failed')}
       settingsErrors={configErrors}
+      toolbarClassName="pool-settings-commandbar"
       toolbar={
         <>
-          <Button icon={<IconRefresh />} onClick={refresh} disabled={saving || undoing || applyingTemplate}>{t('common.refresh')}</Button>
-          <Button icon={<IconSetting />} loading={applyingTemplate} disabled={saving || undoing} onClick={applyOptimalTemplate}>
-            {t('settings.apply_recommended')}
-          </Button>
-          <Button icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0 || applyingTemplate || undoing}>
-            {t('settings.save_changes')} ({Object.keys(pending).length})
-          </Button>
+          <Input
+            className="pool-settings-search"
+            value={query}
+            onChange={setQuery}
+            prefix={<IconSearch />}
+            showClear
+            onClear={() => setQuery('')}
+            aria-label={t('settings.search')}
+            placeholder={t('settings.search_placeholder')}
+          />
+          <div className="pool-settings-commandbar__actions">
+            <Button className="pool-settings-refresh-button" aria-label={t('common.refresh')} icon={<IconRefresh />} onClick={refresh} disabled={saving || undoing || applyingTemplate}>
+              {t('common.refresh')}
+            </Button>
+            <Button aria-label={t('settings.apply_recommended')} icon={<IconSetting />} loading={applyingTemplate} disabled={saving || undoing} onClick={applyOptimalTemplate}>
+              <span className="pool-settings-action-label--long">{t('settings.apply_recommended')}</span>
+              <span className="pool-settings-action-label--short">{t('settings.apply_recommended_short')}</span>
+            </Button>
+            <Button aria-label={`${t('settings.save_changes')} (${Object.keys(pending).length})`} icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0 || applyingTemplate || undoing}>
+              <span className="pool-settings-action-label--long">{t('settings.save_changes')}</span>
+              <span className="pool-settings-action-label--short">{t('settings.save_short')}</span>
+              {' '}({Object.keys(pending).length})
+            </Button>
+          </div>
         </>
       }
     >
-      {Object.entries(cats).length > 0 ? (
-        Object.entries(cats).map(([cat, fs]) => (
-          <Card key={cat} className="pool-card" title={cat} style={{ marginBottom: 16 }}>
-            {fs.map((f) => (
-              <ConfigFieldRow key={f.key} field={f} pending={pending} onChange={setVal} />
-            ))}
-          </Card>
-        ))
+      {visibleCategories.length > 0 ? (
+        <div className="pool-settings-categories" aria-label={t('settings.sections')}>
+          {visibleCategories.map(([category, categoryFields], index) => (
+            <SettingsCategorySection
+              key={category}
+              category={category}
+              fields={categoryFields}
+              pending={pending}
+              onChange={setVal}
+              initialOpen={index === 0}
+              forceOpen={searching}
+            />
+          ))}
+        </div>
+      ) : fields.length > 0 ? (
+        <Card className="pool-card pool-settings-empty" title={t('settings.no_search_results')}>
+          <Typography.Text type="tertiary">{t('settings.no_search_results_desc').replace('{query}', query.trim())}</Typography.Text>
+        </Card>
       ) : (
-        <Card className="pool-card" title={t('settings.no_general')}>
+        <Card className="pool-card pool-settings-empty" title={t('settings.no_general')}>
           <Typography.Text type="tertiary">{t('settings.no_general_desc')}</Typography.Text>
         </Card>
       )}
@@ -490,6 +632,8 @@ const SMS_PROVIDER_CARDS = [
 ];
 const MAILBOX_PROVIDER_CARDS = [
   { key: 'tempmail', name: 'TempMail.lol（免配置）', description: '内置公共临时邮箱，无需 API Key；上游可能限制公共邮箱域名。' },
+  { key: 'mailtm', name: 'mail.tm（免密钥）', description: '标准 accounts / token / messages 协议，按任务创建隔离邮箱会话。' },
+  { key: 'mailgw', name: 'mail.gw（免密钥）', description: 'mail.tm 兼容协议的备用邮箱来源，可独立设置优先级。' },
   { key: 'cloudflare', name: 'Cloudflare / MoeMail', description: '推荐用于稳定批量注册，需要自建 Worker 地址和邮箱域名。' },
   { key: 'imap', name: 'IMAP 固定邮箱', description: 'Gmail、Outlook 或自有域名邮箱；固定地址通常只适合单账号注册。' },
 ];
@@ -673,6 +817,9 @@ function RegistrarTab() {
   const extra: SettingsValues = {};
   Object.keys(cfg).forEach((k) => { if (!KNOWN.includes(k)) extra[k] = cfg[k]; });
   known.advancedJSON = Object.keys(extra).length ? JSON.stringify(extra, null, 2) : '';
+  const smsEnabled = SMS_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
+  const captchaEnabled = CAPTCHA_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
+  const mailboxEnabled = MAILBOX_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
 
   return (
     <SettingsTabShell
@@ -689,71 +836,105 @@ function RegistrarTab() {
     >
       <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
         description="邮箱和接码配置会直接保存到注册流水线实际使用的 provider_settings；住宅代理区域需与手机号国家匹配。" />
-      <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" style={{ display: 'flex', flexWrap: 'wrap', gap: '0 24px' }}>
-        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
-          {SMS_PROVIDER_CARDS.map((card) => (
-            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
-              <Form.Switch field={`${card.key}_enabled`} label="启用" />
-              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
-              <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} placeholder="接码平台密钥" />
-              <Form.Input field={`${card.key}_service`} label="服务代码" style={{ width: 120 }} placeholder="dr" />
-              {card.key === 'smspool' && <Form.Input field={`${card.key}_max_price`} label="最高单价" style={{ width: 120 }} placeholder="0.20" />}
-            </Card>
-          ))}
-        </div>
-        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>验证码求解器</Typography.Title>
-        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
-          {CAPTCHA_PROVIDER_CARDS.map((card) => (
-            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
-              <Form.Switch field={`${card.key}_enabled`} label="启用" />
-              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
-              <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} />
-            </Card>
-          ))}
-        </div>
-        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>Hotmail OTP（protocol_v2 / browser_v3）</Typography.Title>
-        <Card title="Hotmail OTP Reader" className="pool-card" style={{ width: '100%' }} bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
-          <Form.Switch field="hotmail_otp_enabled" label="启用" />
-          <Form.InputNumber field="hotmail_otp_priority" label="优先级" style={{ width: 120 }} min={0} max={1000} />
-          <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }}
-            placeholder={hotmailOTP?.config?.base_email_configured ? '已加密配置；留空保留' : 'account@outlook.com'} />
-          <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }}
-            placeholder={hotmailOTP?.config?.otp_url_configured ? '已加密配置；留空保留' : 'https://otp.example.com/read'} />
-          <Form.Input field="hotmail_otp_auth_token" label="OTP Relay Token" mode="password" style={{ width: 260 }}
-            placeholder={hotmailOTP?.config?.auth_token_configured ? '已加密配置；留空保留' : 'Bearer token'} />
-        </Card>
-        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>邮箱提供商</Typography.Title>
-        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
-          {MAILBOX_PROVIDER_CARDS.map((card) => (
-            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
-              <Typography.Text type="tertiary" size="small" style={{ width: '100%', marginBottom: 8 }}>{card.description}</Typography.Text>
-              <Form.Switch field={`${card.key}_enabled`} label="启用" />
-              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
-              {card.key === 'cloudflare' && <>
-                <Form.Input field="cloudflare_api_url" label="Worker API URL" style={{ width: 280 }} placeholder="https://mail.example.com" />
-                <Form.Input field="cloudflare_domain" label="邮箱域名" style={{ width: 220 }} placeholder="example.com" />
-                <Form.Input field="cloudflare_admin_token" label="Admin Token（可选）" mode="password" style={{ width: 260 }} />
-              </>}
-              {card.key === 'imap' && <>
-                <Form.Input field="imap_host" label="IMAP Host" style={{ width: 220 }} placeholder="imap.gmail.com" />
-                <Form.InputNumber field="imap_port" label="端口" style={{ width: 120 }} min={1} max={65535} />
-                <Form.Input field="imap_email" label="邮箱地址" style={{ width: 260 }} />
-                <Form.Input field="imap_password" label="密码 / App Password" mode="password" style={{ width: 260 }} />
-                <Form.Switch field="imap_tls" label="TLS" />
-              </>}
-            </Card>
-          ))}
-        </div>
-        <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
-        <Form.Input field="proxyHost" label="住宅代理 Host" style={{ width: 220 }} placeholder="us2.cliproxy.io" />
-        <Form.Input field="proxyPort" label="代理端口" style={{ width: 120 }} placeholder="3010" />
-        <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }} placeholder="...-region-BR-sid-xxxx-t-5" />
-        <Form.Input field="proxyPassword" label="代理密码" mode="password" style={{ width: 220 }} />
-        <Form.TextArea field="advancedJSON" label="高级：其它键 (JSON)" style={{ width: '100%' }} autosize
-          placeholder='{ "heroSmsCountryTopN": 10 }' />
-        <div style={{ width: '100%', marginTop: 8 }}>
+      <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" className="pool-registrar-form">
+        <SettingsDisclosure
+          title="接码平台"
+          subtitle={`已启用 ${smsEnabled} / ${SMS_PROVIDER_CARDS.length}`}
+          badge={<Tag size="small">{SMS_PROVIDER_CARDS.length} 个提供商</Tag>}
+        >
+          <div className="pool-registrar-card-grid">
+            {SMS_PROVIDER_CARDS.map((card) => (
+              <Card key={card.key} title={card.name} className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+                <Form.Switch field={`${card.key}_enabled`} label="启用" />
+                <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+                <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} placeholder="接码平台密钥" />
+                <Form.Input field={`${card.key}_service`} label="服务代码" style={{ width: 120 }} placeholder="dr" />
+                {card.key === 'smspool' && <Form.Input field={`${card.key}_max_price`} label="最高单价" style={{ width: 120 }} placeholder="0.20" />}
+              </Card>
+            ))}
+          </div>
+        </SettingsDisclosure>
+
+        <SettingsDisclosure
+          title="验证码求解器"
+          subtitle={`已启用 ${captchaEnabled} / ${CAPTCHA_PROVIDER_CARDS.length}`}
+          badge={<Tag size="small">{CAPTCHA_PROVIDER_CARDS.length} 个提供商</Tag>}
+        >
+          <div className="pool-registrar-card-grid">
+            {CAPTCHA_PROVIDER_CARDS.map((card) => (
+              <Card key={card.key} title={card.name} className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+                <Form.Switch field={`${card.key}_enabled`} label="启用" />
+                <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+                <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} />
+              </Card>
+            ))}
+          </div>
+        </SettingsDisclosure>
+
+        <SettingsDisclosure
+          title="Hotmail OTP"
+          subtitle="protocol_v2 / browser_v3 邮箱验证码"
+          badge={<Tag size="small" color={known.hotmail_otp_enabled === true ? 'green' : undefined}>{known.hotmail_otp_enabled === true ? '已启用' : '已停用'}</Tag>}
+        >
+          <Card title="Hotmail OTP Reader" className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+            <Form.Switch field="hotmail_otp_enabled" label="启用" />
+            <Form.InputNumber field="hotmail_otp_priority" label="优先级" style={{ width: 120 }} min={0} max={1000} />
+            <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }}
+              placeholder={hotmailOTP?.config?.base_email_configured ? '已加密配置；留空保留' : 'account@outlook.com'} />
+            <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }}
+              placeholder={hotmailOTP?.config?.otp_url_configured ? '已加密配置；留空保留' : 'https://otp.example.com/read'} />
+            <Form.Input field="hotmail_otp_auth_token" label="OTP Relay Token" mode="password" style={{ width: 260 }}
+              placeholder={hotmailOTP?.config?.auth_token_configured ? '已加密配置；留空保留' : 'Bearer token'} />
+          </Card>
+        </SettingsDisclosure>
+
+        <SettingsDisclosure
+          title="邮箱提供商"
+          subtitle={`已启用 ${mailboxEnabled} / ${MAILBOX_PROVIDER_CARDS.length}`}
+          badge={<Tag size="small">{MAILBOX_PROVIDER_CARDS.length} 个提供商</Tag>}
+        >
+          <div className="pool-registrar-card-grid">
+            {MAILBOX_PROVIDER_CARDS.map((card) => (
+              <Card key={card.key} title={card.name} className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+                <Typography.Text type="tertiary" size="small" style={{ width: '100%', marginBottom: 8 }}>{card.description}</Typography.Text>
+                <Form.Switch field={`${card.key}_enabled`} label="启用" />
+                <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+                {card.key === 'cloudflare' && <>
+                  <Form.Input field="cloudflare_api_url" label="Worker API URL" style={{ width: 280 }} placeholder="https://mail.example.com" />
+                  <Form.Input field="cloudflare_domain" label="邮箱域名" style={{ width: 220 }} placeholder="example.com" />
+                  <Form.Input field="cloudflare_admin_token" label="Admin Token（可选）" mode="password" style={{ width: 260 }} />
+                </>}
+                {card.key === 'imap' && <>
+                  <Form.Input field="imap_host" label="IMAP Host" style={{ width: 220 }} placeholder="imap.gmail.com" />
+                  <Form.InputNumber field="imap_port" label="端口" style={{ width: 120 }} min={1} max={65535} />
+                  <Form.Input field="imap_email" label="邮箱地址" style={{ width: 260 }} />
+                  <Form.Input field="imap_password" label="密码 / App Password" mode="password" style={{ width: 260 }} />
+                  <Form.Switch field="imap_tls" label="TLS" />
+                </>}
+              </Card>
+            ))}
+          </div>
+        </SettingsDisclosure>
+
+        <SettingsDisclosure
+          title="住宅代理与高级选项"
+          subtitle="国家匹配、代理凭据与扩展 JSON"
+          badge={<Tag size="small" color="orange">敏感配置</Tag>}
+        >
+          <div className="pool-registrar-fields">
+            <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
+            <Form.Input field="proxyHost" label="住宅代理 Host" style={{ width: 220 }} placeholder="us2.cliproxy.io" />
+            <Form.Input field="proxyPort" label="代理端口" style={{ width: 120 }} placeholder="3010" />
+            <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }} placeholder="...-region-BR-sid-xxxx-t-5" />
+            <Form.Input field="proxyPassword" label="代理密码" mode="password" style={{ width: 220 }} />
+            <Form.TextArea field="advancedJSON" label="高级：其它键 (JSON)" className="pool-registrar-advanced" style={{ width: '100%' }} autosize
+              placeholder='{ "heroSmsCountryTopN": 10 }' />
+          </div>
+        </SettingsDisclosure>
+
+        <div className="pool-registrar-actions">
           <Button htmlType="submit" theme="solid" icon={<IconSave />} loading={saving}>保存凭据</Button>
-          <Button style={{ marginLeft: 8 }} onClick={load}>重新加载</Button>
+          <Button onClick={load}>重新加载</Button>
         </div>
       </Form>
     </SettingsTabShell>

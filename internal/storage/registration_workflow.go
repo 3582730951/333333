@@ -32,6 +32,11 @@ type RegistrationCommit struct {
 	RecordID            string
 	WorkflowItemID      string
 	RemoteIdentityAlias string
+	// SessionCookie and LoginPassword are transient plaintext inputs. When
+	// present they are sealed inside the same transaction as the account so a
+	// later workspace switch/OAuth repair never depends on a child-process file.
+	SessionCookie string
+	LoginPassword string
 }
 
 // RegistrationRecoveryResult reports durable work isolated after an unclean
@@ -154,6 +159,13 @@ func (s *Store) CommitRegistration(ctx context.Context, item RegistrationCommit)
 	if strings.TrimSpace(item.EgressID) == "" {
 		return errors.New("verified registration egress is required")
 	}
+	item.SessionCookie = strings.TrimSpace(item.SessionCookie)
+	if len(item.SessionCookie) > 64<<10 || strings.ContainsAny(item.SessionCookie, "\r\n") {
+		return errors.New("registration session cookie is invalid")
+	}
+	if len(item.LoginPassword) > 4096 || strings.ContainsAny(item.LoginPassword, "\r\n") {
+		return errors.New("registration login password is invalid")
+	}
 	now := Now()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -181,6 +193,29 @@ LIMIT 1`,
 
 	if err := s.upsertAccountTx(ctx, tx, item.Account, item.Token, now); err != nil {
 		return err
+	}
+	if item.SessionCookie != "" {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO account_session_cookies(account_id,cookie,updated_at)
+VALUES(?,?,?)
+ON CONFLICT(account_id) DO UPDATE SET cookie=excluded.cookie,updated_at=excluded.updated_at`,
+			item.Account.ID, s.sealToken(item.SessionCookie), now); err != nil {
+			return err
+		}
+	}
+	if item.SessionCookie != "" || strings.TrimSpace(item.LoginPassword) != "" {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO account_codex_reauth_config(
+  account_id,login_email,encrypted_password,encrypted_otp_url,target_workspace_id,
+  auto_enabled,last_status,last_error,created_at,updated_at
+) VALUES(?,?,?,'','',1,'configured','',?,?)
+ON CONFLICT(account_id) DO UPDATE SET
+  login_email=CASE WHEN excluded.login_email<>'' THEN excluded.login_email ELSE account_codex_reauth_config.login_email END,
+  encrypted_password=CASE WHEN excluded.encrypted_password<>'' THEN excluded.encrypted_password ELSE account_codex_reauth_config.encrypted_password END,
+  auto_enabled=1,last_status='configured',last_error='',updated_at=excluded.updated_at`,
+			item.Account.ID, strings.TrimSpace(item.Account.Email), s.sealToken(item.LoginPassword), now, now); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `
 UPDATE accounts SET registration_method=?,registration_task_id=?,updated_at=? WHERE id=?`,

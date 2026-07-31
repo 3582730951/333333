@@ -78,7 +78,7 @@ describe('API contracts', () => {
   it('adapts legacy domain response envelopes without dropping unknown fields', () => {
     expect(parseApiResponse(accountsResponseSchema, {
       accounts: [{ id: 'acc-1', provider: 'codex', future_flag: true }], total: '4',
-    })).toEqual({ rows: [{ id: 'acc-1', provider: 'codex', future_flag: true }], total: 4 });
+    })).toEqual({ rows: [{ id: 'acc-1', provider: 'codex', future_flag: true, capabilities: [] }], total: 4 });
     expect(parseApiResponse(quotaResponseSchema, { quota: [{ account_id: 'acc-1', future_limit: 12 }] }))
       .toEqual([{ account_id: 'acc-1', future_limit: 12 }]);
     expect(parseApiResponse(cfEventsResponseSchema, { events: [{ id: 7, status: '403' }] }))
@@ -278,9 +278,10 @@ describe('API contracts', () => {
 
 describe('routing, responsive actions, and forms', () => {
   it('keeps every management and portal screen in the visual route matrix', () => {
-    expect(adminVisualRoutes).toHaveLength(26);
+    expect(adminVisualRoutes).toHaveLength(28);
     expect(portalRoutes).toHaveLength(4);
     expect(new Set(adminRoutes.map((route) => route.path)).size).toBe(adminRoutes.length);
+    expect(adminRoutes.find((route) => route.path === '/team-lifecycle')?.navGroup).toBe('automation');
     expect(settingsSections.map((section) => section.key)).toEqual(['config', 'automation', 'registrar', 'logging', 'memory', 'thinking', 'moderation']);
     expect(legacyRedirects.find((route) => route.path === '/thinking')?.to).toContain('?tab=thinking');
     expect(adminRoutes.filter((route) => route.path.startsWith('/settings/ai/')).map((route) => route.path)).toEqual([

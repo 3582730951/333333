@@ -1,1 +1,0 @@
-import{A as e,V as t}from"./index-lKLFFv96.js";function n(n){return t(e,n)}export{n as t};

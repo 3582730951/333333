@@ -236,6 +236,16 @@ func (s *Server) resolveDownstreamPolicy(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
+	// A server-selected traffic fallback is applied after ordinary API-key and
+	// source-group policy resolution. It is therefore authoritative for the
+	// destination user group and rewritten model, while identity / attribution
+	// remain tied to the caller's original key.
+	if fallback, ok := trafficFallbackExecutionFromContext(ctx); ok {
+		pol.UserGroupID = strings.TrimSpace(fallback.TargetUserGroupID)
+		pol.ForceModel = strings.TrimSpace(fallback.TargetModel)
+		pol.ProviderHint = "auto"
+		pol.ModelOverrideSource = "traffic_fallback"
+	}
 	return pol, true
 }
 

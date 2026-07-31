@@ -721,6 +721,9 @@ func (s *Server) StartBackground(ctx context.Context) {
 	if s.regHandler != nil {
 		s.regHandler.StartRuntime(ctx)
 	}
+	if s.teamLifecycle != nil {
+		supervisor.Go(ctx, "team-lifecycle", s.teamLifecycle.Run)
+	}
 	// Cooldown→health-recheck loop runs independently of the model-probe sweep (it
 	// must work even when model probing is disabled).
 	s.startRecheckLoop(ctx)

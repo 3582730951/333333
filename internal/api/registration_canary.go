@@ -84,6 +84,12 @@ func (h *Handler) registrationMethodReadiness(ctx context.Context, req pipeline.
 	if err != nil {
 		return out, err
 	}
+	mailboxRelayReady, selectedMailbox, err := h.mailboxRelayProviderReady(ctx, req.MailboxProvider, manager)
+	if err != nil {
+		return out, err
+	}
+	writeRegistrationFingerprint(hasher, "mailbox_provider", selectedMailbox)
+	writeRegistrationFingerprint(hasher, "mailbox_domain", strings.ToLower(strings.TrimSpace(req.MailboxDomain)))
 	switch out.Method {
 	case "protocol":
 		if strings.EqualFold(req.IdentityMode, "email") {
@@ -94,7 +100,7 @@ func (h *Handler) registrationMethodReadiness(ctx context.Context, req pipeline.
 			out.Blockers = append(out.Blockers, "SMS provider is not configured")
 		}
 	case "protocol_v2":
-		if !emailOTPReady {
+		if !emailOTPReady && !mailboxRelayReady {
 			out.Blockers = append(out.Blockers, "authenticated email OTP provider is not configured")
 		}
 	case "node", "browser":
@@ -102,7 +108,7 @@ func (h *Handler) registrationMethodReadiness(ctx context.Context, req pipeline.
 			out.Blockers = append(out.Blockers, "SMS provider is not configured")
 		}
 	case "browser_v3":
-		if !emailOTPReady {
+		if !emailOTPReady && !mailboxRelayReady {
 			out.Blockers = append(out.Blockers, "authenticated email OTP provider is not configured")
 		}
 		if providerCounts["sms"] == 0 {
@@ -122,6 +128,35 @@ func (h *Handler) registrationMethodReadiness(ctx context.Context, req pipeline.
 		}
 	}
 	return out, nil
+}
+
+func (h *Handler) mailboxRelayProviderReady(
+	ctx context.Context,
+	requested string,
+	manager *provider.Manager,
+) (bool, string, error) {
+	selected := strings.ToLower(strings.TrimSpace(requested))
+	if selected == "" {
+		value, ok, err := h.store.GetSetting(ctx, "reg_default_mailbox")
+		if err != nil {
+			return false, "", err
+		}
+		if ok {
+			selected = strings.ToLower(strings.TrimSpace(value))
+		}
+	}
+	if selected == "" || manager == nil {
+		return false, selected, nil
+	}
+	for _, candidate := range manager.Mailbox {
+		name := strings.ToLower(strings.TrimSpace(candidate.Name()))
+		if name == selected ||
+			(selected == "tempmail" && name == "tempmail_lol") ||
+			(selected == "tempmaillol" && name == "tempmail_lol") {
+			return true, selected, nil
+		}
+	}
+	return false, selected, nil
 }
 
 func (h *Handler) authenticatedEmailOTPProviderReady(ctx context.Context) (bool, error) {

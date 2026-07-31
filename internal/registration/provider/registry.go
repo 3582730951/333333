@@ -63,7 +63,7 @@ FROM provider_settings WHERE enabled=1 ORDER BY priority DESC`)
 				m.SMS = append(m.SMS, p)
 			}
 		case "mailbox":
-			if p := buildMailbox(normKey(pkey), cfg, httpClient); p != nil {
+			if p := buildMailbox(strings.TrimSpace(pkey), cfg, httpClient); p != nil {
 				m.Mailbox = append(m.Mailbox, p)
 			}
 		case "captcha":
@@ -107,9 +107,41 @@ func buildSMS(key string, cfg map[string]interface{}, hc *http.Client) SMSProvid
 }
 
 func buildMailbox(key string, cfg map[string]interface{}, hc *http.Client) MailboxProvider {
-	switch key {
+	originalKey := strings.ToLower(strings.TrimSpace(key))
+	normalizedKey := normKey(originalKey)
+	adapter := strings.ToLower(strings.TrimSpace(asString(cfg["adapter"])))
+	switch {
+	case adapter == "cloudflare_temp_email":
+		apiURL := asString(cfg["api_url"])
+		if apiURL == "" {
+			return nil
+		}
+		adminToken := asString(cfg["admin_token"])
+		if adminToken == "" {
+			adminToken = asString(cfg["api_key"])
+		}
+		return mailbox.NewNamedCloudflareTempEmailProvider(originalKey, apiURL, adminToken, asString(cfg["domain"]), hc)
+	case adapter == "generic_http":
+		pipeline, _ := cfg["pipeline"].(map[string]interface{})
+		adapter, err := mailbox.NewGenericHTTPAdapter(pipeline, cfg, asString(cfg["proxy_url"]), originalKey)
+		if err != nil {
+			return nil
+		}
+		return adapter
+	}
+	switch normalizedKey {
 	case "tempmail", "tempmaillol":
 		return mailbox.NewTempMailLolProvider(hc)
+	case "mailtm", "mailgw":
+		apiURL := strings.TrimSpace(asString(cfg["api_url"]))
+		if apiURL == "" {
+			if normalizedKey == "mailgw" {
+				apiURL = "https://api.mail.gw"
+			} else {
+				apiURL = "https://api.mail.tm"
+			}
+		}
+		return mailbox.NewMailTMProvider(originalKey, apiURL, asString(cfg["domain"]), hc)
 	case "cloudflare", "moemail", "freemail", "cftempemail", "cfworker":
 		apiURL := asString(cfg["api_url"])
 		if apiURL == "" {
@@ -119,13 +151,13 @@ func buildMailbox(key string, cfg map[string]interface{}, hc *http.Client) Mailb
 		if adminToken == "" {
 			adminToken = asString(cfg["api_key"])
 		}
-		return mailbox.NewCloudflareTempEmailProvider(apiURL, adminToken, asString(cfg["domain"]), hc)
+		return mailbox.NewNamedCloudflareTempEmailProvider(originalKey, apiURL, adminToken, asString(cfg["domain"]), hc)
 	case "outlookemail", "duckmail":
-		pipeline := getGenericHTTPPipeline(key)
+		pipeline := getGenericHTTPPipeline(normalizedKey)
 		if pipeline == nil {
 			return nil
 		}
-		adapter, err := mailbox.NewGenericHTTPAdapter(pipeline, cfg, "", key)
+		adapter, err := mailbox.NewGenericHTTPAdapter(pipeline, cfg, "", originalKey)
 		if err != nil {
 			return nil
 		}

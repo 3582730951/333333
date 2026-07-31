@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"regexp"
@@ -24,25 +25,49 @@ import (
 // The per-mailbox jwt is returned as the mailboxID (stateless) so a single shared
 // instance can serve concurrent registrations.
 type CloudflareTempEmailProvider struct {
-	apiURL     string
-	adminToken string
-	domain     string
-	httpClient *http.Client
+	providerKey string
+	apiURL      string
+	adminToken  string
+	domain      string
+	httpClient  *http.Client
 }
 
 // NewCloudflareTempEmailProvider builds the provider. adminToken is optional (set when
 // the worker restricts address creation to admins); domain is the worker's mail domain.
 func NewCloudflareTempEmailProvider(apiURL, adminToken, domain string, httpClient *http.Client) *CloudflareTempEmailProvider {
+	return NewNamedCloudflareTempEmailProvider("cloudflare", apiURL, adminToken, domain, httpClient)
+}
+
+func NewNamedCloudflareTempEmailProvider(providerKey, apiURL, adminToken, domain string, httpClient *http.Client) *CloudflareTempEmailProvider {
+	apiURL = strings.TrimRight(strings.TrimSpace(apiURL), "/")
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
 	return &CloudflareTempEmailProvider{
-		apiURL:     strings.TrimRight(strings.TrimSpace(apiURL), "/"),
-		adminToken: strings.TrimSpace(adminToken),
-		domain:     strings.TrimSpace(strings.TrimPrefix(domain, "@")),
-		httpClient: httpClient,
+		providerKey: strings.TrimSpace(providerKey),
+		apiURL:      apiURL,
+		adminToken:  strings.TrimSpace(adminToken),
+		domain:      strings.TrimSpace(strings.TrimPrefix(domain, "@")),
+		httpClient:  newGuardedMailboxHTTPClient(httpClient, apiURL),
 	}
 }
 
-func (p *CloudflareTempEmailProvider) Name() string { return "cloudflare" }
+func (p *CloudflareTempEmailProvider) Name() string {
+	if strings.TrimSpace(p.providerKey) == "" {
+		return "cloudflare"
+	}
+	return p.providerKey
+}
 func (p *CloudflareTempEmailProvider) Type() string { return "mailbox" }
+
+func (p *CloudflareTempEmailProvider) MailboxDomains() []string {
+	if p.domain != "" {
+		return []string{p.domain}
+	}
+	return nil
+}
+
+func (p *CloudflareTempEmailProvider) MailboxUsesCustomDomain() bool { return true }
 
 func randomLocalPart(n int) string {
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -82,12 +107,22 @@ func (p *CloudflareTempEmailProvider) CreateEmail(ctx context.Context) (string, 
 		return "", "", "", err
 	}
 	defer resp.Body.Close()
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, mailboxHTTPResponseBodyLimit+1))
+	if readErr != nil {
+		return "", "", "", fmt.Errorf("cloudflare: read new_address: %w", readErr)
+	}
+	if len(raw) > mailboxHTTPResponseBodyLimit {
+		return "", "", "", fmt.Errorf("cloudflare: new_address response exceeds limit")
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", "", fmt.Errorf("cloudflare: new_address returned HTTP %d", resp.StatusCode)
+	}
 	var data struct {
 		JWT     string `json:"jwt"`
 		Address string `json:"address"`
 		Name    string `json:"name"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	if err := json.Unmarshal(raw, &data); err != nil {
 		return "", "", "", fmt.Errorf("cloudflare: decode new_address: %w", err)
 	}
 	if data.JWT == "" {
@@ -101,6 +136,12 @@ func (p *CloudflareTempEmailProvider) CreateEmail(ctx context.Context) (string, 
 		}
 		email = local + "@" + p.domain
 	}
+	if p.domain != "" {
+		index := strings.LastIndexByte(email, '@')
+		if index < 0 || !strings.EqualFold(strings.TrimSpace(email[index+1:]), p.domain) {
+			return "", "", "", fmt.Errorf("cloudflare: returned address is outside configured domain")
+		}
+	}
 	return email, "", data.JWT, nil
 }
 
@@ -108,22 +149,34 @@ var sixDigit = regexp.MustCompile(`\b(\d{6})\b`)
 
 // WaitOTP polls the mailbox (Bearer = the jwt mailboxID) for a 6-digit code.
 func (p *CloudflareTempEmailProvider) WaitOTP(ctx context.Context, mailboxID string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(4 * time.Second)
-	defer ticker.Stop()
+	if strings.TrimSpace(mailboxID) == "" {
+		return "", fmt.Errorf("cloudflare: mailbox token is required")
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Minute
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	seen := map[string]bool{}
 	for {
 		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				return "", fmt.Errorf("timeout waiting for email")
-			}
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, p.apiURL+"/api/mails?limit=20&offset=0", nil)
+		case <-waitCtx.Done():
+			return "", fmt.Errorf("cloudflare: timeout waiting for email: %w", waitCtx.Err())
+		case <-timer.C:
+			req, _ := http.NewRequestWithContext(waitCtx, http.MethodGet, p.apiURL+"/api/mails?limit=20&offset=0", nil)
 			req.Header.Set("Authorization", "Bearer "+mailboxID)
 			resp, err := p.httpClient.Do(req)
 			if err != nil {
+				timer.Reset(3 * time.Second)
+				continue
+			}
+			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, mailboxHTTPResponseBodyLimit+1))
+			status := resp.StatusCode
+			resp.Body.Close()
+			if readErr != nil || len(raw) > mailboxHTTPResponseBodyLimit || status < 200 || status >= 300 {
+				timer.Reset(3 * time.Second)
 				continue
 			}
 			var data struct {
@@ -135,8 +188,10 @@ func (p *CloudflareTempEmailProvider) WaitOTP(ctx context.Context, mailboxID str
 					Message string      `json:"message"`
 				} `json:"results"`
 			}
-			json.NewDecoder(resp.Body).Decode(&data)
-			resp.Body.Close()
+			if json.Unmarshal(raw, &data) != nil {
+				timer.Reset(3 * time.Second)
+				continue
+			}
 			for _, m := range data.Results {
 				id := fmt.Sprintf("%v", m.ID)
 				if seen[id] {
@@ -148,6 +203,7 @@ func (p *CloudflareTempEmailProvider) WaitOTP(ctx context.Context, mailboxID str
 					return code[1], nil
 				}
 			}
+			timer.Reset(3 * time.Second)
 		}
 	}
 }

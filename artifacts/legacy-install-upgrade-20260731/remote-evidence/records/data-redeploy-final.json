@@ -1,0 +1,30 @@
+{
+  "phase": "redeploy-final",
+  "quick_check": "ok",
+  "integrity_check": "ok",
+  "logical_fingerprint_sha256": "9295ea6d34bdefe8e7152905920fef7b8c39e743fb2beb8806c2bc19071af869",
+  "counts": {
+    "groups": 7,
+    "accounts": 16,
+    "account_rate_limits": 16,
+    "account_model_capabilities": 32,
+    "usage_records": 168,
+    "email_pool": 18,
+    "audit_log": 49,
+    "registration_jobs": 6,
+    "registration_records": 18,
+    "lifecycle_tasks": 8
+  },
+  "fixture_marker": "cache-hit-optimization-to-optimized",
+  "schema_tables": 85,
+  "config_sha256": "46b179c50b737b88daca98c5d4cf48f6190a414ec275550b948e70ebc8226b40",
+  "database_sha256": "4a61bf9fdd733cd72ffb1bacc02dbdaa6974a4e1b92f03e6bb90f7e7798c151f",
+  "current_release": "apple-backend-optimized-v2-20260731",
+  "release_manifest": {
+    "release_id": "apple-backend-optimized-v2-20260731",
+    "commit": "source",
+    "built_at": "2026-07-31T01:10:59Z",
+    "layout": "release-scoped-worker"
+  },
+  "server_binary_sha256": "429f98e8fb44b62b2fe4f71ca8745923dd6feac83629964e2ec82876e8cd9046"
+}

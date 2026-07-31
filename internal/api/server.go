@@ -31,6 +31,7 @@ import (
 	"codex-account-pool/internal/kiro"
 	"codex-account-pool/internal/leakfilter"
 	"codex-account-pool/internal/prompt"
+	"codex-account-pool/internal/registration/teamflow"
 	"codex-account-pool/internal/reliability"
 	"codex-account-pool/internal/responsefilter"
 	"codex-account-pool/internal/routing"
@@ -54,6 +55,10 @@ type Dependencies struct {
 	Upstream          *upstream.Client
 	Planner           *virtual.Planner
 	DeferRuntimeStart bool
+	// TeamLifecycleConnector binds deployment-specific membership and interactive
+	// login actions. The core still owns durable state, encrypted credential
+	// references, quota observation, and replacement registration.
+	TeamLifecycleConnector teamflow.RemoteConnector
 	// Warp is the multi-exit WARP CF-fallback manager (nil = WARP disabled).
 	Warp *warp.Manager
 	// Solver is the cf_clearance solver client (nil/disabled = no solver rung).
@@ -91,6 +96,10 @@ type Server struct {
 	// clientErrors throttles browser-side error reports so the diagnostics endpoint
 	// cannot amplify a frontend fault or unauthenticated request flood into log spam.
 	clientErrors *clientErrorLimiter
+	// routingAudits coalesces repeated non-409 availability audits. Per-attempt
+	// routing facts remain in diagnosticRuntime; strict identity failures bypass it.
+	routingAudits          *clientErrorLimiter
+	routingAuditSuppressed atomic.Uint64
 	// httpMetrics is fixed-cardinality and allocation-free on the request path.
 	// Operators can inspect it in /admin/system or scrape /admin/metrics.
 	httpMetrics httpRequestMetrics
@@ -100,6 +109,7 @@ type Server struct {
 	relState *reliability.Store
 	// regHandler handles registration API requests
 	regHandler         *Handler
+	teamLifecycle      *teamflow.Coordinator
 	claudeRefresh      *claudeRefreshGates
 	antigravityRefresh *antigravityRefreshFlights
 	kiro               *kiro.Manager
@@ -206,6 +216,11 @@ func NewServer(dep Dependencies) *Server {
 			clientErrorLogWindow,
 			clientErrorLogMaxClients,
 		),
+		routingAudits: newClientErrorLimiter(
+			routingAuditLogLimit,
+			routingAuditLogWindow,
+			routingAuditLogMaxKeys,
+		),
 		relState:            reliability.NewStore(relStateTTL, relStateMax),
 		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
 		claudeRefresh:       newClaudeRefreshGates(),
@@ -218,6 +233,28 @@ func NewServer(dep Dependencies) *Server {
 		codexSessionGates:   map[string]*codexSessionGate{},
 		codexResetLocks:     map[string]*sync.Mutex{},
 		diagnosticJobWake:   make(chan struct{}, 1),
+	}
+	if dep.Store != nil {
+		connector := dep.TeamLifecycleConnector
+		if connector == nil {
+			// The native connector is the production default: it reuses encrypted
+			// pool credentials, exact account egress bindings, durable OAuth repair,
+			// and the registration queue. Deployments can still inject a fixture or
+			// provider-specific connector through Dependencies.
+			connector = newNativeTeamLifecycleConnector(s)
+		}
+		adapter := teamflow.NewPoolAdapter(
+			dep.Store,
+			connector,
+			s.regHandler.EnqueueLifecycleReplacement,
+		)
+		s.teamLifecycle = teamflow.NewCoordinator(
+			dep.Store,
+			adapter,
+			teamflow.Options{},
+			teamflow.CoordinatorOptions{Workers: 1},
+			dep.Config.NodeID,
+		)
 	}
 	// Resolve the identity secret once (it can read host files on the unconfigured
 	// path); s.identitySecret() returns this cached value on the hot path.
@@ -490,12 +527,20 @@ func (s *Server) routes() {
 	// Readiness self-check: reports whether "deploy → auto-fill the pool" is actually
 	// configured to run (refill policy, providers, pool deficit, blockers).
 	s.mux.HandleFunc("/admin/register/readiness", s.handleRegisterReadiness)
+	// Durable team/member lifecycle. Execution defaults to a reviewable shadow plan;
+	// connector implementations plug into teamflow.Adapter without persisting secrets.
+	s.mux.HandleFunc("/admin/team-lifecycle/workspaces", s.handleTeamLifecycleWorkspaces)
+	s.mux.HandleFunc("/admin/team-lifecycle/workflows", s.handleTeamLifecycleWorkflows)
+	s.mux.HandleFunc("/admin/team-lifecycle/workflows/", s.handleTeamLifecycleWorkflowAction)
+	s.mux.HandleFunc("/admin/team-lifecycle/stats", s.handleTeamLifecycleStats)
 	// One-release compatibility tombstones for the two superseded registration
 	// orchestrators. All new work goes through /admin/register/batch.
 	s.mux.HandleFunc("/admin/register/email/", s.handleRemovedRegistration)
 	s.mux.HandleFunc("/admin/turbo-gpt-register/", s.handleRemovedRegistration)
 	// Email account pool management (Outlook/Hotmail accounts for registration).
 	s.mux.HandleFunc("/admin/email-pool/import", s.adminEmailPoolImport)
+	s.mux.HandleFunc("/admin/email-pool/cloudflare/test", s.handleCloudflareMailboxTest)
+	s.mux.HandleFunc("/admin/email-pool/cloudflare", s.handleCloudflareMailboxConfig)
 	s.mux.HandleFunc("/admin/email-pool", s.adminEmailPool)
 	s.mux.HandleFunc("/admin/email-pool/", s.adminEmailPoolAction)
 	// Unified settings center (SettingsV2 page): aggregates config registry, registrar

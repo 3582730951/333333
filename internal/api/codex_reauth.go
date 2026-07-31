@@ -28,6 +28,8 @@ type codexReauthWorkerRequest struct {
 	Password          string `json:"password,omitempty"`
 	OTPURL            string `json:"otp_url,omitempty"`
 	Proxy             string `json:"proxy,omitempty"`
+	HeroSMSKey        string `json:"hero_sms_key,omitempty"`
+	SMSCountry        string `json:"sms_country,omitempty"`
 	TargetWorkspaceID string `json:"target_workspace_id,omitempty"`
 	CookieHeader      string `json:"cookie_header,omitempty"`
 }
@@ -365,10 +367,26 @@ func (s *Server) runCodexReauthJob(ctx context.Context, jobID int64) (map[string
 	}
 	_ = s.store.UpdateCodexReauthJobStatus(ctx, job.ID, storage.CodexReauthJobRunning, "")
 	cookie, _ := s.store.GetSessionCookie(ctx, account.ID)
+	proxyURL := ""
+	if binding, bindingErr := s.store.GetEgressBinding(ctx, account.ID); bindingErr == nil {
+		if egress, egressErr := s.store.ResolvePrimaryEgressBinding(ctx, binding); egressErr == nil {
+			proxyURL = strings.TrimSpace(egress.Endpoint)
+			if storage.IsSidecarEgress(egress) && strings.TrimSpace(egress.ChainProxy) != "" {
+				proxyURL = strings.TrimSpace(egress.ChainProxy)
+			}
+			if strings.EqualFold(strings.TrimSpace(egress.Type), "direct") {
+				proxyURL = ""
+			}
+		}
+	}
+	heroSMSKey, smsCountry := s.codexReauthSMSConfig(ctx)
 	payload := codexReauthWorkerRequest{
 		Email:             cfg.LoginEmail,
 		Password:          cfg.Password,
 		OTPURL:            cfg.OTPURL,
+		Proxy:             proxyURL,
+		HeroSMSKey:        heroSMSKey,
+		SMSCountry:        smsCountry,
 		TargetWorkspaceID: cfg.TargetWorkspaceID,
 		CookieHeader:      cookie,
 	}
@@ -430,6 +448,52 @@ func (s *Server) runCodexReauthJob(ctx context.Context, jobID int64) (map[string
 	_ = s.store.UpdateCodexReauthJobStatus(ctx, job.ID, storage.CodexReauthJobSucceeded, "")
 	_ = s.store.UpdateCodexReauthConfigStatus(ctx, account.ID, storage.CodexReauthJobSucceeded, "")
 	return map[string]interface{}{"account": updated, "job_id": job.ID, "status": storage.CodexReauthJobSucceeded}, http.StatusOK, nil
+}
+
+func (s *Server) codexReauthSMSConfig(ctx context.Context) (string, string) {
+	if s == nil || s.store == nil {
+		return "", ""
+	}
+	rows, err := s.store.DB().QueryContext(ctx, `
+SELECT provider_key,config_json,auth_json
+FROM provider_settings
+WHERE provider_type='sms' AND enabled=1
+ORDER BY priority DESC,id`)
+	if err != nil {
+		return "", ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var providerKey, configJSON, authJSON string
+		if rows.Scan(&providerKey, &configJSON, &authJSON) != nil {
+			continue
+		}
+		normalized := strings.NewReplacer("_", "", "-", "", " ", "").
+			Replace(strings.ToLower(strings.TrimSpace(providerKey)))
+		if normalized != "herosms" {
+			continue
+		}
+		configValues := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(configJSON), &configValues)
+		authValues, openErr := s.store.OpenProviderAuthJSON("sms", providerKey, authJSON)
+		if openErr != nil {
+			return "", ""
+		}
+		key := strings.TrimSpace(stringValue(authValues["api_key"]))
+		if key == "" {
+			key = strings.TrimSpace(stringValue(configValues["api_key"]))
+		}
+		country := strings.ToUpper(strings.TrimSpace(firstNonEmpty(
+			stringValue(configValues["country"]),
+			stringValue(configValues["default_country"]),
+			"PH",
+		)))
+		if len(country) != 2 {
+			country = "PH"
+		}
+		return key, country
+	}
+	return "", ""
 }
 
 func validateCodexTargetWorkspace(parsed authparse.ParsedAuth, targetWorkspaceID string) error {

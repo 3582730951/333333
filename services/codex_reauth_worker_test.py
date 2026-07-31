@@ -24,6 +24,18 @@ def make_id_token(workspace_id="workspace-ok", user_id="user-ok", email="ok@exam
 
 
 class CodexReauthWorkerTests(unittest.TestCase):
+    def test_health_endpoint_is_ready_and_does_not_expose_state(self):
+        server, url = self.start_server({})
+        try:
+            with urllib.request.urlopen(url + "/healthz", timeout=5) as resp:
+                body = json.loads(resp.read().decode())
+                cache_control = resp.headers.get("Cache-Control")
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(body, {"ready": True, "service": "codex-reauth-worker"})
+        self.assertEqual(cache_control, "no-store")
+
     def test_extracts_codex_account_and_workspace_from_login_output(self):
         id_token = make_id_token()
         out = "noise\n__CODEX_ACCOUNT__ " + json.dumps({

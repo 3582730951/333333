@@ -1,0 +1,156 @@
+{
+  "source": {
+    "id": "ug_6202e50bb9bb490baae5de19bcfe04ab",
+    "name": "流量兜底演示主分组 · Apple 级精细路由与超长账号名称兼容验证",
+    "system_prompt": "",
+    "prompt_mode": "prepend",
+    "system_prompt_apply_to_compaction": false,
+    "model_instructions_enabled": false,
+    "force_model": "",
+    "force_effort": "",
+    "block_claude_target_groups": [],
+    "block_gpt_target_groups": [],
+    "traffic_fallback_groups": {
+      "gpt": [
+        "ug_48f8cd11eabf4943a20b09130bfc48c2"
+      ],
+      "claude": [
+        "ug_47b27b71a311444ba86fdf422fdd2b65"
+      ],
+      "gemini": [
+        "ug_f83b8ee754e44865ae509a5481a1437d"
+      ]
+    },
+    "traffic_fallback_model_mappings": [
+      {
+        "family": "gpt",
+        "source_model": "gpt-5.6-sol",
+        "target_user_group_id": "ug_48f8cd11eabf4943a20b09130bfc48c2",
+        "target_model": "gpt-5.5"
+      },
+      {
+        "family": "gpt",
+        "source_model": "gpt-5.*",
+        "target_user_group_id": "ug_48f8cd11eabf4943a20b09130bfc48c2",
+        "target_model": "gpt-5.4-codex"
+      },
+      {
+        "family": "claude",
+        "source_model": "claude-opus-*",
+        "target_user_group_id": "ug_47b27b71a311444ba86fdf422fdd2b65",
+        "target_model": "claude-sonnet-4-5"
+      },
+      {
+        "family": "gemini",
+        "source_model": "gemini-3-pro",
+        "target_user_group_id": "ug_f83b8ee754e44865ae509a5481a1437d",
+        "target_model": "gemini-3-flash"
+      }
+    ],
+    "targets": [
+      {
+        "kind": "account_pool_group",
+        "id": "cyber"
+      }
+    ],
+    "model_routing": [],
+    "created_at": 1785491975,
+    "updated_at": 1785491975
+  },
+  "fallbacks": [
+    {
+      "id": "ug_48f8cd11eabf4943a20b09130bfc48c2",
+      "name": "GPT 超长兜底用户分组 · 全球研发与高优先级代码流量 · 2026 夏季容量保障",
+      "system_prompt": "",
+      "prompt_mode": "prepend",
+      "system_prompt_apply_to_compaction": false,
+      "model_instructions_enabled": false,
+      "force_model": "",
+      "force_effort": "",
+      "block_claude_target_groups": [],
+      "block_gpt_target_groups": [],
+      "traffic_fallback_groups": {
+        "gpt": [],
+        "claude": [],
+        "gemini": []
+      },
+      "traffic_fallback_model_mappings": [],
+      "targets": [
+        {
+          "kind": "account_pool_group",
+          "id": "cyber"
+        }
+      ],
+      "model_routing": [],
+      "created_at": 1785491975,
+      "updated_at": 1785491975
+    },
+    {
+      "id": "ug_47b27b71a311444ba86fdf422fdd2b65",
+      "name": "Claude 优雅创作兜底分组",
+      "system_prompt": "",
+      "prompt_mode": "prepend",
+      "system_prompt_apply_to_compaction": false,
+      "model_instructions_enabled": false,
+      "force_model": "",
+      "force_effort": "",
+      "block_claude_target_groups": [],
+      "block_gpt_target_groups": [],
+      "traffic_fallback_groups": {
+        "gpt": [],
+        "claude": [],
+        "gemini": []
+      },
+      "traffic_fallback_model_mappings": [],
+      "targets": [
+        {
+          "kind": "account_pool_group",
+          "id": "cyber"
+        }
+      ],
+      "model_routing": [],
+      "created_at": 1785491975,
+      "updated_at": 1785491975
+    },
+    {
+      "id": "ug_f83b8ee754e44865ae509a5481a1437d",
+      "name": "Gemini 多模态兜底分组",
+      "system_prompt": "",
+      "prompt_mode": "prepend",
+      "system_prompt_apply_to_compaction": false,
+      "model_instructions_enabled": false,
+      "force_model": "",
+      "force_effort": "",
+      "block_claude_target_groups": [],
+      "block_gpt_target_groups": [],
+      "traffic_fallback_groups": {
+        "gpt": [],
+        "claude": [],
+        "gemini": []
+      },
+      "traffic_fallback_model_mappings": [],
+      "targets": [
+        {
+          "kind": "account_pool_group",
+          "id": "cyber"
+        }
+      ],
+      "model_routing": [],
+      "created_at": 1785491975,
+      "updated_at": 1785491975
+    }
+  ],
+  "model_catalog": {
+    "models": [
+      "claude-opus-5",
+      "claude-sonnet-4-5",
+      "gemini-3-flash",
+      "gemini-3-pro",
+      "gpt-5.4-codex",
+      "gpt-5.5",
+      "gpt-5.6-sol"
+    ],
+    "generated_at": 1785492045
+  },
+  "user_group_count": 4
+}

@@ -1,0 +1,1 @@
+{"checks": {"storage": true}, "deployment_state": "active", "fencing_token": 21, "inflight": 0, "ok": true, "ready": true, "release_id": "backend-headroom-final-frontend", "started_at": "2026-07-31T01:22:33.105809529Z", "worker_socket": ""}

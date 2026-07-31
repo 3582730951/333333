@@ -34,6 +34,9 @@ fi
 REGISTRAR_SOURCE="${REGISTRAR_SOURCE:-${PROJECT_ROOT}/workers/node-registrar}"
 REGISTRAR_INSTALL="${REGISTRAR_INSTALL:-${DATA_DIR%/}/registrar}"
 PY_REGISTRAR_SOURCE="${PY_REGISTRAR_SOURCE:-${PROJECT_ROOT}/services/codex_register}"
+CODEX_REAUTH_WORKER_SOURCE="${CODEX_REAUTH_WORKER_SOURCE:-${PROJECT_ROOT}/services/codex_reauth_worker.py}"
+CODEX_REAUTH_ADDR="${CODEX_REAUTH_ADDR:-127.0.0.1:8802}"
+CODEX_REAUTH_CONCURRENCY="${CODEX_REAUTH_CONCURRENCY:-1}"
 NODE_BIN="${NODE_BIN:-}"
 CHROME_BIN="${CHROME_BIN:-}"
 WARP_EXITS="${WARP_EXITS:-8}"
@@ -183,7 +186,8 @@ Environment overrides:
   INSTALL_GO, GO_INSTALL_VERSION, GO_INSTALL_ROOT, GO_BIN, HEALTH_TIMEOUT,
   SKIP_OS_PACKAGES, GO_TARBALL_SHA256,
   WITH_REGISTRATION, NODE_MIN_MAJOR, NODE_INSTALL_MAJOR, NODE_BIN, CHROME_BIN,
-  REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE
+  REGISTRAR_SOURCE, REGISTRAR_INSTALL, PY_REGISTRAR_SOURCE,
+  CODEX_REAUTH_WORKER_SOURCE, CODEX_REAUTH_ADDR, CODEX_REAUTH_CONCURRENCY
 EOF
 }
 
@@ -508,6 +512,32 @@ listen_port() {
   esac
 }
 
+codex_reauth_base_url() {
+  local host port
+  host="$(listen_host "$CODEX_REAUTH_ADDR")"
+  port="$(listen_port "$CODEX_REAUTH_ADDR")"
+  if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+    host="[${host}]"
+  fi
+  printf 'http://%s:%s\n' "$host" "$port"
+}
+
+validate_codex_reauth_settings() {
+  bool_enabled "$WITH_REGISTRATION" || return 0
+  local host port
+  host="$(listen_host "$CODEX_REAUTH_ADDR")"
+  port="$(listen_port "$CODEX_REAUTH_ADDR")"
+  case "$host" in
+    127.*|localhost|::1) ;;
+    *) die "CODEX_REAUTH_ADDR must bind to loopback, got: ${CODEX_REAUTH_ADDR}" ;;
+  esac
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) ||
+    die "CODEX_REAUTH_ADDR has an invalid port: ${CODEX_REAUTH_ADDR}"
+  [[ "$CODEX_REAUTH_CONCURRENCY" =~ ^[0-9]+$ ]] &&
+    (( CODEX_REAUTH_CONCURRENCY >= 1 && CODEX_REAUTH_CONCURRENCY <= 64 )) ||
+    die "CODEX_REAUTH_CONCURRENCY must be between 1 and 64"
+}
+
 external_listen_enabled() {
   local host
   host="$(listen_host "$LISTEN_ADDR")"
@@ -535,7 +565,7 @@ config_string_value() {
 }
 
 render_runtime_config() {
-  local listen_json data_json database_json admin_json sidecar_json
+  local listen_json data_json database_json admin_json sidecar_json reauth_json
   listen_json="$(json_escape "$LISTEN_ADDR")"
   data_json="$(json_escape "${DATA_DIR%/}/data")"
   database_json="$(json_escape "$DATABASE_PATH")"
@@ -545,12 +575,18 @@ render_runtime_config() {
   else
     sidecar_json=""
   fi
+  if bool_enabled "$WITH_REGISTRATION"; then
+    reauth_json="$(json_escape "$(codex_reauth_base_url)")"
+  else
+    reauth_json=""
+  fi
   awk \
     -v listen="$listen_json" \
     -v data_dir="$data_json" \
     -v database="$database_json" \
     -v admin="$admin_json" \
-    -v sidecar="$sidecar_json" '
+    -v sidecar="$sidecar_json" \
+    -v reauth="$reauth_json" '
       /^[[:space:]]*"listen_addr"[[:space:]]*:/ {
         print "  \"listen_addr\": \"" listen "\","
         next
@@ -569,6 +605,10 @@ render_runtime_config() {
       }
       /^[[:space:]]*"default_sidecar_endpoint"[[:space:]]*:/ {
         print "  \"default_sidecar_endpoint\": \"" sidecar "\","
+        next
+      }
+      /^[[:space:]]*"codex_reauth_worker_url"[[:space:]]*:/ {
+        print "  \"codex_reauth_worker_url\": \"" reauth "\","
         next
       }
       { print }
@@ -826,6 +866,10 @@ ensure_project_files() {
       [[ -f "${PY_REGISTRAR_SOURCE%/}/${registrar_file}" ]] ||
         die "repository-owned Python registrar artifact not found: ${PY_REGISTRAR_SOURCE}/${registrar_file}"
     done
+    [[ -f "${PY_REGISTRAR_SOURCE%/}/login_oauth.py" ]] ||
+      die "repository-owned Codex OAuth login artifact not found: ${PY_REGISTRAR_SOURCE}/login_oauth.py"
+    [[ -f "$CODEX_REAUTH_WORKER_SOURCE" ]] ||
+      die "repository-owned Codex reauth worker not found: ${CODEX_REAUTH_WORKER_SOURCE}"
   fi
   if bool_enabled "$WITH_WARP"; then
     [[ -f scripts/warp-exit.sh ]] || die "scripts/warp-exit.sh not found (required for --with-warp)"
@@ -848,6 +892,7 @@ ensure_absolute_paths() {
   require_absolute_path "BUILD_DIR" "$BUILD_DIR"
   require_absolute_path "SIDECAR_INSTALL_DIR" "$SIDECAR_INSTALL_DIR"
   require_absolute_path "SIDECAR_VENV" "$SIDECAR_VENV"
+  require_absolute_path "CODEX_REAUTH_WORKER_SOURCE" "$CODEX_REAUTH_WORKER_SOURCE"
   require_absolute_path "SIDECAR_COOKIE_DIR" "$SIDECAR_COOKIE_DIR"
   require_absolute_path "REGISTRAR_SOURCE" "$REGISTRAR_SOURCE"
   require_absolute_path "REGISTRAR_INSTALL" "$REGISTRAR_INSTALL"
@@ -1119,6 +1164,27 @@ wait_for_service_health() {
     sleep 1
   done
   return 1
+}
+
+activate_codex_reauth_worker() {
+  bool_enabled "$WITH_REGISTRATION" || return 0
+  log "Restarting ${SERVICE_NAME}-reauth.service for release ${RELEASE_ID}"
+  if ! run_root systemctl restart "${SERVICE_NAME}-reauth.service" ||
+    ! wait_for_service_health "$(codex_reauth_base_url)/healthz" "$HEALTH_TIMEOUT" "Codex reauth worker"; then
+    run_root systemctl --no-pager --full status "${SERVICE_NAME}-reauth.service" >&2 || true
+    return 1
+  fi
+}
+
+restore_codex_reauth_worker_after_rollback() {
+  bool_enabled "$WITH_REGISTRATION" || return 0
+  if run_root test -x "${APP_DIR%/}/current/codex-reauth/codex_reauth_worker.py" &&
+    run_root test -x "${APP_DIR%/}/current/registrar-python-venv/bin/python"; then
+    run_root systemctl restart "${SERVICE_NAME}-reauth.service" || return 1
+    wait_for_service_health "$(codex_reauth_base_url)/healthz" "$HEALTH_TIMEOUT" "Codex reauth rollback"
+    return $?
+  fi
+  run_root systemctl stop "${SERVICE_NAME}-reauth.service" >/dev/null 2>&1 || true
 }
 
 wait_worker_ready() {
@@ -1498,6 +1564,8 @@ rollback_pending_activation() {
     destroy_stale_worker_instances "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
     verify_single_active_worker "$ACTIVATION_OLD_WORKER_RELEASE" || return 1
   fi
+  restore_codex_reauth_worker_after_rollback ||
+    warn "previous Codex reauth worker did not recover during activation rollback"
   ACTIVATION_PENDING=0
 }
 
@@ -1635,6 +1703,8 @@ activate_staged_release() {
     fi
     die "first handoff activation failed; staged release remains at ${RELEASE_DIR}"
   fi
+  activate_codex_reauth_worker ||
+    die "Codex OAuth reauth worker failed its health gate; installer cleanup is restoring the previous release"
 
   run_root systemctl enable "${SERVICE_NAME}-worker@${RELEASE_ID}.service" >/dev/null ||
     die "new worker passed readiness but could not be enabled for reboot"
@@ -1678,7 +1748,7 @@ install_systemd_unit() {
     return 0
   fi
 
-  local database_parent read_write_paths tmp unit handoff_unit worker_unit sidecar_unit extra_env admin_env no_new_priv warp_dir_env legacy_pid
+  local database_parent read_write_paths tmp unit handoff_unit worker_unit sidecar_unit reauth_unit extra_env admin_env no_new_priv warp_dir_env legacy_pid
   local node_registrar_unit_dir python_registrar_unit_dir python_registrar_unit_venv
   if systemd_running && ! run_root systemctl is-active --quiet "${HANDOFF_SERVICE_NAME}.service" 2>/dev/null; then
     legacy_pid="$(run_root systemctl show "${SERVICE_NAME}.service" --property=MainPID --value 2>/dev/null || true)"
@@ -1908,6 +1978,57 @@ EOF
     rm -f "$tmp"
   fi
 
+  if bool_enabled "$WITH_REGISTRATION"; then
+    local reauth_host reauth_port reauth_chrome_env
+    reauth_host="$(listen_host "$CODEX_REAUTH_ADDR")"
+    reauth_port="$(listen_port "$CODEX_REAUTH_ADDR")"
+    reauth_chrome_env=""
+    if [[ -n "${CHROME_BIN:-}" ]]; then
+      reauth_chrome_env="
+Environment=\"CHROME_PATH=${CHROME_BIN}\"
+Environment=\"REG_CHROME=${CHROME_BIN}\""
+    fi
+    tmp="$(mktemp)"
+    reauth_unit="${SYSTEMD_DIR%/}/${SERVICE_NAME}-reauth.service"
+    cat >"$tmp" <<EOF
+[Unit]
+Description=Codex Pool OAuth reauth worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SERVICE_USER}
+Group=${SERVICE_GROUP}
+WorkingDirectory=${DATA_DIR}
+Environment="HOME=${DATA_DIR}"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="REG_HEADLESS=1"${reauth_chrome_env}
+ExecStart=${APP_DIR%/}/current/registrar-python-venv/bin/python ${APP_DIR%/}/current/codex-reauth/codex_reauth_worker.py --host ${reauth_host} --port ${reauth_port} --concurrency ${CODEX_REAUTH_CONCURRENCY}
+Restart=always
+RestartSec=3
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${read_write_paths}
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    log "Installing Codex OAuth reauth worker unit to ${reauth_unit}"
+    run_root install -m 0644 "$tmp" "$reauth_unit"
+    rm -f "$tmp"
+  else
+    reauth_unit="${SYSTEMD_DIR%/}/${SERVICE_NAME}-reauth.service"
+    if systemd_running; then
+      run_root systemctl disable --now "${SERVICE_NAME}-reauth.service" >/dev/null 2>&1 || true
+    fi
+    run_root rm -f "$reauth_unit"
+  fi
+
   if systemd_running; then
     run_root systemctl daemon-reload
     run_root systemctl enable "${SERVICE_NAME}.socket" >/dev/null 2>&1 || true
@@ -1915,6 +2036,9 @@ EOF
     run_root systemctl enable "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
     if bool_enabled "$WITH_SIDECAR"; then
       run_root systemctl enable "${SERVICE_NAME}-sidecar.service" >/dev/null 2>&1 || true
+    fi
+    if bool_enabled "$WITH_REGISTRATION"; then
+      run_root systemctl enable "${SERVICE_NAME}-reauth.service" >/dev/null 2>&1 || true
     fi
     if bool_enabled "$START_SERVICE"; then
       # Start and self-test the private A/B worker first. activate_staged_release then
@@ -2069,6 +2193,10 @@ install_nodejs() {
 
 find_chrome() {
   local c
+  if [[ -n "${CHROME_BIN:-}" && -x "${CHROME_BIN:-}" ]]; then
+    printf '%s\n' "$CHROME_BIN"
+    return 0
+  fi
   for c in google-chrome-stable google-chrome chromium chromium-browser; do
     if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
   done
@@ -2083,7 +2211,10 @@ install_chrome() {
 
   # Xvfb + base fonts first: Chrome runs HEADED inside a per-process Xvfb (no monitor
   # required), so a virtual display + fonts must exist even on a headless VPS.
-  log "Installing Xvfb + fonts (virtual display for the headed-in-Xvfb browser)"
+  if bool_enabled "$SKIP_OS_PACKAGES"; then
+    log "Skipping Xvfb/font package changes (SKIP_OS_PACKAGES=1)"
+  else
+    log "Installing Xvfb + fonts (virtual display for the headed-in-Xvfb browser)"
   if command -v apt-get >/dev/null 2>&1; then
     run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb fonts-liberation || warn "could not install xvfb/fonts via apt"
   elif command -v dnf >/dev/null 2>&1; then
@@ -2094,6 +2225,8 @@ install_chrome() {
     run_root apk add --no-cache xvfb ttf-freefont || warn "could not install xvfb/fonts via apk"
   elif command -v pacman >/dev/null 2>&1; then
     run_root pacman -Sy --needed --noconfirm xorg-server-xvfb ttf-liberation || warn "could not install xvfb/fonts via pacman"
+  fi
+
   fi
 
   local chrome arch
@@ -2177,9 +2310,11 @@ install_node_registrar() {
 install_python_registrar() {
   bool_enabled "$WITH_REGISTRATION" || return 0
 
-  local release_source release_venv registrar_file
+  local release_source release_venv reauth_source reauth_module_dir registrar_file
   release_source="${RELEASE_DIR%/}/registrar-python"
   release_venv="${RELEASE_DIR%/}/registrar-python-venv"
+  reauth_source="${RELEASE_DIR%/}/codex-reauth"
+  reauth_module_dir="${reauth_source%/}/codex_register"
   log "Installing immutable Python registrar runtime to ${release_source}"
 
   run_root install -d -m 0750 -o root -g "$SERVICE_GROUP" "$release_source"
@@ -2187,6 +2322,14 @@ install_python_registrar() {
     run_root install -m 0640 -o root -g "$SERVICE_GROUP" \
       "${PY_REGISTRAR_SOURCE%/}/${registrar_file}" "${release_source}/${registrar_file}"
   done
+  log "Installing immutable Codex OAuth reauth worker to ${reauth_source}"
+  run_root install -d -m 0750 -o root -g "$SERVICE_GROUP" "$reauth_source" "$reauth_module_dir"
+  run_root install -m 0750 -o root -g "$SERVICE_GROUP" \
+    "$CODEX_REAUTH_WORKER_SOURCE" "${reauth_source}/codex_reauth_worker.py"
+  run_root install -m 0750 -o root -g "$SERVICE_GROUP" \
+    "${PY_REGISTRAR_SOURCE%/}/login_oauth.py" "${reauth_module_dir}/login_oauth.py"
+  run_root install -m 0640 -o root -g "$SERVICE_GROUP" \
+    "${PY_REGISTRAR_SOURCE%/}/phone_verify.py" "${reauth_module_dir}/phone_verify.py"
 
   run_root python3 -m venv "$release_venv"
   run_root "$release_venv/bin/pip" install --disable-pip-version-check \
@@ -2197,12 +2340,21 @@ install_python_registrar() {
       'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), filename=sys.argv[1])' \
       "${release_source}/${registrar_file}"
   done
+  for registrar_file in "${reauth_source}/codex_reauth_worker.py" "${reauth_module_dir}/login_oauth.py" "${reauth_module_dir}/phone_verify.py"; do
+    run_root env PYTHONDONTWRITEBYTECODE=1 "$release_venv/bin/python" -c \
+      'import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), filename=sys.argv[1])' \
+      "$registrar_file"
+  done
   run_root env PYTHONDONTWRITEBYTECODE=1 "$release_venv/bin/python" -c \
     'import curl_cffi, playwright, playwright_stealth, requests, urllib3'
+  run_root env PYTHONDONTWRITEBYTECODE=1 "$release_venv/bin/python" -c \
+    'import importlib.util, pathlib, sys; p=pathlib.Path(sys.argv[1]); s=importlib.util.spec_from_file_location("codex_reauth_worker", p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert m.make_server' \
+    "${reauth_source}/codex_reauth_worker.py"
 
-  run_root chown -R "root:${SERVICE_GROUP}" "$release_source" "$release_venv"
-  run_root chmod -R u=rwX,g=rX,o= "$release_source" "$release_venv"
+  run_root chown -R "root:${SERVICE_GROUP}" "$release_source" "$release_venv" "$reauth_source"
+  run_root chmod -R u=rwX,g=rX,o= "$release_source" "$release_venv" "$reauth_source"
   log "Python registration workers ready at ${release_source}"
+  log "Codex OAuth reauth worker ready at ${reauth_source}"
 }
 
 # install_warp provisions the multi-exit WARP fallback pool (wgcf + wireproxy): one
@@ -2333,7 +2485,7 @@ frontend_url_hint() {
 }
 
 print_summary() {
-  local sidecar_summary migration_summary warp_summary frontend_url manual_admin_env admin_token_summary
+  local sidecar_summary migration_summary warp_summary frontend_url manual_admin_env admin_token_summary reauth_manual
   if bool_enabled "$WITH_SIDECAR"; then
     sidecar_summary="${SERVICE_NAME}-sidecar.service (${SIDECAR_ADDR})"
   else
@@ -2341,9 +2493,12 @@ print_summary() {
   fi
   local registration_summary
   if bool_enabled "$WITH_REGISTRATION"; then
-    registration_summary="node engine @ ${REGISTRAR_INSTALL} (node=${NODE_BIN:-?}, chrome=${CHROME_BIN:-?})"
+    registration_summary="node engine @ ${REGISTRAR_INSTALL}; OAuth reauth @ $(codex_reauth_base_url) (node=${NODE_BIN:-?}, chrome=${CHROME_BIN:-?})"
+    reauth_manual="
+  ${RELEASE_DIR%/}/registrar-python-venv/bin/python ${RELEASE_DIR%/}/codex-reauth/codex_reauth_worker.py --host $(listen_host "$CODEX_REAUTH_ADDR") --port $(listen_port "$CODEX_REAUTH_ADDR") --concurrency ${CODEX_REAUTH_CONCURRENCY}"
   else
     registration_summary="disabled"
+    reauth_manual=""
   fi
   if bool_enabled "$WITH_WARP"; then
     warp_summary="${WARP_EXITS} exits, ports ${WARP_BASE_PORT}-$(( WARP_BASE_PORT + WARP_EXITS - 1 )) (${SERVICE_NAME}-warp@1..${WARP_EXITS}), ≤${WARP_ACCOUNTS_PER_EXIT}/exit"
@@ -2385,12 +2540,13 @@ WARP:          ${warp_summary}
 Admin token:   ${admin_token_summary}
 
 Manual run:
-  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}
+  CODEX_POOL_DATABASE=${DATABASE_PATH} CODEX_POOL_MIGRATE_USER_GROUPS=${MIGRATE_USER_GROUPS} CODEX_POOL_LISTEN_ADDR=${LISTEN_ADDR}${manual_admin_env} ${BIN_DIR}/${APP_NAME} --config ${CONFIG_FILE}${reauth_manual}
 
 Useful service commands:
   systemctl status ${HANDOFF_SERVICE_NAME}.service
   systemctl status ${SERVICE_NAME}.socket
   systemctl status ${SERVICE_NAME}-worker@${RELEASE_ID}.service
+  systemctl status ${SERVICE_NAME}-reauth.service
   ${BIN_DIR}/codex-pool-rollback
   journalctl -u ${HANDOFF_SERVICE_NAME}.service -f
   systemctl status ${SERVICE_NAME}-sidecar.service
@@ -2401,6 +2557,7 @@ main() {
   normalize_migrate_user_groups
   ensure_project_files
   ensure_absolute_paths
+  validate_codex_reauth_settings
   acquire_deploy_lock
   remove_legacy_auxiliary_units
   trap deployment_exit_cleanup EXIT

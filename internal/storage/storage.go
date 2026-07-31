@@ -139,6 +139,25 @@ type ModelInstructionProfile struct {
 // Once any profile exists, unlisted families are intentionally disabled.
 type ModelInstructionProfiles map[string]ModelInstructionProfile
 
+// TrafficFallbackGroups is the ordered set of user groups that may receive
+// replay-safe traffic after every compatible target in the current user group
+// has been exhausted. Order is significant and is preserved per model family.
+type TrafficFallbackGroups struct {
+	GPT    []string `json:"gpt"`
+	Claude []string `json:"claude"`
+	Gemini []string `json:"gemini"`
+}
+
+// TrafficFallbackModelMapping rewrites one logical source model when traffic
+// moves to a fallback user group. SourceModel supports the same exact / trailing
+// wildcard syntax as ModelRoutingRule (for example "gpt-5.*" or "*").
+type TrafficFallbackModelMapping struct {
+	Family            string `json:"family"`
+	SourceModel       string `json:"source_model"`
+	TargetUserGroupID string `json:"target_user_group_id"`
+	TargetModel       string `json:"target_model"`
+}
+
 type GroupAccountCounts struct {
 	AccountCount       int `json:"account_count"`
 	ActiveAccountCount int `json:"active_account_count"`
@@ -164,12 +183,14 @@ type UserGroup struct {
 	// policy. Each value names an account-pool target selected by this user
 	// group; the underlying account-pool group itself remains unchanged and may
 	// still receive that family through another user group.
-	BlockClaudeTargetGroups []string           `json:"block_claude_target_groups"`
-	BlockGPTTargetGroups    []string           `json:"block_gpt_target_groups"`
-	Targets                 []TargetRef        `json:"targets"`
-	ModelRouting            []ModelRoutingRule `json:"model_routing"`
-	CreatedAt               int64              `json:"created_at"`
-	UpdatedAt               int64              `json:"updated_at"`
+	BlockClaudeTargetGroups      []string                      `json:"block_claude_target_groups"`
+	BlockGPTTargetGroups         []string                      `json:"block_gpt_target_groups"`
+	TrafficFallbackGroups        TrafficFallbackGroups         `json:"traffic_fallback_groups"`
+	TrafficFallbackModelMappings []TrafficFallbackModelMapping `json:"traffic_fallback_model_mappings"`
+	Targets                      []TargetRef                   `json:"targets"`
+	ModelRouting                 []ModelRoutingRule            `json:"model_routing"`
+	CreatedAt                    int64                         `json:"created_at"`
+	UpdatedAt                    int64                         `json:"updated_at"`
 }
 
 const (
@@ -531,9 +552,10 @@ type KiroAuthSummary struct {
 	HasAPIKey       bool   `json:"has_api_key"`
 }
 
-// EmailAccount represents a Microsoft/Outlook email account used for ChatGPT
-// protocol registration. The Password and RefreshToken fields are stored as-is
-// and are never exposed in API list responses.
+// EmailAccount represents a Microsoft/Outlook email account used for protocol
+// registration. Password, OAuth client identity, and refresh token are
+// transparently encrypted at rest whenever the deployment storage key is active.
+// Password and refresh token are never exposed in API list responses.
 type EmailAccount struct {
 	ID           string `json:"id"`
 	Email        string `json:"email"`
@@ -1085,6 +1107,17 @@ func (s *Store) Init(ctx context.Context) error {
 	}
 	// Create lifecycle management tables
 	if _, err := s.db.ExecContext(ctx, lifecycleSchemaSQL); err != nil {
+		return err
+	}
+	// Team-member rotation is an additive durable workflow. It is isolated from
+	// registration_workflow_items so upgrades do not reinterpret in-flight signup
+	// records, and all credential fields remain references to account_auth_tokens.
+	if _, err := s.db.ExecContext(ctx, teamManagementSchemaSQL); err != nil {
+		return err
+	}
+	// Mailbox health is kept outside provider_settings so frequent probes never
+	// rewrite encrypted provider credentials or invalidate provider snapshots.
+	if _, err := s.db.ExecContext(ctx, mailboxProfileSchemaSQL); err != nil {
 		return err
 	}
 	if err := s.migrate(ctx); err != nil {
@@ -2089,6 +2122,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE email_pool ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE email_pool ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
 		`CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name)`,
+		// Team mailbox policy is additive. teamManagementSchemaSQL has an immutable
+		// PostgreSQL checksum, so released databases receive these fields here.
+		`ALTER TABLE team_workspaces ADD COLUMN mailbox_provider_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE team_workspaces ADD COLUMN required_email_domain TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE team_workspaces ADD COLUMN same_domain_required INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE team_lifecycle_workflows ADD COLUMN mailbox_provider_key TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE team_lifecycle_workflows ADD COLUMN required_email_domain TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_team_workspaces_mailbox_provider ON team_workspaces(mailbox_provider_key)`,
 		// goalContinuitySchemaSQL participates in PostgreSQL's immutable base-v1
 		// checksum. Keep new indexes in the additive migration surface so upgrades
 		// do not fail checksum validation.
@@ -2573,6 +2614,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
   force_effort TEXT NOT NULL DEFAULT '',
   block_claude_target_groups TEXT NOT NULL DEFAULT '[]',
   block_gpt_target_groups TEXT NOT NULL DEFAULT '[]',
+  traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}',
+  traffic_fallback_model_mappings_json TEXT NOT NULL DEFAULT '[]',
   model_routing_json TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -2605,6 +2648,8 @@ ON CONFLICT(account_id, group_name) DO NOTHING`,
 		`ALTER TABLE user_groups ADD COLUMN model_instruction_profiles TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE user_groups ADD COLUMN block_claude_target_groups TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE user_groups ADD COLUMN block_gpt_target_groups TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_groups_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE user_groups ADD COLUMN traffic_fallback_model_mappings_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE api_keys ADD COLUMN user_group_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_user_group ON api_keys(user_group_id) WHERE user_group_id <> ''`,
 		// Antigravity explicit cache entries: tracks Gemini CachedContent resources
@@ -3000,13 +3045,13 @@ func (s *Store) DeleteGroup(ctx context.Context, name string) error {
 
 // ── UserGroup CRUD ──────────────────────────────────────────────────────────
 
-const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at`
+const userGroupCols = `id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at`
 
 func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	var g UserGroup
 	var apply, miEnabled int
-	var filesJSON, profilesJSON, blockClaudeJSON, blockGPTJSON, routingJSON string
-	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
+	var filesJSON, profilesJSON, blockClaudeJSON, blockGPTJSON, fallbackGroupsJSON, fallbackMappingsJSON, routingJSON string
+	err := scan(&g.ID, &g.Name, &g.SystemPrompt, &g.PromptMode, &apply, &miEnabled, &filesJSON, &profilesJSON, &g.ForceModel, &g.ForceEffort, &blockClaudeJSON, &blockGPTJSON, &fallbackGroupsJSON, &fallbackMappingsJSON, &routingJSON, &g.CreatedAt, &g.UpdatedAt)
 	g.SystemPromptApplyToCompaction = apply != 0
 	g.ModelInstructionsEnabled = miEnabled != 0
 	g.ModelInstructionsFiles = decodeStringList(filesJSON)
@@ -3014,6 +3059,11 @@ func scanUserGroup(scan func(...interface{}) error) (UserGroup, error) {
 	g.BlockClaudeTargetGroups = decodeStringList(blockClaudeJSON)
 	g.BlockGPTTargetGroups = decodeStringList(blockGPTJSON)
 	if err == nil {
+		g.TrafficFallbackGroups = decodeTrafficFallbackGroups(fallbackGroupsJSON)
+		_ = json.Unmarshal([]byte(fallbackMappingsJSON), &g.TrafficFallbackModelMappings)
+		if g.TrafficFallbackModelMappings == nil {
+			g.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{}
+		}
 		_ = json.Unmarshal([]byte(routingJSON), &g.ModelRouting)
 		if g.ModelRouting == nil {
 			g.ModelRouting = []ModelRoutingRule{}
@@ -3163,9 +3213,9 @@ func (s *Store) CreateUserGroup(ctx context.Context, g UserGroup) error {
 	}
 	g.UpdatedAt = now
 	routingJSON := encodeModelRouting(g.ModelRouting)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`,
-		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), routingJSON, g.CreatedAt, g.UpdatedAt)
+		g.ID, strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), routingJSON, g.CreatedAt, g.UpdatedAt)
 	return err
 }
 
@@ -3340,6 +3390,226 @@ func normalizeBlockedAccountPoolGroups(field string, values []string, targets []
 	return out, nil
 }
 
+const (
+	maxTrafficFallbackGroupsPerFamily = 16
+	maxTrafficFallbackModelMappings   = 128
+	maxTrafficFallbackModelLength     = 200
+)
+
+func trafficFallbackGroupIDs(groups TrafficFallbackGroups, family string) []string {
+	switch strings.ToLower(strings.TrimSpace(family)) {
+	case ModelInstructionFamilyGPT:
+		return groups.GPT
+	case ModelInstructionFamilyClaude:
+		return groups.Claude
+	case ModelInstructionFamilyGemini:
+		return groups.Gemini
+	default:
+		return nil
+	}
+}
+
+func setTrafficFallbackGroupIDs(groups *TrafficFallbackGroups, family string, ids []string) {
+	switch family {
+	case ModelInstructionFamilyGPT:
+		groups.GPT = ids
+	case ModelInstructionFamilyClaude:
+		groups.Claude = ids
+	case ModelInstructionFamilyGemini:
+		groups.Gemini = ids
+	}
+}
+
+func encodeTrafficFallbackGroups(groups TrafficFallbackGroups) string {
+	normalized := TrafficFallbackGroups{
+		GPT:    decodeStringList(encodeStringList(groups.GPT)),
+		Claude: decodeStringList(encodeStringList(groups.Claude)),
+		Gemini: decodeStringList(encodeStringList(groups.Gemini)),
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return `{"gpt":[],"claude":[],"gemini":[]}`
+	}
+	return string(raw)
+}
+
+func decodeTrafficFallbackGroups(raw string) TrafficFallbackGroups {
+	var groups TrafficFallbackGroups
+	_ = json.Unmarshal([]byte(raw), &groups)
+	groups.GPT = decodeStringList(encodeStringList(groups.GPT))
+	groups.Claude = decodeStringList(encodeStringList(groups.Claude))
+	groups.Gemini = decodeStringList(encodeStringList(groups.Gemini))
+	return groups
+}
+
+func encodeTrafficFallbackModelMappings(mappings []TrafficFallbackModelMapping) string {
+	if mappings == nil {
+		mappings = []TrafficFallbackModelMapping{}
+	}
+	raw, err := json.Marshal(mappings)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func normalizeTrafficFallbackConfig(ctx context.Context, tx *sql.Tx, g UserGroup) (TrafficFallbackGroups, []TrafficFallbackModelMapping, error) {
+	var groups TrafficFallbackGroups
+	selectedByFamily := make(map[string]map[string]struct{}, 3)
+	for _, family := range []string{ModelInstructionFamilyGPT, ModelInstructionFamilyClaude, ModelInstructionFamilyGemini} {
+		values := trafficFallbackGroupIDs(g.TrafficFallbackGroups, family)
+		if len(values) > maxTrafficFallbackGroupsPerFamily {
+			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_groups.%s supports at most %d user groups", family, maxTrafficFallbackGroupsPerFamily)
+		}
+		seen := make(map[string]struct{}, len(values))
+		clean := make([]string, 0, len(values))
+		for _, rawID := range values {
+			id := strings.TrimSpace(rawID)
+			if id == "" {
+				continue
+			}
+			if id == g.ID {
+				return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_groups.%s cannot reference the current user group", family)
+			}
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			var exists int
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM user_groups WHERE id = ?`, id).Scan(&exists); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_groups.%s user group %q not found", family, id)
+				}
+				return TrafficFallbackGroups{}, nil, err
+			}
+			seen[id] = struct{}{}
+			clean = append(clean, id)
+		}
+		if clean == nil {
+			clean = []string{}
+		}
+		selectedByFamily[family] = seen
+		setTrafficFallbackGroupIDs(&groups, family, clean)
+	}
+
+	if len(g.TrafficFallbackModelMappings) > maxTrafficFallbackModelMappings {
+		return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic_fallback_model_mappings supports at most %d rules", maxTrafficFallbackModelMappings)
+	}
+	mappings := make([]TrafficFallbackModelMapping, 0, len(g.TrafficFallbackModelMappings))
+	seenMappings := make(map[string]struct{}, len(g.TrafficFallbackModelMappings))
+	mappedTargets := make(map[string]struct{}, len(g.TrafficFallbackModelMappings))
+	for _, mapping := range g.TrafficFallbackModelMappings {
+		family := strings.ToLower(strings.TrimSpace(mapping.Family))
+		if family != ModelInstructionFamilyGPT && family != ModelInstructionFamilyClaude && family != ModelInstructionFamilyGemini {
+			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback mapping family %q is unsupported", mapping.Family)
+		}
+		sourceModel := strings.TrimSpace(mapping.SourceModel)
+		targetModel := strings.TrimSpace(mapping.TargetModel)
+		targetID := strings.TrimSpace(mapping.TargetUserGroupID)
+		if sourceModel == "" || targetModel == "" {
+			return TrafficFallbackGroups{}, nil, errors.New("traffic fallback mapping source_model and target_model are required")
+		}
+		if len(sourceModel) > maxTrafficFallbackModelLength || len(targetModel) > maxTrafficFallbackModelLength {
+			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback model names support at most %d characters", maxTrafficFallbackModelLength)
+		}
+		if strings.Contains(sourceModel[:len(sourceModel)-1], "*") {
+			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback source_model %q only supports a trailing wildcard", sourceModel)
+		}
+		if _, selected := selectedByFamily[family][targetID]; !selected {
+			return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback mapping target user group %q is not selected for %s", targetID, family)
+		}
+		key := family + "\x00" + strings.ToLower(sourceModel) + "\x00" + targetID
+		if _, duplicate := seenMappings[key]; duplicate {
+			return TrafficFallbackGroups{}, nil, fmt.Errorf("duplicate traffic fallback mapping for %s model %q and user group %q", family, sourceModel, targetID)
+		}
+		seenMappings[key] = struct{}{}
+		mappedTargets[family+"\x00"+targetID] = struct{}{}
+		mappings = append(mappings, TrafficFallbackModelMapping{
+			Family: family, SourceModel: sourceModel, TargetUserGroupID: targetID, TargetModel: targetModel,
+		})
+	}
+	for family, selected := range selectedByFamily {
+		for targetID := range selected {
+			if _, configured := mappedTargets[family+"\x00"+targetID]; !configured {
+				return TrafficFallbackGroups{}, nil, fmt.Errorf("traffic fallback user group %q requires at least one %s model mapping", targetID, family)
+			}
+		}
+	}
+	if mappings == nil {
+		mappings = []TrafficFallbackModelMapping{}
+	}
+	return groups, mappings, nil
+}
+
+func trafficFallbackGraphIsAcyclic(ctx context.Context, tx *sql.Tx, currentID string, current TrafficFallbackGroups) error {
+	graph := make(map[string][]string)
+	rows, err := tx.QueryContext(ctx, `SELECT id, traffic_fallback_groups_json FROM user_groups`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		groups := decodeTrafficFallbackGroups(raw)
+		graph[id] = uniqueStringsPreserveOrder(append(append(append([]string{}, groups.GPT...), groups.Claude...), groups.Gemini...))
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	graph[currentID] = uniqueStringsPreserveOrder(append(append(append([]string{}, current.GPT...), current.Claude...), current.Gemini...))
+
+	state := make(map[string]uint8, len(graph))
+	var visit func(string) error
+	visit = func(id string) error {
+		switch state[id] {
+		case 1:
+			return fmt.Errorf("traffic fallback cycle detected at user group %q", id)
+		case 2:
+			return nil
+		}
+		state[id] = 1
+		for _, targetID := range graph[id] {
+			if _, known := graph[targetID]; !known {
+				continue
+			}
+			if err := visit(targetID); err != nil {
+				return err
+			}
+		}
+		state[id] = 2
+		return nil
+	}
+	for id := range graph {
+		if err := visit(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func uniqueStringsPreserveOrder(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g UserGroup) (UserGroup, error) {
 	g.ID = strings.TrimSpace(g.ID)
 	g.Name = strings.TrimSpace(g.Name)
@@ -3408,6 +3678,13 @@ func (s *Store) normalizeUserGroupDefinition(ctx context.Context, tx *sql.Tx, g 
 	if err != nil {
 		return UserGroup{}, err
 	}
+	g.TrafficFallbackGroups, g.TrafficFallbackModelMappings, err = normalizeTrafficFallbackConfig(ctx, tx, g)
+	if err != nil {
+		return UserGroup{}, err
+	}
+	if err := trafficFallbackGraphIsAcyclic(ctx, tx, g.ID, g.TrafficFallbackGroups); err != nil {
+		return UserGroup{}, err
+	}
 	return g, nil
 }
 
@@ -3442,8 +3719,8 @@ func (s *Store) CreateUserGroupDefinition(ctx context.Context, g UserGroup) erro
 		g.CreatedAt = now
 	}
 	g.UpdatedAt = now
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_groups(id, name, system_prompt, prompt_mode, system_prompt_apply_to_compaction, model_instructions_enabled, model_instructions_files, model_instruction_profiles, force_model, force_effort, block_claude_target_groups, block_gpt_target_groups, traffic_fallback_groups_json, traffic_fallback_model_mappings_json, model_routing_json, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), g.CreatedAt, g.UpdatedAt); err != nil {
 		return err
 	}
 	if err := insertUserGroupTargets(ctx, tx, g, now); err != nil {
@@ -3465,8 +3742,8 @@ func (s *Store) ReplaceUserGroupDefinition(ctx context.Context, g UserGroup) err
 		return err
 	}
 	now := Now()
-	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), now, g.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		g.Name, g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), now, g.ID)
 	if err != nil {
 		return err
 	}
@@ -3486,14 +3763,52 @@ func (s *Store) UpdateUserGroup(ctx context.Context, g UserGroup) error {
 	if strings.TrimSpace(g.PromptMode) == "" {
 		g.PromptMode = "prepend"
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, model_routing_json=?, updated_at=? WHERE id=?`,
-		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeModelRouting(g.ModelRouting), Now(), g.ID)
+	_, err := s.db.ExecContext(ctx, `UPDATE user_groups SET name=?, system_prompt=?, prompt_mode=?, system_prompt_apply_to_compaction=?, model_instructions_enabled=?, model_instructions_files=?, model_instruction_profiles=?, force_model=?, force_effort=?, block_claude_target_groups=?, block_gpt_target_groups=?, traffic_fallback_groups_json=?, traffic_fallback_model_mappings_json=?, model_routing_json=?, updated_at=? WHERE id=?`,
+		strings.TrimSpace(g.Name), g.SystemPrompt, g.PromptMode, boolInt(g.SystemPromptApplyToCompaction), boolInt(g.ModelInstructionsEnabled), encodeStringList(g.ModelInstructionsFiles), encodeModelInstructionProfiles(g.ModelInstructionProfiles), g.ForceModel, g.ForceEffort, encodeStringList(g.BlockClaudeTargetGroups), encodeStringList(g.BlockGPTTargetGroups), encodeTrafficFallbackGroups(g.TrafficFallbackGroups), encodeTrafficFallbackModelMappings(g.TrafficFallbackModelMappings), encodeModelRouting(g.ModelRouting), Now(), g.ID)
 	return err
 }
 
 func (s *Store) DeleteUserGroup(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM user_groups WHERE id = ?`, id)
-	return err
+	id = strings.TrimSpace(id)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT id, traffic_fallback_groups_json FROM user_groups WHERE id <> ?`, id)
+	if err != nil {
+		return err
+	}
+	var references []string
+	for rows.Next() {
+		var sourceID, raw string
+		if err := rows.Scan(&sourceID, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		groups := decodeTrafficFallbackGroups(raw)
+		for _, candidate := range append(append(append([]string{}, groups.GPT...), groups.Claude...), groups.Gemini...) {
+			if candidate == id {
+				references = append(references, sourceID)
+				break
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(references) > 0 {
+		sort.Strings(references)
+		return fmt.Errorf("%w: user_group/%s referenced as traffic fallback by %s", ErrTargetInUse, id, strings.Join(references, ", "))
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_groups WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // GetUserGroupTargets returns all targets for a user group, ordered by affinity_weight DESC.
@@ -4728,6 +5043,25 @@ func (s *Store) GetAccount(ctx context.Context, id string) (Account, error) {
 	return scanAccount(row)
 }
 
+// GetAccountByEmail resolves a lifecycle identity without exposing a broad
+// account-list scan to callers. Email comparison is case-insensitive and the
+// newest row wins for legacy databases that predate unique remote-identity
+// enforcement.
+func (s *Store) GetAccountByEmail(ctx context.Context, email string) (Account, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return Account{}, sql.ErrNoRows
+	}
+	row := s.rdb.QueryRowContext(ctx, `
+SELECT id, label, group_name, upstream_account_id, chatgpt_user_id, email, plan_type, provider, status,
+       is_fedramp, ignore_rate_limit_controls, quarantine_until, quarantine_reason, created_at, updated_at
+FROM accounts
+WHERE LOWER(email)=LOWER(?)
+ORDER BY updated_at DESC,id
+LIMIT 1`, email)
+	return scanAccount(row)
+}
+
 func (s *Store) ListAccountsByIDs(ctx context.Context, accountIDs []string) (map[string]Account, error) {
 	out := make(map[string]Account, len(accountIDs))
 	ids := make([]string, 0, len(accountIDs))
@@ -5497,6 +5831,45 @@ func (s *Store) EncryptExistingTokens(ctx context.Context) (int, error) {
 			return n, fmt.Errorf("re-encrypt reauth credentials %s: %w", row.id, sealErr)
 		}
 		if _, err := s.db.ExecContext(ctx, `UPDATE account_codex_reauth_config SET encrypted_password=?,encrypted_otp_url=?,updated_at=? WHERE account_id=?`, sealed[0], sealed[1], Now(), row.id); err != nil {
+			return n, err
+		}
+		n++
+	}
+
+	emailRows, err := s.rdb.QueryContext(ctx, `
+SELECT COALESCE(id,''),COALESCE(password,''),COALESCE(client_id,''),COALESCE(refresh_token,'')
+FROM email_pool
+WHERE COALESCE(password,'')<>'' OR COALESCE(client_id,'')<>'' OR COALESCE(refresh_token,'')<>''`)
+	if err != nil {
+		return n, err
+	}
+	type emailCredentialRec struct {
+		id, password, clientID, refreshToken string
+	}
+	var emailCredentials []emailCredentialRec
+	for emailRows.Next() {
+		var row emailCredentialRec
+		if err := emailRows.Scan(&row.id, &row.password, &row.clientID, &row.refreshToken); err != nil {
+			emailRows.Close()
+			return n, err
+		}
+		if anyNonCurrentSecret(s.tokenKey, row.password, row.clientID, row.refreshToken) {
+			emailCredentials = append(emailCredentials, row)
+		}
+	}
+	emailRows.Close()
+	if err := emailRows.Err(); err != nil {
+		return n, err
+	}
+	for _, row := range emailCredentials {
+		sealed, sealErr := s.resealTokens(row.password, row.clientID, row.refreshToken)
+		if sealErr != nil {
+			return n, fmt.Errorf("re-encrypt email pool credentials %s: %w", row.id, sealErr)
+		}
+		if _, err := s.db.ExecContext(ctx, `
+UPDATE email_pool
+SET password=?,client_id=?,refresh_token=?,updated_at=?
+WHERE id=?`, sealed[0], sealed[1], sealed[2], Now(), row.id); err != nil {
 			return n, err
 		}
 		n++

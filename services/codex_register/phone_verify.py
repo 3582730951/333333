@@ -83,7 +83,7 @@ def hero_get_number(hero_key, country_iso, log=print):
     except Exception as e:
         log(f"   [phone] getNumber err: {e}")
         return None, None
-    log(f"   [phone] hero getNumber({country_iso}): {txt}")
+    log(f"   [phone] virtual number response received country={country_iso}")
     if txt.startswith("ACCESS_NUMBER"):
         parts = txt.split(":", 2)
         if len(parts) == 3:
@@ -391,11 +391,11 @@ def verify_phone(page, *, hero_key, country="PH", log=print,
                     continue
                 national = to_national(full, dial)
                 e164 = to_e164(full, dial)
-                log(f"   [phone] {cur_iso} num={full} dial={dial} national={national} e164={e164}")
+                log(f"   [phone] virtual number allocated country={cur_iso} dial={dial}")
 
                 prep = page.evaluate("(a) => window.__pv.prepare(a.iso, a.dial)",
                                      {"iso": cur_iso, "dial": dial}) or {}
-                log(f"   [phone] prepare: {prep}")
+                log(f"   [phone] add-phone form prepared ok={bool(prep.get('ok'))}")
                 if prep.get("whatsappOnly"):
                     log("   [phone] page is WhatsApp-only -> release number, rotate")
                     hero_set_status(hero_key, order_id, 8, log)
@@ -412,7 +412,7 @@ def verify_phone(page, *, hero_key, country="PH", log=print,
                 fill = page.evaluate("(a) => window.__pv.fillPhone(a.n, a.e)",
                                      {"n": national, "e": e164}) or {}
                 if not fill.get("ok"):
-                    log(f"   [phone] fillPhone failed: {fill}")
+                    log(f"   [phone] fillPhone failed: {str(fill.get('error') or 'unknown')[:120]}")
                     hero_set_status(hero_key, order_id, 8, log)
                     last_err = "fill_failed"
                     continue
@@ -436,7 +436,7 @@ def verify_phone(page, *, hero_key, country="PH", log=print,
                     continue
 
             # ── phone-verification: wait for the SMS code and submit it ──
-            log(f"   [phone] waiting hero SMS (order={order_id}, timeout={sms_timeout}s)")
+            log(f"   [phone] waiting for virtual-platform SMS timeout={sms_timeout}s")
             code = hero_wait_code(hero_key, order_id, sms_timeout, log) if order_id else None
             if not code:
                 log("   [phone] SMS timeout -> rotate")
@@ -444,7 +444,7 @@ def verify_phone(page, *, hero_key, country="PH", log=print,
                     hero_set_status(hero_key, order_id, 8, log)
                 last_err = "sms_timeout"
                 continue
-            log(f"   [phone] SMS code = {code}")
+            log("   [phone] SMS code received")
             page.evaluate("(c) => window.__pv.fillCode(c)", code)
 
             # Success = we left the phone steps (to consent / localhost callback / chatgpt)

@@ -4,7 +4,7 @@ import { IconDelete, IconEdit, IconRefresh, IconPlus } from '../components/pool/
 import PageHeader from '../components/PageHeader.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import MobileResourceCell from '../components/MobileResourceCell.jsx';
-import { MetricRail } from '../components/DisplayPrimitives.jsx';
+import { MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import { fmtDateTime } from '../lib/format.js';
 import { t } from '../lib/i18n.js';
@@ -17,6 +17,7 @@ const { ActionMenu, Button, Modal, Form, Toast, Tag } = PoolUI as any;
 const DataTable = ResourceTable as any;
 const MobileRow = MobileResourceCell as any;
 const SummaryRail = MetricRail as any;
+const Clamp = TextClamp as any;
 
 type EditState = { mode: 'create'; user?: undefined } | { mode: 'edit'; user: UserRow };
 interface UserFormValues {
@@ -111,8 +112,8 @@ export default function Users() {
   );
 
   const cols: any[] = [
-    { title: t('users.email'), dataIndex: 'email', width: 240, render: (v: string) => <b>{v}</b> },
-    { title: t('users.name'), dataIndex: 'name', width: 150, render: (v: string) => v || '—' },
+    { title: t('users.email'), dataIndex: 'email', width: 240, render: (v: string) => <Clamp className="pool-user-identity" title={v} strong>{v}</Clamp> },
+    { title: t('users.name'), dataIndex: 'name', width: 150, render: (v: string) => <Clamp className="pool-user-identity" title={v || undefined} muted={!v}>{v || '—'}</Clamp> },
     { title: t('users.role'), dataIndex: 'role', width: 96, sorter: (a: UserRow, b: UserRow) => String(a.role || '').localeCompare(String(b.role || '')), render: (v: string) => <Tag color={v === 'admin' ? 'violet' : 'blue'}>{v}</Tag> },
     { title: t('users.status'), dataIndex: 'status', width: 96, sorter: (a: UserRow, b: UserRow) => String(a.status || '').localeCompare(String(b.status || '')), render: (v: string) => <Tag color={v === 'active' ? 'green' : 'grey'}>{v}</Tag> },
     { title: t('users.created_at'), dataIndex: 'created_at', width: 180, sorter: (a: UserRow, b: UserRow) => (a.created_at || 0) - (b.created_at || 0), defaultSortOrder: 'descend', render: fmtDateTime },

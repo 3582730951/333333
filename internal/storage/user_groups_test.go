@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -109,6 +110,92 @@ func TestUserGroupTargetFamilyBlocksAreScopedAndValidated(t *testing.T) {
 	group.BlockClaudeTargetGroups = []string{"not-selected"}
 	if err := s.ReplaceUserGroupDefinition(ctx, group); err == nil {
 		t.Fatal("unselected account-pool block was accepted")
+	}
+}
+
+func TestUserGroupTrafficFallbackRoundTripValidationAndCycleGuard(t *testing.T) {
+	s := newTestStore(t)
+	ctx := t.Context()
+	if err := s.CreateGroup(ctx, Group{Name: "fallback-routing-pool"}); err != nil {
+		t.Fatal(err)
+	}
+	base := func(id, name string) UserGroup {
+		return UserGroup{
+			ID:      id,
+			Name:    name,
+			Targets: []TargetRef{{Kind: TargetKindAccountPoolGroup, ID: "fallback-routing-pool"}},
+		}
+	}
+	fallbackB := base("ug_fallback_b", "fallback-b")
+	fallbackC := base("ug_fallback_c", "fallback-c")
+	if err := s.CreateUserGroupDefinition(ctx, fallbackB); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateUserGroupDefinition(ctx, fallbackC); err != nil {
+		t.Fatal(err)
+	}
+
+	primary := base("ug_fallback_primary", "fallback-primary")
+	primary.TrafficFallbackGroups = TrafficFallbackGroups{
+		GPT:    []string{" ug_fallback_b ", "ug_fallback_b"},
+		Claude: []string{"ug_fallback_c"},
+		Gemini: []string{},
+	}
+	primary.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
+		{Family: "GPT", SourceModel: "gpt-5.6-sol", TargetUserGroupID: "ug_fallback_b", TargetModel: "gpt-5.5"},
+		{Family: "gpt", SourceModel: "gpt-5.*", TargetUserGroupID: "ug_fallback_b", TargetModel: "gpt-5.4"},
+		{Family: "claude", SourceModel: "*", TargetUserGroupID: "ug_fallback_c", TargetModel: "claude-sonnet-4-5"},
+	}
+	if err := s.CreateUserGroupDefinition(ctx, primary); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := s.GetUserGroup(ctx, primary.ID)
+	if err != nil || !found {
+		t.Fatalf("get traffic fallback group found=%v err=%v", found, err)
+	}
+	if !reflect.DeepEqual(got.TrafficFallbackGroups.GPT, []string{"ug_fallback_b"}) ||
+		!reflect.DeepEqual(got.TrafficFallbackGroups.Claude, []string{"ug_fallback_c"}) ||
+		len(got.TrafficFallbackGroups.Gemini) != 0 {
+		t.Fatalf("unexpected normalized traffic fallback groups: %+v", got.TrafficFallbackGroups)
+	}
+	if len(got.TrafficFallbackModelMappings) != 3 ||
+		got.TrafficFallbackModelMappings[0].Family != ModelInstructionFamilyGPT ||
+		got.TrafficFallbackModelMappings[0].TargetModel != "gpt-5.5" {
+		t.Fatalf("unexpected traffic fallback mappings: %+v", got.TrafficFallbackModelMappings)
+	}
+
+	missingMapping := base("ug_fallback_missing_mapping", "fallback-missing-mapping")
+	missingMapping.TrafficFallbackGroups.GPT = []string{"ug_fallback_b"}
+	if err := s.CreateUserGroupDefinition(ctx, missingMapping); err == nil {
+		t.Fatal("selected fallback group without a model mapping was accepted")
+	}
+
+	selfReference := base("ug_fallback_self", "fallback-self")
+	selfReference.TrafficFallbackGroups.GPT = []string{selfReference.ID}
+	selfReference.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
+		{Family: "gpt", SourceModel: "*", TargetUserGroupID: selfReference.ID, TargetModel: "gpt-5.5"},
+	}
+	if err := s.CreateUserGroupDefinition(ctx, selfReference); err == nil {
+		t.Fatal("self-referencing traffic fallback was accepted")
+	}
+
+	fallbackB.TrafficFallbackGroups.GPT = []string{"ug_fallback_c"}
+	fallbackB.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
+		{Family: "gpt", SourceModel: "*", TargetUserGroupID: "ug_fallback_c", TargetModel: "gpt-5.4"},
+	}
+	if err := s.ReplaceUserGroupDefinition(ctx, fallbackB); err != nil {
+		t.Fatal(err)
+	}
+	fallbackC.TrafficFallbackGroups.GPT = []string{primary.ID}
+	fallbackC.TrafficFallbackModelMappings = []TrafficFallbackModelMapping{
+		{Family: "gpt", SourceModel: "*", TargetUserGroupID: primary.ID, TargetModel: "gpt-5.3"},
+	}
+	if err := s.ReplaceUserGroupDefinition(ctx, fallbackC); err == nil {
+		t.Fatal("traffic fallback cycle was accepted")
+	}
+
+	if err := s.DeleteUserGroup(ctx, fallbackB.ID); !errors.Is(err, ErrTargetInUse) {
+		t.Fatalf("delete referenced fallback group error=%v, want ErrTargetInUse", err)
 	}
 }
 

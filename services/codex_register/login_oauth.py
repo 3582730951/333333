@@ -40,6 +40,9 @@ PROXY_PASS   = os.environ.get("REG_PROXY_PASS", "")
 EMAIL        = os.environ.get("REG_EMAIL", "")
 PASSWORD     = os.environ.get("REG_PASSWORD", "")
 OTP_URL      = os.environ.get("REG_OTP_URL", "")
+COOKIE_HEADER = os.environ.get("REG_COOKIE_HEADER", "")
+HERO_SMS_KEY = os.environ.get("REG_HEROSMS_KEY", os.environ.get("HEROSMS_KEY", ""))
+SMS_COUNTRY = os.environ.get("REG_SMS_COUNTRY", "PH").upper()
 TARGET_WORKSPACE_ID = os.environ.get("REG_TARGET_WORKSPACE_ID", "")
 CHROME       = os.environ.get("REG_CHROME", os.environ.get("CHROME_PATH", ""))
 HEADLESS     = os.environ.get("REG_HEADLESS", "1") != "0"
@@ -230,6 +233,156 @@ def click_consent_buttons(page, timeout_s=20):
 
         time.sleep(1.5)
 
+
+def seed_session_cookies(context):
+    """Seed a previously sealed ChatGPT Cookie header into this isolated context."""
+    cookies = []
+    for part in COOKIE_HEADER.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if not sep or not name or not value or any(ch in name + value for ch in "\r\n"):
+            continue
+        cookies.append({
+            "name": name,
+            "value": value,
+            "domain": ".chatgpt.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": name.startswith("__Secure-") or "session" in name.lower(),
+            "sameSite": "Lax",
+        })
+    if cookies:
+        context.add_cookies(cookies)
+        log(f"   seeded {len(cookies)} sealed session cookie(s)")
+
+
+def context_cookie_header(context):
+    try:
+        parts = []
+        for cookie in context.cookies(["https://chatgpt.com/"]):
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "").strip()
+            if name and value and not any(ch in name + value for ch in "\r\n"):
+                parts.append(f"{name}={value}")
+        header = "; ".join(parts)
+        return header if len(header) <= 65536 else ""
+    except Exception:
+        return ""
+
+
+def maybe_complete_phone(page):
+    """Run virtual-number verification only when the OAuth UI asks for add_phone."""
+    try:
+        required = page.evaluate(
+            """() => {
+              const path = location.pathname.toLowerCase();
+              return path.includes('/add-phone') || path.includes('/phone-verification') ||
+                !!document.querySelector('form[action*="/add-phone" i],form[action*="/phone-verification" i]');
+            }"""
+        )
+    except Exception:
+        required = "add-phone" in page.url.lower() or "phone-verification" in page.url.lower()
+    if not required:
+        return
+    if not HERO_SMS_KEY:
+        raise RuntimeError("add_phone required but virtual-number provider is not configured")
+    from phone_verify import verify_phone
+    result = verify_phone(
+        page,
+        hero_key=HERO_SMS_KEY,
+        country=SMS_COUNTRY,
+        log=log,
+    )
+    if not result.get("ok"):
+        raise RuntimeError("add_phone verification failed: " + str(result.get("error") or "unknown"))
+    log(f"   add_phone completed country={result.get('country') or SMS_COUNTRY}")
+
+
+def chatgpt_session(page):
+    try:
+        return page.evaluate(
+            'async () => { try { const r = await fetch("/api/auth/session",{credentials:"include"}); return await r.json(); } catch(e) { return {error:e.message}; } }'
+        ) or {}
+    except Exception:
+        return {}
+
+
+def perform_interactive_login(page):
+    log(f"2. email: {EMAIL}")
+    react_fill(page, 'input[name="email"]', EMAIL)
+    time.sleep(random.uniform(0.5, 1.0))
+    clicked = False
+    for btn_text in ["Continue", "Next", "Get started", "Log in", "Sign in"]:
+        try:
+            btn = page.get_by_role("button", name=btn_text)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                log(f"   clicked '{btn_text}'")
+                clicked = True
+                break
+        except Exception:
+            pass
+    if not clicked:
+        page.locator('input[name="email"]').first.press("Enter")
+        log("   pressed Enter")
+    log("   submitted")
+    since_ts = time.strftime("%Y-%m-%dT%H:%M", time.gmtime())
+    time.sleep(5)
+
+    for _ in range(20):
+        if "just a moment" not in page.title().lower():
+            break
+        log("   waiting for CF challenge...")
+        time.sleep(3)
+
+    log(f"3. after email: title={page.title()} | url={page.url[:120]}")
+    password_needed = False
+    otp_needed = False
+    for _ in range(15):
+        if page.locator('input[type="password"]').first.count() > 0:
+            password_needed = True
+            break
+        if page.locator('input[name="code"]').first.count() > 0:
+            otp_needed = True
+            break
+        time.sleep(1)
+
+    if password_needed:
+        log("3a. password page detected")
+        if not PASSWORD:
+            log("   no REG_PASSWORD set — trying OTP fallback")
+            for link_text in [
+                "Use a code", "Verify with a code", "Try another way",
+                "Email me a code", "Send code",
+            ]:
+                try:
+                    link = page.get_by_text(link_text)
+                    if link.count() > 0:
+                        link.first.click()
+                        log(f"   clicked '{link_text}'")
+                        time.sleep(3)
+                        otp_needed = True
+                        break
+                except Exception:
+                    pass
+        else:
+            react_fill(page, 'input[type="password"]', PASSWORD)
+            time.sleep(random.uniform(0.5, 1.0))
+            page.locator('input[type="password"]').first.press("Enter")
+            log("   password submitted")
+            time.sleep(5)
+
+    if otp_needed:
+        log("3b. OTP page — fetching code...")
+        code = fetch_otp(since_ts)
+        if not code:
+            raise RuntimeError("OTP TIMEOUT — login did not complete")
+        log("   OTP received")
+        react_fill(page, 'input[name="code"]', code)
+        time.sleep(random.uniform(0.5, 1.0))
+        page.locator('input[name="code"]').first.press("Enter")
+        time.sleep(6)
+        log(f"   after OTP: title={page.title()} | url={page.url[:120]}")
+
 def main():
     log(f"Login+OAuth for: {EMAIL} | server={PROXY_SERVER}")
 
@@ -247,6 +400,7 @@ def main():
             ignore_default_args=["--enable-automation"],
         )
         ctx.add_init_script(STEALTH)
+        seed_session_cookies(ctx)
         page = ctx.pages[0]
 
         try:
@@ -260,87 +414,12 @@ def main():
             time.sleep(3)
             log(f"   title: {page.title()}")
 
-            # 2. Enter email and click Continue
-            log(f"2. email: {EMAIL}")
-            react_fill(page, 'input[name="email"]', EMAIL)
-            time.sleep(random.uniform(0.5, 1.0))
-
-            # Try multiple ways to submit email: click Continue button OR press Enter
-            clicked = False
-            for btn_text in ["Continue", "Next", "Get started", "Log in", "Sign in"]:
-                try:
-                    btn = page.get_by_role("button", name=btn_text)
-                    if btn.count() > 0 and btn.first.is_visible():
-                        btn.first.click()
-                        log(f"   clicked '{btn_text}'")
-                        clicked = True
-                        break
-                except: pass
-            if not clicked:
-                page.locator('input[name="email"]').first.press("Enter")
-                log("   pressed Enter")
-            log("   submitted")
-            since_ts = time.strftime("%Y-%m-%dT%H:%M", time.gmtime())
-            time.sleep(5)
-
-            # Check for Cloudflare "just a moment"
-            for _ in range(20):
-                if "just a moment" not in page.title().lower():
-                    break
-                log("   waiting for CF challenge...")
-                time.sleep(3)
-
-            log(f"3. after email: title={page.title()} | url={page.url[:120]}")
-
-            # 3. Handle: password page OR OTP page
-            password_needed = False
-            otp_needed = False
-
-            for _ in range(15):
-                if page.locator('input[type="password"]').first.count() > 0:
-                    password_needed = True
-                    break
-                if page.locator('input[name="code"]').first.count() > 0:
-                    otp_needed = True
-                    break
-                time.sleep(1)
-
-            if password_needed:
-                log("3a. password page detected")
-                if not PASSWORD:
-                    log("   no REG_PASSWORD set — trying OTP fallback")
-                    # Click "use verification code" or similar link
-                    for link_text in ["Use a code", "Verify with a code", "Try another way",
-                                       "Email me a code", "Send code"]:
-                        try:
-                            link = page.get_by_text(link_text)
-                            if link.count() > 0:
-                                link.first.click()
-                                log(f"   clicked '{link_text}'")
-                                time.sleep(3)
-                                otp_needed = True
-                                break
-                        except:
-                            pass
-                else:
-                    react_fill(page, 'input[type="password"]', PASSWORD)
-                    time.sleep(random.uniform(0.5, 1.0))
-                    page.locator('input[type="password"]').first.press("Enter")
-                    log("   password submitted")
-                    time.sleep(5)
-
-            if otp_needed:
-                log("3b. OTP page — fetching code...")
-                code = fetch_otp(since_ts)
-                if not code:
-                    log("OTP TIMEOUT — cannot login")
-                    return
-                log(f"   code: {code}")
-                react_fill(page, 'input[name="code"]', code)
-                time.sleep(random.uniform(0.5, 1.0))
-                page.locator('input[name="code"]').first.press("Enter")
-                time.sleep(6)
-                log(f"   after OTP: title={page.title()} | url={page.url[:120]}")
+            seeded_session = chatgpt_session(page)
+            if ((seeded_session.get("user") or {}).get("id")):
+                log("2. sealed session is already authenticated; interactive login skipped")
+                page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+            else:
+                perform_interactive_login(page)
 
             # 4. Wait for login to complete
             log("4. waiting for login completion...")
@@ -373,11 +452,11 @@ def main():
                         pass
                 time.sleep(2)
 
+            maybe_complete_phone(page)
+
             # 5. Extract web session
             log("5. extracting session...")
-            sess = page.evaluate(
-                'async () => { try { const r = await fetch("/api/auth/session",{credentials:"include"}); return await r.json(); } catch(e) { return {error:e.message}; } }'
-            )
+            sess = chatgpt_session(page)
             acct = (sess or {}).get("account", {}) or {}
             user = (sess or {}).get("user", {}) or {}
             session_at = (sess or {}).get("accessToken", "")
@@ -407,6 +486,8 @@ def main():
                 page.goto(oauth_url, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(4)
                 log(f"   authorize page: title={page.title()} | url={page.url[:120]}")
+
+                maybe_complete_phone(page)
 
                 # 6c. Click consent
                 click_consent_buttons(page)
@@ -451,7 +532,7 @@ def main():
                 "access_token": final_access_token,
                 "refresh_token": oauth_refresh_token,
                 "id_token": oauth_id_token,
-                "session_token": session_at,
+                "session_token": context_cookie_header(ctx),
             }
             log(f"✅ SUCCESS oauth_refresh={'yes' if oauth_refresh_token else 'no'}")
             print("__CODEX_ACCOUNT__ " + json.dumps(result, ensure_ascii=False), flush=True)

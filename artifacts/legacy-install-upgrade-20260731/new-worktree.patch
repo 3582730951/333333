@@ -1,0 +1,4419 @@
+diff --git a/internal/api/diagnose.go b/internal/api/diagnose.go
+index 914f1d1..04ba6af 100644
+--- a/internal/api/diagnose.go
++++ b/internal/api/diagnose.go
+@@ -10,12 +10,19 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"codex-account-pool/internal/accountprovider"
+ 	"codex-account-pool/internal/scheduler"
+ 	"codex-account-pool/internal/storage"
+ )
+ 
++const (
++	routingAuditLogLimit   = 1
++	routingAuditLogWindow  = 30 * time.Second
++	routingAuditLogMaxKeys = 2048
++)
++
+ // noAccountHTTPStatus maps a scheduler selection failure to a downstream HTTP status
+ // and a Retry-After hint in seconds (0 = none). Transient pool saturation becomes
+ // 429 + Retry-After so the client transparently re-sends the SAME request — no model,
+@@ -222,16 +229,37 @@ func (s *Server) writePublicNoAccountError(ctx context.Context, w http.ResponseW
+ 	if counters.ModelUnsupported > 0 {
+ 		reason = "model_unsupported"
+ 	}
+-	_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
+-		Action: "routing_unavailable",
+-		State:  "unavailable",
+-		Reason: reason,
+-		Detail: fmt.Sprintf("group_hash=%s allowed_providers=%s requested_model=%s normalized_model=%s kiro_accounts=%d status=%d counters=%s detail=%s",
+-			shortHash(group), strings.Join(allowedProviders, ","), model, normalizedModel, s.activeKiroAccountsInGroup(ctx, group), status, counterJSON, bodySnippet([]byte(detail), 600)),
+-	})
++	auditKey := shortHash(fmt.Sprintf("%d|%s|%s|%s|%s|%s", status, group,
++		strings.Join(allowedProviders, ","), normalizedModel, reason, counterJSON))
++	if status == http.StatusConflict || s.routingAudits.allow(auditKey, time.Now()) {
++		_ = s.store.InsertAuditLog(ctx, storage.AuditLogRow{
++			Action: "routing_unavailable",
++			State:  "unavailable",
++			Reason: reason,
++			Detail: fmt.Sprintf("group_hash=%s allowed_providers=%s requested_model=%s normalized_model=%s kiro_accounts=%d status=%d counters=%s detail=%s",
++				shortHash(group), strings.Join(allowedProviders, ","), model, normalizedModel, s.activeKiroAccountsInGroup(ctx, group), status, counterJSON, bodySnippet([]byte(detail), 600)),
++		})
++	} else {
++		s.routingAuditSuppressed.Add(1)
++	}
+ 	writePublicUnavailable(w, status)
+ }
+ 
++func (s *Server) routingAuditDiagnostics() map[string]interface{} {
++	suppressed := uint64(0)
++	if s != nil {
++		suppressed = s.routingAuditSuppressed.Load()
++	}
++	return map[string]interface{}{
++		"coalesce_limit":           routingAuditLogLimit,
++		"coalesce_window_seconds":  int(routingAuditLogWindow / time.Second),
++		"max_keys":                 routingAuditLogMaxKeys,
++		"suppressed_repetitions":   suppressed,
++		"strict_409_uncoalesced":   true,
++		"route_attempts_preserved": true,
++	}
++}
++
+ func writePublicUnavailable(w http.ResponseWriter, status int) {
+ 	if status <= 0 {
+ 		status = http.StatusServiceUnavailable
+diff --git a/internal/api/diagnostic_runtime.go b/internal/api/diagnostic_runtime.go
+index 6f0b7f9..af8de0b 100644
+--- a/internal/api/diagnostic_runtime.go
++++ b/internal/api/diagnostic_runtime.go
+@@ -68,9 +68,11 @@ func (s *Server) runtimeStorageDiagnostics() map[string]interface{} {
+ 		capacityRejects = s.diagnostics.capacityRejects.Load()
+ 	}
+ 	return map[string]interface{}{
+-		"generated_at": storage.Now(),
+-		"budget":       budget,
+-		"filesystem":   filesystem,
++		"generated_at":  storage.Now(),
++		"budget":        budget,
++		"filesystem":    filesystem,
++		"disk_guard":    s.diskGuardSnapshot(),
++		"routing_audit": s.routingAuditDiagnostics(),
+ 		"policy": map[string]interface{}{
+ 			"max_request_body_bytes":            s.cfg.MaxBodyBytes,
+ 			"memory_spill_threshold_bytes":      s.cfg.BodyMemoryThresholdBytes,
+diff --git a/internal/api/diagnostics_export.go b/internal/api/diagnostics_export.go
+index ed5cd72..53b084b 100644
+--- a/internal/api/diagnostics_export.go
++++ b/internal/api/diagnostics_export.go
+@@ -337,6 +337,7 @@ func (s *Server) writeDiagnosticsExport(ctx context.Context, dst io.Writer, snap
+ 	}
+ 	summary["goal_continuity"] = goalMetrics
+ 	summary["goal_policy"] = diagnosticGoalPolicy(settings, s.cfg)
++	summary["routing_audit"] = s.routingAuditDiagnostics()
+ 	codexCPA := s.codexSessionMappingStatsFromSnapshot(ctx, snapshotStore, settings)
+ 	codexCPA["instruction_policy_groups"] = len(groups)
+ 	namespacePrefixes := make(map[string]struct{})
+@@ -1631,19 +1632,23 @@ func diagnosticGoalPolicy(rows []diagnosticSetting, cfg config.Config) map[strin
+ 	if heartbeatSeconds <= 0 {
+ 		heartbeatSeconds = 15
+ 	}
++	storageMaxBytes := int64(storageMaxMB) << 20
++	storageTargetBytes, storageReserveBytes := goalStorageMaintenanceTarget(storageMaxBytes)
+ 
+ 	return map[string]interface{}{
+-		"continuity_enabled":        boolean("goal_continuity_enabled", cfg.GoalContinuityEnabled),
+-		"legacy_journal_dual_write": boolean("goal_legacy_journal_dual_write", cfg.GoalLegacyJournalDualWrite),
+-		"retention_days":            retentionDays,
+-		"storage_max_mb":            storageMaxMB,
+-		"storage_max_bytes":         int64(storageMaxMB) << 20,
+-		"compression_chunk_ratio":   chunkRatio,
+-		"compression_max_stages":    compressionStages,
+-		"compression_concurrency":   compressionConcurrency,
+-		"lease_seconds":             leaseSeconds,
+-		"heartbeat_seconds":         heartbeatSeconds,
+-		"sources":                   sources,
++		"continuity_enabled":                boolean("goal_continuity_enabled", cfg.GoalContinuityEnabled),
++		"legacy_journal_dual_write":         boolean("goal_legacy_journal_dual_write", cfg.GoalLegacyJournalDualWrite),
++		"retention_days":                    retentionDays,
++		"storage_max_mb":                    storageMaxMB,
++		"storage_max_bytes":                 storageMaxBytes,
++		"storage_maintenance_target_bytes":  storageTargetBytes,
++		"storage_maintenance_reserve_bytes": storageReserveBytes,
++		"compression_chunk_ratio":           chunkRatio,
++		"compression_max_stages":            compressionStages,
++		"compression_concurrency":           compressionConcurrency,
++		"lease_seconds":                     leaseSeconds,
++		"heartbeat_seconds":                 heartbeatSeconds,
++		"sources":                           sources,
+ 	}
+ }
+ 
+diff --git a/internal/api/diagnostics_export_test.go b/internal/api/diagnostics_export_test.go
+index 2e7c168..eb0235f 100644
+--- a/internal/api/diagnostics_export_test.go
++++ b/internal/api/diagnostics_export_test.go
+@@ -309,14 +309,16 @@ func TestAdminDiagnosticsExportAnonymizesBusinessLogs(t *testing.T) {
+ 	if err := json.Unmarshal([]byte(files["diagnostic_summary.json"]), &summary); err != nil {
+ 		t.Fatalf("diagnostic_summary.json: %v\n%s", err, files["diagnostic_summary.json"])
+ 	}
+-	for _, key := range []string{"routing_409", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "goal_continuity", "goal_policy", "usage_journal"} {
++	for _, key := range []string{"routing_409", "routing_audit", "health_test_models", "banned_accounts", "billing_holds", "groups", "codex_cpa", "goal_continuity", "goal_policy", "usage_journal"} {
+ 		if _, ok := summary[key]; !ok {
+ 			t.Fatalf("diagnostic_summary.json missing %q: %+v", key, summary)
+ 		}
+ 	}
+ 	goalPolicy, ok := summary["goal_policy"].(map[string]interface{})
+ 	if !ok || goalPolicy["storage_max_mb"] != float64(384) ||
+-		goalPolicy["storage_max_bytes"] != float64(384<<20) {
++		goalPolicy["storage_max_bytes"] != float64(384<<20) ||
++		goalPolicy["storage_maintenance_target_bytes"] != float64(336<<20) ||
++		goalPolicy["storage_maintenance_reserve_bytes"] != float64(48<<20) {
+ 		t.Fatalf("diagnostic Goal policy does not expose effective storage limit: %+v", summary["goal_policy"])
+ 	}
+ 	sources, ok := goalPolicy["sources"].(map[string]interface{})
+diff --git a/internal/api/disk_guard.go b/internal/api/disk_guard.go
+index 2db3b7c..bccaca7 100644
+--- a/internal/api/disk_guard.go
++++ b/internal/api/disk_guard.go
+@@ -22,6 +22,8 @@ const (
+ 	diskCriticalFreeBytes  = uint64(512 << 20)
+ 	diskEmergencyFreeBytes = uint64(128 << 20)
+ 	diskRecoveryFreeBytes  = uint64(4 << 30)
++	goalStorageReserveMin  = int64(8 << 20)
++	goalStorageReserveMax  = int64(128 << 20)
+ )
+ 
+ type DiskFilesystemSnapshot struct {
+@@ -39,6 +41,9 @@ type DiskGuardSnapshot struct {
+ 	ForcedContextTTLSeconds int                      `json:"forced_context_ttl_seconds"`
+ 	ContextsDeleted         int64                    `json:"contexts_deleted"`
+ 	GoalsDeleted            int64                    `json:"goals_deleted"`
++	GoalBytesReclaimed      int64                    `json:"goal_bytes_reclaimed"`
++	GoalStorageTargetBytes  int64                    `json:"goal_storage_target_bytes"`
++	GoalStorageReserveBytes int64                    `json:"goal_storage_reserve_bytes"`
+ 	CodexMappingsDeleted    int64                    `json:"codex_mappings_deleted"`
+ 	RouteBindingsDeleted    int64                    `json:"route_bindings_deleted"`
+ 	LogsDeleted             int64                    `json:"logs_deleted"`
+@@ -112,6 +117,7 @@ func (s *Server) runDiskGuard(ctx context.Context) {
+ 		LastRunAt:            storage.Now(),
+ 		ContextsDeleted:      previous.ContextsDeleted,
+ 		GoalsDeleted:         previous.GoalsDeleted,
++		GoalBytesReclaimed:   previous.GoalBytesReclaimed,
+ 		CodexMappingsDeleted: previous.CodexMappingsDeleted,
+ 		RouteBindingsDeleted: previous.RouteBindingsDeleted,
+ 		LogsDeleted:          previous.LogsDeleted,
+@@ -120,6 +126,7 @@ func (s *Server) runDiskGuard(ctx context.Context) {
+ 		JournalWritable:      s.journalWritable(),
+ 		SpoolWritable:        s.managedDirectoryWritable(s.cfg.BodySpoolDir),
+ 	}
++	snap.GoalStorageTargetBytes, snap.GoalStorageReserveBytes = goalStorageMaintenanceTarget(s.goalStorageMaxBytes(ctx))
+ 	snap.Filesystems, snap.Level, snap.FreePercent, snap.FreeBytes = summarizeFilesystemProbes(probes)
+ 	if len(probeCodes) > 0 {
+ 		snap.LastError = strings.Join(probeCodes, ",")
+@@ -161,9 +168,10 @@ func (s *Server) runDiskGuard(ctx context.Context) {
+ 		cancel()
+ 	}
+ 	if diskGuardChanged(previous, snap) {
+-		log.Printf("[DISK-GUARD] level=%s free_pct=%.1f free_bytes=%d db_writable=%t journal_writable=%t spool_writable=%t admission_blocked=%t cleanup_contexts=%d cleanup_goals=%d cleanup_mappings=%d cleanup_route_bindings=%d error_code=%s",
++		log.Printf("[DISK-GUARD] level=%s free_pct=%.1f free_bytes=%d db_writable=%t journal_writable=%t spool_writable=%t admission_blocked=%t cleanup_contexts=%d cleanup_goals=%d goal_bytes_reclaimed=%d goal_target_bytes=%d goal_reserve_bytes=%d cleanup_mappings=%d cleanup_route_bindings=%d error_code=%s",
+ 			snap.Level, snap.FreePercent, snap.FreeBytes, snap.DatabaseWritable, snap.JournalWritable,
+ 			snap.SpoolWritable, snap.AdmissionBlocked, snap.ContextsDeleted, snap.GoalsDeleted,
++			snap.GoalBytesReclaimed, snap.GoalStorageTargetBytes, snap.GoalStorageReserveBytes,
+ 			snap.CodexMappingsDeleted, snap.RouteBindingsDeleted, snap.LastError)
+ 		s.recordDiskGuardEvent(ctx, previous, snap)
+ 	}
+@@ -183,9 +191,10 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
+ 	} else {
+ 		snap.GoalsDeleted += goals
+ 	}
+-	if _, goals, err := s.store.EnforceGoalStorageBudget(cleanupCtx, s.goalStorageMaxBytes(cleanupCtx)); err != nil {
++	if freed, goals, err := s.store.EnforceGoalStorageBudget(cleanupCtx, snap.GoalStorageTargetBytes); err != nil {
+ 		snap.LastError = appendDiskGuardCode(snap.LastError, "goal_budget_cleanup_failed")
+ 	} else {
++		snap.GoalBytesReclaimed += freed
+ 		snap.GoalsDeleted += goals
+ 	}
+ 	if mappings, err := s.store.CleanupCodexSessionMappings(cleanupCtx); err != nil {
+@@ -201,6 +210,23 @@ func (s *Server) runSafeDiskCleanup(ctx context.Context, snap *DiskGuardSnapshot
+ 	s.cleanupExpiredDiagnosticJobs(cleanupCtx)
+ }
+ 
++func goalStorageMaintenanceTarget(maxBytes int64) (target, reserve int64) {
++	if maxBytes <= 0 {
++		return 0, 0
++	}
++	reserve = maxBytes / 8
++	if reserve < goalStorageReserveMin {
++		reserve = goalStorageReserveMin
++	}
++	if reserve > goalStorageReserveMax {
++		reserve = goalStorageReserveMax
++	}
++	if reserve >= maxBytes {
++		reserve = maxBytes / 2
++	}
++	return maxBytes - reserve, reserve
++}
++
+ func (s *Server) databaseWritable(ctx context.Context) bool {
+ 	if s.store == nil {
+ 		return false
+@@ -430,6 +456,9 @@ func diskGuardChanged(previous, current DiskGuardSnapshot) bool {
+ 		previous.AdmissionBlocked != current.AdmissionBlocked ||
+ 		previous.ContextsDeleted != current.ContextsDeleted ||
+ 		previous.GoalsDeleted != current.GoalsDeleted ||
++		previous.GoalBytesReclaimed != current.GoalBytesReclaimed ||
++		previous.GoalStorageTargetBytes != current.GoalStorageTargetBytes ||
++		previous.GoalStorageReserveBytes != current.GoalStorageReserveBytes ||
+ 		previous.CodexMappingsDeleted != current.CodexMappingsDeleted ||
+ 		previous.RouteBindingsDeleted != current.RouteBindingsDeleted ||
+ 		previous.LastError != current.LastError
+@@ -440,13 +469,16 @@ func (s *Server) recordDiskGuardEvent(ctx context.Context, previous, current Dis
+ 		return
+ 	}
+ 	detail, _ := json.Marshal(map[string]interface{}{
+-		"previous_level":    previous.Level,
+-		"level":             current.Level,
+-		"admission_blocked": current.AdmissionBlocked,
+-		"database_writable": current.DatabaseWritable,
+-		"journal_writable":  current.JournalWritable,
+-		"spool_writable":    current.SpoolWritable,
+-		"error_code":        current.LastError,
++		"previous_level":             previous.Level,
++		"level":                      current.Level,
++		"admission_blocked":          current.AdmissionBlocked,
++		"database_writable":          current.DatabaseWritable,
++		"journal_writable":           current.JournalWritable,
++		"spool_writable":             current.SpoolWritable,
++		"goal_bytes_reclaimed":       current.GoalBytesReclaimed,
++		"goal_storage_target_bytes":  current.GoalStorageTargetBytes,
++		"goal_storage_reserve_bytes": current.GoalStorageReserveBytes,
++		"error_code":                 current.LastError,
+ 	})
+ 	eventCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+ 	defer cancel()
+diff --git a/internal/api/disk_guard_test.go b/internal/api/disk_guard_test.go
+index b7be639..8e3ff83 100644
+--- a/internal/api/disk_guard_test.go
++++ b/internal/api/disk_guard_test.go
+@@ -1,7 +1,13 @@
+ package api
+ 
+ import (
++	"context"
++	"encoding/base64"
++	"fmt"
+ 	"testing"
++
++	"codex-account-pool/internal/config"
++	"codex-account-pool/internal/storage"
+ )
+ 
+ func TestDiskGuardThresholdsAndHysteresis(t *testing.T) {
+@@ -38,3 +44,83 @@ func TestBodySpoolReservePreservesEmergencyHeadroom(t *testing.T) {
+ 		t.Fatalf("explicit spool reserve = %d, want at least %d", got, explicit)
+ 	}
+ }
++
++func TestGoalStorageMaintenanceTarget(t *testing.T) {
++	cases := []struct {
++		max, target, reserve int64
++	}{
++		{0, 0, 0},
++		{1 << 20, 512 << 10, 512 << 10},
++		{256 << 20, 224 << 20, 32 << 20},
++		{2 << 30, 1920 << 20, 128 << 20},
++	}
++	for _, tc := range cases {
++		target, reserve := goalStorageMaintenanceTarget(tc.max)
++		if target != tc.target || reserve != tc.reserve {
++			t.Errorf("max=%d target/reserve=%d/%d, want %d/%d", tc.max, target, reserve, tc.target, tc.reserve)
++		}
++	}
++}
++
++func TestRunSafeDiskCleanupCreatesGoalStorageHeadroomBeforeHardLimit(t *testing.T) {
++	ctx := context.Background()
++	store, err := storage.OpenInMemory()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer store.Close()
++	if err = store.Init(ctx); err != nil {
++		t.Fatal(err)
++	}
++	cfg := config.Default()
++	s := &Server{cfg: cfg, store: store}
++	maxBytes := int64(1 << 20)
++	target, reserve := goalStorageMaintenanceTarget(maxBytes)
++	var used int64
++	for i := 0; i < 8 && used <= target+(64<<10); i++ {
++		raw := make([]byte, 96<<10)
++		state := uint32(i + 1)
++		for j := range raw {
++			state = state*1664525 + 1013904223
++			raw[j] = byte(state >> 24)
++		}
++		payload := base64.StdEncoding.EncodeToString(raw)
++		_, err = store.CommitGoalTurn(ctx, storage.GoalTurn{
++			Protocol:          "codex",
++			DownstreamKeyHash: fmt.Sprintf("disk-guard-key-%d", i),
++			WorkspaceHash:     fmt.Sprintf("disk-guard-workspace-%d", i),
++			InitialGoalHash:   fmt.Sprintf("disk-guard-goal-%d", i),
++			ResponseID:        fmt.Sprintf("disk-guard-response-%d", i),
++			Aliases:           []storage.GoalAlias{{Type: "codex_root_thread", Value: fmt.Sprintf("disk-guard-root-%d", i)}},
++			CheckpointPayload: `{"model":"gpt-test","input":[]}`,
++			SegmentPayload:    fmt.Sprintf(`{"input":"%s","output":"ok"}`, payload),
++			ExpiresAt:         storage.Now() + 86400,
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err = store.DB().QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&used); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if used <= target || used >= maxBytes {
++		t.Fatalf("fixture storage=%d, want maintenance target %d < used < hard max %d", used, target, maxBytes)
++	}
++	if err = store.SetSetting(ctx, "goal_storage_max_mb", "1"); err != nil {
++		t.Fatal(err)
++	}
++	snap := DiskGuardSnapshot{GoalStorageTargetBytes: target, GoalStorageReserveBytes: reserve}
++	remaining := used
++	for i := 0; i < 8 && remaining > target; i++ {
++		s.runSafeDiskCleanup(ctx, &snap)
++		if err = store.DB().QueryRowContext(ctx, `SELECT COALESCE(SUM(storage_bytes),0) FROM goal_session`).Scan(&remaining); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if snap.GoalBytesReclaimed <= 0 || remaining >= used {
++		t.Fatalf("cleanup reclaimed=%d storage before/after=%d/%d", snap.GoalBytesReclaimed, used, remaining)
++	}
++	if remaining > target {
++		t.Fatalf("cleanup left storage=%d above maintenance target=%d", remaining, target)
++	}
++}
+diff --git a/internal/api/server.go b/internal/api/server.go
+index e0fb91b..6c97194 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -91,6 +91,10 @@ type Server struct {
+ 	// clientErrors throttles browser-side error reports so the diagnostics endpoint
+ 	// cannot amplify a frontend fault or unauthenticated request flood into log spam.
+ 	clientErrors *clientErrorLimiter
++	// routingAudits coalesces repeated non-409 availability audits. Per-attempt
++	// routing facts remain in diagnosticRuntime; strict identity failures bypass it.
++	routingAudits          *clientErrorLimiter
++	routingAuditSuppressed atomic.Uint64
+ 	// httpMetrics is fixed-cardinality and allocation-free on the request path.
+ 	// Operators can inspect it in /admin/system or scrape /admin/metrics.
+ 	httpMetrics httpRequestMetrics
+@@ -206,6 +210,11 @@ func NewServer(dep Dependencies) *Server {
+ 			clientErrorLogWindow,
+ 			clientErrorLogMaxClients,
+ 		),
++		routingAudits: newClientErrorLimiter(
++			routingAuditLogLimit,
++			routingAuditLogWindow,
++			routingAuditLogMaxKeys,
++		),
+ 		relState:            reliability.NewStore(relStateTTL, relStateMax),
+ 		regHandler:          NewHandler(dep.Store, dep.Upstream, dep.Config.DefaultRegisterMethod, dep.Config.RegistrationConcurrency, &dep.Config), // builds live provider Manager from provider_settings
+ 		claudeRefresh:       newClaudeRefreshGates(),
+diff --git a/internal/api/system.go b/internal/api/system.go
+index 5a969b9..8f87432 100644
+--- a/internal/api/system.go
++++ b/internal/api/system.go
+@@ -37,6 +37,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
+ 		BodyStorage       bodysource.BudgetSnapshot  `json:"body_storage"`
+ 		UsageJournal      map[string]interface{}     `json:"usage_journal"`
+ 		HTTP              httpRequestMetricsSnapshot `json:"http"`
++		RoutingAudit      map[string]interface{}     `json:"routing_audit"`
+ 		ContextRebuilt    uint64                     `json:"context_rebuilt"`
+ 		ContextDegraded   uint64                     `json:"context_degraded"`
+ 		CodexSessionMap   map[string]interface{}     `json:"codex_session_mapping"`
+@@ -51,6 +52,7 @@ func (s *Server) adminSystem(w http.ResponseWriter, r *http.Request) {
+ 		BodyStorage:    s.bodyBudgetSnapshot(),
+ 		UsageJournal:   s.usageJournalMetrics(),
+ 		HTTP:           s.httpMetrics.snapshot(),
++		RoutingAudit:   s.routingAuditDiagnostics(),
+ 		ContextRebuilt: atomic.LoadUint64(&s.contextRebuilt), ContextDegraded: atomic.LoadUint64(&s.contextDegraded),
+ 		CodexSessionMap:   s.codexSessionMappingStats(r.Context()),
+ 		Sidecar:           s.sidecarMetrics(r.Context()),
+diff --git a/web-spa/scripts/check-visual-smoke.mjs b/web-spa/scripts/check-visual-smoke.mjs
+index 79da011..5721aa1 100644
+--- a/web-spa/scripts/check-visual-smoke.mjs
++++ b/web-spa/scripts/check-visual-smoke.mjs
+@@ -242,7 +242,7 @@ async function runCase(browser, testCase) {
+   await installMocks(page);
+   await page.goto(`${baseURL}${testCase.route}`, { waitUntil: 'networkidle0', timeout: 60000 });
+   await page.screenshot({ path: testCase.screenshot, fullPage: true });
+-  const metrics = await page.evaluate(({ expectedMobileHeader, requiredText, requiredLabels }) => {
++  const metrics = await page.evaluate(({ expectedMobileHeader, expectedMobileCards, requiredText, requiredLabels }) => {
+     const viewport = { width: window.innerWidth, height: window.innerHeight };
+     const text = document.body.textContent.replace(/\s+/g, ' ').trim();
+     const headers = [...document.querySelectorAll('.pool-table-wrapper th')].map((el) => el.textContent.trim()).filter(Boolean);
+@@ -256,6 +256,8 @@ async function runCase(browser, testCase) {
+     const sider = rect('.pool-sider');
+     const topTitle = rect('.pool-topbar-title');
+     const topActions = rect('.pool-topbar-actions');
++    const mobileLists = [...document.querySelectorAll('.pool-mobile-list[role="list"]')];
++    const mobileListItems = [...document.querySelectorAll('.pool-mobile-list[role="list"] > [role="listitem"]')];
+     return {
+       documentWidth: document.documentElement.scrollWidth,
+       noPageOverflow: document.documentElement.scrollWidth <= viewport.width + 1,
+@@ -264,11 +266,21 @@ async function runCase(browser, testCase) {
+       headers,
+       hasDesktopColumns: headers.includes('Key / 一键安装') && headers.includes('操作'),
+       hasExpectedMobileHeader: !expectedMobileHeader || (headers.length === 1 && headers[0] === expectedMobileHeader),
++      hasExpectedMobileCards: !expectedMobileCards || (
++        headers.length === 0
++        && mobileLists.length === 1
++        && mobileListItems.length > 0
++      ),
+       hasRequiredText: requiredText.every((item) => text.includes(item)),
+       hasRequiredLabels: requiredLabels.every((item) => labels.includes(item)),
+       reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+     };
+-  }, { expectedMobileHeader: testCase.expectedMobileHeader || '', requiredText: testCase.requiredText || [], requiredLabels: testCase.requiredLabels || [] });
++  }, {
++    expectedMobileHeader: testCase.expectedMobileHeader || '',
++    expectedMobileCards: Boolean(testCase.expectedMobileCards),
++    requiredText: testCase.requiredText || [],
++    requiredLabels: testCase.requiredLabels || [],
++  });
+   await page.close();
+   return { name: testCase.name, badResponses, metrics, screenshot: testCase.screenshot };
+ }
+@@ -283,6 +295,7 @@ function assertCase(result) {
+   if (!result.metrics.siderHidden) failures.push('mobile sidebar is visible while closed');
+   if (result.name === 'desktop-keys' && !result.metrics.hasDesktopColumns) failures.push('desktop table columns are missing');
+   if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileHeader) failures.push('mobile table is not using the expected single-column layout');
++  if (result.name.startsWith('mobile-') && !result.metrics.hasExpectedMobileCards) failures.push('mobile card list is missing');
+   if (result.name.startsWith('mobile-') && !result.metrics.hasRequiredText) failures.push('mobile page is missing required row text/actions');
+   if (result.name.startsWith('mobile-') && !result.metrics.hasRequiredLabels) failures.push('mobile page is missing required accessible action labels');
+   if (result.name === 'mobile-keys' && !result.metrics.reducedMotion) failures.push('reduced-motion media query is not active');
+@@ -316,7 +329,7 @@ async function main() {
+           width: 390,
+           height: 844,
+           reducedMotion: true,
+-          expectedMobileHeader: '账号',
++          expectedMobileCards: true,
+           requiredText: ['primary-prod'],
+           requiredLabels: ['账号操作'],
+           screenshot: path.join(screenshotDir, 'accept-mobile-accounts.png'),
+diff --git a/web-spa/src/components/Charts.jsx b/web-spa/src/components/Charts.jsx
+index b006414..032ef0f 100644
+--- a/web-spa/src/components/Charts.jsx
++++ b/web-spa/src/components/Charts.jsx
+@@ -1,4 +1,4 @@
+-import React, { useEffect, useState } from 'react';
++import React, { useEffect, useId, useState } from 'react';
+ import {
+   ResponsiveContainer, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+   XAxis, YAxis, CartesianGrid, Tooltip, Legend, Label,
+@@ -41,16 +41,68 @@ export function ChartCard({ title, sub, extra, children, height = 260 }) {
+   );
+ }
+ 
+-function tooltipStyle(c) {
+-  return {
+-    contentStyle: { background: c.tooltipBg, border: `1px solid ${c.tooltipBorder}`, borderRadius: 10, fontSize: 12 },
+-    labelStyle: { color: c.tick }, itemStyle: { fontSize: 12 },
+-  };
++function ChartFrame({ height, ariaLabel = '数据图表', children }) {
++  return (
++    <div
++      className="pool-chart-frame"
++      style={{ height }}
++      role="img"
++      aria-label={ariaLabel}
++      tabIndex={0}
++    >
++      {children}
++    </div>
++  );
++}
++
++function CompactLegend({ payload = [] }) {
++  if (!payload.length) return null;
++  return (
++    <ul className="pool-chart-legend" aria-hidden="true">
++      {payload.map((item) => (
++        <li key={`${item.dataKey || ''}:${item.value}`}>
++          <span style={{ background: item.color }} />
++          <b title={String(item.value || '')}>{item.value}</b>
++        </li>
++      ))}
++    </ul>
++  );
++}
++
++function PolishedChartTooltip({
++  active,
++  payload,
++  label,
++  valueFormatter = (value) => value,
++  labelFormatter,
++  unit = '',
++}) {
++  if (!active || !payload?.length) return null;
++  const resolvedLabel = labelFormatter?.(label, payload) ?? label;
++  const rows = payload.filter((item) => item.value !== undefined && item.value !== null);
++  if (!rows.length) return null;
++  return (
++    <div className="pool-chart-tooltip">
++      {resolvedLabel !== undefined && resolvedLabel !== null ? (
++        <div className="pool-chart-tooltip__label" title={String(resolvedLabel)}>{resolvedLabel}</div>
++      ) : null}
++      <div className="pool-chart-tooltip__rows">
++        {rows.map((item) => (
++          <div key={`${item.dataKey || item.name}:${item.value}`} className="pool-chart-tooltip__row">
++            <span className="pool-chart-tooltip__swatch" style={{ background: item.color }} />
++            <span>{item.name || item.dataKey}</span>
++            <b>{valueFormatter(item.value)}{unit ? ` ${unit}` : ''}</b>
++          </div>
++        ))}
++      </div>
++    </div>
++  );
+ }
+ 
+ // Stacked token-usage area chart from UsageBucket[] ({bucket, prompt_tokens, completion_tokens, cached_tokens, total_tokens}).
+-export function UsageAreaChart({ buckets = [], height = 260 }) {
++export function UsageAreaChart({ buckets = [], height = 260, ariaLabel = 'Token 用量趋势' }) {
+   useIsDark();
++  const gradientPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+   const c = axisColors();
+   const data = (buckets || []).map((b) => ({
+     t: fmtTime(b.bucket),
+@@ -60,33 +112,46 @@ export function UsageAreaChart({ buckets = [], height = 260 }) {
+     total: b.total_tokens || 0,
+   }));
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <AreaChart data={data} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+-        <defs>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
++          <defs>
++            {['输入', '输出', '缓存'].map((k, i) => (
++              <linearGradient key={k} id={`${gradientPrefix}-usage-${i}`} x1="0" y1="0" x2="0" y2="1">
++                <stop offset="0%" stopColor={PALETTE[i]} stopOpacity={0.42} />
++                <stop offset="68%" stopColor={PALETTE[i]} stopOpacity={0.12} />
++                <stop offset="100%" stopColor={PALETTE[i]} stopOpacity={0.015} />
++              </linearGradient>
++            ))}
++          </defs>
++          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
++          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
++          <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
++          <Tooltip content={<PolishedChartTooltip valueFormatter={fmtTokens} />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
++          <Legend content={<CompactLegend />} />
+           {['输入', '输出', '缓存'].map((k, i) => (
+-            <linearGradient key={k} id={`g-${i}`} x1="0" y1="0" x2="0" y2="1">
+-              <stop offset="0%" stopColor={PALETTE[i]} stopOpacity={0.5} />
+-              <stop offset="100%" stopColor={PALETTE[i]} stopOpacity={0.04} />
+-            </linearGradient>
++            <Area
++              key={k}
++              type="monotone"
++              dataKey={k}
++              stackId="1"
++              stroke={PALETTE[i]}
++              fill={`url(#${gradientPrefix}-usage-${i})`}
++              strokeWidth={2.25}
++              dot={false}
++              activeDot={{ r: 4, strokeWidth: 2, fill: 'var(--pool-bg-surface)' }}
++              isAnimationActive={false}
++            />
+           ))}
+-        </defs>
+-        <CartesianGrid strokeDasharray="3 3" stroke={c.grid} vertical={false} />
+-        <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
+-        <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
+-        <Tooltip {...tooltipStyle(c)} formatter={(v) => fmtTokens(v)} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-        {['输入', '输出', '缓存'].map((k, i) => (
+-          <Area key={k} type="monotone" dataKey={k} stackId="1" stroke={PALETTE[i]} fill={`url(#g-${i})`} strokeWidth={2}
+-            isAnimationActive={false} />
+-        ))}
+-      </AreaChart>
+-    </ResponsiveContainer>
++        </AreaChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+ // Generic donut from [{name, value}]. Shows the total in the center with a
+ // custom SVG label so the chart is both visual and numeric.
+-export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal = true, valueFormatter }) {
++export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal = true, valueFormatter, ariaLabel = '占比分布' }) {
+   useIsDark();
+   const c = axisColors();
+   const items = (data || []).filter((d) => (d.value || 0) > 0);
+@@ -96,44 +161,85 @@ export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal
+   const formattedTotal = String(formatValue(total));
+   const centerFontSize = formattedTotal.length > 10 ? 14 : formattedTotal.length > 7 ? 17 : 22;
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <PieChart>
+-        <Pie data={items} dataKey="value" nameKey="name" innerRadius="58%" outerRadius="82%"
+-          paddingAngle={2} stroke="none" isAnimationActive={false}>
+-          {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
+-          {showCenterTotal ? <Label position="center" value={formattedTotal} fill={c.tick}
+-            fontSize={centerFontSize} fontWeight={700} dy={unit ? -8 : 0} /> : null}
+-          {showCenterTotal && unit ? <Label position="center" value={unit} fill={c.tick}
+-            fontSize={11} fontWeight={500} dy={12} /> : null}
+-        </Pie>
+-        <Tooltip {...tooltipStyle(c)} formatter={(v, n) => [`${formatValue(v)}${unit ? ` ${unit}` : ''}`, n]} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-      </PieChart>
+-    </ResponsiveContainer>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <PieChart>
++          <Pie
++            data={items}
++            dataKey="value"
++            nameKey="name"
++            innerRadius="62%"
++            outerRadius="82%"
++            paddingAngle={3}
++            cornerRadius={6}
++            stroke="none"
++            isAnimationActive={false}
++          >
++            {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
++            {showCenterTotal ? <Label position="center" value={formattedTotal} fill={c.tick}
++              fontSize={centerFontSize} fontWeight={720} dy={unit ? -8 : 0} /> : null}
++            {showCenterTotal && unit ? <Label position="center" value={unit} fill={c.tick}
++              fontSize={11} fontWeight={520} dy={12} /> : null}
++          </Pie>
++          <Tooltip content={<PolishedChartTooltip valueFormatter={formatValue} unit={unit} />} />
++          <Legend content={<CompactLegend />} />
++        </PieChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+ // Grouped bar from [{x, ...series}] with series=[{key,color,name}].
+-export function GroupedBar({ data = [], series = [], height = 240, stacked = false, showValues = false }) {
++export function GroupedBar({
++  data = [],
++  series = [],
++  height = 240,
++  stacked = false,
++  showValues = false,
++  ariaLabel = '柱状数据图',
++  xTickFormatter,
++  tooltipLabelFormatter,
++  valueFormatter = fmtTokens,
++}) {
+   useIsDark();
+   const c = axisColors();
+   if (!data.length) return <Empty />;
+   const labelEl = showValues ? { position: 'top', fill: c.tick, fontSize: 11 } : false;
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <BarChart data={data} margin={{ top: 18, right: 8, left: 0, bottom: 0 }}>
+-        <CartesianGrid strokeDasharray="3 3" stroke={c.grid} vertical={false} />
+-        <XAxis dataKey="x" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={16} />
+-        <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={40} tickFormatter={fmtTokens} />
+-        <Tooltip {...tooltipStyle(c)} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-        {series.map((s, i) => (
+-          <Bar key={s.key} dataKey={s.key} name={s.name || s.key} fill={s.color || PALETTE[i % PALETTE.length]}
+-            stackId={stacked ? '1' : undefined} radius={stacked ? 0 : [4, 4, 0, 0]} maxBarSize={36}
+-            label={labelEl} isAnimationActive={false} />
+-        ))}
+-      </BarChart>
+-    </ResponsiveContainer>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <BarChart data={data} margin={{ top: 18, right: 8, left: 0, bottom: 0 }}>
++          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
++          <XAxis
++            dataKey="x"
++            tick={{ fontSize: 11, fill: c.tick }}
++            tickLine={false}
++            axisLine={false}
++            minTickGap={16}
++            tickFormatter={xTickFormatter}
++          />
++          <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtTokens} />
++          <Tooltip
++            content={<PolishedChartTooltip valueFormatter={valueFormatter} labelFormatter={tooltipLabelFormatter} />}
++            cursor={{ fill: 'var(--pool-bg-hover)', radius: 8 }}
++          />
++          <Legend content={<CompactLegend />} />
++          {series.map((s, i) => (
++            <Bar
++              key={s.key}
++              dataKey={s.key}
++              name={s.name || s.key}
++              fill={s.color || PALETTE[i % PALETTE.length]}
++              stackId={stacked ? '1' : undefined}
++              radius={stacked ? (i === series.length - 1 ? [7, 7, 0, 0] : 0) : [7, 7, 3, 3]}
++              maxBarSize={34}
++              label={labelEl}
++              isAnimationActive={false}
++            />
++          ))}
++        </BarChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+@@ -162,28 +268,20 @@ export function ModelMetricsTooltip({ active, payload, label }) {
+     .sort((a, b) => (b.metric.total_tokens || 0) - (a.metric.total_tokens || 0));
+   if (!rows.length) return null;
+   return (
+-    <div style={{
+-      background: 'var(--pool-chart-tooltip-bg)',
+-      border: '1px solid var(--pool-chart-tooltip-border)',
+-      borderRadius: 8,
+-      padding: '8px 10px',
+-      fontSize: 12,
+-      boxShadow: 'var(--pool-shadow)',
+-      maxWidth: 280,
+-    }}>
+-      <div style={{ fontWeight: 700, marginBottom: 6 }}>{label}</div>
++    <div className="pool-chart-tooltip pool-chart-tooltip--metrics">
++      <div className="pool-chart-tooltip__label">{label}</div>
+       {rows.map(({ item, metric }) => {
+         const requestHit = metricRate(metric.hit_requests, metric.requests);
+         const realTokenHit = metric.real_token_hit_rate ?? metricRate(metric.cache_read_tokens, metric.cache_input_tokens || metric.prompt_tokens);
+         const eligibleHit = metric.eligible_cache_hit_rate ?? metricRate(metric.cache_read_tokens, (metric.cache_read_tokens || 0) + (metric.cache_creation_tokens || 0));
+         const writeShare = metric.cache_write_share ?? metricRate(metric.cache_creation_tokens, metric.cache_input_tokens || metric.prompt_tokens);
+         return (
+-          <div key={item.dataKey} style={{ padding: '6px 0', borderTop: '1px solid var(--pool-border)' }}>
+-            <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 700, marginBottom: 4 }}>
+-              <span style={{ width: 9, height: 9, borderRadius: 3, background: item.color, display: 'inline-block' }} />
++          <div key={item.dataKey} className="pool-chart-tooltip__metric">
++            <div className="pool-chart-tooltip__metric-title">
++              <span className="pool-chart-tooltip__swatch" style={{ background: item.color }} />
+               <span>{metric.series_label || item.name}</span>
+             </div>
+-            <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '3px 12px' }}>
++            <div className="pool-chart-tooltip__metric-grid">
+               <span>Token</span><b>{fmtTokens(metric.total_tokens)}</b>
+               <span>请求数</span><b>{metric.requests == null ? '—' : metric.requests}</b>
+               <span>请求命中率</span><b>{pctOrDash(requestHit)}</b>
+@@ -198,8 +296,16 @@ export function ModelMetricsTooltip({ active, payload, label }) {
+   );
+ }
+ 
+-export function UsageModelAreaChart({ modelSeries = [], series = [], height = 260, metric = 'total_tokens', selectedKeys }) {
++export function UsageModelAreaChart({
++  modelSeries = [],
++  series = [],
++  height = 260,
++  metric = 'total_tokens',
++  selectedKeys,
++  ariaLabel = '模型用量趋势',
++}) {
+   useIsDark();
++  const gradientPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+   const c = axisColors();
+   const descriptors = (series || []).map((s, i) => ({
+     ...s,
+@@ -221,19 +327,40 @@ export function UsageModelAreaChart({ modelSeries = [], series = [], height = 26
+   const data = [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([, row]) => row);
+   if (!data.length) return <Empty />;
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <AreaChart data={data} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+-        <CartesianGrid strokeDasharray="3 3" stroke={c.grid} vertical={false} />
+-        <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
+-        <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
+-        <Tooltip content={<ModelMetricsTooltip />} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-        {descriptors.map((s) => (
+-          <Area key={s.series_key} type="monotone" dataKey={s.field} name={s.series_label || s.series_key}
+-            stackId="model" stroke={s.color} fill={s.color} fillOpacity={0.18} strokeWidth={2} isAnimationActive={false} />
+-        ))}
+-      </AreaChart>
+-    </ResponsiveContainer>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
++          <defs>
++            {descriptors.map((s) => (
++              <linearGradient key={s.series_key} id={`${gradientPrefix}-${s.field}`} x1="0" y1="0" x2="0" y2="1">
++                <stop offset="0%" stopColor={s.color} stopOpacity={0.34} />
++                <stop offset="100%" stopColor={s.color} stopOpacity={0.025} />
++              </linearGradient>
++            ))}
++          </defs>
++          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
++          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
++          <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
++          <Tooltip content={<ModelMetricsTooltip />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
++          <Legend content={<CompactLegend />} />
++          {descriptors.map((s) => (
++            <Area
++              key={s.series_key}
++              type="monotone"
++              dataKey={s.field}
++              name={s.series_label || s.series_key}
++              stackId="model"
++              stroke={s.color}
++              fill={`url(#${gradientPrefix}-${s.field})`}
++              strokeWidth={2.25}
++              dot={false}
++              activeDot={{ r: 4, strokeWidth: 2, fill: 'var(--pool-bg-surface)' }}
++              isAnimationActive={false}
++            />
++          ))}
++        </AreaChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+@@ -255,9 +382,9 @@ export function CacheRateBars({ data = [] }) {
+         return (
+           <div key={i} style={{ marginBottom: 14 }}>
+             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, marginBottom: 6 }}>
+-              <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
++              <span className="pool-cache-model" title={r.model}>
+                 <span style={{ width: 9, height: 9, borderRadius: 3, background: c, display: 'inline-block' }} />
+-                {r.model}
++                <span>{r.model}</span>
+               </span>
+               <span style={{ fontWeight: 600, color: 'var(--pool-text)' }}>{r.rate}%</span>
+             </div>
+diff --git a/web-spa/src/components/DisplayPrimitives.jsx b/web-spa/src/components/DisplayPrimitives.jsx
+index 83f9066..2dc2306 100644
+--- a/web-spa/src/components/DisplayPrimitives.jsx
++++ b/web-spa/src/components/DisplayPrimitives.jsx
+@@ -12,6 +12,7 @@ export function TextClamp({
+   className = '',
+   maxWidth,
+   title,
++  ariaLabel,
+   strong = false,
+   muted = false,
+   onClick,
+@@ -29,6 +30,7 @@ export function TextClamp({
+       ].filter(Boolean).join(' ')}
+       style={{ '--pool-clamp-lines': lines, maxWidth }}
+       onClick={onClick}
++      aria-label={ariaLabel}
+     >
+       {content}
+     </span>
+@@ -87,13 +89,21 @@ export function MetricRail({ items = [], className = '' }) {
+   );
+ }
+ 
+-export function TinyMeter({ value, max = 100, label }) {
++export function TinyMeter({ value, max = 100, label, tone = 'accent' }) {
+   const n = Number(value);
+   const m = Number(max) || 100;
+   const pct = Number.isFinite(n) && m > 0 ? Math.max(0, Math.min(100, Math.round((n / m) * 100))) : 0;
+   return (
+-    <div className="pool-tiny-meter" title={label || `${pct}%`}>
+-      <span style={{ width: `${pct}%` }} />
++    <div
++      className={`pool-tiny-meter pool-tiny-meter--${tone}`}
++      title={label || `${pct}%`}
++      role="progressbar"
++      aria-label={label || `${pct}%`}
++      aria-valuemin={0}
++      aria-valuemax={100}
++      aria-valuenow={pct}
++    >
++      <span className="pool-tiny-meter__bar" style={{ width: `${pct}%` }} />
+     </div>
+   );
+ }
+diff --git a/web-spa/src/components/ResourceTable.jsx b/web-spa/src/components/ResourceTable.jsx
+index 9904b81..b0a46e4 100644
+--- a/web-spa/src/components/ResourceTable.jsx
++++ b/web-spa/src/components/ResourceTable.jsx
+@@ -130,7 +130,11 @@ export default function ResourceTable({
+         {firstLoad ? (
+           <TableSkeleton rows={skeletonRows} cols={1} title={loadingTitle} />
+         ) : visibleRows.length ? (
+-          <div className="pool-mobile-list" role="list" aria-label={mobileListLabel}>
++          <div
++            className={['pool-mobile-list', className].filter(Boolean).join(' ')}
++            role="list"
++            aria-label={mobileListLabel}
++          >
+             {visibleRows.map((row, index) => {
+               const key = rowKeyOf(row, rowKey, index);
+               const isSelected = selected.has(key);
+diff --git a/web-spa/src/components/SettingsTabShell.jsx b/web-spa/src/components/SettingsTabShell.jsx
+index 29f9373..92e1573 100644
+--- a/web-spa/src/components/SettingsTabShell.jsx
++++ b/web-spa/src/components/SettingsTabShell.jsx
+@@ -74,13 +74,14 @@ export default function SettingsTabShell({
+   settingsErrorSection,
+   settingsErrors,
+   className = '',
++  toolbarClassName = '',
+   children,
+ }) {
+   if (loading && !lastRefresh) return <LoadingState title={t('settings.loading')} />;
+   if (error && !lastRefresh) return <LoadErrorBanner error={error} onRetry={onRetry} title={settingsErrorTitle || undefined} />;
+   return (
+     <div className={className}>
+-      {toolbar ? <div className="pool-toolbar">{toolbar}</div> : null}
++      {toolbar ? <div className={['pool-toolbar', toolbarClassName].filter(Boolean).join(' ')}>{toolbar}</div> : null}
+       <LoadErrorBanner error={error} onRetry={onRetry} title={error ? t('settings.refresh_stale') : undefined} />
+       <SavedDiffPanel diffs={diffs} onUndo={onUndo} undoLoading={undoLoading} onClose={onClearDiffs} />
+       {settingsErrorTitle ? (
+diff --git a/web-spa/src/lib/i18n.js b/web-spa/src/lib/i18n.js
+index 4511f29..1c84fe9 100644
+--- a/web-spa/src/lib/i18n.js
++++ b/web-spa/src/lib/i18n.js
+@@ -93,7 +93,17 @@ const zh = {
+   'settings.recommended_template': '全模型稳定推荐配置',
+   'settings.general_failed': '通用配置读取异常',
+   'settings.apply_recommended': '应用全模型推荐配置',
++  'settings.apply_recommended_short': '推荐配置',
+   'settings.save_changes': '保存改动',
++  'settings.save_short': '保存',
++  'settings.search': '搜索设置',
++  'settings.search_placeholder': '搜索名称、说明或技术键…',
++  'settings.sections': '配置分组',
++  'settings.fields_count': '{count} 项设置',
++  'settings.pending_count': '{count} 项待保存',
++  'settings.restart_count': '{count} 项需重启',
++  'settings.no_search_results': '没有匹配的设置',
++  'settings.no_search_results_desc': '未找到与“{query}”匹配的名称、说明或技术键。',
+   'settings.no_general': '暂无通用配置',
+   'settings.no_general_desc': '当前接口没有返回可编辑配置项。',
+   'settings.loading': '正在加载设置…',
+@@ -145,6 +155,49 @@ const zh = {
+   'page.registration.desc': '检查依赖并启动自动注册任务',
+   'page.email_pool.desc': '管理用于ChatGPT注册的Outlook/Hotmail邮箱账号',
+   'page.email_reg.desc': '通过邮箱OTP注册ChatGPT账号并自动导入Agent Identity',
++  'email_pool.total': '邮箱总数',
++  'email_pool.available': '可用',
++  'email_pool.in_use': '使用中',
++  'email_pool.used': '已使用',
++  'email_pool.error': '异常',
++  'email_pool.all_entries': '全部邮箱条目',
++  'email_pool.share': '占总量 {value}',
++  'email_pool.no_entries': '暂无条目',
++  'email_pool.email': '邮箱账号',
++  'email_pool.status': '状态',
++  'email_pool.group': '分组',
++  'email_pool.last_error': '最近错误',
++  'email_pool.last_used': '最近使用',
++  'email_pool.actions': '操作',
++  'email_pool.default_group': '默认分组',
++  'email_pool.never_used': '尚未使用',
++  'email_pool.status_idle': '空闲',
++  'email_pool.status_ready': '可用',
++  'email_pool.status_in_use': '使用中',
++  'email_pool.status_used': '已使用',
++  'email_pool.status_error': '异常',
++  'email_pool.import': '导入邮箱',
++  'email_pool.import_title': '导入邮箱账号',
++  'email_pool.import_help': '每行粘贴一个邮箱账号，字段格式：',
++  'email_pool.import_input': '待导入的邮箱账号',
++  'email_pool.imported': '已导入 {count} 个邮箱账号',
++  'email_pool.import_partial': '另有 {count} 行格式异常，请核对后重试',
++  'email_pool.deleted': '已删除 {count} 个邮箱账号',
++  'email_pool.test': '测试',
++  'email_pool.test_ok': '邮箱 {email} 工作正常',
++  'email_pool.test_failed': '邮箱测试失败：{error}',
++  'email_pool.search_placeholder': '搜索邮箱或分组',
++  'email_pool.select_page': '选择本页',
++  'email_pool.deselect_page': '取消本页',
++  'email_pool.selected_count': '所选 {count} 个邮箱',
++  'email_pool.delete_selected': '删除所选（{count}）',
++  'email_pool.load_failed': '邮箱池读取失败',
++  'email_pool.mobile_list': '邮箱账号列表',
++  'email_pool.empty_title': '邮箱池为空',
++  'email_pool.empty_desc': '导入邮箱后即可用于注册任务',
++  'email_pool.delete_title': '删除 {label}？',
++  'email_pool.delete_desc': '删除后不可恢复；正在使用的注册任务不会自动重试。',
++  'email_pool.entry': '邮箱账号',
+   'page.usage.desc': '分析请求、Token 与缓存用量',
+   'page.quota.desc': '查看账号配额和剩余窗口',
+   'page.quality.desc': '观察模型质量与可用性',
+@@ -750,7 +803,17 @@ const en = {
+   'settings.recommended_template': 'Stable defaults for all models',
+   'settings.general_failed': 'General settings unavailable',
+   'settings.apply_recommended': 'Apply recommended model settings',
++  'settings.apply_recommended_short': 'Recommended',
+   'settings.save_changes': 'Save changes',
++  'settings.save_short': 'Save',
++  'settings.search': 'Search settings',
++  'settings.search_placeholder': 'Search names, descriptions, or technical keys…',
++  'settings.sections': 'Settings sections',
++  'settings.fields_count': '{count} settings',
++  'settings.pending_count': '{count} pending',
++  'settings.restart_count': '{count} require restart',
++  'settings.no_search_results': 'No matching settings',
++  'settings.no_search_results_desc': 'No name, description, or technical key matches “{query}”.',
+   'settings.no_general': 'No general settings',
+   'settings.no_general_desc': 'The API did not return any editable settings.',
+   'settings.loading': 'Loading settings…',
+@@ -802,6 +865,49 @@ const en = {
+   'page.registration.desc': 'Check dependencies and start registration jobs',
+   'page.email_pool.desc': 'Manage Outlook/Hotmail email accounts for ChatGPT registration',
+   'page.email_reg.desc': 'Register ChatGPT accounts via email OTP with Agent Identity import',
++  'email_pool.total': 'Total emails',
++  'email_pool.available': 'Available',
++  'email_pool.in_use': 'In use',
++  'email_pool.used': 'Used',
++  'email_pool.error': 'Errors',
++  'email_pool.all_entries': 'All email entries',
++  'email_pool.share': '{value} of total',
++  'email_pool.no_entries': 'No entries',
++  'email_pool.email': 'Email account',
++  'email_pool.status': 'Status',
++  'email_pool.group': 'Group',
++  'email_pool.last_error': 'Latest error',
++  'email_pool.last_used': 'Last used',
++  'email_pool.actions': 'Actions',
++  'email_pool.default_group': 'Default group',
++  'email_pool.never_used': 'Never used',
++  'email_pool.status_idle': 'Idle',
++  'email_pool.status_ready': 'Ready',
++  'email_pool.status_in_use': 'In use',
++  'email_pool.status_used': 'Used',
++  'email_pool.status_error': 'Error',
++  'email_pool.import': 'Import emails',
++  'email_pool.import_title': 'Import email accounts',
++  'email_pool.import_help': 'Paste one email account per line using this field order:',
++  'email_pool.import_input': 'Email accounts to import',
++  'email_pool.imported': 'Imported {count} email accounts',
++  'email_pool.import_partial': '{count} lines have format errors; review and retry',
++  'email_pool.deleted': 'Deleted {count} email accounts',
++  'email_pool.test': 'Test',
++  'email_pool.test_ok': 'Email {email} is working',
++  'email_pool.test_failed': 'Email test failed: {error}',
++  'email_pool.search_placeholder': 'Search email or group',
++  'email_pool.select_page': 'Select page',
++  'email_pool.deselect_page': 'Deselect page',
++  'email_pool.selected_count': '{count} selected emails',
++  'email_pool.delete_selected': 'Delete selected ({count})',
++  'email_pool.load_failed': 'Email pool unavailable',
++  'email_pool.mobile_list': 'Email account list',
++  'email_pool.empty_title': 'Email pool is empty',
++  'email_pool.empty_desc': 'Import email accounts to use them in registration jobs',
++  'email_pool.delete_title': 'Delete {label}?',
++  'email_pool.delete_desc': 'Deletion is permanent; active registration jobs will not retry automatically.',
++  'email_pool.entry': 'email account',
+   'page.usage.desc': 'Analyze request, token, and cache usage',
+   'page.quota.desc': 'Review account quota and reset windows',
+   'page.quality.desc': 'Observe model quality and availability',
+diff --git a/web-spa/src/pages/Accounts.jsx b/web-spa/src/pages/Accounts.jsx
+index 00783e5..5eab580 100644
+--- a/web-spa/src/pages/Accounts.jsx
++++ b/web-spa/src/pages/Accounts.jsx
+@@ -16,7 +16,7 @@ import useAsyncAction from '../hooks/useAsyncAction.js';
+ import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
+ import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
+ import { toCSV, downloadCSV } from '../lib/csv.js';
+-import { fmtInt, fmtTokens } from '../lib/format.js';
++import { fmtInt, fmtRelative, fmtTokens } from '../lib/format.js';
+ import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
+ import { fetchAccountArchive, importAccountArchive } from '../features/accounts/api/accounts.ts';
+ import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
+@@ -87,6 +87,93 @@ function quotaReason(account) {
+   return account?.quota_summary?.sync_reason || (quotaPercent(account) == null ? 'never_polled' : 'ok');
+ }
+ 
++const QUOTA_REASON_LABELS = {
++  ok: '额度已同步',
++  never_polled: '等待首次同步',
++  stale: '额度数据已过期',
++  partial: '额度数据不完整',
++  inactive: '账号当前未启用',
++  token_missing: '缺少可用凭据',
++  token_expired: '凭据已过期',
++  unsupported_api_key_billing: '按量计费不提供订阅额度',
++  unsupported_claude_non_oauth: '当前认证方式不提供订阅额度',
++  unsupported_provider: '当前提供商不提供额度同步',
++};
++
++function quotaReasonLabel(reason) {
++  const key = String(reason || 'never_polled');
++  if (QUOTA_REASON_LABELS[key]) return QUOTA_REASON_LABELS[key];
++  if (key.startsWith('error/')) return '额度同步失败';
++  return '额度状态待确认';
++}
++
++function quotaWindowLabel(window) {
++  const seconds = Number(window?.limit_window_seconds);
++  if (Number.isFinite(seconds) && seconds > 0) {
++    if (seconds % 86400 === 0) return `${seconds / 86400} 天窗口`;
++    if (seconds % 3600 === 0) return `${seconds / 3600} 小时窗口`;
++    if (seconds % 60 === 0) return `${seconds / 60} 分钟窗口`;
++  }
++  return window?.limiter_type ? `${window.limiter_type} 窗口` : '主额度窗口';
++}
++
++export function quotaPresentation(account) {
++  const primary = account?.quota_summary?.primary || {};
++  const percent = quotaPercent(account);
++  const reason = quotaReason(account);
++  const usedPercent = percent == null ? null : Math.round(percent);
++  const remainingPercent = usedPercent == null ? null : Math.max(0, 100 - usedPercent);
++  const tone = usedPercent == null ? 'muted' : usedPercent >= 90 ? 'danger' : usedPercent >= 70 ? 'warning' : 'success';
++  const remainingTokens = Number(primary.remaining_tokens ?? account?.remaining_tokens ?? account?.quota_remaining_tokens);
++  const limitTokens = Number(primary.limit_tokens ?? account?.limit_tokens ?? account?.quota_limit_tokens);
++  const remainingRequests = Number(primary.remaining_requests);
++  const limitRequests = Number(primary.limit_requests);
++  const details = [];
++  if (Number.isFinite(remainingTokens) && remainingTokens >= 0) {
++    details.push(`${fmtTokens(remainingTokens)} Token 剩余${Number.isFinite(limitTokens) && limitTokens > 0 ? ` / ${fmtTokens(limitTokens)}` : ''}`);
++  } else if (Number.isFinite(remainingRequests) && remainingRequests >= 0) {
++    details.push(`${fmtInt(remainingRequests)} 次请求剩余${Number.isFinite(limitRequests) && limitRequests > 0 ? ` / ${fmtInt(limitRequests)}` : ''}`);
++  }
++  const resetAt = Number(primary.reset_at);
++  if (Number.isFinite(resetAt) && resetAt > 0) details.push(`${fmtRelative(resetAt)}重置`);
++  return {
++    percent: usedPercent,
++    remainingPercent,
++    tone,
++    reason,
++    reasonLabel: quotaReasonLabel(reason),
++    windowLabel: quotaWindowLabel(primary),
++    detail: details.join(' · '),
++  };
++}
++
++function AccountQuota({ account, compact = false }) {
++  const quota = quotaPresentation(account);
++  if (quota.percent == null) {
++    return (
++      <div className={`pool-account-quota pool-account-quota--unknown${compact ? ' pool-account-quota--compact' : ''}`}>
++        <div className="pool-account-quota__head">
++          <strong>额度待同步</strong>
++        </div>
++        <span className="pool-account-quota__meta">{quota.reasonLabel}</span>
++      </div>
++    );
++  }
++  const ariaLabel = `${quota.windowLabel}，已用 ${quota.percent}%，剩余 ${quota.remainingPercent}%${quota.detail ? `，${quota.detail}` : ''}`;
++  return (
++    <div className={`pool-account-quota pool-account-quota--${quota.tone}${compact ? ' pool-account-quota--compact' : ''}`} aria-label={ariaLabel}>
++      <div className="pool-account-quota__head">
++        <strong>{quota.remainingPercent}% <span>剩余</span></strong>
++        <span>{quota.percent}% 已用</span>
++      </div>
++      <TinyMeter value={quota.percent} label={ariaLabel} tone={quota.tone} />
++      <span className="pool-account-quota__meta">
++        {quota.windowLabel}{quota.detail ? ` · ${quota.detail}` : ''}
++      </span>
++    </div>
++  );
++}
++
+ function routeSummary(account) {
+   const binding = account.egress_binding || {};
+   const exit = binding.primary_egress_id || account.egress_id || '默认出口';
+@@ -457,14 +544,22 @@ export default function Accounts() {
+       render: (_, r) => (
+         <div className="pool-account-summary">
+           <div className="pool-account-titleline">
+-            <TextClamp strong onClick={() => setDrawerAcct(r)}>{r.label || r.id}</TextClamp>
++            <TextClamp
++              strong
++              className="pool-account-primary-id"
++              title={r.label || r.id}
++              ariaLabel={r.label || r.id}
++              onClick={() => setDrawerAcct(r)}
++            >
++              {middleEllipsis(r.label || r.id, 30, 14)}
++            </TextClamp>
+             <Tag size="small">{r.provider || 'codex'}</Tag>
+             <Tag size="small" color={r.auth_method === 'api_key' ? 'violet' : r.credential_mode === 'agent_identity' ? 'cyan' : 'blue'}>
+               {r.credential_mode === 'agent_identity' ? 'agent identity' : (r.auth_method || 'oauth')}
+             </Tag>
+           </div>
+           <div className="pool-account-metaline">
+-            <TextClamp muted className="pool-account-email" title={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
++            <TextClamp muted className="pool-account-email" title={r.email || r.id} ariaLabel={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
+           </div>
+         </div>
+       ),
+@@ -514,63 +609,66 @@ export default function Accounts() {
+       },
+     },
+     {
+-      title: '用量',
++      title: '用量 / 额度',
+       key: 'usage',
+-      width: 150,
++      width: 220,
+       align: 'right',
+       render: (_, r) => {
+         const usage = accountUsage(r);
+         const requests = usage.requests ?? r.requests;
+         const tokens = usage.total_tokens ?? r.total_tokens;
+-        const pct = quotaPercent(r);
+-        const reason = quotaReason(r);
+         return (
+-          <div className="pool-quota-cell">
+-            <TextClamp>{tokens == null ? '—' : fmtTokens(tokens)}</TextClamp>
+-            <div className="pool-resource-summary__meta">{requests == null ? '请求未同步' : `${fmtInt(requests)} 次请求`}</div>
+-            <span className="pool-resource-summary__meta">{pct === null ? `配额未同步 · ${reason}` : `配额 ${pct}% 已用`}</span>
+-            <TinyMeter value={pct ?? 0} label={pct === null ? '未同步' : `${pct}% 已用`} />
++          <div className="pool-account-usage">
++            <div className="pool-account-usage__totals">
++              <strong>{tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token`}</strong>
++              <span>{requests == null ? '请求未同步' : `${fmtInt(requests)} 次请求`}</span>
++            </div>
++            <AccountQuota account={r} />
+           </div>
+         );
+       },
+     },
+     { title: '操作', key: 'ops', width: 72, render: (_, r) => renderAccountActions(r) },
+   ];
+-  const mobileAccountCell = (r) => {
++  const mobileAccountCell = (r, mobileMeta = {}) => {
+     const route = routeSummary(r);
+     const usage = accountUsage(r);
+     const requests = usage.requests ?? r.requests;
+     const tokens = usage.total_tokens ?? r.total_tokens;
++    const accountName = r.label || r.id;
++    const accountTitle = (
++      <TextClamp strong title={accountName} ariaLabel={accountName}>
++        {middleEllipsis(accountName, 20, 8)}
++      </TextClamp>
++    );
+     return (
+       <MobileResourceCell
++        selectable={selectMode}
++        selected={Boolean(mobileMeta.selected)}
++        onSelect={() => mobileMeta.toggleSelected?.(!mobileMeta.selected)}
+         title={selectMode
+-          ? middleEllipsis(r.label || r.id, 20, 8)
+-          : <Typography.Text link onClick={() => setDrawerAcct(r)}>{middleEllipsis(r.label || r.id, 20, 8)}</Typography.Text>}
+-        subtitle={middleEllipsis(r.email || r.id, 22, 12)}
++          ? accountTitle
++          : <Typography.Text link onClick={() => setDrawerAcct(r)}>{accountTitle}</Typography.Text>}
++        subtitle={<TextClamp title={r.email || r.id} ariaLabel={r.email || r.id}>{middleEllipsis(r.email || r.id, 22, 12)}</TextClamp>}
+         badges={statusTag(r)}
+         chips={<>
+           <Tag size="small">{r.provider || 'codex'}</Tag>
+-          <Tag size="small">{r.group_name || '默认'}</Tag>
++          <Tag size="small" title={r.group_name || '默认'}>{middleEllipsis(r.group_name || '默认', 12, 6)}</Tag>
+           {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
+           {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
+-          <Tag size="small" color="blue">{route.primary}</Tag>
++          <Tag size="small" color="blue" title={route.primary}>{middleEllipsis(route.primary, 14, 8)}</Tag>
+         </>}
+         details={[
+-          { label: '用量', value: tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token` },
+-          { label: '请求', value: requests == null ? null : `${fmtInt(requests)} 次请求` },
++          {
++            label: '累计用量',
++            value: `${tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token`}${requests == null ? '' : ` · ${fmtInt(requests)} 次请求`}`,
++          },
++          { label: '额度', value: <AccountQuota account={r} compact /> },
+         ]}
+         actions={!selectMode ? renderAccountActions(r) : null}
+       />
+     );
+   };
+-  const mobileColumns = [
+-    {
+-      title: '账号',
+-      dataIndex: 'label',
+-      render: (_, r) => mobileAccountCell(r),
+-    },
+-  ];
+-
+   return (
+     <div>
+       <PageHeader
+@@ -638,9 +736,10 @@ export default function Accounts() {
+         rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: handleSelectionChange } : undefined}
+         className="pool-mobile-table pool-accounts-table"
+         density="account"
+-        minScrollX={1092}
++        minScrollX={1162}
+         rowHeight={72}
+-        mobileColumns={mobileColumns}
++        mobileRenderer={mobileAccountCell}
++        mobileListLabel="账号列表"
+         mobileScroll={false}
+         emptyTitle="账号池为空"
+         emptyDesc="导入 auth.json 或开启自动注册来填充账号池"
+diff --git a/web-spa/src/pages/Dashboard.tsx b/web-spa/src/pages/Dashboard.tsx
+index 1183deb..76f90b2 100644
+--- a/web-spa/src/pages/Dashboard.tsx
++++ b/web-spa/src/pages/Dashboard.tsx
+@@ -43,6 +43,12 @@ function healthTag(available: boolean, ok?: boolean) {
+   return ok ? <Tag color="green">{t('dashboard.service_normal')}</Tag> : <Tag color="red">{t('dashboard.service_abnormal')}</Tag>;
+ }
+ 
++export function compactIdentity(value: unknown, head = 8, tail = 6) {
++  const text = String(value || t('common.unknown'));
++  if (text.length <= head + tail + 1) return text;
++  return `${text.slice(0, head)}…${text.slice(-tail)}`;
++}
++
+ export default function Dashboard() {
+   const navigate = useNavigate();
+   const pageVisible = usePageVisible();
+@@ -138,7 +144,8 @@ export default function Dashboard() {
+     color: modelColor(row.dimension_key || row.model_key || row.model),
+   }));
+   const topAccounts = (secondary?.cache?.by_account || []).slice(0, 8).map((row) => ({
+-    x: String(row.account_id || t('common.unknown')).slice(0, 12),
++    x: compactIdentity(row.account_id),
++    fullLabel: String(row.account_id || t('common.unknown')),
+     input: Number(row.actual_prompt_tokens || row.prompt_tokens || 0),
+     output: Number(row.actual_completion_tokens || 0),
+   }));
+@@ -167,7 +174,7 @@ export default function Dashboard() {
+ 
+       <LoadErrorBanner error={partialError} onRetry={reload} title={partialError ? t('dashboard.partial_failed') : undefined} />
+ 
+-      <section className="pool-dashboard-command" style={{ marginBottom: 18 }}>
++      <section className="pool-dashboard-command">
+         <div className="pool-dashboard-command__main">
+           <div className="pool-dashboard-command__eyebrow">
+             {healthTag(Boolean(core?.healthAvailable), core?.health?.ok)}
+@@ -183,28 +190,36 @@ export default function Dashboard() {
+             <div><span>{t('dashboard.cache_hit')}</span><b>{secondary?.cacheAvailable ? `${Math.round(cacheHitRate * 100)}%` : '—'}</b></div>
+             <div><span>{t('dashboard.registration_rate')}</span><b>{secondary?.registrationAvailable ? `${Math.round(registrationRate * 100)}%` : '—'}</b></div>
+           </div>
++          <div className="pool-quick-actions">
++            <span className="pool-quick-actions__label">{t('dashboard.quick_actions')}</span>
++            <Button icon={<IconPlus />} type="primary" onClick={() => navigate('/accounts?action=import')}>{t('dashboard.import_account')}</Button>
++            <Button icon={<IconUser />} onClick={() => navigate('/accounts')}>{t('dashboard.account_management')}</Button>
++            <Button icon={<IconKey />} onClick={() => navigate('/keys')}>API Keys</Button>
++            <Button icon={<IconLineChartStroked />} onClick={() => navigate('/usage')}>{t('dashboard.usage')}</Button>
++            <Button icon={<IconSetting />} onClick={() => navigate('/settings-v2')}>{t('dashboard.system_settings')}</Button>
++          </div>
+         </div>
+         <div className="pool-dashboard-command__side">
+           <div className="pool-section-title">{t('dashboard.attention')}</div>
+           <div className="pool-attention-list">
+-            <div>
++            <div className={quarantined ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
+               <span>{t('dashboard.quarantined_accounts')}</span><b className={quarantined ? 'pool-danger-text' : ''}>{fmtInt(quarantined)}</b>
+               <p>{quarantined ? t('dashboard.quarantined_issue') : t('dashboard.quarantined_clear')}</p>
+               {quarantined ? <Button size="small" theme="borderless" onClick={() => navigate('/accounts')}>{t('dashboard.view_accounts')}</Button> : null}
+             </div>
+-            <div>
++            <div className={recheck ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
+               <span>{t('dashboard.recheck')}</span><b className={recheck ? 'pool-danger-text' : ''}>{fmtInt(recheck)}</b>
+               <p>{recheck ? t('dashboard.recheck_issue') : t('dashboard.recheck_clear')}</p>
+             </div>
+-            <div>
++            <div className={cooling ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
+               <span>{t('dashboard.cooling')}</span><b>{fmtInt(cooling)}</b>
+               <p>{cooling ? t('dashboard.cooling_issue') : t('dashboard.cooling_clear')}</p>
+             </div>
+-            <div>
++            <div className="pool-attention-item--neutral">
+               <span>{t('dashboard.model_coverage')}</span><b>{secondary?.modelAvailable ? fmtInt(byModel.length) : '—'}</b>
+               <p>{t('dashboard.model_coverage_desc')}</p>
+             </div>
+-            <div>
++            <div className="pool-attention-item--neutral">
+               <span>{t('dashboard.cache_completeness')}</span><b>{secondary?.cacheAvailable ? cacheCompleteness : '—'}</b>
+               <p>{kiroCache?.cache_reporting_state === 'unreported' ? t('dashboard.kiro_cache_unreported') : t('dashboard.cache_completeness_desc')}</p>
+             </div>
+@@ -212,47 +227,44 @@ export default function Dashboard() {
+         </div>
+       </section>
+ 
+-      <div className="pool-quick-actions" style={{ display: 'flex', gap: 10, marginBottom: 18, flexWrap: 'wrap', alignItems: 'center' }}>
+-        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--pool-text-2)', marginRight: 4 }}>{t('dashboard.quick_actions')}</span>
+-        <Button icon={<IconPlus />} type="primary" onClick={() => navigate('/accounts?action=import')}>{t('dashboard.import_account')}</Button>
+-        <Button icon={<IconUser />} onClick={() => navigate('/accounts')}>{t('dashboard.account_management')}</Button>
+-        <Button icon={<IconKey />} onClick={() => navigate('/keys')}>API Keys</Button>
+-        <Button icon={<IconLineChartStroked />} onClick={() => navigate('/usage')}>{t('dashboard.usage')}</Button>
+-        <Button icon={<IconSetting />} onClick={() => navigate('/settings-v2')}>{t('dashboard.system_settings')}</Button>
+-      </div>
+-
+       {core?.timeseriesAvailable ? (
+-        <div className="pool-chart-card" style={{ marginBottom: 18 }}>
++        <div className="pool-chart-card pool-dashboard-trend">
+           <div className="head"><div><div className="t">{t('dashboard.provider_model_trend')}</div><div className="s">{t('dashboard.provider_model_trend_desc')}</div></div></div>
+-          <div style={{ height: 280 }}>
++          <div className="pool-dashboard-trend__canvas">
+             {providerModelSeries.length && providerModelDescriptors.length
+-              ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height={280} />
+-              : <AreaChart buckets={buckets} height={280} />}
++              ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height={280} ariaLabel={t('dashboard.provider_model_trend')} />
++              : <AreaChart buckets={buckets} height={280} ariaLabel={t('dashboard.provider_model_trend')} />}
+           </div>
+         </div>
+       ) : null}
+ 
+       {(hasStatusDistribution || hasProviderDistribution || hasRegistrationTrend) ? (
+-        <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
+-          {hasStatusDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.account_distribution')}</div></div><Donut data={statusDonut} unit={t('dashboard.account_unit')} /></div> : null}
+-          {hasProviderDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.provider_distribution')}</div></div><Donut data={providerDonut} unit={t('dashboard.account_unit')} /></div> : null}
++        <div className="pool-grid cols-3 pool-dashboard-chart-grid">
++          {hasStatusDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.account_distribution')}</div></div><Donut data={statusDonut} unit={t('dashboard.account_unit')} ariaLabel={t('dashboard.account_distribution')} /></div> : null}
++          {hasProviderDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.provider_distribution')}</div></div><Donut data={providerDonut} unit={t('dashboard.account_unit')} ariaLabel={t('dashboard.provider_distribution')} /></div> : null}
+           {hasRegistrationTrend ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.registration_trend')}</div></div>
+-            <BarChart data={registrationDays} series={[{ key: 'success', name: t('dashboard.success'), color: C.green }, { key: 'failed', name: t('dashboard.failed'), color: C.red }]} stacked />
++            <BarChart ariaLabel={t('dashboard.registration_trend')} data={registrationDays} series={[{ key: 'success', name: t('dashboard.success'), color: C.green }, { key: 'failed', name: t('dashboard.failed'), color: C.red }]} stacked />
+           </div> : null}
+         </div>
+       ) : null}
+ 
+       {(officialCacheByModel.length || hasModelTokens || topAccounts.length) ? (
+-        <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
++        <div className="pool-grid cols-3 pool-dashboard-chart-grid">
+           {secondary?.cacheAvailable && officialCacheByModel.length ? <div className="pool-chart-card">
+             <div className="head"><div><div className="t">{t('dashboard.model_cache_rate')}</div><div className="s">{t('dashboard.model_cache_desc')}</div></div></div>
+             <div style={{ paddingTop: 6 }}><CacheBars data={officialCacheByModel} /></div>
+           </div> : null}
+-          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} /></div> : null}
++          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} ariaLabel={t('dashboard.model_token_share')} /></div> : null}
+           {topAccounts.length ? (
+             <div className="pool-chart-card">
+               <div className="head"><div><div className="t">{t('dashboard.top_accounts')}</div><div className="s">{t('dashboard.top_accounts_desc')}</div></div></div>
+-              <BarChart data={topAccounts} series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]} stacked />
++              <BarChart
++                ariaLabel={t('dashboard.top_accounts')}
++                data={topAccounts}
++                series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]}
++                tooltipLabelFormatter={(label: string, payload: any[]) => payload?.[0]?.payload?.fullLabel || label}
++                stacked
++              />
+             </div>
+           ) : null}
+         </div>
+diff --git a/web-spa/src/pages/EmailPool.tsx b/web-spa/src/pages/EmailPool.tsx
+index 9c195de..38e077b 100644
+--- a/web-spa/src/pages/EmailPool.tsx
++++ b/web-spa/src/pages/EmailPool.tsx
+@@ -1,29 +1,53 @@
+ // @ts-nocheck
+-import React, { useState, useCallback } from 'react';
++import React, { useCallback, useMemo, useState } from 'react';
+ import {
+-  Button, ConfirmDialog, Modal, Tag, Toast, Typography, Input,
++  Button, ConfirmDialog, Modal, Tag, Textarea, Toast, Typography, Input,
+ } from '../components/pool/index.jsx';
+ import { IconRefresh, IconPlus, IconSearch, IconDelete } from '../components/pool/icons.jsx';
+-import PageHeader from '../components/PageHeader.jsx';
+ import PageScaffold from '../components/PageScaffold.tsx';
++import ResourceTable from '../components/ResourceTable.jsx';
++import MobileResourceCell from '../components/MobileResourceCell.jsx';
++import {
++  ActionGroup, MetricRail, TextClamp,
++} from '../components/DisplayPrimitives.jsx';
+ import useAsyncAction from '../hooks/useAsyncAction.js';
+ import useAsyncResource from '../hooks/useAsyncResource.js';
+ import { showErrorToast } from '../components/ErrorToast.jsx';
++import { fmtDateTime } from '../lib/format.js';
++import { t } from '../lib/i18n.js';
+ import {
+   fetchEmailPool, importEmailAccounts, deleteEmailAccounts, testEmailAccount,
+ } from '../features/accounts/api/emailPool';
+ import type { EmailAccount } from '../features/accounts/api/emailPool';
+ 
+-const STATUS_COLORS: Record<string, string> = {
+-  idle: 'green',
+-  in_use: 'blue',
+-  used: 'gray',
+-  error: 'red',
++const PAGE_SIZE = 50;
++const STATUS_META: Record<string, { color: string; key: string }> = {
++  idle: { color: 'green', key: 'email_pool.status_idle' },
++  ready: { color: 'green', key: 'email_pool.status_ready' },
++  in_use: { color: 'blue', key: 'email_pool.status_in_use' },
++  used: { color: 'gray', key: 'email_pool.status_used' },
++  error: { color: 'red', key: 'email_pool.status_error' },
+ };
+ 
+ function StatusTag({ status }: { status: string }) {
+-  const color = STATUS_COLORS[status] || 'gray';
+-  return <Tag color={color}>{status}</Tag>;
++  const meta = STATUS_META[status] || { color: 'gray', key: '' };
++  return <Tag color={meta.color}>{meta.key ? t(meta.key) : (status || t('common.unknown'))}</Tag>;
++}
++
++function middleEllipsis(value: unknown, head = 22, tail = 14) {
++  const text = String(value ?? '');
++  if (text.length <= head + tail + 1) return text;
++  return `${text.slice(0, head)}…${text.slice(-tail)}`;
++}
++
++function countOf(counts: Record<string, number>, key: string) {
++  const value = Number(counts?.[key]);
++  return Number.isFinite(value) && value > 0 ? value : 0;
++}
++
++function shareDetail(value: number, total: number) {
++  if (!total) return t('email_pool.no_entries');
++  return t('email_pool.share').replace('{value}', `${Math.round((value / total) * 100)}%`);
+ }
+ 
+ export default function EmailPool() {
+@@ -36,14 +60,16 @@ export default function EmailPool() {
+   const [deleteRequest, setDeleteRequest] = useState<{ ids: string[]; label: string } | null>(null);
+ 
+   const loadData = useCallback(async ({ signal }: { signal?: AbortSignal } = {}) => {
+-    return fetchEmailPool({ page, pageSize: 50, search }, signal);
++    return fetchEmailPool({ page, pageSize: PAGE_SIZE, search }, signal);
+   }, [page, search]);
+-  const emptyData = { accounts: [], total: 0, page: 1, pageSize: 50, counts: {} };
+-  const { data = emptyData, reload: load, loading, error: loadError } = useAsyncResource(
+-    loadData,
+-    [page, search],
+-    { initialData: emptyData },
+-  );
++  const emptyData = { accounts: [], total: 0, page: 1, pageSize: PAGE_SIZE, counts: {} };
++  const {
++    data = emptyData,
++    reload: load,
++    loading,
++    error: loadError,
++    lastRefresh,
++  } = useAsyncResource(loadData, [page, search], { initialData: emptyData });
+   const accounts = data.accounts || [];
+   const total = data.total || 0;
+   const counts = data.counts || {};
+@@ -51,7 +77,10 @@ export default function EmailPool() {
+   const { run: doImport, running: importing } = useAsyncAction(async () => {
+     try {
+       const result = await importEmailAccounts({ text: importText });
+-      Toast.success(`Imported ${result.imported} email accounts`);
++      Toast.success(t('email_pool.imported').replace('{count}', String(result.imported)));
++      if (result.parse_errors?.length) {
++        Toast.warning(t('email_pool.import_partial').replace('{count}', String(result.parse_errors.length)));
++      }
+       setImportModalOpen(false);
+       setImportText('');
+       void load();
+@@ -65,7 +94,7 @@ export default function EmailPool() {
+     setDeleteRequest(null);
+     try {
+       await deleteEmailAccounts(ids);
+-      Toast.success(`Deleted ${ids.length} email account(s)`);
++      Toast.success(t('email_pool.deleted').replace('{count}', String(ids.length)));
+       setSelectedIds((current) => new Set([...current].filter((id) => !ids.includes(id))));
+       void load();
+     } catch (error) {
+@@ -73,11 +102,11 @@ export default function EmailPool() {
+     }
+   });
+ 
+-  const { run: doTest } = useAsyncAction(async (id: string) => {
++  const { run: doTest, running: testing } = useAsyncAction(async (id: string) => {
+     try {
+       const result = await testEmailAccount(id);
+-      if (result.ok) Toast.success(`Email ${result.email} is working`);
+-      else Toast.error(`Email test failed: ${result.error || 'unknown'}`);
++      if (result.ok) Toast.success(t('email_pool.test_ok').replace('{email}', result.email));
++      else Toast.error(t('email_pool.test_failed').replace('{error}', result.error || t('common.unknown')));
+       void load();
+     } catch (error) {
+       showErrorToast(error);
+@@ -89,139 +118,269 @@ export default function EmailPool() {
+     setSearch(searchInput.trim());
+   };
+ 
+-  const toggleSelect = useCallback((id: string) => {
+-    setSelectedIds((prev) => {
+-      const next = new Set(prev);
+-      if (next.has(id)) next.delete(id); else next.add(id);
++  const clearSearch = () => {
++    setSearchInput('');
++    setSearch('');
++    setPage(1);
++  };
++
++  const available = countOf(counts, 'idle') + countOf(counts, 'ready');
++  const inUse = countOf(counts, 'in_use');
++  const used = countOf(counts, 'used');
++  const failed = countOf(counts, 'error');
++  const metrics = [
++    { key: 'total', label: t('email_pool.total'), value: total, detail: t('email_pool.all_entries') },
++    { key: 'available', label: t('email_pool.available'), value: available, detail: shareDetail(available, total), tone: 'success' },
++    { key: 'in-use', label: t('email_pool.in_use'), value: inUse, detail: shareDetail(inUse, total), tone: 'info' },
++    { key: 'used', label: t('email_pool.used'), value: used, detail: shareDetail(used, total) },
++    { key: 'error', label: t('email_pool.error'), value: failed, detail: shareDetail(failed, total), tone: 'danger' },
++  ];
++
++  const selected = [...selectedIds];
++  const selectedOnPage = accounts.filter((account) => selectedIds.has(account.id)).length;
++  const allPageSelected = Boolean(accounts.length) && selectedOnPage === accounts.length;
++  const togglePageSelection = () => {
++    setSelectedIds((current) => {
++      const next = new Set(current);
++      if (allPageSelected) accounts.forEach((account) => next.delete(account.id));
++      else accounts.forEach((account) => next.add(account.id));
+       return next;
+     });
+-  }, []);
++  };
+ 
+-  return (
+-    <PageScaffold>
+-      <PageHeader
+-        title="Email Pool"
+-        description="Manage Outlook/Hotmail email accounts for ChatGPT registration"
+-        actions={
+-          <>
+-            <Button onClick={() => setImportModalOpen(true)}><IconPlus /> Import</Button>
+-            <Button onClick={load}><IconRefresh /></Button>
+-          </>
+-        }
+-      />
++  const renderActions = useCallback((account: EmailAccount) => (
++    <ActionGroup compact className="pool-email-row-actions">
++      <Button
++        size="small"
++        loading={testing}
++        aria-label={`${t('email_pool.test')} ${account.email}`}
++        onClick={() => void doTest(account.id)}
++      >
++        {t('email_pool.test')}
++      </Button>
++      <Button
++        size="small"
++        type="danger"
++        aria-label={`${t('common.delete')} ${account.email}`}
++        onClick={() => setDeleteRequest({ ids: [account.id], label: account.email })}
++      >
++        {t('common.delete')}
++      </Button>
++    </ActionGroup>
++  ), [doTest, testing]);
+ 
+-      {/* Stats bar */}
+-      <div style={{ display: 'flex', gap: 16, marginBottom: 16, flexWrap: 'wrap' }}>
+-        <div className="pool-stat-card"><Typography.Text type="tertiary" style={{ display: 'block' }}>Total</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{total}</Typography.Text></div>
+-        <div className="pool-stat-card" style={{ color: 'var(--pool-green)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>Idle</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.idle || 0}</Typography.Text></div>
+-        <div className="pool-stat-card" style={{ color: 'var(--pool-blue)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>In Use</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.in_use || 0}</Typography.Text></div>
+-        <div className="pool-stat-card" style={{ color: 'var(--pool-gray)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>Used</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.used || 0}</Typography.Text></div>
+-        <div className="pool-stat-card" style={{ color: 'var(--pool-red)' }}><Typography.Text type="tertiary" style={{ display: 'block' }}>Error</Typography.Text><Typography.Text strong style={{ display: 'block', fontSize: 20 }}>{counts.error || 0}</Typography.Text></div>
+-      </div>
+-
+-      {/* Search bar */}
+-      <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+-        <Input
+-          placeholder="Search email..."
+-          value={searchInput}
+-          onChange={setSearchInput}
+-          onEnterPress={applySearch}
+-          prefix={<IconSearch />}
+-          showClear
+-          onClear={() => { setSearch(''); setPage(1); }}
+-          style={{ maxWidth: 300 }}
+-        />
+-        <Button icon={<IconSearch />} onClick={applySearch}>Search</Button>
+-        {selectedIds.size > 0 && (
+-          <Button type="danger" onClick={() => setDeleteRequest({ ids: [...selectedIds], label: `${selectedIds.size} email account(s)` })}>
+-            <IconDelete /> Delete ({selectedIds.size})
+-          </Button>
+-        )}
+-      </div>
+-
+-      {/* Error state */}
+-      {loadError && (
+-        <div style={{ marginBottom: 16, padding: 12, background: 'var(--pool-bg-surface)', borderRadius: 8 }}>
+-          <Typography.Text type="danger">Failed to load: {loadError.message}</Typography.Text>
+-          <Button onClick={load} style={{ marginLeft: 8 }}>Retry</Button>
+-        </div>
+-      )}
++  const columns = useMemo(() => [
++    {
++      title: t('email_pool.email'),
++      dataIndex: 'email',
++      width: 310,
++      render: (value: string) => (
++        <TextClamp
++          strong
++          className="pool-mono pool-email-address"
++          title={value}
++          ariaLabel={value}
++        >
++          {value}
++        </TextClamp>
++      ),
++    },
++    {
++      title: t('email_pool.status'),
++      dataIndex: 'status',
++      width: 112,
++      render: (value: string) => <StatusTag status={value} />,
++    },
++    {
++      title: t('email_pool.group'),
++      dataIndex: 'group_name',
++      width: 168,
++      render: (value?: string) => <TextClamp title={value || undefined}>{value || t('email_pool.default_group')}</TextClamp>,
++    },
++    {
++      title: t('email_pool.last_error'),
++      dataIndex: 'error_message',
++      width: 240,
++      render: (value?: string) => <TextClamp title={value || undefined} muted={!value}>{value || '—'}</TextClamp>,
++    },
++    {
++      title: t('email_pool.last_used'),
++      dataIndex: 'last_used_at',
++      width: 170,
++      render: (value?: number) => value ? fmtDateTime(value) : t('email_pool.never_used'),
++    },
++    {
++      title: t('email_pool.actions'),
++      key: 'actions',
++      width: 156,
++      render: (_: unknown, account: EmailAccount) => renderActions(account),
++    },
++  ], [renderActions]);
+ 
+-      {/* Table */}
+-      {loading && !accounts.length ? (
+-        <Typography.Text>Loading...</Typography.Text>
+-      ) : (
+-        <table className="pool-table" style={{ width: '100%' }}>
+-          <thead>
+-            <tr>
+-              <th style={{ width: 40 }}><input type="checkbox" onChange={(e) => {
+-                if (e.target.checked) setSelectedIds(new Set(accounts.map(a => a.id)));
+-                else setSelectedIds(new Set());
+-              }} /></th>
+-              <th>Email</th>
+-              <th>Status</th>
+-              <th>Group</th>
+-              <th>Error</th>
+-              <th>Last Used</th>
+-              <th>Actions</th>
+-            </tr>
+-          </thead>
+-          <tbody>
+-            {accounts.map((a) => (
+-              <tr key={a.id}>
+-                <td><input type="checkbox" checked={selectedIds.has(a.id)} onChange={() => toggleSelect(a.id)} /></td>
+-                <td><Typography.Text className="pool-mono">{a.email}</Typography.Text></td>
+-                <td><StatusTag status={a.status} /></td>
+-                <td>{a.group_name || '-'}</td>
+-                <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+-                  {a.error_message || '-'}
+-                </td>
+-                <td>{a.last_used_at ? new Date(a.last_used_at * 1000).toLocaleDateString() : '-'}</td>
+-                <td>
+-                  <div style={{ display: 'flex', gap: 4 }}>
+-                    <Button size="small" onClick={() => doTest(a.id)}>Test</Button>
+-                    <Button size="small" type="danger" onClick={() => setDeleteRequest({ ids: [a.id], label: a.email })}>Delete</Button>
+-                  </div>
+-                </td>
+-              </tr>
+-            ))}
+-          </tbody>
+-        </table>
++  const mobileRenderer = useCallback((account: EmailAccount, meta: {
++    selected: boolean;
++    toggleSelected: (checked?: boolean) => void;
++  }) => (
++    <MobileResourceCell
++      selectable
++      selected={meta.selected}
++      onSelect={() => meta.toggleSelected(!meta.selected)}
++      title={(
++        <TextClamp
++          strong
++          className="pool-mono"
++          title={account.email}
++          ariaLabel={account.email}
++        >
++          {middleEllipsis(account.email)}
++        </TextClamp>
+       )}
++      subtitle={account.group_name || t('email_pool.default_group')}
++      badges={<StatusTag status={account.status} />}
++      details={[
++        {
++          label: t('email_pool.last_used'),
++          value: account.last_used_at ? fmtDateTime(account.last_used_at) : t('email_pool.never_used'),
++        },
++        account.error_message ? {
++          label: t('email_pool.last_error'),
++          value: <TextClamp title={account.error_message}>{middleEllipsis(account.error_message, 28, 12)}</TextClamp>,
++        } : null,
++      ].filter(Boolean)}
++      actions={renderActions(account)}
++    />
++  ), [renderActions]);
+ 
+-      {/* Pagination */}
+-      {total > 50 && (
+-        <div style={{ display: 'flex', justifyContent: 'center', gap: 8, marginTop: 16 }}>
+-          <Button disabled={page <= 1} onClick={() => setPage(p => p - 1)}>Prev</Button>
+-          <Typography.Text>Page {page} (Total: {total})</Typography.Text>
+-          <Button disabled={page * 50 >= total} onClick={() => setPage(p => p + 1)}>Next</Button>
++  return (
++    <PageScaffold
++      title={t('nav.email_pool')}
++      description={t('page.email_pool.desc')}
++      ready={Boolean(lastRefresh || loadError)}
++      actions={(
++        <>
++          <Button icon={<IconPlus />} theme="solid" onClick={() => setImportModalOpen(true)}>
++            {t('email_pool.import')}
++          </Button>
++          <Button
++            icon={<IconRefresh />}
++            aria-label={t('common.refresh')}
++            title={t('common.refresh')}
++            loading={loading && Boolean(lastRefresh)}
++            onClick={() => void load()}
++          >
++            {t('common.refresh')}
++          </Button>
++        </>
++      )}
++      filters={(
++        <div className="pool-email-toolbar">
++          <Input
++            aria-label={t('email_pool.search_placeholder')}
++            placeholder={t('email_pool.search_placeholder')}
++            value={searchInput}
++            onChange={setSearchInput}
++            onEnterPress={applySearch}
++            prefix={<IconSearch />}
++            showClear
++            onClear={clearSearch}
++            className="pool-email-search"
++          />
++          <Button icon={<IconSearch />} onClick={applySearch}>{t('common.search')}</Button>
++          <Button
++            theme="outline"
++            disabled={!accounts.length}
++            aria-pressed={allPageSelected}
++            onClick={togglePageSelection}
++          >
++            {allPageSelected ? t('email_pool.deselect_page') : t('email_pool.select_page')}
++          </Button>
++          {selected.length > 0 ? (
++            <Button
++              type="danger"
++              icon={<IconDelete />}
++              onClick={() => setDeleteRequest({
++                ids: selected,
++                label: t('email_pool.selected_count').replace('{count}', String(selected.length)),
++              })}
++            >
++              {t('email_pool.delete_selected').replace('{count}', String(selected.length))}
++            </Button>
++          ) : null}
+         </div>
+       )}
++      summary={<MetricRail items={metrics} className="pool-email-metrics" />}
++    >
++      <ResourceTable
++        error={loadError}
++        errorTitle={t('email_pool.load_failed')}
++        onRetry={load}
++        loading={loading}
++        lastRefresh={lastRefresh}
++        dataSource={accounts}
++        columns={columns}
++        rowKey="id"
++        pagination={{
++          pageSize: PAGE_SIZE,
++          total,
++          currentPage: page,
++          onPageChange: setPage,
++        }}
++        rowSelection={{
++          selectedRowKeys: selected,
++          onChange: (keys: string[]) => setSelectedIds(new Set(keys)),
++        }}
++        minScrollX={1156}
++        safeActionWidth={156}
++        density="regular"
++        rowHeight={68}
++        mobileRenderer={mobileRenderer}
++        mobileScroll={false}
++        mobileListLabel={t('email_pool.mobile_list')}
++        emptyTitle={t('email_pool.empty_title')}
++        emptyDesc={t('email_pool.empty_desc')}
++        emptyType="accounts"
++        emptyAction={<Button theme="solid" icon={<IconPlus />} onClick={() => setImportModalOpen(true)}>{t('email_pool.import')}</Button>}
++        skeletonRows={7}
++        skeletonCols={6}
++        className="pool-email-table"
++      />
+ 
+-      {/* Import Modal */}
+-      <Modal open={importModalOpen} onCancel={() => setImportModalOpen(false)} title="Import Email Accounts" footer={null}>
+-        <Typography.Text style={{ display: 'block', marginBottom: 8 }}>
+-          Paste email accounts, one per line:<br />
++      <Modal
++        open={importModalOpen}
++        onCancel={() => setImportModalOpen(false)}
++        title={t('email_pool.import_title')}
++        footer={null}
++      >
++        <Typography.Text className="pool-email-import-help">
++          {t('email_pool.import_help')}<br />
+           <code>email----password----client_id----refresh_token</code>
+         </Typography.Text>
+-        <textarea
++        <Textarea
+           rows={8}
+-          style={{ width: '100%', fontFamily: 'monospace', padding: 8, border: '1px solid var(--pool-border)', borderRadius: 4 }}
++          className="pool-email-import-textarea"
+           value={importText}
+-          onChange={(e) => setImportText(e.target.value)}
+-          placeholder={`user1@hotmail.com----password123----client-id----refresh_token\nuser2@outlook.com----password456----client-id----refresh_token`}
++          onChange={setImportText}
++          aria-label={t('email_pool.import_input')}
++          placeholder={`user1@sample.test----password----client-id----refresh-token\nuser2@sample.test----password----client-id----refresh-token`}
+         />
+-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+-          <Button theme="outline" onClick={() => setImportModalOpen(false)}>Cancel</Button>
+-          <Button theme="solid" onClick={doImport} disabled={!importText.trim() || importing}>Import</Button>
++        <div className="pool-email-modal-actions">
++          <Button theme="outline" onClick={() => setImportModalOpen(false)}>{t('common.cancel')}</Button>
++          <Button
++            theme="solid"
++            loading={importing}
++            disabled={!importText.trim() || importing}
++            onClick={() => void doImport()}
++          >
++            {t('email_pool.import')}
++          </Button>
+         </div>
+       </Modal>
+       <ConfirmDialog
+         open={Boolean(deleteRequest)}
+-        title={`Delete ${deleteRequest?.label || 'email account'}?`}
+-        description="Deleted email pool entries cannot be recovered."
+-        confirmText="Delete"
+-        cancelText="Cancel"
++        title={t('email_pool.delete_title').replace('{label}', deleteRequest?.label || t('email_pool.entry'))}
++        description={t('email_pool.delete_desc')}
++        confirmText={t('common.delete')}
++        cancelText={t('common.cancel')}
+         destructive
+         onCancel={() => { if (!deleting) setDeleteRequest(null); }}
+         onConfirm={() => { if (deleteRequest) void doDelete(deleteRequest.ids); }}
+diff --git a/web-spa/src/pages/ModelQuality.jsx b/web-spa/src/pages/ModelQuality.jsx
+index d417d1c..3687a01 100644
+--- a/web-spa/src/pages/ModelQuality.jsx
++++ b/web-spa/src/pages/ModelQuality.jsx
+@@ -1,9 +1,10 @@
+ import React, { useCallback, useMemo, useState } from 'react';
+ import { useNavigate } from 'react-router';
+-import { Button, Tag, Toast, Typography } from '../components/pool/index.jsx';
++import { Button, Drawer, Tag, Toast, Typography } from '../components/pool/index.jsx';
+ import { IconPlay, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
+ import { errMsg, get, post } from '../api.js';
+ import PageHeader, { Panel } from '../components/PageHeader.jsx';
++import MobileResourceCell from '../components/MobileResourceCell.jsx';
+ import ResourceTable from '../components/ResourceTable.jsx';
+ import StatCard from '../components/StatCard.jsx';
+ import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
+@@ -43,9 +44,39 @@ function answerSummary(row) {
+   return `${row.last_actual || '∅'} / ${row.last_expected || '∅'}`;
+ }
+ 
++function QualityStatusDetails({ row, threshold }) {
++  const details = [
++    ['分组', row.group_name || '默认分组'],
++    ['模型', <span className="pool-mono">{row.model || '—'}</span>],
++    ['提供方', row.provider ? <Tag>{row.provider}</Tag> : '—'],
++    ['智力状态', stateTag(row.state)],
++    ['最近结果', outcomeTag(row.last_outcome)],
++    ['连续异常', `${row.consecutive_anomalies || 0} / ${threshold}`],
++    ['答案 / 标准', <span className="pool-mono">{answerSummary(row)}</span>],
++    ['返回模型', row.last_returned_model ? <span className="pool-mono">{row.last_returned_model}</span> : '—'],
++    ['累计 Token', row.total_tokens ? fmtTokens(row.total_tokens) : '—'],
++    ['延迟', row.last_latency_ms ? `${row.last_latency_ms} ms` : '—'],
++    ['最近检测', row.last_probe_at ? <span title={fmtDateTime(row.last_probe_at)}>{fmtRelative(row.last_probe_at)}</span> : '从未'],
++  ];
++  return (
++    <div className="pool-task-detail">
++      <dl className="pool-task-detail__grid">
++        {details.map(([label, value]) => (
++          <div key={label}>
++            <dt>{label}</dt>
++            <dd>{value}</dd>
++          </div>
++        ))}
++      </dl>
++    </div>
++  );
++}
++
+ export default function ModelQuality() {
+   const navigate = useNavigate();
+   const [runningKey, setRunningKey] = useState('');
++  const [selectedStatus, setSelectedStatus] = useState(null);
++  const [statusPage, setStatusPage] = useState(1);
+   const fetchQuality = useCallback(async ({ signal }) => get('/admin/model-quality', { limit: 200 }, { signal }), []);
+   const {
+     data = {},
+@@ -126,6 +157,30 @@ export default function ModelQuality() {
+     { title: '错误', dataIndex: 'error_kind', width: 130, render: (v, r) => v ? <Typography.Text title={r.error_message || v}>{v}</Typography.Text> : '—' },
+   ];
+ 
++  const degradedThreshold = data?.degraded_threshold || 2;
++  const renderMobileStatus = (row) => (
++    <MobileResourceCell
++      title={<span className="pool-mono">{row.model || '—'}</span>}
++      subtitle={row.group_name || '默认分组'}
++      badges={stateTag(row.state)}
++      chips={row.provider ? <Tag>{row.provider}</Tag> : null}
++      details={[
++        { label: '最近结果', value: outcomeTag(row.last_outcome) },
++        { label: '连续异常', value: `${row.consecutive_anomalies || 0} / ${degradedThreshold}` },
++        { label: '最近检测', value: row.last_probe_at ? fmtRelative(row.last_probe_at) : '从未检测' },
++      ]}
++      actions={(
++        <Button
++          size="small"
++          aria-label={`查看 ${row.model || '模型'} 详情`}
++          onClick={() => setSelectedStatus(row)}
++        >
++          详情
++        </Button>
++      )}
++    />
++  );
++
+   const checked = statuses.length - (summary.unknown || 0);
+   return (
+     <div>
+@@ -154,12 +209,14 @@ export default function ModelQuality() {
+           dataSource={statuses}
+           columns={statusColumns}
+           rowKey={qualityKey}
+-          pagination={{ pageSize: 20 }}
++          pagination={{ pageSize: 20, currentPage: statusPage, onPageChange: setStatusPage }}
+           layout="fit"
+           emptyTitle="暂无可检测的分组模型"
+           emptyDesc="请先添加活跃账号及其模型能力；启用定时检测后会自动生成状态。"
+           skeletonRows={6}
+           skeletonCols={12}
++          mobileRenderer={renderMobileStatus}
++          mobileListLabel="分组模型状态"
+         />
+       </Panel>
+ 
+@@ -177,6 +234,28 @@ export default function ModelQuality() {
+           skeletonCols={10}
+         />
+       </Panel>
++
++      <Drawer
++        visible={Boolean(selectedStatus)}
++        onCancel={() => setSelectedStatus(null)}
++        title={`模型质量 · ${selectedStatus?.model || '详情'}`}
++        footer={selectedStatus ? (
++          <Button
++            theme="solid"
++            icon={<IconPlay />}
++            disabled={Boolean(runningKey) || Boolean(data?.running)}
++            onClick={() => {
++              const row = selectedStatus;
++              setSelectedStatus(null);
++              void runOne(row);
++            }}
++          >
++            立即检测
++          </Button>
++        ) : null}
++      >
++        {selectedStatus ? <QualityStatusDetails row={selectedStatus} threshold={degradedThreshold} /> : null}
++      </Drawer>
+     </div>
+   );
+ }
+diff --git a/web-spa/src/pages/Registration.tsx b/web-spa/src/pages/Registration.tsx
+index ac8a98e..8b6df57 100644
+--- a/web-spa/src/pages/Registration.tsx
++++ b/web-spa/src/pages/Registration.tsx
+@@ -61,6 +61,39 @@ function providerOptionLabel(option: RegistrationProviderOption): string {
+   return typeof option === 'string' ? option : option.label;
+ }
+ 
++export function RegistrationJobCard({ job, onOpen }: { job: RegistrationJob; onOpen: () => void }) {
++  const group = job.group_name || t('registration.default_group');
++  const egress = job.egress_id || t('registration.default_egress');
++  return (
++    <button
++      type="button"
++      className="pool-compact-record pool-registration-job-card"
++      onClick={onOpen}
++      aria-label={`${t('registration.drawer_title')} ${job.id || 'register-job'}`}
++    >
++      <span className="pool-compact-record__head">
++        <span className="pool-compact-record__identity">
++          <Clamp strong title={job.id || 'register-job'} ariaLabel={job.id || 'register-job'}>
++            {job.id || 'register-job'}
++          </Clamp>
++          <span className="pool-compact-record__chips">
++            <Tag size="small">{job.method || 'node'}</Tag>
++            {job.identity_mode ? <Tag size="small" color="blue">{job.identity_mode}</Tag> : null}
++          </span>
++        </span>
++        {jobTag(job.status)}
++      </span>
++      <Progress task={job} totalKey="total" successKey="succeeded" failedKey="failed" />
++      <span className="pool-compact-record__foot">
++        <span title={group}>{group}</span>
++        <span aria-hidden="true">·</span>
++        <span title={egress}>{egress}</span>
++        <span className="pool-compact-record__disclosure" aria-hidden="true">›</span>
++      </span>
++    </button>
++  );
++}
++
+ export default function Registration() {
+   const navigate = useNavigate();
+   const [detailJob, setDetailJob] = useState<RegistrationJob | null>(null);
+@@ -358,8 +391,12 @@ export default function Registration() {
+           skeletonRows={6}
+           skeletonCols={4}
+           onRow={(row: RegistrationJob) => ({ onClick: () => setDetailJob(row) })}
++          mobileRenderer={(row: RegistrationJob) => (
++            <RegistrationJobCard job={row} onOpen={() => setDetailJob(row)} />
++          )}
++          mobileListLabel={t('registration.jobs')}
+         />
+-        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} /> : null}
++        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} className="pool-registration-metrics" /> : null}
+       </div>
+       <DetailDrawer
+         task={detailJob}
+diff --git a/web-spa/src/pages/SettingsV2.tsx b/web-spa/src/pages/SettingsV2.tsx
+index d7cd43a..17df2a2 100644
+--- a/web-spa/src/pages/SettingsV2.tsx
++++ b/web-spa/src/pages/SettingsV2.tsx
+@@ -1,7 +1,7 @@
+ import React, { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
+ import { useLocation, useNavigate, useSearchParams } from 'react-router';
+ import * as PoolUI from '../components/pool/index.jsx';
+-import { IconSave, IconRefresh, IconSetting } from '../components/pool/icons.jsx';
++import { IconChevronDown, IconSave, IconRefresh, IconSearch, IconSetting } from '../components/pool/icons.jsx';
+ import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
+ import PageHeaderBase from '../components/PageHeader.jsx';
+ import SettingsTabShellBase from '../components/SettingsTabShell.jsx';
+@@ -80,6 +80,21 @@ function configCategories(fields: ConfigField[]): Record<string, ConfigField[]>
+   }, {});
+ }
+ 
++export function filterConfigCategories(fields: ConfigField[], query: string): Array<[string, ConfigField[]]> {
++  const normalized = query.trim().toLocaleLowerCase();
++  return Object.entries(configCategories(fields))
++    .map(([category, categoryFields]) => {
++      if (!normalized) return [category, categoryFields] as [string, ConfigField[]];
++      const visible = categoryFields.filter((field) => (
++        [category, field.label, field.help, field.key]
++          .filter(Boolean)
++          .some((value) => String(value).toLocaleLowerCase().includes(normalized))
++      ));
++      return [category, visible] as [string, ConfigField[]];
++    })
++    .filter(([, categoryFields]) => categoryFields.length > 0);
++}
++
+ function configSettingsErrors(fields: ConfigField[]) {
+   return Object.fromEntries(
+     fields
+@@ -88,6 +103,103 @@ function configSettingsErrors(fields: ConfigField[]) {
+   );
+ }
+ 
++export function SettingsCategorySection({
++  category,
++  fields,
++  pending,
++  onChange,
++  initialOpen = false,
++  forceOpen = false,
++}: {
++  category: string;
++  fields: ConfigField[];
++  pending: SettingsValues;
++  onChange: (key: string, value: unknown) => void;
++  initialOpen?: boolean;
++  forceOpen?: boolean;
++}) {
++  const panelId = React.useId();
++  const hasError = fields.some((field) => Boolean(field.settings_error));
++  const pendingCount = fields.filter((field) => hasPendingValue(pending, field.key)).length;
++  const restartCount = fields.filter((field) => field.effect === 'restart').length;
++  const [expanded, setExpanded] = useState(initialOpen || hasError);
++  const open = forceOpen || expanded;
++
++  useEffect(() => {
++    if (hasError) setExpanded(true);
++  }, [hasError]);
++
++  return (
++    <section className="pool-settings-category" data-expanded={open ? 'true' : 'false'}>
++      <button
++        type="button"
++        className="pool-settings-category__trigger"
++        aria-expanded={open}
++        aria-controls={panelId}
++        onClick={() => setExpanded((value) => !value)}
++      >
++        <span className="pool-settings-category__leading">
++          <span className="pool-settings-category__icon" aria-hidden="true"><IconChevronDown /></span>
++          <span className="pool-settings-category__copy">
++            <strong>{category}</strong>
++            <span>{t('settings.fields_count').replace('{count}', String(fields.length))}</span>
++          </span>
++        </span>
++        <span className="pool-settings-category__badges">
++          {pendingCount > 0 ? <Tag size="small" color="green">{t('settings.pending_count').replace('{count}', String(pendingCount))}</Tag> : null}
++          {hasError ? <Tag size="small" color="red">{t('settings.stored_error')}</Tag> : null}
++          {restartCount > 0 ? <Tag size="small" color="orange">{t('settings.restart_count').replace('{count}', String(restartCount))}</Tag> : null}
++        </span>
++      </button>
++      <div id={panelId} className="pool-settings-category__body" hidden={!open}>
++        {fields.map((field) => (
++          <ConfigFieldRow key={field.key} field={field} pending={pending} onChange={onChange} />
++        ))}
++      </div>
++    </section>
++  );
++}
++
++export function SettingsDisclosure({
++  title,
++  subtitle,
++  badge,
++  initialOpen = false,
++  children,
++}: {
++  title: ReactNode;
++  subtitle?: ReactNode;
++  badge?: ReactNode;
++  initialOpen?: boolean;
++  children: ReactNode;
++}) {
++  const panelId = React.useId();
++  const [expanded, setExpanded] = useState(initialOpen);
++  return (
++    <section className="pool-settings-category pool-settings-disclosure" data-expanded={expanded ? 'true' : 'false'}>
++      <button
++        type="button"
++        className="pool-settings-category__trigger"
++        aria-expanded={expanded}
++        aria-controls={panelId}
++        onClick={() => setExpanded((value) => !value)}
++      >
++        <span className="pool-settings-category__leading">
++          <span className="pool-settings-category__icon" aria-hidden="true"><IconChevronDown /></span>
++          <span className="pool-settings-category__copy">
++            <strong>{title}</strong>
++            {subtitle ? <span>{subtitle}</span> : null}
++          </span>
++        </span>
++        {badge ? <span className="pool-settings-category__badges">{badge}</span> : null}
++      </button>
++      <div id={panelId} className="pool-settings-category__body pool-settings-disclosure__body" hidden={!expanded}>
++        {children}
++      </div>
++    </section>
++  );
++}
++
+ function ConfigFieldRow({ field, pending, onChange }: { field: ConfigField; pending: SettingsValues; onChange: (key: string, value: unknown) => void }) {
+   const pendingValue = hasPendingValue(pending, field.key);
+   return (
+@@ -118,6 +230,7 @@ function ConfigTab() {
+   const [pending, setPending] = useState<SettingsValues>({});
+   const [diffs, setDiffs] = useState<SettingsDiff[] | null>(null);
+   const [prevSnapshot, setPrevSnapshot] = useState<{ oldSnap: SettingsValues; pending: SettingsValues } | null>(null);
++  const [query, setQuery] = useState('');
+ 
+   const {
+     data: fields = [],
+@@ -190,8 +303,9 @@ function ConfigTab() {
+   const undoing = undoMutation.isPending;
+   const applyingTemplate = templateMutation.isPending;
+ 
+-  const cats = useMemo(() => configCategories(fields), [fields]);
++  const visibleCategories = useMemo(() => filterConfigCategories(fields, query), [fields, query]);
+   const configErrors = useMemo(() => configSettingsErrors(fields), [fields]);
++  const searching = Boolean(query.trim());
+ 
+   return (
+     <SettingsTabShell
+@@ -206,28 +320,56 @@ function ConfigTab() {
+       onClearDiffs={() => setDiffs(null)}
+       settingsErrorTitle={t('settings.general_failed')}
+       settingsErrors={configErrors}
++      toolbarClassName="pool-settings-commandbar"
+       toolbar={
+         <>
+-          <Button icon={<IconRefresh />} onClick={refresh} disabled={saving || undoing || applyingTemplate}>{t('common.refresh')}</Button>
+-          <Button icon={<IconSetting />} loading={applyingTemplate} disabled={saving || undoing} onClick={applyOptimalTemplate}>
+-            {t('settings.apply_recommended')}
+-          </Button>
+-          <Button icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0 || applyingTemplate || undoing}>
+-            {t('settings.save_changes')} ({Object.keys(pending).length})
+-          </Button>
++          <Input
++            className="pool-settings-search"
++            value={query}
++            onChange={setQuery}
++            prefix={<IconSearch />}
++            showClear
++            onClear={() => setQuery('')}
++            aria-label={t('settings.search')}
++            placeholder={t('settings.search_placeholder')}
++          />
++          <div className="pool-settings-commandbar__actions">
++            <Button className="pool-settings-refresh-button" aria-label={t('common.refresh')} icon={<IconRefresh />} onClick={refresh} disabled={saving || undoing || applyingTemplate}>
++              {t('common.refresh')}
++            </Button>
++            <Button aria-label={t('settings.apply_recommended')} icon={<IconSetting />} loading={applyingTemplate} disabled={saving || undoing} onClick={applyOptimalTemplate}>
++              <span className="pool-settings-action-label--long">{t('settings.apply_recommended')}</span>
++              <span className="pool-settings-action-label--short">{t('settings.apply_recommended_short')}</span>
++            </Button>
++            <Button aria-label={`${t('settings.save_changes')} (${Object.keys(pending).length})`} icon={<IconSave />} theme="solid" loading={saving} onClick={save} disabled={Object.keys(pending).length === 0 || applyingTemplate || undoing}>
++              <span className="pool-settings-action-label--long">{t('settings.save_changes')}</span>
++              <span className="pool-settings-action-label--short">{t('settings.save_short')}</span>
++              {' '}({Object.keys(pending).length})
++            </Button>
++          </div>
+         </>
+       }
+     >
+-      {Object.entries(cats).length > 0 ? (
+-        Object.entries(cats).map(([cat, fs]) => (
+-          <Card key={cat} className="pool-card" title={cat} style={{ marginBottom: 16 }}>
+-            {fs.map((f) => (
+-              <ConfigFieldRow key={f.key} field={f} pending={pending} onChange={setVal} />
+-            ))}
+-          </Card>
+-        ))
++      {visibleCategories.length > 0 ? (
++        <div className="pool-settings-categories" aria-label={t('settings.sections')}>
++          {visibleCategories.map(([category, categoryFields], index) => (
++            <SettingsCategorySection
++              key={category}
++              category={category}
++              fields={categoryFields}
++              pending={pending}
++              onChange={setVal}
++              initialOpen={index === 0}
++              forceOpen={searching}
++            />
++          ))}
++        </div>
++      ) : fields.length > 0 ? (
++        <Card className="pool-card pool-settings-empty" title={t('settings.no_search_results')}>
++          <Typography.Text type="tertiary">{t('settings.no_search_results_desc').replace('{query}', query.trim())}</Typography.Text>
++        </Card>
+       ) : (
+-        <Card className="pool-card" title={t('settings.no_general')}>
++        <Card className="pool-card pool-settings-empty" title={t('settings.no_general')}>
+           <Typography.Text type="tertiary">{t('settings.no_general_desc')}</Typography.Text>
+         </Card>
+       )}
+@@ -673,6 +815,9 @@ function RegistrarTab() {
+   const extra: SettingsValues = {};
+   Object.keys(cfg).forEach((k) => { if (!KNOWN.includes(k)) extra[k] = cfg[k]; });
+   known.advancedJSON = Object.keys(extra).length ? JSON.stringify(extra, null, 2) : '';
++  const smsEnabled = SMS_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
++  const captchaEnabled = CAPTCHA_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
++  const mailboxEnabled = MAILBOX_PROVIDER_CARDS.filter((card) => known[`${card.key}_enabled`] === true).length;
+ 
+   return (
+     <SettingsTabShell
+@@ -689,71 +834,105 @@ function RegistrarTab() {
+     >
+       <Banner type="info" closeIcon={null} style={{ marginBottom: 12 }}
+         description="邮箱和接码配置会直接保存到注册流水线实际使用的 provider_settings；住宅代理区域需与手机号国家匹配。" />
+-      <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" style={{ display: 'flex', flexWrap: 'wrap', gap: '0 24px' }}>
+-        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
+-          {SMS_PROVIDER_CARDS.map((card) => (
+-            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+-              <Form.Switch field={`${card.key}_enabled`} label="启用" />
+-              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+-              <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} placeholder="接码平台密钥" />
+-              <Form.Input field={`${card.key}_service`} label="服务代码" style={{ width: 120 }} placeholder="dr" />
+-              {card.key === 'smspool' && <Form.Input field={`${card.key}_max_price`} label="最高单价" style={{ width: 120 }} placeholder="0.20" />}
+-            </Card>
+-          ))}
+-        </div>
+-        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>验证码求解器</Typography.Title>
+-        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
+-          {CAPTCHA_PROVIDER_CARDS.map((card) => (
+-            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+-              <Form.Switch field={`${card.key}_enabled`} label="启用" />
+-              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+-              <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} />
+-            </Card>
+-          ))}
+-        </div>
+-        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>Hotmail OTP（protocol_v2 / browser_v3）</Typography.Title>
+-        <Card title="Hotmail OTP Reader" className="pool-card" style={{ width: '100%' }} bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+-          <Form.Switch field="hotmail_otp_enabled" label="启用" />
+-          <Form.InputNumber field="hotmail_otp_priority" label="优先级" style={{ width: 120 }} min={0} max={1000} />
+-          <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }}
+-            placeholder={hotmailOTP?.config?.base_email_configured ? '已加密配置；留空保留' : 'account@outlook.com'} />
+-          <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }}
+-            placeholder={hotmailOTP?.config?.otp_url_configured ? '已加密配置；留空保留' : 'https://otp.example.com/read'} />
+-          <Form.Input field="hotmail_otp_auth_token" label="OTP Relay Token" mode="password" style={{ width: 260 }}
+-            placeholder={hotmailOTP?.config?.auth_token_configured ? '已加密配置；留空保留' : 'Bearer token'} />
+-        </Card>
+-        <Typography.Title heading={6} style={{ width: '100%', margin: '8px 0 0' }}>邮箱提供商</Typography.Title>
+-        <div style={{ width: '100%', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 12 }}>
+-          {MAILBOX_PROVIDER_CARDS.map((card) => (
+-            <Card key={card.key} title={card.name} className="pool-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
+-              <Typography.Text type="tertiary" size="small" style={{ width: '100%', marginBottom: 8 }}>{card.description}</Typography.Text>
+-              <Form.Switch field={`${card.key}_enabled`} label="启用" />
+-              <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
+-              {card.key === 'cloudflare' && <>
+-                <Form.Input field="cloudflare_api_url" label="Worker API URL" style={{ width: 280 }} placeholder="https://mail.example.com" />
+-                <Form.Input field="cloudflare_domain" label="邮箱域名" style={{ width: 220 }} placeholder="example.com" />
+-                <Form.Input field="cloudflare_admin_token" label="Admin Token（可选）" mode="password" style={{ width: 260 }} />
+-              </>}
+-              {card.key === 'imap' && <>
+-                <Form.Input field="imap_host" label="IMAP Host" style={{ width: 220 }} placeholder="imap.gmail.com" />
+-                <Form.InputNumber field="imap_port" label="端口" style={{ width: 120 }} min={1} max={65535} />
+-                <Form.Input field="imap_email" label="邮箱地址" style={{ width: 260 }} />
+-                <Form.Input field="imap_password" label="密码 / App Password" mode="password" style={{ width: 260 }} />
+-                <Form.Switch field="imap_tls" label="TLS" />
+-              </>}
+-            </Card>
+-          ))}
+-        </div>
+-        <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
+-        <Form.Input field="proxyHost" label="住宅代理 Host" style={{ width: 220 }} placeholder="us2.cliproxy.io" />
+-        <Form.Input field="proxyPort" label="代理端口" style={{ width: 120 }} placeholder="3010" />
+-        <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }} placeholder="...-region-BR-sid-xxxx-t-5" />
+-        <Form.Input field="proxyPassword" label="代理密码" mode="password" style={{ width: 220 }} />
+-        <Form.TextArea field="advancedJSON" label="高级：其它键 (JSON)" style={{ width: '100%' }} autosize
+-          placeholder='{ "heroSmsCountryTopN": 10 }' />
+-        <div style={{ width: '100%', marginTop: 8 }}>
++      <Form key={settingsFormKey('registrar', known)} onSubmit={save} initValues={known} labelPosition="top" className="pool-registrar-form">
++        <SettingsDisclosure
++          title="接码平台"
++          subtitle={`已启用 ${smsEnabled} / ${SMS_PROVIDER_CARDS.length}`}
++          badge={<Tag size="small">{SMS_PROVIDER_CARDS.length} 个提供商</Tag>}
++        >
++          <div className="pool-registrar-card-grid">
++            {SMS_PROVIDER_CARDS.map((card) => (
++              <Card key={card.key} title={card.name} className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
++                <Form.Switch field={`${card.key}_enabled`} label="启用" />
++                <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
++                <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} placeholder="接码平台密钥" />
++                <Form.Input field={`${card.key}_service`} label="服务代码" style={{ width: 120 }} placeholder="dr" />
++                {card.key === 'smspool' && <Form.Input field={`${card.key}_max_price`} label="最高单价" style={{ width: 120 }} placeholder="0.20" />}
++              </Card>
++            ))}
++          </div>
++        </SettingsDisclosure>
++
++        <SettingsDisclosure
++          title="验证码求解器"
++          subtitle={`已启用 ${captchaEnabled} / ${CAPTCHA_PROVIDER_CARDS.length}`}
++          badge={<Tag size="small">{CAPTCHA_PROVIDER_CARDS.length} 个提供商</Tag>}
++        >
++          <div className="pool-registrar-card-grid">
++            {CAPTCHA_PROVIDER_CARDS.map((card) => (
++              <Card key={card.key} title={card.name} className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
++                <Form.Switch field={`${card.key}_enabled`} label="启用" />
++                <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
++                <Form.Input field={`${card.key}_api_key`} label="API Key" mode="password" style={{ width: 260 }} />
++              </Card>
++            ))}
++          </div>
++        </SettingsDisclosure>
++
++        <SettingsDisclosure
++          title="Hotmail OTP"
++          subtitle="protocol_v2 / browser_v3 邮箱验证码"
++          badge={<Tag size="small" color={known.hotmail_otp_enabled === true ? 'green' : undefined}>{known.hotmail_otp_enabled === true ? '已启用' : '已停用'}</Tag>}
++        >
++          <Card title="Hotmail OTP Reader" className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
++            <Form.Switch field="hotmail_otp_enabled" label="启用" />
++            <Form.InputNumber field="hotmail_otp_priority" label="优先级" style={{ width: 120 }} min={0} max={1000} />
++            <Form.Input field="hotmail_base_email" label="基础邮箱" style={{ width: 260 }}
++              placeholder={hotmailOTP?.config?.base_email_configured ? '已加密配置；留空保留' : 'account@outlook.com'} />
++            <Form.Input field="hotmail_otp_url" label="OTP Reader URL" style={{ width: 360 }}
++              placeholder={hotmailOTP?.config?.otp_url_configured ? '已加密配置；留空保留' : 'https://otp.example.com/read'} />
++            <Form.Input field="hotmail_otp_auth_token" label="OTP Relay Token" mode="password" style={{ width: 260 }}
++              placeholder={hotmailOTP?.config?.auth_token_configured ? '已加密配置；留空保留' : 'Bearer token'} />
++          </Card>
++        </SettingsDisclosure>
++
++        <SettingsDisclosure
++          title="邮箱提供商"
++          subtitle={`已启用 ${mailboxEnabled} / ${MAILBOX_PROVIDER_CARDS.length}`}
++          badge={<Tag size="small">{MAILBOX_PROVIDER_CARDS.length} 个提供商</Tag>}
++        >
++          <div className="pool-registrar-card-grid">
++            {MAILBOX_PROVIDER_CARDS.map((card) => (
++              <Card key={card.key} title={card.name} className="pool-card pool-registrar-provider-card" bodyStyle={{ display: 'flex', flexWrap: 'wrap', gap: '0 12px' }}>
++                <Typography.Text type="tertiary" size="small" style={{ width: '100%', marginBottom: 8 }}>{card.description}</Typography.Text>
++                <Form.Switch field={`${card.key}_enabled`} label="启用" />
++                <Form.InputNumber field={`${card.key}_priority`} label="优先级" style={{ width: 120 }} min={0} max={1000} />
++                {card.key === 'cloudflare' && <>
++                  <Form.Input field="cloudflare_api_url" label="Worker API URL" style={{ width: 280 }} placeholder="https://mail.example.com" />
++                  <Form.Input field="cloudflare_domain" label="邮箱域名" style={{ width: 220 }} placeholder="example.com" />
++                  <Form.Input field="cloudflare_admin_token" label="Admin Token（可选）" mode="password" style={{ width: 260 }} />
++                </>}
++                {card.key === 'imap' && <>
++                  <Form.Input field="imap_host" label="IMAP Host" style={{ width: 220 }} placeholder="imap.gmail.com" />
++                  <Form.InputNumber field="imap_port" label="端口" style={{ width: 120 }} min={1} max={65535} />
++                  <Form.Input field="imap_email" label="邮箱地址" style={{ width: 260 }} />
++                  <Form.Input field="imap_password" label="密码 / App Password" mode="password" style={{ width: 260 }} />
++                  <Form.Switch field="imap_tls" label="TLS" />
++                </>}
++              </Card>
++            ))}
++          </div>
++        </SettingsDisclosure>
++
++        <SettingsDisclosure
++          title="住宅代理与高级选项"
++          subtitle="国家匹配、代理凭据与扩展 JSON"
++          badge={<Tag size="small" color="orange">敏感配置</Tag>}
++        >
++          <div className="pool-registrar-fields">
++            <Form.Input field="phoneCountryCode" label="手机号国家码" style={{ width: 140 }} placeholder="BR" />
++            <Form.Input field="proxyHost" label="住宅代理 Host" style={{ width: 220 }} placeholder="us2.cliproxy.io" />
++            <Form.Input field="proxyPort" label="代理端口" style={{ width: 120 }} placeholder="3010" />
++            <Form.Input field="proxyUsername" label="代理用户名" style={{ width: 320 }} placeholder="...-region-BR-sid-xxxx-t-5" />
++            <Form.Input field="proxyPassword" label="代理密码" mode="password" style={{ width: 220 }} />
++            <Form.TextArea field="advancedJSON" label="高级：其它键 (JSON)" className="pool-registrar-advanced" style={{ width: '100%' }} autosize
++              placeholder='{ "heroSmsCountryTopN": 10 }' />
++          </div>
++        </SettingsDisclosure>
++
++        <div className="pool-registrar-actions">
+           <Button htmlType="submit" theme="solid" icon={<IconSave />} loading={saving}>保存凭据</Button>
+-          <Button style={{ marginLeft: 8 }} onClick={load}>重新加载</Button>
++          <Button onClick={load}>重新加载</Button>
+         </div>
+       </Form>
+     </SettingsTabShell>
+diff --git a/web-spa/src/pages/System.tsx b/web-spa/src/pages/System.tsx
+index 7a7ea98..6f58f1c 100644
+--- a/web-spa/src/pages/System.tsx
++++ b/web-spa/src/pages/System.tsx
+@@ -12,7 +12,7 @@ import { t } from '../lib/i18n.js';
+ import { useSystemMetricsData } from '../features/observability/queries/system';
+ import type { SupervisorEvent, SupervisorModule, SystemProcess } from '../features/observability/model/system';
+ 
+-const { Tag, Button, Typography, Banner } = PoolUI as any;
++const { Tag, Button, Typography, Banner, Drawer } = PoolUI as any;
+ const ErrorBanner = LoadErrorBanner as any;
+ const DataTable = ResourceTable as any;
+ const MetricCard = StatCard as any;
+@@ -30,8 +30,57 @@ const moduleStateLabel = (state: unknown) => {
+ };
+ const fmtModuleRuntime = (_: unknown, row: SupervisorModule) => fmtMillis(row.status === 'running' ? row.uptime_millis : (row.last_uptime_millis || row.uptime_millis));
+ 
++type CompactStat = [label: string, value: React.ReactNode];
++type SystemDetail = {
++  title: string;
++  badge?: React.ReactNode;
++  rows: CompactStat[];
++};
++
++export function CompactSystemRecord({
++  title,
++  titleLabel,
++  badge,
++  subtitle,
++  stats,
++  note,
++  onOpen,
++}: {
++  title: React.ReactNode;
++  titleLabel: string;
++  badge?: React.ReactNode;
++  subtitle?: React.ReactNode;
++  stats: CompactStat[];
++  note?: React.ReactNode;
++  onOpen: () => void;
++}) {
++  return (
++    <button type="button" className="pool-compact-record pool-system-record" onClick={onOpen} aria-label={titleLabel}>
++      <span className="pool-compact-record__head">
++        <span className="pool-system-record__title" title={titleLabel}>{title}</span>
++        {badge}
++      </span>
++      {subtitle ? <span className="pool-system-record__subtitle">{subtitle}</span> : null}
++      <span className="pool-system-record__stats">
++        {stats.map(([label, value]) => (
++          <span key={label}>
++            <small>{label}</small>
++            <strong>{value ?? '—'}</strong>
++          </span>
++        ))}
++      </span>
++      {note ? <span className="pool-system-record__note">{note}</span> : null}
++      <span className="pool-compact-record__disclosure pool-system-record__disclosure" aria-hidden="true">›</span>
++    </button>
++  );
++}
++
+ export default function System() {
+   const { data: system, loading, error, lastRefresh, reload } = useSystemMetricsData();
++  const [detail, setDetail] = React.useState<SystemDetail | null>(null);
++  const [modulePage, setModulePage] = React.useState(1);
++  const [eventPage, setEventPage] = React.useState(1);
++  const [processPage, setProcessPage] = React.useState(1);
+ 
+   if (error && !lastRefresh && !loading) {
+     return (
+@@ -68,6 +117,59 @@ export default function System() {
+     key: module.name || `${module.status || 'module'}-${module.last_event_unix || 0}-${index}`,
+   }));
+   const processes = registration.procs || [];
++  const modulePagination = modules.length > 8 ? { pageSize: 8, currentPage: modulePage, onPageChange: setModulePage } : false;
++  const eventPagination = events.length > 8 ? { pageSize: 8, currentPage: eventPage, onPageChange: setEventPage } : false;
++  const processPagination = processes.length > 12 ? { pageSize: 12, currentPage: processPage, onPageChange: setProcessPage } : false;
++
++  const openModule = (row: SupervisorModule) => {
++    const name = row.name || t('common.unknown');
++    setDetail({
++      title: `${t('system.module')} · ${name}`,
++      badge: <Tag color={moduleColor[row.status || ''] || 'grey'}>{moduleStateLabel(row.status)}</Tag>,
++      rows: [
++        [t('system.module'), name],
++        [t('system.status'), moduleStateLabel(row.status)],
++        [t('system.restarts'), fmtInt(row.restart_count)],
++        ['panic', fmtInt(row.panic_count)],
++        [t('system.unexpected_exits'), fmtInt(row.unexpected_exit_count)],
++        [t('system.current_previous'), fmtModuleRuntime(null, row)],
++        [t('system.backoff'), fmtMillis(row.restart_backoff_millis)],
++        [t('system.next_retry'), fmtDateTime(row.next_restart_unix)],
++        [t('system.recent_status'), row.last_panic ? `${row.last_message || 'panic'}: ${row.last_panic}` : (row.last_message || '—')],
++      ],
++    });
++  };
++
++  const openEvent = (row: SupervisorEvent) => {
++    const type = row.type || 'event';
++    const message = row.panic ? `${row.message || 'panic'}: ${row.panic}` : (row.message || '—');
++    setDetail({
++      title: `${t('system.module_events')} · ${row.module || type}`,
++      badge: <Tag color={eventColor[type] || 'grey'}>{type}</Tag>,
++      rows: [
++        [t('system.time'), fmtDateTime(row.time_unix)],
++        [t('system.module'), row.module || '—'],
++        [t('system.kind'), type],
++        [t('system.description'), message],
++        [t('system.runtime'), fmtMillis(row.uptime_millis)],
++        [t('system.backoff'), fmtMillis(row.backoff_millis)],
++      ],
++    });
++  };
++
++  const openProcess = (row: SystemProcess) => {
++    const processName = row.comm || t('common.unknown');
++    setDetail({
++      title: `${t('system.process')} · ${processName}`,
++      badge: <Tag color={kindColor[row.kind || ''] || 'grey'}>{row.kind || 'other'}</Tag>,
++      rows: [
++        [t('system.pid'), row.pid],
++        [t('system.process'), processName],
++        [t('system.kind'), row.kind || 'other'],
++        [t('system.rss'), fmtKB(row.rss_kb)],
++      ],
++    });
++  };
+ 
+   const processColumns: any[] = [
+     { title: t('system.pid'), dataIndex: 'pid', width: 90, render: (value: number | string) => <span className="pool-mono">{value}</span> },
+@@ -102,7 +204,7 @@ export default function System() {
+ 
+       <ErrorBanner error={error} onRetry={reload} />
+ 
+-      <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
++      <div className="pool-stat-grid pool-system-stat-grid" style={{ marginBottom: 18 }}>
+         <MetricCard label={t('system.cpu_usage')} value={`${cpu.usage_pct ?? '—'}%`} color={meterColor(cpu.usage_pct || 0)} sub={`${cpu.cores || 0} ${t('system.cores')} · ${t('system.load')} ${cpu.load1 ?? '—'}`} />
+         <MetricCard label={t('system.memory_usage')} value={`${memory.used_pct ?? '—'}%`} color={meterColor(memory.used_pct || 0)} sub={`${fmtKB(memory.used_kb)} / ${fmtKB(memory.total_kb)}`} />
+         <MetricCard label={t('system.disk_usage')} value={`${disk.used_pct ?? '—'}%`} color={meterColor(disk.used_pct || 0)} sub={`${fmtBytes(disk.used_bytes)} / ${fmtBytes(disk.total_bytes)}`} />
+@@ -125,10 +227,29 @@ export default function System() {
+           columns={moduleColumns}
+           rowKey="key"
+           size="small"
+-          pagination={modules.length > 8 ? { pageSize: 8 } : false}
++          pagination={modulePagination}
+           emptyTitle={t('system.no_modules')}
+           skeletonRows={6}
+           skeletonCols={9}
++          mobileListLabel={t('system.module_health')}
++          mobileRenderer={(row: SupervisorModule) => {
++            const name = row.name || t('common.unknown');
++            const message = row.last_panic ? `${row.last_message || 'panic'}: ${row.last_panic}` : (row.last_message || '—');
++            return (
++              <CompactSystemRecord
++                title={<span className="pool-mono">{name}</span>}
++                titleLabel={`${t('system.module')} ${name}`}
++                badge={<Tag color={moduleColor[row.status || ''] || 'grey'}>{moduleStateLabel(row.status)}</Tag>}
++                stats={[
++                  [t('system.restarts'), fmtInt(row.restart_count)],
++                  ['panic', fmtInt(row.panic_count)],
++                  [t('system.unexpected_exits'), fmtInt(row.unexpected_exit_count)],
++                ]}
++                note={`${fmtModuleRuntime(null, row)} · ${message}`}
++                onOpen={() => openModule(row)}
++              />
++            );
++          }}
+         />
+       </Section>
+ 
+@@ -142,10 +263,29 @@ export default function System() {
+           columns={eventColumns}
+           rowKey="key"
+           size="small"
+-          pagination={events.length > 8 ? { pageSize: 8 } : false}
++          pagination={eventPagination}
+           emptyTitle={t('system.no_events')}
+           skeletonRows={6}
+           skeletonCols={6}
++          mobileListLabel={t('system.module_events')}
++          mobileRenderer={(row: SupervisorEvent) => {
++            const type = row.type || 'event';
++            const message = row.panic ? `${row.message || 'panic'}: ${row.panic}` : (row.message || '—');
++            return (
++              <CompactSystemRecord
++                title={<span className="pool-mono">{row.module || t('common.unknown')}</span>}
++                titleLabel={`${t('system.module_events')} ${row.module || type}`}
++                badge={<Tag color={eventColor[type] || 'grey'}>{type}</Tag>}
++                subtitle={fmtDateTime(row.time_unix)}
++                stats={[
++                  [t('system.runtime'), fmtMillis(row.uptime_millis)],
++                  [t('system.backoff'), fmtMillis(row.backoff_millis)],
++                ]}
++                note={message}
++                onOpen={() => openEvent(row)}
++              />
++            );
++          }}
+         />
+       </Section>
+ 
+@@ -159,12 +299,44 @@ export default function System() {
+           columns={processColumns}
+           rowKey="pid"
+           size="small"
+-          pagination={processes.length > 12 ? { pageSize: 12 } : false}
++          pagination={processPagination}
+           emptyTitle={t('system.no_processes')}
+           skeletonRows={6}
+           skeletonCols={4}
++          mobileListLabel={t('system.processes')}
++          mobileRenderer={(row: SystemProcess) => (
++            <CompactSystemRecord
++              title={<span className="pool-mono">{row.comm || t('common.unknown')}</span>}
++              titleLabel={`${t('system.process')} ${row.comm || row.pid}`}
++              badge={<Tag color={kindColor[row.kind || ''] || 'grey'}>{row.kind || 'other'}</Tag>}
++              subtitle={`${t('system.pid')} ${row.pid}`}
++              stats={[[t('system.rss'), fmtKB(row.rss_kb)]]}
++              onOpen={() => openProcess(row)}
++            />
++          )}
+         />
+       </Section>
++
++      <Drawer
++        visible={Boolean(detail)}
++        onCancel={() => setDetail(null)}
++        title={detail?.title || t('system.recent_status')}
++        width={560}
++      >
++        {detail ? (
++          <div className="pool-system-detail">
++            {detail.badge ? <div className="pool-system-detail__badge">{detail.badge}</div> : null}
++            <dl className="pool-system-detail__grid">
++              {detail.rows.map(([label, value]) => (
++                <div key={label}>
++                  <dt>{label}</dt>
++                  <dd>{value ?? '—'}</dd>
++                </div>
++              ))}
++            </dl>
++          </div>
++        ) : null}
++      </Drawer>
+     </div>
+   );
+ }
+diff --git a/web-spa/src/styles/components.css b/web-spa/src/styles/components.css
+index ac52bc6..c4a544e 100644
+--- a/web-spa/src/styles/components.css
++++ b/web-spa/src/styles/components.css
+@@ -318,6 +318,16 @@
+   gap: 12px;
+ }
+ 
++.pool-system-stat-grid {
++  grid-template-columns: repeat(4, minmax(0, 1fr));
++}
++
++@media (max-width: 900px) {
++  .pool-system-stat-grid {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++}
++
+ .pool-grid.cols-2 {
+   grid-template-columns: repeat(2, minmax(0, 1fr));
+ }
+@@ -1653,6 +1663,205 @@
+   padding-top: 2px;
+ }
+ 
++.pool-compact-record {
++  width: 100%;
++  min-width: 0;
++  display: grid;
++  gap: 11px;
++  padding: 14px;
++  border: 0;
++  border-radius: inherit;
++  background: transparent;
++  color: var(--pool-text);
++  font: inherit;
++  text-align: left;
++  cursor: pointer;
++  transition:
++    background-color var(--pool-motion-fast) var(--pool-motion-ease),
++    transform var(--pool-motion-fast) var(--pool-motion-ease);
++}
++
++.pool-compact-record:hover {
++  background: var(--pool-bg-hover);
++}
++
++.pool-compact-record:active {
++  transform: scale(0.995);
++}
++
++.pool-compact-record:focus-visible {
++  outline: 2px solid var(--pool-accent);
++  outline-offset: -3px;
++}
++
++.pool-compact-record__head,
++.pool-compact-record__identity,
++.pool-compact-record__chips,
++.pool-compact-record__foot {
++  min-width: 0;
++  display: flex;
++  align-items: center;
++}
++
++.pool-compact-record__head {
++  justify-content: space-between;
++  gap: 10px;
++}
++
++.pool-compact-record__head > .pool-tag,
++.pool-compact-record__chips > .pool-tag {
++  flex: 0 0 auto;
++  white-space: nowrap;
++}
++
++.pool-compact-record__identity {
++  gap: 7px;
++  overflow: hidden;
++}
++
++.pool-compact-record__identity > .pool-text-clamp {
++  flex: 1 1 auto;
++}
++
++.pool-compact-record__chips {
++  flex: 0 0 auto;
++  gap: 5px;
++}
++
++.pool-compact-record__foot {
++  gap: 6px;
++  color: var(--pool-text-3);
++  font-size: 12px;
++}
++
++.pool-compact-record__foot > span:not(.pool-compact-record__disclosure) {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-compact-record__disclosure {
++  margin-left: auto;
++  color: var(--pool-text-3);
++  font-size: 19px;
++  line-height: 1;
++}
++
++.pool-registration-job-card .pool-task-progress {
++  gap: 6px;
++}
++
++.pool-registration-metrics .pool-metric-card {
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-lg);
++  background: var(--pool-bg-surface);
++}
++
++.pool-system-record {
++  position: relative;
++  gap: 9px;
++  padding-right: 34px;
++}
++
++.pool-system-record__title {
++  min-width: 0;
++  overflow: hidden;
++  font-weight: 680;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__subtitle,
++.pool-system-record__note {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--pool-text-3);
++  font-size: 12px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__stats {
++  display: grid;
++  grid-template-columns: repeat(3, minmax(0, 1fr));
++  gap: 7px;
++}
++
++.pool-system-record__stats > span {
++  min-width: 0;
++  display: grid;
++  gap: 2px;
++  padding: 7px 8px;
++  border-radius: var(--pool-radius-sm);
++  background: var(--pool-bg-surface-2);
++}
++
++.pool-system-record__stats small {
++  overflow: hidden;
++  color: var(--pool-text-3);
++  font-size: 10.5px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__stats strong {
++  overflow: hidden;
++  font-size: 13px;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__disclosure {
++  position: absolute;
++  right: 13px;
++  top: 50%;
++  transform: translateY(-50%);
++}
++
++.pool-system-detail {
++  display: grid;
++  gap: 14px;
++}
++
++.pool-system-detail__badge {
++  display: flex;
++  justify-content: flex-start;
++}
++
++.pool-system-detail__grid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 1px;
++  margin: 0;
++  overflow: hidden;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-lg);
++  background: var(--pool-border);
++}
++
++.pool-system-detail__grid > div {
++  min-width: 0;
++  display: grid;
++  gap: 5px;
++  padding: 12px 14px;
++  background: var(--pool-bg-surface);
++}
++
++.pool-system-detail__grid dt {
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-system-detail__grid dd {
++  min-width: 0;
++  margin: 0;
++  overflow-wrap: anywhere;
++  color: var(--pool-text);
++  font-size: 13px;
++}
++
+ .pool-service-health-strip {
+   display: flex;
+   align-items: center;
+@@ -2685,103 +2894,283 @@
+   font-size: 12px;
+ }
+ 
+-.pool-mobile-row__subtitle {
+-  display: block;
+-  margin-top: 3px;
+-  overflow: hidden;
+-  text-overflow: ellipsis;
+-  white-space: nowrap;
++.pool-email-metrics {
++  grid-template-columns: repeat(5, minmax(0, 1fr));
++  gap: 10px;
+ }
+ 
+-.pool-mobile-row__details {
+-  display: flex;
+-  align-items: center;
+-  gap: 6px;
+-  flex-wrap: wrap;
+-  margin-top: 8px;
++.pool-email-metrics .pool-metric-card {
++  align-items: start;
++  display: grid;
++  min-height: 88px;
++  padding: 14px 16px;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-lg);
++  background:
++    linear-gradient(145deg, color-mix(in srgb, var(--pool-bg-surface) 96%, white 4%), var(--pool-bg-surface));
++  box-shadow: var(--pool-shadow-sm);
+ }
+ 
+-.pool-mobile-row__detail {
+-  min-width: 0;
++.pool-email-metrics .pool-metric-card strong {
++  color: var(--pool-text);
++  font-size: 24px;
++  line-height: 1;
++  letter-spacing: -0.035em;
+ }
+ 
+-.pool-mobile-row__label {
+-  display: none;
++.pool-email-metrics .pool-metric-card--success strong {
++  color: var(--pool-success);
+ }
+ 
+-.pool-mobile-row__value {
+-  max-width: 100%;
+-  color: var(--pool-text-2);
+-  font-size: 12px;
++.pool-email-metrics .pool-metric-card--info strong {
++  color: var(--pool-info);
+ }
+ 
+-.pool-mobile-row__actions {
+-  display: inline-flex;
+-  align-items: center;
+-  justify-content: flex-end;
++.pool-email-metrics .pool-metric-card--danger strong {
++  color: var(--pool-danger);
+ }
+ 
+-.pool-mobile-row__actions .pool-button {
+-  min-width: var(--pool-hit-target);
+-  min-height: var(--pool-hit-target);
++.pool-email-toolbar {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  min-width: 0;
++  padding: 10px;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-xl);
++  background: color-mix(in srgb, var(--pool-bg-surface) 94%, transparent);
++  box-shadow: var(--pool-shadow-sm);
+ }
+ 
+-.pool-diagnostic-card {
+-  display: grid;
+-  gap: 10px;
+-  padding: 14px;
++.pool-email-search {
++  width: min(360px, 40vw);
+ }
+ 
+-.pool-diagnostic-card__title {
+-  min-width: 0;
++.pool-email-address {
++  display: block;
++  width: 100%;
++  max-width: 100%;
+   overflow: hidden;
+-  font-weight: 700;
+   text-overflow: ellipsis;
+   white-space: nowrap;
++  overflow-wrap: normal;
+ }
+ 
+-.pool-diagnostic-card__grid {
+-  display: grid;
+-  grid-template-columns: repeat(2, minmax(0, 1fr));
+-  gap: 8px;
+-}
+-
+-.pool-diagnostic-card__item {
+-  min-width: 0;
+-  padding: 8px;
+-  border-radius: var(--pool-radius-sm);
+-  background: var(--pool-bg-surface-2);
+-}
+-
+-.pool-diagnostic-card__label {
+-  display: block;
+-  color: var(--pool-text-3);
+-  font-size: 11px;
++.pool-email-table .pool-table td {
++  overflow: hidden;
+ }
+ 
+-.pool-diagnostic-card__value {
++.pool-email-table .pool-text-clamp {
+   display: block;
+-  min-width: 0;
+-  margin-top: 3px;
++  width: 100%;
++  max-width: 100%;
+   overflow: hidden;
+-  color: var(--pool-text);
+-  font-size: 13px;
+-  font-weight: 650;
+   text-overflow: ellipsis;
+   white-space: nowrap;
++  overflow-wrap: normal;
+ }
+ 
+-.pool-modal-overlay,
+-.pool-drawer-overlay {
+-  position: fixed;
+-  inset: 0;
+-  background: var(--pool-bg-overlay);
+-  backdrop-filter: blur(14px);
+-  z-index: 2000;
+-  animation: pool-fade-in var(--pool-motion-normal) var(--pool-motion-ease);
++.pool-email-row-actions {
++  flex-wrap: nowrap;
+ }
+ 
+-.pool-modal-content,
++.pool-email-import-help {
++  display: block;
++  margin-bottom: 12px;
++  color: var(--pool-text-2);
++  line-height: 1.55;
++}
++
++.pool-email-import-help code {
++  display: inline-block;
++  max-width: 100%;
++  margin-top: 5px;
++  overflow-wrap: anywhere;
++  color: var(--pool-text);
++}
++
++.pool-email-import-textarea {
++  width: 100%;
++  min-height: 196px;
++  resize: vertical;
++  font-family: var(--pool-font-mono);
++}
++
++.pool-email-modal-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 16px;
++}
++
++@media (max-width: 1080px) {
++  .pool-email-metrics {
++    grid-template-columns: repeat(3, minmax(0, 1fr));
++  }
++}
++
++@media (max-width: 767px) {
++  .pool-email-toolbar {
++    width: 100%;
++    overflow-x: auto;
++    padding: 8px;
++    border-radius: var(--pool-radius-lg);
++    scrollbar-width: thin;
++    overscroll-behavior-inline: contain;
++    -webkit-overflow-scrolling: touch;
++  }
++
++  .pool-email-toolbar > * {
++    flex: 0 0 auto;
++  }
++
++  .pool-email-search {
++    width: min(68vw, 280px);
++  }
++
++  .pool-email-metrics {
++    grid-template-columns: none;
++    grid-auto-flow: column;
++    grid-auto-columns: minmax(136px, 1fr);
++    overflow-x: auto;
++    padding: 1px 1px 7px;
++  }
++
++  .pool-email-metrics .pool-metric-card {
++    min-height: 82px;
++    padding: 12px 14px;
++  }
++
++  .pool-email-table .pool-mobile-row {
++    grid-template-columns: 22px minmax(0, 1fr);
++    grid-template-areas:
++      "select main"
++      "actions actions";
++    align-items: start;
++    column-gap: 12px;
++    row-gap: 10px;
++  }
++
++  .pool-email-table .pool-mobile-row > input[type='checkbox'] {
++    grid-area: select;
++    margin-top: 3px;
++  }
++
++  .pool-email-table .pool-mobile-row__main {
++    grid-area: main;
++  }
++
++  .pool-email-table .pool-mobile-row__actions {
++    grid-area: actions;
++    grid-column: 1 / -1;
++    width: 100%;
++    justify-content: flex-end;
++    margin-top: 0;
++  }
++
++  .pool-email-table .pool-email-row-actions {
++    width: 100%;
++    justify-content: flex-end;
++  }
++}
++
++.pool-mobile-row__subtitle {
++  display: block;
++  margin-top: 3px;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-mobile-row__details {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  flex-wrap: wrap;
++  margin-top: 8px;
++}
++
++.pool-mobile-row__detail {
++  min-width: 0;
++}
++
++.pool-mobile-row__label {
++  display: none;
++}
++
++.pool-mobile-row__value {
++  max-width: 100%;
++  color: var(--pool-text-2);
++  font-size: 12px;
++}
++
++.pool-mobile-row__actions {
++  display: inline-flex;
++  align-items: center;
++  justify-content: flex-end;
++}
++
++.pool-mobile-row__actions .pool-button {
++  min-width: var(--pool-hit-target);
++  min-height: var(--pool-hit-target);
++}
++
++.pool-diagnostic-card {
++  display: grid;
++  gap: 10px;
++  padding: 14px;
++}
++
++.pool-diagnostic-card__title {
++  min-width: 0;
++  overflow: hidden;
++  font-weight: 700;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-diagnostic-card__grid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 8px;
++}
++
++.pool-diagnostic-card__item {
++  min-width: 0;
++  padding: 8px;
++  border-radius: var(--pool-radius-sm);
++  background: var(--pool-bg-surface-2);
++}
++
++.pool-diagnostic-card__label {
++  display: block;
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-diagnostic-card__value {
++  display: block;
++  min-width: 0;
++  margin-top: 3px;
++  overflow: hidden;
++  color: var(--pool-text);
++  font-size: 13px;
++  font-weight: 650;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-modal-overlay,
++.pool-drawer-overlay {
++  position: fixed;
++  inset: 0;
++  background: var(--pool-bg-overlay);
++  backdrop-filter: blur(14px);
++  z-index: 2000;
++  animation: pool-fade-in var(--pool-motion-normal) var(--pool-motion-ease);
++}
++
++.pool-modal-content,
+ .pool-drawer-content {
+   z-index: 2001;
+   background: var(--pool-bg-elevated);
+@@ -3145,111 +3534,315 @@
+   gap: 18px;
+ }
+ 
+-.pool-settings-row {
++.pool-settings-shell {
++  min-width: 0;
++}
++
++.pool-settings-commandbar {
+   display: grid;
+-  grid-template-columns: minmax(220px, 1fr) minmax(180px, auto);
+-  gap: 14px;
+-  align-items: center;
+-  padding: 14px 0;
+-  border-bottom: 1px solid var(--pool-border);
++  grid-template-columns: minmax(240px, 1fr) auto;
++  gap: 10px;
++  padding: 10px;
++  border-radius: var(--pool-radius-xl);
++  background: color-mix(in srgb, var(--pool-bg-surface) 96%, transparent);
++  box-shadow: var(--pool-shadow-sm);
+ }
+ 
+-.pool-settings-row:last-child {
+-  border-bottom: 0;
++.pool-settings-commandbar .pool-input-wrap {
++  width: min(460px, 100%);
++  justify-self: start;
++  border-radius: var(--pool-radius-md);
++  background: var(--pool-bg-surface-2);
+ }
+ 
+-.pool-settings-row__meta {
++.pool-settings-commandbar .pool-settings-search {
++  width: 100%;
+   min-width: 0;
+ }
+ 
+-.pool-settings-row__title {
++.pool-settings-commandbar__actions {
+   display: flex;
+   align-items: center;
+-  gap: 6px;
+-  flex-wrap: wrap;
+-  color: var(--pool-text);
+-  font-weight: 680;
+-}
+-
+-.pool-settings-row__help,
+-.pool-settings-row__error,
+-.pool-settings-row__key {
+-  display: block;
+-  margin-top: 4px;
+-}
+-
+-.pool-settings-row__key {
+-  grid-column: 1 / -1;
+-  margin-top: -8px;
+-  color: var(--pool-text-3);
+-  font-family: var(--pool-font-mono);
++  justify-content: flex-end;
++  gap: 8px;
++  min-width: 0;
+ }
+ 
+-.pool-settings-row__control {
+-  justify-self: end;
++.pool-settings-action-label--short {
++  display: none;
+ }
+ 
+-.pool-ai-settings-layout {
++.pool-settings-categories {
+   display: grid;
+-  grid-template-columns: minmax(176px, 208px) minmax(0, 1fr);
+-  gap: 20px;
+-  align-items: start;
++  gap: 12px;
+ }
+ 
+-.pool-ai-settings-nav {
+-  position: sticky;
+-  top: 76px;
+-  display: grid;
+-  gap: 4px;
+-  padding: 6px;
++.pool-settings-category {
++  min-width: 0;
++  overflow: hidden;
+   border: 1px solid var(--pool-border);
+-  border-radius: var(--pool-radius-lg);
++  border-radius: var(--pool-radius-xl);
+   background: var(--pool-bg-surface);
++  box-shadow: var(--pool-shadow-sm);
+ }
+ 
+-.pool-ai-settings-nav button {
+-  min-height: 42px;
+-  padding: 9px 12px;
++.pool-settings-category__trigger {
++  width: 100%;
++  min-height: 72px;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 14px;
++  padding: 14px 16px;
+   border: 0;
+-  border-radius: var(--pool-radius-md);
+   background: transparent;
+-  color: var(--pool-text-2);
++  color: var(--pool-text);
+   font: inherit;
+-  font-weight: 620;
+   text-align: left;
+   cursor: pointer;
++  transition: background-color var(--pool-motion-fast) var(--pool-motion-ease);
+ }
+ 
+-.pool-ai-settings-nav button:hover {
+-  background: var(--pool-bg-surface-2);
+-  color: var(--pool-text);
++.pool-settings-category__trigger:hover {
++  background: var(--pool-bg-hover);
+ }
+ 
+-.pool-ai-settings-nav button:focus-visible {
++.pool-settings-category__trigger:focus-visible {
++  position: relative;
++  z-index: 1;
+   outline: 2px solid var(--pool-accent);
+-  outline-offset: 1px;
++  outline-offset: -3px;
+ }
+ 
+-.pool-ai-settings-nav button.is-active {
+-  background: var(--pool-accent-soft);
+-  color: var(--pool-accent);
++.pool-settings-category[data-expanded='true'] .pool-settings-category__trigger {
++  background: color-mix(in srgb, var(--pool-bg-surface-2) 76%, transparent);
+ }
+ 
+-.pool-ai-settings-content {
++.pool-settings-category__leading,
++.pool-settings-category__badges {
+   min-width: 0;
+-  max-width: 940px;
++  display: flex;
++  align-items: center;
+ }
+ 
+-.pool-ai-settings-heading {
+-  display: flex;
+-  min-height: 52px;
+-  margin-bottom: 14px;
+-  align-items: flex-start;
+-  justify-content: space-between;
+-  gap: 16px;
++.pool-settings-category__leading {
++  gap: 11px;
+ }
+ 
+-.pool-ai-settings-card {
++.pool-settings-category__icon {
++  width: 30px;
++  height: 30px;
++  flex: 0 0 30px;
++  display: grid;
++  place-items: center;
++  border-radius: 999px;
++  background: var(--pool-bg-surface-2);
++  color: var(--pool-text-2);
++  transition: transform var(--pool-motion-fast) var(--pool-motion-ease);
++}
++
++.pool-settings-category__icon .pool-icon {
++  width: 16px;
++  height: 16px;
++}
++
++.pool-settings-category[data-expanded='true'] .pool-settings-category__icon {
++  transform: rotate(180deg);
++  background: var(--pool-accent-soft);
++  color: var(--pool-accent);
++}
++
++.pool-settings-category__copy {
++  min-width: 0;
++  display: grid;
++  gap: 3px;
++}
++
++.pool-settings-category__copy strong {
++  overflow: hidden;
++  font-size: 14px;
++  font-weight: 680;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-settings-category__copy > span {
++  color: var(--pool-text-3);
++  font-size: 12px;
++}
++
++.pool-settings-category__badges {
++  justify-content: flex-end;
++  gap: 6px;
++  flex-wrap: wrap;
++}
++
++.pool-settings-category__badges .pool-tag {
++  white-space: nowrap;
++}
++
++.pool-settings-category__body {
++  padding: 0 18px 3px;
++  border-top: 1px solid var(--pool-border);
++}
++
++.pool-settings-category__body[hidden] {
++  display: none;
++}
++
++.pool-settings-category__body .pool-settings-row:last-child {
++  border-bottom: 0;
++}
++
++.pool-settings-disclosure__body {
++  padding: 16px 18px 18px;
++}
++
++.pool-registrar-form {
++  display: grid;
++  gap: 12px;
++}
++
++.pool-registrar-card-grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
++  gap: 12px;
++}
++
++.pool-registrar-provider-card {
++  min-width: 0;
++  box-shadow: none;
++}
++
++.pool-registrar-fields {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 0 18px;
++}
++
++.pool-registrar-fields .pool-registrar-advanced {
++  width: 100% !important;
++}
++
++.pool-registrar-actions {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  padding: 2px;
++}
++
++.pool-settings-empty {
++  min-height: 150px;
++  display: grid;
++  align-content: center;
++  text-align: center;
++}
++
++.pool-settings-row {
++  display: grid;
++  grid-template-columns: minmax(220px, 1fr) minmax(180px, auto);
++  gap: 14px;
++  align-items: center;
++  padding: 14px 0;
++  border-bottom: 1px solid var(--pool-border);
++}
++
++.pool-settings-row:last-child {
++  border-bottom: 0;
++}
++
++.pool-settings-row__meta {
++  min-width: 0;
++}
++
++.pool-settings-row__title {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  flex-wrap: wrap;
++  color: var(--pool-text);
++  font-weight: 680;
++}
++
++.pool-settings-row__help,
++.pool-settings-row__error,
++.pool-settings-row__key {
++  display: block;
++  margin-top: 4px;
++}
++
++.pool-settings-row__key {
++  grid-column: 1 / -1;
++  margin-top: -8px;
++  color: var(--pool-text-3);
++  font-family: var(--pool-font-mono);
++}
++
++.pool-settings-row__control {
++  justify-self: end;
++}
++
++.pool-ai-settings-layout {
++  display: grid;
++  grid-template-columns: minmax(176px, 208px) minmax(0, 1fr);
++  gap: 20px;
++  align-items: start;
++}
++
++.pool-ai-settings-nav {
++  position: sticky;
++  top: 76px;
++  display: grid;
++  gap: 4px;
++  padding: 6px;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-lg);
++  background: var(--pool-bg-surface);
++}
++
++.pool-ai-settings-nav button {
++  min-height: 42px;
++  padding: 9px 12px;
++  border: 0;
++  border-radius: var(--pool-radius-md);
++  background: transparent;
++  color: var(--pool-text-2);
++  font: inherit;
++  font-weight: 620;
++  text-align: left;
++  cursor: pointer;
++}
++
++.pool-ai-settings-nav button:hover {
++  background: var(--pool-bg-surface-2);
++  color: var(--pool-text);
++}
++
++.pool-ai-settings-nav button:focus-visible {
++  outline: 2px solid var(--pool-accent);
++  outline-offset: 1px;
++}
++
++.pool-ai-settings-nav button.is-active {
++  background: var(--pool-accent-soft);
++  color: var(--pool-accent);
++}
++
++.pool-ai-settings-content {
++  min-width: 0;
++  max-width: 940px;
++}
++
++.pool-ai-settings-heading {
++  display: flex;
++  min-height: 52px;
++  margin-bottom: 14px;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 16px;
++}
++
++.pool-ai-settings-card {
+   margin-bottom: 16px;
+ }
+ 
+@@ -3640,6 +4233,123 @@
+     align-content: start;
+   }
+ 
++  .pool-settings-commandbar {
++    grid-template-columns: minmax(0, 1fr);
++    gap: 8px;
++  }
++
++  .pool-settings-commandbar .pool-input-wrap {
++    width: 100%;
++  }
++
++  .pool-settings-commandbar__actions {
++    display: grid;
++    grid-template-columns: var(--pool-hit-target) minmax(0, 1fr) auto;
++    justify-content: stretch;
++    overflow: visible;
++  }
++
++  .pool-settings-commandbar__actions .pool-button {
++    min-width: 0;
++    padding-inline: 10px;
++  }
++
++  .pool-settings-commandbar__actions .pool-button__label {
++    min-width: 0;
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++  }
++
++  .pool-settings-refresh-button {
++    width: var(--pool-hit-target);
++    padding: 0 !important;
++  }
++
++  .pool-settings-refresh-button .pool-button__label,
++  .pool-settings-action-label--long {
++    display: none;
++  }
++
++  .pool-settings-action-label--short {
++    display: inline;
++  }
++
++  .pool-settings-categories {
++    gap: 10px;
++  }
++
++  .pool-settings-category__trigger {
++    min-height: 68px;
++    align-items: flex-start;
++    padding: 13px 14px;
++  }
++
++  .pool-settings-category__leading {
++    align-items: flex-start;
++  }
++
++  .pool-settings-category__badges {
++    max-width: 48%;
++  }
++
++  .pool-settings-category__body {
++    padding: 0 14px 2px;
++  }
++
++  .pool-settings-disclosure__body {
++    padding: 12px;
++  }
++
++  .pool-registrar-card-grid {
++    grid-template-columns: minmax(0, 1fr);
++  }
++
++  .pool-registrar-provider-card {
++    padding: 14px;
++  }
++
++  .pool-registrar-provider-card .pool-input,
++  .pool-registrar-provider-card .pool-input-wrap,
++  .pool-registrar-provider-card .pool-select,
++  .pool-registrar-fields .pool-input,
++  .pool-registrar-fields .pool-input-wrap,
++  .pool-registrar-fields .pool-select,
++  .pool-registrar-fields .pool-textarea {
++    max-width: 100%;
++  }
++
++  .pool-registrar-actions {
++    position: sticky;
++    z-index: 12;
++    bottom: max(10px, env(safe-area-inset-bottom));
++    padding: 8px;
++    border: 1px solid var(--pool-border);
++    border-radius: var(--pool-radius-lg);
++    background: color-mix(in srgb, var(--pool-bg-surface) 94%, transparent);
++    box-shadow: var(--pool-shadow-md);
++    backdrop-filter: blur(16px);
++  }
++
++  .pool-metric-rail.pool-registration-metrics {
++    grid-auto-flow: row;
++    grid-auto-columns: auto;
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    overflow: visible;
++    padding: 0;
++  }
++
++  .pool-registration-metrics .pool-metric-card {
++    min-height: 74px;
++    display: grid;
++    align-content: space-between;
++    padding: 12px 14px;
++  }
++
++  .pool-system-detail__grid {
++    grid-template-columns: 1fr;
++  }
++
+   .pool-metric-rail {
+     grid-auto-flow: column;
+     grid-auto-columns: minmax(132px, 1fr);
+@@ -3978,3 +4688,450 @@
+     overflow: visible;
+   }
+ }
++
++/* Account identity and quota presentation: readable at a glance without losing full values. */
++.pool-tiny-meter__bar {
++  display: block;
++  height: 100%;
++  border-radius: inherit;
++  background: var(--pool-accent);
++  transition: width var(--pool-motion-normal) var(--pool-motion-ease);
++}
++
++.pool-tiny-meter--success .pool-tiny-meter__bar {
++  background: var(--pool-success);
++}
++
++.pool-tiny-meter--warning .pool-tiny-meter__bar {
++  background: var(--pool-warning);
++}
++
++.pool-tiny-meter--danger .pool-tiny-meter__bar {
++  background: var(--pool-danger);
++}
++
++.pool-tiny-meter--muted .pool-tiny-meter__bar {
++  background: var(--pool-text-3);
++}
++
++.pool-account-primary-id.pool-text-clamp {
++  display: block;
++  overflow: hidden !important;
++  text-overflow: ellipsis !important;
++  white-space: nowrap !important;
++}
++
++.pool-account-usage {
++  display: grid;
++  gap: 9px;
++  min-width: 0;
++  text-align: left;
++}
++
++.pool-account-usage__totals {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: 8px;
++  min-width: 0;
++}
++
++.pool-account-usage__totals strong {
++  min-width: 0;
++  color: var(--pool-text);
++  font-size: 13px;
++  font-weight: 680;
++}
++
++.pool-account-usage__totals span {
++  flex: 0 0 auto;
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-account-quota {
++  display: grid;
++  gap: 5px;
++  min-width: 0;
++}
++
++.pool-account-quota__head {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: 8px;
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-account-quota__head strong {
++  color: var(--pool-text);
++  font-size: 13px;
++  font-weight: 720;
++}
++
++.pool-account-quota__head strong span {
++  color: var(--pool-text-2);
++  font-size: 11px;
++  font-weight: 620;
++}
++
++.pool-account-quota--danger .pool-account-quota__head strong {
++  color: var(--pool-danger);
++}
++
++.pool-account-quota--warning .pool-account-quota__head strong {
++  color: var(--pool-warning);
++}
++
++.pool-account-quota--success .pool-account-quota__head strong {
++  color: var(--pool-success);
++}
++
++.pool-account-quota__meta {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--pool-text-3);
++  font-size: 10.5px;
++  line-height: 1.35;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-account-quota--unknown {
++  padding: 7px 9px;
++  border-radius: var(--pool-radius-sm);
++  background: var(--pool-bg-surface-2);
++}
++
++.pool-account-quota--compact {
++  width: min(100%, 280px);
++  gap: 4px;
++}
++
++.pool-account-quota--compact .pool-account-quota__meta {
++  white-space: normal;
++}
++
++.pool-mobile-row__value .pool-account-quota {
++  font-size: initial;
++}
++
++/* Calm, Apple-like chart treatment with compact legends and readable tooltips. */
++.pool-chart-frame {
++  width: 100%;
++  min-width: 0;
++  border-radius: var(--pool-radius-md);
++  outline: none;
++}
++
++.pool-chart-frame:focus-visible {
++  box-shadow: var(--pool-focus);
++}
++
++.pool-chart-legend {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 7px 14px;
++  max-width: 100%;
++  margin: 0;
++  padding: 7px 4px 0;
++  overflow-x: auto;
++  list-style: none;
++  scrollbar-width: none;
++}
++
++.pool-chart-legend::-webkit-scrollbar {
++  display: none;
++}
++
++.pool-chart-legend li {
++  display: inline-flex;
++  flex: 0 0 auto;
++  align-items: center;
++  gap: 6px;
++  min-width: 0;
++  color: var(--pool-text-2);
++  font-size: 11px;
++  font-weight: 560;
++}
++
++.pool-chart-legend li > span {
++  width: 8px;
++  height: 8px;
++  flex: 0 0 auto;
++  border-radius: 999px;
++  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 8%, transparent);
++}
++
++.pool-chart-legend li > b {
++  max-width: 150px;
++  overflow: hidden;
++  font-weight: inherit;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip {
++  min-width: 150px;
++  max-width: min(320px, calc(100vw - 32px));
++  padding: 11px 12px;
++  border: 1px solid var(--pool-chart-tooltip-border);
++  border-radius: 14px;
++  background: color-mix(in srgb, var(--pool-chart-tooltip-bg) 92%, transparent);
++  box-shadow: var(--pool-shadow-md);
++  backdrop-filter: blur(18px) saturate(1.25);
++  color: var(--pool-text);
++  font-size: 12px;
++}
++
++.pool-chart-tooltip__label {
++  max-width: 100%;
++  margin-bottom: 8px;
++  overflow: hidden;
++  color: var(--pool-text);
++  font-weight: 700;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip__rows {
++  display: grid;
++  gap: 6px;
++}
++
++.pool-chart-tooltip__row {
++  display: grid;
++  grid-template-columns: auto minmax(0, 1fr) auto;
++  align-items: center;
++  gap: 7px;
++  min-width: 0;
++}
++
++.pool-chart-tooltip__row > span:nth-child(2) {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--pool-text-2);
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip__row b {
++  font-variant-numeric: tabular-nums;
++}
++
++.pool-chart-tooltip__swatch {
++  width: 8px;
++  height: 8px;
++  border-radius: 999px;
++}
++
++.pool-chart-tooltip--metrics {
++  max-width: 300px;
++}
++
++.pool-chart-tooltip__metric {
++  padding: 8px 0 2px;
++  border-top: 1px solid var(--pool-border);
++}
++
++.pool-chart-tooltip__metric-title {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  min-width: 0;
++  margin-bottom: 6px;
++  font-weight: 700;
++}
++
++.pool-chart-tooltip__metric-title > span:last-child {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip__metric-grid {
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) auto;
++  gap: 3px 12px;
++  color: var(--pool-text-2);
++}
++
++.pool-chart-tooltip__metric-grid b {
++  color: var(--pool-text);
++  font-variant-numeric: tabular-nums;
++}
++
++.pool-cache-model {
++  display: inline-flex;
++  align-items: center;
++  gap: 7px;
++  min-width: 0;
++}
++
++.pool-cache-model > span:last-child {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* Dashboard hierarchy: compact command surface, two-column mobile KPIs, and balanced chart grids. */
++.pool-dashboard-command {
++  align-items: start;
++  margin-bottom: 18px;
++}
++
++.pool-dashboard-command__main {
++  background:
++    radial-gradient(circle at 92% 8%, color-mix(in srgb, var(--pool-accent) 10%, transparent), transparent 42%),
++    color-mix(in srgb, var(--pool-bg-surface) 96%, transparent);
++}
++
++.pool-dashboard-command__metric strong {
++  font-variant-numeric: tabular-nums;
++  letter-spacing: -0.045em;
++}
++
++.pool-dashboard-command__subgrid div {
++  border-color: color-mix(in srgb, var(--pool-border) 72%, transparent);
++  background: color-mix(in srgb, var(--pool-bg-surface-2) 80%, transparent);
++}
++
++.pool-dashboard-command__side {
++  gap: 10px;
++}
++
++.pool-dashboard-command__side .pool-attention-list {
++  gap: 6px;
++}
++
++.pool-dashboard-command__side .pool-attention-list div {
++  padding: 8px 10px;
++  border-color: color-mix(in srgb, var(--pool-border) 72%, transparent);
++  background: transparent;
++}
++
++.pool-dashboard-command__side .pool-attention-list .pool-attention-item--issue {
++  border-color: color-mix(in srgb, var(--pool-danger) 26%, var(--pool-border));
++  background: color-mix(in srgb, var(--pool-danger-soft) 56%, transparent);
++}
++
++.pool-dashboard-command__side .pool-attention-list .pool-attention-item--clear {
++  border-color: color-mix(in srgb, var(--pool-success) 18%, var(--pool-border));
++}
++
++.pool-quick-actions {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  min-width: 0;
++  margin-bottom: 18px;
++}
++
++.pool-quick-actions__label {
++  flex: 0 0 auto;
++  margin-right: 2px;
++  color: var(--pool-text-2);
++  font-size: 12px;
++  font-weight: 650;
++}
++
++.pool-dashboard-command__main > .pool-quick-actions {
++  margin: 0;
++  padding-top: 2px;
++}
++
++@media (min-width: 1101px) {
++  .pool-dashboard-command {
++    grid-template-columns: minmax(0, 1fr) minmax(380px, 420px);
++  }
++
++  .pool-dashboard-command__side .pool-attention-list {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++
++  .pool-dashboard-command__side .pool-attention-list > div:first-child {
++    grid-column: 1 / -1;
++  }
++}
++
++.pool-dashboard-trend,
++.pool-dashboard-chart-grid {
++  margin-bottom: 18px;
++}
++
++.pool-dashboard-trend__canvas {
++  height: 280px;
++}
++
++.pool-dashboard-chart-grid {
++  align-items: stretch;
++}
++
++.pool-dashboard-chart-grid > .pool-chart-card {
++  min-width: 0;
++  overflow: hidden;
++}
++
++@media (min-width: 768px) and (max-width: 1100px) {
++  .pool-dashboard-chart-grid.pool-grid.cols-3 {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++}
++
++@media (max-width: 767px) {
++  .pool-account-quota--compact {
++    width: 100%;
++  }
++
++  .pool-account-quota--compact .pool-account-quota__head {
++    max-width: 280px;
++  }
++
++  .pool-dashboard-command__subgrid {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    gap: 8px;
++  }
++
++  .pool-dashboard-command__subgrid div {
++    min-height: 70px;
++  }
++
++  .pool-quick-actions {
++    width: 100%;
++    overflow-x: auto;
++    padding: 1px 1px 7px;
++    scrollbar-width: thin;
++    overscroll-behavior-inline: contain;
++    -webkit-overflow-scrolling: touch;
++  }
++
++  .pool-quick-actions > * {
++    flex: 0 0 auto;
++  }
++
++  .pool-dashboard-trend__canvas,
++  .pool-dashboard-trend .pool-chart-frame {
++    height: 238px !important;
++  }
++
++  .pool-dashboard-chart-grid.pool-grid.cols-3 {
++    grid-template-columns: minmax(0, 1fr);
++  }
++
++  .pool-chart-card {
++    overflow: hidden;
++  }
++
++  .pool-chart-legend {
++    justify-content: flex-start;
++    padding-inline: 2px;
++  }
++
++  .pool-chart-legend li > b {
++    max-width: 118px;
++  }
++}
+diff --git a/web-spa/src/styles/layout.css b/web-spa/src/styles/layout.css
+index b4a1017..63561c7 100644
+--- a/web-spa/src/styles/layout.css
++++ b/web-spa/src/styles/layout.css
+@@ -81,12 +81,19 @@
+   display: flex;
+   justify-content: space-between;
+   align-items: flex-start;
++  flex-wrap: wrap;
+   gap: 18px;
+   margin-bottom: 18px;
+ }
+ 
+ .pool-pagehead-copy {
+-  min-width: 0;
++  flex: 1 1 260px;
++  min-width: min(100%, 220px);
++}
++
++.pool-pagehead-copy .pool-page-title {
++  word-break: keep-all;
++  overflow-wrap: normal;
+ }
+ 
+ .pool-pagehead .sub {
+@@ -99,6 +106,8 @@
+   display: flex;
+   align-items: center;
+   justify-content: flex-end;
++  flex: 0 1 auto;
++  min-width: 0;
+   gap: 8px;
+   flex-wrap: wrap;
+ }
+diff --git a/web-spa/tests/contracts.test.ts b/web-spa/tests/contracts.test.ts
+index eb9cd90..e16bcbe 100644
+--- a/web-spa/tests/contracts.test.ts
++++ b/web-spa/tests/contracts.test.ts
+@@ -78,7 +78,7 @@ describe('API contracts', () => {
+   it('adapts legacy domain response envelopes without dropping unknown fields', () => {
+     expect(parseApiResponse(accountsResponseSchema, {
+       accounts: [{ id: 'acc-1', provider: 'codex', future_flag: true }], total: '4',
+-    })).toEqual({ rows: [{ id: 'acc-1', provider: 'codex', future_flag: true }], total: 4 });
++    })).toEqual({ rows: [{ id: 'acc-1', provider: 'codex', future_flag: true, capabilities: [] }], total: 4 });
+     expect(parseApiResponse(quotaResponseSchema, { quota: [{ account_id: 'acc-1', future_limit: 12 }] }))
+       .toEqual([{ account_id: 'acc-1', future_limit: 12 }]);
+     expect(parseApiResponse(cfEventsResponseSchema, { events: [{ id: 7, status: '403' }] }))

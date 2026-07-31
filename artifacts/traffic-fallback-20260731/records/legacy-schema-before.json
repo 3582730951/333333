@@ -1,0 +1,27 @@
+{
+  "columns": [
+    "id",
+    "name",
+    "system_prompt",
+    "prompt_mode",
+    "system_prompt_apply_to_compaction",
+    "model_instructions_enabled",
+    "model_instructions_files",
+    "model_instruction_profiles",
+    "force_model",
+    "force_effort",
+    "block_claude_target_groups",
+    "block_gpt_target_groups",
+    "model_routing_json",
+    "created_at",
+    "updated_at"
+  ],
+  "has_traffic_fallback_groups_json": false,
+  "has_traffic_fallback_model_mappings_json": false,
+  "sentinel": [
+    "ug_8c5098fc5f93429e98dad35c5c8608b0",
+    "Legacy fallback migration sentinel"
+  ],
+  "quick_check": "ok",
+  "integrity_check": "ok"
+}

@@ -2,12 +2,32 @@ package lifecycle
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"codex-account-pool/internal/storage"
 )
+
+type recordingLifecycleChecker struct {
+	batches       []int
+	concurrencies []int
+}
+
+func (c *recordingLifecycleChecker) CheckAccount(context.Context, storage.Account) HealthStatus {
+	return HealthStatus{Alive: true}
+}
+
+func (c *recordingLifecycleChecker) BatchCheckAccountsN(_ context.Context, accounts []storage.Account, concurrency int) []HealthStatus {
+	c.batches = append(c.batches, len(accounts))
+	c.concurrencies = append(c.concurrencies, concurrency)
+	results := make([]HealthStatus, len(accounts))
+	for index := range results {
+		results[index].Alive = true
+	}
+	return results
+}
 
 func TestSchedulerStartIgnoresCancelledContextAndInvalidInterval(t *testing.T) {
 	s := NewScheduler(nil)
@@ -89,6 +109,49 @@ func TestSchedulerSurvivesHealthCyclePanic(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("scheduler did not exit after recovered health-check panic")
+	}
+}
+
+func TestHealthCyclePagesAccountsBeforeChecking(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for index := 0; index < 53; index++ {
+		id := fmt.Sprintf("account-%03d", index)
+		if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO accounts(
+  id,label,upstream_account_id,chatgpt_user_id,email,plan_type,provider,status,created_at,updated_at
+) VALUES(?,?,'','','','','codex','active',?,?)`,
+			id, id, int64(index+1), int64(index+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	checker := &recordingLifecycleChecker{}
+	scheduler := NewScheduler(store)
+	scheduler.checker = checker
+	scheduler.batchSize = 17
+	scheduler.concurrency = 4
+	scheduler.runHealthCheckCycle(ctx)
+
+	want := []int{17, 17, 17, 2}
+	if len(checker.batches) != len(want) {
+		t.Fatalf("batch sizes=%v want=%v", checker.batches, want)
+	}
+	for index := range want {
+		if checker.batches[index] != want[index] || checker.concurrencies[index] != 4 {
+			t.Fatalf("batch sizes=%v concurrency=%v", checker.batches, checker.concurrencies)
+		}
+	}
+	stats := scheduler.GetStatistics()
+	if stats.TotalChecks != 53 || stats.AliveCount != 53 || stats.DeadCount != 0 {
+		t.Fatalf("stats=%+v", stats)
 	}
 }
 

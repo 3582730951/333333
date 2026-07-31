@@ -1,0 +1,18 @@
+{
+  "quick_check": "ok",
+  "integrity_check": "ok",
+  "counts": {
+    "accounts": 2,
+    "groups": 4,
+    "email_pool": 0,
+    "usage_records": 0,
+    "registration_jobs": 0,
+    "lifecycle_tasks": 0
+  },
+  "identity_fingerprints": {
+    "accounts": "9cb32cfd707b8a86e062342a957534944c05b1df6c2efd9bc823b9078f69bc08",
+    "groups": "d8e0594da37242e8348295ff44d14b33082dd1bb86dfeaac862d6e5cbcd4b8f0",
+    "email_pool": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  },
+  "team_schema_tables": []
+}

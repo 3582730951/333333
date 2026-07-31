@@ -30,16 +30,17 @@ import (
 )
 
 type codexAccountLine struct {
-	Type         string `json:"type"`
-	Email        string `json:"email"`
-	AccountID    string `json:"account_id"`
-	UserID       string `json:"user_id"`
-	PlanType     string `json:"plan_type"`
-	Name         string `json:"name"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	IDToken      string `json:"id_token"`
-	SessionToken string `json:"session_token,omitempty"`
+	Type          string `json:"type"`
+	Email         string `json:"email"`
+	AccountID     string `json:"account_id"`
+	UserID        string `json:"user_id"`
+	PlanType      string `json:"plan_type"`
+	Name          string `json:"name"`
+	AccessToken   string `json:"access_token"`
+	RefreshToken  string `json:"refresh_token"`
+	IDToken       string `json:"id_token"`
+	SessionToken  string `json:"session_token,omitempty"`
+	LoginPassword string `json:"login_password,omitempty"`
 }
 
 // proxyURLFromEgress returns the egress profile's proxy URL (rotated for cliproxy), or "".
@@ -153,9 +154,25 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 	script := firstEnv("services/codex_register/protocol_register.py", "CODEX_REG_PROTOCOL_SCRIPT")
 	proxyURL := p.proxyURLFromEgress(ctx, req.EgressID)
 	emailProvider := firstEnv("hotmail_otp", "CODEX_REG_EMAIL_PROVIDER")
-	baseEmail, otpURL, otpToken, emailErr := p.getEmailForRegistration(ctx)
-	if emailErr != nil {
-		return nil, fmt.Errorf("protocol_v2: email: %w", emailErr)
+	baseEmail, otpURL, otpToken := "", "", ""
+	exactEmail := "0"
+	var relay *mailboxRelay
+	if strings.TrimSpace(req.MailboxProvider) != "" {
+		var relayErr error
+		relay, relayErr = p.prepareMailboxRelay(ctx, req)
+		if relayErr != nil {
+			return nil, fmt.Errorf("protocol_v2: mailbox relay: %w", relayErr)
+		}
+		defer relay.Close(ctx)
+		baseEmail, otpURL, otpToken = relay.Email, relay.URL, relay.Token
+		emailProvider = "hotmail_otp"
+		exactEmail = "1"
+	} else {
+		var emailErr error
+		baseEmail, otpURL, otpToken, emailErr = p.getEmailForRegistration(ctx)
+		if emailErr != nil {
+			return nil, fmt.Errorf("protocol_v2: email: %w", emailErr)
+		}
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, 8*time.Minute)
@@ -172,6 +189,7 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 		"HOTMAIL_BASE_EMAIL="+baseEmail,
 		"HOTMAIL_OTP_URL="+otpURL,
 		"HOTMAIL_OTP_TOKEN="+otpToken,
+		"HOTMAIL_EXACT_EMAIL="+exactEmail,
 	)
 	out, err := p.runRegistrarCommand(cctx, cmd)
 	if err != nil && len(out) == 0 {
@@ -205,5 +223,7 @@ func (p *Pipeline) protocolV2RegisterOne(ctx context.Context, req RegisterReques
 		AccessToken:       acct.AccessToken,
 		RefreshToken:      acct.RefreshToken,
 		IDToken:           acct.IDToken,
+		SessionToken:      acct.SessionToken,
+		LoginPassword:     acct.LoginPassword,
 	})
 }

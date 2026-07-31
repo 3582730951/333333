@@ -1,0 +1,14 @@
+account_code,group_name,declared_provider,effective_provider,status,plan_type,is_fedramp,ignore_rate_limit_controls,quarantine_until,quarantine_reason,created_at,updated_at,primary_egress_id,standby_egress_ids,sidecar_egress_id,cooldown_until,recheck_pending
+ACC-2K2OJBSXIQE2SYJVU5WZABT4NI,gpt-plus-备用2(可破甲),codex,codex,active,,false,false,0,,1785406806,1785407366,egress_direct,,,1785447433,true
+ACC-UTFYZURQ5KTWCWOESJ66KGJ2ZQ,gpt-plus-备用2(可破甲),codex,codex,active,,false,false,0,,1785406806,1785407364,egress_direct,,,0,false
+ACC-YRPLDQBRRHOQWDM6Q3WWM3VAWM,gpt-pro,codex,codex,active,,false,false,0,,1785406806,1785407362,egress_direct,,,0,false
+ACC-AHBCFSVVRS6LD7SODZNCOJQAZU,gpt-plus-正常(备用1),codex,codex,active,,false,false,0,,1785406806,1785407360,egress_direct,,,1785447515,true
+ACC-NK6ZSGVDHFYJ7XPOALJSGRBZ7I,claude,claude,claude,auth_expired,,false,false,0,,1785407469,1785445434,egress_jp_01,,,1785435362,false
+ACC-JX6NDCRVSN4MFKTOPLQXZMNOUI,gpt-plus-备用2(可破甲),codex,codex,active,,false,false,0,,1785406806,1785427985,egress_direct,,,1785447493,true
+ACC-TP5ELWQQJ2C3BYGXSN2GIKQTEE,gpt-plus-备用2(可破甲),codex,codex,active,,false,false,0,,1785406806,1785407356,egress_direct,,,1785447453,true
+ACC-YIAYS4VQ3AYXJWWOVIAVKNTLIM,cyber,antigravity,antigravity,active,,false,false,0,,1785428811,1785428821,egress_direct,,,0,false
+ACC-KTRZJAHV67UMB4QDJHUCYPZKNM,gpt-plus-正常(备用1),codex,codex,active,,false,false,0,,1785406806,1785407351,egress_direct,,,1785447534,true
+ACC-HH3MS4CH2YTRUI2AD4F5XY6VTU,gpt-plus-正常(备用1),codex,codex,active,,false,false,0,,1785406806,1785407350,egress_direct,,,0,false
+ACC-OWBQQZUPFT7GVHF6NPYMAYFFCU,gpt-plus-备用2(可破甲),codex,codex,active,,false,false,0,,1785406806,1785407348,egress_direct,,,1785447473,true
+ACC-V5HUEWZFSBH45DWE5GJJ5SM4LA,gpt-plus-正常(备用1),codex,codex,active,,false,false,0,,1785406806,1785407345,egress_direct,,,0,false
+ACC-F7V2KG5F535O755MND4UDOTTBM,gpt-plus-正常(备用1),codex,codex,active,,false,false,0,,1785406806,1785407345,egress_direct,,,1785447513,true

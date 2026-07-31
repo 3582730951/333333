@@ -97,12 +97,22 @@ type RegisterRequest struct {
 	SMSCountry           string  `json:"sms_country,omitempty"` // ISO-2 of the country chosen (for stats recording)
 	SMSCost              float64 `json:"sms_cost,omitempty"`    // cost of the SMS number (for stats recording)
 	MailboxProvider      string  `json:"mailbox_provider"`
+	MailboxDomain        string  `json:"mailbox_domain,omitempty"`
 	CaptchaSolver        string  `json:"captcha_solver"`
 	Canary               bool    `json:"canary,omitempty"`
 	JobID                string  `json:"-"`
 	RecordID             string  `json:"-"`
 	WorkflowItemID       string  `json:"-"`
 	ReadinessFingerprint string  `json:"-"`
+	// Team lifecycle handoff fields are server-generated and never accepted from
+	// the public registration JSON. A successful replacement registration uses
+	// them to enqueue the next durable invite/quota/rotation cycle.
+	TeamLifecycleSourceWorkflowID   string `json:"-"`
+	TeamLifecycleWorkspaceID        string `json:"-"`
+	TeamLifecycleParentAccountID    string `json:"-"`
+	TeamLifecycleReplacementMethod  string `json:"-"`
+	TeamLifecycleRotateThresholdBPS int    `json:"-"`
+	TeamLifecycleMaxAttempts        int    `json:"-"`
 }
 
 // acquireSMS resolves the SMS provider + phone number + order id for one registration.
@@ -320,9 +330,11 @@ func (p *Pipeline) RegisterOne(ctx context.Context, req RegisterRequest) (*stora
 	}
 
 	return p.persistVerifiedRegistration(ctx, req, registrationCredential{
-		LabelPrefix: "protocol-",
-		Email:       result.Email,
-		AccessToken: result.AccessToken,
+		LabelPrefix:   "protocol-",
+		Email:         result.Email,
+		AccessToken:   result.AccessToken,
+		SessionToken:  result.SessionToken,
+		LoginPassword: password,
 	})
 }
 
@@ -332,7 +344,7 @@ func (p *Pipeline) registerViaEmail(ctx context.Context, req RegisterRequest) (*
 	if p.providerMgr == nil {
 		return nil, fmt.Errorf("no providers configured: add a mailbox provider on the Provider page first")
 	}
-	mbox, email, _, mailboxID, err := p.providerMgr.GetMailboxFromProvider(ctx, req.MailboxProvider)
+	mbox, email, _, mailboxID, err := p.providerMgr.GetMailboxWithConstraints(ctx, req.MailboxProvider, req.MailboxDomain)
 	if err != nil {
 		return nil, fmt.Errorf("getMailbox: %w", err)
 	}
@@ -359,9 +371,11 @@ func (p *Pipeline) registerViaEmail(ctx context.Context, req RegisterRequest) (*
 	}
 
 	return p.persistVerifiedRegistration(ctx, req, registrationCredential{
-		LabelPrefix: "protocol-",
-		Email:       email,
-		AccessToken: result.AccessToken,
+		LabelPrefix:   "protocol-",
+		Email:         email,
+		AccessToken:   result.AccessToken,
+		SessionToken:  result.SessionToken,
+		LoginPassword: password,
 	})
 }
 

@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"codex-account-pool/internal/storage"
 )
@@ -38,6 +41,9 @@ func (s *Server) adminEmailPoolList(w http.ResponseWriter, r *http.Request) {
 	}
 	if pageSize < 1 {
 		pageSize = 50
+	}
+	if pageSize > 200 {
+		pageSize = 200
 	}
 
 	accounts, total, err := s.store.ListEmailAccounts(r.Context(), page, pageSize, search, status)
@@ -106,7 +112,7 @@ func (s *Server) adminEmailPoolImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Support both JSON body {text: "..."} and raw text/plain body.
-	var raw string
+	var raw, groupName string
 	ct := r.Header.Get("Content-Type")
 	if strings.Contains(ct, "application/json") {
 		var req struct {
@@ -118,13 +124,22 @@ func (s *Server) adminEmailPoolImport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		raw = req.Text
+		groupName = strings.TrimSpace(req.GroupName)
 	} else {
-		body, err := io.ReadAll(io.LimitReader(r.Body, adminJSONBodyLimit))
+		body, err := io.ReadAll(io.LimitReader(r.Body, adminJSONBodyLimit+1))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if int64(len(body)) > adminJSONBodyLimit {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("email pool import exceeds request limit"))
+			return
+		}
 		raw = string(body)
+	}
+	if len(groupName) > 128 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("group_name exceeds 128 bytes"))
+		return
 	}
 
 	lines := strings.Split(raw, "\n")
@@ -148,12 +163,18 @@ func (s *Server) adminEmailPoolImport(w http.ResponseWriter, r *http.Request) {
 			parseErrors = append(parseErrors, fmt.Sprintf("line %d: email and refresh_token are required", i+1))
 			continue
 		}
+		if len(email) > 320 || len(password) > 4096 || len(clientID) > 1024 || len(refreshToken) > 16384 ||
+			strings.Count(email, "@") != 1 {
+			parseErrors = append(parseErrors, fmt.Sprintf("line %d: one or more fields are invalid or exceed their limit", i+1))
+			continue
+		}
 		accounts = append(accounts, storage.EmailAccount{
 			Email:        email,
 			Password:     password,
 			ClientID:     clientID,
 			RefreshToken: refreshToken,
 			Status:       "idle",
+			GroupName:    groupName,
 		})
 	}
 
@@ -218,19 +239,33 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 
-	// Try to exchange the refresh token for an IMAP access token.
-	// This is a basic connectivity check — the full IMAP test can be added later.
+	// Exchange the refresh token using a bounded, request-scoped client. Form
+	// encoding is required because OAuth credentials may contain '+', '&', or '='.
 	tokenURL := "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-	form := fmt.Sprintf("client_id=%s&grant_type=refresh_token&refresh_token=%s&scope=%s",
-		acct.ClientID, acct.RefreshToken, "https://outlook.office.com/.default")
-	resp, err := http.Post(tokenURL, "application/x-www-form-urlencoded", strings.NewReader(form))
+	form := url.Values{
+		"client_id":     {acct.ClientID},
+		"grant_type":   {"refresh_token"},
+		"refresh_token": {acct.RefreshToken},
+		"scope":         {"https://outlook.office.com/.default"},
+	}
+	req, err := http.NewRequestWithContext(
+		r.Context(), http.MethodPost, tokenURL, strings.NewReader(form.Encode()),
+	)
+	if err == nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+	}
+	var resp *http.Response
+	if err == nil {
+		resp, err = (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	}
 	if err != nil {
-		acct.ErrorMessage = fmt.Sprintf("token exchange failed: %v", err)
+		acct.ErrorMessage = "token exchange connection failed"
 		acct.Status = "error"
 		_ = s.store.UpdateEmailAccount(r.Context(), acct)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"ok":    false,
-			"error": err.Error(),
+			"error": acct.ErrorMessage,
 			"email": acct.Email,
 		})
 		return
@@ -241,17 +276,36 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 		var tokenResp struct {
 			AccessToken string `json:"access_token"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&tokenResp)
+		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&tokenResp)
+		if decodeErr != nil || strings.TrimSpace(tokenResp.AccessToken) == "" {
+			acct.ErrorMessage = "token exchange returned an incompatible response"
+			acct.Status = "error"
+			_ = s.store.UpdateEmailAccount(r.Context(), acct)
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"ok": false, "error": acct.ErrorMessage, "email": acct.Email,
+			})
+			return
+		}
 		acct.ErrorMessage = ""
+		if acct.Status == "error" {
+			acct.Status = "idle"
+		}
 		_ = s.store.UpdateEmailAccount(r.Context(), acct)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"ok":        true,
 			"email":     acct.Email,
-			"has_token": tokenResp.AccessToken != "",
+			"has_token": true,
 		})
 	} else {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		errMsg := fmt.Sprintf("token exchange failed: HTTP %d %s", resp.StatusCode, string(body))
+		var oauthErr struct {
+			Code string `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&oauthErr)
+		code := strings.TrimSpace(oauthErr.Code)
+		if !oauthErrorCodePattern.MatchString(code) {
+			code = "upstream_rejected"
+		}
+		errMsg := fmt.Sprintf("token exchange rejected: HTTP %d (%s)", resp.StatusCode, code)
 		acct.ErrorMessage = errMsg
 		acct.Status = "error"
 		_ = s.store.UpdateEmailAccount(r.Context(), acct)
@@ -262,3 +316,5 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 		})
 	}
 }
+
+var oauthErrorCodePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,80}$`)

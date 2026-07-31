@@ -1,0 +1,9 @@
+{
+  "source_archive_sha256": "f4a9fefe2bff91bf3c7f736149c9a4a2f1a8636490374d1684750f0b9aa452bf",
+  "npm_ci_exit": 0,
+  "build_exit": 0,
+  "email_regression_test_exit": 0,
+  "old_dist_index_sha256": "16fef72460d54cf891aa77eac156ae845a53e7c4025dae938239742d80402f88",
+  "new_dist_index_sha256": "c56c968e9703f066dca5e601fb836c1665ff332843512d98ea769a308ed0037f",
+  "asset_files": 55
+}

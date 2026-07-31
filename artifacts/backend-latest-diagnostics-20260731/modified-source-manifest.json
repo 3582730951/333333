@@ -1,0 +1,47 @@
+[
+  {
+    "path": "internal/api/disk_guard.go",
+    "sha256": "58a75e9f675ca74f0e372969b763adf3bd2eed2c5188e70fd08aae851edc7f66",
+    "bytes": 16742
+  },
+  {
+    "path": "internal/api/diagnose.go",
+    "sha256": "2085f0aa4d4dceb2c62c65f36e48e1622ed61330a2fa7102b3e034349123788a",
+    "bytes": 10620
+  },
+  {
+    "path": "internal/api/server.go",
+    "sha256": "bddbe8720a3b20b13d88eb1e5ee17b536d6e7c528927318c0afaf4a6b464edd6",
+    "bytes": 180994
+  },
+  {
+    "path": "internal/api/diagnostics_export.go",
+    "sha256": "fcff8c4821f2ab8bb0fdfbc8f26964721305d5fb551fe63c97421ed22034b869",
+    "bytes": 114340
+  },
+  {
+    "path": "internal/api/diagnostic_runtime.go",
+    "sha256": "6ad2e51f661203fb61e8d1638ffa243adb50f65133bdacc91811b8ea05642e40",
+    "bytes": 6655
+  },
+  {
+    "path": "internal/api/system.go",
+    "sha256": "350ff0e3d3b555114c25615fcf55d9441fddf532ed928396cd230dd1b734e246",
+    "bytes": 3579
+  },
+  {
+    "path": "internal/api/disk_guard_test.go",
+    "sha256": "ee69f342cb3a0a840dc402caa7241efdc52b36dbda2091ab6f21173d23b72e5a",
+    "bytes": 4282
+  },
+  {
+    "path": "internal/api/diagnostics_export_test.go",
+    "sha256": "8ecf9e03b26a8d03d1698be8fd7c645da38f18941c9deb3f5a10bb3c984ac24c",
+    "bytes": 29627
+  },
+  {
+    "path": "internal/api/routing_audit_test.go",
+    "sha256": "46733ed8d51f2dfacf6a8b535da7ae24504db86efd87e315d655b68588f29b8b",
+    "bytes": 1874
+  }
+]

@@ -85,6 +85,7 @@ export interface RegistrationStartInput {
   method: string;
   registration_egress_pool_id: string;
   sms_provider: string;
+  mailbox_provider: string;
   identity_mode: RegistrationIdentityMode;
   country: string;
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -107,6 +108,186 @@ func TestUserGroupTargetFamilyPolicySkipsOnlySelectedAccountPool(t *testing.T) {
 	}
 	if len(gptPlan.Candidates) != 2 || !userGroupTargetsContain(gptPlan.Candidates, primary) || !userGroupTargetsContain(gptPlan.Candidates, secondary) {
 		t.Fatalf("GPT candidates=%+v, want both account pools", gptPlan.Candidates)
+	}
+}
+
+func TestUserGroupTrafficFallbackRewritesModelAndTriesOrderedGroups(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	for _, name := range []string{"traffic-fallback-primary", "traffic-fallback-first", "traffic-fallback-second"} {
+		if err := h.store.CreateGroup(t.Context(), storage.Group{Name: name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstID := "ug_traffic_fallback_first"
+	secondID := "ug_traffic_fallback_second"
+	sourceID := "ug_traffic_fallback_source"
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: firstID, Name: firstID,
+		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "traffic-fallback-first"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: secondID, Name: secondID,
+		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "traffic-fallback-second"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: sourceID, Name: sourceID,
+		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "traffic-fallback-primary"}},
+		TrafficFallbackGroups: storage.TrafficFallbackGroups{
+			GPT: []string{firstID, secondID},
+		},
+		TrafficFallbackModelMappings: []storage.TrafficFallbackModelMapping{
+			{Family: "gpt", SourceModel: "gpt-5.*", TargetUserGroupID: firstID, TargetModel: "gpt-wildcard"},
+			{Family: "gpt", SourceModel: "gpt-5.6-sol", TargetUserGroupID: firstID, TargetModel: "gpt-5.5"},
+			{Family: "gpt", SourceModel: "*", TargetUserGroupID: secondID, TargetModel: "gpt-5.4"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := []byte(`{"model":"gpt-5.6-sol","input":"fallback","stream":false}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(raw))
+	recorder := httptest.NewRecorder()
+	targetModels := make(map[string]string)
+	targetOrder := make([]string, 0, 3)
+	var dispatch func(http.ResponseWriter, *http.Request)
+	dispatch = func(w http.ResponseWriter, candidate *http.Request) {
+		if target, forced := userGroupRouteOverride(candidate.Context()); forced {
+			body, err := io.ReadAll(candidate.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetOrder = append(targetOrder, target.ID)
+			targetModels[target.ID] = routing.Model(body)
+			switch target.ID {
+			case "traffic-fallback-primary", "traffic-fallback-first":
+				writePoolCodeError(w, http.StatusServiceUnavailable, "capability_unavailable", "fixture target unavailable")
+			case "traffic-fallback-second":
+				writeJSON(w, http.StatusOK, map[string]string{"id": "resp_cross_group_fallback", "status": "completed"})
+			default:
+				t.Fatalf("unexpected target: %+v", target)
+			}
+			return
+		}
+		fallbackPolicy, ok := h.app.resolveDownstreamPolicy(w, candidate)
+		if !ok {
+			return
+		}
+		body, err := io.ReadAll(candidate.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !h.app.dispatchUserGroupRouteCandidates(w, candidate, body, body, fallbackPolicy, dispatch) {
+			t.Fatalf("fallback policy %q did not dispatch", fallbackPolicy.UserGroupID)
+		}
+	}
+
+	handled := h.app.dispatchUserGroupRouteCandidates(
+		recorder,
+		request,
+		raw,
+		raw,
+		downstreamPolicy{UserGroupID: sourceID, Group: "cyber"},
+		dispatch,
+	)
+	if !handled || recorder.Code != http.StatusOK {
+		t.Fatalf("handled=%v status=%d body=%s", handled, recorder.Code, recorder.Body.String())
+	}
+	wantOrder := []string{"traffic-fallback-primary", "traffic-fallback-first", "traffic-fallback-second"}
+	if !reflect.DeepEqual(targetOrder, wantOrder) {
+		t.Fatalf("target order=%v, want %v", targetOrder, wantOrder)
+	}
+	if targetModels["traffic-fallback-first"] != "gpt-5.5" {
+		t.Fatalf("exact mapping did not outrank wildcard: models=%v", targetModels)
+	}
+	if targetModels["traffic-fallback-second"] != "gpt-5.4" {
+		t.Fatalf("second fallback model=%q, want gpt-5.4", targetModels["traffic-fallback-second"])
+	}
+	if recorder.Header().Get("X-Pool-Fallback-Group") != secondID ||
+		recorder.Header().Get("X-Pool-Fallback-Model") != "gpt-5.4" ||
+		recorder.Header().Get("X-Pool-Fallback-From-Group") != sourceID {
+		t.Fatalf("fallback diagnostics headers=%v", recorder.Header())
+	}
+}
+
+func TestTrafficFallbackCandidatesCoverClaudeGeminiAndManualModels(t *testing.T) {
+	group := storage.UserGroup{
+		TrafficFallbackGroups: storage.TrafficFallbackGroups{
+			Claude: []string{"ug_claude_fallback"},
+			Gemini: []string{"ug_gemini_fallback"},
+			GPT:    []string{"ug_manual_fallback"},
+		},
+		TrafficFallbackModelMappings: []storage.TrafficFallbackModelMapping{
+			{Family: "claude", SourceModel: "claude-*", TargetUserGroupID: "ug_claude_fallback", TargetModel: "claude-sonnet-4-5"},
+			{Family: "gemini", SourceModel: "*", TargetUserGroupID: "ug_gemini_fallback", TargetModel: "gemini-3-flash"},
+			{Family: "gpt", SourceModel: "vendor-manual", TargetUserGroupID: "ug_manual_fallback", TargetModel: "gpt-5.5"},
+		},
+	}
+	cases := []struct {
+		model, groupID, targetModel, family string
+	}{
+		{"claude-opus-5", "ug_claude_fallback", "claude-sonnet-4-5", "claude"},
+		{"gemini-3-pro", "ug_gemini_fallback", "gemini-3-flash", "gemini"},
+		{"vendor-manual", "ug_manual_fallback", "gpt-5.5", "gpt"},
+	}
+	for _, tc := range cases {
+		candidates := trafficFallbackCandidates(group, tc.model, []string{"ug_source"})
+		if len(candidates) != 1 ||
+			candidates[0].UserGroupID != tc.groupID ||
+			candidates[0].TargetModel != tc.targetModel ||
+			candidates[0].Family != tc.family {
+			t.Fatalf("%s candidates=%+v", tc.model, candidates)
+		}
+	}
+	if candidates := trafficFallbackCandidates(group, "claude-opus-5", []string{
+		"one", "two", "three", "four", "five", "six", "seven", "eight",
+	}); len(candidates) != 0 {
+		t.Fatalf("fallback depth guard returned candidates: %+v", candidates)
+	}
+}
+
+func TestUserGroupTrafficFallbackDoesNotReplayServerSideState(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "stateful-fallback-primary"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateGroup(t.Context(), storage.Group{Name: "stateful-fallback-target"}); err != nil {
+		t.Fatal(err)
+	}
+	fallbackID := "ug_stateful_fallback_target"
+	sourceID := "ug_stateful_fallback_source"
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: fallbackID, Name: fallbackID,
+		Targets: []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "stateful-fallback-target"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.CreateUserGroupDefinition(t.Context(), storage.UserGroup{
+		ID: sourceID, Name: sourceID,
+		Targets:               []storage.TargetRef{{Kind: storage.TargetKindAccountPoolGroup, ID: "stateful-fallback-primary"}},
+		TrafficFallbackGroups: storage.TrafficFallbackGroups{GPT: []string{fallbackID}},
+		TrafficFallbackModelMappings: []storage.TrafficFallbackModelMapping{{
+			Family: "gpt", SourceModel: "*", TargetUserGroupID: fallbackID, TargetModel: "gpt-5.5",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_existing","input":[]}`)
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	recorder := httptest.NewRecorder()
+	attempts := 0
+	h.app.dispatchUserGroupRouteCandidates(recorder, request, raw, raw, downstreamPolicy{UserGroupID: sourceID}, func(w http.ResponseWriter, candidate *http.Request) {
+		attempts++
+		if _, fallback := trafficFallbackExecutionFromContext(candidate.Context()); fallback {
+			t.Fatal("stateful request entered traffic fallback")
+		}
+		writePoolCodeError(w, http.StatusServiceUnavailable, "capability_unavailable", "fixture unavailable")
+	})
+	if attempts != 1 || recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stateful traffic fallback attempts=%d status=%d body=%s", attempts, recorder.Code, recorder.Body.String())
 	}
 }
 

@@ -1,0 +1,10 @@
+{
+  "rollback_release": "legacy-cache-hit-optimization",
+  "rollback_console_sha256": "16fef72460d54cf891aa77eac156ae845a53e7c4025dae938239742d80402f88",
+  "final_release": "apple-backend-optimized-v2-20260731",
+  "final_console_sha256": "c56c968e9703f066dca5e601fb836c1665ff332843512d98ea769a308ed0037f",
+  "logical_fingerprint_sha256": "9295ea6d34bdefe8e7152905920fef7b8c39e743fb2beb8806c2bc19071af869",
+  "rollback_ready": true,
+  "redeploy_ready": true,
+  "data_preserved": true
+}

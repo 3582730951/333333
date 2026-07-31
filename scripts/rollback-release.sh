@@ -9,6 +9,7 @@ DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
 WORKER_DESTROY_TIMEOUT="${WORKER_DESTROY_TIMEOUT:-30}"
 DEPLOY_LOCK_FILE="${DEPLOY_LOCK_FILE:-/var/lock/codex-pool-install.lock}"
 HANDOFF_CONTROL_SOCKET="${HANDOFF_CONTROL_SOCKET:-${DATA_DIR%/}/run/handoff-control.sock}"
+CODEX_REAUTH_URL="${CODEX_REAUTH_URL:-http://127.0.0.1:8802}"
 HANDOFF_PAUSED=0
 KEEP_ADMISSION_PAUSED=0
 
@@ -253,5 +254,26 @@ if [[ "$resume_failed" == 1 ]]; then
 fi
 if systemctl cat "${SERVICE_NAME}-sidecar.service" >/dev/null 2>&1; then
   systemctl restart "${SERVICE_NAME}-sidecar.service" || true
+fi
+if systemctl cat "${SERVICE_NAME}-reauth.service" >/dev/null 2>&1; then
+  if [[ -x "${APP_DIR%/}/current/codex-reauth/codex_reauth_worker.py" &&
+        -x "${APP_DIR%/}/current/registrar-python-venv/bin/python" ]]; then
+    systemctl restart "${SERVICE_NAME}-reauth.service"
+    reauth_ready=0
+    for ((i=0; i<HEALTH_TIMEOUT; i++)); do
+      payload="$(curl --noproxy '*' --silent --max-time 2 "${CODEX_REAUTH_URL%/}/healthz" 2>/dev/null || true)"
+      if [[ "$payload" == *'"ready":true'* ]]; then
+        reauth_ready=1
+        break
+      fi
+      sleep 1
+    done
+    [[ "$reauth_ready" == 1 ]] || {
+      echo "rolled-back Codex reauth worker did not become ready" >&2
+      exit 1
+    }
+  else
+    systemctl stop "${SERVICE_NAME}-reauth.service" >/dev/null 2>&1 || true
+  fi
 fi
 echo "rolled back to release ${previous_id}; release ${current_id} destroyed; exactly one worker remains"

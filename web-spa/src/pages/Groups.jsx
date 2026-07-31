@@ -1,4 +1,5 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useId, useMemo, useState } from 'react';
+import * as PopoverPrimitive from '@radix-ui/react-popover';
 import { ActionMenu, Banner, Button, Card, Form, Modal, Select, Switch, Tabs, TabPane, Tag, Toast } from '../components/pool/index.jsx';
 import { IconPlus, IconRefresh } from '../components/pool/icons.jsx';
 import { del, get, patch, post, put } from '../api.js';
@@ -19,6 +20,7 @@ const INSTRUCTION_FAMILIES = [
   { key: 'claude', label: 'Claude', help: '用于原生 Claude、Claude Code，以及 Kiro / Antigravity 中的 Claude 模型。' },
   { key: 'gemini', label: 'Gemini', help: '用于 Antigravity 等目标中的 Gemini 模型，并进入其 systemInstruction。' },
 ];
+const FALLBACK_FAMILIES = INSTRUCTION_FAMILIES.map(({ key, label }) => ({ key, label }));
 
 function rowsOf(value, keys = []) {
   if (Array.isArray(value)) return value;
@@ -33,6 +35,27 @@ function uniqueStrings(values) {
     seen.add(value);
     return true;
   });
+}
+
+function blankTrafficFallbackGroups() {
+  return Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [key, []]));
+}
+
+function modelFamily(model) {
+  const value = String(model || '').trim().toLowerCase();
+  if (/^(claude(?:-|$)|opus$|sonnet$|haiku$|fable$)/.test(value)) return 'claude';
+  if (/^gemini(?:-|$)/.test(value)) return 'gemini';
+  if (/^(gpt(?:-|$)|chatgpt(?:-|$)|codex(?:-|$)|o[134])/.test(value)) return 'gpt';
+  return '';
+}
+
+function modelsByFamily(models) {
+  const output = { gpt: [], claude: [], gemini: [], other: [] };
+  uniqueStrings(models).forEach((model) => {
+    const family = modelFamily(model);
+    output[family || 'other'].push(model);
+  });
+  return output;
 }
 
 function groupEgressIDs(group) {
@@ -109,6 +132,8 @@ function blankUserGroup() {
     force_effort: '',
     block_claude_target_groups: [],
     block_gpt_target_groups: [],
+    traffic_fallback_groups: blankTrafficFallbackGroups(),
+    traffic_fallback_model_mappings: [],
     target_keys: [],
     model_routing: [],
   };
@@ -138,6 +163,16 @@ function userGroupDraft(row) {
     model_instruction_profiles: normalizedInstructionProfiles(row),
     block_claude_target_groups: uniqueStrings(row.block_claude_target_groups),
     block_gpt_target_groups: uniqueStrings(row.block_gpt_target_groups),
+    traffic_fallback_groups: Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [
+      key,
+      uniqueStrings(row.traffic_fallback_groups?.[key]),
+    ])),
+    traffic_fallback_model_mappings: (row.traffic_fallback_model_mappings || []).map((mapping) => ({
+      family: String(mapping.family || '').trim().toLowerCase(),
+      source_model: String(mapping.source_model || ''),
+      target_user_group_id: String(mapping.target_user_group_id || ''),
+      target_model: String(mapping.target_model || ''),
+    })),
     model_routing: (row.model_routing || []).map((rule) => ({
       model: rule.model || '',
       tiers: (rule.tiers || []).map((tier) => (tier || []).map(targetKey)),
@@ -157,6 +192,21 @@ function normalizedUserGroupPayload(draft, providers = []) {
   }]));
   const enabledProfiles = Object.values(profiles).filter((profile) => profile.enabled);
   const legacyFiles = uniqueStrings(enabledProfiles.flatMap((profile) => profile.files));
+  const trafficFallbackGroups = Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [
+    key,
+    uniqueStrings(draft.traffic_fallback_groups?.[key]),
+  ]));
+  const trafficFallbackModelMappings = (draft.traffic_fallback_model_mappings || [])
+    .map((mapping) => ({
+      family: String(mapping.family || '').trim().toLowerCase(),
+      source_model: String(mapping.source_model || '').trim(),
+      target_user_group_id: String(mapping.target_user_group_id || '').trim(),
+      target_model: String(mapping.target_model || '').trim(),
+    }))
+    .filter((mapping) => FALLBACK_FAMILIES.some(({ key }) => key === mapping.family)
+      && trafficFallbackGroups[mapping.family].includes(mapping.target_user_group_id)
+      && mapping.source_model
+      && mapping.target_model);
   return {
     name: String(draft.name || '').trim(),
     system_prompt: String(draft.system_prompt || ''),
@@ -171,6 +221,8 @@ function normalizedUserGroupPayload(draft, providers = []) {
       .filter((groupName) => selectedAccountGroups.has(groupName)),
     block_gpt_target_groups: uniqueStrings(draft.block_gpt_target_groups)
       .filter((groupName) => selectedAccountGroups.has(groupName)),
+    traffic_fallback_groups: trafficFallbackGroups,
+    traffic_fallback_model_mappings: trafficFallbackModelMappings,
     targets,
     model_routing: (draft.model_routing || []).filter((rule) => String(rule.model || '').trim()).map((rule) => {
       const mentioned = new Set();
@@ -302,11 +354,288 @@ function ModelRoutingEditor({ draft, setDraft, targetOptions, providers }) {
   );
 }
 
+function fallbackConfigurationIssues(draft) {
+  const mappings = Array.isArray(draft.traffic_fallback_model_mappings) ? draft.traffic_fallback_model_mappings : [];
+  const issues = [];
+  const seenMappings = new Set();
+  FALLBACK_FAMILIES.forEach(({ key, label }) => {
+    uniqueStrings(draft.traffic_fallback_groups?.[key]).forEach((groupID) => {
+      const configured = mappings.some((mapping) => mapping.family === key
+        && mapping.target_user_group_id === groupID
+        && String(mapping.source_model || '').trim()
+        && String(mapping.target_model || '').trim());
+      if (!configured) issues.push(`${label} · ${groupID} 尚未配置模型转换`);
+    });
+  });
+  mappings.forEach((mapping, index) => {
+    const sourceModel = String(mapping.source_model || '').trim();
+    const targetModel = String(mapping.target_model || '').trim();
+    if (!mapping.family || !mapping.target_user_group_id || !sourceModel || !targetModel) {
+      issues.push(`模型转换 ${index + 1} 尚未填写完整`);
+      return;
+    }
+    if (!uniqueStrings(draft.traffic_fallback_groups?.[mapping.family]).includes(mapping.target_user_group_id)) {
+      issues.push(`模型转换 ${index + 1} 的兜底分组未在 ${mapping.family} 家族中勾选`);
+    }
+    if (sourceModel.slice(0, -1).includes('*')) {
+      issues.push(`模型转换 ${index + 1} 仅支持末尾通配符`);
+    }
+    if (sourceModel.length > 200 || targetModel.length > 200) {
+      issues.push(`模型转换 ${index + 1} 的模型名不能超过 200 个字符`);
+    }
+    const key = `${mapping.family}\u0000${sourceModel.toLowerCase()}\u0000${mapping.target_user_group_id}`;
+    if (seenMappings.has(key)) {
+      issues.push(`模型转换 ${index + 1} 与已有规则重复`);
+    }
+    seenMappings.add(key);
+  });
+  return uniqueStrings(issues);
+}
+
+function TrafficFallbackGroupSelector({ value, onChange, options, disabled }) {
+  const [open, setOpen] = useState(false);
+  const [activeFamily, setActiveFamily] = useState('gpt');
+  const [query, setQuery] = useState('');
+  const triggerID = useId();
+  const normalized = Object.fromEntries(FALLBACK_FAMILIES.map(({ key }) => [key, uniqueStrings(value?.[key])]));
+  const selectedCount = FALLBACK_FAMILIES.reduce((sum, { key }) => sum + normalized[key].length, 0);
+  const activeSelected = new Set(normalized[activeFamily]);
+  const filteredOptions = options.filter((option) => {
+    const needle = query.trim().toLowerCase();
+    return !needle || `${option.label} ${option.id}`.toLowerCase().includes(needle);
+  });
+  const toggle = (id) => {
+    const current = normalized[activeFamily];
+    const next = activeSelected.has(id) ? current.filter((item) => item !== id) : [...current, id];
+    onChange({ ...normalized, [activeFamily]: next });
+  };
+
+  return (
+    <PopoverPrimitive.Root open={open} onOpenChange={(next) => {
+      if (disabled) return;
+      setOpen(next);
+      if (!next) setQuery('');
+    }}>
+      <PopoverPrimitive.Trigger asChild>
+        <button
+          id={triggerID}
+          type="button"
+          className="pool-fallback-selector__trigger"
+          aria-label="选择 GPT、Claude、Gemini 流量的兜底用户分组"
+          aria-expanded={open}
+          disabled={disabled}
+        >
+          <span className="pool-fallback-selector__summary">
+            {selectedCount ? FALLBACK_FAMILIES.map(({ key, label }) => (
+              <span className="pool-fallback-selector__pill" key={key}>{label} <b>{normalized[key].length}</b></span>
+            )) : <span className="pool-fallback-selector__placeholder">选择流量家族与兜底用户分组</span>}
+          </span>
+          <span className="pool-fallback-selector__chevron" aria-hidden="true">⌄</span>
+        </button>
+      </PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Content
+          className="pool-fallback-selector__content"
+          align="start"
+          sideOffset={6}
+          collisionPadding={16}
+        >
+          <div className="pool-fallback-selector__families" aria-label="模型家族">
+            {FALLBACK_FAMILIES.map(({ key, label }) => (
+              <button
+                type="button"
+                key={key}
+                className={activeFamily === key ? 'is-active' : ''}
+                aria-pressed={activeFamily === key}
+                onClick={() => { setActiveFamily(key); setQuery(''); }}
+              >
+                <span>{label}</span>
+                <b>{normalized[key].length}</b>
+              </button>
+            ))}
+          </div>
+          <div className="pool-fallback-selector__groups">
+            <div className="pool-fallback-selector__groups-head">
+              <strong>{FALLBACK_FAMILIES.find(({ key }) => key === activeFamily)?.label} 兜底分组</strong>
+              <span>{activeSelected.size} 已选</span>
+            </div>
+            <input
+              className="pool-input"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索用户分组"
+              aria-label="搜索兜底用户分组"
+            />
+            <div className="pool-fallback-selector__list" role="group" aria-label="可选兜底用户分组">
+              {filteredOptions.length ? filteredOptions.map((option) => {
+                const checked = activeSelected.has(option.id);
+                return (
+                  <button
+                    type="button"
+                    key={option.id}
+                    className={checked ? 'is-selected' : ''}
+                    role="checkbox"
+                    aria-checked={checked}
+                    onClick={() => toggle(option.id)}
+                  >
+                    <span className="pool-fallback-selector__option-copy">
+                      <strong title={option.label}>{option.label}</strong>
+                      <small title={option.id}>{option.id}</small>
+                    </span>
+                    <span className="pool-fallback-selector__check" aria-hidden="true">{checked ? '✓' : ''}</span>
+                  </button>
+                );
+              }) : <div className="pool-fallback-selector__empty">{options.length ? '没有匹配的用户分组' : '请先创建另一个用户分组'}</div>}
+            </div>
+          </div>
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
+  );
+}
+
+function ModelCatalogInput({ label, value, onChange, models, placeholder, help }) {
+  const listID = `pool-model-catalog-${useId().replace(/:/g, '')}`;
+  return (
+    <>
+      <Form.Input
+        label={label}
+        value={value}
+        onChange={onChange}
+        list={listID}
+        placeholder={placeholder}
+        help={help}
+        autoComplete="off"
+      />
+      <datalist id={listID}>
+        {uniqueStrings(models).map((model) => <option key={model} value={model} />)}
+      </datalist>
+    </>
+  );
+}
+
+function TrafficFallbackModelEditor({ draft, setDraft, userGroups, models }) {
+  const catalog = useMemo(() => modelsByFamily(models), [models]);
+  const mappings = draft.traffic_fallback_model_mappings || [];
+  const updateMapping = (index, patchValue) => setDraft((current) => ({
+    ...current,
+    traffic_fallback_model_mappings: current.traffic_fallback_model_mappings.map((mapping, mappingIndex) => (
+      mappingIndex === index ? { ...mapping, ...patchValue } : mapping
+    )),
+  }));
+  const addMapping = () => setDraft((current) => {
+    let family = 'gpt';
+    let targetUserGroupID = '';
+    for (const candidate of FALLBACK_FAMILIES) {
+      const selected = uniqueStrings(current.traffic_fallback_groups?.[candidate.key]);
+      const missing = selected.find((groupID) => !(current.traffic_fallback_model_mappings || []).some((mapping) => (
+        mapping.family === candidate.key && mapping.target_user_group_id === groupID
+      )));
+      if (missing) {
+        family = candidate.key;
+        targetUserGroupID = missing;
+        break;
+      }
+      if (!targetUserGroupID && selected[0]) {
+        family = candidate.key;
+        targetUserGroupID = selected[0];
+      }
+    }
+    return {
+      ...current,
+      traffic_fallback_model_mappings: [...(current.traffic_fallback_model_mappings || []), {
+        family,
+        source_model: '',
+        target_user_group_id: targetUserGroupID,
+        target_model: '',
+      }],
+    };
+  });
+  const removeMapping = (index) => setDraft((current) => ({
+    ...current,
+    traffic_fallback_model_mappings: current.traffic_fallback_model_mappings.filter((_, mappingIndex) => mappingIndex !== index),
+  }));
+  const selectedCount = FALLBACK_FAMILIES.reduce((sum, { key }) => sum + uniqueStrings(draft.traffic_fallback_groups?.[key]).length, 0);
+
+  return (
+    <section className="pool-traffic-fallback-editor">
+      <div className="pool-user-routing-editor__head">
+        <div>
+          <strong>模型流量转换</strong>
+          <div className="pool-field__help">精确模型优先于前缀通配符；可从实时模型目录选择，也可直接输入尚未探测到的模型名。</div>
+        </div>
+        <Button onClick={addMapping} disabled={!selectedCount}>添加模型转换</Button>
+      </div>
+      {mappings.length ? mappings.map((mapping, index) => {
+        const selectedGroups = uniqueStrings(draft.traffic_fallback_groups?.[mapping.family]);
+        const groupOptions = selectedGroups.map((id) => {
+          const group = userGroups.find((item) => item.id === id);
+          return { label: group?.name || id, value: id };
+        });
+        const sourceModels = [...(catalog[mapping.family] || []), ...catalog.other];
+        return (
+          <Card key={`${index}:${mapping.family}:${mapping.target_user_group_id}`} className="pool-fallback-mapping-card">
+            <div className="pool-fallback-mapping-card__index">
+              <span>{String(index + 1).padStart(2, '0')}</span>
+              <small>转换规则</small>
+            </div>
+            <div className="pool-fallback-mapping-card__fields">
+              <Form.Select
+                label="流量家族"
+                value={mapping.family}
+                onChange={(family) => updateMapping(index, {
+                  family,
+                  target_user_group_id: uniqueStrings(draft.traffic_fallback_groups?.[family])[0] || '',
+                })}
+                optionList={FALLBACK_FAMILIES.map(({ key, label }) => ({ label, value: key }))}
+              />
+              <ModelCatalogInput
+                label="来源模型"
+                value={mapping.source_model}
+                onChange={(source_model) => updateMapping(index, { source_model })}
+                models={sourceModels}
+                placeholder="gpt-5.6-sol 或 gpt-5.*"
+              />
+              <div className="pool-fallback-mapping-card__arrow" aria-hidden="true">→</div>
+              <Form.Select
+                label="请求转入用户分组"
+                value={mapping.target_user_group_id}
+                onChange={(target_user_group_id) => updateMapping(index, { target_user_group_id })}
+                optionList={groupOptions}
+                placeholder="选择已勾选的兜底分组"
+              />
+              <ModelCatalogInput
+                label="目标模型"
+                value={mapping.target_model}
+                onChange={(target_model) => updateMapping(index, { target_model })}
+                models={[...catalog.gpt, ...catalog.claude, ...catalog.gemini, ...catalog.other]}
+                placeholder="gpt-5.5（支持手动输入）"
+              />
+            </div>
+            <Button size="small" type="danger" onClick={() => removeMapping(index)}>删除</Button>
+          </Card>
+        );
+      }) : (
+        <Banner
+          type={selectedCount ? 'warning' : 'info'}
+          title={selectedCount ? '为已选兜底分组添加模型转换' : '尚未启用流量兜底'}
+          description={selectedCount
+            ? '每个已勾选的模型家族与兜底分组至少需要一条来源模型 → 目标模型规则；使用 * 可覆盖该家族的所有模型。'
+            : '先在上方二级下拉框中选择 GPT、Claude 或 Gemini 的兜底用户分组。'}
+        />
+      )}
+    </section>
+  );
+}
+
 function UserGroupEditor({
   editor,
   groups,
+  userGroups,
   providers,
   instructionFiles,
+  models,
+  modelsError,
   catalogLoading,
   catalogError,
   onRetryCatalog,
@@ -323,7 +652,11 @@ function UserGroupEditor({
   const blockedAccountGroupOptions = groups
     .filter((group) => draft.target_keys.includes(`${TARGET_ACCOUNT_GROUP}:${group.name}`))
     .map((group) => ({ label: `账号池分组 · ${group.name}`, value: group.name }));
+  const fallbackGroupOptions = userGroups
+    .filter((group) => group.id !== editor?.row?.id)
+    .map((group) => ({ id: group.id, label: group.name || group.id }));
   const payload = normalizedUserGroupPayload(draft, providers);
+  const fallbackIssues = fallbackConfigurationIssues(draft);
 
   const setTargets = (targetKeys) => setDraft((current) => {
     const selected = new Set(targetKeys);
@@ -350,6 +683,13 @@ function UserGroupEditor({
       ...current.model_instruction_profiles,
       [family]: { ...current.model_instruction_profiles?.[family], ...patchValue },
     },
+  }));
+  const setTrafficFallbackGroups = (traffic_fallback_groups) => setDraft((current) => ({
+    ...current,
+    traffic_fallback_groups,
+    traffic_fallback_model_mappings: (current.traffic_fallback_model_mappings || []).filter((mapping) => (
+      uniqueStrings(traffic_fallback_groups?.[mapping.family]).includes(mapping.target_user_group_id)
+    )),
   }));
 
   return (
@@ -413,6 +753,33 @@ function UserGroupEditor({
           </div>
         </div>
       </Card>
+      <Card title="流量兜底" className="pool-card pool-traffic-fallback-card">
+        <Banner
+          type="info"
+          title="仅在当前分组全部候选失败后接管"
+          description="按 GPT / Claude / Gemini 分别选择兜底用户分组，再配置来源模型到目标模型的转换。只重放尚未提交且不携带服务端会话状态的请求；循环引用会在保存时被拦截。"
+        />
+        <div className="pool-field pool-field--top">
+          <span className="pool-field__label">流量兜底分组</span>
+          <TrafficFallbackGroupSelector
+            value={draft.traffic_fallback_groups}
+            onChange={setTrafficFallbackGroups}
+            options={fallbackGroupOptions}
+            disabled={catalogLoading && fallbackGroupOptions.length === 0}
+          />
+          <div className="pool-field__help">一级选择模型家族，二级列表勾选有序兜底分组；同一家族按勾选顺序尝试。</div>
+        </div>
+        {modelsError ? (
+          <Banner type="warning" title="模型目录暂不可用" description="手动输入仍可正常配置与保存，目录恢复后会自动补全候选项。" />
+        ) : null}
+        <TrafficFallbackModelEditor draft={draft} setDraft={setDraft} userGroups={userGroups} models={models} />
+        {fallbackIssues.length ? (
+          <div className="pool-fallback-validation" role="alert">
+            <strong>还需完成 {fallbackIssues.length} 项配置</strong>
+            <span>{fallbackIssues.slice(0, 3).join('；')}{fallbackIssues.length > 3 ? `；另有 ${fallbackIssues.length - 3} 项` : ''}</span>
+          </div>
+        ) : null}
+      </Card>
       <Card title="指令与模型策略" className="pool-card">
         <Form.TextArea label="系统提示词" value={draft.system_prompt} onChange={(system_prompt) => setDraft((current) => ({ ...current, system_prompt }))} rows={5} placeholder="留空则不注入额外系统提示" />
         <div className="pool-user-group-grid">
@@ -463,12 +830,21 @@ function UserGroupEditor({
                   : '所有兼容目标等权'}
               </div>
             ))}
+            {FALLBACK_FAMILIES.flatMap(({ key, label }) => (payload.traffic_fallback_groups[key] || []).map((groupID) => {
+              const group = userGroups.find((item) => item.id === groupID);
+              const mappings = payload.traffic_fallback_model_mappings.filter((mapping) => mapping.family === key && mapping.target_user_group_id === groupID);
+              return (
+                <div key={`fallback:${key}:${groupID}`}>
+                  <strong>{label} 兜底</strong>：{group?.name || groupID} · {mappings.map((mapping) => `${mapping.source_model} → ${mapping.target_model}`).join('，')}
+                </div>
+              );
+            }))}
           </>
         ) : <span className="pool-muted">至少选择一个目标后显示路由摘要。</span>}
       </Card>
       <div className="pool-modal-actions">
         <Button onClick={onCancel} disabled={saving}>取消</Button>
-        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0} onClick={() => onSave(payload)}>保存用户分组</Button>
+        <Button theme="solid" loading={saving} disabled={!payload.name || payload.targets.length === 0 || fallbackIssues.length > 0} onClick={() => onSave(payload)}>保存用户分组</Button>
       </div>
     </div>
   );
@@ -489,19 +865,22 @@ export default function Groups() {
   const fetchEgresses = useCallback(async ({ signal }) => rowsOf(await get('/admin/egress-profiles', undefined, { signal }), ['profiles', 'egress_profiles']), []);
   const fetchUserGroups = useCallback(async ({ signal }) => rowsOf(await get('/admin/user-groups', undefined, { signal }), ['user_groups']), []);
   const fetchProviders = useCallback(async ({ signal }) => rowsOf(await get('/admin/providers', undefined, { signal }), ['providers']), []);
+  const fetchModels = useCallback(async ({ signal }) => rowsOf(await get('/admin/models', undefined, { signal }), ['models']), []);
 
   const groupsResource = useAsyncResource(fetchGroups, [fetchGroups], { initialData: [] });
   const instructionsResource = useAsyncResource(fetchInstructions, [fetchInstructions], { initialData: [] });
   const egressesResource = useAsyncResource(fetchEgresses, [fetchEgresses], { initialData: [] });
   const userGroupsResource = useAsyncResource(fetchUserGroups, [fetchUserGroups], { initialData: [] });
   const providersResource = useAsyncResource(fetchProviders, [fetchProviders], { initialData: [] });
-  const resources = [groupsResource, instructionsResource, egressesResource, userGroupsResource, providersResource];
+  const modelsResource = useAsyncResource(fetchModels, [fetchModels], { initialData: [] });
+  const resources = [groupsResource, instructionsResource, egressesResource, userGroupsResource, providersResource, modelsResource];
   const data = {
     groups: groupsResource.data || [],
     instructions: instructionsResource.data || [],
     egresses: egressesResource.data || [],
     userGroups: userGroupsResource.data || [],
     providers: providersResource.data || [],
+    models: modelsResource.data || [],
   };
   const loading = resources.some((resource) => resource.loading);
   const lastRefresh = resources.reduce((latest, resource) => {
@@ -515,6 +894,7 @@ export default function Groups() {
       egressesResource.reload(),
       userGroupsResource.reload(),
       providersResource.reload(),
+      modelsResource.reload(),
     ]);
   }, [
     groupsResource.reload,
@@ -522,14 +902,16 @@ export default function Groups() {
     egressesResource.reload,
     userGroupsResource.reload,
     providersResource.reload,
+    modelsResource.reload,
   ]);
   const refreshUserGroupCatalog = useCallback(() => {
     void Promise.allSettled([
       groupsResource.reload(),
       providersResource.reload(),
       instructionsResource.reload(),
+      modelsResource.reload(),
     ]);
-  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload]);
+  }, [groupsResource.reload, providersResource.reload, instructionsResource.reload, modelsResource.reload]);
   const openUserGroupEditor = useCallback((editor) => {
     setUserEditor(editor);
     refreshUserGroupCatalog();
@@ -538,7 +920,7 @@ export default function Groups() {
     setAccountEditor(editor);
     void egressesResource.reload();
   }, [egressesResource.reload]);
-  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading;
+  const targetCatalogLoading = groupsResource.loading || providersResource.loading || instructionsResource.loading || modelsResource.loading;
   const targetCatalogError = groupsResource.error || providersResource.error || instructionsResource.error;
 
   const { run: saveAccountGroup, running: savingAccountGroup } = useAsyncAction(async (values) => {
@@ -663,6 +1045,9 @@ export default function Groups() {
         row.system_prompt_apply_to_compaction ? '压缩时应用' : '',
         row.block_claude_target_groups?.length ? `Claude 跳过 ${row.block_claude_target_groups.length} 组` : '',
         row.block_gpt_target_groups?.length ? `GPT 跳过 ${row.block_gpt_target_groups.length} 组` : '',
+        FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)
+          ? `流量兜底 ${FALLBACK_FAMILIES.reduce((count, { key }) => count + (row.traffic_fallback_groups?.[key]?.length || 0), 0)} 组`
+          : '',
       ].filter(Boolean)} max={3} />,
     },
     {
@@ -691,6 +1076,7 @@ export default function Groups() {
     { label: '用户分组', value: data.userGroups.length },
     { label: '混合目标', value: data.userGroups.filter((row) => new Set((row.targets || []).map((target) => canonicalTarget(target).kind)).size > 1).length },
     { label: '模型分层', value: data.userGroups.filter((row) => row.model_routing?.length).length, tone: 'success' },
+    { label: '流量兜底', value: data.userGroups.filter((row) => FALLBACK_FAMILIES.some(({ key }) => row.traffic_fallback_groups?.[key]?.length)).length, tone: 'success' },
   ];
 
   return (
@@ -737,8 +1123,11 @@ export default function Groups() {
             key={`${userEditor.mode}:${userEditor.row?.id || 'new'}`}
             editor={userEditor}
             groups={data.groups}
+            userGroups={data.userGroups}
             providers={data.providers}
             instructionFiles={data.instructions}
+            models={data.models}
+            modelsError={modelsResource.error}
             catalogLoading={targetCatalogLoading}
             catalogError={targetCatalogError}
             onRetryCatalog={refreshUserGroupCatalog}
@@ -762,4 +1151,11 @@ export default function Groups() {
   );
 }
 
-export { blankUserGroup, normalizedUserGroupPayload, userGroupDraft };
+export {
+  blankUserGroup,
+  fallbackConfigurationIssues,
+  modelFamily,
+  modelsByFamily,
+  normalizedUserGroupPayload,
+  userGroupDraft,
+};

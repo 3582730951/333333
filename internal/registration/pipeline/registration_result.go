@@ -26,6 +26,19 @@ type registrationCredential struct {
 	AccessToken       string
 	RefreshToken      string
 	IDToken           string
+	SessionToken      string
+	LoginPassword     string
+}
+
+func registrationSessionCookie(sessionToken string) string {
+	sessionToken = strings.TrimSpace(sessionToken)
+	if sessionToken == "" || len(sessionToken) > 64<<10 || strings.ContainsAny(sessionToken, "\r\n") {
+		return ""
+	}
+	if strings.Contains(sessionToken, "=") {
+		return sessionToken
+	}
+	return "__Secure-next-auth.session-token=" + sessionToken
 }
 
 func (p *Pipeline) updateWorkflow(ctx context.Context, req RegisterRequest, state, errorClass string) {
@@ -111,6 +124,8 @@ func (p *Pipeline) persistVerifiedRegistration(ctx context.Context, req Register
 		Account: account, Token: token, EgressID: req.EgressID, Method: req.Method,
 		JobID: req.JobID, RecordID: req.RecordID, WorkflowItemID: req.WorkflowItemID,
 		RemoteIdentityAlias: p.registrationIdentityAlias(parsed.AccountID),
+		SessionCookie:       registrationSessionCookie(candidate.SessionToken),
+		LoginPassword:       candidate.LoginPassword,
 	}); err != nil {
 		state := storage.RegistrationItemFailed
 		class := "import_failed"

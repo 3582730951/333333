@@ -117,6 +117,7 @@ HOTMAIL_OTP_URL = os.environ.get(
     "",
 )
 HOTMAIL_OTP_TOKEN = os.environ.get("HOTMAIL_OTP_TOKEN", "")
+HOTMAIL_EXACT_EMAIL = os.environ.get("HOTMAIL_EXACT_EMAIL", "0") == "1"
 
 def _hotmail_headers():
     if not HOTMAIL_OTP_TOKEN:
@@ -394,7 +395,7 @@ def _decode_jwt_payload(token: str):
         return {}
 
 
-def _save_codex_tokens(email: str, tokens: dict):
+def _save_codex_tokens(email: str, tokens: dict, *, login_password: str = ""):
     access_token = tokens.get("access_token", "")
     refresh_token = tokens.get("refresh_token", "")
     id_token = tokens.get("id_token", "")
@@ -434,6 +435,10 @@ def _save_codex_tokens(email: str, tokens: dict):
         "access_token": access_token,
         "last_refresh": now.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
         "refresh_token": refresh_token,
+        "session_token": str(tokens.get("session_token") or ""),
+        # The Go parent consumes the marker from a bounded in-memory pipe and
+        # seals this value in the same database transaction as the tokens.
+        "login_password": login_password,
     }
 
     # Machine-readable marker so a parent process (pool_server Go) can import the account.
@@ -636,8 +641,11 @@ class ChatGPTRegister:
         try:
             # ====== hotmail_otp: 真实 Hotmail + plus-addressing（直连读信） ======
             if EMAIL_PROVIDER == "hotmail_otp":
-                tag = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-                email = HOTMAIL_BASE_EMAIL.replace("@", f"+{tag}@")
+                if HOTMAIL_EXACT_EMAIL:
+                    email = HOTMAIL_BASE_EMAIL
+                else:
+                    tag = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+                    email = HOTMAIL_BASE_EMAIL.replace("@", f"+{tag}@")
                 # 快照当前收件箱，后续只接受「之后」到达的新邮件，避免取到旧验证码
                 self._hotmail_seen = set()
                 try:
@@ -1053,10 +1061,27 @@ class ChatGPTRegister:
                 "access_token": access_token,
                 "refresh_token": data.get("refreshToken") or data.get("refresh_token") or "",
                 "id_token": data.get("idToken") or data.get("id_token") or "",
+                "session_token": self.session_cookie_header(),
             }
         except Exception as e:
             self._print(f"[Session] 获取 session 异常: {e}")
             return None
+
+    def session_cookie_header(self):
+        """Return the current cookie jar as one bounded Cookie header."""
+        try:
+            items = list(self.session.cookies.items())
+        except Exception:
+            return ""
+        parts = []
+        for name, value in items:
+            name = str(name or "").strip()
+            value = str(value or "").strip()
+            if not name or not value or any(ch in name + value for ch in "\r\n"):
+                continue
+            parts.append(f"{name}={value}")
+        header = "; ".join(parts)
+        return header if len(header) <= 65536 else ""
 
     @staticmethod
     def _find_jwt_in_data(data, depth=0):
@@ -1932,7 +1957,9 @@ def _register_one(idx, total, proxy, output_file, max_retries=3):
                         email, chatgpt_password, mail_token=mail_token)
                 oauth_ok = bool(tokens and tokens.get("access_token"))
                 if oauth_ok:
-                    _save_codex_tokens(email, tokens)
+                    if tokens is not None and not tokens.get("session_token"):
+                        tokens["session_token"] = reg.session_cookie_header()
+                    _save_codex_tokens(email, tokens, login_password=chatgpt_password)
                 else:
                     if OAUTH_REQUIRED:
                         raise Exception("OAuth 获取失败 (required=true)")

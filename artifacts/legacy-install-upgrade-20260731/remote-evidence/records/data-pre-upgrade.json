@@ -1,0 +1,30 @@
+{
+  "phase": "pre-upgrade",
+  "quick_check": "ok",
+  "integrity_check": "ok",
+  "logical_fingerprint_sha256": "be7b9be9822fa9b4c1a502acf3c99f63b47831321aa9acbe143ae43bbd4d1b56",
+  "counts": {
+    "groups": 7,
+    "accounts": 16,
+    "account_rate_limits": 16,
+    "account_model_capabilities": 32,
+    "usage_records": 168,
+    "email_pool": 18,
+    "audit_log": 49,
+    "registration_jobs": 6,
+    "registration_records": 18,
+    "lifecycle_tasks": 8
+  },
+  "fixture_marker": "cache-hit-optimization-to-optimized",
+  "schema_tables": 85,
+  "config_sha256": "46b179c50b737b88daca98c5d4cf48f6190a414ec275550b948e70ebc8226b40",
+  "database_sha256": "ab6c2d6d72c14c539f9007810451000a1f01b95f06a187ed9ca2978822a81c96",
+  "current_release": "legacy-cache-hit-optimization",
+  "release_manifest": {
+    "release_id": "legacy-cache-hit-optimization",
+    "commit": "source",
+    "built_at": "2026-07-31T00:53:38Z",
+    "layout": "release-scoped-worker"
+  },
+  "server_binary_sha256": "33228f5fde9d2bb059b5ac3399cb30b422303da2e244d895c8b8df7255af82f7"
+}

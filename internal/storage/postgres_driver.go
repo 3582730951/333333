@@ -449,6 +449,40 @@ driver TEXT NOT NULL, version TEXT NOT NULL, checksum TEXT NOT NULL, applied_at 
 ON CONFLICT(driver,version) DO NOTHING`, version, checksum, now); err != nil {
 		return err
 	}
+	// Keep the immutable base checksum stable for existing PostgreSQL installs.
+	// Team lifecycle is an additive migration with its own checksum/version.
+	const teamLifecycleVersion = "20260731_team_lifecycle_v1"
+	teamLifecycleSchema := postgresSchema(teamManagementSchemaSQL)
+	teamChecksumRaw := sha256.Sum256([]byte(teamLifecycleSchema))
+	teamChecksum := hex.EncodeToString(teamChecksumRaw[:])
+	existing = ""
+	err = tx.QueryRowContext(ctx, `
+SELECT checksum FROM schema_migrations WHERE driver='postgres' AND version=?`,
+		teamLifecycleVersion).Scan(&existing)
+	if err == nil && existing != teamChecksum {
+		return fmt.Errorf("PostgreSQL migration checksum mismatch for %s", teamLifecycleVersion)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	for _, statement := range splitSQLStatements(teamLifecycleSchema) {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply PostgreSQL team lifecycle schema: %w", err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `
+INSERT INTO schema_migrations(driver,version,checksum,applied_at)
+VALUES('postgres',?,?,?) ON CONFLICT(driver,version) DO NOTHING`,
+		teamLifecycleVersion, teamChecksum, now); err != nil {
+		return err
+	}
+	// This table is independent from the immutable base and team lifecycle v1
+	// migrations. The checked migration below owns the team mailbox columns.
+	for _, statement := range splitSQLStatements(postgresSchema(mailboxProfileSchemaSQL)) {
+		if _, err = tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("apply PostgreSQL mailbox health schema: %w", err)
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO settings(key,value,updated_at) VALUES('usage_accuracy_cutover_at',?,?)
 ON CONFLICT(key) DO NOTHING`, fmt.Sprint(now), now); err != nil {
 		return err
@@ -493,6 +527,17 @@ type checkedPostgresMigration struct {
 }
 
 var checkedPostgresMigrations = []checkedPostgresMigration{
+	{
+		version: "20260731_team_mailbox_policy_v1",
+		statements: []string{
+			`ALTER TABLE team_workspaces ADD COLUMN IF NOT EXISTS mailbox_provider_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE team_workspaces ADD COLUMN IF NOT EXISTS required_email_domain TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE team_workspaces ADD COLUMN IF NOT EXISTS same_domain_required INTEGER NOT NULL DEFAULT 1`,
+			`ALTER TABLE team_lifecycle_workflows ADD COLUMN IF NOT EXISTS mailbox_provider_key TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE team_lifecycle_workflows ADD COLUMN IF NOT EXISTS required_email_domain TEXT NOT NULL DEFAULT ''`,
+			`CREATE INDEX IF NOT EXISTS idx_team_workspaces_mailbox_provider ON team_workspaces(mailbox_provider_key)`,
+		},
+	},
 	{
 		version: "20260727_float64_v1",
 		statements: []string{

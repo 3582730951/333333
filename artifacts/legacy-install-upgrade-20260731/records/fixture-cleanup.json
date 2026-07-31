@@ -1,0 +1,14 @@
+{
+  "fixture_root_removed": true,
+  "fixture_port_34276": "stopped",
+  "main_port_34273": {
+    "status": 200,
+    "ready": true,
+    "release_id": "apple-email-overflow-final-main"
+  },
+  "frontend_port_34274": {
+    "status": 200,
+    "ready": true,
+    "release_id": "apple-email-overflow-final-frontend"
+  }
+}

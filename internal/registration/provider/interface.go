@@ -3,6 +3,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -31,6 +32,11 @@ type MailboxProvider interface {
 	DeleteEmail(ctx context.Context, mailboxID string) error
 	Name() string
 	Type() string
+}
+
+type MailboxCapabilityProvider interface {
+	MailboxDomains() []string
+	MailboxUsesCustomDomain() bool
 }
 
 // CaptchaSolver solves captcha challenges
@@ -137,42 +143,88 @@ func (m *Manager) GetSMSFromProvider(ctx context.Context, providerName, country 
 
 // GetMailbox returns the highest priority mailbox provider and creates an email
 func (m *Manager) GetMailbox(ctx context.Context) (MailboxProvider, string, string, string, error) {
-	for _, p := range m.Mailbox {
-		email, password, mailboxID, err := p.CreateEmail(ctx)
-		if err == nil {
-			return p, email, password, mailboxID, nil
-		}
-	}
-	return nil, "", "", "", ErrNoProviderAvailable
+	return m.GetMailboxWithConstraints(ctx, "", "")
 }
 
 // GetMailboxFromProvider honors the provider selected by the registration form or
 // lifecycle defaults. Empty/auto keeps priority-based fallback behavior.
 func (m *Manager) GetMailboxFromProvider(ctx context.Context, providerName string) (MailboxProvider, string, string, string, error) {
+	return m.GetMailboxWithConstraints(ctx, providerName, "")
+}
+
+// GetMailboxWithConstraints preserves priority fallback while enforcing an
+// optional provider and canonical email domain. A provisioned address that does
+// not satisfy the domain constraint is released before the next candidate is
+// tried, so team rotation can never silently cross domains.
+func (m *Manager) GetMailboxWithConstraints(
+	ctx context.Context,
+	providerName string,
+	requiredDomain string,
+) (MailboxProvider, string, string, string, error) {
 	providerName = strings.ToLower(strings.TrimSpace(providerName))
-	if providerName == "" || providerName == "auto" {
-		return m.GetMailbox(ctx)
-	}
+	requiredDomain = normalizeMailboxDomain(requiredDomain)
 	var lastErr error
 	for _, p := range m.Mailbox {
 		name := strings.ToLower(strings.TrimSpace(p.Name()))
-		matches := name == providerName ||
+		matches := providerName == "" || providerName == "auto" || name == providerName ||
 			(providerName == "tempmail" && name == "tempmail_lol") ||
 			(providerName == "tempmaillol" && name == "tempmail_lol")
 		if !matches {
 			continue
 		}
-		email, password, mailboxID, err := p.CreateEmail(ctx)
-		if err == nil {
-			return p, email, password, mailboxID, nil
+		if requiredDomain != "" {
+			if capable, ok := p.(MailboxCapabilityProvider); ok {
+				domains := capable.MailboxDomains()
+				if len(domains) > 0 && !mailboxDomainListed(domains, requiredDomain) {
+					continue
+				}
+			}
 		}
-		lastErr = err
-		break
+		email, password, mailboxID, err := p.CreateEmail(ctx)
+		if err != nil {
+			lastErr = err
+			if providerName != "" && providerName != "auto" {
+				break
+			}
+			continue
+		}
+		if requiredDomain != "" && mailboxAddressDomain(email) != requiredDomain {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			_ = p.DeleteEmail(cleanupCtx, mailboxID)
+			cancel()
+			lastErr = fmt.Errorf("mailbox provider %s returned an address outside required domain %s", p.Name(), requiredDomain)
+			if providerName != "" && providerName != "auto" {
+				break
+			}
+			continue
+		}
+		return p, email, password, mailboxID, nil
 	}
 	if lastErr != nil {
 		return nil, "", "", "", lastErr
 	}
 	return nil, "", "", "", ErrNoProviderAvailable
+}
+
+func normalizeMailboxDomain(value string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(value, "@")), "."))
+}
+
+func mailboxAddressDomain(address string) string {
+	index := strings.LastIndexByte(strings.TrimSpace(address), '@')
+	if index < 0 || index == len(address)-1 {
+		return ""
+	}
+	return normalizeMailboxDomain(address[index+1:])
+}
+
+func mailboxDomainListed(domains []string, required string) bool {
+	for _, domain := range domains {
+		if normalizeMailboxDomain(domain) == required {
+			return true
+		}
+	}
+	return false
 }
 
 // SolveCaptcha tries all solvers until one succeeds

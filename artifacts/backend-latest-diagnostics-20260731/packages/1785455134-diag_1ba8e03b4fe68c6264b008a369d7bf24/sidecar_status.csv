@@ -1,0 +1,2 @@
+sidecar_egress_id,real_egress_id,health,profile_max_concurrency,adaptive_limit,inflight,queue_depth,recent_failures,circuit_state,circuit_until,bypass_until,cooldown_until,bound_account_count,created_at,updated_at
+egress_sidecar,,healthy,16,,,,,,,,0,0,1785406766,1785447527

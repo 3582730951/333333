@@ -19,7 +19,7 @@ for (const redirect of redirects) {
   if (!routePaths.includes(target)) failures.push(`redirect target has no route: ${redirect.path} -> ${redirect.to}`);
 }
 if (routePaths.filter((pathValue) => pathValue.startsWith('/portal')).length !== 4) failures.push('portal route matrix must contain four routes.');
-if (routePaths.filter((pathValue) => !pathValue.startsWith('/portal')).length !== 24) failures.push('admin route metadata must contain twenty-four canonical routes.');
+if (routePaths.filter((pathValue) => !pathValue.startsWith('/portal')).length !== 26) failures.push('admin route metadata must contain twenty-six canonical routes.');
 const aiRoutes = routePaths.filter((pathValue) => pathValue.startsWith('/settings/ai/'));
 if (aiRoutes.length !== 6) failures.push('AI settings must expose six canonical secondary routes.');
 if (!aiSettingsSource.includes("dispatchBrowserEvent('pool-ai-settings-dirty', dirty)") || !appSource.includes("addWindowListener('pool-ai-settings-dirty'")) {

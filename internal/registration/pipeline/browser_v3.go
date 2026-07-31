@@ -150,13 +150,26 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 		return nil, fmt.Errorf("browser_v3: bad proxy: %w", err)
 	}
 
-	// Build plus-addressed email from the configured base
-	baseEmail, otpURL, otpToken, err := p.getEmailForRegistration(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("browser_v3: email: %w", err)
+	// Use the connector-neutral loopback relay when a mailbox provider was
+	// selected. Legacy authenticated plus-addressing remains compatible.
+	email, otpURL, otpToken := "", "", ""
+	var relay *mailboxRelay
+	if strings.TrimSpace(req.MailboxProvider) != "" {
+		relay, err = p.prepareMailboxRelay(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("browser_v3: mailbox relay: %w", err)
+		}
+		defer relay.Close(ctx)
+		email, otpURL, otpToken = relay.Email, relay.URL, relay.Token
+	} else {
+		baseEmail, legacyOTPURL, legacyOTPToken, emailErr := p.getEmailForRegistration(ctx)
+		if emailErr != nil {
+			return nil, fmt.Errorf("browser_v3: email: %w", emailErr)
+		}
+		tag := randomHex(6)
+		email = strings.Replace(baseEmail, "@", "+"+tag+"@", 1)
+		otpURL, otpToken = legacyOTPURL, legacyOTPToken
 	}
-	tag := randomHex(6)
-	email := strings.Replace(baseEmail, "@", "+"+tag+"@", 1)
 
 	// Resolve paths
 	python := firstEnv("python3", "CODEX_REG_PYTHON")
@@ -210,6 +223,8 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 				AccessToken:       a.AccessToken,
 				RefreshToken:      a.RefreshToken,
 				IDToken:           a.IDToken,
+				SessionToken:      a.SessionToken,
+				LoginPassword:     a.LoginPassword,
 			})
 		}
 	}

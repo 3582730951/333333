@@ -603,6 +603,20 @@ def main():
                 log("❌ No access token (neither OAuth nor session) — account unusable")
                 return
 
+            cookie_header = ""
+            try:
+                cookie_parts = []
+                for cookie in ctx.cookies(["https://chatgpt.com/"]):
+                    name = str(cookie.get("name") or "").strip()
+                    value = str(cookie.get("value") or "").strip()
+                    if name and value and "\r" not in name + value and "\n" not in name + value:
+                        cookie_parts.append(f"{name}={value}")
+                candidate_cookie = "; ".join(cookie_parts)
+                if len(candidate_cookie) <= 65536:
+                    cookie_header = candidate_cookie
+            except Exception:
+                cookie_header = ""
+
             result = {
                 "type": "codex",
                 "email": EMAIL,
@@ -614,7 +628,7 @@ def main():
                 "refresh_token": oauth_refresh_token,
                 "id_token": oauth_id_token,
                 # Fallback session fields (useful for cookie-based refresh)
-                "session_token": session_at,
+                "session_token": cookie_header,
             }
             log(f"✅ SUCCESS user={user.get('id')} account={acct.get('id')} oauth_refresh={'yes' if oauth_refresh_token else 'no'}")
             print("__CODEX_ACCOUNT__ " + json.dumps(result, ensure_ascii=False), flush=True)

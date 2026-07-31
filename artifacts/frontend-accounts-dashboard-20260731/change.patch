@@ -1,0 +1,1261 @@
+--- a/web-spa/src/pages/Accounts.jsx
++++ b/web-spa/src/pages/Accounts.jsx
+@@ -16,7 +16,7 @@
+ import useKeyedAsyncAction from '../hooks/useKeyedAsyncAction.js';
+ import useResponsiveLayout from '../hooks/useResponsiveLayout.js';
+ import { toCSV, downloadCSV } from '../lib/csv.js';
+-import { fmtInt, fmtTokens } from '../lib/format.js';
++import { fmtInt, fmtRelative, fmtTokens } from '../lib/format.js';
+ import { accountQueryKeys, useAccountsPage } from '../features/accounts/queries/accounts.ts';
+ import { fetchAccountArchive, importAccountArchive } from '../features/accounts/api/accounts.ts';
+ import { abortController, abortSignal, createAbortController } from '../lib/browserAbort.js';
+@@ -87,6 +87,93 @@
+   return account?.quota_summary?.sync_reason || (quotaPercent(account) == null ? 'never_polled' : 'ok');
+ }
+ 
++const QUOTA_REASON_LABELS = {
++  ok: '额度已同步',
++  never_polled: '等待首次同步',
++  stale: '额度数据已过期',
++  partial: '额度数据不完整',
++  inactive: '账号当前未启用',
++  token_missing: '缺少可用凭据',
++  token_expired: '凭据已过期',
++  unsupported_api_key_billing: '按量计费不提供订阅额度',
++  unsupported_claude_non_oauth: '当前认证方式不提供订阅额度',
++  unsupported_provider: '当前提供商不提供额度同步',
++};
++
++function quotaReasonLabel(reason) {
++  const key = String(reason || 'never_polled');
++  if (QUOTA_REASON_LABELS[key]) return QUOTA_REASON_LABELS[key];
++  if (key.startsWith('error/')) return '额度同步失败';
++  return '额度状态待确认';
++}
++
++function quotaWindowLabel(window) {
++  const seconds = Number(window?.limit_window_seconds);
++  if (Number.isFinite(seconds) && seconds > 0) {
++    if (seconds % 86400 === 0) return `${seconds / 86400} 天窗口`;
++    if (seconds % 3600 === 0) return `${seconds / 3600} 小时窗口`;
++    if (seconds % 60 === 0) return `${seconds / 60} 分钟窗口`;
++  }
++  return window?.limiter_type ? `${window.limiter_type} 窗口` : '主额度窗口';
++}
++
++export function quotaPresentation(account) {
++  const primary = account?.quota_summary?.primary || {};
++  const percent = quotaPercent(account);
++  const reason = quotaReason(account);
++  const usedPercent = percent == null ? null : Math.round(percent);
++  const remainingPercent = usedPercent == null ? null : Math.max(0, 100 - usedPercent);
++  const tone = usedPercent == null ? 'muted' : usedPercent >= 90 ? 'danger' : usedPercent >= 70 ? 'warning' : 'success';
++  const remainingTokens = Number(primary.remaining_tokens ?? account?.remaining_tokens ?? account?.quota_remaining_tokens);
++  const limitTokens = Number(primary.limit_tokens ?? account?.limit_tokens ?? account?.quota_limit_tokens);
++  const remainingRequests = Number(primary.remaining_requests);
++  const limitRequests = Number(primary.limit_requests);
++  const details = [];
++  if (Number.isFinite(remainingTokens) && remainingTokens >= 0) {
++    details.push(`${fmtTokens(remainingTokens)} Token 剩余${Number.isFinite(limitTokens) && limitTokens > 0 ? ` / ${fmtTokens(limitTokens)}` : ''}`);
++  } else if (Number.isFinite(remainingRequests) && remainingRequests >= 0) {
++    details.push(`${fmtInt(remainingRequests)} 次请求剩余${Number.isFinite(limitRequests) && limitRequests > 0 ? ` / ${fmtInt(limitRequests)}` : ''}`);
++  }
++  const resetAt = Number(primary.reset_at);
++  if (Number.isFinite(resetAt) && resetAt > 0) details.push(`${fmtRelative(resetAt)}重置`);
++  return {
++    percent: usedPercent,
++    remainingPercent,
++    tone,
++    reason,
++    reasonLabel: quotaReasonLabel(reason),
++    windowLabel: quotaWindowLabel(primary),
++    detail: details.join(' · '),
++  };
++}
++
++function AccountQuota({ account, compact = false }) {
++  const quota = quotaPresentation(account);
++  if (quota.percent == null) {
++    return (
++      <div className={`pool-account-quota pool-account-quota--unknown${compact ? ' pool-account-quota--compact' : ''}`}>
++        <div className="pool-account-quota__head">
++          <strong>额度待同步</strong>
++        </div>
++        <span className="pool-account-quota__meta">{quota.reasonLabel}</span>
++      </div>
++    );
++  }
++  const ariaLabel = `${quota.windowLabel}，已用 ${quota.percent}%，剩余 ${quota.remainingPercent}%${quota.detail ? `，${quota.detail}` : ''}`;
++  return (
++    <div className={`pool-account-quota pool-account-quota--${quota.tone}${compact ? ' pool-account-quota--compact' : ''}`} aria-label={ariaLabel}>
++      <div className="pool-account-quota__head">
++        <strong>{quota.remainingPercent}% <span>剩余</span></strong>
++        <span>{quota.percent}% 已用</span>
++      </div>
++      <TinyMeter value={quota.percent} label={ariaLabel} tone={quota.tone} />
++      <span className="pool-account-quota__meta">
++        {quota.windowLabel}{quota.detail ? ` · ${quota.detail}` : ''}
++      </span>
++    </div>
++  );
++}
++
+ function routeSummary(account) {
+   const binding = account.egress_binding || {};
+   const exit = binding.primary_egress_id || account.egress_id || '默认出口';
+@@ -457,14 +544,22 @@
+       render: (_, r) => (
+         <div className="pool-account-summary">
+           <div className="pool-account-titleline">
+-            <TextClamp strong onClick={() => setDrawerAcct(r)}>{r.label || r.id}</TextClamp>
++            <TextClamp
++              strong
++              className="pool-account-primary-id"
++              title={r.label || r.id}
++              ariaLabel={r.label || r.id}
++              onClick={() => setDrawerAcct(r)}
++            >
++              {middleEllipsis(r.label || r.id, 30, 14)}
++            </TextClamp>
+             <Tag size="small">{r.provider || 'codex'}</Tag>
+             <Tag size="small" color={r.auth_method === 'api_key' ? 'violet' : r.credential_mode === 'agent_identity' ? 'cyan' : 'blue'}>
+               {r.credential_mode === 'agent_identity' ? 'agent identity' : (r.auth_method || 'oauth')}
+             </Tag>
+           </div>
+           <div className="pool-account-metaline">
+-            <TextClamp muted className="pool-account-email" title={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
++            <TextClamp muted className="pool-account-email" title={r.email || r.id} ariaLabel={r.email || r.id}>{middleEllipsis(r.email || r.id)}</TextClamp>
+           </div>
+         </div>
+       ),
+@@ -514,63 +609,66 @@
+       },
+     },
+     {
+-      title: '用量',
++      title: '用量 / 额度',
+       key: 'usage',
+-      width: 150,
++      width: 220,
+       align: 'right',
+       render: (_, r) => {
+         const usage = accountUsage(r);
+         const requests = usage.requests ?? r.requests;
+         const tokens = usage.total_tokens ?? r.total_tokens;
+-        const pct = quotaPercent(r);
+-        const reason = quotaReason(r);
+         return (
+-          <div className="pool-quota-cell">
+-            <TextClamp>{tokens == null ? '—' : fmtTokens(tokens)}</TextClamp>
+-            <div className="pool-resource-summary__meta">{requests == null ? '请求未同步' : `${fmtInt(requests)} 次请求`}</div>
+-            <span className="pool-resource-summary__meta">{pct === null ? `配额未同步 · ${reason}` : `配额 ${pct}% 已用`}</span>
+-            <TinyMeter value={pct ?? 0} label={pct === null ? '未同步' : `${pct}% 已用`} />
++          <div className="pool-account-usage">
++            <div className="pool-account-usage__totals">
++              <strong>{tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token`}</strong>
++              <span>{requests == null ? '请求未同步' : `${fmtInt(requests)} 次请求`}</span>
++            </div>
++            <AccountQuota account={r} />
+           </div>
+         );
+       },
+     },
+     { title: '操作', key: 'ops', width: 72, render: (_, r) => renderAccountActions(r) },
+   ];
+-  const mobileAccountCell = (r) => {
++  const mobileAccountCell = (r, mobileMeta = {}) => {
+     const route = routeSummary(r);
+     const usage = accountUsage(r);
+     const requests = usage.requests ?? r.requests;
+     const tokens = usage.total_tokens ?? r.total_tokens;
++    const accountName = r.label || r.id;
++    const accountTitle = (
++      <TextClamp strong title={accountName} ariaLabel={accountName}>
++        {middleEllipsis(accountName, 20, 8)}
++      </TextClamp>
++    );
+     return (
+       <MobileResourceCell
++        selectable={selectMode}
++        selected={Boolean(mobileMeta.selected)}
++        onSelect={() => mobileMeta.toggleSelected?.(!mobileMeta.selected)}
+         title={selectMode
+-          ? middleEllipsis(r.label || r.id, 20, 8)
+-          : <Typography.Text link onClick={() => setDrawerAcct(r)}>{middleEllipsis(r.label || r.id, 20, 8)}</Typography.Text>}
+-        subtitle={middleEllipsis(r.email || r.id, 22, 12)}
++          ? accountTitle
++          : <Typography.Text link onClick={() => setDrawerAcct(r)}>{accountTitle}</Typography.Text>}
++        subtitle={<TextClamp title={r.email || r.id} ariaLabel={r.email || r.id}>{middleEllipsis(r.email || r.id, 22, 12)}</TextClamp>}
+         badges={statusTag(r)}
+         chips={<>
+           <Tag size="small">{r.provider || 'codex'}</Tag>
+-          <Tag size="small">{r.group_name || '默认'}</Tag>
++          <Tag size="small" title={r.group_name || '默认'}>{middleEllipsis(r.group_name || '默认', 12, 6)}</Tag>
+           {r.plan_type ? <Tag size="small">{r.plan_type}</Tag> : null}
+           {r.billing_mode === 'pay_as_you_go' ? <Tag size="small" color="violet">按量计费</Tag> : null}
+-          <Tag size="small" color="blue">{route.primary}</Tag>
++          <Tag size="small" color="blue" title={route.primary}>{middleEllipsis(route.primary, 14, 8)}</Tag>
+         </>}
+         details={[
+-          { label: '用量', value: tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token` },
+-          { label: '请求', value: requests == null ? null : `${fmtInt(requests)} 次请求` },
++          {
++            label: '累计用量',
++            value: `${tokens == null ? 'Token 未同步' : `${fmtTokens(tokens)} Token`}${requests == null ? '' : ` · ${fmtInt(requests)} 次请求`}`,
++          },
++          { label: '额度', value: <AccountQuota account={r} compact /> },
+         ]}
+         actions={!selectMode ? renderAccountActions(r) : null}
+       />
+     );
+   };
+-  const mobileColumns = [
+-    {
+-      title: '账号',
+-      dataIndex: 'label',
+-      render: (_, r) => mobileAccountCell(r),
+-    },
+-  ];
+-
+   return (
+     <div>
+       <PageHeader
+@@ -638,9 +736,10 @@
+         rowSelection={!responsive.isMobile || selectMode ? { selectedRowKeys: selected, onChange: handleSelectionChange } : undefined}
+         className="pool-mobile-table pool-accounts-table"
+         density="account"
+-        minScrollX={1092}
++        minScrollX={1162}
+         rowHeight={72}
+-        mobileColumns={mobileColumns}
++        mobileRenderer={mobileAccountCell}
++        mobileListLabel="账号列表"
+         mobileScroll={false}
+         emptyTitle="账号池为空"
+         emptyDesc="导入 auth.json 或开启自动注册来填充账号池"
+--- a/web-spa/src/pages/Dashboard.tsx
++++ b/web-spa/src/pages/Dashboard.tsx
+@@ -43,6 +43,12 @@
+   return ok ? <Tag color="green">{t('dashboard.service_normal')}</Tag> : <Tag color="red">{t('dashboard.service_abnormal')}</Tag>;
+ }
+ 
++export function compactIdentity(value: unknown, head = 8, tail = 6) {
++  const text = String(value || t('common.unknown'));
++  if (text.length <= head + tail + 1) return text;
++  return `${text.slice(0, head)}…${text.slice(-tail)}`;
++}
++
+ export default function Dashboard() {
+   const navigate = useNavigate();
+   const pageVisible = usePageVisible();
+@@ -138,7 +144,8 @@
+     color: modelColor(row.dimension_key || row.model_key || row.model),
+   }));
+   const topAccounts = (secondary?.cache?.by_account || []).slice(0, 8).map((row) => ({
+-    x: String(row.account_id || t('common.unknown')).slice(0, 12),
++    x: compactIdentity(row.account_id),
++    fullLabel: String(row.account_id || t('common.unknown')),
+     input: Number(row.actual_prompt_tokens || row.prompt_tokens || 0),
+     output: Number(row.actual_completion_tokens || 0),
+   }));
+@@ -167,7 +174,7 @@
+ 
+       <LoadErrorBanner error={partialError} onRetry={reload} title={partialError ? t('dashboard.partial_failed') : undefined} />
+ 
+-      <section className="pool-dashboard-command" style={{ marginBottom: 18 }}>
++      <section className="pool-dashboard-command">
+         <div className="pool-dashboard-command__main">
+           <div className="pool-dashboard-command__eyebrow">
+             {healthTag(Boolean(core?.healthAvailable), core?.health?.ok)}
+@@ -187,24 +194,24 @@
+         <div className="pool-dashboard-command__side">
+           <div className="pool-section-title">{t('dashboard.attention')}</div>
+           <div className="pool-attention-list">
+-            <div>
++            <div className={quarantined ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
+               <span>{t('dashboard.quarantined_accounts')}</span><b className={quarantined ? 'pool-danger-text' : ''}>{fmtInt(quarantined)}</b>
+               <p>{quarantined ? t('dashboard.quarantined_issue') : t('dashboard.quarantined_clear')}</p>
+               {quarantined ? <Button size="small" theme="borderless" onClick={() => navigate('/accounts')}>{t('dashboard.view_accounts')}</Button> : null}
+             </div>
+-            <div>
++            <div className={recheck ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
+               <span>{t('dashboard.recheck')}</span><b className={recheck ? 'pool-danger-text' : ''}>{fmtInt(recheck)}</b>
+               <p>{recheck ? t('dashboard.recheck_issue') : t('dashboard.recheck_clear')}</p>
+             </div>
+-            <div>
++            <div className={cooling ? 'pool-attention-item--issue' : 'pool-attention-item--clear'}>
+               <span>{t('dashboard.cooling')}</span><b>{fmtInt(cooling)}</b>
+               <p>{cooling ? t('dashboard.cooling_issue') : t('dashboard.cooling_clear')}</p>
+             </div>
+-            <div>
++            <div className="pool-attention-item--neutral">
+               <span>{t('dashboard.model_coverage')}</span><b>{secondary?.modelAvailable ? fmtInt(byModel.length) : '—'}</b>
+               <p>{t('dashboard.model_coverage_desc')}</p>
+             </div>
+-            <div>
++            <div className="pool-attention-item--neutral">
+               <span>{t('dashboard.cache_completeness')}</span><b>{secondary?.cacheAvailable ? cacheCompleteness : '—'}</b>
+               <p>{kiroCache?.cache_reporting_state === 'unreported' ? t('dashboard.kiro_cache_unreported') : t('dashboard.cache_completeness_desc')}</p>
+             </div>
+@@ -212,8 +219,8 @@
+         </div>
+       </section>
+ 
+-      <div className="pool-quick-actions" style={{ display: 'flex', gap: 10, marginBottom: 18, flexWrap: 'wrap', alignItems: 'center' }}>
+-        <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--pool-text-2)', marginRight: 4 }}>{t('dashboard.quick_actions')}</span>
++      <div className="pool-quick-actions">
++        <span className="pool-quick-actions__label">{t('dashboard.quick_actions')}</span>
+         <Button icon={<IconPlus />} type="primary" onClick={() => navigate('/accounts?action=import')}>{t('dashboard.import_account')}</Button>
+         <Button icon={<IconUser />} onClick={() => navigate('/accounts')}>{t('dashboard.account_management')}</Button>
+         <Button icon={<IconKey />} onClick={() => navigate('/keys')}>API Keys</Button>
+@@ -222,37 +229,43 @@
+       </div>
+ 
+       {core?.timeseriesAvailable ? (
+-        <div className="pool-chart-card" style={{ marginBottom: 18 }}>
++        <div className="pool-chart-card pool-dashboard-trend">
+           <div className="head"><div><div className="t">{t('dashboard.provider_model_trend')}</div><div className="s">{t('dashboard.provider_model_trend_desc')}</div></div></div>
+-          <div style={{ height: 280 }}>
++          <div className="pool-dashboard-trend__canvas">
+             {providerModelSeries.length && providerModelDescriptors.length
+-              ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height={280} />
+-              : <AreaChart buckets={buckets} height={280} />}
++              ? <ModelAreaChart modelSeries={providerModelSeries} series={providerModelDescriptors} height={280} ariaLabel={t('dashboard.provider_model_trend')} />
++              : <AreaChart buckets={buckets} height={280} ariaLabel={t('dashboard.provider_model_trend')} />}
+           </div>
+         </div>
+       ) : null}
+ 
+       {(hasStatusDistribution || hasProviderDistribution || hasRegistrationTrend) ? (
+-        <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
+-          {hasStatusDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.account_distribution')}</div></div><Donut data={statusDonut} unit={t('dashboard.account_unit')} /></div> : null}
+-          {hasProviderDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.provider_distribution')}</div></div><Donut data={providerDonut} unit={t('dashboard.account_unit')} /></div> : null}
++        <div className="pool-grid cols-3 pool-dashboard-chart-grid">
++          {hasStatusDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.account_distribution')}</div></div><Donut data={statusDonut} unit={t('dashboard.account_unit')} ariaLabel={t('dashboard.account_distribution')} /></div> : null}
++          {hasProviderDistribution ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.provider_distribution')}</div></div><Donut data={providerDonut} unit={t('dashboard.account_unit')} ariaLabel={t('dashboard.provider_distribution')} /></div> : null}
+           {hasRegistrationTrend ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.registration_trend')}</div></div>
+-            <BarChart data={registrationDays} series={[{ key: 'success', name: t('dashboard.success'), color: C.green }, { key: 'failed', name: t('dashboard.failed'), color: C.red }]} stacked />
++            <BarChart ariaLabel={t('dashboard.registration_trend')} data={registrationDays} series={[{ key: 'success', name: t('dashboard.success'), color: C.green }, { key: 'failed', name: t('dashboard.failed'), color: C.red }]} stacked />
+           </div> : null}
+         </div>
+       ) : null}
+ 
+       {(officialCacheByModel.length || hasModelTokens || topAccounts.length) ? (
+-        <div className="pool-grid cols-3" style={{ marginBottom: 18 }}>
++        <div className="pool-grid cols-3 pool-dashboard-chart-grid">
+           {secondary?.cacheAvailable && officialCacheByModel.length ? <div className="pool-chart-card">
+             <div className="head"><div><div className="t">{t('dashboard.model_cache_rate')}</div><div className="s">{t('dashboard.model_cache_desc')}</div></div></div>
+             <div style={{ paddingTop: 6 }}><CacheBars data={officialCacheByModel} /></div>
+           </div> : null}
+-          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} /></div> : null}
++          {hasModelTokens ? <div className="pool-chart-card"><div className="head"><div className="t">{t('dashboard.model_token_share')}</div></div><Donut data={modelTokenDonut} unit="Token" valueFormatter={modelTokenFormatter} ariaLabel={t('dashboard.model_token_share')} /></div> : null}
+           {topAccounts.length ? (
+             <div className="pool-chart-card">
+               <div className="head"><div><div className="t">{t('dashboard.top_accounts')}</div><div className="s">{t('dashboard.top_accounts_desc')}</div></div></div>
+-              <BarChart data={topAccounts} series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]} stacked />
++              <BarChart
++                ariaLabel={t('dashboard.top_accounts')}
++                data={topAccounts}
++                series={[{ key: 'input', name: t('usage.input'), color: C.blue }, { key: 'output', name: t('usage.output'), color: C.green }]}
++                tooltipLabelFormatter={(label: string, payload: any[]) => payload?.[0]?.payload?.fullLabel || label}
++                stacked
++              />
+             </div>
+           ) : null}
+         </div>
+--- a/web-spa/src/components/Charts.jsx
++++ b/web-spa/src/components/Charts.jsx
+@@ -1,4 +1,4 @@
+-import React, { useEffect, useState } from 'react';
++import React, { useEffect, useId, useState } from 'react';
+ import {
+   ResponsiveContainer, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+   XAxis, YAxis, CartesianGrid, Tooltip, Legend, Label,
+@@ -41,16 +41,68 @@
+   );
+ }
+ 
+-function tooltipStyle(c) {
+-  return {
+-    contentStyle: { background: c.tooltipBg, border: `1px solid ${c.tooltipBorder}`, borderRadius: 10, fontSize: 12 },
+-    labelStyle: { color: c.tick }, itemStyle: { fontSize: 12 },
+-  };
++function ChartFrame({ height, ariaLabel = '数据图表', children }) {
++  return (
++    <div
++      className="pool-chart-frame"
++      style={{ height }}
++      role="img"
++      aria-label={ariaLabel}
++      tabIndex={0}
++    >
++      {children}
++    </div>
++  );
++}
++
++function CompactLegend({ payload = [] }) {
++  if (!payload.length) return null;
++  return (
++    <ul className="pool-chart-legend" aria-hidden="true">
++      {payload.map((item) => (
++        <li key={`${item.dataKey || ''}:${item.value}`}>
++          <span style={{ background: item.color }} />
++          <b title={String(item.value || '')}>{item.value}</b>
++        </li>
++      ))}
++    </ul>
++  );
++}
++
++function PolishedChartTooltip({
++  active,
++  payload,
++  label,
++  valueFormatter = (value) => value,
++  labelFormatter,
++  unit = '',
++}) {
++  if (!active || !payload?.length) return null;
++  const resolvedLabel = labelFormatter?.(label, payload) ?? label;
++  const rows = payload.filter((item) => item.value !== undefined && item.value !== null);
++  if (!rows.length) return null;
++  return (
++    <div className="pool-chart-tooltip">
++      {resolvedLabel !== undefined && resolvedLabel !== null ? (
++        <div className="pool-chart-tooltip__label" title={String(resolvedLabel)}>{resolvedLabel}</div>
++      ) : null}
++      <div className="pool-chart-tooltip__rows">
++        {rows.map((item) => (
++          <div key={`${item.dataKey || item.name}:${item.value}`} className="pool-chart-tooltip__row">
++            <span className="pool-chart-tooltip__swatch" style={{ background: item.color }} />
++            <span>{item.name || item.dataKey}</span>
++            <b>{valueFormatter(item.value)}{unit ? ` ${unit}` : ''}</b>
++          </div>
++        ))}
++      </div>
++    </div>
++  );
+ }
+ 
+ // Stacked token-usage area chart from UsageBucket[] ({bucket, prompt_tokens, completion_tokens, cached_tokens, total_tokens}).
+-export function UsageAreaChart({ buckets = [], height = 260 }) {
++export function UsageAreaChart({ buckets = [], height = 260, ariaLabel = 'Token 用量趋势' }) {
+   useIsDark();
++  const gradientPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+   const c = axisColors();
+   const data = (buckets || []).map((b) => ({
+     t: fmtTime(b.bucket),
+@@ -60,33 +112,46 @@
+     total: b.total_tokens || 0,
+   }));
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <AreaChart data={data} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+-        <defs>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
++          <defs>
++            {['输入', '输出', '缓存'].map((k, i) => (
++              <linearGradient key={k} id={`${gradientPrefix}-usage-${i}`} x1="0" y1="0" x2="0" y2="1">
++                <stop offset="0%" stopColor={PALETTE[i]} stopOpacity={0.42} />
++                <stop offset="68%" stopColor={PALETTE[i]} stopOpacity={0.12} />
++                <stop offset="100%" stopColor={PALETTE[i]} stopOpacity={0.015} />
++              </linearGradient>
++            ))}
++          </defs>
++          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
++          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
++          <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
++          <Tooltip content={<PolishedChartTooltip valueFormatter={fmtTokens} />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
++          <Legend content={<CompactLegend />} />
+           {['输入', '输出', '缓存'].map((k, i) => (
+-            <linearGradient key={k} id={`g-${i}`} x1="0" y1="0" x2="0" y2="1">
+-              <stop offset="0%" stopColor={PALETTE[i]} stopOpacity={0.5} />
+-              <stop offset="100%" stopColor={PALETTE[i]} stopOpacity={0.04} />
+-            </linearGradient>
++            <Area
++              key={k}
++              type="monotone"
++              dataKey={k}
++              stackId="1"
++              stroke={PALETTE[i]}
++              fill={`url(#${gradientPrefix}-usage-${i})`}
++              strokeWidth={2.25}
++              dot={false}
++              activeDot={{ r: 4, strokeWidth: 2, fill: 'var(--pool-bg-surface)' }}
++              isAnimationActive={false}
++            />
+           ))}
+-        </defs>
+-        <CartesianGrid strokeDasharray="3 3" stroke={c.grid} vertical={false} />
+-        <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
+-        <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
+-        <Tooltip {...tooltipStyle(c)} formatter={(v) => fmtTokens(v)} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-        {['输入', '输出', '缓存'].map((k, i) => (
+-          <Area key={k} type="monotone" dataKey={k} stackId="1" stroke={PALETTE[i]} fill={`url(#g-${i})`} strokeWidth={2}
+-            isAnimationActive={false} />
+-        ))}
+-      </AreaChart>
+-    </ResponsiveContainer>
++        </AreaChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+ // Generic donut from [{name, value}]. Shows the total in the center with a
+ // custom SVG label so the chart is both visual and numeric.
+-export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal = true, valueFormatter }) {
++export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal = true, valueFormatter, ariaLabel = '占比分布' }) {
+   useIsDark();
+   const c = axisColors();
+   const items = (data || []).filter((d) => (d.value || 0) > 0);
+@@ -96,44 +161,85 @@
+   const formattedTotal = String(formatValue(total));
+   const centerFontSize = formattedTotal.length > 10 ? 14 : formattedTotal.length > 7 ? 17 : 22;
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <PieChart>
+-        <Pie data={items} dataKey="value" nameKey="name" innerRadius="58%" outerRadius="82%"
+-          paddingAngle={2} stroke="none" isAnimationActive={false}>
+-          {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
+-          {showCenterTotal ? <Label position="center" value={formattedTotal} fill={c.tick}
+-            fontSize={centerFontSize} fontWeight={700} dy={unit ? -8 : 0} /> : null}
+-          {showCenterTotal && unit ? <Label position="center" value={unit} fill={c.tick}
+-            fontSize={11} fontWeight={500} dy={12} /> : null}
+-        </Pie>
+-        <Tooltip {...tooltipStyle(c)} formatter={(v, n) => [`${formatValue(v)}${unit ? ` ${unit}` : ''}`, n]} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-      </PieChart>
+-    </ResponsiveContainer>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <PieChart>
++          <Pie
++            data={items}
++            dataKey="value"
++            nameKey="name"
++            innerRadius="62%"
++            outerRadius="82%"
++            paddingAngle={3}
++            cornerRadius={6}
++            stroke="none"
++            isAnimationActive={false}
++          >
++            {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
++            {showCenterTotal ? <Label position="center" value={formattedTotal} fill={c.tick}
++              fontSize={centerFontSize} fontWeight={720} dy={unit ? -8 : 0} /> : null}
++            {showCenterTotal && unit ? <Label position="center" value={unit} fill={c.tick}
++              fontSize={11} fontWeight={520} dy={12} /> : null}
++          </Pie>
++          <Tooltip content={<PolishedChartTooltip valueFormatter={formatValue} unit={unit} />} />
++          <Legend content={<CompactLegend />} />
++        </PieChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+ // Grouped bar from [{x, ...series}] with series=[{key,color,name}].
+-export function GroupedBar({ data = [], series = [], height = 240, stacked = false, showValues = false }) {
++export function GroupedBar({
++  data = [],
++  series = [],
++  height = 240,
++  stacked = false,
++  showValues = false,
++  ariaLabel = '柱状数据图',
++  xTickFormatter,
++  tooltipLabelFormatter,
++  valueFormatter = fmtTokens,
++}) {
+   useIsDark();
+   const c = axisColors();
+   if (!data.length) return <Empty />;
+   const labelEl = showValues ? { position: 'top', fill: c.tick, fontSize: 11 } : false;
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <BarChart data={data} margin={{ top: 18, right: 8, left: 0, bottom: 0 }}>
+-        <CartesianGrid strokeDasharray="3 3" stroke={c.grid} vertical={false} />
+-        <XAxis dataKey="x" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={16} />
+-        <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={40} tickFormatter={fmtTokens} />
+-        <Tooltip {...tooltipStyle(c)} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-        {series.map((s, i) => (
+-          <Bar key={s.key} dataKey={s.key} name={s.name || s.key} fill={s.color || PALETTE[i % PALETTE.length]}
+-            stackId={stacked ? '1' : undefined} radius={stacked ? 0 : [4, 4, 0, 0]} maxBarSize={36}
+-            label={labelEl} isAnimationActive={false} />
+-        ))}
+-      </BarChart>
+-    </ResponsiveContainer>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <BarChart data={data} margin={{ top: 18, right: 8, left: 0, bottom: 0 }}>
++          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
++          <XAxis
++            dataKey="x"
++            tick={{ fontSize: 11, fill: c.tick }}
++            tickLine={false}
++            axisLine={false}
++            minTickGap={16}
++            tickFormatter={xTickFormatter}
++          />
++          <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtTokens} />
++          <Tooltip
++            content={<PolishedChartTooltip valueFormatter={valueFormatter} labelFormatter={tooltipLabelFormatter} />}
++            cursor={{ fill: 'var(--pool-bg-hover)', radius: 8 }}
++          />
++          <Legend content={<CompactLegend />} />
++          {series.map((s, i) => (
++            <Bar
++              key={s.key}
++              dataKey={s.key}
++              name={s.name || s.key}
++              fill={s.color || PALETTE[i % PALETTE.length]}
++              stackId={stacked ? '1' : undefined}
++              radius={stacked ? (i === series.length - 1 ? [7, 7, 0, 0] : 0) : [7, 7, 3, 3]}
++              maxBarSize={34}
++              label={labelEl}
++              isAnimationActive={false}
++            />
++          ))}
++        </BarChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+@@ -162,28 +268,20 @@
+     .sort((a, b) => (b.metric.total_tokens || 0) - (a.metric.total_tokens || 0));
+   if (!rows.length) return null;
+   return (
+-    <div style={{
+-      background: 'var(--pool-chart-tooltip-bg)',
+-      border: '1px solid var(--pool-chart-tooltip-border)',
+-      borderRadius: 8,
+-      padding: '8px 10px',
+-      fontSize: 12,
+-      boxShadow: 'var(--pool-shadow)',
+-      maxWidth: 280,
+-    }}>
+-      <div style={{ fontWeight: 700, marginBottom: 6 }}>{label}</div>
++    <div className="pool-chart-tooltip pool-chart-tooltip--metrics">
++      <div className="pool-chart-tooltip__label">{label}</div>
+       {rows.map(({ item, metric }) => {
+         const requestHit = metricRate(metric.hit_requests, metric.requests);
+         const realTokenHit = metric.real_token_hit_rate ?? metricRate(metric.cache_read_tokens, metric.cache_input_tokens || metric.prompt_tokens);
+         const eligibleHit = metric.eligible_cache_hit_rate ?? metricRate(metric.cache_read_tokens, (metric.cache_read_tokens || 0) + (metric.cache_creation_tokens || 0));
+         const writeShare = metric.cache_write_share ?? metricRate(metric.cache_creation_tokens, metric.cache_input_tokens || metric.prompt_tokens);
+         return (
+-          <div key={item.dataKey} style={{ padding: '6px 0', borderTop: '1px solid var(--pool-border)' }}>
+-            <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontWeight: 700, marginBottom: 4 }}>
+-              <span style={{ width: 9, height: 9, borderRadius: 3, background: item.color, display: 'inline-block' }} />
++          <div key={item.dataKey} className="pool-chart-tooltip__metric">
++            <div className="pool-chart-tooltip__metric-title">
++              <span className="pool-chart-tooltip__swatch" style={{ background: item.color }} />
+               <span>{metric.series_label || item.name}</span>
+             </div>
+-            <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '3px 12px' }}>
++            <div className="pool-chart-tooltip__metric-grid">
+               <span>Token</span><b>{fmtTokens(metric.total_tokens)}</b>
+               <span>请求数</span><b>{metric.requests == null ? '—' : metric.requests}</b>
+               <span>请求命中率</span><b>{pctOrDash(requestHit)}</b>
+@@ -198,8 +296,16 @@
+   );
+ }
+ 
+-export function UsageModelAreaChart({ modelSeries = [], series = [], height = 260, metric = 'total_tokens', selectedKeys }) {
++export function UsageModelAreaChart({
++  modelSeries = [],
++  series = [],
++  height = 260,
++  metric = 'total_tokens',
++  selectedKeys,
++  ariaLabel = '模型用量趋势',
++}) {
+   useIsDark();
++  const gradientPrefix = useId().replace(/[^a-zA-Z0-9_-]/g, '');
+   const c = axisColors();
+   const descriptors = (series || []).map((s, i) => ({
+     ...s,
+@@ -221,19 +327,40 @@
+   const data = [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([, row]) => row);
+   if (!data.length) return <Empty />;
+   return (
+-    <ResponsiveContainer width="100%" height={height}>
+-      <AreaChart data={data} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+-        <CartesianGrid strokeDasharray="3 3" stroke={c.grid} vertical={false} />
+-        <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
+-        <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
+-        <Tooltip content={<ModelMetricsTooltip />} />
+-        <Legend wrapperStyle={{ fontSize: 12 }} />
+-        {descriptors.map((s) => (
+-          <Area key={s.series_key} type="monotone" dataKey={s.field} name={s.series_label || s.series_key}
+-            stackId="model" stroke={s.color} fill={s.color} fillOpacity={0.18} strokeWidth={2} isAnimationActive={false} />
+-        ))}
+-      </AreaChart>
+-    </ResponsiveContainer>
++    <ChartFrame height={height} ariaLabel={ariaLabel}>
++      <ResponsiveContainer width="100%" height="100%">
++        <AreaChart data={data} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
++          <defs>
++            {descriptors.map((s) => (
++              <linearGradient key={s.series_key} id={`${gradientPrefix}-${s.field}`} x1="0" y1="0" x2="0" y2="1">
++                <stop offset="0%" stopColor={s.color} stopOpacity={0.34} />
++                <stop offset="100%" stopColor={s.color} stopOpacity={0.025} />
++              </linearGradient>
++            ))}
++          </defs>
++          <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
++          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
++          <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
++          <Tooltip content={<ModelMetricsTooltip />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
++          <Legend content={<CompactLegend />} />
++          {descriptors.map((s) => (
++            <Area
++              key={s.series_key}
++              type="monotone"
++              dataKey={s.field}
++              name={s.series_label || s.series_key}
++              stackId="model"
++              stroke={s.color}
++              fill={`url(#${gradientPrefix}-${s.field})`}
++              strokeWidth={2.25}
++              dot={false}
++              activeDot={{ r: 4, strokeWidth: 2, fill: 'var(--pool-bg-surface)' }}
++              isAnimationActive={false}
++            />
++          ))}
++        </AreaChart>
++      </ResponsiveContainer>
++    </ChartFrame>
+   );
+ }
+ 
+@@ -255,9 +382,9 @@
+         return (
+           <div key={i} style={{ marginBottom: 14 }}>
+             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12.5, marginBottom: 6 }}>
+-              <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
++              <span className="pool-cache-model" title={r.model}>
+                 <span style={{ width: 9, height: 9, borderRadius: 3, background: c, display: 'inline-block' }} />
+-                {r.model}
++                <span>{r.model}</span>
+               </span>
+               <span style={{ fontWeight: 600, color: 'var(--pool-text)' }}>{r.rate}%</span>
+             </div>
+--- a/web-spa/src/components/DisplayPrimitives.jsx
++++ b/web-spa/src/components/DisplayPrimitives.jsx
+@@ -89,13 +89,21 @@
+   );
+ }
+ 
+-export function TinyMeter({ value, max = 100, label }) {
++export function TinyMeter({ value, max = 100, label, tone = 'accent' }) {
+   const n = Number(value);
+   const m = Number(max) || 100;
+   const pct = Number.isFinite(n) && m > 0 ? Math.max(0, Math.min(100, Math.round((n / m) * 100))) : 0;
+   return (
+-    <div className="pool-tiny-meter" title={label || `${pct}%`}>
+-      <span style={{ width: `${pct}%` }} />
++    <div
++      className={`pool-tiny-meter pool-tiny-meter--${tone}`}
++      title={label || `${pct}%`}
++      role="progressbar"
++      aria-label={label || `${pct}%`}
++      aria-valuemin={0}
++      aria-valuemax={100}
++      aria-valuenow={pct}
++    >
++      <span className="pool-tiny-meter__bar" style={{ width: `${pct}%` }} />
+     </div>
+   );
+ }
+--- a/web-spa/src/styles/components.css
++++ b/web-spa/src/styles/components.css
+@@ -4122,3 +4122,431 @@
+     overflow: visible;
+   }
+ }
++
++/* Account identity and quota presentation: readable at a glance without losing full values. */
++.pool-tiny-meter__bar {
++  display: block;
++  height: 100%;
++  border-radius: inherit;
++  background: var(--pool-accent);
++  transition: width var(--pool-motion-normal) var(--pool-motion-ease);
++}
++
++.pool-tiny-meter--success .pool-tiny-meter__bar {
++  background: var(--pool-success);
++}
++
++.pool-tiny-meter--warning .pool-tiny-meter__bar {
++  background: var(--pool-warning);
++}
++
++.pool-tiny-meter--danger .pool-tiny-meter__bar {
++  background: var(--pool-danger);
++}
++
++.pool-tiny-meter--muted .pool-tiny-meter__bar {
++  background: var(--pool-text-3);
++}
++
++.pool-account-primary-id.pool-text-clamp {
++  display: block;
++  overflow: hidden !important;
++  text-overflow: ellipsis !important;
++  white-space: nowrap !important;
++}
++
++.pool-account-usage {
++  display: grid;
++  gap: 9px;
++  min-width: 0;
++  text-align: left;
++}
++
++.pool-account-usage__totals {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: 8px;
++  min-width: 0;
++}
++
++.pool-account-usage__totals strong {
++  min-width: 0;
++  color: var(--pool-text);
++  font-size: 13px;
++  font-weight: 680;
++}
++
++.pool-account-usage__totals span {
++  flex: 0 0 auto;
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-account-quota {
++  display: grid;
++  gap: 5px;
++  min-width: 0;
++}
++
++.pool-account-quota__head {
++  display: flex;
++  align-items: baseline;
++  justify-content: space-between;
++  gap: 8px;
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-account-quota__head strong {
++  color: var(--pool-text);
++  font-size: 13px;
++  font-weight: 720;
++}
++
++.pool-account-quota__head strong span {
++  color: var(--pool-text-2);
++  font-size: 11px;
++  font-weight: 620;
++}
++
++.pool-account-quota--danger .pool-account-quota__head strong {
++  color: var(--pool-danger);
++}
++
++.pool-account-quota--warning .pool-account-quota__head strong {
++  color: var(--pool-warning);
++}
++
++.pool-account-quota--success .pool-account-quota__head strong {
++  color: var(--pool-success);
++}
++
++.pool-account-quota__meta {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--pool-text-3);
++  font-size: 10.5px;
++  line-height: 1.35;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-account-quota--unknown {
++  padding: 7px 9px;
++  border-radius: var(--pool-radius-sm);
++  background: var(--pool-bg-surface-2);
++}
++
++.pool-account-quota--compact {
++  width: min(100%, 280px);
++  gap: 4px;
++}
++
++.pool-account-quota--compact .pool-account-quota__meta {
++  white-space: normal;
++}
++
++.pool-mobile-row__value .pool-account-quota {
++  font-size: initial;
++}
++
++/* Calm, Apple-like chart treatment with compact legends and readable tooltips. */
++.pool-chart-frame {
++  width: 100%;
++  min-width: 0;
++  border-radius: var(--pool-radius-md);
++  outline: none;
++}
++
++.pool-chart-frame:focus-visible {
++  box-shadow: var(--pool-focus);
++}
++
++.pool-chart-legend {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 7px 14px;
++  max-width: 100%;
++  margin: 0;
++  padding: 7px 4px 0;
++  overflow-x: auto;
++  list-style: none;
++  scrollbar-width: none;
++}
++
++.pool-chart-legend::-webkit-scrollbar {
++  display: none;
++}
++
++.pool-chart-legend li {
++  display: inline-flex;
++  flex: 0 0 auto;
++  align-items: center;
++  gap: 6px;
++  min-width: 0;
++  color: var(--pool-text-2);
++  font-size: 11px;
++  font-weight: 560;
++}
++
++.pool-chart-legend li > span {
++  width: 8px;
++  height: 8px;
++  flex: 0 0 auto;
++  border-radius: 999px;
++  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 8%, transparent);
++}
++
++.pool-chart-legend li > b {
++  max-width: 150px;
++  overflow: hidden;
++  font-weight: inherit;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip {
++  min-width: 150px;
++  max-width: min(320px, calc(100vw - 32px));
++  padding: 11px 12px;
++  border: 1px solid var(--pool-chart-tooltip-border);
++  border-radius: 14px;
++  background: color-mix(in srgb, var(--pool-chart-tooltip-bg) 92%, transparent);
++  box-shadow: var(--pool-shadow-md);
++  backdrop-filter: blur(18px) saturate(1.25);
++  color: var(--pool-text);
++  font-size: 12px;
++}
++
++.pool-chart-tooltip__label {
++  max-width: 100%;
++  margin-bottom: 8px;
++  overflow: hidden;
++  color: var(--pool-text);
++  font-weight: 700;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip__rows {
++  display: grid;
++  gap: 6px;
++}
++
++.pool-chart-tooltip__row {
++  display: grid;
++  grid-template-columns: auto minmax(0, 1fr) auto;
++  align-items: center;
++  gap: 7px;
++  min-width: 0;
++}
++
++.pool-chart-tooltip__row > span:nth-child(2) {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--pool-text-2);
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip__row b {
++  font-variant-numeric: tabular-nums;
++}
++
++.pool-chart-tooltip__swatch {
++  width: 8px;
++  height: 8px;
++  border-radius: 999px;
++}
++
++.pool-chart-tooltip--metrics {
++  max-width: 300px;
++}
++
++.pool-chart-tooltip__metric {
++  padding: 8px 0 2px;
++  border-top: 1px solid var(--pool-border);
++}
++
++.pool-chart-tooltip__metric-title {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  min-width: 0;
++  margin-bottom: 6px;
++  font-weight: 700;
++}
++
++.pool-chart-tooltip__metric-title > span:last-child {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-chart-tooltip__metric-grid {
++  display: grid;
++  grid-template-columns: minmax(0, 1fr) auto;
++  gap: 3px 12px;
++  color: var(--pool-text-2);
++}
++
++.pool-chart-tooltip__metric-grid b {
++  color: var(--pool-text);
++  font-variant-numeric: tabular-nums;
++}
++
++.pool-cache-model {
++  display: inline-flex;
++  align-items: center;
++  gap: 7px;
++  min-width: 0;
++}
++
++.pool-cache-model > span:last-child {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++/* Dashboard hierarchy: compact command surface, two-column mobile KPIs, and balanced chart grids. */
++.pool-dashboard-command {
++  align-items: start;
++  margin-bottom: 18px;
++}
++
++.pool-dashboard-command__main {
++  background:
++    radial-gradient(circle at 92% 8%, color-mix(in srgb, var(--pool-accent) 10%, transparent), transparent 42%),
++    color-mix(in srgb, var(--pool-bg-surface) 96%, transparent);
++}
++
++.pool-dashboard-command__metric strong {
++  font-variant-numeric: tabular-nums;
++  letter-spacing: -0.045em;
++}
++
++.pool-dashboard-command__subgrid div {
++  border-color: color-mix(in srgb, var(--pool-border) 72%, transparent);
++  background: color-mix(in srgb, var(--pool-bg-surface-2) 80%, transparent);
++}
++
++.pool-dashboard-command__side {
++  gap: 10px;
++}
++
++.pool-dashboard-command__side .pool-attention-list {
++  gap: 6px;
++}
++
++.pool-dashboard-command__side .pool-attention-list div {
++  padding: 8px 10px;
++  border-color: color-mix(in srgb, var(--pool-border) 72%, transparent);
++  background: transparent;
++}
++
++.pool-dashboard-command__side .pool-attention-list .pool-attention-item--issue {
++  border-color: color-mix(in srgb, var(--pool-danger) 26%, var(--pool-border));
++  background: color-mix(in srgb, var(--pool-danger-soft) 56%, transparent);
++}
++
++.pool-dashboard-command__side .pool-attention-list .pool-attention-item--clear {
++  border-color: color-mix(in srgb, var(--pool-success) 18%, var(--pool-border));
++}
++
++.pool-quick-actions {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  min-width: 0;
++  margin-bottom: 18px;
++}
++
++.pool-quick-actions__label {
++  flex: 0 0 auto;
++  margin-right: 2px;
++  color: var(--pool-text-2);
++  font-size: 12px;
++  font-weight: 650;
++}
++
++.pool-dashboard-trend,
++.pool-dashboard-chart-grid {
++  margin-bottom: 18px;
++}
++
++.pool-dashboard-trend__canvas {
++  height: 280px;
++}
++
++.pool-dashboard-chart-grid {
++  align-items: stretch;
++}
++
++.pool-dashboard-chart-grid > .pool-chart-card {
++  min-width: 0;
++  overflow: hidden;
++}
++
++@media (min-width: 768px) and (max-width: 1100px) {
++  .pool-dashboard-chart-grid.pool-grid.cols-3 {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++}
++
++@media (max-width: 767px) {
++  .pool-account-quota--compact {
++    width: 100%;
++  }
++
++  .pool-account-quota--compact .pool-account-quota__head {
++    max-width: 280px;
++  }
++
++  .pool-dashboard-command__subgrid {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    gap: 8px;
++  }
++
++  .pool-dashboard-command__subgrid div {
++    min-height: 70px;
++  }
++
++  .pool-quick-actions {
++    width: 100%;
++    overflow-x: auto;
++    padding: 1px 1px 7px;
++    scrollbar-width: thin;
++    overscroll-behavior-inline: contain;
++    -webkit-overflow-scrolling: touch;
++  }
++
++  .pool-quick-actions > * {
++    flex: 0 0 auto;
++  }
++
++  .pool-dashboard-trend__canvas,
++  .pool-dashboard-trend .pool-chart-frame {
++    height: 238px !important;
++  }
++
++  .pool-dashboard-chart-grid.pool-grid.cols-3 {
++    grid-template-columns: minmax(0, 1fr);
++  }
++
++  .pool-chart-card {
++    overflow: hidden;
++  }
++
++  .pool-chart-legend {
++    justify-content: flex-start;
++    padding-inline: 2px;
++  }
++
++  .pool-chart-legend li > b {
++    max-width: 118px;
++  }
++}
+diff --git a/web-spa/tests/accounts-dashboard-presentation.test.ts b/web-spa/tests/accounts-dashboard-presentation.test.ts
+new file mode 100755
+index 0000000..a36ba39
+--- /dev/null
++++ b/web-spa/tests/accounts-dashboard-presentation.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, it } from 'vitest';
++import { quotaPresentation } from '../src/pages/Accounts.jsx';
++import { compactIdentity } from '../src/pages/Dashboard';
++
++describe('account and dashboard presentation helpers', () => {
++  it('turns quota_summary into a clear remaining-capacity presentation', () => {
++    const quota = quotaPresentation({
++      quota_summary: {
++        sync_reason: 'ok',
++        primary: {
++          used_percent: 90,
++          remaining_tokens: 1_000,
++          limit_tokens: 10_000,
++          limit_window_seconds: 18_000,
++        },
++      },
++    });
++
++    expect(quota.percent).toBe(90);
++    expect(quota.remainingPercent).toBe(10);
++    expect(quota.tone).toBe('danger');
++    expect(quota.windowLabel).toBe('5 小时窗口');
++    expect(quota.detail).toContain('Token 剩余');
++  });
++
++  it('uses a human-readable reason when quota has not synchronized', () => {
++    const quota = quotaPresentation({
++      quota_summary: { sync_reason: 'token_expired', primary: null },
++    });
++
++    expect(quota.percent).toBeNull();
++    expect(quota.reasonLabel).toBe('凭据已过期');
++    expect(quota.tone).toBe('muted');
++  });
++
++  it('keeps both ends of long account identities so adjacent labels remain distinct', () => {
++    const first = compactIdentity('ui-demo-account-production-0001');
++    const second = compactIdentity('ui-demo-account-production-0002');
++
++    expect(first).toContain('…');
++    expect(first).toMatch(/0001$/);
++    expect(second).toMatch(/0002$/);
++    expect(first).not.toBe(second);
++  });
++});

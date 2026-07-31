@@ -1,0 +1,622 @@
+--- a/web-spa/src/pages/Registration.tsx
++++ b/web-spa/src/pages/Registration.tsx
+@@ -61,6 +61,39 @@
+   return typeof option === 'string' ? option : option.label;
+ }
+ 
++export function RegistrationJobCard({ job, onOpen }: { job: RegistrationJob; onOpen: () => void }) {
++  const group = job.group_name || t('registration.default_group');
++  const egress = job.egress_id || t('registration.default_egress');
++  return (
++    <button
++      type="button"
++      className="pool-compact-record pool-registration-job-card"
++      onClick={onOpen}
++      aria-label={`${t('registration.drawer_title')} ${job.id || 'register-job'}`}
++    >
++      <span className="pool-compact-record__head">
++        <span className="pool-compact-record__identity">
++          <Clamp strong title={job.id || 'register-job'} ariaLabel={job.id || 'register-job'}>
++            {job.id || 'register-job'}
++          </Clamp>
++          <span className="pool-compact-record__chips">
++            <Tag size="small">{job.method || 'node'}</Tag>
++            {job.identity_mode ? <Tag size="small" color="blue">{job.identity_mode}</Tag> : null}
++          </span>
++        </span>
++        {jobTag(job.status)}
++      </span>
++      <Progress task={job} totalKey="total" successKey="succeeded" failedKey="failed" />
++      <span className="pool-compact-record__foot">
++        <span title={group}>{group}</span>
++        <span aria-hidden="true">·</span>
++        <span title={egress}>{egress}</span>
++        <span className="pool-compact-record__disclosure" aria-hidden="true">›</span>
++      </span>
++    </button>
++  );
++}
++
+ export default function Registration() {
+   const navigate = useNavigate();
+   const [detailJob, setDetailJob] = useState<RegistrationJob | null>(null);
+@@ -358,8 +391,12 @@
+           skeletonRows={6}
+           skeletonCols={4}
+           onRow={(row: RegistrationJob) => ({ onClick: () => setDetailJob(row) })}
++          mobileRenderer={(row: RegistrationJob) => (
++            <RegistrationJobCard job={row} onOpen={() => setDetailJob(row)} />
++          )}
++          mobileListLabel={t('registration.jobs')}
+         />
+-        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} /> : null}
++        {!dashboardQuery.error || dashboardQuery.lastRefresh ? <SummaryRail items={jobMetrics} className="pool-registration-metrics" /> : null}
+       </div>
+       <DetailDrawer
+         task={detailJob}
+--- a/web-spa/src/pages/System.tsx
++++ b/web-spa/src/pages/System.tsx
+@@ -12,7 +12,7 @@
+ import { useSystemMetricsData } from '../features/observability/queries/system';
+ import type { SupervisorEvent, SupervisorModule, SystemProcess } from '../features/observability/model/system';
+ 
+-const { Tag, Button, Typography, Banner } = PoolUI as any;
++const { Tag, Button, Typography, Banner, Drawer } = PoolUI as any;
+ const ErrorBanner = LoadErrorBanner as any;
+ const DataTable = ResourceTable as any;
+ const MetricCard = StatCard as any;
+@@ -30,8 +30,57 @@
+ };
+ const fmtModuleRuntime = (_: unknown, row: SupervisorModule) => fmtMillis(row.status === 'running' ? row.uptime_millis : (row.last_uptime_millis || row.uptime_millis));
+ 
++type CompactStat = [label: string, value: React.ReactNode];
++type SystemDetail = {
++  title: string;
++  badge?: React.ReactNode;
++  rows: CompactStat[];
++};
++
++export function CompactSystemRecord({
++  title,
++  titleLabel,
++  badge,
++  subtitle,
++  stats,
++  note,
++  onOpen,
++}: {
++  title: React.ReactNode;
++  titleLabel: string;
++  badge?: React.ReactNode;
++  subtitle?: React.ReactNode;
++  stats: CompactStat[];
++  note?: React.ReactNode;
++  onOpen: () => void;
++}) {
++  return (
++    <button type="button" className="pool-compact-record pool-system-record" onClick={onOpen} aria-label={titleLabel}>
++      <span className="pool-compact-record__head">
++        <span className="pool-system-record__title" title={titleLabel}>{title}</span>
++        {badge}
++      </span>
++      {subtitle ? <span className="pool-system-record__subtitle">{subtitle}</span> : null}
++      <span className="pool-system-record__stats">
++        {stats.map(([label, value]) => (
++          <span key={label}>
++            <small>{label}</small>
++            <strong>{value ?? '—'}</strong>
++          </span>
++        ))}
++      </span>
++      {note ? <span className="pool-system-record__note">{note}</span> : null}
++      <span className="pool-compact-record__disclosure pool-system-record__disclosure" aria-hidden="true">›</span>
++    </button>
++  );
++}
++
+ export default function System() {
+   const { data: system, loading, error, lastRefresh, reload } = useSystemMetricsData();
++  const [detail, setDetail] = React.useState<SystemDetail | null>(null);
++  const [modulePage, setModulePage] = React.useState(1);
++  const [eventPage, setEventPage] = React.useState(1);
++  const [processPage, setProcessPage] = React.useState(1);
+ 
+   if (error && !lastRefresh && !loading) {
+     return (
+@@ -68,6 +117,59 @@
+     key: module.name || `${module.status || 'module'}-${module.last_event_unix || 0}-${index}`,
+   }));
+   const processes = registration.procs || [];
++  const modulePagination = modules.length > 8 ? { pageSize: 8, currentPage: modulePage, onPageChange: setModulePage } : false;
++  const eventPagination = events.length > 8 ? { pageSize: 8, currentPage: eventPage, onPageChange: setEventPage } : false;
++  const processPagination = processes.length > 12 ? { pageSize: 12, currentPage: processPage, onPageChange: setProcessPage } : false;
++
++  const openModule = (row: SupervisorModule) => {
++    const name = row.name || t('common.unknown');
++    setDetail({
++      title: `${t('system.module')} · ${name}`,
++      badge: <Tag color={moduleColor[row.status || ''] || 'grey'}>{moduleStateLabel(row.status)}</Tag>,
++      rows: [
++        [t('system.module'), name],
++        [t('system.status'), moduleStateLabel(row.status)],
++        [t('system.restarts'), fmtInt(row.restart_count)],
++        ['panic', fmtInt(row.panic_count)],
++        [t('system.unexpected_exits'), fmtInt(row.unexpected_exit_count)],
++        [t('system.current_previous'), fmtModuleRuntime(null, row)],
++        [t('system.backoff'), fmtMillis(row.restart_backoff_millis)],
++        [t('system.next_retry'), fmtDateTime(row.next_restart_unix)],
++        [t('system.recent_status'), row.last_panic ? `${row.last_message || 'panic'}: ${row.last_panic}` : (row.last_message || '—')],
++      ],
++    });
++  };
++
++  const openEvent = (row: SupervisorEvent) => {
++    const type = row.type || 'event';
++    const message = row.panic ? `${row.message || 'panic'}: ${row.panic}` : (row.message || '—');
++    setDetail({
++      title: `${t('system.module_events')} · ${row.module || type}`,
++      badge: <Tag color={eventColor[type] || 'grey'}>{type}</Tag>,
++      rows: [
++        [t('system.time'), fmtDateTime(row.time_unix)],
++        [t('system.module'), row.module || '—'],
++        [t('system.kind'), type],
++        [t('system.description'), message],
++        [t('system.runtime'), fmtMillis(row.uptime_millis)],
++        [t('system.backoff'), fmtMillis(row.backoff_millis)],
++      ],
++    });
++  };
++
++  const openProcess = (row: SystemProcess) => {
++    const processName = row.comm || t('common.unknown');
++    setDetail({
++      title: `${t('system.process')} · ${processName}`,
++      badge: <Tag color={kindColor[row.kind || ''] || 'grey'}>{row.kind || 'other'}</Tag>,
++      rows: [
++        [t('system.pid'), row.pid],
++        [t('system.process'), processName],
++        [t('system.kind'), row.kind || 'other'],
++        [t('system.rss'), fmtKB(row.rss_kb)],
++      ],
++    });
++  };
+ 
+   const processColumns: any[] = [
+     { title: t('system.pid'), dataIndex: 'pid', width: 90, render: (value: number | string) => <span className="pool-mono">{value}</span> },
+@@ -102,7 +204,7 @@
+ 
+       <ErrorBanner error={error} onRetry={reload} />
+ 
+-      <div className="pool-stat-grid" style={{ marginBottom: 18 }}>
++      <div className="pool-stat-grid pool-system-stat-grid" style={{ marginBottom: 18 }}>
+         <MetricCard label={t('system.cpu_usage')} value={`${cpu.usage_pct ?? '—'}%`} color={meterColor(cpu.usage_pct || 0)} sub={`${cpu.cores || 0} ${t('system.cores')} · ${t('system.load')} ${cpu.load1 ?? '—'}`} />
+         <MetricCard label={t('system.memory_usage')} value={`${memory.used_pct ?? '—'}%`} color={meterColor(memory.used_pct || 0)} sub={`${fmtKB(memory.used_kb)} / ${fmtKB(memory.total_kb)}`} />
+         <MetricCard label={t('system.disk_usage')} value={`${disk.used_pct ?? '—'}%`} color={meterColor(disk.used_pct || 0)} sub={`${fmtBytes(disk.used_bytes)} / ${fmtBytes(disk.total_bytes)}`} />
+@@ -125,10 +227,29 @@
+           columns={moduleColumns}
+           rowKey="key"
+           size="small"
+-          pagination={modules.length > 8 ? { pageSize: 8 } : false}
++          pagination={modulePagination}
+           emptyTitle={t('system.no_modules')}
+           skeletonRows={6}
+           skeletonCols={9}
++          mobileListLabel={t('system.module_health')}
++          mobileRenderer={(row: SupervisorModule) => {
++            const name = row.name || t('common.unknown');
++            const message = row.last_panic ? `${row.last_message || 'panic'}: ${row.last_panic}` : (row.last_message || '—');
++            return (
++              <CompactSystemRecord
++                title={<span className="pool-mono">{name}</span>}
++                titleLabel={`${t('system.module')} ${name}`}
++                badge={<Tag color={moduleColor[row.status || ''] || 'grey'}>{moduleStateLabel(row.status)}</Tag>}
++                stats={[
++                  [t('system.restarts'), fmtInt(row.restart_count)],
++                  ['panic', fmtInt(row.panic_count)],
++                  [t('system.unexpected_exits'), fmtInt(row.unexpected_exit_count)],
++                ]}
++                note={`${fmtModuleRuntime(null, row)} · ${message}`}
++                onOpen={() => openModule(row)}
++              />
++            );
++          }}
+         />
+       </Section>
+ 
+@@ -142,10 +263,29 @@
+           columns={eventColumns}
+           rowKey="key"
+           size="small"
+-          pagination={events.length > 8 ? { pageSize: 8 } : false}
++          pagination={eventPagination}
+           emptyTitle={t('system.no_events')}
+           skeletonRows={6}
+           skeletonCols={6}
++          mobileListLabel={t('system.module_events')}
++          mobileRenderer={(row: SupervisorEvent) => {
++            const type = row.type || 'event';
++            const message = row.panic ? `${row.message || 'panic'}: ${row.panic}` : (row.message || '—');
++            return (
++              <CompactSystemRecord
++                title={<span className="pool-mono">{row.module || t('common.unknown')}</span>}
++                titleLabel={`${t('system.module_events')} ${row.module || type}`}
++                badge={<Tag color={eventColor[type] || 'grey'}>{type}</Tag>}
++                subtitle={fmtDateTime(row.time_unix)}
++                stats={[
++                  [t('system.runtime'), fmtMillis(row.uptime_millis)],
++                  [t('system.backoff'), fmtMillis(row.backoff_millis)],
++                ]}
++                note={message}
++                onOpen={() => openEvent(row)}
++              />
++            );
++          }}
+         />
+       </Section>
+ 
+@@ -159,12 +299,44 @@
+           columns={processColumns}
+           rowKey="pid"
+           size="small"
+-          pagination={processes.length > 12 ? { pageSize: 12 } : false}
++          pagination={processPagination}
+           emptyTitle={t('system.no_processes')}
+           skeletonRows={6}
+           skeletonCols={4}
++          mobileListLabel={t('system.processes')}
++          mobileRenderer={(row: SystemProcess) => (
++            <CompactSystemRecord
++              title={<span className="pool-mono">{row.comm || t('common.unknown')}</span>}
++              titleLabel={`${t('system.process')} ${row.comm || row.pid}`}
++              badge={<Tag color={kindColor[row.kind || ''] || 'grey'}>{row.kind || 'other'}</Tag>}
++              subtitle={`${t('system.pid')} ${row.pid}`}
++              stats={[[t('system.rss'), fmtKB(row.rss_kb)]]}
++              onOpen={() => openProcess(row)}
++            />
++          )}
+         />
+       </Section>
++
++      <Drawer
++        visible={Boolean(detail)}
++        onCancel={() => setDetail(null)}
++        title={detail?.title || t('system.recent_status')}
++        width={560}
++      >
++        {detail ? (
++          <div className="pool-system-detail">
++            {detail.badge ? <div className="pool-system-detail__badge">{detail.badge}</div> : null}
++            <dl className="pool-system-detail__grid">
++              {detail.rows.map(([label, value]) => (
++                <div key={label}>
++                  <dt>{label}</dt>
++                  <dd>{value ?? '—'}</dd>
++                </div>
++              ))}
++            </dl>
++          </div>
++        ) : null}
++      </Drawer>
+     </div>
+   );
+ }
+--- a/web-spa/src/styles/components.css
++++ b/web-spa/src/styles/components.css
+@@ -318,6 +318,16 @@
+   gap: 12px;
+ }
+ 
++.pool-system-stat-grid {
++  grid-template-columns: repeat(4, minmax(0, 1fr));
++}
++
++@media (max-width: 900px) {
++  .pool-system-stat-grid {
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++  }
++}
++
+ .pool-grid.cols-2 {
+   grid-template-columns: repeat(2, minmax(0, 1fr));
+ }
+@@ -1653,6 +1663,205 @@
+   padding-top: 2px;
+ }
+ 
++.pool-compact-record {
++  width: 100%;
++  min-width: 0;
++  display: grid;
++  gap: 11px;
++  padding: 14px;
++  border: 0;
++  border-radius: inherit;
++  background: transparent;
++  color: var(--pool-text);
++  font: inherit;
++  text-align: left;
++  cursor: pointer;
++  transition:
++    background-color var(--pool-motion-fast) var(--pool-motion-ease),
++    transform var(--pool-motion-fast) var(--pool-motion-ease);
++}
++
++.pool-compact-record:hover {
++  background: var(--pool-bg-hover);
++}
++
++.pool-compact-record:active {
++  transform: scale(0.995);
++}
++
++.pool-compact-record:focus-visible {
++  outline: 2px solid var(--pool-accent);
++  outline-offset: -3px;
++}
++
++.pool-compact-record__head,
++.pool-compact-record__identity,
++.pool-compact-record__chips,
++.pool-compact-record__foot {
++  min-width: 0;
++  display: flex;
++  align-items: center;
++}
++
++.pool-compact-record__head {
++  justify-content: space-between;
++  gap: 10px;
++}
++
++.pool-compact-record__head > .pool-tag,
++.pool-compact-record__chips > .pool-tag {
++  flex: 0 0 auto;
++  white-space: nowrap;
++}
++
++.pool-compact-record__identity {
++  gap: 7px;
++  overflow: hidden;
++}
++
++.pool-compact-record__identity > .pool-text-clamp {
++  flex: 1 1 auto;
++}
++
++.pool-compact-record__chips {
++  flex: 0 0 auto;
++  gap: 5px;
++}
++
++.pool-compact-record__foot {
++  gap: 6px;
++  color: var(--pool-text-3);
++  font-size: 12px;
++}
++
++.pool-compact-record__foot > span:not(.pool-compact-record__disclosure) {
++  min-width: 0;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-compact-record__disclosure {
++  margin-left: auto;
++  color: var(--pool-text-3);
++  font-size: 19px;
++  line-height: 1;
++}
++
++.pool-registration-job-card .pool-task-progress {
++  gap: 6px;
++}
++
++.pool-registration-metrics .pool-metric-card {
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-lg);
++  background: var(--pool-bg-surface);
++}
++
++.pool-system-record {
++  position: relative;
++  gap: 9px;
++  padding-right: 34px;
++}
++
++.pool-system-record__title {
++  min-width: 0;
++  overflow: hidden;
++  font-weight: 680;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__subtitle,
++.pool-system-record__note {
++  min-width: 0;
++  overflow: hidden;
++  color: var(--pool-text-3);
++  font-size: 12px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__stats {
++  display: grid;
++  grid-template-columns: repeat(3, minmax(0, 1fr));
++  gap: 7px;
++}
++
++.pool-system-record__stats > span {
++  min-width: 0;
++  display: grid;
++  gap: 2px;
++  padding: 7px 8px;
++  border-radius: var(--pool-radius-sm);
++  background: var(--pool-bg-surface-2);
++}
++
++.pool-system-record__stats small {
++  overflow: hidden;
++  color: var(--pool-text-3);
++  font-size: 10.5px;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__stats strong {
++  overflow: hidden;
++  font-size: 13px;
++  font-variant-numeric: tabular-nums;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.pool-system-record__disclosure {
++  position: absolute;
++  right: 13px;
++  top: 50%;
++  transform: translateY(-50%);
++}
++
++.pool-system-detail {
++  display: grid;
++  gap: 14px;
++}
++
++.pool-system-detail__badge {
++  display: flex;
++  justify-content: flex-start;
++}
++
++.pool-system-detail__grid {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 1px;
++  margin: 0;
++  overflow: hidden;
++  border: 1px solid var(--pool-border);
++  border-radius: var(--pool-radius-lg);
++  background: var(--pool-border);
++}
++
++.pool-system-detail__grid > div {
++  min-width: 0;
++  display: grid;
++  gap: 5px;
++  padding: 12px 14px;
++  background: var(--pool-bg-surface);
++}
++
++.pool-system-detail__grid dt {
++  color: var(--pool-text-3);
++  font-size: 11px;
++}
++
++.pool-system-detail__grid dd {
++  min-width: 0;
++  margin: 0;
++  overflow-wrap: anywhere;
++  color: var(--pool-text);
++  font-size: 13px;
++}
++
+ .pool-service-health-strip {
+   display: flex;
+   align-items: center;
+@@ -3784,6 +3993,25 @@
+     align-content: start;
+   }
+ 
++  .pool-metric-rail.pool-registration-metrics {
++    grid-auto-flow: row;
++    grid-auto-columns: auto;
++    grid-template-columns: repeat(2, minmax(0, 1fr));
++    overflow: visible;
++    padding: 0;
++  }
++
++  .pool-registration-metrics .pool-metric-card {
++    min-height: 74px;
++    display: grid;
++    align-content: space-between;
++    padding: 12px 14px;
++  }
++
++  .pool-system-detail__grid {
++    grid-template-columns: 1fr;
++  }
++
+   .pool-metric-rail {
+     grid-auto-flow: column;
+     grid-auto-columns: minmax(132px, 1fr);
+diff --git a/web-spa/tests/compact-operational-records.test.tsx b/web-spa/tests/compact-operational-records.test.tsx
+new file mode 100755
+index 0000000..bd038d6
+--- /dev/null
++++ b/web-spa/tests/compact-operational-records.test.tsx
+@@ -0,0 +1,63 @@
++import React from 'react';
++import { fireEvent, render, screen } from '@testing-library/react';
++import { describe, expect, it, vi } from 'vitest';
++import { RegistrationJobCard } from '../src/pages/Registration';
++import { CompactSystemRecord } from '../src/pages/System';
++
++describe('compact operational records', () => {
++  it('keeps a long registration id accessible and opens the complete detail view', () => {
++    const onOpen = vi.fn();
++    const id = 'registration-production-long-running-job-with-a-very-long-identifier-20260731';
++
++    render(
++      <RegistrationJobCard
++        job={{
++          id,
++          method: 'protocol_v2',
++          identity_mode: 'email',
++          status: 'running',
++          total: 40,
++          succeeded: 31,
++          failed: 2,
++          group_name: 'production-registration-group-with-a-long-name',
++          egress_id: 'global-egress-route-with-a-long-name',
++        }}
++        onOpen={onOpen}
++      />,
++    );
++
++    const trigger = screen.getByRole('button', { name: new RegExp(id) });
++    expect(trigger).toHaveTextContent(id);
++    expect(trigger).toHaveTextContent('protocol_v2');
++    expect(trigger).toHaveTextContent('31');
++    expect(trigger).toHaveTextContent('2');
++    fireEvent.click(trigger);
++    expect(onOpen).toHaveBeenCalledTimes(1);
++  });
++
++  it('summarizes lifecycle counters without removing the detail affordance', () => {
++    const onOpen = vi.fn();
++
++    render(
++      <CompactSystemRecord
++        title="diagnostic-artifact-expiry-with-a-long-module-name"
++        titleLabel="模块 diagnostic-artifact-expiry-with-a-long-module-name"
++        badge={<span>运行中</span>}
++        stats={[
++          ['重启', 3],
++          ['panic', 1],
++          ['异常退出', 2],
++        ]}
++        note="运行 4分钟 · module running"
++        onOpen={onOpen}
++      />,
++    );
++
++    const trigger = screen.getByRole('button', { name: /diagnostic-artifact-expiry/ });
++    expect(trigger).toHaveTextContent('重启');
++    expect(trigger).toHaveTextContent('panic');
++    expect(trigger).toHaveTextContent('异常退出');
++    fireEvent.click(trigger);
++    expect(onOpen).toHaveBeenCalledTimes(1);
++  });
++});

@@ -1,0 +1,47 @@
+{
+  "mode": "modified",
+  "ok": true,
+  "common": true,
+  "behavior": true,
+  "results": {
+    "settings": {
+      "height": 1261,
+      "overflow": false,
+      "categories": 5,
+      "expandedCategories": 1,
+      "compactRecords": 0,
+      "visibleTables": 0,
+      "mobileLists": 0,
+      "quota90": false,
+      "alerts": 0,
+      "failedResponses": [],
+      "consoleErrors": []
+    },
+    "system": {
+      "height": 4682,
+      "overflow": false,
+      "categories": 0,
+      "expandedCategories": 0,
+      "compactRecords": 20,
+      "visibleTables": 0,
+      "mobileLists": 2,
+      "quota90": false,
+      "alerts": 0,
+      "failedResponses": [],
+      "consoleErrors": []
+    },
+    "accounts": {
+      "height": 3232,
+      "overflow": false,
+      "categories": 0,
+      "expandedCategories": 0,
+      "compactRecords": 0,
+      "visibleTables": 0,
+      "mobileLists": 1,
+      "quota90": true,
+      "alerts": 0,
+      "failedResponses": [],
+      "consoleErrors": []
+    }
+  }
+}
