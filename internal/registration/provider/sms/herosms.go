@@ -69,6 +69,10 @@ func (p *HeroSMSProvider) Type() string { return "sms" }
 
 // GetNumber purchases a phone number
 func (p *HeroSMSProvider) GetNumber(ctx context.Context, country string) (string, string, error) {
+	return p.GetNumberWithPriceBounds(ctx, country, 0, 0)
+}
+
+func (p *HeroSMSProvider) GetNumberWithPriceBounds(ctx context.Context, country string, minPrice, maxPrice float64) (string, string, error) {
 	svc := p.service
 	if svc == "" {
 		svc = "ot"
@@ -78,6 +82,12 @@ func (p *HeroSMSProvider) GetNumber(ctx context.Context, country string) (string
 	params.Set("action", "getNumber")
 	params.Set("service", svc)
 	params.Set("country", heroCountryID(country))
+	if minPrice > 0 {
+		params.Set("minPrice", strconv.FormatFloat(minPrice, 'f', -1, 64))
+	}
+	if maxPrice > 0 {
+		params.Set("maxPrice", strconv.FormatFloat(maxPrice, 'f', -1, 64))
+	}
 
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		heroSMSBase+"?"+params.Encode(), nil)
@@ -254,6 +264,25 @@ func (p *HeroSMSProvider) GetTopCountries(ctx context.Context, service string) (
 		lastErr = fmt.Errorf("herosms getTopCountries: empty result")
 	}
 	return nil, lastErr
+}
+
+// GetAllCountryPrices traverses the complete country market for the hourly comparator.
+func (p *HeroSMSProvider) GetAllCountryPrices(ctx context.Context, service string) ([]CountryPrice, error) {
+	svc := strings.TrimSpace(service)
+	if svc == "" {
+		svc = p.service
+	}
+	params := url.Values{}
+	params.Set("api_key", p.apiKey)
+	params.Set("action", "getPrices")
+	params.Set("service", svc)
+	req, _ := http.NewRequestWithContext(ctx, "GET", heroSMSBase+"?"+params.Encode(), nil)
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return parseSMSBowerAllPrices(string(readSMSProviderBody(resp.Body)), svc)
 }
 
 // strconv 和 truncate 在 smsbower.go 中定义 (同包共享)

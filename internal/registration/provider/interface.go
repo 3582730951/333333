@@ -5,7 +5,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
+
+	"codex-account-pool/internal/registration/provider/catalog"
 )
 
 // SMSProvider provides phone numbers and retrieves SMS codes
@@ -56,10 +59,11 @@ type CaptchaRequest struct {
 
 // Manager coordinates multiple providers with fallback
 type Manager struct {
-	SMS     []SMSProvider
-	Mailbox []MailboxProvider
-	Captcha []CaptchaSolver
-	Stats   *SMSStats // per-platform, per-country success-rate tracker (optional, nullable)
+	SMS            []SMSProvider
+	Mailbox        []MailboxProvider
+	Captcha        []CaptchaSolver
+	Stats          *SMSStats // per-platform, per-country success-rate tracker (optional, nullable)
+	priceRefreshMu sync.Mutex
 }
 
 // BalanceProvider is an optional capability an SMSProvider may implement: querying the
@@ -74,39 +78,37 @@ type BalanceProvider interface {
 // "rank" returned by GetTopCountries is the platform's own internal success-priority order
 // (per the SMS-Activate-compatible getTopCountriesByService "sorted by internal priority"
 // semantics) — rank 0 = highest same-day success probability.
-//
-// The sms package defines its own CountryInfo / CountryPrice types; the interface uses
-// generic slices (any) + type assertion because the concrete types live in the sms
-// sub-package to avoid a circular import.
 type PriceProvider interface {
-	GetCountries(ctx context.Context) ([]interface{}, error)
-	GetTopCountries(ctx context.Context, service string) ([]interface{}, error)
+	GetCountries(ctx context.Context) ([]catalog.CountryInfo, error)
+	GetTopCountries(ctx context.Context, service string) ([]catalog.CountryPrice, error)
 }
 
-// smsCountryInfo is a platform country entry (numeric id + localized names + ISO/dial if known).
-type smsCountryInfo struct {
-	ID   int    `json:"id"`
-	Eng  string `json:"eng"`
-	Chn  string `json:"chn"`
-	ISO  string `json:"iso,omitempty"`
-	Dial string `json:"dial,omitempty"`
+// FullPriceProvider supplies every priced country, rather than only the provider's top ten.
+type FullPriceProvider interface {
+	GetAllCountryPrices(ctx context.Context, service string) ([]catalog.CountryPrice, error)
 }
 
-// smsCountryPrice is one country's price+stock for a service, in the platform's internal
-// success-priority order (Rank 0 = highest success probability).
-type smsCountryPrice struct {
-	Country string  `json:"country"` // numeric country id (as a string)
-	Name    string  `json:"name,omitempty"`
-	Price   float64 `json:"price"`
-	Count   int     `json:"count"`
-	Rank    int     `json:"rank"` // 0-based position in the platform's success ranking
+// BoundedSMSProvider lets the platform enforce the administrator's price guard at purchase
+// time as well as in the selector.
+type BoundedSMSProvider interface {
+	GetNumberWithPriceBounds(ctx context.Context, country string, minPrice, maxPrice float64) (phone, orderID string, err error)
 }
 
-// CountryInfo is the exported alias (the sms package's local alias points here).
-type CountryInfo = smsCountryInfo
+// SMSPurchase carries the exact provider/country/price selection through the pipeline so
+// historical success statistics describe the number that was actually purchased.
+type SMSPurchase struct {
+	Provider   SMSProvider `json:"-"`
+	Phone      string      `json:"phone"`
+	OrderID    string      `json:"order_id"`
+	CountryID  string      `json:"country_id"`
+	CountryISO string      `json:"country_iso"`
+	Price      float64     `json:"price"`
+}
 
-// CountryPrice is the exported alias (the sms package's local alias points here).
-type CountryPrice = smsCountryPrice
+type CountryInfo = catalog.CountryInfo
+type CountryPrice = catalog.CountryPrice
+type smsCountryInfo = catalog.CountryInfo
+type smsCountryPrice = catalog.CountryPrice
 
 // GetSMS returns the highest priority SMS provider and gets a number
 func (m *Manager) GetSMS(ctx context.Context, country string) (SMSProvider, string, string, error) {
@@ -139,6 +141,72 @@ func (m *Manager) GetSMSFromProvider(ctx context.Context, providerName, country 
 		return nil, "", "", lastErr
 	}
 	return nil, "", "", ErrNoProviderAvailable
+}
+
+// GetSMSPurchase acquires from the first working provider while preserving the country and
+// enforcing price bounds on adapters that support them.
+func (m *Manager) GetSMSPurchase(ctx context.Context, country string, minPrice, maxPrice float64) (SMSPurchase, error) {
+	for _, p := range m.SMS {
+		purchase, err := m.purchaseFrom(ctx, p, country, minPrice, maxPrice)
+		if err == nil {
+			return purchase, nil
+		}
+	}
+	return SMSPurchase{}, ErrNoProviderAvailable
+}
+
+func (m *Manager) GetSMSPurchaseFromProvider(ctx context.Context, providerName, country string, minPrice, maxPrice float64) (SMSPurchase, error) {
+	providerName = strings.ToLower(strings.TrimSpace(providerName))
+	if providerName == "" || providerName == "auto" {
+		return m.GetSMSPurchase(ctx, country, minPrice, maxPrice)
+	}
+	for _, p := range m.SMS {
+		if strings.EqualFold(strings.TrimSpace(p.Name()), providerName) {
+			return m.purchaseFrom(ctx, p, country, minPrice, maxPrice)
+		}
+	}
+	return SMSPurchase{}, ErrNoProviderAvailable
+}
+
+func (m *Manager) purchaseFrom(ctx context.Context, p SMSProvider, country string, minPrice, maxPrice float64) (SMSPurchase, error) {
+	country = strings.TrimSpace(country)
+	metadata := SMSPriceSnapshot{}
+	if m != nil && m.Stats != nil {
+		for _, item := range m.Stats.PriceSnapshots(ctx, 0) {
+			if !strings.EqualFold(item.Provider, p.Name()) {
+				continue
+			}
+			if strings.EqualFold(item.CountryID, country) || strings.EqualFold(item.CountryISO, country) {
+				metadata = item
+				break
+			}
+		}
+	}
+	if metadata.Price > 0 && !priceWithinBounds(metadata.Price, minPrice, maxPrice) {
+		return SMSPurchase{}, fmt.Errorf("SMS country price %.4f is outside configured bounds", metadata.Price)
+	}
+	providerCountry := country
+	if metadata.CountryID != "" {
+		providerCountry = metadata.CountryID
+	}
+	var phone, orderID string
+	var err error
+	if bounded, ok := p.(BoundedSMSProvider); ok {
+		phone, orderID, err = bounded.GetNumberWithPriceBounds(ctx, providerCountry, minPrice, maxPrice)
+	} else {
+		if minPrice > 0 || maxPrice > 0 {
+			return SMSPurchase{}, fmt.Errorf("SMS provider %s cannot enforce configured price bounds", p.Name())
+		}
+		phone, orderID, err = p.GetNumber(ctx, providerCountry)
+	}
+	if err != nil {
+		return SMSPurchase{}, err
+	}
+	iso := normalizedCountryISO(metadata.CountryISO, providerCountry)
+	if iso == "" && len(country) == 2 {
+		iso = strings.ToUpper(country)
+	}
+	return SMSPurchase{Provider: p, Phone: phone, OrderID: orderID, CountryID: providerCountry, CountryISO: iso, Price: metadata.Price}, nil
 }
 
 // GetMailbox returns the highest priority mailbox provider and creates an email

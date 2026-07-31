@@ -5,6 +5,7 @@ import { IconPulse, IconRefresh } from './pool/icons.jsx';
 import { post } from '../api.js';
 import { showErrorToast } from './ErrorToast.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
+import { parseProxyEndpoint } from '../lib/proxyEndpoint';
 
 function cx(...parts) {
   return parts.filter(Boolean).join(' ');
@@ -165,6 +166,8 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
   const [authMode, setAuthMode] = useState(initial.proxy_auth_mode || '');
   const [showAdvanced, setShowAdvanced] = useState(Boolean(initialValues?.id));
   const [testResult, setTestResult] = useState(null);
+  const [proxyPreview, setProxyPreview] = useState(null);
+  const [proxyInputError, setProxyInputError] = useState('');
 
   useEffect(() => {
     const next = initialWithTemplate(initialValues);
@@ -173,6 +176,8 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
     setAuthMode(next.proxy_auth_mode || '');
     setShowAdvanced(Boolean(initialValues?.id));
     setTestResult(null);
+    setProxyPreview(null);
+    setProxyInputError('');
   }, [initialValues]);
 
   const bindFormApi = useCallback((api) => {
@@ -214,6 +219,31 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
   const isApiMode = authMode === 'api_whitelist';
   const isDirect = profileType === 'direct';
   const isSidecar = profileType === 'curl_cffi_sidecar';
+
+  const inspectProxyInput = useCallback((value, normalize = false) => {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      setProxyPreview(null);
+      setProxyInputError('');
+      return;
+    }
+    try {
+      const parsed = parseProxyEndpoint(raw, profileType);
+      setProxyPreview(parsed);
+      setProxyInputError('');
+      if (normalize) {
+        formApi.current?.setValue?.('endpoint', parsed.endpoint);
+        if (parsed.egressType !== profileType) {
+          formApi.current?.setValue?.('type', parsed.egressType);
+          setProfileType(parsed.egressType);
+          setSelectedTemplate(parsed.egressType.startsWith('socks5') ? 'socks5' : 'proxy_url');
+        }
+      }
+    } catch (error) {
+      setProxyPreview(null);
+      setProxyInputError(error instanceof Error ? error.message : '代理格式无法识别');
+    }
+  }, [profileType]);
 
   return (
     <Form
@@ -283,11 +313,33 @@ export default function EgressProfileForm({ initialValues, saving, onSubmit, get
       ) : null}
 
       {!isDirect && !isApiMode ? (
-        <Form.Input
-          field="endpoint"
-          label={isSidecar ? 'Sidecar Endpoint' : 'Endpoint'}
-          placeholder={endpointPlaceholder(profileType, authMode)}
-        />
+        <>
+          <Form.Input
+            field="endpoint"
+            label={isSidecar ? 'Sidecar Endpoint' : '住宅代理地址'}
+            placeholder={endpointPlaceholder(profileType, authMode)}
+            onChange={(value) => { if (!isSidecar) inspectProxyInput(value, false); }}
+            onBlur={(event) => { if (!isSidecar) inspectProxyInput(event?.target?.value, true); }}
+          />
+          {!isSidecar ? (
+            <div className="pool-proxy-parser" aria-live="polite">
+              <div className="pool-proxy-parser__formats">
+                <span>自动识别</span>
+                <code>host:port:user:pass</code>
+                <code>user:pass@host:port</code>
+                <code>host:port@user:pass</code>
+                <code>socks5://user:pass@host:port</code>
+              </div>
+              {proxyPreview ? (
+                <div className="pool-proxy-parser__result">
+                  <Tag color="green">已解析</Tag>
+                  <Typography.Text size="small">{proxyPreview.masked}</Typography.Text>
+                </div>
+              ) : null}
+              {proxyInputError ? <Typography.Text type="danger" size="small">{proxyInputError}</Typography.Text> : null}
+            </div>
+          ) : null}
+        </>
       ) : null}
 
       {isSidecar ? (

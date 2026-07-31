@@ -167,6 +167,8 @@ def run_login(payload: Dict[str, Any]) -> Dict[str, Any]:
         "REG_COOKIE_HEADER": str(payload.get("cookie_header") or ""),
         "REG_HEROSMS_KEY": str(payload.get("hero_sms_key") or ""),
         "REG_SMS_COUNTRY": str(payload.get("sms_country") or "PH"),
+        "REG_SMS_MIN_PRICE": str(payload.get("sms_min_price") or ""),
+        "REG_SMS_MAX_PRICE": str(payload.get("sms_max_price") or ""),
         "REG_TARGET_WORKSPACE_ID": str(payload.get("target_workspace_id") or ""),
         "REG_HEADLESS": env.get("REG_HEADLESS", "1"),
     })

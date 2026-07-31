@@ -69,7 +69,10 @@ def maybe_handle_phone(page, log_fn):
         if not has_form:
             return False
     log_fn(f"   📱 add-phone step detected (country={SMS_COUNTRY}) — running phone_verify")
-    res = verify_phone(page, hero_key=HEROSMS_KEY, country=SMS_COUNTRY, log=log_fn)
+    # Keep the number country pinned to the already-selected residential proxy region.
+    # Cross-country fallback here would silently create an IP/phone geography mismatch.
+    res = verify_phone(page, hero_key=HEROSMS_KEY, country=SMS_COUNTRY, log=log_fn,
+                       allow_country_rotation=False)
     log_fn(f"   📱 phone_verify: ok={res.get('ok')} phone={res.get('phone','')} err={res.get('error','')}")
     time.sleep(2)
     return True

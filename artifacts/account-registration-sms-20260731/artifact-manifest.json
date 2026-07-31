@@ -1,0 +1,155 @@
+{
+  "format": "account-registration-sms-evidence-v1",
+  "generated_on": "2026-07-31",
+  "diagnostic_bundle_sha256": "ad9541db76eed065ae97b721669b537ecaf28ead040510a8d37695a5aa1a9700",
+  "remote_binary_sha256": "0ae17ee2b53ec494e2b54ea9a58b4a2820a9122b807e777a7f074d0816bfad86",
+  "staged_source_diff_sha256": "dc74e5371a70b111edb5c1a6f8a424ad9db6ca16630600cb9791e8ca9f1fb422",
+  "screenshot_count": 18,
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 2246,
+      "sha256": "0754df06360a4296c0067d21a9abc39daf0015063ec2ab5ef4153e5529e0c60f"
+    },
+    {
+      "path": "account-null-baseline-modified.txt",
+      "bytes": 673,
+      "sha256": "5e9bc2316dc9acf22efe8da2ef4e411a76ac998112c7b9eb3cded7e54034385e"
+    },
+    {
+      "path": "changed-files.txt",
+      "bytes": 1749,
+      "sha256": "be1c03672ab246c18378c676dd5d74a8b6bffa06de02db35e57f6d771ea90fc4"
+    },
+    {
+      "path": "diagnostic-analysis.md",
+      "bytes": 3049,
+      "sha256": "652424815a46a1872638bdd4b8cb6c0fbc8e73a0f4f9d8d9d4fede5a5ecff92d"
+    },
+    {
+      "path": "modified-source.tar.gz",
+      "bytes": 353539,
+      "sha256": "d5cf9a178c5add9088608cc29f63fb78ec172bd4e5aca72d439b53647bcc571b"
+    },
+    {
+      "path": "remote-test-verification.txt",
+      "bytes": 8717,
+      "sha256": "5f02411967814a8b291239c721f730a5d135cdfc38cca6eadd5b12b113b203f5"
+    },
+    {
+      "path": "rollback.sh",
+      "bytes": 325,
+      "sha256": "7a8d9dd3938554b7852da152018d71e235266537079a5dd78b1518565ce3ffbb"
+    },
+    {
+      "path": "runtime-api-verification.json",
+      "bytes": 1044,
+      "sha256": "b08a0f8617ce043f502b1017f977e5295f6b822de9773308cd79f17b39c3dd39"
+    },
+    {
+      "path": "screenshots/desktop-dark-accounts-long-identities.png",
+      "bytes": 406873,
+      "sha256": "c14bf126bb6bcc75f05f22695515cb4b8400c643cbb15c82cd4c33288d815400"
+    },
+    {
+      "path": "screenshots/desktop-dark-egress-four-format-parser.png",
+      "bytes": 188168,
+      "sha256": "7038a6fc62dea85d031a64f68281fa4b3073f8362e5df737c8442f1030eaf847"
+    },
+    {
+      "path": "screenshots/desktop-dark-registration-engines-sms-market.png",
+      "bytes": 258631,
+      "sha256": "edc5be3f40c2d7697048e0b64e85ff0ad31b90482075c01553c93ef110ab5748"
+    },
+    {
+      "path": "screenshots/desktop-dark-team-cycle-guided-form.png",
+      "bytes": 191070,
+      "sha256": "19573a01287f6d203d5d931312bbda4743ca7e0405fb5a931e340a0d0c83e460"
+    },
+    {
+      "path": "screenshots/desktop-dark-team-lifecycle-overview.png",
+      "bytes": 339710,
+      "sha256": "fc173d5f788d8999d5d265f4694d2dc3beb4b2e6a2826e6822bb8e41ed71e2fb"
+    },
+    {
+      "path": "screenshots/desktop-dark-team-workspace-guided-form.png",
+      "bytes": 196757,
+      "sha256": "c6c0117e1b5557da8a282cb0c485507b9dd58d37cb7f32b8131a33424632dc6c"
+    },
+    {
+      "path": "screenshots/desktop-light-accounts-long-identities.png",
+      "bytes": 398378,
+      "sha256": "ae1088264ed0559ce3ce70cdc58f38b538209471d40adf25604d0c7748f2151f"
+    },
+    {
+      "path": "screenshots/desktop-light-egress-four-format-parser.png",
+      "bytes": 216740,
+      "sha256": "b01c26e43287a2bc69610702cd909d7fd6a2f4ea414a64fc3a637fa0fb7e2713"
+    },
+    {
+      "path": "screenshots/desktop-light-registration-engines-sms-market.png",
+      "bytes": 253040,
+      "sha256": "2b4b96f4e6c8924185ea71d8001940ca232da6277cdcc1666d46db2ed1e7f4f7"
+    },
+    {
+      "path": "screenshots/desktop-light-team-cycle-guided-form.png",
+      "bytes": 218366,
+      "sha256": "8b34224e52eef5434a9f0fa7abe4187f44c32470e37466e0510189db71847a61"
+    },
+    {
+      "path": "screenshots/desktop-light-team-lifecycle-overview.png",
+      "bytes": 275341,
+      "sha256": "68b7c0cbbf263f41daf96c0cbd7d1fb49aff5b8be74c263637fad5c2103833f6"
+    },
+    {
+      "path": "screenshots/desktop-light-team-workspace-guided-form.png",
+      "bytes": 224530,
+      "sha256": "401346ffea8789b238a3e6c9cc6e4c1f73bbd0098bd808c83f68f4f41d9c504a"
+    },
+    {
+      "path": "screenshots/mobile-dark-accounts-long-identities.png",
+      "bytes": 356621,
+      "sha256": "c19acbbefd7b0634a07353197e5988dc44b8d671a6bbaff7ad2148ffe34495a9"
+    },
+    {
+      "path": "screenshots/mobile-dark-registration-engines-sms-market.png",
+      "bytes": 230127,
+      "sha256": "dfeb4197a2eb64df8718df0b8d8bd0554059b371fa57a98476d63ad78b57d683"
+    },
+    {
+      "path": "screenshots/mobile-dark-team-lifecycle-overview.png",
+      "bytes": 144039,
+      "sha256": "ac6e2da17ee2e7ffcc03f00c9882af4468546154e5e9be3d1046eab937da2e16"
+    },
+    {
+      "path": "screenshots/mobile-light-accounts-long-identities.png",
+      "bytes": 343786,
+      "sha256": "7519508987240a70131fc63361758ab9d3739da12943ae5f433e137d3e42214d"
+    },
+    {
+      "path": "screenshots/mobile-light-registration-engines-sms-market.png",
+      "bytes": 223167,
+      "sha256": "7bbf369e27ac8492bd4ce0c3df57d5d54ed7ce298cf189d6db0b4a15fb7f0e65"
+    },
+    {
+      "path": "screenshots/mobile-light-team-lifecycle-overview.png",
+      "bytes": 113549,
+      "sha256": "febf2b1160ce0ee9939373f5a69f12adf86b2f75196f29fcd60fabe932eeb0c3"
+    },
+    {
+      "path": "source.patch",
+      "bytes": 161912,
+      "sha256": "dc74e5371a70b111edb5c1a6f8a424ad9db6ca16630600cb9791e8ca9f1fb422"
+    },
+    {
+      "path": "ui-verification.json",
+      "bytes": 14840,
+      "sha256": "3c739a008326604adcd4ba35c1d26edf6ab36c06336551556a8361d434cbe6e3"
+    },
+    {
+      "path": "verification-record.md",
+      "bytes": 3312,
+      "sha256": "d7dc95b59f09f9cf7997899482284a2cf2bf44a281600c4c442f84285b8ca3c8"
+    }
+  ]
+}

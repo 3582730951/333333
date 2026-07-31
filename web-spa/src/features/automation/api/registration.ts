@@ -5,7 +5,7 @@ import { normalizeRegisterMethod } from '../model/registration';
 import type {
   RegistrationCountry, RegistrationDashboard, RegistrationJob, RegistrationOptions,
   RegistrationGroup, RegistrationPool, RegistrationProviderOptions, RegistrationReadiness,
-  RegistrationStartInput, RegistrationStrategyConfig, RegistrationStrategyInput,
+  RegistrationStartInput, RegistrationStrategyConfig, RegistrationStrategyInput, SMSMarketSnapshot,
 } from '../model/registration';
 
 const jobSchema = z.object({ id: z.string().optional(), status: z.string().optional() }).passthrough();
@@ -59,6 +59,40 @@ export const registrationCountriesSchema = z.array(z.object({
   name: z.string(),
   nameZh: z.string().default(''),
 }).passthrough());
+
+const smsMarketCandidateSchema = z.object({
+  provider: z.string(),
+  service: z.string().default('dr'),
+  country_id: z.coerce.string(),
+  country_iso: z.string().default(''),
+  country_name: z.string().optional(),
+  price: z.coerce.number(),
+  inventory: z.coerce.number().int(),
+  provider_rank: z.coerce.number().int(),
+  balance: z.coerce.number(),
+  fetched_at: z.coerce.number().int(),
+  attempts: z.coerce.number().int().default(0),
+  succeeded: z.coerce.number().int().default(0),
+  success_rate: z.coerce.number().default(0.5),
+  score: z.coerce.number().default(0),
+  eligible: z.boolean().default(false),
+  selection_basis: z.string().default('community_cold_start'),
+}).passthrough();
+
+export const smsMarketSchema = z.object({
+  items: z.array(smsMarketCandidateSchema).default([]),
+  min_price: z.coerce.number().default(0),
+  max_price: z.coerce.number().default(0),
+  preferred_countries: z.array(z.string()).default(['BR', 'CO', 'PL']),
+  cold_start_policy: z.string().default('community_recommended_order'),
+  history_window_days: z.coerce.number().int().default(14),
+  minimum_history_samples: z.coerce.number().int().default(3),
+  refresh_interval_seconds: z.coerce.number().int().default(3600),
+  last_refreshed_at: z.coerce.number().int().default(0),
+  stale: z.boolean().default(true),
+  refreshed_rows: z.coerce.number().int().default(0),
+  warning: z.string().default(''),
+}).passthrough();
 
 const configFieldSchema = z.object({ key: z.string(), value: z.unknown() }).passthrough();
 export const registrationConfigResponseSchema = z.union([
@@ -132,6 +166,8 @@ export function adaptRegistrationStrategy(fields: Array<{ key: string; value: un
     strategy,
     manualCountry: strategy === 'manual' ? String(values.get('sms_manual_country') || '') : '',
     defaultMethod: normalizeRegisterMethod(values.get('default_register_method'), 'protocol_v2'),
+    minPrice: Number(values.get('sms_min_price') || 0),
+    maxPrice: Number(values.get('sms_max_price') || 0),
   };
 }
 
@@ -147,8 +183,18 @@ export async function saveRegistrationStrategy(input: RegistrationStrategyInput)
     values: {
       sms_platform_strategy: strategy,
       sms_manual_country: strategy === 'manual' ? input.manualCountry : '',
+      sms_min_price: Number.isFinite(input.minPrice) ? input.minPrice : 0,
+      sms_max_price: Number.isFinite(input.maxPrice) ? input.maxPrice : 0,
     },
   }]);
+}
+
+export async function fetchSMSMarket(signal?: AbortSignal): Promise<SMSMarketSnapshot> {
+  return parseApiResponse(smsMarketSchema, await get('/admin/register/sms-market', undefined, { signal })) as SMSMarketSnapshot;
+}
+
+export async function refreshSMSMarket(): Promise<SMSMarketSnapshot> {
+  return parseApiResponse(smsMarketSchema, await post('/admin/register/sms-market', {})) as SMSMarketSnapshot;
 }
 
 export async function startRegistrationJob(input: RegistrationStartInput) {

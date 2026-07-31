@@ -22,17 +22,17 @@ describe('account archive API', () => {
   });
 
   it('loads account pages when imported accounts have null optional arrays', async () => {
-    vi.mocked(get).mockResolvedValue({
-      accounts: [{
+    vi.mocked(api.get).mockResolvedValue({
+      data: { accounts: [{
         id: 'acc-imported',
         label: 'Imported',
         provider: 'codex',
         status: 'active',
         capabilities: null,
         usage: null,
-      }],
-      total: 1,
-    });
+      }], total: 1 },
+      headers: { 'x-request-id': 'REQ-ACCOUNT-1' },
+    } as never);
 
     const result = await fetchAccountsPage({ page: 1, pageSize: 50, search: '' });
 
@@ -41,17 +41,44 @@ describe('account archive API', () => {
   });
 
   it('accepts alternate account list envelopes used by older admin builds', async () => {
-    vi.mocked(get).mockResolvedValue({
-      data: {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { data: {
         items: [{ id: 'legacy-row', status: 'active', capabilities: null }],
         total: 1,
-      },
-    });
+      } },
+      headers: { 'x-request-id': 'REQ-ACCOUNT-2' },
+    } as never);
 
     const result = await fetchAccountsPage({ page: 1, pageSize: 50, search: '' });
 
     expect(result).toMatchObject({ total: 1 });
     expect(result.rows.map((row) => row.id)).toEqual(['legacy-row']);
+  });
+
+  it('keeps the response request id and explains an HTML API fallback', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: '<!doctype html><html><body>console</body></html>',
+      headers: { 'x-request-id': 'REQ-ACCOUNT-HTML' },
+    } as never);
+
+    await expect(fetchAccountsPage({ page: 1, pageSize: 50, search: '' })).rejects.toMatchObject({
+      code: 'ACCOUNTS_RESPONSE_INCOMPATIBLE',
+      requestId: 'REQ-ACCOUNT-HTML',
+      userMessage: expect.stringContaining('/admin/accounts'),
+    });
+  });
+
+  it('does not silently turn a success-status error object into an empty account pool', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: { error: 'upstream mismatch' },
+      headers: { 'x-request-id': 'REQ-ACCOUNT-ERROR-OBJECT' },
+    } as never);
+
+    await expect(fetchAccountsPage({ page: 1, pageSize: 50, search: '' })).rejects.toMatchObject({
+      code: 'ACCOUNTS_RESPONSE_INCOMPATIBLE',
+      requestId: 'REQ-ACCOUNT-ERROR-OBJECT',
+      userMessage: expect.stringContaining('成功状态返回了错误对象'),
+    });
   });
 
   it('downloads one selected account as a validated JSON document', async () => {

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"codex-account-pool/internal/registration/provider/catalog"
 )
 
 // smsBowerBase is the live SMSBower handler endpoint. SMSBower is fully
@@ -116,24 +118,12 @@ func (p *SMSBowerProvider) GetBalance(ctx context.Context) (float64, error) {
 }
 
 // CountryInfo is a platform country entry (id + localized names).
-type CountryInfo struct {
-	ID   int    `json:"id"`
-	Eng  string `json:"eng"`
-	Chn  string `json:"chn"`
-	ISO  string `json:"iso,omitempty"`
-	Dial string `json:"dial,omitempty"`
-}
+type CountryInfo = catalog.CountryInfo
 
 // CountryPrice is one country's price+stock for a service, in the platform's internal
 // success-priority order (rank 0 = highest success probability per the getTopCountriesByService
 // "sorted by internal priority" semantics).
-type CountryPrice struct {
-	Country string  `json:"country"` // numeric country id (as a string)
-	Name    string  `json:"name,omitempty"`
-	Price   float64 `json:"price"`
-	Count   int     `json:"count"`
-	Rank    int     `json:"rank"` // 0-based position in the platform's success ranking
-}
+type CountryPrice = catalog.CountryPrice
 
 // GetCountries returns the platform's country catalog. SMSBower returns JSON keyed by numeric
 // id: {"0":{"id":0,"rus":"Россия","eng":"Russia","chn":"俄罗斯"}, ...} or an array form.
@@ -220,6 +210,58 @@ func (p *SMSBowerProvider) GetTopCountries(ctx context.Context, service string) 
 		return nil, err
 	}
 	return parseSMSBowerTopCountries(raw)
+}
+
+// GetAllCountryPrices returns every country with OpenAI stock. The documented getPrices
+// action supports an omitted country parameter, producing a country -> service -> offer map.
+func (p *SMSBowerProvider) GetAllCountryPrices(ctx context.Context, service string) ([]CountryPrice, error) {
+	svc := strings.TrimSpace(service)
+	if svc == "" {
+		svc = p.service
+	}
+	raw, err := p.rawRequest(ctx, "getPrices", map[string]string{"service": svc})
+	if err != nil {
+		return nil, err
+	}
+	return parseSMSBowerAllPrices(raw, svc)
+}
+
+func parseSMSBowerAllPrices(raw, service string) ([]CountryPrice, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw[0] != '{' {
+		return nil, fmt.Errorf("smsbower getPrices: unexpected %s", truncate(raw, 120))
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return nil, fmt.Errorf("smsbower getPrices: parse: %w", err)
+	}
+	if _, hasStatus := obj["status"]; hasStatus {
+		return nil, fmt.Errorf("smsbower getPrices: %s", truncate(raw, 120))
+	}
+	keys := orderedJSONKeys(raw, obj)
+	out := make([]CountryPrice, 0, len(keys))
+	for _, countryID := range keys {
+		var country map[string]interface{}
+		if json.Unmarshal(obj[countryID], &country) != nil {
+			continue
+		}
+		offer := country
+		if serviceValue, ok := country[service]; ok {
+			if typed, ok := serviceValue.(map[string]interface{}); ok {
+				offer = typed
+			}
+		}
+		price := numField(offer, "cost", "price", "activationCost")
+		count := int(numField(offer, "count", "qty", "available", "stock", "total"))
+		if price <= 0 || count <= 0 {
+			continue
+		}
+		out = append(out, CountryPrice{Country: countryID, Price: price, Count: count, Rank: 9999})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("smsbower getPrices: no priced countries in %s", truncate(raw, 120))
+	}
+	return out, nil
 }
 
 // parseSMSBowerTopCountries flattens the nested country→partner→{price,count} map into a
@@ -352,14 +394,27 @@ func (p *SMSBowerProvider) ResolveOpenAIServiceCode(ctx context.Context) (string
 // "ACCESS_NUMBER:<activationId>:<phoneNumber>" on success, or a bare error code
 // (NO_NUMBERS / NO_BALANCE / BAD_KEY / BAD_SERVICE) on failure.
 func (p *SMSBowerProvider) GetNumber(ctx context.Context, country string) (string, string, error) {
+	return p.GetNumberWithPriceBounds(ctx, country, 0, 0)
+}
+
+// GetNumberWithPriceBounds repeats the selector's guard in the provider request, preventing
+// a price change between the hourly snapshot and purchase from exceeding the policy.
+func (p *SMSBowerProvider) GetNumberWithPriceBounds(ctx context.Context, country string, minPrice, maxPrice float64) (string, string, error) {
 	svc := p.service
 	if svc == "" {
 		svc = "dr"
 	}
-	raw, err := p.rawRequest(ctx, "getNumber", map[string]string{
+	params := map[string]string{
 		"service": svc,
 		"country": country,
-	})
+	}
+	if minPrice > 0 {
+		params["minPrice"] = strconv.FormatFloat(minPrice, 'f', -1, 64)
+	}
+	if maxPrice > 0 {
+		params["maxPrice"] = strconv.FormatFloat(maxPrice, 'f', -1, 64)
+	}
+	raw, err := p.rawRequest(ctx, "getNumber", params)
 	if err != nil {
 		return "", "", err
 	}

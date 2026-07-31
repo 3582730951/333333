@@ -42,15 +42,15 @@ func TestAcquireSMSRespectsRequestedProvider(t *testing.T) {
 	bower := &pipelineSMSProvider{name: "smsbower"}
 	p := NewPipeline(nil, &provider.Manager{SMS: []provider.SMSProvider{hero, bower}}, nil, nil)
 
-	got, _, orderID, err := p.acquireSMS(context.Background(), RegisterRequest{
+	purchase, err := p.acquireSMS(context.Background(), RegisterRequest{
 		SMSProvider: "smsbower",
 		Country:     "BR",
 	})
 	if err != nil {
 		t.Fatalf("acquireSMS: %v", err)
 	}
-	if got.Name() != "smsbower" || orderID != "smsbower-order" {
-		t.Fatalf("provider/order = %s/%s, want smsbower/smsbower-order", got.Name(), orderID)
+	if purchase.Provider.Name() != "smsbower" || purchase.OrderID != "smsbower-order" {
+		t.Fatalf("provider/order = %s/%s, want smsbower/smsbower-order", purchase.Provider.Name(), purchase.OrderID)
 	}
 	if len(hero.calls) != 0 {
 		t.Fatalf("herosms should not be called when smsbower is requested, calls=%v", hero.calls)
@@ -62,7 +62,7 @@ func TestAcquireSMSRespectsRequestedProvider(t *testing.T) {
 
 func TestAcquireSMSUnknownRequestedProviderErrors(t *testing.T) {
 	p := NewPipeline(nil, &provider.Manager{SMS: []provider.SMSProvider{&pipelineSMSProvider{name: "herosms"}}}, nil, nil)
-	_, _, _, err := p.acquireSMS(context.Background(), RegisterRequest{SMSProvider: "smsbower", Country: "BR"})
+	_, err := p.acquireSMS(context.Background(), RegisterRequest{SMSProvider: "smsbower", Country: "BR"})
 	if err == nil || !errors.Is(err, provider.ErrNoProviderAvailable) {
 		t.Fatalf("err = %v, want ErrNoProviderAvailable", err)
 	}

@@ -24,14 +24,16 @@ type codexReauthConfigRequest struct {
 }
 
 type codexReauthWorkerRequest struct {
-	Email             string `json:"email"`
-	Password          string `json:"password,omitempty"`
-	OTPURL            string `json:"otp_url,omitempty"`
-	Proxy             string `json:"proxy,omitempty"`
-	HeroSMSKey        string `json:"hero_sms_key,omitempty"`
-	SMSCountry        string `json:"sms_country,omitempty"`
-	TargetWorkspaceID string `json:"target_workspace_id,omitempty"`
-	CookieHeader      string `json:"cookie_header,omitempty"`
+	Email             string  `json:"email"`
+	Password          string  `json:"password,omitempty"`
+	OTPURL            string  `json:"otp_url,omitempty"`
+	Proxy             string  `json:"proxy,omitempty"`
+	HeroSMSKey        string  `json:"hero_sms_key,omitempty"`
+	SMSCountry        string  `json:"sms_country,omitempty"`
+	SMSMinPrice       float64 `json:"sms_min_price,omitempty"`
+	SMSMaxPrice       float64 `json:"sms_max_price,omitempty"`
+	TargetWorkspaceID string  `json:"target_workspace_id,omitempty"`
+	CookieHeader      string  `json:"cookie_header,omitempty"`
 }
 
 type codexReauthWorkerResponse struct {
@@ -379,7 +381,7 @@ func (s *Server) runCodexReauthJob(ctx context.Context, jobID int64) (map[string
 			}
 		}
 	}
-	heroSMSKey, smsCountry := s.codexReauthSMSConfig(ctx)
+	heroSMSKey, smsCountry, smsMinPrice, smsMaxPrice := s.codexReauthSMSConfig(ctx)
 	payload := codexReauthWorkerRequest{
 		Email:             cfg.LoginEmail,
 		Password:          cfg.Password,
@@ -387,6 +389,8 @@ func (s *Server) runCodexReauthJob(ctx context.Context, jobID int64) (map[string
 		Proxy:             proxyURL,
 		HeroSMSKey:        heroSMSKey,
 		SMSCountry:        smsCountry,
+		SMSMinPrice:       smsMinPrice,
+		SMSMaxPrice:       smsMaxPrice,
 		TargetWorkspaceID: cfg.TargetWorkspaceID,
 		CookieHeader:      cookie,
 	}
@@ -450,9 +454,9 @@ func (s *Server) runCodexReauthJob(ctx context.Context, jobID int64) (map[string
 	return map[string]interface{}{"account": updated, "job_id": job.ID, "status": storage.CodexReauthJobSucceeded}, http.StatusOK, nil
 }
 
-func (s *Server) codexReauthSMSConfig(ctx context.Context) (string, string) {
+func (s *Server) codexReauthSMSConfig(ctx context.Context) (string, string, float64, float64) {
 	if s == nil || s.store == nil {
-		return "", ""
+		return "", "", 0, 0
 	}
 	rows, err := s.store.DB().QueryContext(ctx, `
 SELECT provider_key,config_json,auth_json
@@ -460,7 +464,7 @@ FROM provider_settings
 WHERE provider_type='sms' AND enabled=1
 ORDER BY priority DESC,id`)
 	if err != nil {
-		return "", ""
+		return "", "", 0, 0
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -477,7 +481,7 @@ ORDER BY priority DESC,id`)
 		_ = json.Unmarshal([]byte(configJSON), &configValues)
 		authValues, openErr := s.store.OpenProviderAuthJSON("sms", providerKey, authJSON)
 		if openErr != nil {
-			return "", ""
+			return "", "", 0, 0
 		}
 		key := strings.TrimSpace(stringValue(authValues["api_key"]))
 		if key == "" {
@@ -486,14 +490,28 @@ ORDER BY priority DESC,id`)
 		country := strings.ToUpper(strings.TrimSpace(firstNonEmpty(
 			stringValue(configValues["country"]),
 			stringValue(configValues["default_country"]),
-			"PH",
+			"BR",
 		)))
-		if len(country) != 2 {
-			country = "PH"
+		minPrice, maxPrice := 0.0, 0.0
+		if s.regHandler != nil {
+			market, policyMin, policyMax, preferred := s.regHandler.smsMarketSnapshot(ctx)
+			minPrice, maxPrice = policyMin, policyMax
+			for _, item := range market {
+				if item.Eligible && strings.EqualFold(item.Provider, "herosms") && len(item.CountryISO) == 2 {
+					country = item.CountryISO
+					break
+				}
+			}
+			if len(country) != 2 && len(preferred) > 0 {
+				country = preferred[0]
+			}
 		}
-		return key, country
+		if len(country) != 2 {
+			country = "BR"
+		}
+		return key, country, minPrice, maxPrice
 	}
-	return "", ""
+	return "", "", 0, 0
 }
 
 func validateCodexTargetWorkspace(parsed authparse.ParsedAuth, targetWorkspaceID string) error {

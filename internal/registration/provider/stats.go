@@ -26,6 +26,29 @@ type SMSStats struct {
 	ttl     time.Duration
 }
 
+// SMSPriceSnapshot is the latest hourly market observation for one provider and country.
+type SMSPriceSnapshot struct {
+	Provider    string  `json:"provider"`
+	Service     string  `json:"service"`
+	CountryID   string  `json:"country_id"`
+	CountryISO  string  `json:"country_iso"`
+	CountryName string  `json:"country_name,omitempty"`
+	Price       float64 `json:"price"`
+	Inventory   int     `json:"inventory"`
+	Rank        int     `json:"provider_rank"`
+	Balance     float64 `json:"balance"`
+	FetchedAt   int64   `json:"fetched_at"`
+}
+
+// SMSSuccessStat exposes the evidence used by automatic country selection.
+type SMSSuccessStat struct {
+	Provider    string  `json:"provider"`
+	CountryISO  string  `json:"country_iso"`
+	Attempts    int     `json:"attempts"`
+	Succeeded   int     `json:"succeeded"`
+	SuccessRate float64 `json:"success_rate"`
+}
+
 // NewSMSStats creates a stats reader backed by the pool_server's sqlite DB.
 // db is the write-capable handle (reads are safe on WAL sqlite).
 func NewSMSStats(db *sql.DB) *SMSStats {
@@ -48,10 +71,9 @@ func (s *SMSStats) SuccessRate(ctx context.Context, provider, countryISO string)
 	key := s.cacheKey(provider, countryISO)
 	s.mu.RLock()
 	if time.Since(s.cacheTS) < s.ttl {
-		if v, ok := s.cache[key]; ok {
-			s.mu.RUnlock()
-			return v, true
-		}
+		v, ok := s.cache[key]
+		s.mu.RUnlock()
+		return v, ok
 	}
 	s.mu.RUnlock()
 
@@ -59,7 +81,7 @@ func (s *SMSStats) SuccessRate(ctx context.Context, provider, countryISO string)
 	// GetBestSMS call only hits the DB once.
 	cutoff := time.Now().Unix() - int64(14*24*3600)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT sms_provider, sms_country, COUNT(*), SUM(CASE WHEN status='success' THEN 1 ELSE 0 END)
+		`SELECT sms_provider, sms_country, COUNT(*), SUM(CASE WHEN status IN ('success','succeeded') THEN 1 ELSE 0 END)
 		 FROM registration_records
 		 WHERE created_at >= ? AND sms_provider != '' AND sms_country != ''
 		 GROUP BY sms_provider, sms_country`, cutoff)
@@ -100,6 +122,91 @@ func (s *SMSStats) SuccessRateSnapshot(ctx context.Context) map[string]float64 {
 	out := make(map[string]float64, len(s.cache))
 	for k, v := range s.cache {
 		out[k] = v
+	}
+	return out
+}
+
+// SuccessStatsSnapshot returns 14-day sample counts as well as rates. Both historical
+// "succeeded" and current "success" spellings are accepted during rolling upgrades.
+func (s *SMSStats) SuccessStatsSnapshot(ctx context.Context) map[string]SMSSuccessStat {
+	out := map[string]SMSSuccessStat{}
+	if s == nil || s.db == nil {
+		return out
+	}
+	cutoff := time.Now().Unix() - int64(14*24*3600)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT sms_provider, sms_country, COUNT(*),
+       SUM(CASE WHEN status IN ('success','succeeded') THEN 1 ELSE 0 END)
+FROM registration_records
+WHERE created_at >= ? AND sms_provider <> '' AND sms_country <> ''
+GROUP BY sms_provider, sms_country`, cutoff)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item SMSSuccessStat
+		if rows.Scan(&item.Provider, &item.CountryISO, &item.Attempts, &item.Succeeded) != nil {
+			continue
+		}
+		if item.Attempts > 0 {
+			item.SuccessRate = float64(item.Succeeded) / float64(item.Attempts)
+		}
+		out[fmt.Sprintf("%s|%s", item.Provider, item.CountryISO)] = item
+	}
+	return out
+}
+
+// ReplacePriceSnapshots atomically replaces one provider's latest catalog. Network work
+// is completed before this method is called, keeping the write transaction short.
+func (s *SMSStats) ReplacePriceSnapshots(ctx context.Context, provider, service string, items []SMSPriceSnapshot, fetchedAt int64) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sms_country_price_snapshots WHERE provider=? AND service=?`, provider, service); err != nil {
+		return err
+	}
+	for _, item := range items {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO sms_country_price_snapshots(
+ provider,service,country_id,country_iso,country_name,price,inventory,provider_rank,balance,fetched_at
+) VALUES(?,?,?,?,?,?,?,?,?,?)`, provider, service, item.CountryID, item.CountryISO, item.CountryName,
+			item.Price, item.Inventory, item.Rank, item.Balance, fetchedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PriceSnapshots returns observations newer than maxAge. maxAge<=0 returns all rows.
+func (s *SMSStats) PriceSnapshots(ctx context.Context, maxAge time.Duration) []SMSPriceSnapshot {
+	out := []SMSPriceSnapshot{}
+	if s == nil || s.db == nil {
+		return out
+	}
+	cutoff := int64(0)
+	if maxAge > 0 {
+		cutoff = time.Now().Add(-maxAge).Unix()
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT provider,service,country_id,country_iso,country_name,price,inventory,provider_rank,balance,fetched_at
+FROM sms_country_price_snapshots WHERE fetched_at >= ?
+ORDER BY price ASC, provider_rank ASC, provider ASC, country_iso ASC`, cutoff)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item SMSPriceSnapshot
+		if rows.Scan(&item.Provider, &item.Service, &item.CountryID, &item.CountryISO, &item.CountryName,
+			&item.Price, &item.Inventory, &item.Rank, &item.Balance, &item.FetchedAt) == nil {
+			out = append(out, item)
+		}
 	}
 	return out
 }

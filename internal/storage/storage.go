@@ -1963,6 +1963,21 @@ CREATE TABLE IF NOT EXISTS registration_records(
 CREATE INDEX IF NOT EXISTS idx_reg_records_job ON registration_records(job_id);
 CREATE INDEX IF NOT EXISTS idx_reg_records_status ON registration_records(status);
 
+CREATE TABLE IF NOT EXISTS sms_country_price_snapshots(
+  provider TEXT NOT NULL,
+  service TEXT NOT NULL DEFAULT 'dr',
+  country_id TEXT NOT NULL,
+  country_iso TEXT NOT NULL DEFAULT '',
+  country_name TEXT NOT NULL DEFAULT '',
+  price REAL NOT NULL DEFAULT 0,
+  inventory INTEGER NOT NULL DEFAULT 0,
+  provider_rank INTEGER NOT NULL DEFAULT 9999,
+  balance REAL NOT NULL DEFAULT -1,
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY(provider, service, country_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sms_country_prices_fresh ON sms_country_price_snapshots(fetched_at, provider, country_iso);
+
 CREATE TABLE IF NOT EXISTS registration_task_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL,
@@ -2405,6 +2420,20 @@ ON CONFLICT(account_id) DO NOTHING`,
 		`ALTER TABLE registration_records ADD COLUMN sms_provider TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE registration_records ADD COLUMN sms_country TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE registration_records ADD COLUMN sms_cost REAL NOT NULL DEFAULT 0`,
+		`CREATE TABLE IF NOT EXISTS sms_country_price_snapshots(
+  provider TEXT NOT NULL,
+  service TEXT NOT NULL DEFAULT 'dr',
+  country_id TEXT NOT NULL,
+  country_iso TEXT NOT NULL DEFAULT '',
+  country_name TEXT NOT NULL DEFAULT '',
+  price REAL NOT NULL DEFAULT 0,
+  inventory INTEGER NOT NULL DEFAULT 0,
+  provider_rank INTEGER NOT NULL DEFAULT 9999,
+  balance REAL NOT NULL DEFAULT -1,
+  fetched_at INTEGER NOT NULL,
+  PRIMARY KEY(provider, service, country_id)
+)`,
+		`CREATE INDEX IF NOT EXISTS idx_sms_country_prices_fresh ON sms_country_price_snapshots(fetched_at, provider, country_iso)`,
 		// CLIPProxy API whitelist mode + exit-region validation (Phase 8 — additive).
 		// ProxyAuthMode selects credential vs api_whitelist IP acquisition; ProxyAPIKey is
 		// the cliproxy account token used in api_whitelist mode.
@@ -10844,10 +10873,25 @@ func scanAccount(row scanner) (Account, error) {
 	var acc Account
 	var fed int
 	var ignoreRateLimitControls int
-	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &acc.UpstreamAccountID, &acc.ChatGPTUserID, &acc.Email, &acc.PlanType, &acc.Provider, &acc.Status, &fed, &ignoreRateLimitControls, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
+	// These identity fields were nullable in the original schema and can still be
+	// NULL in databases populated by older importers or direct administrative
+	// tooling. Scanning a SQL NULL into a Go string aborts the entire account-list
+	// response, so normalize the legacy representation at the storage boundary.
+	var upstreamAccountID sql.NullString
+	var chatGPTUserID sql.NullString
+	var email sql.NullString
+	var planType sql.NullString
+	err := row.Scan(&acc.ID, &acc.Label, &acc.GroupName, &upstreamAccountID, &chatGPTUserID, &email, &planType, &acc.Provider, &acc.Status, &fed, &ignoreRateLimitControls, &acc.QuarantineUntil, &acc.QuarantineReason, &acc.CreatedAt, &acc.UpdatedAt)
+	if err != nil {
+		return Account{}, err
+	}
+	acc.UpstreamAccountID = upstreamAccountID.String
+	acc.ChatGPTUserID = chatGPTUserID.String
+	acc.Email = email.String
+	acc.PlanType = planType.String
 	acc.IsFedramp = fed != 0
 	acc.IgnoreRateLimitControls = ignoreRateLimitControls != 0
-	return acc, err
+	return acc, nil
 }
 
 func scanEgress(row scanner) (EgressProfile, error) {

@@ -204,6 +204,17 @@ type captchaAdapter struct {
 	}
 }
 
+// Compile-time capability checks prevent the smart selector from silently degrading when
+// an adapter's catalog method signature changes.
+var (
+	_ PriceProvider      = (*sms.SMSBowerProvider)(nil)
+	_ FullPriceProvider  = (*sms.SMSBowerProvider)(nil)
+	_ BoundedSMSProvider = (*sms.SMSBowerProvider)(nil)
+	_ PriceProvider      = (*sms.HeroSMSProvider)(nil)
+	_ FullPriceProvider  = (*sms.HeroSMSProvider)(nil)
+	_ BoundedSMSProvider = (*sms.HeroSMSProvider)(nil)
+)
+
 func (a *captchaAdapter) Solve(ctx context.Context, req CaptchaRequest) (string, error) {
 	innerReq := captcha.CaptchaRequest{
 		Type:     req.Type,

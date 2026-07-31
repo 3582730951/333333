@@ -517,6 +517,9 @@ func (s *Server) routes() {
 	// Phone-country catalog (ISO/dial/中英文名) for the registration page's searchable
 	// country Select. Static, embedded from phone_countries.json.
 	s.mux.HandleFunc("/admin/register/countries", s.adminRegisterCountries)
+	// Hourly all-country SMS price catalog, historical success evidence, policy bounds,
+	// and a manual refresh action (GET=snapshot, POST=refresh then snapshot).
+	s.mux.HandleFunc("/admin/register/sms-market", s.adminRegisterSMSMarket)
 	// Daily registration statistics by SMS provider + country (success-rate aggregation
 	// accumulated locally from registration_records, for the stats-driven selection UI).
 	s.mux.HandleFunc("/admin/register/stats/daily", s.adminRegisterStatsDaily)

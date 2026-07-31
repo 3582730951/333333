@@ -127,6 +127,41 @@ func (h *Handler) StartRuntime(ctx context.Context) {
 	}
 	h.runtimeCtx, h.runtimeCancel = context.WithCancel(ctx)
 	h.runtimeActive = true
+	runtimeCtx := h.runtimeCtx
+	h.jobWG.Add(1)
+	go h.runSMSPriceScanner(runtimeCtx)
+}
+
+func (h *Handler) runSMSPriceScanner(ctx context.Context) {
+	defer h.jobWG.Done()
+	defer supervisor.Recover("registration-sms-price-scanner")
+	refresh := func() {
+		refreshCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		active := h.currentPipeline()
+		if active == nil {
+			return
+		}
+		count, err := active.RefreshSMSPrices(refreshCtx)
+		if err != nil {
+			log.Printf("[REGISTRATION] SMS country price refresh completed with warnings: rows=%d err=%v", count, err)
+			return
+		}
+		if count > 0 {
+			log.Printf("[REGISTRATION] SMS country price refresh completed: rows=%d", count)
+		}
+	}
+	refresh()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
 }
 
 // StopRuntime prevents new jobs, cancels every child process through its job
@@ -571,6 +606,22 @@ func (h *Handler) currentPipeline() *pipeline.Pipeline {
 	return h.pipeline
 }
 
+func (h *Handler) refreshSMSPrices(ctx context.Context) (int, error) {
+	active := h.currentPipeline()
+	if active == nil {
+		return 0, errors.New("registration pipeline is not initialized")
+	}
+	return active.RefreshSMSPrices(ctx)
+}
+
+func (h *Handler) smsMarketSnapshot(ctx context.Context) ([]provider.SMSMarketCandidate, float64, float64, []string) {
+	active := h.currentPipeline()
+	if active == nil {
+		return []provider.SMSMarketCandidate{}, 0, 0, []string{"BR", "CO", "PL"}
+	}
+	return active.SMSMarketSnapshot(ctx)
+}
+
 // HandleRegisterBatch starts a batch registration job
 func (h *Handler) HandleRegisterBatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -866,8 +917,8 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 				canaryAccountID = account.ID
 			}
 			h.store.DB().ExecContext(bg,
-				`UPDATE registration_records SET status='success', account_id=?, sms_provider=?, sms_country=?, sms_cost=?, duration_seconds=? WHERE id=?`,
-				account.ID, req.SMSProvider, req.SMSCountry, req.SMSCost, duration, recordID)
+				`UPDATE registration_records SET status='success', account_id=?, duration_seconds=? WHERE id=?`,
+				account.ID, duration, recordID)
 			h.logEvent(bg, jobID, "info", fmt.Sprintf("Registration %d succeeded", i+1))
 		}
 		h.store.DB().ExecContext(bg,

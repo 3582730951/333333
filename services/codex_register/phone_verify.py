@@ -33,6 +33,7 @@ Usage (from a Playwright page already sitting on / about to show the add-phone p
 Returns: {"ok": bool, "phone": str, "country": str, "channel": str, "error": str}
 """
 import json
+import os
 import re
 import time
 import urllib.parse
@@ -40,6 +41,8 @@ import urllib.request
 
 HEROSMS_BASE = "https://hero-sms.com/stubs/handler_api.php"
 HEROSMS_SERVICE = "dr"  # "dr" = OpenAI/ChatGPT on hero-sms (NOT "ot" = other)
+SMS_MIN_PRICE = os.environ.get("REG_SMS_MIN_PRICE", "").strip()
+SMS_MAX_PRICE = os.environ.get("REG_SMS_MAX_PRICE", "").strip()
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 # country ISO-2 -> (hero-sms country id, dial code). Cheapest-first ordering for FALLBACK_ORDER.
@@ -74,10 +77,15 @@ def hero_get_number(hero_key, country_iso, log=print):
     if not cfg:
         log(f"   [phone] unknown country {country_iso}")
         return None, None
-    q = urllib.parse.urlencode({
+    params = {
         "api_key": hero_key, "action": "getNumber",
         "service": HEROSMS_SERVICE, "country": cfg["hero"],
-    })
+    }
+    if SMS_MIN_PRICE not in ("", "0"):
+        params["minPrice"] = SMS_MIN_PRICE
+    if SMS_MAX_PRICE not in ("", "0"):
+        params["maxPrice"] = SMS_MAX_PRICE
+    q = urllib.parse.urlencode(params)
     try:
         txt = _http(f"{HEROSMS_BASE}?{q}", timeout=20)
     except Exception as e:

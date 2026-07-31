@@ -125,19 +125,22 @@ type RegisterRequest struct {
 //   - "manual": the request's explicit req.Country is used verbatim against the providers in
 //     priority order (the legacy GetSMS path).
 //
-// Returns the chosen provider, phone, and order id. The caller must settle the lease
+// Returns the exact purchase metadata. The caller must settle the lease
 // exactly once: complete it after an OTP was consumed, otherwise cancel it.
-func (p *Pipeline) acquireSMS(ctx context.Context, req RegisterRequest) (provider.SMSProvider, string, string, error) {
+func (p *Pipeline) acquireSMS(ctx context.Context, req RegisterRequest) (provider.SMSPurchase, error) {
 	if p == nil || p.providerMgr == nil || len(p.providerMgr.SMS) == 0 {
-		return nil, "", "", provider.ErrNoProviderAvailable
+		return provider.SMSPurchase{}, provider.ErrNoProviderAvailable
 	}
+	minPrice, maxPrice := smsPriceBounds(ctx, p.store)
 	requestedProvider := strings.ToLower(strings.TrimSpace(req.SMSProvider))
 	if requestedProvider != "" && requestedProvider != "auto" {
 		country := strings.TrimSpace(req.Country)
 		if country == "" {
 			country = firstPreferredCountry(ctx, p.store)
 		}
-		return p.providerMgr.GetSMSFromProvider(ctx, requestedProvider, country)
+		purchase, err := p.providerMgr.GetSMSPurchaseFromProvider(ctx, requestedProvider, country, minPrice, maxPrice)
+		p.recordSMSSelection(ctx, req, purchase)
+		return purchase, err
 	}
 	strategy := "auto"
 	if p.store != nil {
@@ -153,14 +156,17 @@ func (p *Pipeline) acquireSMS(ctx context.Context, req RegisterRequest) (provide
 		if country == "" {
 			country = firstPreferredCountry(ctx, p.store)
 		}
-		return p.providerMgr.GetSMS(ctx, country)
+		purchase, err := p.providerMgr.GetSMSPurchase(ctx, country, minPrice, maxPrice)
+		p.recordSMSSelection(ctx, req, purchase)
+		return purchase, err
 	}
 	// auto: live-stats smart selection across all funded platforms.
 	pref := preferredCountries(ctx, p.store)
 	topN := smsStatsTopN(ctx, p.store)
-	prov, phone, orderID, err := p.providerMgr.GetBestSMS(ctx, pref, topN)
+	purchase, err := p.providerMgr.GetBestSMSPurchase(ctx, pref, topN, minPrice, maxPrice)
 	if err == nil {
-		return prov, phone, orderID, nil
+		p.recordSMSSelection(ctx, req, purchase)
+		return purchase, nil
 	}
 	// Fallback: if smart selection found nothing (e.g. no platform exposes PriceProvider,
 	// or all stats calls failed), degrade to the legacy explicit-country path so a
@@ -169,7 +175,77 @@ func (p *Pipeline) acquireSMS(ctx context.Context, req RegisterRequest) (provide
 	if country == "" {
 		country = firstPreferredCountry(ctx, p.store)
 	}
-	return p.providerMgr.GetSMS(ctx, country)
+	purchase, fallbackErr := p.providerMgr.GetSMSPurchase(ctx, country, minPrice, maxPrice)
+	p.recordSMSSelection(ctx, req, purchase)
+	return purchase, fallbackErr
+}
+
+func smsPriceBounds(ctx context.Context, store *storage.Store) (float64, float64) {
+	if store == nil {
+		return 0, 0
+	}
+	read := func(key string) float64 {
+		value, ok, _ := store.GetSetting(ctx, key)
+		if !ok {
+			return 0
+		}
+		price, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || price < 0 {
+			return 0
+		}
+		return price
+	}
+	return read("sms_min_price"), read("sms_max_price")
+}
+
+func (p *Pipeline) recordSMSSelection(ctx context.Context, req RegisterRequest, purchase provider.SMSPurchase) {
+	if p == nil || p.store == nil || strings.TrimSpace(req.RecordID) == "" || purchase.Provider == nil {
+		return
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, _ = p.store.DB().ExecContext(persistCtx, `
+UPDATE registration_records SET sms_provider=?, sms_country=?, sms_cost=? WHERE id=?`,
+		purchase.Provider.Name(), purchase.CountryISO, purchase.Price, req.RecordID)
+}
+
+// RefreshSMSPrices is called by the runtime's hourly scanner and the manual admin action.
+func (p *Pipeline) RefreshSMSPrices(ctx context.Context) (int, error) {
+	if p == nil || p.providerMgr == nil {
+		return 0, provider.ErrNoProviderAvailable
+	}
+	return p.providerMgr.RefreshSMSPrices(ctx)
+}
+
+func (p *Pipeline) SMSMarketSnapshot(ctx context.Context) ([]provider.SMSMarketCandidate, float64, float64, []string) {
+	if p == nil {
+		return []provider.SMSMarketCandidate{}, 0, 0, []string{"BR", "CO", "PL"}
+	}
+	minPrice, maxPrice := smsPriceBounds(ctx, p.store)
+	preferred := preferredCountries(ctx, p.store)
+	if p == nil || p.providerMgr == nil {
+		return []provider.SMSMarketCandidate{}, minPrice, maxPrice, preferred
+	}
+	return p.providerMgr.SMSMarketSnapshot(ctx, preferred, minPrice, maxPrice), minPrice, maxPrice, preferred
+}
+
+func (p *Pipeline) bestSMSCountry(ctx context.Context, providerName string) (provider.SMSMarketCandidate, bool) {
+	if p == nil || p.providerMgr == nil {
+		return provider.SMSMarketCandidate{}, false
+	}
+	minPrice, maxPrice := smsPriceBounds(ctx, p.store)
+	return p.providerMgr.BestSMSCountry(ctx, providerName, preferredCountries(ctx, p.store), minPrice, maxPrice)
+}
+
+func (p *Pipeline) recordSMSCountrySelection(ctx context.Context, req RegisterRequest, providerName, countryISO string, price float64) {
+	if p == nil || p.store == nil || strings.TrimSpace(req.RecordID) == "" {
+		return
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_, _ = p.store.DB().ExecContext(persistCtx, `
+UPDATE registration_records SET sms_provider=?, sms_country=?, sms_cost=? WHERE id=?`,
+		strings.TrimSpace(providerName), strings.ToUpper(strings.TrimSpace(countryISO)), price, req.RecordID)
 }
 
 func (p *Pipeline) settleSMSLease(ctx context.Context, req RegisterRequest, smsProvider provider.SMSProvider, orderID string, consumed bool) {
@@ -284,10 +360,11 @@ func (p *Pipeline) RegisterOne(ctx context.Context, req RegisterRequest) (*stora
 	// operator's preferred-country priority (BR>CO>PL) to pick the best (platform, country);
 	// under "manual" the request's explicit country is used verbatim. Either way the chosen
 	// provider lease is settled exactly once after the flow returns.
-	smsProvider, phone, orderID, err := p.acquireSMS(ctx, req)
+	purchase, err := p.acquireSMS(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("acquireSMS: %w", err)
 	}
+	smsProvider, phone, orderID := purchase.Provider, purchase.Phone, purchase.OrderID
 	codeConsumed := false
 	defer func() {
 		p.settleSMSLease(ctx, req, smsProvider, orderID, codeConsumed)

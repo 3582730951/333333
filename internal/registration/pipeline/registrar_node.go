@@ -468,20 +468,6 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 	baseConfig := sanitizeNodeWorkerConfig(p.nodeRegistrarBaseConfig(ctx, regDir))
 	maxAttempts := nodeRegMaxAttempts()
 
-	// Resolve the SMS country for THIS registration. Under "auto" the Manager already picked
-	// the best (platform, country) — but the node engine runs its OWN hero-sms flow (it doesn't
-	// use pool_server's SMSProvider), so we resolve the country here the same way acquireSMS
-	// would and feed it to the engine: req.Country (manual or the auto-chosen ISO) wins,
-	// else the operator's preferred list (BR>CO>PL), else BR (live-verified best).
-	countryISO := strings.ToUpper(strings.TrimSpace(req.Country))
-	if countryISO == "" || countryISO == "RAND" {
-		countryISO = firstPreferredCountry(ctx, p.store)
-	}
-	// hero-sms numeric country id. The phoneCountryCatalog maps ISO→heroSmsCountry for the
-	// known set; unmapped ISOs (e.g. a new country) fall back to a live getCountries lookup
-	// would be ideal, but the engine itself does getCountries+getTopCountries and will use
-	// heroSmsCountry from its own catalog resolution — so we only set it when we know it.
-	countryID := heroSmsCountryID(countryISO)
 	// Drive retries by spawning a FRESH node process per attempt (REG_ONE_SHOT=1), each
 	// doing exactly ONE browser launch. This sidesteps the puppeteer-real-browser relaunch
 	// flakiness (2nd+ connect() in a long-lived process fails to fetch the debug URL) and
@@ -489,10 +475,19 @@ func (p *Pipeline) nodeRegisterOne(ctx context.Context, req RegisterRequest) (*s
 	var acct *nodeTokenFile
 	for attempt := 1; attempt <= maxAttempts && ctx.Err() == nil; attempt++ {
 		cctx, cancel := context.WithTimeout(ctx, nodeRegAttemptTimeout())
-		smsProvider, phone, orderID, acquireErr := p.acquireSMS(cctx, req)
+		purchase, acquireErr := p.acquireSMS(cctx, req)
 		if acquireErr != nil {
 			cancel()
 			continue
+		}
+		smsProvider, phone, orderID := purchase.Provider, purchase.Phone, purchase.OrderID
+		countryISO := strings.ToUpper(strings.TrimSpace(purchase.CountryISO))
+		if countryISO == "" {
+			countryISO = firstPreferredCountry(ctx, p.store)
+		}
+		countryID := strings.TrimSpace(purchase.CountryID)
+		if countryID == "" {
+			countryID = heroSmsCountryID(countryISO)
 		}
 		relay, relayErr := startRegistrarOTPRelay(cctx, smsProvider, orderID, 3*time.Minute)
 		if relayErr != nil {

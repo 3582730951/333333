@@ -29,6 +29,7 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	w.Header().Set("X-Response-Contract", "admin.accounts.v1")
 	// Server-side pagination: the frontend sends ?page=1&pageSize=20&search=&status=.
 	// When page is 0 (old frontend), fall back to the full list for backward compat.
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
@@ -48,6 +49,7 @@ func (s *Server) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"accounts": out, "total": total, "page": page, "pageSize": pageSize,
+			"contract_version": "admin.accounts.v1",
 		})
 		return
 	}

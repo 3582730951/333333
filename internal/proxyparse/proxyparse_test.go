@@ -1,6 +1,9 @@
 package proxyparse
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseLineFormats(t *testing.T) {
 	cases := []struct {
@@ -15,6 +18,7 @@ func TestParseLineFormats(t *testing.T) {
 		{in: "jp.example.com:1080", host: "jp.example.com", port: "1080"},
 		{in: "host:1080:onlyuser", host: "host", port: "1080", user: "onlyuser"},
 		{in: "alice:secret@1.2.3.4:1080", host: "1.2.3.4", port: "1080", user: "alice", pass: "secret"},
+		{in: "proxy.example:1080@alice:secret", host: "proxy.example", port: "1080", user: "alice", pass: "secret"},
 		{in: "socks5h://bob:p@ss@5.6.7.8:1080", host: "5.6.7.8", port: "1080", user: "bob", pass: "p@ss"},
 		{in: "host:1080:user:pa:ss:word", host: "host", port: "1080", user: "user", pass: "pa:ss:word"},
 		{in: "", isErr: true},
@@ -78,5 +82,28 @@ func TestFromFieldsEndpointSchemes(t *testing.T) {
 				t.Fatalf("endpoint = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeEndpointInfersSchemeAndEscapesCredentials(t *testing.T) {
+	endpoint, typ, err := NormalizeEndpoint("socks5://user:p@ss@proxy.example:1080", "http_proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typ != "socks5_proxy" {
+		t.Fatalf("type = %q", typ)
+	}
+	if endpoint != "socks5://user:p%40ss@proxy.example:1080" {
+		t.Fatalf("endpoint = %q", endpoint)
+	}
+}
+
+func TestParseLineRejectsInvalidPortWithoutEchoingCredential(t *testing.T) {
+	_, err := ParseLine("proxy.example:not-a-port:user:do-not-echo")
+	if err == nil {
+		t.Fatal("expected invalid port")
+	}
+	if strings.Contains(err.Error(), "do-not-echo") {
+		t.Fatalf("error exposed credential: %v", err)
 	}
 }

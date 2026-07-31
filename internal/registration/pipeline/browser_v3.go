@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -138,10 +139,18 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 	if err != nil {
 		return nil, fmt.Errorf("browser_v3: egress not found: %w", err)
 	}
-	// Pin the residential exit IP country to the SMS number's country (and rotate the
-	// session id for a fresh, isolated IP per account). A random region raises OpenAI's
-	// add-phone gate and ban rate.
-	country := pickV3Country(req.Country)
+	// Pin the residential exit to the country chosen by the hourly market table. This does
+	// not reserve a number: browser_v3 purchases only if OAuth actually exposes add_phone.
+	country := strings.ToUpper(strings.TrimSpace(req.Country))
+	selectedPrice := 0.0
+	if country == "" || country == "RAND" {
+		if selected, ok := p.bestSMSCountry(ctx, "herosms"); ok && selected.CountryISO != "" {
+			country = selected.CountryISO
+			selectedPrice = selected.Price
+		} else {
+			country = pickV3Country("")
+		}
+	}
 	if proxy.IsCliproxy(egress.Endpoint) {
 		egress.Endpoint = proxy.WithRegion(egress.Endpoint, country)
 	}
@@ -183,6 +192,7 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 	cctx, cancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, python, "-u", script)
+	minPrice, maxPrice := smsPriceBounds(ctx, p.store)
 	cmd.Env = append(registrarBaseEnv(),
 		"REG_PROXY_SERVER="+server,
 		"REG_PROXY_USER="+user,
@@ -195,11 +205,19 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 		// SMS country must match the proxy region so the IP and phone agree; reg_v3.py
 		// only draws a hero-sms number if OpenAI demands add-phone during OAuth.
 		"REG_SMS_COUNTRY="+country,
+		"REG_SMS_MIN_PRICE="+strconv.FormatFloat(minPrice, 'f', -1, 64),
+		"REG_SMS_MAX_PRICE="+strconv.FormatFloat(maxPrice, 'f', -1, 64),
 	)
 	if hk := p.herosmsKey(ctx); hk != "" {
 		cmd.Env = append(cmd.Env, "HEROSMS_KEY="+hk)
 	}
 	out, err := p.runRegistrarCommand(cctx, cmd)
+	if usedCountry, used := browserV3SMSCountry(out, country); used {
+		if !strings.EqualFold(usedCountry, country) {
+			selectedPrice = 0
+		}
+		p.recordSMSCountrySelection(ctx, req, "herosms", usedCountry, selectedPrice)
+	}
 	if err != nil && len(out) == 0 {
 		return nil, errors.New("browser_v3: harness process failed")
 	}
@@ -229,6 +247,24 @@ func (p *Pipeline) browserV3RegisterOne(ctx context.Context, req RegisterRequest
 		}
 	}
 	return nil, fmt.Errorf("browser_v3: no account produced")
+}
+
+func browserV3SMSCountry(output []byte, fallback string) (string, bool) {
+	text := string(output)
+	if !strings.Contains(text, "add-phone step detected") {
+		return "", false
+	}
+	const marker = "virtual number allocated country="
+	if index := strings.LastIndex(text, marker); index >= 0 {
+		value := text[index+len(marker):]
+		if len(value) >= 2 {
+			country := strings.ToUpper(value[:2])
+			if country[0] >= 'A' && country[0] <= 'Z' && country[1] >= 'A' && country[1] <= 'Z' {
+				return country, true
+			}
+		}
+	}
+	return strings.ToUpper(strings.TrimSpace(fallback)), true
 }
 
 func randomHex(n int) string {

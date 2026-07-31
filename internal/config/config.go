@@ -713,6 +713,10 @@ type Config struct {
 	// up (default 3). Higher = more fallback resilience at the cost of more number purchases
 	// on a bad day.
 	SMSStatsTopN int `json:"sms_stats_top_n"`
+	// SMSMinPrice/SMSMaxPrice bound automatic number purchases in USD. Zero leaves
+	// the corresponding side open; the same bounds are shown on the registration page.
+	SMSMinPrice float64 `json:"sms_min_price"`
+	SMSMaxPrice float64 `json:"sms_max_price"`
 
 	// ── CLIPProxy API whitelist mode + exit-region validation ──
 	// CliproxyAPIBase is the cliproxy white-api base URL (default https://api.cliproxy.io),

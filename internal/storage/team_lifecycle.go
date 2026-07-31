@@ -160,7 +160,7 @@ func (s *Store) UpsertTeamWorkspace(ctx context.Context, workspace TeamWorkspace
 	}
 	workspace.ConnectorKind = strings.ToLower(strings.TrimSpace(workspace.ConnectorKind))
 	if workspace.ConnectorKind == "" {
-		workspace.ConnectorKind = "fixture"
+		workspace.ConnectorKind = "native"
 	}
 	if workspace.MaxMembers <= 0 {
 		workspace.MaxMembers = 10

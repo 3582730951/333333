@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import {
   fetchRegistrationCountries, fetchRegistrationDashboard, fetchRegistrationOptions,
-  fetchRegistrationStrategy, saveRegistrationStrategy, startRegistrationJob,
+  fetchRegistrationStrategy, fetchSMSMarket, refreshSMSMarket, saveRegistrationStrategy, startRegistrationJob,
 } from '../api/registration';
 import { queryKeys, useApiMutation, useQueryView } from '../../shared/queries';
 
@@ -11,6 +11,7 @@ export const registrationQueryKeys = {
   options: queryKeys.list('registration-options'),
   countries: queryKeys.list('registration-countries'),
   strategy: queryKeys.list('registration-strategy'),
+  smsMarket: queryKeys.list('registration-sms-market'),
 };
 
 export function useRegistrationDashboardData() {
@@ -47,7 +48,19 @@ export function useRegistrationStrategyData() {
 }
 
 export function useSaveRegistrationStrategyMutation() {
-  return useApiMutation({ mutationFn: saveRegistrationStrategy, invalidate: [registrationQueryKeys.strategy] });
+  return useApiMutation({ mutationFn: saveRegistrationStrategy, invalidate: [registrationQueryKeys.strategy, registrationQueryKeys.smsMarket] });
+}
+
+export function useSMSMarketData() {
+  return useQueryView(useQuery({
+    queryKey: registrationQueryKeys.smsMarket,
+    queryFn: ({ signal }) => fetchSMSMarket(signal),
+    staleTime: 5 * 60_000,
+  }));
+}
+
+export function useRefreshSMSMarketMutation() {
+  return useApiMutation({ mutationFn: refreshSMSMarket, invalidate: [registrationQueryKeys.smsMarket] });
 }
 
 export function useStartRegistrationJobMutation() {

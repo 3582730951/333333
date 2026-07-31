@@ -1627,6 +1627,215 @@
   grid-column: 1 / -1;
 }
 
+.pool-registration-engine-summary {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  padding: 13px 14px;
+  border: 1px solid color-mix(in srgb, var(--pool-accent) 18%, var(--pool-border));
+  border-radius: 16px;
+  background:
+    radial-gradient(circle at 0 0, color-mix(in srgb, var(--pool-accent) 10%, transparent), transparent 48%),
+    color-mix(in srgb, var(--pool-bg-surface-2) 88%, transparent);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--pool-shadow-color) 7%, transparent);
+}
+
+.pool-registration-engine-summary__icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  color: var(--pool-accent);
+  background: color-mix(in srgb, var(--pool-accent) 12%, transparent);
+  font-size: 22px;
+}
+
+.pool-registration-engine-summary__body {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  color: var(--pool-text-2);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.pool-registration-engine-summary__title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  color: var(--pool-text);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.pool-sms-market-card .pool-card-body {
+  display: grid;
+  gap: 16px;
+}
+
+.pool-sms-market-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.pool-sms-market-description {
+  max-width: 760px;
+  margin: 6px 0 0;
+  color: var(--pool-text-3);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.pool-sms-market-actions {
+  flex: 0 0 auto;
+}
+
+.pool-sms-price-policy {
+  display: grid;
+  grid-template-columns: minmax(150px, 210px) minmax(150px, 210px) auto minmax(180px, 1fr);
+  gap: 12px;
+  align-items: end;
+  padding: 14px;
+  border-radius: 18px;
+  background: var(--pool-bg-surface-2);
+  border: 1px solid var(--pool-border-subtle, var(--pool-border));
+}
+
+.pool-sms-price-policy label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: var(--pool-text-2);
+  font-size: 12px;
+}
+
+.pool-sms-price-policy .pool-input {
+  width: 100%;
+}
+
+.pool-sms-market-freshness {
+  align-self: center;
+  justify-self: end;
+  min-width: 0;
+  color: var(--pool-text-3);
+  font-size: 12px;
+  text-align: right;
+}
+
+.pool-sms-market-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.pool-sms-market-item {
+  display: grid;
+  grid-template-columns: 28px minmax(88px, 1fr) minmax(72px, auto) minmax(72px, auto) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--pool-border-subtle, var(--pool-border));
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--pool-bg-surface) 94%, transparent);
+  transition: transform var(--pool-motion-fast) var(--pool-motion-ease), border-color var(--pool-motion-fast) var(--pool-motion-ease);
+}
+
+.pool-sms-market-item:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--pool-accent) 28%, var(--pool-border));
+}
+
+.pool-sms-market-item.is-ineligible {
+  opacity: 0.55;
+}
+
+.pool-sms-market-rank {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--pool-accent) 10%, var(--pool-bg-surface-2));
+  color: var(--pool-accent);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.pool-sms-market-country,
+.pool-sms-market-stat {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.pool-sms-market-country strong,
+.pool-sms-market-stat strong {
+  color: var(--pool-text);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-sms-market-country span,
+.pool-sms-market-stat span,
+.pool-sms-market-stat small {
+  overflow: hidden;
+  color: var(--pool-text-3);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pool-sms-market-empty {
+  grid-column: 1 / -1;
+  padding: 26px;
+  border: 1px dashed var(--pool-border);
+  border-radius: 16px;
+  color: var(--pool-text-3);
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .pool-sms-price-policy {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .pool-sms-market-freshness {
+    justify-self: start;
+    text-align: left;
+  }
+
+  .pool-sms-market-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .pool-sms-market-head {
+    display: grid;
+  }
+
+  .pool-sms-price-policy {
+    grid-template-columns: 1fr;
+  }
+
+  .pool-sms-market-item {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+  }
+
+  .pool-sms-market-item .pool-sms-market-stat {
+    grid-column: 2;
+  }
+}
+
 .pool-registration-strategy-row {
   display: grid;
   grid-template-columns: repeat(3, minmax(150px, 1fr));
@@ -1944,6 +2153,45 @@
   flex-wrap: wrap;
   gap: 8px;
   min-height: 34px;
+}
+
+.pool-proxy-parser {
+  display: grid;
+  gap: 8px;
+  margin-top: -4px;
+  padding: 10px 12px;
+  border: 1px solid var(--pool-border);
+  border-radius: var(--pool-radius-md);
+  background: var(--pool-bg-surface-2);
+}
+
+.pool-proxy-parser__formats,
+.pool-proxy-parser__result {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.pool-proxy-parser__formats > span {
+  color: var(--pool-text-3);
+  font-size: 11px;
+}
+
+.pool-proxy-parser__formats code {
+  padding: 2px 6px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--pool-bg-elevated) 76%, transparent);
+  color: var(--pool-text-2);
+  font-size: 10px;
+}
+
+.pool-proxy-parser__result .pool-typography {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pool-egress-test-result {
@@ -5817,6 +6065,93 @@
 .pool-lifecycle-quota > span {
   color: var(--pool-text-3);
   font-size: 10px;
+}
+
+.pool-lifecycle-form-intro {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 12px;
+  margin: 0 0 18px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--pool-accent) 18%, var(--pool-border));
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at 0 0, color-mix(in srgb, var(--pool-accent) 9%, transparent), transparent 52%),
+    var(--pool-bg-surface-2);
+}
+
+.pool-lifecycle-form-intro__number {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  background: var(--pool-accent);
+  box-shadow: 0 8px 18px color-mix(in srgb, var(--pool-accent) 20%, transparent);
+  color: var(--pool-on-accent, white);
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.pool-lifecycle-form-intro strong {
+  color: var(--pool-text);
+  font-size: 14px;
+}
+
+.pool-lifecycle-form-intro p {
+  margin: 4px 0 0;
+  color: var(--pool-text-3);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.pool-lifecycle-auto-field {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 11px 12px;
+  border-radius: 14px;
+  background: var(--pool-bg-surface-2);
+  color: var(--pool-text-2);
+  font-size: 12px;
+}
+
+.pool-lifecycle-auto-field > span {
+  color: var(--pool-text-3);
+}
+
+.pool-lifecycle-auto-field > small {
+  grid-column: 1 / -1;
+  color: var(--pool-text-3);
+}
+
+.pool-lifecycle-cycle-preview {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--pool-accent) 7%, var(--pool-bg-surface-2));
+  scrollbar-width: thin;
+}
+
+.pool-lifecycle-cycle-preview span {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid var(--pool-border);
+  border-radius: 999px;
+  background: var(--pool-bg-elevated);
+  color: var(--pool-text-2);
+  font-size: 11px;
+}
+
+.pool-lifecycle-cycle-preview i {
+  color: var(--pool-accent);
+  font-style: normal;
 }
 
 .pool-lifecycle-modal-actions {

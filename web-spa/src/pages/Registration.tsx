@@ -12,7 +12,8 @@ import { normalizeApiError } from '../api/errors';
 import { t } from '../lib/i18n.js';
 import {
   useRegistrationCountriesData, useRegistrationDashboardData, useRegistrationOptionsData,
-  useRegistrationStrategyData, useSaveRegistrationStrategyMutation, useStartRegistrationJobMutation,
+  useRefreshSMSMarketMutation, useRegistrationStrategyData, useSaveRegistrationStrategyMutation,
+  useSMSMarketData, useStartRegistrationJobMutation,
 } from '../features/automation/queries/registration';
 import {
   lockedIdentityForMethod, manualStartBlockers, methodUsesSMSCountry, normalizeRegisterMethod,
@@ -33,6 +34,14 @@ const DetailDrawer = TaskDetailDrawer as any;
 const Progress = TaskProgress as any;
 
 const DEFAULT_PREFERRED = ['BR', 'CO', 'PL'];
+
+const ENGINE_GUIDES = [
+  { value: 'protocol_v2', name: '协议注册 v2', badge: '推荐', mode: '邮箱 OTP', detail: 'curl_cffi 浏览器指纹 + Sentinel PoW；当前主要协议注册引擎，资源占用低。' },
+  { value: 'protocol', name: '内置协议注册', badge: '协议', mode: '邮箱 / 短信', detail: 'Go 原生协议流程，可手动选择邮箱或短信身份；适合兼容性回退。' },
+  { value: 'browser_v3', name: '浏览器注册 v3', badge: '真实浏览器', mode: '邮箱优先 · 短信兜底', detail: 'Playwright + 隐身配置；页面变化时更有韧性，资源消耗高于协议引擎。' },
+  { value: 'node', name: 'Node 浏览器注册', badge: 'Puppeteer', mode: '短信', detail: '隔离 Chrome 配置与短信中继；每次尝试使用独立浏览器资料和代理出口。' },
+  { value: 'browser', name: '旧版浏览器注册', badge: '兼容', mode: '短信', detail: '保留的 Playwright 兼容引擎；仅在新版引擎不适配时使用。' },
+];
 
 interface RegistrationFormValues {
   count?: number | string;
@@ -105,11 +114,17 @@ export default function Registration() {
   const [defaultMethod, setDefaultMethod] = useState('node');
   const [selectedMethod, setSelectedMethod] = useState('');
   const [identityMode, setIdentityMode] = useState<RegistrationIdentityMode>('phone');
+  const [minPriceInput, setMinPriceInput] = useState('');
+  const [maxPriceInput, setMaxPriceInput] = useState('');
+  const [savedMinPrice, setSavedMinPrice] = useState(0);
+  const [savedMaxPrice, setSavedMaxPrice] = useState(0);
 
   const dashboardQuery = useRegistrationDashboardData();
   const optionsQuery = useRegistrationOptionsData();
   const countriesQuery = useRegistrationCountriesData();
   const strategyQuery = useRegistrationStrategyData();
+  const smsMarketQuery = useSMSMarketData();
+  const refreshSMSMarketMutation = useRefreshSMSMarketMutation();
   const saveStrategyMutation = useSaveRegistrationStrategyMutation();
   const startMutation = useStartRegistrationJobMutation();
 
@@ -121,6 +136,10 @@ export default function Registration() {
     setSavedStrategy(strategyConfig.strategy);
     setSavedManualCountry(strategyConfig.manualCountry);
     setDefaultMethod(strategyConfig.defaultMethod);
+    setMinPriceInput(strategyConfig.minPrice > 0 ? String(strategyConfig.minPrice) : '');
+    setMaxPriceInput(strategyConfig.maxPrice > 0 ? String(strategyConfig.maxPrice) : '');
+    setSavedMinPrice(strategyConfig.minPrice);
+    setSavedMaxPrice(strategyConfig.maxPrice);
     setIdentityMode(lockedIdentityForMethod(strategyConfig.defaultMethod) || 'phone');
   }, [strategyConfig]);
 
@@ -134,16 +153,39 @@ export default function Registration() {
   const savingStrategy = saveStrategyMutation.isPending;
   const strategyReady = Boolean(strategyConfig || strategyQuery.error);
 
-  const persistStrategy = async (nextStrategy: RegistrationCountryStrategy, manualIso: string) => {
+  const persistStrategy = async (nextStrategy: RegistrationCountryStrategy, manualIso: string, minPrice = Number(minPriceInput) || 0, maxPrice = Number(maxPriceInput) || 0) => {
     const nextManualCountry = nextStrategy === 'manual' ? manualIso : '';
-    if (nextStrategy === savedStrategy && nextManualCountry === savedManualCountry) return;
-    await saveStrategyMutation.mutateAsync({ strategy: nextStrategy, manualCountry: nextManualCountry });
+    if (minPrice < 0 || maxPrice < 0 || minPrice > 1000 || maxPrice > 1000 || (minPrice > 0 && maxPrice > 0 && minPrice > maxPrice)) {
+      throw new Error('接码价格范围无效：需要 0–1000 USD，且最低价不能高于最高价。');
+    }
+    if (nextStrategy === savedStrategy && nextManualCountry === savedManualCountry && minPrice === savedMinPrice && maxPrice === savedMaxPrice) return;
+    await saveStrategyMutation.mutateAsync({ strategy: nextStrategy, manualCountry: nextManualCountry, minPrice, maxPrice });
     setSavedStrategy(nextStrategy);
     setSavedManualCountry(nextManualCountry);
+    setSavedMinPrice(minPrice);
+    setSavedMaxPrice(maxPrice);
     Toast.success(t('registration.strategy_saved'));
   };
 
+  const saveSMSPolicy = async () => {
+    try {
+      await persistStrategy(strategy, manualCountry);
+    } catch (error) {
+      showErrorToast(error);
+    }
+  };
+
+  const refreshSMSMarket = async () => {
+    try {
+      await refreshSMSMarketMutation.mutateAsync(undefined);
+      Toast.success('国家价格与库存已重新扫描');
+    } catch (error) {
+      showErrorToast(error);
+    }
+  };
+
   const effectiveMethod = normalizeRegisterMethod(selectedMethod, defaultMethod);
+  const activeEngineGuide = ENGINE_GUIDES.find((engine) => engine.value === effectiveMethod) || ENGINE_GUIDES[0];
   const lockedIdentityMode = lockedIdentityForMethod(effectiveMethod);
   const activeIdentityMode: RegistrationIdentityMode = lockedIdentityMode || identityMode;
   const smsCountryRequired = methodUsesSMSCountry(effectiveMethod, activeIdentityMode);
@@ -258,6 +300,8 @@ export default function Registration() {
       value: providerOptionValue(option),
     })),
   ];
+  const smsMarket = smsMarketQuery.data;
+  const visibleMarket = (smsMarket?.items || []).slice(0, 8);
 
   return (
     <div>
@@ -293,12 +337,8 @@ export default function Registration() {
               ]} />
             <Form.Select field="method" label={t('registration.engine')} initValue="" disabled={starting || savingStrategy}
               optionList={[
-                { label: `${t('registration.default')} (${defaultMethod})`, value: '' },
-                { label: 'protocol', value: 'protocol' },
-                { label: 'node (puppeteer)', value: 'node' },
-                { label: 'protocol_v2', value: 'protocol_v2' },
-                { label: 'browser', value: 'browser' },
-                { label: 'browser_v3', value: 'browser_v3' },
+                { label: `${t('registration.default')} · ${ENGINE_GUIDES.find((engine) => engine.value === defaultMethod)?.name || defaultMethod}`, value: '' },
+                ...ENGINE_GUIDES.map((engine) => ({ label: `${engine.name} · ${engine.mode}`, value: engine.value })),
               ]}
               onChange={(value: string) => {
                 const nextMethod = value || '';
@@ -306,6 +346,17 @@ export default function Registration() {
                 setSelectedMethod(nextMethod);
                 setIdentityMode(lockedIdentityForMethod(nextEffectiveMethod) || identityMode || 'phone');
               }} />
+            <div className="pool-registration-engine-summary" aria-live="polite">
+              <span className="pool-registration-engine-summary__icon" aria-hidden="true">⌁</span>
+              <span className="pool-registration-engine-summary__body">
+                <span className="pool-registration-engine-summary__title">
+                  {activeEngineGuide.name}
+                  <Tag size="small" color={activeEngineGuide.value === 'protocol_v2' ? 'blue' : 'grey'}>{activeEngineGuide.badge}</Tag>
+                  <Tag size="small">{activeEngineGuide.mode}</Tag>
+                </span>
+                <span>{activeEngineGuide.detail}</span>
+              </span>
+            </div>
             <div className="pool-registration-control">
               <Typography.Text size="small" className="pool-registration-field-label">{t('registration.identity')}</Typography.Text>
               <Select
@@ -382,6 +433,56 @@ export default function Registration() {
               ) : null}
             </div>
           </Form>
+        </div>
+      </Card>
+
+      <ErrorBanner error={smsMarketQuery.error} onRetry={smsMarketQuery.reload} title="接码国家市场读取失败" />
+      <Card className="pool-card pool-sms-market-card" style={{ marginBottom: 18 }} title="接码国家智能选择">
+        <div className="pool-sms-market-head">
+          <div>
+            <Typography.Text strong>成功率优先，价格与库存共同决策</Typography.Text>
+            <p className="pool-sms-market-description">
+              系统每小时遍历各平台国家价格；累计至少 {smsMarket?.minimum_history_samples || 3} 次后按近 {smsMarket?.history_window_days || 14} 天成功率选择。冷启动按社区推荐 {((smsMarket?.preferred_countries || DEFAULT_PREFERRED).join(' › '))}。
+            </p>
+          </div>
+          <div className="pool-sms-market-actions">
+            <Button icon={<IconRefresh />} loading={refreshSMSMarketMutation.isPending} onClick={refreshSMSMarket}>立即比价</Button>
+          </div>
+        </div>
+        <div className="pool-sms-price-policy">
+          <label>
+            <span>最低单价 · USD</span>
+            <input className="pool-input" type="number" min="0" max="1000" step="0.001" placeholder="不限" value={minPriceInput} onChange={(event) => setMinPriceInput(event.target.value)} />
+          </label>
+          <label>
+            <span>最高单价 · USD</span>
+            <input className="pool-input" type="number" min="0" max="1000" step="0.001" placeholder="不限" value={maxPriceInput} onChange={(event) => setMaxPriceInput(event.target.value)} />
+          </label>
+          <Button theme="solid" loading={savingStrategy} onClick={saveSMSPolicy}>保存价格范围</Button>
+          <span className="pool-sms-market-freshness">
+            {smsMarket?.last_refreshed_at
+              ? `${smsMarket.stale ? '数据待刷新' : '价格已同步'} · ${new Date(smsMarket.last_refreshed_at * 1000).toLocaleString()}`
+              : '等待首次价格扫描'}
+          </span>
+        </div>
+        <div className="pool-sms-market-grid">
+          {visibleMarket.map((item, index) => (
+            <article className={`pool-sms-market-item${item.eligible ? '' : ' is-ineligible'}`} key={`${item.provider}-${item.country_id}`}>
+              <span className="pool-sms-market-rank">{index + 1}</span>
+              <div className="pool-sms-market-country">
+                <strong>{item.country_iso || item.country_id}</strong>
+                <span title={item.country_name || item.provider}>{item.country_name || item.provider}</span>
+              </div>
+              <div className="pool-sms-market-stat"><span>成功率</span><strong>{Math.round(item.success_rate * 100)}%</strong><small>{item.attempts ? `${item.succeeded}/${item.attempts}` : '冷启动'}</small></div>
+              <div className="pool-sms-market-stat"><span>单价</span><strong>${item.price.toFixed(3)}</strong><small>库存 {item.inventory}</small></div>
+              <Tag size="small" color={item.selection_basis === 'historical_success_rate' ? 'green' : 'blue'}>
+                {item.selection_basis === 'historical_success_rate' ? '历史概率' : '社区推荐'}
+              </Tag>
+            </article>
+          ))}
+          {!smsMarketQuery.loading && visibleMarket.length === 0 ? (
+            <div className="pool-sms-market-empty">保存接码平台凭据后点击“立即比价”，国家价格、库存与历史成功率会显示在这里。</div>
+          ) : null}
         </div>
       </Card>
 

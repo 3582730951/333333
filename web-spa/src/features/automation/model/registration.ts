@@ -72,11 +72,49 @@ export interface RegistrationStrategyConfig {
   strategy: RegistrationCountryStrategy;
   manualCountry: string;
   defaultMethod: string;
+  minPrice: number;
+  maxPrice: number;
 }
 
 export interface RegistrationStrategyInput {
   strategy: RegistrationCountryStrategy;
   manualCountry: string;
+  minPrice: number;
+  maxPrice: number;
+}
+
+export interface SMSMarketCandidate {
+  provider: string;
+  service: string;
+  country_id: string;
+  country_iso: string;
+  country_name?: string;
+  price: number;
+  inventory: number;
+  provider_rank: number;
+  balance: number;
+  fetched_at: number;
+  attempts: number;
+  succeeded: number;
+  success_rate: number;
+  score: number;
+  eligible: boolean;
+  selection_basis: 'historical_success_rate' | 'community_cold_start' | string;
+}
+
+export interface SMSMarketSnapshot {
+  items: SMSMarketCandidate[];
+  min_price: number;
+  max_price: number;
+  preferred_countries: string[];
+  cold_start_policy: string;
+  history_window_days: number;
+  minimum_history_samples: number;
+  refresh_interval_seconds: number;
+  last_refreshed_at: number;
+  stale: boolean;
+  refreshed_rows: number;
+  warning: string;
 }
 
 export interface RegistrationStartInput {

@@ -71,6 +71,23 @@ func (s *Server) handleTeamLifecycleWorkspaces(w http.ResponseWriter, r *http.Re
 		if strings.TrimSpace(request.ID) == "" {
 			request.ID = "teamws_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		}
+		if strings.TrimSpace(request.ConnectorKind) == "" {
+			request.ConnectorKind = "native"
+		}
+		// The selected parent already stores the opaque upstream workspace identifier.
+		// Keep workspace_ref as an advanced override instead of making operators copy it.
+		if strings.TrimSpace(request.WorkspaceRef) == "" {
+			parent, err := s.store.GetAccount(r.Context(), strings.TrimSpace(request.ParentAccountID))
+			if err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("select a parent account from the account pool"))
+				return
+			}
+			request.WorkspaceRef = strings.TrimSpace(parent.UpstreamAccountID)
+			if request.WorkspaceRef == "" {
+				writeError(w, http.StatusBadRequest, errors.New("selected parent account has no upstream workspace id; fill the advanced workspace reference"))
+				return
+			}
+		}
 		if strings.TrimSpace(request.MailboxProviderKey) == "" {
 			if value, ok, err := s.store.GetSetting(r.Context(), "team_default_mailbox_provider"); err != nil {
 				writeError(w, http.StatusInternalServerError, err)

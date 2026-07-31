@@ -62,6 +62,20 @@ func TestParseSMSBowerTopCountries_BadKey(t *testing.T) {
 	}
 }
 
+func TestParseSMSBowerAllPrices(t *testing.T) {
+	raw := `{"4":{"dr":{"cost":0.025,"count":14}},"73":{"dr":{"cost":"0.045","count":"31"}},"15":{"tg":{"cost":0.2,"count":2}}}`
+	out, err := parseSMSBowerAllPrices(raw, "dr")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(out) != 2 || out[0].Country != "4" || out[1].Country != "73" {
+		t.Fatalf("unexpected all-price catalog: %+v", out)
+	}
+	if out[1].Price != 0.045 || out[1].Count != 31 || out[1].Rank != 9999 {
+		t.Fatalf("unexpected BR offer: %+v", out[1])
+	}
+}
+
 func TestSMSBowerProvider_ServiceDefault(t *testing.T) {
 	p := NewSMSBowerProvider("k", nil)
 	if p.service != "dr" {

@@ -418,6 +418,10 @@ func configFields() []configField {
 				}
 				return c.SMSStatsTopN
 			}},
+		{Key: "sms_min_price", Label: "接码最低单价 (USD)", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "auto 策略只考虑不低于该价格的号码；0 表示不设下限。", boot: func(c config.Config) interface{} { return c.SMSMinPrice }},
+		{Key: "sms_max_price", Label: "接码最高单价 (USD)", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "auto 策略与实际购买都不会超过该价格；0 表示不设上限。", boot: func(c config.Config) interface{} { return c.SMSMaxPrice }},
 
 		// ── 引导（需重启）─────────────────────────────────────────────────────
 		{Key: "listen_addr", Label: "监听地址", Category: catBoot, Type: fieldString, Effect: effectRestart,
@@ -694,6 +698,26 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 		default:
 			return "", fmt.Errorf("expected comma-separated ISO-2 country list")
 		}
+	case "sms_min_price", "sms_max_price":
+		var text string
+		switch typed := v.(type) {
+		case string:
+			text = strings.TrimSpace(typed)
+		case float64:
+			text = strconv.FormatFloat(typed, 'f', -1, 64)
+		case int:
+			text = strconv.Itoa(typed)
+		default:
+			return "", fmt.Errorf("expected a decimal USD price")
+		}
+		if text == "" {
+			return "0", nil
+		}
+		price, err := strconv.ParseFloat(text, 64)
+		if err != nil || price < 0 || price > 1000 {
+			return "", fmt.Errorf("must be a decimal between 0 and 1000")
+		}
+		return strconv.FormatFloat(price, 'f', -1, 64), nil
 	case "account_token_budget":
 		raw, err := validateIntegerSetting(v)
 		if err != nil {

@@ -57,6 +57,9 @@ describe('team lifecycle presentation', () => {
       http.get('*/admin/email-pool/cloudflare', () =>
         HttpResponse.json({ profiles: [] }),
       ),
+      http.get('*/admin/accounts', () =>
+        HttpResponse.json({ accounts: [{ id: 'parent-ref', label: 'Parent', email: 'parent@example.com', status: 'active' }] }),
+      ),
     );
 
     render(<TeamLifecycle />);

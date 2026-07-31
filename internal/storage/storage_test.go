@@ -456,6 +456,47 @@ func TestAccountBatchExpansionHelpers(t *testing.T) {
 	}
 }
 
+func TestAccountReadersNormalizeLegacyNullableIdentityFields(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := Now()
+	if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO accounts(
+ id,label,group_name,upstream_account_id,chatgpt_user_id,email,plan_type,
+ provider,status,created_at,updated_at
+) VALUES('legacy-null-account','Legacy nullable identity','cyber',NULL,NULL,NULL,NULL,'codex','active',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := store.ListAccounts(ctx)
+	if err != nil {
+		t.Fatalf("list accounts with legacy NULL identity fields: %v", err)
+	}
+	if len(listed) != 1 {
+		t.Fatalf("listed accounts = %d, want 1", len(listed))
+	}
+	got := listed[0]
+	if got.UpstreamAccountID != "" || got.ChatGPTUserID != "" || got.Email != "" || got.PlanType != "" {
+		t.Fatalf("nullable identity fields were not normalized: %+v", got)
+	}
+
+	paged, total, err := store.ListAccountsPage(ctx, 20, 0, "", "")
+	if err != nil {
+		t.Fatalf("page accounts with legacy NULL identity fields: %v", err)
+	}
+	if total != 1 || len(paged) != 1 || paged[0].ID != got.ID {
+		t.Fatalf("paged accounts total=%d rows=%+v", total, paged)
+	}
+
+	loaded, err := store.GetAccount(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("get account with legacy NULL identity fields: %v", err)
+	}
+	if loaded.Email != "" || loaded.ChatGPTUserID != "" {
+		t.Fatalf("loaded nullable fields were not normalized: %+v", loaded)
+	}
+}
+
 func TestReplaceCapabilitiesPersistsAuthoritativeEmptyCatalog(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

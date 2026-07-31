@@ -232,6 +232,14 @@ func (s *Server) adminEgressProfiles(w http.ResponseWriter, r *http.Request) {
 			}
 			profile.Endpoint = d.Endpoint(profile.Type)
 		}
+		if isProxyEgressType(profile.Type) && strings.TrimSpace(profile.Endpoint) != "" {
+			endpoint, inferredType, err := proxyparse.NormalizeEndpoint(profile.Endpoint, profile.Type)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			profile.Endpoint, profile.Type = endpoint, inferredType
+		}
 		if strings.TrimSpace(profile.ID) == "" {
 			profile.ID = generatedID("egress")
 		}
@@ -669,6 +677,13 @@ func (s *Server) egressProfileForTest(ctx context.Context, req egressProfileTest
 		}
 		profile.Endpoint = d.Endpoint(profile.Type)
 	}
+	if isProxyEgressType(profile.Type) && strings.TrimSpace(profile.Endpoint) != "" {
+		endpoint, inferredType, err := proxyparse.NormalizeEndpoint(profile.Endpoint, profile.Type)
+		if err != nil {
+			return storage.EgressProfile{}, err
+		}
+		profile.Endpoint, profile.Type = endpoint, inferredType
+	}
 	if strings.EqualFold(strings.TrimSpace(profile.ProxyAuthMode), "api_whitelist") && strings.TrimSpace(profile.Endpoint) == "" {
 		return s.cliproxyAPIWhitelistProbeProfile(ctx, profile, req.Profile)
 	}
@@ -800,6 +815,15 @@ func isEgressProfileInputError(err error) bool {
 	return false
 }
 
+func isProxyEgressType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "http_proxy", "https_proxy", "socks5_proxy", "socks5h_proxy":
+		return true
+	default:
+		return false
+	}
+}
+
 // adminEgressImport bulk-creates proxy egress profiles from newline-separated
 // "host:port:username:password" lines (the batch-import format). Region detection
 // is off by default (one outbound probe per proxy would be slow on large lists);
@@ -825,11 +849,12 @@ func (s *Server) adminEgressImport(w http.ResponseWriter, r *http.Request) {
 	detect := req.DetectRegion != nil && *req.DetectRegion
 	created := make([]storage.EgressProfile, 0, len(drafts))
 	for _, d := range drafts {
+		typ := d.EgressType(req.Type)
 		p := storage.EgressProfile{
 			ID:             generatedID("egress"),
 			Name:           firstNonEmpty(d.Host, "proxy"),
-			Type:           req.Type,
-			Endpoint:       d.Endpoint(req.Type),
+			Type:           typ,
+			Endpoint:       d.Endpoint(typ),
 			StreamCapable:  true,
 			Health:         "healthy",
 			MaxConcurrency: 16,

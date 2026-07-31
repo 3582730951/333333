@@ -1,0 +1,13 @@
+## BASELINE
+COMMAND: go test ./internal/storage -run TestAccountReadersNormalizeLegacyNullableIdentityFields -count=1
+--- FAIL: TestAccountReadersNormalizeLegacyNullableIdentityFields (0.05s)
+    storage_test.go:473: list accounts with legacy NULL identity fields: sql: Scan error on column index 3, name "upstream_account_id": converting NULL to string is unsupported
+FAIL
+FAIL	codex-account-pool/internal/storage	0.063s
+FAIL
+EXIT_STATUS=1
+## MODIFIED
+COMMAND: go test ./internal/storage -run TestAccountReadersNormalizeLegacyNullableIdentityFields -count=1
+ok  	codex-account-pool/internal/storage	0.074s
+EXIT_STATUS=0
+EXPECTED_BASELINE_FAILURE_AND_MODIFIED_SUCCESS=true

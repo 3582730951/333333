@@ -16,7 +16,7 @@ import { emailPoolResponseSchema } from '../src/features/accounts/api/emailPool'
 import { cfEventsResponseSchema, quotaResponseSchema } from '../src/features/observability/api/events';
 import {
   adaptRegistrationStrategy, registrationCountriesSchema, registrationJobsResponseSchema,
-  registrationProviderOptionsSchema, registrationReadinessSchema,
+  registrationProviderOptionsSchema, registrationReadinessSchema, smsMarketSchema,
 } from '../src/features/automation/api/registration';
 import {
   lockedIdentityForMethod, manualStartBlockers, methodUsesSMSCountry,
@@ -138,7 +138,21 @@ describe('API contracts', () => {
       { key: 'sms_platform_strategy', value: 'manual' },
       { key: 'sms_manual_country', value: 'US' },
       { key: 'default_register_method', value: 'BROWSER_V3' },
-    ])).toEqual({ strategy: 'manual', manualCountry: 'US', defaultMethod: 'browser_v3' });
+    ])).toEqual({ strategy: 'manual', manualCountry: 'US', defaultMethod: 'browser_v3', minPrice: 0, maxPrice: 0 });
+    expect(parseApiResponse(smsMarketSchema, {
+      items: [{
+        provider: 'herosms', service: 'dr', country_id: 73, country_iso: 'BR',
+        price: '0.045', inventory: '25', provider_rank: 0, balance: 3,
+        fetched_at: 1_800_000_000, attempts: 8, succeeded: 6,
+        success_rate: 0.75, score: 0.8, eligible: true,
+        selection_basis: 'historical_success_rate',
+      }],
+      preferred_countries: ['BR', 'CO', 'PL'],
+    })).toMatchObject({
+      items: [{ country_id: '73', price: 0.045, inventory: 25, success_rate: 0.75, eligible: true }],
+      refresh_interval_seconds: 3600,
+      minimum_history_samples: 3,
+    });
   });
 
   it('normalizes system metrics while preserving supervisor diagnostics', () => {

@@ -3,8 +3,12 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"codex-account-pool/internal/storage"
 )
 
 // mockSMSProvider implements SMSProvider + BalanceProvider + PriceProvider for testing
@@ -69,22 +73,14 @@ func (m *mockSMSProvider) CancelNumber(ctx context.Context, orderID string) erro
 func (m *mockSMSProvider) GetBalance(ctx context.Context) (float64, error) {
 	return m.bal, m.balErr
 }
-func (m *mockSMSProvider) GetCountries(ctx context.Context) ([]interface{}, error) {
-	out := make([]interface{}, 0, len(m.countries))
-	for i := range m.countries {
-		out = append(out, m.countries[i])
-	}
-	return out, nil
+func (m *mockSMSProvider) GetCountries(ctx context.Context) ([]CountryInfo, error) {
+	return append([]CountryInfo(nil), m.countries...), nil
 }
-func (m *mockSMSProvider) GetTopCountries(ctx context.Context, service string) ([]interface{}, error) {
+func (m *mockSMSProvider) GetTopCountries(ctx context.Context, service string) ([]CountryPrice, error) {
 	if m.topErr != nil {
 		return nil, m.topErr
 	}
-	out := make([]interface{}, 0, len(m.tops))
-	for i := range m.tops {
-		out = append(out, m.tops[i])
-	}
-	return out, nil
+	return append([]CountryPrice(nil), m.tops...), nil
 }
 
 func TestGetBestSMS_PicksCheaperFundedPlatform(t *testing.T) {
@@ -202,6 +198,72 @@ func TestGetBestSMS_NoneAvailable(t *testing.T) {
 	_, _, _, err := m.GetBestSMS(context.Background(), []string{"BR"}, 3)
 	if !errors.Is(err, ErrNoProviderAvailable) {
 		t.Errorf("expected ErrNoProviderAvailable, got %v", err)
+	}
+}
+
+func TestGetBestSMSPurchaseUsesHistoricalSuccessAndPriceBounds(t *testing.T) {
+	store, err := storage.Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stats := NewSMSStats(store.DB())
+	now := time.Now().Unix()
+	if err := stats.ReplacePriceSnapshots(ctx, "herosms", "dr", []SMSPriceSnapshot{{
+		Provider: "herosms", Service: "dr", CountryID: "73", CountryISO: "BR",
+		Price: 0.045, Inventory: 50, Rank: 0, Balance: 10, FetchedAt: now,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := stats.ReplacePriceSnapshots(ctx, "smsbower", "dr", []SMSPriceSnapshot{{
+		Provider: "smsbower", Service: "dr", CountryID: "33", CountryISO: "CO",
+		// 9999 is the persisted sentinel when a full-market country is not in the
+		// provider's short ranked list; history must still be able to select it.
+		Price: 0.030, Inventory: 50, Rank: 9999, Balance: 10, FetchedAt: now,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	for index, status := range []string{"failed", "failed", "failed", "success", "success", "success", "success"} {
+		providerName, country := "herosms", "BR"
+		if index >= 4 {
+			providerName, country = "smsbower", "CO"
+		}
+		if _, err := store.DB().ExecContext(ctx, `
+INSERT INTO registration_records(id,job_id,status,created_at,sms_provider,sms_country,sms_cost)
+VALUES(?,?,?,?,?,?,?)`, fmt.Sprintf("history-%d", index), "history-job", status, now, providerName, country, 0.04); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hero := &mockSMSProvider{namev: "herosms", numberResults: map[string]struct {
+		phone   string
+		orderID string
+		err     error
+	}{"73": {"+551", "hero", nil}}}
+	bower := &mockSMSProvider{namev: "smsbower", numberResults: map[string]struct {
+		phone   string
+		orderID string
+		err     error
+	}{"33": {"+571", "bower", nil}}}
+	manager := &Manager{SMS: []SMSProvider{hero, bower}, Stats: stats}
+
+	purchase, err := manager.GetBestSMSPurchase(ctx, []string{"BR", "CO", "PL"}, 3, 0, 0.06)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purchase.Provider.Name() != "smsbower" || purchase.CountryISO != "CO" || purchase.Price != 0.030 {
+		t.Fatalf("historical selector chose %+v", purchase)
+	}
+
+	purchase, err = manager.GetBestSMSPurchase(ctx, []string{"BR", "CO", "PL"}, 3, 0.04, 0.06)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if purchase.Provider.Name() != "herosms" || purchase.CountryISO != "BR" {
+		t.Fatalf("price-bound selector chose %+v", purchase)
 	}
 }
 

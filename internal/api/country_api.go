@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -144,7 +145,7 @@ func (s *Server) adminRegisterStatsDaily(w http.ResponseWriter, r *http.Request)
 	rows, err := s.store.DB().QueryContext(r.Context(), `
 		SELECT date(created_at,'unixepoch') AS d, sms_provider, sms_country,
 		       COUNT(*) AS total,
-		       SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END) AS succ,
+		       SUM(CASE WHEN status IN ('success','succeeded') THEN 1 ELSE 0 END) AS succ,
 		       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS fail,
 		       AVG(cost_usd) AS avg_cost
 		FROM registration_records
@@ -181,4 +182,52 @@ func (s *Server) adminRegisterStatsDaily(w http.ResponseWriter, r *http.Request)
 		out = append(out, r)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// adminRegisterSMSMarket exposes the same evidence used by automatic country selection.
+// GET is side-effect free; POST performs an immediate comparison scan before returning.
+func (s *Server) adminRegisterSMSMarket(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if s.regHandler == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("registration pipeline is not initialized"))
+		return
+	}
+	refreshed := 0
+	warning := ""
+	if r.Method == http.MethodPost {
+		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+		defer cancel()
+		var err error
+		refreshed, err = s.regHandler.refreshSMSPrices(ctx)
+		if err != nil {
+			warning = err.Error()
+		}
+	}
+	items, minPrice, maxPrice, preferred := s.regHandler.smsMarketSnapshot(r.Context())
+	latest := int64(0)
+	for _, item := range items {
+		if item.FetchedAt > latest {
+			latest = item.FetchedAt
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"items":                    items,
+		"min_price":                minPrice,
+		"max_price":                maxPrice,
+		"preferred_countries":      preferred,
+		"cold_start_policy":        "community_recommended_order",
+		"history_window_days":      14,
+		"minimum_history_samples":  3,
+		"refresh_interval_seconds": 3600,
+		"last_refreshed_at":        latest,
+		"stale":                    latest == 0 || time.Now().Unix()-latest > 5400,
+		"refreshed_rows":           refreshed,
+		"warning":                  warning,
+	})
 }
