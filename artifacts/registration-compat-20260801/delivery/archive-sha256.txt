@@ -1,0 +1,2 @@
+a3cb5d64b91836801ccc43d66269536f2394ebd14ad0420728295be431b6d9c8  /workspace/artifacts/registration-compat-20260801/modified/registration-compat-source.tar.gz
+b428a46cac3602ae083c440d585100dc06a818f7b81fa95553ff51fe226071ef  /workspace/artifacts/registration-compat-20260801/delivery/rollback-baseline.tar.gz

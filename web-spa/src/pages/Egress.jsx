@@ -8,6 +8,7 @@ import MobileResourceCell from '../components/MobileResourceCell.jsx';
 import { ActionGroup, MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { showErrorToast } from '../components/ErrorToast.jsx';
 import EgressProfileForm from '../components/EgressProfileForm.jsx';
+import CopyCodeBlock from '../components/CopyCodeBlock.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
 import useAsyncResource from '../hooks/useAsyncResource.js';
 import { loadResourceGroup } from '../lib/resource.js';
@@ -19,6 +20,14 @@ const AUTH_MODES = [
 ];
 
 const EMPTY_EGRESS = { profiles: [], pools: [], config: [], error: null };
+
+const RESIDENTIAL_QUICKSTART = `export POOL_URL='https://POOL_HOST'
+export ADMIN_TOKEN='ADMIN_TOKEN'
+read -rsp 'Residential proxy URL: ' RESIDENTIAL_PROXY_URL; echo
+
+curl -fsS -X POST "$POOL_URL/admin/egress-profiles" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \\
+  --data "$(jq -n --arg endpoint "$RESIDENTIAL_PROXY_URL" '{id:"egress_residential_registration",name:"Registration residential",type:"http_proxy",endpoint:$endpoint,region:"US",ip_mode:"dynamic_residential",provider_key:"residential",max_concurrency:1,detect_region:true}')"`;
 
 const formatDynamicConfig = (value) => {
   if (!value) return '{}';
@@ -312,6 +321,14 @@ export default function Egress() {
           <Button icon={<IconPlus />} onClick={() => openEdit(null)}>新建</Button>
           <Button icon={<IconRefresh />} onClick={load}>刷新</Button>
         </>} />
+      <section className="pool-egress-quickstart">
+        <div>
+          <Tag color="blue">复制粘贴</Tag>
+          <h2>住宅 IP 最短接入</h2>
+          <p>替换地址与 Token，粘贴完整代理 URL。保存后在本页测试出口 IP，再点“加入默认注册池”。动态住宅注册建议并发为 1。</p>
+        </div>
+        <CopyCodeBlock code={RESIDENTIAL_QUICKSTART} label="复制住宅代理命令" />
+      </section>
       <div className="pool-toolbar pool-egress-registration-toolbar">
         <Typography.Text strong>默认注册池</Typography.Text>
         <Select

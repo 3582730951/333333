@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { get, post, put, del } from '../../../api.js';
+import { get, getResponse, post, put, del } from '../../../api.js';
 import { parseApiResponse } from '../../../api/contracts';
 
 export interface EmailAccount {
@@ -69,6 +69,8 @@ export interface CloudflareMailboxConfigResponse {
   defaults: { registration?: string; team?: string };
   deployment?: {
     recommended_adapter?: string;
+    repository_path?: string;
+    quickstart?: string[];
     steps?: string[];
     references?: string[];
   };
@@ -95,16 +97,21 @@ export interface CloudflareMailboxProbeResponse {
   message: string;
 }
 
+const optionalLegacyString = z.preprocess((value) => value == null ? undefined : value, z.string().optional());
+const optionalLegacyNumber = z.preprocess((value) => value == null || value === '' ? undefined : value, z.coerce.number().optional());
+
 const emailAccountSchema = z.object({
-  id: z.string(),
-  email: z.string(),
-  client_id: z.string().optional(),
-  status: z.string(),
-  group_name: z.string().optional(),
-  error_message: z.string().optional(),
-  last_used_at: z.coerce.number().optional(),
-  created_at: z.coerce.number(),
-  updated_at: z.coerce.number(),
+  id: z.string().min(1),
+  email: z.string().min(1),
+  client_id: optionalLegacyString,
+  status: z.string().min(1).default('idle'),
+  group_name: optionalLegacyString,
+  error_message: optionalLegacyString,
+  last_used_at: optionalLegacyNumber,
+  // Pre-release responses did not consistently expose timestamps. A zero value
+  // means "unknown" throughout the existing UI and preserves those rows.
+  created_at: z.preprocess((value) => value == null || value === '' ? 0 : value, z.coerce.number()),
+  updated_at: z.preprocess((value) => value == null || value === '' ? 0 : value, z.coerce.number()),
 }).passthrough();
 
 const cloudflareMailboxHealthSchema = z.object({
@@ -139,18 +146,133 @@ export const cloudflareMailboxConfigSchema = z.object({
   }).optional().default({}),
   deployment: z.object({
     recommended_adapter: z.string().optional(),
+    repository_path: z.string().optional(),
+    quickstart: z.array(z.string()).optional(),
     steps: z.array(z.string()).optional(),
     references: z.array(z.string()).optional(),
   }).optional(),
 }).passthrough();
 
-export const emailPoolResponseSchema = z.object({
+type UnknownRecord = Record<string, unknown>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function firstDefined(record: UnknownRecord, keys: string[]): unknown {
+  for (const key of keys) {
+    if (record[key] !== undefined) return record[key];
+  }
+  return undefined;
+}
+
+function normalizeLegacyEmailStatus(value: unknown): string {
+  const normalized = String(value || '').trim().toLowerCase().replaceAll('-', '_');
+  if (['', 'idle', 'unused', 'active', 'valid'].includes(normalized)) return 'idle';
+  // `ready` was a user-visible state in the legacy UI ("可用"). Keep that
+  // display semantic while the page still treats both ready and idle as
+  // selectable capacity. New servers emit idle; old servers remain legible.
+  if (['ready', 'available'].includes(normalized)) return 'ready';
+  if (['in_use', 'inuse', 'busy', 'reserved', 'using', 'processing'].includes(normalized)) return 'in_use';
+  if (['error', 'failed', 'invalid', 'disabled', 'dead'].includes(normalized)) return 'error';
+  if (['used', 'consumed', 'done', 'completed'].includes(normalized)) return 'used';
+  return normalized;
+}
+
+function normalizeLegacyEmailCounts(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const counts: Record<string, number> = {};
+  for (const [status, rawCount] of Object.entries(value)) {
+    const count = Number(rawCount);
+    if (!Number.isFinite(count) || count < 0) continue;
+    const canonical = normalizeLegacyEmailStatus(status);
+    counts[canonical] = (counts[canonical] || 0) + count;
+  }
+  return counts;
+}
+
+function normalizeLegacyEmailAccount(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const normalized: UnknownRecord = { ...value };
+  const aliases = [
+    'account_id', 'accountId', 'address', 'clientId', 'state', 'groupName',
+    'errorMessage', 'lastUsedAt', 'createdAt', 'updatedAt',
+  ];
+  for (const alias of aliases) delete normalized[alias];
+  const canonical: Array<[string, unknown]> = [
+    ['id', firstDefined(value, ['id', 'account_id', 'accountId'])],
+    ['email', firstDefined(value, ['email', 'address'])],
+    ['client_id', firstDefined(value, ['client_id', 'clientId'])],
+    ['status', normalizeLegacyEmailStatus(firstDefined(value, ['status', 'state']))],
+    ['group_name', firstDefined(value, ['group_name', 'groupName'])],
+    ['error_message', firstDefined(value, ['error_message', 'errorMessage'])],
+    ['last_used_at', firstDefined(value, ['last_used_at', 'lastUsedAt'])],
+    ['created_at', firstDefined(value, ['created_at', 'createdAt']) ?? 0],
+    ['updated_at', firstDefined(value, ['updated_at', 'updatedAt']) ?? 0],
+  ];
+  for (const [key, next] of canonical) {
+    if (next == null || next === '') delete normalized[key];
+    else normalized[key] = next;
+  }
+  // Timestamp schemas intentionally map missing values to zero.
+  if (normalized.created_at === undefined) normalized.created_at = 0;
+  if (normalized.updated_at === undefined) normalized.updated_at = 0;
+  return normalized;
+}
+
+/**
+ * Adapt only response shapes emitted by known pool releases. Unknown objects
+ * (including API error payloads) deliberately remain invalid instead of being
+ * displayed as an empty pool.
+ */
+export function normalizeEmailPoolResponse(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return { accounts: value.map(normalizeLegacyEmailAccount) };
+  }
+  if (!isRecord(value)) return value;
+
+  const directRows = firstDefined(value, ['accounts', 'email_accounts', 'emailAccounts', 'rows', 'items', 'list']);
+  if (Array.isArray(directRows)) {
+    const pagination = isRecord(value.pagination) ? value.pagination : {};
+    return {
+      accounts: directRows.map(normalizeLegacyEmailAccount),
+      total: firstDefined(value, ['total', 'count']) ?? firstDefined(pagination, ['total', 'count']),
+      page: firstDefined(value, ['page', 'current_page', 'currentPage'])
+        ?? firstDefined(pagination, ['page', 'current_page', 'currentPage']),
+      pageSize: firstDefined(value, ['pageSize', 'page_size', 'limit'])
+        ?? firstDefined(pagination, ['pageSize', 'page_size', 'per_page', 'perPage', 'limit']),
+      counts: normalizeLegacyEmailCounts(firstDefined(value, ['counts', 'status_counts', 'statusCounts'])),
+    };
+  }
+
+  // Some releases wrapped the page in { data: ... } or { result: ... }.
+  const nested = firstDefined(value, ['data', 'result', 'payload']);
+  if (Array.isArray(nested) || isRecord(nested)) {
+    const normalized = normalizeEmailPoolResponse(nested);
+    if (isRecord(normalized) && Array.isArray(normalized.accounts)) {
+      return {
+        ...normalized,
+        total: normalized.total ?? firstDefined(value, ['total', 'count']),
+        page: normalized.page ?? firstDefined(value, ['page', 'current_page', 'currentPage']),
+        pageSize: normalized.pageSize ?? firstDefined(value, ['pageSize', 'page_size', 'limit']),
+        counts: normalized.counts ?? normalizeLegacyEmailCounts(firstDefined(value, ['counts', 'status_counts', 'statusCounts'])),
+      };
+    }
+  }
+  return value;
+}
+
+const normalizedEmailPoolResponseSchema = z.object({
   accounts: z.array(emailAccountSchema).optional(),
   total: z.coerce.number().int().nonnegative().optional(),
   page: z.coerce.number().int().positive().optional(),
   pageSize: z.coerce.number().int().positive().optional(),
   counts: z.record(z.string(), z.coerce.number().int().nonnegative()).optional(),
-}).passthrough().transform((value): EmailPoolListResponse => {
+}).passthrough().superRefine((value, context) => {
+  if (!Array.isArray(value.accounts)) {
+    context.addIssue({ code: 'custom', message: 'email pool rows are missing' });
+  }
+}).transform((value): EmailPoolListResponse => {
   const accounts = value.accounts ?? [];
   return {
     accounts,
@@ -161,6 +283,11 @@ export const emailPoolResponseSchema = z.object({
   };
 });
 
+export const emailPoolResponseSchema = z.preprocess(
+  normalizeEmailPoolResponse,
+  normalizedEmailPoolResponseSchema,
+);
+
 export async function fetchEmailPool(params: {
   page?: number;
   pageSize?: number;
@@ -170,11 +297,25 @@ export async function fetchEmailPool(params: {
   const searchParams = new URLSearchParams();
   if (params.page) searchParams.set('page', String(params.page));
   if (params.pageSize) searchParams.set('pageSize', String(params.pageSize));
-  if (params.search) searchParams.set('search', params.search);
-  if (params.status) searchParams.set('status', params.status);
+  if (params.pageSize) searchParams.set('page_size', String(params.pageSize));
+  if (params.search) {
+    searchParams.set('search', params.search);
+    searchParams.set('q', params.search);
+  }
+  if (params.status) {
+    searchParams.set('status', params.status);
+    searchParams.set('state', params.status);
+  }
   const qs = searchParams.toString();
-  const response = await get(`/admin/email-pool${qs ? `?${qs}` : ''}`, undefined, { signal });
-  return parseApiResponse(emailPoolResponseSchema, response);
+  const response = await getResponse(`/admin/email-pool${qs ? `?${qs}` : ''}`, undefined, { signal });
+  const bodyRequestId = isRecord(response.data) && typeof response.data.request_id === 'string'
+    ? response.data.request_id
+    : '';
+  const rawHeaderRequestId = typeof response.headers?.get === 'function'
+    ? response.headers.get('x-request-id')
+    : response.headers?.['x-request-id'];
+  const headerRequestId = typeof rawHeaderRequestId === 'string' ? rawHeaderRequestId : '';
+  return parseApiResponse(emailPoolResponseSchema, response.data, bodyRequestId || headerRequestId);
 }
 
 export async function importEmailAccounts(data: EmailPoolImportRequest): Promise<EmailPoolImportResponse> {

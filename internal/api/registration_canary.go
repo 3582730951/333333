@@ -20,6 +20,7 @@ import (
 
 	"codex-account-pool/internal/registration/pipeline"
 	"codex-account-pool/internal/registration/provider"
+	"codex-account-pool/internal/registration/provider/mailbox"
 )
 
 var errRegistrationCanaryRequired = errors.New("registration method requires a successful canary for the current configuration")
@@ -135,15 +136,9 @@ func (h *Handler) mailboxRelayProviderReady(
 	requested string,
 	manager *provider.Manager,
 ) (bool, string, error) {
-	selected := strings.ToLower(strings.TrimSpace(requested))
+	selected := normalizeMailboxProviderAlias(requested)
 	if selected == "" {
-		value, ok, err := h.store.GetSetting(ctx, "reg_default_mailbox")
-		if err != nil {
-			return false, "", err
-		}
-		if ok {
-			selected = strings.ToLower(strings.TrimSpace(value))
-		}
+		selected = h.resolveDefaultMailboxProvider(ctx)
 	}
 	if selected == "" || manager == nil {
 		return false, selected, nil
@@ -292,7 +287,20 @@ FROM provider_settings WHERE enabled=1 ORDER BY provider_type,provider_key`)
 			configJSON, authJSON, fmt.Sprint(updatedAt),
 		}, "\x00"))
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	fingerprint, count, err := mailbox.EmailPoolFingerprint(ctx, h.store)
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		out = append(out, strings.Join([]string{"mailbox", "email_pool", fingerprint, fmt.Sprint(count)}, "\x00"))
+	}
+	return out, nil
 }
 
 func (h *Handler) registrationEgressFingerprint(ctx context.Context, req pipeline.RegisterRequest, hash io.Writer) error {
@@ -345,8 +353,8 @@ func (h *Handler) HandleCanary(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"canaries": canaries})
 	case http.MethodPost:
-		var req pipeline.RegisterRequest
-		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+		req, err := decodeRegistrationRequest(r.Body)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

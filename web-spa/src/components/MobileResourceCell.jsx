@@ -15,29 +15,21 @@ export default function MobileResourceCell({
   actions,
   selected = false,
   selectable = false,
+  selectLabel = '选择此项',
   onSelect,
 }) {
   const visibleDetails = details.filter((item) => hasRenderableValue(item?.value));
   return (
     <div
       className="pool-mobile-row"
-      role={selectable ? 'button' : undefined}
-      tabIndex={selectable ? 0 : undefined}
-      aria-pressed={selectable ? selected : undefined}
       onClick={selectable ? onSelect : undefined}
-      onKeyDown={selectable ? (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          onSelect?.();
-        }
-      } : undefined}
     >
       {selectable ? (
         <input
           type="checkbox"
           checked={selected}
           readOnly
-          aria-label="选择此项"
+          aria-label={selectLabel}
           onClick={(event) => {
             event.stopPropagation();
             onSelect?.();

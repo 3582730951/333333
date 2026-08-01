@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"codex-account-pool/internal/config"
 	"codex-account-pool/internal/registration/pipeline"
 	"codex-account-pool/internal/registration/provider"
 	"codex-account-pool/internal/supervisor"
@@ -25,6 +26,7 @@ const (
 	PolicyTypeScheduled = "scheduled" // scheduled batch registration (persisted; execution TODO: needs cron)
 	PolicyTypeRefill    = "refill"    // auto-refill when the active pool drops below a threshold
 	PolicyTypeHealth    = "health"    // health-check automation (handled by the lifecycle subsystem)
+	PolicyTypePlus      = "plus"      // decoded from historical settings only; never exposed or executed
 
 	automationPoliciesKey = "automation_policies"
 	automationRefillCap   = 10 // max registrations a single refill tick may start
@@ -51,13 +53,11 @@ func (s *Server) loadPoliciesWithError(ctx context.Context) (map[string]*Policy,
 	if err != nil || !ok || strings.TrimSpace(v) == "" {
 		return out, err
 	}
-	if err := json.Unmarshal([]byte(v), &out); err != nil {
+	decoded, err := decodeAutomationPolicies([]byte(v))
+	if err != nil {
 		return out, fmt.Errorf("%s has invalid JSON: %w", automationPoliciesKey, err)
 	}
-	if out == nil {
-		out = map[string]*Policy{}
-	}
-	return out, nil
+	return decoded, nil
 }
 
 func (s *Server) savePolicies(ctx context.Context, m map[string]*Policy) error {
@@ -89,19 +89,17 @@ func (s *Server) automationListPolicies(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	list := make([]*Policy, 0, len(m))
-	for _, p := range m {
-		list = append(list, p)
+	for _, policyType := range []string{PolicyTypeScheduled, PolicyTypeRefill, PolicyTypeHealth} {
+		if p := m[policyType]; p != nil {
+			list = append(list, p)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"policies": list})
 }
 
 func (s *Server) automationSavePolicy(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Type    string                 `json:"type"`
-		Enabled bool                   `json:"enabled"`
-		Config  map[string]interface{} `json:"config"`
-	}
-	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+	req, err := decodeAutomationPolicyRequest(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -120,7 +118,7 @@ func (s *Server) automationSavePolicy(w http.ResponseWriter, r *http.Request) {
 		p = &Policy{ID: req.Type, Type: req.Type, Created: now}
 	}
 	p.Enabled = req.Enabled
-	p.Config = req.Config
+	p.Config = canonicalizeAutomationConfig(req.Config)
 	p.Updated = now
 	m[req.Type] = p
 	if err := s.savePolicies(r.Context(), m); err != nil {
@@ -181,7 +179,7 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 	}
 	target := intFromConfig(cfg, "target", 20)
 	threshold := intFromConfig(cfg, "threshold", 10)
-	method := strings.ToLower(firstNonEmpty(
+	method := normalizeRegistrationMethodAlias(firstNonEmpty(
 		strFromConfig(cfg, "register_method", ""),
 		s.settingString(ctx, "default_register_method", firstNonEmpty(s.cfg.DefaultRegisterMethod, "protocol_v2")),
 		"protocol_v2",
@@ -206,7 +204,7 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 	if identityMode == "" {
 		identityMode = "phone"
 	}
-	group := firstNonEmpty(strFromConfig(cfg, "group", ""), s.cfg.DefaultGroup, "default")
+	group := firstNonEmpty(strFromConfig(cfg, "group", ""), s.settingString(ctx, "registration_default_group", s.cfg.RegistrationDefaultGroup), s.cfg.DefaultGroup, config.DefaultGroupName)
 	egressID := firstNonEmpty(
 		strFromConfig(cfg, "egress_id", ""),
 		strFromConfig(cfg, "egress", ""),
@@ -244,7 +242,7 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 	blockers := []string{}
 	if s.regHandler == nil {
 		blockers = append(blockers, "注册子系统未初始化")
-	} else if !s.regHandler.enabled {
+	} else if !s.regHandler.registrationEnabled(ctx) {
 		blockers = append(blockers, "注册功能默认关闭；需显式启用 registration_enabled")
 	}
 	if policyErr != nil {
@@ -328,11 +326,11 @@ func (s *Server) registrationReadiness(ctx context.Context) map[string]interface
 			"register_method": method, "identity_mode": identityMode, "group": group,
 			"egress": egressID, "registration_egress_pool_id": registrationPoolID, "platform": platform,
 		},
-		"registration_enabled": s.regHandler != nil && s.regHandler.enabled,
+		"registration_enabled": s.regHandler != nil && s.regHandler.registrationEnabled(ctx),
 		"method_readiness":     methodReadiness,
 		"providers":            map[string]int{"mailbox": mailboxN, "email_otp": emailOTPN, "sms": smsN, "captcha": captchaN},
 		"pool":                 map[string]int{"active": active, "target": target, "deficit": deficit},
-		"ready":                policyErr == nil && providerErr == nil && s.regHandler != nil && s.regHandler.enabled && refillEnabled && len(blockers) == 0,
+		"ready":                policyErr == nil && providerErr == nil && s.regHandler != nil && s.regHandler.registrationEnabled(ctx) && refillEnabled && len(blockers) == 0,
 		"policy_error":         policyError,
 		"provider_error":       providerError,
 		"pool_error":           poolError,
@@ -442,8 +440,12 @@ func (s *Server) autoRefill(ctx context.Context, p *Policy) {
 		IdentityMode:             strFromConfig(p.Config, "identity_mode", ""),
 		Count:                    need,
 		GroupName:                strFromConfig(p.Config, "group", ""),
+		EgressID:                 strFromConfig(p.Config, "egress_id", ""),
 		RegistrationEgressPoolID: strFromConfig(p.Config, "registration_egress_pool_id", ""),
 		SMSProvider:              strFromConfig(p.Config, "sms_provider", ""),
+		MailboxProvider:          strFromConfig(p.Config, "mailbox_provider", ""),
+		MailboxDomain:            strFromConfig(p.Config, "mailbox_domain", ""),
+		CaptchaSolver:            strFromConfig(p.Config, "captcha_solver", ""),
 	}
 	jobID, err := s.regHandler.StartJob(ctx, req)
 	if err != nil {

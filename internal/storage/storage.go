@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +43,7 @@ var (
 	ErrEgressInUse                 = errors.New("egress is in use")
 	ErrTargetInUse                 = errors.New("routing target is in use")
 	ErrInvalidProviderModelMapping = errors.New("invalid provider model mapping")
+	ErrInvalidProviderRoute        = errors.New("invalid provider route")
 )
 
 type Store struct {
@@ -93,6 +95,38 @@ type Store struct {
 type ReadQuerier interface {
 	QueryContext(context.Context, string, ...interface{}) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
+}
+
+type contextExecer interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+// removeUnusedLegacySeedProviders cleans up the two example rows emitted by
+// older installers. Every historical default field must still match, the row
+// must never have been updated, and no account may reference it. This keeps
+// operator-edited or active providers intact while making upgrades converge to
+// the same empty provider list as a fresh installation.
+func removeUnusedLegacySeedProviders(ctx context.Context, exec contextExecer) error {
+	legacy := []struct {
+		id, name, baseURL, models string
+	}{
+		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", `["deepseek-chat","deepseek-reasoner"]`},
+		{"siliconflow", "SiliconFlow 硅基流动", "https://api.siliconflow.cn/v1", `[]`},
+	}
+	for _, provider := range legacy {
+		if _, err := exec.ExecContext(ctx, `
+DELETE FROM custom_providers
+WHERE id=? AND name=? AND base_url=?
+  AND upstream_protocol='chat_completions'
+  AND transport_profile='generic' AND egress_ids='[]'
+  AND enabled=1 AND auto_discover_models=1 AND models_json=?
+  AND created_at=updated_at
+  AND NOT EXISTS (SELECT 1 FROM accounts WHERE LOWER(provider)=LOWER(?))`,
+			provider.id, provider.name, provider.baseURL, provider.models, provider.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type Group struct {
@@ -886,23 +920,44 @@ type UpstreamErrorRule struct {
 // OpenAI-compat path prefix (e.g. ".../v1"); the adapter appends /chat/completions
 // or /responses for live requests, and /models for discovery.
 type CustomProvider struct {
-	ID                 string   `json:"id"`
-	Name               string   `json:"name"`
-	BaseURL            string   `json:"base_url"`
-	UpstreamProtocol   string   `json:"upstream_protocol"`
-	TransportProfile   string   `json:"transport_profile"`
-	EgressIDs          []string `json:"egress_ids"`
-	Enabled            bool     `json:"enabled"`
-	AutoDiscoverModels bool     `json:"auto_discover_models"`
-	Models             []string `json:"models"`
+	ID                 string                `json:"id"`
+	Name               string                `json:"name"`
+	BaseURL            string                `json:"base_url"`
+	UpstreamProtocol   string                `json:"upstream_protocol"`
+	TransportProfile   string                `json:"transport_profile"`
+	Routes             []CustomProviderRoute `json:"routes"`
+	EgressIDs          []string              `json:"egress_ids"`
+	Enabled            bool                  `json:"enabled"`
+	AutoDiscoverModels bool                  `json:"auto_discover_models"`
+	Models             []string              `json:"models"`
 	// ModelMappings rewrites a downstream model name to the concrete name
 	// accepted by this relay. Exact keys win; "*" is an optional provider-wide
 	// fallback. The requested and resolved names remain separately attributable
 	// in request diagnostics.
-	ModelMappings map[string]string `json:"model_mappings"`
-	CreatedAt     int64             `json:"created_at"`
-	UpdatedAt     int64             `json:"updated_at"`
+	ModelMappings          map[string]string `json:"model_mappings"`
+	CreatedAt              int64             `json:"created_at"`
+	UpdatedAt              int64             `json:"updated_at"`
+	ResolvedRouteID        string            `json:"-"`
+	ResolvedDownstreamPath string            `json:"-"`
 }
+
+// CustomProviderRoute overrides the legacy/default endpoint for one downstream
+// entrypoint. Empty endpoint/protocol/profile values inherit the provider default
+// on write, so old single-route clients and partial backup documents stay valid.
+type CustomProviderRoute struct {
+	ID               string `json:"id"`
+	DownstreamPath   string `json:"downstream_path"`
+	BaseURL          string `json:"base_url"`
+	UpstreamProtocol string `json:"upstream_protocol"`
+	TransportProfile string `json:"transport_profile"`
+}
+
+const (
+	CustomProviderDownstreamChat      = "/v1/chat/completions"
+	CustomProviderDownstreamResponses = "/v1/responses"
+	CustomProviderDownstreamMessages  = "/v1/messages"
+	CustomProviderDownstreamWildcard  = "*"
+)
 
 const (
 	CustomProviderProtocolChatCompletions   = "chat_completions"
@@ -942,6 +997,155 @@ func NormalizeCustomProviderProtocol(raw string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func NormalizeCustomProviderDownstreamPath(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	switch strings.ToLower(raw) {
+	case "chat", "chat_completions", "/chat/completions", CustomProviderDownstreamChat:
+		return CustomProviderDownstreamChat, true
+	case "responses", "/responses", CustomProviderDownstreamResponses:
+		return CustomProviderDownstreamResponses, true
+	case "messages", "anthropic_messages", "/messages", CustomProviderDownstreamMessages:
+		return CustomProviderDownstreamMessages, true
+	case "*", "passthrough":
+		return CustomProviderDownstreamWildcard, true
+	}
+	if !strings.HasPrefix(raw, "/") || strings.ContainsAny(raw, "?#") {
+		return "", false
+	}
+	cleaned := pathpkg.Clean(raw)
+	if cleaned == "." || cleaned == "/" || strings.Contains(cleaned, "..") {
+		return "", false
+	}
+	return cleaned, true
+}
+
+func customProviderRouteID(raw, downstreamPath string) (string, bool) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		switch downstreamPath {
+		case CustomProviderDownstreamChat:
+			raw = "chat"
+		case CustomProviderDownstreamResponses:
+			raw = "responses"
+		case CustomProviderDownstreamMessages:
+			raw = "messages"
+		case CustomProviderDownstreamWildcard:
+			raw = "passthrough"
+		default:
+			raw = "path-" + strings.Trim(strings.NewReplacer("/", "-", ".", "-", "_", "-").Replace(downstreamPath), "-")
+		}
+	}
+	if raw == "" || len(raw) > 64 {
+		return "", false
+	}
+	for _, r := range raw {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return "", false
+		}
+	}
+	return raw, true
+}
+
+func canonicalCustomProviderRoutes(routes []CustomProviderRoute, provider CustomProvider, reject bool) ([]CustomProviderRoute, error) {
+	out := make([]CustomProviderRoute, 0, len(routes))
+	seenPaths := make(map[string]struct{}, len(routes))
+	seenIDs := make(map[string]struct{}, len(routes))
+	for index, route := range routes {
+		downstreamPath, ok := NormalizeCustomProviderDownstreamPath(route.DownstreamPath)
+		if !ok {
+			if reject {
+				return nil, fmt.Errorf("%w: route %d has an invalid downstream_path", ErrInvalidProviderRoute, index+1)
+			}
+			continue
+		}
+		id, ok := customProviderRouteID(route.ID, downstreamPath)
+		if !ok {
+			if reject {
+				return nil, fmt.Errorf("%w: route %d has an invalid id", ErrInvalidProviderRoute, index+1)
+			}
+			continue
+		}
+		if _, duplicate := seenPaths[downstreamPath]; duplicate {
+			if reject {
+				return nil, fmt.Errorf("%w: downstream_path %q is duplicated", ErrInvalidProviderRoute, downstreamPath)
+			}
+			continue
+		}
+		if _, duplicate := seenIDs[id]; duplicate {
+			if reject {
+				return nil, fmt.Errorf("%w: route id %q is duplicated", ErrInvalidProviderRoute, id)
+			}
+			continue
+		}
+		baseURL := strings.TrimSpace(route.BaseURL)
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(provider.BaseURL)
+		}
+		protocol, ok := NormalizeCustomProviderProtocol(route.UpstreamProtocol)
+		if strings.TrimSpace(route.UpstreamProtocol) == "" {
+			protocol, ok = NormalizeCustomProviderProtocol(provider.UpstreamProtocol)
+		}
+		if !ok {
+			if reject {
+				return nil, fmt.Errorf("%w: route %q has an invalid upstream_protocol", ErrInvalidProviderRoute, id)
+			}
+			continue
+		}
+		profile, ok := NormalizeCustomProviderTransportProfile(route.TransportProfile)
+		if strings.TrimSpace(route.TransportProfile) == "" {
+			profile, ok = NormalizeCustomProviderTransportProfile(provider.TransportProfile)
+		}
+		if !ok || baseURL == "" {
+			if reject {
+				return nil, fmt.Errorf("%w: route %q requires a base_url and valid transport_profile", ErrInvalidProviderRoute, id)
+			}
+			continue
+		}
+		seenPaths[downstreamPath] = struct{}{}
+		seenIDs[id] = struct{}{}
+		out = append(out, CustomProviderRoute{
+			ID: id, DownstreamPath: downstreamPath, BaseURL: baseURL,
+			UpstreamProtocol: protocol, TransportProfile: profile,
+		})
+	}
+	return out, nil
+}
+
+// ResolveCustomProviderRoute returns an effective provider for an incoming
+// downstream path. Exact entries win, then "*", then the legacy fields.
+func ResolveCustomProviderRoute(provider CustomProvider, downstreamPath string) (CustomProvider, string) {
+	normalized, ok := NormalizeCustomProviderDownstreamPath(downstreamPath)
+	if !ok {
+		normalized = CustomProviderDownstreamWildcard
+	}
+	var selected *CustomProviderRoute
+	for i := range provider.Routes {
+		if provider.Routes[i].DownstreamPath == normalized {
+			selected = &provider.Routes[i]
+			break
+		}
+		if provider.Routes[i].DownstreamPath == CustomProviderDownstreamWildcard {
+			selected = &provider.Routes[i]
+		}
+	}
+	if selected == nil {
+		provider.ResolvedRouteID = "default"
+		switch normalized {
+		case CustomProviderDownstreamChat, CustomProviderDownstreamResponses, CustomProviderDownstreamMessages:
+			provider.ResolvedDownstreamPath = normalized
+		default:
+			provider.ResolvedDownstreamPath = CustomProviderDownstreamWildcard
+		}
+		return provider, provider.ResolvedRouteID
+	}
+	provider.BaseURL = selected.BaseURL
+	provider.UpstreamProtocol = selected.UpstreamProtocol
+	provider.TransportProfile = selected.TransportProfile
+	provider.ResolvedRouteID = selected.ID
+	provider.ResolvedDownstreamPath = selected.DownstreamPath
+	return provider, selected.ID
 }
 
 // ModerationConfig is the operator-configured response/history moderation policy.
@@ -1177,25 +1381,8 @@ ON CONFLICT(id) DO NOTHING`, DefaultDirectEgressID, now, now)
 	if _, err := s.db.ExecContext(ctx, `UPDATE egress_profiles SET max_concurrency=0, updated_at=? WHERE id='egress_sidecar' AND type='curl_cffi_sidecar' AND max_concurrency=16`, now); err != nil {
 		return err
 	}
-	// Seed default OpenAI-compatible custom providers so the adapter works out of the
-	// box (the "适配 deepseek / 硅基流动" baseline). Operators can edit base_url / model
-	// list from the admin UI, disable them, or add more (Kimi, OpenRouter, vLLM, …).
-	// base_url carries the OpenAI-compat "/v1" prefix; the adapter appends
-	// /chat/completions and /models. ON CONFLICT keeps any operator edits on restart.
-	seededProviders := []struct{ id, name, baseURL, models string }{
-		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", `["deepseek-chat","deepseek-reasoner"]`},
-		// SiliconFlow (硅基流动) aggregates many open models behind one OpenAI-compatible
-		// API; its catalog is large and changes often, so seed an empty model list and
-		// rely on auto-discovery ({base}/models) once an API key is imported.
-		{"siliconflow", "SiliconFlow 硅基流动", "https://api.siliconflow.cn/v1", `[]`},
-	}
-	for _, p := range seededProviders {
-		if _, err = s.db.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, upstream_protocol, enabled, auto_discover_models, models_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, 1, 1, ?, ?, ?)
-ON CONFLICT(id) DO NOTHING`, p.id, p.name, p.baseURL, CustomProviderProtocolChatCompletions, p.models, now, now); err != nil {
-			return err
-		}
+	if err := removeUnusedLegacySeedProviders(ctx, s.db); err != nil {
+		return err
 	}
 	if _, err := s.RepairMissingAccountEgressBindings(ctx); err != nil {
 		return err
@@ -2136,6 +2323,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE email_pool ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE email_pool ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE email_pool ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
+		`UPDATE email_pool SET status=CASE
+		  WHEN lower(trim(COALESCE(status,''))) IN ('','idle','ready','available','unused','active','valid') THEN 'idle'
+		  WHEN replace(lower(trim(status)),'-','_') IN ('in_use','inuse','busy','reserved','using','processing') THEN 'in_use'
+		  WHEN lower(trim(status)) IN ('error','failed','invalid','disabled','dead') THEN 'error'
+		  WHEN lower(trim(status)) IN ('used','consumed','done','completed') THEN 'used'
+		  ELSE lower(trim(status)) END`,
 		`CREATE INDEX IF NOT EXISTS idx_email_pool_status ON email_pool(status, group_name)`,
 		// Team mailbox policy is additive. teamManagementSchemaSQL has an immutable
 		// PostgreSQL checksum, so released databases receive these fields here.
@@ -2156,6 +2349,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE groups ADD COLUMN model_instructions_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE groups ADD COLUMN model_instructions_files TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE custom_providers ADD COLUMN transport_profile TEXT NOT NULL DEFAULT 'generic'`,
+		`ALTER TABLE custom_providers ADD COLUMN routes_json TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE custom_providers ADD COLUMN egress_ids TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE custom_providers ADD COLUMN model_mappings_json TEXT NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE egress_profiles ADD COLUMN exit_ip TEXT NOT NULL DEFAULT ''`,
@@ -7980,8 +8174,8 @@ func (s *Store) SetModerationConfig(ctx context.Context, cfg ModerationConfig) e
 func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error) {
 	var p CustomProvider
 	var enabled, auto int
-	var modelsJSON, modelMappingsJSON, egressJSON string
-	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &p.TransportProfile, &egressJSON, &enabled, &auto, &modelsJSON, &modelMappingsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var modelsJSON, modelMappingsJSON, routesJSON, egressJSON string
+	if err := scan(&p.ID, &p.Name, &p.BaseURL, &p.UpstreamProtocol, &p.TransportProfile, &routesJSON, &egressJSON, &enabled, &auto, &modelsJSON, &modelMappingsJSON, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return CustomProvider{}, err
 	}
 	if proto, ok := NormalizeCustomProviderProtocol(p.UpstreamProtocol); ok {
@@ -8002,6 +8196,13 @@ func scanCustomProvider(scan func(...interface{}) error) (CustomProvider, error)
 	p.AutoDiscoverModels = auto != 0
 	p.Models = decodeProviderModels(modelsJSON)
 	p.ModelMappings = decodeProviderModelMappings(modelMappingsJSON)
+	var routes []CustomProviderRoute
+	if json.Unmarshal([]byte(strings.TrimSpace(routesJSON)), &routes) == nil {
+		p.Routes, _ = canonicalCustomProviderRoutes(routes, p, false)
+	}
+	if p.Routes == nil {
+		p.Routes = []CustomProviderRoute{}
+	}
 	return p, nil
 }
 
@@ -8068,7 +8269,7 @@ func canonicalProviderModelMappings(in map[string]string, rejectConflicts bool) 
 	return out, nil
 }
 
-const customProviderCols = `id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at`
+const customProviderCols = `id, name, base_url, upstream_protocol, transport_profile, routes_json, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at`
 
 func (s *Store) ListCustomProviders(ctx context.Context) ([]CustomProvider, error) {
 	rows, err := s.rdb.QueryContext(ctx, `SELECT `+customProviderCols+` FROM custom_providers ORDER BY id`)
@@ -8120,6 +8321,11 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 		p.TransportProfile = CustomProviderTransportGeneric
 	}
 	p.EgressIDs = normalizeOrderedIDs(p.EgressIDs)
+	routes, err := canonicalCustomProviderRoutes(p.Routes, p, true)
+	if err != nil {
+		return err
+	}
+	p.Routes = routes
 	now := Now()
 	if p.CreatedAt == 0 {
 		p.CreatedAt = now
@@ -8143,21 +8349,30 @@ func (s *Store) UpsertCustomProvider(ctx context.Context, p CustomProvider) erro
 		}
 		modelMappingsJSON = string(raw)
 	}
+	routesJSON := "[]"
+	if len(p.Routes) > 0 {
+		raw, err := json.Marshal(p.Routes)
+		if err != nil {
+			return err
+		}
+		routesJSON = string(raw)
+	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, routes_json, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name = excluded.name,
  base_url = excluded.base_url,
  upstream_protocol = excluded.upstream_protocol,
  transport_profile = excluded.transport_profile,
+ routes_json = excluded.routes_json,
  egress_ids = excluded.egress_ids,
  enabled = excluded.enabled,
  auto_discover_models = excluded.auto_discover_models,
  models_json = excluded.models_json,
  model_mappings_json = excluded.model_mappings_json,
  updated_at = excluded.updated_at`,
-		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, p.TransportProfile, encodeOrderedIDs(p.EgressIDs), boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, modelMappingsJSON, p.CreatedAt, p.UpdatedAt)
+		p.ID, p.Name, p.BaseURL, p.UpstreamProtocol, p.TransportProfile, routesJSON, encodeOrderedIDs(p.EgressIDs), boolInt(p.Enabled), boolInt(p.AutoDiscoverModels), modelsJSON, modelMappingsJSON, p.CreatedAt, p.UpdatedAt)
 	return err
 }
 

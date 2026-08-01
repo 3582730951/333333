@@ -79,7 +79,7 @@ func (p *Pipeline) persistVerifiedRegistration(ctx context.Context, req Register
 	}
 
 	p.updateWorkflow(ctx, req, storage.RegistrationItemRemoteAccountVerifying, "")
-	if p.remoteVerificationRequired || req.Canary {
+	if p.remoteVerificationRequired || req.Canary || strings.TrimSpace(req.ReadinessFingerprint) != "" {
 		if err := p.verifyRegistrationLiveness(ctx, req, parsed.AccessToken, parsed.UpstreamAccountID); err != nil {
 			p.finalizeWorkflow(ctx, req, storage.RegistrationItemQuarantined, "remote_liveness_failed")
 			return nil, err

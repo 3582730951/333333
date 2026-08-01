@@ -1,7 +1,11 @@
 package api
 
 import (
+	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -34,6 +38,132 @@ type teamLifecycleCreateRequest struct {
 	RotateThresholdPercent *float64 `json:"rotate_threshold_percent"`
 	MaxAttempts            int      `json:"max_attempts"`
 	ShadowMode             *bool    `json:"shadow_mode"`
+}
+
+type teamLifecycleSetupBlocker struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Href    string `json:"href"`
+}
+
+type teamLifecycleSetupReadiness struct {
+	Ready                    bool                        `json:"ready"`
+	WorkspaceCreateReady     bool                        `json:"workspace_create_ready"`
+	CycleCreateReady         bool                        `json:"cycle_create_ready"`
+	ParentAccounts           int                         `json:"parent_accounts"`
+	MailboxProfiles          int                         `json:"mailbox_profiles"`
+	MailboxDefaultConfigured bool                        `json:"mailbox_default_configured"`
+	MailboxHealthy           bool                        `json:"mailbox_healthy"`
+	RegistrationReady        bool                        `json:"registration_ready"`
+	RegistrationMethod       string                      `json:"registration_method,omitempty"`
+	Workspaces               int                         `json:"workspaces"`
+	Blockers                 []teamLifecycleSetupBlocker `json:"blockers"`
+}
+
+func (s *Server) teamLifecycleSetupReadiness(ctx context.Context) (teamLifecycleSetupReadiness, error) {
+	readiness := teamLifecycleSetupReadiness{Blockers: make([]teamLifecycleSetupBlocker, 0, 4)}
+	accounts, err := s.store.ListAccounts(ctx)
+	if err != nil {
+		return readiness, err
+	}
+	for _, account := range accounts {
+		providerName := strings.ToLower(strings.TrimSpace(account.Provider))
+		if account.Status != "active" || strings.TrimSpace(account.UpstreamAccountID) == "" ||
+			(providerName != "" && providerName != "codex") {
+			continue
+		}
+		token, tokenErr := s.store.GetToken(ctx, account.ID)
+		if errors.Is(tokenErr, sql.ErrNoRows) {
+			continue
+		}
+		if tokenErr != nil {
+			return readiness, tokenErr
+		}
+		if strings.TrimSpace(token.AccessToken) != "" &&
+			(token.ExpiresAt == 0 || token.ExpiresAt > storage.Now()+60) {
+			readiness.ParentAccounts++
+		}
+	}
+
+	defaultMailbox := s.settingString(ctx, "team_default_mailbox_provider", "")
+	defaultDomain := s.settingString(ctx, "team_default_mailbox_domain", "")
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+SELECT provider_key,config_json FROM provider_settings
+WHERE provider_type='mailbox' AND enabled=1
+ORDER BY provider_key`)
+	if err != nil {
+		return readiness, err
+	}
+	for rows.Next() {
+		var providerKey, configJSON string
+		if err := rows.Scan(&providerKey, &configJSON); err != nil {
+			rows.Close()
+			return readiness, err
+		}
+		config := map[string]interface{}{}
+		if json.Unmarshal([]byte(configJSON), &config) != nil ||
+			!strings.EqualFold(strings.TrimSpace(fmt.Sprint(config["adapter"])), cloudflareMailboxAdapter) {
+			continue
+		}
+		domain, domainErr := storage.NormalizeMailboxDomain(fmt.Sprint(config["domain"]))
+		if domainErr != nil || domain == "" {
+			continue
+		}
+		readiness.MailboxProfiles++
+		if providerKey == defaultMailbox && domain == defaultDomain {
+			readiness.MailboxDefaultConfigured = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return readiness, err
+	}
+	if defaultMailbox != "" {
+		health, found, healthErr := s.store.GetMailboxProviderHealth(ctx, defaultMailbox)
+		if healthErr != nil {
+			return readiness, healthErr
+		}
+		readiness.MailboxHealthy = found && health.LastStatus == "healthy"
+	}
+
+	workspaces, err := s.store.ListTeamWorkspaces(ctx, 1000)
+	if err != nil {
+		return readiness, err
+	}
+	readiness.Workspaces = len(workspaces)
+	registration := s.registrationReadiness(ctx)
+	registrationEnabled, _ := registration["registration_enabled"].(bool)
+	methodReadiness, _ := registration["method_readiness"].(registrationMethodReadiness)
+	readiness.RegistrationMethod = methodReadiness.Method
+	readiness.RegistrationReady = registrationEnabled && methodReadiness.Ready && methodReadiness.CanaryReady
+
+	if readiness.ParentAccounts == 0 {
+		readiness.Blockers = append(readiness.Blockers, teamLifecycleSetupBlocker{
+			Code: "parent_account", Message: "添加一个带 Team workspace ID 和有效凭据的母号", Href: "/accounts",
+		})
+	}
+	if !readiness.MailboxDefaultConfigured {
+		readiness.Blockers = append(readiness.Blockers, teamLifecycleSetupBlocker{
+			Code: "mailbox_default", Message: "连接自建邮箱，并设为团队默认邮箱", Href: "/email-pool/cloudflare",
+		})
+	} else if !readiness.MailboxHealthy {
+		readiness.Blockers = append(readiness.Blockers, teamLifecycleSetupBlocker{
+			Code: "mailbox_health", Message: "运行团队默认邮箱的连接检测", Href: "/email-pool/cloudflare",
+		})
+	}
+	if !readiness.RegistrationReady {
+		readiness.Blockers = append(readiness.Blockers, teamLifecycleSetupBlocker{
+			Code: "registration", Message: "完成自动注册配置并通过单账号 canary", Href: "/registration",
+		})
+	}
+	if readiness.Workspaces == 0 {
+		readiness.Blockers = append(readiness.Blockers, teamLifecycleSetupBlocker{
+			Code: "workspace", Message: "创建第一个 Team 空间", Href: "#new-workspace",
+		})
+	}
+	readiness.WorkspaceCreateReady = readiness.ParentAccounts > 0 && readiness.MailboxDefaultConfigured && readiness.MailboxHealthy
+	readiness.CycleCreateReady = readiness.WorkspaceCreateReady && readiness.Workspaces > 0 && readiness.RegistrationReady
+	readiness.Ready = readiness.CycleCreateReady
+	return readiness, nil
 }
 
 func (s *Server) teamLifecycleReady(w http.ResponseWriter, r *http.Request) bool {
@@ -290,8 +420,14 @@ func (s *Server) handleTeamLifecycleStats(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	readiness, err := s.teamLifecycleSetupReadiness(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"states":                   counts,
+		"readiness":                readiness,
 		"default_shadow_mode":      true,
 		"credential_persistence":   "encrypted_account_reference",
 		"lease_heartbeat":          true,

@@ -1,0 +1,8 @@
+web-spa/src/styles/tokens.css
+web-spa/src/styles/layout.css
+web-spa/src/styles/components.css
+web-spa/src/App.tsx
+web-spa/src/components/PageHeader.jsx
+web-spa/src/components/DisplayPrimitives.jsx
+web-spa/src/pages/TeamLifecycle.tsx
+web-spa/scripts/capture-ui-review.mjs

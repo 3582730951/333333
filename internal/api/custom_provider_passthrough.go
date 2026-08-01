@@ -48,6 +48,7 @@ func (s *Server) handleCustomProviderPassthrough(
 		)
 		return
 	}
+	provider, _ = storage.ResolveCustomProviderRoute(provider, r.URL.Path)
 
 	body := bodySourceFromContext(r.Context())
 	var raw []byte
@@ -64,8 +65,8 @@ func (s *Server) handleCustomProviderPassthrough(
 
 	r = r.WithContext(withDownstreamKey(r.Context(), policy))
 
-	affinity := routing.ExtractAffinityKey(r, raw)
-	resourceAffinity, resourceKind, resourceID := customProviderResourceAffinity(provider.ID, r.URL.Path)
+	affinity := customProviderScopedAffinity(r, provider, routing.ExtractAffinityKey(r, raw))
+	resourceAffinity, resourceKind, resourceID := customProviderResourceAffinity(r, provider, r.URL.Path)
 	immutableResource := false
 	if resourceAffinity.Hash != "" {
 		if _, err := s.store.GetAffinityBinding(r.Context(), resourceAffinity.Hash); err == nil {
@@ -114,7 +115,7 @@ func (s *Server) handleCustomProviderPassthrough(
 		Account:          lease.Account,
 		Token:            token,
 		Egress:           lease.Egress,
-		CookieJarKey:     customProviderCookieJarKey(lease, provider),
+		CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
 		OSHint:           s.osHint(nil, lease.Egress),
 	})
 	if err != nil {
@@ -153,9 +154,8 @@ func (s *Server) handleCustomProviderPassthrough(
 			ID string `json:"id"`
 		}
 		if json.Unmarshal(responseBody, &created) == nil && strings.TrimSpace(created.ID) != "" {
-			createdAffinity := routing.AffinityFromKey(
-				"custom_resource:"+provider.ID+":"+resourceKind+":"+strings.TrimSpace(created.ID),
-				"custom_resource",
+			createdAffinity, _, _ := customProviderResourceAffinity(
+				r, provider, "/v1/"+resourceKind+"/"+strings.TrimSpace(created.ID),
 			)
 			s.persistCustomProviderResourceBinding(r.Context(), provider.ID, createdAffinity, resourceKind, lease)
 		}
@@ -203,7 +203,7 @@ func customProviderPassthroughPath(baseURL string, requestURL *url.URL) string {
 	return pathWithQuery(requestPath, requestURL.RawQuery)
 }
 
-func customProviderResourceAffinity(providerID, path string) (routing.AffinityKey, string, string) {
+func customProviderResourceAffinity(r *http.Request, provider storage.CustomProvider, path string) (routing.AffinityKey, string, string) {
 	parts := strings.Split(strings.Trim(strings.TrimSpace(path), "/"), "/")
 	if len(parts) < 2 || !strings.EqualFold(parts[0], "v1") {
 		return routing.AffinityKey{}, "", ""
@@ -222,7 +222,8 @@ func customProviderResourceAffinity(providerID, path string) (routing.AffinityKe
 		return routing.AffinityKey{}, kind, ""
 	}
 	return routing.AffinityFromKey(
-		"custom_resource:"+strings.TrimSpace(providerID)+":"+kind+":"+id,
+		"custom_resource:"+strings.TrimSpace(provider.ID)+":"+customProviderRouteScope(provider)+":"+
+			customProviderDownstreamScope(r)+":"+kind+":"+id,
 		"custom_resource",
 	), kind, id
 }

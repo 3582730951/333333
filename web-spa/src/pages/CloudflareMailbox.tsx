@@ -6,6 +6,7 @@ import {
   IconCheckCircleStroked, IconDelete, IconGlobe, IconRefresh, IconSave,
 } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
+import CopyCodeBlock from '../components/CopyCodeBlock.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import { MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
@@ -217,6 +218,17 @@ export default function CloudflareMailbox() {
               </li>
             ))}
           </ol>
+          <div className="pool-cf-mail-quickstart">
+            <strong>复制粘贴部署</strong>
+            <p>在项目根目录执行；把两个 example.com 换成 Cloudflare 中的实际域名。</p>
+            <CopyCodeBlock code={(data.deployment?.quickstart || []).join('\n')} label="复制全部命令" />
+            <small>仓库路径：<code>{data.deployment?.repository_path || 'deploy/cloudflare-mailbox'}</code></small>
+          </div>
+          <div className="pool-cf-mail-references">
+            {(data.deployment?.references || []).map((reference, index) => (
+              <a key={reference} href={reference} target="_blank" rel="noreferrer">Cloudflare 官方步骤 {index + 1}</a>
+            ))}
+          </div>
           <div className="pool-cf-mail-note">
             <IconCheckCircleStroked />
             <div>

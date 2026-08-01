@@ -37,12 +37,12 @@
 - 租户、用户、项目、账号生命周期管理：`/admin/tenants`、`/admin/users`、`/admin/projects`、`/admin/accounts/:id/disable|enable|delete`。
 - 下游响应过滤内部 header，避免泄露账号 ID、egress ID、pool/sidecar 私有 header。
 
-## 多供应商（DeepSeek / 硅基流动 等 OpenAI 兼容）
+## 多供应商（OpenAI / Responses / Anthropic 兼容）
 
-- 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**或 **OpenAI Responses 原生**上游（DeepSeek、硅基流动 SiliconFlow、Kimi/Moonshot、OpenRouter、本地 vLLM、Responses 兼容网关）都能接入。初始化即种入 `deepseek`（`https://api.deepseek.com/v1`）与 `siliconflow`（`https://api.siliconflow.cn/v1`）两个供应商,开箱即用。
+- 通用「自定义供应商」框架：任何 **OpenAI Chat-Completions 兼容**、**OpenAI Responses 原生**或 **Anthropic Messages** 上游都能接入。新数据库不预置第三方供应商；升级只清理从未编辑且没有账号引用的旧版精确示例，用户配置保持不变。
 - 每个供应商显式声明 `upstream_protocol`：默认 `chat_completions`（Tier 3，Responses→Chat 桥接，支持稳定版 function/namespace/custom/client tool-search，兼容性损失显式报告）；可选 `responses`（Tier 2，`/v1/responses` 原生透明转发，保留 typed tools、`include`、`previous_response_id` 与未来字段/事件）。
-- 模型可**自动发现**(探测 `{base_url}/models` 并回写)或手动维护;同一供应商可被 **Codex(`/v1/responses`)、Claude Code(`/v1/messages`，模型由客户端选择)、第三方(`/v1/chat/completions`)** 三种入口使用(按 `upstream_protocol` 透明转发或协议转换,含流式)。
-- 管理端「供应商」页用**输入框**维护(ID / 名称 / base_url + 逐条模型增删),非 JSON;并提供 DeepSeek / 硅基流动 / Kimi / OpenRouter **一键预设**。
+- 一个供应商可为 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 和其他资源路径分别配置 Base URL、协议与传输画像；精确路径优先于 `*` 回退。每条路径的粘性会话和 Cookie jar 均按下游身份隔离。
+- 模型可**自动发现**（探测 `{base_url}/models` 并回写）或手动维护；管理端「供应商」页用普通表单新增，不依赖厂商预设。
 - REST:`GET/POST /admin/providers`、`DELETE /admin/providers/{id}`、`POST /admin/accounts/import-key`(裸 API Key 入池)。
 
 ## Web 控制台 / 多用户门户

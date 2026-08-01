@@ -144,6 +144,41 @@ func TestAdminProvidersAcceptsAnthropicMessagesProtocol(t *testing.T) {
 	}
 }
 
+func TestAdminProvidersPersistsMultipleInvocationRoutes(t *testing.T) {
+	h := newHarness(t, func(http.ResponseWriter, *http.Request) {})
+	code, raw := grpReq(t, h, http.MethodPost, "/admin/providers", `{
+		"id":"multi-path-relay",
+		"name":"Multi Path Relay",
+		"base_url":"https://default.example/v1",
+		"routes":[
+			{"downstream_path":"/v1/chat/completions","base_url":"https://chat.example/v1","upstream_protocol":"chat_completions","transport_profile":"generic"},
+			{"id":"codex-edge","downstream_path":"responses","base_url":"https://responses.example/openai/v1","upstream_protocol":"responses","transport_profile":"codex_cli"}
+		]
+	}`)
+	if code != http.StatusOK {
+		t.Fatalf("create multi-route provider = %d: %s", code, raw)
+	}
+	var got storage.CustomProvider
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Routes) != 2 || got.Routes[0].ID != "chat" ||
+		got.Routes[1].ID != "codex-edge" ||
+		got.Routes[1].DownstreamPath != storage.CustomProviderDownstreamResponses {
+		t.Fatalf("stored routes = %+v", got.Routes)
+	}
+
+	for _, body := range []string{
+		`{"id":"bad-route-url","base_url":"https://default.example/v1","routes":[{"downstream_path":"/v1/responses","base_url":"file:///tmp/socket"}]}`,
+		`{"id":"duplicate-route","base_url":"https://default.example/v1","routes":[{"downstream_path":"responses"},{"downstream_path":"/v1/responses"}]}`,
+	} {
+		code, raw = grpReq(t, h, http.MethodPost, "/admin/providers", body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("invalid route status=%d body=%s request=%s", code, raw, body)
+		}
+	}
+}
+
 func TestAdminProvidersPartialPatchPreservesProtocolAndRoutingFields(t *testing.T) {
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {})
 	upsertTestEgressProfile(t, h, "provider-patch-egress")

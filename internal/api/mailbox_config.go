@@ -328,14 +328,22 @@ ORDER BY priority DESC,display_name,provider_key`)
 		},
 		"deployment": map[string]interface{}{
 			"recommended_adapter": cloudflareMailboxAdapter,
+			"repository_path":     "deploy/cloudflare-mailbox",
+			"quickstart": []string{
+				"cd deploy/cloudflare-mailbox",
+				"npx wrangler login",
+				"MAIL_DOMAIN=mail.example.com API_HOST=mailbox-api.example.com ./deploy.sh",
+			},
 			"steps": []string{
-				"Deploy a compatible Cloudflare Email Worker with Email Routing and D1.",
-				"Set the Worker HTTPS URL, owned mail domain, and optional admin token here.",
-				"Run the connection check, then make the profile the registration and team default.",
+				"Copy the quickstart below to deploy this repository's Worker and D1 migration.",
+				"In Cloudflare Email Routing, send the catch-all rule to the deployed Worker.",
+				"Paste the printed HTTPS URL, mail domain, and one-time Admin Token here.",
+				"Save and test, then make the profile the registration and team default.",
 			},
 			"references": []string{
-				"https://github.com/dreamhunter2333/cloudflare_temp_email",
-				"https://github.com/agenticmail/agenticmail",
+				"https://developers.cloudflare.com/email-service/configuration/email-routing-addresses/",
+				"https://developers.cloudflare.com/email-service/api/route-emails/email-handler/",
+				"https://developers.cloudflare.com/d1/reference/migrations/",
 			},
 		},
 	})

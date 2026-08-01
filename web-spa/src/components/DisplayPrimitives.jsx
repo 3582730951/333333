@@ -77,15 +77,15 @@ export function MetricRail({ items = [], className = '' }) {
   const list = Array.isArray(items) ? items.filter(Boolean) : [];
   if (!list.length) return null;
   return (
-    <aside className={['pool-metric-rail', className].filter(Boolean).join(' ')} tabIndex={0} aria-label="指标摘要">
+    <div className={['pool-metric-rail', className].filter(Boolean).join(' ')} role="complementary" aria-label="指标摘要">
       {list.map((item) => (
-        <div key={item.key || item.label} className={['pool-metric-card', item.tone ? `pool-metric-card--${item.tone}` : ''].filter(Boolean).join(' ')}>
-          <span className="pool-metric-card__label">{item.label}</span>
-          <strong>{item.value}</strong>
-          {item.detail ? <span className="pool-metric-card__detail">{item.detail}</span> : null}
-        </div>
+        <dl key={item.key || item.label} className={['pool-metric-card', item.tone ? `pool-metric-card--${item.tone}` : ''].filter(Boolean).join(' ')}>
+          <dt className="pool-metric-card__label">{item.label}</dt>
+          <dd className="pool-metric-card__value"><strong>{item.value}</strong></dd>
+          {item.detail ? <dd className="pool-metric-card__detail">{item.detail}</dd> : null}
+        </dl>
       ))}
-    </aside>
+    </div>
   );
 }
 

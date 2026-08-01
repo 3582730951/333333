@@ -23,6 +23,7 @@ function apiFixture(pathname: string, search: URLSearchParams): unknown {
   if (pathname === '/admin/usage/timeseries' || pathname === '/user/usage/timeseries') return { buckets: [] };
   if (pathname === '/admin/usage/by-model') return { models: [] };
   if (pathname === '/admin/usage/cache') return { summary: {}, by_model: [], by_api_key: [], by_account_model: [], by_route: [], by_route_account_model: [] };
+  if (pathname === '/admin/usage/dashboard') return { accounts: [], timeseries: [], models: [], model_series: [], series: [], cache: { summary: {}, by_model: [], by_provider: [], by_provider_model: [] }, window: { timezone: 'Asia/Shanghai', utc_offset_seconds: 28800 } };
   if (pathname === '/admin/usage') return { rows: [], window: { timezone: 'Asia/Shanghai', utc_offset_seconds: 28800 } };
   if (pathname === '/admin/thinking') return { enabled: true, default_mode: 'level', default_level: 'medium', default_budget: 4096, providers: {}, models: {} };
   if (pathname === '/admin/moderation') return { enabled: false, model: 'gpt-5-mini', auto_translate: true, words: [] };
@@ -136,7 +137,7 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
       ] });
     }
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/settings-center/apply-template') {
-      return route.fulfill({ json: { id: 'kiro-no-degradation', name: 'Kiro 不降智推荐配置', description: '测试模板', saved: [{ section: 'config', key: 'require_downstream_key', old_value: false, new_value: true }] } });
+      return route.fulfill({ json: { id: 'optimal-stable-models-v1', name: '全模型稳定推荐配置', description: '测试模板', saved: [{ section: 'config', key: 'require_downstream_key', old_value: false, new_value: true }] } });
     }
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/settings-center') {
       const body = request.postDataJSON();
@@ -160,6 +161,28 @@ async function mockBackend(page: Page, role: Role, state: FixtureState = 'ready'
     }
     if (state === 'interactive' && request.method() === 'POST' && url.pathname === '/admin/usage/cache/reset') {
       return route.fulfill({ json: { ok: true } });
+    }
+    if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/usage/dashboard') {
+      const total = url.searchParams.has('since') ? 7654 : 1234;
+      return route.fulfill({ json: {
+        accounts: [{
+          account_id: 'account-with-a-very-long-usage-identifier-001', label: 'Primary usage account', requests: 12,
+          prompt_tokens: total - 234, completion_tokens: 234, total_tokens: total,
+          actual_requests: 12, actual_prompt_tokens: total - 234, actual_completion_tokens: 234,
+          actual_total_tokens: total, combined_total_tokens: total,
+        }],
+        timeseries: [{ bucket: 1_700_000_000, requests: 12, prompt_tokens: total - 234, completion_tokens: 234, total_tokens: total, cache_read_tokens: 400, cache_creation_tokens: 100 }],
+        models: [{ model: 'gpt-5', model_key: 'gpt-5', model_label: 'GPT-5', requests: 12, prompt_tokens: total - 234, total_tokens: total, cache_input_tokens: 500, cache_read_tokens: 400 }],
+        model_series: [{ bucket: 1_700_000_000, series_key: 'gpt-5', series_label: 'GPT-5', requests: 12, prompt_tokens: total - 234, completion_tokens: 234, total_tokens: total, cache_read_tokens: 400 }],
+        series: [{ series_dimension: 'model', series_key: 'gpt-5', series_label: 'GPT-5' }],
+        cache: {
+          summary: { requests: 12, hit_requests: 8, request_hit_rate: 2 / 3, cache_input_tokens: 500, cache_read_tokens: 400, cache_creation_tokens: 100 },
+          by_model: [{ model: 'gpt-5', cache_input_tokens: 500, cache_read_tokens: 400, total_tokens: total }],
+          by_provider: [], by_provider_model: [],
+        },
+        window: { timezone: 'Asia/Shanghai', utc_offset_seconds: 28800, next_day_start_at: 1_700_086_400 },
+        effective_start_at: 1_700_000_000, effective_until_at: 1_700_086_400,
+      } });
     }
     if (state === 'interactive' && request.method() === 'GET' && url.pathname === '/admin/usage') {
       const total = url.searchParams.has('since') ? 7654 : 1234;
@@ -293,7 +316,7 @@ test('submit, success, download, batch selection, and confirmation remain usable
   await batchPage.goto('/console/accounts');
   await expect(batchPage.locator('[data-page-ready="true"]')).toBeVisible();
   await batchPage.getByRole('button', { name: '选择', exact: true }).click();
-  await batchPage.getByRole('checkbox', { name: /选择第 1 行/ }).check();
+  await batchPage.getByRole('checkbox', { name: '选择 Primary production account' }).check();
   await expect(batchPage.getByText('已选 1 项')).toBeVisible();
   await batchPage.getByRole('button', { name: '批量删除' }).click();
   await expect(batchPage.getByText('删除选中的 1 个账号？')).toBeVisible();
@@ -350,7 +373,7 @@ test('access and audit pages switch locale without remounting', async ({ browser
   await adminPage.goto('/console/settings-v2');
   await expect(adminPage.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();
   await expect(adminPage.getByRole('tab', { name: 'General' })).toBeVisible();
-  await expect(adminPage.getByRole('button', { name: 'Apply Kiro no-degradation template' })).toBeVisible();
+  await expect(adminPage.getByRole('button', { name: 'Apply recommended model settings' })).toBeVisible();
   await adminPage.getByRole('tab', { name: 'Reasoning' }).click();
   await expect(adminPage.getByRole('heading', { name: 'Reasoning', exact: true })).toBeVisible();
   await expect(adminPage.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
@@ -398,7 +421,7 @@ test('registration saves manual country strategy before starting a job', async (
   await startButton.click();
 
   expect((await strategyRequest).postDataJSON()).toEqual([{
-    section: 'config', values: { sms_platform_strategy: 'manual', sms_manual_country: 'US' },
+    section: 'config', values: { sms_platform_strategy: 'manual', sms_manual_country: 'US', sms_min_price: 0, sms_max_price: 0 },
   }]);
   expect((await startRequest).postDataJSON()).toMatchObject({
     count: 1, method: '', identity_mode: 'phone', country: 'US',
@@ -430,7 +453,7 @@ test('usage range, reset, locale, and first-load failure states are explicit', a
   let dashboardRequests = 0;
   usagePage.on('request', (request) => {
     const url = new URL(request.url());
-    if (request.method() === 'GET' && url.pathname === '/admin/usage') dashboardRequests += 1;
+    if (request.method() === 'GET' && url.pathname === '/admin/usage/dashboard') dashboardRequests += 1;
   });
   await usagePage.goto('/console/usage');
   await expect(usagePage.locator('[data-page-ready="true"]')).toBeVisible();
@@ -438,7 +461,7 @@ test('usage range, reset, locale, and first-load failure states are explicit', a
 
   const rangeRequest = usagePage.waitForRequest((request) => {
     const url = new URL(request.url());
-    return request.method() === 'GET' && url.pathname === '/admin/usage' && url.searchParams.has('since');
+    return request.method() === 'GET' && url.pathname === '/admin/usage/dashboard' && url.searchParams.has('since');
   });
   await usagePage.getByLabel('窗口').selectOption('604800');
   await rangeRequest;
@@ -475,6 +498,7 @@ test('settings save, template, lazy section query, and failure states are explic
   });
   await settingsPage.goto('/console/settings-v2');
   await expect(settingsPage.locator('[data-page-ready="true"]')).toBeVisible();
+  await settingsPage.getByRole('button', { name: /^安全/ }).click();
   const securitySwitch = settingsPage.getByRole('switch', { name: '要求下游 Key' });
   await expect(securitySwitch).not.toBeChecked();
   await securitySwitch.click();
@@ -486,14 +510,14 @@ test('settings save, template, lazy section query, and failure states are explic
   await expect(settingsPage.getByText('已保存 1 项配置', { exact: true })).toBeVisible();
   await expect.poll(() => configRequests).toBeGreaterThan(beforeSave);
 
-  const templateButton = settingsPage.getByRole('button', { name: '应用 Kiro 不降智模板' });
+  const templateButton = settingsPage.getByRole('button', { name: '应用全模型推荐配置' });
   await expect(templateButton).toBeVisible();
   const [templateRequest] = await Promise.all([
     settingsPage.waitForRequest((request) => request.method() === 'POST' && new URL(request.url()).pathname === '/admin/settings-center/apply-template'),
     templateButton.click(),
   ]);
-  expect(templateRequest.postDataJSON()).toEqual({ template_id: 'kiro-no-degradation' });
-  await expect(settingsPage.getByText('已应用模板: Kiro 不降智推荐配置', { exact: true })).toBeVisible();
+  expect(templateRequest.postDataJSON()).toEqual({ template_id: 'optimal-stable-models-v1' });
+  await expect(settingsPage.getByText('已应用模板: 全模型稳定推荐配置', { exact: true })).toBeVisible();
 
   const memoryRequest = settingsPage.waitForRequest((request) => {
     const url = new URL(request.url());

@@ -1,42 +1,44 @@
 :root,
 html[data-theme='dark'] {
   color-scheme: dark;
-  --pool-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", sans-serif;
+  --pool-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
   --pool-font-mono: "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
 
-  --pool-bg-page: #1c1c1e;
-  --pool-bg-grouped: #242426;
-  --pool-bg-surface: #2c2c2e;
-  --pool-bg-surface-2: #323236;
-  --pool-bg-surface-3: #3a3a3c;
-  --pool-bg-elevated: #3a3a3c;
+  --pool-bg-page: #15171a;
+  --pool-bg-grouped: #1a1d21;
+  --pool-bg-surface: #20242a;
+  --pool-bg-surface-2: #272c33;
+  --pool-bg-surface-3: #313740;
+  --pool-bg-elevated: #272c33;
   --pool-bg-overlay: rgba(0, 0, 0, 0.50);
   --pool-bg-hover: rgba(255, 255, 255, 0.07);
   --pool-bg-pressed: rgba(255, 255, 255, 0.11);
   --pool-bg-selected: rgba(10, 132, 255, 0.20);
 
-  --pool-text: rgba(255, 255, 255, 0.92);
-  --pool-text-2: rgba(235, 235, 245, 0.68);
-  --pool-text-3: rgba(235, 235, 245, 0.46);
-  --pool-text-disabled: rgba(235, 235, 245, 0.32);
-  --pool-border: rgba(255, 255, 255, 0.14);
-  --pool-border-strong: rgba(255, 255, 255, 0.22);
+  --pool-text: #f2f4f7;
+  --pool-text-2: #b7bec8;
+  --pool-text-3: #8f98a5;
+  --pool-text-disabled: #68717d;
+  --pool-border: #343b45;
+  --pool-border-strong: #4b5563;
 
-  --pool-shadow-sm: 0 1px 1px rgba(0, 0, 0, 0.20), 0 10px 26px rgba(0, 0, 0, 0.22);
-  --pool-shadow-md: 0 1px 2px rgba(0, 0, 0, 0.30), 0 22px 60px rgba(0, 0, 0, 0.36);
-  --pool-shadow-compact: 0 5px 16px rgba(0, 0, 0, 0.24);
-  --pool-shadow-orbit: 0 12px 28px rgba(0, 0, 0, 0.26);
-  --pool-shadow-card-lift: 0 14px 32px rgba(0, 0, 0, 0.28);
-  --pool-shadow-glass: 0 18px 42px rgba(0, 0, 0, 0.30);
-  --pool-shadow-hero: 0 20px 52px rgba(0, 0, 0, 0.32);
-  --pool-shadow-hero-lg: 0 24px 60px rgba(0, 0, 0, 0.34);
+  --pool-shadow-sm: none;
+  --pool-shadow-md: 0 18px 48px rgba(0, 0, 0, 0.34);
+  --pool-shadow-compact: none;
+  --pool-shadow-orbit: none;
+  --pool-shadow-card-lift: none;
+  --pool-shadow-glass: none;
+  --pool-shadow-hero: none;
+  --pool-shadow-hero-lg: none;
   --pool-shadow-hover: var(--pool-shadow-md);
   --pool-shadow: var(--pool-shadow-md);
 
-  --pool-accent: #0a84ff;
-  --pool-accent-text: #66b5ff;
-  --pool-accent-hover: #2997ff;
-  --pool-accent-pressed: #0071e3;
+  --pool-accent: #69b7ff;
+  --pool-accent-text: #8ac7ff;
+  --pool-accent-hover: #8ac7ff;
+  --pool-accent-pressed: #4da5f5;
+  --pool-action: #0b6fc2;
+  --pool-on-action: #ffffff;
   --pool-accent-soft: rgba(10, 132, 255, 0.18);
   --pool-success: #32d074;
   --pool-success-soft: rgba(50, 208, 116, 0.16);
@@ -50,11 +52,11 @@ html[data-theme='dark'] {
   --pool-purple-soft: rgba(192, 132, 252, 0.16);
   --pool-gray-soft: rgba(255, 255, 255, 0.09);
 
-  --pool-radius-xs: 6px;
-  --pool-radius-sm: 9px;
-  --pool-radius-md: 12px;
-  --pool-radius-lg: 16px;
-  --pool-radius-xl: 20px;
+  --pool-radius-xs: 4px;
+  --pool-radius-sm: 6px;
+  --pool-radius-md: 8px;
+  --pool-radius-lg: 10px;
+  --pool-radius-xl: 12px;
   --pool-hit-target: 44px;
   --pool-space-1: 4px;
   --pool-space-2: 8px;
@@ -112,39 +114,41 @@ html[data-theme='dark'] {
 
 html[data-theme='light'] {
   color-scheme: light;
-  --pool-bg-page: #f5f5f7;
-  --pool-bg-grouped: #f2f2f7;
+  --pool-bg-page: #f6f7f9;
+  --pool-bg-grouped: #f0f2f5;
   --pool-bg-surface: #ffffff;
-  --pool-bg-surface-2: #f6f6f8;
-  --pool-bg-surface-3: #ececf0;
+  --pool-bg-surface-2: #f1f3f6;
+  --pool-bg-surface-3: #e6e9ed;
   --pool-bg-elevated: #ffffff;
   --pool-bg-overlay: rgba(60, 60, 67, 0.28);
   --pool-bg-hover: rgba(60, 60, 67, 0.07);
   --pool-bg-pressed: rgba(60, 60, 67, 0.11);
   --pool-bg-selected: rgba(0, 122, 255, 0.11);
 
-  --pool-text: rgba(0, 0, 0, 0.88);
-  --pool-text-2: rgba(60, 60, 67, 0.78);
-  --pool-text-3: rgba(60, 60, 67, 0.74);
-  --pool-text-disabled: rgba(60, 60, 67, 0.32);
-  --pool-border: rgba(60, 60, 67, 0.16);
-  --pool-border-strong: rgba(60, 60, 67, 0.24);
+  --pool-text: #171a1f;
+  --pool-text-2: #4d5661;
+  --pool-text-3: #5f6b79;
+  --pool-text-disabled: #98a0aa;
+  --pool-border: #d8dde3;
+  --pool-border-strong: #b8c0ca;
 
-  --pool-shadow-sm: 0 1px 1px rgba(0, 0, 0, 0.035), 0 10px 24px rgba(0, 0, 0, 0.055);
-  --pool-shadow-md: 0 1px 2px rgba(0, 0, 0, 0.06), 0 22px 58px rgba(0, 0, 0, 0.12);
-  --pool-shadow-compact: 0 5px 16px rgba(15, 23, 42, 0.08);
-  --pool-shadow-orbit: 0 12px 28px rgba(15, 23, 42, 0.08);
-  --pool-shadow-card-lift: 0 14px 32px rgba(15, 23, 42, 0.07);
-  --pool-shadow-glass: 0 18px 42px rgba(15, 23, 42, 0.09);
-  --pool-shadow-hero: 0 20px 52px rgba(15, 23, 42, 0.07);
-  --pool-shadow-hero-lg: 0 24px 60px rgba(15, 23, 42, 0.08);
+  --pool-shadow-sm: none;
+  --pool-shadow-md: 0 18px 48px rgba(22, 29, 37, 0.16);
+  --pool-shadow-compact: none;
+  --pool-shadow-orbit: none;
+  --pool-shadow-card-lift: none;
+  --pool-shadow-glass: none;
+  --pool-shadow-hero: none;
+  --pool-shadow-hero-lg: none;
   --pool-shadow-hover: var(--pool-shadow-md);
   --pool-shadow: var(--pool-shadow-md);
 
-  --pool-accent: #007aff;
-  --pool-accent-text: #005eb8;
-  --pool-accent-hover: #0a84ff;
-  --pool-accent-pressed: #0066cc;
+  --pool-accent: #005fb8;
+  --pool-accent-text: #00569f;
+  --pool-accent-hover: #07569f;
+  --pool-accent-pressed: #004a91;
+  --pool-action: #0067bd;
+  --pool-on-action: #ffffff;
   --pool-accent-soft: rgba(0, 122, 255, 0.12);
   --pool-success: #1f7a36;
   --pool-success-soft: rgba(52, 199, 89, 0.14);

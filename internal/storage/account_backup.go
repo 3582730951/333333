@@ -131,6 +131,11 @@ func normalizeAccountBackupCustomProvider(provider CustomProvider) (CustomProvid
 		return CustomProvider{}, fmt.Errorf("custom provider %q: %w", provider.ID, err)
 	}
 	provider.ModelMappings = mappings
+	routes, err := canonicalCustomProviderRoutes(provider.Routes, provider, true)
+	if err != nil {
+		return CustomProvider{}, fmt.Errorf("custom provider %q: %w", provider.ID, err)
+	}
+	provider.Routes = routes
 	return provider, nil
 }
 
@@ -825,14 +830,23 @@ func restoreAccountBackupCustomProviderTx(ctx context.Context, tx *sql.Tx, provi
 	if err != nil {
 		return err
 	}
+	routes, err := canonicalCustomProviderRoutes(provider.Routes, provider, true)
+	if err != nil {
+		return err
+	}
+	routesJSON, err := json.Marshal(routes)
+	if err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO custom_providers(id, name, base_url, upstream_protocol, transport_profile, routes_json, egress_ids, enabled, auto_discover_models, models_json, model_mappings_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
  name=excluded.name,
  base_url=excluded.base_url,
  upstream_protocol=excluded.upstream_protocol,
  transport_profile=excluded.transport_profile,
+ routes_json=excluded.routes_json,
  egress_ids=excluded.egress_ids,
  enabled=excluded.enabled,
  auto_discover_models=excluded.auto_discover_models,
@@ -840,7 +854,7 @@ ON CONFLICT(id) DO UPDATE SET
  model_mappings_json=excluded.model_mappings_json,
  updated_at=excluded.updated_at`,
 		provider.ID, provider.Name, provider.BaseURL, provider.UpstreamProtocol,
-		provider.TransportProfile, encodeOrderedIDs(provider.EgressIDs), boolInt(provider.Enabled),
+		provider.TransportProfile, string(routesJSON), encodeOrderedIDs(provider.EgressIDs), boolInt(provider.Enabled),
 		boolInt(provider.AutoDiscoverModels), string(modelsJSON), string(mappingsJSON),
 		provider.CreatedAt, provider.UpdatedAt,
 	)

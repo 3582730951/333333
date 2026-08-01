@@ -43,6 +43,35 @@ func TestEmailPoolMigratesLegacyMissingColumns(t *testing.T) {
 	}
 }
 
+func TestEmailPoolMigratesLegacyStatusAliases(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, err := store.db.Exec(`CREATE TABLE email_pool(
+id TEXT PRIMARY KEY,email TEXT,password TEXT,client_id TEXT,refresh_token TEXT,status TEXT,
+group_name TEXT,error_message TEXT,last_used_at INTEGER,created_at INTEGER,updated_at INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ id, status string }{{"ready", "ready"}, {"busy", "busy"}, {"failed", "failed"}, {"done", "consumed"}} {
+		if _, err := store.db.Exec(`INSERT INTO email_pool(id,email,status) VALUES(?,?,?)`, row.id, row.id+"@example.test", row.status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wants := map[string]string{"ready": "idle", "busy": "in_use", "failed": "error", "done": "used"}
+	for id, want := range wants {
+		account, found, err := store.GetEmailAccount(ctx, id)
+		if err != nil || !found || account.Status != want {
+			t.Fatalf("%s status=%q found=%v err=%v, want %q", id, account.Status, found, err, want)
+		}
+	}
+}
+
 func TestEmailPoolReadsLegacyNullableRows(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "pool.sqlite3"))
 	if err != nil {

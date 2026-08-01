@@ -69,8 +69,8 @@ func NewHandler(store *storage.Store, up *upstream.Client, defaultMethod string,
 		defaultMethod = "protocol_v2"
 	}
 	defaultGroup := config.DefaultGroupName
-	if cfg != nil && strings.TrimSpace(cfg.DefaultGroup) != "" {
-		defaultGroup = strings.TrimSpace(cfg.DefaultGroup)
+	if cfg != nil {
+		defaultGroup = firstNonEmpty(cfg.RegistrationDefaultGroup, cfg.DefaultGroup, config.DefaultGroupName)
 	}
 	if concurrency < 1 {
 		concurrency = 1
@@ -235,6 +235,21 @@ func (h *Handler) resolveConcurrency(ctx context.Context) int {
 			logInvalidRegistrationSetting("registration_concurrency", trimmed, "integer >= 1")
 		}
 	}
+	if v, ok := h.setting(ctx, "email_registration_concurrency"); ok {
+		trimmed := strings.TrimSpace(v)
+		if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 {
+			if n > memCap {
+				return memCap
+			}
+			return n
+		}
+	}
+	if legacy, ok := h.legacyEmailRegistrationSettings(ctx); ok && legacy.Concurrency > 0 {
+		if legacy.Concurrency > memCap {
+			return memCap
+		}
+		return legacy.Concurrency
+	}
 	if h.concurrency < 1 {
 		return 1
 	}
@@ -338,6 +353,55 @@ func (h *Handler) flagEnabledStr(ctx context.Context, key, def string) (bool, er
 	return false, nil
 }
 
+// registrationEnabled resolves the hot setting first and the boot value second.
+// This lets an upgraded deployment turn registration on or off from the settings
+// center without restarting, while malformed stored values retain the known boot
+// state instead of silently changing behavior.
+func (h *Handler) registrationEnabled(ctx context.Context) bool {
+	if value, ok := h.setting(ctx, "registration_enabled"); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "1", "on", "yes":
+			return true
+		case "false", "0", "off", "no":
+			return false
+		default:
+			logInvalidRegistrationSetting("registration_enabled", strings.TrimSpace(value), "boolean")
+		}
+	}
+	if value, ok := h.setting(ctx, "email_registration_enabled"); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "true", "1", "on", "yes":
+			return true
+		case "false", "0", "off", "no":
+			return false
+		}
+	}
+	return h != nil && h.enabled
+}
+
+func (h *Handler) resolveRegistrationTimeout(ctx context.Context) time.Duration {
+	seconds := 0
+	if value, ok := h.setting(ctx, "registration_timeout"); ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && parsed > 0 {
+			seconds = parsed
+		} else {
+			logInvalidRegistrationSetting("registration_timeout", strings.TrimSpace(value), "integer >= 1")
+		}
+	}
+	if seconds == 0 {
+		if value, ok := h.setting(ctx, "email_registration_timeout_seconds"); ok {
+			seconds, _ = strconv.Atoi(strings.TrimSpace(value))
+		}
+	}
+	if seconds == 0 && h != nil && h.cfg != nil {
+		seconds = h.cfg.RegistrationTimeout
+	}
+	if seconds <= 0 {
+		seconds = 300
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func (h *Handler) setting(ctx context.Context, key string) (string, bool) {
 	if h == nil || h.store == nil {
 		return "", false
@@ -360,14 +424,14 @@ func logInvalidRegistrationSetting(key, value, kind string) {
 // the admin trigger and auto-refill.
 func (h *Handler) resolveMethod(ctx context.Context, reqMethod string) string {
 	if m := strings.TrimSpace(reqMethod); m != "" {
-		return m
+		return normalizeRegistrationMethodAlias(m)
 	}
 	if v, ok := h.setting(ctx, "default_register_method"); ok {
 		if v = strings.TrimSpace(v); v != "" {
-			return v
+			return normalizeRegistrationMethodAlias(v)
 		}
 	}
-	return h.defaultMethod
+	return normalizeRegistrationMethodAlias(h.defaultMethod)
 }
 
 func lockedIdentityModeForMethod(method string) string {
@@ -437,7 +501,7 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		return invalidRegisterRequest("unsupported platform %q", req.Platform)
 	}
 
-	req.Method = strings.ToLower(strings.TrimSpace(h.resolveMethod(ctx, req.Method)))
+	req.Method = normalizeRegistrationMethodAlias(h.resolveMethod(ctx, req.Method))
 	if req.Method == "" {
 		req.Method = "protocol_v2"
 	}
@@ -453,6 +517,24 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 	}
 
 	req.GroupName = strings.TrimSpace(req.GroupName)
+	if req.GroupName == "" {
+		if value, ok := h.setting(ctx, "registration_default_group"); ok {
+			req.GroupName = strings.TrimSpace(value)
+		}
+	}
+	if req.GroupName == "" {
+		if value, ok := h.setting(ctx, "reg_default_group"); ok {
+			req.GroupName = strings.TrimSpace(value)
+		}
+	}
+	if req.GroupName == "" {
+		if legacy, ok := h.legacyEmailRegistrationSettings(ctx); ok {
+			req.GroupName = strings.TrimSpace(legacy.GroupName)
+		}
+	}
+	if req.GroupName == "" && h.cfg != nil {
+		req.GroupName = strings.TrimSpace(h.cfg.RegistrationDefaultGroup)
+	}
 	if req.GroupName == "" {
 		req.GroupName = strings.TrimSpace(h.defaultGroup)
 	}
@@ -477,6 +559,24 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 			}
 		}
 		if req.RegistrationEgressPoolID == "" {
+			if poolID, ok := h.setting(ctx, "reg_default_egress"); ok {
+				req.RegistrationEgressPoolID = strings.TrimSpace(poolID)
+			}
+		}
+		if req.RegistrationEgressPoolID == "" {
+			if poolID, ok := h.setting(ctx, "email_registration_egress_pool_id"); ok {
+				req.RegistrationEgressPoolID = strings.TrimSpace(poolID)
+			}
+		}
+		if req.RegistrationEgressPoolID == "" {
+			if legacy, ok := h.legacyEmailRegistrationSettings(ctx); ok {
+				req.RegistrationEgressPoolID = strings.TrimSpace(legacy.EgressPoolID)
+			}
+		}
+		if req.RegistrationEgressPoolID == "" && h.cfg != nil {
+			req.RegistrationEgressPoolID = strings.TrimSpace(h.cfg.RegistrationEgressPoolID)
+		}
+		if req.RegistrationEgressPoolID == "" {
 			return invalidRegisterRequest("registration_egress_pool_id is required; configure the default registration egress pool or pass a registration pool")
 		}
 		if _, err := h.getRegistrationEgressPool(ctx, req.RegistrationEgressPoolID); err != nil {
@@ -489,6 +589,9 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 	req.RuntimeEgressPoolID = ""
 
 	req.IdentityMode = strings.ToLower(strings.TrimSpace(req.IdentityMode))
+	if req.IdentityMode == "mail" || req.IdentityMode == "mailbox" {
+		req.IdentityMode = "email"
+	}
 	switch req.IdentityMode {
 	case "", "phone", "sms", "email":
 	default:
@@ -536,11 +639,18 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		}
 	}
 	req.SMSProvider = strings.ToLower(strings.TrimSpace(req.SMSProvider))
-	req.MailboxProvider = strings.ToLower(strings.TrimSpace(req.MailboxProvider))
-	if req.MailboxProvider == "" && req.IdentityMode == "email" {
-		if value, ok := h.setting(ctx, "reg_default_mailbox"); ok {
-			req.MailboxProvider = strings.ToLower(strings.TrimSpace(value))
+	if req.SMSProvider == "" {
+		if value, ok := h.setting(ctx, "default_sms_provider"); ok {
+			req.SMSProvider = strings.ToLower(strings.TrimSpace(value))
+		} else if value, ok := h.setting(ctx, "reg_default_sms"); ok {
+			req.SMSProvider = strings.ToLower(strings.TrimSpace(value))
+		} else if h.cfg != nil {
+			req.SMSProvider = strings.ToLower(strings.TrimSpace(h.cfg.DefaultSMSProvider))
 		}
+	}
+	req.MailboxProvider = normalizeMailboxProviderAlias(req.MailboxProvider)
+	if req.MailboxProvider == "" && req.IdentityMode == "email" {
+		req.MailboxProvider = h.resolveDefaultMailboxProvider(ctx)
 	}
 	var mailboxDomainErr error
 	req.MailboxDomain, mailboxDomainErr = storage.NormalizeMailboxDomain(req.MailboxDomain)
@@ -548,7 +658,46 @@ func (h *Handler) normalizeRegisterRequest(ctx context.Context, req *pipeline.Re
 		return invalidRegisterRequest("mailbox_domain: %v", mailboxDomainErr)
 	}
 	req.CaptchaSolver = strings.TrimSpace(req.CaptchaSolver)
+	if req.CaptchaSolver == "" {
+		if value, ok := h.setting(ctx, "default_captcha_provider"); ok {
+			req.CaptchaSolver = strings.TrimSpace(value)
+		} else if value, ok := h.setting(ctx, "reg_default_captcha"); ok {
+			req.CaptchaSolver = strings.TrimSpace(value)
+		} else if h.cfg != nil {
+			req.CaptchaSolver = strings.TrimSpace(h.cfg.DefaultCaptchaProvider)
+		}
+	}
 	return nil
+}
+
+func (h *Handler) resolveDefaultMailboxProvider(ctx context.Context) string {
+	if value, ok := h.setting(ctx, "default_mailbox_provider"); ok && strings.TrimSpace(value) != "" {
+		return normalizeMailboxProviderAlias(value)
+	}
+	if value, ok := h.setting(ctx, "reg_default_mailbox"); ok && strings.TrimSpace(value) != "" {
+		return normalizeMailboxProviderAlias(value)
+	}
+	configured := ""
+	if h != nil && h.cfg != nil {
+		configured = normalizeMailboxProviderAlias(h.cfg.DefaultMailboxProvider)
+	}
+	manager, err := provider.BuildManagerWithError(ctx, h.store, h.httpClient)
+	if err != nil || manager == nil {
+		return configured
+	}
+	fallback := ""
+	for _, candidate := range manager.Mailbox {
+		name := normalizeMailboxProviderAlias(candidate.Name())
+		if name == configured && configured != "" {
+			return configured
+		}
+		if name == "email_pool" {
+			fallback = name
+		} else if fallback == "" {
+			fallback = name
+		}
+	}
+	return firstNonEmpty(fallback, configured)
 }
 
 func invalidRegisterRequest(format string, args ...interface{}) error {
@@ -629,8 +778,8 @@ func (h *Handler) HandleRegisterBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req pipeline.RegisterRequest
-	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+	req, err := decodeRegistrationRequest(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -718,7 +867,7 @@ func (h *Handler) startRegistrationJob(ctx context.Context, req pipeline.Registe
 	if err := h.normalizeRegisterRequest(ctx, &req); err != nil {
 		return "", err
 	}
-	if !h.enabled {
+	if !h.registrationEnabled(ctx) {
 		return "", errRegistrationDisabled
 	}
 	req.Canary = canary
@@ -812,6 +961,8 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 	concurrency := h.resolveConcurrency(ctx)
 	var mu sync.Mutex
 	cancelled = runBounded(ctx, req.Count, concurrency, func(i int) {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, h.resolveRegistrationTimeout(ctx))
+		defer attemptCancel()
 		recordID := fmt.Sprintf("rec_%d_%d", time.Now().UnixNano(), i)
 		workflowItemID := fmt.Sprintf("rwi_%d_%d", time.Now().UnixNano(), i)
 		start := time.Now()
@@ -862,7 +1013,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		workerReq := req
 		var err error
 		if strings.TrimSpace(workerReq.EgressID) == "" {
-			egress, selErr := h.store.SelectEgressFromPool(ctx, workerReq.RegistrationEgressPoolID)
+			egress, selErr := h.store.SelectEgressFromPool(attemptCtx, workerReq.RegistrationEgressPoolID)
 			if selErr != nil {
 				err = fmt.Errorf("select registration egress: %w", selErr)
 			} else {
@@ -873,7 +1024,7 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 		workerReq.RecordID = recordID
 		workerReq.WorkflowItemID = workflowItemID
 		if err == nil {
-			err = h.store.UpdateRegistrationWorkflowItem(ctx, workflowItemID, storage.RegistrationItemResourcesLeased, "")
+			err = h.store.UpdateRegistrationWorkflowItem(attemptCtx, workflowItemID, storage.RegistrationItemResourcesLeased, "")
 		}
 		var account *storage.Account
 		if err == nil {
@@ -884,14 +1035,14 @@ func (h *Handler) processBatch(ctx context.Context, jobID string, req pipeline.R
 				// Snapshot one immutable pipeline for the complete attempt. A provider
 				// reload affects the next attempt and cannot swap dependencies midway
 				// through a browser/OAuth transaction.
-				account, err = activePipeline.RegisterOne(ctx, workerReq)
+				account, err = activePipeline.RegisterOne(attemptCtx, workerReq)
 			}
 		}
 		if err == nil && account != nil {
-			err = h.bindRegisteredAccountToRuntimePool(ctx, workerReq, account.ID)
+			err = h.bindRegisteredAccountToRuntimePool(attemptCtx, workerReq, account.ID)
 		}
 		if err == nil && account != nil {
-			err = h.enqueueRegisteredTeamLifecycle(ctx, workerReq, account.ID)
+			err = h.enqueueRegisteredTeamLifecycle(attemptCtx, workerReq, account.ID)
 		}
 		duration := int(time.Since(start).Seconds())
 		bg, cancel := registrationPersistenceContext(ctx)
@@ -1463,6 +1614,14 @@ var regDefaultKeys = map[string]string{
 	"egress":  "reg_default_egress",
 }
 
+var regCanonicalDefaultKeys = map[string]string{
+	"sms":     "default_sms_provider",
+	"mailbox": "default_mailbox_provider",
+	"captcha": "default_captcha_provider",
+	"group":   "registration_default_group",
+	"egress":  "registration_egress_pool_id",
+}
+
 func cfgString(v interface{}) string { s, _ := v.(string); return strings.TrimSpace(s) }
 
 func (h *Handler) getDefaults(ctx context.Context) map[string]string {
@@ -1472,13 +1631,16 @@ func (h *Handler) getDefaults(ctx context.Context) map[string]string {
 
 func (h *Handler) getDefaultsWithError(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
-	for field, key := range regDefaultKeys {
-		v, ok, err := h.store.GetSetting(ctx, key)
-		if err != nil {
-			return out, fmt.Errorf("read registration default %q: %w", field, err)
-		}
-		if ok && v != "" {
-			out[field] = v
+	for field, legacyKey := range regDefaultKeys {
+		for _, key := range []string{regCanonicalDefaultKeys[field], legacyKey} {
+			v, ok, err := h.store.GetSetting(ctx, key)
+			if err != nil {
+				return out, fmt.Errorf("read registration default %q: %w", field, err)
+			}
+			if ok && v != "" {
+				out[field] = v
+				break
+			}
 		}
 	}
 	return out, nil
@@ -1497,11 +1659,13 @@ func (h *Handler) saveDefaults(ctx context.Context, d map[string]interface{}) er
 func (h *Handler) saveDefaultsWithExecutor(ctx context.Context, exec sqlExecutor, d map[string]interface{}) error {
 	for field, key := range regDefaultKeys {
 		if v, ok := d[field]; ok {
-			if _, err := exec.ExecContext(ctx,
-				`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
-				 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-				key, cfgString(v), storage.Now()); err != nil {
-				return err
+			for _, storageKey := range []string{regCanonicalDefaultKeys[field], key} {
+				if _, err := exec.ExecContext(ctx,
+					`INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+					 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+					storageKey, cfgString(v), storage.Now()); err != nil {
+					return err
+				}
 			}
 		}
 	}

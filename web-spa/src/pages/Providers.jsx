@@ -78,6 +78,27 @@ const TRANSPORT_PROFILES = [
   },
 ];
 
+const DOWNSTREAM_PATH_OPTIONS = [
+  { label: 'OpenAI · /v1/chat/completions', value: '/v1/chat/completions' },
+  { label: 'Codex · /v1/responses', value: '/v1/responses' },
+  { label: 'Claude · /v1/messages', value: '/v1/messages' },
+  { label: '其他资源路径 · *', value: '*' },
+];
+
+const newProviderRoute = (routes = []) => {
+  const used = new Set((routes || []).map((route) => route.downstream_path));
+  const downstreamPath = DOWNSTREAM_PATH_OPTIONS.find((option) => !used.has(option.value))?.value || '/v1/chat/completions';
+  const profile = downstreamPath === '/v1/responses'
+    ? TRANSPORT_PROFILES[1]
+    : downstreamPath === '/v1/messages'
+      ? TRANSPORT_PROFILES[2]
+      : TRANSPORT_PROFILES[0];
+  return {
+    id: '', downstream_path: downstreamPath, base_url: '',
+    upstream_protocol: profile.protocol, transport_profile: profile.value,
+  };
+};
+
 const protocolLabel = (protocol) => {
   if (protocol === 'responses') return 'Codex · Responses';
   if (protocol === 'anthropic_messages') return 'Claude · Messages';
@@ -98,12 +119,13 @@ const egressOptionList = (profiles = []) => {
   return out;
 };
 
-const providerFormValues = (row) => ({
+export const providerFormValues = (row) => ({
   id: row?.id || '',
   name: row?.name || '',
   base_url: row?.base_url || '',
   upstream_protocol: row?.upstream_protocol || 'chat_completions',
   transport_profile: row?.transport_profile || 'generic',
+  routes: Array.isArray(row?.routes) ? row.routes.map((route) => ({ ...route })) : [],
   egress_ids: Array.isArray(row?.egress_ids) ? row.egress_ids : [],
   enabled: row?.enabled !== false,
   auto_discover_models: row?.auto_discover_models !== false,
@@ -111,16 +133,38 @@ const providerFormValues = (row) => ({
   model_mappings_text: joinModelMappings(row?.model_mappings),
 });
 
+export const providerRoutesPayload = (routes) => (Array.isArray(routes) ? routes : [])
+  .map((route) => ({
+    id: String(route?.id || '').trim(),
+    downstream_path: String(route?.downstream_path || '').trim(),
+    base_url: String(route?.base_url || '').trim(),
+    upstream_protocol: String(route?.upstream_protocol || '').trim(),
+    transport_profile: String(route?.transport_profile || '').trim(),
+  }))
+  .filter((route) => route.downstream_path);
+
 function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
   const [values, setValues] = useState(() => editor?.values || providerFormValues());
   const setValue = (key, value) => setValues((current) => ({ ...current, [key]: value }));
+  const updateRoute = (index, patch) => setValues((current) => ({
+    ...current,
+    routes: (current.routes || []).map((route, routeIndex) => routeIndex === index ? { ...route, ...patch } : route),
+  }));
+  const removeRoute = (index) => setValues((current) => ({
+    ...current,
+    routes: (current.routes || []).filter((_, routeIndex) => routeIndex !== index),
+  }));
+  const addRoute = () => setValues((current) => ({
+    ...current,
+    routes: [...(current.routes || []), newProviderRoute(current.routes)],
+  }));
   return (
     <div className="pool-provider-editor">
       <div className="pool-user-group-grid">
         <Form.Input label="Provider ID" value={values.id} onChange={(value) => setValue('id', value)} disabled={editor.mode === 'edit'} placeholder="例如：codex-edge" />
         <Form.Input label="显示名称" value={values.name} onChange={(value) => setValue('name', value)} placeholder="例如：Codex Edge" />
       </div>
-      <Form.Input label="Base URL" value={values.base_url} onChange={(value) => setValue('base_url', value)} placeholder="https://api.example.com/v1" />
+      <Form.Input label="默认 Base URL（旧配置兼容）" value={values.base_url} onChange={(value) => setValue('base_url', value)} placeholder="https://api.example.com/v1" help="没有命中下方调用路径时使用；已有单路径配置保持原行为。" />
       <div className="pool-field pool-field--top">
         <span className="pool-field__label">客户端传输画像</span>
         <div className="pool-provider-profile-cards" role="radiogroup" aria-label="客户端传输画像">
@@ -148,6 +192,47 @@ function ProviderEditor({ editor, egressOptions, saving, onCancel, onSave }) {
         title="请求画像会影响协议头与会话语义"
         description="Codex CLI 和 Claude Code 画像会模拟对应客户端的已测试请求形态；generic 保持现有中转行为。协议转换仍由统一 Adapter 完成。"
       />
+      <div className="pool-provider-routes" aria-label="调用路径">
+        <div className="pool-provider-routes__heading">
+          <div>
+            <strong>调用路径</strong>
+            <div className="pool-field__help">同一 Provider 可按下游入口使用不同 Base URL、协议与客户端画像；精确路径优先，* 处理文件等辅助接口。</div>
+          </div>
+          <Button icon={<IconPlus />} onClick={addRoute} disabled={saving}>添加路径</Button>
+        </div>
+        {(values.routes || []).length === 0 ? (
+          <div className="pool-provider-routes__empty">未添加覆盖路径，全部请求继续使用上方默认配置。</div>
+        ) : (values.routes || []).map((route, index) => (
+          <div className="pool-provider-route-card" key={index}>
+            <div className="pool-provider-route-card__heading">
+              <strong>路径 {index + 1}</strong>
+              <Button icon={<IconDelete />} theme="borderless" aria-label={`删除调用路径 ${index + 1}`} onClick={() => removeRoute(index)}>删除</Button>
+            </div>
+            <div className="pool-user-group-grid">
+              <Form.Select
+                label="下游入口"
+                value={route.downstream_path}
+                onChange={(value) => updateRoute(index, { downstream_path: value })}
+                optionList={DOWNSTREAM_PATH_OPTIONS}
+              />
+              <Form.Input label="路径 ID（可选）" value={route.id || ''} onChange={(value) => updateRoute(index, { id: value })} placeholder="自动生成" />
+            </div>
+            <Form.Input label="该路径 Base URL" value={route.base_url || ''} onChange={(value) => updateRoute(index, { base_url: value })} placeholder={values.base_url || 'https://relay.example/v1'} help="留空继承默认 Base URL。" />
+            <div className="pool-user-group-grid">
+              <Form.Select
+                label="客户端画像"
+                value={route.transport_profile || 'generic'}
+                onChange={(value) => {
+                  const selected = TRANSPORT_PROFILES.find((profile) => profile.value === value);
+                  updateRoute(index, { transport_profile: value, upstream_protocol: selected?.protocol || route.upstream_protocol });
+                }}
+                optionList={TRANSPORT_PROFILES.map((profile) => ({ label: profile.label, value: profile.value }))}
+              />
+              <Form.Select label="上游协议" value={route.upstream_protocol || 'chat_completions'} onChange={(value) => updateRoute(index, { upstream_protocol: value })} optionList={PROTOCOL_OPTIONS} />
+            </div>
+          </div>
+        ))}
+      </div>
       <div className="pool-field pool-field--top">
         <span className="pool-field__label">有序出口</span>
         <OrderedEgressSelect
@@ -185,6 +270,7 @@ export default function Providers() {
   const [tester, setTester] = useState(null);
   const [testModel, setTestModel] = useState('');
   const [testResult, setTestResult] = useState(null);
+  const [testDownstreamPath, setTestDownstreamPath] = useState('');
 
   const fetchRows = useCallback(async ({ signal }) => {
     return rowsOf(await get('/admin/providers', undefined, { signal }));
@@ -219,6 +305,7 @@ export default function Providers() {
         auto_discover_models: values.auto_discover_models !== false,
         models: splitModels(values.models_text),
         model_mappings: splitModelMappings(values.model_mappings_text),
+        routes: providerRoutesPayload(values.routes),
       });
       Toast.success('已保存');
       setEditor(null);
@@ -252,7 +339,10 @@ export default function Providers() {
       return;
     }
     try {
-      const result = await post(`/admin/providers/${encodeURIComponent(tester.id)}/test`, { model: String(testModel).trim() });
+      const result = await post(`/admin/providers/${encodeURIComponent(tester.id)}/test`, {
+        model: String(testModel).trim(),
+        downstream_path: testDownstreamPath || undefined,
+      });
       setTestResult(result);
       if (result?.ok) {
         Toast.success(`已到达目标中转站：${result.target_model || testModel}`);
@@ -282,7 +372,7 @@ export default function Providers() {
       items={[
         { label: '编辑', icon: <IconEdit />, disabled: providerOperationRunning, onSelect: () => setEditor({ mode: 'edit', values: providerFormValues(row) }) },
         { label: '导入 Key', icon: <IconKey />, disabled: providerOperationRunning, onSelect: () => setImporter(row) },
-        { label: '测试模型', icon: <IconPlay />, disabled: providerOperationRunning, onSelect: () => { setTester(row); setTestModel(row.models?.[0] || Object.keys(row.model_mappings || {})[0] || ''); setTestResult(null); } },
+        { label: '测试模型', icon: <IconPlay />, disabled: providerOperationRunning, onSelect: () => { setTester(row); setTestModel(row.models?.[0] || Object.keys(row.model_mappings || {})[0] || ''); setTestDownstreamPath(row.routes?.[0]?.downstream_path || ''); setTestResult(null); } },
         {
           label: isRemovingProvider(row.id) ? '删除中' : '删除',
           icon: <IconDelete />,
@@ -317,7 +407,15 @@ export default function Providers() {
         </div>
       ),
     },
-    { title: 'Base URL', dataIndex: 'base_url', width: 260, render: (v) => <TextClamp>{v || '-'}</TextClamp> },
+    {
+      title: '调用路径', key: 'routes', width: 280,
+      render: (_, row) => (
+        <div className="pool-resource-summary">
+          <TextClamp>{row.base_url || '-'}</TextClamp>
+          <div className="pool-resource-summary__meta">{row.routes?.length ? `${row.routes.length} 条路径覆盖` : '默认单路径'}</div>
+        </div>
+      ),
+    },
     {
       title: '协议 / 画像',
       key: 'protocol',
@@ -364,6 +462,7 @@ export default function Providers() {
           badges={<><Tag>{row.id || '-'}</Tag><Tag color={row.enabled === false ? 'grey' : 'green'}>{row.enabled === false ? '停用' : '启用'}</Tag></>}
           details={[
             { label: '协议', value: protocolLabel(row.upstream_protocol) },
+            { label: '调用路径', value: row.routes?.length ? `${row.routes.length} 条覆盖` : '默认单路径' },
             { label: '画像', value: row.transport_profile || 'generic' },
             { label: '出口', value: row.egress_ids?.length ? row.egress_ids.join(' → ') : '系统默认' },
             { label: '模型', value: renderModels(row.models, row) },
@@ -441,6 +540,20 @@ export default function Providers() {
         maskClosable={!testingProvider}
       >
         <Form.Input label="测试模型" value={testModel} onChange={setTestModel} placeholder="例如 claude-sonnet-5" />
+        {tester?.routes?.length ? (
+          <Form.Select
+            label="测试调用路径"
+            value={testDownstreamPath}
+            onChange={setTestDownstreamPath}
+            optionList={[
+              { label: '默认配置', value: '' },
+              ...tester.routes.map((route) => ({
+                label: `${route.downstream_path} · ${route.id || '自动 ID'}`,
+                value: route.downstream_path,
+              })),
+            ]}
+          />
+        ) : null}
         <div className="pool-field__help">请求会经过该提供商的 Base URL、协议画像、API Key、出口及模型映射；结果同时显示下游模型与目标模型。</div>
         {testResult ? (
           <div className="pool-resource-summary" style={{ marginTop: 12 }}>
@@ -448,6 +561,7 @@ export default function Providers() {
             <div className="pool-resource-summary__meta">
               {testResult.requested_model || '-'} → {testResult.target_model || '-'} · HTTP {testResult.http_status || 0} · {testResult.latency_ms || 0} ms
             </div>
+            {testResult.route_id ? <div className="pool-resource-summary__meta">调用路径：{testResult.downstream_path || '-'} · {testResult.route_id}</div> : null}
             {testResult.error_code ? <div className="pool-resource-summary__meta">错误：{testResult.error_code}</div> : null}
             {testResult.response_sample ? <TextClamp>{testResult.response_sample}</TextClamp> : null}
           </div>

@@ -1,12 +1,11 @@
 import React from 'react';
 import { Typography } from './pool/index.jsx';
 
-// Consistent page header: title + optional subtitle on the left, actions on the right.
 export default function PageHeader({ title, subtitle, actions }) {
   return (
     <header className="pool-pagehead">
       <div className="pool-pagehead-copy">
-        <Typography.Title heading={1} className="pool-page-title" style={{ margin: 0 }}>{title}</Typography.Title>
+        <Typography.Title heading={1} className="pool-page-title">{title}</Typography.Title>
         {subtitle ? <div className="sub">{subtitle}</div> : null}
       </div>
       {actions ? <div className="actions pool-page-actions">{actions}</div> : null}
@@ -14,13 +13,12 @@ export default function PageHeader({ title, subtitle, actions }) {
   );
 }
 
-// A panel with a section title, used to group content on a page.
 export function Panel({ title, extra, children, style }) {
   return (
     <div className="pool-panel" style={style}>
       {(title || extra) && (
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-          <div className="pool-section-title" style={{ margin: 0 }}>{title}</div>
+        <div className="pool-panel-head">
+          <div className="pool-section-title">{title}</div>
           {extra}
         </div>
       )}
@@ -29,7 +27,6 @@ export function Panel({ title, extra, children, style }) {
   );
 }
 
-// Horizontal usage/percent meter (CPU/mem/disk/quota).
 export function Meter({ label, pct, color = 'var(--pool-accent)', right }) {
   const p = Math.max(0, Math.min(100, Number(pct) || 0));
   return (

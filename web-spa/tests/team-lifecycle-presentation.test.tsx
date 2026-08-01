@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { render, screen } from '@testing-library/react';
 import { http, HttpResponse } from 'msw';
+import { MemoryRouter } from 'react-router';
 import { describe, expect, it } from 'vitest';
 import TeamLifecycle from '../src/pages/TeamLifecycle';
 import { server } from './setup';
@@ -52,17 +53,32 @@ describe('team lifecycle presentation', () => {
         }),
       ),
       http.get('*/admin/team-lifecycle/stats', () =>
-        HttpResponse.json({ states: { active: 1 } }),
+        HttpResponse.json({
+          states: { active: 1 },
+          readiness: {
+            ready: true,
+            workspace_create_ready: true,
+            cycle_create_ready: true,
+            parent_accounts: 1,
+            mailbox_profiles: 1,
+            mailbox_default_configured: true,
+            mailbox_healthy: true,
+            registration_ready: true,
+            registration_method: 'protocol_v2',
+            workspaces: 1,
+            blockers: [],
+          },
+        }),
       ),
       http.get('*/admin/email-pool/cloudflare', () =>
         HttpResponse.json({ profiles: [] }),
       ),
       http.get('*/admin/accounts', () =>
-        HttpResponse.json({ accounts: [{ id: 'parent-ref', label: 'Parent', email: 'parent@example.com', status: 'active' }] }),
+        HttpResponse.json({ accounts: [{ id: 'parent-ref', label: 'Parent', email: 'parent@example.com', upstream_account_id: 'remote-ref', status: 'active' }] }),
       ),
     );
 
-    render(<TeamLifecycle />);
+    render(<MemoryRouter><TeamLifecycle /></MemoryRouter>);
 
     expect(await screen.findByText(longChildReference)).toHaveClass(
       'pool-text-clamp',
@@ -73,9 +89,11 @@ describe('team lifecycle presentation', () => {
     expect(screen.getByText('邀请成员')).toBeInTheDocument();
     expect(screen.getByText('解析凭据')).toBeInTheDocument();
     expect(screen.getByText('补位任务已排队')).toBeInTheDocument();
+    expect(screen.getByText('四项配置，按顺序点完即可')).toBeInTheDocument();
+    expect(screen.getAllByLabelText('已就绪')).toHaveLength(4);
   });
 
-  it('uses bounded table cells and a continuous theme-aware lifecycle line', () => {
+  it('uses bounded table cells and a flat ordered lifecycle ledger', () => {
     const css = readFileSync(
       resolve(process.cwd(), 'src/styles/components.css'),
       'utf8',
@@ -84,13 +102,14 @@ describe('team lifecycle presentation', () => {
       /\.pool-lifecycle-table \.pool-table td\s*\{[^}]*overflow:\s*hidden;/s,
     );
     expect(css).toMatch(
-      /\.pool-lifecycle-flow::before\s*\{[^}]*border-radius:\s*999px;[^}]*linear-gradient/s,
+      /\.pool-lifecycle-flow::before\s*\{[^}]*display:\s*none;/s,
     );
     expect(css).toMatch(
-      /\.pool-lifecycle-hero\s*\{[^}]*var\(--pool-bg-elevated\)[^}]*var\(--pool-bg-surface\)/s,
+      /\.pool-lifecycle-hero\s*\{[^}]*border-block:\s*1px solid var\(--pool-border\);[^}]*background:\s*transparent;/s,
     );
     expect(css).toMatch(
-      /@media \(max-width:\s*767px\)[\s\S]*\.pool-lifecycle-flow\s*\{[^}]*grid-template-columns:\s*repeat\(8,\s*92px\)/,
+      /@media \(max-width:\s*767px\)[\s\S]*\.pool-lifecycle-flow\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/,
     );
+    expect(css).not.toMatch(/\.pool-lifecycle-(?:hero|flow|threshold)[^{]*\{[^}]*(?:radial|linear|conic)-gradient/s);
   });
 });

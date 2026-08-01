@@ -50,6 +50,21 @@ for (const entry of cases) {
           window: { timezone: 'Asia/Shanghai', utc_offset_seconds: 28800 },
         } });
       }
+      if (url.pathname === '/admin/usage/dashboard') {
+        return route.fulfill({ json: {
+          accounts: [{ account_id: 'long-accessible-account-identifier-001', label: 'Accessible usage account', requests: 5, prompt_tokens: 800, completion_tokens: 200, total_tokens: 1000 }],
+          timeseries: [{ bucket: 1_700_000_000, requests: 5, prompt_tokens: 800, completion_tokens: 200, total_tokens: 1000 }],
+          models: [{ model: 'gpt-5', model_key: 'gpt-5', model_label: 'GPT-5', cache_input_tokens: 800, cache_read_tokens: 600, total_tokens: 1000 }],
+          model_series: [{ bucket: 1_700_000_000, series_key: 'gpt-5', series_label: 'GPT-5', total_tokens: 1000 }],
+          series: [{ series_dimension: 'model', series_key: 'gpt-5', series_label: 'GPT-5' }],
+          cache: {
+            summary: { requests: 5, hit_requests: 3, request_hit_rate: 0.6, cache_input_tokens: 800, cache_read_tokens: 600, cache_creation_tokens: 100 },
+            by_model: [{ model: 'gpt-5', cache_input_tokens: 800, cache_read_tokens: 600, total_tokens: 1000 }],
+            by_provider: [], by_provider_model: [],
+          },
+          window: { timezone: 'Asia/Shanghai', utc_offset_seconds: 28800 },
+        } });
+      }
       if (url.pathname === '/admin/usage/timeseries') {
         return route.fulfill({ json: {
           buckets: [{ bucket: 1_700_000_000, requests: 5, prompt_tokens: 800, completion_tokens: 200, total_tokens: 1000 }],

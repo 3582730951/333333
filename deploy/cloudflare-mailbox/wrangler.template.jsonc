@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "__WORKER_NAME__",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-31",
+  "workers_dev": true,
+  "preview_urls": false,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "__D1_DATABASE_NAME__",
+      "database_id": "__D1_DATABASE_ID__",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "MAIL_DOMAIN": "__MAIL_DOMAIN__",
+    "ALLOW_PUBLIC_CREATE": "false",
+    "MAILBOX_TTL_SECONDS": "86400",
+    "MESSAGE_TTL_SECONDS": "86400"
+  }__ROUTES__
+}

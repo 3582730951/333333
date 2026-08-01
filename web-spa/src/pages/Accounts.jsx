@@ -645,6 +645,7 @@ export default function Accounts() {
       <MobileResourceCell
         selectable={selectMode}
         selected={Boolean(mobileMeta.selected)}
+        selectLabel={`选择 ${accountName}`}
         onSelect={() => mobileMeta.toggleSelected?.(!mobileMeta.selected)}
         title={selectMode
           ? accountTitle

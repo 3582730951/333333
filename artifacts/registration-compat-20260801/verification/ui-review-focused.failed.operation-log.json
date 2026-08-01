@@ -1,0 +1,2781 @@
+[
+  {
+    "at": "2026-08-01T06:39:58.441Z",
+    "event": "server_start",
+    "port": 5192,
+    "baseURL": "http://127.0.0.1:5192/console"
+  },
+  {
+    "at": "2026-08-01T06:40:04.188Z",
+    "event": "login_cookies",
+    "cookies": [
+      {
+        "name": "cp_csrf",
+        "value": "admin-csrf",
+        "expires": 1785652804,
+        "session": false
+      },
+      {
+        "name": "cp_session",
+        "value": "admin-fixture",
+        "expires": 1785652804,
+        "session": false
+      }
+    ]
+  },
+  {
+    "at": "2026-08-01T06:40:08.545Z",
+    "event": "login",
+    "role": "admin",
+    "method": "fixture-mocked-login"
+  },
+  {
+    "at": "2026-08-01T06:40:13.599Z",
+    "event": "session_reuse_check",
+    "session_reused": true,
+    "browser_restarted": true,
+    "cookies": [
+      {
+        "name": "cp_csrf",
+        "value": "admin-csrf",
+        "expires": 1785652804,
+        "session": false
+      },
+      {
+        "name": "cp_session",
+        "value": "admin-fixture",
+        "expires": 1785652804,
+        "session": false
+      }
+    ],
+    "body_excerpt": "P\nPool 控制台\n总览\n账号\n账号池\n分组\n邮箱池\n接入\n模型提供商\n模型列表\n出口/代理\n上游错误规则\n自动化\n自动注册\n团队生命周期\n观测\n用量\n配额\n模型智商\n系统监控\nCF 事件\n审计日志\n访问\nAPI Keys\n用户\nAI 设置\n设置中心\n通用\n自动化\n注册器\n日志\n内存\n思考\n合规\n收起侧边栏\n管理控制"
+  },
+  {
+    "at": "2026-08-01T06:40:32.666Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1440x900",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/1440x900/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1440x900/Registration.png",
+      ".run/ui-review/screenshots/admin/light/1440x900/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/1440x900/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 914,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 348,
+      "resourceCount": 156,
+      "domContentLoadedMS": 337,
+      "loadMS": 340,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 1374,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 1318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 1270,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 922,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:40:32.676Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1440x900",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/light/1440x900/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 收起侧边栏 管理控制台 / 自动注册 A admin@example.test 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / "
+  },
+  {
+    "at": "2026-08-01T06:40:36.463Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1440x900",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/1440x900/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1440x900/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 309,
+      "resourceCount": 145,
+      "domContentLoadedMS": 331,
+      "loadMS": 333,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 823,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:40:55.453Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/1280x720/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1280x720/Registration.png",
+      ".run/ui-review/screenshots/admin/light/1280x720/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/1280x720/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 914,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 348,
+      "resourceCount": 156,
+      "domContentLoadedMS": 342,
+      "loadMS": 345,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 1374,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 1318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 1270,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 762,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:40:55.461Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/light/1280x720/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 收起侧边栏 管理控制台 / 自动注册 A admin@example.test 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / "
+  },
+  {
+    "at": "2026-08-01T06:40:59.131Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/1280x720/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1280x720/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 309,
+      "resourceCount": 145,
+      "domContentLoadedMS": 354,
+      "loadMS": 356,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 663,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:41:18.064Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/390x844/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/390x844/Registration.png",
+      ".run/ui-review/screenshots/admin/light/390x844/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/390x844/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 881,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 337,
+      "resourceCount": 156,
+      "domContentLoadedMS": 353,
+      "loadMS": 356,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 2354,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 2302,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 2266,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:41:18.073Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/light/390x844/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 自动注册 A 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / 短信 浏览器注册 v3 · 邮箱优先 · 短信兜底 Node 浏览"
+  },
+  {
+    "at": "2026-08-01T06:41:22.253Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/390x844/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/390x844/EmailPool.png",
+      ".run/ui-review/screenshots/admin/light/390x844/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/light/390x844/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 295,
+      "resourceCount": 145,
+      "domContentLoadedMS": 369,
+      "loadMS": 371,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:41:41.503Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "360x800",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/360x800/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/360x800/Registration.png",
+      ".run/ui-review/screenshots/admin/light/360x800/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/360x800/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 881,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 337,
+      "resourceCount": 156,
+      "domContentLoadedMS": 404,
+      "loadMS": 407,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 2354,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 2302,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 2266,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:41:41.511Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "360x800",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/light/360x800/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 自动注册 A 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / 短信 浏览器注册 v3 · 邮箱优先 · 短信兜底 Node 浏览"
+  },
+  {
+    "at": "2026-08-01T06:41:45.606Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "360x800",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/360x800/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/360x800/EmailPool.png",
+      ".run/ui-review/screenshots/admin/light/360x800/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/light/360x800/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 295,
+      "resourceCount": 145,
+      "domContentLoadedMS": 380,
+      "loadMS": 383,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:42:04.772Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1440x900",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/1440x900/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1440x900/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/1440x900/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/1440x900/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 914,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 340,
+      "resourceCount": 156,
+      "domContentLoadedMS": 331,
+      "loadMS": 334,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 1374,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 1318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 1270,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 922,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:42:04.784Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1440x900",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/dark/1440x900/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 收起侧边栏 管理控制台 / 自动注册 A admin@example.test 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / "
+  },
+  {
+    "at": "2026-08-01T06:42:08.761Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1440x900",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/1440x900/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1440x900/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 301,
+      "resourceCount": 145,
+      "domContentLoadedMS": 356,
+      "loadMS": 359,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 823,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:42:27.922Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/1280x720/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1280x720/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/1280x720/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/1280x720/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 914,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 340,
+      "resourceCount": 156,
+      "domContentLoadedMS": 376,
+      "loadMS": 379,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 1374,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 1318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 1270,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 762,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:42:27.933Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/dark/1280x720/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 收起侧边栏 管理控制台 / 自动注册 A admin@example.test 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / "
+  },
+  {
+    "at": "2026-08-01T06:42:31.895Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/1280x720/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1280x720/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 301,
+      "resourceCount": 145,
+      "domContentLoadedMS": 380,
+      "loadMS": 382,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 663,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:42:50.860Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "390x844",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/390x844/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/390x844/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 881,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 329,
+      "resourceCount": 156,
+      "domContentLoadedMS": 341,
+      "loadMS": 343,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 2354,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 2302,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 2266,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:42:50.871Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "390x844",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/dark/390x844/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 自动注册 A 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / 短信 浏览器注册 v3 · 邮箱优先 · 短信兜底 Node 浏览"
+  },
+  {
+    "at": "2026-08-01T06:42:54.778Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "390x844",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/390x844/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/390x844/EmailPool.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 287,
+      "resourceCount": 145,
+      "domContentLoadedMS": 311,
+      "loadMS": 313,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:43:13.819Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "360x800",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/360x800/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/360x800/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 881,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 329,
+      "resourceCount": 156,
+      "domContentLoadedMS": 369,
+      "loadMS": 372,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 2354,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 2302,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 2266,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:43:13.827Z",
+    "event": "page_failure",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "360x800",
+    "page": "Registration",
+    "route": "/registration",
+    "message": "admin/dark/360x800/Registration is missing expected content after render: 暂无注册任务; body=P Pool 控制台 总览 账号 账号池 分组 邮箱池 接入 模型提供商 模型列表 出口/代理 上游错误规则 自动化 自动注册 团队生命周期 观测 用量 配额 模型智商 系统监控 CF 事件 审计日志 访问 API Keys 用户 AI 设置 设置中心 通用 自动化 注册器 日志 内存 思考 合规 自动注册 A 自动注册 发起注册任务、选择国家策略并查看注册进度 注册器凭据 刷新 最短路径 代理池 → 自建邮箱 → Provider → 单号 canary 页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。 1. 住宅代理 2. 自建邮箱 3. Provider 凭据 复制检查与单号命令 启动注册任务 依赖检查失败 接口返回了无法识别的数据，请联系管理员并附上请求 ID。 数量 分组 默认 默认 cyber staging 注册代理池 使用出口页默认 Registration Pool (1) 引擎 默认 · 协议注册 v2 协议注册 v2 · 邮箱 OTP 内置协议注册 · 邮箱 / 短信 浏览器注册 v3 · 邮箱优先 · 短信兜底 Node 浏览"
+  },
+  {
+    "at": "2026-08-01T06:43:17.737Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "360x800",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/360x800/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/360x800/EmailPool.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 287,
+      "resourceCount": 145,
+      "domContentLoadedMS": 348,
+      "loadMS": 350,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:43:20.962Z",
+    "event": "state_capture",
+    "states": [
+      "validation"
+    ],
+    "file": ".run/ui-review/screenshots/states/login-validation.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/?fixture_login_delay=1",
+      "textLength": 79,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 44,
+      "resourceCount": 81,
+      "domContentLoadedMS": 353,
+      "loadMS": 355,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:21.348Z",
+    "event": "state_capture",
+    "states": [
+      "submitting",
+      "loading",
+      "disabled"
+    ],
+    "file": ".run/ui-review/screenshots/states/login-submitting.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/?fixture_login_delay=1",
+      "textLength": 70,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 46,
+      "resourceCount": 81,
+      "domContentLoadedMS": 353,
+      "loadMS": 355,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:22.113Z",
+    "event": "state_capture",
+    "states": [
+      "error"
+    ],
+    "file": ".run/ui-review/screenshots/states/login-error-toast.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/?fixture_login_delay=1",
+      "textLength": 112,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 52,
+      "resourceCount": 82,
+      "domContentLoadedMS": 353,
+      "loadMS": 355,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:26.038Z",
+    "event": "state_capture",
+    "states": [
+      "selected",
+      "bulk-selected"
+    ],
+    "file": ".run/ui-review/screenshots/states/accounts-bulk-selected.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/accounts",
+      "textLength": 763,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 411,
+      "resourceCount": 143,
+      "domContentLoadedMS": 381,
+      "loadMS": 384,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 613,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 565,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:30.722Z",
+    "event": "state_capture",
+    "states": [
+      "hover",
+      "focus"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-button-hover-focus.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1406,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": true,
+      "domNodes": 726,
+      "resourceCount": 144,
+      "domContentLoadedMS": 340,
+      "loadMS": 344,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:30.852Z",
+    "event": "state_capture",
+    "states": [
+      "pressed"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-button-pressed.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1406,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": true,
+      "domNodes": 726,
+      "resourceCount": 144,
+      "domContentLoadedMS": 340,
+      "loadMS": 344,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:31.224Z",
+    "event": "state_capture",
+    "states": [
+      "modal/drawer"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-modal.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1484,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 742,
+      "resourceCount": 144,
+      "domContentLoadedMS": 340,
+      "loadMS": 344,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:32.575Z",
+    "event": "state_capture",
+    "states": [
+      "success toast"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-success-toast.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1420,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 732,
+      "resourceCount": 147,
+      "domContentLoadedMS": 340,
+      "loadMS": 344,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:37.093Z",
+    "event": "state_capture",
+    "states": [
+      "timezone-offset"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-vps-tokyo-offset.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage?fixture_tz=tokyo",
+      "textLength": 1400,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 718,
+      "resourceCount": 144,
+      "domContentLoadedMS": 377,
+      "loadMS": 379,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 638,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:37.695Z",
+    "event": "state_capture",
+    "states": [
+      "loading"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-loading.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_loading=1",
+      "textLength": 0,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 41,
+      "resourceCount": 78,
+      "domContentLoadedMS": 385,
+      "loadMS": 388,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:44.557Z",
+    "event": "state_capture",
+    "states": [
+      "empty"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-empty.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_empty=1",
+      "textLength": 288,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 237,
+      "resourceCount": 147,
+      "domContentLoadedMS": 361,
+      "loadMS": 363,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 461,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 413,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:48.350Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/audit?limit=500"
+  },
+  {
+    "at": "2026-08-01T06:43:48.350Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-08-01T06:43:50.256Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/audit?limit=500"
+  },
+  {
+    "at": "2026-08-01T06:43:50.256Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-08-01T06:43:53.161Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/audit?limit=500"
+  },
+  {
+    "at": "2026-08-01T06:43:53.161Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-08-01T06:43:53.935Z",
+    "event": "state_capture",
+    "states": [
+      "network failure",
+      "error"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-network-error.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_error=1",
+      "textLength": 294,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 244,
+      "resourceCount": 150,
+      "domContentLoadedMS": 360,
+      "loadMS": 363,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 306,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 246,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:43:57.130Z",
+    "event": "expected_http_error",
+    "status": 403,
+    "url": "http://127.0.0.1:5192/admin/usage/dashboard?bucket=3600&series_dimension=provider_model&series_limit=8&dimension=provider_model&fields=summary,by_model,by_provider,by_provider_model"
+  },
+  {
+    "at": "2026-08-01T06:43:57.130Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "message": "Failed to load resource: the server responded with a status of 403 (Forbidden)"
+  },
+  {
+    "at": "2026-08-01T06:43:57.904Z",
+    "event": "state_capture",
+    "states": [
+      "permission_denied"
+    ],
+    "file": ".run/ui-review/screenshots/states/permission-denied-admin-usage.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage?force403=1",
+      "textLength": 209,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 208,
+      "resourceCount": 144,
+      "domContentLoadedMS": 410,
+      "loadMS": 412,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 322,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 274,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:44:02.223Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/export/cache-hits"
+  },
+  {
+    "at": "2026-08-01T06:44:02.223Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-08-01T06:44:02.365Z",
+    "event": "state_capture",
+    "states": [
+      "export failure",
+      "error"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-export-failed.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_export_fail=1",
+      "textLength": 597,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 285,
+      "resourceCount": 148,
+      "domContentLoadedMS": 369,
+      "loadMS": 371,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 450,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 402,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": "",
+    "toast_text": "!Request failed with status code 500×"
+  },
+  {
+    "at": "2026-08-01T06:44:06.358Z",
+    "event": "state_capture",
+    "states": [
+      "submitting",
+      "loading"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-download-loading.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit",
+      "textLength": 557,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 275,
+      "resourceCount": 147,
+      "domContentLoadedMS": 364,
+      "loadMS": 366,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 450,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 402,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-08-01T06:44:06.969Z",
+    "event": "download_capture",
+    "states": [
+      "download",
+      "success toast"
+    ],
+    "downloads": [
+      "codex-pool-cache-hits-fixture.zip"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-download-toast.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit",
+      "textLength": 574,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 285,
+      "resourceCount": 148,
+      "domContentLoadedMS": 364,
+      "loadMS": 366,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 450,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 402,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:44:06.978Z",
+    "event": "coverage",
+    "session_reused": true,
+    "viewports": [
+      "1440x900",
+      "1280x720",
+      "390x844",
+      "360x800"
+    ],
+    "themes": [
+      "light",
+      "dark"
+    ],
+    "admin_pages": [
+      "Registration",
+      "EmailPool"
+    ],
+    "user_pages": [],
+    "states": [
+      "bulk-selected",
+      "disabled",
+      "download",
+      "empty",
+      "error",
+      "export failure",
+      "focus",
+      "hover",
+      "loading",
+      "modal/drawer",
+      "network failure",
+      "permission_denied",
+      "pressed",
+      "selected",
+      "submitting",
+      "success toast",
+      "timezone-offset",
+      "validation"
+    ],
+    "record_only": false
+  },
+  {
+    "at": "2026-08-01T06:44:07.156Z",
+    "event": "fatal",
+    "message": "UI review found 8 page failures; inspect operation-log.json",
+    "stack": "Error: UI review found 8 page failures; inspect operation-log.json\n    at main (file:///workspace/web-spa/scripts/capture-ui-review.mjs:1213:49)"
+  }
+]

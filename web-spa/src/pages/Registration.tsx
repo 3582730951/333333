@@ -4,6 +4,7 @@ import * as PoolUI from '../components/pool/index.jsx';
 import { IconRefresh, IconPlay, IconSetting } from '../components/pool/icons.jsx';
 import LoadErrorBanner from '../components/LoadErrorBanner.jsx';
 import PageHeader from '../components/PageHeader.jsx';
+import CopyCodeBlock from '../components/CopyCodeBlock.jsx';
 import ResourceTable from '../components/ResourceTable.jsx';
 import { MetricRail, TextClamp } from '../components/DisplayPrimitives.jsx';
 import { ReadinessPanel, TaskDetailDrawer, TaskProgress } from '../components/WorkflowPrimitives.jsx';
@@ -34,6 +35,15 @@ const DetailDrawer = TaskDetailDrawer as any;
 const Progress = TaskProgress as any;
 
 const DEFAULT_PREFERRED = ['BR', 'CO', 'PL'];
+
+const REGISTRATION_QUICKSTART = `export POOL_URL='https://POOL_HOST'
+export ADMIN_TOKEN='ADMIN_TOKEN'
+curl -fsS "$POOL_URL/admin/register/readiness" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+
+curl -fsS -X POST "$POOL_URL/admin/register/batch" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \\
+  --data '{"count":1,"method":"protocol_v2","identity_mode":"email","registration_egress_pool_id":"pool_registration_residential"}' | jq`;
 
 const ENGINE_GUIDES = [
   { value: 'protocol_v2', name: '协议注册 v2', badge: '推荐', mode: '邮箱 OTP', detail: 'curl_cffi 浏览器指纹 + Sentinel PoW；当前主要协议注册引擎，资源占用低。' },
@@ -316,6 +326,20 @@ export default function Registration() {
       <ErrorBanner error={optionsQuery.error || optionsQuery.data?.error} onRetry={optionsQuery.reload} title={t('registration.options_failed')} />
       <ErrorBanner error={countriesQuery.error} onRetry={countriesQuery.reload} title={t('registration.countries_failed')} />
       <ErrorBanner error={strategyQuery.error} onRetry={strategyQuery.reload} title={t('registration.strategy_failed')} />
+
+      <Card className="pool-card pool-registration-quickstart" style={{ marginBottom: 18 }}>
+        <div className="pool-registration-quickstart__copy">
+          <Tag color="blue">最短路径</Tag>
+          <h2>代理池 → 自建邮箱 → Provider → 单号 canary</h2>
+          <p>页面会把缺项逐条列出。先完成前三项，再运行一号任务；成功后再提高数量或开启自动补池。</p>
+          <div>
+            <Button size="small" onClick={() => navigate('/egress')}>1. 住宅代理</Button>
+            <Button size="small" onClick={() => navigate('/email-pool/cloudflare')}>2. 自建邮箱</Button>
+            <Button size="small" onClick={() => navigate('/settings-v2?tab=registrar')}>3. Provider 凭据</Button>
+          </div>
+        </div>
+        <CopyCodeBlock code={REGISTRATION_QUICKSTART} label="复制检查与单号命令" />
+      </Card>
 
       <Card className="pool-card pool-registration-start-card" style={{ marginBottom: 18 }} title={t('registration.start_card')}>
         <div className="pool-registration-start-layout">

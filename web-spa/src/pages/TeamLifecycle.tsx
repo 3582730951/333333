@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router';
 import * as PoolUI from '../components/pool/index.jsx';
 import { IconPlus, IconPulse, IconRefresh, IconStop, IconUndo, IconUserGroup } from '../components/pool/icons.jsx';
 import PageHeader from '../components/PageHeader.jsx';
@@ -77,15 +78,30 @@ interface TeamAccount {
   status?: string;
 }
 
+interface LifecycleReadiness {
+  ready: boolean;
+  workspace_create_ready: boolean;
+  cycle_create_ready: boolean;
+  parent_accounts: number;
+  mailbox_profiles: number;
+  mailbox_default_configured: boolean;
+  mailbox_healthy: boolean;
+  registration_ready: boolean;
+  registration_method?: string;
+  workspaces: number;
+  blockers: Array<{ code: string; message: string; href: string }>;
+}
+
 interface LifecycleSnapshot {
   workspaces: TeamWorkspace[];
   workflows: TeamWorkflow[];
   states: Record<string, number>;
   mailboxProfiles: Array<{ provider_key: string; display_name: string; domain: string; enabled: boolean; default_for_team?: boolean }>;
   accounts: TeamAccount[];
+  readiness: LifecycleReadiness | null;
 }
 
-const EMPTY_SNAPSHOT: LifecycleSnapshot = { workspaces: [], workflows: [], states: {}, mailboxProfiles: [], accounts: [] };
+const EMPTY_SNAPSHOT: LifecycleSnapshot = { workspaces: [], workflows: [], states: {}, mailboxProfiles: [], accounts: [], readiness: null };
 
 function newOperationKey(prefix: string): string {
   const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -136,6 +152,7 @@ function quotaCell(workflow: TeamWorkflow) {
 }
 
 export default function TeamLifecycle() {
+  const navigate = useNavigate();
   const [snapshot, setSnapshot] = useState<LifecycleSnapshot>(EMPTY_SNAPSHOT);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<unknown>(null);
@@ -148,6 +165,8 @@ export default function TeamLifecycle() {
   const [events, setEvents] = useState<TeamEvent[]>([]);
   const [eventsLoading, setEventsLoading] = useState(false);
   const [manualChild, setManualChild] = useState(false);
+  const [workspaceAdvanced, setWorkspaceAdvanced] = useState(false);
+  const [cycleAdvanced, setCycleAdvanced] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -167,6 +186,9 @@ export default function TeamLifecycle() {
         accounts: Array.isArray(accountPayload) ? accountPayload
           : (Array.isArray(accountPayload?.accounts) ? accountPayload.accounts
             : (Array.isArray(accountPayload?.rows) ? accountPayload.rows : [])),
+        readiness: statsPayload?.readiness && typeof statsPayload.readiness === 'object'
+          ? statsPayload.readiness as LifecycleReadiness
+          : null,
       });
       setError(null);
       setLastRefresh(new Date());
@@ -196,12 +218,53 @@ export default function TeamLifecycle() {
       label: `${account.label || account.email || account.id} · ${account.email || account.id}${account.plan_type ? ` · ${account.plan_type}` : ''}`,
       value: account.id,
     }));
+  const parentAccountOptions = snapshot.accounts
+    .filter((account) => account.status !== 'disabled' && Boolean(account.upstream_account_id))
+    .map((account) => ({
+      label: `${account.label || account.email || account.id} · ${account.email || account.id}${account.plan_type ? ` · ${account.plan_type}` : ''}`,
+      value: account.id,
+    }));
+
+  const openWorkspace = () => {
+    setWorkspaceAdvanced(false);
+    setWorkspaceOpen(true);
+  };
 
   const openCycle = () => {
     setCycleKey(newOperationKey('team-cycle'));
     setManualChild(false);
+    setCycleAdvanced(false);
     setCycleOpen(true);
   };
+
+  const readiness = snapshot.readiness;
+  const firstBlocker = readiness?.blockers?.[0]?.message || '';
+  const setupChecks = [
+    {
+      key: 'parent', ready: (readiness?.parent_accounts || 0) > 0,
+      title: '1. 母号凭据', detail: readiness ? `${readiness.parent_accounts} 个可用 Team 母号` : '正在检查母号与 workspace ID',
+      action: '管理账号', run: () => navigate('/accounts'),
+    },
+    {
+      key: 'mailbox', ready: Boolean(readiness?.mailbox_default_configured && readiness?.mailbox_healthy),
+      title: '2. 同域邮箱', detail: readiness?.mailbox_default_configured
+        ? (readiness.mailbox_healthy ? '团队默认邮箱检测通过' : '默认邮箱尚未通过连接检测')
+        : '连接 Worker 并设为团队默认',
+      action: '配置邮箱', run: () => navigate('/email-pool/cloudflare'),
+    },
+    {
+      key: 'registration', ready: Boolean(readiness?.registration_ready),
+      title: '3. 自动补号', detail: readiness?.registration_ready
+        ? `${readiness.registration_method || '默认'} 已通过 canary`
+        : '配置注册器、住宅代理并通过 canary',
+      action: '配置注册', run: () => navigate('/registration'),
+    },
+    {
+      key: 'workspace', ready: (readiness?.workspaces ?? snapshot.workspaces.length) > 0,
+      title: '4. Team 空间', detail: `${readiness?.workspaces ?? snapshot.workspaces.length} 个已配置空间`,
+      action: '创建空间', run: openWorkspace,
+    },
+  ];
 
   const saveWorkspace = async (values: Record<string, unknown>) => {
     setSaving(true);
@@ -380,12 +443,29 @@ export default function TeamLifecycle() {
         subtitle={t('team_lifecycle.subtitle')}
         actions={(
           <>
-            <Button icon={<IconUserGroup />} onClick={() => setWorkspaceOpen(true)}>{t('team_lifecycle.new_workspace')}</Button>
-            <Button theme="solid" icon={<IconPlus />} disabled={!snapshot.workspaces.length} onClick={openCycle}>{t('team_lifecycle.new_cycle')}</Button>
+            <Button icon={<IconUserGroup />} disabled={Boolean(readiness && !readiness.workspace_create_ready)} title={firstBlocker} onClick={openWorkspace}>{t('team_lifecycle.new_workspace')}</Button>
+            <Button theme="solid" icon={<IconPlus />} disabled={readiness ? !readiness.cycle_create_ready : !snapshot.workspaces.length} title={firstBlocker} onClick={openCycle}>{t('team_lifecycle.new_cycle')}</Button>
             <Button icon={<IconRefresh />} loading={loading} onClick={() => void load()}>{t('common.refresh')}</Button>
           </>
         )}
       />
+
+      <section className="pool-lifecycle-readiness" aria-label="Team 生命周期配置清单">
+        <div className="pool-lifecycle-readiness__head">
+          <div><span>开始前</span><h2>四项配置，按顺序点完即可</h2></div>
+          <Tag color={readiness?.ready ? 'green' : 'orange'}>{readiness?.ready ? '可以启动循环' : '还需完成配置'}</Tag>
+        </div>
+        <ol className="pool-lifecycle-readiness__grid">
+          {setupChecks.map((check) => (
+            <li key={check.key} className={check.ready ? 'is-ready' : ''}>
+              <span className="pool-lifecycle-readiness__state" aria-label={check.ready ? '已就绪' : '待配置'}>{check.ready ? '✓' : '!'}</span>
+              <div><strong>{check.title}</strong><p>{check.detail}</p></div>
+              <Button size="small" theme="borderless" onClick={check.run}>{check.ready ? '查看' : check.action}</Button>
+            </li>
+          ))}
+        </ol>
+        {firstBlocker ? <p className="pool-lifecycle-readiness__next"><strong>下一步：</strong>{firstBlocker}</p> : null}
+      </section>
 
       <section className="pool-lifecycle-hero" aria-label={t('team_lifecycle.flow_title')}>
         <div className="pool-lifecycle-hero__copy">
@@ -397,14 +477,14 @@ export default function TeamLifecycle() {
           <strong>1%</strong>
           <span>{t('team_lifecycle.rotation_line')}</span>
         </div>
-        <div className="pool-lifecycle-flow">
+        <ol className="pool-lifecycle-flow">
           {flowSteps.map(([index, label]) => (
-            <div className="pool-lifecycle-flow__step" key={index}>
+            <li className="pool-lifecycle-flow__step" key={index}>
               <span>{index}</span>
               <strong>{label}</strong>
-            </div>
+            </li>
           ))}
-        </div>
+        </ol>
       </section>
 
       <SummaryRail
@@ -432,7 +512,7 @@ export default function TeamLifecycle() {
         className="pool-lifecycle-table"
         emptyTitle={t('team_lifecycle.empty')}
         emptyDesc={t('team_lifecycle.empty_desc')}
-        emptyAction={snapshot.workspaces.length ? <Button theme="solid" icon={<IconPlus />} onClick={openCycle}>{t('team_lifecycle.new_cycle')}</Button> : <Button theme="solid" icon={<IconUserGroup />} onClick={() => setWorkspaceOpen(true)}>{t('team_lifecycle.new_workspace')}</Button>}
+        emptyAction={snapshot.workspaces.length ? <Button theme="solid" icon={<IconPlus />} disabled={Boolean(readiness && !readiness.cycle_create_ready)} onClick={openCycle}>{t('team_lifecycle.new_cycle')}</Button> : <Button theme="solid" icon={<IconUserGroup />} disabled={Boolean(readiness && !readiness.workspace_create_ready)} onClick={openWorkspace}>{t('team_lifecycle.new_workspace')}</Button>}
         skeletonRows={7}
         skeletonCols={8}
         mobileRenderer={(workflow: TeamWorkflow) => (
@@ -460,27 +540,32 @@ export default function TeamLifecycle() {
         </div>
         <Form onSubmit={saveWorkspace} initValues={{ max_members: 10, mailbox_provider_key: snapshot.mailboxProfiles.find((profile) => profile.default_for_team)?.provider_key || '', same_domain_required: true }}>
           <Form.Input field="name" label={t('team_lifecycle.workspace_name')} placeholder="例如：Free 子号循环 · A 组" rules={[{ required: true }]} />
-          <Form.Select field="parent_account_id" label="母号（账号池）" filter placeholder="搜索名称、邮箱或账号 ID" rules={[{ required: true }]} optionList={accountOptions} />
+          <Form.Select field="parent_account_id" label="母号（账号池）" filter placeholder="搜索名称、邮箱或账号 ID" rules={[{ required: true }]} optionList={parentAccountOptions} />
           <div className="pool-lifecycle-auto-field">
             <span>连接方式</span><strong>内置 Team API</strong><Tag size="small" color="green">自动</Tag>
             <small>凭据从加密账号池读取，不需要再次粘贴 Token。</small>
           </div>
-          <Form.Input field="workspace_ref" label="Team workspace ID（高级覆盖）" placeholder="通常留空，由母号自动识别" />
-          <Form.InputNumber field="max_members" label={t('team_lifecycle.max_members')} min={1} max={10000} />
-          <Form.Select
-            field="mailbox_provider_key"
-            label={t('team_lifecycle.mailbox_provider')}
-            optionList={[
-              { label: t('team_lifecycle.mailbox_default'), value: '' },
-              ...snapshot.mailboxProfiles.filter((profile) => profile.enabled).map((profile) => ({
-                label: `${profile.display_name} · @${profile.domain}`,
-                value: profile.provider_key,
-              })),
-            ]}
-          />
-          <Form.Input field="required_email_domain" label={t('team_lifecycle.required_domain')} placeholder={t('team_lifecycle.required_domain_auto')} />
-          <Form.Switch field="same_domain_required" label={t('team_lifecycle.same_domain_required')} />
-          <Typography.Text type="tertiary" size="small">{t('team_lifecycle.same_domain_help')}</Typography.Text>
+          <Button theme="borderless" onClick={() => setWorkspaceAdvanced((value) => !value)}>
+            {workspaceAdvanced ? '收起高级设置' : '高级设置（通常不用改）'}
+          </Button>
+          {workspaceAdvanced ? <div className="pool-lifecycle-advanced-fields">
+            <Form.Input field="workspace_ref" label="Team workspace ID（高级覆盖）" placeholder="通常留空，由母号自动识别" />
+            <Form.InputNumber field="max_members" label={t('team_lifecycle.max_members')} min={1} max={10000} />
+            <Form.Select
+              field="mailbox_provider_key"
+              label={t('team_lifecycle.mailbox_provider')}
+              optionList={[
+                { label: t('team_lifecycle.mailbox_default'), value: '' },
+                ...snapshot.mailboxProfiles.filter((profile) => profile.enabled).map((profile) => ({
+                  label: `${profile.display_name} · @${profile.domain}`,
+                  value: profile.provider_key,
+                })),
+              ]}
+            />
+            <Form.Input field="required_email_domain" label={t('team_lifecycle.required_domain')} placeholder={t('team_lifecycle.required_domain_auto')} />
+            <Form.Switch field="same_domain_required" label={t('team_lifecycle.same_domain_required')} />
+            <Typography.Text type="tertiary" size="small">{t('team_lifecycle.same_domain_help')}</Typography.Text>
+          </div> : null}
           <div className="pool-lifecycle-modal-actions">
             <Button onClick={() => setWorkspaceOpen(false)}>{t('common.cancel')}</Button>
             <Button theme="solid" htmlType="submit" loading={saving}>{t('common.save')}</Button>
@@ -507,15 +592,20 @@ export default function TeamLifecycle() {
             optionList={[...accountOptions, { label: '手动填写邮箱或账号 ID…', value: '__manual__' }]}
           />
           {manualChild ? <Form.Input field="child_identity" label="子号邮箱 / 账号 ID" placeholder="child@example.com" rules={[{ required: true }]} /> : null}
-          <Form.Select field="replacement_method" label={t('team_lifecycle.replacement_method')} optionList={[
-            { label: t('team_lifecycle.default_registration'), value: '' },
-            { label: t('team_lifecycle.protocol_registration'), value: 'protocol_v2' },
-            { label: t('team_lifecycle.browser_registration'), value: 'browser_v3' },
-          ]} />
-          <Form.InputNumber field="rotate_threshold_percent" label={t('team_lifecycle.threshold_percent')} min={0.01} max={100} step={0.01} />
-          <Form.InputNumber field="max_attempts" label={t('team_lifecycle.max_attempts')} min={1} max={20} />
-          <Form.Switch field="shadow_mode" label={t('team_lifecycle.shadow_first')} />
-          <Typography.Text type="tertiary" size="small">{t('team_lifecycle.shadow_help')}</Typography.Text>
+          <Button theme="borderless" onClick={() => setCycleAdvanced((value) => !value)}>
+            {cycleAdvanced ? '收起高级策略' : '高级策略（默认：1% 自动轮换，失败重试 5 次）'}
+          </Button>
+          {cycleAdvanced ? <div className="pool-lifecycle-advanced-fields">
+            <Form.Select field="replacement_method" label={t('team_lifecycle.replacement_method')} optionList={[
+              { label: t('team_lifecycle.default_registration'), value: '' },
+              { label: t('team_lifecycle.protocol_registration'), value: 'protocol_v2' },
+              { label: t('team_lifecycle.browser_registration'), value: 'browser_v3' },
+            ]} />
+            <Form.InputNumber field="rotate_threshold_percent" label={t('team_lifecycle.threshold_percent')} min={0.01} max={100} step={0.01} />
+            <Form.InputNumber field="max_attempts" label={t('team_lifecycle.max_attempts')} min={1} max={20} />
+            <Form.Switch field="shadow_mode" label={t('team_lifecycle.shadow_first')} />
+            <Typography.Text type="tertiary" size="small">{t('team_lifecycle.shadow_help')}</Typography.Text>
+          </div> : null}
           <div className="pool-lifecycle-cycle-preview">
             <span>邀请子号</span><i>→</i><span>令牌 / OAuth</span><i>→</i><span>add_phone</span><i>→</i><span>额度 1%</span><i>→</i><span>踢出补号</span>
           </div>

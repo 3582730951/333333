@@ -35,7 +35,8 @@
 # Env overrides (all optional; sensible defaults / auto-discovery otherwise):
 #   DATA_DIR (default /var/lib/codex-pool), DATABASE_PATH, CONFIG_FILE,
 #   SERVICE_NAME (default codex-pool), LISTEN_ADDR (default 0.0.0.0:<port>),
-#   BACKUP_DIR (default <db-dir>/backups), BACKUP_KEEP (default 10),
+#   BACKUP_DIR (default <db-dir>/backups), BACKUP_KEEP (default 3),
+#   BACKUP_MAX_AGE_DAYS (default 30), BACKUP_MAX_BYTES (default 1 GiB),
 #   SKIP_BACKUP=1 (skip the DB backup — only if you back up yourself),
 #   CLEAN_MODCACHE=1 (also wipe the Go module cache),
 #   CLEAN_NPM_CACHE=1 (also wipe the npm download cache for the node registrar).
@@ -163,13 +164,82 @@ count_accounts() {
 # file_size prints a file's size in bytes (0 if absent).
 file_size() { run_root stat -c %s "$1" 2>/dev/null || echo 0; }
 
+backup_pair_equal() {
+  local left="$1" right="$2" left_wal="${1%.gz}-wal.gz" right_wal="${2%.gz}-wal.gz"
+  [[ -f "$left" && -f "$right" ]] || return 1
+  run_root cmp -s "$left" "$right" || return 1
+  if [[ -f "$left_wal" || -f "$right_wal" ]]; then
+    [[ -f "$left_wal" && -f "$right_wal" ]] || return 1
+    run_root cmp -s "$left_wal" "$right_wal" || return 1
+  fi
+}
+
+remove_backup_pair() {
+  local file="$1"
+  run_root rm -f -- "$file" "${file%.gz}-wal.gz"
+}
+
+prune_backups() {
+  local dir="$1" keep="${BACKUP_KEEP:-3}" max_age="${BACKUP_MAX_AGE_DAYS:-30}" max_bytes="${BACKUP_MAX_BYTES:-1073741824}"
+  local now cutoff file total=0 pair_size
+  local -a files=()
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=3
+  (( keep >= 1 )) || keep=1
+  [[ "$max_age" =~ ^[0-9]+$ ]] || max_age=30
+  [[ "$max_bytes" =~ ^[0-9]+$ ]] || max_bytes=1073741824
+
+  mapfile -t files < <(find "$dir" -maxdepth 1 -type f -name 'pool-*.sqlite3.gz' -print 2>/dev/null | sort -r)
+  [[ ${#files[@]} -gt 0 ]] || return 0
+  now="$(date +%s)"
+  cutoff=$(( now - max_age * 86400 ))
+
+  # Age pruning is disabled with zero and always preserves the newest snapshot.
+  if (( max_age > 0 )); then
+    for file in "${files[@]:1}"; do
+      if (( $(run_root stat -c %Y "$file" 2>/dev/null || echo "$now") < cutoff )); then
+        remove_backup_pair "$file"
+        log "Pruned expired DB backup: ${file}"
+      fi
+    done
+  fi
+
+  mapfile -t files < <(find "$dir" -maxdepth 1 -type f -name 'pool-*.sqlite3.gz' -print 2>/dev/null | sort -r)
+  while (( ${#files[@]} > keep )); do
+    file="${files[${#files[@]}-1]}"
+    remove_backup_pair "$file"
+    log "Pruned excess DB backup: ${file}"
+    unset "files[$((${#files[@]} - 1))]"
+  done
+
+  # Apply a total byte ceiling to complete snapshot pairs; keep at least newest.
+  if (( max_bytes > 0 )); then
+    for file in "${files[@]}"; do
+      pair_size=$(file_size "$file")
+      [[ -f "${file%.gz}-wal.gz" ]] && pair_size=$(( pair_size + $(file_size "${file%.gz}-wal.gz") ))
+      total=$(( total + pair_size ))
+    done
+    while (( total > max_bytes && ${#files[@]} > 1 )); do
+      file="${files[${#files[@]}-1]}"
+      pair_size=$(file_size "$file")
+      [[ -f "${file%.gz}-wal.gz" ]] && pair_size=$(( pair_size + $(file_size "${file%.gz}-wal.gz") ))
+      remove_backup_pair "$file"
+      total=$(( total - pair_size ))
+      log "Pruned DB backup to honor BACKUP_MAX_BYTES: ${file}"
+      unset "files[$((${#files[@]} - 1))]"
+    done
+  fi
+
+  # Interrupted online snapshots are never useful after a day.
+  run_root find "$dir" -maxdepth 1 -type f -name '.pool-*.tmp' -mtime +0 -delete 2>/dev/null || true
+}
+
 # backup_db takes a compressed, consistent snapshot of the accounts DB. It scales:
 # the snapshot is gzip-compressed (SQLite compresses heavily, so a big usage/ledger
 # history stays small) and a disk-space preflight aborts BEFORE rebuilding rather
 # than risk filling the disk or deploying without a safety net. 200-300 accounts is
 # tiny for SQLite; this guard matters when the history DB grows large.
 backup_db() {
-  local db="$1" dir ts tmp dest dbsize wal free need
+  local db="$1" dir ts tmp dest dbsize wal free need previous
   if [[ ! -f "$db" ]]; then
     warn "no existing database at ${db} — treating this as a fresh install (nothing to back up)"
     return 0
@@ -190,29 +260,29 @@ backup_db() {
     die "备份空间不足：账号库≈$(human "$dbsize")，需≈$(human "$need")，可用$(human "$free")。请清磁盘、或 BACKUP_DIR=<更大分区路径> sudo ./update.sh、或 SKIP_BACKUP=1（自担风险）后重试。"
   fi
 
-  ts="$(date +%Y%m%d-%H%M%S)"
+  ts="$(date -u +%Y%m%d-%H%M%S)-$(date +%N 2>/dev/null || printf '%09d' "$$")"
   tmp="${dir}/.pool-${ts}.tmp"
   dest="${dir}/pool-${ts}.sqlite3.gz"
   if command -v sqlite3 >/dev/null 2>&1; then
     # Online .backup is consistent even while the service is running (WAL-safe),
     # then we compress and drop the uncompressed temp.
     run_root sqlite3 "$db" ".backup '${tmp}'"
-    run_root sh -c "gzip -c '${tmp}' > '${dest}'"
+    run_root sh -c "gzip -n -c '${tmp}' > '${dest}'"
     run_root rm -f "${tmp}"
   else
-    run_root sh -c "gzip -c '${db}' > '${dest}'"
-    [[ -f "${db}-wal" ]] && run_root sh -c "gzip -c '${db}-wal' > '${dest%.gz}-wal.gz'" || true
+    run_root sh -c "gzip -n -c '${db}' > '${dest}'"
+    [[ -f "${db}-wal" ]] && run_root sh -c "gzip -n -c '${db}-wal' > '${dest%.gz}-wal.gz'" || true
+  fi
+
+  previous="$(find "$dir" -maxdepth 1 -type f -name 'pool-*.sqlite3.gz' ! -path "$dest" -print 2>/dev/null | sort -r | head -1)"
+  if [[ -n "$previous" ]] && backup_pair_equal "$dest" "$previous"; then
+    remove_backup_pair "$previous"
+    log "数据库内容未变化：以本次快照替换上一份相同备份，磁盘副本数不增加"
   fi
   BACKUP="$dest"
   log "Backed up accounts DB -> ${dest} (压缩后 $(human "$(file_size "$dest")")，源库 $(human "$dbsize"))"
 
-  # Retain the most recent BACKUP_KEEP (default 10). Sort by the timestamped
-  # filename (deterministic) rather than mtime.
-  local keep="${BACKUP_KEEP:-10}"
-  [[ "$keep" =~ ^[0-9]+$ ]] || keep=10
-  ls -1 "${dir}"/pool-*.sqlite3.gz 2>/dev/null | sort -r | tail -n +$(( keep + 1 )) | while read -r f; do
-    run_root rm -f "$f" "${f%.gz}-wal.gz" 2>/dev/null || true
-  done
+  prune_backups "$dir"
 }
 
 clean_build() {
@@ -261,6 +331,9 @@ STALE_SOURCES=(
 # only ever removes those exact, known paths — never anything discovered at runtime.
 remove_stale_sources() {
   local f removed=0
+  if [[ -x "${PROJECT_ROOT}/scripts/prune-managed-source.sh" ]]; then
+    "${PROJECT_ROOT}/scripts/prune-managed-source.sh"
+  fi
   for f in "${STALE_SOURCES[@]}"; do
     [[ -n "$f" ]] || continue
     if [[ -e "${PROJECT_ROOT}/${f}" ]]; then
@@ -393,4 +466,6 @@ main() {
   print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

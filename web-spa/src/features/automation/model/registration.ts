@@ -141,7 +141,10 @@ export interface RegistrationBlocker {
 }
 
 export function normalizeRegisterMethod(method: unknown, fallback = 'protocol_v2'): string {
-  return String(method || fallback || 'protocol_v2').trim().toLowerCase();
+  const normalized = String(method || fallback || 'protocol_v2').trim().toLowerCase().replaceAll('-', '_');
+  if (['email', 'email_otp', 'email_register', 'protocol2', 'protocol_v_2'].includes(normalized)) return 'protocol_v2';
+  if (['turbo', 'turbo_gpt', 'turbo_gpt_register', 'playwright', 'browser3', 'browser_v_3'].includes(normalized)) return 'browser_v3';
+  return normalized;
 }
 
 export function lockedIdentityForMethod(method: unknown): RegistrationIdentityMode | '' {

@@ -536,10 +536,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/admin/team-lifecycle/workflows", s.handleTeamLifecycleWorkflows)
 	s.mux.HandleFunc("/admin/team-lifecycle/workflows/", s.handleTeamLifecycleWorkflowAction)
 	s.mux.HandleFunc("/admin/team-lifecycle/stats", s.handleTeamLifecycleStats)
-	// One-release compatibility tombstones for the two superseded registration
-	// orchestrators. All new work goes through /admin/register/batch.
-	s.mux.HandleFunc("/admin/register/email/", s.handleRemovedRegistration)
-	s.mux.HandleFunc("/admin/turbo-gpt-register/", s.handleRemovedRegistration)
+	// Compatibility facade: old email-registration clients are translated onto
+	// the unified readiness/canary/persistence pipeline.
+	s.mux.HandleFunc("/admin/register/email/", s.handleEmailRegistrationCompatibility)
+	s.mux.HandleFunc("/admin/turbo-gpt-register/", s.handleTurboRegistrationCompatibility)
 	// Email account pool management (Outlook/Hotmail accounts for registration).
 	s.mux.HandleFunc("/admin/email-pool/import", s.adminEmailPoolImport)
 	s.mux.HandleFunc("/admin/email-pool/cloudflare/test", s.handleCloudflareMailboxTest)

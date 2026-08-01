@@ -1,0 +1,70 @@
+{
+  "capture_command": "UI_REVIEW_RECORD_ONLY=1 npm --prefix web-spa run capture:ui-review",
+  "capture_exit": 1,
+  "fatal_stage": "audit export failure state text wait",
+  "canonical_page_captures": 240,
+  "canonical_page_failures": 240,
+  "unique_pages": 30,
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "viewports": [
+    "1280x720",
+    "1440x900",
+    "360x800",
+    "390x844"
+  ],
+  "png_files": 489,
+  "state_captures": 13,
+  "page_overflow_pages": 0,
+  "table_text_overflow_pages": 20,
+  "table_text_overflow_items": 24,
+  "sibling_overlap_pages": 0,
+  "clipped_control_pages": 240,
+  "clipped_control_items": 322,
+  "blank_chart_pages": 0,
+  "missing_content_pages": 16,
+  "console_errors": 9,
+  "page_errors": 0,
+  "performance": {
+    "dom_nodes": {
+      "min": 95,
+      "median": 268.0,
+      "p95": 688,
+      "max": 727
+    },
+    "resources": {
+      "min": 106,
+      "median": 144.0,
+      "p95": 150,
+      "max": 151
+    },
+    "dom_content_loaded_ms": {
+      "min": 285,
+      "median": 328.0,
+      "p95": 361,
+      "max": 406
+    },
+    "load_ms": {
+      "min": 287,
+      "median": 330.0,
+      "p95": 363,
+      "max": 409
+    }
+  },
+  "build": {
+    "command": "npm --prefix web-spa run build",
+    "exit": 0,
+    "assets": 58,
+    "asset_bytes": 1691330,
+    "css_bytes": 132036
+  },
+  "source_css": {
+    "lines": 7978,
+    "bytes": 160362,
+    "gradients": 22,
+    "box_shadow_declarations": 56,
+    "backdrop_filter_declarations": 12
+  }
+}

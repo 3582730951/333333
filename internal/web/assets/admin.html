@@ -106,7 +106,7 @@
         <div class="note" style="margin-top:8px">按量计费凭据，与下游 cap_* Key 完全分离。系统先免费读取模型列表；认证成功后执行一次固定提示的最小推理。</div>
         <label class="f"><input type="checkbox" id="claude_confirm_cost"> 我确认最小推理探针可能产生少量上游费用。</label></div>
       <div data-m="customkey" class="hide"><label class="f">供应商 / Provider</label><select class="t" id="ck_provider"></select><label class="f">API Key</label><textarea class="t mono" id="ck_apikey" placeholder="sk-..."></textarea>
-        <p class="muted">为 DeepSeek / 硅基流动 等 OpenAI 兼容上游导入账号（Bearer 鉴权）。在「供应商」页管理 base_url 与模型。</p></div>
+        <p class="muted">为自定义 OpenAI 兼容上游导入账号（Bearer 鉴权）。在「供应商」页管理路径、base_url 与模型。</p></div>
       <div class="row" style="margin-top:6px"><div style="flex:1"><label class="f">标签 / Label</label><input class="t" id="imp_label" placeholder="main"></div><div style="flex:1"><label class="f">分组 / Group</label><input class="t" id="imp_group" placeholder="cyber"></div></div>
       <div style="height:14px"></div><button class="btn pri" id="impSubmitBtn" onclick="doImport()">导入 / Import</button>
       <div id="providerKeyResult" class="note hide" style="margin-top:10px"></div>

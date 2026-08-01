@@ -12,11 +12,12 @@ import { filenameFromDisposition } from '../src/features/observability/api/expor
 import { keysResponseSchema } from '../src/features/access/api/keys';
 import { usersResponseSchema } from '../src/features/access/api/users';
 import { accountsResponseSchema } from '../src/features/accounts/api/accounts';
-import { emailPoolResponseSchema } from '../src/features/accounts/api/emailPool';
+import { cloudflareMailboxConfigSchema, emailPoolResponseSchema } from '../src/features/accounts/api/emailPool';
 import { cfEventsResponseSchema, quotaResponseSchema } from '../src/features/observability/api/events';
 import {
-  adaptRegistrationStrategy, registrationCountriesSchema, registrationJobsResponseSchema,
-  registrationProviderOptionsSchema, registrationReadinessSchema, smsMarketSchema,
+  adaptRegistrationStrategy, registrationConfigResponseSchema, registrationCountriesSchema,
+  registrationJobsResponseSchema, registrationProviderOptionsSchema, registrationReadinessSchema,
+  smsMarketSchema,
 } from '../src/features/automation/api/registration';
 import {
   lockedIdentityForMethod, manualStartBlockers, methodUsesSMSCountry,
@@ -97,7 +98,7 @@ describe('API contracts', () => {
       .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
   });
 
-  it('normalizes email pool pagination and rejects non-object responses', () => {
+  it('normalizes current and legacy email pool response shapes', () => {
     expect(parseApiResponse(emailPoolResponseSchema, {
       accounts: [{
         id: 'email-1', email: 'operator@example.test', status: 'idle', created_at: '1700000000', updated_at: 1_700_000_001,
@@ -109,14 +110,83 @@ describe('API contracts', () => {
       }],
       total: 4, page: 2, pageSize: 1, counts: { idle: 3, error: 1 },
     });
-    expect(() => parseApiResponse(emailPoolResponseSchema, []))
+    expect(parseApiResponse(emailPoolResponseSchema, [{
+      id: 'legacy-1', address: 'legacy@example.test', state: 'idle', groupName: null,
+    }])).toEqual({
+      accounts: [{
+        id: 'legacy-1', email: 'legacy@example.test', status: 'idle', created_at: 0, updated_at: 0,
+      }],
+      total: 1, page: 1, pageSize: 1, counts: {},
+    });
+    expect(parseApiResponse(emailPoolResponseSchema, {
+      request_id: 'req-envelope',
+      data: {
+        rows: [{
+          id: 'legacy-2', email: 'wrapped@example.test', status: 'error',
+          createdAt: '1700000002', updatedAt: null, errorMessage: null,
+        }],
+        count: '8', page: '2', page_size: '5', status_counts: { error: '2' },
+      },
+    })).toEqual({
+      accounts: [{
+        id: 'legacy-2', email: 'wrapped@example.test', status: 'error',
+        created_at: 1_700_000_002, updated_at: 0,
+      }],
+      total: 8, page: 2, pageSize: 5, counts: { error: 2 },
+    });
+    expect(parseApiResponse(emailPoolResponseSchema, {
+      result: {
+        email_accounts: [{ accountId: 'legacy-3', address: 'list@example.test', state: 'ready' }],
+        pagination: { count: '1', current_page: '3', per_page: '10' },
+        statusCounts: { ready: '1' },
+      },
+    })).toEqual({
+      accounts: [{
+        id: 'legacy-3', email: 'list@example.test', status: 'ready', created_at: 0, updated_at: 0,
+      }],
+      total: 1, page: 3, pageSize: 10, counts: { ready: 1 },
+    });
+  });
+
+  it('rejects malformed email pool and error payloads', () => {
+    expect(() => parseApiResponse(emailPoolResponseSchema, { error: 'database unavailable' }))
       .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
+    expect(() => parseApiResponse(emailPoolResponseSchema, '<html>gateway error</html>'))
+      .toThrowError(expect.objectContaining({ code: 'INVALID_RESPONSE' }));
+  });
+
+  it('preserves repository-owned mailbox deployment commands', () => {
+    expect(parseApiResponse(cloudflareMailboxConfigSchema, {
+      profiles: [],
+      deployment: {
+        recommended_adapter: 'cloudflare_temp_email',
+        repository_path: 'deploy/cloudflare-mailbox',
+        quickstart: ['cd deploy/cloudflare-mailbox', 'npx wrangler login', 'MAIL_DOMAIN=mail.example ./deploy.sh'],
+        references: ['https://developers.cloudflare.com/email-service/'],
+      },
+    })).toMatchObject({
+      deployment: {
+        repository_path: 'deploy/cloudflare-mailbox',
+        quickstart: ['cd deploy/cloudflare-mailbox', 'npx wrangler login', 'MAIL_DOMAIN=mail.example ./deploy.sh'],
+      },
+    });
   });
 
   it('normalizes registration provider options', () => {
     expect(parseApiResponse(registrationProviderOptionsSchema, {
       sms: ['sms-a'], mailbox: [{ label: 'Mailbox A', value: 'mail-a', future: true }],
     })).toEqual({ sms: ['sms-a'], mailbox: [{ label: 'Mailbox A', value: 'mail-a', future: true }], captcha: [] });
+    expect(parseApiResponse(registrationProviderOptionsSchema, {
+      providers: [
+        { type: 'sms', key: 'sms-old', display_name: 'SMS Old', enabled: true },
+        { provider_type: 'mail', provider_key: 'email_pool', name: '邮箱池', enabled: 1 },
+        { type: 'captcha', key: 'captcha-off', enabled: false },
+      ],
+    })).toEqual({
+      sms: [{ label: 'SMS Old', value: 'sms-old' }],
+      mailbox: [{ label: '邮箱池', value: 'email_pool' }],
+      captcha: [],
+    });
   });
 
   it('adapts registration responses and method-specific blockers', () => {
@@ -134,6 +204,24 @@ describe('API contracts', () => {
     expect(methodUsesSMSCountry('browser_v3', 'email')).toBe(true);
     expect(parseApiResponse(registrationCountriesSchema, [{ isoCode: 'US', name: 'United States' }]))
       .toEqual([{ isoCode: 'US', name: 'United States', nameZh: '' }]);
+    expect(parseApiResponse(registrationJobsResponseSchema, {
+      data: { tasks: [{ jobId: 'legacy-job', state: 'queued', success_count: '1', fail_count: 0 }] },
+    })).toEqual([{ id: 'legacy-job', status: 'queued', succeeded: 1, failed: 0 }]);
+    expect(parseApiResponse(registrationJobsResponseSchema, {})).toEqual([]);
+    expect(parseApiResponse(registrationJobsResponseSchema, { success: true, request_id: 'req-empty' })).toEqual([]);
+    expect(parseApiResponse(registrationReadinessSchema, {
+      is_ready: 'true', provider_counts: { mail: '2', sms: 1 }, reasons: [], registrationEnabled: 1,
+    })).toMatchObject({ ready: true, registration_enabled: true, providers: { mailbox: 2, sms: 1 } });
+    expect(parseApiResponse(registrationCountriesSchema, {
+      countries: [{ iso_code: 'BR', country_name: 'Brazil', name_zh: '巴西' }],
+    })).toEqual([{ isoCode: 'BR', name: 'Brazil', nameZh: '巴西' }]);
+    expect(parseApiResponse(registrationConfigResponseSchema, {
+      sms_platform_strategy: 'manual', sms_manual_country: 'BR', default_register_method: 'email',
+    })).toEqual([
+      { key: 'sms_platform_strategy', value: 'manual' },
+      { key: 'sms_manual_country', value: 'BR' },
+      { key: 'default_register_method', value: 'email' },
+    ]);
     expect(adaptRegistrationStrategy([
       { key: 'sms_platform_strategy', value: 'manual' },
       { key: 'sms_manual_country', value: 'US' },

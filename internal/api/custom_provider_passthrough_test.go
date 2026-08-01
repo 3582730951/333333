@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -182,7 +183,16 @@ func TestCustomProviderSharedFilesPreservesMultipartQueryAuthBodyAndResponse(t *
 		t.Fatalf("resolved provider = %q", got)
 	}
 
-	affinity, _, _ := customProviderResourceAffinity(providerID, "/v1/files/file_custom_1")
+	storedProvider, found, err := h.store.GetCustomProvider(t.Context(), providerID)
+	if err != nil || !found {
+		t.Fatalf("load provider for resource affinity: found=%v err=%v", found, err)
+	}
+	storedProvider, _ = storage.ResolveCustomProviderRoute(storedProvider, "/v1/files/file_custom_1")
+	affinityRequest := httptest.NewRequest(http.MethodGet, "/v1/files/file_custom_1", nil)
+	affinityRequest = affinityRequest.WithContext(withDownstreamKey(
+		affinityRequest.Context(), downstreamPolicy{KeyHash: hashAPIKey(poolKey)},
+	))
+	affinity, _, _ := customProviderResourceAffinity(affinityRequest, storedProvider, "/v1/files/file_custom_1")
 	binding, err := h.store.GetAffinityBinding(context.Background(), affinity.Hash)
 	if err != nil {
 		t.Fatalf("created resource binding: %v", err)

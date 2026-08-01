@@ -75,6 +75,14 @@ FROM provider_settings WHERE enabled=1 ORDER BY priority DESC`)
 	if err := rows.Err(); err != nil {
 		return m, err
 	}
+	if err := rows.Close(); err != nil {
+		return m, err
+	}
+	if _, count, err := mailbox.EmailPoolFingerprint(ctx, store); err != nil {
+		return m, err
+	} else if count > 0 {
+		m.Mailbox = append(m.Mailbox, mailbox.NewEmailPoolProvider(store, httpClient))
+	}
 	return m, nil
 }
 

@@ -387,8 +387,20 @@ func configFields() []configField {
 			Help:    "触发注册未指定引擎时使用。引擎只有在制品、provider、注册出口就绪且当前配置的单账号 canary 成功后才可批量运行。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.DefaultRegisterMethod, "protocol_v2") }},
 		{Key: "registration_egress_pool_id", Label: "默认注册池", Category: catReg, Type: fieldString, Effect: effectHot,
 			Help: "注册任务发起阶段使用的默认注册代理池。注册成功的账号仍默认直连，账号详情页单独修改运行出口。", boot: func(c config.Config) interface{} { return c.RegistrationEgressPoolID }},
+		{Key: "registration_enabled", Label: "启用自动注册", Category: catReg, Type: fieldBool, Effect: effectHot,
+			Help: "统一控制手动批量、旧版邮箱入口和自动补号。仍需通过出口、Provider 与单账号 canary 就绪检查。", boot: func(c config.Config) interface{} { return c.RegistrationEnabled }},
 		{Key: "registration_concurrency", Label: "注册并发上限", Category: catReg, Type: fieldInt, Effect: effectHot,
 			Help: "单批最多并行的注册数(每个浏览器独立隔离)。仅在轮换出口上提高，固定 IP 出口保持 1。", boot: func(c config.Config) interface{} { return c.RegistrationConcurrency }},
+		{Key: "registration_timeout", Label: "单次注册超时（秒）", Category: catReg, Type: fieldInt, Effect: effectHot,
+			Help: "每个注册尝试的总超时，覆盖邮箱轮询、浏览器或协议执行；默认 300 秒。", boot: func(c config.Config) interface{} { return c.RegistrationTimeout }},
+		{Key: "registration_default_group", Label: "默认注册分组", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "请求未指定分组时使用；兼容旧 email_registration_group。", boot: func(c config.Config) interface{} { return c.RegistrationDefaultGroup }},
+		{Key: "default_sms_provider", Label: "默认接码 Provider", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "请求与自动补号未指定接码商时使用。", boot: func(c config.Config) interface{} { return c.DefaultSMSProvider }},
+		{Key: "default_mailbox_provider", Label: "默认邮箱 Provider", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "请求与自动补号未指定邮箱来源时使用；旧 Outlook 邮箱池使用 email_pool。", boot: func(c config.Config) interface{} { return c.DefaultMailboxProvider }},
+		{Key: "default_captcha_provider", Label: "默认验证码 Provider", Category: catReg, Type: fieldString, Effect: effectHot,
+			Help: "请求与自动补号未指定验证码服务时使用。", boot: func(c config.Config) interface{} { return c.DefaultCaptchaProvider }},
 		{Key: "codex_install_model", Label: "Codex 安装默认模型", Category: catReg, Type: fieldString, Effect: effectHot,
 			Help: "一键脚本写入 config.toml 的 model（默认 gpt-5.6-sol）。", boot: func(c config.Config) interface{} { return firstNonEmpty(c.CodexInstallModel, "gpt-5.6-sol") }},
 		{Key: "codex_install_effort", Label: "Codex 安装推理强度", Category: catReg, Type: fieldSelect, Effect: effectHot,
@@ -654,6 +666,19 @@ func (s *Server) applySettingsPatch(ctx context.Context, body map[string]interfa
 // the settings table, rejecting type/option mismatches.
 func validateSettingValue(f configField, v interface{}) (string, error) {
 	switch f.Key {
+	case "registration_concurrency", "registration_timeout":
+		raw, err := validateIntegerSetting(v)
+		if err != nil {
+			return "", err
+		}
+		n, _ := strconv.Atoi(raw)
+		if n < 1 {
+			return "", fmt.Errorf("must be greater than 0")
+		}
+		if f.Key == "registration_timeout" && n > 86400 {
+			return "", fmt.Errorf("must be at most 86400")
+		}
+		return raw, nil
 	case "kiro_default_thinking":
 		enabled := false
 		switch value := v.(type) {
@@ -879,6 +904,9 @@ func validateSettingValue(f configField, v interface{}) (string, error) {
 	case fieldSelect:
 		str, _ := v.(string)
 		str = strings.TrimSpace(str)
+		if f.Key == "default_register_method" {
+			str = normalizeRegistrationMethodAlias(str)
+		}
 		for _, o := range f.Options {
 			if o == str {
 				return str, nil

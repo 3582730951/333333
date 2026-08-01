@@ -1,0 +1,56 @@
+{
+  "command": "UI_REVIEW_PAGES=Registration,EmailPool UI_REVIEW_SKIP_STATES=1 npm run capture:ui-review",
+  "exit_status": 0,
+  "events": {
+    "coverage": 1,
+    "login": 1,
+    "login_cookies": 1,
+    "screenshot": 16,
+    "server_start": 1,
+    "session_reuse_check": 1
+  },
+  "page_combinations": 16,
+  "pages": [
+    "EmailPool",
+    "Registration"
+  ],
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "viewports": [
+    "1280x720",
+    "1440x900",
+    "360x800",
+    "390x844"
+  ],
+  "page_failures": 0,
+  "fatal_errors": 0,
+  "visual_issues": 0,
+  "png_count": 40,
+  "overlap_totals": {
+    "text_overflows": 0,
+    "sibling_overlaps": 0,
+    "chart_text_overlaps": 0,
+    "clipped_controls": 0,
+    "page_overflows": 0
+  },
+  "performance": {
+    "dom_nodes": {
+      "median": 329.0,
+      "max": 369
+    },
+    "resource_count": {
+      "median": 147.0,
+      "max": 149
+    },
+    "dom_content_loaded_ms": {
+      "median": 345.5,
+      "max": 393
+    },
+    "load_ms": {
+      "median": 348.5,
+      "max": 396
+    }
+  }
+}

@@ -236,7 +236,9 @@ func (m *Manager) GetMailboxWithConstraints(
 		name := strings.ToLower(strings.TrimSpace(p.Name()))
 		matches := providerName == "" || providerName == "auto" || name == providerName ||
 			(providerName == "tempmail" && name == "tempmail_lol") ||
-			(providerName == "tempmaillol" && name == "tempmail_lol")
+			(providerName == "tempmaillol" && name == "tempmail_lol") ||
+			(providerName == "emailpool" && name == "email_pool") ||
+			(providerName == "outlook_pool" && name == "email_pool")
 		if !matches {
 			continue
 		}

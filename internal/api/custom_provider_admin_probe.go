@@ -17,6 +17,8 @@ import (
 type customProviderModelTestResult struct {
 	OK             bool   `json:"ok"`
 	ProviderID     string `json:"provider_id"`
+	RouteID        string `json:"route_id"`
+	DownstreamPath string `json:"downstream_path"`
 	RequestedModel string `json:"requested_model"`
 	TargetModel    string `json:"target_model"`
 	UpstreamPath   string `json:"upstream_path"`
@@ -37,7 +39,8 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		return
 	}
 	var request struct {
-		Model string `json:"model"`
+		Model          string `json:"model"`
+		DownstreamPath string `json:"downstream_path"`
 	}
 	if err := decodeJSONRequestBody(r.Body, &request, adminJSONBodyLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -57,9 +60,26 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		http.NotFound(w, r)
 		return
 	}
+	request.DownstreamPath = strings.TrimSpace(request.DownstreamPath)
+	if request.DownstreamPath == "" {
+		switch provider.UpstreamProtocol {
+		case storage.CustomProviderProtocolResponses:
+			request.DownstreamPath = storage.CustomProviderDownstreamResponses
+		case storage.CustomProviderProtocolAnthropicMessages:
+			request.DownstreamPath = storage.CustomProviderDownstreamMessages
+		default:
+			request.DownstreamPath = storage.CustomProviderDownstreamChat
+		}
+	}
+	if _, ok := storage.NormalizeCustomProviderDownstreamPath(request.DownstreamPath); !ok {
+		writeError(w, http.StatusBadRequest, errors.New("downstream_path is invalid"))
+		return
+	}
+	provider, _ = storage.ResolveCustomProviderRoute(provider, request.DownstreamPath)
 	targetModel, _ := customProviderMappedModel(provider, request.Model)
 	result := customProviderModelTestResult{
 		ProviderID: provider.ID, RequestedModel: request.Model, TargetModel: targetModel,
+		RouteID: provider.ResolvedRouteID, DownstreamPath: provider.ResolvedDownstreamPath,
 	}
 
 	lease, token, err := s.customProviderTestLease(r, provider, targetModel)
@@ -98,7 +118,7 @@ func (s *Server) adminCustomProviderModelTest(w http.ResponseWriter, r *http.Req
 		Method: http.MethodPost, Provider: provider.ID, BaseURL: provider.BaseURL,
 		TransportProfile: provider.TransportProfile, DownstreamPath: result.UpstreamPath,
 		Headers: headers, Account: account, Token: token, Egress: lease.Egress,
-		CookieJarKey: customProviderCookieJarKey(lease, provider), MinimalProbe: true,
+		CookieJarKey: customProviderCookieJarKey(r, lease, provider), MinimalProbe: true,
 	}
 	probe.SetBodyBytes(body)
 	started := time.Now()
@@ -195,7 +215,7 @@ func (s *Server) auditCustomProviderModelTest(r *http.Request, account storage.A
 	_ = s.store.InsertAuditLog(r.Context(), storage.AuditLogRow{
 		AccountID: account.ID, AccountLabel: account.Label,
 		Action: "custom_provider_model_test", State: state, Reason: result.ErrorCode,
-		Detail: fmt.Sprintf("provider=%s requested_model=%s target_model=%s path=%s http=%d latency_ms=%d",
-			result.ProviderID, result.RequestedModel, result.TargetModel, result.UpstreamPath, result.HTTPStatus, result.LatencyMS),
+		Detail: fmt.Sprintf("provider=%s route=%s downstream_path=%s requested_model=%s target_model=%s path=%s http=%d latency_ms=%d",
+			result.ProviderID, result.RouteID, result.DownstreamPath, result.RequestedModel, result.TargetModel, result.UpstreamPath, result.HTTPStatus, result.LatencyMS),
 	})
 }

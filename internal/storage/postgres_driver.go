@@ -499,15 +499,6 @@ VALUES(?,'direct','direct','','',1,'healthy',0,0,'',0,0,?,?) ON CONFLICT(id) DO 
 	if _, err = tx.ExecContext(ctx, `UPDATE egress_profiles SET max_concurrency=0,updated_at=? WHERE id=? AND type='direct' AND max_concurrency=128`, now, DefaultDirectEgressID); err != nil {
 		return err
 	}
-	for _, provider := range []struct{ id, name, baseURL, models string }{
-		{"deepseek", "DeepSeek", "https://api.deepseek.com/v1", `["deepseek-chat","deepseek-reasoner"]`},
-		{"siliconflow", "SiliconFlow 硅基流动", "https://api.siliconflow.cn/v1", `[]`},
-	} {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO custom_providers(id,name,base_url,upstream_protocol,enabled,auto_discover_models,models_json,created_at,updated_at)
-VALUES(?,?,?,'chat_completions',1,1,?,?,?) ON CONFLICT(id) DO NOTHING`, provider.id, provider.name, provider.baseURL, provider.models, now, now); err != nil {
-			return err
-		}
-	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
@@ -515,6 +506,9 @@ VALUES(?,?,?,'chat_completions',1,1,?,?,?) ON CONFLICT(id) DO NOTHING`, provider
 		return fmt.Errorf("apply PostgreSQL additive migrations: %w", err)
 	}
 	if err = s.applyCheckedPostgresMigrations(ctx); err != nil {
+		return err
+	}
+	if err = removeUnusedLegacySeedProviders(ctx, s.db); err != nil {
 		return err
 	}
 	_, err = s.RepairMissingAccountEgressBindings(ctx)

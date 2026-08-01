@@ -81,6 +81,11 @@ WHERE provider_type='mailbox' AND provider_key='cf_team'`).Scan(&authJSON); err 
 	if strings.Contains(string(raw), adminSecret) || !strings.Contains(string(raw), `"last_status":"healthy"`) {
 		t.Fatalf("profile list leaked a secret or omitted health: %s", raw)
 	}
+	if !strings.Contains(string(raw), `"repository_path":"deploy/cloudflare-mailbox"`) ||
+		!strings.Contains(string(raw), `"npx wrangler login"`) ||
+		strings.Contains(string(raw), "github.com/dreamhunter") {
+		t.Fatalf("profile list omitted repository-owned deployment instructions: %s", raw)
+	}
 }
 
 func TestCloudflareMailboxUnsettingAndDeleteClearDefaults(t *testing.T) {

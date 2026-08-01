@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"codex-account-pool/internal/storage"
 )
 
 // ── Email Pool Management ──────────────────────────────────────────
@@ -31,10 +30,16 @@ func (s *Server) adminEmailPool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) adminEmailPoolList(w http.ResponseWriter, r *http.Request) {
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
-	search := strings.TrimSpace(r.URL.Query().Get("search"))
-	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	page, _ := strconv.Atoi(firstNonEmpty(r.URL.Query().Get("page"), r.URL.Query().Get("current_page")))
+	pageSize, _ := strconv.Atoi(firstNonEmpty(
+		r.URL.Query().Get("pageSize"), r.URL.Query().Get("page_size"),
+		r.URL.Query().Get("per_page"), r.URL.Query().Get("limit"),
+	))
+	search := strings.TrimSpace(firstNonEmpty(
+		r.URL.Query().Get("search"), r.URL.Query().Get("q"),
+		r.URL.Query().Get("query"), r.URL.Query().Get("email"),
+	))
+	status := normalizeEmailPoolStatus(firstNonEmpty(r.URL.Query().Get("status"), r.URL.Query().Get("state")))
 
 	if page < 1 {
 		page = 1
@@ -56,6 +61,7 @@ func (s *Server) adminEmailPoolList(w http.ResponseWriter, r *http.Request) {
 	for i := range accounts {
 		accounts[i].Password = ""
 		accounts[i].RefreshToken = ""
+		accounts[i].Status = normalizeEmailPoolStatus(accounts[i].Status)
 	}
 
 	counts, err := s.store.CountEmailAccountsByStatus(r.Context())
@@ -63,41 +69,44 @@ func (s *Server) adminEmailPoolList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	counts = normalizeEmailPoolCounts(counts)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"accounts": accounts,
-		"total":    total,
-		"page":     page,
-		"pageSize": pageSize,
-		"counts":   counts,
+		"accounts":      accounts,
+		"total":         total,
+		"page":          page,
+		"pageSize":      pageSize,
+		"page_size":     pageSize,
+		"counts":        counts,
+		"status_counts": counts,
 	})
 }
 
 func (s *Server) adminEmailPoolDelete(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		IDs []string `json:"ids"`
-	}
-	if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
+	ids, err := decodeEmailPoolDeleteIDs(r.Body)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if len(req.IDs) == 0 {
+	if len(ids) == 0 {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("ids is required"))
 		return
 	}
 	var errs []string
-	for _, id := range req.IDs {
+	for _, id := range ids {
 		if err := s.store.DeleteEmailAccount(r.Context(), id); err != nil {
 			errs = append(errs, fmt.Sprintf("%s: %v", id, err))
 		}
 	}
 	if len(errs) > 0 {
+		s.reloadRegistrationProvidersAfterEmailPoolChange(r.Context())
 		writeJSON(w, http.StatusPartialContent, map[string]interface{}{
-			"deleted": len(req.IDs) - len(errs),
+			"deleted": len(ids) - len(errs),
 			"errors":  errs,
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": len(req.IDs)})
+	s.reloadRegistrationProvidersAfterEmailPoolChange(r.Context())
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": len(ids)})
 }
 
 // adminEmailPoolImport handles POST /admin/email-pool/import
@@ -111,71 +120,31 @@ func (s *Server) adminEmailPoolImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Support both JSON body {text: "..."} and raw text/plain body.
-	var raw, groupName string
-	ct := r.Header.Get("Content-Type")
-	if strings.Contains(ct, "application/json") {
-		var req struct {
-			Text      string `json:"text"`
-			GroupName string `json:"group_name"`
-		}
-		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		raw = req.Text
-		groupName = strings.TrimSpace(req.GroupName)
-	} else {
-		body, err := io.ReadAll(io.LimitReader(r.Body, adminJSONBodyLimit+1))
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		if int64(len(body)) > adminJSONBodyLimit {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("email pool import exceeds request limit"))
-			return
-		}
-		raw = string(body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, adminJSONBodyLimit+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if int64(len(body)) > adminJSONBodyLimit {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("email pool import exceeds request limit"))
+		return
+	}
+	accounts, groupName, parseErrors, err := decodeEmailPoolImport(
+		body, strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "json"),
+	)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 	if len(groupName) > 128 {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("group_name exceeds 128 bytes"))
 		return
 	}
 
-	lines := strings.Split(raw, "\n")
-	var accounts []storage.EmailAccount
-	var parseErrors []string
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	for i := range accounts {
+		if strings.TrimSpace(accounts[i].GroupName) == "" {
+			accounts[i].GroupName = groupName
 		}
-		parts := strings.SplitN(line, "----", 4)
-		if len(parts) < 4 {
-			parseErrors = append(parseErrors, fmt.Sprintf("line %d: expected email----password----client_id----refresh_token, got %d fields", i+1, len(parts)))
-			continue
-		}
-		email := strings.TrimSpace(parts[0])
-		password := strings.TrimSpace(parts[1])
-		clientID := strings.TrimSpace(parts[2])
-		refreshToken := strings.TrimSpace(parts[3])
-		if email == "" || refreshToken == "" {
-			parseErrors = append(parseErrors, fmt.Sprintf("line %d: email and refresh_token are required", i+1))
-			continue
-		}
-		if len(email) > 320 || len(password) > 4096 || len(clientID) > 1024 || len(refreshToken) > 16384 ||
-			strings.Count(email, "@") != 1 {
-			parseErrors = append(parseErrors, fmt.Sprintf("line %d: one or more fields are invalid or exceed their limit", i+1))
-			continue
-		}
-		accounts = append(accounts, storage.EmailAccount{
-			Email:        email,
-			Password:     password,
-			ClientID:     clientID,
-			RefreshToken: refreshToken,
-			Status:       "idle",
-			GroupName:    groupName,
-		})
 	}
 
 	if len(accounts) == 0 {
@@ -191,10 +160,18 @@ func (s *Server) adminEmailPoolImport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if imported > 0 {
+		if err := s.reloadRegistrationProvidersAfterEmailPoolChange(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 
 	result := map[string]interface{}{
-		"imported": imported,
-		"total":    len(accounts),
+		"imported":      imported,
+		"total":         len(accounts),
+		"success_count": imported,
+		"failed":        len(parseErrors),
 	}
 	if len(parseErrors) > 0 {
 		result["parse_errors"] = parseErrors
@@ -220,7 +197,7 @@ func (s *Server) adminEmailPoolAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	case action == "test" && r.Method == http.MethodPost:
+	case (action == "test" || action == "check" || action == "verify") && r.Method == http.MethodPost:
 		s.adminEmailPoolTest(w, r, id)
 	default:
 		writeError(w, http.StatusNotFound, fmt.Errorf("unknown email pool action: %s", action))
@@ -244,7 +221,7 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 	tokenURL := "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
 	form := url.Values{
 		"client_id":     {acct.ClientID},
-		"grant_type":   {"refresh_token"},
+		"grant_type":    {"refresh_token"},
 		"refresh_token": {acct.RefreshToken},
 		"scope":         {"https://outlook.office.com/.default"},
 	}
@@ -318,3 +295,10 @@ func (s *Server) adminEmailPoolTest(w http.ResponseWriter, r *http.Request, id s
 }
 
 var oauthErrorCodePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,80}$`)
+
+func (s *Server) reloadRegistrationProvidersAfterEmailPoolChange(ctx context.Context) error {
+	if s == nil || s.regHandler == nil {
+		return nil
+	}
+	return s.regHandler.ReloadProviders(ctx)
+}

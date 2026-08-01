@@ -125,7 +125,7 @@ export function UsageAreaChart({ buckets = [], height = 260, ariaLabel = 'Token 
             ))}
           </defs>
           <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
-          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
+          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} padding={{ left: 12, right: 8 }} />
           <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
           <Tooltip content={<PolishedChartTooltip valueFormatter={fmtTokens} />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
           <Legend content={<CompactLegend />} />
@@ -177,9 +177,9 @@ export function DonutChart({ data = [], height = 240, unit = '', showCenterTotal
           >
             {items.map((d, i) => <Cell key={i} fill={d.color || PALETTE[i % PALETTE.length]} />)}
             {showCenterTotal ? <Label position="center" value={formattedTotal} fill={c.tick}
-              fontSize={centerFontSize} fontWeight={720} dy={unit ? -8 : 0} /> : null}
+              fontSize={centerFontSize} fontWeight={720} dy={unit ? -12 : 0} /> : null}
             {showCenterTotal && unit ? <Label position="center" value={unit} fill={c.tick}
-              fontSize={11} fontWeight={520} dy={12} /> : null}
+              fontSize={11} fontWeight={520} dy={16} /> : null}
           </Pie>
           <Tooltip content={<PolishedChartTooltip valueFormatter={formatValue} unit={unit} />} />
           <Legend content={<CompactLegend />} />
@@ -339,7 +339,7 @@ export function UsageModelAreaChart({
             ))}
           </defs>
           <CartesianGrid stroke={c.grid} strokeOpacity={0.58} vertical={false} />
-          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} />
+          <XAxis dataKey="t" tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} minTickGap={24} padding={{ left: 12, right: 8 }} />
           <YAxis tick={{ fontSize: 11, fill: c.tick }} tickLine={false} axisLine={false} width={44} tickFormatter={fmtTokens} />
           <Tooltip content={<ModelMetricsTooltip />} cursor={{ stroke: c.grid, strokeWidth: 1 }} />
           <Legend content={<CompactLegend />} />

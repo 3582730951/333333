@@ -1,0 +1,1974 @@
+[
+  {
+    "at": "2026-07-31T17:13:10.630Z",
+    "event": "server_start",
+    "port": 5192,
+    "baseURL": "http://127.0.0.1:5192/console"
+  },
+  {
+    "at": "2026-07-31T17:13:16.442Z",
+    "event": "login_cookies",
+    "cookies": [
+      {
+        "name": "cp_csrf",
+        "value": "admin-csrf",
+        "expires": 1785604396,
+        "session": false
+      },
+      {
+        "name": "cp_session",
+        "value": "admin-fixture",
+        "expires": 1785604396,
+        "session": false
+      }
+    ]
+  },
+  {
+    "at": "2026-07-31T17:13:18.781Z",
+    "event": "login",
+    "role": "admin",
+    "method": "fixture-mocked-login"
+  },
+  {
+    "at": "2026-07-31T17:13:23.902Z",
+    "event": "session_reuse_check",
+    "session_reused": true,
+    "browser_restarted": true,
+    "cookies": [
+      {
+        "name": "cp_session",
+        "value": "admin-fixture",
+        "expires": 1785604396,
+        "session": false
+      },
+      {
+        "name": "cp_csrf",
+        "value": "admin-csrf",
+        "expires": 1785604396,
+        "session": false
+      }
+    ],
+    "body_excerpt": "P\nPool 控制台\n总览\n账号\n账号池\n分组\n邮箱池\n接入\n模型提供商\n模型列表\n出口/代理\n上游错误规则\n自动化\n自动注册\n团队生命周期\n观测\n用量\n配额\n模型智商\n系统监控\nCF 事件\n审计日志\n访问\nAPI Keys\n用户\nAI 设置\n设置中心\n通用\n自动化\n注册器\n日志\n内存\n思考\n合规\n收起侧边栏\n管理控制"
+  },
+  {
+    "at": "2026-07-31T17:13:27.543Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1440x900",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/light/1440x900/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1440x900/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 374,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 255,
+      "resourceCount": 145,
+      "domContentLoadedMS": 341,
+      "loadMS": 344,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 260,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 212,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 936,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:31.199Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/light/1280x720/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1280x720/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 374,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 255,
+      "resourceCount": 145,
+      "domContentLoadedMS": 348,
+      "loadMS": 350,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 260,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 212,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 776,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:34.876Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/light/390x844/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/390x844/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 321,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 227,
+      "resourceCount": 145,
+      "domContentLoadedMS": 355,
+      "loadMS": 358,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 282,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:38.578Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "360x800",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/light/360x800/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/360x800/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 321,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 227,
+      "resourceCount": 145,
+      "domContentLoadedMS": 348,
+      "loadMS": 351,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 800,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 282,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:42.315Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1440x900",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/dark/1440x900/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1440x900/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 374,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 247,
+      "resourceCount": 145,
+      "domContentLoadedMS": 363,
+      "loadMS": 366,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 260,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 212,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 936,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:46.035Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/dark/1280x720/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1280x720/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 374,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 247,
+      "resourceCount": 145,
+      "domContentLoadedMS": 357,
+      "loadMS": 359,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 260,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 212,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 776,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:49.761Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "390x844",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/dark/390x844/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/390x844/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 321,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 219,
+      "resourceCount": 145,
+      "domContentLoadedMS": 361,
+      "loadMS": 364,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 282,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:53.470Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "360x800",
+    "page": "Quota",
+    "route": "/quota",
+    "file": ".run/ui-review/screenshots/admin/dark/360x800/Quota.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/360x800/Quota.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/quota",
+      "textLength": 321,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 219,
+      "resourceCount": 145,
+      "domContentLoadedMS": 316,
+      "loadMS": 318,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 800,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 318,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 282,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:13:56.576Z",
+    "event": "state_capture",
+    "states": [
+      "validation"
+    ],
+    "file": ".run/ui-review/screenshots/states/login-validation.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/?fixture_login_delay=1",
+      "textLength": 79,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 44,
+      "resourceCount": 81,
+      "domContentLoadedMS": 366,
+      "loadMS": 368,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:13:56.970Z",
+    "event": "state_capture",
+    "states": [
+      "submitting",
+      "loading",
+      "disabled"
+    ],
+    "file": ".run/ui-review/screenshots/states/login-submitting.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/?fixture_login_delay=1",
+      "textLength": 70,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 46,
+      "resourceCount": 81,
+      "domContentLoadedMS": 366,
+      "loadMS": 368,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:13:57.772Z",
+    "event": "state_capture",
+    "states": [
+      "error"
+    ],
+    "file": ".run/ui-review/screenshots/states/login-error-toast.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/?fixture_login_delay=1",
+      "textLength": 112,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 52,
+      "resourceCount": 82,
+      "domContentLoadedMS": 366,
+      "loadMS": 368,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:01.805Z",
+    "event": "state_capture",
+    "states": [
+      "selected",
+      "bulk-selected"
+    ],
+    "file": ".run/ui-review/screenshots/states/accounts-bulk-selected.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/accounts",
+      "textLength": 763,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 411,
+      "resourceCount": 143,
+      "domContentLoadedMS": 376,
+      "loadMS": 378,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 613,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 565,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:06.546Z",
+    "event": "state_capture",
+    "states": [
+      "hover",
+      "focus"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-button-hover-focus.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1406,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": true,
+      "domNodes": 726,
+      "resourceCount": 144,
+      "domContentLoadedMS": 346,
+      "loadMS": 348,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:06.682Z",
+    "event": "state_capture",
+    "states": [
+      "pressed"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-button-pressed.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1406,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": true,
+      "domNodes": 726,
+      "resourceCount": 144,
+      "domContentLoadedMS": 346,
+      "loadMS": 348,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:07.053Z",
+    "event": "state_capture",
+    "states": [
+      "modal/drawer"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-modal.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1484,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 742,
+      "resourceCount": 144,
+      "domContentLoadedMS": 346,
+      "loadMS": 348,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:08.455Z",
+    "event": "state_capture",
+    "states": [
+      "success toast"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-reset-success-toast.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage",
+      "textLength": 1420,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 732,
+      "resourceCount": 147,
+      "domContentLoadedMS": 346,
+      "loadMS": 348,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 798,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:13.381Z",
+    "event": "state_capture",
+    "states": [
+      "timezone-offset"
+    ],
+    "file": ".run/ui-review/screenshots/states/usage-vps-tokyo-offset.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage?fixture_tz=tokyo",
+      "textLength": 1400,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 718,
+      "resourceCount": 144,
+      "domContentLoadedMS": 388,
+      "loadMS": 391,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 2192,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 2136,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 2070,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 638,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:13.987Z",
+    "event": "state_capture",
+    "states": [
+      "loading"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-loading.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_loading=1",
+      "textLength": 0,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 41,
+      "resourceCount": 78,
+      "domContentLoadedMS": 363,
+      "loadMS": 366,
+      "layout": []
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:21.422Z",
+    "event": "state_capture",
+    "states": [
+      "empty"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-empty.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_empty=1",
+      "textLength": 288,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 237,
+      "resourceCount": 147,
+      "domContentLoadedMS": 383,
+      "loadMS": 385,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 461,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 413,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:25.614Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/audit?limit=500"
+  },
+  {
+    "at": "2026-07-31T17:14:25.614Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-07-31T17:14:27.519Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/audit?limit=500"
+  },
+  {
+    "at": "2026-07-31T17:14:27.519Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-07-31T17:14:30.425Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/audit?limit=500"
+  },
+  {
+    "at": "2026-07-31T17:14:30.425Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-07-31T17:14:31.198Z",
+    "event": "state_capture",
+    "states": [
+      "network failure",
+      "error"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-network-error.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_error=1",
+      "textLength": 294,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 244,
+      "resourceCount": 150,
+      "domContentLoadedMS": 498,
+      "loadMS": 501,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 306,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 246,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:34.772Z",
+    "event": "expected_http_error",
+    "status": 403,
+    "url": "http://127.0.0.1:5192/admin/usage/dashboard?bucket=3600&series_dimension=provider_model&series_limit=8&dimension=provider_model&fields=summary,by_model,by_provider,by_provider_model"
+  },
+  {
+    "at": "2026-07-31T17:14:34.772Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "message": "Failed to load resource: the server responded with a status of 403 (Forbidden)"
+  },
+  {
+    "at": "2026-07-31T17:14:35.558Z",
+    "event": "state_capture",
+    "states": [
+      "permission_denied"
+    ],
+    "file": ".run/ui-review/screenshots/states/permission-denied-admin-usage.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/usage?force403=1",
+      "textLength": 209,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 208,
+      "resourceCount": 144,
+      "domContentLoadedMS": 410,
+      "loadMS": 413,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 844,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 322,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 274,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:40.181Z",
+    "event": "expected_http_error",
+    "status": 500,
+    "url": "http://127.0.0.1:5192/admin/export/cache-hits"
+  },
+  {
+    "at": "2026-07-31T17:14:40.181Z",
+    "event": "console_error",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "message": "Failed to load resource: the server responded with a status of 500 (Internal Server Error)"
+  },
+  {
+    "at": "2026-07-31T17:14:40.305Z",
+    "event": "state_capture",
+    "states": [
+      "export failure",
+      "error"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-export-failed.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit?fixture_export_fail=1",
+      "textLength": 597,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 285,
+      "resourceCount": 148,
+      "domContentLoadedMS": 388,
+      "loadMS": 391,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 450,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 402,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": "",
+    "toast_text": "!Request failed with status code 500×"
+  },
+  {
+    "at": "2026-07-31T17:14:44.460Z",
+    "event": "state_capture",
+    "states": [
+      "submitting",
+      "loading"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-download-loading.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit",
+      "textLength": 557,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 275,
+      "resourceCount": 147,
+      "domContentLoadedMS": 413,
+      "loadMS": 415,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 450,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 402,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    },
+    "issue": ""
+  },
+  {
+    "at": "2026-07-31T17:14:45.087Z",
+    "event": "download_capture",
+    "states": [
+      "download",
+      "success toast"
+    ],
+    "downloads": [
+      "codex-pool-cache-hits-fixture.zip"
+    ],
+    "file": ".run/ui-review/screenshots/states/audit-download-toast.png",
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/audit",
+      "textLength": 574,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 285,
+      "resourceCount": 148,
+      "domContentLoadedMS": 413,
+      "loadMS": 415,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 450,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 402,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-07-31T17:14:45.098Z",
+    "event": "coverage",
+    "session_reused": true,
+    "viewports": [
+      "1440x900",
+      "1280x720",
+      "390x844",
+      "360x800"
+    ],
+    "themes": [
+      "light",
+      "dark"
+    ],
+    "admin_pages": [
+      "Quota"
+    ],
+    "user_pages": [],
+    "states": [
+      "bulk-selected",
+      "disabled",
+      "download",
+      "empty",
+      "error",
+      "export failure",
+      "focus",
+      "hover",
+      "loading",
+      "modal/drawer",
+      "network failure",
+      "permission_denied",
+      "pressed",
+      "selected",
+      "submitting",
+      "success toast",
+      "timezone-offset",
+      "validation"
+    ],
+    "record_only": false
+  }
+]

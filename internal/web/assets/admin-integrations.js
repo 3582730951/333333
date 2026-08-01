@@ -6,13 +6,11 @@
 let PROV_EDIT = {};
 async function loadProvidersPage() {
   $("#providersView").innerHTML = `<div class="panel" style="max-width:920px"><div class="hd"><h2>${t("settings.providers_title")}</h2><span class="sp"></span><button class="btn" onclick="addProvider()">${icon("plus")} ${LANG === "en" ? "Add provider" : "新增供应商"}</button></div><div class="bd">
-    <div class="note">${LANG === "en" ? "OpenAI Chat-Completions compatible upstreams (DeepSeek, SiliconFlow, Kimi, OpenRouter, local vLLM). Models can be auto-discovered from {base_url}/models. Import a key on the Accounts page (自定义 · API Key)." : "为 OpenAI Chat-Completions 兼容上游配置 base_url 与模型（可自动发现 {base_url}/models）。在「账号」页用 自定义 · API Key 导入其 Key。"}</div>
+    <div class="note">${LANG === "en" ? "Configure an OpenAI-compatible upstream from a blank form. Models can be auto-discovered from {base_url}/models. Import a key on the Accounts page." : "从空白表单配置 OpenAI 兼容上游；模型可从 {base_url}/models 自动发现，再到「账号」页导入对应 API Key。"}</div>
     <div id="presets" class="row" style="margin:4px 0 10px"></div><div id="providersBox" class="note">${t("common.loading")}</div></div></div>`;
   renderPresets(); renderProviders();
 }
 const PROVIDER_PRESETS = [
-  { id: "deepseek", name: "DeepSeek", base_url: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"] },
-  { id: "siliconflow", name: "SiliconFlow 硅基流动", base_url: "https://api.siliconflow.cn/v1", models: [] },
   { id: "kimi", name: "Kimi (Moonshot)", base_url: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k", "moonshot-v1-32k"] },
   { id: "openrouter", name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", models: [] },
 ];
@@ -33,10 +31,10 @@ function providerModels(p, isNew) { const key = isNew ? "" : p.id; let list = PR
 function providerCard(p, isNew) {
   const key = isNew ? "" : p.id; const models = providerModels(p, isNew);
   const rows = models.map((m, i) => `<div class="row" style="gap:6px;margin:3px 0"><input class="t mono" style="flex:1" value="${esc(m)}" oninput="provModelEdit('${esc(key)}',${i},this.value)"><button class="btn sm" onclick="provModelDel('${esc(key)}',${i})">${icon("x")}</button></div>`).join("");
-  const idField = isNew ? `<input class="t mono" id="pv_id_" placeholder="deepseek" style="flex:1">` : `<span class="mono">${esc(p.id)}</span>`;
+  const idField = isNew ? `<input class="t mono" id="pv_id_" placeholder="provider-id" style="flex:1">` : `<span class="mono">${esc(p.id)}</span>`;
   return `<div class="panel" style="margin:8px 0" data-pv="${esc(key)}"><div class="bd">
-    <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end"><div><label class="f">ID</label><div class="row" style="gap:6px">${idField}</div></div><div style="flex:1"><label class="f">${LANG === "en" ? "Name" : "名称"}</label><input class="t" id="pv_name_${esc(key)}" value="${esc(p.name || "")}" placeholder="DeepSeek"></div></div>
-    <label class="f">Base URL (incl /v1)</label><input class="t mono" id="pv_base_${esc(key)}" value="${esc(p.base_url || "")}" placeholder="https://api.deepseek.com/v1">
+    <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end"><div><label class="f">ID</label><div class="row" style="gap:6px">${idField}</div></div><div style="flex:1"><label class="f">${LANG === "en" ? "Name" : "名称"}</label><input class="t" id="pv_name_${esc(key)}" value="${esc(p.name || "")}" placeholder="Provider name"></div></div>
+    <label class="f">Base URL (incl /v1)</label><input class="t mono" id="pv_base_${esc(key)}" value="${esc(p.base_url || "")}" placeholder="https://api.example.com/v1">
     <div class="row" style="gap:18px;margin:8px 0"><label class="f" style="margin:0"><input type="checkbox" id="pv_en_${esc(key)}" ${p.enabled !== false ? "checked" : ""}> ${LANG === "en" ? "Enabled" : "启用"}</label><label class="f" style="margin:0"><input type="checkbox" id="pv_auto_${esc(key)}" ${p.auto_discover_models !== false ? "checked" : ""}> ${LANG === "en" ? "Auto-discover models" : "自动发现模型"}</label></div>
     <label class="f">${LANG === "en" ? "Models (auto-filled on probe; editable)" : "模型列表（探测后自动填充，可增删）"}</label><div id="pv_models_${esc(key)}">${rows || `<div class="muted" style="margin:2px 0">${LANG === "en" ? "(none yet)" : "（暂无）"}</div>`}</div>
     <div class="row" style="gap:6px;margin-top:6px"><button class="btn sm" onclick="provModelAdd('${esc(key)}')">${icon("plus")} ${LANG === "en" ? "Model" : "模型"}</button></div>

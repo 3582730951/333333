@@ -43,7 +43,7 @@ export default function Quota() {
   };
 
   const cols: any[] = [
-    { title: t('quota.account'), dataIndex: 'account_id', width: 230, render: (v: unknown, r: QuotaRow) => <b>{r.label || String(v || '')}</b> },
+    { title: t('quota.account'), dataIndex: 'account_id', width: 230, render: (v: unknown, r: QuotaRow) => <b className="pool-break-value">{r.label || String(v || '')}</b> },
     { title: t('quota.provider'), dataIndex: 'provider', width: 96, render: (v: any) => v ? <Tag>{v}</Tag> : '—' },
     { title: t('quota.plan'), dataIndex: 'plan_type', width: 110, render: (v: any) => v ? <Tag>{v}</Tag> : '—' },
     { title: 'OAuth Tier', dataIndex: 'oauth_rate_limit_tier', width: 140, render: (v: any) => v ? <span className="pool-mono">{v}</span> : '—' },

@@ -1,0 +1,198 @@
+{
+  "seed": "ui-review-v6.1-fixed-seed",
+  "timezoneScenarios": [
+    {
+      "label": "vps-new-york",
+      "timezone": "America/New_York",
+      "utc_offset_seconds": -14400
+    },
+    {
+      "label": "vps-tokyo",
+      "timezone": "Asia/Tokyo",
+      "utc_offset_seconds": 32400
+    },
+    {
+      "label": "vps-utc",
+      "timezone": "UTC",
+      "utc_offset_seconds": 0
+    }
+  ],
+  "notes": [
+    "Long account names, long emails, empty fields, large token counts, unusual statuses, low hit/high spend rows, VPS offset, permission denied, network failure, empty data, loading delay and export failure fixtures are deterministic."
+  ],
+  "accounts": [
+    {
+      "id": "acct_prod_primary_with_a_very_long_identifier_001",
+      "label": "primary-prod-account-with-long-human-label",
+      "email": "primary.operator.with.long.email.alias@example-very-long-domain.test",
+      "provider": "codex",
+      "group_name": "cyber",
+      "plan_type": "pro",
+      "upstream_account_id": "team-parent-fixture-001",
+      "status": "active",
+      "usage": {
+        "requests": 987654,
+        "total_tokens": 987654321,
+        "cached_tokens": 456789123
+      }
+    },
+    {
+      "id": "acct_low_hit_high_spend_002",
+      "label": "",
+      "email": "",
+      "provider": "claude",
+      "group_name": "staging",
+      "plan_type": "team",
+      "status": "permission_denied",
+      "quarantine_until": 1783129200,
+      "usage": {
+        "requests": 42,
+        "total_tokens": 18000000,
+        "cached_tokens": 125
+      }
+    },
+    {
+      "id": "acct_empty_state_003",
+      "label": "空值 / 异常状态",
+      "email": "empty@example.test",
+      "provider": "custom",
+      "group_name": "",
+      "plan_type": "",
+      "status": "unreachable",
+      "usage": null
+    }
+  ],
+  "apiKeys": [
+    {
+      "label": "production-cli-key-with-long-label",
+      "group_name": "cyber",
+      "force_model": "gpt-5.5",
+      "force_effort": "high",
+      "secret": "cap_fixture_secret_admin",
+      "enabled": true,
+      "key_hash": "abcdef1234567890abcdef",
+      "created_at": 1783122000
+    },
+    {
+      "label": "disabled-low-cache-key",
+      "group_name": "staging",
+      "force_model": "",
+      "force_effort": "",
+      "secret": "",
+      "enabled": false,
+      "key_hash": "deadbeef9876543210",
+      "created_at": 1783039200
+    }
+  ],
+  "usageRows": [
+    {
+      "account_id": "acct_prod_primary_with_a_very_long_identifier_001",
+      "requests": 1234,
+      "prompt_tokens": 7100000,
+      "completion_tokens": 890000,
+      "total_tokens": 7990000,
+      "cached_tokens": 5900000,
+      "cache_read_tokens": 5900000,
+      "cache_creation_tokens": 320000
+    },
+    {
+      "account_id": "acct_low_hit_high_spend_002",
+      "requests": 98,
+      "prompt_tokens": 4200000,
+      "completion_tokens": 180000,
+      "total_tokens": 4380000,
+      "cached_tokens": 1200,
+      "cache_read_tokens": 1200,
+      "cache_creation_tokens": 2100000
+    }
+  ],
+  "auditRows": [
+    {
+      "id": 1,
+      "created_at": 1783125510,
+      "account_id": "acct_prod_primary_with_a_very_long_identifier_001",
+      "account_label": "primary-prod-account-with-long-human-label",
+      "action": "usage_daily_window_reset",
+      "state": "ok",
+      "reason": "daily_window",
+      "detail": "VPS local day reset"
+    },
+    {
+      "id": 2,
+      "created_at": 1783125570,
+      "account_id": "acct_low_hit_high_spend_002",
+      "account_label": "",
+      "action": "usage_cache_stats_reset",
+      "state": "ok",
+      "reason": "manual_reset",
+      "detail": "Manual cache diagnostics baseline advanced without deleting history"
+    },
+    {
+      "id": 3,
+      "created_at": 1783125590,
+      "account_id": "acct_empty_state_003",
+      "account_label": "空值 / 异常状态",
+      "action": "permission_denied_no_quarantine",
+      "state": "permission_denied",
+      "reason": "scope",
+      "detail": "Long diagnostic detail that should ellipsize in table cells without forcing page overflow"
+    }
+  ],
+  "users": [
+    {
+      "id": "user_admin",
+      "email": "admin@example.test",
+      "name": "Admin Fixture",
+      "role": "admin",
+      "status": "active",
+      "created_at": 1783039200
+    },
+    {
+      "id": "user_normal",
+      "email": "user@example.test",
+      "name": "User Fixture With Long Display Name",
+      "role": "user",
+      "status": "active",
+      "created_at": 1783122000
+    }
+  ],
+  "configFields": [
+    {
+      "key": "require_downstream_key",
+      "label": "下游 Key 必填",
+      "category": "访问控制",
+      "type": "bool",
+      "effect": "hot",
+      "options": [],
+      "help": "要求普通请求携带用户 API Key。",
+      "value": true,
+      "overridden": true
+    },
+    {
+      "key": "conversation_isolation",
+      "label": "会话隔离",
+      "category": "访问控制",
+      "type": "bool",
+      "effect": "hot",
+      "options": [],
+      "help": "按账号隔离上游会话标识。",
+      "value": true,
+      "overridden": false
+    },
+    {
+      "key": "claude_cache_ttl",
+      "label": "Claude 缓存 TTL",
+      "category": "缓存",
+      "type": "select",
+      "effect": "hot",
+      "options": [
+        "",
+        "5m",
+        "1h"
+      ],
+      "help": "Claude prompt cache control TTL。",
+      "value": "1h",
+      "overridden": true
+    }
+  ]
+}

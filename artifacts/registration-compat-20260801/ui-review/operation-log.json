@@ -1,0 +1,1491 @@
+[
+  {
+    "at": "2026-08-01T06:46:41.904Z",
+    "event": "server_start",
+    "port": 5192,
+    "baseURL": "http://127.0.0.1:5192/console"
+  },
+  {
+    "at": "2026-08-01T06:46:47.097Z",
+    "event": "login_cookies",
+    "cookies": [
+      {
+        "name": "cp_csrf",
+        "value": "admin-csrf",
+        "expires": 1785653207,
+        "session": false
+      },
+      {
+        "name": "cp_session",
+        "value": "admin-fixture",
+        "expires": 1785653207,
+        "session": false
+      }
+    ]
+  },
+  {
+    "at": "2026-08-01T06:46:49.362Z",
+    "event": "login",
+    "role": "admin",
+    "method": "fixture-mocked-login"
+  },
+  {
+    "at": "2026-08-01T06:46:54.434Z",
+    "event": "session_reuse_check",
+    "session_reused": true,
+    "browser_restarted": true,
+    "cookies": [
+      {
+        "name": "cp_session",
+        "value": "admin-fixture",
+        "expires": 1785653207,
+        "session": false
+      },
+      {
+        "name": "cp_csrf",
+        "value": "admin-csrf",
+        "expires": 1785653207,
+        "session": false
+      }
+    ],
+    "body_excerpt": "P\nPool 控制台\n总览\n账号\n账号池\n分组\n邮箱池\n接入\n模型提供商\n模型列表\n出口/代理\n上游错误规则\n自动化\n自动注册\n团队生命周期\n观测\n用量\n配额\n模型智商\n系统监控\nCF 事件\n审计日志\n访问\nAPI Keys\n用户\nAI 设置\n设置中心\n通用\n自动化\n注册器\n日志\n内存\n思考\n合规\n收起侧边栏\n管理控制"
+  },
+  {
+    "at": "2026-08-01T06:46:58.331Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1440x900",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/1440x900/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1440x900/Registration.png",
+      ".run/ui-review/screenshots/admin/light/1440x900/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/1440x900/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 953,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 369,
+      "resourceCount": 149,
+      "domContentLoadedMS": 317,
+      "loadMS": 319,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 1510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 1454,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 1406,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 922,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:02.078Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1440x900",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/1440x900/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1440x900/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 309,
+      "resourceCount": 145,
+      "domContentLoadedMS": 358,
+      "loadMS": 361,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 823,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:05.936Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/1280x720/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1280x720/Registration.png",
+      ".run/ui-review/screenshots/admin/light/1280x720/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/1280x720/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 953,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 369,
+      "resourceCount": 149,
+      "domContentLoadedMS": 330,
+      "loadMS": 332,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 1510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 1454,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 1406,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 762,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:09.635Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "1280x720",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/1280x720/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/1280x720/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 309,
+      "resourceCount": 145,
+      "domContentLoadedMS": 375,
+      "loadMS": 377,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 663,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:13.617Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/390x844/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/390x844/Registration.png",
+      ".run/ui-review/screenshots/admin/light/390x844/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/390x844/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 920,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 357,
+      "resourceCount": 149,
+      "domContentLoadedMS": 363,
+      "loadMS": 365,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 2631,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 2579,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 2543,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:17.695Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "390x844",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/390x844/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/390x844/EmailPool.png",
+      ".run/ui-review/screenshots/admin/light/390x844/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/light/390x844/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 295,
+      "resourceCount": 145,
+      "domContentLoadedMS": 346,
+      "loadMS": 349,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:21.771Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "360x800",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/light/360x800/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/360x800/Registration.png",
+      ".run/ui-review/screenshots/admin/light/360x800/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/light/360x800/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 920,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 357,
+      "resourceCount": 149,
+      "domContentLoadedMS": 345,
+      "loadMS": 348,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 2631,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 2579,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 2543,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:26.062Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "light",
+    "viewport": "360x800",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/light/360x800/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/light/360x800/EmailPool.png",
+      ".run/ui-review/screenshots/admin/light/360x800/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/light/360x800/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 295,
+      "resourceCount": 145,
+      "domContentLoadedMS": 393,
+      "loadMS": 396,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:30.029Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1440x900",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/1440x900/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1440x900/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/1440x900/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/1440x900/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 953,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 361,
+      "resourceCount": 149,
+      "domContentLoadedMS": 331,
+      "loadMS": 333,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 1510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 1454,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 1406,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 922,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:33.710Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1440x900",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/1440x900/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1440x900/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1440,
+      "viewportWidth": 1440,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 301,
+      "resourceCount": 145,
+      "domContentLoadedMS": 342,
+      "loadMS": 344,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 900,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1192,
+          "height": 900,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1192,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 1144,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 823,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:37.626Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/1280x720/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1280x720/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/1280x720/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/1280x720/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 953,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 361,
+      "resourceCount": 149,
+      "domContentLoadedMS": 338,
+      "loadMS": 341,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 1510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 1454,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 1406,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 762,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:41.334Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "1280x720",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/1280x720/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/1280x720/EmailPool.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 561,
+      "documentWidth": 1280,
+      "viewportWidth": 1280,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 301,
+      "resourceCount": 145,
+      "domContentLoadedMS": 361,
+      "loadMS": 364,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": 0,
+          "y": 0,
+          "width": 248,
+          "height": 720,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 248,
+          "y": 0,
+          "width": 1032,
+          "height": 720,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 248,
+          "y": 56,
+          "width": 1032,
+          "height": 510,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 272,
+          "y": 80,
+          "width": 984,
+          "height": 462,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 272,
+          "y": 80,
+          "width": 663,
+          "height": 39,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:45.314Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "390x844",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/390x844/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/390x844/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 920,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 349,
+      "resourceCount": 149,
+      "domContentLoadedMS": 309,
+      "loadMS": 312,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 2631,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 2579,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 2543,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:49.259Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "390x844",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/390x844/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/390x844/EmailPool.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/dark/390x844/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 390,
+      "viewportWidth": 390,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 287,
+      "resourceCount": 145,
+      "domContentLoadedMS": 343,
+      "loadMS": 345,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 844,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 390,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 390,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 366,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:53.332Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "360x800",
+    "page": "Registration",
+    "route": "/registration",
+    "file": ".run/ui-review/screenshots/admin/dark/360x800/Registration.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/360x800/Registration.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/Registration--middle.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/Registration--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/registration",
+      "textLength": 920,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 349,
+      "resourceCount": 149,
+      "domContentLoadedMS": 364,
+      "loadMS": 366,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 2631,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 2579,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 2543,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:57.368Z",
+    "event": "screenshot",
+    "role": "admin",
+    "theme": "dark",
+    "viewport": "360x800",
+    "page": "EmailPool",
+    "route": "/email-pool",
+    "file": ".run/ui-review/screenshots/admin/dark/360x800/EmailPool.png",
+    "files": [
+      ".run/ui-review/screenshots/admin/dark/360x800/EmailPool.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/EmailPool--middle.png",
+      ".run/ui-review/screenshots/admin/dark/360x800/EmailPool--bottom.png"
+    ],
+    "metrics": {
+      "textOverflows": [],
+      "blankChartCards": [],
+      "siblingOverlaps": [],
+      "chartTextOverlaps": [],
+      "clippedControls": [],
+      "path": "/console/email-pool",
+      "textLength": 432,
+      "documentWidth": 360,
+      "viewportWidth": 360,
+      "noPageOverflow": true,
+      "focusedVisible": false,
+      "domNodes": 287,
+      "resourceCount": 145,
+      "domContentLoadedMS": 357,
+      "loadMS": 360,
+      "layout": [
+        {
+          "selector": ".pool-shell-sider",
+          "x": -304,
+          "y": 0,
+          "width": 304,
+          "height": 800,
+          "display": "flex",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "matrix(1, 0, 0, 1, -304, 0)"
+        },
+        {
+          "selector": ".pool-main-layout",
+          "x": 0,
+          "y": 0,
+          "width": 360,
+          "height": 1031,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-shell",
+          "x": 0,
+          "y": 52,
+          "width": 360,
+          "height": 979,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 943,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        },
+        {
+          "selector": ".pool-route-content h1, .pool-route-content .pool-page-title",
+          "x": 12,
+          "y": 66,
+          "width": 336,
+          "height": 36,
+          "display": "block",
+          "visibility": "visible",
+          "opacity": "1",
+          "transform": "none"
+        }
+      ]
+    }
+  },
+  {
+    "at": "2026-08-01T06:47:57.380Z",
+    "event": "coverage",
+    "session_reused": true,
+    "viewports": [
+      "1440x900",
+      "1280x720",
+      "390x844",
+      "360x800"
+    ],
+    "themes": [
+      "light",
+      "dark"
+    ],
+    "admin_pages": [
+      "Registration",
+      "EmailPool"
+    ],
+    "user_pages": [],
+    "states": [],
+    "record_only": false
+  }
+]

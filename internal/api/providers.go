@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	authparse "codex-account-pool/internal/auth"
@@ -39,16 +40,17 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, ps)
 	case http.MethodPost, http.MethodPatch:
 		var req struct {
-			ID                 string            `json:"id"`
-			Name               string            `json:"name"`
-			BaseURL            string            `json:"base_url"`
-			UpstreamProtocol   *string           `json:"upstream_protocol"`
-			TransportProfile   *string           `json:"transport_profile"`
-			EgressIDs          *[]string         `json:"egress_ids"`
-			Enabled            *bool             `json:"enabled"`
-			AutoDiscoverModels *bool             `json:"auto_discover_models"`
-			Models             []string          `json:"models"`
-			ModelMappings      map[string]string `json:"model_mappings"`
+			ID                 string                         `json:"id"`
+			Name               string                         `json:"name"`
+			BaseURL            string                         `json:"base_url"`
+			UpstreamProtocol   *string                        `json:"upstream_protocol"`
+			TransportProfile   *string                        `json:"transport_profile"`
+			Routes             *[]storage.CustomProviderRoute `json:"routes"`
+			EgressIDs          *[]string                      `json:"egress_ids"`
+			Enabled            *bool                          `json:"enabled"`
+			AutoDiscoverModels *bool                          `json:"auto_discover_models"`
+			Models             []string                       `json:"models"`
+			ModelMappings      map[string]string              `json:"model_mappings"`
 		}
 		if err := decodeJSONRequestBody(r.Body, &req, adminJSONBodyLimit); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -95,6 +97,11 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 			if req.ModelMappings != nil {
 				p.ModelMappings = req.ModelMappings
 			}
+			if req.Routes != nil {
+				p.Routes = *req.Routes
+			}
+		} else if req.Routes != nil {
+			p.Routes = *req.Routes
 		}
 		baseURL := p.BaseURL
 		if err := validateCustomProviderBaseURL(baseURL); err != nil {
@@ -132,8 +139,18 @@ func (s *Server) adminProviders(w http.ResponseWriter, r *http.Request) {
 		if req.AutoDiscoverModels != nil {
 			p.AutoDiscoverModels = *req.AutoDiscoverModels
 		}
+		for index, route := range p.Routes {
+			baseURL := strings.TrimSpace(route.BaseURL)
+			if baseURL == "" {
+				baseURL = p.BaseURL
+			}
+			if err := validateCustomProviderBaseURL(baseURL); err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("route "+strconv.Itoa(index+1)+": "+err.Error()))
+				return
+			}
+		}
 		if err := s.store.UpsertCustomProvider(r.Context(), p); err != nil {
-			if errors.Is(err, storage.ErrInvalidProviderModelMapping) {
+			if errors.Is(err, storage.ErrInvalidProviderModelMapping) || errors.Is(err, storage.ErrInvalidProviderRoute) {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}

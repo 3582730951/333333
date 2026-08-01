@@ -689,12 +689,16 @@ type Config struct {
 	// FlareSolverr / Byparr / Solvearr.
 	CFSolverURL string `json:"cf_solver_url"`
 	// ── Registration (auto phone registration) ──
-	RegistrationEnabled     bool   `json:"registration_enabled"`
-	RegistrationConcurrency int    `json:"registration_concurrency"`
-	RegistrationTimeout     int    `json:"registration_timeout"`
-	DefaultSMSProvider      string `json:"default_sms_provider"`
-	DefaultMailboxProvider  string `json:"default_mailbox_provider"`
-	DefaultCaptchaProvider  string `json:"default_captcha_provider"`
+	RegistrationEnabled     bool `json:"registration_enabled"`
+	RegistrationConcurrency int  `json:"registration_concurrency"`
+	RegistrationTimeout     int  `json:"registration_timeout"`
+	// RegistrationDefaultGroup is the account group used only by registration
+	// triggers that do not name a group. It is the canonical replacement for the
+	// historical email_registration_group key.
+	RegistrationDefaultGroup string `json:"registration_default_group"`
+	DefaultSMSProvider       string `json:"default_sms_provider"`
+	DefaultMailboxProvider   string `json:"default_mailbox_provider"`
+	DefaultCaptchaProvider   string `json:"default_captcha_provider"`
 
 	// ── SMS multi-platform smart country selection ──
 	// SMSPlatformStrategy is "auto" (default) to let the Manager pick the best platform +
@@ -939,6 +943,7 @@ func Default() Config {
 		WarpAccountsPerExit:                 3,
 		RegistrationConcurrency:             1,
 		RegistrationTimeout:                 300,
+		RegistrationDefaultGroup:            DefaultGroupName,
 		CodexPreferSidecarJA3OverWS:         true,
 		SMSPlatformStrategy:                 "auto",
 		SMSPreferredCountries:               "BR,CO,PL",
@@ -968,6 +973,9 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return Config{}, err
+		}
+		if err := applyLegacyRegistrationConfig(raw, &cfg); err != nil {
 			return Config{}, err
 		}
 	}
@@ -1753,7 +1761,12 @@ func (c *Config) normalize() {
 	if c.RegistrationTimeout <= 0 {
 		c.RegistrationTimeout = 300
 	}
+	c.RegistrationDefaultGroup = strings.TrimSpace(c.RegistrationDefaultGroup)
+	if c.RegistrationDefaultGroup == "" {
+		c.RegistrationDefaultGroup = firstNonEmptyConfig(c.DefaultGroup, DefaultGroupName)
+	}
 	c.RegistrationEgressPoolID = strings.TrimSpace(c.RegistrationEgressPoolID)
+	c.DefaultRegisterMethod = normalizeRegistrationMethodAlias(c.DefaultRegisterMethod)
 	// Email registration normalization
 	if c.DefaultSMSProvider == "" {
 		c.DefaultSMSProvider = "smsbower"

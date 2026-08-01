@@ -10,8 +10,9 @@ import { get, oauthStart, oauthComplete, post } from '../api.js';
 import { showErrorToast } from './ErrorToast.jsx';
 import VendorLogo from './VendorLogo.jsx';
 import useAsyncAction from '../hooks/useAsyncAction.js';
-import { writeClipboard } from '../lib/browserClipboard.js';
+import { selectTextForManualCopy, writeClipboard } from '../lib/browserClipboard.js';
 import { clearBrowserInterval, clearBrowserTimeout, setBrowserInterval, setBrowserTimeout } from '../lib/browserLifecycle.js';
+import { getDocumentElementById } from '../lib/browserDocument.js';
 import { openExternalURL } from '../lib/browserNavigation.js';
 
 const { Text } = Typography;
@@ -45,6 +46,7 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
   const [groups, setGroups] = useState([]);
   const countdownRef = useRef(null);
   const copyResetRef = useRef(null);
+  const authUrlInputId = 'pool-oauth-authorization-url';
   const actionEpochRef = useRef(0);
   const [countdown, setCountdown] = useState(0);
 
@@ -164,7 +166,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
       copyResetRef.current = setBrowserTimeout(() => setCopied(false), 2000);
       return true;
     }
-    Toast.error('复制失败，请手动复制');
+    const input = getDocumentElementById(authUrlInputId);
+    if (selectTextForManualCopy(input)) {
+      Toast.warning('浏览器未开放剪贴板，链接已选中；请按 Ctrl/Cmd+C');
+    } else {
+      Toast.error('复制失败，请手动选择授权链接');
+    }
     return false;
   };
 
@@ -667,6 +674,8 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
               }}
             >
               <Input
+                id={authUrlInputId}
+                aria-label="授权链接"
                 value={authUrl}
                 readOnly
                 style={{
@@ -679,8 +688,12 @@ export default function OAuthLoginModal({ visible, onClose, onSuccess, open }) {
                 <Button
                   icon={copied ? <IconTick /> : <IconCopy />}
                   onClick={handleCopyUrl}
+                  aria-label={copied ? '授权链接已复制' : '复制授权链接'}
+                  title={copied ? '已复制' : '复制授权链接'}
                   style={{ flexShrink: 0 }}
-                />
+                >
+                  {copied ? '已复制' : '复制'}
+                </Button>
               </Tooltip>
               <Button
                 icon={<IconChevronRight />}

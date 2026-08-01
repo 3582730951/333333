@@ -72,7 +72,7 @@ func (s *Server) customProvidersForModel(ctx context.Context, model string) []st
 		// account probe has produced an authoritative list, the maintained Claude
 		// candidate table makes an auto-discovery provider immediately routable.
 		if p.AutoDiscoverModels && len(p.Models) == 0 &&
-			p.UpstreamProtocol == storage.CustomProviderProtocolAnthropicMessages &&
+			customProviderSupportsProtocol(p, storage.CustomProviderProtocolAnthropicMessages) &&
 			capability.IsClaudeProbeModel(model) {
 			matches = append(matches, p)
 			matched[p.ID] = true
@@ -89,6 +89,18 @@ func (s *Server) customProvidersForModel(ctx context.Context, model string) []st
 		}
 	}
 	return matches
+}
+
+func customProviderSupportsProtocol(provider storage.CustomProvider, protocol string) bool {
+	if provider.UpstreamProtocol == protocol {
+		return true
+	}
+	for _, route := range provider.Routes {
+		if route.UpstreamProtocol == protocol {
+			return true
+		}
+	}
+	return false
 }
 
 // customProviderForModel returns the first matching custom provider that the
@@ -277,11 +289,57 @@ func (s *Server) selectCustomProviderEgress(ctx context.Context, provider storag
 	return scheduler.Lease{}, egressIDs, false
 }
 
-func customProviderCookieJarKey(lease scheduler.Lease, provider storage.CustomProvider) string {
-	if len(provider.EgressIDs) > 0 && strings.TrimSpace(lease.Egress.ID) != "" {
-		return lease.Account.ID + ":" + strings.TrimSpace(lease.Egress.ID)
+func customProviderDownstreamScope(r *http.Request) string {
+	identity := "anonymous"
+	if r != nil {
+		keyHash, userID := downstreamFromCtx(r.Context())
+		switch {
+		case strings.TrimSpace(keyHash) != "":
+			identity = "key:" + strings.TrimSpace(keyHash)
+		case strings.TrimSpace(userID) != "":
+			identity = "user:" + strings.TrimSpace(userID)
+		case strings.TrimSpace(downstreamBearer(r)) != "":
+			identity = "credential:" + hashAPIKey(downstreamBearer(r))
+		default:
+			for _, header := range []string{"X-Pool-Client-ID", "X-Client-ID", "X-Session-ID"} {
+				if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+					identity = "client:" + value
+					break
+				}
+			}
+		}
 	}
-	return lease.Binding.CookieJarKey
+	return hashAPIKey("custom-provider-downstream:" + identity)[:24]
+}
+
+func customProviderRouteScope(provider storage.CustomProvider) string {
+	return hashAPIKey(strings.Join([]string{
+		"custom-provider-route", strings.TrimSpace(provider.ID),
+		strings.TrimSpace(provider.ResolvedRouteID), strings.TrimSpace(provider.ResolvedDownstreamPath),
+		strings.TrimSpace(provider.BaseURL), strings.TrimSpace(provider.UpstreamProtocol),
+		strings.TrimSpace(provider.TransportProfile),
+	}, "\x00"))[:24]
+}
+
+func customProviderScopedAffinity(r *http.Request, provider storage.CustomProvider, affinity routing.AffinityKey) routing.AffinityKey {
+	if strings.TrimSpace(affinity.Hash) == "" {
+		return affinity
+	}
+	return routing.AffinityFromKey(strings.Join([]string{
+		"custom-provider", strings.TrimSpace(provider.ID),
+		customProviderRouteScope(provider), customProviderDownstreamScope(r), affinity.Hash,
+	}, ":"), affinity.Source)
+}
+
+func customProviderCookieJarKey(r *http.Request, lease scheduler.Lease, provider storage.CustomProvider) string {
+	base := lease.Binding.CookieJarKey
+	if len(provider.EgressIDs) > 0 && strings.TrimSpace(lease.Egress.ID) != "" {
+		base = lease.Account.ID + ":" + strings.TrimSpace(lease.Egress.ID)
+	}
+	if strings.TrimSpace(base) == "" {
+		base = lease.Account.ID + ":" + strings.TrimSpace(lease.Egress.ID)
+	}
+	return base + ":custom:" + customProviderRouteScope(provider) + ":" + customProviderDownstreamScope(r)
 }
 
 func writeInvalidCustomUpstreamResponse(w http.ResponseWriter) {
@@ -357,7 +415,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 	if strings.TrimSpace(upstreamPath) == "" {
 		upstreamPath = "/chat/completions"
 	}
-	affinity := routing.ExtractAffinityKey(r, body)
+	affinity := customProviderScopedAffinity(r, provider, routing.ExtractAffinityKey(r, body))
 	lease, err := s.scheduler.Select(r.Context(), scheduler.Route{
 		Group:              routeGroup,
 		Provider:           provider.ID,
@@ -411,7 +469,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 			Account:          lease.Account,
 			Token:            token,
 			Egress:           lease.Egress,
-			CookieJarKey:     customProviderCookieJarKey(lease, provider),
+			CookieJarKey:     customProviderCookieJarKey(r, lease, provider),
 			OSHint:           s.osHint(body, lease.Egress),
 		})
 		if requestErr == nil && (resp == nil || !customProviderRetryableEgressStatus(resp.StatusCode) || len(remainingEgressIDs) == 0) {
@@ -528,6 +586,7 @@ func (s *Server) callCustomAttempt(w http.ResponseWriter, r *http.Request, provi
 // sides speak Chat Completions, so the body and response pass through unchanged (only
 // sensitive-word scrubbing + usage capture are applied).
 func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamChat)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolResponses:
 		s.handleChatViaNativeResponsesCustom(w, r, raw, model, routeGroup, provider)
@@ -579,6 +638,7 @@ func (s *Server) handleChatViaCustom(w http.ResponseWriter, r *http.Request, raw
 // handleResponsesViaCustom serves a Codex /v1/responses request from a custom provider:
 // Responses request → chat, then chat response/SSE → Responses response/SSE.
 func (s *Server) handleResponsesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamResponses)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolResponses:
 		s.handleNativeResponsesViaCustom(w, r, raw, model, routeGroup, provider)
@@ -901,6 +961,7 @@ func (s *Server) handleMessagesViaResponsesCustom(w http.ResponseWriter, r *http
 // handleMessagesViaCustom serves a Claude Code /v1/messages request from a custom
 // provider: Anthropic request → chat, then chat response/SSE → Anthropic response/SSE.
 func (s *Server) handleMessagesViaCustom(w http.ResponseWriter, r *http.Request, raw []byte, model, routeGroup string, provider storage.CustomProvider) {
+	provider, _ = storage.ResolveCustomProviderRoute(provider, storage.CustomProviderDownstreamMessages)
 	switch provider.UpstreamProtocol {
 	case storage.CustomProviderProtocolAnthropicMessages:
 		s.handleNativeAnthropicMessagesViaCustom(w, r, raw, model, routeGroup, provider)

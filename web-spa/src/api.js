@@ -40,6 +40,9 @@ api.interceptors.response.use(
 );
 
 // Thin helpers returning response data directly.
+// Use getResponse only at compatibility boundaries that also need response
+// metadata (for example a request ID). Most callers should keep using get().
+export const getResponse = (url, params, config = {}) => api.get(url, { ...config, params });
 export const get = (url, params, config = {}) => api.get(url, { ...config, params }).then((r) => r.data);
 export const post = (url, body, config = {}) => api.post(url, body, config).then((r) => r.data);
 export const put = (url, body, config = {}) => api.put(url, body, config).then((r) => r.data);

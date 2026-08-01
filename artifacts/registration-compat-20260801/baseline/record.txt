@@ -1,0 +1,5 @@
+branch=cache-hit-optimization
+head=a14151d862aaf74d21d68f759ab6b2aecd0f2744
+source_files=943
+archive_bytes=2945209
+32031b516c8affe106d40c047b7a4acb52e48ed954c8c45ecf8daaee3b411c88  artifacts/registration-compat-20260801/baseline/source-before.tar.gz

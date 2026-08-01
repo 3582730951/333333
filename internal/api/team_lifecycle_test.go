@@ -68,6 +68,31 @@ func TestTeamLifecycleWorkspaceAutoFillsNativeConnectorAndWorkspaceReference(t *
 	}
 }
 
+func TestTeamLifecycleStatsExposeActionableSetupReadiness(t *testing.T) {
+	harness := newHarness(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	if err := harness.store.UpsertAccount(context.Background(), storage.Account{
+		ID: "ready-parent", Label: "Ready parent", Email: "parent@example.test",
+		UpstreamAccountID: "team-workspace", Provider: "codex", Status: "active",
+	}, storage.AccountToken{AccountID: "ready-parent", AccessToken: "fixture-access"}); err != nil {
+		t.Fatal(err)
+	}
+	response, body := teamLifecycleRequest(t, harness.pool.Client(), http.MethodGet,
+		harness.pool.URL+"/admin/team-lifecycle/stats", nil, nil)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+	var payload struct {
+		Readiness teamLifecycleSetupReadiness `json:"readiness"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Readiness.ParentAccounts != 1 || payload.Readiness.WorkspaceCreateReady ||
+		len(payload.Readiness.Blockers) == 0 || payload.Readiness.Blockers[0].Code != "mailbox_default" {
+		t.Fatalf("readiness=%+v", payload.Readiness)
+	}
+}
+
 func TestTeamLifecycleAdminAPIIdempotencyAndNoSecretFields(t *testing.T) {
 	harness := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)

@@ -1289,6 +1289,15 @@ func (s *Server) validateImportedAccountBackups(backups []storage.AccountBackup)
 			if err := validateCustomProviderBaseURL(provider.BaseURL); err != nil {
 				return fmt.Errorf("custom provider %q: %w", provider.ID, err)
 			}
+			for index, route := range provider.Routes {
+				baseURL := strings.TrimSpace(route.BaseURL)
+				if baseURL == "" {
+					baseURL = provider.BaseURL
+				}
+				if err := validateCustomProviderBaseURL(baseURL); err != nil {
+					return fmt.Errorf("custom provider %q route %d: %w", provider.ID, index+1, err)
+				}
+			}
 		}
 	}
 	return nil

@@ -277,7 +277,7 @@ export default function App() {
         <Header className="pool-shell-header">
           <div className="pool-topbar-left">
             <Button theme="borderless" icon={<IconList />} onClick={() => setMobileOpen((value) => !value)} className="pool-mobile-menu-btn" aria-label={t('app.toggle_menu')} />
-            <div className="pool-topbar-title"><span>{isAdmin ? t('app.admin') : t('app.portal')}</span>{activeRoute ? <><span className="pool-topbar-divider">/</span><span className="pool-topbar-current">{t(activeRoute.titleKey)}</span></> : null}</div>
+            <div className="pool-topbar-title"><span className="pool-topbar-title-main">{isAdmin ? t('app.admin') : t('app.portal')}</span>{activeRoute ? <><span className="pool-topbar-divider">/</span><span className="pool-topbar-current">{t(activeRoute.titleKey)}</span></> : null}</div>
           </div>
           <div className="pool-topbar-actions">
             <Button className="pool-topbar-icon-button pool-desktop-only" theme="borderless" icon={<IconLanguage />} onClick={switchLocale} aria-label={t('app.language')} />
