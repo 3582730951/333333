@@ -53,6 +53,9 @@ GO_INSTALL_ROOT="${GO_INSTALL_ROOT:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/.build}"
 SKIP_OS_PACKAGES="${SKIP_OS_PACKAGES:-0}"
 SIDECAR_ADDR="${SIDECAR_ADDR:-127.0.0.1:8790}"
+ADMIN_PORT_OVERRIDE=""
+EGRESS_TCP_PORT_OVERRIDE=""
+EGRESS_UDP_PORT_OVERRIDE=""
 # HEALTH_TIMEOUT bounds private-worker and post-switch /readyz gates.
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-180}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
@@ -164,8 +167,12 @@ Options:
   --with-warp               Provision the multi-exit WARP CF-fallback pool (wgcf + wireproxy)
   --without-warp            Do not provision WARP (default)
   --warp-exits N            Independent WARP exits to provision (implies --with-warp; default ${WARP_EXITS})
+  --warp-base-port PORT     First local WARP egress port. Default: ${WARP_BASE_PORT}
   --cf-solver-url URL       FlareSolverr-compatible cf_clearance solver base URL (enables the solver rung)
   --listen-addr ADDR        HTTP listen address for API + embedded frontend. Default: ${LISTEN_ADDR}
+  --admin-port PORT         Change only the embedded admin/frontend port
+  --egress-tcp-port PORT    TCP sidecar egress port; occupied foreign listener is terminated or PORT+1 is used
+  --egress-udp-port PORT    UDP/WARP egress base port; occupied foreign listener is terminated or PORT+1 is used
   --admin-token TOKEN       Admin API token. Generated for new externally exposed configs when empty
   --public-url URL          Public frontend URL to print in the install summary
   --open-firewall           Try to open the listen TCP port in ufw/firewalld
@@ -363,6 +370,16 @@ while [[ $# -gt 0 ]]; do
       WITH_WARP=1
       shift
       ;;
+    --warp-base-port)
+      EGRESS_UDP_PORT_OVERRIDE="${2:?missing value for --warp-base-port}"
+      WITH_WARP=1
+      shift 2
+      ;;
+    --warp-base-port=*)
+      EGRESS_UDP_PORT_OVERRIDE="${1#*=}"
+      WITH_WARP=1
+      shift
+      ;;
     --cf-solver-url)
       CF_SOLVER_URL="${2:?missing value for --cf-solver-url}"
       shift 2
@@ -377,6 +394,34 @@ while [[ $# -gt 0 ]]; do
       ;;
     --listen-addr=*)
       LISTEN_ADDR="${1#*=}"
+      shift
+      ;;
+    --admin-port)
+      ADMIN_PORT_OVERRIDE="${2:?missing value for --admin-port}"
+      shift 2
+      ;;
+    --admin-port=*)
+      ADMIN_PORT_OVERRIDE="${1#*=}"
+      shift
+      ;;
+    --egress-tcp-port)
+      EGRESS_TCP_PORT_OVERRIDE="${2:?missing value for --egress-tcp-port}"
+      WITH_SIDECAR=1
+      shift 2
+      ;;
+    --egress-tcp-port=*)
+      EGRESS_TCP_PORT_OVERRIDE="${1#*=}"
+      WITH_SIDECAR=1
+      shift
+      ;;
+    --egress-udp-port)
+      EGRESS_UDP_PORT_OVERRIDE="${2:?missing value for --egress-udp-port}"
+      WITH_WARP=1
+      shift 2
+      ;;
+    --egress-udp-port=*)
+      EGRESS_UDP_PORT_OVERRIDE="${1#*=}"
+      WITH_WARP=1
       shift
       ;;
     --admin-token)
@@ -510,6 +555,217 @@ listen_port() {
     *:*) printf '%s\n' "${addr##*:}" ;;
     *) printf '%s\n' "$addr" ;;
   esac
+}
+
+valid_port() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+address_with_port() {
+  local addr="${1:-}" port="$2"
+  case "$addr" in
+    \[*\]:*) printf '%s:%s\n' "${addr%:*}" "$port" ;;
+    :*) printf ':%s\n' "$port" ;;
+    *:*) printf '%s:%s\n' "${addr%:*}" "$port" ;;
+    "") printf '0.0.0.0:%s\n' "$port" ;;
+    *) printf '%s:%s\n' "$addr" "$port" ;;
+  esac
+}
+
+apply_port_overrides() {
+  if [[ -n "$ADMIN_PORT_OVERRIDE" ]]; then
+    valid_port "$ADMIN_PORT_OVERRIDE" || die "--admin-port must be between 1 and 65535"
+    LISTEN_ADDR="$(address_with_port "$LISTEN_ADDR" "$ADMIN_PORT_OVERRIDE")"
+  fi
+  if [[ -n "$EGRESS_TCP_PORT_OVERRIDE" ]]; then
+    valid_port "$EGRESS_TCP_PORT_OVERRIDE" || die "--egress-tcp-port must be between 1 and 65535"
+    SIDECAR_ADDR="$(address_with_port "$SIDECAR_ADDR" "$EGRESS_TCP_PORT_OVERRIDE")"
+  fi
+  if [[ -n "$EGRESS_UDP_PORT_OVERRIDE" ]]; then
+    valid_port "$EGRESS_UDP_PORT_OVERRIDE" || die "--egress-udp-port/--warp-base-port must be between 1 and 65535"
+    WARP_BASE_PORT="$EGRESS_UDP_PORT_OVERRIDE"
+  fi
+}
+
+listener_pids() {
+  local protocol="$1" port="$2"
+  if command -v lsof >/dev/null 2>&1; then
+    if [[ "$protocol" == tcp ]]; then
+      run_root lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+    else
+      run_root lsof -nP -t -iUDP:"$port" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  if command -v fuser >/dev/null 2>&1; then
+    run_root fuser -n "$protocol" "$port" 2>&1 | tr ' ' '\n' | grep -E '^[0-9]+$' || true
+    return 0
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if [[ "$protocol" == tcp ]]; then
+      run_root ss -H -ltnp "sport = :${port}" 2>/dev/null
+    else
+      run_root ss -H -lunp "sport = :${port}" 2>/dev/null
+    fi | grep -oE 'pid=[0-9]+' | cut -d= -f2 || true
+  fi
+}
+
+port_in_use() {
+  local protocol="$1" port="$2"
+  if [[ -n "$(listener_pids "$protocol" "$port")" ]]; then
+    return 0
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if [[ "$protocol" == tcp ]]; then
+      run_root ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+    else
+      run_root ss -H -lun "sport = :${port}" 2>/dev/null | grep -q .
+    fi
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    run_root python3 - "$protocol" "$port" <<'PY'
+import errno
+import socket
+import sys
+
+protocol, port = sys.argv[1], int(sys.argv[2])
+kind = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
+occupied = False
+for family, address in (
+    (socket.AF_INET, ("0.0.0.0", port)),
+    (socket.AF_INET6, ("::", port)),
+):
+    try:
+        sock = socket.socket(family, kind)
+    except OSError:
+        continue
+    try:
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind(address)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            occupied = True
+    finally:
+        sock.close()
+sys.exit(0 if occupied else 1)
+PY
+    return $?
+  fi
+  return 1
+}
+
+ports_in_use() {
+  local protocols="$1" port="$2" protocol
+  for protocol in $protocols; do
+    port_in_use "$protocol" "$port" && return 0
+  done
+  return 1
+}
+
+managed_unit_pid() {
+  local unit="$1"
+  command -v systemctl >/dev/null 2>&1 || return 1
+  run_root systemctl show "$unit" --property=MainPID --value 2>/dev/null | grep -E '^[1-9][0-9]*$'
+}
+
+port_owned_by_managed_unit() {
+  local protocols="$1" port="$2" unit="$3" managed pid protocol found=0
+  [[ -n "$unit" ]] || return 1
+  managed="$(managed_unit_pid "$unit" || true)"
+  [[ -n "$managed" ]] || return 1
+  for protocol in $protocols; do
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      found=1
+      [[ "$pid" == "$managed" ]] || return 1
+    done < <(listener_pids "$protocol" "$port" | sort -u)
+  done
+  (( found == 1 ))
+}
+
+terminate_port_listeners() {
+  local protocols="$1" port="$2" unit="$3" protocol pid managed comm
+  local -a pids=()
+  managed="$(managed_unit_pid "$unit" || true)"
+  for protocol in $protocols; do
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+      [[ "$pid" == "$managed" || "$pid" == "$$" || "$pid" == "1" ]] && continue
+      comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+      case "$comm" in systemd|init|sshd) continue ;; esac
+      pids+=("$pid")
+    done < <(listener_pids "$protocol" "$port" | sort -u)
+  done
+  (( ${#pids[@]} > 0 )) || return 1
+  log "Port ${port} is occupied; terminating listener pid(s): ${pids[*]}"
+  run_root kill -TERM "${pids[@]}" >/dev/null 2>&1 || return 1
+  for _ in {1..30}; do
+    sleep 0.1
+    ports_in_use "$protocols" "$port" || return 0
+    port_owned_by_managed_unit "$protocols" "$port" "$unit" && return 0
+  done
+  return 1
+}
+
+port_conflicts_with_selected_listener() {
+  local protocols="$1" port="$2" admin_port sidecar_port
+  admin_port="$(listen_port "$LISTEN_ADDR")"
+  sidecar_port="$(listen_port "$SIDECAR_ADDR")"
+  if [[ " $protocols " == *" tcp "* && "$port" == "$admin_port" ]]; then
+    return 0
+  fi
+  if [[ " $protocols " == *" tcp "* && -n "${RESOLVED_SIDECAR_PORT:-}" && "$port" == "$sidecar_port" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+resolve_egress_port() {
+  local protocols="$1" requested="$2" label="$3" managed_unit="$4" candidate
+  valid_port "$requested" || die "${label} port must be between 1 and 65535: ${requested}"
+  candidate="$requested"
+  if ! port_conflicts_with_selected_listener "$protocols" "$candidate" && ! ports_in_use "$protocols" "$candidate"; then
+    RESOLVED_EGRESS_PORT="$candidate"
+    return 0
+  fi
+  if ! port_conflicts_with_selected_listener "$protocols" "$candidate" &&
+    port_owned_by_managed_unit "$protocols" "$candidate" "$managed_unit"; then
+    RESOLVED_EGRESS_PORT="$candidate"
+    return 0
+  fi
+  if ! port_conflicts_with_selected_listener "$protocols" "$candidate" && terminate_port_listeners "$protocols" "$candidate" "$managed_unit"; then
+    RESOLVED_EGRESS_PORT="$candidate"
+    return 0
+  fi
+
+  warn "${label} port ${requested} remains occupied; selecting the first free +1 port"
+  for (( candidate=requested+1; candidate<=65535; candidate++ )); do
+    port_conflicts_with_selected_listener "$protocols" "$candidate" && continue
+    ports_in_use "$protocols" "$candidate" && continue
+    RESOLVED_EGRESS_PORT="$candidate"
+    log "${label} port changed ${requested} -> ${candidate}"
+    return 0
+  done
+  die "no free ${label} port remains above ${requested}"
+}
+
+resolve_requested_egress_ports() {
+  local port
+  RESOLVED_SIDECAR_PORT=""
+  if bool_enabled "$WITH_SIDECAR"; then
+    port="$(listen_port "$SIDECAR_ADDR")"
+    resolve_egress_port "tcp" "$port" "TCP egress" "${SERVICE_NAME}-sidecar.service"
+    SIDECAR_ADDR="$(address_with_port "$SIDECAR_ADDR" "$RESOLVED_EGRESS_PORT")"
+    RESOLVED_SIDECAR_PORT="$RESOLVED_EGRESS_PORT"
+  fi
+  if bool_enabled "$WITH_WARP"; then
+    [[ "$WARP_EXITS" =~ ^[0-9]+$ && "$WARP_EXITS" -ge 1 ]] || die "--warp-exits must be a positive integer (got: ${WARP_EXITS})"
+    resolve_egress_port "tcp udp" "$WARP_BASE_PORT" "UDP/WARP egress" "${SERVICE_NAME}-warp@1.service"
+    WARP_BASE_PORT="$RESOLVED_EGRESS_PORT"
+    (( WARP_BASE_PORT + WARP_EXITS - 1 <= 65535 )) || die "WARP exit port range exceeds 65535"
+  fi
 }
 
 codex_reauth_base_url() {
@@ -726,7 +982,7 @@ install_os_packages() {
 
   local base_pkgs sidecar_pkgs
   if command -v apt-get >/dev/null 2>&1; then
-    base_pkgs=(ca-certificates curl tar build-essential sqlite3)
+    base_pkgs=(ca-certificates curl tar build-essential sqlite3 lsof)
     sidecar_pkgs=(python3 python3-venv python3-pip)
     log "Installing OS packages with apt-get"
     run_root env DEBIAN_FRONTEND=noninteractive apt-get update
@@ -736,7 +992,7 @@ install_os_packages() {
       run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${base_pkgs[@]}"
     fi
   elif command -v dnf >/dev/null 2>&1; then
-    base_pkgs=(ca-certificates curl tar gcc gcc-c++ make sqlite)
+    base_pkgs=(ca-certificates curl tar gcc gcc-c++ make sqlite lsof)
     sidecar_pkgs=(python3 python3-pip)
     log "Installing OS packages with dnf"
     if python_runtime_enabled; then
@@ -745,7 +1001,7 @@ install_os_packages() {
       run_root dnf install -y "${base_pkgs[@]}"
     fi
   elif command -v yum >/dev/null 2>&1; then
-    base_pkgs=(ca-certificates curl tar gcc gcc-c++ make sqlite)
+    base_pkgs=(ca-certificates curl tar gcc gcc-c++ make sqlite lsof)
     sidecar_pkgs=(python3 python3-pip)
     log "Installing OS packages with yum"
     if python_runtime_enabled; then
@@ -754,7 +1010,7 @@ install_os_packages() {
       run_root yum install -y "${base_pkgs[@]}"
     fi
   elif command -v apk >/dev/null 2>&1; then
-    base_pkgs=(ca-certificates curl tar build-base sqlite)
+    base_pkgs=(ca-certificates curl tar build-base sqlite lsof)
     sidecar_pkgs=(python3 py3-pip py3-virtualenv)
     log "Installing OS packages with apk"
     if python_runtime_enabled; then
@@ -763,7 +1019,7 @@ install_os_packages() {
       run_root apk add --no-cache "${base_pkgs[@]}"
     fi
   elif command -v pacman >/dev/null 2>&1; then
-    base_pkgs=(ca-certificates curl tar base-devel sqlite)
+    base_pkgs=(ca-certificates curl tar base-devel sqlite lsof)
     sidecar_pkgs=(python python-pip python-virtualenv)
     log "Installing OS packages with pacman"
     if python_runtime_enabled; then
@@ -780,6 +1036,7 @@ need_system_deps() {
   command -v curl >/dev/null 2>&1 || return 0
   command -v tar >/dev/null 2>&1 || return 0
   command -v sqlite3 >/dev/null 2>&1 || return 0
+  { command -v lsof >/dev/null 2>&1 || command -v fuser >/dev/null 2>&1 || command -v ss >/dev/null 2>&1; } || return 0
   { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; } || return 0
   if python_runtime_enabled; then
     command -v python3 >/dev/null 2>&1 || return 0
@@ -2554,6 +2811,7 @@ EOF
 }
 
 main() {
+  apply_port_overrides
   normalize_migrate_user_groups
   ensure_project_files
   ensure_absolute_paths
@@ -2569,6 +2827,7 @@ main() {
   adopt_interrupted_install_pause
   ensure_go
   build_project
+  resolve_requested_egress_ports
   prepare_runtime_layout
   install_binary_and_config
   install_sidecar

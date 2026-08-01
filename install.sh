@@ -40,12 +40,63 @@ cd "$PROJECT_ROOT"
 }
 
 install_mode="${CODEX_POOL_INSTALL_MODE:-auto}"
+admin_port_override=""
+egress_tcp_port_override=""
+egress_udp_port_override=""
+admin_port_choice_set=0
+egress_tcp_port_choice_set=0
+egress_udp_port_choice_set=0
+warp_exits_choice_set=0
+[[ -v LISTEN_ADDR ]] && admin_port_choice_set=1
+[[ -v SIDECAR_ADDR ]] && egress_tcp_port_choice_set=1
+[[ -v WARP_BASE_PORT ]] && egress_udp_port_choice_set=1
+[[ -v WARP_EXITS ]] && warp_exits_choice_set=1
+
 forward_args=()
-for arg in "$@"; do
-  case "$arg" in
-    --fresh-install) install_mode="fresh" ;;
-    --update) install_mode="update" ;;
-    *) forward_args+=("$arg") ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fresh-install)
+      install_mode="fresh"
+      shift
+      ;;
+    --update)
+      install_mode="update"
+      shift
+      ;;
+    --admin-port)
+      admin_port_override="${2:?missing value for --admin-port}"
+      admin_port_choice_set=1
+      shift 2
+      ;;
+    --admin-port=*)
+      admin_port_override="${1#*=}"
+      admin_port_choice_set=1
+      shift
+      ;;
+    --egress-tcp-port)
+      egress_tcp_port_override="${2:?missing value for --egress-tcp-port}"
+      egress_tcp_port_choice_set=1
+      shift 2
+      ;;
+    --egress-tcp-port=*)
+      egress_tcp_port_override="${1#*=}"
+      egress_tcp_port_choice_set=1
+      shift
+      ;;
+    --egress-udp-port|--warp-base-port)
+      egress_udp_port_override="${2:?missing value for $1}"
+      egress_udp_port_choice_set=1
+      shift 2
+      ;;
+    --egress-udp-port=*|--warp-base-port=*)
+      egress_udp_port_override="${1#*=}"
+      egress_udp_port_choice_set=1
+      shift
+      ;;
+    *)
+      forward_args+=("$1")
+      shift
+      ;;
   esac
 done
 set -- "${forward_args[@]}"
@@ -93,6 +144,68 @@ detect_existing_install() {
      -f "${systemd_dir%/}/${service_name}.service" || -f "${systemd_dir%/}/${service_name}-handoff.service" ]]
 }
 
+valid_port() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+listen_port() {
+  local addr="${1:-}"
+  case "$addr" in
+    \[*\]:*|*:*) printf '%s\n' "${addr##*:}" ;;
+    *) printf '%s\n' "$addr" ;;
+  esac
+}
+
+address_with_port() {
+  local addr="${1:-}" port="$2"
+  case "$addr" in
+    \[*\]:*) printf '%s:%s\n' "${addr%:*}" "$port" ;;
+    :*) printf ':%s\n' "$port" ;;
+    *:*) printf '%s:%s\n' "${addr%:*}" "$port" ;;
+    "") printf '0.0.0.0:%s\n' "$port" ;;
+    *) printf '%s:%s\n' "$addr" "$port" ;;
+  esac
+}
+
+config_value() {
+  local file="$1" key="$2"
+  [[ -r "$file" ]] || return 1
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}[[:space:]]*,\{0,1\}.*/\1/p" "$file" | head -1
+}
+
+load_installed_port_defaults() {
+  local config_file="${CONFIG_FILE:-/etc/codex-pool/config.json}" value
+  [[ -r "$config_file" ]] || return 0
+  if [[ "$admin_port_choice_set" == 0 ]]; then
+    value="$(config_value "$config_file" listen_addr || true)"
+    [[ -n "$value" ]] && LISTEN_ADDR="$value"
+  fi
+  if [[ "$egress_tcp_port_choice_set" == 0 ]]; then
+    value="$(config_value "$config_file" default_sidecar_endpoint || true)"
+    value="${value#http://}"
+    value="${value#https://}"
+    [[ -n "$value" ]] && SIDECAR_ADDR="$value"
+  fi
+  if [[ "$egress_udp_port_choice_set" == 0 ]]; then
+    value="$(config_value "$config_file" warp_exit_base_port || true)"
+    valid_port "$value" && WARP_BASE_PORT="$value"
+  fi
+}
+
+prompt_port() {
+  local label="$1" default_port="$2" answer
+  while true; do
+    printf '%s [%s]: ' "$label" "$default_port" >&2
+    IFS= read -r answer || true
+    answer="${answer:-$default_port}"
+    if valid_port "$answer"; then
+      printf '%s\n' "$answer"
+      return 0
+    fi
+    printf '端口必须是 1-65535 的整数，请重新输入。\n' >&2
+  done
+}
+
 echo "================================"
 echo " Pool Server 安装 / 更新"
 echo "================================"
@@ -107,12 +220,70 @@ echo
 # MIGRATE_USER_GROUPS=0/1.
 migration_choice_set=0
 help_requested=0
+sidecar_prompt_enabled=1
+warp_prompt_enabled=1
 for arg in "$@"; do
   case "$arg" in
     --migrate-user-groups|--no-migrate-user-groups) migration_choice_set=1 ;;
+    --listen-addr|--listen-addr=*) admin_port_choice_set=1 ;;
+    --sidecar-addr|--sidecar-addr=*) egress_tcp_port_choice_set=1 ;;
+    --warp-exits|--warp-exits=*) warp_exits_choice_set=1 ;;
+    --minimal) sidecar_prompt_enabled=0; warp_prompt_enabled=0 ;;
+    --without-sidecar) sidecar_prompt_enabled=0 ;;
+    --without-warp) warp_prompt_enabled=0 ;;
     -h|--help) help_requested=1 ;;
   esac
 done
+
+if [[ -v WITH_SIDECAR ]] && ! [[ "${WITH_SIDECAR}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+  sidecar_prompt_enabled=0
+fi
+if [[ -v WITH_WARP ]] && ! [[ "${WITH_WARP}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+  warp_prompt_enabled=0
+fi
+
+if [[ "$help_requested" == 0 ]]; then
+  load_installed_port_defaults
+  LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:8787}"
+  SIDECAR_ADDR="${SIDECAR_ADDR:-127.0.0.1:8790}"
+  WARP_BASE_PORT="${WARP_BASE_PORT:-40000}"
+
+  if [[ -n "$admin_port_override" ]]; then
+    valid_port "$admin_port_override" || { printf 'ERROR: --admin-port must be 1-65535\n' >&2; exit 2; }
+    LISTEN_ADDR="$(address_with_port "$LISTEN_ADDR" "$admin_port_override")"
+  elif [[ "$admin_port_choice_set" == 0 && -t 0 ]]; then
+    selected_port="$(prompt_port '管理员前端绑定监听端口' "$(listen_port "$LISTEN_ADDR")")"
+    LISTEN_ADDR="$(address_with_port "$LISTEN_ADDR" "$selected_port")"
+  fi
+  export LISTEN_ADDR
+
+  if [[ "$sidecar_prompt_enabled" == 1 ]]; then
+    if [[ -n "$egress_tcp_port_override" ]]; then
+      valid_port "$egress_tcp_port_override" || { printf 'ERROR: --egress-tcp-port must be 1-65535\n' >&2; exit 2; }
+      SIDECAR_ADDR="$(address_with_port "$SIDECAR_ADDR" "$egress_tcp_port_override")"
+    elif [[ "$egress_tcp_port_choice_set" == 0 && -t 0 ]]; then
+      selected_port="$(prompt_port '全部上游流量 TCP 出口监听端口' "$(listen_port "$SIDECAR_ADDR")")"
+      SIDECAR_ADDR="$(address_with_port "$SIDECAR_ADDR" "$selected_port")"
+    fi
+    export SIDECAR_ADDR
+  fi
+
+  if [[ "$warp_prompt_enabled" == 1 ]]; then
+    if [[ -n "$egress_udp_port_override" ]]; then
+      valid_port "$egress_udp_port_override" || { printf 'ERROR: --egress-udp-port must be 1-65535\n' >&2; exit 2; }
+      WARP_BASE_PORT="$egress_udp_port_override"
+    elif [[ "$egress_udp_port_choice_set" == 0 && -t 0 ]]; then
+      WARP_BASE_PORT="$(prompt_port '全部上游流量 UDP/WARP 出口监听端口' "$WARP_BASE_PORT")"
+    fi
+    if [[ -n "$egress_udp_port_override" || "$egress_udp_port_choice_set" == 1 || -t 0 ]]; then
+      WITH_WARP=1
+      if [[ "$warp_exits_choice_set" == 0 ]]; then
+        WARP_EXITS=1
+      fi
+      export WITH_WARP WARP_EXITS WARP_BASE_PORT
+    fi
+  fi
+fi
 
 if [[ "$help_requested" == "0" && "$migration_choice_set" == "0" && ! -v MIGRATE_USER_GROUPS ]]; then
   migration_answer=""
